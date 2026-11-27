@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>24. 備份與災難復原：沒還原過的備份不算備份</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="24" data-practice="devops">
+<header>
+  <div class="eyebrow">階段 6：可觀測性與可靠性 · 第 24 課</div>
+  <h1>備份與災難復原：沒還原過的備份不算備份</h1>
+</header>
+<main>
+
+<p>星期一早上，同事跑 migration 時下錯了一句 <code>DELETE</code>，orders 表少了三個月的訂單。大家鬆了一口氣：「還好每天都有備份。」打開備份資料夾，最新的檔案是 0 byte；往前翻，每一份都是 0 byte。半年前資料庫換了密碼，備份腳本從那天起每晚都失敗，可是它用的是 <code>pg_dump … | gzip &gt; 檔案</code>，結束碼一直是 0，排程也一直顯示成功。</p>
+<p>這一課讓備份從「看起來有」變成「證明能用」，再把範圍擴大到整個系統：什麼都沒了的時候，照著哪份文件、花多久能把咖啡店救回來。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>RPO 與 RTO：「要備份」不是需求，「最多能丟多少資料、最多能停多久」才是，這兩個數字要跟老闆一起訂；也先給開場 0 byte 備份的原因（最小答案）。</li>
+  <li>備份的種類與不會騙你的備份腳本：<code>pg_dump</code>、實體備份、WAL 封存怎麼選，開場那個 0 byte 的備份為什麼一直「成功」，怎麼讓失敗大聲說出來。</li>
+  <li>還原與驗證：用自動化的還原演練證明備份真的能用，量出還原實際要花多久。</li>
+  <li>異地、不可變、保留與排程：備份放哪裡才不會跟正式資料一起被刪、被勒索，要留幾份、怎麼排程才不會悄悄停掉。</li>
+  <li>整個系統的災難復原：機器、映像、機密、DNS 都沒了的時候，照著 runbook 把服務救回來。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../postgresql/lessons/37-backup-replication.html">PostgreSQL 課第 37 課</a>的備份：<code>pg_dump</code> 匯出一份邏輯備份，<code>pg_basebackup</code> 複製整個資料目錄，再加上 WAL 封存就能還原到任一時間點。</li>
+  <li><a href="02-shell.html">第 2 課</a>的結束碼與 <code>set -euo pipefail</code>：管線預設只看最後一段的結束碼；<code>pipefail</code> 讓任何一段失敗都算失敗，<code>-e</code> 讓腳本一出錯就停。</li>
+</ul></div>
+
+<h2>從需求開始：RPO 與 RTO</h2>
+<p>「要備份」不是需求，需求是兩個數字：</p>
+<ul>
+  <li><strong>RPO（復原點目標，Recovery Point Objective）</strong>：出事時最多能接受遺失多久的資料。RPO 15 分鐘，表示最近 15 分鐘內的訂單可以不見，再多就不行。</li>
+  <li><strong>RTO（復原時間目標，Recovery Time Objective）</strong>：從出事到恢復服務，最多能接受停多久。RTO 1 小時，表示一小時內客人要能再點餐。</li>
+</ul>
+<figure>
+  <svg viewBox="0 0 700 200" role="img" aria-label="時間軸：最後一次備份到事故之間是遺失的資料，長度不能超過 RPO；事故到恢復服務之間是停機時間，長度不能超過 RTO">
+    <defs><marker id="arr24a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <line class="d-line" x1="20" y1="100" x2="680" y2="100" marker-end="url(#arr24a)"/>
+    <circle class="d-box" cx="150" cy="100" r="8"/>
+    <circle class="d-box" cx="380" cy="100" r="8"/>
+    <circle class="d-box" cx="600" cy="100" r="8"/>
+    <text class="d-text" x="150" y="135" text-anchor="middle">最後一次備份</text>
+    <text class="d-small" x="150" y="155" text-anchor="middle">03:00</text>
+    <text class="d-accent" x="380" y="135" text-anchor="middle">事故</text>
+    <text class="d-small" x="380" y="155" text-anchor="middle">誤刪 orders 14:20</text>
+    <text class="d-text" x="600" y="135" text-anchor="middle">恢復服務</text>
+    <text class="d-small" x="600" y="155" text-anchor="middle">15:05</text>
+    <line class="d-line" x1="160" y1="60" x2="370" y2="60" marker-start="url(#arr24a)" marker-end="url(#arr24a)"/>
+    <text class="d-accent" x="265" y="45" text-anchor="middle">遺失的資料 ≤ RPO</text>
+    <line class="d-line" x1="390" y1="60" x2="590" y2="60" marker-start="url(#arr24a)" marker-end="url(#arr24a)"/>
+    <text class="d-accent" x="490" y="45" text-anchor="middle">停機時間 ≤ RTO</text>
+    <text class="d-small" x="350" y="190" text-anchor="middle">每天 03:00 備份一次，最壞情況會丟掉將近 24 小時的資料</text>
+  </svg>
+  <figcaption>RPO 決定備份要多頻繁、要不要連續保存交易紀錄；RTO 決定還原的方式和事前的準備。</figcaption>
+</figure>
+<p>兩個數字要跟老闆一起訂，因為越小越貴。不同的資料可以有不同的數字：訂單和集點卡 RPO 5 分鐘、RTO 1 小時；分析報表可以從訂單重算，RPO 一天、RTO 一天就夠了。</p>
+<p>從數字推回做法：每天備份一次，RPO 最壞接近 24 小時；要 RPO 5 分鐘，定時匯出做不到，要用 WAL 封存（下一節）。RTO 包含發現問題、決定要還原、拿到備份、還原、驗證、切換流量，每一段都要時間，只有實際演練過才知道總共多久。</p>
+<p>不過開場的備份連 RPO 都談不上，因為它根本沒備到東西。原因先講結論：<code>pg_dump … | gzip</code> 這條管線的結束碼只看最後一段的 <code>gzip</code>，換密碼後 <code>pg_dump</code> 連不上資料庫而失敗，<code>gzip</code> 照樣把「什麼都沒有」壓成一個檔、回報成功，排程就一直以為沒事。怎麼寫出失敗會大聲說出來的腳本，細節在後面的〈一個不會騙你的備份腳本〉。</p>
+<div class="callout practice"><strong>💡 實務上：RPO／RTO 是跟 PM、老闆談出來的</strong><br>你最常在兩個場合遇到這兩個數字：新服務上線前的檢查清單，以及客戶或資安問卷問「你們的備份策略是什麼」。工程師的工作是把每個選項的代價講清楚，例如「RPO 從 24 小時降到 5 分鐘，要開 WAL 封存或改用 RDS 的 PITR，每月多出儲存費，還要有人維護」，讓決策的人選。談定後寫進文件，之後每次演練拿實測值對照。資深工程師會先問：哪些資料丟了會賠錢或違法？哪些可以重算？停機一小時，客服電話會打給誰？</div>
+
+<h2>備份的種類</h2>
+<p><a href="../../postgresql/lessons/37-backup-replication.html">PostgreSQL 課第 37 課</a>介紹過這幾種，這裡從維運的角度比較：</p>
+<div class="table-wrap"><table>
+  <tr><th>種類</th><th>例子</th><th>RPO</th><th>還原速度</th><th>適合</th></tr>
+  <tr><td><strong>邏輯備份</strong>（logical backup）：匯出成 SQL 或封存格式</td><td><code>pg_dump</code></td><td>兩次匯出的間隔</td><td>慢：要重新寫入資料、重建索引</td><td>小型資料庫、搬家、跨大版本升級、只還原一張表</td></tr>
+  <tr><td><strong>實體備份</strong>（physical backup）：複製資料檔</td><td><code>pg_basebackup</code>、pgBackRest、Barman</td><td>搭配 WAL 封存可以到幾秒</td><td>快：直接放回資料檔，再重播 WAL</td><td>正式環境的主要備份</td></tr>
+  <tr><td><strong>WAL 封存與 PITR</strong>（時間點還原）</td><td><code>archive_command</code>＋基礎備份</td><td>幾秒到幾分鐘</td><td>看要重播多少 WAL</td><td>「還原到誤刪前一分鐘」</td></tr>
+  <tr><td><strong>快照</strong>（snapshot）：某個時間點的磁碟映像</td><td>EBS snapshot</td><td>快照的間隔</td><td>快</td><td>整台機器；資料庫要確保快照時資料一致</td></tr>
+  <tr><td><strong>託管服務的備份</strong></td><td>RDS 自動備份＋手動快照</td><td>RDS 的 PITR 通常可以到最近 5 分鐘內</td><td>還原成<strong>一個新的</strong>執行個體，要改連線位址</td><td>用 RDS 時的預設選擇</td></tr>
+</table></div>
+<p>PostgreSQL 18 的 <a href="https://www.postgresql.org/docs/current/app-pgdump.html">pg_dump 文件</a>自己寫明：除了簡單的情況，pg_dump 通常不適合當正式資料庫的定期備份。它的優點是匯出時不會擋住讀寫、結果可以還原到更新的大版本；缺點是 RPO 只能到匯出的間隔，資料大了以後匯出和還原都很慢。這課的練習用 pg_dump，因為它最容易看清楚「備份、驗證、還原」的每一步；這些步驟換成 pgBackRest 或 RDS 也一樣要做。RDS 的自動備份保留期可以設 0 到 35 天，設 0 等於關掉。</p>
+<p>還有兩個常見的誤解：</p>
+<ul>
+  <li><strong>複寫（replica）不是備份</strong>：誤刪的 <code>DELETE</code> 在一秒內就複寫到 replica 了。replica 解決的是「機器壞了」，備份解決的是「資料壞了」。</li>
+  <li><strong>RAID、雲端硬碟的耐用度不是備份</strong>：它們保證寫進去的東西不會因為硬體壞掉而不見，但你自己刪掉、勒索軟體加密的資料，它們一樣忠實地保存。</li>
+</ul>
+<p>放在哪裡，業界常用 <strong>3-2-1 原則</strong>：資料至少 3 份（正式資料加兩份備份）、放在 2 種不同的儲存媒介、其中 1 份在異地。雲端上的「異地」通常指另一個 region，而且最好是另一個帳號。</p>
+
+<h2>一個不會騙你的備份腳本</h2>
+<p>開場那個 0 byte 的備份，問題出在管線：<a href="02-shell.html">第 2 課</a>教過，管線的結束碼只看最後一段，<code>pg_dump</code> 失敗了，<code>gzip</code> 照樣成功壓縮了「什麼都沒有」。可靠的備份腳本要做到：任何一步失敗就以非 0 結束、不留下看起來像備份的半成品、成功時留下可以驗證的資訊。步驟是：</p>
+<ol>
+  <li><strong>一致的匯出</strong>：用 <code>docker exec</code>（<a href="10-compose.html">第 10 課</a>）在資料庫容器裡執行 <code>pg_dump -Fc</code>。容器裡的 pg_dump 跟伺服器同一個版本；主機上舊版的 pg_dump 會拒絕匯出比它新的伺服器。<code>-Fc</code> 是 custom 格式：已經壓縮，可以用 <code>pg_restore</code> 選擇性還原。</li>
+  <li><strong>寫到暫存檔</strong>：寫到同一個資料夾裡的 <code>.cafe-….dump.tmp</code>，全部成功才 <code>mv</code> 成正式檔名。同一個檔案系統裡的 <code>mv</code> 是原子的：別人只會看到完整的檔案或沒有檔案。</li>
+  <li><strong>快速驗證</strong>：<code>pg_restore --list</code> 讀得出目錄。</li>
+  <li><strong>manifest</strong>：記下各表的列數，還原演練時拿來比對。</li>
+  <li><strong>校驗和</strong>（checksum）：用 SHA-256（<a href="../../auth/lessons/02-crypto-toolbox.html">Auth 課第 2 課</a>）算出檔案的雜湊值寫進 <code>.sha256</code>。之後任何一個 byte 改變，雜湊值就不同，可以分辨檔案有沒有壞掉或被換掉。</li>
+  <li><strong>更新 LATEST、輸出結果</strong>：全部完成才更新「最新一份是哪個」的指標，最後印一行 JSON（大小、耗時），給監控讀。</li>
+</ol>
+<pre>set -euo pipefail
+name=cafe-$(date -u +%Y%m%dT%H%M%SZ)          # 檔名用 UTC 時間
+tmp="$OFFSITE_DIR/.$name.dump.tmp"
+trap 'rm -f "$tmp"' EXIT                        # 失敗時清掉暫存檔
+bytes=$(docker exec ld-24-db pg_dump -U postgres -d cafe -Fc | tee "$tmp" | wc -c)
+…驗證、manifest、校驗和…
+mv "$tmp" "$OFFSITE_DIR/$name.dump"</pre>
+<p><code>pg_restore --list</code> 有一個陷阱。我們把一份 1 MB 的 custom 格式備份截掉後面 30%，模擬「傳到一半連線斷了」：</p>
+<pre>$ head -c 766622 full.dump &gt; cut.dump
+$ docker exec -i ld-24-db pg_restore --list &lt; cut.dump &gt; /dev/null; echo $?
+0                                   ← 目錄在檔案開頭，照樣讀得出來
+$ docker exec -i ld-24-db pg_restore -f /dev/null &lt; cut.dump; echo $?
+pg_restore: error: could not read from input file: end of file
+1                                   ← 要真的讀完資料才發現</pre>
+<p>所以 <code>--list</code> 只能擋下「完全不是備份」的檔案，擋不住只有一半的備份。這就是為什麼 pipefail 不能省：pg_dump 中途失敗時，要靠它讓腳本停下來。完整的驗證交給下一節的還原演練。</p>
+<div class="callout warn">用 <code>grep -q</code> 接在管線後面要小心：<code>grep -q</code> 一找到就結束，前面的程式可能因為 SIGPIPE 而以非 0 結束，加了 pipefail 後反而變成「成功也被判失敗」。把輸出先存進變數，再用 <code>grep -q … &lt;&lt;&lt; "$toc"</code> 檢查。</div>
+<p>還有兩件事練習沒有要求，正式環境要做：</p>
+<ul>
+  <li><strong>加密</strong>：備份裡有顧客資料。上傳前用 age 或 gpg 以<strong>公鑰</strong>加密，備份主機上只放公鑰；解密用的私鑰放在別的地方，只有還原時才拿出來。上傳到 S3 也要開伺服器端加密。</li>
+  <li><strong>角色與權限</strong>：pg_dump 只匯出一個資料庫，裡面的 <code>GRANT … TO cafe_app</code> 會被匯出，<code>cafe_app</code> 這個角色本身不會。另外用 <code>pg_dumpall --globals-only</code> 備份角色（裡面有密碼雜湊，跟備份一樣要加密保管），還原時先還原它。</li>
+</ul>
+<p>manifest 的列數和 pg_dump 不是在同一個快照裡算的，匯出期間有寫入時兩者可能差幾列。練習時沒有寫入，所以沒問題；正式環境可以改成比對「還原後的列數不少於備份開始前的列數」，或改用實體備份工具內建的驗證。</p>
+
+<h2>還原與驗證</h2>
+<p>備份腳本每天回報成功，只代表檔案產生了。它能不能還原、還原出來的資料對不對、要花多久，只有真的還原一次才知道。<strong>還原演練</strong>（restore drill）就是定期、自動地做這件事：</p>
+<ol>
+  <li><strong>先驗證校驗和</strong>：在檔案所在的資料夾執行 <code>sha256sum -c cafe-….sha256</code>。不符就停，壞掉的檔案還原出來的東西不能信。</li>
+  <li><strong>還原到全新的臨時容器</strong>：不同名稱、跟正式環境同一個映像。<strong>絕對不要</strong>還原進正式的資料庫：<code>pg_restore --clean</code> 會先刪掉現有的物件，備份之後才寫入的訂單就這樣被蓋掉了。</li>
+  <li><strong>還原時遇錯就停</strong>：<a href="https://www.postgresql.org/docs/current/app-pgrestore.html">pg_restore</a> 預設遇到錯誤會繼續做完，最後印出 <code>errors ignored on restore: N</code> 並以 1 結束。加 <code>--exit-on-error</code> 在第一個錯誤就停（<code>-1</code>／<code>--single-transaction</code> 也有同樣效果），並且讓 <code>set -e</code> 檢查結束碼。很多人因為「有一些 owner 的錯誤沒關係」而加上 <code>|| true</code>，部分還原從此也算成功。</li>
+  <li><strong>比對 manifest</strong>：用同一句 SQL 數還原後的列數，跟備份時記下的比。</li>
+  <li><strong>煙霧測試</strong>（smoke test）：對還原出來的資料庫跑 app 最常做的事。練習用 SQL 檢查訂單總額和明細一致、每日營收查得出來；正式環境可以把 app 的映像接到這個資料庫，打幾個 API。</li>
+  <li><strong>量 RTO、收拾</strong>：從開始到驗證完成花了幾秒，印成 JSON。不論成功或失敗，都用 <code>trap</code> 把臨時容器刪掉。</li>
+</ol>
+<pre>$ bash restore-drill.sh offsite/cafe-20261101T030000Z.dump
+{"ok":true,"rto_seconds":9}</pre>
+<p>這裡量到的 9 秒只是「還原這份資料」的時間。真正的 RTO 還要加上：發現問題、決定還原、從異地下載備份、改 app 的連線設定、確認服務恢復。資料量長大後還原時間會跟著變長，所以演練要排程（例如每週一次），把 <code>rto_seconds</code> 當成指標記下來，超過目標就告警。</p>
+<div class="callout practice"><strong>💡 實務上：誤刪資料時，通常只還原一部分</strong><br>開場那種誤刪，最常見的救法不是把整個資料庫倒回早上 3 點，那樣會把之後的新訂單一起丟掉。做法是把備份還原到旁邊的臨時資料庫（就是演練用的流程），查出被刪掉的那些列，再用 <code>INSERT … SELECT</code> 或匯出、匯入補回正式資料庫；custom 格式可以用 <code>pg_restore -t orders</code> 只還原一張表。動手前先跟負責人確認範圍，補完請 PM 或客服抽查幾筆。平常演練過，這時才不會手忙腳亂。</div>
+
+<h2>異地與不可變</h2>
+<p>備份跟正式資料放在同一台機器、同一個雲端帳號、用同一組權限，等於只有一份：</p>
+<ul>
+  <li>同事在錯的資料夾 <code>rm -rf</code>，或 IaC（<a href="20-iac.html">第 20 課</a>）把整個 bucket 刪了。</li>
+  <li>攻擊者拿到 app 的雲端金鑰，先刪備份、再加密資料庫，然後要贖金（勒索軟體的標準流程）。</li>
+</ul>
+<p>保護的層次：</p>
+<ul>
+  <li><strong>權限分離</strong>（<a href="11-config-secrets.html">第 11 課</a>、<a href="19-aws-iam.html">第 19 課</a>）：備份程式只有「寫入」權限，沒有刪除；app 的帳號完全碰不到備份。備份放在另一個 AWS 帳號更好，正式帳號被入侵也碰不到。</li>
+  <li><strong>S3 版本控制</strong>（versioning）：覆蓋或刪除只會產生新版本或刪除標記，舊版本還在。</li>
+  <li><strong>不可變備份</strong>（immutable backup）：寫入後一段時間內不能修改或刪除。S3 Object Lock 要求 bucket 開啟版本控制，有兩種模式：<strong>governance</strong> 模式下，有 <code>s3:BypassGovernanceRetention</code> 權限的人仍然可以刪；<strong>compliance</strong> 模式下，保留期限內任何人都不能刪，包括帳號的 root 使用者，期限也不能縮短。先用 governance 測試設定，確定之後再用 compliance。</li>
+  <li><strong>生命週期規則</strong>（lifecycle）：舊的備份自動轉到較便宜的儲存類別，到期自動刪除，不用自己寫腳本。</li>
+</ul>
+
+<h2>保留政策與排程</h2>
+<p><strong>保留政策</strong>（retention policy）決定留哪些備份、留多久。只留最近 7 份，發現「兩週前就開始有髒資料」時就沒救了；全部留，費用一直漲。常見的做法是每日、每週、每月各留幾份：</p>
+<ul>
+  <li>每日：最近 7 個有備份的日子，每天留最新的一份。</li>
+  <li>每週：最近 4 個有備份的週（週一到週日），每週留最新的一份。</li>
+  <li>每月：最近 6 個有備份的月份，每月留最新的一份。</li>
+</ul>
+<p>三條規則各自計算，取聯集。日期一律用檔名裡的 UTC 時間判斷：台北時間比 UTC 快 8 小時，23:30 UTC 的備份在台北已經是隔天，用本地時區算，週日的最後一份會被歸到下一週。成熟的備份工具都內建這種規則，例如 <a href="https://restic.readthedocs.io/en/stable/060_forget.html">restic</a> 的 <code>forget --keep-daily 7 --keep-weekly 4 --keep-monthly 6</code>（它的週也是週一到週日，只計算有備份的日、週、月）。S3 上也可以直接用生命週期規則。練習 3 自己寫一次，是為了看懂這些規則和容易出錯的地方。</p>
+<p>排程的選擇：</p>
+<ul>
+  <li><strong>cron</strong>（<a href="../../nestjs/lessons/21-scheduling-events.html">NestJS 課第 21 課</a>）：Linux 傳統的排程程式。crontab 一行是五個時間欄位（分 時 日 月 星期）加一個指令，<code>0 3 * * * /opt/cafe/backup.sh</code> 是每天 03:00。時區是主機的時區；機器剛好關機時那一次就錯過了，執行結果也要自己導到 log。</li>
+  <li><strong>systemd timer</strong>（unit 檔的寫法見<a href="06-ssh-systemd.html">第 6 課</a>）：用 <code>OnCalendar=</code> 指定時間，觸發同名的 service。<code>Persistent=true</code> 會把上次執行的時間存在磁碟上，關機期間錯過的那次在開機後補跑一次；輸出自動進 journal，<code>systemctl list-timers</code> 看得到下次執行時間。</li>
+  <li><strong>Kubernetes CronJob</strong>、雲端的排程服務（例如 EventBridge Scheduler）、託管資料庫內建的備份：在那些平台上就用它們。</li>
+</ul>
+<pre># /etc/systemd/system/cafe-backup.service
+[Service]
+Type=oneshot
+ExecStart=/opt/cafe/backup.sh
+
+# /etc/systemd/system/cafe-backup.timer
+[Timer]
+OnCalendar=*-*-* 03:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target</pre>
+<p>排程本身也會壞：timer 被停用、機器下線、腳本卡住。只在「失敗時告警」抓不到這些情況，因為根本沒有執行。要用<strong>死人開關</strong>（dead man's switch）：每次備份成功就送出「我還活著」（例如把最後成功時間寫成指標 <code>backup_last_success_timestamp_seconds</code>，或呼叫 healthchecks 類服務的網址），一段時間沒收到才告警。告警怎麼送、送給誰，是<a href="25-alerting-incidents.html">第 25 課</a>的主題。</p>
+
+<h2>整個系統的災難復原</h2>
+<p><strong>災難復原</strong>（disaster recovery，DR）要回答的是：整台機器、整個 AZ、甚至整個 AWS 帳號都沒了，怎麼把咖啡店救回來。資料庫只是其中一項：</p>
+<div class="table-wrap"><table>
+  <tr><th>項目</th><th>放在哪裡</th><th>演練時確認</th></tr>
+  <tr><td>程式碼</td><td>git，至少有一份在另一個服務</td><td>從乾淨的機器 clone 得下來</td></tr>
+  <tr><td>映像</td><td>registry，用 digest 釘版本（第 16 課）</td><td>拉得到上線中的那個 digest</td></tr>
+  <tr><td>基礎設施</td><td>IaC（第 20 課）</td><td>能在另一個 region 建出一套</td></tr>
+  <tr><td>機密</td><td>secret manager，另外備份（加密）</td><td>不靠任何一個人的筆電就拿得到</td></tr>
+  <tr><td>資料</td><td>備份、異地、不可變</td><td>還原演練通過，RTO 在目標內</td></tr>
+  <tr><td>DNS</td><td>DNS 服務商</td><td>TTL 夠短，切換後幾分鐘內生效</td></tr>
+  <tr><td>runbook</td><td>不跟系統放在一起的地方</td><td>新人照著做得完</td></tr>
+</table></div>
+<p><strong>runbook</strong>（操作手冊）是一步一步寫好的處理程序，每一步都有可以直接複製執行的指令和預期結果。出事的時候人很慌，不要指望當下想得起來。</p>
+<div class="callout practice"><strong>💡 實務上：從「桌上演練」開始</strong><br>小團隊第一次做 DR，通常不會真的把正式環境關掉，而是先做桌上演練（tabletop exercise）：大家坐下來，主持人說「現在 AWS 帳號被鎖了」，每個人照 runbook 說出自己下一步要做什麼、需要什麼權限、去哪裡拿。這種演練最常發現的是「只有離職同事知道 DNS 帳號密碼」「備份的解密私鑰找不到」這類問題。發現的缺口開成工作單，排進下個迭代修。等桌上演練順了，再挑一個環境真的重建一次。</div>
+<p>範圍與成本：<a href="18-aws-architecture.html">第 18 課</a>的多 AZ（RDS Multi-AZ、ALB 跨 AZ）處理的是一個機房掛掉，切換是自動的；整個 region 掛掉要靠跨 region 的備份或複寫，成本和複雜度高很多。大部分的服務做到「多 AZ＋備份複製到另一個 region、演練過怎麼在那裡重建」就夠了，RTO 是幾小時；需要幾分鐘的 RTO，才考慮兩個 region 同時在跑。</p>
+<p><strong>演練檢查表</strong>：至少一年一次，挑一個上班時間，假設正式環境整個不見了：</p>
+<ul>
+  <li>只用 runbook 和備份，在全新的環境把服務建起來，記下每一步花的時間。</li>
+  <li>確認還原出來的資料是哪個時間點的（實際的 RPO），服務多久恢復（實際的 RTO），跟目標比較。</li>
+  <li>記下 runbook 裡錯的、少的、過時的步驟，當天就修。</li>
+  <li>換人做：只有一個人會的流程，那個人休假時就等於沒有。</li>
+</ul>
+
+<h2>練習</h2>
+<p>練習 1～3 在 <code>devops/practice</code> 做，都需要 Docker 在跑，寫的都是 bash 腳本（用 <code>bash 檔名</code> 執行）。練習 1、2 的測試每次都會重建 <code>ld-24</code> 的資料庫、寫入隨機數量的訂單，跑完也會收掉；練習 2 需要 <code>jq</code>（第 2 課）。練習 3 在 Debian 容器裡執行，用的是 GNU 版的 <code>date</code>。</p>
+
+<div class="local" data-test="ex1" data-files="backup.sh">
+  <p>練習 1：改寫 <code>backup.sh</code>。環境變數 <code>DB_CONTAINER</code>（預設 <code>ld-24-db</code>）、<code>DB_NAME</code>（預設 <code>cafe</code>）、<code>OFFSITE_DIR</code>（預設 <code>offsite</code>）。用 <code>docker exec</code> 在容器裡執行 <code>pg_dump -Fc</code>，在 <code>OFFSITE_DIR</code> 產生三個檔案：<code>cafe-&lt;UTC 時間&gt;.dump</code>（時間格式 <code>20261101T030000Z</code>）、<code>cafe-&lt;時間&gt;.sha256</code>（<code>sha256sum</code> 的格式，只寫檔名）、<code>cafe-&lt;時間&gt;.manifest.json</code>（<code>{"dump": 檔名, "tables": counts.sql 印出的 JSON}</code>）。先寫暫存檔，用 <code>pg_restore --list</code> 驗證過、全部成功才改名，最後才把 <code>LATEST</code> 的內容改成新的 .dump 檔名；最後一行印出 <code>{"file":…,"bytes":…,"seconds":…}</code>。測試會注入五種失敗：資料庫名稱打錯、pg_dump 傳到一半斷線、pg_dump 回報成功但內容是壞的、<code>OFFSITE_DIR</code> 唯讀、資料庫停了。每一種都要以非 0 結束，<code>OFFSITE_DIR</code> 裡不能多出或少掉任何檔案，<code>LATEST</code> 不變。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="restore-drill.sh">
+  <p>練習 2：改寫 <code>restore-drill.sh &lt;dump&gt;</code>（同一個資料夾裡有同名的 .sha256 和 .manifest.json）。依序：在 .dump 所在的資料夾用 <code>sha256sum -c</code> 驗證；用 <code>postgres:18.6-alpine3.24</code> 啟動全新的臨時容器 <code>ld-24-drill</code>，等它就緒（<code>pg_isready -h 127.0.0.1</code>）後建立 <code>cafe</code> 資料庫；用 <code>pg_restore --exit-on-error</code> 還原；用 <code>counts.sql</code> 數列數，跟 manifest 的 <code>tables</code> 比對（<code>jq -e</code>）；跑 <code>smoke.sql</code>（<code>psql -v ON_ERROR_STOP=1</code>）。全部通過印出 <code>{"ok":true,"rto_seconds":秒數}</code>；任何一步失敗都以非 0 結束。成功或失敗都要刪掉臨時容器。測試會用一份好的備份、一份被改了一個 byte 的、一份 manifest 不符的、一份訂單總額跟明細對不起來的（只有煙霧測試抓得到）、一份還原時會出錯的備份來跑，並確認正式的 <code>ld-24-db</code> 完全沒被動到。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="prune.sh">
+  <p>練習 3：改寫 <code>prune.sh [--dry-run] &lt;資料夾&gt;</code>。只處理檔名完全符合 <code>cafe-YYYYMMDDTHHMMSSZ.dump</code> 的備份，依檔名裡的 UTC 時間保留：最近 7 個有備份的日子、最近 4 個有備份的 ISO 週（週一到週日，<code>date -u -d 20261101 +%G-%V</code>）、最近 6 個有備份的月份，每一格留最新的一份，三條規則取聯集，最新的一份一定留。刪除時同名的 <code>.sha256</code>、<code>.manifest.json</code> 一起刪；<code>LATEST</code> 和格式不符的檔案一律不碰。每個要刪的 .dump 印一行檔名；<code>--dry-run</code> 只印、不刪。測試會產生 13 個月約 500 份假備份（含 23:30 UTC 的檔案），在 <code>TZ=Asia/Taipei</code> 下執行，比對留下的集合。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：咖啡店每天凌晨 3 點做一次 pg_dump，備份都有驗證過。資料庫在晚上 11 點損壞，會遺失多久的資料？這套做法能做到的 RPO 是多少？</p>
+  <label data-key="a">0，有備份就不會遺失資料</label>
+  <label data-key="b">3 小時，從凌晨 3 點算起</label>
+  <label data-key="c">這次遺失 20 小時：凌晨 3 點之後寫入的都不在備份裡；這套做法的 RPO 最壞接近 24 小時</label>
+  <label data-key="d">要看還原花多久</label>
+  <p class="why">✓ c。能還原的最新時間點是凌晨 3 點，之後的寫入都不在備份裡，這次丟掉 20 小時；事故發生在下一次備份前一刻時，最多丟掉將近 24 小時，所以這套做法只能承諾「RPO 24 小時」。要更小的 RPO，就要更頻繁的備份或 WAL 封存。a 把「有備份」當成「不會遺失」；b 方向算反了；d 說的是 RTO。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：備份腳本已經跑了一年，每天都以 exit 0 結束，監控從來沒告警過，但從來沒有人還原過。這份備份可靠嗎？</p>
+  <label data-key="a">可靠，exit 0 代表 pg_dump 成功了</label>
+  <label data-key="b">不知道：exit 0 只代表腳本沒有偵測到錯誤。檔案可能是空的、截斷的、少了角色，還原也可能花太久，只有定期實際還原並驗證才知道</label>
+  <label data-key="c">可靠，只要檔案大小每天都差不多</label>
+  <label data-key="d">不可靠，pg_dump 不能用來備份</label>
+  <p class="why">✓ b。開場的 0 byte 備份就是 exit 0；截斷的備份連 <code>pg_restore --list</code> 都讀得出來；少了角色的備份要真的還原才會出錯。a、c 都只是間接的訊號；d 太絕對，pg_dump 可以當備份，只是 RPO 和還原速度有限，而且同樣要演練。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：備份上傳到同一個 AWS 帳號的 S3 bucket，app 的 IAM 角色對這個 bucket 有完整權限。同事說：「S3 的耐用度是 11 個 9，不會掉。」風險在哪裡？</p>
+  <label data-key="a">耐用度只防硬體故障。app 的金鑰外洩或帳號被入侵時，攻擊者可以用同一組權限把備份和正式資料一起刪掉或加密</label>
+  <label data-key="b">沒有風險，S3 會自動保留被刪掉的檔案</label>
+  <label data-key="c">風險是 S3 太貴，應該改放在 EC2 的磁碟上</label>
+  <label data-key="d">只要開啟 S3 的伺服器端加密就安全了</label>
+  <p class="why">✓ a。耐用度保證的是「寫進去的不會因為硬體壞掉而不見」，不管是誰下的刪除指令。要用權限分離（備份只能寫、app 碰不到）、另一個帳號、版本控制加 Object Lock。b 沒開版本控制時刪了就沒了；c 放回同一台機器更糟；d 加密防的是被讀走，防不了被刪。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 7：資料庫已經有一台即時同步的 replica，還有自動切換。主管問：「這樣是不是可以不用備份了？」</p>
+  <label data-key="a">可以，replica 就是一份完整的備份</label>
+  <label data-key="b">可以，只要 replica 放在另一個 AZ</label>
+  <label data-key="c">不行，因為 replica 的資料會延遲幾秒</label>
+  <label data-key="d">不行：誤刪、錯誤的 migration、資料損壞會立刻複寫到 replica。replica 解決機器壞掉，備份才能回到出事之前的時間點</label>
+  <p class="why">✓ d。replica 忠實地重現主機做的每一件事，包括錯的那件。要能回到過去，需要和正式資料分開保存、有時間點的備份（最好加上 PITR）。a、b 混淆了高可用和備份；c 延遲不是重點，就算零延遲也一樣救不回誤刪。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>管線沒有 pipefail</strong>：<code>pg_dump | gzip</code> 失敗了仍然回 0，留下空的備份。每個腳本開頭都寫 <code>set -euo pipefail</code>。</li>
+  <li><strong>直接寫到最終檔名</strong>：失敗時留下半個檔案，看起來像一份備份。寫暫存檔，成功才 <code>mv</code>，用 <code>trap</code> 清掉暫存檔。</li>
+  <li><strong>以為 <code>pg_restore --list</code> 讀得出來就是完整的</strong>：它只讀開頭的目錄。完整的驗證是實際還原。</li>
+  <li><strong>從來沒有測試還原</strong>：備份唯一的用途是還原。排程做還原演練，記錄 RTO。</li>
+  <li><strong>用主機上比伺服器舊的 pg_dump</strong>：它會拒絕匯出。在資料庫容器裡執行，或裝同一個大版本。</li>
+  <li><strong>忘了角色與權限</strong>：pg_dump 不匯出角色，還原時 <code>GRANT</code> 會失敗。另外備份 <code>pg_dumpall --globals-only</code>。</li>
+  <li><strong>pg_restore 遇錯繼續，或加了 <code>|| true</code></strong>：只還原了一部分也算成功。加 <code>--exit-on-error</code>，檢查結束碼。</li>
+  <li><strong>還原演練還原進正式的資料庫</strong>：<code>--clean</code> 會蓋掉備份之後的資料。一律用全新的臨時環境。</li>
+  <li><strong>備份沒有加密，或和正式環境用同一組權限</strong>：外洩一次就是全部的歷史資料；被入侵時一起被刪。用公鑰加密、分開的帳號與權限、Object Lock。</li>
+  <li><strong>保留政策用本地時區算日期</strong>：跨午夜的備份被歸錯天、錯週。一律用 UTC。</li>
+  <li><strong>把 replica 或 RAID 當成備份</strong>：它們會把錯誤一起複製過去。</li>
+  <li><strong>排程只在失敗時告警</strong>：排程沒執行就不會有失敗。用死人開關，監控「最後成功時間」。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>從 RPO（最多丟多少資料）和 RTO（最多停多久）推出做法；不同的資料可以有不同的數字。</li>
+  <li>pg_dump 適合小型資料庫與搬家；正式環境的主力是實體備份加 WAL 封存（PITR），或託管服務的自動備份。replica、RAID 不是備份。</li>
+  <li>可靠的備份腳本：pipefail、暫存檔加原子改名、驗證、manifest、校驗和、最後才更新 LATEST，輸出一行 JSON 給監控。</li>
+  <li>還原演練：先驗校驗和，還原到全新的臨時環境，<code>--exit-on-error</code>，比對列數，跑煙霧測試，量出 RTO，定期自動執行。</li>
+  <li>3-2-1、權限分離、另一個帳號、版本控制與 Object Lock，讓備份撐得過誤刪和勒索軟體。</li>
+  <li>保留政策用 UTC 計算日、週、月；排程用 systemd timer（<code>Persistent=true</code>）或平台的排程，並用死人開關監控。</li>
+  <li>災難復原涵蓋程式碼、映像、IaC、機密、資料、DNS 與 runbook，定期換人演練。</li>
+</ul>
+<p>備份失敗、演練超時、排程沒跑，都要有人知道：下一課處理告警、值班與事故處理。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

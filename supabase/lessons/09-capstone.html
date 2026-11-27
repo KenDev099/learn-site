@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>9. 期末專題：咖啡店點餐上線，修好權限漏洞，決定要不要留在 Supabase</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="9" data-practice="supabase">
+<header>
+  <div class="eyebrow">階段 4：伺服器端邏輯與上線 · 第 9 課</div>
+  <h1>期末專題：咖啡店點餐上線，修好權限漏洞，決定要不要留在 Supabase</h1>
+</header>
+<main>
+
+<p>咖啡店的點餐系統要正式上線了。前幾課做出來的東西（訂單的 policy、收據的 bucket、結帳的函式）都是在本機的 Studio 或 SQL 裡一段一段建的，正式環境要怎麼得到一模一樣的設定？上線前資安同事審了一次，留下一句「至少有四個權限漏洞」，沒說是哪四個。一年後，老闆又問：要串 POS 對帳和電子發票了，我們還要繼續用 Supabase 嗎？</p>
+<p>這一課把這三件事當成期末專題：用 Supabase CLI 的 migration 管理資料庫的變更、先寫攻擊測試找出漏洞再用新的 migration 修好、最後寫一份決策紀錄。三件事都是資深工程師接手 Supabase 專案時真的會做的。</p>
+
+<div class="callout"><strong>這課的路線</strong>
+<ul>
+  <li>Migration：資料庫的變更怎麼從本機走到正式環境，已經上線的檔案為什麼不能改。</li>
+  <li>修權限漏洞：用前面幾課的漏洞清單審一份 migration，先寫攻擊測試，再修。</li>
+  <li>決策紀錄的材料：連線池、備份、費用、搬離的成本，各自的事實。</li>
+  <li>一年後的咖啡店：要寫 ADR 的情境。</li>
+</ul></div>
+
+<div class="callout"><strong>這課會用到：</strong>migration 的觀念（把資料庫的每次變更寫成依序執行的 SQL 檔，進 git、每個環境照順序套用，<a href="../../postgresql/lessons/22-migrations.html">PostgreSQL 課第 22 課</a>）；RLS 的漏洞清單與測法（<a href="05-rls-patterns.html">第 5 課</a>）；Storage 的 policy（<a href="07-storage.html">第 7 課</a>）；ADR 的格式（背景、選項、決定、後果，<a href="../../system-design/lessons/18-design-docs-adr.html">system-design 課第 18 課</a>）。</div>
+
+<div class="callout warn"><strong>環境</strong>：這課用到資料庫、gateway、Data API、Auth、Storage（db、kong、rest、auth、storage），<code>npm run up</code> 預設都會開。課程的本機 Supabase 是所有練習共用的，<strong>不要在課程的資料夾執行 <code>supabase db reset</code></strong>：它會刪掉所有資料重建，包括其他練習正在用的東西。下面的指令請在你自己的專案練習。</div>
+
+<h2>Migration：資料庫的變更怎麼上線</h2>
+<p>先回答第一個問題。Supabase CLI 把 migration 放在專案的 <code>supabase/migrations/</code>，每個檔案的檔名是「14 位數時間戳＿名稱.sql」，CLI 依檔名排序套用。課程的咖啡店資料就是這樣建的：<code>supabase/practice/supabase/migrations/20261114191058_cafe_baseline.sql</code>。日常流程：</p>
+<pre>npx supabase migration new add_receipts      # 建立 supabase/migrations/&lt;時間戳&gt;_add_receipts.sql，空的，自己寫 SQL
+npx supabase migration up                    # 把還沒套用的 migration 套到本機資料庫
+npx supabase db reset                        # 本機整個重建：依序套用全部 migration，再跑 seed.sql（只在自己的專案用）
+npx supabase migration list --remote         # 比對本機的檔案與雲端已經套用過哪些
+npx supabase db push --remote --dry-run      # 列出會套用到雲端的 migration，不實際執行
+npx supabase db push --remote                # 套用到雲端（CLI 3.x 會先問你確定嗎）</pre>
+<p>CLI 在資料庫的 <code>supabase_migrations.schema_migrations</code> 表記下套用過的版本（時間戳），<code>push</code> 只套用還沒記錄的檔案。由這個機制可以推出兩條規則：</p>
+<ul>
+  <li><strong>已經套用到正式環境的 migration 不能改</strong>：改了也不會再跑一次，正式環境不會跟著變，結果是 git 裡的檔案跟正式環境不一致。要修正就寫一個新的 migration（例如 <code>alter policy</code>、<code>alter view</code>）。</li>
+  <li><strong>migration 只往前走</strong>：要復原就再寫一個反向的 migration。<code>migration repair</code> 只改「記錄」，不改資料庫，用在記錄與實際狀態對不上時。</li>
+</ul>
+<p>在 Studio 點來點去改了表，可以用 <code>npx supabase db diff -f 名稱</code> 比對本機資料庫與 migration 的差異，產生一個新的 migration 檔。產生出來的 SQL 一定要自己看過：工具可能用「刪掉再建」來表達改名，正式環境就會掉資料。另一種做法是 <strong>declarative schema</strong>（宣告式 schema）：在 <code>supabase/schemas/</code> 寫「表最後應該長怎樣」，再用 <code>db diff</code> 產生 migration，適合表很多、常改欄位的專案。</p>
+<p>前幾課在 SQL 裡建的東西，全部都能放進 migration：表、RLS、policy、GRANT、函式、trigger，還有 Storage 的 bucket（<code>insert into storage.buckets …</code>）與 <code>storage.objects</code> 上的 policy。不要留任何「上線時記得去 Dashboard 點一下」的步驟，那一步一定會被忘記。</p>
+<p>CI（每次 push 自動跑的流程，<a href="../../devops/lessons/17-deploy-migrations.html">devops 課第 17 課</a>）用官方的 <code>supabase/setup-cli</code> 安裝 CLI：</p>
+<pre># .github/workflows/db.yml（節錄）
+- uses: supabase/setup-cli@v1
+  with:
+    version: 3.1.0
+- run: supabase db start                                  # 在 CI 裡起一個空的資料庫
+- run: supabase db reset                                  # 套用全部 migration：有語法錯誤這一步就失敗
+- run: supabase db advisors --type security --fail-on error
+# 合併到 main 之後，另一個 job 用 SUPABASE_ACCESS_TOKEN 執行 supabase db push --remote</pre>
+<div class="callout practice"><strong>💡 實務上：migration 的 review 看什麼</strong><br>審 migration 的 PR 時，資深工程師會看：新表有沒有開 RLS、GRANT 是不是只給需要的角色與動作、新函式有沒有 revoke execute、會不會鎖表很久（在大表上加 not null 欄位、建索引沒用 <code>concurrently</code>，零停機的做法在 <a href="../../postgresql/lessons/34-zero-downtime-migrations.html">PostgreSQL 課第 34 課</a>）、有沒有改到已經上線的舊檔案。上線順序是先套 migration、再部署會用到新欄位的前端；反過來，新前端會在 migration 套用前打到不存在的欄位。</div>
+
+<h2>修權限漏洞：先寫攻擊測試</h2>
+<p>migration 讓變更可以審、可以重現，接著就來審。第 5 課整理過 Supabase 專案最常見的權限漏洞，期末用它當檢查清單：</p>
+<div class="table-wrap"><table>
+  <tr><th>漏洞</th><th>看哪裡</th><th>出處</th></tr>
+  <tr><td>public 的表沒開 RLS、或 policy 是 <code>using (true)</code></td><td>每張表的 <code>enable row level security</code> 與 policy 條件</td><td>第 4 課</td></tr>
+  <tr><td>UPDATE 的 WITH CHECK 寫成 <code>true</code>、或 GRANT 了不該改的欄位</td><td>update policy、<code>grant update (欄位)</code></td><td>第 4 課</td></tr>
+  <tr><td>角色判斷用 <code>user_metadata</code></td><td>policy 裡的 <code>auth.jwt()</code></td><td>第 5 課</td></tr>
+  <tr><td>view 沒有 <code>security_invoker</code></td><td><code>create view</code></td><td>第 5 課</td></tr>
+  <tr><td>security definer 函式放在公開的 schema、沒檢查呼叫者、沒 revoke execute</td><td>函式的定義與權限</td><td>第 5、8 課</td></tr>
+  <tr><td>Storage 的 policy 漏了 bucket 或路徑檢查、私人檔案放 public bucket</td><td><code>storage.objects</code> 的 policy、<code>storage.buckets.public</code></td><td>第 7 課</td></tr>
+  <tr><td>secret key 出現在前端、或 Edge Function 一律用 secret key</td><td>前端的環境變數、函式建 client 的方式</td><td>第 3、8 課</td></tr>
+</table></div>
+<p>練習用的 <code>20261120090000_cafe_orders.sql</code>（已經上線）有四個漏洞。看出來還不夠，資深的做法是<strong>先寫一個測試去真的攻擊它</strong>：漏洞還在時攻擊成功，修好之後攻擊失敗。這樣做有三個好處：證明漏洞真的存在（不是看錯）、證明修正真的有效、之後有人改壞時測試會再抓到。攻擊測試的寫法跟第 5 課一樣：用兩個真的使用者，A 有資料，B 試著碰 A 的資料。例如「B 能不能從報表看到 A」：</p>
+<pre>const { data } = await asB.from('order_report').select('customer_id')
+const leaked = (data ?? []).some(r =&gt; r.customer_id === aId)   // true＝漏洞還在</pre>
+<p>兩個寫攻擊測試時容易犯的錯：</p>
+<ul>
+  <li><strong>只檢查「有沒有錯誤」</strong>：RLS 擋下讀取時回的是空陣列，不是錯誤；UPDATE 被擋時常常是「0 列」而不是錯誤。要檢查結果裡有沒有別人的資料。</li>
+  <li><strong>用錯身分</strong>：用 A 去讀 A 的資料當然讀得到。攻擊者一定是「另一個人」或「沒登入的人」。有些攻擊還要先做準備動作，例如改自己的 <code>user_metadata</code> 之後要 <code>refreshSession()</code>，新的 token 才帶著改過的內容。</li>
+</ul>
+<p><code>npx supabase db advisors</code> 會自動檢查一部分問題。在練習的漏洞版本上實測，它抓到了 policy 讀 <code>user_metadata</code>（<code>rls_references_user_metadata</code>，ERROR），也提醒了效能問題（policy 裡的 <code>auth.jwt()</code> 沒包 <code>(select …)</code>：<code>auth_rls_initplan</code>），但沒有指出另外三個漏洞。advisors 適合放進 CI 當基本檢查，不能取代攻擊測試。要在資料庫裡寫測試，Supabase 也支援 pgTAP（<code>npx supabase test db</code>），寫法是在交易裡切換角色與 claims，跟第 5 課一樣。</p>
+<div class="callout practice"><strong>💡 實務上：修漏洞的順序</strong><br>真的在正式環境發現權限漏洞時：先寫攻擊測試確認、評估影響範圍（從什麼時候開始、有沒有被利用的跡象，查 API 的 log）、用新的 migration 修、跑攻擊測試確認修好、部署，最後把攻擊測試留在 CI 裡。修的時候注意「功能要照常」：把 view 刪掉、把權限全部收回也能讓攻擊失敗，但顧客的頁面就壞了。資料真的外洩時，還要跟主管、法務一起決定要不要通知使用者。</div>
+
+<h2>決策紀錄的材料</h2>
+<p>漏洞修好了，最後一個問題是「要不要繼續用 Supabase」。這種決定要先把事實攤開。下面是寫決策紀錄會用到的材料，數字都來自官方文件或定價頁（2026-11-20 查詢），會隨時間變動，真的要決定時再查一次。</p>
+
+<h3>連線池：伺服器要怎麼連資料庫</h3>
+<p>前端走 API 不用管連線。但混合架構裡的 NestJS 服務、Edge Function 直連資料庫時，要知道 Postgres 能同時開的連線有限（每條連線都佔記憶體，<a href="../../postgresql/lessons/36-connections-monitoring.html">PostgreSQL 課第 36 課</a>）。Supabase 用 Supavisor 當連線池（connection pooler），有三種連法：</p>
+<div class="table-wrap"><table>
+  <tr><th>連法</th><th>port</th><th>適合</th><th>限制</th></tr>
+  <tr><td>直連（direct）</td><td>5432（<code>db.&lt;專案代號&gt;.supabase.co</code>）</td><td>長時間執行的伺服器、migration</td><td>Free 與 Pro 方案是 IPv6；網路只有 IPv4 時要買 IPv4 add-on，或改用 session mode</td></tr>
+  <tr><td>Supavisor session mode</td><td>5432（pooler 的網址）</td><td>只有 IPv4 的環境、需要 session 功能的程式</td><td>一條用戶端連線佔用一條資料庫連線</td></tr>
+  <tr><td>Supavisor transaction mode</td><td>6543</td><td>serverless、Edge Function 這類大量短連線</td><td>每個交易可能換一條連線：不支援 prepared statement（Prisma 加 <code>pgbouncer=true</code>、postgres.js 設 <code>prepare: false</code>），<code>set</code>、<code>listen</code>／<code>notify</code>、暫存表不會留到下一個交易</td></tr>
+</table></div>
+<p>課程的本機排除了 supavisor（<code>[db.pooler] enabled = false</code>），練習都直連 55422。</p>
+
+<h3>備份與還原</h3>
+<ul>
+  <li>Free 方案：沒有自動備份；一週沒有活動的專案會被暫停。</li>
+  <li>Pro 方案：每日備份，保留 7 天。</li>
+  <li>PITR（Point-in-Time Recovery，還原到任意時間點）：加購，每月 100 美元起（每 7 天的保留期）。每日備份最多掉一天的資料；PITR 能還原到出事前一分鐘。</li>
+  <li>Storage 的檔案不在資料庫的備份裡：<code>storage.objects</code> 只有檔案的資訊，檔案本身在物件儲存。誤刪檔案要另外規劃。</li>
+</ul>
+<p>不管用哪個方案，<code>pg_dump</code> 都能把資料庫匯出來，自己存一份；還原要定期演練才算有備份（<a href="../../postgresql/lessons/37-backup-replication.html">PostgreSQL 課第 37 課</a>）。</p>
+
+<h3>費用的組成</h3>
+<div class="table-wrap"><table>
+  <tr><th>項目</th><th>Free</th><th>Pro（每月 25 美元起）</th></tr>
+  <tr><td>運算（compute）</td><td>共用 CPU、500 MB 記憶體</td><td>含 10 美元額度，夠一台 Micro；更大的機器另計</td></tr>
+  <tr><td>資料庫大小</td><td>500 MB</td><td>8 GB，之後每 GB 0.125 美元</td></tr>
+  <tr><td>每月活躍使用者（MAU）</td><td>50,000</td><td>100,000，之後每人 0.00325 美元</td></tr>
+  <tr><td>流量（egress，從 Supabase 傳出去的資料）</td><td>5 GB</td><td>250 GB，之後每 GB 0.09 美元</td></tr>
+  <tr><td>檔案儲存</td><td>1 GB</td><td>100 GB，之後每 GB 0.0213 美元</td></tr>
+  <tr><td>Edge Function 呼叫次數</td><td>500,000</td><td>（依定價頁）</td></tr>
+</table></div>
+<p>（查表用，不用背。）估費用時先找出會長最快的那一項：收據圖片多，看 storage 與 egress；會員多，看 MAU；報表查詢重，看要不要升級運算。</p>
+
+<h3>搬離的成本：帶得走什麼、帶不走什麼</h3>
+<ul>
+  <li><strong>帶得走</strong>：資料庫是標準的 PostgreSQL，<code>pg_dump</code> 整個匯出，包括 <code>auth.users</code>（密碼是 bcrypt 雜湊，換到別的系統通常還能驗）。表、policy、函式都是 SQL。</li>
+  <li><strong>要重寫或替換</strong>：Auth 服務本身（登入、發 token、OAuth、寄驗證信）；RLS 依賴的 <code>auth.uid()</code>、<code>auth.jwt()</code> 與角色 <code>anon</code>／<code>authenticated</code>（換成自己的後端後，要自己把使用者身分傳進資料庫，作品專案課 <a href="../../portfolio/lessons/09-rls-defense-in-depth.html">第 9 課</a>就是這樣做的）；Storage 的檔案要搬到另一個物件儲存、policy 改寫成後端的程式；前端每一個 supabase-js 呼叫都要改成呼叫新的 API。</li>
+  <li>Supabase 的服務都是開源的，也可以自架，但維運（升級、備份、監控）就變成自己的事。</li>
+</ul>
+<div class="callout practice"><strong>💡 實務上：「要不要換」的會議先帶一份 ADR 草稿</strong><br>這類討論最常見的失敗是各說各話：有人講費用、有人講技術債、有人講「大家都在用」。先寫一份 ADR 草稿，把背景的事實、三個選項各自的代價列清楚，會議只討論「哪個代價我們願意付」。結論常常不是全有全無：混合架構讓你先解決眼前的需求，同時保留之後再調整的空間。寫下「什麼情況要重新評估」（例如 MAU 到多少、某個功能需要什麼），未來的人才知道這個決定什麼時候過期。</div>
+
+<h2>一年後的咖啡店</h2>
+<p>練習 3 的決策紀錄用這個情境。點餐系統上線一年後：</p>
+<ul>
+  <li>規模：三家分店、每月活躍使用者約 8,000 人、資料庫 3 GB、收據檔案 20 GB、每月 egress 約 40 GB。目前用 Pro 方案，費用就是基本的 25 美元。</li>
+  <li>現在的架構：前端直接用 supabase-js，權限全部在 RLS；結帳是第 8 課的 <code>place_order</code>（RPC）＋<code>checkout</code>（Edge Function）。</li>
+  <li>新需求：每晚 2 點跟 POS 系統對帳、自動開電子發票。POS 的 API 偶爾逾時，要能重試、要能查每一筆的處理進度，整批要跑 10～20 分鐘。</li>
+  <li>團隊：兩位前端工程師，下個月加入一位熟 NestJS 的後端工程師。</li>
+  <li>預算：每月雲端費用希望控制在 100 美元以內。</li>
+</ul>
+<p>沒有標準答案。三個選項（繼續只用 Supabase、混合、搬離）在不同的團隊與預算下都可能是對的，重要的是理由與代價寫清楚。ADR 的格式照 <a href="../../system-design/lessons/18-design-docs-adr.html">system-design 課第 18 課</a>：背景（客觀的事實）、考慮的選項（每個都有優缺點）、決定（「我們將……」）、後果（好的、壞的都要寫）。</p>
+
+<h2>練習</h2>
+<p>練習都在本機，題目資料夾是 <code>supabase/practice/work/09/</code>。<code>migrations/</code> 裡的 SQL 照正式專案的寫法寫 <code>public.</code>、<code>private.</code> 與 <code>'receipts'</code>，判分時測試會從一個空的 schema 開始，依檔名順序套用每個 migration，並把這些名字換成這一題專屬的 schema 與 bucket（<code>private</code> schema 已經建好，要用的話寫 <code>create schema if not exists private</code>）。</p>
+
+<div class="local" data-test="ex1" data-files="probes.ts">
+  <p>練習 1：先讀 <code>migrations/20261120090000_cafe_orders.sql</code>，照上面的漏洞清單找出四個漏洞，然後在 <code>probes.ts</code> 替每一個寫一個攻擊測試函式：漏洞存在時回傳 <code>true</code>、修好時回傳 <code>false</code>。四個函式的註解寫了要攻擊什麼：B 從報表看到 A 的統計、B 把自己升成店員讀到 A 的訂單、B 把檔案放進 A 的資料夾、B 查到 A 的累積消費。測試會在「還沒修」與「修好」兩個版本上各跑一次你的四個函式。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="migrations/20261120100000_fix_security.sql">
+  <p>練習 2：在新的 migration <code>migrations/20261120100000_fix_security.sql</code> 修好四個漏洞。<code>20261120090000_cafe_orders.sql</code> 已經上線，不能改。功能要照常：顧客讀自己的訂單、改自己訂單的備註、從 <code>order_report</code> 看自己的統計、<code>rpc('customer_spend', { customer: 自己的 id })</code> 查自己的累積消費（前端已經在用，參數不能改）、上傳自己的收據；店員（<code>app_metadata.role = 'staff'</code>）讀得到全部訂單。測試會套用你的所有 migration，再逐一攻擊與檢查功能。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="decision.md">
+  <p>練習 3：照「一年後的咖啡店」的情境，在 <code>decision.md</code> 寫一份 ADR：要繼續只用 Supabase、混合（加上自己的 NestJS 服務）、還是搬離。背景只寫事實；三個選項各自寫怎麼做、優點、缺點；決定用「我們將……」開頭；後果條列，好的、壞的都要寫。用上「決策紀錄的材料」那一節的事實。測試只檢查結構完整，不判斷你選哪一個。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 4：上週上線的 migration 有一條 policy 寫錯了。同事直接改了那個 migration 檔、push 到 main，CI 的 <code>supabase db push --remote</code> 也跑成功了。正式環境的 policy 現在是？</p>
+  <label data-key="a">已經是新的：push 會重新套用改過的檔案</label>
+  <label data-key="b">還是舊的：那個版本已經記錄為套用過，push 不會再跑一次；要另外寫一個新的 migration 修正</label>
+  <label data-key="c">push 會失敗，因為檔案的內容變了</label>
+  <label data-key="d">會被清空，因為 CLI 偵測到衝突就先 reset</label>
+  <p class="why">✓ CLI 只依版本（時間戳）判斷有沒有套用過，不比對內容，所以改舊檔不會影響已經套用過的環境，只會讓 git 跟正式環境不一致。修正一律寫新的 migration。a 是最常見的誤會。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 5：為了驗證「B 看不到 A 的訂單」這個修正，有人寫了這個測試，修正前後都是綠的。問題在哪？</p>
+<pre>const { error } = await asB.from('orders').select('*').eq('customer_id', aId)
+assert.equal(error, null)</pre>
+  <label data-key="a"><code>eq</code> 應該改成 <code>match</code></label>
+  <label data-key="b">應該用 secret key 查，才看得到全部資料</label>
+  <label data-key="c">要先用 A 的身分查一次</label>
+  <label data-key="d">RLS 擋下讀取時回的是空陣列、不是錯誤，所以這個斷言永遠成立；要檢查回傳的資料裡有沒有 A 的訂單</label>
+  <p class="why">✓ 沒有符合的 policy 時 API 回 <code>[]</code>（第 4 課），<code>error</code> 一直是 null，測試什麼都沒驗到。攻擊測試要檢查結果，例如 <code>assert.deepEqual(data, [])</code>，並確認修正前它是紅的。b 用 secret key 會繞過 RLS，測的就不是 B 的權限了。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：混合架構裡的 NestJS 服務部署在 serverless 平台上，每個請求可能開一個新的程序。它連 Supabase 的資料庫該怎麼設定？</p>
+  <label data-key="a">用 Supavisor 的 transaction mode（port 6543），並關掉 ORM 的 prepared statement</label>
+  <label data-key="b">直連 5432，連線數不夠時把 Postgres 的 <code>max_connections</code> 調大</label>
+  <label data-key="c">用 publishable key 透過 Data API 存取，就不需要連線</label>
+  <label data-key="d">用 session mode，因為它支援所有功能</label>
+  <p class="why">✓ serverless 會開大量短連線，transaction mode 讓很多用戶端共用少數幾條資料庫連線；代價是不支援 prepared statement 這類 session 功能。b 最常見：每條連線都佔記憶體，調大只是把問題延後。d 的 session mode 一條用戶端連線就佔一條資料庫連線，跟直連一樣會用完。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>改已經上線的 migration</strong>：正式環境不會跟著變。修正寫新的 migration。</li>
+  <li><strong>上線步驟裡有「去 Dashboard 點一下」</strong>：bucket、policy、函式的權限都寫進 migration。</li>
+  <li><strong>在共用的環境執行 <code>db reset</code></strong>：刪光資料重建。只在自己的本機專案或 CI 用。</li>
+  <li><strong><code>db diff</code> 產生的 SQL 沒看就上線</strong>：可能用刪掉再建來表達改名，資料會不見。</li>
+  <li><strong>攻擊測試只檢查有沒有錯誤</strong>：RLS 擋讀取回空陣列、擋更新常是 0 列。檢查結果，並確認修正前測試是紅的。</li>
+  <li><strong>用「把權限全部收回」修漏洞</strong>：攻擊會失敗，但功能也壞了。修正後要同時跑攻擊測試與功能測試。</li>
+  <li><strong>以為 advisors 全綠就沒有漏洞</strong>：它只認得特定的寫法。</li>
+  <li><strong>serverless 程式直連 5432</strong>：連線很快用完。用 transaction mode（6543）。</li>
+  <li><strong>決策紀錄只寫優點</strong>：沒有負面後果的 ADR 通常是沒想清楚。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>Supabase CLI 的 migration 在 <code>supabase/migrations/</code>，檔名是時間戳＿名稱，依序套用；<code>migration new</code> 建檔、<code>migration up</code> 套到本機、<code>db push --remote</code> 套到雲端（先 <code>--dry-run</code>）。已經套用過的檔案不能改，修正寫新的 migration。bucket、policy、函式權限都寫進 migration；CI 用 <code>supabase/setup-cli</code> 套一次全部 migration 並跑 advisors。</li>
+  <li>修權限漏洞：用漏洞清單審，先寫攻擊測試（用另一個人的身分做攻擊、檢查結果而不是錯誤），在修正前是紅的、修正後是綠的，再寫新的 migration 修，功能測試也要照常通過。advisors 只能抓到一部分。</li>
+  <li>決策的材料：伺服器端程式用 Supavisor transaction mode（6543，不支援 prepared statement）；Free 沒有備份，Pro 每日備份保留 7 天，PITR 另外加購；費用看 compute、資料庫大小、MAU、egress、storage 哪一項長最快；搬離時資料用 <code>pg_dump</code> 帶得走，Auth、Storage、依賴 <code>auth.*</code> 的 RLS 與前端的呼叫要重寫。</li>
+  <li>ADR：背景只寫事實、每個選項都有代價、決定寫「我們將……」、後果好壞都寫，並寫下什麼時候要重新評估。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 6 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 7：會員點數的兌換要「扣點數、建兌換紀錄、把優惠券標成已使用」三件事一起成功。前端工程師打算連續呼叫三次 supabase-js 的 <code>update</code>／<code>insert</code>，每次都檢查 error。比較好的做法是？</p>
+  <label data-key="a">維持三個請求，失敗時前端再呼叫三個反向的請求復原</label>
+  <label data-key="b">放進 Edge Function，用 secret key 依序執行三個請求</label>
+  <label data-key="c">寫成一個資料庫函式，前端用 <code>rpc()</code> 呼叫：PostgREST 把一個請求包成一個交易，任何一步失敗全部回滾</label>
+  <label data-key="d">在前端用 <code>Promise.all</code> 同時送出三個請求，比較快</label>
+  <p class="why">✓ 跨請求沒有交易，只有包進同一個函式才能「一起成功或一起失敗」，點數的計算也由資料庫決定。b 最常見：Edge Function 裡依序呼叫三次 API 仍然是三個交易，還多了繞過 RLS 的風險；它適合要呼叫外部 API 的情況。a 的復原請求本身也可能失敗。（第 8 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 8：同事寫了 <code>create function public.refund(order_id int) … security definer</code>，函式裡直接把那張訂單改成已退款，沒有其他檢查，也沒有 revoke。上線後會發生什麼？</p>
+  <label data-key="a">任何人（包括沒登入的人）都能 <code>POST /rest/v1/rpc/refund</code> 替任何訂單退款：新函式預設 PUBLIC 可執行，definer 又繞過 RLS</label>
+  <label data-key="b">沒人呼叫得到：2026 年起新函式跟新表一樣，預設不開放給 API</label>
+  <label data-key="c">只有店員呼叫得到，因為 definer 會檢查擁有者</label>
+  <label data-key="d">呼叫時會被 RLS 擋下，因為 orders 有開 RLS</label>
+  <p class="why">✓ 新預設只收了表的權限，函式仍然預設 PUBLIC 可執行（本機實測）；security definer 以擁有者的權限執行，RLS 擋不住。修法：revoke execute from public, anon、只 grant 給需要的角色，函式裡自己檢查呼叫者，definer 放不公開的 schema。b 是最多人會選的誤會。（第 5、8 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 9：Edge Function <code>apply-coupon</code> 的 log 顯示每次都很快就回 200，但店長說有時候大量匯入優惠券（幾萬筆、要呼叫外部系統驗證）會中途停掉、只匯了一半。最先懷疑什麼？</p>
+  <label data-key="a">publishable key 被限流</label>
+  <label data-key="b">RLS 擋掉了一部分的列</label>
+  <label data-key="c">Deno 不支援大量的 fetch</label>
+  <label data-key="d">超過 Edge Function 的執行時間或 CPU 上限被終止；長時間的批次要改放背景工作（佇列＋重試）</label>
+  <p class="why">✓ Edge Function 有整體執行時間與每個請求 CPU 時間的上限，適合短流程。批次匯入、要呼叫外部系統的長工作放自己後端的佇列，失敗能重試、能查進度。b 的 RLS 擋寫入時會回錯誤，不會「中途停掉」。（第 8 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 10：專案剛從 Free 升級到 Pro。工程師說「現在有備份了，誤刪資料可以救回到刪除前一分鐘」。這句話對嗎？</p>
+  <label data-key="a">對，Pro 方案包含 PITR</label>
+  <label data-key="b">不對，Pro 是每日備份（保留 7 天），最多掉一天的資料；要還原到任意時間點得另外加購 PITR，而且檔案（Storage）不在資料庫備份裡</label>
+  <label data-key="c">不對，Supabase 沒有任何備份，只能自己 pg_dump</label>
+  <label data-key="d">對，而且 Storage 的檔案也會一起還原</label>
+  <p class="why">✓ 每日備份與 PITR 是兩件事，PITR 是加購；<code>storage.objects</code> 只記錄檔案的資訊，檔案本身不在資料庫的備份裡。決策紀錄要寫清楚「能接受掉多少資料」，再決定要不要付 PITR 的費用。（第 9 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 11：面試官問：「用了 Supabase，以後要搬走很難嗎？」哪個回答最準確？</p>
+  <label data-key="a">不可能搬走，資料格式是 Supabase 專有的</label>
+  <label data-key="b">很容易，pg_dump 一下全部都帶走了</label>
+  <label data-key="c">資料是標準的 PostgreSQL，pg_dump 帶得走；要重寫的是 Auth 服務、依賴 <code>auth.uid()</code> 與 anon／authenticated 角色的 RLS、Storage 的檔案與 policy，以及前端所有直接打 API 的程式</label>
+  <label data-key="d">只要把前端的網址換成自己的伺服器就好</label>
+  <p class="why">✓ 資料不是被綁住的部分，綁住的是「前端直接打 API、權限寫在依賴 Supabase 角色與函式的 RLS」這套設計。b 最常見：資料帶得走，但登入、檔案、權限的整個執行環境帶不走。這也是決策紀錄裡「搬離」選項的主要代價。（第 9 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 12：咖啡店要做「店員把訂單改成已出餐，只能改 status 欄位，而且只能改自己分店的單」。哪個設計最合適？</p>
+  <label data-key="a">一個 security invoker 的資料庫函式（或 GRANT update (status) 加上分店的 RLS），前端用 <code>rpc()</code> 或 <code>update()</code> 呼叫</label>
+  <label data-key="b">一個 Edge Function，用 secret key 更新</label>
+  <label data-key="c">前端直接 update，把 status 以外的欄位在畫面上設成唯讀</label>
+  <label data-key="d">另外建一個 NestJS 服務專門做這件事</label>
+  <p class="why">✓ 規則都在資料庫裡就能表達：欄位層級的 GRANT 限制能改哪一欄，RLS 限制能改哪幾列（分店），不需要離開資料庫。c 最危險：畫面上的唯讀擋不了自己組請求的人。b 繞過 RLS 又沒有必要，d 為一個簡單規則多養一個服務。（第 4、5、8 課）</p>
+</div>
+
+<p>這個階段的重點整理成<a href="../sheets/stage-4.html">一頁圖解</a>。</p>
+<p>接下來可以學什麼：想把混合架構裡「自己的後端」那一半做紮實，接著做<a href="../../portfolio/index.html">作品專案課</a>的多租戶後台，它用 NestJS＋Prisma 實作了這門課交給 Supabase 做的事（登入、租戶隔離、RLS 當第二道防線、檔案上傳、背景工作），兩邊對照能看清楚 BaaS 幫你省了什麼、代價是什麼。想深入推播與即時更新的規模取捨，看 <a href="../../system-design/lessons/17-realtime-push.html">system-design 課第 17 課</a>。</p>
+
+<div class="callout">版本：Supabase CLI 3.1.0（<code>migration</code>、<code>db diff</code>、<code>db push</code>、<code>db advisors</code> 的用法照 <code>--help</code>）、PostgreSQL 17.11。advisors 的結果是 2026-11-20 在本機對練習的漏洞版本實測；連線池、備份、定價照官方文件 guides/database/connecting-to-postgres 與 supabase.com/pricing（2026-11-20 查詢）。</div>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

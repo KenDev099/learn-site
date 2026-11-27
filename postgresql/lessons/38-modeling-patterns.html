@@ -1,0 +1,915 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>38. 資料建模模式：軟刪除、稽核、時間區間、多租戶</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="38" data-pg-extensions="btree_gist">
+<header>
+  <div class="eyebrow">階段 11：資深必備｜資料建模與期末專題 · 第 38 課</div>
+  <h1>資料建模模式：軟刪除、稽核、時間區間、多租戶</h1>
+</header>
+<main>
+<p>咖啡店從一家店擴展成台北、台中、高雄三家分店，三家共用同一套系統、同一個資料庫。上線前，老闆和店長們交來一張需求清單：</p>
+<ul>
+  <li>會員刪除帳號後，要能在一段時間內「復原」。</li>
+  <li>價格出問題時，要查得到「是誰、在什麼時候，把拿鐵改成 150 元」。</li>
+  <li>訂位不能把同一張桌子的同一個時段賣給兩組人。</li>
+  <li>台中店的店員絕對不能看到台北店的訂單。</li>
+</ul>
+<p>這一課的任務：你是負責資料層的後端工程師，要把這四條需求做進資料庫，最後寫一份測試，證明最危險的那一條（分店之間的隔離）真的成立。四條需求有一個共通點：它們都是「每一次寫入、每一個查詢都必須遵守」的規則。只寫在程式裡、靠每支 API 記得檢查，總有一條路會忘記：新同事寫的報表、直接連資料庫修資料的 SQL、另一支背景服務。所以這課每一節都在回答同一個問題：<strong>怎麼讓資料庫自己守住這條規則，程式忘了也不會出事？</strong>用到的是前面學過的約束、trigger、RLS，再加上幾個新工具：範圍型別與排除約束、固定 <code>search_path</code> 的 SECURITY DEFINER 函式、複合外鍵，以及用「故意改壞」驗證測試真的有效的做法。</p>
+
+<div class="callout"><strong>這課的路線：</strong>照需求清單的順序走，每一節解決一條需求，也留下下一節要處理的問題。
+<ol>
+  <li>會員刪除後要能復原，怎麼刪除又不真的刪？軟刪除，以及它讓唯一約束、外鍵出的問題。</li>
+  <li>是誰把拿鐵改成 150 元？用 trigger 記下每一次修改，並讓應用程式改不掉這份紀錄。</li>
+  <li>同一張桌子、同一時段，怎麼只賣一次？範圍型別加排除約束，讓資料庫在寫入時擋下重疊。</li>
+  <li>台中店怎麼看不到台北店？店的 id 進主鍵、外鍵、索引，RLS 依每個交易設定的店過濾。</li>
+  <li>怎麼證明隔離真的有效？用 SQL 寫測試，再故意改壞 policy 確認測試抓得到；最後對照四個模式的代價。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="23-views-functions-triggers.html">第 23 課</a>的 view 與 trigger：view 把一句查詢存成虛擬表；trigger 是一個 <code>RETURNS trigger</code> 的 function 加上 <code>CREATE TRIGGER … AFTER … FOR EACH ROW</code>，用 <code>NEW</code>、<code>OLD</code> 讀新舊資料。</li>
+  <li><a href="24-rls.html">第 24 課</a>的 role 與 RLS：<code>GRANT</code> 把權限給某個 role，<code>SET ROLE</code> 暫時切換成另一個 role；超級使用者和表的擁有者預設繞過 RLS；<code>set_config(…, true)</code> 設一個只在這個交易有效的值，讓 RLS 知道現在是誰。</li>
+  <li><a href="26-capstone.html">第 26 課</a>的 schema 與 <code>search_path</code>：schema 是表的命名空間，就像資料夾；名字沒寫 schema 時，依 <code>search_path</code> 列出的 schema 去找。</li>
+  <li><a href="36-connections-monitoring.html">第 36 課</a>的連線池與應用程式的 role：transaction 模式的連線池每個交易結束就把連線還回去，下一個交易不一定拿到同一條；應用程式用不是表擁有者的 role 連線，RLS 才對它有效。</li>
+</ul></div>
+
+<div class="callout"><strong>這頁的環境：</strong>會改資料的範例都包在 <code>BEGIN; … ROLLBACK;</code> 裡，不會改到頁面上的資料。練習在全新的資料庫裡判分。</div>
+
+<p><strong>這頁的資料：</strong>三家分店 <code>stores</code>（台北店 1、台中店 2、高雄店 3）；軟刪除用的會員 <code>members</code>；稽核用的空表 <code>audit_log</code>；時間區間用的訂位 <code>reservations</code>；多租戶用的 <code>products</code>、<code>orders</code>、<code>order_items</code>；應用程式用的 role <code>app_user</code>。每一節開頭再說明用到的表。</p>
+
+<h2>會員刪除後要能復原：怎麼刪除又不真的刪？</h2>
+<p>從清單的第一條開始。真的執行 <code>DELETE</code>，那一列就從表裡消失了：會員一週後反悔想回來，資料已經沒有了。如果有訂單引用這位會員，還會碰到<a href="08-foreign-keys.html">第 8 課</a>的外鍵：要嘛被擋住刪不掉，要嘛設了 <code>ON DELETE CASCADE</code>，連他的訂單一起消失，營收報表跟著少一截。</p>
+<p><strong>軟刪除</strong>（soft delete）的做法是不執行 <code>DELETE</code>，改成 <code>UPDATE</code>，在 <code>deleted_at</code> 欄記下刪除的時間（<a href="06-update-delete.html">第 6 課</a>提過）。<code>deleted_at</code> 是 <code>NULL</code> 的是現役會員，有時間的就是已刪除。復原只要把它改回 <code>NULL</code>；想知道上個月刪除了哪些會員，查 <code>deleted_at</code> 的範圍就好；訂單引用的會員也還在。這頁的 <code>members</code> 有 6 位會員，執行後看 <code>deleted_at</code> 欄：</p>
+<div class="lab" data-sql="SELECT id, name, phone, deleted_at FROM members ORDER BY id;"></div>
+<p>陳美華和李建國的 <code>deleted_at</code> 有值，代表已經刪除，但他們還在表裡。這就是軟刪除的代價：這張表從此有兩種列，每一個查詢都要記得排除已刪除的。忘了加 <code>WHERE deleted_at IS NULL</code> 是軟刪除最常見的 bug：後台的會員列表、寄行銷簡訊的名單，已刪除的會員又出現了。</p>
+<p>不要指望每個人都記得，把條件集中在一個地方：建一個 view，名字就表明它只有現役會員，程式一律查這個 view，不直接查 <code>members</code>。執行後看陳美華和李建國還在不在：</p>
+<div class="lab" data-sql="BEGIN;
+CREATE VIEW active_members AS
+  SELECT id, name, phone FROM members WHERE deleted_at IS NULL;
+SELECT * FROM active_members ORDER BY id;
+ROLLBACK;"></div>
+<p>另一種集中的方式是第 24 課的 RLS：替應用程式的 role 加一條 policy，讓它根本讀不到 <code>deleted_at</code> 有值的列，連「查錯表」的機會都沒有。代價是後台要看「已刪除的會員」時，得換一個不受這條 policy 限制的 role。</p>
+<p>過濾解決了「讀」的問題。但已刪除的列還留在表裡，表上的約束也看得到它們，第一個出問題的是唯一約束。</p>
+
+<h3>已刪除會員的手機，能不能給新會員註冊？</h3>
+<p>手機號碼要唯一，否則簡訊驗證、用手機找會員都會對到兩個人。但這條規則只該限制「現役會員」：已刪除的會員不會再用這支手機登入，號碼可能被電信公司回收、給了別人，新的主人應該能註冊。資料裡就有這個情況：陳美華刪除帳號後，她的手機 <code>0922-111-222</code> 被張雅婷拿去註冊。</p>
+<p>直覺的兩種寫法都不對。下面用 seed 裡的 <code>try_sql(sql)</code> 各試一次：它執行一句 SQL，成功回傳 <code>ok</code>，失敗回傳錯誤碼和訊息，不會讓整格中斷（第 32 課用過）。執行後由左到右看三欄：</p>
+<div class="lab" data-sql="BEGIN;
+SELECT try_sql('CREATE UNIQUE INDEX m_phone ON members (phone)') AS 只有_phone;
+SELECT try_sql('CREATE UNIQUE INDEX m_phone_deleted ON members (phone, deleted_at)') AS 加上_deleted_at;
+SELECT try_sql('INSERT INTO members (name, phone) VALUES (''冒名者'', ''0912-345-678'')') AS 重複王小明的手機;
+ROLLBACK;"></div>
+<ul>
+  <li><code>UNIQUE (phone)</code> 建不起來：陳美華（已刪除）和張雅婷用同一支手機。就算建得起來，刪除帳號的人的手機也永遠不能再註冊。</li>
+  <li><code>UNIQUE (phone, deleted_at)</code> 建得起來，卻擋不住重複（第三欄）：還沒刪除的會員 <code>deleted_at</code> 都是 <code>NULL</code>，而唯一約束預設把兩個 <code>NULL</code> 當成<strong>不相等</strong>，所以 <code>('0912-345-678', NULL)</code> 可以出現很多次。</li>
+</ul>
+<p>第二種寫法看起來最合理，失敗的原因要多想一步。<code>NULL</code> 在 SQL 裡的意思是「不知道」，兩個不知道的值無法判定相等，所以唯一約束不把它們算成重複。結果是：這條約束只在「已刪除的會員之間」有作用，偏偏我們要管的是現役會員。</p>
+<p>正確的工具是<a href="27-index-design.html">第 27 課</a>的<strong>部分唯一索引</strong>（partial unique index）。部分索引只收錄符合 <code>WHERE</code> 條件的列；在 <code>CREATE UNIQUE INDEX</code> 後面加上 <code>WHERE 條件</code>，就只在這些列之間要求不重複。條件寫「還沒刪除」，已刪除的會員根本不在索引裡，他們的手機不跟任何人比；會員一被軟刪除，他那一列就離開索引，手機立刻可以給別人用。練習 1 由你寫出來。PostgreSQL 15 起還有另一種寫法，取捨見課末的「補充與查表」。</p>
+<p>唯一約束修好了。另一個會被「已刪除但還在表裡」影響的約束是外鍵。</p>
+
+<h3>外鍵和 CASCADE 還管得到已刪除的會員嗎？</h3>
+<p>管不到。外鍵只檢查「被引用的那一列存在」，它不知道 <code>deleted_at</code> 代表什麼。軟刪除的會員還在表裡，所以新訂單照樣可以掛在已刪除的會員身上。要擋，就在寫入的程式或 trigger 裡檢查，或者在子表也記一個狀態。</p>
+<p>反方向也一樣：<code>ON DELETE CASCADE</code> 只在真的 <code>DELETE</code> 時觸發（<a href="08-foreign-keys.html">第 8 課</a>），軟刪除是 <code>UPDATE</code>，不會觸發。會員的集點卡、地址都還在，刪除帳號時要自己決定這些子資料怎麼辦：一起軟刪除、保留，還是清掉。</p>
+<p>到這裡，軟刪除的成本都是「要多做一點」。但有一種情況，軟刪除本身就不合格。</p>
+
+<h3>個資必須真的刪除時怎麼辦？</h3>
+<p>使用者依個資法要求刪除個人資料時，「標記已刪除」不算刪除：姓名和手機還完整地存在資料庫裡。常見的做法是<strong>去識別化</strong>：保留這一列（訂單統計還要用到它），把姓名、手機改掉或清空，讓這一列再也對應不到一個真人。</p>
+<p>另一個方向是乾脆不用軟刪除，改成把資料<strong>搬到封存表</strong>：刪除時把那一列搬到另一張 <code>members_archive</code>，主表永遠只有現役的資料。這樣查詢不用過濾、唯一約束也不用特別處理，前面兩個問題一起消失；代價是復原時要從封存表搬回來。<code>DELETE … RETURNING</code>（第 6 課）配上 CTE，可以用一句完成「刪除並搬走」。執行後看封存表裡的會員，以及主表剩下幾筆：</p>
+<div class="lab" data-sql="BEGIN;
+CREATE TABLE members_archive (LIKE members, archived_at timestamptz NOT NULL);
+WITH gone AS (
+  DELETE FROM members WHERE deleted_at IS NOT NULL RETURNING *
+)
+INSERT INTO members_archive SELECT gone.*, now() FROM gone;
+SELECT id, name, phone FROM members_archive ORDER BY id;
+SELECT count(*) AS 主表剩下 FROM members;
+ROLLBACK;"></div>
+<div class="callout practice"><strong>💡 實務上：決定軟刪除前，先問「誰要復原、復原多久」</strong><br>會員、商品下架、文章這類「使用者可能後悔」或「訂單還在引用」的資料，常用軟刪除；草稿、暫存、log 類的資料通常直接刪就好。很多 ORM 有內建的軟刪除（例如 Laravel 的 SoftDeletes、Sequelize 的 paranoid），會自動幫查詢加條件，但手寫的 SQL、報表、資料匯出不會經過它，已刪除的資料最常從這些地方漏出來。資深工程師會先跟 PM 確認：誰可以復原、保留多久、報表要不要算已刪除的，再決定用軟刪除、封存表還是直接刪除。</div>
+<p>第一條需求做完了：過濾集中在 view，唯一性用部分唯一索引，外鍵和 <code>CASCADE</code> 管不到的要自己補。但軟刪除只留下「最後的狀態」：陳美華的 <code>deleted_at</code> 告訴你她在 3 月 1 日被刪除，卻看不出是誰按的刪除、刪除前資料長什麼樣。老闆的第二個問題正是這種「表裡看不出來」的事。</p>
+
+<h2>是誰把拿鐵改成 150 元？讓每次修改都留下紀錄</h2>
+<p>拿鐵現在賣多少，查 <code>products</code> 就知道；它昨天賣多少、是誰改的，表裡沒有，因為 <code>UPDATE</code> 直接蓋掉了舊值。要回答老闆，就得在每次修改時另外記一筆<strong>稽核紀錄</strong>（audit log）：哪張表、什麼操作、改之前、改之後、誰改的、什麼時候。</p>
+<p>紀錄寫在哪裡？最直覺的是寫在程式裡：每支修改資料的 API 自己 <code>INSERT</code> 一筆稽核。這和上一節「忘了過濾」是同一種漏洞：只要有一條路沒經過這些 API，就沒有紀錄。有人直接連資料庫下 SQL 修資料、另一支服務改了價格、新寫的 API 忘了記，都會留下空白，而出事時要查的往往就是這些不尋常的路。所以用第 23 課的 trigger：它掛在表上，不管修改從哪裡來，資料庫都會呼叫它。這一節把紀錄寫進這頁空的 <code>audit_log</code>，範例改 <code>members</code>，練習 2 改 <code>products</code>。</p>
+
+<h3>trigger 怎麼知道改了什麼、是誰改的？</h3>
+<p>我們希望一個 trigger 函式就能給很多張表用，不必每張表各寫一個。trigger 函式執行時，可以讀到幾個特別的變數和函式，靠它們拿到這次修改的資訊：</p>
+<ul>
+  <li><code>TG_OP</code>：觸發的操作，<code>'INSERT'</code>、<code>'UPDATE'</code> 或 <code>'DELETE'</code>。<code>TG_TABLE_NAME</code>：表名。</li>
+  <li><code>to_jsonb(OLD)</code>、<code>to_jsonb(NEW)</code>：把整列轉成 JSONB 物件（<a href="14-jsonb-arrays.html">第 14 課</a>）。<code>INSERT</code> 時 <code>OLD</code> 是 <code>NULL</code>，<code>DELETE</code> 時 <code>NEW</code> 是 <code>NULL</code>。用 JSONB 存，表加了欄位也不必改稽核表。</li>
+  <li><code>current_setting('app.user_id', true)</code>：資料庫不知道「哪位店員」在操作，因為應用程式都用同一個 <code>app_user</code> 連線。所以由後端在每個交易開頭用 <code>set_config('app.user_id', …, true)</code> 告訴它（第 24 課的做法）。第二個參數 <code>true</code> 表示沒設定時回傳 <code>NULL</code>，而不是報錯。</li>
+</ul>
+<p>下面建好函式和 trigger，以店員 <code>staff-3</code> 的身分改兩位會員：一次軟刪除、一次改手機。執行後看 <code>audit_log</code> 每一列的 <code>op</code>、<code>changed_by</code> 和新舊兩欄：</p>
+<div class="lab" data-sql="BEGIN;
+CREATE FUNCTION audit_row() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO audit_log (table_name, op, old_row, new_row, changed_by)
+  VALUES (TG_TABLE_NAME, TG_OP, to_jsonb(OLD), to_jsonb(NEW), current_setting('app.user_id', true));
+  RETURN NULL;   -- AFTER trigger 的回傳值不會被用到
+END $$;
+CREATE TRIGGER members_audit AFTER INSERT OR UPDATE OR DELETE ON members
+  FOR EACH ROW EXECUTE FUNCTION audit_row();
+SELECT set_config('app.user_id', 'staff-3', true);
+UPDATE members SET deleted_at = '2026-11-01 09:00+08' WHERE id = 3;   -- 軟刪除也是一次 UPDATE
+UPDATE members SET phone = '0912-000-111' WHERE id = 1;
+SELECT id, table_name, op, changed_by, old_row, new_row FROM audit_log ORDER BY id;
+ROLLBACK;"></div>
+<p>兩次修改各留下一列，<code>changed_by</code> 都是 <code>staff-3</code>。軟刪除也被記下來了，因為它就是一次 <code>UPDATE</code>：上一節「看不出是誰刪的」的問題，在這裡一起解決。</p>
+<p>整列存下來很完整，但不好讀：要回答「改了哪個欄位」，得自己比對兩大段 JSON。這件事可以交給 SQL：用 <code>jsonb_object_keys</code> 把 <code>new_row</code> 的每個鍵（也就是欄位名）展開成一列，再只留新舊值不同的鍵。比較時用 <code>IS DISTINCT FROM</code>，不用 <code>&lt;&gt;</code>：<code>NULL &lt;&gt; 值</code> 的結果是 <code>NULL</code>，會被 <code>WHERE</code> 濾掉，像 <code>deleted_at</code> 從 <code>NULL</code> 變成有值這種修改就會漏掉；<code>IS DISTINCT FROM</code> 把 <code>NULL</code> 也當成一個值來比。</p>
+<p>這一格和接下來兩格都要先建同一個函式和 trigger。為了不每格重抄，seed 裡的 <code>install_audit()</code> 就是上一格的 <code>CREATE FUNCTION audit_row()</code> 和 <code>CREATE TRIGGER members_audit</code> 兩句，在目前的交易裡建好。下面用它重做上一格的兩次修改，執行後看「欄位」「改之前」「改之後」三欄：</p>
+<div class="lab" data-sql="BEGIN;
+SELECT install_audit();
+SELECT set_config('app.user_id', 'staff-3', true);
+UPDATE members SET deleted_at = '2026-11-01 09:00+08' WHERE id = 3;
+UPDATE members SET phone = '0912-000-111' WHERE id = 1;
+SELECT a.id, a.changed_by, k AS 欄位, a.old_row -&gt; k AS 改之前, a.new_row -&gt; k AS 改之後
+FROM audit_log a, jsonb_object_keys(a.new_row) AS k
+WHERE a.op = 'UPDATE' AND a.old_row -&gt; k IS DISTINCT FROM a.new_row -&gt; k
+ORDER BY a.id;
+ROLLBACK;"></div>
+<p>紀錄有了。但稽核紀錄要能當證據，還有一個前提：被查的人改不掉它。</p>
+
+<h3>應用程式碰不到稽核表，trigger 要怎麼寫進去？</h3>
+<p>如果應用程式的 role 可以改、刪 <code>audit_log</code>，有人改了價格之後，順手把那筆紀錄刪掉，稽核就失去意義。所以這頁的 <code>app_user</code> 可以讀和改 <code>members</code>，對 <code>audit_log</code> 沒有任何權限。</p>
+<p>問題是 trigger 函式預設用<strong>觸發它的人</strong>的權限執行。<code>app_user</code> 一改會員，trigger 就以 <code>app_user</code> 的身分寫 <code>audit_log</code>，沒有權限而失敗；trigger 失敗，整個 <code>UPDATE</code> 也跟著失敗。執行後看錯誤碼：</p>
+<div class="lab" data-sql="BEGIN;
+SELECT install_audit();
+SET LOCAL ROLE app_user;
+SELECT try_sql('UPDATE members SET deleted_at = now() WHERE id = 3') AS app_user_軟刪除;
+ROLLBACK;"></div>
+<p>把 <code>INSERT</code> 權限給 <code>app_user</code> 可以解決，但這樣應用程式也能自己塞假紀錄。更好的做法是 <strong>SECURITY DEFINER</strong>：函式以<strong>擁有者</strong>（通常是建立它的人）的權限執行，而不是呼叫者的。<code>app_user</code> 自己碰不到 <code>audit_log</code>，只能透過這個函式、照函式寫好的方式寫進去。</p>
+<p>SECURITY DEFINER 等於把擁有者的權限借給呼叫者。借出去之前要確認：呼叫者只能用這份權限做函式寫好的事。這裡有一個不明顯的漏洞。</p>
+
+<h3>SECURITY DEFINER 函式要防什麼？</h3>
+<p>函式裡寫的是 <code>audit_log</code>，沒有標 schema。PostgreSQL 依照<strong>呼叫當下</strong>的 <code>search_path</code> 去找這個名字（第 26 課），而 <code>search_path</code> 是呼叫者能影響的。函式卻是以擁有者的權限執行，所以呼叫者只要能讓 <code>audit_log</code> 這個名字指到別的東西，就能決定「擁有者的權限」被用在哪裡。這叫 <strong>search_path 劫持</strong>（search_path hijacking）。</p>
+<p>最容易被利用的是暫存表。任何人都能建暫存表，暫存表放在每條連線專屬的 schema <code>pg_temp</code> 裡；而找表名時，<strong><code>pg_temp</code> 如果沒寫在 <code>search_path</code> 裡，就排在最前面</strong>。<code>install_audit(true)</code> 建的是同一個函式加上 <code>SECURITY DEFINER</code>，沒有設定 <code>search_path</code>。看 <code>app_user</code> 怎麼讓自己的修改不留紀錄，執行後比較兩欄的筆數：</p>
+<div class="lab" data-sql="BEGIN;
+SELECT install_audit(true);   -- audit_row() 加上 SECURITY DEFINER
+SET LOCAL ROLE app_user;
+-- 攻擊者建一張同名的暫存表
+CREATE TEMP TABLE audit_log (table_name text, op text, old_row jsonb, new_row jsonb, changed_by text);
+UPDATE members SET deleted_at = now() WHERE id = 3;
+RESET ROLE;
+SELECT (SELECT count(*) FROM public.audit_log) AS 真的稽核表, (SELECT count(*) FROM pg_temp.audit_log) AS 攻擊者的暫存表;
+ROLLBACK;"></div>
+<p>紀錄寫進了攻擊者的暫存表，真的稽核表一筆都沒有；暫存表在連線結束時就消失，證據也跟著不見。如果 <code>search_path</code> 裡還有攻擊者能建立物件的 schema，連函式和運算子都能被換成同名的假貨，讓攻擊者的程式碼以擁有者的權限執行（哪些 schema 屬於這種，見課末）。</p>
+<p>PostgreSQL 18 文件的建議：用 <code>SET</code> 子句固定 <code>search_path</code>，只放可信任的 schema，<strong><code>pg_temp</code> 明確寫在最後</strong>：</p>
+<pre>CREATE FUNCTION audit_row() RETURNS trigger
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path = public, pg_temp      -- 只在這個函式執行期間生效
+AS $$ … $$;</pre>
+<p>只寫 <code>SET search_path = public</code> 不夠：沒列出來的 <code>pg_temp</code> 還是排在最前面，上面的攻擊照樣成功（<code>pg_catalog, public</code> 也一樣）。另一種做法是函式裡每個表名都寫完整（<code>public.audit_log</code>），但很容易漏掉一個。練習 2 會以 <code>app_user</code> 的身分、帶著一張同名的暫存表，檢查你寫的稽核函式。</p>
+<p>寫入的路徑安全了。最後要算的是稽核的成本。</p>
+
+<h3>稽核表會越長越大，哪些表該記？</h3>
+<p>稽核表<strong>長得很快</strong>：每修改一列，它就多一列。可以依月份分割，舊的分區整個搬到便宜的儲存或刪掉（<a href="35-partitioning.html">第 35 課</a>）。更根本的是<strong>只記需要的表</strong>：高頻寫入的表（例如計數器）每次都多寫一列 JSONB，成本不小；如果只想知道「最後一次是什麼時候改的」，加一個 <code>updated_at</code> 欄就夠了。程式端也有辦法拿到新舊值，但它取代不了 trigger，見課末。</p>
+<div class="callout practice"><strong>💡 實務上：稽核紀錄是出事時拿來查的，平常就要確認查得到</strong><br>常見的場景是客服或老闆問「拿鐵的價格是誰改的」、「這筆訂單的金額為什麼變了」，工程師去稽核表查 <code>changed_by</code> 和新舊值。所以要確認每條寫入路徑都有設定 <code>app.user_id</code>，背景工作也給一個固定的名稱（例如 <code>job:nightly-sync</code>），否則紀錄一堆 <code>NULL</code>，查了也沒用。另一個坑：稽核表存的是整列，會員的姓名、手機也在裡面，使用者要求刪除個資時，稽核表也要一併處理。給使用者看的「操作紀錄」頁面通常另外設計，不要直接把這張表的 JSONB 丟給前端。</div>
+<p>第二條需求做完了：trigger 記下每條路徑的修改，SECURITY DEFINER 加上固定的 <code>search_path</code>，讓應用程式只能透過它寫入稽核表。但稽核是事後追查，它告訴你錯誤已經發生了。第三條需求不能等事後：同一張桌子賣給兩組客人，客人到店才發現，查到是誰訂的也來不及。這種錯誤要在寫入的當下擋住。</p>
+
+<h2>同一張桌子、同一時段，怎麼只賣一次？</h2>
+<p>這是<a href="26-capstone.html">第 26 課</a>留下的問題。先看為什麼前面學過的工具都不夠：</p>
+<ul>
+  <li><code>CHECK</code> 約束只看得到正在寫入的那一列，「時段重疊」卻是兩列之間的關係。</li>
+  <li><code>UNIQUE</code> 管得到兩列之間，但它只比「相等」。用 <code>starts_at</code>、<code>ends_at</code> 兩欄存時段時，<code>UNIQUE (table_id, starts_at)</code> 只擋開始時間完全相同的兩筆；18:00–19:30 和 19:00–20:30 的開始時間一個是 18:00、一個是 19:00，是不同的值，<code>UNIQUE</code> 不擋，兩段時間卻明明重疊。</li>
+  <li>用程式先查「這段時間有沒有人訂」再寫入：兩個請求同時進來，兩邊都查到「沒有」，然後一起寫入（<a href="19-concurrency.html">第 19 課</a>的並發問題）。</li>
+</ul>
+<p>PostgreSQL 的答案分兩步：先用<strong>範圍型別</strong>把「一段時間」存成一個值，再用<strong>排除約束</strong>讓資料庫拒絕「同一張桌子、時段重疊」的兩列。</p>
+
+<h3>怎麼把「一段時間」存成一個值？</h3>
+<p>用 <code>starts_at</code>、<code>ends_at</code> 兩個欄位也能存時段，但每次判斷重疊都要自己寫成「a 的開始早於 b 的結束，而且 b 的開始早於 a 的結束」，邊界很容易寫錯。<strong>範圍型別</strong>（range type）把「一段區間」存成一個值，重疊、包含這些判斷由資料庫提供。常用的有 <code>tstzrange</code>（帶時區的時間）、<code>daterange</code>（日期）、<code>int4range</code>（整數）。</p>
+<p>區間的寫法是 <code>[開始, 結束)</code>：<code>[</code> 表示包含這一端，<code>)</code> 表示不包含。<code>tstzrange(a, b)</code> 預設就是 <code>[a, b)</code>，叫<strong>半開區間</strong>。常用的運算子有兩個：<code>&amp;&amp;</code> 判斷兩段有沒有重疊，<code>@&gt;</code> 判斷是否包含某個時間點或某一段。執行後先比較前兩欄：同樣是前一段 19:30 結束、下一段 19:30 開始，兩種寫法的答案不同：</p>
+<div class="lab" data-sql="SELECT
+  tstzrange('2026-11-14 18:00+08', '2026-11-14 19:30+08') &amp;&amp; tstzrange('2026-11-14 19:30+08', '2026-11-14 21:00+08') AS 半開_相鄰算重疊,
+  tstzrange('2026-11-14 18:00+08', '2026-11-14 19:30+08', '[]') &amp;&amp; tstzrange('2026-11-14 19:30+08', '2026-11-14 21:00+08', '[]') AS 包含結尾_相鄰算重疊,
+  tstzrange('2026-11-14 18:00+08', '2026-11-14 19:30+08') @&gt; timestamptz '2026-11-14 19:00+08' AS 包含_19點,
+  upper(tstzrange('2026-11-14 18:00+08', '2026-11-14 19:30+08')) AS 結束時間;"></div>
+<ul>
+  <li>半開區間：<code>false</code>。前一段不包含 19:30，下一段從 19:30 開始，兩段只是相鄰。</li>
+  <li>包含結尾的 <code>[]</code>：<code>true</code>。兩段共用 19:30 這一點，被當成重疊。</li>
+  <li>後兩欄：19:00 落在 18:00–19:30 之內；<code>upper()</code> 取出區間的結束時間。</li>
+</ul>
+<figure>
+  <svg viewBox="0 0 700 200" role="img" aria-label="三號桌的時間軸：王小明 18:00 到 19:30，下一組 19:30 到 21:00。半開區間時兩段只是相鄰，不算重疊；包含結尾時兩段共用 19:30 這一點，被當成重疊">
+    <line class="d-line" x1="40" y1="160" x2="660" y2="160"/>
+    <text class="d-small" x="40" y="185" text-anchor="middle">18:00</text>
+    <text class="d-small" x="350" y="185" text-anchor="middle">19:30</text>
+    <text class="d-small" x="660" y="185" text-anchor="middle">21:00</text>
+    <line class="d-line" x1="350" y1="20" x2="350" y2="165" stroke-dasharray="4 4"/>
+    <text class="d-text" x="40" y="34">半開 [ )：相鄰，不重疊</text>
+    <rect class="d-soft" x="40" y="44" width="306" height="34" rx="6"/>
+    <text class="d-small" x="193" y="66" text-anchor="middle">王小明 [18:00, 19:30)</text>
+    <rect class="d-box" x="354" y="44" width="306" height="34" rx="6"/>
+    <text class="d-small" x="507" y="66" text-anchor="middle">下一組 [19:30, 21:00)</text>
+    <text class="d-text" x="40" y="104">包含結尾 [ ]：共用 19:30 這一點</text>
+    <rect class="d-soft" x="40" y="114" width="310" height="34" rx="6"/>
+    <rect class="d-box" x="350" y="114" width="310" height="34" rx="6"/>
+    <text class="d-small" x="193" y="136" text-anchor="middle">[18:00, 19:30]</text>
+    <text class="d-accent" x="507" y="136" text-anchor="middle">重疊 → 被擋</text>
+  </svg>
+  <figcaption>時段一律用半開區間 [開始, 結束)：前一組的結束等於下一組的開始，剛好接上。</figcaption>
+</figure>
+<p>訂位的時段一定是一組接一組：前一組 19:30 離開，下一組 19:30 入座。用包含結尾的寫法，這兩組會被誤判成衝突，只能硬把結束時間改成 19:29:59 這類奇怪的值。半開區間讓「結束等於下一段的開始」剛好接上，所以時段一律用 <code>[)</code>。</p>
+<p>這頁的 <code>reservations</code> 就是用 <code>tstzrange</code> 存訂位：<code>during</code> 是時段，<code>status</code> 是 <code>booked</code> 或 <code>cancelled</code>。執行後看 3 號桌：陳美華取消之後，林志豪訂了和她重疊的時段：</p>
+<div class="lab" data-sql="SELECT id, table_id, guest, during, status FROM reservations ORDER BY table_id, lower(during);"></div>
+<p>這筆資料提醒我們，規則要寫得精確：擋的是「同一張桌子、時段重疊、而且都還有效」的兩筆，已取消的訂位不該佔位子。時段已經是一個值了，接下來要讓資料庫拿它來比較兩列。</p>
+
+<h3>怎麼讓資料庫拒絕重疊的兩列？</h3>
+<p><strong>排除約束</strong>（exclusion constraint）是唯一約束的一般化。<code>UNIQUE (a)</code> 的意思是「任兩列的 a 不能 <code>=</code>」；<code>EXCLUDE</code> 讓你自己指定每個欄位用哪個運算子比，所有運算子同時成立的兩列就不准共存：</p>
+<pre>ALTER TABLE 表 ADD CONSTRAINT 約束名
+  EXCLUDE USING gist (欄位1 WITH =, 欄位2 WITH &amp;&amp;)
+  WHERE (條件);      -- 選用：只在符合條件的列之間檢查，跟部分唯一索引一樣</pre>
+<p>套到訂位上：「同一張桌子（<code>table_id WITH =</code>）而且時段重疊（<code>during WITH &amp;&amp;</code>）」的兩列不准共存；已取消的不算，就用 <code>WHERE</code> 排除，和第一節的部分唯一索引是同一個想法。</p>
+<p>資料庫要在每次寫入時快速找出「可能重疊的列」，需要一個索引幫忙，所以排除約束靠索引實作。B-tree 把值排成一條直線，只能回答「等於、大於、小於」，沒辦法回答「這兩段有沒有交集」。能處理重疊的是 GiST 索引（Generalized Search Tree，<a href="28-gin-search.html">第 28 課</a>提過的另一種索引）：它把資料分成一層層的外框，每個外框記下底下所有值涵蓋的範圍；查「有沒有和 19:00–20:30 重疊」時，外框整個落在範圍之外的，底下的資料就整框跳過，不用一列一列比。所以這裡寫 <code>USING gist</code>。GiST 是為範圍、幾何這類型別設計的，PostgreSQL 內建時並沒有替一般整數準備 GiST 版的 <code>=</code>，<code>table_id WITH =</code> 就沒辦法用。要靠 <strong>btree_gist</strong> 擴充套件替一般型別加上 GiST 的比較方法；這頁的 seed 已經 <code>CREATE EXTENSION btree_gist</code>。下面在交易裡先把它移除，執行後看沒有它時的錯誤碼（42704）：</p>
+<div class="lab" data-sql="BEGIN;
+DROP EXTENSION btree_gist;
+SELECT try_sql('ALTER TABLE reservations ADD EXCLUDE USING gist (table_id WITH =, during WITH &amp;&amp;)') AS 沒有_btree_gist;
+ROLLBACK;"></div>
+<p>約束加上之後，違反它的寫入會得到錯誤碼 <strong>23P01</strong>（<code>exclusion_violation</code>），後端可以接住它，回應「這個時段已經有人訂了」。因為檢查發生在資料庫寫入的當下，兩個請求同時搶同一個時段，也只有一個會成功，這正是「先查再寫」做不到的。練習 3 由你替 <code>reservations</code> 加上它；注意已取消的訂位不該擋人。PostgreSQL 18 還把這類規則做成主鍵和外鍵的語法（<code>WITHOUT OVERLAPS</code>、<code>PERIOD</code>），適合「某段期間有效」的資料，見課末。</p>
+<div class="callout practice"><strong>💡 實務上：凡是「預約」都該讓資料庫擋重疊</strong><br>訂位、會議室、看診時段、員工排班、租借設備，都是「同一個資源、同一時段只能一筆」。前端先查空位、把滿的時段反灰只是讓使用者好用，真正把關的是排除約束；後端收到 23P01 就回「這個時段剛被訂走，請重新選擇」，並重新載入空位。時間一律用帶時區的型別，前端送 ISO 8601 加上時區（例如 <code>2026-11-14T18:00:00+08:00</code>），不要送「當地時間字串」讓後端猜。</div>
+<p>第三條需求做完了：時段用半開區間存成範圍型別，重疊交給排除約束在寫入時擋下。不過到這裡的每一條規則，都默默假設只有一家店：3 號桌是哪家店的 3 號桌？拿鐵是哪家店的拿鐵？三家店共用同一批表之後，最後一條需求要回答的就是「這一列屬於哪家店，誰看得到它」。</p>
+
+<h2>三家店共用一套系統，台中店怎麼看不到台北店？</h2>
+<p><strong>多租戶</strong>（multi-tenant）是一套系統服務多個客戶，每個客戶叫一個租戶（tenant），彼此的資料要隔離。這裡的租戶是分店；如果做的是給很多公司訂閱的線上服務（SaaS），租戶就是每家公司。</p>
+<p>第一個要決定的是資料放在哪裡。有三種做法，差別在隔離靠什麼、要付什麼代價：</p>
+<div class="table-wrap"><table>
+  <tr><th>做法</th><th>隔離</th><th>代價</th><th>適合</th></tr>
+  <tr><td>共用表，每列帶 <code>store_id</code></td><td>靠 <code>WHERE</code> 與 RLS</td><td>寫錯一個條件就外洩；大租戶會影響小租戶的效能</td><td>大多數 SaaS、租戶很多</td></tr>
+  <tr><td>每個租戶一個 schema</td><td>靠 <code>search_path</code></td><td>migration 要對每個 schema 跑一遍；上千個 schema 時系統目錄很大、備份與監控變慢</td><td>租戶不多、要客製表結構</td></tr>
+  <tr><td>每個租戶一個資料庫</td><td>最強</td><td>連線池、監控、升級都要乘上租戶數；跨租戶報表很難</td><td>少數大客戶、合約要求實體隔離</td></tr>
+</table></div>
+<p>咖啡店是同一間公司的三家分店，表結構一樣，總部還要看跨店報表，所以用第一種：共用表，每列帶 <code>store_id</code>。它的代價寫在表格第一列：隔離完全靠條件，寫錯一個就外洩。所以接下來要讓 <code>store_id</code> 出現在三個地方，每個地方擋一種錯誤：</p>
+<ul>
+  <li><strong>主鍵與外鍵</strong>：擋「寫錯的引用」，例如台北店的訂單掛上台中店的商品。</li>
+  <li><strong>RLS</strong>：擋「看到別家的列」，程式忘了加條件也一樣。</li>
+  <li><strong>索引</strong>：每個查詢都帶 <code>store_id</code>，索引要配合它才查得快。</li>
+</ul>
+<p>誰屬於哪個租戶、怎麼從登入資訊拿到租戶 id，是授權的設計，見<a href="../../auth/lessons/20-multi-tenancy.html">認證課第 20 課</a>；這裡只管資料庫這一層。這一節用到的表：</p>
+<ul>
+  <li><code>products</code>：三家店各 6 樣商品，台北店是 1～6 號、台中店 7～12 號、高雄店 13～18 號。主鍵是 <code>(store_id, id)</code>，另外有一個舊的 <code>UNIQUE (id)</code>。</li>
+  <li><code>orders</code>：每家店 10 筆（台北 1～10、台中 11～20、高雄 21～30），已開啟 RLS。<code>order_items</code>：每筆訂單一個品項。</li>
+  <li><code>app_user</code> 可以讀寫 <code>orders</code>、<code>products</code>。</li>
+</ul>
+
+<h3>台北店的訂單，能不能掛上台中店的商品？</h3>
+<p>先看第一個位置。<code>order_items</code> 有 <code>store_id</code>，但它的商品外鍵只用 <code>product_id</code> 參照 <code>products (id)</code>。外鍵只確認「有這個商品」，不管是哪家店的。下面替台北店寫兩筆明細，執行後看兩欄：</p>
+<div class="lab" data-sql="BEGIN;
+SELECT try_sql('INSERT INTO order_items (store_id, order_id, product_id, quantity) VALUES (1, 1, 8, 1)') AS 台北的訂單_台中的拿鐵,
+       try_sql('INSERT INTO order_items (store_id, order_id, product_id, quantity) VALUES (1, 15, 2, 1)') AS 台北的明細_台中的訂單;
+ROLLBACK;"></div>
+<ul>
+  <li>第一筆寫進去了：台北店的訂單掛上了台中店的商品，報表會算錯、價格也可能不同。</li>
+  <li>第二筆被擋（23503），因為訂單的外鍵已經是<strong>複合外鍵</strong>（composite foreign key）：<code>FOREIGN KEY (store_id, order_id) REFERENCES orders (store_id, id)</code>。兩個欄位要一起對上，「明細的店」就必須等於「訂單的店」。</li>
+</ul>
+<p>複合外鍵把「同一家店」這條規則變成外鍵的一部分：明細的 <code>(store_id, order_id)</code> 這一對值，必須在 <code>orders</code> 找到完全相同的一對。外鍵要求被參照的那邊有涵蓋這些欄位的主鍵或唯一約束，所以 <code>orders</code> 有 <code>UNIQUE (store_id, id)</code>、<code>products</code> 的主鍵是 <code>(store_id, id)</code>。練習 4 替商品補上同樣的保護。</p>
+<p>複合外鍵擋的是寫錯的引用。但每家店查訂單時看得到哪些列，外鍵管不到，那是 RLS 的工作。</p>
+
+<h3>怎麼讓每家店只看得到自己的訂單？</h3>
+<p>第 24 課的 RLS 在表上加 policy：<code>USING</code> 決定看得到哪些列，<code>WITH CHECK</code> 決定寫入的列要符合什麼。policy 要知道「現在是哪家店」，做法和上一節稽核的 <code>app.user_id</code> 一樣：後端在每個交易開頭用 <code>set_config</code> 設定 <code>app.store_id</code>，policy 用 <code>current_setting</code> 讀出來。<code>orders</code> 的 policy：</p>
+<pre>CREATE POLICY orders_tenant ON orders TO app_user
+  USING (store_id = current_setting('app.store_id')::int)        -- 看得到哪些列
+  WITH CHECK (store_id = current_setting('app.store_id')::int);  -- 寫入的列要符合</pre>
+<p>下面以台中店的身分查訂單，再替台北店下單，執行後看兩個結果：</p>
+<div class="lab" data-sql="BEGIN;
+SET LOCAL ROLE app_user;
+SELECT set_config('app.store_id', '2', true);
+SELECT store_id, count(*) AS 看得到的訂單 FROM orders GROUP BY store_id;
+SELECT try_sql('INSERT INTO orders (store_id, customer, total) VALUES (1, ''王小明'', 80)') AS 替台北店下單;
+ROLLBACK;"></div>
+<p>台中店的身分只看得到台中店的 10 筆；替別家店寫入被 <code>WITH CHECK</code> 擋下（42501）。查詢裡沒寫任何 <code>WHERE store_id</code>，過濾是 RLS 加上的，程式忘了寫也不會外洩。</p>
+<p>這個 policy 有一個前提：<code>app.store_id</code> 一定要是「這個請求」的店。上面用的是 <code>set_config(…, true)</code>，設定只在目前的交易有效。這個 <code>true</code> 不能省，原因要從連線池說起。</p>
+
+<h3>租戶設定為什麼只能在交易內有效？</h3>
+<p>第 36 課講過，transaction 模式的連線池會讓<strong>每個交易</strong>借到不一定相同的連線。如果租戶設定跟著連線走，它就可能被下一個借到這條連線的請求用到。下面一步一步看：</p>
+<div class="tl">
+  <div class="table-wrap"><table>
+    <tr><th>步驟</th><th>連線 C1 上的 app.store_id</th><th>請求 A（台北店）</th><th>請求 B（台中店）</th></tr>
+    <tr data-note="請求 A 借到連線 C1，用 set_config('app.store_id', '1', false) 設定租戶。false 表示在整個連線（session）都有效。"><td>1</td><td>1</td><td>借到 C1，設定 store_id = 1（session 層級）</td><td></td></tr>
+    <tr data-note="A 查完訂單，交易結束，連線池把 C1 收回來。session 層級的設定跟著連線走，沒有被清掉。"><td>2</td><td>1（還在）</td><td>交易結束，C1 還給連線池</td><td></td></tr>
+    <tr data-note="請求 B 借到同一條 C1。程式某條路徑（例如背景工作、新寫的 API）忘了設定租戶。"><td>3</td><td>1</td><td></td><td>借到 C1，<span class="wait">忘了設定</span></td></tr>
+    <tr data-note="B 查訂單，RLS 用的是 C1 上殘留的 1：台中店的請求看到台北店的訂單。這種外洩只在高流量、連線被重複使用時才發生，開發時很難發現。"><td>4</td><td>1</td><td></td><td>查到<strong>台北店</strong>的訂單</td></tr>
+    <tr data-note="改用 set_config(…, true) 或 SET LOCAL：設定在交易結束時就消失。B 忘了設定時，current_setting('app.store_id') 得到空字串，轉 int 失敗而報錯，請求失敗，而不是串到別家店。"><td>5</td><td>交易結束即清除</td><td>每個交易開頭 <code>set_config(…, true)</code></td><td>忘了設定 → 報錯，不外洩</td></tr>
+  </table></div>
+  <div class="bar"><button data-prev>◀ 上一步</button><button class="primary" data-next>下一步 ▶</button><span class="kbd" data-count></span></div>
+  <p class="note"></p>
+</div>
+<p>驗證最後一步：交易結束之後，這個設定變成空字串，policy 裡的 <code>::int</code> 會失敗。執行後看兩欄：</p>
+<div class="lab" data-sql="BEGIN;
+SELECT set_config('app.store_id', '2', true);
+COMMIT;
+SELECT current_setting('app.store_id', true) = '' AS 交易後是空字串,
+       try_sql('SELECT current_setting(''app.store_id'')::int') AS 轉成整數;"></div>
+<p>忘了設定時報錯，比悄悄用錯店的設定好得多：報錯會在開發或測試時就被看到，外洩卻可能好幾個月沒人發現。</p>
+<p>RLS 只保護開了它的表，也只對不能繞過它的 role 有效。正式專案裡，<strong>每張租戶的表都要有 policy</strong>：這頁只替 <code>orders</code> 開了 RLS，<code>products</code>、<code>order_items</code> 也要。也要記得<strong>誰會繞過 RLS</strong>（第 24 課）：超級使用者、有 <code>BYPASSRLS</code> 的 role、表的擁有者（除非 <code>FORCE ROW LEVEL SECURITY</code>）；所以應用程式要像第 36 課那樣，用不是擁有者的 <code>app_user</code> 連線。</p>
+<p>租戶 id 的第三個位置是<strong>索引</strong>：幾乎每個查詢都帶 <code>store_id = …</code>（RLS 會自動加上），所以索引以 <code>store_id</code> 開頭，例如 <code>(store_id, ordered_at)</code>。</p>
+<p>到這裡，表本身守住了。但還有一條常見的漏洞，不是出在表上，而是出在為了方便建的 view。</p>
+
+<h3>加了 view 之後，RLS 還有效嗎？</h3>
+<p>有人替應用程式建了一個 view，方便查訂單。view 預設用<strong>擁有者</strong>的身分和 RLS 去查底層的表（PostgreSQL 18 的 <code>CREATE VIEW</code> 文件），不是用查詢者的。擁有者是超級使用者或表的擁有者時，RLS 對它無效，於是 <code>app_user</code> 透過 view 拿到了它自己拿不到的列。執行後先比較前兩欄，再看加上 <code>security_invoker</code> 之後的筆數：</p>
+<div class="lab" data-sql="BEGIN;
+CREATE VIEW v_orders AS SELECT * FROM orders;
+GRANT SELECT ON v_orders TO app_user;
+SET LOCAL ROLE app_user;
+SELECT set_config('app.store_id', '1', true);
+SELECT (SELECT count(*) FROM orders) AS 直接查, (SELECT count(*) FROM v_orders) AS 經由_view;
+RESET ROLE;
+ALTER VIEW v_orders SET (security_invoker = true);
+SET LOCAL ROLE app_user;
+SELECT count(*) AS 設了_security_invoker FROM v_orders;
+ROLLBACK;"></div>
+<p>直接查 10 筆，經由 view 30 筆，三家店的訂單全部外洩。<code>security_invoker = true</code>（PostgreSQL 15 起）讓 view 改用<strong>查詢者</strong>的權限和 policy。在有 RLS 的表上建 view，一律加上它：<code>CREATE VIEW … WITH (security_invoker = true) AS …</code>。第一節為軟刪除建的 <code>active_members</code>，如果 <code>members</code> 也開了 RLS，同樣要加。</p>
+<div class="callout practice"><strong>💡 實務上：多租戶的外洩，多半出在「新加的那一條路」</strong><br>主要的 API 通常都測過，出事的常是後來加的東西：新的一張表忘了開 RLS、為了報表建的 view、背景工作或匯出 CSV 沒設定租戶、客服後台用了能繞過 RLS 的帳號。資深工程師 review 這類 PR 時會逐項問：新表有沒有 <code>store_id</code> 和 policy？外鍵、索引有沒有帶 <code>store_id</code>？新的 view 有沒有 <code>security_invoker</code>？這段程式用哪個 role 連線、在哪裡設定租戶？客服或總部真的需要跨店查詢時，給一個專用的 role，並把它的操作記進稽核紀錄，而不是共用最高權限的帳號。</div>
+<p>第四條需求的規則都寫好了：<code>store_id</code> 進主鍵、外鍵、索引，RLS 依每個交易設定的店過濾，view 用查詢者的身分。但「寫好」不等於「有效」：一個寫錯的 policy，在開發時看起來可能一切正常。交件前的最後一步，是證明它。</p>
+
+<h2>怎麼證明分店之間真的隔離？</h2>
+<p>隔離規則寫在資料庫裡，就在資料庫裡測。測試是一個 PL/pgSQL 函式，用 <strong>ASSERT</strong> 檢查：<code>ASSERT 條件, '訊息'</code>，條件不成立（或是 <code>NULL</code>）就丟出 <code>P0004</code>（<code>assert_failure</code>）錯誤。測試通過，就是函式正常結束。</p>
+<p>測試要<strong>用應用程式的 role 測</strong>。在函式裡寫 <code>SET LOCAL ROLE app_user</code>，之後的查詢都以 <code>app_user</code> 執行，交易結束就恢復。用超級使用者測，永遠看到全部，測試永遠不準。</p>
+<p>測試寫好、也通過了，怎麼知道它真的在保護什麼？做法是故意把被測的東西改壞，看測試會不會失敗。改壞了測試還通過，代表它根本沒在檢查這件事。這就是<strong>變異測試</strong>（mutation testing）的想法。這頁的 <code>mutation_check('SELECT 測試函式()')</code> 依序把 <code>orders_tenant</code> 的 <code>USING</code> 換成五種：正確的、<code>true</code>（全部外洩）、<code>store_id = 1</code>（寫死台北店）、<code>store_id = 2</code>（寫死台中店）、<code>false</code>（誰都看不到），每種跑一次測試，回報通過與否，最後把 policy 改回來。好的測試只有第一列通過。</p>
+<p>測試函式裡要呼叫 <code>set_config</code> 但不需要它的結果，PL/pgSQL 規定用 <code>PERFORM</code> 取代 <code>SELECT</code>（<a href="33-job-queue.html">第 33 課</a>）。先看一個常見的「半套」測試：只用台北店、只檢查「看不到別家」。執行後由上到下看「測試通過」欄：</p>
+<div class="lab" data-sql="BEGIN;
+CREATE FUNCTION weak_test() RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  SET LOCAL ROLE app_user;
+  PERFORM set_config('app.store_id', '1', true);
+  ASSERT NOT EXISTS (SELECT 1 FROM orders WHERE store_id &lt;&gt; 1), '台北店看到了別家的訂單';
+END $$;
+SELECT * FROM mutation_check('SELECT weak_test()');
+ROLLBACK;"></div>
+<ul>
+  <li>正確的 policy：通過。</li>
+  <li><code>USING (true)</code>（全部外洩）：失敗，抓到了。</li>
+  <li><code>USING (store_id = 1)</code>（寫死台北店）：<strong>通過</strong>。這個測試只用台北店測，寫死台北店時，台北店看起來一切正常。</li>
+  <li><code>USING (store_id = 2)</code>（寫死台中店）：失敗，抓到了。</li>
+  <li><code>USING (false)</code>（誰都看不到）：<strong>通過</strong>。這個測試只檢查「看不到別人」，沒檢查「看得到自己」。每家店都看不到自己的訂單，顯然是壞的，測試卻放行。</li>
+</ul>
+<p>兩個漏網的錯誤，對應測試少做的兩件事：只測一家店，就分不出「正確」和「寫死這家店」；只測「看不到別人」，就分不出「正確」和「誰都看不到」。所以好的隔離測試要測兩家以上的店，每家都同時檢查兩個方向。練習 5 由你寫出能抓到全部四種錯誤的測試。正式專案可以用 <strong>pgTAP</strong>（PostgreSQL 的測試框架，提供 <code>is()</code>、<code>results_eq()</code> 等斷言），並在 CI 用跟正式環境同版本的 PostgreSQL 跑（<a href="../../devops/lessons/15-ci.html">DevOps 課第 15 課</a>）。每次改 policy 或 migration，測試都會跑一遍。</p>
+<p>四條需求都做進資料庫了，最危險的隔離也有測試證明。最後退一步看：這四個模式都有代價，不是每個專案都該全部用上。</p>
+
+<h2>這四個模式，什麼時候該用、什麼時候不該用？</h2>
+<p>每個模式都是用一些成本，換「程式忘了也不會出事」。判斷要不要用，就是比較這兩邊：不用這個模式時，規則會在哪條路上破掉、破掉的代價多大；用了之後，每天要多付什麼。對照這張表：</p>
+<div class="table-wrap"><table>
+  <tr><th>模式</th><th>解決什麼</th><th>代價</th><th>什麼時候不要用</th></tr>
+  <tr><td>軟刪除（<code>deleted_at</code>）</td><td>可復原、保留歷史與關聯</td><td>每個查詢都要過濾；唯一約束要改成部分索引；外鍵不知道已刪除</td><td>資料必須真的消失（個資）；刪除很頻繁的表（改用封存表）</td></tr>
+  <tr><td>稽核 trigger</td><td>任何來源的修改都有紀錄</td><td>每次寫入多一筆 JSONB；表很快變大</td><td>高頻寫入的計數類資料；只需要「最後修改時間」時加一個 <code>updated_at</code> 就夠</td></tr>
+  <tr><td>範圍型別＋EXCLUDE／WITHOUT OVERLAPS</td><td>時段不重疊，並發時也成立</td><td>GiST 索引寫入較慢；要 btree_gist</td><td>時段是固定格子（例如每小時一格）時，用 <code>UNIQUE (table_id, slot)</code> 更簡單</td></tr>
+  <tr><td>共用表＋<code>store_id</code>＋RLS</td><td>一套 schema 服務所有租戶</td><td>每張表、每個鍵、每個索引都帶租戶 id；要測試隔離</td><td>合約要求實體隔離；只有一個租戶</td></tr>
+</table></div>
+<p>另一個常被問到、但不屬於這四種的需求是「發票號碼要連續」，做法放在課末。</p>
+
+<h2>補充與查表</h2>
+<p>主線刻意略過的版本差異和延伸做法，集中在這裡，需要時再查。</p>
+
+<h3>部分唯一索引的另一種寫法：NULLS NOT DISTINCT</h3>
+<p>PostgreSQL 15 起可以寫 <code>UNIQUE NULLS NOT DISTINCT (phone, deleted_at)</code>，讓 <code>NULL</code> 被當成相等。但它也會要求「同一支手機、同一個刪除時間」不重複，語意比較繞，一般用部分唯一索引。</p>
+
+<h3>search_path 劫持：哪些 schema 危險</h3>
+<p>攻擊者能建立物件的 schema 才危險。PostgreSQL 15 以前，<code>public</code> schema 人人可寫；15 起，新資料庫的 <code>public</code> schema 預設不再讓所有人建物件，所以攻擊者通常只剩 <code>pg_temp</code> 可以用，這正是主線示範的。</p>
+
+<h3>程式端拿新舊值：RETURNING old／new</h3>
+<p>PostgreSQL 18 起 <code>RETURNING</code> 可以寫 <code>old.欄位</code>、<code>new.欄位</code>。適合把變更送到訊息系統，但它不能取代稽核 trigger：直接下 SQL 的修改不會經過你的程式。執行後看「改之前」「改之後」兩欄：</p>
+<div class="lab" data-sql="BEGIN;
+UPDATE products SET price = price + 5 WHERE store_id = 1 AND id = 2
+RETURNING name, old.price AS 改之前, new.price AS 改之後;
+ROLLBACK;"></div>
+
+<h3>PostgreSQL 18：WITHOUT OVERLAPS 與 PERIOD 外鍵</h3>
+<p>訂位之外，「某段時間內有效」的資料也很常見：商品的歷史價格、員工的職位、合約的期間。PostgreSQL 18 把這類規則做成了<strong>時間性約束</strong>（temporal constraint）。這裡換成歷史價格的例子，因為它要的是主鍵和外鍵，訂位表用不到：</p>
+<ul>
+  <li><code>PRIMARY KEY (product_id, valid_at WITHOUT OVERLAPS)</code>：同一個商品的有效期間不能重疊。文件說明它等於 <code>EXCLUDE USING gist (product_id WITH =, valid_at WITH &amp;&amp;)</code>，一樣需要 btree_gist。</li>
+  <li><code>FOREIGN KEY (product_id, PERIOD during) REFERENCES product_prices (product_id, PERIOD valid_at)</code>：參照的那一段期間，必須被對方的期間<strong>完全涵蓋</strong>（可以由好幾列接起來）。</li>
+</ul>
+<p>先看 <code>WITHOUT OVERLAPS</code>。下面的歷史價格表 <code>product_prices</code> 給 2 號商品兩段價格；<code>[2026-07-01,)</code> 的結尾空著，表示「到現在都有效」。執行後看兩個結果：期間重疊的那一筆被擋下的錯誤碼，以及查「哪一段期間包含三月十五日」得到的價格：</p>
+<div class="lab" data-sql="BEGIN;
+CREATE TABLE product_prices (
+  product_id integer NOT NULL REFERENCES products (id),
+  price integer NOT NULL,
+  valid_at daterange NOT NULL,
+  PRIMARY KEY (product_id, valid_at WITHOUT OVERLAPS)
+);
+INSERT INTO product_prices VALUES (2, 110, '[2026-01-01,2026-07-01)'), (2, 120, '[2026-07-01,)');
+SELECT try_sql('INSERT INTO product_prices VALUES (2, 115, ''[2026-06-01,2026-08-01)'')') AS 期間重疊;
+SELECT price AS 三月十五日的價格 FROM product_prices WHERE product_id = 2 AND valid_at @&gt; date '2026-03-15';
+ROLLBACK;"></div>
+<p>再看 <code>PERIOD</code> 外鍵：促銷期間內，商品必須一直有定價。seed 裡的 <code>make_product_prices()</code> 就是上一格的建表和那兩段價格。執行後看兩欄：跨兩段價格的促銷，和有一段沒有定價的促銷：</p>
+<div class="lab" data-sql="BEGIN;
+SELECT make_product_prices();
+CREATE TABLE promotions (
+  product_id integer NOT NULL,
+  during daterange NOT NULL,
+  FOREIGN KEY (product_id, PERIOD during) REFERENCES product_prices (product_id, PERIOD valid_at)
+);
+SELECT try_sql('INSERT INTO promotions VALUES (2, ''[2026-06-15,2026-07-15)'')') AS 跨兩段價格,
+       try_sql('INSERT INTO promotions VALUES (2, ''[2025-12-01,2026-01-15)'')') AS 有一段沒有定價;
+ROLLBACK;"></div>
+<p>PERIOD 外鍵在 PostgreSQL 18 只支援預設的 <code>NO ACTION</code>：寫 <code>ON DELETE CASCADE</code>、<code>SET NULL</code>，連 <code>RESTRICT</code> 都會得到 0A000。這是 18 才有的新功能，ORM 和 migration 工具不一定認得，用之前先確認團隊的工具鏈。歷史價格表適合用來查「某天的定價」；但訂單本身仍要存下單當下的單價，不要每次都回頭查價格表算金額。</p>
+
+<h3>發票號碼要連續</h3>
+<p><a href="31-isolation-upsert.html">第 31 課</a>看過 IDENTITY 和序列在 <code>ROLLBACK</code> 時會跳號，它們只保證不重複、不保證連續。要連續就用一張計數表，在開發票的同一個交易裡更新：</p>
+<pre>CREATE TABLE invoice_counters (store_id integer PRIMARY KEY, last_no integer NOT NULL);
+
+-- 開發票的交易裡：
+UPDATE invoice_counters SET last_no = last_no + 1 WHERE store_id = $1 RETURNING last_no;</pre>
+<p><code>UPDATE</code> 鎖住這家店的那一列，同一家店的開票排隊進行（第 19 課）；交易 <code>ROLLBACK</code> 時號碼也一起退回，所以不會跳號。代價是同一家店的開票不能並行，交易要短。</p>
+
+<h2>練習</h2>
+<div class="exercise"
+  data-start="-- 未刪除的會員，手機不能重複；已刪除會員的手機可以給新會員用
+"
+  data-answer="CREATE UNIQUE INDEX members_phone_active_key ON members (phone) WHERE deleted_at IS NULL;"
+  data-check="SELECT left(try_sql('INSERT INTO members (name, phone) VALUES (''新會員甲'', ''0955-222-333'')'), 5) AS 用已刪除會員的手機,
+       left(try_sql('INSERT INTO members (name, phone) VALUES (''新會員乙'', ''0955-222-333'')'), 5) AS 再用一次同一支,
+       left(try_sql('INSERT INTO members (name, phone) VALUES (''新會員丙'', ''0912-345-678'')'), 5) AS 用王小明的手機,
+       left(try_sql('INSERT INTO members (name, phone) VALUES (''新會員丁'', ''0988-777-666'')'), 5) AS 用黃淑芬的手機,
+       left(try_sql('UPDATE members SET deleted_at = now() WHERE id = 3'), 5) AS 林志豪刪除帳號,
+       left(try_sql('INSERT INTO members (name, phone) VALUES (''新會員戊'', ''0933-456-789'')'), 5) AS 用林志豪的手機,
+       (SELECT count(*) FROM members WHERE id &lt;= 6) AS 原本的會員;"
+  data-forbid="\bFUNCTION\b[^;(]*\btry_sql\b"
+  data-forbid-msg="這題不能改寫檢查用的 try_sql。"
+  data-isolated>
+  <p>練習 1：<code>members</code> 用 <code>deleted_at</code> 做軟刪除。建一個索引，讓<strong>未刪除</strong>的會員手機不能重複，但已刪除會員（例如李建國）的手機可以被新會員使用。之後有會員刪除帳號，他的手機也要能馬上給別人用。不要改動現有的資料。</p>
+  <script type="text/sql" data-role="wrong">CREATE UNIQUE INDEX members_phone_key ON members (phone);</script>
+  <script type="text/sql" data-role="wrong">CREATE UNIQUE INDEX members_phone_key ON members (phone, deleted_at);</script>
+  <script type="text/sql" data-role="wrong">CREATE UNIQUE INDEX members_phone_key ON members (phone) WHERE deleted_at IS NOT NULL;</script>
+  <script type="text/sql" data-role="wrong">CREATE INDEX members_phone_idx ON members (phone) WHERE deleted_at IS NULL;</script>
+  <script type="text/sql" data-role="wrong">CREATE UNIQUE INDEX members_phone_key ON members (phone) WHERE deleted_at IS NULL AND phone <> '0955-222-333';</script>
+  <script type="text/sql" data-role="wrong">DELETE FROM members WHERE deleted_at IS NOT NULL;
+CREATE UNIQUE INDEX members_phone_key ON members (phone);</script>
+  <script type="text/sql" data-role="wrong">CREATE OR REPLACE FUNCTION try_sql(sql text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN CASE WHEN sql LIKE '%0955-222-333%' OR sql LIKE 'UPDATE%' OR sql LIKE '%0933%' THEN 'ok' ELSE '23505' END;
+END $$;</script>
+</div>
+
+<div class="exercise"
+  data-start="-- 1. 寫一個 trigger 函式：把 table_name、op、old_row、new_row、changed_by 寫進 audit_log
+-- 2. 在 products 上建立 UPDATE 的 trigger
+"
+  data-answer="CREATE FUNCTION audit_row() RETURNS trigger
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path = public, pg_temp
+AS $$
+BEGIN
+  INSERT INTO audit_log (table_name, op, old_row, new_row, changed_by)
+  VALUES (TG_TABLE_NAME, TG_OP, to_jsonb(OLD), to_jsonb(NEW), current_setting('app.user_id', true));
+  RETURN NULL;
+END $$;
+CREATE TRIGGER products_audit AFTER UPDATE ON products
+  FOR EACH ROW EXECUTE FUNCTION audit_row();"
+  data-check="SET ROLE app_user;
+CREATE TEMP TABLE audit_log (table_name text, op text, old_row jsonb, new_row jsonb, changed_by text);
+SELECT set_config('app.user_id', 'staff-7', false);
+UPDATE products SET price = 125 WHERE store_id = 1 AND id = 2;
+SELECT set_config('app.user_id', 'staff-9', false);
+UPDATE products SET price = 130 WHERE store_id = 1 AND id = 2;
+RESET ROLE;
+SELECT a.table_name, a.op, a.old_row -&gt;&gt; 'price' AS 舊價, a.new_row -&gt;&gt; 'price' AS 新價,
+  a.new_row -&gt;&gt; 'name' AS 品名, a.old_row -&gt;&gt; 'store_id' AS 店, a.changed_by,
+  (SELECT price FROM products WHERE store_id = 1 AND id = 2) AS 現在的價格,
+  (SELECT count(*) FROM pg_temp.audit_log) AS 寫進暫存表的
+FROM public.audit_log a;"
+  data-forbid="\b(GRANT|OWNER|ROLE)\b"
+  data-forbid-msg="這題不能改權限、擁有者或 role：稽核表只讓擁有者寫，應用程式只能透過 trigger 留下紀錄。"
+  data-isolated>
+  <p>練習 2：替 <code>products</code> 寫稽核。每次 <code>UPDATE</code> 一列商品，就在 <code>audit_log</code> 記下 <code>table_name</code>、<code>op</code>、<code>old_row</code>、<code>new_row</code>（整列的 JSONB）和 <code>changed_by</code>（<code>current_setting('app.user_id', true)</code>）。改價要照常生效。檢查時會用 <code>app_user</code> 的身分、以兩位不同的店員改價兩次，而 <code>app_user</code> 對 <code>audit_log</code> 沒有權限，也不能給它；改價之前它還會先建一張同名的暫存表 <code>audit_log</code>，紀錄必須照樣寫進真的稽核表。</p>
+  <script type="text/sql" data-role="wrong">CREATE FUNCTION audit_row() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO audit_log (table_name, op, old_row, new_row, changed_by)
+  VALUES (TG_TABLE_NAME, TG_OP, to_jsonb(OLD), to_jsonb(NEW), current_setting('app.user_id', true));
+  RETURN NULL;
+END $$;
+CREATE TRIGGER products_audit AFTER UPDATE ON products FOR EACH ROW EXECUTE FUNCTION audit_row();</script>
+  <script type="text/sql" data-role="wrong">CREATE FUNCTION audit_row() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+  INSERT INTO audit_log (table_name, op, old_row, new_row, changed_by)
+  VALUES (TG_TABLE_NAME, TG_OP, to_jsonb(OLD), to_jsonb(NEW), current_setting('app.user_id', true));
+  RETURN NULL;
+END $$;
+CREATE TRIGGER products_audit AFTER UPDATE ON products FOR EACH ROW EXECUTE FUNCTION audit_row();</script>
+  <script type="text/sql" data-role="wrong">CREATE FUNCTION audit_row() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+BEGIN
+  INSERT INTO audit_log (table_name, op, old_row, new_row, changed_by)
+  VALUES (TG_TABLE_NAME, TG_OP, to_jsonb(OLD), to_jsonb(NEW), current_setting('app.user_id', true));
+  RETURN NULL;
+END $$;
+CREATE TRIGGER products_audit AFTER UPDATE ON products FOR EACH ROW EXECUTE FUNCTION audit_row();</script>
+  <script type="text/sql" data-role="wrong">CREATE FUNCTION audit_row() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+BEGIN
+  INSERT INTO audit_log (table_name, op, old_row, new_row, changed_by)
+  VALUES (TG_TABLE_NAME, TG_OP, to_jsonb(OLD), to_jsonb(NEW), current_setting('app.user_id', true));
+  RETURN NULL;
+END $$;
+CREATE TRIGGER products_audit AFTER UPDATE ON products FOR EACH ROW EXECUTE FUNCTION audit_row();</script>
+  <script type="text/sql" data-role="wrong">CREATE FUNCTION audit_row() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+BEGIN
+  INSERT INTO audit_log (table_name, op, old_row, new_row, changed_by)
+  VALUES (TG_TABLE_NAME, TG_OP, to_jsonb(OLD), to_jsonb(NEW), current_setting('app.user_id', true));
+  RETURN NULL;
+END $$;
+CREATE TRIGGER products_audit BEFORE UPDATE ON products FOR EACH ROW EXECUTE FUNCTION audit_row();</script>
+  <script type="text/sql" data-role="wrong">CREATE FUNCTION audit_row() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+BEGIN
+  INSERT INTO audit_log (table_name, op, old_row, new_row, changed_by)
+  VALUES (TG_TABLE_NAME, TG_OP, to_jsonb(OLD), to_jsonb(NEW), current_setting('app.user_id', true));
+  RETURN NULL;
+END $$;
+CREATE TRIGGER products_audit AFTER UPDATE ON products FOR EACH STATEMENT EXECUTE FUNCTION audit_row();</script>
+  <script type="text/sql" data-role="wrong">CREATE FUNCTION audit_row() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+BEGIN
+  INSERT INTO audit_log (table_name, op, old_row, new_row)
+  VALUES (TG_TABLE_NAME, TG_OP, to_jsonb(OLD), to_jsonb(NEW));
+  RETURN NULL;
+END $$;
+CREATE TRIGGER products_audit AFTER UPDATE ON products FOR EACH ROW EXECUTE FUNCTION audit_row();</script>
+  <script type="text/sql" data-role="wrong">CREATE FUNCTION audit_row() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+BEGIN
+  INSERT INTO audit_log (table_name, op, old_row, new_row, changed_by)
+  VALUES (TG_TABLE_NAME, TG_OP, to_jsonb(OLD), to_jsonb(NEW), 'staff-7');
+  RETURN NULL;
+END $$;
+CREATE TRIGGER products_audit AFTER UPDATE ON products FOR EACH ROW EXECUTE FUNCTION audit_row();</script>
+  <script type="text/sql" data-role="wrong">CREATE FUNCTION audit_row() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+BEGIN
+  INSERT INTO audit_log (table_name, op, old_row, new_row, changed_by)
+  VALUES (TG_TABLE_NAME, TG_OP, jsonb_build_object('price', OLD.price), jsonb_build_object('price', NEW.price), current_setting('app.user_id', true));
+  RETURN NULL;
+END $$;
+CREATE TRIGGER products_audit AFTER UPDATE ON products FOR EACH ROW EXECUTE FUNCTION audit_row();</script>
+  <script type="text/sql" data-role="wrong">GRANT INSERT ON audit_log TO app_user;
+CREATE FUNCTION audit_row() RETURNS trigger LANGUAGE plpgsql SET search_path = public, pg_temp AS $$
+BEGIN
+  INSERT INTO audit_log (table_name, op, old_row, new_row, changed_by)
+  VALUES (TG_TABLE_NAME, TG_OP, to_jsonb(OLD), to_jsonb(NEW), current_setting('app.user_id', true));
+  RETURN NULL;
+END $$;
+CREATE TRIGGER products_audit AFTER UPDATE ON products FOR EACH ROW EXECUTE FUNCTION audit_row();</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE audit_log OWNER TO app_user;
+CREATE FUNCTION audit_row() RETURNS trigger LANGUAGE plpgsql SET search_path = public, pg_temp AS $$
+BEGIN
+  INSERT INTO audit_log (table_name, op, old_row, new_row, changed_by)
+  VALUES (TG_TABLE_NAME, TG_OP, to_jsonb(OLD), to_jsonb(NEW), current_setting('app.user_id', true));
+  RETURN NULL;
+END $$;
+CREATE TRIGGER products_audit AFTER UPDATE ON products FOR EACH ROW EXECUTE FUNCTION audit_row();</script>
+</div>
+
+<div class="exercise"
+  data-start="ALTER TABLE reservations ADD CONSTRAINT reservations_no_overlap
+"
+  data-answer="ALTER TABLE reservations ADD CONSTRAINT reservations_no_overlap
+  EXCLUDE USING gist (table_id WITH =, during WITH &amp;&amp;)
+  WHERE (status &lt;&gt; 'cancelled');"
+  data-check="SELECT
+  left(try_sql('INSERT INTO reservations (table_id, guest, during) VALUES (3, ''重疊'', tstzrange(''2026-11-14 19:00+08'', ''2026-11-14 20:00+08''))'), 5) AS 三號桌重疊,
+  left(try_sql('INSERT INTO reservations (table_id, guest, during) VALUES (5, ''重疊'', tstzrange(''2026-11-14 19:00+08'', ''2026-11-14 19:30+08''))'), 5) AS 五號桌重疊,
+  left(try_sql('INSERT INTO reservations (table_id, guest, during) VALUES (5, ''相鄰'', tstzrange(''2026-11-14 20:00+08'', ''2026-11-14 21:00+08''))'), 5) AS 剛好相鄰,
+  left(try_sql('INSERT INTO reservations (table_id, guest, during) VALUES (7, ''補位'', tstzrange(''2026-11-14 12:30+08'', ''2026-11-14 13:30+08''))'), 5) AS 與已取消的重疊,
+  left(try_sql('INSERT INTO reservations (table_id, guest, during) VALUES (8, ''新桌'', tstzrange(''2026-11-14 18:00+08'', ''2026-11-14 19:00+08''))'), 5) AS 別桌同時段,
+  left(try_sql('INSERT INTO reservations (table_id, guest, during) VALUES (8, ''搶位'', tstzrange(''2026-11-14 18:30+08'', ''2026-11-14 19:30+08''))'), 5) AS 八號桌重疊,
+  left(try_sql('INSERT INTO reservations (table_id, guest, during, status) VALUES (3, ''已取消'', tstzrange(''2026-11-14 18:30+08'', ''2026-11-14 19:00+08''), ''cancelled'')'), 5) AS 寫入已取消的,
+  (SELECT count(*) FROM reservations WHERE id &lt;= 5) AS 原本的訂位;"
+  data-forbid="\bFUNCTION\b[^;(]*\btry_sql\b"
+  data-forbid-msg="這題不能改寫檢查用的 try_sql。"
+  data-isolated>
+  <p>練習 3：替 <code>reservations</code> 加上約束：同一張桌子、時段重疊的訂位不能同時存在，但<strong>已取消</strong>的訂位不算（3 號桌陳美華取消後，林志豪訂了重疊的時段，這是合法的）。剛好相鄰的時段（前一組 20:00 結束、下一組 20:00 開始）要能訂，不同桌子同一時段當然也可以。不要改動現有的資料。</p>
+  <script type="text/sql" data-role="wrong">ALTER TABLE reservations ADD CONSTRAINT reservations_no_overlap UNIQUE (table_id, during);</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE reservations ADD CONSTRAINT reservations_no_overlap
+  EXCLUDE USING gist (table_id WITH =, during WITH &&);</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE reservations ADD CONSTRAINT reservations_no_overlap
+  EXCLUDE USING gist (table_id WITH =, during WITH =) WHERE (status <> 'cancelled');</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE reservations ADD CONSTRAINT reservations_no_overlap
+  EXCLUDE USING gist (during WITH &&) WHERE (status <> 'cancelled');</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE reservations ADD CONSTRAINT reservations_no_overlap
+  EXCLUDE USING gist (table_id WITH =, tstzrange(lower(during), upper(during), '[]') WITH &&) WHERE (status <> 'cancelled');</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE reservations ADD CONSTRAINT reservations_no_overlap
+  EXCLUDE USING gist (table_id WITH =, during WITH &&) WHERE (status <> 'cancelled' AND table_id = 3);</script>
+  <script type="text/sql" data-role="wrong">DELETE FROM reservations WHERE status = 'cancelled';
+ALTER TABLE reservations ADD CONSTRAINT reservations_no_overlap
+  EXCLUDE USING gist (table_id WITH =, during WITH &&);</script>
+</div>
+
+<div class="exercise"
+  data-start="-- order_items 的商品外鍵只有 (product_id) → products (id)
+"
+  data-answer="ALTER TABLE order_items ADD CONSTRAINT order_items_store_product_fkey
+  FOREIGN KEY (store_id, product_id) REFERENCES products (store_id, id);"
+  data-check="SELECT
+  left(try_sql('INSERT INTO order_items (store_id, order_id, product_id, quantity) VALUES (1, 1, 8, 1)'), 5) AS 跨店引用,
+  left(try_sql('INSERT INTO order_items (store_id, order_id, product_id, quantity) VALUES (1, 1, 2, 1)'), 5) AS 同店引用,
+  left(try_sql('INSERT INTO products (store_id, id, name, price) VALUES (2, 100, ''季節限定'', 150)'), 5) AS 台中店新商品,
+  left(try_sql('INSERT INTO order_items (store_id, order_id, product_id, quantity) VALUES (1, 1, 100, 1)'), 5) AS 台北引用新商品,
+  left(try_sql('INSERT INTO order_items (store_id, order_id, product_id, quantity) VALUES (2, 11, 100, 1)'), 5) AS 台中引用新商品,
+  (SELECT count(*) FROM order_items WHERE id &lt;= 30) AS 原本的明細;"
+  data-forbid="\bFUNCTION\b[^;(]*\btry_sql\b"
+  data-forbid-msg="這題不能改寫檢查用的 try_sql。"
+  data-isolated>
+  <p>練習 4：台北店的訂單明細可以引用台中店的商品（前面示範過）。替 <code>order_items</code> 加上一個外鍵，讓明細的商品一定和明細屬於同一家店；同一家店的商品（包括之後才新增的商品）要照常可以寫入。</p>
+  <script type="text/sql" data-role="wrong">SELECT 1 FROM order_items LIMIT 1;</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE order_items ADD CONSTRAINT order_items_store_product_fkey
+  FOREIGN KEY (product_id, store_id) REFERENCES products (store_id, id);</script>
+  <script type="text/sql" data-role="wrong">DELETE FROM order_items;
+ALTER TABLE order_items ADD CONSTRAINT order_items_store_product_fkey
+  FOREIGN KEY (product_id, store_id) REFERENCES products (store_id, id);</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE order_items ADD CONSTRAINT order_items_store_fkey
+  FOREIGN KEY (store_id) REFERENCES stores (id);</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE order_items ADD CONSTRAINT order_items_product_range
+  CHECK (product_id BETWEEN (store_id - 1) * 6 + 1 AND store_id * 6);</script>
+</div>
+
+<div class="exercise"
+  data-start="CREATE FUNCTION test_tenant_isolation() RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  -- 以 app_user 的身分，分別檢查台北店（1）與台中店（2）
+END $$;"
+  data-answer="CREATE FUNCTION test_tenant_isolation() RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  SET LOCAL ROLE app_user;
+  PERFORM set_config('app.store_id', '1', true);
+  ASSERT EXISTS (SELECT 1 FROM orders WHERE store_id = 1), '台北店看不到自己的訂單';
+  ASSERT NOT EXISTS (SELECT 1 FROM orders WHERE store_id &lt;&gt; 1), '台北店看到了別家的訂單';
+  PERFORM set_config('app.store_id', '2', true);
+  ASSERT EXISTS (SELECT 1 FROM orders WHERE store_id = 2), '台中店看不到自己的訂單';
+  ASSERT NOT EXISTS (SELECT 1 FROM orders WHERE store_id &lt;&gt; 2), '台中店看到了別家的訂單';
+END $$;"
+  data-check="SELECT policy, 測試通過 FROM mutation_check('SELECT test_tenant_isolation()');"
+  data-ordered
+  data-forbid="\bmutation_check\b|\bFUNCTION\b[^;(]*\btry_sql\b|\b(ALTER|CREATE|DROP)\s+POLICY\b|pg_polic|pg_get_expr"
+  data-forbid-msg="測試要真的以 app_user 去查訂單：不能讀或改 policy 本身，也不能改寫 mutation_check、try_sql。"
+  data-isolated>
+  <p>練習 5：寫測試函式 <code>test_tenant_isolation()</code>（<code>RETURNS void</code>、<code>LANGUAGE plpgsql</code>）：以 <code>app_user</code> 的身分，分別設定台北店（1）與台中店（2），用 <code>ASSERT</code> 確認每家店<strong>看得到自己的</strong>訂單、<strong>看不到別家的</strong>。policy 正確時正常結束，有問題就丟出錯誤。檢查時會用 <code>mutation_check</code> 跑它：正確的 policy 要通過，四種壞掉的 policy 都要失敗。</p>
+  <script type="text/sql" data-role="wrong">CREATE FUNCTION test_tenant_isolation() RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM set_config('app.store_id', '1', true);
+  ASSERT EXISTS (SELECT 1 FROM orders WHERE store_id = 1), '台北店看不到自己的訂單';
+  ASSERT NOT EXISTS (SELECT 1 FROM orders WHERE store_id <> 1), '台北店看到了別家的訂單';
+  PERFORM set_config('app.store_id', '2', true);
+  ASSERT EXISTS (SELECT 1 FROM orders WHERE store_id = 2), '台中店看不到自己的訂單';
+  ASSERT NOT EXISTS (SELECT 1 FROM orders WHERE store_id <> 2), '台中店看到了別家的訂單';
+END $$;</script>
+  <script type="text/sql" data-role="wrong">CREATE FUNCTION test_tenant_isolation() RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  SET LOCAL ROLE app_user;
+  PERFORM set_config('app.store_id', '1', true);
+  ASSERT NOT EXISTS (SELECT 1 FROM orders WHERE store_id <> 1), '台北店看到了別家的訂單';
+END $$;</script>
+  <script type="text/sql" data-role="wrong">CREATE FUNCTION test_tenant_isolation() RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  SET LOCAL ROLE app_user;
+  PERFORM set_config('app.store_id', '1', true);
+  ASSERT NOT EXISTS (SELECT 1 FROM orders WHERE store_id <> 1), '台北店看到了別家的訂單';
+  PERFORM set_config('app.store_id', '2', true);
+  ASSERT NOT EXISTS (SELECT 1 FROM orders WHERE store_id <> 2), '台中店看到了別家的訂單';
+END $$;</script>
+  <script type="text/sql" data-role="wrong">CREATE FUNCTION test_tenant_isolation() RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  SET LOCAL ROLE app_user;
+  PERFORM set_config('app.store_id', '1', true);
+  ASSERT EXISTS (SELECT 1 FROM orders WHERE store_id = 1), '台北店看不到自己的訂單';
+  ASSERT NOT EXISTS (SELECT 1 FROM orders WHERE store_id <> 1), '台北店看到了別家的訂單';
+END $$;</script>
+  <script type="text/sql" data-role="wrong">CREATE FUNCTION test_tenant_isolation() RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  SET LOCAL ROLE app_user;
+  PERFORM set_config('app.store_id', '2', true);
+  ASSERT EXISTS (SELECT 1 FROM orders WHERE store_id = 2), '台中店看不到自己的訂單';
+  ASSERT NOT EXISTS (SELECT 1 FROM orders WHERE store_id <> 2), '台中店看到了別家的訂單';
+END $$;</script>
+  <script type="text/sql" data-role="wrong">CREATE FUNCTION test_tenant_isolation() RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  SET LOCAL ROLE app_user;
+  PERFORM set_config('app.store_id', '1', true);
+  ASSERT (SELECT count(*) FROM orders) = 10, '台北店應該看到 10 筆';
+  PERFORM set_config('app.store_id', '2', true);
+  ASSERT (SELECT count(*) FROM orders) = 10, '台中店應該看到 10 筆';
+END $$;</script>
+  <script type="text/sql" data-role="wrong">CREATE FUNCTION test_tenant_isolation() RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  ASSERT false, '還沒寫';
+END $$;</script>
+  <script type="text/sql" data-role="wrong">CREATE FUNCTION test_tenant_isolation() RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  SET LOCAL ROLE app_user;
+  PERFORM set_config('app.store_id', '1', true);
+  PERFORM count(*) FROM orders;
+END $$;</script>
+  <script type="text/sql" data-role="wrong">CREATE FUNCTION test_tenant_isolation() RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  ASSERT (SELECT qual FROM pg_policies WHERE policyname = 'orders_tenant') LIKE '%current_setting%', 'policy 被改壞了';
+END $$;</script>
+  <script type="text/sql" data-role="wrong">CREATE FUNCTION test_tenant_isolation() RETURNS void LANGUAGE plpgsql AS $$ BEGIN END $$;
+CREATE OR REPLACE FUNCTION mutation_check(test text) RETURNS TABLE (policy text, 測試通過 boolean, 訊息 text) LANGUAGE sql AS $$
+  VALUES ('正確的 policy', true, ''), ('USING (true)', false, ''), ('USING (store_id = 1)', false, ''), ('USING (store_id = 2)', false, ''), ('USING (false)', false, '')
+$$;</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 6：稽核用的 trigger 函式加了 <code>SECURITY DEFINER</code>，讓沒有 <code>audit_log</code> 權限的 <code>app_user</code> 也能留下紀錄，但沒有設定 <code>search_path</code>。風險是什麼？</p>
+  <label data-key="a">沒有風險：SECURITY DEFINER 只是讓權限夠用</label>
+  <label data-key="b">函式會變慢，因為每次都要重新找 <code>audit_log</code></label>
+  <label data-key="c">呼叫者可以建一個同名的暫存表，讓這個以擁有者權限執行的函式把紀錄寫到它那裡</label>
+  <label data-key="d">只有超級使用者能呼叫這個函式</label>
+  <p class="why">✓ 函式裡沒標 schema 的表名依呼叫當下的 <code>search_path</code> 找，而沒列出來的 <code>pg_temp</code> 排第一、任何人都能建暫存表；稽核紀錄會被導到攻擊者的表。<code>search_path</code> 裡若有攻擊者可寫的 schema，連函式、運算子都能被換掉，以擁有者的權限執行。解法是 <code>SET search_path = 可信任的 schema, pg_temp</code>（<code>pg_temp</code> 明確放最後）。a：SECURITY DEFINER 是把擁有者的權限借出去，借出去就要限制它能碰到什麼。b：效能不是重點。d：誰能呼叫由 <code>EXECUTE</code> 權限決定，跟 SECURITY DEFINER 無關。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：API 經過 transaction 模式的連線池連到資料庫，每個請求一開始執行 <code>SELECT set_config('app.store_id', $1, false)</code>，RLS 依它過濾。會發生什麼事？</p>
+  <label data-key="a">沒問題：設定只影響這個請求</label>
+  <label data-key="b">設定留在連線上；下一個借到這條連線、卻忘了設定的請求，會看到上一家店的資料</label>
+  <label data-key="c">每次查詢都會報錯，因為 <code>false</code> 的設定不能用在 RLS</label>
+  <label data-key="d">連線池會自動在交易結束時清掉所有設定</label>
+  <p class="why">✓ <code>false</code> 是 session 層級，跟著連線走；transaction 模式的連線池把同一條連線輪流借給不同請求。改用 <code>set_config(…, true)</code> 或 <code>SET LOCAL</code>，並在同一個交易裡查詢：交易結束設定就消失，忘了設定時 policy 報錯而不是外洩。a：請求和連線不是一對一。c：RLS 不在乎設定的層級。d：transaction 模式的連線池不會替你清 session 設定（第 36 課）。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 8：<code>orders</code> 有租戶 RLS。DBA 用 <code>postgres</code>（超級使用者）建了 <code>CREATE VIEW v_orders AS SELECT * FROM orders</code> 並 <code>GRANT SELECT</code> 給 <code>app_user</code>。<code>app_user</code> 設定台北店後查 <code>v_orders</code>，會看到什麼？</p>
+  <label data-key="a">三家店的全部訂單：view 預設用擁有者的身分查表，超級使用者繞過 RLS</label>
+  <label data-key="b">只有台北店的訂單：RLS 會自動套用到查詢者</label>
+  <label data-key="c">permission denied：<code>app_user</code> 不能查 view</label>
+  <label data-key="d">什麼都看不到：view 不支援 RLS</label>
+  <p class="why">✓ view 預設以擁有者的權限與 policy 存取底層的表（<code>CREATE VIEW</code> 文件），擁有者是超級使用者或表的擁有者時 RLS 不生效。PostgreSQL 15 起加上 <code>WITH (security_invoker = true)</code>，改用查詢者的權限和 policy，才會是 b 的結果。c：已經 <code>GRANT SELECT</code>。d：view 照常運作，問題是「用誰的身分」。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>軟刪除後有些查詢忘了過濾</strong>：已刪除的資料又出現在列表、報表裡。用 view 或 RLS 集中處理過濾條件。</li>
+  <li><strong>軟刪除的唯一約束寫成 <code>UNIQUE (phone, deleted_at)</code></strong>：<code>NULL</code> 彼此不相等，未刪除的重複擋不住。用部分唯一索引 <code>WHERE deleted_at IS NULL</code>。</li>
+  <li><strong>以為外鍵會擋住指向已刪除資料的寫入</strong>：軟刪除的列還在，外鍵照樣通過，<code>ON DELETE CASCADE</code> 也不會觸發。在程式或 trigger 處理。</li>
+  <li><strong>稽核只寫在程式裡</strong>：直接下 SQL 或別的服務改資料就沒有紀錄。用 trigger。</li>
+  <li><strong>SECURITY DEFINER 函式沒有固定 <code>search_path</code></strong>：呼叫者可以用暫存表或同名函式劫持。加上 <code>SET search_path = …, pg_temp</code>（<code>pg_temp</code> 明確放最後，只寫 <code>public</code> 不夠），或表名都寫完整的 schema。</li>
+  <li><strong>時段用包含結尾的 <code>[]</code> 區間</strong>：相鄰的時段被當成重疊。一律用 <code>[)</code>。</li>
+  <li><strong>用 <code>UNIQUE</code> 或「先查再寫」防止時段重疊</strong>：<code>UNIQUE</code> 只擋完全相同的值，先查再寫在並發時會一起通過。用 <code>EXCLUDE</code> 或 18 的 <code>WITHOUT OVERLAPS</code>。</li>
+  <li><strong>多租戶的表有 <code>store_id</code>，卻沒放進主鍵、外鍵、索引</strong>：跨租戶的引用寫得進去、查詢走不到好的索引。用複合鍵，索引以 <code>store_id</code> 開頭。</li>
+  <li><strong>租戶設定用 session 層級</strong>：經過連線池串到下一個請求。用 <code>set_config(…, true)</code> 或 <code>SET LOCAL</code>。</li>
+  <li><strong>在有 RLS 的表上建 view 卻沒設 <code>security_invoker</code></strong>：view 以擁有者的身分查表，RLS 被繞過。</li>
+  <li><strong>用超級使用者或擁有者測 RLS；只測「看不到別人」</strong>：前者永遠看到全部，後者抓不到「誰都看不到」。用應用程式的 role 測兩個方向，並故意改壞 policy 確認測試會失敗。</li>
+</ul>
+
+<h2>小結</h2>
+<p>這課把三家分店的四條需求做進資料庫，每一條都讓資料庫自己守住，程式忘了也不會出事：</p>
+<ul>
+  <li>會員要能復原 → 軟刪除：<code>deleted_at</code>＋view 集中過濾；唯一性用部分唯一索引（<code>NULL</code> 彼此不相等）；外鍵與 <code>CASCADE</code> 不知道「已刪除」；個資要真的刪除或去識別化，或改用封存表。</li>
+  <li>誰改了拿鐵的價格 → 稽核 trigger：通用函式用 <code>TG_OP</code>、<code>TG_TABLE_NAME</code>、<code>to_jsonb(OLD/NEW)</code>、<code>current_setting('app.user_id', true)</code>；應用程式碰不到稽核表，函式用 <code>SECURITY DEFINER</code> 並固定 <code>search_path</code>（<code>pg_temp</code> 放最後）。</li>
+  <li>同一時段只賣一次 → 範圍型別用半開區間 <code>[)</code>；<code>EXCLUDE USING gist (… WITH =, … WITH &amp;&amp;)</code> 在寫入時擋重疊（23P01），可加 <code>WHERE</code>，需要 btree_gist；PostgreSQL 18 另有 <code>WITHOUT OVERLAPS</code> 與 <code>PERIOD</code> 外鍵。</li>
+  <li>分店彼此看不到 → 租戶 id 進主鍵、複合外鍵、索引；RLS＋每個交易 <code>set_config(…, true)</code>；應用程式不能用擁有者或超級使用者連線；view 要 <code>security_invoker = true</code>。</li>
+  <li>證明隔離有效 → 用 SQL 測：以應用程式的 role、測兩家以上的店、同時測「看得到自己」與「看不到別人」，再故意改壞 policy 確認測試會失敗。</li>
+</ul>
+<p>下一課是資深篇的期末專題：拿到一個有效能、鎖、migration、資料保留問題的系統，從量測開始一路修好，並做上線前審查與事故演練。</p>
+</main>
+<script type="text/sql" id="seed">
+CREATE EXTENSION btree_gist;
+CREATE TABLE stores (id integer PRIMARY KEY, name text NOT NULL);
+INSERT INTO stores VALUES (1, '台北店'), (2, '台中店'), (3, '高雄店');
+
+-- 軟刪除：陳美華（已刪除）的手機被張雅婷重新使用
+CREATE TABLE members (
+  id integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  name text NOT NULL,
+  phone text,
+  deleted_at timestamptz
+);
+INSERT INTO members (id, name, phone, deleted_at) VALUES
+  (1, '王小明', '0912-345-678', NULL),
+  (2, '陳美華', '0922-111-222', '2026-03-01 10:00+08'),
+  (3, '林志豪', '0933-456-789', NULL),
+  (4, '張雅婷', '0922-111-222', NULL),
+  (5, '李建國', '0955-222-333', '2026-05-20 15:30+08'),
+  (6, '黃淑芬', '0988-777-666', NULL);
+SELECT setval(pg_get_serial_sequence('members', 'id'), 6);
+
+-- 多分店的商品：台北 1～6、台中 7～12、高雄 13～18
+CREATE TABLE products (
+  store_id integer NOT NULL REFERENCES stores,
+  id integer NOT NULL,
+  name text NOT NULL,
+  price integer NOT NULL,
+  PRIMARY KEY (store_id, id),
+  UNIQUE (id)
+);
+INSERT INTO products (store_id, id, name, price)
+SELECT s, (s - 1) * 6 + p.n, p.name, p.price
+FROM generate_series(1, 3) AS s,
+  (VALUES (1, '美式咖啡', 80), (2, '拿鐵', 110), (3, '卡布奇諾', 110), (4, '伯爵紅茶', 90), (5, '可頌', 70), (6, '起司蛋糕', 120)) AS p(n, name, price);
+
+CREATE TABLE audit_log (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  table_name text NOT NULL,
+  op text NOT NULL,
+  old_row jsonb,
+  new_row jsonb,
+  changed_by text,
+  changed_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE orders (
+  id integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  store_id integer NOT NULL REFERENCES stores,
+  customer text NOT NULL,
+  total integer NOT NULL,
+  UNIQUE (store_id, id)
+);
+INSERT INTO orders (id, store_id, customer, total)
+SELECT g, (g - 1) / 10 + 1, (ARRAY['王小明', '陳美華', '林志豪', '張雅婷', '李建國', '黃淑芬'])[g % 6 + 1], 70 + (g % 6) * 10
+FROM generate_series(1, 30) AS g;
+SELECT setval(pg_get_serial_sequence('orders', 'id'), 30);
+
+-- 訂單外鍵已經是複合的；商品外鍵只有 product_id
+CREATE TABLE order_items (
+  id integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  store_id integer NOT NULL,
+  order_id integer NOT NULL,
+  product_id integer NOT NULL REFERENCES products (id),
+  quantity integer NOT NULL,
+  FOREIGN KEY (store_id, order_id) REFERENCES orders (store_id, id)
+);
+INSERT INTO order_items (id, store_id, order_id, product_id, quantity)
+SELECT g, (g - 1) / 10 + 1, g, ((g - 1) / 10) * 6 + g % 6 + 1, g % 3 + 1
+FROM generate_series(1, 30) AS g;
+SELECT setval(pg_get_serial_sequence('order_items', 'id'), 30);
+
+-- 訂位：3 號桌陳美華取消後，林志豪訂了重疊的時段；7 號桌的李建國也取消了
+CREATE TABLE reservations (
+  id integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  table_id integer NOT NULL,
+  guest text NOT NULL,
+  during tstzrange NOT NULL,
+  status text NOT NULL DEFAULT 'booked' CHECK (status IN ('booked', 'cancelled'))
+);
+INSERT INTO reservations (id, table_id, guest, during, status) VALUES
+  (1, 3, '王小明', tstzrange('2026-11-14 18:00+08', '2026-11-14 19:30+08'), 'booked'),
+  (2, 3, '陳美華', tstzrange('2026-11-14 19:30+08', '2026-11-14 21:00+08'), 'cancelled'),
+  (3, 3, '林志豪', tstzrange('2026-11-14 20:00+08', '2026-11-14 21:00+08'), 'booked'),
+  (4, 5, '張雅婷', tstzrange('2026-11-14 18:00+08', '2026-11-14 20:00+08'), 'booked'),
+  (5, 7, '李建國', tstzrange('2026-11-14 12:00+08', '2026-11-14 13:00+08'), 'cancelled');
+SELECT setval(pg_get_serial_sequence('reservations', 'id'), 5);
+
+-- 應用程式的 role 與租戶 RLS
+CREATE ROLE app_user;
+GRANT SELECT, INSERT, UPDATE, DELETE ON orders, products TO app_user;
+GRANT SELECT, UPDATE ON members TO app_user;
+GRANT USAGE ON SEQUENCE orders_id_seq TO app_user;
+ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+CREATE POLICY orders_tenant ON orders TO app_user
+  USING (store_id = current_setting('app.store_id')::int)
+  WITH CHECK (store_id = current_setting('app.store_id')::int);
+
+-- 執行一句 SQL：成功回傳 ok，失敗回傳錯誤碼與訊息（也攔下 ASSERT 的 P0004）
+CREATE FUNCTION try_sql(sql text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE sql;
+  RETURN 'ok';
+EXCEPTION WHEN OTHERS OR assert_failure THEN
+  RETURN SQLSTATE || ' ' || SQLERRM;
+END $$;
+
+-- 把 orders_tenant 的 USING 依序換成正確的與三種壞掉的，各跑一次測試，最後改回來
+CREATE FUNCTION mutation_check(test text) RETURNS TABLE (policy text, 測試通過 boolean, 訊息 text) LANGUAGE plpgsql AS $$
+DECLARE
+  good text := 'store_id = current_setting(''app.store_id'')::int';
+  u text;
+  r text;
+BEGIN
+  FOREACH u IN ARRAY ARRAY[good, 'true', 'store_id = 1', 'store_id = 2', 'false'] LOOP
+    EXECUTE format('ALTER POLICY orders_tenant ON orders USING (%s)', u);
+    r := try_sql(test);
+    RESET ROLE;
+    policy := CASE WHEN u = good THEN '正確的 policy' ELSE 'USING (' || u || ')' END;
+    測試通過 := r = 'ok';
+    訊息 := CASE WHEN r = 'ok' THEN '' ELSE r END;
+    RETURN NEXT;
+  END LOOP;
+  EXECUTE format('ALTER POLICY orders_tenant ON orders USING (%s)', good);
+END $$;
+-- 範例用：建立稽核的 audit_row() 與 members 上的 trigger（就是課文第一格的兩句）；definer = true 時函式加上 SECURITY DEFINER
+CREATE FUNCTION install_audit(definer boolean DEFAULT false) RETURNS void LANGUAGE plpgsql AS $f$
+BEGIN
+  EXECUTE format($sql$CREATE FUNCTION audit_row() RETURNS trigger LANGUAGE plpgsql %s AS $$
+BEGIN
+  INSERT INTO audit_log (table_name, op, old_row, new_row, changed_by)
+  VALUES (TG_TABLE_NAME, TG_OP, to_jsonb(OLD), to_jsonb(NEW), current_setting('app.user_id', true));
+  RETURN NULL;
+END $$
+$sql$, CASE WHEN definer THEN 'SECURITY DEFINER' ELSE '' END);
+  CREATE TRIGGER members_audit AFTER INSERT OR UPDATE OR DELETE ON members
+    FOR EACH ROW EXECUTE FUNCTION audit_row();
+END $f$;
+
+-- 範例用：建立歷史價格表 product_prices 與 2 號商品的兩段價格（就是課文 WITHOUT OVERLAPS 那一格）
+CREATE FUNCTION make_product_prices() RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  CREATE TABLE product_prices (
+    product_id integer NOT NULL REFERENCES products (id),
+    price integer NOT NULL,
+    valid_at daterange NOT NULL,
+    PRIMARY KEY (product_id, valid_at WITHOUT OVERLAPS)
+  );
+  INSERT INTO product_prices VALUES (2, 110, '[2026-01-01,2026-07-01)'), (2, 120, '[2026-07-01,)');
+END $$;
+</script>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>9. pgvector：在 PostgreSQL 裡存向量與搜尋</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="9" data-practice="ai">
+<header>
+  <div class="eyebrow">階段 4：RAG：讓模型根據你的資料回答 · 第 9 課</div>
+  <h1>pgvector：在 PostgreSQL 裡存向量與搜尋</h1>
+</header>
+<main>
+
+<p>第 8 課把門市手冊切成塊、算出每一塊的 embedding，再用暴力搜尋找出最像的幾塊。那些塊和向量都放在記憶體的陣列裡：程式一重啟就不見，每次啟動都要重新 embedding（要花錢），資料一多，每個問題都要把全部的塊算一遍。</p>
+<p>這一課用 pgvector 把它們存進 PostgreSQL。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>為什麼放在 PostgreSQL：重啟就不見、每次重算要錢的問題，為什麼不必另外架向量資料庫（開場問題的最小答案）。</li>
+  <li>練習環境與三個距離運算子、建表：三種距離各怎麼算，向量欄位怎麼建，為什麼每一塊要記下 embedding 模型。</li>
+  <li>寫入與更新：店長改了手冊一句話，怎麼只重算那一塊的 embedding。</li>
+  <li>查詢、HNSW 索引：top-k 怎麼寫成一句 SQL，資料多了怎麼用索引換速度，怎麼確認真的用到索引。</li>
+  <li>過濾的陷阱：加了 <code>WHERE</code> 條件結果卻變少，客服回報「問過敏原只回一筆」時怎麼處理。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="08-chunking-embeddings.html">第 8 課</a>的檢索：cosine 相似度比較兩個向量的方向，top-k 取最像的前 k 塊，每塊記下 <code>embed_model</code>，換模型時才知道哪些要重算。</li>
+  <li><a href="../../postgresql/lessons/20-indexes.html">PostgreSQL 課第 20 課</a>的索引：讓資料庫不用掃完整張表就找到資料，規劃器會判斷用索引是否比較快。</li>
+  <li><a href="../../postgresql/lessons/21-explain.html">PostgreSQL 課第 21 課</a>的 <code>EXPLAIN</code>：印出資料庫打算怎麼執行查詢，看得到有沒有用到索引。</li>
+  <li><a href="../../postgresql/lessons/31-isolation-upsert.html">PostgreSQL 課第 31 課</a>的 <code>INSERT … ON CONFLICT</code>：資料已經存在就改成更新，一句 SQL 完成「有就改、沒有就新增」。</li>
+</ul></div>
+
+<h2>為什麼放在 PostgreSQL</h2>
+<p>專門存向量、做相似度搜尋的資料庫叫<strong>向量資料庫（vector database）</strong>，例如 Pinecone、Qdrant、Weaviate。咖啡店一開始不需要它，因為你的 PostgreSQL 加上 <strong>pgvector</strong> 擴充就能做同樣的事。pgvector 是 PostgreSQL 的擴充（extension），提供三樣東西：<code>vector</code> 型別、計算距離的運算子、向量索引。</p>
+<p>放在同一個資料庫的好處，是那些你已經會的東西全部可以直接用：</p>
+<ul>
+  <li><strong>過濾與 JOIN</strong>：「只找過敏原文件」「只找還在販售的商品」就是一個 <code>WHERE</code>，要商品價格就 <code>JOIN products</code>。分成兩個系統時，要先在向量資料庫找、再回 PostgreSQL 查，兩邊的資料還可能不同步。</li>
+  <li><strong>交易</strong>：文件改版時，更新塊和刪除舊塊在同一個交易裡完成，搜尋不會看到改到一半的文件。</li>
+  <li><strong>備份、權限、監控</strong>：沿用現有的，不用多維護一套系統。</li>
+</ul>
+<p>什麼時候才考慮專門的向量資料庫：向量多到上億筆、每秒查詢量非常高、需要它們特有的功能，而且你已經量過 pgvector 撐不住。幾百萬筆以內，pgvector 加上 HNSW 索引通常足夠。這是「先用最簡單、能滿足需求的工具，等量測出瓶頸再換」的判斷。</p>
+
+<h2>練習環境與三個距離運算子</h2>
+<p>練習用 <strong>PGlite</strong>：編譯成 WebAssembly、在 Node 程序裡執行的 PostgreSQL，資料放在記憶體，不用裝 Docker、不開 port。這門課鎖定 <code>@electric-sql/pglite</code> 0.5.13（PostgreSQL 18.6）加 <code>@electric-sql/pglite-pgvector</code> 0.0.14，本機實測載入的 pgvector 是 0.8.7。這兩個套件的版本是綁在一起的（0.0.14 對應 0.5.13），升級時要一起升。<code>helpers/pg.ts</code> 的 <code>openVectorDb()</code> 已經寫好，開一個載入 vector 擴充的全新資料庫。</p>
+<p>正式環境用一般的 PostgreSQL 伺服器，要裝了 pgvector 的：Docker 可以用 <code>pgvector/pgvector:0.8.7-pg18-trixie</code> 映像（NestJS 課 compose.yaml 用的 <code>postgres:18.6-alpine</code> 沒有 pgvector）；雲端資料庫多半內建，在資料庫裡執行一次 <code>CREATE EXTENSION vector</code> 就能用。SQL 寫法完全一樣。</p>
+<p>向量在 SQL 裡寫成方括號包起來、逗號分隔的字串，再轉型成 <code>vector</code>：</p>
+<pre>SELECT '[1,2,3]'::vector &lt;=&gt; '[2,4,6]'::vector;   -- 0：方向一樣，cosine 距離是 0
+SELECT '[1,0]'::vector   &lt;=&gt; '[0,1]'::vector;     -- 1：互相垂直，沒有關係</pre>
+<p>pgvector 提供三個常用的距離運算子。注意它們算的都是<strong>距離</strong>：越小越像，所以 <code>ORDER BY 距離</code> 由小到大，就是由像到不像。</p>
+<div class="table-wrap"><table>
+  <tr><th>運算子</th><th>意思</th><th>對應的索引運算子類別</th><th>什麼時候用</th></tr>
+  <tr><td><code>&lt;=&gt;</code></td><td>cosine 距離 = 1 − cosine 相似度</td><td><code>vector_cosine_ops</code></td><td>預設選它：只看方向，不受向量長度影響</td></tr>
+  <tr><td><code>&lt;-&gt;</code></td><td>L2 距離（直線距離）</td><td><code>vector_l2_ops</code></td><td>embedding 模型的文件指定用 L2 時</td></tr>
+  <tr><td><code>&lt;#&gt;</code></td><td><strong>負的</strong>內積</td><td><code>vector_ip_ops</code></td><td>向量都正規化過、想省一點計算時（排序結果跟 cosine 一樣）</td></tr>
+</table></div>
+<p><code>&lt;#&gt;</code> 回傳負數，是因為 PostgreSQL 的索引只能由小到大掃描，內積是越大越像，取負號之後才能一樣 <code>ORDER BY … ASC</code>。第 8 課說過 Voyage 的 embedding 已經正規化，這時 cosine 和內積的排序相同；這門課一律用 <code>&lt;=&gt;</code>，分數最好理解：<strong>相似度 = 1 − (embedding &lt;=&gt; 查詢向量)</strong>。</p>
+
+<h2>建表：vector(n) 與 embed_model</h2>
+<p>這是練習 1 要寫的 migration（PostgreSQL 課第 22 課：schema 的變更寫成可以重複執行的 SQL 檔）。每一列是一塊：</p>
+<pre>CREATE TABLE IF NOT EXISTS chunks (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  doc_id text NOT NULL,              -- 哪一份文件，例如 'hours'
+  seq integer NOT NULL,              -- 文件裡的第幾塊，從 0 開始
+  heading_path text[] NOT NULL,      -- ['門市手冊', '過敏原']，引用來源時用（第 10 課）
+  content text NOT NULL,
+  content_hash text NOT NULL,        -- 內容的雜湊，用來判斷要不要重算 embedding
+  embedding vector(64) NOT NULL,     -- 64 維：練習用的 toyEmbed
+  embed_model text NOT NULL,         -- 這個向量是哪個模型算的
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (doc_id, seq)
+);</pre>
+<ul>
+  <li><strong><code>vector(n)</code></strong> 是固定 n 維的向量欄位。維度寫在型別上，資料庫會擋下維度不對的向量；只寫 <code>vector</code> 不給維度，什麼長度都收，而且建不了 HNSW 索引。不要用 <code>real[]</code> 或 <code>jsonb</code> 存向量：它們沒有距離運算子，也不能建向量索引。</li>
+  <li><strong>維度跟著模型走</strong>：練習的 <code>toyEmbed</code> 是 64 維，Voyage <code>voyage-4</code> 預設 1024 維。換一個維度不同的模型，就要寫 migration 改欄位型別，並把全部的塊重算。本機實測 pgvector 0.8.7：<code>vector</code> 欄位要建 HNSW 索引最多 2,000 維，超過就報錯；<code>halfvec</code>（每個數字用一半的空間存）最多 4,000 維，所以選 <code>voyage-4</code> 的 2048 維時要改用 <code>halfvec(2048)</code>。</li>
+  <li><strong><code>embed_model</code></strong>：第 8 課說過不同模型的向量不能互相比較。換模型時如果沒記錄，新舊向量混在同一張表，搜尋結果會悄悄變差，沒有任何錯誤訊息。記下來才能查出「還有哪些塊是舊模型算的」並重算。</li>
+  <li><strong><code>UNIQUE (doc_id, seq)</code></strong>：同一份文件的第幾塊只有一列。下一節的 <code>ON CONFLICT (doc_id, seq)</code> 就是靠它判斷「這一塊已經存在，改成更新」。</li>
+</ul>
+<p>migration 要能重複執行，所以每一句都加 <code>IF NOT EXISTS</code>：<code>CREATE EXTENSION IF NOT EXISTS vector</code>、<code>CREATE TABLE IF NOT EXISTS</code>，索引也一樣，但 <code>CREATE INDEX IF NOT EXISTS</code> 必須寫出索引名稱（沒有名字就沒辦法判斷「是不是已經有了」）。</p>
+
+<div class="callout practice"><strong>💡 實務上：換 embedding 模型是一次資料遷移</strong><br>維度不同要改欄位型別；維度相同也要全部重算，因為不同模型的向量不能互相比較。常見做法是新模型先寫進新欄位或新表，背景重算完、用 eval 比較過，再把查詢切過去，最後刪掉舊的。這段期間查詢向量和文件向量一定要用同一個模型，所以查詢程式要知道目前用哪個 <code>embed_model</code>。跟 PM 估時程時，重算的 API 費用和時間要一起算進去。</div>
+
+<h2>寫入與更新：內容雜湊與 UPSERT</h2>
+<p>手冊會改。店長把「可頌含奶油與小麥」改成「可頌含奶油、小麥與蛋」，整份 50 塊只有一塊變了。如果每次都把 50 塊重算 embedding，就是花 50 倍的錢和時間做白工。做法是替每塊記下<strong>內容雜湊（content hash）</strong>：用文字算出一個固定長度的值（例如 SHA-256），文字一樣雜湊就一樣，文字改了一個字雜湊就完全不同。比雜湊就知道哪些塊要重算，不用把整段內容拿出來比。</p>
+<pre>import { createHash } from 'node:crypto'
+const contentHash = (text: string) =&gt; createHash('sha256').update(text).digest('hex')</pre>
+<p>雜湊的是「送去 embedding 的那段文字」。練習 2 送的是標題路徑加內容（<code>embedText(c)</code>，已經寫好），所以標題改了也會重算。一份文件的更新分三步：</p>
+<ol>
+  <li><strong>讀出現有的雜湊與模型</strong>：<code>SELECT seq, content_hash, embed_model FROM chunks WHERE doc_id = $1</code>。</li>
+  <li><strong>挑出要重算的塊，一次批次呼叫 embed</strong>：新的塊、雜湊不同的塊，以及 <code>embed_model</code> 跟這次不同的塊（換了模型，內容沒變也要重算）。embedding API 都接受一次送很多段文字，一次呼叫比逐塊呼叫快，也比較不會被限流。沒有要重算的就不要呼叫。</li>
+  <li><strong>在一個交易裡寫入與刪除</strong>：每一塊用 UPSERT 寫入，再刪掉 <code>seq</code> 大於等於新塊數的舊塊（文件變短了，舊的第 5 塊已經不存在，留著會被搜到）。</li>
+</ol>
+<pre>INSERT INTO chunks (doc_id, seq, heading_path, content, content_hash, embedding, embed_model)
+VALUES ($1, $2, $3, $4, $5, $6::vector, $7)
+ON CONFLICT (doc_id, seq) DO UPDATE SET
+  heading_path = EXCLUDED.heading_path, content = EXCLUDED.content,
+  content_hash = EXCLUDED.content_hash, embedding = EXCLUDED.embedding,
+  embed_model = EXCLUDED.embed_model, updated_at = now();
+
+DELETE FROM chunks WHERE doc_id = $1 AND seq &gt;= $2;   -- $2 是新的塊數；一定要有 doc_id 條件</pre>
+<p><code>EXCLUDED</code> 是「這次想插入、但因為衝突沒插進去的那一列」，PostgreSQL 課第 31 課教過。向量用 <code>helpers/pg.ts</code> 的 <code>toSql(v)</code> 轉成 <code>'[0.1,0.2,…]'</code> 字串，當成參數傳、在 SQL 裡寫 <code>$6::vector</code>。所有值都用 <code>$1</code>、<code>$2</code> 參數傳，不要拼進 SQL 字串：文件內容裡有單引號（<code>店員's 推薦</code>）時，拼接的 SQL 會直接壞掉，內容是使用者寫的時候就是 SQL injection。</p>
+<p>PGlite 的交易寫法：</p>
+<pre>await db.transaction(async tx =&gt; {
+  await tx.query('INSERT …', [...])     // 交易裡一律用 tx：用 db.query 會排隊等這個交易結束，PGlite 就卡住了
+  await tx.query('DELETE …', [...])
+})                                       // callback 正常結束就 COMMIT，丟錯就 ROLLBACK</pre>
+<p>正式環境用 <code>pg</code> 的連線池時，是 <a href="../../node/lessons/20-postgres-pool-transactions.html">Node 課第 20 課</a>的 <code>BEGIN</code>／<code>COMMIT</code>／<code>ROLLBACK</code> 寫法，SQL 本身一樣。</p>
+<div class="callout"><strong>embedding 放在交易外面呼叫。</strong>呼叫外部 API 可能要好幾秒，甚至逾時；在交易裡等它，連線和鎖會一直被佔住，其他請求跟著排隊。所以順序是：先讀、在交易外呼叫 embed、拿到所有向量後才開交易寫入。embed 失敗時還沒寫任何東西，資料表自然維持原狀；寫到一半出錯（例如某個向量維度不對）時，交易把已經寫進去的也回滾。</div>
+
+<div class="callout practice"><strong>💡 實務上：文件更新通常交給背景工作</strong><br>店長在後台按「儲存」時，常見做法是先存好文件、丟一個「重建這份文件的塊」的工作到佇列，由背景程式呼叫 <code>upsertDoc</code>，不要讓店長的請求等 embedding API。因為有內容雜湊，同一份文件重跑幾次結果都一樣，失敗了直接重試就好。也別忘了整份文件被刪除或下架時，要把它的塊一起刪掉，不然顧客還會搜到已經不存在的規定。每次更新記下重算與刪除了幾塊，費用突然變高時才查得出是哪份文件在反覆重算。</div>
+
+<h2>查詢：ORDER BY 距離 LIMIT k</h2>
+<p>top-k 搜尋就是一句 SQL。第 8 課在 JavaScript 裡算全部的相似度再排序，現在交給資料庫：</p>
+<pre>SELECT doc_id, seq, content, 1 - (embedding &lt;=&gt; $1::vector) AS score
+FROM chunks
+WHERE doc_id = ANY($2::text[])          -- 只搜這幾份文件
+ORDER BY embedding &lt;=&gt; $1::vector       -- 距離由小到大 = 由像到不像
+LIMIT 5;</pre>
+<ul>
+  <li><strong>查詢向量用參數傳</strong>：<code>db.query(sql, [toSql(queryVector), ['hours', 'menu']])</code>。1024 個數字拼進 SQL 字串又長又難除錯，也會養成拼接 SQL 的習慣；用參數傳，資料庫把它當成一個值，不會當成 SQL 解讀。</li>
+  <li><strong>排序用距離，分數另外算</strong>：<code>SELECT</code> 裡算 <code>1 - 距離</code> 當分數給程式用，<code>ORDER BY</code> 直接寫 <code>embedding &lt;=&gt; $1</code>。pgvector 的索引只在「<code>ORDER BY 距離運算子</code> 由小到大，加上 <code>LIMIT</code>」時用得到；寫成 <code>ORDER BY score DESC</code> 結果一樣，但永遠用不到索引。</li>
+  <li><strong>過濾寫在 <code>WHERE</code></strong>：先過濾再取前 k 名。如果先 <code>LIMIT 5</code> 取全部文件的前 5 名、再在 JavaScript 裡留下 hours，可能只剩 1 筆甚至 0 筆。</li>
+  <li><strong>可選的條件</strong>：沒給 docIds 時不過濾，可以寫成 <code>WHERE ($2::text[] IS NULL OR doc_id = ANY($2::text[]))</code>，參數傳 <code>null</code>；不必組兩種 SQL 字串。</li>
+  <li><strong>分數門檻</strong>：分數太低的塊多半不相關，放進 prompt 只會干擾模型。結果已經依分數排序，拿回來後 <code>filter(r =&gt; r.score &gt;= minScore)</code> 就好；門檻要用 eval 決定（第 11 課），第 10 課會用它判斷「資料不夠，不回答」。</li>
+</ul>
+
+<h2>HNSW 索引：用一點準確度換速度</h2>
+<p>沒有索引時，上面那句 SQL 會把每一列的距離都算一次再排序，跟第 8 課的暴力搜尋一樣，資料量變成 100 萬塊就太慢了。向量沒辦法像數字一樣用 B-tree 排序，所以 pgvector 提供<strong>近似最近鄰（ANN, approximate nearest neighbor）</strong>索引：不保證找到真正最近的那幾個，但只看一小部分資料就找到「幾乎最近」的，用一點準確度換大量速度。</p>
+<p><strong>HNSW</strong> 是其中最常用的一種。你可以把它想成一張分好幾層的「鄰居關係圖」：搜尋時從上層粗略地跳到大概的區域，再到下層一步步往更近的鄰居走。細節不用記，要記的是它的取捨：</p>
+<ul>
+  <li>查得快、查詢品質好；代價是建索引比較慢、比較吃記憶體，而且結果是近似的。</li>
+  <li>近似的意思是偶爾會漏掉一兩個真正的最近鄰。衡量的指標叫<strong>召回率（recall）</strong>：真正最近的 k 筆裡，有多少比例被找回來。要不要接受，用第 11 課的 eval 量，不是用感覺。</li>
+  <li>每次查詢先取多少候選由 <code>hnsw.ef_search</code> 決定，預設 40。調高會更準、更慢。</li>
+</ul>
+<pre>CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw
+  ON chunks USING hnsw (embedding vector_cosine_ops);</pre>
+<p>括號裡的 <code>vector_cosine_ops</code> 是<strong>運算子類別（operator class）</strong>，決定這個索引是照哪一種距離建的。<strong>索引的運算子類別要和查詢的運算子一致</strong>：用 <code>vector_l2_ops</code> 建的索引只服務 <code>&lt;-&gt;</code>，查詢寫 <code>&lt;=&gt;</code> 時規劃器用不到它，悄悄退回全表掃描。資料少時看不出差別，資料一多就慢下來。</p>
+<p>確認有沒有用到索引，用 PostgreSQL 課第 21 課的 <code>EXPLAIN</code>：</p>
+<pre>Limit
+  -&gt;  Index Scan using chunks_embedding_hnsw on chunks
+        Order By: (embedding &lt;=&gt; '[…]'::vector)</pre>
+<p>看到 <code>Index Scan using … on chunks</code>、而且有 <code>Order By</code> 這一行，就是索引在幫你排序。如果是 <code>Seq Scan</code> 加 <code>Sort</code>，就是全部算完再排。</p>
+<p>有一個容易誤會的地方：<strong>資料很少時，PostgreSQL 選全表掃描是對的</strong>。練習的表只有 1,000 筆，全部算一次比走索引還快，規劃器會選 <code>Seq Scan</code>。這時想確認「索引能不能被用到」，在交易裡關掉全表掃描再看計畫：</p>
+<pre>await db.transaction(async tx =&gt; {
+  await tx.query('SET LOCAL enable_seqscan = off')   // 只在這個交易裡生效
+  const { rows } = await tx.query('EXPLAIN SELECT …', [toSql(v)])
+})</pre>
+<p><code>SET LOCAL</code> 的設定在交易結束時自動恢復；寫成 <code>SET</code> 會一直留在這條連線上，正式環境的連線池會把這條連線借給別的請求，它們全部都不能全表掃描了。<code>enable_seqscan = off</code> 只用在檢查與測試，不要寫進正式的查詢。</p>
+
+<div class="callout practice"><strong>💡 實務上：向量欄位和索引很佔空間</strong><br>1024 維的 <code>vector</code> 每列約 4 KB（每個數字 4 bytes），100 萬塊就是 4 GB，HNSW 索引還要再加。估資料庫容量時要算進去；<code>SELECT</code> 不需要向量時不要把它撈回來。大量匯入時先寫資料、最後再建索引比較快；正式環境對大表建索引用 <code>CREATE INDEX CONCURRENTLY</code>（<a href="../../postgresql/lessons/22-migrations.html">PostgreSQL 課第 22 課</a>），避免鎖住寫入。</div>
+
+<h2>過濾的陷阱：iterative scan 與部分索引</h2>
+<p>索引上線後，客服回報：「問過敏原，只回一筆。」資料表裡明明有 20 塊過敏原的內容。原因是 HNSW 處理 <code>WHERE</code> 的順序：</p>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="HNSW 先從索引取 40 個最近的候選，再套用 WHERE doc_id 條件，只剩 1 筆；開啟 iterative scan 後會繼續往下掃，直到湊滿 5 筆">
+    <defs><marker id="ar9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="var(--muted)"/></marker></defs>
+    <rect x="20" y="30" width="180" height="56" rx="6" class="d-box"/>
+    <text x="110" y="54" text-anchor="middle" class="d-text">HNSW 索引</text>
+    <text x="110" y="74" text-anchor="middle" class="d-small">取最近的 40 個候選</text>
+    <line x1="200" y1="58" x2="258" y2="58" class="d-line" marker-end="url(#ar9)"/>
+    <rect x="260" y="30" width="190" height="56" rx="6" class="d-soft"/>
+    <text x="355" y="54" text-anchor="middle" class="d-text">WHERE doc_id = …</text>
+    <text x="355" y="74" text-anchor="middle" class="d-small">40 個裡只有 1 個符合</text>
+    <line x1="450" y1="58" x2="508" y2="58" class="d-line" marker-end="url(#ar9)"/>
+    <rect x="510" y="30" width="170" height="56" rx="6" class="d-box"/>
+    <text x="595" y="54" text-anchor="middle" class="d-text">LIMIT 5</text>
+    <text x="595" y="74" text-anchor="middle" class="d-small">只回傳 1 筆</text>
+    <text x="20" y="130" class="d-accent">開啟 hnsw.iterative_scan：</text>
+    <rect x="20" y="145" width="180" height="56" rx="6" class="d-box"/>
+    <text x="110" y="169" text-anchor="middle" class="d-text">再取下一批候選</text>
+    <text x="110" y="189" text-anchor="middle" class="d-small">直到湊滿或達到上限</text>
+    <line x1="200" y1="173" x2="258" y2="173" class="d-line" marker-end="url(#ar9)"/>
+    <rect x="260" y="145" width="190" height="56" rx="6" class="d-soft"/>
+    <text x="355" y="169" text-anchor="middle" class="d-text">WHERE 過濾</text>
+    <text x="355" y="189" text-anchor="middle" class="d-small">符合的累積到 5 筆</text>
+    <line x1="450" y1="173" x2="508" y2="173" class="d-line" marker-end="url(#ar9)"/>
+    <rect x="510" y="145" width="170" height="56" rx="6" class="d-box"/>
+    <text x="595" y="169" text-anchor="middle" class="d-text">回傳 5 筆</text>
+    <text x="595" y="189" text-anchor="middle" class="d-small">relaxed_order 可能稍微亂序</text>
+    <path d="M110,201 L110,225 L355,225 L355,203" fill="none" class="d-line"/>
+    <text x="232" y="242" text-anchor="middle" class="d-small">不夠就再取</text>
+  </svg>
+  <figcaption>近似索引先取一批候選再過濾；條件越嚴格，剩下的越少。</figcaption>
+</figure>
+<p>索引只負責「找最近的 40 個」（<code>ef_search</code>），<code>WHERE</code> 是拿到候選之後才套用。1,000 塊裡只有 3% 是過敏原，40 個候選平均只有 1 個符合。這不是 bug，是近似索引的工作方式。三種處理方式：</p>
+<ul>
+  <li><strong>iterative scan</strong>（pgvector 0.8 起）：候選被過濾掉太多時，索引繼續往下掃，直到湊滿 <code>LIMIT</code> 的筆數，或掃到 <code>hnsw.max_scan_tuples</code>（預設 20,000）為止。設定值有兩種：<code>strict_order</code> 保證結果嚴格依距離排序；<code>relaxed_order</code> 允許結果稍微亂序，但召回率比較好。</li>
+  <li><strong>部分索引</strong>（<a href="../../postgresql/lessons/27-index-design.html">PostgreSQL 課第 27 課</a>）：常用、固定的條件，可以建只包含那些列的索引：<code>CREATE INDEX … USING hnsw (embedding vector_cosine_ops) WHERE doc_id = 'hours'</code>。適合條件的值只有少數幾種時；值很多就不實際。</li>
+  <li><strong>讓規劃器用一般索引</strong>：條件夠嚴格、而且 <code>doc_id</code> 有 B-tree 索引時（例如 <code>UNIQUE (doc_id, seq)</code> 附帶的那個），PostgreSQL 常會直接用 B-tree 找出那 30 塊、全部算距離再排序。這是精確搜尋，結果完全正確；本機實測練習 1 的表就是這樣。陷阱發生在過濾欄位沒有合適的索引、或條件看起來不嚴格的時候，所以上線後要用 <code>EXPLAIN</code> 和 eval 確認。</li>
+</ul>
+<p>iterative scan 的設定一樣用 <code>SET LOCAL</code> 只開在這次查詢的交易裡。<code>relaxed_order</code> 可能讓結果稍微亂序，pgvector 文件的做法是把查詢包進 <code>MATERIALIZED</code> 的 CTE，外面再排一次：</p>
+<pre>await db.transaction(async tx =&gt; {
+  await tx.query('SET LOCAL hnsw.iterative_scan = relaxed_order')
+  return (await tx.query(`
+    WITH hits AS MATERIALIZED (
+      SELECT doc_id, seq, content, embedding &lt;=&gt; $1::vector AS distance
+      FROM chunks WHERE doc_id = $2
+      ORDER BY distance LIMIT $3
+    )
+    SELECT doc_id, seq, content, 1 - distance AS score FROM hits ORDER BY distance + 0`,
+    [toSql(v), 'allergens', 5])).rows
+})</pre>
+<p><code>MATERIALIZED</code> 讓 CTE 先單獨執行完（用索引取出 5 筆），外層再對這 5 筆排序。<code>distance + 0</code> 是 pgvector 文件特別寫的：PostgreSQL 17 以後要加 <code>+ 0</code>，外層的排序才不會被最佳化掉。</p>
+
+<div class="callout practice"><strong>💡 實務上：召回率要量，不要用感覺判斷</strong><br>HNSW 是近似的，<code>ef_search</code>、過濾條件、iterative scan 都會改變找回來的塊。調整這些設定前後，拿一批真實問題各查兩次：一次走索引，一次在交易裡 <code>SET LOCAL enable_indexscan = off</code> 做精確搜尋，前 k 名重疊的比例就是索引的召回率。至於「找回來的塊是不是使用者要的」，則要靠一組「問題 → 應該找到的塊」的 eval（第 11 課）。客服回報「明明手冊有寫，卻說找不到」時，先用 <code>EXPLAIN</code> 看計畫、再查召回率，不要先改 prompt。</div>
+
+<h2>練習</h2>
+<p>在 learn 資料夾執行 <code>node check.mjs ai 09</code>，會建立 <code>ai/practice/work/09/</code>。練習 2～4 的測試會用你在練習 1 寫的 <code>ex1.sql</code> 建表，所以<strong>照順序做</strong>。每個測試檔會開一個記憶體裡的 PGlite，第一次開要幾秒鐘，不需要 Docker、也不需要任何 API key。<code>fixtures.ts</code> 是測試用的工具，不用改。做完後可以在 <code>ai/practice</code> 執行 <code>node --env-file-if-exists=.env work/09/live.ts</code>，把咖啡店的文件寫進資料庫再搜尋：<code>.env</code> 裡有 <code>VOYAGE_API_KEY</code> 時用 <code>voyage-4</code>（1024 維），沒有就用 <code>toyEmbed</code>（只比字面，結果會比較怪）。</p>
+
+<div class="local" data-test="ex1" data-files="ex1.sql">
+  <p>練習 1：寫 <code>ex1.sql</code> 這份 migration：啟用 vector 擴充；建 <code>chunks</code> 表，欄位照課文（<code>id</code>、<code>doc_id</code>、<code>seq</code>、<code>heading_path text[]</code>、<code>content</code>、<code>content_hash</code>、<code>embedding vector(64)</code>、<code>embed_model</code>、<code>updated_at timestamptz</code> 預設 <code>now()</code>），全部 <code>NOT NULL</code>，加上 <code>UNIQUE (doc_id, seq)</code>；再建 <code>embedding</code> 的 HNSW 索引，用 cosine 距離。整個檔案要能連續執行兩次都不出錯。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="ex2.ts">
+  <p>練習 2：完成 <code>upsertDoc(db, docId, chunks, embed, model)</code>。讀出這份文件現有的 <code>content_hash</code> 與 <code>embed_model</code>；只把新的、雜湊變了、或模型不同的塊（雜湊用寫好的 <code>contentHash(embedText(c))</code>）<strong>一次</strong>交給 <code>embed</code>，沒有就不要呼叫；然後在一個 <code>db.transaction</code> 裡用 <code>INSERT … ON CONFLICT (doc_id, seq) DO UPDATE</code> 寫入這些塊，並刪除這份文件 <code>seq</code> 大於等於新塊數的舊塊。回傳 <code>{ embedded, deleted }</code>（重算了幾塊、刪了幾塊，刪除筆數可以用 <code>affectedRows</code>）。所有值都用參數傳。測試會檢查 embed 是在 <code>db.transaction</code> 之前呼叫的，也會讓 embed 失敗、讓某一塊寫入失敗，檢查資料表都維持原狀。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="ex3.ts">
+  <p>練習 3：完成 <code>search(db, queryVector, { k, docIds, minScore })</code>，回傳 <code>{ docId, seq, content, score }[]</code>：<code>score</code> 是 1 − cosine 距離，由高到低，最多 <code>k</code> 筆；有 <code>docIds</code> 時只搜這些文件（先過濾再取前 k 名）；有 <code>minScore</code> 時不回傳分數比它低的（<code>0</code> 也是門檻：cosine 相似度可以是負的）。排序和距離要在 SQL 裡用 <code>&lt;=&gt;</code> 做，<code>ORDER BY</code> 要寫成索引用得到的形式，查詢向量用參數傳。測試傳入的 <code>db</code> 包了一層，會記錄你送出的每一句 SQL。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="ex4.ts">
+  <p>練習 4：完成兩個函式。<code>explainUsesIndex(db, queryVector)</code>：在交易裡 <code>SET LOCAL enable_seqscan = off</code>，對 <code>SELECT id FROM chunks ORDER BY embedding &lt;=&gt; $1::vector LIMIT 5</code> 跑 <code>EXPLAIN</code>（結果每一列的欄位叫 <code>QUERY PLAN</code>），計畫裡出現 <code>Index Scan using … on chunks</code> 時回傳 <code>true</code>。<code>searchFiltered(db, queryVector, { k, docId })</code>：在交易裡 <code>SET LOCAL hnsw.iterative_scan = relaxed_order</code>，查出這份文件最像的 <code>k</code> 塊，回傳跟練習 3 一樣的形狀，依分數嚴格由高到低（<code>relaxed_order</code> 會稍微亂序，要用課文的 <code>MATERIALIZED</code> CTE 再排一次）。測試在 1,000 塊、只有 3% 屬於該文件的表上查，並拿掉 <code>doc_id</code> 的 B-tree 索引、關掉全表掃描，模擬大資料表上規劃器選 HNSW 的情況；查完後連線的設定要恢復原狀。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：索引建成 <code>USING hnsw (embedding vector_l2_ops)</code>，查詢寫 <code>ORDER BY embedding &lt;=&gt; $1 LIMIT 5</code>。會用到這個索引嗎？</p>
+  <label data-key="a">會，都是向量索引</label>
+  <label data-key="b">不會：<code>&lt;=&gt;</code> 是 cosine 距離，要 <code>vector_cosine_ops</code> 的索引；運算子要和索引的運算子類別一致</label>
+  <label data-key="c">只有資料超過 1 萬筆才會</label>
+  <label data-key="d">會，但回傳的結果是錯的</label>
+  <p class="why">✓ pgvector 的索引綁定一種距離。不一致時規劃器根本不會選它，查詢退回全表掃描：結果是對的（所以 d 錯），只是資料一多就很慢，而且沒有任何錯誤訊息。跟資料量無關（c）。用 <code>EXPLAIN</code> 確認有沒有 <code>Index Scan</code>。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：HNSW 查詢加了 <code>WHERE doc_id = 'allergens'</code>，<code>LIMIT 5</code> 卻只回 1 筆，資料表裡明明有 20 塊過敏原的內容。最可能的原因是？</p>
+  <label data-key="a">資料損毀，要重建資料表</label>
+  <label data-key="b">索引先取一小批最近的候選（<code>ef_search</code> 預設 40），再被 <code>WHERE</code> 過濾掉大部分；要開 iterative scan、建部分索引，或確認規劃器的選擇</label>
+  <label data-key="c"><code>LIMIT</code> 要寫在 <code>WHERE</code> 前面</label>
+  <label data-key="d">cosine 距離不支援 <code>WHERE</code></label>
+  <p class="why">✓ 近似索引是「先取候選、再過濾」，條件越嚴格，剩下的越少。pgvector 0.8 起的 <code>hnsw.iterative_scan</code> 會繼續往下掃到湊滿筆數；常用的固定條件也可以建部分索引。這是近似索引的工作方式，不是資料壞了（a）；SQL 的語法順序也沒有問題（c），任何 <code>WHERE</code> 都能和距離排序一起用（d）。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：FAQ 只改了一個錯字，你的匯入程式每次都把整份 50 塊重新 embedding。主要的問題是？</p>
+  <label data-key="a">沒問題，全部重算比較簡單，結果也一樣</label>
+  <label data-key="b">浪費 embedding 的費用與時間；用內容雜湊只重算變動的塊，並在交易裡寫入與刪除</label>
+  <label data-key="c">同一段文字算兩次會得到不同的向量，搜尋會變不準</label>
+  <label data-key="d">pgvector 不允許更新已經存在的向量</label>
+  <p class="why">✓ 每次 embedding 都是一次付費的 API 呼叫，文件多、更新頻繁時，全部重算的費用和時間會是增量更新的幾十倍，還更容易碰到限流。同一個模型對同一段文字算出的向量基本上相同，重算不會讓它變準或變不準（c 錯）；向量欄位可以像一般欄位一樣 <code>UPDATE</code>（d 錯）。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>沒記錄 <code>embed_model</code></strong>：換模型後新舊向量混在一起，搜尋悄悄變差。每一塊記下模型，換模型時把舊的全部重算。</li>
+  <li><strong>用 <code>real[]</code>、<code>jsonb</code> 或沒寫維度的 <code>vector</code> 存向量</strong>：沒有距離運算子、建不了索引、擋不住維度錯誤。用 <code>vector(n)</code>。</li>
+  <li><strong>索引的運算子類別與查詢的運算子不一致</strong>：<code>vector_l2_ops</code> 配 <code>&lt;=&gt;</code> 用不到索引。用 <code>EXPLAIN</code> 確認。</li>
+  <li><strong><code>ORDER BY score DESC</code></strong>：結果一樣，但索引只認「<code>ORDER BY 距離運算子</code> 由小到大」，永遠用不到。分數在 <code>SELECT</code> 裡算，排序用距離。</li>
+  <li><strong>過濾在 <code>LIMIT</code> 之後做</strong>：在 JavaScript 裡過濾前 k 名，結果會少於 k 筆。條件寫在 SQL 的 <code>WHERE</code>；HNSW 加嚴格條件時開 iterative scan。</li>
+  <li><strong>把向量或文字拼進 SQL</strong>：內容有單引號就壞掉，還有 SQL injection 的風險。一律用參數，向量用 <code>$1::vector</code>。</li>
+  <li><strong>每次全部重算 embedding</strong>：用內容雜湊，只重算新的和改過的。</li>
+  <li><strong>在交易裡等 embedding API</strong>：外部呼叫可能好幾秒，連線和鎖被佔住。先在交易外拿到向量，再開交易寫入。</li>
+  <li><strong>用 <code>SET</code> 而不是 <code>SET LOCAL</code></strong>：設定留在連線上，連線池把它借給下一個請求，影響到不相關的查詢。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>pgvector 讓 PostgreSQL 存向量、算距離、建向量索引；塊和商品、訂單在同一個資料庫，過濾、JOIN、交易、備份都是現成的。幾百萬筆以內先用它。</li>
+  <li><code>vector(n)</code> 把維度寫在型別上；記下 <code>embed_model</code>，換模型或換維度就是一次 migration 加全部重算。</li>
+  <li><code>&lt;=&gt;</code> 是 cosine 距離，相似度 = 1 − 距離；<code>ORDER BY embedding &lt;=&gt; $1 LIMIT k</code>，過濾寫在 <code>WHERE</code>，值一律用參數。</li>
+  <li>用內容雜湊只重算變動的塊，一次批次呼叫 embed；寫入、刪除多出來的塊放在同一個交易，embed 在交易外呼叫。</li>
+  <li>HNSW 是近似最近鄰索引，用一點召回率換速度；運算子類別要和查詢一致，用 <code>EXPLAIN</code> 確認；資料少時全表掃描是正確的選擇。</li>
+  <li>嚴格的過濾條件會讓近似索引回傳太少結果：用 <code>SET LOCAL hnsw.iterative_scan</code>、部分索引，或讓規劃器用 B-tree 做精確搜尋。</li>
+</ul>
+<p>下一課處理向量搜尋的盲點：顧客問「SKU-0042」這種編號時，把關鍵字搜尋和向量搜尋合併、重排，再讓模型引用來源回答。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

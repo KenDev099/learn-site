@@ -1,0 +1,573 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>15. 可觀測性與產品化：記錄、追蹤與把串流送到前端</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="15" data-practice="ai">
+<header>
+  <div class="eyebrow">階段 5：上線：評估、安全、成本、可靠性與可觀測性 · 第 15 課</div>
+  <h1>可觀測性與產品化：記錄、追蹤與把串流送到前端</h1>
+</header>
+<main>
+
+<p>客服助理上線一個月。店長轉來一則顧客抱怨：「昨天晚上問起司蛋糕有沒有含堅果，AI 說沒有，結果有。」你打開伺服器的 log，只看到一行 <code>POST /chat 200 4120ms</code>。那次用的是哪一版 prompt？檢索到哪幾份文件？模型呼叫了哪個工具？是模型講錯，還是文件本身就寫錯？全部查不到。</p>
+<p>這一課把助理做成能維運的產品：前半段是<strong>可觀測性</strong>（observability），出事時查得到發生什麼；後半段是<strong>產品化</strong>，把模型的串流送到 Vue 前端。</p>
+
+<div class="callout"><strong>第一輪只要記住：</strong>
+<ul>
+  <li>每次模型呼叫記一筆結構化 log：一定要有 request id 與 prompt 版本；<code>status</code> 把 <code>ok</code>、<code>refusal</code>、<code>error</code>、<code>client_aborted</code> 分開；問題與回答先遮蔽個資、再截斷。</li>
+  <li>指標看 p95 不看平均；告警只對要有人馬上處理的事設：錯誤率、TTFT、費用突增、快取命中率突降。</li>
+  <li>SSE 轉送：收到一段就送一段，每個事件以空行結尾；前端斷線聽<strong>回應</strong>的 <code>close</code> 再 abort 上游；部署時關掉代理的緩衝。</li>
+  <li>Vue 用 <code>fetch</code> 讀 POST 的串流（<code>EventSource</code> 只能 GET），回答用文字插值顯示，不用 <code>v-html</code>。</li>
+</ul>
+追蹤的程式寫法、框架的對照表，工作上用到再回來查。</div>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>出事時要回答的問題：顧客說 AI 答錯過敏原時，你要查出哪些事，各靠 log、指標、追蹤哪一種工具（開場問題的最小答案）。</li>
+  <li>每次模型呼叫記一筆結構化 log、指標與告警：一筆 log 要記哪些欄位、個資怎麼處理，哪些數字變差時才該叫人起床。</li>
+  <li>追蹤：一個客服請求要經過檢索、模型、工具好幾步，顧客說「好慢」時怎麼找出慢在哪一步（程式寫法練習不會用到，先看懂 span 樹就好）。</li>
+  <li>SSE 端點、前端：怎麼把模型的串流轉送給 Vue 前端，使用者關掉分頁時怎麼中斷上游，出錯、拒答時畫面怎麼顯示。</li>
+  <li>框架與 MCP：你手寫過的東西在 LangChain、LlamaIndex、MCP 裡叫什麼，看到職缺寫這些名字時怎麼對應（對照表查表用，練習 8 考的是什麼時候該做成 MCP server）。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="03-streaming.html">第 3 課</a>的串流：模型的回答以 SSE 事件一段一段送來，<code>AbortController</code> 中斷請求，TTFT 是送出到第一個字的時間。</li>
+  <li><a href="../../node/lessons/13-http-server.html">Node 課第 13 課</a>的 <code>node:http</code>：<code>createServer</code> 的處理函式拿到 <code>req</code>、<code>res</code>，用 <code>res.write</code> 一段一段寫回應。</li>
+  <li><a href="../../node/lessons/19-structured-logging.html">Node 課第 19 課</a>的結構化 log：每筆 log 是固定欄位的 JSON，帶著 request id，才搜尋得到、統計得了。</li>
+</ul></div>
+
+<h2>出事時要回答的問題</h2>
+<p>回到那則抱怨。要查清楚，你需要能回答這些問題：</p>
+<ul>
+  <li><strong>哪一次</strong>：那位顧客的那次對話是哪一個請求？</li>
+  <li><strong>用了什麼</strong>：哪個模型、哪一版 prompt、檢索到哪幾塊文件（<a href="10-hybrid-rerank-citations.html">第 10 課</a>的引用來源）、呼叫了哪些工具。</li>
+  <li><strong>結果如何</strong>：<code>stop_reason</code> 是什麼、有沒有出錯、花了多久、花了多少錢。</li>
+  <li><strong>是不是個案</strong>：同一個路由最近的錯誤率、拒答率、延遲有沒有變化。</li>
+  <li><strong>要不要找供應商</strong>：如果懷疑是 API 的問題，向 Anthropic 回報時要附上 <strong>request id</strong>。</li>
+</ul>
+<p>這些問題分別靠三種工具回答，部署課<a href="../../devops/lessons/21-logs.html">第 21 課</a>（集中 log）、<a href="../../devops/lessons/22-metrics-slo.html">第 22 課</a>（指標與 SLO）、<a href="../../devops/lessons/23-tracing.html">第 23 課</a>（OpenTelemetry 追蹤）分別教過，這裡用在 LLM 功能上：</p>
+<div class="table-wrap"><table>
+<tr><th>工具</th><th>是什麼</th><th>回答哪種問題</th></tr>
+<tr><td>log</td><td>每件事一筆紀錄</td><td>「那一次」發生了什麼</td></tr>
+<tr><td>指標（metrics）</td><td>隨時間變化的數字</td><td>「最近」是不是變差了；該不該叫人起床</td></tr>
+<tr><td>追蹤（trace）</td><td>一個請求經過的每個步驟與耗時</td><td>「慢在哪裡、錯在哪一步」</td></tr>
+</table></div>
+
+<h2>每次模型呼叫記一筆結構化 log</h2>
+<p><strong>結構化 log</strong>（structured log）是每筆都是固定欄位的 JSON，而不是一行人類讀的句子。固定欄位才能在集中 log 系統裡搜尋「<code>promptVersion = support-v3</code> 而且 <code>status = refusal</code>」、才能統計。Node 課第 19 課用 pino 輸出的就是這種 log。一次模型呼叫記這些欄位：</p>
+<div class="table-wrap"><table>
+<tr><th>欄位</th><th>為什麼要記</th></tr>
+<tr><td><code>at</code>、<code>route</code></td><td>什麼時候、哪個功能（客服、摘要、批次分類）呼叫的</td></tr>
+<tr><td><code>promptVersion</code>、<code>model</code></td><td>出事時知道是哪一版。prompt 改了沒記版本，就無法比較改版前後</td></tr>
+<tr><td><code>status</code></td><td><code>ok</code>、<code>refusal</code>、<code>error</code>、<code>client_aborted</code> 四種分開。使用者自己離開不是系統錯誤，混在一起會把錯誤率灌高</td></tr>
+<tr><td><code>latencyMs</code>、<code>ttftMs</code></td><td>總時間與首字延遲（第 3 課）。串流時使用者感受到的是 TTFT</td></tr>
+<tr><td><code>requestId</code></td><td>API 的請求識別碼，向供應商回報問題時唯一能讓對方找到那次請求的東西</td></tr>
+<tr><td><code>stopReason</code>、<code>refusalCategory</code>、<code>errorType</code></td><td>是正常結束、被截斷、拒答（<a href="14-reliability.html">第 14 課</a>），還是哪一類錯誤</td></tr>
+<tr><td>token 與 <code>costUsd</code></td><td>四種 token 與費用（<a href="13-cost-caching.html">第 13 課</a> <code>costOf</code>）。費用突增要能追到是哪個路由</td></tr>
+<tr><td><code>toolCalls</code></td><td>模型呼叫了哪些工具；第 16 課還會加上檢索到的文件 id</td></tr>
+<tr><td><code>question</code>、<code>answer</code></td><td>遮蔽個資、截斷後的內容。下面細談</td></tr>
+</table></div>
+<p>一筆實際的 log 長這樣（練習 1 要產生的就是它）：</p>
+<pre>{"at":"2026-11-01T12:03:41.120Z","route":"/chat","promptVersion":"support-v3","model":"claude-opus-5-5",
+ "status":"ok","latencyMs":2350,"ttftMs":820,"requestId":"req_011CX…","stopReason":"end_turn",
+ "refusalCategory":null,"errorType":null,"inputTokens":1200,"outputTokens":300,"cacheReadTokens":8000,
+ "cacheWriteTokens":500,"costUsd":0.0149,"toolCalls":["get_my_orders"],
+ "question":"我是王小明，電話 [電話]，幫我查訂單","answer":"您最近一筆訂單已完成。"}</pre>
+
+<h3>request id 從哪裡拿</h3>
+<p>每個 API 回應的標頭都有 <code>request-id</code>。SDK 1.3.0 用幾種方式提供它（本機的 <code>node_modules/@anthropic-ai/sdk</code> 型別與實測）：</p>
+<ul>
+  <li><code>messages.create()</code> 回傳的物件有不可列舉的 <code>_request_id</code>（<code>console.log</code> 看不到，但讀得到）；或用 <code>const { data, request_id } = await client.messages.create(params).withResponse()</code>。</li>
+  <li>串流：<code>client.messages.stream()</code> 回傳的物件有 <code>request_id</code> 屬性，收到回應標頭後就有值。</li>
+  <li>失敗：<code>Anthropic.APIError</code> 有 <code>requestID</code>。失敗的請求最需要它，不要只在成功時記。</li>
+</ul>
+
+<h3>內容欄位：遮蔽、截斷、取樣</h3>
+<p>問題與回答是最有用、也最危險的欄位。log 系統通常整個工程團隊都看得到、保存好幾個月，還可能送到第三方的 log 服務。顧客在問題裡打的電話、Email、卡號，原樣寫進去就是外洩（<a href="12-llm-security.html">第 12 課</a>）。處理方式由輕到重：</p>
+<ol>
+  <li><strong>遮蔽</strong>：用第 12 課的 <code>redactPII</code> 換掉個資。answer 也要遮蔽，因為模型可能把顧客的電話複述一次。</li>
+  <li><strong>截斷</strong>：只留前 500 個字元。一則 log 幾十 KB，費用和查詢速度都會出問題。順序是<strong>先遮蔽、再截斷</strong>：先截斷的話，剛好被切成一半的電話號碼（<code>09123</code>）遮蔽規則認不出來，前幾碼就留在 log 裡。</li>
+  <li><strong>只存雜湊</strong>：一般 log 只放內容的 SHA-256，能判斷「兩次問的是不是同一句」，但讀不出內容。</li>
+  <li><strong>取樣</strong>（log sampling）：只把一部分請求（例如 1%，加上所有出錯與被投訴的）的完整內容存到另一個有權限控管、有保留期限（例如 30 天）的地方。</li>
+</ol>
+<p>用哪一種，要跟法務、隱私政策一起決定。原則是一般 log 只放除錯一定需要的東西；完整內容放在少數人能看、會自動刪除的地方。</p>
+<div class="callout warn">不要把整個 <code>error</code> 物件、<code>client</code>、<code>Response</code> 放進 log。它們可能帶著請求標頭（裡面有 API key），序列化出來也大多是 <code>{}</code>。只取需要的欄位：<code>error.type</code>、<code>error.status</code>、<code>error.requestID</code>。</div>
+<p>費用有一個限制要知道：只有拿到最終的 <code>usage</code> 才算得出來。串流中途出錯或被中斷時，已經產生的 token 照樣計費，但你手上沒有完整的 usage，log 裡記 0 會低估。要準確的費用以 Console 的用量報表為準，log 的費用用來找趨勢與異常。</p>
+
+<div class="callout practice"><strong>💡 實務上：讓客服拿得到「是哪一次對話」</strong><br>顧客投訴時，客服通常只知道「下午三點左右、某位顧客」。光靠時間在 log 裡大海撈針很慢。常見做法是每段對話有一個 id，存在對話紀錄裡，客服後台看得到、回報時附上；每筆 log 都帶著這個 id，工程師就能直接查到那幾次模型呼叫和 request id。設計聊天功能時就要把這個 id 規劃進去，事後補很麻煩。</div>
+
+<h2>指標與告警</h2>
+<p>log 回答「那一次」，指標回答「最近」。把 log 依路由彙整，就能得到這些數字（練習 2）：</p>
+<div class="table-wrap"><table>
+<tr><th>指標</th><th>算法</th><th>看什麼</th></tr>
+<tr><td>p50／p95 延遲、TTFT</td><td>每個路由分開算</td><td>使用者等多久；p95 是慢的那群人</td></tr>
+<tr><td>費用</td><td>每天、每路由、每租戶（tenant，共用同一套系統的客戶，例如每間加盟店）加總</td><td>突增通常是有人改了 prompt、agent 迴圈失控（<a href="07-agent-loop.html">第 7 課</a>）或被濫用</td></tr>
+<tr><td>錯誤率</td><td><code>error</code> 筆數 ÷ 全部筆數</td><td>API 過載、你的程式出錯</td></tr>
+<tr><td>拒答率</td><td>模型拒答（<code>refusal</code>）筆數 ÷ 全部筆數</td><td>prompt 改版後突然升高，常是新寫法讓正常問題看起來可疑</td></tr>
+<tr><td>快取命中率</td><td>cache_read ÷（input＋cache_read＋cache_write）</td><td>突然掉到接近 0，通常是有人改了 prompt 的前綴（第 13 課）</td></tr>
+<tr><td>abstain 率</td><td>你的系統因為檢索分數太低、主動回答「請店員確認」的比例（第 10 課的拒答門檻，跟模型的 refusal 不同）</td><td>升高可能是檢索壞了或知識庫缺資料</td></tr>
+</table></div>
+<h3>為什麼看 p95，不看平均</h3>
+<p>把延遲由小到大排好，<strong>p95</strong> 是排在 95% 位置的那個值：95% 的請求比它快，5% 比它慢。假設 20 個請求裡 18 個是 2 秒、2 個是 30 秒：平均是 4.8 秒，看起來還好；但每 10 個顧客就有 1 個等了半分鐘，平均把他們藏起來了。p95 這時是 30 秒，問題一眼可見。</p>
+<p>p95 有幾種算法，練習用最簡單的 <strong>nearest-rank</strong>：排序後取第 <code>ceil(0.95 × n)</code> 個，陣列索引是 <code>ceil(0.95 × n) - 1</code>。20 筆時是第 19 個（索引 18）；只有 1 筆時就是那一筆。Prometheus 這類系統用 histogram（把延遲分成幾個區間各自計數）估算，數字會跟這個略有出入，但看趨勢時沒有差別。</p>
+<h3>該對什麼設告警</h3>
+<p>告警會叫人起床，所以只對「需要有人馬上處理」的事設（部署課第 22 課的 SLO 思維）：</p>
+<ul>
+  <li><strong>錯誤率</strong>：客服路由 5 分鐘內超過 5%。</li>
+  <li><strong>p95 TTFT</strong>：超過你承諾的體驗，例如 5 秒。</li>
+  <li><strong>費用</strong>：每小時費用超過過去一週同時段的 3 倍。這是唯一能在帳單到之前發現迴圈失控或濫用的方法。</li>
+  <li><strong>快取命中率突降</strong>：從 80% 掉到 5%，費用馬上變好幾倍。</li>
+</ul>
+<p>拒答率、abstain 率的變化通常不用半夜叫人，放在每天看的儀表板，配合 prompt 改版的時間點比對。</p>
+
+<div class="callout practice"><strong>💡 實務上：告警要有人接，改版要在圖上看得到</strong><br>AI 功能「突然變差」，最常見的原因不是 API 出事，而是有人改了 prompt、換了模型或更新了知識庫。常見做法是每次部署都在儀表板上加一個標記（Grafana 這類工具叫 annotation），拒答率或費用一變，馬上對得上是哪次改版。每條告警也要寫清楚誰會收到、第一步查什麼（例如先看哪個路由、哪個 <code>promptVersion</code>）；沒人知道怎麼處理的告警，最後只會被靜音。剛上線時寧可少設幾條、門檻寬一點，看一兩週實際的數字再調。</div>
+
+<h2>追蹤：把一次客服請求串起來</h2>
+<p>log 是一筆一筆的，但一個客服請求裡有好幾個步驟：檢索（向量與關鍵字兩路，第 10 課）、第一次模型呼叫、執行工具（查訂單）、第二次模型呼叫（第 7 課的 agent 迴圈）。顧客說「好慢」時，你要知道慢在哪一步。<strong>追蹤</strong>（trace）把這些步驟記成一棵樹，每個節點是一個 <strong>span</strong>：一段有開始時間、結束時間和屬性的工作。同一棵樹的 span 共用一個 trace id。</p>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="一次客服請求的 span 樹：最上面是 POST /chat，底下依時間排列檢索、第一次模型呼叫、工具 get_my_orders、第二次模型呼叫，每條的長度代表耗時">
+    <text x="20" y="24" class="d-small">時間 →</text>
+    <rect x="20" y="36" width="660" height="30" rx="4" class="d-soft"/><text x="30" y="56" class="d-text">POST /chat（4120 ms）</text>
+    <rect x="40" y="76" width="90" height="26" rx="4" class="d-box"/><text x="48" y="94" class="d-small">檢索 210 ms</text>
+    <rect x="60" y="108" width="50" height="22" rx="4" class="d-box"/><text x="118" y="124" class="d-small">向量、關鍵字</text>
+    <rect x="135" y="140" width="250" height="26" rx="4" class="d-box"/><text x="145" y="158" class="d-small">anthropic messages：model、tokens、stop_reason=tool_use</text>
+    <rect x="390" y="172" width="60" height="26" rx="4" class="d-box"/><text x="396" y="190" class="d-small">工具</text>
+    <rect x="455" y="204" width="220" height="26" rx="4" class="d-box"/><text x="465" y="222" class="d-small">anthropic messages：end_turn</text>
+  </svg>
+  <figcaption>一個請求的 span 樹。橫條的長度是耗時：這次的時間大多花在兩次模型呼叫，檢索與工具很快。</figcaption>
+</figure>
+<p>OpenTelemetry（部署課第 23 課）是追蹤的標準。它為生成式 AI 定了一組屬性名稱（GenAI semantic conventions），例如 <code>gen_ai.request.model</code>、<code>gen_ai.usage.input_tokens</code>、<code>gen_ai.usage.output_tokens</code>、<code>gen_ai.response.id</code>，各家工具都看得懂。</p>
+<p><strong>SDK 1.3.0 內建 OpenTelemetry</strong>：只要你的應用程式用 <code>@opentelemetry/api</code> 註冊了 tracer provider（負責建立 span、交給 exporter 送出的元件；部署課第 23 課設定的 NodeSDK 就會註冊），每次 API 呼叫自動產生一個 span，帶著上面那些 <code>gen_ai.*</code> 屬性，以及 <code>anthropic.request.id</code>、<code>anthropic.message.stop_reason</code>、首字時間 <code>gen_ai.response.time_to_first_chunk</code>。不用改任何呼叫的程式。設定在建立 client 時（依 SDK 1.3.0 的 README 與型別）：</p>
+<pre>new Anthropic()                                             // 預設：有 span，不含內容
+new Anthropic({ openTelemetry: false })                     // 不產生 span（或設環境變數 ANTHROPIC_OPEN_TELEMETRY=false）
+new Anthropic({ openTelemetry: { traces: { contentMode: 'content' } } })   // span 裡帶 prompt 與回答</pre>
+<p><code>contentMode</code> 預設是 <code>'metadata_only'</code>：span 只有模型、token、時間這些中繼資料。改成 <code>'content'</code> 會把 prompt 與回答放進 span，追蹤系統就成了另一個存個資的地方，跟 log 一樣要考慮權限與保留期限，通常只在開發環境開。</p>
+<p>SDK 只負責它自己的 API 呼叫。檢索、工具這些步驟要自己包成 span。下面這段程式練習不會用到，第一次讀可以只看註解，知道「自己的步驟要自己包」就好。<code>startActiveSpan</code> 會把新的 span 設成「目前的 span」，在回呼函式裡建立的 span（包括 SDK 的）自動成為它的子節點：</p>
+<pre>import { trace, SpanStatusCode } from '@opentelemetry/api'
+
+const tracer = trace.getTracer('coffee-support')
+
+export function handleChat(question: string) {
+  return tracer.startActiveSpan('chat', async span =&gt; {
+    try {
+      const chunks = await tracer.startActiveSpan('retrieve', async s =&gt; {
+        try {
+          const found = await hybridSearch(question)          // 第 10 課的混合搜尋（參數省略）
+          s.setAttribute('retrieval.doc_ids', found.map(c =&gt; c.docId))
+          return found
+        } finally {
+          s.end()
+        }
+      })
+      return await runAgent(client, chunks, question)        // 裡面每次 API 呼叫，SDK 自動產生子 span
+    } catch (err) {
+      span.recordException(err as Error)
+      span.setStatus({ code: SpanStatusCode.ERROR })
+      throw err
+    } finally {
+      span.end()
+    }
+  })
+}</pre>
+<p>練習資料夾沒有安裝 exporter（把 span 送到 Jaeger、Grafana Tempo 等後端的套件），這段只在課文示範；<code>@opentelemetry/api</code> 是 SDK 的依賴，所以已經在 <code>node_modules</code> 裡。沒有註冊 provider 時，這些呼叫什麼都不做，不會出錯。</p>
+
+<h2>SSE 端點：把模型的串流轉送給前端</h2>
+<p>第 3 課你在後端<strong>收</strong>模型的 SSE。現在要把它<strong>轉送</strong>給瀏覽器：前端不能直接呼叫 Anthropic API（API key 會外洩），所以由你的伺服器在中間，一邊收、一邊送。</p>
+<figure>
+  <svg viewBox="0 0 700 170" role="img" aria-label="瀏覽器用 POST 送問題給你的伺服器，伺服器用 SDK 串流呼叫 Anthropic API，收到每段文字就轉成 delta 事件送回瀏覽器；瀏覽器斷線時伺服器中斷上游">
+    <defs><marker id="ar15" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="var(--muted)"/></marker></defs>
+    <rect x="20" y="50" width="150" height="60" rx="6" class="d-box"/><text x="95" y="78" text-anchor="middle" class="d-text">瀏覽器（Vue）</text><text x="95" y="98" text-anchor="middle" class="d-small">fetch＋ReadableStream</text>
+    <rect x="275" y="50" width="150" height="60" rx="6" class="d-soft"/><text x="350" y="78" text-anchor="middle" class="d-text">你的伺服器</text><text x="350" y="98" text-anchor="middle" class="d-small">/chat（SSE）</text>
+    <rect x="530" y="50" width="150" height="60" rx="6" class="d-box"/><text x="605" y="78" text-anchor="middle" class="d-text">Anthropic API</text><text x="605" y="98" text-anchor="middle" class="d-small">stream</text>
+    <line x1="170" y1="62" x2="270" y2="62" class="d-line" marker-end="url(#ar15)"/><text x="220" y="40" text-anchor="middle" class="d-small">POST { question }</text>
+    <line x1="425" y1="62" x2="525" y2="62" class="d-line" marker-end="url(#ar15)"/><text x="475" y="40" text-anchor="middle" class="d-small">messages.stream</text>
+    <line x1="525" y1="98" x2="425" y2="98" class="d-line" marker-end="url(#ar15)"/>
+    <line x1="270" y1="98" x2="170" y2="98" class="d-line" marker-end="url(#ar15)"/><text x="220" y="135" text-anchor="middle" class="d-small">delta… done／error</text>
+    <text x="350" y="150" text-anchor="middle" class="d-small">瀏覽器斷線 → 回應的 close → abort 上游</text>
+  </svg>
+  <figcaption>伺服器在中間：API key 留在後端，事件格式由你決定，前端斷線時由你中斷上游。</figcaption>
+</figure>
+<p><strong>SSE 端點</strong>就是一個 <code>Content-Type: text/event-stream</code> 的 HTTP 回應，連線保持開著，伺服器一段一段寫入事件。每個事件是幾行文字，<strong>最後一定要有一個空行</strong>，瀏覽器讀到空行才算一個事件結束：</p>
+<pre>event: delta
+data: {"text":"拿鐵一杯"}
+
+event: delta
+data: {"text":" 110 元。"}
+
+event: done
+data: {"outputTokens":42,"stopReason":"end_turn"}
+</pre>
+<p>事件名稱和內容是你自己定的，不必照抄 Anthropic 的事件。給前端的事件越少越好：<code>delta</code>（一段文字）、<code>done</code>（結束，附 <code>stopReason</code> 讓前端分辨拒答與截斷）、<code>error</code>（給使用者看的固定訊息）。<code>data</code> 用 <code>JSON.stringify</code>，文字裡的換行會變成 <code>\n</code>，不會打斷事件格式。</p>
+<p>伺服器的骨架（練習 3、4 會寫完整版）：</p>
+<pre>res.writeHead(200, {
+  'Content-Type': 'text/event-stream; charset=utf-8',
+  'Cache-Control': 'no-cache',        // 中間的快取不要存
+  'X-Accel-Buffering': 'no',          // 叫 Nginx 不要緩衝這個回應
+})
+res.flushHeaders()                    // 標頭馬上送出；不然 Node 會等到第一次 write，模型思考時前端什麼都收不到
+const send = (event: string, data: unknown) =&gt;
+  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+
+const upstream = new AbortController()
+res.on('close', () =&gt; {
+  if (!res.writableFinished) upstream.abort()      // 還沒送完連線就關了 = 前端走了
+})
+const stream = client.messages.stream(params, { signal: upstream.signal })
+stream.on('text', text =&gt; send('delta', { text }))  // 收到一段就送一段</pre>
+<h3>前端斷線時中斷上游</h3>
+<p>使用者關掉分頁，模型還在產生，每個 token 都在計費（第 3 課）。要偵測「前端走了」，聽的是<strong>回應</strong>的 <code>'close'</code> 事件，並檢查 <code>res.writableFinished</code>：正常送完時也會觸發 close，這時 <code>writableFinished</code> 是 <code>true</code>，不能誤判。</p>
+<p>常見的錯是聽<strong>請求</strong>的事件。本機用 Node 24.22.1 實測：<code>req</code> 的 <code>'end'</code> 和 <code>'close'</code> 都在<strong>請求本體讀完</strong>時就觸發，跟前端在不在無關。聽它們的話，要嘛每個請求一開始就被中斷，要嘛（註冊得太晚）永遠不會觸發。</p>
+<p>中斷後 SDK 會丟出 <code>Anthropic.APIUserAbortError</code>。在 <code>catch</code> 裡接住、記一筆 <code>client_aborted</code> 的 log 就好，不要再往外丟：<code>http.createServer</code> 的處理函式是 async，丟出去的錯沒有人接，就是 unhandled rejection，Node 預設會讓整個程序結束。</p>
+<h3>錯誤事件不帶內部細節</h3>
+<p>串流中途 API 過載（第 3 課的 error 事件）時，HTTP 狀態已經是 200 送出去了，沒辦法改成 500，只能送一個 <code>error</code> 事件。它的內容是固定的使用者訊息，例如「助理暫時無法回答，請稍後再試。」。<code>overloaded_error</code>、堆疊、內部主機名稱只寫進 log：使用者看不懂，攻擊者看得懂。</p>
+<h3>部署：代理會把串流變成一整段</h3>
+<p>本機一切正常，部署到 Nginx 後面，使用者卻要等十幾秒才一次看到整段回答。原因是 Nginx（<a href="../../devops/lessons/12-nginx.html">部署課第 12 課</a>的反向代理）的 <code>proxy_buffering</code> 預設是 <code>on</code>：它把上游的回應收進緩衝區再轉給瀏覽器（nginx.org 的 proxy 模組文件）。要處理的有三件事：</p>
+<ul>
+  <li><strong>關緩衝</strong>：SSE 路由在 location 裡寫 <code>proxy_buffering off;</code>，或由應用程式回 <code>X-Accel-Buffering: no</code> 標頭（Nginx 會依它關閉這個回應的緩衝）。</li>
+  <li><strong>閒置逾時</strong>：<code>proxy_read_timeout</code> 預設 60 秒，模型思考很久沒送任何東西時連線會被切斷。要調長，或定時送註解行（以 <code>:</code> 開頭的行，瀏覽器會忽略）保持連線。</li>
+  <li><strong>其他層</strong>：CDN、雲端的負載平衡器也可能緩衝，上線前用真的網址測一次。</li>
+</ul>
+<p>用 NestJS 時，<code>@Sse()</code> 裝飾器回傳 Observable 也能送出同樣格式的事件；道理都一樣：關緩衝、斷線時中斷上游、錯誤不帶細節。連線數變多之後的問題（每條 SSE 佔一個連線、水平擴展）在<a href="../../system-design/lessons/17-realtime-push.html">系統設計課第 17 課</a>。</p>
+
+<div class="callout practice"><strong>💡 實務上：上線前在真正的代理後面測一次串流</strong><br>本機直連時串流通常正常，問題多半出在中間那一層：Nginx、負載平衡器、CDN 都可能緩衝回應或在閒置一段時間後切斷連線。上線前在 staging（正式環境之前的測試環境）用 <code>curl -N</code>（不緩衝輸出）打 SSE 端點，確認文字是一段一段出來，而不是最後一次出現。這需要維運一起確認每一層的設定，最好寫進上線檢查清單。</div>
+
+<h2>前端：在 Vue 裡讀串流</h2>
+<p>下面把呼叫串流的邏輯包成一個 composable（<a href="../../vue/lessons/12-composables.html">Vue 課第 12 課</a>）。瀏覽器內建的 <code>EventSource</code> 專門收 SSE，但它<strong>只能發 GET</strong>，不能帶請求本體，也不能自訂標頭。問題要用 POST 送（太長放不進網址，也不該出現在網址和伺服器的存取 log 裡），所以改用 <code>fetch</code>，自己讀 <code>response.body</code> 這個 ReadableStream 並切出事件。格式還是 SSE，只是解析由你來做：</p>
+<pre>// useChat.ts（composable，Vue 課第 12 課）
+import { ref } from 'vue'
+
+type State = 'idle' | 'waiting' | 'typing' | 'done' | 'refused' | 'error' | 'stopped'
+
+export function useChat() {
+  const state = ref&lt;State&gt;('idle')
+  const answer = ref('')
+  const notice = ref('')
+  let controller: AbortController | null = null
+
+  async function ask(question: string) {
+    controller?.abort()                       // 上一個還沒結束就先取消（Vue 課第 17 課的競態）
+    controller = new AbortController()
+    state.value = 'waiting'
+    answer.value = ''
+    notice.value = ''
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question }),
+        signal: controller.signal,
+      })
+      if (!res.ok) {                          // 400 這類：本體是 JSON
+        state.value = 'error'
+        notice.value = (await res.json()).error ?? '送出失敗，請重試'
+        return
+      }
+      const reader = res.body!.pipeThrough(new TextDecoderStream()).getReader()
+      let buffer = ''
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += value                       // 一次讀到的可能是半個事件，也可能是好幾個
+        let end: number
+        while ((end = buffer.indexOf('\n\n')) !== -1) {
+          const block = buffer.slice(0, end)
+          buffer = buffer.slice(end + 2)
+          const event = /^event: (.*)$/m.exec(block)?.[1]
+          const data = JSON.parse(/^data: (.*)$/m.exec(block)?.[1] ?? 'null')
+          if (event === 'delta') {
+            state.value = 'typing'
+            answer.value += data.text
+          } else if (event === 'done') {
+            state.value = data.stopReason === 'refusal' ? 'refused' : 'done'
+            if (data.stopReason === 'refusal') notice.value = '這個問題助理無法回答，已為您轉給店員。'
+            if (data.stopReason === 'max_tokens' || data.stopReason === 'model_context_window_exceeded') notice.value = '回答太長，只顯示了一部分。'
+          } else if (event === 'error') {
+            state.value = 'error'
+            notice.value = data.message
+          }
+        }
+      }
+      if (state.value === 'waiting' || state.value === 'typing') {
+        state.value = 'error'                 // 沒收到 done 或 error 連線就斷了
+        notice.value = '連線中斷，請重試'
+      }
+    } catch (err) {
+      if ((err as Error).name === 'AbortError') state.value = 'stopped'
+      else {
+        state.value = 'error'
+        notice.value = '網路連線中斷，請重試'
+      }
+    }
+  }
+
+  const stop = () =&gt; controller?.abort()     // 「停止」按鈕：前端中斷 → 伺服器收到 close → 中斷上游
+  return { state, answer, notice, ask, stop }
+}</pre>
+<p>畫面依 <code>state</code> 顯示：<code>waiting</code> 時顯示「正在輸入…」（Opus 5.5 會先思考，TTFT 可能好幾秒，沒有提示使用者會以為壞了）；<code>typing</code> 時顯示「停止」按鈕；<code>error</code>、<code>stopped</code> 時顯示「重試」按鈕，已經收到的部分文字留著。連續送出兩個問題時，<code>ask</code> 會先取消上一個，舊的回答才不會蓋掉新的（<a href="../../vue/lessons/17-async-data.html">Vue 課第 17 課</a>的競態）。</p>
+<div class="callout warn">回答用 <code>{{ answer }}</code> 文字插值顯示（搭配 CSS <code>white-space: pre-wrap</code> 保留換行），<strong>不要用 <code>v-html</code></strong>。模型的輸出是不可信的內容（第 12 課）：<code>v-html</code> 就是 XSS，Markdown 圖片一渲染就把資料送出去。要顯示 Markdown，先經過第 12 課的 <code>sanitizeOutput</code>，再用會淨化 HTML 的 Markdown 套件。</div>
+
+<div class="callout practice"><strong>💡 實務上：每種狀態的畫面跟 PM、設計一起定</strong><br>「正在輸入…」「停止」「重試」「已為您轉給店員」看起來是小事，卻是顧客對 AI 功能的第一印象。常見的狀況是工程師只做好順利回答的畫面，拒答、截斷、斷線時畫面只剩一個空白框。開發時把 <code>state</code> 的每種值（加上 <code>done</code> 但回答被截斷的情況）列成一張表，寫上要顯示的文字、有沒有按鈕、要不要轉真人，給 PM 和設計確認。做完後親手把每種狀態看過一遍：在瀏覽器 DevTools 把網路調成慢速看「正在輸入…」，回答到一半時停掉後端看斷線的畫面。</div>
+
+<h2>框架與 MCP：同樣的東西在別的工具裡叫什麼</h2>
+<p>助理到這裡已經能上線。這門課從第 6 課起都用 <code>@anthropic-ai/sdk</code> 1.3.0 手寫：工具、迴圈、檢索、log 都是自己的程式。台灣的 AI 應用職缺常把 LangChain、Dify、MCP 列在條件裡，這節把你寫過的東西對到它們的名字，並說明什麼時候該用。版本是 2026-11-19 用 Context7 與 npm 查的：<code>langchain</code> 1.6.7、<code>llamaindex</code>（LlamaIndex.TS）0.12.1、MCP 規格 2026-07-28 版。</p>
+<p><strong>LangChain</strong> 與 <strong>LlamaIndex</strong> 都是 <strong>框架</strong>（framework）：把模型呼叫、工具、迴圈、檢索包成現成的元件，換模型供應商時只改設定。LangChain 偏重 agent 與流程；LlamaIndex 從「把資料建成索引再查詢」起家，偏重 RAG。對照表（查表用，不用背）：</p>
+<div class="table-wrap"><table>
+<tr><th>這門課</th><th>LangChain JS</th><th>LlamaIndex.TS</th></tr>
+<tr><td>工具定義與 handler（第 6 課）</td><td><code>tool(fn, { name, description, schema })</code>，schema 用 zod</td><td><code>tool({ name, description, parameters, execute })</code></td></tr>
+<tr><td>agent 迴圈（第 7 課）</td><td><code>createAgent({ model, tools })</code>：呼叫模型、執行工具，直到不再要求工具；底層是 LangGraph</td><td><code>agent({ tools, llm })</code>（<code>@llamaindex/workflow</code>）</td></tr>
+<tr><td>切塊（第 8 課）</td><td>text splitter，例如 <code>RecursiveCharacterTextSplitter</code></td><td><code>VectorStoreIndex.fromDocuments()</code> 裡自動切塊並算 embedding</td></tr>
+<tr><td>向量搜尋（第 9、10 課）</td><td>vector store 的 <code>asRetriever()</code>；<code>createRetrieverTool</code> 把檢索包成一個工具</td><td><code>index.asRetriever()</code>；<code>index.asQueryEngine()</code> 把檢索和產生回答包成一步</td></tr>
+</table></div>
+<p>名字不同，做的事就是你寫過的那幾步。差別在誰控制細節：</p>
+<ul>
+  <li><strong>用原生 SDK</strong>：只用一家模型；每一輪要自訂行為（第 7 課的 status、預算、重複偵測、人工確認，這課的 log 與 trace）；要用假的 client 寫確定的測試。程式少一層，出錯時直接看到 API 的請求與回應。</li>
+  <li><strong>用框架</strong>：要在幾家模型之間切換或比較；要快速做原型；需要它現成的整合（各種文件載入器、向量資料庫連接器）。代價是多一層抽象、版本更新快，出事時要穿過框架找原因。例如 LangChain 的 <code>@langchain/mcp-adapters</code> 在 MCP 工具執行失敗時丟出 <code>ToolException</code>，文件提醒 TypeScript 版不會把錯誤當成失敗的工具結果回給模型，要自己 try/catch；第 6 課「錯誤也是一種結果」的處理得自己補回來。</li>
+</ul>
+<p><strong>Dify</strong> 是另一類：開源、可自架的平台，在網頁上用拖拉的方式組 workflow、知識庫（RAG）和 agent，發布成網頁、API 或 MCP server。適合讓 PM、客服主管自己調流程；工程師的工作通常是把後端的資料和動作做成它能呼叫的工具。</p>
+
+<h3>MCP：把工具做成獨立的伺服器</h3>
+<p><strong>MCP</strong>（Model Context Protocol）是一個開放協定，用 JSON-RPC 讓 AI 應用程式接上外部的工具和資料。三個角色：<strong>host</strong> 是使用者在用的 AI 應用程式（Claude Code、IDE、Dify）；host 為每個連線開一個 <strong>client</strong>；<strong>server</strong> 是你寫的程式，提供三種東西：</p>
+<ul>
+  <li><strong>tools</strong>：模型決定要不要呼叫的函式，就是第 6 課的工具。</li>
+  <li><strong>resources</strong>：由應用程式決定附上的資料，例如一份檔案的內容。</li>
+  <li><strong>prompts</strong>：使用者自己選的範本，例如斜線指令。</li>
+</ul>
+<p>傳輸方式有兩種：<strong>stdio</strong>（host 把 server 當子程序啟動，用標準輸入輸出溝通，適合本機工具）和 <strong>Streamable HTTP</strong>（server 是獨立的 HTTP 服務，可以同時服務很多 client，適合部署在公司內部）。Dify 只支援 HTTP 這種。</p>
+<p>MCP 不取代 tool use，兩者是上下兩層。host 從 MCP server 拿到工具清單，轉成第 6 課的工具定義放進請求；模型照樣回 tool_use；host 再透過 MCP 請 server 執行，把結果包成 tool_result 送回模型。模型那端的流程完全一樣，MCP 統一的是「工具放在哪裡、怎麼被找到、怎麼被呼叫」。</p>
+<p>什麼時候把工具做成 MCP server：</p>
+<ul>
+  <li><strong>該做</strong>：同一組工具要給好幾個 AI 應用程式共用（員工的 Claude Code、Dify 上的店務助理、別組的 agent）；工具由另一個團隊維護、要獨立部署。</li>
+  <li><strong>不必做</strong>：只有自己的後端在用時（像這門課的客服助理），直接寫成函式最簡單，多一個 server 就多一套部署、授權和監控。</li>
+  <li><strong>做了之後</strong>：它就是一支 API。第 12 課的最小權限照樣適用，遠端的 server 要做授權；能改資料的工具仍然只能提出申請，由人確認（第 7 課）。</li>
+</ul>
+<div class="callout practice"><strong>💡 實務上：面試被問「會不會 LangChain」時，講你懂它底下在做什麼</strong><br>職缺列 LangChain、Dify、MCP，面試官想確認的通常是你能不能把 AI 功能做上線。可以這樣回答：「我用原生 SDK 自己寫過 tool use、有上限與預算的 agent 迴圈、混合搜尋的 RAG、eval 和成本報告；LangChain 的 <code>createAgent</code>、retriever 做的就是這些事，接手專案時我知道去哪裡看它的迴圈和錯誤處理。要支援多家模型或趕原型時我會用框架，要細部控制時用 SDK。」被問 MCP 就講「它是工具的標準介面，不取代 tool use」，再舉一個該做成 MCP server 的例子（多個 AI 應用程式共用的庫存查詢）和一個不該做的例子。實際用過 Dify 或 LangChain 的話，準備一個「框架哪裡不夠、我怎麼補」的故事，比列出用過的套件更有說服力。</div>
+
+<h2>練習</h2>
+<p>在 learn 資料夾執行 <code>node check.mjs ai 15</code>，會建立 <code>ai/practice/work/15/</code>。</p>
+<ul>
+  <li><code>lib.ts</code> 已經寫好（<code>MODEL</code>、<code>SYSTEM</code>、第 12 課的 <code>redactPII</code>、第 13 課的 <code>costOf</code>），不用改。</li>
+  <li><strong>照順序做</strong>：練習 2 用練習 1 的 <code>LlmLog</code> 型別；練習 4 接著寫在 <code>ex3.ts</code> 裡，並呼叫練習 1 的 <code>toLogRecord</code>。</li>
+  <li>每個檔案的註解寫著完整規則，題目這裡是步驟與提示。測試用假的 client，不花錢、不需要 API key。</li>
+  <li>做完後，有 API key 的話可以在 <code>ai/practice</code> 執行 <code>node --env-file-if-exists=.env work/15/live.ts</code>，看真實模型的 SSE 原始事件與寫進 log 的那一筆。</li>
+</ul>
+
+<div class="local" data-test="ex1" data-files="ex1.ts">
+  <p>練習 1：完成 <code>toLogRecord(info)</code>。<strong>做完的樣子</strong>：成功、拒答、出錯、中斷四種呼叫，都變成一筆像課文範例那樣的 <code>LlmLog</code>，欄位剛好是型別裡那些，值只有字串、數字、null、字串陣列（不能放 error 這類物件）。</p>
+  <ol>
+    <li>先決定 <code>status</code>：有 <code>error</code> 時，<code>Anthropic.APIUserAbortError</code> 是 <code>client_aborted</code>，其他是 <code>error</code>；沒有 error 時，<code>stop_reason</code> 是 <code>refusal</code> 就是 <code>refusal</code>，否則 <code>ok</code>（「每次模型呼叫記一筆結構化 log」的欄位表）。</li>
+    <li>時間：<code>at</code> 是 <code>startedAt</code> 的 ISO 字串，<code>latencyMs</code> 是兩個時間相減。</li>
+    <li><code>requestId</code>：優先用 <code>info.requestId</code>，沒有就用 API 錯誤的 <code>requestID</code>，都沒有是 <code>null</code>（「request id 從哪裡拿」）。<code>errorType</code> 只有 <code>status</code> 是 <code>error</code> 才有值。</li>
+    <li>有 <code>message</code> 時才讀 usage、<code>stop_reason</code>、工具；沒有 message 時 token 與費用都是 0。費用用 <code>costOf</code>，模型傳 <code>info.model</code>。</li>
+    <li><code>question</code>、<code>answer</code>：先 <code>redactPII</code>、再截斷到 <code>MAX_TEXT</code> 個字元（「內容欄位：遮蔽、截斷、取樣」）。</li>
+  </ol>
+  <details><summary>提示</summary>
+  <ul>
+    <li><code>errorType</code>：API 錯誤用 <code>error.type</code>（是 null 時寫 <code>'api_error'</code>），其他 <code>Error</code> 用 <code>error.name</code>，丟出來的不是 Error（例如字串）寫 <code>'unknown'</code>。判斷順序要先檢查 <code>APIUserAbortError</code>，它也是一種 <code>APIError</code>。</li>
+    <li><code>refusalCategory</code> 從 <code>message.stop_details?.category</code> 讀（第 14 課），<code>stop_details</code> 可能是 null。</li>
+    <li><code>toolCalls</code>：<code>content</code> 裡還有 thinking、text 這些 block，先依 <code>type === 'tool_use'</code> 過濾再取 <code>name</code>。</li>
+    <li>usage 的四種 token 是 <code>input_tokens</code>、<code>output_tokens</code>、<code>cache_read_input_tokens</code>、<code>cache_creation_input_tokens</code>，可能是 null 的要補成 0。</li>
+  </ul>
+  </details>
+</div>
+
+<div class="local" data-test="ex2" data-files="ex2.ts">
+  <p>練習 2：完成 <code>summarize(logs)</code>。<strong>做完的樣子</strong>：回傳 <code>{ [route]: RouteStats }</code>，每個路由一組指標；沒有 log 時回傳 <code>{}</code>（「指標與告警」）。</p>
+  <ol>
+    <li>依 <code>route</code> 把 log 分組。</li>
+    <li>每組算 <code>count</code>、<code>errorRate</code>、<code>refusalRate</code>：分母都是全部筆數（拒答、中斷也算在分母裡）。</li>
+    <li><code>p95LatencyMs</code>：複製一份再排序，取索引 <code>ceil(0.95 × n) - 1</code>（「為什麼看 p95，不看平均」）。</li>
+    <li><code>costUsd</code> 加總後四捨五入到小數第 6 位；<code>cacheHitRate</code> 照指標表的公式，分母是 0 時是 0。</li>
+  </ol>
+  <details><summary>提示</summary>
+  <ul>
+    <li>直接 <code>logs.sort()</code> 會改到呼叫端的陣列；先 <code>logs.map(l =&gt; l.latencyMs)</code> 得到新陣列再排序，數字排序要傳 <code>(a, b) =&gt; a - b</code>。</li>
+    <li>四捨五入到第 6 位：<code>Math.round(x * 1e6) / 1e6</code>。</li>
+  </ul>
+  </details>
+</div>
+
+<div class="local" data-test="ex3" data-files="ex3.ts">
+  <p>練習 3：完成 <code>createChatServer(client)</code>。<strong>做完的樣子</strong>：<code>POST /chat</code> 送問題，收到一串 <code>delta</code> 事件、最後一個 <code>done</code>（或出錯時一個 <code>error</code>），每段文字一收到就送出；不合格的請求回 400 JSON，其他路徑回 404（「SSE 端點」那一節的骨架）。</p>
+  <ol>
+    <li>路由：只處理 <code>POST /chat</code>，其他方法或路徑（包括 <code>GET /chat</code>）用 <code>sendJson</code> 回 404。</li>
+    <li>驗證：用 <code>readBody</code> 讀本體再 <code>JSON.parse</code>；解析失敗、<code>question</code> 不是字串、trim 後是空的、超過 <code>MAX_QUESTION</code> 個字 → 400 <code>{ error: '…' }</code>，不呼叫 API。</li>
+    <li>標頭：<code>writeHead(200, …)</code> 帶 <code>text/event-stream</code>、<code>no-cache</code>、<code>X-Accel-Buffering: no</code>，再 <code>flushHeaders()</code>。</li>
+    <li>串流：<code>client.messages.stream</code>（<code>MODEL</code>、<code>max_tokens: 16000</code>、<code>system: SYSTEM</code>、一則 user 訊息），<code>on('text')</code> 每段送一個 <code>delta</code>。</li>
+    <li>收尾：<code>await stream.finalMessage()</code> 後送 <code>done</code>（<code>outputTokens</code>、<code>stopReason</code>）；<code>catch</code> 裡送 <code>error</code>（<code>{ message: USER_ERROR }</code>）；兩種都要 <code>res.end()</code>（「錯誤事件不帶內部細節」）。</li>
+  </ol>
+  <details><summary>提示</summary>
+  <ul>
+    <li>先寫一個 <code>send(event, data)</code>，格式是 <code>event: 名稱\ndata: JSON\n\n</code>，所有事件都經過它，空行就不會漏。</li>
+    <li>一開始就失敗（例如 529）時，<code>finalMessage()</code> 一樣會 reject，同一個 <code>catch</code> 就接得到，不用另外處理。</li>
+    <li>處理函式是 async：整段包在 try/catch 裡，錯誤不要往外丟。</li>
+  </ul>
+  </details>
+</div>
+
+<div class="local" data-test="ex4" data-files="ex3.ts">
+  <p>練習 4：接著改 <code>ex3.ts</code> 的 <code>createChatServer</code>。<strong>做完的樣子</strong>：每個請求不論成功、出錯或前端斷線，都剛好呼叫一次 <code>deps.log</code>；前端斷線時上游請求被中斷、log 記成 <code>client_aborted</code>，伺服器沒有未處理的錯誤；正常結束時不能被誤判成斷線。</p>
+  <ol>
+    <li>中斷上游：建立 <code>AbortController</code>，聽<strong>回應</strong>的 <code>'close'</code>，<code>!res.writableFinished</code> 時 abort；把 signal 傳給 <code>client.messages.stream</code> 的第二個參數（「前端斷線時中斷上游」）。</li>
+    <li>計時：送出請求前記 <code>startedAt = now()</code>，第一段文字時記 TTFT，結束時記 <code>endedAt</code>。一律用 <code>deps.now</code>，不用 <code>Date.now()</code>。</li>
+    <li>累積 <code>answer</code>：每送出一個 <code>delta</code> 就把文字接上去。</li>
+    <li>記 log：成功時傳 <code>message</code>，<code>catch</code> 到的（出錯或中斷）傳 <code>error</code>；其他欄位是 <code>route: '/chat'</code>、<code>PROMPT_VERSION</code>、<code>MODEL</code>、<code>requestId: stream.request_id</code>、<code>question</code>、<code>answer</code>。</li>
+  </ol>
+  <details><summary>提示</summary>
+  <ul>
+    <li><code>deps.log</code>、<code>deps.now</code> 都可能沒傳（練習 3 的測試就沒傳）：例如 <code>const now = deps.now ?? Date.now</code>，記 log 用 <code>deps.log?.(…)</code>。</li>
+    <li>「只記一筆」：<code>try</code> 裡送完 <code>done</code> 後記一次（傳 <code>message</code>），<code>catch</code> 裡記一次（傳 <code>error</code>），共用的欄位先放進一個物件。</li>
+    <li>斷線後 <code>catch</code> 到的是 <code>APIUserAbortError</code>：連線已經關了，不用再送 <code>error</code> 事件（可以看 <code>upstream.signal.aborted</code>）；照樣交給 <code>toLogRecord</code>，不要再丟出去。</li>
+  </ul>
+  </details>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：為了方便除錯，把每次的完整 prompt 與回答都永久寫進一般的 log 系統。主要的風險是？</p>
+  <label data-key="a">沒有風險，log 只有工程師看得到</label>
+  <label data-key="b">個資與機密長期散落在權限寬鬆的 log 裡；要遮蔽、截斷、取樣，完整內容放在有權限控管、有保留期限的地方</label>
+  <label data-key="c">只是 log 的費用比較高</label>
+  <label data-key="d">會讓模型的回應變慢</label>
+  <p class="why">✓ log 通常整個工程團隊都看得到、保存很久，還可能送到第三方服務，顧客打的電話、卡號原樣進去就是外洩（a 錯）。費用確實會變高，但不是主要風險（c）。寫 log 發生在你的伺服器，跟模型的速度無關（d 錯）。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：Vue 前端要 POST 一個問題並接收串流回答，可以用 <code>EventSource</code> 嗎？</p>
+  <label data-key="a">可以，<code>new EventSource(url, { method: 'POST' })</code></label>
+  <label data-key="b">不行，EventSource 只能發 GET、不能帶本體；改用 fetch 讀 response.body 的 ReadableStream，自己切出 SSE 事件</label>
+  <label data-key="c">不行，串流一定要用 WebSocket</label>
+  <label data-key="d">用 axios 發 POST 就會自動逐段更新畫面</label>
+  <p class="why">✓ EventSource 的選項只有 <code>withCredentials</code>，沒有 method（a 錯）。SSE 就是一般的 HTTP 回應，fetch 讀得到，不需要雙向的 WebSocket（c 錯）。axios 在瀏覽器預設等整個回應收完才給你（d 錯）。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：部署到 Nginx 後面之後，使用者都要等很久才一次看到整段回答，本機卻是逐字出現。最可能的原因是？</p>
+  <label data-key="a">正式環境的模型比較慢</label>
+  <label data-key="b">反向代理緩衝了回應；SSE 路由要關掉 <code>proxy_buffering</code>，或回 <code>X-Accel-Buffering: no</code></label>
+  <label data-key="c">前端的電腦太慢</label>
+  <label data-key="d">SSE 不能在 HTTPS 上使用</label>
+  <p class="why">✓ Nginx 的 <code>proxy_buffering</code> 預設開著，會把上游的回應收進緩衝區再轉送，串流就被收集成一整段。模型慢（a）或前端電腦慢（c）只會讓整體變慢，不會讓本機逐字、上線後一次出現；SSE 在 HTTPS 上完全可用（d 錯）。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 8：咖啡店的後台客服助理、Dify 上給店長用的店務助理、工程師的 Claude Code 都想查即時庫存。怎麼提供最好？</p>
+  <label data-key="a">三個地方各寫一份查庫存的工具定義與 SQL，各自維護</label>
+  <label data-key="b">全部改用 LangChain，框架會讓三個應用程式自動共用工具</label>
+  <label data-key="c">把查庫存做成一個 MCP server（Streamable HTTP），三個應用程式都接它，權限照最小權限設定</label>
+  <label data-key="d">每天把庫存表匯出，貼進三個助理的 system prompt</label>
+  <p class="why">✓ 多個 AI 應用程式共用同一組工具，正是 MCP 的用途：工具只寫一次、由一個團隊維護，模型那端照樣是 tool use。a 會讓三份 SQL 和權限檢查各自走樣；框架只管自己的程式，不會讓別的應用程式接上你的工具（b 錯）；貼進 prompt 的庫存不即時，也讓快取每天失效（d 錯）。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>沒有記 request id 與 prompt 版本</strong>：出事時無法向供應商回報，也無法比較改版前後。失敗的請求也要記 request id（<code>error.requestID</code>）。</li>
+  <li><strong>log 存了完整個資</strong>：先遮蔽再截斷；完整內容只放在有權限控管、有保留期限的取樣儲存。</li>
+  <li><strong>把整個 error 物件放進 log</strong>：可能帶著標頭裡的 key，序列化也沒有用。只取 type、status、requestID。</li>
+  <li><strong>錯誤時讀 <code>message.usage</code></strong>：失敗時根本沒有 message，log 函式自己丟出 TypeError，那次請求就沒有任何紀錄。</li>
+  <li><strong>只看平均延遲</strong>：平均會把少數等很久的使用者藏起來。看 p95 與 TTFT。</li>
+  <li><strong>使用者中斷算成錯誤</strong>：錯誤率被灌高，告警亂響。<code>client_aborted</code> 分開記。</li>
+  <li><strong>SSE 事件少了結尾空行</strong>：瀏覽器一直等不到事件結束，畫面不動。</li>
+  <li><strong>等全部產生完才一次送</strong>：串流就失去意義，TTFT 變成總時間。收到一段就 <code>res.write</code> 一段。</li>
+  <li><strong>聽請求的 end／close 判斷斷線</strong>：請求本體讀完就觸發。聽回應的 <code>close</code>，再檢查 <code>res.writableFinished</code>。</li>
+  <li><strong>前端斷線沒有中斷上游</strong>：沒人看的回答繼續產生、繼續計費。把 AbortSignal 傳給 SDK。</li>
+  <li><strong>error 事件送出內部錯誤訊息</strong>：使用者看不懂、攻擊者看得懂。送固定訊息，細節進 log。</li>
+  <li><strong>忘了代理的緩衝</strong>：本機正常、上線後變成一整段。<code>proxy_buffering off</code> 或 <code>X-Accel-Buffering: no</code>，上線前用真的網址測。</li>
+  <li><strong>用 <code>v-html</code> 顯示模型輸出</strong>：XSS 與資料外洩。用文字插值，Markdown 要先淨化。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>可觀測性靠三種工具：log 回答「那一次」、指標回答「最近」、追蹤回答「慢在哪一步」。</li>
+  <li>每次模型呼叫記一筆結構化 log：路由、prompt 版本、模型、status、延遲與 TTFT、request id、stop_reason、token 與費用、工具；內容先遮蔽再截斷，完整內容只做有權限、有期限的取樣。</li>
+  <li>指標依路由分組：p95 延遲與 TTFT、費用、錯誤率、拒答率、快取命中率；對錯誤率、TTFT、費用突增、快取命中率突降設告警。</li>
+  <li>追蹤把檢索、模型呼叫、工具串成一棵 span 樹；SDK 1.3.0 註冊 tracer provider 後自動產生 API 呼叫的 span，<code>contentMode</code> 預設不帶內容。</li>
+  <li>SSE 端點：<code>text/event-stream</code>、<code>no-cache</code>、每個事件以空行結尾、收到就送；事件只有 delta、done、error；error 不帶細節。</li>
+  <li>前端斷線聽回應的 <code>close</code>，abort 傳給 SDK 的 signal，接住 <code>APIUserAbortError</code> 並記 <code>client_aborted</code>；代理要關緩衝。</li>
+  <li>Vue 用 fetch＋ReadableStream 讀 POST 的串流；顯示等待、停止、重試、拒答與錯誤的狀態；不用 <code>v-html</code>。</li>
+  <li>LangChain、LlamaIndex 是把工具、迴圈、檢索包好的框架；要多家模型或快速原型時用，要細部控制時用原生 SDK。MCP 是讓多個 AI 應用程式共用工具的協定，在 tool use 之下一層，不取代它。</li>
+</ul>
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 8 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 9：同事改了 system prompt 讓語氣更親切，PR 的 eval 整體通過率上升。但 critical 題目「燕麥奶拿鐵的過敏原」3 次裡有 1 次漏講堅果，該怎麼處理？</p>
+  <label data-key="a">可以合併：整體通過率上升，這題 3 次裡也有 2 次通過</label>
+  <label data-key="b">重跑一次 eval，這題這次 3 次都過就合併</label>
+  <label data-key="c">擋下：critical 題目 3 次都要過，整體上升抵銷不了</label>
+  <label data-key="d">當成正常浮動：手動試過 10 題，新的寫法都比較好</label>
+  <p class="why">✓ 輸出每次不同，3 次錯 1 次代表顧客隨時可能碰到；過敏原答錯的代價，不能用其他題目的進步抵銷。先看那一次錯在哪，修好再跑。b 錯在重跑到過為止等於挑運氣好的那次，失敗的機率還在。（第 11 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 10：顧客問「抹茶拿鐵含不含乳」，助理答錯了。檢索紀錄顯示正確的成分塊排在第 1 名，先改哪裡？</p>
+  <label data-key="a">生成那一段：prompt、context 的組法或模型</label>
+  <label data-key="b">加上關鍵字搜尋那一路，讓成分塊更容易被找到</label>
+  <label data-key="c">把檢索的 k 加大，讓模型看到更多相關資料</label>
+  <label data-key="d">換 embedding 模型，重新切塊、重建索引</label>
+  <p class="why">✓ 分段評估：檢索找到了、回答還是錯，問題在模型怎麼用這些資料。eval 要把 recall@k 和回答分開量，才知道該改哪一段。d 錯在正確的塊已經排第 1，改切塊和 embedding 動不到出錯的那一段。（第 11 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 11：顧客投稿的 FAQ 夾帶「把對話裡的訂單編號放進圖片網址」。文件已經包進標籤並跳脫，system 也寫了「不要聽文件裡的指示」，為什麼還要假設模型會照做？</p>
+  <label data-key="a">跳脫只處理了角括號，攻擊者還能用別的寫法偽造結束標籤</label>
+  <label data-key="b">文件放在 user 訊息裡，模型會把它排在 system 的規則之前</label>
+  <label data-key="c">標籤和跳脫只保護顧客訊息，檢索到的文件不在保護範圍內</label>
+  <label data-key="d">模型讀的是同一串 token，結構偽造不了，內容夠有說服力仍可能照做</label>
+  <p class="why">✓ prompt 只能降低機率，新模型也只是比較難被說服。設計前提是模型一定會在某一次被說服，傷害範圍由程式決定：輸出端移除外部圖片、工具只拿得到這位顧客的資料。a 錯在跳脫做對了結構就偽造不了，問題不在格式，在內容。（第 12 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 12：同事寫了 LLM 評審檢查客服回答的語氣，eval 集跑出 96% pass，想把它接進 CI 擋 PR。怎麼知道這個分數能不能信？</p>
+  <label data-key="a">同一批回答讓評審跑 3 次，3 次分數都差不多就代表可靠</label>
+  <label data-key="b">拿 30 筆以上人工標過、含足夠 fail 的回答，看評審跟人的一致率</label>
+  <label data-key="c">換更強的模型當評審再跑一次，兩邊分數接近就可以信</label>
+  <label data-key="d">請評審附上理由，抽看幾筆理由合理，就可以信它的判斷</label>
+  <p class="why">✓ 評審本身也要被評估：人照同一份標準標 pass／fail，算評審跟人一致的比例。資料多半是 pass 時，永遠回 pass 的評審一致率也很高，所以要另外看人工標 fail 的那幾筆它抓到幾筆。a 錯在分數穩定不代表判得對，一直判錯也可以很穩定。（第 11 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 13：合併一個 PR 後，流量沒變，每天費用卻變成好幾倍。usage 顯示每個請求都寫入大量快取，讀取幾乎是 0，這個 PR 最可能改了什麼？</p>
+  <label data-key="a">在這次的 user 訊息後面加一則 <code>role: 'system'</code> 營運方指令</label>
+  <label data-key="b">把今天的日期從 system 移到最後一則 user 訊息</label>
+  <label data-key="c">工具清單改成從資料庫讀出，沒有排序就直接放進請求</label>
+  <label data-key="d">開放多輪對話，每個請求帶的對話歷史比以前長</label>
+  <p class="why">✓ prompt caching 是逐位元的前綴比對，順序是 tools → system → messages。工具順序一變，最前面就不同，後面全部重新寫入，比不快取還貴。修法是依 name 排序，再看 usage 確認命中。a 錯在 mid-conversation system 訊息接在對話後面，前面的前綴不變，這正是它不破壞快取的原因。（第 13 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 14：為了省錢，沒跑 eval 就把客服從 Opus 5.5 換成 Haiku 5.5。每個請求便宜很多，每天的總成本卻沒降多少，為什麼？</p>
+  <label data-key="a">小模型答錯時顧客重問、轉真人，每完成一個任務的成本沒跟著降</label>
+  <label data-key="b">換模型後快取要重新寫入，之後每個請求都比換之前貴</label>
+  <label data-key="c">回答長度沒變，輸出 token 一樣多，所以費用省不下來</label>
+  <p class="why">✓ 要看每完成一個任務的成本，不是每個請求的單價：答錯一次，顧客再問、agent 多跑幾輪、最後轉真人。換之前用同一組 eval 比較通過率與平均成本，通過率沒掉才換。b 錯在快取只有切換後的前幾次要重新寫入，之後一樣命中。（第 13 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 15：晚上尖峰，供應商過載，主要模型一直回 529，備用模型也一樣。顧客正在畫面前等，客服助理該怎麼設計？</p>
+  <label data-key="a">再加一個同供應商的模型當第三層備用，總有一層會成功</label>
+  <label data-key="b">deadline 內試主要和備用模型，時間到或都失敗就回寫好的回覆並通知店員</label>
+  <label data-key="c">調大重試次數、拉長退避時間，等供應商恢復就拿得到回答</label>
+  <p class="why">✓ 可靠性是讓每種失敗都有設計好的結果。deadline 管整個操作的總時間，每次送出前用剩下的時間當 timeout；預先準備的回覆不需要模型，所以不會失敗。a 錯在同一家供應商過載時，幾個模型可能一起忙，最後一層要是不依賴模型的回覆。（第 14 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 16：客服主管說：「從昨天下午開始，AI 常回『請洽店員』。」錯誤率告警沒有響，先查什麼？</p>
+  <label data-key="a">先向供應商回報，請他們確認模型最近有沒有變</label>
+  <label data-key="b">看錯誤率和 p95 延遲，找出 API 從什麼時候開始出問題</label>
+  <label data-key="c">先把 system prompt 改回比較寬鬆的寫法，看會不會改善</label>
+  <label data-key="d">看拒答率、abstain 率從何時升高，對照那時的 prompt、模型與知識庫改版</label>
+  <p class="why">✓ 突然變差最常見的原因是自己改了 prompt、換了模型或更新了知識庫。指標依路由算拒答率與 abstain 率，儀表板標上部署時間，就對得上是哪次改版；再用 log 的 prompt 版本挑幾次對話看細節。b 錯在拒答和 abstain 都不算錯誤，錯誤率和延遲看不出來。（第 15 課）</p>
+</div>
+
+<p>這個階段的重點整理成<a href="../sheets/stage-5.html">一頁圖解</a>。</p>
+<p>下一課是期末專題：把整門課的東西組成一個咖啡店客服助理，包含 RAG、查訂單工具、防護、eval 與成本報告。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

@@ -1,0 +1,671 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>15. GitOps 與 EKS：正式環境的叢集怎麼運作（資深）</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="15" data-practice="kubernetes">
+<header>
+  <div class="eyebrow">階段 5：正式環境與期末專題 · 第 15 課</div>
+  <h1>GitOps 與 EKS：正式環境的叢集怎麼運作（資深）</h1>
+</header>
+<main>
+
+<p>到目前為止，部署都是你（或你的腳本）下指令：<code>kubectl apply</code>、<code>helm upgrade</code>。在公司的正式叢集，這樣做會遇到三個問題：CI 要拿著能改正式叢集的憑證；誰在什麼時候改了什麼，只散落在各個人的終端機；有人半夜手動改了設定，沒人知道，下次部署又被蓋掉。另一方面，正式叢集不是 kind，而是雲端代管的叢集，例如 AWS 的 EKS，它有自己的網路、身分、費用與升級規則。</p>
+<p>這一課學兩件事。<strong>GitOps</strong>：讓 git 成為唯一的真相，叢集裡的 Argo CD 自己把叢集調整成 git 的樣子。<strong>EKS</strong>：你在 kind 學的每個概念，在 EKS 上對應到什麼，以及怎麼規劃一次不出事的版本升級。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>從 push 到 pull：CI 拿著正式叢集的憑證直接部署有什麼問題，GitOps 怎麼反過來讓叢集自己去讀 git。</li>
+  <li>Argo CD 的 Application、drift 與 selfHeal：怎麼告訴 Argo CD 部署哪個 repo 的哪個路徑；半夜手動加的副本為什麼幾秒後被改回去，救火也要走 git。</li>
+  <li>CI 與 GitOps 的分工：CI 只建映像、開 PR，不碰叢集。</li>
+  <li>從 kind 到 EKS：同樣的物件在 EKS 底下換成什麼，Pod 多了為什麼子網路的 IP 會用完，費用花在哪裡。</li>
+  <li>版本與升級、和平台團隊合作：每年都要排的叢集升級怎麼做才不出事，交付服務前用哪份清單檢查自己。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="01-why-kubernetes.html">第 1 課</a>的期望狀態與控制迴圈：你宣告要的結果，控制器一直比對實際狀態、把差異改回來。</li>
+  <li><a href="13-helm.html">第 13 課</a>的 Helm chart：一份範本加上每個環境的 values 檔，部署時用 <code>--set image.tag=…</code> 指定版本。</li>
+  <li><a href="../../devops/lessons/18-aws-architecture.html">devops 課第 18 課</a>的 AWS 網路：VPC 是自己的私有網路，切成公有、私有子網路，私有子網路的機器經過 NAT Gateway 連外，對外流量由負載平衡器接。</li>
+  <li><a href="../../devops/lessons/19-aws-iam.html">devops 課第 19 課</a>的 IAM：人和程式都用 IAM 角色拿短期憑證，政策決定能做什麼。</li>
+</ul></div>
+
+<h2>從 push 到 pull：GitOps 是什麼</h2>
+<p><a href="../../devops/lessons/16-cd.html">devops 課第 16 課</a>的部署是 <strong>push 型</strong>：CI 建好映像，接著自己連上伺服器（或叢集）去部署。換到 Kubernetes，就是 CI 裡有一步 <code>kubectl apply</code> 或 <code>helm upgrade</code>，而 CI 必須持有正式叢集的憑證。</p>
+<p><strong>GitOps</strong> 反過來，是 <strong>pull 型</strong>：叢集裡跑一個代理程式，它定期讀 git，把叢集調整成 git 描述的樣子。CI 只負責建置映像，再把「prod 要用這個新版本」寫進 git。GitOps 的四個原則：</p>
+<ol>
+  <li><strong>宣告式</strong>：整個系統用期望狀態描述（第 1 課的 YAML），不是一串指令。</li>
+  <li><strong>版本化在 git</strong>：期望狀態存在 git，每次變更都是一個 commit，有作者、時間、review。</li>
+  <li><strong>自動拉取</strong>：代理程式自己從 git 拉，不用外部推進來。</li>
+  <li><strong>持續調和</strong>：代理程式一直比對 git 與叢集，不一樣就修正，也就是第 1 課的控制迴圈，只是期望狀態從 etcd 換成了 git。</li>
+</ol>
+<figure>
+  <svg viewBox="0 0 700 270" role="img" aria-label="開發者把程式合併到 app repo；CI 建置映像推到 registry，再對 config repo 開 PR 修改 image tag；PR 合併後，叢集裡的 Argo CD 讀 config repo，把叢集同步成 git 的樣子。CI 沒有連到叢集的箭頭">
+    <defs><marker id="g1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="10" y="20" width="130" height="56" rx="8"/>
+    <text class="d-text" x="75" y="44" text-anchor="middle">app repo</text>
+    <text class="d-small" x="75" y="63" text-anchor="middle">cafe-api 程式</text>
+    <path class="d-line" d="M140,48 L200,48" marker-end="url(#g1)"/>
+    <text class="d-small" x="170" y="40" text-anchor="middle">合併</text>
+    <rect class="d-box" x="205" y="20" width="140" height="56" rx="8"/>
+    <text class="d-text" x="275" y="44" text-anchor="middle">CI</text>
+    <text class="d-small" x="275" y="63" text-anchor="middle">建置、測試</text>
+    <path class="d-line" d="M345,48 L415,48" marker-end="url(#g1)"/>
+    <text class="d-small" x="380" y="40" text-anchor="middle">推映像</text>
+    <rect class="d-soft" x="420" y="20" width="150" height="56" rx="8"/>
+    <text class="d-text" x="495" y="44" text-anchor="middle">registry</text>
+    <text class="d-small" x="495" y="63" text-anchor="middle">cafe-api:&lt;sha&gt;</text>
+    <path class="d-line" d="M275,76 L275,160" marker-end="url(#g1)"/>
+    <text class="d-small" x="285" y="115">開 PR：image.tag = &lt;sha&gt;</text>
+    <rect class="d-soft" x="195" y="165" width="160" height="56" rx="8"/>
+    <text class="d-text" x="275" y="189" text-anchor="middle">config repo</text>
+    <text class="d-small" x="275" y="208" text-anchor="middle">chart＋values-prod.yaml</text>
+    <rect class="d-box" x="440" y="150" width="250" height="100" rx="8"/>
+    <text class="d-text" x="565" y="172" text-anchor="middle">正式叢集</text>
+    <rect class="d-soft" x="455" y="183" width="100" height="50" rx="6"/>
+    <text class="d-text" x="505" y="213" text-anchor="middle">Argo CD</text>
+    <text class="d-small" x="625" y="205" text-anchor="middle">Deployment…</text>
+    <path class="d-line" d="M555,208 L590,208" marker-end="url(#g1)"/>
+    <path class="d-line" d="M455,200 L360,195" marker-end="url(#g1)"/>
+    <text class="d-small" x="365" y="240">Argo CD 自己來拉（pull）</text>
+    <path class="d-line" d="M495,76 L495,148" marker-end="url(#g1)"/>
+    <text class="d-small" x="505" y="115">節點拉映像</text>
+  </svg>
+  <figcaption>CI 到「開 PR」就停了；沒有任何箭頭從 CI 指向叢集</figcaption>
+</figure>
+<p>這樣換來的好處：</p>
+<ul>
+  <li><strong>CI 不需要正式叢集的權限</strong>：CI 是最常被攻擊的地方之一（第三方 action、外部 PR）。CI 被入侵，最多能開一個 PR，還要有人 review 才會合併。</li>
+  <li><strong>每次變更都有紀錄</strong>：「prod 現在跑哪一版」看 config repo 就知道；「誰改的」看 commit。</li>
+  <li><strong>回滾就是 <code>git revert</code></strong>：把 image tag 改回上一版的 PR，合併後 Argo CD 自己同步。</li>
+  <li><strong>偵測手動修改</strong>：叢集跟 git 不一樣，Argo CD 會顯示出來，可以設定自動改回去。</li>
+</ul>
+<p>代價：多一個要維運的元件（Argo CD 本身），部署多了「開 PR、合併、等同步」幾個步驟，救火時不能直接 <code>kubectl edit</code>（下一節）。小團隊只有一個叢集時，CI 用最小權限的部署角色直接 <code>helm upgrade</code> 也是合理的選擇；叢集與團隊一多，GitOps 的紀錄與權限分離才值回成本。</p>
+<p>常見的 GitOps 工具有兩個：<strong>Argo CD</strong>（有網頁介面，這課用它）和 <strong>Flux</strong>（沒有內建介面，全部用 Kubernetes 物件設定）。Argo CD 目前維護 3.5、3.4、3.3 三條版本線，最新是 v3.5.6。</p>
+
+<h2>Argo CD 的 Application</h2>
+<p>Argo CD 用一個自訂資源 <strong>Application</strong> 描述「哪個 repo 的哪個路徑，要部署到哪個叢集的哪個 namespace，用什麼規則同步」。Application 物件放在 Argo CD 所在的 namespace（通常是 <code>argocd</code>），它本身也存在 git 裡。</p>
+<pre>apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cafe-staging
+  namespace: argocd
+spec:
+  project: cafe                      # AppProject：平台團隊限制這個團隊能用哪些 repo、部署到哪些 namespace
+  source:
+    repoURL: https://github.com/example-cafe/cafe-config
+    path: charts/cafe                # repo 裡 chart 的資料夾（第 13 課寫的 chart）
+    targetRevision: main             # 要讀哪個分支、tag 或 commit
+    helm:
+      valueFiles:
+        - values-staging.yaml        # 相對於 chart 的資料夾
+  destination:
+    server: https://kubernetes.default.svc   # Argo CD 所在的叢集
+    namespace: cafe-staging
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true         # namespace 不存在就建立</pre>
+<p>幾個要做判斷的欄位：</p>
+<ul>
+  <li><strong>targetRevision</strong>：寫分支（<code>main</code>）時，合併就上線，適合 staging。prod 釘 <strong>tag</strong> 或 commit SHA：看設定就知道 prod 跑哪一版，回滾有明確的目標，也不會有人誤合併就直接上 prod。不要用 <code>HEAD</code>：等於「預設分支的最新 commit」，看不出版本。</li>
+  <li><strong>project</strong>：<code>default</code> 專案什麼都允許。正式環境由平台團隊為每個團隊建 AppProject，限制來源 repo 與目的 namespace，一個團隊寫錯 Application 不會部署到別人的 namespace。</li>
+  <li><strong>sync（同步）</strong>：把叢集調整成 git 的樣子。沒有 <code>automated</code> 時，要有人在介面上按 Sync。</li>
+  <li><strong>prune</strong>：git 裡刪掉的資源，叢集也刪掉。預設不刪，因為刪除比較危險；不開的話，改名或移除的 CronJob、Service 會一直留在叢集。</li>
+  <li><strong>selfHeal</strong>：叢集被人手動改了，自動改回 git 的樣子（下一節）。</li>
+</ul>
+<p>Argo CD 對每個 Application 顯示兩種狀態，分開看：</p>
+<div class="table-wrap"><table>
+  <tr><th>狀態</th><th>值</th><th>意思</th></tr>
+  <tr><td>同步狀態</td><td>Synced／OutOfSync</td><td>叢集跟 git 一不一樣</td></tr>
+  <tr><td>健康狀態</td><td>Healthy／Progressing／Degraded／Missing</td><td>資源本身好不好：Deployment 更新完成且可用是 Healthy，正在滾動更新是 Progressing，Pod 一直起不來是 Degraded</td></tr>
+</table></div>
+<p>「Synced 但 Degraded」很常見：git 裡的設定已經套上去了，可是新版本起不來（第 14 課的 CrashLoopBackOff）。同步成功不等於服務正常。</p>
+<p><strong>順序</strong>：<a href="10-jobs-cronjobs.html">第 10 課</a>的 migration 要比新版本先跑。Argo CD 用 annotation 控制：<code>argocd.argoproj.io/hook: PreSync</code> 讓 Job 在同步前執行（失敗就停止同步），<code>argocd.argoproj.io/sync-wave: "-1"</code> 這類數字讓資源依波次套用，小的先。</p>
+<p>一個團隊有很多服務、很多環境時，Application 會有幾十個。<strong>app of apps</strong> 是用一個 Application 指向「放了很多 Application YAML 的資料夾」；<strong>ApplicationSet</strong> 用範本加產生器（例如列出每個環境）一次產生多個 Application。兩者都是平台團隊常用的管理方式，你多半只會在既有的結構裡加一個值檔或一個 Application。</p>
+<div class="callout">這門課不在本機安裝 Argo CD：它有十幾個元件，會吃掉 kind 叢集不少記憶體。練習只用 kubeconform 檢查 Application 的結構；想實際玩的話，照 Argo CD 官方文件安裝到一個新的 namespace，用完刪掉。</div>
+
+<h2>drift 與 selfHeal：救火也要走 git</h2>
+<p><strong>drift（漂移）</strong>是叢集的實際狀態偏離了 git 的宣告。情境：半夜流量暴增，值班的人 <code>kubectl scale deployment cafe-api --replicas=10</code>。開了 selfHeal 時，Argo CD 幾秒後發現 replicas 跟 git 的 3 不一樣，把它改回 3。</p>
+<p>這是設計上的行為，不是 bug。git 是唯一的真相，叢集上的手動修改都算 drift。正確的處理：</p>
+<ul>
+  <li><strong>平常</strong>：副本數交給 HPA（<a href="08-resources-autoscaling.html">第 8 課</a>），救火時改 HPA 的 maxReplicas 也是開 PR。</li>
+  <li><strong>緊急</strong>：先暫停這個 Application 的自動同步（在介面關掉，或把 <code>automated.enabled</code> 設成 <code>false</code>），在事故頻道記下「幾點、誰、為什麼暫停」，止血後把修正寫回 git，再恢復自動同步。暫停卻忘了恢復，之後的部署都不會上線，所以要有人負責。</li>
+</ul>
+<p>HPA 本身也會造成 drift：它一直在改 Deployment 的 <code>spec.replicas</code>。如果 chart 輸出了 replicas（第 13 課提醒過不要），Argo CD 會跟 HPA 搶。即使 chart 沒輸出，也建議在 Application 宣告忽略這個欄位：</p>
+<pre>spec:
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas
+  syncPolicy:
+    syncOptions:
+      - RespectIgnoreDifferences=true</pre>
+<p><code>ignoreDifferences</code> 預設只影響「算不算 OutOfSync」；真的同步時（例如換了新 tag），Argo CD 還是把整份期望狀態套上去，replicas 會被寫回 git 的值。加上 <code>RespectIgnoreDifferences=true</code>，同步時也會略過這些欄位（資源已經存在時才有效）。</p>
+<p>比對「一不一樣」時還有一個細節：YAML 的欄位順序不代表任何意思，<code>{cpu, memory}</code> 和 <code>{memory, cpu}</code> 是同一個設定。用 <code>JSON.stringify</code> 比對就會出錯：</p>
+<div class="lab"><script type="code">
+const git = { resources: { requests: { cpu: '100m', memory: '128Mi' } }, replicas: 3 }
+const live = { replicas: 3, resources: { requests: { memory: '128Mi', cpu: '100m' } } }
+console.log('JSON.stringify 比對：', JSON.stringify(git) === JSON.stringify(live))
+
+function same(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false
+  if (Array.isArray(a) !== Array.isArray(b)) return false
+  const ka = Object.keys(a), kb = Object.keys(b)
+  return ka.length === kb.length && ka.every(k => k in b && same((a as any)[k], (b as any)[k]))
+}
+console.log('逐欄位比對：', same(git, live))
+console.log('陣列的順序有意義：', same({ args: ['a', 'b'] }, { args: ['b', 'a'] }))
+</script></div>
+<p>練習 1 會用這個比對函式，寫出 Argo CD 每一輪在做的決定。</p>
+
+<div class="callout practice"><strong>💡 實務上：一直 OutOfSync，先看是誰改的</strong><br>Argo CD 上某個 Application 永遠是 OutOfSync，不一定是有人手動改了叢集。常見的來源是其他控制器：HPA 改 replicas，某些工具的 mutating webhook 在 Pod 範本注入 sidecar 或 annotation。處理前先打開 Argo CD 的 diff，看是哪幾個欄位不一樣、是誰改的，再用 <code>ignoreDifferences</code> 只忽略那幾個欄位；整個資源一起忽略，真正的 drift 就看不到了。如果 diff 顯示的是人改的（例如 resources 被調大），那是一次救火還沒寫回 git，要找到當事人把它變成 PR。</div>
+
+<h2>CI 與 GitOps 的分工</h2>
+<p>常見的做法是兩個 repo：<strong>app repo</strong> 放程式，<strong>config repo</strong> 放 chart、每個環境的值檔與 Application。分開的原因：改程式的人很多，能改 prod 設定的人比較少，權限可以分開設；Argo CD 只要讀 config repo。</p>
+<p>app repo 的 CI（<a href="../../devops/lessons/15-ci.html">devops 課第 15 課</a>的 GitHub Actions）在合併到 main 後做三件事：</p>
+<ol>
+  <li>建置並推送映像，tag 用這次的 commit SHA（devops 課第 16 課）。</li>
+  <li>取出 config repo，用 <strong>yq</strong>（命令列的 YAML 編輯工具，GitHub 的 ubuntu-24.04 runner 已內建 4.54.1）只改一個欄位：<code>yq -i '.image.tag = strenv(TAG)' charts/cafe/values-prod.yaml</code>。<code>strenv(TAG)</code> 讀環境變數 TAG 並當成字串。yq 會保留檔案的註解與排版，PR 的差異只有一行。</li>
+  <li>推到新分支，用 GitHub CLI（<code>gh pr create</code>）開 PR。</li>
+</ol>
+<p>要注意權限：每個 workflow 自動拿到的 <code>GITHUB_TOKEN</code> 只能操作自己這個 repo，推不到 config repo。要另外建一把只對 config repo 有「內容寫入、開 PR」權限的 token（GitHub App 或 fine-grained token），存成 secret，例如 <code>CONFIG_REPO_TOKEN</code>。它的權限比「正式叢集的 admin」小得多，而且改動還要經過 PR review。</p>
+<p>staging 可以讓 PR 自動合併，prod 要人核准。合併之後，Argo CD 在幾分鐘內（預設每 3 分鐘內檢查一次 git，也可以設 webhook 立刻通知）偵測到新 commit 並同步。</p>
+
+<div class="callout practice"><strong>💡 實務上：出事時 revert 哪一個 repo</strong><br>prod 上了壞版本，直覺是去 app repo revert 那個 commit。但那樣要重新跑測試、建置映像、再開一次 config repo 的 PR，十幾分鐘後才會上線。止血要 revert 的是 config repo 裡改 image tag 的那個 commit：上一版的映像還在 registry，Argo CD 同步完就回去了。程式的修正再照正常流程從 app repo 走一次。值班 runbook 要寫清楚 config repo 在哪、誰有權限合併 prod 的 PR，半夜才不會卡在找人核准。</div>
+
+<h2>從 kind 到 EKS</h2>
+<p><strong>EKS</strong>（Amazon Elastic Kubernetes Service）是 AWS 代管的 Kubernetes：AWS 負責控制平面，你負責節點上的工作負載。叢集本身通常用 OpenTofu 建立（<a href="../../devops/lessons/20-iac.html">devops 課第 20 課</a>）。你在 kind 學的物件（Deployment、Service、HTTPRoute、PVC、RBAC）在 EKS 上完全一樣，不同的是底下的實作：</p>
+<div class="table-wrap"><table>
+  <tr><th>項目</th><th>這門課的 kind</th><th>EKS</th><th>對你的影響</th></tr>
+  <tr><td>控制平面</td><td>control-plane 容器，看得到 etcd 的 Pod</td><td>AWS 代管、跨可用區，看不到 etcd 與控制平面節點</td><td>不用備份 etcd、不用維護 API server；按叢集每小時收費（標準支援 0.10 美元、延伸支援 0.60 美元）</td></tr>
+  <tr><td>節點</td><td>Docker 容器</td><td>EC2：managed node group、Karpenter、Auto Mode；或 Fargate</td><td>見下方</td></tr>
+  <tr><td>網路（CNI）</td><td>kindnet，Pod 用叢集內部網段</td><td><strong>VPC CNI</strong>：每個 Pod 直接拿 VPC 子網路的 IP</td><td>Pod 多了子網路會用完 IP，新 Pod 卡在 ContainerCreating；建 VPC 時要規劃夠大的 CIDR</td></tr>
+  <tr><td>對外流量</td><td>cloud-provider-kind 開 Envoy 容器</td><td><strong>AWS Load Balancer Controller</strong>：Service 變成 NLB、Gateway 變成 ALB 或 NLB</td><td>第 5 課的 Gateway／HTTPRoute 寫法不變；v3.0.0 起 Gateway API 支援 GA，最新 v3.6.2。每個負載平衡器按小時計費</td></tr>
+  <tr><td>儲存</td><td>local-path</td><td><strong>EBS CSI driver</strong>，常用 gp3</td><td>EBS 磁碟只存在一個可用區，Pod 只能排到那個可用區的節點（<a href="11-storage.html">第 11 課</a>）</td></tr>
+  <tr><td>人的身分</td><td>kubeconfig 裡的憑證</td><td>IAM 身分；用 <strong>access entries</strong> 把 IAM 角色對應到叢集權限；<code>aws eks update-kubeconfig</code> 產生 kubeconfig</td><td>權限跟著公司的 IAM 與 SSO 走，離職就失效</td></tr>
+  <tr><td>Pod 的 AWS 權限</td><td>沒有</td><td>Pod Identity（<a href="12-security.html">第 12 課</a>），不需要 OIDC provider</td><td>程式不用放 access key</td></tr>
+  <tr><td>可觀測性</td><td>kubectl logs、top</td><td>CloudWatch Container Insights，或自建 Prometheus＋Grafana</td><td>log 與指標要送出叢集，Pod 刪掉後還查得到</td></tr>
+</table></div>
+<p>節點有四種提供方式，選擇取決於你想管多少：</p>
+<ul>
+  <li><strong>managed node group</strong>：AWS 幫你管理一組 EC2（Auto Scaling group），升級時由 AWS 滾動替換節點，但什麼時候升級、用哪種機型由你決定。</li>
+  <li><strong>Karpenter</strong>：開源的節點自動擴展工具。看到 Pending 的 Pod，直接開一台大小剛好的 EC2；節點閒置就收掉。省錢，但它本身要安裝與維護。</li>
+  <li><strong>EKS Auto Mode</strong>：節點、擴展、負載平衡、區塊儲存都交給 AWS，控制平面升級後節點也由它逐步換新（會遵守 PDB）。除了 EC2 費用，還有依執行個體計算的管理費。</li>
+  <li><strong>Fargate</strong>：每個 Pod 跑在自己的小虛擬機，沒有節點要管。限制多：不能跑 DaemonSet、不能用特權容器與 hostNetwork、不能掛 EBS、只能在私有子網路、不支援 Pod Identity（要用 IRSA）。</li>
+</ul>
+<p>費用的大項：控制平面的時數、節點、<strong>NAT Gateway</strong>（私有子網路的節點拉映像、呼叫外部 API 都經過它，按時數加流量計費）、負載平衡器。每個 <code>type: LoadBalancer</code> 的 Service 都是一個獨立計費的負載平衡器，所以對外入口集中在少數幾個 Gateway。</p>
+
+<h2>版本與升級</h2>
+<p>Kubernetes 每年大約發佈三個小版本（1.35、1.36、1.37…）。EKS 每個版本有 14 個月的<strong>標準支援</strong>，之後是 12 個月要加錢的<strong>延伸支援</strong>（extended support）。目前標準支援 1.34～1.37、延伸支援 1.31～1.33；1.37 在 2026-10-01 上 EKS。延伸支援結束後，AWS 會自動把<strong>控制平面</strong>升到最舊的受支援版本，但<strong>節點群組不會跟著升</strong>。等到被迫升級最危險，所以要每年排兩三次升級，當成例行工作。</p>
+<p>升級的規則（AWS 的升級文件）：</p>
+<ul>
+  <li><strong>一次只能升一個小版本</strong>：1.35 要到 1.37，必須 1.35 → 1.36 → 1.37。</li>
+  <li><strong>控制平面先，節點後</strong>：Kubernetes 的版本差距政策是 kubelet 可以比 API server 舊最多 3 個小版本，但不能比它新。EKS 更嚴格：升級控制平面之前，managed node group 和 Fargate 要先跟控制平面同版本。所以每升一版控制平面，就把外掛與節點跟上，再升下一版。</li>
+  <li><strong>開始後不能暫停</strong>：控制平面升級一旦開始就不能停；EKS 檢查失敗會自動退回原版本。升級後 7 天內可以退回上一個小版本，超過就只能新建叢集搬遷。</li>
+  <li><strong>需要空的 IP</strong>：升級時 EKS 要從叢集的子網路拿最多 5 個 IP，子網路用光了升級會失敗（又是 VPC CNI 的 IP 規劃問題）。</li>
+</ul>
+<p>升級前的檢查：</p>
+<ol>
+  <li><strong>upgrade insights</strong>：EKS 會自動掃描叢集，列出已棄用 API 的呼叫、節點版本落後等問題。對照 Kubernetes 的已移除 API 清單（Deprecated API Migration Guide）：這份清單最後一次移除內建 API 是 1.32，但 CRD 與第三方外掛的 API 版本由它們自己的版本決定，一樣要查。</li>
+  <li><strong>外掛</strong>：VPC CNI、CoreDNS、kube-proxy、Load Balancer Controller、Karpenter 都有對應 Kubernetes 版本的相容表。AWS 文件特別提到：VPC CNI 早於 1.8.0 的，要先升級再升叢集。</li>
+  <li><strong>PDB</strong>：節點升級就是一台一台 drain（<a href="09-rollouts-pdb.html">第 9 課</a>）。<code>minAvailable</code> 等於副本數（或 <code>100%</code>、<code>maxUnavailable: 0</code>）的 PDB 允許中斷 0 個 Pod，drain 會永遠卡住。</li>
+  <li><strong>落後的節點群組</strong>：還停在舊版本的節點群組，要先升到跟控制平面同版本。</li>
+</ol>
+<p>每一版的順序是：控制平面 → 外掛（升到對應這一版的建議版本）→ 節點（滾動替換，靠 PDB、多副本、分散規則、優雅關機做到不中斷）。先在 staging 叢集完整跑一遍，再升 prod。</p>
+
+<h2>實務：和平台團隊合作</h2>
+<p>在有一定規模的公司，叢集由<strong>平台團隊</strong>維運，你是使用叢集的應用團隊。分工大致是：</p>
+<div class="table-wrap"><table>
+  <tr><th>平台團隊</th><th>應用團隊（你）</th></tr>
+  <tr><td>建立與升級叢集、節點、外掛；Argo CD 本身；AppProject、namespace、ResourceQuota；監控與 log 的基礎設施；Gateway 與憑證</td><td>服務的 chart 與每個環境的值檔；Application；映像與 CI；服務的 dashboard、告警與 runbook；配合升級修正自己的設定</td></tr>
+</table></div>
+<p>平台團隊排升級時，最常被卡住的是應用團隊的設定：PDB 堵死 drain、沒有 requests 讓新節點排不下、單一副本一換節點就中斷。交付一個服務前，用這份清單檢查自己（期末專題第 16 課要全部通過）：</p>
+<ul>
+  <li>resources 的 requests 與 memory limit（第 8 課）</li>
+  <li>readiness、liveness probe 與優雅關機（第 7 課）</li>
+  <li>至少 2～3 個副本、PDB 留出可中斷的空間、topologySpreadConstraints 分散到不同節點與可用區（第 9 課）</li>
+  <li>securityContext 通過 restricted、專用的 ServiceAccount、NetworkPolicy（第 12 課）</li>
+  <li>映像釘版本、設定與機密分開（第 6 課）</li>
+  <li>dashboard 與告警：出事時看得到、被叫得醒</li>
+</ul>
+<p>開口問平台團隊時，帶著具體資料：「cafe-prod namespace 的 Pod 卡在 ContainerCreating，事件是 failed to assign an IP address」比「叢集壞了」快得多被處理。</p>
+
+<h2>練習</h2>
+<p>練習 1 在頁面上寫。練習 2～4 在 <code>learn</code> 資料夾執行頁面上的指令，起始檔會複製到 <code>kubernetes/practice/work/15/</code>。這三題都是靜態檢查，<strong>不需要叢集</strong>；練習 3 用 Docker 跑 actionlint（和 devops 課第 15 課同一個映像），並在暫存資料夾執行你寫的 yq 指令（需要 <code>brew install yq</code>）。</p>
+
+<div class="exercise">
+  <p>練習 1：寫出 Argo CD 每一輪的決定 <code>planSync(desired, live, opts)</code>。資源用 <code>kind/namespace/name</code> 當鍵（例如 <code>Deployment/cafe/cafe-api</code>）。<code>desired</code> 是 git 裡的資源，<code>live</code> 是叢集裡的資源，<code>managedByApp: true</code> 表示是這個 Application 建立的。規則：</p>
+  <ul>
+    <li>git 有、叢集沒有：缺少。兩邊都有但 <code>spec</code> 不同：有差異。叢集有、git 沒有、而且 <code>managedByApp</code>：多出來。三者任一存在，<code>outOfSync</code> 就是 <code>true</code>。沒有 <code>managedByApp</code> 的資源不屬於這個 Application，不算差異，<strong>永遠不能刪</strong>。</li>
+    <li>比對 <code>spec</code> 時，物件的欄位順序不算差異，陣列的順序算。<code>opts.ignore</code> 裡每一條 <code>{ kind, path }</code>（path 是 <code>/spec/replicas</code> 這種 JSON pointer）對符合 kind 的資源，兩邊都不比這個欄位。</li>
+    <li>要不要動手：<code>opts.selfHeal</code> 是 <code>true</code>，或 git 有新 commit（<code>opts.revision</code> 不等於 <code>opts.syncedRevision</code>）時才動手；否則全部只回報（三個陣列都空，<code>outOfSync</code> 照實回報）。動手時缺少的放 <code>create</code>、有差異的放 <code>update</code>；多出來的只有 <code>opts.prune</code> 為 <code>true</code> 才放 <code>delete</code>。</li>
+    <li>三個陣列都放鍵、依字串排序。不能修改傳入的資料。</li>
+  </ul>
+  <script type="start">
+type Res = { kind: string, namespace: string, name: string, spec: Record<string, unknown>, managedByApp?: boolean }
+type Ignore = { kind: string, path: string }   // path 例如 '/spec/replicas'
+type Opts = { prune: boolean, selfHeal: boolean, revision: string, syncedRevision: string, ignore: Ignore[] }
+type Plan = { create: string[], update: string[], delete: string[], outOfSync: boolean }
+
+const keyOf = (r: Res) => `${r.kind}/${r.namespace}/${r.name}`
+
+function planSync(desired: Res[], live: Res[], opts: Opts): Plan {
+  // 1. 用鍵找出：缺少的、spec 有差異的（先拿掉 ignore 的欄位、逐欄位比對）、多出來的（只算 managedByApp）
+  // 2. 決定要不要動手：selfHeal，或 git 有新 commit
+  // 3. 動手時：create、update；prune 才 delete
+  return { create: [], update: [], delete: [], outOfSync: false }
+}
+
+const api = (replicas: number): Res => ({ kind: 'Deployment', namespace: 'cafe', name: 'cafe-api', spec: { replicas, image: 'cafe-api:v2' }, managedByApp: true })
+console.log(planSync([api(3)], [api(5)], { prune: true, selfHeal: true, revision: 'b2', syncedRevision: 'b2', ignore: [{ kind: 'Deployment', path: '/spec/replicas' }] }))
+</script>
+  <script type="answer">
+type Res = { kind: string, namespace: string, name: string, spec: Record<string, unknown>, managedByApp?: boolean }
+type Ignore = { kind: string, path: string }   // path 例如 '/spec/replicas'
+type Opts = { prune: boolean, selfHeal: boolean, revision: string, syncedRevision: string, ignore: Ignore[] }
+type Plan = { create: string[], update: string[], delete: string[], outOfSync: boolean }
+
+const keyOf = (r: Res) => `${r.kind}/${r.namespace}/${r.name}`
+
+function same(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false
+  if (Array.isArray(a) !== Array.isArray(b)) return false
+  const ka = Object.keys(a), kb = Object.keys(b)
+  return ka.length === kb.length && ka.every(k => k in b && same((a as any)[k], (b as any)[k]))
+}
+
+// 複製一份 spec，拿掉這個 kind 要忽略的欄位
+function compared(r: Res, ignore: Ignore[]): Record<string, unknown> {
+  const spec = structuredClone(r.spec)
+  for (const rule of ignore) {
+    if (rule.kind !== r.kind) continue
+    const parts = rule.path.split('/').slice(2)   // '/spec/replicas' → ['replicas']
+    let obj: any = spec
+    for (const p of parts.slice(0, -1)) obj = obj?.[p]
+    if (obj && typeof obj === 'object') delete obj[parts[parts.length - 1]]
+  }
+  return spec
+}
+
+function planSync(desired: Res[], live: Res[], opts: Opts): Plan {
+  const liveByKey = new Map(live.map(r => [keyOf(r), r]))
+  const wanted = new Set(desired.map(keyOf))
+  const missing: string[] = []
+  const changed: string[] = []
+  for (const d of desired) {
+    const l = liveByKey.get(keyOf(d))
+    if (!l) missing.push(keyOf(d))
+    else if (!same(compared(d, opts.ignore), compared(l, opts.ignore))) changed.push(keyOf(d))
+  }
+  const extra = live.filter(l => l.managedByApp && !wanted.has(keyOf(l))).map(keyOf)
+  const act = opts.selfHeal || opts.revision !== opts.syncedRevision
+  return {
+    create: act ? missing.sort() : [],
+    update: act ? changed.sort() : [],
+    delete: act && opts.prune ? extra.sort() : [],
+    outOfSync: missing.length + changed.length + extra.length > 0,
+  }
+}
+
+const api = (replicas: number): Res => ({ kind: 'Deployment', namespace: 'cafe', name: 'cafe-api', spec: { replicas, image: 'cafe-api:v2' }, managedByApp: true })
+console.log(planSync([api(3)], [api(5)], { prune: true, selfHeal: true, revision: 'b2', syncedRevision: 'b2', ignore: [{ kind: 'Deployment', path: '/spec/replicas' }] }))
+</script>
+  <script type="tests">
+const mk = (kind: string, name: string, spec: Record<string, unknown>, managedByApp = true): Res => ({ kind, namespace: 'cafe', name, spec, managedByApp })
+const base: Opts = { prune: true, selfHeal: true, revision: 'a1', syncedRevision: 'a1', ignore: [] }
+const o = (x: Partial<Opts>): Opts => ({ ...base, ...x })
+const empty = { create: [], update: [], delete: [], outOfSync: false }
+const dep = (spec: Record<string, unknown>, managed = true) => mk('Deployment', 'cafe-api', spec, managed)
+
+assert.deepEqual(planSync(
+  [dep({ image: 'v2', resources: { requests: { cpu: '100m', memory: '128Mi' } } })],
+  [dep({ resources: { requests: { memory: '128Mi', cpu: '100m' } }, image: 'v2' })], base), empty,
+  '欄位順序不同但內容一樣，要判定為相同（不能用 JSON.stringify 比對），回傳全空且 outOfSync false')
+assert.deepEqual(planSync([dep({ args: ['a', 'b'] })], [dep({ args: ['b', 'a'] })], base).update, ['Deployment/cafe/cafe-api'],
+  '陣列的順序有意義（例如 args），順序不同要算差異')
+
+assert.deepEqual(planSync([dep({ image: 'v1' }), mk('Service', 'cafe-api', { port: 80 })], [dep({ image: 'v1' })], o({ revision: 'b2' })),
+  { create: ['Service/cafe/cafe-api'], update: [], delete: [], outOfSync: true }, 'git 新增的資源要放進 create')
+assert.deepEqual(planSync([dep({ image: 'v2' })], [dep({ image: 'v1' })], o({ selfHeal: false, revision: 'b2' })),
+  { create: [], update: ['Deployment/cafe/cafe-api'], delete: [], outOfSync: true }, 'git 有新 commit（revision 改變）時，即使 selfHeal 關閉也要 update')
+
+const cron = mk('CronJob', 'cafe-report', { schedule: '0 3 * * *' })
+assert.deepEqual(planSync([dep({ image: 'v1' })], [dep({ image: 'v1' }), cron], o({ revision: 'b2' })).delete, ['CronJob/cafe/cafe-report'],
+  'git 刪掉的資源，prune 開啟時要放進 delete')
+assert.deepEqual(planSync([dep({ image: 'v1' })], [dep({ image: 'v1' }), cron], o({ prune: false, revision: 'b2' })),
+  { create: [], update: [], delete: [], outOfSync: true }, 'prune 關閉時不能刪除，但要回報 outOfSync: true')
+
+const manual = mk('ConfigMap', 'debug-notes', { a: '1' }, false)
+assert.deepEqual(planSync([dep({ image: 'v1' })], [dep({ image: 'v1' }), manual], o({ revision: 'b2' })), empty,
+  '沒有 managedByApp 的資源不屬於這個 Application：不能刪，也不算 OutOfSync')
+
+assert.deepEqual(planSync([dep({ image: 'v1', replicas: 3 })], [dep({ image: 'v1', replicas: 10 })], o({ selfHeal: false })),
+  { create: [], update: [], delete: [], outOfSync: true }, 'selfHeal 關閉、git 沒有新 commit 時，手動改的 drift 只回報 outOfSync，不能 update')
+assert.deepEqual(planSync([dep({ image: 'v1' })], [], o({ selfHeal: false })),
+  { create: [], update: [], delete: [], outOfSync: true }, 'selfHeal 關閉、git 沒有新 commit 時，被手動刪掉的資源也只回報，不能 create')
+assert.deepEqual(planSync([dep({ image: 'v1', replicas: 3 })], [dep({ image: 'v1', replicas: 10 })], base).update, ['Deployment/cafe/cafe-api'],
+  'selfHeal 開啟時，手動改的 drift 要 update 回 git 的樣子')
+
+const hpa = o({ ignore: [{ kind: 'Deployment', path: '/spec/replicas' }] })
+assert.deepEqual(planSync([dep({ image: 'v1', replicas: 3 })], [dep({ image: 'v1', replicas: 7 })], hpa), empty,
+  'ignore 了 Deployment 的 /spec/replicas：HPA 改的副本數不算差異')
+assert.deepEqual(planSync([dep({ image: 'v1' })], [dep({ image: 'v1', replicas: 7 })], hpa), empty,
+  'git 沒有寫 replicas、叢集有（HPA 設的）：忽略之後也算相同')
+assert.deepEqual(planSync([dep({ image: 'v2', replicas: 3 })], [dep({ image: 'v1', replicas: 7 })], hpa).update, ['Deployment/cafe/cafe-api'],
+  'ignore 只略過 replicas，其他欄位（image）改變仍要 update')
+assert.deepEqual(planSync([mk('StatefulSet', 'db', { replicas: 1 })], [mk('StatefulSet', 'db', { replicas: 2 })], hpa).update, ['StatefulSet/cafe/db'],
+  'ignore 只套用在符合 kind 的資源（這條規則只對 Deployment）')
+const nested = o({ ignore: [{ kind: 'Deployment', path: '/spec/template/metadata/annotations' }] })
+assert.deepEqual(planSync([dep({ template: { metadata: { annotations: { a: '1' } }, image: 'v1' } })], [dep({ template: { metadata: { annotations: { a: '2' } }, image: 'v1' } })], nested), empty,
+  'path 可以是多層的，例如 /spec/template/metadata/annotations')
+
+const many = planSync([mk('Service', 'b', {}), mk('Service', 'a', {}), mk('ConfigMap', 'z', {})], [mk('Secret', 'y', {}), mk('Secret', 'x', {})], base)
+assert.deepEqual(many, { create: ['ConfigMap/cafe/z', 'Service/cafe/a', 'Service/cafe/b'], update: [], delete: ['Secret/cafe/x', 'Secret/cafe/y'], outOfSync: true },
+  '三個陣列都要依鍵的字串排序')
+
+const d1 = [dep({ image: 'v1', replicas: 3 })]
+const l1 = [dep({ image: 'v1', replicas: 7 }), cron]
+const snap = structuredClone([d1, l1])
+planSync(d1, l1, hpa)
+assert.deepEqual([d1, l1], snap, '不能修改傳入的 desired、live（拿掉 ignore 欄位前要先複製）')
+</script>
+  <script type="wrong">
+type Res = { kind: string, namespace: string, name: string, spec: Record<string, unknown>, managedByApp?: boolean }
+type Ignore = { kind: string, path: string }
+type Opts = { prune: boolean, selfHeal: boolean, revision: string, syncedRevision: string, ignore: Ignore[] }
+type Plan = { create: string[], update: string[], delete: string[], outOfSync: boolean }
+const keyOf = (r: Res) => `${r.kind}/${r.namespace}/${r.name}`
+// prune 關閉時仍刪除
+function same(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false
+  if (Array.isArray(a) !== Array.isArray(b)) return false
+  const ka = Object.keys(a), kb = Object.keys(b)
+  return ka.length === kb.length && ka.every(k => k in b && same((a as any)[k], (b as any)[k]))
+}
+function compared(r: Res, ignore: Ignore[]): Record<string, unknown> {
+  const spec = structuredClone(r.spec)
+  for (const rule of ignore) {
+    if (rule.kind !== r.kind) continue
+    const parts = rule.path.split('/').slice(2)
+    let obj: any = spec
+    for (const p of parts.slice(0, -1)) obj = obj?.[p]
+    if (obj && typeof obj === 'object') delete obj[parts[parts.length - 1]]
+  }
+  return spec
+}
+function planSync(desired: Res[], live: Res[], opts: Opts): Plan {
+  const liveByKey = new Map(live.map(r => [keyOf(r), r]))
+  const wanted = new Set(desired.map(keyOf))
+  const missing: string[] = [], changed: string[] = []
+  for (const d of desired) {
+    const l = liveByKey.get(keyOf(d))
+    if (!l) missing.push(keyOf(d))
+    else if (!same(compared(d, opts.ignore), compared(l, opts.ignore))) changed.push(keyOf(d))
+  }
+  const extra = live.filter(l => l.managedByApp && !wanted.has(keyOf(l))).map(keyOf)
+  const act = opts.selfHeal || opts.revision !== opts.syncedRevision
+  return { create: act ? missing.sort() : [], update: act ? changed.sort() : [], delete: act ? extra.sort() : [], outOfSync: missing.length + changed.length + extra.length > 0 }
+}
+</script>
+  <script type="wrong">
+type Res = { kind: string, namespace: string, name: string, spec: Record<string, unknown>, managedByApp?: boolean }
+type Ignore = { kind: string, path: string }
+type Opts = { prune: boolean, selfHeal: boolean, revision: string, syncedRevision: string, ignore: Ignore[] }
+type Plan = { create: string[], update: string[], delete: string[], outOfSync: boolean }
+const keyOf = (r: Res) => `${r.kind}/${r.namespace}/${r.name}`
+// 刪除了沒有 managedByApp 標記的資源
+function same(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false
+  if (Array.isArray(a) !== Array.isArray(b)) return false
+  const ka = Object.keys(a), kb = Object.keys(b)
+  return ka.length === kb.length && ka.every(k => k in b && same((a as any)[k], (b as any)[k]))
+}
+function compared(r: Res, ignore: Ignore[]): Record<string, unknown> {
+  const spec = structuredClone(r.spec)
+  for (const rule of ignore) {
+    if (rule.kind !== r.kind) continue
+    const parts = rule.path.split('/').slice(2)
+    let obj: any = spec
+    for (const p of parts.slice(0, -1)) obj = obj?.[p]
+    if (obj && typeof obj === 'object') delete obj[parts[parts.length - 1]]
+  }
+  return spec
+}
+function planSync(desired: Res[], live: Res[], opts: Opts): Plan {
+  const liveByKey = new Map(live.map(r => [keyOf(r), r]))
+  const wanted = new Set(desired.map(keyOf))
+  const missing: string[] = [], changed: string[] = []
+  for (const d of desired) {
+    const l = liveByKey.get(keyOf(d))
+    if (!l) missing.push(keyOf(d))
+    else if (!same(compared(d, opts.ignore), compared(l, opts.ignore))) changed.push(keyOf(d))
+  }
+  const extra = live.filter(l => !wanted.has(keyOf(l))).map(keyOf)
+  const act = opts.selfHeal || opts.revision !== opts.syncedRevision
+  return { create: act ? missing.sort() : [], update: act ? changed.sort() : [], delete: act && opts.prune ? extra.sort() : [], outOfSync: missing.length + changed.length + extra.length > 0 }
+}
+</script>
+  <script type="wrong">
+type Res = { kind: string, namespace: string, name: string, spec: Record<string, unknown>, managedByApp?: boolean }
+type Ignore = { kind: string, path: string }
+type Opts = { prune: boolean, selfHeal: boolean, revision: string, syncedRevision: string, ignore: Ignore[] }
+type Plan = { create: string[], update: string[], delete: string[], outOfSync: boolean }
+const keyOf = (r: Res) => `${r.kind}/${r.namespace}/${r.name}`
+// 沒套用 ignore：HPA 改的 replicas 被當成差異
+function same(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false
+  if (Array.isArray(a) !== Array.isArray(b)) return false
+  const ka = Object.keys(a), kb = Object.keys(b)
+  return ka.length === kb.length && ka.every(k => k in b && same((a as any)[k], (b as any)[k]))
+}
+function planSync(desired: Res[], live: Res[], opts: Opts): Plan {
+  const liveByKey = new Map(live.map(r => [keyOf(r), r]))
+  const wanted = new Set(desired.map(keyOf))
+  const missing: string[] = [], changed: string[] = []
+  for (const d of desired) {
+    const l = liveByKey.get(keyOf(d))
+    if (!l) missing.push(keyOf(d))
+    else if (!same(d.spec, l.spec)) changed.push(keyOf(d))
+  }
+  const extra = live.filter(l => l.managedByApp && !wanted.has(keyOf(l))).map(keyOf)
+  const act = opts.selfHeal || opts.revision !== opts.syncedRevision
+  return { create: act ? missing.sort() : [], update: act ? changed.sort() : [], delete: act && opts.prune ? extra.sort() : [], outOfSync: missing.length + changed.length + extra.length > 0 }
+}
+</script>
+  <script type="wrong">
+type Res = { kind: string, namespace: string, name: string, spec: Record<string, unknown>, managedByApp?: boolean }
+type Ignore = { kind: string, path: string }
+type Opts = { prune: boolean, selfHeal: boolean, revision: string, syncedRevision: string, ignore: Ignore[] }
+type Plan = { create: string[], update: string[], delete: string[], outOfSync: boolean }
+const keyOf = (r: Res) => `${r.kind}/${r.namespace}/${r.name}`
+// 用 JSON.stringify 比對：欄位順序不同就被當成差異
+function compared(r: Res, ignore: Ignore[]): Record<string, unknown> {
+  const spec = structuredClone(r.spec)
+  for (const rule of ignore) {
+    if (rule.kind !== r.kind) continue
+    const parts = rule.path.split('/').slice(2)
+    let obj: any = spec
+    for (const p of parts.slice(0, -1)) obj = obj?.[p]
+    if (obj && typeof obj === 'object') delete obj[parts[parts.length - 1]]
+  }
+  return spec
+}
+function planSync(desired: Res[], live: Res[], opts: Opts): Plan {
+  const liveByKey = new Map(live.map(r => [keyOf(r), r]))
+  const wanted = new Set(desired.map(keyOf))
+  const missing: string[] = [], changed: string[] = []
+  for (const d of desired) {
+    const l = liveByKey.get(keyOf(d))
+    if (!l) missing.push(keyOf(d))
+    else if (JSON.stringify(compared(d, opts.ignore)) !== JSON.stringify(compared(l, opts.ignore))) changed.push(keyOf(d))
+  }
+  const extra = live.filter(l => l.managedByApp && !wanted.has(keyOf(l))).map(keyOf)
+  const act = opts.selfHeal || opts.revision !== opts.syncedRevision
+  return { create: act ? missing.sort() : [], update: act ? changed.sort() : [], delete: act && opts.prune ? extra.sort() : [], outOfSync: missing.length + changed.length + extra.length > 0 }
+}
+</script>
+  <script type="wrong">
+type Res = { kind: string, namespace: string, name: string, spec: Record<string, unknown>, managedByApp?: boolean }
+type Ignore = { kind: string, path: string }
+type Opts = { prune: boolean, selfHeal: boolean, revision: string, syncedRevision: string, ignore: Ignore[] }
+type Plan = { create: string[], update: string[], delete: string[], outOfSync: boolean }
+const keyOf = (r: Res) => `${r.kind}/${r.namespace}/${r.name}`
+// 不管 selfHeal：每次都把 drift 改回去
+function same(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false
+  if (Array.isArray(a) !== Array.isArray(b)) return false
+  const ka = Object.keys(a), kb = Object.keys(b)
+  return ka.length === kb.length && ka.every(k => k in b && same((a as any)[k], (b as any)[k]))
+}
+function compared(r: Res, ignore: Ignore[]): Record<string, unknown> {
+  const spec = structuredClone(r.spec)
+  for (const rule of ignore) {
+    if (rule.kind !== r.kind) continue
+    const parts = rule.path.split('/').slice(2)
+    let obj: any = spec
+    for (const p of parts.slice(0, -1)) obj = obj?.[p]
+    if (obj && typeof obj === 'object') delete obj[parts[parts.length - 1]]
+  }
+  return spec
+}
+function planSync(desired: Res[], live: Res[], opts: Opts): Plan {
+  const liveByKey = new Map(live.map(r => [keyOf(r), r]))
+  const wanted = new Set(desired.map(keyOf))
+  const missing: string[] = [], changed: string[] = []
+  for (const d of desired) {
+    const l = liveByKey.get(keyOf(d))
+    if (!l) missing.push(keyOf(d))
+    else if (!same(compared(d, opts.ignore), compared(l, opts.ignore))) changed.push(keyOf(d))
+  }
+  const extra = live.filter(l => l.managedByApp && !wanted.has(keyOf(l))).map(keyOf)
+  return { create: missing.sort(), update: changed.sort(), delete: opts.prune ? extra.sort() : [], outOfSync: missing.length + changed.length + extra.length > 0 }
+}
+</script>
+  <script type="wrong">
+type Res = { kind: string, namespace: string, name: string, spec: Record<string, unknown>, managedByApp?: boolean }
+type Ignore = { kind: string, path: string }
+type Opts = { prune: boolean, selfHeal: boolean, revision: string, syncedRevision: string, ignore: Ignore[] }
+type Plan = { create: string[], update: string[], delete: string[], outOfSync: boolean }
+const keyOf = (r: Res) => `${r.kind}/${r.namespace}/${r.name}`
+// 直接從傳入的 spec 刪掉 ignore 的欄位：改到了呼叫者的資料
+function same(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false
+  if (Array.isArray(a) !== Array.isArray(b)) return false
+  const ka = Object.keys(a), kb = Object.keys(b)
+  return ka.length === kb.length && ka.every(k => k in b && same((a as any)[k], (b as any)[k]))
+}
+function compared(r: Res, ignore: Ignore[]): Record<string, unknown> {
+  const spec = r.spec
+  for (const rule of ignore) {
+    if (rule.kind !== r.kind) continue
+    const parts = rule.path.split('/').slice(2)
+    let obj: any = spec
+    for (const p of parts.slice(0, -1)) obj = obj?.[p]
+    if (obj && typeof obj === 'object') delete obj[parts[parts.length - 1]]
+  }
+  return spec
+}
+function planSync(desired: Res[], live: Res[], opts: Opts): Plan {
+  const liveByKey = new Map(live.map(r => [keyOf(r), r]))
+  const wanted = new Set(desired.map(keyOf))
+  const missing: string[] = [], changed: string[] = []
+  for (const d of desired) {
+    const l = liveByKey.get(keyOf(d))
+    if (!l) missing.push(keyOf(d))
+    else if (!same(compared(d, opts.ignore), compared(l, opts.ignore))) changed.push(keyOf(d))
+  }
+  const extra = live.filter(l => l.managedByApp && !wanted.has(keyOf(l))).map(keyOf)
+  const act = opts.selfHeal || opts.revision !== opts.syncedRevision
+  return { create: act ? missing.sort() : [], update: act ? changed.sort() : [], delete: act && opts.prune ? extra.sort() : [], outOfSync: missing.length + changed.length + extra.length > 0 }
+}
+</script>
+</div>
+<p>真正的 Argo CD 比這個多做幾件事：比對前會先正規化（例如補上 Kubernetes 自動填的預設值），依 sync wave 與資源種類排順序，套用後還要等健康狀態。但「git 是期望狀態、叢集是實際狀態、只做差額、有開關決定要不要動手」就是它的骨架，也是第 1 課控制迴圈的同一套想法。</p>
+
+<div class="local" data-test="ex2" data-files="ex2/cafe-prod.yaml">
+  <p>練習 2：完成 <code>ex2/cafe-prod.yaml</code>，一個名為 <code>cafe-prod</code>、放在 <code>argocd</code> namespace、project 是 <code>cafe</code> 的 Application：部署 config repo <code>https://github.com/example-cafe/cafe-config</code> 的 <code>charts/cafe</code>，valueFiles 用 <code>values-prod.yaml</code>，targetRevision 是這次發佈的 tag <code>release-2026.11.1</code>；目的地是同一個叢集（<code>https://kubernetes.default.svc</code>）的 <code>cafe-prod</code> namespace。開啟自動同步並打開 prune 與 selfHeal，syncOptions 自動建立 namespace。prod 的 chart 開了 HPA：對所有 Deployment 的 <code>/spec/replicas</code> 設 ignoreDifferences，並讓同步時也遵守它。測試先用 kubeconform（含 Argo CD Application 的 schema，strict）檢查，再逐欄檢查。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="ex3/.github/workflows/release.yml">
+  <p>練習 3：<code>ex3/.github/workflows/release.yml</code> 現在是 push 型：<code>deploy</code> job 拿 AWS 角色、產生 kubeconfig、直接 <code>kubectl set image</code>，映像還是 latest。改成 GitOps：<code>build</code> job 推的映像 tag 改用 <code>${{ github.sha }}</code>；刪掉 <code>deploy</code>，寫一個 <code>bump-config</code> job（在 build 之後）：用 <code>actions/checkout</code>（同一個釘好的 SHA）以 <code>repository: example-cafe/cafe-config</code>、<code>token: ${{ secrets.CONFIG_REPO_TOKEN }}</code>、<code>path: config</code> 取出 config repo；用 yq 把 <code>config/charts/cafe/values-prod.yaml</code> 的 <code>image.tag</code> 改成這次的 SHA（用 step 的 <code>env</code> 傳入、yq 裡用 <code>strenv</code>）；最後在新分支 commit、push，用 <code>gh pr create</code> 開 PR（<code>gh</code> 讀 <code>GH_TOKEN</code> 環境變數）。最上層 permissions 只有 <code>contents: read</code>，所有 uses 釘 40 字元 SHA。測試跑 actionlint、檢查工作流程裡沒有 kubectl、helm upgrade、kubeconfig 或 AWS 部署角色，再到暫存資料夾實際執行你的 yq 指令，確認 values-prod.yaml 只有 image.tag 那一行改變。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="ex4/upgrade.json">
+  <p>練習 4：<code>ex4/upgrade.json</code> 的 <code>cluster</code> 是一個 EKS 1.35 叢集的現況（節點群組、外掛、PDB），不要改它。填兩個陣列，把它升到 1.37：</p>
+  <ul>
+    <li><code>steps</code>：依序寫出步驟代碼。可以用的代碼：<code>check-insights</code>（看 upgrade insights 與已棄用 API）、<code>fix-blockers</code>（排除阻擋項目）、<code>cp-1.36</code>、<code>cp-1.37</code>（升級控制平面到該版）、<code>addons-1.36</code>、<code>addons-1.37</code>（外掛升到對應該版的建議版本）、<code>nodes-1.36</code>、<code>nodes-1.37</code>（滾動替換所有節點群組到該版）。每個代碼都要用到、各一次。</li>
+    <li><code>blockers</code>：開始升級前必須先處理的項目，格式 <code>pdb/&lt;名稱&gt;</code>、<code>addon/&lt;名稱&gt;</code>、<code>nodegroup/&lt;名稱&gt;</code>。沒有問題的項目不要列。</li>
+  </ul>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：Argo CD 開了 selfHeal。值班的人用 <code>kubectl scale</code> 把 cafe-api 從 3 個副本改成 10 個救火，幾秒後又變回 3 個。正確的做法是？</p>
+  <label data-key="a">把 Argo CD 整個關掉，事後再開</label>
+  <label data-key="b">透過 git 修改（PR 調整 values，或交給 HPA）；真的來不及時，暫停這個 Application 的自動同步並在事故紀錄寫下來，止血後把修正寫回 git 再恢復</label>
+  <label data-key="c">寫個迴圈每秒執行一次 kubectl scale</label>
+  <label data-key="d">直接改 etcd 裡的資料，Argo CD 就不會發現</label>
+  <p class="why">✓ GitOps 下 git 是唯一的真相，手動修改就是 drift，會被修回。長期解法是 HPA，緊急時只暫停這一個 Application 並留紀錄。a 影響所有服務的部署；c 跟 Argo CD 互相拉扯；d 在 EKS 根本碰不到 etcd，而且 Argo CD 比對的就是 API server 回報的狀態，照樣會改回去。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：公司的 EKS 叢集停在 1.33，延伸支援也到期了。會發生什麼事？</p>
+  <label data-key="a">叢集停止運作，所有 Pod 被刪除</label>
+  <label data-key="b">AWS 自動把控制平面升到最舊的受支援版本，但節點群組不會跟著升，要自己升級</label>
+  <label data-key="c">什麼都不會發生，只是不再收到安全更新</label>
+  <label data-key="d">控制平面與節點都會自動升到最新版</label>
+  <p class="why">✓ AWS 文件：延伸支援結束後控制平面會被自動升級，外掛與節點群組要自己處理。被動升級時你沒有先在 staging 測過，也沒檢查 PDB 與外掛相容性，所以要主動規劃。延伸支援期間每小時的費用也比標準支援高。a、d 都不是 AWS 的行為；c 錯在控制平面會被強制升級。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：EKS 上的 cafe-api 尖峰擴展時，新的 Pod 一直卡在 ContainerCreating，事件寫著 failed to assign an IP address。最可能的原因？</p>
+  <label data-key="a">每個節點只能有一個 IP</label>
+  <label data-key="b">VPC CNI 讓每個 Pod 直接使用 VPC 子網路的 IP，子網路的 IP 用完了，新 Pod 拿不到位址</label>
+  <label data-key="c">EKS 不支援 IPv4</label>
+  <label data-key="d">HPA 的 maxReplicas 設太大</label>
+  <p class="why">✓ 這是 EKS 和 kind 很不一樣的地方：kind 的 Pod 用叢集內部的網段，EKS 的 Pod 佔用真的 VPC 位址。子網路太小會成為擴展的天花板，連控制平面升級都需要空的 IP。建 VPC 時就要規劃夠大的 CIDR，或請平台團隊加子網路。a、c 都不是事實；d 只是讓 Pod 變多，真正的限制是位址。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>targetRevision 用 HEAD 或 main 部署 prod</strong>：看不出 prod 跑哪一版，誤合併就直接上線。prod 釘 tag 或 commit。</li>
+  <li><strong>CI 持有正式叢集的 admin 憑證</strong>：CI 被入侵就等於整個叢集被入侵。用 GitOps，CI 只能開 PR；或至少用只能部署單一 namespace 的最小權限角色。</li>
+  <li><strong>GitOps 與 HPA 搶 replicas</strong>：chart 不輸出 replicas，Application 加 ignoreDifferences 與 RespectIgnoreDifferences。</li>
+  <li><strong>救火時直接 kubectl edit</strong>：開了 selfHeal 會被改回去，沒開則留下 git 不知道的設定。止血後一定要寫回 git。</li>
+  <li><strong>沒開 prune</strong>：git 裡刪掉的資源一直留在叢集，佔資源也讓人誤會。開 prune，並用 project 限制範圍。</li>
+  <li><strong>以為 EKS 會幫你升級節點</strong>：控制平面與節點分開升級，延伸支援到期也只會強制升控制平面。</li>
+  <li><strong>一次跳兩個小版本</strong>：EKS 一次只能升一個小版本，每一版都要把外掛與節點跟上再往下。</li>
+  <li><strong>PDB 設成 minAvailable 等於副本數</strong>：drain 永遠卡住，整個叢集的升級被你的服務擋下。</li>
+  <li><strong>子網路太小</strong>：VPC CNI 的 Pod 用 VPC 的 IP，擴展與升級都會因為 IP 不夠失敗。</li>
+  <li><strong>沒算 NAT Gateway 與負載平衡器的費用</strong>：常是 EKS 帳單的大項。對外入口集中在少數 Gateway，不要每個服務一個 LoadBalancer。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>GitOps：宣告式、版本化在 git、叢集裡的代理程式自動拉取、持續調和。CI 不碰叢集，回滾是 git revert，手動修改會被偵測。</li>
+  <li>Argo CD 的 Application：source（repoURL、path、targetRevision、helm.valueFiles）、destination、syncPolicy（automated、prune、selfHeal、syncOptions）。同步狀態與健康狀態分開看；PreSync hook 與 sync wave 控制順序。</li>
+  <li>drift 是叢集偏離 git。selfHeal 會把它改回去，所以救火也走 git，緊急時暫停自動同步並留紀錄。HPA 管的 replicas 用 ignoreDifferences＋RespectIgnoreDifferences。</li>
+  <li>CI 建置映像（tag 用 commit SHA），用 yq 改 config repo 的 image.tag，用專屬 token 開 PR；Argo CD 在合併後同步。</li>
+  <li>EKS 和 kind 的物件一樣，底下不同：代管控制平面、四種節點（managed node group、Karpenter、Auto Mode、Fargate）、VPC CNI 用真的 IP、Load Balancer Controller 實作 Gateway、EBS 綁可用區、IAM 與 access entries、Pod Identity。</li>
+  <li>升級：標準支援 14 個月＋延伸支援 12 個月；一次一個小版本；每一版控制平面 → 外掛 → 節點；先查 insights、外掛相容性、會卡住 drain 的 PDB、落後的節點群組。</li>
+  <li>平台團隊管叢集，你管服務；交付前用 resources、probe、PDB、分散、securityContext、NetworkPolicy、告警這份清單檢查自己。</li>
+</ul>
+<p>下一課是期末專題：把咖啡店的 NestJS 服務完整搬上 Kubernetes，通過上線檢查清單，並處理埋好的事故。</p>
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

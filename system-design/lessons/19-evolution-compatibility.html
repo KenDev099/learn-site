@@ -1,0 +1,1724 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>19. 演進：API 相容性、功能旗標與 strangler fig</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="19">
+<header>
+  <div class="eyebrow">階段 5：資深工程實踐：決策、演進、審查與除錯 · 第 19 課</div>
+  <h1>演進：API 相容性、功能旗標與 strangler fig</h1>
+</header>
+<main>
+
+<p>咖啡店的訂單 API 已經上線兩年。後端工程師覺得 <code>total</code> 這個名字不好，改成 <code>amount</code>，順便把 <code>id</code> 從數字改成字串，部署。十分鐘後客服電話響個不停：App 的訂單頁全部顯示「NT$ undefined」，合作的外送平台對帳程式整批失敗。App 已經在幾十萬支手機上，沒辦法跟後端同時更新；外送平台的工程師下週才有空。系統一旦有了使用者，就不能說改就改。</p>
+<p>回滾之後，檢討會議的結論不是「以後不要改」，因為訂單 API 接下來還有四件事要做：<code>total</code> 改名 <code>amount</code>、<code>id</code> 改成字串；訂單多一個「已退款」狀態 <code>'refunded'</code>；新的結帳頁要上線；還有<a href="15-monolith-microservices.html">第 15 課</a>評估過的方向，把訂單功能從單體搬到獨立的服務。主管交給你的任務是：<strong>把這四件事排成一份演進計畫，每一步都不弄壞任何正在用的人</strong>。這一課從頭到尾都在完成這份計畫。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>改名為什麼會壞：誰在讀這個欄位，同一個改動為什麼對某些人沒事、對某些人是破壞；改名要分幾步（開場問題的最小答案）。</li>
+  <li>後端加了 <code>'refunded'</code>，前端怎麼不整頁壞掉：寬容的讀取端，以及它為什麼不能對錯誤寬容。</li>
+  <li><code>total</code> 改成 <code>amount</code> 的完整步驟：expand → migrate → contract，誰先部署，怎麼在合併前自動抓到破壞。</li>
+  <li>外送平台等不了怎麼辦：讓新舊版本並存，舊版怎麼量、怎麼通知、怎麼關。</li>
+  <li>新結帳頁怎麼只給 10% 的人、出事一鍵關掉：功能旗標與穩定分桶。</li>
+  <li>把訂單整塊搬出單體：strangler fig 與影子流量；最後一節整理每一步上線後要看的指標。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../nestjs/lessons/23-openapi-versioning.html">NestJS 課第 23 課</a>的 API 版本：用網址區分 <code>/v1</code>、<code>/v2</code>，用 <code>Deprecation</code>／<code>Sunset</code> 標頭通知舊版要退場，在 CI 比對新舊 OpenAPI 抓出破壞。</li>
+  <li><a href="../../devops/lessons/16-cd.html">部署課第 16 課</a>的部署策略：滾動更新時新舊版本會同時在線；金絲雀先讓一小部分流量走新版，功能旗標不重新部署就能開關功能。</li>
+  <li><a href="07-sharding-consistent-hashing.html">第 7 課</a>的 <code>hash32</code>：把任意字串穩定地轉成一個 32 位元整數，同樣的輸入永遠得到同樣的結果。</li>
+</ul></div>
+
+<h2>改名為什麼會壞？先搞清楚誰在讀</h2>
+<p>開場的後端工程師沒有寫錯任何一行程式。<code>amount</code> 有值、<code>id</code> 是合法的字串、測試全部通過。壞掉的是別人的程式：App 裡寫著 <code>order.total</code>，現在拿到 <code>undefined</code>；外送平台把 <code>id</code> 存進整數欄位，現在收到 <code>"ord_42"</code>。所以要回答「這個改動安不安全」，不能只看自己的程式，要看所有讀這份資料的程式。</p>
+<p>會讓現有使用者壞掉的改動，叫<strong>破壞性變更（breaking change）</strong>。開場的改名就是一個。它的反面是「相容」，而相容有兩個方向，分開想比較清楚：</p>
+<ul>
+  <li><strong>向後相容（backward compatible）</strong>：新版的伺服器仍然能服務舊版的客戶端。後端升級了，還沒更新的 App 照樣能用。開場的改動就是破壞了這一點。</li>
+  <li><strong>向前相容（forward compatible）</strong>：舊版的讀取端能處理新版產生的資料，通常靠「看不懂的部分就忽略」。後端在回應裡多加一個欄位，舊版 App 不認得它，但照樣能顯示訂單。</li>
+</ul>
+<p>你可能會想：文件上沒寫的東西，別人不該依賴，改了是他們的問題。實務上不是這樣。Google 工程師 Hyrum Wright 觀察到：<strong>使用者夠多時，你的系統所有可以被觀察到的行為，都會被某人依賴</strong>，不管文件有沒有寫。這叫 <strong>Hyrum 定律</strong>。文件說「訂單清單沒有保證順序」，但回應一直是依時間排序，就一定有人的程式假設第一筆是最新的；你改成依 id 排序，他的「最近一筆訂單」就錯了。對方不會去讀你的文件，他只會看到程式壞了、客服電話響了。</p>
+<p>用 Hyrum 定律看計畫裡的改動，會發現每一個都有人依賴：</p>
+<ul>
+  <li><code>total</code> 改名 <code>amount</code>：讀 <code>order.total</code> 的程式拿到 <code>undefined</code>。</li>
+  <li><code>id</code> 從 <code>42</code> 改成 <code>"ord_42"</code>：用 <code>id === 42</code> 比對、或把 id 存進整數欄位的程式都會壞。</li>
+  <li>狀態多了 <code>'refunded'</code>：Vue 前端用 <code>switch (order.status)</code> 決定徽章顏色，沒有 <code>default</code>，退款的訂單徽章是空白；如果用的是「找不到就丟錯」的寫法，整頁直接壞掉。</li>
+  <li>錯誤訊息的文字改了：有人用 <code>message.includes('庫存不足')</code> 判斷錯誤種類。</li>
+</ul>
+<p>既然什麼都可能被依賴，怎麼判斷一個改動會不會出事？關鍵是<strong>資料流動的方向</strong>：誰寫、誰讀。請求是客戶端寫、伺服器讀；回應是伺服器寫、客戶端讀；事件（<a href="16-events-webhooks.html">第 16 課</a>）是生產者寫、所有消費者讀。出事的永遠是讀的那一邊，所以問題要問成「讀的那一邊能不能接受這個改動」。同樣是「加一個欄位」，加在請求和加在回應，結果完全不同：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>改動</th><th>方向</th><th>相容嗎</th><th>為什麼</th></tr></thead>
+  <tbody>
+    <tr><td>請求加一個<strong>選填</strong>欄位 <code>note</code></td><td>客戶端 → 伺服器</td><td>相容</td><td>舊客戶端不帶，伺服器用預設值</td></tr>
+    <tr><td>請求加一個<strong>必填</strong>欄位，或把選填改成必填</td><td>客戶端 → 伺服器</td><td>破壞</td><td>所有舊客戶端都會收到 400</td></tr>
+    <tr><td>請求放寬限制（數量上限 10 改 20）</td><td>客戶端 → 伺服器</td><td>相容</td><td>以前合法的請求現在還是合法</td></tr>
+    <tr><td>回應加一個新欄位 <code>currency</code></td><td>伺服器 → 客戶端</td><td>相容（對寬容的讀取端）</td><td>不認得的欄位被忽略；嚴格驗證「不能有多餘欄位」的讀取端會壞</td></tr>
+    <tr><td>回應刪掉或改名欄位</td><td>伺服器 → 客戶端</td><td>破壞</td><td>讀那個欄位的程式拿到 <code>undefined</code></td></tr>
+    <tr><td>回應的列舉多一個值 <code>'refunded'</code></td><td>伺服器 → 客戶端</td><td>看讀取端</td><td>沒有處理未知值的讀取端會壞</td></tr>
+    <tr><td>改型別（數字 id 改字串）、改單位（元改成分）</td><td>任何方向</td><td>破壞</td><td>格式一樣也可能語意不同：<code>110</code> 從元變成分，程式不會報錯，帳會錯</td></tr>
+  </tbody>
+</table></div>
+<p>表裡有一個規律：「加」通常相容，「刪、改名、改型別、改單位」幾乎都是破壞。開場的改名正是刪一個欄位、加一個欄位，刪的那一半弄壞了所有讀 <code>total</code> 的人。這就是開場問題的最小答案：<strong>把 <code>total</code> 改成 <code>amount</code> 不能一步做完</strong>。先讓回應同時送 <code>total</code> 和 <code>amount</code>（只有「加」，相容），等 App 和外送平台都改讀 <code>amount</code>，最後才拿掉 <code>total</code>。第三節會把這三步講完整。</p>
+<div class="callout practice"><strong>💡 實務上：改回應格式前，先問「誰在讀它」</strong><br>前端工程師最常踩到的不是外部客戶，而是自己人：後端部署了，使用者還開著昨天的分頁，舊的 JS 打新的 API；App 更是會有好幾個版本同時在外面跑。所以審查一個改回應的 PR，第一個問題是「讀這個欄位的有哪些程式、哪些版本」，答不出來就當作有人在用。改名、改型別、改單位這三種，在 PR 說明裡要明確寫出影響範圍，不要藏在「順便重構」裡。只有呼叫端和提供端在同一次部署裡一起換、而且沒有快取或舊分頁的情況，才可以直接改。</div>
+<p>表裡還有兩列寫著「看讀取端」：回應多一個欄位、列舉多一個值，會不會壞取決於讀的程式怎麼寫。計畫的第二件事 <code>'refunded'</code> 就屬於這一類，而咖啡店自己的 Vue 前端就是讀取端之一。讀取端要怎麼寫，後端「加東西」時才不會弄壞它？</p>
+
+<h2>後端加了 refunded，前端怎麼不整頁壞掉？</h2>
+<p>先看問題出在哪。Vue 前端拿到訂單後，會檢查 <code>status</code> 是不是 <code>pending</code>、<code>paid</code>、<code>done</code>、<code>cancelled</code> 這四種已知狀態之一，不是就丟錯。這個檢查原本是好意：擋掉壞資料。但後端開始送 <code>'refunded'</code> 的那一刻，這段檢查把一筆完全正常的訂單當成壞資料，整筆失敗。讀取端寫得越「嚴格」，對方每加一樣東西，它就越容易壞。</p>
+<p>Martin Fowler 在〈Tolerant Reader〉（2011）建議讀取外部資料時：<strong>只讀你需要的、忽略不認得的欄位、對結構做最少的假設、把解析集中在一個地方</strong>。照這四條寫的讀取端，叫<strong>寬容讀取端（tolerant reader）</strong>。它讓對方「加東西」不會弄壞你，等於讀取端自己替對方取得了向前相容。</p>
+<p>下面比較兩個讀取訂單狀態的寫法，資料是後端開始送 <code>'refunded'</code> 之後的回應。執行後看第 2 筆：嚴格的版本整筆失敗，寬容的版本把它歸到 <code>'unknown'</code>，畫面可以顯示「其他」，其他欄位照常顯示；多出來的 <code>refundedAt</code> 也被直接忽略：</p>
+<div class="lab"><script type="code">
+type Status = 'pending' | 'paid' | 'done' | 'cancelled'
+const KNOWN: readonly string[] = ['pending', 'paid', 'done', 'cancelled']
+
+function strictStatus(s: string): Status {
+  if (!KNOWN.includes(s)) throw new Error(`不認得的狀態 ${s}`)
+  return s as Status
+}
+function tolerantStatus(s: string): Status | 'unknown' {
+  return KNOWN.includes(s) ? (s as Status) : 'unknown'
+}
+
+const fromServer = [
+  { id: 1, status: 'paid', total: 190 },
+  { id: 2, status: 'refunded', total: 110, refundedAt: '2026-10-30' },  // 新版後端多送的
+]
+for (const o of fromServer) {
+  try { console.log('嚴格：', o.id, strictStatus(o.status)) }
+  catch (e) { console.log('嚴格：', o.id, '整筆失敗 →', (e as Error).message) }
+  console.log('寬容：', o.id, tolerantStatus(o.status), '（refundedAt 不認得，直接忽略）')
+}
+</script></div>
+<p>你可能會想：TypeScript 不是已經會檢查了嗎？<a href="../../typescript/lessons/16-narrowing.html">TypeScript 課第 16 課</a>的窮舉檢查（用 <code>never</code> 確認每一種狀態都處理過）確實有用，但它只在<strong>編譯時</strong>檢查你寫的程式有沒有處理完所有<em>已知</em>的值。伺服器在執行時送來的字串不會經過型別檢查，已經裝在使用者手機上的舊版 App 也不會重新編譯。所以解析資料時，要把未知值明確轉成 <code>'unknown'</code> 這個分支，型別裡也寫出它，畫面上給一個「其他」的樣式。這樣窮舉檢查會逼你處理 <code>'unknown'</code>，執行時也不會遇到沒處理的值。</p>
+<p>寬容讀取端很好用，但「寬容」很容易被推過頭：既然要寬容，那金額是負數、必填欄位缺了，是不是也收下？答案是不行，而這個教訓有一段歷史。網際網路早期有一條 <strong>Postel 法則（robustness principle）</strong>：「送出時保守，接收時寬容」。它讓早期各家不完美的實作能互相溝通，但用了幾十年之後副作用浮現了。IAB（Internet Architecture Board，網際網路架構委員會）在 2023 年的 <a href="https://www.rfc-editor.org/rfc/rfc9413.html">RFC 9413〈Maintaining Robust Protocols〉</a>（資訊性文件）指出，長期對錯誤寬容會讓協定<strong>腐化</strong>：</p>
+<ol>
+  <li>送錯資料的一方從來沒收到錯誤，所以永遠不會修。</li>
+  <li>各家讀取端為了容忍這些錯誤，各自累積一堆將就的寫法。</li>
+  <li>最後這些怪行為變成大家都得相容的「事實標準」，新寫的實作必須「連 bug 都相容」。</li>
+</ol>
+<p>RFC 9413 的建議是分清楚兩種情況：在設計好的<strong>擴充點</strong>上寬容，例如新欄位、新列舉值，這些是規格允許長大的地方；對<strong>違反規格</strong>的資料明確地失敗，問題才會在源頭被修好。放到咖啡店的訂單上，就是下面這張表。注意第三列：遷移期間 <code>total</code> 和 <code>amount</code> 會同時出現，這是第一節那個「先兩個都送」的過渡期，讀取端要兩個都接受；但兩個值不相等，代表某一邊算錯了，不能默默挑一個用：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>情況</th><th>寬容讀取端怎麼做</th></tr></thead>
+  <tbody>
+    <tr><td>多了不認得的欄位（<code>currency</code>、<code>lines</code>）</td><td>忽略，輸出裡也不要帶著走</td></tr>
+    <tr><td>列舉多了不認得的值</td><td>轉成 <code>'unknown'</code>，畫面有預設樣式</td></tr>
+    <tr><td>遷移期間新舊欄位都可能出現（<code>total</code>／<code>amount</code>）</td><td>兩個都接受，優先讀新的；兩個都有但不相等就報錯，不要默默挑一個</td></tr>
+    <tr><td>金額是負數、是小數、必填欄位缺了</td><td>拒絕：這是違反規格，不是擴充</td></tr>
+  </tbody>
+</table></div>
+<p>第一列的「輸出裡也不要帶著走」容易被忽略：如果解析時用展開把整個物件複製下來，不認得的欄位會跟著流進你的程式，某天有人開始用它，你就又多了一個沒寫在規格裡的依賴。</p>
+<p>這些規則要寫在<strong>一個</strong>解析函式裡，其他地方只用解析後的型別，這就是 <a href="../../typescript/lessons/26-runtime-validation.html">TypeScript 課第 26 課</a>的 parse, don't validate。好處是之後格式再變，只要改一個地方。練習 1 會把這張表寫成程式。</p>
+<p>寬容讀取端處理的是「對方加東西」：新欄位、新列舉值。但 <code>total</code> 改名 <code>amount</code> 不只是加，還要刪掉 <code>total</code>，讀取端再寬容，也變不出一個被刪掉的欄位。刪的那一半要怎麼安全地做？</p>
+
+<h2>total 改成 amount 要分幾步？誰先部署？</h2>
+<p>第一節已經看到，「加」通常相容、「刪」通常破壞。既然如此，就把一個不相容的改名，拆成「先加、等大家搬家、最後才刪」幾個各自相容的步驟。這個做法叫 <strong>parallel change</strong>（Danilo Sato，2014），三個階段的名字描述了介面的形狀先變大、再變小：</p>
+<ol>
+  <li><strong>expand（擴充）</strong>：加上新的，舊的保留。回應同時有 <code>total</code> 和 <code>amount</code>，兩個值永遠相同。這一步只有「加」，舊 App 完全不受影響。</li>
+  <li><strong>migrate（遷移）</strong>：讓使用者一個一個搬到新的。App 改讀 <code>amount</code>、外送平台改讀 <code>amount</code>，同時量測還有誰在讀舊的。</li>
+  <li><strong>contract（收縮）</strong>：確定沒人用舊的之後，才移除 <code>total</code> 和為了相容寫的程式。</li>
+</ol>
+<figure>
+  <svg viewBox="0 0 700 230" role="img" aria-label="三個階段由左到右：expand 時回應同時有 total 和 amount；migrate 時客戶端逐一改讀 amount，監控顯示讀 total 的客戶端從 3 個降到 0；contract 時移除 total。每一步都可以單獨部署與回滾">
+    <defs><marker id="arr19a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="20" y="30" width="190" height="130" rx="8"/>
+    <text class="d-accent" x="115" y="55" text-anchor="middle">1. expand</text>
+    <text class="d-small" x="115" y="82" text-anchor="middle">回應：total ＋ amount</text>
+    <text class="d-small" x="115" y="104" text-anchor="middle">兩個值永遠相同</text>
+    <text class="d-small" x="115" y="126" text-anchor="middle">舊客戶端完全不受影響</text>
+    <rect class="d-soft" x="255" y="30" width="190" height="130" rx="8"/>
+    <text class="d-accent" x="350" y="55" text-anchor="middle">2. migrate</text>
+    <text class="d-small" x="350" y="82" text-anchor="middle">App、外送平台改讀 amount</text>
+    <text class="d-small" x="350" y="104" text-anchor="middle">量測：還在讀 total 的</text>
+    <text class="d-small" x="350" y="126" text-anchor="middle">客戶端 3 → 1 → 0</text>
+    <rect class="d-soft" x="490" y="30" width="190" height="130" rx="8"/>
+    <text class="d-accent" x="585" y="55" text-anchor="middle">3. contract</text>
+    <text class="d-small" x="585" y="82" text-anchor="middle">移除 total</text>
+    <text class="d-small" x="585" y="104" text-anchor="middle">移除相容用的程式</text>
+    <text class="d-small" x="585" y="126" text-anchor="middle">（用量是 0 才做）</text>
+    <line class="d-line" x1="210" y1="95" x2="253" y2="95" marker-end="url(#arr19a)"/>
+    <line class="d-line" x1="445" y1="95" x2="488" y2="95" marker-end="url(#arr19a)"/>
+    <text class="d-text" x="350" y="195" text-anchor="middle">每一步都是相容的，可以單獨部署、單獨回滾</text>
+    <text class="d-small" x="350" y="218" text-anchor="middle">migrate 可能要好幾個月：App 舊版本要等使用者更新</text>
+  </svg>
+  <figcaption>parallel change：不相容的改動拆成三個相容的步驟。最花時間的是中間那步，因為你控制不了別人什麼時候升級。</figcaption>
+</figure>
+<p>為什麼要拆成三步，而不是「加完 <code>amount</code> 隔天就刪 <code>total</code>」？因為每一步單獨看都是相容的，所以每一步都可以單獨部署、單獨回滾；出事時你只要退一小步。中間的 migrate 是最花時間的一步，因為它不在你的控制之內：App 要等使用者更新，外送平台要等對方排時間。量測就是在這裡派上用場：不量的話，你只能猜「應該都搬完了吧」，然後重演開場的事故。</p>
+<p>三步裡還藏著一個順序問題：誰先部署？以計畫的第二件事 <code>'refunded'</code> 為例，如果後端先開始送，前端的寬容版本還沒上線，就會重演上一節的整頁壞掉。規則是<strong>讀的那一邊先準備好，寫的那一邊才開始送</strong>：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>改動</th><th>先部署</th><th>再部署</th></tr></thead>
+  <tbody>
+    <tr><td>請求多一個新欄位</td><td>伺服器（先能接受、沒帶時有預設）</td><td>客戶端開始送</td></tr>
+    <tr><td>回應多一個新欄位或列舉值</td><td>客戶端（先能忽略或處理未知值）</td><td>伺服器開始送</td></tr>
+    <tr><td>事件多一個新欄位或新種類</td><td>所有消費者（先寬容）</td><td>生產者開始送</td></tr>
+  </tbody>
+</table></div>
+<p>這個順序不只對外部客戶有意義，對自己的部署也是。部署本身就是一段新舊並存的時間：<a href="../../devops/lessons/16-cd.html">部署課第 16 課</a>的滾動更新會讓新舊版本同時在處理請求；回滾則會讓新版寫入的資料被舊版讀到。所以「新版本寫出的資料，舊版本讀得懂」本身就是一個要求，就算這個 API 只有你自己的服務在用也一樣。</p>
+<p>同樣的三步也用在 API 以外的介面，只是每一種介面的「舊資料」活得一樣久或更久：</p>
+<ul>
+  <li><strong>資料庫</strong>：加新欄位 → 雙寫並回填 → 程式改讀新欄位 → 刪舊欄位。每一步的鎖與安全寫法在 <a href="../../postgresql/lessons/34-zero-downtime-migrations.html">PostgreSQL 課第 34 課</a>，跟部署怎麼配合在 <a href="../../devops/lessons/17-deploy-migrations.html">部署課第 17 課</a>。</li>
+  <li><strong>事件</strong>：事件存在佇列裡、可能被重播，所以舊格式的事件會存在很久，比 API 的舊回應久得多。消費者要比生產者更早能讀新格式。</li>
+</ul>
+<p>最後一個問題：拆成三步要靠人記得，人會忘。有沒有辦法讓「不小心一步刪掉 <code>total</code>」在合併前就被擋下來？有兩種工具，抓的東西不一樣，所以是互補的：</p>
+<ul>
+  <li><strong>OpenAPI 比對</strong>：<a href="../../nestjs/lessons/23-openapi-versioning.html">NestJS 課第 23 課</a>在 CI 比對新舊兩份 OpenAPI 文件，可以自動抓出「刪了欄位」「選填改必填」這類<strong>格式</strong>上的破壞。它不需要知道誰在用，所以設定一次就能保護所有呼叫端。它的盲點是<strong>語意</strong>：金額從元改成分、排序改了、預設值改了，OpenAPI 長得一模一樣，比對不出差異。</li>
+  <li><strong>契約測試（consumer-driven contract test）</strong>：反過來由呼叫端寫下「我依賴回應裡的哪些欄位、什麼樣的值」，例如 App 團隊寫下「<code>amount</code> 是整數元」。提供端的 CI 每次都對所有呼叫端的契約跑一遍，改壞了在合併前就知道。Pact 是常見工具。它抓得到語意上的依賴，代價是每個呼叫端都要寫、要維護。外部的、你不認識的使用者寫不了契約，這部分只能靠下一節的版本與棄用流程。</li>
+</ul>
+<div class="callout practice"><strong>💡 實務上：一個改名會變成好幾張工作單</strong><br>在團隊裡，「把 <code>total</code> 改成 <code>amount</code>」不會是一個 PR，而是 expand、各端改讀、contract 三到四個 PR，可能橫跨好幾個迭代。最常被忘記的是最後的 contract：新欄位上線後大家就去做別的事，舊欄位和相容程式留了好幾年。資深工程師會在開工時就把 contract 開成工作單、寫上「用量歸零後執行」的條件，並在估時程時跟 PM 說明這是好幾週的事，不是改一行。</div>
+<p>expand → migrate → contract 有一個前提：所有讀取端終究會搬家。但外送平台的工程師下週才有空，之後也未必排得出時間；<code>id</code> 改成字串，也許可以另加一個字串型的 <code>orderId</code> 欄位來 expand；但 contract 的前提是外送平台終究會改讀新欄位。對方排不出時間，舊欄位就永遠刪不掉，<code>id</code> 這個名字也永遠沒辦法換成字串。等不了、又非改不可的時候，該怎麼辦？</p>
+
+<h2>外送平台等不了：怎麼讓新舊版並存，舊版怎麼退場？</h2>
+<p>答案是讓兩個版本的 API 同時存在：還沒準備好的人繼續用舊版，準備好的人改用新版，彼此互不影響。<a href="../../node/lessons/14-rest-api-design.html">Node 課第 14 課</a>介紹過 API 版本，這裡要回答的是資深工程師在意的三件事：版本標在哪裡、多個版本的程式怎麼維護、舊版怎麼收掉。</p>
+<p>先看版本標在哪裡。客戶端必須在請求裡說「我要哪個版本」，常見三種寫法：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>方法</th><th>例子</th><th>好處</th><th>代價</th></tr></thead>
+  <tbody>
+    <tr><td>URI 版本</td><td><code>/v1/orders</code>、<code>/v2/orders</code></td><td>一眼看得出來，好路由、好快取（NestJS 課第 23 課的做法）</td><td>版本粒度粗，改一個欄位就要整套 v2</td></tr>
+    <tr><td>標頭版本</td><td><code>Api-Version: 2</code></td><td>網址不變</td><td>瀏覽器直接開、看 log 時比較不明顯；回應要加 <code>Vary: Api-Version</code>，快取才會把不同版本分開存</td></tr>
+    <tr><td>日期版本</td><td><code>Stripe-Version: 2026-10-28.endive</code></td><td>每個不相容改動都有日期，可以細到單一欄位</td><td>要有轉換鏈的基礎設施</td></tr>
+  </tbody>
+</table></div>
+<p>咖啡店選 URI 版本，跟 NestJS 課第 23 課的做法一樣：外送平台繼續打 <code>/v1/orders</code>，新的 App 改打 <code>/v2/orders</code>。標在哪裡比較好選，難的是第二件事：多個版本的程式怎麼維護。最直覺、也最危險的做法是<strong>每個版本複製一整套程式</strong>：<code>OrdersV1Controller</code>、<code>OrdersV2Controller</code>……到 v7 時修一個 bug 要修七份，而且總會漏掉一份。</p>
+<p>Stripe 在〈APIs as infrastructure〉（2017）描述了另一種做法：程式只有<strong>最新版</strong>一份；每一個不相容的改動，另外寫成一個<strong>版本轉換（version change module）</strong>，內容只有一件事：「怎麼把改動後的回應轉回改動前的樣子」。以咖啡店為例，<code>id</code> 改字串那天寫一個轉換，負責把 <code>"ord_42"</code> 轉回 <code>42</code>；<code>total</code> 改名那天再寫一個，負責把 <code>amount</code> 轉回 <code>total</code>。</p>
+<p>請求指定了某個舊版時，伺服器照常算出最新版的回應，再把「比目標版本新」的轉換<strong>由新到舊</strong>依序套用。順序很重要：越新的轉換，假設它拿到的是越新的格式。如果先套用舊的轉換，它會拿到一份它不認得的格式。這樣一來，商業邏輯只維護一份，舊版只是「在出口多做幾次轉換」；修 bug 只修一處。練習 2 會實作這條轉換鏈。Stripe 目前的版本命名與發布節奏放在課末「補充與查表」。</p>
+<p>有了新版本，舊版就不能永遠留著，否則轉換鏈會越來越長。第三件事是舊版怎麼退場，順序是先<strong>量</strong>、再<strong>通知</strong>、最後才<strong>關</strong>：</p>
+<ul>
+  <li><strong>量</strong>：每個請求記下版本與呼叫者（API key、App 版本），做成「各版本每天的請求數、還在用舊版的客戶清單」。沒有這份資料就訂退場日，等於賭沒人在用，開場的事故就是賭輸的樣子。</li>
+  <li><strong>通知</strong>：寄信給清單上的客戶，回應也加上機器讀得懂的標頭。這裡有兩個常被混用的詞：<strong>棄用（deprecation）</strong>是宣告「不建議再用」，舊版仍然正常服務；<strong>Sunset</strong> 是宣告「哪一天停止服務」。</li>
+  <li><strong>關</strong>：用量真的降到可以接受（或期限到了、已經個別聯絡過剩下的客戶）才關。關之前可以先在低峰時段短暫回 410（Gone，資源已經不在）做「斷電演習」（brownout）：還沒搬家的人會在這短短幾分鐘內發現，而且是在你預期、可以馬上恢復的時間點。</li>
+</ul>
+<p>通知用的兩個標頭各有標準格式：<code>Deprecation</code> 是「@ 加 Unix 秒數」，<code>Sunset</code> 是 HTTP 日期，而且 Sunset 不能早於 Deprecation。下面這格產生咖啡店 v1 的退場標頭，執行後看三個標頭的值，以及最後一行的檢查：</p>
+<div class="lab"><script type="code">
+// RFC 9745（2025-03）：Deprecation 的值是 Structured Field 的 Date，寫成 @ 加 Unix 秒數
+// RFC 8594（2019-05）：Sunset 的值是 HTTP-date；Sunset 不能早於 Deprecation
+const deprecatedAt = Date.UTC(2026, 9, 31, 0, 0, 0)    // 2026-10-31（月份從 0 開始）
+const sunsetAt = Date.UTC(2027, 3, 30, 23, 59, 59)     // 2027-04-30
+
+const headers = {
+  Deprecation: `@${Math.floor(deprecatedAt / 1000)}`,
+  Sunset: new Date(sunsetAt).toUTCString(),
+  Link: '<https://api.coffee.example/docs/migrate-v1-to-v2>; rel="deprecation"; type="text/html"',
+}
+for (const [name, value] of Object.entries(headers)) console.log(`${name}: ${value}`)
+console.log('Sunset 不早於 Deprecation：', sunsetAt >= deprecatedAt)
+</script></div>
+<p>這兩個標頭只是通知，不會讓任何人自動改程式。它們的價值是讓客戶端的 SDK 或閘道可以自動記下警告、讓監控抓得到；真正讓人搬家的，仍然是用量資料加上直接聯絡。</p>
+<div class="callout practice"><strong>💡 實務上：大部分內部 API 不需要開 v2</strong><br>只給自家前端用的 API，通常靠「只加不刪」加上 expand → migrate → contract 就夠了，開 v2 反而要多維護一整套。版本與 Sunset 流程主要用在對外的 API：合作夥伴、開放平台、改不動的舊 App。以這份計畫來說，咖啡店自己的 Vue 前端用 expand → migrate → contract 就好，外送平台才需要版本。有人提議開 v2 時，資深工程師會先問：這個改動能不能拆成相容的步驟？舊版要維護多久、誰負責通知客戶？這兩題沒答案，就先不要開。</div>
+<p>到這裡，計畫的前兩件事都有了做法。它們有一個共同點：改的是資料的<strong>格式</strong>，只要格式相容，就不會弄壞別人。計畫的第三件事不一樣：新結帳頁的 API 格式可能完全相容，但它是一段全新的<strong>行為</strong>，算錢的邏輯可能有 bug。一部署上去，所有人同時用到；出事時唯一的退路是回滾整個部署。能不能先讓一小部分人用，出事時立刻關掉？</p>
+
+<h2>新結帳頁怎麼只給 10% 的人，出事一鍵關掉？</h2>
+<p>問題的根源是「部署」和「讓使用者用到」綁在一起了。把它們拆開：<strong>部署（deploy）</strong>是把程式放上伺服器，<strong>發布（release）</strong>是讓使用者用到新功能。拆開的工具是<strong>功能旗標（feature flag，也叫 toggle）</strong>：程式裡寫 <code>if (旗標開了) 走新結帳頁 else 走舊的</code>，而旗標的值存在程式外面，可以在執行時改，不用重新部署。</p>
+<p>有了旗標，新結帳頁的上線變成這樣：先部署，旗標關著，沒有任何人看到；再對 1%、10%、50% 的人打開，每一步看錯誤率；出事就把旗標關掉，所有人立刻回到舊結帳頁，不用回滾整個部署，同一次部署裡的其他修正也不受影響。</p>
+<p>「出事時立刻關掉」這個用法本身有一個名字：<strong>kill switch</strong>，出事時立刻關掉某個功能的開關。它不只用在新功能。<a href="11-circuit-breaker-bulkhead.html">第 11 課</a>的降級（推薦服務慢就不顯示推薦）如果事先做成旗標，值班時就是一鍵的事，不用在半夜改程式、跑 CI、部署。旗標依用途不只一種，壽命與管理方式也不同。Pete Hodgson 在〈Feature Toggles〉（martinfowler.com）把旗標依用途分類：新結帳頁這種逐步放量、放量完就刪的叫 <strong>release 旗標</strong>；kill switch 屬於 <strong>ops 旗標</strong>；依方案開放功能（企業方案才有的團購）叫 <strong>permission 旗標</strong>，會存在好幾年。另外還有 A/B 實驗用的 experiment 旗標，完整的四類對照表放在課末「補充與查表」。</p>
+<p>接下來是這一節的核心：「對 10% 的人開」，怎麼決定是哪 10%？直覺的寫法是 <code>Math.random() &lt; 0.1</code>，比例確實是 10%，但它每個請求重抽一次：</p>
+<ul>
+  <li>王小明重新整理一次看到新結帳頁、再整理一次看到舊的，購物車可能在兩個版本之間壞掉。</li>
+  <li>如果是 A/B 實驗，結果沒辦法比較，因為同一個人兩組都待過。</li>
+  <li>從 10% 調到 30% 時，原本看到新版的人不保證還看得到。</li>
+</ul>
+<p>需要的性質是：同一個人每次都得到同樣的結果。這個性質叫<strong>黏著性（stickiness）</strong>。做法是<strong>分桶（bucketing）</strong>：把「旗標名稱＋使用者 ID」用第 7 課的 <code>hash32</code> 雜湊，再取除以 100 的餘數，得到 0～99 的桶號；桶號小於百分比就開啟。雜湊對同樣的輸入永遠給同樣的輸出，所以王小明永遠落在同一個桶。</p>
+<p>下面這格驗證三件事，執行後由上到下看：前兩行比較隨機與分桶，王小明重新整理時結果會不會變；中間兩行看 10% 調到 30% 時，原本開啟的人是不是還開著；最後一行看兩個不同旗標是不是選到同一群人：</p>
+<div class="lab"><script type="code">
+// 第 7 課的 hash32：FNV-1a 加上 fmix32 收尾
+function hash32(s: string): number {
+  let h = 0x811c9dc5
+  for (const b of new TextEncoder().encode(s)) {
+    h ^= b
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  h ^= h >>> 16
+  h = Math.imul(h, 0x85ebca6b)
+  h ^= h >>> 13
+  h = Math.imul(h, 0xc2b2ae35)
+  h ^= h >>> 16
+  return h >>> 0
+}
+const bucket = (flag: string, userId: string) => hash32(`${flag}:${userId}`) % 100
+
+console.log('隨機：王小明重新整理三次 →', [1, 2, 3].map(() => Math.random() < 0.3 ? '新' : '舊').join(' '))
+console.log('分桶：王小明的桶號 →', bucket('new-checkout', '王小明'), '每次都一樣')
+
+const ids = Array.from({ length: 10000 }, (_, i) => `user-${i + 1}`)
+const on = (flag: string, percent: number) => new Set(ids.filter(id => bucket(flag, id) < percent))
+const at10 = on('new-checkout', 10)
+const at30 = on('new-checkout', 30)
+console.log('10% 開啟', at10.size, '人；30% 開啟', at30.size, '人')
+console.log('10% 時開啟的人，調到 30% 後仍開啟：', [...at10].every(id => at30.has(id)))
+
+// 不同旗標用自己的名稱當鹽：兩個 30% 的旗標重疊約 9%（30% × 30%），不是同一群人
+const promo = on('oat-milk-promo', 30)
+console.log('兩個旗標都開啟的人：', [...at30].filter(id => promo.has(id)).length)
+</script></div>
+<p>結果的意義：</p>
+<ul>
+  <li>桶號是固定的，百分比從 10 調到 30 只是把門檻往上移：原本開啟的人（桶號 0～9）一定還在範圍內，<strong>放量只會加人、不會把人關掉</strong>。</li>
+  <li>兩個 30% 的旗標只重疊約 9%，是因為雜湊裡放了旗標名稱。如果只雜湊使用者 ID，桶號 0～9 的那群人會是每一個新功能的白老鼠，而且兩個實驗的結果會互相污染：你分不清轉換率上升是哪個功能造成的。</li>
+</ul>
+<p>正式環境通常不自己寫旗標系統，而是用 OpenFeature 這類廠商中立的 API 接上現成的服務（套件與版本見課末）。不管用哪一套，程式裡只問「這個使用者的 <code>new-checkout</code> 開了嗎」，判斷邏輯集中在一處。練習 3 會把百分比、kill switch、允許與拒絕名單組合成完整的判斷。</p>
+<div class="callout warn"><strong>旗標是有持有成本的庫存。</strong>每個旗標讓程式多一條分支，兩個旗標就有四種組合要測。Hodgson 的建議：加 release 旗標時就在待辦清單放一張「移除旗標」的工作；每個旗標設到期日，過期就讓測試失敗；限制旗標總數，要加一個就得先移除一個。放量到 100% 一週沒事之後，就把舊路徑和旗標一起刪掉。</div>
+<div class="callout practice"><strong>💡 實務上：前端的旗標只管「顯示」，不管「權限」</strong><br>在 Vue 裡用旗標藏起一個按鈕很常見，但前端的判斷使用者改得掉，而且還沒發布的功能程式碼可能已經打包在 JS 裡，被人翻出來。所以 permission 類的旗標（企業方案才有的團購）一定要在後端的 API 再檢查一次，前端只負責「要不要顯示」。上線前也要確認旗標關閉時的畫面：旗標服務連不上時，預設值應該是安全的那一邊（通常是「不開放新功能」）。</div>
+<p>旗標切換的是<strong>同一個程式裡</strong>的兩條路徑：新結帳頁和舊結帳頁都在同一次部署裡。計畫的最後一件事規模大得多：新的路徑是一整個新服務，有自己的程式和資料庫。同樣「一小部分一小部分切過去、隨時能切回來」的想法，放大到整個系統要怎麼做？</p>
+
+<h2>把訂單整塊搬出單體：strangler fig 怎麼一塊一塊換？</h2>
+<p><a href="15-monolith-microservices.html">第 15 課</a>說過，要從單體拆出服務，不能一次重寫再切換：重寫期間舊系統還在改，新系統永遠追不上；切換那天所有差異同時爆發，而且退不回去。<strong>strangler fig</strong>（絞殺榕，Martin Fowler 取的名字）的做法是：在舊系統旁邊長出新系統，一塊一塊接手功能，直到舊系統可以退休。絞殺榕在宿主樹上發芽，慢慢長到包住整棵樹，名字就是這樣來的。</p>
+<p>它用的工具都是這一課前面出現過的：用分桶決定哪些人走新路徑，用相容的步驟讓每一步都能退回。下圖是做到一半的樣子：</p>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="App 的請求先到閘道。閘道依路徑轉送：/menu 和 /loyalty 仍到舊的單體；/orders 有 20% 轉到新的訂單服務，80% 到單體。另外一條虛線把 /orders 的請求複製一份給新服務當影子流量，只比對結果、不回給使用者">
+    <defs><marker id="arr19b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="20" y="100" width="90" height="44" rx="8"/><text class="d-text" x="65" y="127" text-anchor="middle">App</text>
+    <rect class="d-soft" x="170" y="100" width="120" height="44" rx="8"/><text class="d-text" x="230" y="127" text-anchor="middle">閘道</text>
+    <rect class="d-box" x="420" y="20" width="250" height="80" rx="8"/>
+    <text class="d-text" x="545" y="50" text-anchor="middle">舊單體</text>
+    <text class="d-small" x="545" y="75" text-anchor="middle">/menu、/loyalty、80% 的 /orders</text>
+    <rect class="d-box" x="420" y="150" width="250" height="80" rx="8"/>
+    <text class="d-text" x="545" y="180" text-anchor="middle">新訂單服務</text>
+    <text class="d-small" x="545" y="205" text-anchor="middle">20% 的 /orders ＋ 影子流量</text>
+    <line class="d-line" x1="110" y1="122" x2="168" y2="122" marker-end="url(#arr19b)"/>
+    <line class="d-line" x1="290" y1="112" x2="418" y2="60" marker-end="url(#arr19b)"/>
+    <line class="d-line" x1="290" y1="132" x2="418" y2="180" marker-end="url(#arr19b)"/>
+    <line class="d-line" x1="290" y1="140" x2="418" y2="205" marker-end="url(#arr19b)" stroke-dasharray="5 4"/>
+    <text class="d-small" x="330" y="75">路由切換</text>
+    <text class="d-small" x="300" y="232">影子（只比對）</text>
+  </svg>
+  <figcaption>入口（nginx 或 API 閘道）是切換點：依路徑、依使用者分桶決定請求去哪裡。新服務先只收影子流量，比對穩定後再逐步接手真的流量。</figcaption>
+</figure>
+<p>咖啡店把訂單功能搬到新服務，分五步。每一步都在解決上一步留下的風險：</p>
+<ol>
+  <li><strong>建立切換點</strong>：所有請求先經過閘道，閘道一開始把 <code>/orders/*</code> 全部轉給單體。這一步不改任何行為，看起來什麼都沒做；但從此之後，每一步都只是改閘道的設定，切回去也只是改設定。</li>
+  <li><strong>影子流量（shadow traffic）</strong>：新服務寫好了，但你不知道它跟舊系統算出來的結果是不是一樣。影子流量的做法是把真實請求複製一份給新服務執行，比對兩邊的結果，但回給使用者的永遠是舊系統的。這能用真實資料找出新系統的差異，又不影響使用者。條件是新系統在影子模式下<strong>不能有副作用</strong>：不寄收據、不扣款、不推播，否則同一位顧客會收到兩封收據、被扣兩次款。最簡單的影子是只讀的請求（查訂單）；寫入的請求要讓新服務在「乾跑」模式下只算出結果、不提交。</li>
+  <li><strong>雙寫與回填（dual write／backfill）</strong>：新服務有自己的資料庫，裡面一開始是空的。遷移期間舊系統寫入時也寫一份到新的那邊，這叫雙寫，最好用<a href="12-queues-outbox.html">第 12 課</a>的 outbox 確保不漏；再把歷史資料批次複製過去，這叫回填。接著要<strong>比對</strong>：筆數、金額總和、抽樣逐筆比較。雙寫不比對，新舊資料會默默分歧，到切換那天才發現。</li>
+  <li><strong>切換讀取，再切換寫入</strong>：用上一節的穩定分桶讓 1%、10%、100% 的使用者走新服務，每一步看錯誤率與延遲。舊路徑保留著，隨時可以切回去。</li>
+  <li><strong>移除舊路徑</strong>：停止寫舊表、刪掉單體裡的訂單程式、刪掉閘道的分流規則和比對程式。這是 expand → migrate → contract 的 contract，放大到整個系統。</li>
+</ol>
+<p>注意第 5 步要刪的東西：閘道規則、雙寫、比對程式。它們有一個共同的名字，<strong>過渡架構（transitional architecture）</strong>：只為遷移期間存在、遷移完就要丟掉的程式。它們跟 contract 工作單一樣容易被遺忘，所以在設計文件（<a href="18-design-docs-adr.html">第 18 課</a>）的上線計畫裡就要寫出它們什麼時候移除，否則它們會變成永久的複雜度。</p>
+<p>第 2 步的影子比對程式本身也要寫對，它是放在正式請求路徑上的程式，寫錯會直接影響使用者。要小心三件事，練習 4 會實作：</p>
+<ul>
+  <li>回應不能等新系統，否則新系統的延遲直接加到使用者身上。</li>
+  <li>新系統的任何錯誤都不能影響回應，包括變成未處理的 rejection。</li>
+  <li>比對要看「內容」而不是字串：<code>{"a":1,"b":2}</code> 和 <code>{"b":2,"a":1}</code> 是同一筆資料；時間戳記、自動產生的 id 這類本來就會不同的欄位要排除，否則比對結果全是雜訊。</li>
+</ul>
+<p>五步裡的每一步都有一個「可以往下走了嗎」的判斷：影子比對夠一致了嗎？雙寫的資料對得上嗎？10% 的錯誤率正常嗎？前面幾節也一樣：<code>total</code> 還有人讀嗎？v1 還有誰在用？這些判斷都要靠資料，而不是感覺。</p>
+
+<h2>每一步怎麼知道可以往下走、退路還在？</h2>
+<p>回頭看整份演進計畫，每一件事都有一個「下一步」要靠量測決定。下表把它們整理在一起，每一列對應計畫裡的一個決定。這張表是查表用，不用背，實際做到那一步時回來對照：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>指標</th><th>用來回答</th></tr></thead>
+  <tbody>
+    <tr><td>各 API 版本每天的請求數，依呼叫者分組</td><td>舊版還有誰在用？可以訂退場日了嗎？</td></tr>
+    <tr><td>呼叫已棄用端點的客戶清單與 App 版本分布</td><td>要個別聯絡誰？強制更新的門檻要設在哪一版？</td></tr>
+    <tr><td>每個旗標的評估次數與 true／false 比例</td><td>放量比例符合設定嗎？哪些旗標已經 100% 很久、該移除了？哪些旗標根本沒被評估（死旗標）？</td></tr>
+    <tr><td>影子比對的不一致比例，依欄位分類</td><td>不一致集中在哪個欄位、哪種訂單？是新系統的 bug 還是本來就會不同的欄位？</td></tr>
+    <tr><td>新舊路徑各自的錯誤率與 p99 延遲</td><td>放量的下一步可以走嗎？</td></tr>
+    <tr><td>回滾演練的結果</td><td>現在切回舊路徑還可行嗎？新路徑寫的資料舊系統讀得懂嗎？</td></tr>
+  </tbody>
+</table></div>
+<p>最後一列最常被忽略。這一課的每個做法都假設「出事可以退回去」，但退路會在不知不覺中消失：遷移做到一半，新服務已經寫了一週的資料，舊系統卻沒有，這時「回滾」已經不是改閘道設定那麼簡單。每往前一步，都要確認退路還在，或者明確地決定「從這裡開始不回頭」並寫進文件。</p>
+<p>這就是主管要的演進計畫的完整樣子：改名用 expand → migrate → contract，<code>'refunded'</code> 先讓讀取端寬容再開始送，外送平台用版本並存與退場流程，新結帳頁用旗標逐步放量，訂單服務用 strangler fig 一塊一塊接手；每一步都有可以量測的「往下走」條件，和確認過的退路。</p>
+
+<h2>補充與查表</h2>
+<p>這一節不用背，實作時需要再回來查。</p>
+<p><strong>Stripe 的版本命名與發布節奏</strong>：Stripe 的帳號有一個預設版本，〈APIs as infrastructure〉說明預設是帳號第一次呼叫 API 時的最新版；目前的官方文件建議在每個請求用 <code>Stripe-Version</code> 標頭（或固定版本的 SDK）明確指定，版本名稱是日期加名稱，例如 <code>2026-10-28.endive</code>。Stripe 從 <code>2024-09-30.acacia</code> 開始改成每月發一個不含破壞性變更的版本，一年兩次發「大版本」（例如 <code>basil</code>、<code>endive</code>），破壞性變更只放在大版本的第一個版本裡，讓使用者能預期什麼時候要改程式。</p>
+<p><strong>功能旗標的四種類型</strong>：Pete Hodgson 在〈Feature Toggles〉（martinfowler.com）把旗標分成四類，壽命和「多常改」差很多，管理方式也不同：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>類型</th><th>咖啡店的例子</th><th>壽命</th><th>決定方式</th></tr></thead>
+  <tbody>
+    <tr><td>release：發布用</td><td>新結帳頁逐步放量</td><td>幾天到幾週，放量完就移除</td><td>依使用者分桶</td></tr>
+    <tr><td>experiment：實驗用</td><td>燕麥奶加購按鈕的 A/B 測試</td><td>到統計結果出來</td><td>依使用者分組，分組要穩定</td></tr>
+    <tr><td>ops：維運用</td><td>尖峰時關掉推薦區塊的 <strong>kill switch</strong></td><td>多半短，kill switch 可能長期存在</td><td>值班人員在執行時直接切換</td></tr>
+    <tr><td>permission：權限用</td><td>企業客戶才有的團購功能</td><td>好幾年</td><td>依使用者或方案</td></tr>
+  </tbody>
+</table></div>
+<p><strong>Unleash 的分桶</strong>：Unleash 的做法跟這課的分桶一樣：它用 MurmurHash 雜湊使用者 ID 加上 <code>groupId</code>（預設是旗標名稱）；幾個旗標設成同一個 <code>groupId</code> 就會選到同一群人，改 <code>groupId</code> 會整個重新洗牌。演算法跟我們的 <code>hash32</code> 不同，原理相同。練習 3 的 <code>salt</code> 就是同樣的用途。</p>
+<p><strong>旗標系統的套件</strong>：<a href="../../devops/lessons/16-cd.html">部署課第 16 課</a>介紹的 OpenFeature 是廠商中立的 API（<code>@openfeature/server-sdk</code> 1.23.0），後面可以接 Unleash（<code>unleash-client</code> 6.12.2）、LaunchDarkly 或自架的服務。Hodgson 把「程式裡問旗標開了沒」的地方稱為切換點，主張把切換點和決策邏輯分開，OpenFeature 的設計就是這樣。</p>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：寫 <code>parseOrderTolerant(json)</code>，把從外部收到的訂單（可能是舊格式、新格式或遷移中的格式）解析成 <code>ParsedOrder</code>。規則：</p>
+  <ul>
+    <li>必須是物件（不是 <code>null</code>、不是陣列），否則 <code>not_object</code>。</li>
+    <li><code>id</code> 可以是正整數（舊版）或非空字串（新版），一律輸出字串；其他情況 <code>bad_id</code>。</li>
+    <li>金額優先讀 <code>amount</code>（新），沒有（<code>undefined</code>）就讀 <code>total</code>（舊）。兩個都有但不相等 <code>amount_mismatch</code>；兩個都沒有 <code>missing_amount</code>；讀到的值不是非負整數 <code>bad_amount</code>。</li>
+    <li><code>status</code> 不是字串 <code>bad_status</code>；是四種已知狀態之一就照用，其他字串變成 <code>'unknown'</code>。</li>
+    <li><code>items</code> 沒有（<code>undefined</code>）時是 <code>[]</code>；有但不是陣列 <code>bad_items</code>；每一筆要是物件，且 <code>productId</code>、<code>quantity</code> 都是正整數，否則 <code>bad_item</code>。</li>
+    <li>每一層多出來的欄位都忽略：輸出只有規定的欄位。不能修改輸入。</li>
+  </ul>
+  <p>錯誤一律丟 <code>new ParseError(代碼)</code>。</p>
+  <script type="start">
+type OrderStatus = 'pending' | 'paid' | 'done' | 'cancelled'
+type ParsedOrder = {
+  id: string
+  status: OrderStatus | 'unknown'
+  amount: number
+  items: Array<{ productId: number; quantity: number }>
+}
+type ParseReason =
+  | 'not_object' | 'bad_id' | 'missing_amount' | 'amount_mismatch' | 'bad_amount'
+  | 'bad_status' | 'bad_items' | 'bad_item'
+
+class ParseError extends Error {
+  name = 'ParseError'
+  constructor(readonly reason: ParseReason) {
+    super(reason)
+  }
+}
+
+function parseOrderTolerant(json: unknown): ParsedOrder {
+  throw new Error('TODO')
+}
+
+console.log(parseOrderTolerant({ id: 42, status: 'paid', total: 190, items: [{ productId: 2, quantity: 1 }] }))
+console.log(parseOrderTolerant({ id: 'ord_43', status: 'refunded', amount: 110, currency: 'TWD' }))
+</script>
+  <script type="answer">
+type OrderStatus = 'pending' | 'paid' | 'done' | 'cancelled'
+type ParsedOrder = {
+  id: string
+  status: OrderStatus | 'unknown'
+  amount: number
+  items: Array<{ productId: number; quantity: number }>
+}
+type ParseReason =
+  | 'not_object' | 'bad_id' | 'missing_amount' | 'amount_mismatch' | 'bad_amount'
+  | 'bad_status' | 'bad_items' | 'bad_item'
+
+class ParseError extends Error {
+  name = 'ParseError'
+  constructor(readonly reason: ParseReason) {
+    super(reason)
+  }
+}
+
+const STATUSES: readonly string[] = ['pending', 'paid', 'done', 'cancelled']
+const isRecord = (x: unknown): x is Record<string, unknown> =>
+  typeof x === 'object' && x !== null && !Array.isArray(x)
+const isPositiveInt = (x: unknown): x is number => typeof x === 'number' && Number.isInteger(x) && x > 0
+
+function parseOrderTolerant(json: unknown): ParsedOrder {
+  if (!isRecord(json)) throw new ParseError('not_object')
+
+  let id: string
+  if (isPositiveInt(json.id)) id = String(json.id)
+  else if (typeof json.id === 'string' && json.id !== '') id = json.id
+  else throw new ParseError('bad_id')
+
+  // 遷移期間新舊欄位都接受；兩個都有就必須一致，不默默挑一個
+  const { amount: a, total: t } = json
+  if (a !== undefined && t !== undefined && a !== t) throw new ParseError('amount_mismatch')
+  const value = a !== undefined ? a : t
+  if (value === undefined) throw new ParseError('missing_amount')
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) throw new ParseError('bad_amount')
+
+  if (typeof json.status !== 'string') throw new ParseError('bad_status')
+  const status = STATUSES.includes(json.status) ? (json.status as OrderStatus) : 'unknown'
+
+  const rawItems = json.items === undefined ? [] : json.items
+  if (!Array.isArray(rawItems)) throw new ParseError('bad_items')
+  const items = rawItems.map((item: unknown) => {
+    if (!isRecord(item) || !isPositiveInt(item.productId) || !isPositiveInt(item.quantity)) throw new ParseError('bad_item')
+    return { productId: item.productId, quantity: item.quantity }   // 只帶走需要的欄位
+  })
+
+  return { id, status, amount: value, items }
+}
+
+console.log(parseOrderTolerant({ id: 42, status: 'paid', total: 190, items: [{ productId: 2, quantity: 1 }] }))
+console.log(parseOrderTolerant({ id: 'ord_43', status: 'refunded', amount: 110, currency: 'TWD' }))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<ReturnType<typeof parseOrderTolerant>, ParsedOrder>>  // 回傳 ParsedOrder
+type _2 = Expect<Equal<Parameters<typeof parseOrderTolerant>[0], unknown>>  // 參數是 unknown：外部資料先當成不知道是什麼
+</script>
+  <script type="tests">
+function deepFreeze<T>(x: T): T {
+  if (x && typeof x === 'object') { for (const v of Object.values(x)) deepFreeze(v); Object.freeze(x) }
+  return x
+}
+const reasonOf = (input: unknown): string => {
+  try { parseOrderTolerant(deepFreeze(input)) } catch (e) {
+    assert(e instanceof ParseError && (e as Error).name === 'ParseError', `錯誤要是 ParseError，得到 ${String(e)}`)
+    return (e as ParseError).reason
+  }
+  return '（沒有丟錯）'
+}
+const parseOk = (input: unknown, msg: string): ParsedOrder => {
+  try { return parseOrderTolerant(deepFreeze(input)) }
+  catch (e) { assert(false, `${msg}：這筆是合法的訂單，不能丟錯，卻丟了 ${String(e)}`); throw e }
+}
+{
+  const r = parseOk({ id: 42, status: 'paid', total: 190, items: [{ productId: 2, quantity: 1 }, { productId: 5, quantity: 1 }] }, '舊格式')
+  assert.deepEqual(r, { id: '42', status: 'paid', amount: 190, items: [{ productId: 2, quantity: 1 }, { productId: 5, quantity: 1 }] }, '舊格式：數字 id 轉字串、讀 total')
+}
+{
+  const r = parseOk({
+    id: 'ord_9f3', status: 'done', amount: 110, currency: 'TWD', createdBy: 'app-5.2',
+    lines: [{ sku: 'latte' }], items: [{ productId: 2, quantity: 1, note: '少冰' }], customer: { name: '陳美華' },
+  }, '新格式多了 currency、lines、customer 這些欄位（寬容讀取端要忽略不認得的欄位）')
+  assert.deepEqual(r, { id: 'ord_9f3', status: 'done', amount: 110, items: [{ productId: 2, quantity: 1 }] }, '新格式：多出來的欄位（currency、lines、customer、items 裡的 note）都要忽略，輸出不能帶著走')
+}
+{
+  const r = parseOk({ id: 7, status: 'pending', amount: 80, total: 80 }, '遷移中的格式')
+  assert.deepEqual(r, { id: '7', status: 'pending', amount: 80, items: [] }, '遷移中：amount 與 total 都有且相等就接受；沒有 items 時是 []')
+}
+{
+  const r = parseOk({ id: 8, status: 'refunded', amount: 0 }, '不認得的狀態 refunded 要變成 unknown，不能整筆丟錯')
+  assert.equal(r.status, 'unknown', '不認得的狀態 refunded 要變成 unknown（不是 pending，也不是丟錯）')
+  assert.equal(r.amount, 0, '金額 0 是合法的非負整數')
+  assert.equal(parseOk({ id: 9, status: 'cancelled', total: 70 }, '已知狀態').status, 'cancelled', '已知狀態照用')
+}
+assert.equal(reasonOf({ id: 1, status: 'paid', amount: 190, total: 180 }), 'amount_mismatch', 'amount 與 total 不相等時不能默默挑一個')
+assert.equal(reasonOf({ id: 1, status: 'paid', total: 190, amount: 180 }), 'amount_mismatch', '不管哪個在前面，不相等就是 amount_mismatch')
+assert.equal(reasonOf({ id: 1, status: 'paid' }), 'missing_amount', '兩個金額欄位都沒有')
+assert.equal(reasonOf({ id: 1, status: 'paid', total: -5 }), 'bad_amount', '金額為負是違反規格，要拒絕')
+assert.equal(reasonOf({ id: 1, status: 'paid', amount: 12.5 }), 'bad_amount', '金額要是整數元')
+assert.equal(reasonOf({ id: 1, status: 'paid', amount: '80' }), 'bad_amount', '金額是字串也要拒絕')
+assert.equal(reasonOf({ id: 1, status: 'paid', amount: null }), 'bad_amount', 'amount 是 null 不等於沒有這個欄位')
+assert.equal(reasonOf({ id: 1, status: 3, amount: 80 }), 'bad_status', 'status 不是字串')
+assert.equal(reasonOf({ id: 1, amount: 80 }), 'bad_status', '缺 status')
+assert.equal(reasonOf(null), 'not_object', 'null 不是訂單')
+assert.equal(reasonOf([1, 2]), 'not_object', '陣列不是訂單')
+assert.equal(reasonOf('order'), 'not_object', '字串不是訂單')
+assert.equal(reasonOf({ id: true, status: 'paid', amount: 80 }), 'bad_id', 'id 是布林值')
+assert.equal(reasonOf({ id: '', status: 'paid', amount: 80 }), 'bad_id', 'id 是空字串')
+assert.equal(reasonOf({ id: 1.5, status: 'paid', amount: 80 }), 'bad_id', '數字 id 要是正整數')
+assert.equal(reasonOf({ status: 'paid', amount: 80 }), 'bad_id', '缺 id')
+assert.equal(reasonOf({ id: 1, status: 'paid', amount: 80, items: 'latte' }), 'bad_items', 'items 不是陣列')
+assert.equal(reasonOf({ id: 1, status: 'paid', amount: 80, items: [{ productId: 0, quantity: 1 }] }), 'bad_item', 'productId 要是正整數')
+assert.equal(reasonOf({ id: 1, status: 'paid', amount: 80, items: [{ productId: 2, quantity: 1.5 }] }), 'bad_item', 'quantity 要是正整數')
+assert.equal(reasonOf({ id: 1, status: 'paid', amount: 80, items: [null] }), 'bad_item', '明細要是物件')
+assert.equal(reasonOf({ id: 1, status: 'paid', amount: 80, items: null }), 'bad_items', 'items 是 null 不等於沒有這個欄位')
+assert.equal(reasonOf({ id: 1, status: 'paid', amount: 0, total: 80 }), 'amount_mismatch', 'amount 是 0、total 是 80 也是不相等：判斷「有沒有這個欄位」要比較 undefined，不能用真假值')
+assert.equal(reasonOf({ id: -3, status: 'paid', amount: 80 }), 'bad_id', '數字 id 要是正整數，負數不行')
+assert.equal(parseOk({ id: 1, status: 'toString', amount: 80 }, '不認得的狀態').status, 'unknown', "'toString' 不是已知狀態：用陣列的 includes 比對，不要用 in 查物件（會查到原型上的屬性）")
+</script>
+  <script type="wrong">
+// 嚴格的讀取端：不認得的欄位就丟錯
+type OrderStatus = 'pending' | 'paid' | 'done' | 'cancelled'
+type ParsedOrder = { id: string; status: OrderStatus | 'unknown'; amount: number; items: Array<{ productId: number; quantity: number }> }
+type ParseReason = 'not_object' | 'bad_id' | 'missing_amount' | 'amount_mismatch' | 'bad_amount' | 'bad_status' | 'bad_items' | 'bad_item'
+class ParseError extends Error { name = 'ParseError'; constructor(readonly reason: ParseReason) { super(reason) } }
+const STATUSES: readonly string[] = ['pending', 'paid', 'done', 'cancelled']
+const isRecord = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x)
+const isPositiveInt = (x: unknown): x is number => typeof x === 'number' && Number.isInteger(x) && x > 0
+function parseOrderTolerant(json: unknown): ParsedOrder {
+  if (!isRecord(json)) throw new ParseError('not_object')
+  for (const k of Object.keys(json)) if (!['id', 'status', 'amount', 'total', 'items'].includes(k)) throw new ParseError('not_object')
+  let id: string
+  if (isPositiveInt(json.id)) id = String(json.id)
+  else if (typeof json.id === 'string' && json.id !== '') id = json.id
+  else throw new ParseError('bad_id')
+  const { amount: a, total: t } = json
+  if (a !== undefined && t !== undefined && a !== t) throw new ParseError('amount_mismatch')
+  const value = a !== undefined ? a : t
+  if (value === undefined) throw new ParseError('missing_amount')
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) throw new ParseError('bad_amount')
+  if (typeof json.status !== 'string') throw new ParseError('bad_status')
+  const status = STATUSES.includes(json.status) ? (json.status as OrderStatus) : 'unknown'
+  const rawItems = json.items === undefined ? [] : json.items
+  if (!Array.isArray(rawItems)) throw new ParseError('bad_items')
+  const items = rawItems.map((item: unknown) => {
+    if (!isRecord(item) || !isPositiveInt(item.productId) || !isPositiveInt(item.quantity)) throw new ParseError('bad_item')
+    return { productId: item.productId, quantity: item.quantity }
+  })
+  return { id, status, amount: value, items }
+}
+</script>
+  <script type="wrong">
+// 未知狀態變成 pending
+type OrderStatus = 'pending' | 'paid' | 'done' | 'cancelled'
+type ParsedOrder = { id: string; status: OrderStatus | 'unknown'; amount: number; items: Array<{ productId: number; quantity: number }> }
+type ParseReason = 'not_object' | 'bad_id' | 'missing_amount' | 'amount_mismatch' | 'bad_amount' | 'bad_status' | 'bad_items' | 'bad_item'
+class ParseError extends Error { name = 'ParseError'; constructor(readonly reason: ParseReason) { super(reason) } }
+const STATUSES: readonly string[] = ['pending', 'paid', 'done', 'cancelled']
+const isRecord = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x)
+const isPositiveInt = (x: unknown): x is number => typeof x === 'number' && Number.isInteger(x) && x > 0
+function parseOrderTolerant(json: unknown): ParsedOrder {
+  if (!isRecord(json)) throw new ParseError('not_object')
+  let id: string
+  if (isPositiveInt(json.id)) id = String(json.id)
+  else if (typeof json.id === 'string' && json.id !== '') id = json.id
+  else throw new ParseError('bad_id')
+  const { amount: a, total: t } = json
+  if (a !== undefined && t !== undefined && a !== t) throw new ParseError('amount_mismatch')
+  const value = a !== undefined ? a : t
+  if (value === undefined) throw new ParseError('missing_amount')
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) throw new ParseError('bad_amount')
+  if (typeof json.status !== 'string') throw new ParseError('bad_status')
+  const status = STATUSES.includes(json.status) ? (json.status as OrderStatus) : 'pending'
+  const rawItems = json.items === undefined ? [] : json.items
+  if (!Array.isArray(rawItems)) throw new ParseError('bad_items')
+  const items = rawItems.map((item: unknown) => {
+    if (!isRecord(item) || !isPositiveInt(item.productId) || !isPositiveInt(item.quantity)) throw new ParseError('bad_item')
+    return { productId: item.productId, quantity: item.quantity }
+  })
+  return { id, status, amount: value, items }
+}
+</script>
+  <script type="wrong">
+// 未知狀態整筆丟錯
+type OrderStatus = 'pending' | 'paid' | 'done' | 'cancelled'
+type ParsedOrder = { id: string; status: OrderStatus | 'unknown'; amount: number; items: Array<{ productId: number; quantity: number }> }
+type ParseReason = 'not_object' | 'bad_id' | 'missing_amount' | 'amount_mismatch' | 'bad_amount' | 'bad_status' | 'bad_items' | 'bad_item'
+class ParseError extends Error { name = 'ParseError'; constructor(readonly reason: ParseReason) { super(reason) } }
+const STATUSES: readonly string[] = ['pending', 'paid', 'done', 'cancelled']
+const isRecord = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x)
+const isPositiveInt = (x: unknown): x is number => typeof x === 'number' && Number.isInteger(x) && x > 0
+function parseOrderTolerant(json: unknown): ParsedOrder {
+  if (!isRecord(json)) throw new ParseError('not_object')
+  let id: string
+  if (isPositiveInt(json.id)) id = String(json.id)
+  else if (typeof json.id === 'string' && json.id !== '') id = json.id
+  else throw new ParseError('bad_id')
+  const { amount: a, total: t } = json
+  if (a !== undefined && t !== undefined && a !== t) throw new ParseError('amount_mismatch')
+  const value = a !== undefined ? a : t
+  if (value === undefined) throw new ParseError('missing_amount')
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) throw new ParseError('bad_amount')
+  if (typeof json.status !== 'string' || !STATUSES.includes(json.status)) throw new ParseError('bad_status')
+  const status = json.status as OrderStatus
+  const rawItems = json.items === undefined ? [] : json.items
+  if (!Array.isArray(rawItems)) throw new ParseError('bad_items')
+  const items = rawItems.map((item: unknown) => {
+    if (!isRecord(item) || !isPositiveInt(item.productId) || !isPositiveInt(item.quantity)) throw new ParseError('bad_item')
+    return { productId: item.productId, quantity: item.quantity }
+  })
+  return { id, status, amount: value, items }
+}
+</script>
+  <script type="wrong">
+// 兩個金額欄位都有時優先讀舊的 total，也不檢查是否一致
+type OrderStatus = 'pending' | 'paid' | 'done' | 'cancelled'
+type ParsedOrder = { id: string; status: OrderStatus | 'unknown'; amount: number; items: Array<{ productId: number; quantity: number }> }
+type ParseReason = 'not_object' | 'bad_id' | 'missing_amount' | 'amount_mismatch' | 'bad_amount' | 'bad_status' | 'bad_items' | 'bad_item'
+class ParseError extends Error { name = 'ParseError'; constructor(readonly reason: ParseReason) { super(reason) } }
+const STATUSES: readonly string[] = ['pending', 'paid', 'done', 'cancelled']
+const isRecord = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x)
+const isPositiveInt = (x: unknown): x is number => typeof x === 'number' && Number.isInteger(x) && x > 0
+function parseOrderTolerant(json: unknown): ParsedOrder {
+  if (!isRecord(json)) throw new ParseError('not_object')
+  let id: string
+  if (isPositiveInt(json.id)) id = String(json.id)
+  else if (typeof json.id === 'string' && json.id !== '') id = json.id
+  else throw new ParseError('bad_id')
+  const value = json.total !== undefined ? json.total : json.amount
+  if (value === undefined) throw new ParseError('missing_amount')
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) throw new ParseError('bad_amount')
+  if (typeof json.status !== 'string') throw new ParseError('bad_status')
+  const status = STATUSES.includes(json.status) ? (json.status as OrderStatus) : 'unknown'
+  const rawItems = json.items === undefined ? [] : json.items
+  if (!Array.isArray(rawItems)) throw new ParseError('bad_items')
+  const items = rawItems.map((item: unknown) => {
+    if (!isRecord(item) || !isPositiveInt(item.productId) || !isPositiveInt(item.quantity)) throw new ParseError('bad_item')
+    return { productId: item.productId, quantity: item.quantity }
+  })
+  return { id, status, amount: value, items }
+}
+</script>
+  <script type="wrong">
+// 過度寬容：金額為負或小數也接受
+type OrderStatus = 'pending' | 'paid' | 'done' | 'cancelled'
+type ParsedOrder = { id: string; status: OrderStatus | 'unknown'; amount: number; items: Array<{ productId: number; quantity: number }> }
+type ParseReason = 'not_object' | 'bad_id' | 'missing_amount' | 'amount_mismatch' | 'bad_amount' | 'bad_status' | 'bad_items' | 'bad_item'
+class ParseError extends Error { name = 'ParseError'; constructor(readonly reason: ParseReason) { super(reason) } }
+const STATUSES: readonly string[] = ['pending', 'paid', 'done', 'cancelled']
+const isRecord = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x)
+const isPositiveInt = (x: unknown): x is number => typeof x === 'number' && Number.isInteger(x) && x > 0
+function parseOrderTolerant(json: unknown): ParsedOrder {
+  if (!isRecord(json)) throw new ParseError('not_object')
+  let id: string
+  if (isPositiveInt(json.id)) id = String(json.id)
+  else if (typeof json.id === 'string' && json.id !== '') id = json.id
+  else throw new ParseError('bad_id')
+  const { amount: a, total: t } = json
+  if (a !== undefined && t !== undefined && a !== t) throw new ParseError('amount_mismatch')
+  const value = a !== undefined ? a : t
+  if (value === undefined) throw new ParseError('missing_amount')
+  if (typeof value !== 'number') throw new ParseError('bad_amount')
+  if (typeof json.status !== 'string') throw new ParseError('bad_status')
+  const status = STATUSES.includes(json.status) ? (json.status as OrderStatus) : 'unknown'
+  const rawItems = json.items === undefined ? [] : json.items
+  if (!Array.isArray(rawItems)) throw new ParseError('bad_items')
+  const items = rawItems.map((item: unknown) => {
+    if (!isRecord(item) || !isPositiveInt(item.productId) || !isPositiveInt(item.quantity)) throw new ParseError('bad_item')
+    return { productId: item.productId, quantity: item.quantity }
+  })
+  return { id, status, amount: value, items }
+}
+</script>
+  <script type="wrong">
+// 用展開保留了所有欄位：輸出帶著 currency、lines、note 等多餘欄位
+type OrderStatus = 'pending' | 'paid' | 'done' | 'cancelled'
+type ParsedOrder = { id: string; status: OrderStatus | 'unknown'; amount: number; items: Array<{ productId: number; quantity: number }> }
+type ParseReason = 'not_object' | 'bad_id' | 'missing_amount' | 'amount_mismatch' | 'bad_amount' | 'bad_status' | 'bad_items' | 'bad_item'
+class ParseError extends Error { name = 'ParseError'; constructor(readonly reason: ParseReason) { super(reason) } }
+const STATUSES: readonly string[] = ['pending', 'paid', 'done', 'cancelled']
+const isRecord = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x)
+const isPositiveInt = (x: unknown): x is number => typeof x === 'number' && Number.isInteger(x) && x > 0
+function parseOrderTolerant(json: unknown): ParsedOrder {
+  if (!isRecord(json)) throw new ParseError('not_object')
+  let id: string
+  if (isPositiveInt(json.id)) id = String(json.id)
+  else if (typeof json.id === 'string' && json.id !== '') id = json.id
+  else throw new ParseError('bad_id')
+  const { amount: a, total: t } = json
+  if (a !== undefined && t !== undefined && a !== t) throw new ParseError('amount_mismatch')
+  const value = a !== undefined ? a : t
+  if (value === undefined) throw new ParseError('missing_amount')
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) throw new ParseError('bad_amount')
+  if (typeof json.status !== 'string') throw new ParseError('bad_status')
+  const status = STATUSES.includes(json.status) ? (json.status as OrderStatus) : 'unknown'
+  const rawItems = json.items === undefined ? [] : json.items
+  if (!Array.isArray(rawItems)) throw new ParseError('bad_items')
+  const items = rawItems.map((item: unknown) => {
+    if (!isRecord(item) || !isPositiveInt(item.productId) || !isPositiveInt(item.quantity)) throw new ParseError('bad_item')
+    return { ...item, productId: item.productId, quantity: item.quantity }
+  })
+  const rest: Record<string, unknown> = { ...json }
+  delete rest.total
+  return { ...rest, id, status, amount: value, items } as ParsedOrder
+}
+</script>
+  <script type="wrong">
+// 用真假值判斷欄位存在：amount 是 0 時沒發現和 total 不一致
+type OrderStatus = 'pending' | 'paid' | 'done' | 'cancelled'
+type ParsedOrder = { id: string; status: OrderStatus | 'unknown'; amount: number; items: Array<{ productId: number; quantity: number }> }
+type ParseReason = 'not_object' | 'bad_id' | 'missing_amount' | 'amount_mismatch' | 'bad_amount' | 'bad_status' | 'bad_items' | 'bad_item'
+class ParseError extends Error { name = 'ParseError'; constructor(readonly reason: ParseReason) { super(reason) } }
+const STATUSES: readonly string[] = ['pending', 'paid', 'done', 'cancelled']
+const isRecord = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x)
+const isPositiveInt = (x: unknown): x is number => typeof x === 'number' && Number.isInteger(x) && x > 0
+function parseOrderTolerant(json: unknown): ParsedOrder {
+  if (!isRecord(json)) throw new ParseError('not_object')
+  let id: string
+  if (isPositiveInt(json.id)) id = String(json.id)
+  else if (typeof json.id === 'string' && json.id !== '') id = json.id
+  else throw new ParseError('bad_id')
+  const { amount: a, total: t } = json
+  if (a && t && a !== t) throw new ParseError('amount_mismatch')
+  const value = a !== undefined ? a : t
+  if (value === undefined) throw new ParseError('missing_amount')
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) throw new ParseError('bad_amount')
+  if (typeof json.status !== 'string') throw new ParseError('bad_status')
+  const status = STATUSES.includes(json.status) ? (json.status as OrderStatus) : 'unknown'
+  const rawItems = json.items === undefined ? [] : json.items
+  if (!Array.isArray(rawItems)) throw new ParseError('bad_items')
+  const items = rawItems.map((item: unknown) => {
+    if (!isRecord(item) || !isPositiveInt(item.productId) || !isPositiveInt(item.quantity)) throw new ParseError('bad_item')
+    return { productId: item.productId, quantity: item.quantity }
+  })
+  return { id, status, amount: value, items }
+}
+</script>
+  <script type="wrong">
+// 用 in 查物件判斷已知狀態：'toString' 這類原型上的名字也被當成已知
+type OrderStatus = 'pending' | 'paid' | 'done' | 'cancelled'
+type ParsedOrder = { id: string; status: OrderStatus | 'unknown'; amount: number; items: Array<{ productId: number; quantity: number }> }
+type ParseReason = 'not_object' | 'bad_id' | 'missing_amount' | 'amount_mismatch' | 'bad_amount' | 'bad_status' | 'bad_items' | 'bad_item'
+class ParseError extends Error { name = 'ParseError'; constructor(readonly reason: ParseReason) { super(reason) } }
+const STATUSES: readonly string[] = ['pending', 'paid', 'done', 'cancelled']
+const isRecord = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x)
+const isPositiveInt = (x: unknown): x is number => typeof x === 'number' && Number.isInteger(x) && x > 0
+function parseOrderTolerant(json: unknown): ParsedOrder {
+  if (!isRecord(json)) throw new ParseError('not_object')
+  let id: string
+  if (isPositiveInt(json.id)) id = String(json.id)
+  else if (typeof json.id === 'string' && json.id !== '') id = json.id
+  else throw new ParseError('bad_id')
+  const { amount: a, total: t } = json
+  if (a !== undefined && t !== undefined && a !== t) throw new ParseError('amount_mismatch')
+  const value = a !== undefined ? a : t
+  if (value === undefined) throw new ParseError('missing_amount')
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) throw new ParseError('bad_amount')
+  if (typeof json.status !== 'string') throw new ParseError('bad_status')
+  const status = json.status in { pending: 1, paid: 1, done: 1, cancelled: 1 } ? (json.status as OrderStatus) : 'unknown'
+  const rawItems = json.items === undefined ? [] : json.items
+  if (!Array.isArray(rawItems)) throw new ParseError('bad_items')
+  const items = rawItems.map((item: unknown) => {
+    if (!isRecord(item) || !isPositiveInt(item.productId) || !isPositiveInt(item.quantity)) throw new ParseError('bad_item')
+    return { productId: item.productId, quantity: item.quantity }
+  })
+  return { id, status, amount: value, items }
+}
+</script>
+  <script type="wrong">
+// items 用 ?? []：null 也被當成沒有
+type OrderStatus = 'pending' | 'paid' | 'done' | 'cancelled'
+type ParsedOrder = { id: string; status: OrderStatus | 'unknown'; amount: number; items: Array<{ productId: number; quantity: number }> }
+type ParseReason = 'not_object' | 'bad_id' | 'missing_amount' | 'amount_mismatch' | 'bad_amount' | 'bad_status' | 'bad_items' | 'bad_item'
+class ParseError extends Error { name = 'ParseError'; constructor(readonly reason: ParseReason) { super(reason) } }
+const STATUSES: readonly string[] = ['pending', 'paid', 'done', 'cancelled']
+const isRecord = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x)
+const isPositiveInt = (x: unknown): x is number => typeof x === 'number' && Number.isInteger(x) && x > 0
+function parseOrderTolerant(json: unknown): ParsedOrder {
+  if (!isRecord(json)) throw new ParseError('not_object')
+  let id: string
+  if (isPositiveInt(json.id)) id = String(json.id)
+  else if (typeof json.id === 'string' && json.id !== '') id = json.id
+  else throw new ParseError('bad_id')
+  const { amount: a, total: t } = json
+  if (a !== undefined && t !== undefined && a !== t) throw new ParseError('amount_mismatch')
+  const value = a !== undefined ? a : t
+  if (value === undefined) throw new ParseError('missing_amount')
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) throw new ParseError('bad_amount')
+  if (typeof json.status !== 'string') throw new ParseError('bad_status')
+  const status = STATUSES.includes(json.status) ? (json.status as OrderStatus) : 'unknown'
+  const rawItems = json.items ?? []
+  if (!Array.isArray(rawItems)) throw new ParseError('bad_items')
+  const items = rawItems.map((item: unknown) => {
+    if (!isRecord(item) || !isPositiveInt(item.productId) || !isPositiveInt(item.quantity)) throw new ParseError('bad_item')
+    return { productId: item.productId, quantity: item.quantity }
+  })
+  return { id, status, amount: value, items }
+}
+</script>
+  <script type="wrong">
+// 數字 id 只檢查整數，負數也接受
+type OrderStatus = 'pending' | 'paid' | 'done' | 'cancelled'
+type ParsedOrder = { id: string; status: OrderStatus | 'unknown'; amount: number; items: Array<{ productId: number; quantity: number }> }
+type ParseReason = 'not_object' | 'bad_id' | 'missing_amount' | 'amount_mismatch' | 'bad_amount' | 'bad_status' | 'bad_items' | 'bad_item'
+class ParseError extends Error { name = 'ParseError'; constructor(readonly reason: ParseReason) { super(reason) } }
+const STATUSES: readonly string[] = ['pending', 'paid', 'done', 'cancelled']
+const isRecord = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x)
+const isPositiveInt = (x: unknown): x is number => typeof x === 'number' && Number.isInteger(x) && x > 0
+function parseOrderTolerant(json: unknown): ParsedOrder {
+  if (!isRecord(json)) throw new ParseError('not_object')
+  let id: string
+  if (typeof json.id === 'number' && Number.isInteger(json.id)) id = String(json.id)
+  else if (typeof json.id === 'string' && json.id !== '') id = json.id
+  else throw new ParseError('bad_id')
+  const { amount: a, total: t } = json
+  if (a !== undefined && t !== undefined && a !== t) throw new ParseError('amount_mismatch')
+  const value = a !== undefined ? a : t
+  if (value === undefined) throw new ParseError('missing_amount')
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) throw new ParseError('bad_amount')
+  if (typeof json.status !== 'string') throw new ParseError('bad_status')
+  const status = STATUSES.includes(json.status) ? (json.status as OrderStatus) : 'unknown'
+  const rawItems = json.items === undefined ? [] : json.items
+  if (!Array.isArray(rawItems)) throw new ParseError('bad_items')
+  const items = rawItems.map((item: unknown) => {
+    if (!isRecord(item) || !isPositiveInt(item.productId) || !isPositiveInt(item.quantity)) throw new ParseError('bad_item')
+    return { productId: item.productId, quantity: item.quantity }
+  })
+  return { id, status, amount: value, items }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：寫 <code>renderForVersion(latest, requested, changes, oldestSupported)</code>，用 Stripe 式的轉換鏈把最新版的回應轉成客戶端要求的版本。版本是 <code>'YYYY-MM-DD'</code> 字串（這種格式直接用字串比較就是日期先後）。規則：</p>
+  <ul>
+    <li><code>requested</code> 格式不對，或比 <code>oldestSupported</code> 舊，丟 <code>UnsupportedVersionError</code>。等於 <code>oldestSupported</code> 是可以的。</li>
+    <li>先 <code>structuredClone(latest)</code>，再把 <code>version</code> <strong>嚴格大於</strong> <code>requested</code> 的改動，依版本<strong>由新到舊</strong>套用 <code>down</code>（每個 <code>down</code> 回傳轉換後的物件，下一個 <code>down</code> 接著處理它）。</li>
+    <li><code>changes</code> 傳進來不一定有排序。不能修改 <code>latest</code>（它可能是好幾個請求共用的快取資料）。</li>
+  </ul>
+  <script type="start">
+type Payload = Record<string, unknown>
+type VersionChange = {
+  version: string          // 這個不相容的改動在哪一天上線
+  description: string
+  down: (o: Payload) => Payload   // 把「改動後」的格式轉回「改動前」
+}
+class UnsupportedVersionError extends Error {
+  name = 'UnsupportedVersionError'
+  constructor(readonly requested: string) {
+    super(`不支援的 API 版本：${requested}`)
+  }
+}
+
+function renderForVersion(
+  latest: Readonly<Payload>,
+  requested: string,
+  changes: ReadonlyArray<VersionChange>,
+  oldestSupported: string,
+): Payload {
+  throw new Error('TODO')
+}
+
+const changes: VersionChange[] = [
+  { version: '2026-03-01', description: 'total 改名 amount', down: o => { o.total = o.amount; delete o.amount; return o } },
+  { version: '2026-09-01', description: 'items 搬到 lines', down: o => { o.items = o.lines; delete o.lines; return o } },
+]
+const latest = { id: 'ord_9f3', amount: 190, lines: [{ productId: 2, quantity: 1 }] }
+console.log(renderForVersion(latest, '2026-01-10', changes, '2026-01-01'))
+console.log(renderForVersion(latest, '2026-09-01', changes, '2026-01-01'))
+</script>
+  <script type="answer">
+type Payload = Record<string, unknown>
+type VersionChange = {
+  version: string          // 這個不相容的改動在哪一天上線
+  description: string
+  down: (o: Payload) => Payload   // 把「改動後」的格式轉回「改動前」
+}
+class UnsupportedVersionError extends Error {
+  name = 'UnsupportedVersionError'
+  constructor(readonly requested: string) {
+    super(`不支援的 API 版本：${requested}`)
+  }
+}
+
+const VERSION = /^\d{4}-\d{2}-\d{2}$/
+
+function renderForVersion(
+  latest: Readonly<Payload>,
+  requested: string,
+  changes: ReadonlyArray<VersionChange>,
+  oldestSupported: string,
+): Payload {
+  if (!VERSION.test(requested) || requested < oldestSupported) throw new UnsupportedVersionError(requested)
+  const toApply = changes
+    .filter(c => c.version > requested)                          // 等於 requested 的改動，客戶端已經認得
+    .toSorted((a, b) => (a.version < b.version ? 1 : -1))        // 由新到舊
+  let out: Payload = structuredClone(latest)                     // 不碰共用的 latest
+  for (const change of toApply) out = change.down(out)
+  return out
+}
+
+const changes: VersionChange[] = [
+  { version: '2026-03-01', description: 'total 改名 amount', down: o => { o.total = o.amount; delete o.amount; return o } },
+  { version: '2026-09-01', description: 'items 搬到 lines', down: o => { o.items = o.lines; delete o.lines; return o } },
+]
+const latest = { id: 'ord_9f3', amount: 190, lines: [{ productId: 2, quantity: 1 }] }
+console.log(renderForVersion(latest, '2026-01-10', changes, '2026-01-01'))
+console.log(renderForVersion(latest, '2026-09-01', changes, '2026-01-01'))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<ReturnType<typeof renderForVersion>, Payload>>  // 回傳 Payload
+</script>
+  <script type="tests">
+function deepFreeze<T>(x: T): T {
+  if (x && typeof x === 'object') { for (const v of Object.values(x)) deepFreeze(v); Object.freeze(x) }
+  return x
+}
+const realChanges: VersionChange[] = [
+  { version: '2026-06-15', description: '狀態 completed 改名 done', down: o => { if (o.status === 'done') o.status = 'completed'; return o } },
+  { version: '2026-03-01', description: 'total 改名 amount', down: o => { o.total = o.amount; delete o.amount; return o } },
+  { version: '2026-09-01', description: 'items 搬到 lines', down: o => { o.items = o.lines; delete o.lines; return o } },
+]
+const latest = deepFreeze({ id: 'ord_9f3', status: 'done', amount: 190, currency: 'TWD', lines: [{ productId: 2, quantity: 1 }, { productId: 5, quantity: 1 }] })
+const lines = [{ productId: 2, quantity: 1 }, { productId: 5, quantity: 1 }]
+{
+  let r: Payload = {}
+  try { r = renderForVersion(latest, '2026-01-10', realChanges, '2026-01-01') }
+  catch (e) { assert(false, `latest 是共用的快取資料（測試把它凍結了），要先 structuredClone 再轉換，不能直接改它：${String(e)}`) }
+  assert.deepEqual(r, { id: 'ord_9f3', status: 'completed', total: 190, currency: 'TWD', items: lines }, '要求 2026-01-10：三個改動都要轉回去')
+  assert(r !== latest, '要回傳新的物件，不能回傳 latest 本身')
+}
+{
+  const r = renderForVersion(latest, '2026-06-15', realChanges, '2026-01-01')
+  assert.deepEqual(r, { id: 'ord_9f3', status: 'done', amount: 190, currency: 'TWD', items: lines }, '要求 2026-06-15：只套用 2026-09-01；版本等於 requested 的改動客戶端已經認得，不能套用')
+}
+{
+  assert.deepEqual(renderForVersion(latest, '2026-09-01', realChanges, '2026-01-01'), { ...latest, lines }, '要求最新版：原樣回傳')
+  assert.deepEqual(renderForVersion(latest, '2026-12-01', realChanges, '2026-01-01'), { ...latest, lines }, '要求比所有改動都新的版本：原樣回傳')
+  assert.deepEqual(renderForVersion(latest, '2026-01-01', realChanges, '2026-01-01').total, 190, '等於 oldestSupported 的版本可以用')
+}
+{ // 順序：每個 down 在軌跡上記下自己
+  const trail = (v: string): VersionChange => ({ version: v, description: v, down: o => ({ ...o, trail: [...(o.trail as string[]), v] }) })
+  const shuffled = Object.freeze(['2026-05-01', '2026-10-01', '2026-02-01', '2026-08-01', '2026-04-01'].map(trail))
+  let r: Payload = {}
+  try { r = renderForVersion(deepFreeze({ trail: [] as string[] }), '2026-03-01', shuffled, '2026-01-01') }
+  catch (e) { assert(false, `不能修改傳進來的 changes（例如直接 sort），要先複製再排序：${String(e)}`) }
+  assert.deepEqual(r.trail, ['2026-10-01', '2026-08-01', '2026-05-01', '2026-04-01'], 'changes 沒排序時，要自己依版本由新到舊套用（越新的轉換假設的是越新的格式）')
+}
+{ // 巢狀的物件也要是複本
+  const nested = deepFreeze({ id: 'ord_9f3', lines: [{ productId: 2, quantity: 1, unitPrice: 110 }] })
+  const rename: VersionChange = {
+    version: '2026-07-01', description: '明細的 price 改名 unitPrice',
+    down: o => { for (const l of o.lines as Array<Record<string, unknown>>) { l.price = l.unitPrice; delete l.unitPrice } return o },
+  }
+  let r: Payload = {}
+  try { r = renderForVersion(nested, '2026-01-01', [rename], '2026-01-01') }
+  catch (e) { assert(false, `down 會改到巢狀的明細：要用 structuredClone 複製整個物件，淺複製（{ ...latest }）的明細還是共用的 latest：${String(e)}`) }
+  assert.deepEqual(r, { id: 'ord_9f3', lines: [{ productId: 2, quantity: 1, price: 110 }] }, '明細裡的 unitPrice 要轉回 price')
+}
+for (const bad of ['x2026-01-01', '2025-12-31', '2026-1-5', 'latest', '', '2026-01-01x']) {
+  let error: unknown
+  try { renderForVersion(latest, bad, realChanges, '2026-01-01') } catch (e) { error = e }
+  assert(error instanceof UnsupportedVersionError && (error as Error).name === 'UnsupportedVersionError', `版本 ${JSON.stringify(bad)} 要丟 UnsupportedVersionError（格式不對或比 oldestSupported 舊）`)
+}
+assert.equal(latest.amount, 190, 'latest 不能被修改')
+</script>
+  <script type="wrong">
+// 依由舊到新套用
+type Payload = Record<string, unknown>
+type VersionChange = { version: string; description: string; down: (o: Payload) => Payload }
+class UnsupportedVersionError extends Error { name = 'UnsupportedVersionError'; constructor(readonly requested: string) { super(requested) } }
+function renderForVersion(latest: Readonly<Payload>, requested: string, changes: ReadonlyArray<VersionChange>, oldestSupported: string): Payload {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(requested) || requested < oldestSupported) throw new UnsupportedVersionError(requested)
+  let out: Payload = structuredClone(latest)
+  for (const c of changes.filter(c => c.version > requested).toSorted((a, b) => (a.version < b.version ? -1 : 1))) out = c.down(out)
+  return out
+}
+</script>
+  <script type="wrong">
+// 包含版本等於 requested 的改動
+type Payload = Record<string, unknown>
+type VersionChange = { version: string; description: string; down: (o: Payload) => Payload }
+class UnsupportedVersionError extends Error { name = 'UnsupportedVersionError'; constructor(readonly requested: string) { super(requested) } }
+function renderForVersion(latest: Readonly<Payload>, requested: string, changes: ReadonlyArray<VersionChange>, oldestSupported: string): Payload {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(requested) || requested < oldestSupported) throw new UnsupportedVersionError(requested)
+  let out: Payload = structuredClone(latest)
+  for (const c of changes.filter(c => c.version >= requested).toSorted((a, b) => (a.version < b.version ? 1 : -1))) out = c.down(out)
+  return out
+}
+</script>
+  <script type="wrong">
+// 直接修改 latest
+type Payload = Record<string, unknown>
+type VersionChange = { version: string; description: string; down: (o: Payload) => Payload }
+class UnsupportedVersionError extends Error { name = 'UnsupportedVersionError'; constructor(readonly requested: string) { super(requested) } }
+function renderForVersion(latest: Readonly<Payload>, requested: string, changes: ReadonlyArray<VersionChange>, oldestSupported: string): Payload {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(requested) || requested < oldestSupported) throw new UnsupportedVersionError(requested)
+  let out = latest as Payload
+  for (const c of changes.filter(c => c.version > requested).toSorted((a, b) => (a.version < b.version ? 1 : -1))) out = c.down(out)
+  return out
+}
+</script>
+  <script type="wrong">
+// 假設 changes 已經由新到舊排好
+type Payload = Record<string, unknown>
+type VersionChange = { version: string; description: string; down: (o: Payload) => Payload }
+class UnsupportedVersionError extends Error { name = 'UnsupportedVersionError'; constructor(readonly requested: string) { super(requested) } }
+function renderForVersion(latest: Readonly<Payload>, requested: string, changes: ReadonlyArray<VersionChange>, oldestSupported: string): Payload {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(requested) || requested < oldestSupported) throw new UnsupportedVersionError(requested)
+  let out: Payload = structuredClone(latest)
+  for (const c of changes) if (c.version > requested) out = c.down(out)
+  return out
+}
+</script>
+  <script type="wrong">
+// 沒有擋掉太舊或格式錯誤的版本
+type Payload = Record<string, unknown>
+type VersionChange = { version: string; description: string; down: (o: Payload) => Payload }
+class UnsupportedVersionError extends Error { name = 'UnsupportedVersionError'; constructor(readonly requested: string) { super(requested) } }
+function renderForVersion(latest: Readonly<Payload>, requested: string, changes: ReadonlyArray<VersionChange>, oldestSupported: string): Payload {
+  let out: Payload = structuredClone(latest)
+  for (const c of changes.filter(c => c.version > requested).toSorted((a, b) => (a.version < b.version ? 1 : -1))) out = c.down(out)
+  return out
+}
+</script>
+  <script type="wrong">
+// 淺複製：巢狀的明細還是共用的 latest
+type Payload = Record<string, unknown>
+type VersionChange = { version: string; description: string; down: (o: Payload) => Payload }
+class UnsupportedVersionError extends Error { name = 'UnsupportedVersionError'; constructor(readonly requested: string) { super(requested) } }
+function renderForVersion(latest: Readonly<Payload>, requested: string, changes: ReadonlyArray<VersionChange>, oldestSupported: string): Payload {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(requested) || requested < oldestSupported) throw new UnsupportedVersionError(requested)
+  let out: Payload = { ...latest }
+  for (const c of changes.filter(c => c.version > requested).toSorted((a, b) => (a.version < b.version ? 1 : -1))) out = c.down(out)
+  return out
+}
+</script>
+  <script type="wrong">
+// 直接 sort 傳進來的 changes（改到呼叫端的陣列）
+type Payload = Record<string, unknown>
+type VersionChange = { version: string; description: string; down: (o: Payload) => Payload }
+class UnsupportedVersionError extends Error { name = 'UnsupportedVersionError'; constructor(readonly requested: string) { super(requested) } }
+function renderForVersion(latest: Readonly<Payload>, requested: string, changes: ReadonlyArray<VersionChange>, oldestSupported: string): Payload {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(requested) || requested < oldestSupported) throw new UnsupportedVersionError(requested)
+  let out: Payload = structuredClone(latest)
+  for (const c of (changes as VersionChange[]).sort((a, b) => (a.version < b.version ? 1 : -1))) if (c.version > requested) out = c.down(out)
+  return out
+}
+</script>
+  <script type="wrong">
+// 正規表示式沒有錨定開頭
+type Payload = Record<string, unknown>
+type VersionChange = { version: string; description: string; down: (o: Payload) => Payload }
+class UnsupportedVersionError extends Error { name = 'UnsupportedVersionError'; constructor(readonly requested: string) { super(requested) } }
+function renderForVersion(latest: Readonly<Payload>, requested: string, changes: ReadonlyArray<VersionChange>, oldestSupported: string): Payload {
+  if (!/\d{4}-\d{2}-\d{2}$/.test(requested) || requested < oldestSupported) throw new UnsupportedVersionError(requested)
+  let out: Payload = structuredClone(latest)
+  for (const c of changes.filter(c => c.version > requested).toSorted((a, b) => (a.version < b.version ? 1 : -1))) out = c.down(out)
+  return out
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：寫 <code>isEnabled(flag, userId)</code>，決定某個使用者的功能旗標是否開啟。依序判斷：</p>
+  <ol>
+    <li><code>percent</code> 不是 0～100 的整數，丟 <code>RangeError</code>。</li>
+    <li><code>killed</code> 是 <code>true</code>（kill switch）→ <code>false</code>，連 allow 名單上的人也關。</li>
+    <li><code>deny</code> 包含 <code>userId</code> → <code>false</code>。</li>
+    <li><code>allow</code> 包含 <code>userId</code> → <code>true</code>（例如內部員工先試用）。</li>
+    <li>否則桶號 = <code>hash32(`${flag.salt ?? flag.key}:${userId}`) % 100</code>，桶號小於 <code>percent</code> 時開啟。</li>
+  </ol>
+  <p>不能用 <code>Math.random</code>。<code>hash32</code> 已經寫好了。</p>
+  <script type="start">
+type Flag = {
+  key: string
+  percent: number               // 0～100 的整數
+  salt?: string                 // 有的話用它取代 key 當雜湊的鹽（幾個旗標想選到同一群人時）
+  allow?: readonly string[]
+  deny?: readonly string[]
+  killed?: boolean
+}
+
+// 已經寫好：第 7 課的 hash32（FNV-1a 加上 fmix32）
+function hash32(s: string): number {
+  let h = 0x811c9dc5
+  for (const b of new TextEncoder().encode(s)) {
+    h ^= b
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  h ^= h >>> 16
+  h = Math.imul(h, 0x85ebca6b)
+  h ^= h >>> 13
+  h = Math.imul(h, 0xc2b2ae35)
+  h ^= h >>> 16
+  return h >>> 0
+}
+
+function isEnabled(flag: Flag, userId: string): boolean {
+  throw new Error('TODO')
+}
+
+const checkout: Flag = { key: 'new-checkout', percent: 30, allow: ['staff-1'] }
+for (const id of ['王小明', '陳美華', '林志豪', 'staff-1']) console.log(id, isEnabled(checkout, id))
+</script>
+  <script type="answer">
+type Flag = {
+  key: string
+  percent: number               // 0～100 的整數
+  salt?: string                 // 有的話用它取代 key 當雜湊的鹽（幾個旗標想選到同一群人時）
+  allow?: readonly string[]
+  deny?: readonly string[]
+  killed?: boolean
+}
+
+// 已經寫好：第 7 課的 hash32（FNV-1a 加上 fmix32）
+function hash32(s: string): number {
+  let h = 0x811c9dc5
+  for (const b of new TextEncoder().encode(s)) {
+    h ^= b
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  h ^= h >>> 16
+  h = Math.imul(h, 0x85ebca6b)
+  h ^= h >>> 13
+  h = Math.imul(h, 0xc2b2ae35)
+  h ^= h >>> 16
+  return h >>> 0
+}
+
+function isEnabled(flag: Flag, userId: string): boolean {
+  if (!Number.isInteger(flag.percent) || flag.percent < 0 || flag.percent > 100) {
+    throw new RangeError(`percent 必須是 0～100 的整數，收到 ${flag.percent}`)
+  }
+  if (flag.killed) return false                       // kill switch 最優先
+  if (flag.deny?.includes(userId)) return false
+  if (flag.allow?.includes(userId)) return true
+  // 旗標自己的鹽 + 使用者 ID：同一個人永遠同一個桶，不同旗標選到不同的人
+  return hash32(`${flag.salt ?? flag.key}:${userId}`) % 100 < flag.percent
+}
+
+const checkout: Flag = { key: 'new-checkout', percent: 30, allow: ['staff-1'] }
+for (const id of ['王小明', '陳美華', '林志豪', 'staff-1']) console.log(id, isEnabled(checkout, id))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<ReturnType<typeof isEnabled>, boolean>>  // 回傳 boolean
+</script>
+  <script type="tests">
+function refHash(s: string): number {
+  let h = 0x811c9dc5
+  for (const b of new TextEncoder().encode(s)) { h ^= b; h = Math.imul(h, 0x01000193) >>> 0 }
+  h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16
+  return h >>> 0
+}
+const realRandom = Math.random
+Math.random = () => { throw new Error('不能用 Math.random：同一個人每次結果會不同，請用 hash32 分桶') }
+try {
+  const ids = Array.from({ length: 10000 }, (_, i) => `user-${i + 1}`)
+  const enabledSet = (flag: Flag) => new Set(ids.filter(id => isEnabled(flag, id)))
+
+  for (const id of ids.slice(0, 2000)) {
+    const expected = refHash(`new-checkout:${id}`) % 100 < 30
+    assert.equal(isEnabled({ key: 'new-checkout', percent: 30 }, id), expected, `${id} 的結果不對：桶號是 hash32(\`\${key}:\${userId}\`) % 100，小於 percent 才開啟`)
+  }
+  const f = { key: 'new-checkout', percent: 30 }
+  assert.equal(isEnabled(f, '王小明'), isEnabled(f, '王小明'), '同樣的輸入每次都要同樣的結果')
+
+  const at30 = enabledSet({ key: 'new-checkout', percent: 30 })
+  assert(at30.size >= 2800 && at30.size <= 3200, `percent 30 時 1 萬人中應該約 3,000 人開啟，得到 ${at30.size}`)
+  const at10 = enabledSet({ key: 'new-checkout', percent: 10 })
+  const at20 = enabledSet({ key: 'new-checkout', percent: 20 })
+  assert([...at10].every(id => at20.has(id)), 'percent 從 10 調到 20 時，原本開啟的人必須仍然開啟')
+
+  const other = enabledSet({ key: 'oat-milk-promo', percent: 30 })
+  const overlap = [...at30].filter(id => other.has(id)).length
+  assert(overlap > 700 && overlap < 1100, `兩個 30% 的旗標重疊應該接近 30% × 30% = 900 人（各自獨立），得到 ${overlap}：雜湊裡要放旗標的 key`)
+  assert.deepEqual(enabledSet({ key: 'oat-milk-promo', salt: 'new-checkout', percent: 30 }), at30, '有 salt 時用 salt 取代 key：salt 相同的旗標選到同一群人')
+
+  assert.equal(enabledSet({ key: 'new-checkout', percent: 0 }).size, 0, 'percent 0 時沒有任何人開啟')
+  assert.equal(enabledSet({ key: 'new-checkout', percent: 100 }).size, 10000, 'percent 100 時所有人開啟')
+
+  const someoneOn = [...at30][0]
+  const someoneOff = ids.find(id => !at30.has(id))!
+  assert.equal(isEnabled({ key: 'new-checkout', percent: 30, deny: [someoneOn] }, someoneOn), false, 'deny 名單上的人要關閉')
+  assert.equal(isEnabled({ key: 'new-checkout', percent: 30, allow: [someoneOff] }, someoneOff), true, 'allow 名單上的人要開啟')
+  assert.equal(isEnabled({ key: 'new-checkout', percent: 30, allow: ['x'], deny: ['x'] }, 'x'), false, 'deny 比 allow 優先')
+  assert.equal(isEnabled({ key: 'new-checkout', percent: 100, allow: [someoneOn], killed: true }, someoneOn), false, 'killed 時所有人都關閉，allow 名單也一樣')
+  assert.equal(isEnabled({ key: 'new-checkout', percent: 30, killed: false }, someoneOn), true, 'killed: false 不影響')
+
+  for (const bad of [-1, 101, 10.5, Number.NaN]) {
+    let error: unknown
+    try { isEnabled({ key: 'new-checkout', percent: bad }, 'u') } catch (e) { error = e }
+    assert(error instanceof RangeError, `percent ${bad} 要丟 RangeError`)
+  }
+  let killedBad: unknown
+  try { isEnabled({ key: 'new-checkout', percent: 150, killed: true }, 'u') } catch (e) { killedBad = e }
+  assert(killedBad instanceof RangeError, '設定錯誤要先檢查：percent 150 就算 killed 也要丟 RangeError，壞掉的設定才不會被藏起來')
+} finally {
+  Math.random = realRandom
+}
+</script>
+  <script type="wrong">
+// 用 Math.random：每個請求重抽一次
+type Flag = { key: string; percent: number; salt?: string; allow?: readonly string[]; deny?: readonly string[]; killed?: boolean }
+function hash32(s: string): number { return s.length }
+function isEnabled(flag: Flag, userId: string): boolean {
+  if (!Number.isInteger(flag.percent) || flag.percent < 0 || flag.percent > 100) throw new RangeError('percent')
+  if (flag.killed) return false
+  if (flag.deny?.includes(userId)) return false
+  if (flag.allow?.includes(userId)) return true
+  return Math.random() * 100 < flag.percent
+}
+</script>
+  <script type="wrong">
+// bucket ≤ percent：percent 0 時仍有人開啟
+type Flag = { key: string; percent: number; salt?: string; allow?: readonly string[]; deny?: readonly string[]; killed?: boolean }
+function hash32(s: string): number {
+  let h = 0x811c9dc5
+  for (const b of new TextEncoder().encode(s)) { h ^= b; h = Math.imul(h, 0x01000193) >>> 0 }
+  h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16
+  return h >>> 0
+}
+function isEnabled(flag: Flag, userId: string): boolean {
+  if (!Number.isInteger(flag.percent) || flag.percent < 0 || flag.percent > 100) throw new RangeError('percent')
+  if (flag.killed) return false
+  if (flag.deny?.includes(userId)) return false
+  if (flag.allow?.includes(userId)) return true
+  return hash32(`${flag.salt ?? flag.key}:${userId}`) % 100 <= flag.percent
+}
+</script>
+  <script type="wrong">
+// 只雜湊 userId：每個旗標都選到同一群人
+type Flag = { key: string; percent: number; salt?: string; allow?: readonly string[]; deny?: readonly string[]; killed?: boolean }
+function hash32(s: string): number {
+  let h = 0x811c9dc5
+  for (const b of new TextEncoder().encode(s)) { h ^= b; h = Math.imul(h, 0x01000193) >>> 0 }
+  h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16
+  return h >>> 0
+}
+function isEnabled(flag: Flag, userId: string): boolean {
+  if (!Number.isInteger(flag.percent) || flag.percent < 0 || flag.percent > 100) throw new RangeError('percent')
+  if (flag.killed) return false
+  if (flag.deny?.includes(userId)) return false
+  if (flag.allow?.includes(userId)) return true
+  return hash32(userId) % 100 < flag.percent
+}
+</script>
+  <script type="wrong">
+// allow 比 killed 優先：kill switch 關不掉內部員工
+type Flag = { key: string; percent: number; salt?: string; allow?: readonly string[]; deny?: readonly string[]; killed?: boolean }
+function hash32(s: string): number {
+  let h = 0x811c9dc5
+  for (const b of new TextEncoder().encode(s)) { h ^= b; h = Math.imul(h, 0x01000193) >>> 0 }
+  h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16
+  return h >>> 0
+}
+function isEnabled(flag: Flag, userId: string): boolean {
+  if (!Number.isInteger(flag.percent) || flag.percent < 0 || flag.percent > 100) throw new RangeError('percent')
+  if (flag.deny?.includes(userId)) return false
+  if (flag.allow?.includes(userId)) return true
+  if (flag.killed) return false
+  return hash32(`${flag.salt ?? flag.key}:${userId}`) % 100 < flag.percent
+}
+</script>
+  <script type="wrong">
+// 忽略 salt
+type Flag = { key: string; percent: number; salt?: string; allow?: readonly string[]; deny?: readonly string[]; killed?: boolean }
+function hash32(s: string): number {
+  let h = 0x811c9dc5
+  for (const b of new TextEncoder().encode(s)) { h ^= b; h = Math.imul(h, 0x01000193) >>> 0 }
+  h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16
+  return h >>> 0
+}
+function isEnabled(flag: Flag, userId: string): boolean {
+  if (!Number.isInteger(flag.percent) || flag.percent < 0 || flag.percent > 100) throw new RangeError('percent')
+  if (flag.killed) return false
+  if (flag.deny?.includes(userId)) return false
+  if (flag.allow?.includes(userId)) return true
+  return hash32(`${flag.key}:${userId}`) % 100 < flag.percent
+}
+</script>
+  <script type="wrong">
+// 先看 killed 才檢查 percent：壞掉的設定被藏起來
+type Flag = { key: string; percent: number; salt?: string; allow?: readonly string[]; deny?: readonly string[]; killed?: boolean }
+function hash32(s: string): number {
+  let h = 0x811c9dc5
+  for (const b of new TextEncoder().encode(s)) { h ^= b; h = Math.imul(h, 0x01000193) >>> 0 }
+  h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16
+  return h >>> 0
+}
+function isEnabled(flag: Flag, userId: string): boolean {
+  if (flag.killed) return false
+  if (!Number.isInteger(flag.percent) || flag.percent < 0 || flag.percent > 100) throw new RangeError('percent')
+  if (flag.deny?.includes(userId)) return false
+  if (flag.allow?.includes(userId)) return true
+  return hash32(`${flag.salt ?? flag.key}:${userId}`) % 100 < flag.percent
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 4：寫 <code>shadowCompare(primary, candidate, opts)</code>，做 strangler fig 的影子比對。<code>primary</code> 是舊系統、<code>candidate</code> 是新系統。規則：</p>
+  <ul>
+    <li>兩個同時開始。回傳（或丟出）<code>primary</code> 的結果，<strong>不能等 candidate</strong>。</li>
+    <li><code>primary</code> 成功後開始計時 <code>timeoutMs</code>（用 <code>opts.schedule</code>：代替 <code>setTimeout</code>，回傳取消函式，測試用假時鐘推進，見<a href="03-latency-percentiles.html">第 3 課</a>）：candidate 在時限內成功，就用 <code>opts.diff</code> 比較，沒有差異 <code>report({ kind: 'match' })</code>，有差異 <code>report({ kind: 'mismatch', paths })</code>；candidate 失敗 <code>report({ kind: 'candidate-error', error })</code>；時限到了還沒完成 <code>report({ kind: 'candidate-timeout' })</code>，之後才完成也不再 report。candidate 在 primary 之前就完成的話，primary 一成功就比較。比較完要取消計時器。</li>
+    <li><code>primary</code> 失敗時照樣丟出它的錯誤，不 report。</li>
+    <li>candidate 的任何錯誤（包含呼叫時就同步丟出的）都不能影響回應，也不能變成未處理的 rejection。</li>
+  </ul>
+  <script type="start">
+type ShadowReport =
+  | { kind: 'match' }
+  | { kind: 'mismatch'; paths: string[] }
+  | { kind: 'candidate-error'; error: unknown }
+  | { kind: 'candidate-timeout' }
+type ShadowOptions<T> = {
+  diff: (a: T, b: T) => string[]          // 回傳不一樣的欄位路徑，空陣列表示一致
+  report: (r: ShadowReport) => void
+  timeoutMs: number
+  schedule: (ms: number, fn: () => void) => () => void   // 回傳取消函式
+}
+
+async function shadowCompare<T>(primary: () => Promise<T>, candidate: () => Promise<T>, opts: ShadowOptions<T>): Promise<T> {
+  throw new Error('TODO')
+}
+
+// 範例：用真的 setTimeout 當 schedule（題目程式本身不能直接用 setTimeout）
+const schedule = (ms: number, fn: () => void) => { const t = setTimeout(fn, ms); return () => clearTimeout(t) }
+const diff = (a: { total: number }, b: { total: number }) => (a.total === b.total ? [] : ['total'])
+const result = await shadowCompare(
+  async () => ({ total: 190 }),
+  async () => ({ total: 180 }),
+  { diff, report: r => console.log('影子比對：', r), timeoutMs: 50, schedule },
+)
+console.log('回給使用者：', result)
+</script>
+  <script type="answer">
+type ShadowReport =
+  | { kind: 'match' }
+  | { kind: 'mismatch'; paths: string[] }
+  | { kind: 'candidate-error'; error: unknown }
+  | { kind: 'candidate-timeout' }
+type ShadowOptions<T> = {
+  diff: (a: T, b: T) => string[]          // 回傳不一樣的欄位路徑，空陣列表示一致
+  report: (r: ShadowReport) => void
+  timeoutMs: number
+  schedule: (ms: number, fn: () => void) => () => void   // 回傳取消函式
+}
+
+async function shadowCompare<T>(primary: () => Promise<T>, candidate: () => Promise<T>, opts: ShadowOptions<T>): Promise<T> {
+  // async 包一層：candidate 同步丟錯也會變成 rejection；再把成功與失敗都轉成一般的值，這個 Promise 永遠不會 reject
+  const shadow = (async () => candidate())().then(
+    value => ({ ok: true as const, value }),
+    (error: unknown) => ({ ok: false as const, error }),
+  )
+  const result = await primary()          // primary 失敗就直接丟出，不 report
+
+  let finished = false
+  const cancel = opts.schedule(opts.timeoutMs, () => {
+    if (finished) return
+    finished = true
+    opts.report({ kind: 'candidate-timeout' })
+  })
+  void shadow.then(outcome => {
+    if (finished) return                  // 已經逾時：晚到的結果不再 report
+    finished = true
+    cancel()
+    if (!outcome.ok) return opts.report({ kind: 'candidate-error', error: outcome.error })
+    const paths = opts.diff(result, outcome.value)
+    opts.report(paths.length === 0 ? { kind: 'match' } : { kind: 'mismatch', paths })
+  })
+  return result                           // 不等 candidate
+}
+
+// 範例：用真的 setTimeout 當 schedule（題目程式本身不能直接用 setTimeout）
+const schedule = (ms: number, fn: () => void) => { const t = setTimeout(fn, ms); return () => clearTimeout(t) }
+const diff = (a: { total: number }, b: { total: number }) => (a.total === b.total ? [] : ['total'])
+const result = await shadowCompare(
+  async () => ({ total: 190 }),
+  async () => ({ total: 180 }),
+  { diff, report: r => console.log('影子比對：', r), timeoutMs: 50, schedule },
+)
+console.log('回給使用者：', result)
+</script>
+  <script type="types">
+type _1 = Expect<Equal<ReturnType<typeof shadowCompare<number>>, Promise<number>>>  // 回傳 primary 的型別
+</script>
+  <script type="tests">
+const tick = () => new Promise<void>(r => setTimeout(r, 0))
+function createScheduler() {
+  let now = 0
+  const timers = new Set<{ at: number; fn: () => void }>()
+  return {
+    schedule(ms: number, fn: () => void) { const t = { at: now + ms, fn }; timers.add(t); return () => { timers.delete(t) } },
+    async advance(ms: number) {
+      const end = now + ms
+      for (;;) {
+        const due = [...timers].filter(t => t.at <= end).sort((a, b) => a.at - b.at)[0]
+        if (!due) break
+        timers.delete(due); now = due.at; due.fn(); await tick()
+      }
+      now = end
+    },
+    pending: () => timers.size,
+  }
+}
+type Order = { id: string; total: number; status: string }
+// 依內容比較（不管鍵的順序），回傳不同的欄位
+function orderDiff(a: Order, b: Order): string[] {
+  return (['id', 'total', 'status'] as const).filter(k => a[k] !== b[k])
+}
+function setup() {
+  const sched = createScheduler()
+  const reports: ShadowReport[] = []
+  const p = Promise.withResolvers<Order>()
+  const c = Promise.withResolvers<Order>()
+  const calls = { primary: 0, candidate: 0 }
+  const opts = { diff: orderDiff, report: (r: ShadowReport) => { reports.push(r) }, timeoutMs: 100, schedule: sched.schedule }
+  const primary = () => { calls.primary++; return p.promise }
+  const candidate = () => { calls.candidate++; return c.promise }
+  return { sched, reports, p, c, calls, opts, primary, candidate }
+}
+const oldOrder: Order = { id: 'ord_1', total: 190, status: 'paid' }
+{ // 不等 candidate；鍵順序不同但內容相同 → match
+  const t = setup()
+  let done: Order | undefined
+  void shadowCompare(t.primary, t.candidate, t.opts).then(v => { done = v })
+  await tick()
+  assert.equal(t.calls.primary, 1, 'primary 要呼叫一次')
+  assert.equal(t.calls.candidate, 1, 'candidate 要和 primary 同時開始')
+  t.p.resolve(oldOrder)
+  await tick()
+  assert.equal(done, oldOrder, 'candidate 還沒完成時，就要回傳 primary 的結果（不能等新系統，否則它的延遲會加到使用者身上）')
+  assert.equal(t.reports.length, 0, 'candidate 還沒完成，不能 report')
+  t.c.resolve({ status: 'paid', total: 190, id: 'ord_1' })
+  await tick()
+  assert.deepEqual(t.reports, [{ kind: 'match' }], '內容相同（鍵的順序不同）要用 opts.diff 比較，report match')
+  assert.equal(t.sched.pending(), 0, '比較完要取消計時器')
+}
+{ // mismatch，而且回傳的是 primary 的結果
+  const t = setup()
+  const s = shadowCompare(t.primary, t.candidate, t.opts)
+  t.c.resolve({ id: 'ord_1', total: 180, status: 'done' })
+  t.p.resolve(oldOrder)
+  assert.equal(await s, oldOrder, '要回傳 primary 的結果，不是 candidate 的')
+  await tick()
+  assert.deepEqual(t.reports, [{ kind: 'mismatch', paths: ['total', 'status'] }], 'candidate 先完成時，primary 一成功就比較，paths 用 opts.diff 的結果')
+  assert.equal(t.sched.pending(), 0, '比較完要取消計時器')
+}
+{ // candidate 失敗
+  const t = setup()
+  const s = shadowCompare(t.primary, t.candidate, t.opts)
+  const boom = new Error('新服務壞了')
+  t.c.reject(boom)
+  t.p.resolve(oldOrder)
+  assert.equal(await s, oldOrder, 'candidate 失敗不能影響回應')
+  await tick()
+  assert.equal(t.reports.length, 1, 'candidate 失敗要 report 一次')
+  assert.equal(t.reports[0].kind, 'candidate-error', 'candidate 失敗要 report candidate-error')
+  assert.equal((t.reports[0] as { error: unknown }).error, boom, 'candidate-error 要帶著原本的錯誤')
+}
+{ // candidate 同步丟錯
+  const t = setup()
+  const syncBoom = new Error('還沒設定好')
+  let s: Promise<Order> = Promise.resolve(oldOrder)
+  try { s = shadowCompare(t.primary, () => { throw syncBoom }, t.opts) }
+  catch (e) { assert(false, `candidate 呼叫時就同步丟錯，shadowCompare 不能跟著丟出：${String(e)}`) }
+  t.p.resolve(oldOrder)
+  let got: unknown
+  try { got = await s } catch (e) { got = e }
+  assert.equal(got, oldOrder, 'candidate 呼叫時就同步丟錯，也不能影響回應')
+  await tick()
+  assert.deepEqual(t.reports, [{ kind: 'candidate-error', error: syncBoom }], '同步丟錯也要 report candidate-error')
+}
+{ // 逾時
+  const t = setup()
+  const s = shadowCompare(t.primary, t.candidate, t.opts)
+  t.p.resolve(oldOrder)
+  assert.equal(await s, oldOrder, '逾時的情況也是先回傳 primary 的結果')
+  await t.sched.advance(99)
+  assert.equal(t.reports.length, 0, '還沒到 timeoutMs 不能 report 逾時（計時從 primary 成功開始）')
+  await t.sched.advance(1)
+  assert.deepEqual(t.reports, [{ kind: 'candidate-timeout' }], '到了 timeoutMs 要 report candidate-timeout')
+  t.c.resolve(oldOrder)
+  await tick()
+  assert.equal(t.reports.length, 1, '逾時之後 candidate 才完成，不能再 report 一次')
+}
+{ // 計時從 primary 成功開始，不是從呼叫開始
+  const t = setup()
+  const s = shadowCompare(t.primary, t.candidate, t.opts)
+  await t.sched.advance(80)
+  t.p.resolve(oldOrder)
+  assert.equal(await s, oldOrder, '要回傳 primary 的結果')
+  await t.sched.advance(99)
+  assert.equal(t.reports.length, 0, 'primary 花了 80ms，成功後才開始算 timeoutMs：這時還不能 report 逾時')
+  await t.sched.advance(1)
+  assert.deepEqual(t.reports, [{ kind: 'candidate-timeout' }], 'primary 成功後滿 timeoutMs 要 report candidate-timeout')
+}
+{ // candidate 在 primary 之前很久就失敗
+  const t = setup()
+  const s = shadowCompare(t.primary, t.candidate, t.opts)
+  const early = new Error('新服務一開始就壞了')
+  const unhandled: unknown[] = []
+  const onUnhandled = (e: Event) => { unhandled.push((e as Event & { reason: unknown }).reason) }
+  self.addEventListener('unhandledrejection', onUnhandled)
+  t.c.reject(early)
+  await tick(); await tick()
+  self.removeEventListener('unhandledrejection', onUnhandled)
+  assert.equal(unhandled.length, 0, 'candidate 在 primary 完成前就失敗了，它的錯誤要馬上有人接住（一開始就接上 .then(成功, 失敗)），不能等 primary 完成才處理，否則會變成未處理的 rejection')
+  t.p.resolve(oldOrder)
+  assert.equal(await s, oldOrder, 'candidate 先失敗也不能影響回應')
+  await tick()
+  assert.deepEqual(t.reports, [{ kind: 'candidate-error', error: early }], 'candidate 在 primary 完成前失敗，primary 成功後要 report candidate-error')
+}
+{ // primary 失敗
+  const t = setup()
+  const s = shadowCompare(t.primary, t.candidate, t.opts)
+  const down = new Error('單體壞了')
+  t.p.reject(down)
+  let thrown: unknown
+  try { await s } catch (e) { thrown = e }
+  assert.equal(thrown, down, 'primary 失敗要照樣丟出它的錯誤')
+  t.c.resolve(oldOrder)
+  await tick()
+  await t.sched.advance(1000)
+  assert.equal(t.reports.length, 0, 'primary 失敗時沒有東西可以比較，不能 report')
+}
+</script>
+  <script type="wrong">
+// 等 candidate 完成才回應
+type ShadowReport = { kind: 'match' } | { kind: 'mismatch'; paths: string[] } | { kind: 'candidate-error'; error: unknown } | { kind: 'candidate-timeout' }
+type ShadowOptions<T> = { diff: (a: T, b: T) => string[]; report: (r: ShadowReport) => void; timeoutMs: number; schedule: (ms: number, fn: () => void) => () => void }
+async function shadowCompare<T>(primary: () => Promise<T>, candidate: () => Promise<T>, opts: ShadowOptions<T>): Promise<T> {
+  const shadow = (async () => candidate())().then(value => ({ ok: true as const, value }), (error: unknown) => ({ ok: false as const, error }))
+  const result = await primary()
+  const outcome = await shadow
+  if (!outcome.ok) opts.report({ kind: 'candidate-error', error: outcome.error })
+  else {
+    const paths = opts.diff(result, outcome.value)
+    opts.report(paths.length === 0 ? { kind: 'match' } : { kind: 'mismatch', paths })
+  }
+  return result
+}
+</script>
+  <script type="wrong">
+// 回傳 candidate 的結果
+type ShadowReport = { kind: 'match' } | { kind: 'mismatch'; paths: string[] } | { kind: 'candidate-error'; error: unknown } | { kind: 'candidate-timeout' }
+type ShadowOptions<T> = { diff: (a: T, b: T) => string[]; report: (r: ShadowReport) => void; timeoutMs: number; schedule: (ms: number, fn: () => void) => () => void }
+async function shadowCompare<T>(primary: () => Promise<T>, candidate: () => Promise<T>, opts: ShadowOptions<T>): Promise<T> {
+  const shadow = (async () => candidate())().then(value => ({ ok: true as const, value }), (error: unknown) => ({ ok: false as const, error }))
+  const result = await primary()
+  let finished = false
+  const cancel = opts.schedule(opts.timeoutMs, () => { if (!finished) { finished = true; opts.report({ kind: 'candidate-timeout' }) } })
+  const outcome = await shadow
+  if (finished) return result
+  finished = true
+  cancel()
+  if (!outcome.ok) { opts.report({ kind: 'candidate-error', error: outcome.error }); return result }
+  const paths = opts.diff(result, outcome.value)
+  opts.report(paths.length === 0 ? { kind: 'match' } : { kind: 'mismatch', paths })
+  return outcome.value
+}
+</script>
+  <script type="wrong">
+// candidate 的 rejection 沒有處理
+type ShadowReport = { kind: 'match' } | { kind: 'mismatch'; paths: string[] } | { kind: 'candidate-error'; error: unknown } | { kind: 'candidate-timeout' }
+type ShadowOptions<T> = { diff: (a: T, b: T) => string[]; report: (r: ShadowReport) => void; timeoutMs: number; schedule: (ms: number, fn: () => void) => () => void }
+async function shadowCompare<T>(primary: () => Promise<T>, candidate: () => Promise<T>, opts: ShadowOptions<T>): Promise<T> {
+  const shadow = candidate()
+  const result = await primary()
+  let finished = false
+  const cancel = opts.schedule(opts.timeoutMs, () => { if (!finished) { finished = true; opts.report({ kind: 'candidate-timeout' }) } })
+  void shadow.then(value => {
+    if (finished) return
+    finished = true
+    cancel()
+    const paths = opts.diff(result, value)
+    opts.report(paths.length === 0 ? { kind: 'match' } : { kind: 'mismatch', paths })
+  })
+  return result
+}
+</script>
+  <script type="wrong">
+// 用 JSON.stringify 比較：鍵的順序不同就被誤判為不一致
+type ShadowReport = { kind: 'match' } | { kind: 'mismatch'; paths: string[] } | { kind: 'candidate-error'; error: unknown } | { kind: 'candidate-timeout' }
+type ShadowOptions<T> = { diff: (a: T, b: T) => string[]; report: (r: ShadowReport) => void; timeoutMs: number; schedule: (ms: number, fn: () => void) => () => void }
+async function shadowCompare<T>(primary: () => Promise<T>, candidate: () => Promise<T>, opts: ShadowOptions<T>): Promise<T> {
+  const shadow = (async () => candidate())().then(value => ({ ok: true as const, value }), (error: unknown) => ({ ok: false as const, error }))
+  const result = await primary()
+  let finished = false
+  const cancel = opts.schedule(opts.timeoutMs, () => { if (!finished) { finished = true; opts.report({ kind: 'candidate-timeout' }) } })
+  void shadow.then(outcome => {
+    if (finished) return
+    finished = true
+    cancel()
+    if (!outcome.ok) return opts.report({ kind: 'candidate-error', error: outcome.error })
+    opts.report(JSON.stringify(result) === JSON.stringify(outcome.value) ? { kind: 'match' } : { kind: 'mismatch', paths: ['$'] })
+  })
+  return result
+}
+</script>
+  <script type="wrong">
+// 逾時之後 candidate 完成又再 report 一次
+type ShadowReport = { kind: 'match' } | { kind: 'mismatch'; paths: string[] } | { kind: 'candidate-error'; error: unknown } | { kind: 'candidate-timeout' }
+type ShadowOptions<T> = { diff: (a: T, b: T) => string[]; report: (r: ShadowReport) => void; timeoutMs: number; schedule: (ms: number, fn: () => void) => () => void }
+async function shadowCompare<T>(primary: () => Promise<T>, candidate: () => Promise<T>, opts: ShadowOptions<T>): Promise<T> {
+  const shadow = (async () => candidate())().then(value => ({ ok: true as const, value }), (error: unknown) => ({ ok: false as const, error }))
+  const result = await primary()
+  const cancel = opts.schedule(opts.timeoutMs, () => opts.report({ kind: 'candidate-timeout' }))
+  void shadow.then(outcome => {
+    cancel()
+    if (!outcome.ok) return opts.report({ kind: 'candidate-error', error: outcome.error })
+    const paths = opts.diff(result, outcome.value)
+    opts.report(paths.length === 0 ? { kind: 'match' } : { kind: 'mismatch', paths })
+  })
+  return result
+}
+</script>
+  <script type="wrong">
+// candidate 同步丟錯時直接把回應弄壞
+type ShadowReport = { kind: 'match' } | { kind: 'mismatch'; paths: string[] } | { kind: 'candidate-error'; error: unknown } | { kind: 'candidate-timeout' }
+type ShadowOptions<T> = { diff: (a: T, b: T) => string[]; report: (r: ShadowReport) => void; timeoutMs: number; schedule: (ms: number, fn: () => void) => () => void }
+async function shadowCompare<T>(primary: () => Promise<T>, candidate: () => Promise<T>, opts: ShadowOptions<T>): Promise<T> {
+  const shadow = candidate().then(value => ({ ok: true as const, value }), (error: unknown) => ({ ok: false as const, error }))
+  const result = await primary()
+  let finished = false
+  const cancel = opts.schedule(opts.timeoutMs, () => { if (!finished) { finished = true; opts.report({ kind: 'candidate-timeout' }) } })
+  void shadow.then(outcome => {
+    if (finished) return
+    finished = true
+    cancel()
+    if (!outcome.ok) return opts.report({ kind: 'candidate-error', error: outcome.error })
+    const paths = opts.diff(result, outcome.value)
+    opts.report(paths.length === 0 ? { kind: 'match' } : { kind: 'mismatch', paths })
+  })
+  return result
+}
+</script>
+  <script type="wrong">
+// 計時從呼叫開始，而不是從 primary 成功開始
+type ShadowReport = { kind: 'match' } | { kind: 'mismatch'; paths: string[] } | { kind: 'candidate-error'; error: unknown } | { kind: 'candidate-timeout' }
+type ShadowOptions<T> = { diff: (a: T, b: T) => string[]; report: (r: ShadowReport) => void; timeoutMs: number; schedule: (ms: number, fn: () => void) => () => void }
+async function shadowCompare<T>(primary: () => Promise<T>, candidate: () => Promise<T>, opts: ShadowOptions<T>): Promise<T> {
+  const shadow = (async () => candidate())().then(value => ({ ok: true as const, value }), (error: unknown) => ({ ok: false as const, error }))
+  let finished = false
+  const cancel = opts.schedule(opts.timeoutMs, () => { if (!finished) { finished = true; opts.report({ kind: 'candidate-timeout' }) } })
+  let result: T
+  try { result = await primary() } catch (e) { finished = true; cancel(); throw e }
+  void shadow.then(outcome => {
+    if (finished) return
+    finished = true
+    cancel()
+    if (!outcome.ok) return opts.report({ kind: 'candidate-error', error: outcome.error })
+    const paths = opts.diff(result, outcome.value)
+    opts.report(paths.length === 0 ? { kind: 'match' } : { kind: 'mismatch', paths })
+  })
+  return result
+}
+</script>
+  <script type="wrong">
+// 等 primary 完成後才接住 candidate 的錯誤：candidate 先失敗時會變成未處理的 rejection
+type ShadowReport = { kind: 'match' } | { kind: 'mismatch'; paths: string[] } | { kind: 'candidate-error'; error: unknown } | { kind: 'candidate-timeout' }
+type ShadowOptions<T> = { diff: (a: T, b: T) => string[]; report: (r: ShadowReport) => void; timeoutMs: number; schedule: (ms: number, fn: () => void) => () => void }
+async function shadowCompare<T>(primary: () => Promise<T>, candidate: () => Promise<T>, opts: ShadowOptions<T>): Promise<T> {
+  let started: Promise<T>
+  try { started = candidate() } catch (e) { started = Promise.reject(e) }
+  const result = await primary()
+  const shadow = started.then(value => ({ ok: true as const, value }), (error: unknown) => ({ ok: false as const, error }))
+  let finished = false
+  const cancel = opts.schedule(opts.timeoutMs, () => { if (!finished) { finished = true; opts.report({ kind: 'candidate-timeout' }) } })
+  void shadow.then(outcome => {
+    if (finished) return
+    finished = true
+    cancel()
+    if (!outcome.ok) return opts.report({ kind: 'candidate-error', error: outcome.error })
+    const paths = opts.diff(result, outcome.value)
+    opts.report(paths.length === 0 ? { kind: 'match' } : { kind: 'mismatch', paths })
+  })
+  return result
+}
+</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：訂單 API 的回應多了一個狀態值 <code>'refunded'</code>，其他什麼都沒改。Vue 前端用 <code>switch (order.status)</code> 決定徽章，沒有 <code>default</code>。這算相容的改動嗎？</p>
+  <label data-key="a">算，只是新增，新增永遠是相容的</label>
+  <label data-key="b">算，TypeScript 的窮舉檢查會在編譯時提醒前端</label>
+  <label data-key="c">對這個前端是破壞性的。要先讓讀取端能處理未知值（例如歸到「其他」），部署出去之後，後端才開始送 <code>'refunded'</code></label>
+  <label data-key="d">不算，後端應該永遠不新增列舉值</label>
+  <p class="why">✓ c。相不相容要看讀取端：沒有處理未知值的讀取端，遇到新值就出錯或顯示空白，新增不一定相容（a 錯）。TypeScript 的型別只存在於編譯時，伺服器在執行時送來的字串不會經過前端的型別檢查，而且已經裝在手機上的舊版 App 也不會重新編譯（b 錯）。列舉本來就會長大，禁止新增不切實際；正確的做法是寬容讀取端加上「讀取端先部署」的順序（d 錯）。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：產品要求下單請求的 <code>note</code>（備註）欄位改成必填。最好的上線方式是？</p>
+  <label data-key="a">改 DTO 的驗證規則加上必填，部署；沒帶的客戶端會收到清楚的 400 訊息，自己會改</label>
+  <label data-key="b">先量測有多少請求沒帶 <code>note</code>、是哪些客戶端；在新版本（或新端點）要求必填，舊版本沒帶時用預設值；通知並給期限，用量歸零後才收掉舊版本</label>
+  <label data-key="c">在回應裡加 <code>Deprecation</code> 標頭，隔天就改成必填</label>
+  <p class="why">✓ b。請求從選填改必填是破壞性變更：直接部署的話，所有舊客戶端（包含使用者沒更新的 App）都會 400，訂單直接掉單（a 錯）。<code>Deprecation</code> 只是通知，沒人會在一天內改完並上架，而且 App 要等使用者更新（c 錯）。先量測、再過渡、再收掉，是 expand → migrate → contract 的順序。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 7：新結帳頁用 <code>Math.random() &lt; 0.1</code> 決定要不要顯示，「統計上就是 10% 的人」。有什麼問題？</p>
+  <label data-key="a">同一個人每次請求可能看到不同版本，購物流程可能在兩版之間壞掉、實驗無法比較，放量時也不能保證原本看到新版的人繼續看到</label>
+  <label data-key="b">沒有問題，比例是對的，而且比雜湊快</label>
+  <label data-key="c">Math.random 不夠隨機，換成 crypto.getRandomValues 就好</label>
+  <p class="why">✓ a。比例對，但是「誰」每次都在變：王小明重新整理就可能從新版跳回舊版。A/B 實驗需要同一個人一直在同一組，放量需要「已經開啟的人不會被關掉」，這些都要靠用旗標 key 加使用者 ID 的雜湊分桶（b 錯）。問題不在亂數的品質，換成更好的亂數一樣每次不同（c 錯）。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 8：新訂單服務跑了一週影子流量，比對結果 99.9% 一致。可以把流量切過去了嗎？</p>
+  <label data-key="a">可以，99.9% 已經非常高</label>
+  <label data-key="b">可以，而且可以直接切 100%，反正影子流量已經驗證過</label>
+  <label data-key="c">不行，要 100% 一致才能切</label>
+  <label data-key="d">先看那 0.1% 是哪些欄位、哪些情境；確認影子沒比對到的部分（寫入、副作用、負載下的延遲）；準備好回滾後，用分桶從小比例開始切</label>
+  <p class="why">✓ d。一致率是平均值，0.1% 可能全部集中在「有折扣碼的訂單」或「金額」欄位，這種錯一筆都不行（a 錯）。影子流量通常只比對得到讀取或乾跑的結果，真的寫入、扣款、寄信，以及新服務在真實負載下的延遲都沒驗證過，所以要小比例放量並保留回滾（b 錯）。有些差異是預期的（時間戳記、新產生的 id、浮點格式），要求 100% 一致會永遠切不過去；重點是每一類差異都解釋得出來（c 錯）。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>直接改回應的形狀</strong>：改名、刪欄位、改型別或單位，任何依賴舊行為的客戶端都會壞（Hyrum 定律）。用 expand → migrate → contract，或開新版本。</li>
+  <li><strong>嚴格的讀取端</strong>：對方多送一個欄位或一個新列舉值，整個功能就壞。只讀需要的、忽略不認得的、未知列舉有預設處理。</li>
+  <li><strong>過度寬容</strong>：金額為負、必填欄位缺了也收下，錯誤被吞掉，最後誰都不敢修（RFC 9413）。在擴充點寬容，對違反規格的資料明確地失敗。</li>
+  <li><strong>部署順序搞反</strong>：伺服器先送新列舉值、客戶端還沒能處理。讀的那一邊先準備好，寫的那一邊才開始送。</li>
+  <li><strong>沒有使用量資料就移除舊版</strong>：不知道誰還在用，關掉的那天才知道。每個請求記下版本和呼叫者，用量歸零（或已個別聯絡）才關。</li>
+  <li><strong>每個版本複製一整套程式</strong>：v1 到 v7 每次修 bug 要修七份。程式只維護最新版，舊版用轉換鏈產生。</li>
+  <li><strong>旗標永遠不移除</strong>：程式裡充滿死掉的分支和測不完的組合。加旗標時就排好移除工作、設到期日、限制數量。</li>
+  <li><strong>放量用隨機而不是穩定的分桶</strong>：同一個人每次看到不同版本。用旗標 key 加使用者 ID 的雜湊。</li>
+  <li><strong>影子流量沒關掉副作用</strong>：同一位顧客收到兩封收據、被扣兩次款。影子模式只讀或乾跑，副作用全部關掉。</li>
+  <li><strong>影子比對的錯誤影響了正式回應</strong>：等新系統、或新系統丟錯讓整個請求失敗。新系統的結果只用來比對，錯誤全部接住。</li>
+  <li><strong>雙寫卻沒有比對</strong>：新舊資料默默分歧，切換那天才發現。定期比對筆數、總和、抽樣逐筆比較。</li>
+  <li><strong>過渡架構沒有移除計畫</strong>：閘道規則、雙寫程式、相容欄位變成永久的。在設計文件裡寫出每一個什麼時候刪。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>Hyrum 定律：使用者夠多時，所有可觀察的行為都會被依賴。判斷相容性要看資料流動的方向：讀取端能不能接受。「加」通常相容，「刪、改名、改型別、改單位」幾乎都是破壞。</li>
+  <li>寬容讀取端：只讀需要的、忽略不認得的、未知列舉有預設、遷移期間新舊欄位都接受；對違反規格的資料不寬容（RFC 9413）。解析集中在一個函式。</li>
+  <li>不相容的改動拆成 expand → migrate → contract，每一步都相容、可回滾；讀取端先部署，寫入端後開始送。OpenAPI 比對抓結構，契約測試抓呼叫端實際依賴的行為。</li>
+  <li>等不了所有人搬家時開新版本：URI、標頭或日期版本；程式只維護最新版，舊版用由新到舊的轉換鏈產生。舊版退場先量、再用 <code>Deprecation</code>（RFC 9745）與 <code>Sunset</code>（RFC 8594）通知、最後才關。</li>
+  <li>功能旗標把部署和發布分開。分桶用旗標 key 加使用者 ID 的雜湊：結果穩定、放量只加人、不同旗標選到不同的人。kill switch 讓降級變成一鍵操作。旗標要有到期日和移除計畫。</li>
+  <li>Strangler fig：建立切換點 → 影子流量比對（不等、不影響回應、關掉副作用）→ 雙寫、回填、比對 → 分桶逐步切換 → 移除舊路徑與過渡架構。</li>
+  <li>每一步都要有可量測的「往下走」條件，並確認退路還在；回不去的那一步要明確決定並寫進文件。</li>
+</ul>
+<p>下一課學 code review 與技術債：怎麼審查別人的改動、抓出高風險寫法，以及用「利息」決定先還哪一筆技術債。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

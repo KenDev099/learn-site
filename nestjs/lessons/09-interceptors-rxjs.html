@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>9. Interceptor 與 RxJS 入門</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="9" data-practice="nestjs">
+<header>
+  <div class="eyebrow">階段 2：請求管線與測試 · 第 9 課</div>
+  <h1>Interceptor 與 RxJS 入門</h1>
+</header>
+<main>
+
+<p>前端同事在做 Vue 的「訂單追蹤頁」：顧客下單後，頁面先呼叫 <code>GET /orders/1</code> 顯示訂單內容，再呼叫 <code>GET /deliveries/1/eta</code> 顯示外送預計幾點到。客服轉來一則回報：「外送時間有時候轉圈圈轉十幾秒」。他和後端一起追這個回報，查出三個問題：</p>
+<ol>
+  <li><strong>不知道慢在哪</strong>：外送時間的請求有時十幾秒才回來，可是後端的 log 看不出這個請求在伺服器上花了多久，是網路慢、前端慢還是後端慢，誰也說不清楚。</li>
+  <li><strong>卡住時沒人喊停</strong>：外送平台偶爾卡住，我們的 API 就跟著一直等，顧客對著轉圈圈，沒有人告訴他「稍後再試」。</li>
+  <li><strong>回應送出了不該送的東西</strong>：在 Network 分頁點開 <code>GET /orders/1</code> 的回應，裡面有顧客的手機號碼，還有店員寫的「曾經惡意退款」備註。</li>
+</ol>
+<p>三個問題有一個共同點：它們都不是哪一支 API 自己的業務邏輯，而是<strong>每個請求進出時都該做的事</strong>。進去時記下時間，等太久就放棄，出來前把不該送的欄位拿掉。這一課用 NestJS 的 <strong>interceptor</strong> 一件一件修好它們，最後把三個 interceptor 組在一起，讓訂單追蹤頁的每個請求都經過。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>三件事為什麼不寫在 handler 裡：interceptor 是什麼，為什麼它是唯一能同時在 handler 前後做事的關卡（開場問題的最小答案）。</li>
+  <li><code>next.handle()</code> 回傳的 Observable 是什麼：用熟悉的 Promise 對照，只學寫 interceptor 需要的 RxJS。</li>
+  <li>計時：用 <code>Server-Timing</code> 標頭讓前端在 DevTools 直接看到後端花了多久，並補上最容易漏掉的錯誤回應。</li>
+  <li>逾時：外送平台卡住時 1 秒就回「稍後再試」，每個路由各自設上限；以及為什麼「不等了」不代表外送平台的請求停下來了。</li>
+  <li>序列化與組裝：回應只送允許清單裡的欄位；三個 interceptor 一起註冊時誰包誰，哪些事它們管不到。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../typescript/lessons/08-promises.html">TypeScript 課第 8 課</a>的 Promise：代表一個「之後才會有結果」的值，用 <code>.then</code> 串接、<code>.catch</code> 接錯誤。這課拿它對照 RxJS 的 Observable。</li>
+  <li><a href="06-middleware-guards.html">第 6 課</a>的請求生命週期與 <code>Reflector.createDecorator</code>：請求依序經過 middleware、guard、interceptor、pipe 才到 handler；<code>createDecorator</code> 在路由上貼標記，執行時再用 <code>Reflector</code> 讀出來。</li>
+  <li><a href="08-exception-filters.html">第 8 課</a>的錯誤格式與 filter：錯誤回應帶 <code>errorCode</code> 讓前端判斷；丟出去的例外由 filter 統一轉成這個格式。</li>
+</ul></div>
+
+<h2>三件事為什麼不寫在 handler 裡？</h2>
+<p>最直覺的修法是在每個 handler 裡自己處理：開頭記下時間，回傳前設一個標頭；呼叫外送平台時自己用 <code>Promise.race</code> 跟計時器比賽；回傳訂單前 <code>delete order.customer.phone</code>。訂單追蹤頁只有兩支 API，這樣寫好像還應付得來。</p>
+<p>問題在規模。咖啡店的 API 有幾十個路由，每一個都要記得寫這三段。哪天有人新增一個路由忘了其中一段，那支 API 就沒有計時、沒有逾時，或者把手機號碼送出去，而且沒有任何東西會提醒你。這三段程式也跟「查訂單」本身無關，混在 handler 裡，讀程式的人得先分辨哪幾行是業務、哪幾行是例行公事。這類「每個路由都要做、但不屬於任何一個路由」的工作，叫做<strong>橫切關注點</strong>：它們像一條橫線，切過所有的 controller。</p>
+<p>所以要把它們搬到 handler 外面、每個請求都會經過的地方。<a href="06-middleware-guards.html">第 6 課</a>的請求生命週期有好幾個關卡，但前面學過的都做不到我們要的事：</p>
+<ul>
+  <li><strong>middleware</strong> 拿不到 guard 用的 <code>ExecutionContext</code>，不知道這個請求會交給哪個 controller 的哪個方法，所以讀不到第 6 課 <code>@AdminOnly</code> 這種貼在路由上的標記；它也拿不到 handler 回傳的值，沒辦法在送出前過濾欄位。</li>
+  <li><strong>guard</strong> 只在 handler 之前執行一次，回答「放不放行」，之後的事它看不到。</li>
+  <li><strong>filter</strong> 只在出錯時才被叫到，成功的回應不會經過它。</li>
+</ul>
+<p>我們要的關卡得同時做到兩件事：在 handler <strong>之前</strong>執行（記下開始時間），而且在 handler <strong>之後</strong>還拿得到它的結果或錯誤（算出耗時、等太久就放棄、過濾欄位）。這就是 <strong>interceptor</strong>，中文常譯作攔截器：一個實作 <code>NestInterceptor</code> 介面的 class，它包住 handler，前後都能執行程式，還能改寫 handler 的結果或錯誤。在第 6 課的生命週期圖裡，它是唯一出現兩次的關卡：請求進去時經過一次，回應出來時再經過一次。</p>
+<p>「包住」是字面上的意思。interceptor 可以掛在三個層級，每一層包住裡面那一層，像洋蔥一樣：</p>
+<figure>
+  <svg viewBox="0 0 700 270" role="img" aria-label="三層 interceptor 像洋蔥一樣包住 handler：請求從外到內是全域、controller、路由，回應從內到外反過來">
+    <defs><marker id="a9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="110" y="20" width="480" height="230" rx="14"/>
+    <text class="d-accent" x="130" y="44">全域 interceptor（APP_INTERCEPTOR）</text>
+    <rect class="d-box" x="170" y="60" width="360" height="170" rx="12"/>
+    <text class="d-text" x="190" y="84">controller 的 @UseInterceptors</text>
+    <rect class="d-soft" x="230" y="100" width="240" height="110" rx="10"/>
+    <text class="d-text" x="250" y="124">路由的 @UseInterceptors</text>
+    <rect class="d-box" x="290" y="140" width="120" height="50" rx="8"/>
+    <text class="d-accent" x="350" y="170" text-anchor="middle">handler</text>
+    <line class="d-line" x1="20" y1="150" x2="286" y2="150" marker-end="url(#a9)"/>
+    <text class="d-small" x="20" y="140">請求進來</text>
+    <line class="d-line" x1="414" y1="180" x2="680" y2="180" marker-end="url(#a9)"/>
+    <text class="d-small" x="600" y="200">回應出去</text>
+  </svg>
+  <figcaption>進去時：全域 → controller → 路由；出來時反過來。同一層有好幾個時，先登記的在外層。</figcaption>
+</figure>
+<p>請求從最外層進去，一路穿過每一層到 handler；handler 的結果再從裡往外，依相反順序穿出來。這課的三個 interceptor 都要套用到每個路由，所以都會註冊在最外圈的全域；同一層有好幾個時誰在外面，最後一節組裝時再談。</p>
+<p>一個 interceptor 的骨架長這樣：</p>
+<pre>@Injectable()
+export class LoggingInterceptor implements NestInterceptor {
+  intercept(context: ExecutionContext, next: CallHandler): Observable&lt;unknown&gt; {
+    console.log('handler 之前')                       // ① 進去
+    return next.handle().pipe(                        // ② 呼叫裡面那一層（最後是 handler）
+      tap(() =&gt; console.log('handler 之後')),         // ③ 出來
+    )
+  }
+}</pre>
+<p>每個請求進來，Nest 會呼叫一次 <code>intercept()</code>，給它兩個參數。<code>context</code> 跟 guard 拿到的是同一種 <code>ExecutionContext</code>：知道這次是哪個 controller 的哪個方法，所以讀得到路由上的標記，也能用 <code>switchToHttp()</code> 拿到 Express 的 <code>req</code>、<code>res</code>。<code>next</code> 代表「洋蔥裡面那一層」，呼叫 <code>next.handle()</code> 就是讓請求繼續往裡走，最裡面是 handler。</p>
+<p>這也表示 interceptor 有權決定要不要往裡走：<strong>不呼叫 <code>next.handle()</code>，handler 就不會執行</strong>。<a href="19-caching-redis.html">第 19 課</a>的 <code>CacheInterceptor</code> 就是用這招，快取裡有資料時直接回傳，不打擾 handler。</p>
+<p>對照開場的三個問題，骨架已經給出最小的答案：在 ① 記下開始時間，在 ③ 算出耗時；在 ② 之後接一個「等太久就放棄」；在 ③ 把回傳值換成過濾後的版本。剩下的問題是 ② 那一行：<code>next.handle()</code> 回傳的不是 Promise，而是一個 <strong>Observable</strong>，「之後」的程式不能用 <code>await</code> 或 <code>.then</code>，要用 <code>.pipe(tap(…))</code> 接在後面。要寫得出 ②、③，得先知道 Observable 是什麼。</p>
+
+<h2><code>next.handle()</code> 回傳的 Observable 是什麼？</h2>
+<p>Observable 來自 <strong>RxJS</strong>，一個處理「隨時間陸續到來的值」的函式庫。Nest 內部用它把一層層的 interceptor 串起來，所以 <code>next.handle()</code> 交給你的是 RxJS 的物件。你不需要學會整個 RxJS，寫 interceptor 只需要懂一個概念和幾個函式。</p>
+<p><strong>Observable</strong> 是一個資料來源，可以陸續發出好幾個值，最後以「完成」或「出錯」結束。它跟 Promise 最大的不同是：Observable 本身只是一份「怎麼產生值」的說明，建立時什麼都不會發生。要有人<strong>訂閱</strong>它，也就是呼叫 <code>subscribe</code>，交給它「收到值怎麼辦、出錯怎麼辦、結束了怎麼辦」幾個回呼，它才開始執行，把值一個個送給訂閱的人。訂閱的人不想再聽了，可以<strong>取消訂閱</strong>（unsubscribe），之後就不會再收到任何值。用你熟悉的 Promise 對照：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Promise</th><th>Observable</th></tr>
+  <tr><td>值的數量</td><td>一個</td><td>零到很多個，最後「完成」或「出錯」</td></tr>
+  <tr><td>什麼時候開始跑</td><td>建立時就開始</td><td>有人 <code>subscribe</code>（訂閱）才開始</td></tr>
+  <tr><td>能不能取消</td><td>不能（要另外傳 <code>AbortSignal</code>）</td><td>取消訂閱（unsubscribe）：不再接收值</td></tr>
+  <tr><td>串接方式</td><td><code>.then()</code>、<code>.catch()</code>、<code>.finally()</code></td><td><code>.pipe(operator, operator, …)</code></td></tr>
+</table></div>
+<p>表上的「零到很多個值」聽起來複雜，但在 Nest 的 HTTP 請求裡用不到：handler 回傳的值（或 Promise 的結果）會被包成<strong>只發出一個值就完成</strong>的 Observable。所以寫 HTTP 的 interceptor 時，可以把它想成「會用 pipe 串接的 Promise」：要嘛成功給你一個值，要嘛出錯。</p>
+<p>誰來訂閱？不是你，是 Nest。Nest 訂閱最外層 interceptor 回傳的 Observable，拿到值就送出回應，出錯就把錯誤交給<a href="08-exception-filters.html">第 8 課</a>的 filter。你在 <code>intercept()</code> 裡做的事，是拿 <code>next.handle()</code> 給你的 Observable，加工成一個新的 Observable 回傳出去。外層的 interceptor 又會拿你回傳的去加工，一層層包到最外面。這就是洋蔥在程式裡的樣子。</p>
+<p>加工用的工具叫 <strong>operator</strong>：一個函式，接收一個 Observable、回傳一個加工過的新 Observable。把好幾個 operator 放進 <code>.pipe()</code>，它們會依序套用，就像 Promise 一路 <code>.then().then()</code>。先認識兩個最常用的，都從 <code>'rxjs'</code> import：</p>
+<ul>
+  <li><code>map(fn)</code>：把值換成 <code>fn(值)</code> 往下傳，等於 <code>.then(v =&gt; fn(v))</code>。要改寫 handler 的結果時用它。</li>
+  <li><code>tap(fn)</code>：看一眼值、做點副作用（記 log、設標頭），值原樣往下傳，等於 <code>.then(v =&gt; { fn(v); return v })</code>。骨架的 ③ 用的就是它。</li>
+</ul>
+<p>後面處理錯誤和逾時時，會在用到的地方再介紹 <code>catchError</code>、<code>finalize</code>、<code>timeout</code> 三個。這課用到的 operator 全部整理在課末<a href="#appendix">補充與查表</a>，查表用，不用背。</p>
+<div class="callout warn">RxJS 的 <code>pipe()</code> 跟 Nest 的 pipe（<a href="07-pipes-validation.html">第 7 課</a>的 <code>ValidationPipe</code>）只是同名，毫無關係。前者是「把 operator 串起來」的方法，後者是在 handler 前轉換、驗證參數的元件。</div>
+<p>現在 ①②③ 都讀得懂了：① 在訂閱之前執行，也就是 handler 之前；② 拿到裡面那一層的 Observable；③ 的 <code>tap</code> 在 handler 的值出來時執行。可以開始修第一個問題了：讓前端知道後端到底花了多久。</p>
+
+<h2>計時：怎麼讓前端在 DevTools 看到後端花了多久？</h2>
+<p>耗時量出來之後要放在哪裡？寫進後端的 log，只有後端看得到；前端同事查「轉圈圈」時開的是 DevTools，最好他在那裡就能看到。HTTP 正好有一個為此設計的回應標頭：<strong>Server-Timing</strong>（標頭見 <a href="../../node/lessons/12-http-protocol.html">Node 課第 12 課</a>）。它告訴瀏覽器伺服器端花了多少時間，格式是 <code>名稱;dur=毫秒</code>，例如 <code>Server-Timing: app;dur=12.3</code>。Chrome DevTools 的 Network → Timing 分頁會直接把它畫出來，前端不用翻後端 log，就能分出慢在前端、網路還是伺服器。</p>
+<p>把骨架的 ① 換成記下開始時間、③ 換成設標頭，第一版很直覺：</p>
+<pre>intercept(context: ExecutionContext, next: CallHandler) {
+  const start = performance.now()
+  const res = context.switchToHttp().getResponse&lt;Response&gt;()
+  return next.handle().pipe(
+    tap(() =&gt; res.setHeader('Server-Timing', `app;dur=${(performance.now() - start).toFixed(1)}`)),
+  )
+}</pre>
+<p>這幾行裡有三個選擇，每個都有原因：</p>
+<p><strong>用 <code>performance.now()</code> 而不是 <code>Date.now()</code></strong>。<code>Date.now()</code> 讀的是系統時間，伺服器會定期跟時間伺服器校時，校時可能讓系統時間往前或往回跳，兩次相減就可能算出負數或不準的值。<code>performance.now()</code> 是單調時鐘：只會往前走，不受校時影響，而且有小數，量短時間更準。</p>
+<p><strong><code>start</code> 寫在 <code>intercept()</code> 裡</strong>。interceptor 跟 service 一樣，預設是<a href="03-providers-di.html">第 3 課</a>的 singleton：整個應用程式只有一個實例，所有請求共用。<code>intercept()</code> 每個請求呼叫一次，寫在裡面的 <code>start</code> 才是這個請求自己的開始時間。寫在檔案最上層或 constructor，只會在應用程式啟動時記一次，量到的變成「應用程式啟動到現在」。</p>
+<p><strong>在 <code>tap</code> 裡設標頭</strong>。標頭必須在回應送出之前設好。<code>tap</code> 執行時，值還在往外傳的路上，Nest 要等值傳到最外面才送出回應，所以這時設的標頭來得及。</p>
+<p>寫好之後，要讓每個路由都套用，就把它註冊成全域 interceptor：在 <code>AppModule</code> 的 <code>providers</code> 加上 <code>{ provide: APP_INTERCEPTOR, useClass: TimingInterceptor }</code>。這跟第 6 課用 <code>APP_GUARD</code> 註冊全域 guard 是同一種寫法，其他註冊方式留到最後一節。</p>
+<p>用 <code>curl -i</code> 打 <code>GET /menu</code>，回應有 <code>Server-Timing</code>。但改打一個不存在的商品 <code>GET /products/999</code>，404 的回應卻沒有這個標頭。</p>
+<p>原因在 Observable 的兩個出口。handler 丟出 <code>NotFoundException</code> 時，Observable 發出的不是值，而是<strong>錯誤</strong>。<code>tap(fn)</code> 只在有值時呼叫 <code>fn</code>，錯誤會直接越過它往外傳，所以 404 沒有標頭。這不是小事：最慢、最需要量的請求，往往就是出錯的那些，例如逾時、資料庫錯誤。計時要可信，兩個出口都得量到。先把設標頭的那段抽成一個函式 <code>record</code>，寫在 <code>intercept()</code> 裡、<code>start</code> 和 <code>res</code> 的下面：</p>
+<pre>const record = () =&gt; res.setHeader('Server-Timing', `app;dur=${(performance.now() - start).toFixed(1)}`)</pre>
+<p>接著有三種寫法：</p>
+<pre>// 1. tap 同時給 next 和 error
+next.handle().pipe(tap({ next: record, error: record }))
+
+// 2. catchError 記完再丟出去
+next.handle().pipe(tap(record), catchError(err =&gt; { record(); return throwError(() =&gt; err) }))
+
+// 3. finalize：不論成功或失敗都執行
+next.handle().pipe(finalize(record))</pre>
+<p>三種寫法差在把 <code>record</code> 掛在哪個出口：</p>
+<ul>
+  <li><strong><code>tap({ next, error })</code></strong>：<code>tap</code> 也可以傳一個物件，<code>next</code> 在有值時呼叫，<code>error</code> 在出錯時呼叫。它只是「看一眼」，錯誤照樣往外傳。</li>
+  <li><strong><code>catchError(fn)</code></strong>：出錯時執行 <code>fn</code>，對應 Promise 的 <code>.catch()</code>。它跟 <code>.catch()</code> 一樣會<strong>接住</strong>錯誤：<code>fn</code> 回傳的 Observable 會取代原本出錯的那一條。所以只想記錄、不想吞掉錯誤時，要回傳 <code>throwError(() =&gt; err)</code>，它建立一個「立刻發出這個錯誤」的 Observable，讓錯誤繼續往外丟。下一節的逾時會用到這個 operator。</li>
+  <li><strong><code>finalize(fn)</code></strong>：不論成功、出錯或被取消訂閱，結束時都執行，對應 Promise 的 <code>.finally()</code>。</li>
+</ul>
+<p>三種在 Nest 12.3.2 實測都會讓 404、409 的回應帶上標頭。不論用哪一種，錯誤本身都要原樣往外丟，<a href="08-exception-filters.html">第 8 課</a>的 filter 才能照常把它轉成錯誤回應。三種在「被取消訂閱」時的表現不同，最後一節把逾時和計時組在一起時，這個差別會決定標頭還在不在。</p>
+<div class="callout practice"><strong>💡 實務上：前端回報「好慢」時，先看 Server-Timing</strong><br>前端說「查外送時間轉很久」，你請他在 DevTools 點開那個請求的 Timing：伺服器時間很短，就是網路或前端的問題；伺服器時間很長，才回頭查後端 log。這能省下很多「是你那邊慢還是我這邊慢」的來回。要注意 Server-Timing 任何人都看得到：只寫總時間沒問題，把 <code>db;dur=…</code>、<code>cache;desc=miss</code> 這類細節也公開，等於告訴攻擊者哪個請求打得到資料庫。正式環境的細項放 log 或追蹤系統（<a href="24-observability-shutdown.html">第 24 課</a>）。</div>
+<p>有了計時，前端同事在 Timing 裡看到外送時間的請求，伺服器時間真的是 12 秒：後端一直在等外送平台。第一個問題「慢在哪」有答案了，接著是第二個問題：等太久時，怎麼主動放棄？</p>
+
+<h2>逾時：外送平台卡住時，怎麼 1 秒就回「稍後再試」？</h2>
+<p>外送平台卡住時，我們的 API 什麼都不做，就會一直等下去。顧客對著轉圈圈，最後可能是瀏覽器或中間的代理伺服器先放棄，回一個看不懂的錯誤。我們寧可 1 秒就告訴顧客「外送時間暫時查不到，稍後再試」，讓前端顯示一個清楚的畫面。</p>
+<p>「等太久就放棄」正是 Observable 擅長的事，因為它能取消訂閱。RxJS 的 <code>timeout(ms)</code> operator：超過 <code>ms</code> 還沒有值，就取消訂閱，不再等裡面那一層，並丟出一個 <code>TimeoutError</code>。用 Promise 要達到同樣效果，得自己用 <code>Promise.race</code> 讓工作跟計時器比賽。官方文件的逾時 interceptor 長這樣：</p>
+<pre>return next.handle().pipe(
+  timeout(5000),
+  catchError(err =&gt; {
+    if (err instanceof TimeoutError) return throwError(() =&gt; new RequestTimeoutException())
+    return throwError(() =&gt; err)   // 其他錯誤原樣丟出
+  }),
+)</pre>
+<p>讀法：<code>timeout(5000)</code> 在 5 秒內沒等到值，就丟出 <code>TimeoutError</code>；接著 <code>catchError</code> 接住錯誤，用 <code>instanceof</code> 判斷是不是逾時。是逾時就換成 Nest 的 HTTP 例外，讓 filter 轉成錯誤回應；不是逾時就原樣丟出。這個範例可以直接用，但套到咖啡店之前，有兩個地方要改。</p>
+<p><strong>第一個要改的是狀態碼</strong>。<code>RequestTimeoutException</code> 是 <strong>408 Request Timeout</strong>，意思是「伺服器等<strong>客戶端</strong>把請求送完，等太久了」，是客戶端的問題。我們的情況剛好相反：請求早就收完了，是我們自己處理太慢，應該回 5xx。<a href="08-exception-filters.html">第 8 課</a>說過 504 是「等上游等到逾時」，看起來很貼切，但一個通用的逾時 interceptor 不知道 handler 是在等外送平台，還是在跑自己的運算，所以不能斷定是上游的錯。這裡用 <strong>503 Service Unavailable</strong>：暫時無法服務，可以稍後重試。再用第 8 課的寫法，在例外的選項帶上 <code>errorCode: 'TIMEOUT'</code>，前端就能據此顯示「稍後再試」，不用解析訊息文字。範例裡逾時那一行改成：</p>
+<pre>if (err instanceof TimeoutError) return throwError(() =&gt; new ServiceUnavailableException('外送時間暫時查不到，請稍後再試', { errorCode: 'TIMEOUT' }))</pre>
+<p><code>ServiceUnavailableException</code> 就是 503，跟 <code>RequestTimeoutException</code> 一樣從 <code>@nestjs/common</code> import；<code>{ errorCode: 'TIMEOUT' }</code> 用的是第 8 課「選項物件放在最後一個參數」的寫法。</p>
+<p>換的時候只能換 <code>TimeoutError</code>。如果圖省事把所有錯誤都換成 503，<code>GET /products/999</code> 的 404、庫存不足的 409 全都會變成「稍後再試」，前端會叫顧客一直重試一個永遠不會成功的請求。範例裡 <code>return throwError(() =&gt; err)</code> 那一行就是為了讓其他錯誤保持原樣。</p>
+<p><strong>第二個要改的是時間</strong>。官方範例所有路由都等 5 秒，但每個路由合理的等待時間不同：查菜單應該很快，每日報表本來就慢，外送時間我們只願意等 1 秒。做法是沿用<a href="06-middleware-guards.html">第 6 課</a>的 <code>Reflector.createDecorator</code>，做一個 <code>@Timeout(ms)</code> 貼在路由上，interceptor 執行時讀出來，沒標的路由用預設值：</p>
+<pre>// timeout.decorator.ts
+export const Timeout = Reflector.createDecorator&lt;number&gt;()
+
+// interceptor 裡
+const ms = this.reflector.getAllAndOverride(Timeout, [context.getHandler(), context.getClass()]) ?? 3000
+
+// controller
+@Get(':orderId/eta')
+@Timeout(1000)
+eta(…) { … }</pre>
+<p><code>getAllAndOverride</code> 依序看方法、再看 controller 上有沒有 <code>@Timeout</code>，回傳第一個找到的值；都沒有就是 <code>undefined</code>，<code>?? 3000</code> 補上預設的 3 秒。這樣逾時仍然是一個全域 interceptor，每個路由都自動有上限，只有需要不同時間的路由才要標。interceptor 能讀到這些標記，靠的就是第一節說的：它拿得到 <code>ExecutionContext</code>，知道這次是哪個方法、哪個 controller。逾時 interceptor 要在 constructor 注入 <code>Reflector</code>，這點在最後一節選註冊方式時會用到。</p>
+<p>現在外送平台卡住時，顧客 1 秒就會看到「稍後再試」。但 503 送出去的那一刻，外送平台的那個請求呢？</p>
+
+<h2>503 送出去之後，外送平台的請求停了嗎？</h2>
+<p>沒有。<code>timeout</code> 觸發時做的事是<strong>取消訂閱</strong>：interceptor 不再等這個結果，馬上回 503。但 handler 已經開始的工作<strong>照樣在跑</strong>：送往外送平台的 HTTP 請求還在等回應，資料庫查詢還會跑完，跑完的結果沒有人要，就被丟掉。官方文件也寫明，取消訂閱不會中止 handler 已經開始的工作（例如還沒結束的資料庫查詢）。</p>
+<p>為什麼停不下來？因為取消訂閱只是「我不聽了」，不是「你停下來」。handler 裡的 <code>await fetch(…)</code> 或資料庫查詢，是在 Observable 之外各自進行的非同步工作；JavaScript 沒有辦法從外面強行中斷一個已經開始的 Promise，除非那個工作本身接受取消的訊號。這跟前面對照表裡 Promise「不能取消」那一格是同一件事。</p>
+<p>這在正式環境很要命。想像資料庫因為某個原因變慢：請求逾時，前端收到 503 後重試，重試的請求又開了一句新查詢，而舊的那句還在跑。同時在跑的查詢越來越多，資料庫就更慢，更多請求逾時。interceptor 的逾時讓顧客不用乾等，卻沒有減輕後端的負擔。要讓工作真的停下來，得讓底層的工作自己有期限：</p>
+<ul>
+  <li><strong>接受 <code>AbortSignal</code> 的工作</strong>（<code>fetch</code>、許多 HTTP 客戶端）：呼叫時傳 <code>AbortSignal.timeout(1000)</code>，時間到請求真的被中止（<a href="../../typescript/lessons/11-timeouts-cancellation.html">TypeScript 課第 11 課</a>、<a href="../../node/lessons/17-calling-external-apis.html">Node 課第 17 課</a>）。呼叫外送平台就屬於這一種。</li>
+  <li><strong>資料庫查詢</strong>：Prisma 的查詢不接受 <code>AbortSignal</code>，要在資料庫端設 <code>statement_timeout</code>，讓 PostgreSQL 自己停掉太久的查詢（<a href="16-query-performance.html">第 16 課</a>）。</li>
+</ul>
+<p>兩層逾時的分工是：interceptor 的逾時是給使用者的上限，保證顧客最多等多久；底層工作的逾時要設得比它短，工作在 interceptor 放棄之前就先自己結束，才不會留下沒人等的工作。</p>
+<div class="callout practice"><strong>💡 實務上：逾時的數字要跟前端、維運一起定</strong><br>逾時不是隨便填 3000：先問「這個畫面使用者願意等多久」、「上游（外送平台、金流）平常多快、最慢多慢」。設太短，正常請求也被砍；設太長，等於沒設。前端收到 <code>TIMEOUT</code> 要決定怎麼呈現：查詢類可以顯示「稍後再試」或自動重試一次，但「送出訂單」這種會寫入的請求不能盲目重試，因為後端可能其實已經建好訂單。資深工程師會把逾時值寫在一個看得到的地方（decorator 或設定），而不是散落在各處的魔術數字。</div>
+<p>前兩個問題都跟「慢」有關。第三個問題不一樣：<code>GET /orders/1</code> 很快，但回應的內容本身就錯了。</p>
+
+<h2>手機號碼為什麼會出現在 <code>GET /orders/1</code> 的回應裡？</h2>
+<p>handler 回傳一個物件，Nest 要把它變成 HTTP 回應的 JSON 字串。這個「把回傳值轉成要送出的格式」的步驟叫<strong>序列化</strong>（serialization）。Nest 預設的序列化就是直接 <code>JSON.stringify</code> 整個物件：service 從資料庫拿到什麼，客戶端就收到什麼。</p>
+<p>追一下 <code>GET /orders/1</code>：<code>OrdersService</code> 查出訂單，連同下單的顧客一起回傳。顧客那筆資料有 <code>phone</code> 欄位（取餐簡訊要用）和 <code>internalNote</code> 欄位（店員要看），service 需要它們，所以不能從資料裡拿掉。handler 原樣回傳，序列化原樣送出，手機號碼和備註就到了前端。而且這不是一次性的意外：哪天資料表多了一個欄位，下一秒它就會出現在 API 回應裡，沒有人會發現。</p>
+<p>要擋住它，有兩種思維：</p>
+<ul>
+  <li><strong>禁止清單</strong>：列出不能送的欄位，送出前刪掉，例如 <code>delete body.phone</code>。問題是它預設放行：新增敏感欄位時忘了加進清單，就洩漏了；巢狀的物件，例如訂單裡的 <code>customer</code>，也常被漏掉，第一層的 <code>phone</code> 刪了，<code>customer.phone</code> 照送。</li>
+  <li><strong>允許清單</strong>（allowlist）：只送出明確列出的欄位，沒列到的一律不送。它預設擋下：新增欄位時，最壞的結果是「前端拿不到」，而不是「洩漏」。前端拿不到會有人來問，洩漏卻可能沒人發現。回應用這種。</li>
+</ul>
+<p>允許清單要在哪裡執行？跟計時、逾時一樣，它是每個回應都該做的事，而且要在 handler 回傳之後、送出之前改寫結果，正好是 interceptor 加上 <code>map</code> 的工作。這個 interceptor 不用自己寫，NestJS 12 新增了一個現成的：<code>StandardSchemaSerializerInterceptor</code>。</p>
+<p>它的做法是：用 zod 這類 Standard Schema 寫出回應的形狀，送出前讓回傳值通過 schema，<strong>送出的是 schema 的輸出</strong>。<a href="07-pipes-validation.html">第 7 課</a>用 zod 的 schema 驗證進來的請求，這裡反過來，用同一套寫法規定出去的回應。要三個部分配合：</p>
+<pre>// customer.schema.ts
+export const customerResponseSchema = z.object({ id: z.number(), name: z.string(), stamps: z.number() })
+
+// customers.controller.ts
+@Get(':id')
+@SerializeOptions({ schema: customerResponseSchema })
+findOne(…) { return this.customers.find(id) }   // 回傳的物件有 phone、internalNote
+
+// app.module.ts
+{ provide: APP_INTERCEPTOR, useClass: StandardSchemaSerializerInterceptor }</pre>
+<p>schema 檔寫出允許的欄位；<code>@SerializeOptions({ schema })</code> 把 schema 貼在路由上，跟前一節的 <code>@Timeout</code> 一樣是一個標記；全域註冊的 <code>StandardSchemaSerializerInterceptor</code> 執行時用 <code>Reflector</code> 讀出這個標記，拿 schema 處理回傳值。它需要注入 <code>Reflector</code>，用 <code>APP_INTERCEPTOR</code> 註冊時 Nest 會自動注入。沒有 <code>@SerializeOptions({ schema })</code> 的路由，回應原樣送出。</p>
+<p>允許清單之所以成立，是因為 <code>z.object</code> 的預設行為：解析時<strong>丟掉沒列的欄位</strong>。<code>customerResponseSchema</code> 只列了 <code>id</code>、<code>name</code>、<code>stamps</code>，所以 <code>phone</code>、<code>internalNote</code> 被丟掉。zod 還有兩種寫法，行為不同，選錯會壞事：</p>
+<ul>
+  <li><code>z.looseObject</code> 會保留沒列的欄位，正好讓允許清單破功，回應不要用。</li>
+  <li><code>z.strictObject</code> 遇到多的欄位會丟出錯誤。回傳值裡本來就有 <code>phone</code>，用它每個請求都會失敗，所以回應用 <code>z.object</code>。</li>
+</ul>
+<p>回到訂單：<code>GET /orders/1</code> 的手機號碼在巢狀的 <code>customer</code> 裡。schema 只會處理它列出的結構，所以訂單 schema 的 <code>customer</code> 欄位要用同一份 <code>customerResponseSchema</code>，巢狀物件才會一樣被過濾；寫成任意物件就等於沒過濾。handler 回傳陣列時，schema 會套用在每一個元素上，<code>@SerializeOptions</code> 傳單筆的 schema 就好。</p>
+<p>反過來，回傳值<strong>不符合</strong> schema 時，例如少了 <code>stamps</code>、型別不對，interceptor 會丟出錯誤，回應變成 <strong>500</strong>，而不是送出一半的資料。這是故意的：前端依賴這個形狀，形狀壞了就是後端的 bug，應該在測試裡抓到，而不是讓前端拿到缺欄位的 200 才在畫面上壞掉。</p>
+<p>網路上的教學大多是另一種做法：<code>class-transformer</code> 的 <code>@Exclude()</code> 搭配 <code>ClassSerializerInterceptor</code>。它有一個陷阱，回傳一般物件時完全不起作用，細節見課末<a href="#appendix">補充與查表</a>；新專案用 schema 版。另一種常見的回應 interceptor，是把每個回應都包成 <code>{ data: … }</code>，它不解決洩漏問題，要不要用的取捨也放在課末。</p>
+<div class="callout practice"><strong>💡 實務上：資料表加欄位時，順手看回應 schema</strong><br>真實的洩漏很少是有人故意送出密碼，多半是「資料表加了 <code>internalNote</code>、<code>passwordHash</code>，沒人想到它會跟著出去」。有回應 schema 之後，新欄位預設不會送出，前端真的需要時，後端再明確加進 schema，PR 裡也看得到「這次 API 多送了什麼」。Code review 時可以問兩件事：這個回應有沒有 schema？巢狀的關聯（訂單裡的顧客、店員）有沒有也過 schema？資安或個資相關的稽核問到「API 會送出哪些欄位」時，schema 就是現成的答案。</div>
+<p>三個問題各有一個 interceptor 了：計時、逾時、序列化，三個都要套用到每個路由。最後一步是把它們一起註冊，這時就得決定誰包在誰外面。</p>
+
+<h2>三個 interceptor 一起上線：誰包在外面，哪些事它們管不到？</h2>
+<p>先確認註冊方式。interceptor 的註冊跟第 6 課的 guard 一樣有三個層級：<code>@UseInterceptors()</code> 貼在方法上，只套用到那個路由；貼在 controller 上，套用到整個 controller；全域則在模組的 <code>providers</code> 寫 <code>{ provide: APP_INTERCEPTOR, useClass: X }</code>。全域還有另一種寫法 <code>app.useGlobalInterceptors(new X())</code>，寫在 <code>main.ts</code>，但它在模組之外自己 <code>new</code> 物件，Nest 沒辦法注入依賴，逾時和序列化都需要的 <code>Reflector</code> 就拿不到；而且只寫在 <code>main.ts</code> 的設定，測試裡建立的應用程式也沒有它（<a href="10-e2e-testing.html">第 10 課</a>會處理這個問題）。所以三個都用 <code>APP_INTERCEPTOR</code>。</p>
+<p>同一層有好幾個時，<strong>全域 interceptor 依登記順序由外往內包</strong>：先登記的在外層。順序會影響結果，計時和逾時就是一個例子。在 12.3.2 實測，計時用前面第一種寫法 <code>tap({ next, error })</code>，外送平台的路由逾時：</p>
+<ul>
+  <li><strong>計時登記在逾時前面</strong>（計時在外層）：逾時的 interceptor 在裡面丟出 503 的錯誤，錯誤往外傳，經過計時的 <code>error</code> 出口，標頭照樣設上。503 回應帶有 <code>app;dur=1003.8</code>，正好是 1 秒的上限加上一點處理時間。</li>
+  <li><strong>順序反過來</strong>（計時在裡層）：逾時取消訂閱的是它裡面那一層，也就是計時。被取消訂閱的 Observable 不會再發出任何東西，計時既收不到值也收不到錯誤，503 就沒有標頭。</li>
+  <li><strong>計時在裡層但改用 <code>finalize</code></strong>：<code>finalize</code> 在取消訂閱時也會執行，標頭還在，但它量不到外層 interceptor 花的時間。</li>
+</ul>
+<p>結論是計時放最外層，它量到的才是包含所有 interceptor 在內的完整時間，前端在 Timing 看到的數字也才跟實際等待的時間一致。序列化放最靠近 handler，它處理的就是 handler 的回傳值：</p>
+<pre>providers: [
+  { provide: APP_INTERCEPTOR, useClass: TimingInterceptor },                    // 最外層
+  { provide: APP_INTERCEPTOR, useClass: TimeoutInterceptor },
+  { provide: APP_INTERCEPTOR, useClass: StandardSchemaSerializerInterceptor },  // 最靠近 handler
+]</pre>
+<p>組好之後，訂單追蹤頁的每個請求都會依序穿過這三層：有耗時、有上限、只送允許的欄位。但有兩種情況是 interceptor 管不到的，一種會讓剛修好的洩漏重新出現，一種是把不該放的東西放進來。</p>
+<p><strong>handler 用了 <code>@Res()</code>，回應轉換就失效</strong>。handler 注入 <code>@Res() res</code>，自己呼叫 <code>res.json(…)</code>，就進入官方文件說的 library-specific 模式：回應由你直接寫給 Express 送出，不再經過 Nest 的回傳值流程。interceptor 還是會執行，但它的 <code>map</code>、序列化都碰不到已經送出的內容，<code>phone</code> 會照送，Nest 也不會警告。除非真的需要自己控制回應（例如串流），handler 都用 <code>return</code> 回傳值。</p>
+<p><strong>商業邏輯不放 interceptor</strong>。interceptor 適合跟業務無關、每個路由都一樣的事，就是這課的計時、逾時、序列化，還有<a href="19-caching-redis.html">第 19 課</a>的快取。「下單時順便加點數」如果寫在 interceptor 裡，讀 <code>OrdersService</code> 的人看不到這件事；第 20 課的佇列、第 21 課的排程直接呼叫同一個 service 時，請求沒有經過 interceptor，點數也就不會加。業務規則留在 service 裡。</p>
+
+<h2>練習</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs nestjs 09</code> 建立 <code>work/09/</code>。起始專案接續第 8 課（request id、兩個 filter 都已經註冊），多了 <code>GET /menu</code>、<code>GET /customers/:id</code>、<code>GET /orders/:id</code>、<code>GET /deliveries/:orderId/eta</code>（呼叫外送平台）、<code>GET /reports/daily</code>（很慢的報表）。要寫的檔案已經有空殼，裡面有註解。可以用 <code>npm run start:dev</code> 啟動，再用 <code>curl -i localhost:3100/menu</code> 看標頭。</p>
+
+<div class="local" data-test="ex1" data-files="src/interceptors/timing.interceptor.ts src/app.module.ts">
+  <p>練習 1：在 <code>src/interceptors/timing.interceptor.ts</code> 寫 <code>TimingInterceptor</code>，用 <code>APP_INTERCEPTOR</code> 註冊成全域：</p>
+  <ul>
+    <li>每個回應都帶 <code>Server-Timing: app;dur=&lt;毫秒&gt;</code>，<strong>包含</strong> 404、400、409 這些錯誤回應。</li>
+    <li>量的是這個請求自己的時間。測試會把報表換成固定 120ms 的假資料，檢查 dur 至少 120、又不能大到像「從啟動開始算」。</li>
+  </ul>
+</div>
+
+<div class="local" data-test="ex2" data-files="src/timeout.decorator.ts src/interceptors/timeout.interceptor.ts src/delivery/delivery.controller.ts src/app.module.ts">
+  <p>練習 2：逾時。</p>
+  <ul>
+    <li>在 <code>src/timeout.decorator.ts</code> 用 <code>Reflector.createDecorator</code> 匯出 <code>Timeout</code>。</li>
+    <li>在 <code>src/interceptors/timeout.interceptor.ts</code> 寫 <code>TimeoutInterceptor</code>：讀路由或 controller 上的 <code>@Timeout(ms)</code>，沒標就是 3000ms；逾時回 <strong>503</strong>，<code>errorCode</code> 是 <code>'TIMEOUT'</code>；其他錯誤原樣往外丟。用 <code>APP_INTERCEPTOR</code> 註冊（想想它跟計時的先後）。</li>
+    <li>外送平台最多等 1 秒：在 <code>GET /deliveries/:orderId/eta</code> 加上 <code>@Timeout(1000)</code>。</li>
+  </ul>
+  <p>測試會另外加一個自己的 controller，裡面有一條 <code>@Timeout(100)</code>、跑 1000ms 的路由，還有一個整個貼了 <code>@Timeout(100)</code> 的 controller，所以逾時要寫在全域 interceptor，路由和 controller 上的值都要讀得到。逾時的 503 也要有練習 1 的 <code>Server-Timing</code>。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="src/customers/customer.schema.ts src/orders/order.schema.ts src/customers/customers.controller.ts src/orders/orders.controller.ts src/app.module.ts">
+  <p>練習 3：<code>GET /customers/:id</code> 只能送出 <code>id</code>、<code>name</code>、<code>stamps</code>；<code>GET /orders/:id</code> 送出訂單的所有欄位，但裡面的 <code>customer</code> 也只能有這三個欄位。</p>
+  <ul>
+    <li>在 <code>customer.schema.ts</code>、<code>order.schema.ts</code> 用 zod 寫 <code>customerResponseSchema</code>、<code>orderResponseSchema</code>，用 <code>@SerializeOptions({ schema })</code> 套到兩個路由，並註冊 <code>StandardSchemaSerializerInterceptor</code>。</li>
+    <li><code>CustomersService</code> 的資料不能改：取餐簡訊要用 <code>phone</code>，店員要看 <code>internalNote</code>。</li>
+  </ul>
+  <p>測試比對整個回應，每一層都不能多、不能少欄位。測試也會讓 <code>CustomersService</code> 回傳少了 <code>stamps</code> 的顧客，這時要回 <strong>500</strong>，不能送出缺欄位的 200，所以不能在 controller 裡自己挑欄位。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：計時 interceptor 寫成 <code>next.handle().pipe(tap(() =&gt; res.setHeader('Server-Timing', …)))</code>。handler 丟出 <code>NotFoundException</code> 時，404 回應有這個標頭嗎？</p>
+  <label data-key="a">有，<code>tap</code> 在 handler 結束後一定會執行</label>
+  <label data-key="b">有，filter 會把 interceptor 設的標頭補上</label>
+  <label data-key="c">沒有，<code>tap(fn)</code> 只在成功發出值時執行；要用 <code>tap({ next, error })</code>、<code>catchError</code> 或 <code>finalize</code> 處理錯誤路徑</label>
+  <p class="why">✓ Observable 出錯時，<code>tap(fn)</code> 的 <code>fn</code> 不會被呼叫，錯誤直接往外傳。a 是把 <code>tap</code> 當成 <code>finally</code>；<code>finalize</code> 才是。b 錯：filter 只負責轉換錯誤，不會知道 interceptor 本來想設什麼標頭。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 5：報表路由貼了 <code>@Timeout(3000)</code>，handler 裡的資料庫查詢跑了 10 秒。3 秒時 interceptor 回了 503，那句查詢會怎樣？</p>
+  <label data-key="a">照樣在資料庫裡跑完，結果被丟掉；要真的停下來，得在資料庫端設 <code>statement_timeout</code></label>
+  <label data-key="b">被取消，因為 <code>timeout</code> 取消了訂閱</label>
+  <label data-key="c">Nest 會等查詢跑完才送出 503</label>
+  <p class="why">✓ 取消訂閱只代表「不等這個結果了」，已經開始的工作不會停，官方文件也這樣寫。b 是最常見的誤解：只有接受 <code>AbortSignal</code>、或有自己期限的工作才會真的停。c 錯：503 在 3 秒時就送出，這正是逾時的用意。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：全域註冊了 <code>StandardSchemaSerializerInterceptor</code>，某個 handler 改成注入 <code>@Res() res</code>，自己呼叫 <code>res.json(customer)</code>。回應會怎樣？</p>
+  <label data-key="a">一樣被 schema 過濾，因為 interceptor 是全域的</label>
+  <label data-key="b">不會被過濾，<code>phone</code>、<code>internalNote</code> 照送：用了 <code>@Res()</code> 的 handler 自己送出回應，interceptor 改不到</label>
+  <label data-key="c">Nest 啟動時會報錯，禁止 <code>@Res()</code> 和 interceptor 同時使用</label>
+  <p class="why">✓ 注入 <code>@Res()</code> 進入 library-specific 模式，回應由 handler 直接寫給 Express，interceptor 的回應轉換拿不到這個值。a 錯：interceptor 還是會執行，但改不到已經送出的內容。c 錯：Nest 不會阻止，所以這種洩漏很難發現。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>把 RxJS 的 pipe 跟 Nest 的 pipe 搞混</strong>：<code>next.handle().pipe(…)</code> 是串接 operator；Nest 的 pipe 是轉換、驗證參數的元件。兩者無關。</li>
+  <li><strong>只用 <code>tap(fn)</code> 記錄結果</strong>：錯誤時不會執行，最該記錄的慢請求、失敗請求反而沒有紀錄。用 <code>tap({ next, error })</code> 或 <code>finalize</code>。</li>
+  <li><strong>計時的開始時間寫在檔案最上層或 constructor</strong>：interceptor 是 singleton，量到的是應用程式啟動到現在。在 <code>intercept()</code> 裡記。</li>
+  <li><strong>以為 <code>timeout</code> 會取消工作</strong>：它只是不等了。底層的 HTTP 請求要傳 <code>AbortSignal</code>，資料庫要設 <code>statement_timeout</code>。</li>
+  <li><strong><code>catchError</code> 把所有錯誤都變成同一種</strong>：404、409 也變成 503，前端會一直重試不可能成功的請求。只轉換 <code>TimeoutError</code>，其他用 <code>throwError(() =&gt; err)</code> 原樣丟出。</li>
+  <li><strong>逾時回 408</strong>：408 是客戶端送請求太慢。自己處理太慢是 503（加上 errorCode）。</li>
+  <li><strong>計時登記在逾時後面</strong>：計時變成裡層，逾時取消訂閱時它收不到值也收不到錯誤，503 沒有 <code>Server-Timing</code>。計時登記在最前面，當最外層。</li>
+  <li><strong>序列化只處理第一層</strong>：在 controller 裡 <code>delete body.phone</code>，訂單裡的 <code>customer.phone</code> 照樣送出。用允許清單的 schema，巢狀物件也用 schema。</li>
+  <li><strong><code>ClassSerializerInterceptor</code> 配上回傳一般物件的 service</strong>：<code>@Exclude</code> 只對 class 實例有效，欄位照送。</li>
+  <li><strong>把商業邏輯寫進 interceptor</strong>：藏在看不到的地方，換一個入口（佇列、排程）就不會執行。interceptor 只做跟業務無關的橫切工作。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>計時、逾時、序列化是每個路由都要做、但不屬於任何路由的事，放在 interceptor，不寫在每個 handler 裡。</li>
+  <li>interceptor 包住 handler：<code>next.handle()</code> 之前是「進去」，接在它後面的 operator 是「出來」；進去時全域 → controller → 路由，出來時反過來。不呼叫 <code>next.handle()</code>，handler 就不會執行。</li>
+  <li><code>next.handle()</code> 回傳 Observable，HTTP 請求裡只有一個值。Nest 負責訂閱，你用 <code>pipe</code> 串 <code>map</code>、<code>tap</code>、<code>catchError</code>、<code>timeout</code>、<code>finalize</code> 加工後回傳。</li>
+  <li>計時用 <code>Server-Timing</code> 讓前端在 DevTools 看到後端耗時；每個請求在 <code>intercept()</code> 裡記開始時間，錯誤路徑也要量。</li>
+  <li>逾時用 <code>timeout(ms)</code> 加 <code>@Timeout(ms)</code>，只把 <code>TimeoutError</code> 轉成 503＋<code>TIMEOUT</code>。逾時只是不等了，底層工作要自己有更短的期限。</li>
+  <li>回應用允許清單：v12 的 <code>StandardSchemaSerializerInterceptor</code>＋<code>@SerializeOptions({ schema })</code>，巢狀物件也要過 schema；不符合就是 500。</li>
+  <li>全域用 <code>APP_INTERCEPTOR</code> 註冊，依登記順序由外往內包，計時放最外層；<code>@Res()</code> 會讓回應轉換失效；商業邏輯留在 service。</li>
+</ul>
+<p>下一課學 E2E 測試：從 HTTP 測整個應用，並讓測試跟 <code>main.ts</code> 套用同樣的全域設定。</p>
+
+<h2 id="appendix">補充與查表</h2>
+<p>主線用不到、但寫程式或讀舊專案時會查的細節。</p>
+
+<h3>這課用到的 RxJS operator</h3>
+<p>練習資料夾裝的是 rxjs 7.8.2。下面的 operator 和重新丟出錯誤用的 <code>throwError</code> 都從 <code>'rxjs'</code> import。查表用，不用背：</p>
+<div class="table-wrap"><table>
+  <tr><th>operator</th><th>做什麼</th><th>Promise 的對照</th></tr>
+  <tr><td><code>map(fn)</code></td><td>把值換成 <code>fn(值)</code></td><td><code>.then(v =&gt; fn(v))</code></td></tr>
+  <tr><td><code>tap(fn)</code></td><td>看一眼值、做點副作用，值原樣往下傳</td><td><code>.then(v =&gt; { fn(v); return v })</code></td></tr>
+  <tr><td><code>tap({ next, error })</code></td><td>成功時呼叫 <code>next</code>，出錯時呼叫 <code>error</code>，錯誤照樣往下傳</td><td>—</td></tr>
+  <tr><td><code>catchError(fn)</code></td><td>出錯時執行；回傳新的 Observable 取代原本的流，要繼續出錯就回 <code>throwError(() =&gt; err)</code></td><td><code>.catch()</code></td></tr>
+  <tr><td><code>timeout(ms)</code></td><td>超過 <code>ms</code> 還沒有值，就取消訂閱並丟出 <code>TimeoutError</code></td><td>自己寫 <code>Promise.race</code></td></tr>
+  <tr><td><code>finalize(fn)</code></td><td>不論成功、出錯或取消，結束時執行</td><td><code>.finally()</code></td></tr>
+</table></div>
+
+<h3>zod 的 looseObject 舊名</h3>
+<p>會保留沒列欄位的 <code>z.looseObject</code>，舊名是 <code>passthrough</code>。在舊專案的回應 schema 看到 <code>.passthrough()</code>，代表那個回應沒有過濾欄位。</p>
+
+<h3>舊做法：ClassSerializerInterceptor 與 @Exclude</h3>
+<p>網路上大多是 <code>class-transformer</code> 的寫法：在 class 的欄位貼 <code>@Exclude()</code>，註冊 <code>ClassSerializerInterceptor</code>。它有一個陷阱：<strong>只對 class 的實例有效</strong>。service 回傳一般物件（Prisma 查詢的結果就是），<code>@Exclude</code> 完全不起作用，欄位照送。要用它，每個 handler 都得 <code>new CustomerEntity(data)</code> 或 <code>plainToInstance</code>，忘了一個就洩漏。新專案用 schema 版。</p>
+
+<h3>要不要包一層 { data }</h3>
+<p>常見的另一種 interceptor 是用 <code>map(data =&gt; ({ data }))</code> 把每個回應包成 <code>{ data: … }</code>。取捨：多數 API 不需要，HTTP 狀態碼和標頭已經能表達成功與否；包了之後每個前端呼叫都要多寫 <code>.data</code>，錯誤回應（filter 產生的）又不會被包，格式反而不一致。只有回應真的需要附帶資料時才包，例如分頁的 <code>{ data, total, nextCursor }</code>（<a href="16-query-performance.html">第 16 課</a>），而且寫在那個 handler 的回應型別裡就好。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

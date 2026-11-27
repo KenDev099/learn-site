@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>8. 例外與 exception filter：一致的錯誤格式</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="8" data-practice="nestjs">
+<header>
+  <div class="eyebrow">階段 2：請求管線與測試 · 第 8 課</div>
+  <h1>例外與 exception filter：一致的錯誤格式</h1>
+</header>
+<main>
+
+<p>客人用 Vue 前台點了 3 塊起司蛋糕，店裡只剩 2 塊。前端希望在起司蛋糕旁邊標紅、寫「只剩 2 個」，客人改一下數量就能結帳。可是如果 <code>OrdersService</code> 裡寫的是 <code>throw new Error('庫存不足')</code>，前端收到的是 500 和一句英文的 <code>Internal server error</code>，畫面只能顯示「系統錯誤」，客人分不出是自己點太多，還是店家的系統壞了。</p>
+<p>這課就拿這張訂單當主線，把整個 API 的錯誤處理做完整：先讓「庫存不足」用前端讀得懂的格式回去；再讓 service 不必知道 HTTP；最後替沒人預料到的錯誤（資料庫斷線、程式 bug）加上最後一道防線。做完之後，每個端點的錯誤長得一樣，前端不用替每支 API 各寫一套解析；5xx 一定有記錄；資料庫的錯誤訊息（裡面可能有資料表名稱，甚至連線字串）不會原樣回到客人手上。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>為什麼 <code>throw new Error('庫存不足')</code> 送到前端只剩 500：沒寫任何 filter 時，Nest 怎麼把例外變成回應。</li>
+  <li>前端要靠什麼分辨「庫存不足」：錯誤回應的固定格式與 errorCode。這節給出最小答案：回 409 加上 <code>OUT_OF_STOCK</code>。</li>
+  <li>service 也會被佇列、排程呼叫，該丟什麼：領域錯誤，以及把它翻成 409 的第一個自訂 filter。</li>
+  <li>資料庫斷線這類沒預料到的錯誤：catch-all filter 怎麼寫進 log、又不把細節回給客人。</li>
+  <li>兩個 filter 都接得到時誰處理、庫存不足為什麼是 409：註冊方式、比對順序，與狀態碼怎麼選。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../typescript/lessons/04-errors.html">TypeScript 課第 4 課</a>的 <code>Error</code> 子類別與 <code>cause</code>：<code>class OutOfStockError extends Error</code> 讓 <code>instanceof</code> 分得出錯誤種類；<code>cause</code> 把原本的錯誤掛在新錯誤上。</li>
+  <li><a href="../../node/lessons/18-error-handling.html">Node 課第 18 課</a>的可預期與非預期錯誤：庫存不足這類業務上會發生的錯誤要告訴使用者原因；程式 bug、資料庫斷線只記 log，對外回固定訊息。兩種都在邊界統一轉換。</li>
+  <li><a href="06-middleware-guards.html">第 6 課</a>的 request id 與 <code>APP_GUARD</code>：middleware 替每個請求編號（<code>req.requestId</code>）；用 <code>APP_GUARD</code> 這種特殊 token 登記的 provider 會變成全域元件。</li>
+</ul></div>
+
+<h2>為什麼 throw new Error('庫存不足') 前端只看到 500？</h2>
+<p>先看這個 500 是誰產生的。下單的請求進到 <code>OrdersController</code> 的 handler，handler 呼叫 <code>OrdersService.create</code>，service 發現庫存不夠，<code>throw new Error('庫存不足')</code>。這個例外會沿著呼叫的順序往外傳：service 沒接，就傳到 handler；handler 沒寫 <code>try/catch</code>，就繼續往外傳。Nest 在整個請求處理的最外面包了一層，專門接住所有沒被處理的例外，這一層叫<strong>例外層</strong>（exceptions layer）。</p>
+<p>例外層接到例外之後，要決定回給客戶端什麼：狀態碼是多少、body 長什麼樣子、要不要寫 log。做這個決定的元件叫 <strong>exception filter</strong>。名字裡的 filter 不是「過濾掉」的意思，而是「依例外的種類篩選、交給對應的處理方式」。你可以自己寫 filter，這課後面會寫兩個；一個都沒寫的時候，用的是 Nest 內建的那一個。handler、service、guard、pipe 丟出的例外，最後都走到這裡。</p>
+<p>內建 filter 判斷的依據是：丟出來的東西是不是 <strong>HttpException</strong>。HttpException 是 <code>@nestjs/common</code> 提供的一個例外 class，建立時就帶著狀態碼；它有一整個家族的子類別，每一個對應一個狀態碼：<code>BadRequestException</code>（400）、<code>UnauthorizedException</code>（401）、<code>ForbiddenException</code>（403）、<code>NotFoundException</code>（404）、<code>ConflictException</code>（409）、<code>UnprocessableEntityException</code>（422）、<code>ServiceUnavailableException</code>（503）等。你其實已經見過它：第 7 課 ValidationPipe 驗證失敗時丟的就是 <code>BadRequestException</code>，所以前端才會收到 400。</p>
+<p>內建 filter 只分兩種情況（以下是 Nest 12.3.2 的實際行為）：</p>
+<div class="table-wrap"><table>
+  <tr><th>丟出的東西</th><th>狀態碼</th><th>回應內容</th><th>寫 log 嗎</th></tr>
+  <tr><td><code>HttpException</code> 或它的子類別，例如 <code>new NotFoundException('找不到商品 99')</code></td><td>例外自己帶的（404）</td><td><code>{ message: '找不到商品 99', error: 'Not Found', statusCode: 404 }</code></td><td>不寫</td></tr>
+  <tr><td>其他任何東西：<code>new Error('庫存不足')</code>、<code>TypeError</code>、資料庫錯誤、<code>throw 'oops'</code></td><td>500</td><td><code>{ statusCode: 500, message: 'Internal server error' }</code></td><td>用 <code>ExceptionsHandler</code> 這個 logger 寫 error，含堆疊</td></tr>
+</table></div>
+<p>我們的 <code>new Error('庫存不足')</code> 落在第二列。為什麼 Nest 不把「庫存不足」這幾個字送出去？因為對 Nest 來說，<code>'庫存不足'</code> 和 <code>'duplicate key value violates unique constraint "customers_phone_key"'</code> 都只是一個 <code>Error</code> 的 message，它分不出哪一個可以給客人看、哪一個會洩漏資料庫的結構。最安全的預設就是一律換成固定字串，原本的訊息和堆疊只寫進伺服器的 log。這是刻意的設計：寧可讓前端看不到有用的訊息，也不要把不該公開的細節送出去。</p>
+<p>第一列反過來。會丟 HttpException 的人，是明確表達了「這是預期中的錯誤，狀態碼和訊息都可以公開」，所以 Nest 照它帶的內容回應。它也不寫 log：4xx 代表客戶端的問題（送錯資料、沒登入、找不到東西），是正常營運中天天會發生的事，每一筆都寫成 error，真正需要修的 bug 就會被淹沒在 log 裡。</p>
+<p>所以要讓前端看到「庫存不足」，就要讓這個錯誤變成「明確可以公開的錯誤」，最直接的做法是改丟 HttpException。但只把 <code>Error</code> 換成 <code>ConflictException('庫存不足')</code> 還不夠：前端拿到 409 和一句中文，要怎麼知道這是「庫存不足」而不是「訂單已經出餐不能取消」？兩者都是 409。這就需要一個前端可以穩定判斷的格式。</p>
+
+<h2>前端要靠什麼分辨「庫存不足」？</h2>
+<p>前端拿到錯誤時要做的事，通常是「依錯誤的種類決定怎麼顯示」：庫存不足就在商品旁邊標紅；驗證失敗就在欄位下方顯示訊息；500 就顯示「請稍後再試」，並附上一個編號讓客人回報。要做到這些，前端需要兩樣東西：一個能穩定辨識錯誤種類的值，和顯示畫面需要的資料（例如還剩幾個）。而且這兩樣東西在每支 API 都要放在同一個位置，前端才能寫一套共用的處理，不必每個端點各寫一套。</p>
+<p>這種「後端保證回應長這樣、前端依賴它寫程式」的約定，叫做<strong>契約</strong>。後端一旦公開了某個形狀，就不能隨便改，否則依賴它的前端會壞。這門課的錯誤回應契約是這樣，任何端點都不例外：</p>
+<pre>{
+  "statusCode": 409,
+  "error": "Conflict",
+  "message": "商品 6 庫存不足：要 3，剩 2",
+  "errorCode": "OUT_OF_STOCK",
+  "details": { "productId": 6, "requested": 3, "available": 2 },
+  "requestId": "6c1f0a52-3e1b-4a8e-9a43-1d7c2b8e5f10"
+}</pre>
+<ul>
+  <li><code>statusCode</code>、<code>error</code>、<code>message</code>：沿用上一節表格裡 Nest 預設的三個欄位。ValidationPipe 產生的 400 本來就是這個樣子，不用改。</li>
+  <li><strong>錯誤代碼</strong>（<code>errorCode</code>）：給程式判斷用的字串，例如 <code>OUT_OF_STOCK</code>。它是契約的一部分，一旦公開就不改名。</li>
+  <li><code>details</code>：選填，前端顯示需要的補充資料，例如「還剩 2 個」的那個 2。</li>
+  <li><code>requestId</code>：<a href="06-middleware-guards.html">第 6 課</a> middleware 產生的請求編號。客人回報「剛剛結帳失敗」時附上它，你就能在 log 找到那一筆。</li>
+</ul>
+<p>為什麼要另外多一個 <code>errorCode</code>，前端不能直接看 <code>message</code>？因為 <code>message</code> 是給人看的文案，它屬於產品，會因為產品的需求而改：今天寫「庫存不足」，下週行銷改成「這個商品賣完了」，下個月加了英文版。前端如果寫 <code>message === '庫存不足'</code>，文案一改，判斷就默默失效，畫面退回通用的錯誤訊息，而且不會有任何地方報錯。<code>errorCode</code> 是專門給程式判斷用的識別值，文案怎麼改它都不變。Vue 端的寫法：</p>
+<pre>// Vue：依 errorCode 決定顯示什麼，沒列到的才用後端的 message
+const text: Record&lt;string, (e: ApiError) =&gt; string&gt; = {
+  OUT_OF_STOCK: e =&gt; `只剩 ${e.details?.available} 個`,
+  PRODUCT_NOT_FOUND: () =&gt; '這個商品已經下架',
+  INTERNAL_ERROR: e =&gt; `系統忙碌，請稍後再試（編號 ${e.requestId}）`,
+}
+const show = (e: ApiError) =&gt; text[e.errorCode]?.(e) ?? String(e.message)</pre>
+<p>後端怎麼送出 <code>errorCode</code>？Nest 12 讓 HttpException 直接支援它：放在建構子最後一個參數的選項物件裡，就會出現在回應中。開場那張訂單的最小解法，就是在 service 裡改丟帶 errorCode 的 <code>ConflictException</code>，前端就拿得到 409 和 <code>OUT_OF_STOCK</code>：</p>
+<pre>throw new ConflictException(`商品 ${product.id} 庫存不足`, { errorCode: 'OUT_OF_STOCK' })
+
+throw new NotFoundException(`找不到商品 ${id}`, { errorCode: 'PRODUCT_NOT_FOUND' })
+// → 404 { "message": "找不到商品 99", "error": "Not Found", "statusCode": 404, "errorCode": "PRODUCT_NOT_FOUND" }</pre>
+<div class="callout practice"><strong>💡 實務上：errorCode 清單是前後端一起維護的文件</strong><br>新功能開工時，前後端通常會先對好「這支 API 可能回哪些 errorCode、前端各自怎麼顯示」，清單寫在團隊共用的文件或 API 文件裡（第 23 課的 OpenAPI 可以放）。最常見的坑是後端順手把 <code>OUT_OF_STOCK</code> 改名成 <code>SOLD_OUT</code>：網頁版跟著部署還好，App 的舊版本留在客人手機上好幾個月，畫面就會退回通用的錯誤訊息。所以 errorCode 只增不改，要淘汰也是先新增、等舊版沒人用再移除。代碼的粒度以「前端會不會做不同的事」為準：每個欄位驗證都開一個代碼沒有意義，那些交給 ValidationPipe 的 400 就好。</div>
+<p>到這裡，前端已經分得出庫存不足了。但這個做法還差兩件事：回應裡還沒有契約要的 <code>details</code> 和 <code>requestId</code>；而且 <code>OrdersService</code> 現在 import 了 <code>@nestjs/common</code> 的 HTTP 例外。後者在 service 只給 controller 用時看不出問題，等它被 HTTP 以外的地方呼叫就會出事。</p>
+
+<h2>service 也會被佇列、排程呼叫，該丟什麼？</h2>
+<p><code>OrdersService</code> 不只被 controller 呼叫。第 20 課的佇列 worker 會呼叫它處理批次訂單，第 21 課的排程會呼叫它，管理用的 CLI 也會。在這些地方沒有 HTTP 請求，也沒有前端在等回應，「409 Conflict」沒有意義。worker 真正想知道的是「這筆失敗是因為庫存不足，重試也沒用，不用重試」。service 一旦丟 <code>ConflictException</code>，業務邏輯就綁死在 HTTP 上：worker 只能去讀狀態碼猜原因，或者為了不用 HTTP 的概念，又把同一段邏輯另外寫一份。</p>
+<p>解法是讓 service 丟<strong>領域錯誤</strong>（domain error）。「領域」指的是這個系統要處理的業務本身，在這裡就是咖啡店的點餐、庫存、集點。領域錯誤用業務的語言描述哪裡不行：「商品 6 庫存不足，要 3 個，剩 2 個」，裡面沒有狀態碼，也不 import 任何 HTTP 相關的東西。誰在乎 HTTP，誰就負責翻譯：HTTP 這一層把它翻成 409，worker 則依錯誤種類決定要不要重試。</p>
+<p>先寫一個所有領域錯誤共用的父類別，規定每個領域錯誤都要有 <code>code</code>（也就是回應裡的 errorCode）和 <code>details</code>：</p>
+<pre>// src/errors/domain-errors.ts
+export abstract class DomainError extends Error {
+  abstract readonly code: string     // 也就是回應裡的 errorCode
+
+  constructor(message: string, readonly details: Record&lt;string, unknown&gt; = {}, options?: ErrorOptions) {
+    super(message, options)          // options 可以帶 { cause }
+    this.name = new.target.name      // log 裡顯示 OutOfStockError，而不是 Error
+  }
+}
+
+export class OutOfStockError extends DomainError {
+  readonly code = 'OUT_OF_STOCK'
+
+  constructor(productId: number, requested: number, available: number) {
+    super(`商品 ${productId} 庫存不足：要 ${requested}，剩 ${available}`, { productId, requested, available })
+  }
+}</pre>
+<p>兩個語法細節。<code>abstract</code> 讓 <code>DomainError</code> 本身不能被 <code>new</code>，而且每個子類別一定要給 <code>code</code>，忘了寫就是型別錯誤。<code>new.target</code> 是「實際被 <code>new</code> 的那個 class」：<code>new OutOfStockError(…)</code> 時它是 <code>OutOfStockError</code>，所以 <code>name</code> 會是子類別的名字，log 裡一眼就看得出是哪種錯誤。service 裡只要：</p>
+<pre>if (product.stock &lt; item.qty) throw new OutOfStockError(product.id, item.qty, product.stock)</pre>
+<p>現在 <code>OutOfStockError</code> 不是 HttpException，照第一節的表格，內建 filter 會把它變成 500。所以要有人把它翻成 409，這就是我們要寫的第一個自訂 exception filter。</p>
+<p>自訂 filter 是一個實作 <code>ExceptionFilter</code> 介面的 class，有兩個部分：class 上的 <code>@Catch(…)</code> 宣告它負責哪些例外；<code>catch(exception, host)</code> 方法是例外發生時 Nest 呼叫的地方，你在這裡自己送出回應。<code>catch</code> 的第二個參數是 <strong>ArgumentsHost</strong>，代表「這次呼叫的參數」。Nest 不只能跑 HTTP，也能跑 WebSocket、微服務，這些情況下的「參數」長得不一樣，所以它不直接給你 request，而是讓你先用 <code>host.switchToHttp()</code> 表明「我知道這是 HTTP」，再用 <code>getRequest()</code>、<code>getResponse()</code> 拿到 Express 的 request 與 response 物件。</p>
+<pre>// src/filters/domain-exception.filter.ts
+import { Catch, type ArgumentsHost, type ExceptionFilter } from '@nestjs/common'
+import type { Request, Response } from 'express'
+import { STATUS_CODES } from 'node:http'
+import { DomainError } from '../errors/domain-errors.js'
+
+const STATUS_BY_CODE: Record&lt;string, number&gt; = {
+  OUT_OF_STOCK: 409,
+  PRODUCT_NOT_FOUND: 404,
+}
+
+@Catch(DomainError)                        // 只接 DomainError 和它的子類別
+export class DomainExceptionFilter implements ExceptionFilter {
+  catch(exception: DomainError, host: ArgumentsHost) {
+    const ctx = host.switchToHttp()
+    const req = ctx.getRequest&lt;Request&gt;()
+    const res = ctx.getResponse&lt;Response&gt;()
+    const status = STATUS_BY_CODE[exception.code] ?? 422
+    res.status(status).json({
+      statusCode: status,
+      error: STATUS_CODES[status],         // Node 內建的狀態碼文字：409 → 'Conflict'
+      message: exception.message,
+      errorCode: exception.code,
+      details: exception.details,
+      requestId: req.requestId,
+    })
+  }
+}</pre>
+<ul>
+  <li><code>@Catch(DomainError)</code>：Nest 用 <code>instanceof</code> 比對，所以 <code>OutOfStockError</code> 這些子類別也算。可以列好幾個 class；寫成 <code>@Catch()</code> 不帶參數就是全部都接，下一節會用到。</li>
+  <li>對照表用 <code>exception.code</code> 查，<strong>不比對 message 文字</strong>，理由跟前端一樣：文案會改。沒列在表上的領域錯誤，代表「資料格式對，但違反業務規則」，用 422。409 和 422 怎麼分，最後一節會講。</li>
+  <li>filter 自己負責送出回應，Nest 不會再處理。所以一定要設狀態碼：只寫 <code>res.json(…)</code> 會是 200，前端會以為下單成功。</li>
+</ul>
+<p>filter 寫好之後要登記，Nest 才會用它。這門課在 <code>AppModule</code> 的 providers 加 <code>{ provide: APP_FILTER, useClass: DomainExceptionFilter }</code>，寫法跟第 6 課的 <code>APP_GUARD</code> 一樣，登記之後它就是全域的。為什麼不用別的登記方式，後面「兩個 filter 都接得到時，誰處理？」那一節再比較。</p>
+<p>回到開場的訂單：service 丟 <code>OutOfStockError</code>，<code>DomainExceptionFilter</code> 把它翻成 409，回應裡有 <code>errorCode</code>、<code>details</code> 和 <code>requestId</code>，前端可以顯示「只剩 2 個」；同一個 service 給 worker 用時，worker 拿到的是 <code>OutOfStockError</code>，自己判斷要不要重試。領域錯誤和 <a href="../../typescript/lessons/27-modeling-state-errors.html">TypeScript 課第 27 課</a>的 <code>Result</code> 型別怎麼選，放在課末的補充。</p>
+<div class="callout practice"><strong>💡 實務上：小專案不必每個錯誤都開領域錯誤 class</strong><br>只有 controller 會呼叫的簡單 CRUD（例如後台的商品管理），在 controller 裡直接丟 <code>NotFoundException</code> 很常見，也不算錯。值得改成領域錯誤的時機是：同一段業務邏輯開始被 worker、排程或 CLI 共用（只是要給前端 errorCode 的話，上面 HttpException 的 <code>errorCode</code> 選項就夠了）。code review 時資深工程師常看一件事：<code>*.service.ts</code> 有沒有 import <code>@nestjs/common</code> 的 HTTP 例外，有的話問一句「這個 service 會不會在 HTTP 以外被呼叫？」。領域錯誤也不要一個情境開一個 class，前端不需要分開處理的情境共用一個、用 <code>details</code> 帶差異，清單才維護得動。</div>
+<p>預料得到的錯誤都有人翻譯了。可是同一張訂單也可能遇到沒人預料到的錯誤：查庫存時資料庫斷線、程式裡讀到 <code>undefined</code> 的屬性丟出 <code>TypeError</code>。這些不是 <code>DomainError</code>，<code>DomainExceptionFilter</code> 不會接，又回到內建 filter 手上。</p>
+
+<h2>資料庫斷線這類沒預料到的錯誤，怎麼處理？</h2>
+<p>沒預料到的錯誤交給內建 filter，會回 500 和 <code>Internal server error</code>，細節不外洩，這部分是對的。問題在兩個地方。第一，回應不符合契約：沒有 <code>errorCode</code>，也沒有 <code>requestId</code>，前端那套共用的錯誤處理拿不到編號，客人也沒有東西可以回報。第二，內建 filter 寫的 log 裡沒有 request id，就算客人給了編號，你也對不到是哪一筆。</p>
+<p>所以要寫一個接住所有例外的 filter，叫做 <strong>catch-all filter</strong>，當作最後一道防線：任何前面沒人處理的例外，都由它回成契約的格式，並把細節連同 request id 寫進 log。</p>
+<pre>// src/filters/all-exceptions.filter.ts
+import { Catch, HttpException, Logger, type ArgumentsHost, type ExceptionFilter } from '@nestjs/common'
+import { HttpAdapterHost } from '@nestjs/core'
+import type { Request } from 'express'
+
+@Catch()                                   // 不帶參數：所有例外
+export class AllExceptionsFilter implements ExceptionFilter {
+  private readonly logger = new Logger(AllExceptionsFilter.name)
+
+  constructor(private readonly adapterHost: HttpAdapterHost) {}
+
+  catch(exception: unknown, host: ArgumentsHost) {
+    const { httpAdapter } = this.adapterHost
+    const ctx = host.switchToHttp()
+    const req = ctx.getRequest&lt;Request&gt;()
+
+    if (exception instanceof HttpException) {
+      // 練習 3：保留原本的狀態碼與內容
+    }
+
+    const stack = exception instanceof Error ? exception.stack : String(exception)
+    this.logger.error(`[${req.requestId}] ${req.method} ${req.originalUrl} 未處理的例外`, stack)
+    httpAdapter.reply(ctx.getResponse(), {
+      statusCode: 500,
+      error: 'Internal Server Error',
+      message: '伺服器發生錯誤',
+      errorCode: 'INTERNAL_ERROR',
+      requestId: req.requestId,
+    }, 500)
+  }
+}</pre>
+<p>跟 <code>DomainExceptionFilter</code> 比，這裡有三個新東西。中間那個空的 HttpException 判斷先跳過，本節後面會說明為什麼一定要有它。</p>
+<p>第一是 <strong>HttpAdapterHost</strong>。它是 Nest 提供的 provider，裡面的 <code>httpAdapter</code> 包裝了底層的 HTTP 框架（Express 或 Fastify）。用 <code>httpAdapter.reply(res, body, status)</code> 回應，而不是直接呼叫 Express 的 <code>res.status().json()</code>，這個 filter 就不綁死在 Express 上，官方文件的 catch-all 範例也是這樣寫。因為它要透過建構子注入，這個 filter 必須由 Nest 建立，所以一樣用 <code>APP_FILTER</code> 登記，不能自己 <code>new</code>。</p>
+<p>第二是 <code>exception</code> 的型別是 <code>unknown</code>（<a href="../../typescript/lessons/17-unknown-any-guards.html">TypeScript 課第 17 課</a>）。JavaScript 可以 <code>throw</code> 任何值，包括字串，所以 catch-all 拿到的不一定是 <code>Error</code>。要取 <code>stack</code> 前先用 <code>instanceof Error</code> 縮小型別。這一點在 filter 裡特別要緊：<strong>filter 裡不能再丟出例外</strong>，它已經是最後一道防線，自己出錯的話，請求會卡住，或拿到 Nest 最原始的錯誤回應。</p>
+<p>第三是 log。<code>logger.error(訊息, stack)</code> 用的是 Nest 的 <code>Logger</code>（<a href="04-modules.html">第 4 課</a>），它把第二個參數當堆疊印出。訊息裡放 request id、方法與路徑，客人給你編號，你就搜得到這一行。堆疊裡有原本的錯誤訊息，SQL、連線字串可能都在這裡，所以它<strong>只進 log、不進回應</strong>。</p>
+<div class="callout warn">最常見的外洩寫法是 <code>message: exception.message</code>。資料庫的錯誤訊息會帶出資料表與 constraint 名稱，連線失敗的訊息可能帶出主機與帳號。攻擊者看到 <code>customers_phone_key</code>，就知道有個 <code>customers</code> 表、電話不能重複，可以拿來試探哪些電話已經註冊。給客戶端的 500 只能是固定訊息加 request id。</div>
+<p>寫到這裡還有一個洞。<code>@Catch()</code> 接所有例外，也就包括 HttpException：ValidationPipe（<a href="07-pipes-validation.html">第 7 課</a>）的 400、找不到路由的 404、guard 的 403。照上面的程式，這些全部會變成 500，客人送錯欄位卻看到「伺服器發生錯誤」，監控也會滿是假的 5xx。所以 HttpException 要保留原本的狀態碼和內容，只補上契約要的 <code>errorCode</code> 和 <code>requestId</code>。尤其 ValidationPipe 的 <code>message</code> 是以欄位分組的物件，前端靠它把錯誤顯示在對應的欄位旁邊，不能動。要讀出原本的內容，用 HttpException 的兩個方法：<code>getStatus()</code> 回狀態碼；<code>getResponse()</code> 回建立時給的內容，可能是字串，也可能是物件。這是練習 3 的內容。</p>
+<p>HttpException 裡也有 5xx。例如結帳時呼叫金流 API 失敗，我們會丟 <code>BadGatewayException</code>（502，最後一節解釋為什麼是 502），並用選項物件的 <code>cause</code>（<a href="../../typescript/lessons/04-errors.html">TypeScript 課第 4 課</a>的錯誤原因鏈）把金流 API 回的原始錯誤掛在上面：</p>
+<pre>throw new BadGatewayException('金流服務暫時無法使用', { cause: err, errorCode: 'PAYMENT_GATEWAY_FAILED' })</pre>
+<p><code>cause</code> <strong>不會</strong>出現在回應裡，它是給你自己查問題用的。可是第一節的表格說過，內建 filter 不記錄 HttpException，所以這個 cause 預設不會出現在任何地方。要看到它，catch-all 碰到 5xx 的 HttpException 時要寫 error log，並把 <code>exception.cause</code> 一起寫進去。只寫 <code>exception.stack</code> 不夠：它只有這個例外自己的堆疊，不含 cause 的內容。這也是練習 3 的一部分。</p>
+<p>整理成一條寫 log 的原則：5xx 一定寫 error，那是你要修的東西，不管它是 HttpException 還是沒預料到的錯誤；4xx 不寫 error。真的需要追 4xx（例如有人一直猜密碼），用 warn 或 debug 這類較低的等級，第 24 課會講 log 等級怎麼分。</p>
+<div class="callout practice"><strong>💡 實務上：客服回報的 500 就是靠 request id 追</strong><br>典型流程是：客人截圖「系統忙碌，請稍後再試（編號 6c1f…）」給客服，客服轉給工程師，工程師拿編號到 log 系統搜尋，就能看到那一筆的路徑、時間和堆疊。所以前端顯示 500 時一定要把 <code>requestId</code> 印在畫面上，最好能讓客人一鍵複製。寫 log 時也要小心另一個方向的外洩：不要把整個 request body 寫進去，密碼、電話、信用卡號會跟著進 log，看得到 log 的人通常比看得到資料庫的人多。上線後團隊通常會對 5xx 的數量設警報，這也是 4xx 不能寫成 error 的原因：否則警報天天響，真正的 bug 反而被忽略。</div>
+<p>現在全域有兩個 filter：<code>DomainExceptionFilter</code> 接 <code>DomainError</code>，<code>AllExceptionsFilter</code> 接所有例外。<code>OutOfStockError</code> 兩個都接得到。如果被 catch-all 接走，庫存不足又會變回 500，開場的問題就白修了。所以接下來要搞清楚：一個例外有好幾個 filter 符合時，到底誰處理。</p>
+
+<h2>兩個 filter 都接得到時，誰處理？</h2>
+<p>要回答這個問題，先看 filter 可以掛在哪裡。除了前面用的全域登記，filter 也可以只掛在某個 controller 或某個路由上：</p>
+<div class="table-wrap"><table>
+  <tr><th>範圍</th><th>寫法</th><th>用在</th></tr>
+  <tr><td>路由</td><td>handler 上加 <code>@UseFilters(XFilter)</code></td><td>某個端點有特別的格式（很少需要）</td></tr>
+  <tr><td>controller</td><td>class 上加 <code>@UseFilters(XFilter)</code></td><td>整個 controller 都需要</td></tr>
+  <tr><td>全域</td><td>模組的 providers 加 <code>{ provide: APP_FILTER, useClass: XFilter }</code>，或 <code>main.ts</code> 的 <code>app.useGlobalFilters(new XFilter())</code></td><td>錯誤格式這種整個 API 一致的規則</td></tr>
+</table></div>
+<p>例外發生時，Nest 從最靠近的地方往外找：先看路由上有沒有 filter 的 <code>@Catch</code> 符合，沒有再看 controller，最後才看全域；都不符合，就交給內建 filter。重點是<strong>只有一個 filter 會處理</strong>，第一個符合的接走之後，其他的都不執行，不會一層一層都跑。controller 上的 filter 接走了，全域的就不會執行。</p>
+<figure>
+  <svg viewBox="0 0 700 270" role="img" aria-label="例外往外傳的順序：先找路由上的 filter，再找 controller 的 filter，最後找全域 filter，第一個 @Catch 符合的處理，其他不會執行。middleware 丟出的例外不經過路由與 controller 的 filter，只有全域 filter 接得到">
+    <defs><marker id="a8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="20" y="30" width="150" height="56" rx="10"/>
+    <text class="d-text" x="95" y="54" text-anchor="middle">handler、pipe、</text>
+    <text class="d-text" x="95" y="74" text-anchor="middle">guard 丟出例外</text>
+    <rect class="d-box" x="210" y="30" width="130" height="56" rx="10"/>
+    <text class="d-text" x="275" y="54" text-anchor="middle">路由的</text>
+    <text class="d-text" x="275" y="74" text-anchor="middle">@UseFilters</text>
+    <rect class="d-box" x="380" y="30" width="130" height="56" rx="10"/>
+    <text class="d-text" x="445" y="54" text-anchor="middle">controller 的</text>
+    <text class="d-text" x="445" y="74" text-anchor="middle">@UseFilters</text>
+    <rect class="d-box" x="550" y="30" width="130" height="56" rx="10"/>
+    <text class="d-text" x="615" y="54" text-anchor="middle">全域 filter</text>
+    <text class="d-small" x="615" y="74" text-anchor="middle">後登記的先比對</text>
+    <line class="d-line" x1="170" y1="58" x2="206" y2="58" marker-end="url(#a8)"/>
+    <line class="d-line" x1="340" y1="58" x2="376" y2="58" marker-end="url(#a8)"/>
+    <line class="d-line" x1="510" y1="58" x2="546" y2="58" marker-end="url(#a8)"/>
+    <text class="d-small" x="445" y="120" text-anchor="middle">由近到遠，第一個 @Catch 符合的處理，其他都不執行</text>
+    <rect class="d-soft" x="20" y="160" width="150" height="56" rx="10"/>
+    <text class="d-text" x="95" y="184" text-anchor="middle">middleware</text>
+    <text class="d-text" x="95" y="204" text-anchor="middle">丟出例外</text>
+    <path class="d-line" d="M170,188 L615,188 L615,90" fill="none" marker-end="url(#a8)"/>
+    <text class="d-small" x="390" y="178" text-anchor="middle">還沒進到路由：只有全域 filter 接得到</text>
+    <rect class="d-soft" x="550" y="225" width="130" height="34" rx="8"/>
+    <text class="d-small" x="615" y="247" text-anchor="middle">都不符合：Nest 內建</text>
+  </svg>
+  <figcaption>例外從最靠近的地方往外找 filter，只有一個會處理。middleware、找不到路由、解析 body 失敗這些發生在路由之前的錯誤，只有全域 filter 接得到，所以錯誤格式一定要放在全域。</figcaption>
+</figure>
+<p>圖的下半部說明了錯誤格式為什麼要放在全域：middleware 丟的例外、找不到路由、body 解析失敗，這些錯誤發生時請求還沒對應到任何 controller，掛在 controller 上的 filter 根本輪不到。只有全域 filter 能保證「每一種錯誤都是契約的格式」。</p>
+<p><code>DomainExceptionFilter</code> 和 <code>AllExceptionsFilter</code> 都是全域的，在同一層，誰先比對？答案是<strong>後登記的先比對</strong>（Nest 12.3.2 實測：<code>useGlobalFilters(B, C)</code> 兩個都接得到的例外由 C 處理；<code>APP_FILTER</code> 照 providers 的順序登記，一樣是後面的先比對）。官方文件的說法是「catch-all 要宣告在前面」。順序放反時，<code>@Catch()</code> 先比對到所有例外，<code>DomainExceptionFilter</code> 永遠輪不到，庫存不足全變成 500。正確的順序是 catch-all 先登記、專門的 filter 後登記：</p>
+<pre>providers: [
+  { provide: APP_FILTER, useClass: AllExceptionsFilter },     // 先登記：最後才比對
+  { provide: APP_FILTER, useClass: DomainExceptionFilter },   // 後登記：先比對
+],</pre>
+<p>這樣 <code>OutOfStockError</code> 先被 <code>DomainExceptionFilter</code> 接走，回 409；其他所有例外才落到 catch-all。</p>
+<p>順序講清楚了，還剩前面留下的問題：為什麼用 <code>APP_FILTER</code> 登記，而不是 <code>main.ts</code> 的 <code>useGlobalFilters</code>。兩種寫法都是全域，差別在這裡：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th><code>APP_FILTER</code></th><th><code>useGlobalFilters</code></th></tr>
+  <tr><td>誰建立 filter</td><td>Nest 的 DI 容器，可以注入 <code>HttpAdapterHost</code>、<code>Logger</code>、設定</td><td>你自己 <code>new</code>，依賴要自己傳</td></tr>
+  <tr><td>測試</td><td>測試用 <code>Test.createTestingModule({ imports: [AppModule] })</code> 建立應用時就有</td><td>寫在 <code>main.ts</code>，測試不會執行 <code>main.ts</code>，測試裡的錯誤格式跟正式環境不一樣</td></tr>
+</table></div>
+<p>catch-all 要注入 <code>HttpAdapterHost</code>，測試也要看到跟正式環境一樣的錯誤格式，兩點都指向 <code>APP_FILTER</code>。不管寫在哪個模組，它都是全域的；放在 <code>AppModule</code> 最容易找到。</p>
+<p>錯誤怎麼流到哪個 filter 已經清楚，剩下一個前面一直先用了、還沒解釋的問題：庫存不足為什麼是 409，沒列在對照表上的領域錯誤為什麼是 422？</p>
+
+<h2>庫存不足為什麼是 409，不是 400 或 422？</h2>
+<p>狀態碼是給程式看的第一層分類：前端、監控、重試機制都會先看它，再看 errorCode。選錯了，前端可能把「請稍後再試」顯示成「你送錯資料」，監控也可能把上游的問題算成自己的 bug。<a href="../../node/lessons/14-rest-api-design.html">Node 課第 14 課</a>有完整的決策表，這裡整理錯誤會用到的幾個，重點是 4xx 之間、5xx 之間的分界：</p>
+<div class="table-wrap"><table>
+  <tr><th>狀態碼</th><th>意思</th><th>咖啡店的例子</th></tr>
+  <tr><td>400 Bad Request</td><td>請求本身格式不對</td><td><code>qty</code> 是字串、少了 <code>items</code>（ValidationPipe）</td></tr>
+  <tr><td>404 Not Found</td><td>指名的資源不存在</td><td><code>GET /products/99</code>、訂單裡的商品不存在</td></tr>
+  <tr><td>409 Conflict</td><td>跟資源<strong>目前的狀態</strong>衝突，狀態變了可能就會成功</td><td>庫存不足、取消已經出餐的訂單、電話已經註冊過</td></tr>
+  <tr><td>422 Unprocessable Content</td><td>格式對，但違反業務規則，再送幾次都一樣</td><td>集點卡已經集滿還要再蓋章、訂購日期在過去</td></tr>
+  <tr><td>500 Internal Server Error</td><td>我們自己的 bug 或沒預期到的錯誤</td><td><code>TypeError</code>、沒處理的資料庫錯誤</td></tr>
+  <tr><td>502 Bad Gateway</td><td>我們呼叫的上游服務回了錯誤</td><td>金流 API 回 500</td></tr>
+  <tr><td>503 Service Unavailable</td><td>暫時無法服務，等一下再試</td><td>維護中、正在關機（第 24 課）、資料庫連線池滿了</td></tr>
+  <tr><td>504 Gateway Timeout</td><td>等上游服務等到逾時</td><td>金流 API 10 秒沒回應</td></tr>
+</table></div>
+<p>拿開場的訂單對照。「要 3 塊起司蛋糕」這個請求格式完全正確，所以不是 400；起司蛋糕這個商品存在，所以不是 404。它失敗的原因是庫存<strong>目前</strong>只有 2 塊，等店員補貨，同一個請求原封不動再送一次就會成功，這正是 409「跟資源目前的狀態衝突」的意思。422 則是不管什麼時候送都不會成功的請求，例如集點卡已經集滿還要再蓋章。這也是 <code>DomainExceptionFilter</code> 把沒列在對照表上的領域錯誤預設成 422 的原因：大多數業務規則的違反屬於這一種，要回 409 或 404 的，明確列進對照表。</p>
+<p>5xx 選對也有實際用途。監控看到 502、504 變多，是上游的問題，要聯絡金流商；500 變多是你的 bug，要自己修。前一節的金流例子用 502，就是因為錯誤發生在我們呼叫的金流 API，而不是我們自己的程式。重試也看這個分類：502／503／504 通常可以重試，500 重試多半還是失敗。至於錯誤回應整體要用哪一種格式（這門課的 <code>errorCode</code> 格式，或另一種標準 problem details），放在課末的補充。</p>
+<p>到這裡，開場那張訂單的每一步都有了答案：service 丟 <code>OutOfStockError</code>，後登記的 <code>DomainExceptionFilter</code> 把它翻成 409 加 <code>OUT_OF_STOCK</code>，前端顯示「只剩 2 個」；沒預料到的錯誤由 catch-all 回成固定的 500 和 request id，細節只進 log。練習就是把這兩個 filter 親手寫出來。</p>
+
+<h2>補充與查表</h2>
+<p>主線用不到、但讀舊專案或查問題時會遇到的細節。</p>
+
+<h3>http-errors 格式的錯誤</h3>
+<p>還有一個少見的情況：第三方 middleware 丟出 <code>http-errors</code> 套件格式的錯誤（物件上有 <code>statusCode</code> 和 <code>expose</code>），Nest 會沿用它的狀態碼；Nest 12.2 起，<code>expose: false</code> 的這類錯誤只回狀態碼的標準文字（例如 <code>Payload Too Large</code>），不回原本的訊息。</p>
+
+<h3>領域錯誤與 Result 型別</h3>
+<p>這跟 <a href="../../typescript/lessons/27-modeling-state-errors.html">TypeScript 課第 27 課</a>的 <code>Result</code> 型別是兩種做法：<code>Result</code> 讓呼叫的人在型別上被迫處理失敗，適合呼叫端要依結果走不同流程的地方；例外適合「這個請求到此為止」的情況，由邊界統一翻譯。Nest 的 controller 大多是後者。</p>
+
+<h3>另一種錯誤格式：problem details</h3>
+<p>另一種標準化的錯誤格式是 <strong>problem details</strong>（RFC 9457，Node 課第 14 課教過）：<code>Content-Type: application/problem+json</code>，欄位是 <code>type</code>、<code>title</code>、<code>status</code>、<code>detail</code>、<code>instance</code>。它的好處是跨語言、跨公司的工具看得懂。這門課沿用 Nest 預設的 <code>statusCode</code>／<code>message</code> 加上 <code>errorCode</code>，因為 ValidationPipe 和內建例外本來就產生這個形狀，改動最少。兩種都可以，重點是<strong>選一種，整個 API 一致用到底</strong>；最糟的是一半端點用 A、一半用 B。</p>
+
+<h2>練習</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs nestjs 08</code> 建立 <code>work/08/</code>。起始專案接續第 6、7 課：有 request id middleware、全域 ValidationPipe（<code>errorFormat: 'grouped'</code>）、<code>POST /orders</code>、<code>GET /products/:id</code>。<code>OrdersService</code> 目前丟的是 <code>ConflictException</code>／<code>NotFoundException</code>，兩個 filter 的檔案是空的。商品的庫存：起司蛋糕（id 6）只剩 2 個。在 <code>work/08</code> 執行 <code>npm run start:dev</code> 後可以用這行試：</p>
+<pre>curl -i localhost:3100/orders -H 'content-type: application/json' \
+  -d '{"customerId":1,"items":[{"productId":6,"qty":3,"size":"M"}]}'</pre>
+
+<div class="local" data-test="ex1" data-files="src/errors/domain-errors.ts src/orders/orders.service.ts src/filters/domain-exception.filter.ts src/app.module.ts">
+  <p>練習 1：讓訂單改用領域錯誤。</p>
+  <ul>
+    <li>在 <code>domain-errors.ts</code> 照 <code>OutOfStockError</code> 的樣子寫 <code>ProductNotFoundError</code>：<code>code</code> 是 <code>'PRODUCT_NOT_FOUND'</code>，建構子收 <code>productId</code>，<code>details</code> 是 <code>{ productId }</code>。</li>
+    <li><code>OrdersService.create</code> 改丟 <code>ProductNotFoundError</code> 與 <code>OutOfStockError(product.id, item.qty, product.stock)</code>，不再 import 任何 HTTP 例外。</li>
+    <li>寫 <code>@Catch(DomainError)</code> 的 <code>DomainExceptionFilter</code>：用 <code>exception.code</code> 查對照表，<code>OUT_OF_STOCK</code>→409、<code>PRODUCT_NOT_FOUND</code>→404、其他→422；回應 <code>{ statusCode, error, message, errorCode, details, requestId }</code>。</li>
+    <li>在 <code>AppModule</code> 用 <code>APP_FILTER</code> 登記。</li>
+  </ul>
+  <p>測試會直接 <code>new OrdersService(…)</code> 確認丟出的是領域錯誤；也會加一條測試路由，丟出 <code>code</code> 一樣是 <code>OUT_OF_STOCK</code>、訊息卻是英文的領域錯誤，所以比對 <code>message</code> 文字的寫法過不了。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="src/filters/all-exceptions.filter.ts src/app.module.ts">
+  <p>練習 2：寫 <code>@Catch()</code> 的 <code>AllExceptionsFilter</code>，注入 <code>HttpAdapterHost</code> 回應。非 HttpException 的例外一律回 500：</p>
+  <pre>{ "statusCode": 500, "error": "Internal Server Error", "message": "伺服器發生錯誤",
+  "errorCode": "INTERNAL_ERROR", "requestId": "&lt;跟 X-Request-Id 標頭一樣&gt;" }</pre>
+  <p>並用 <code>new Logger(AllExceptionsFilter.name)</code> 的 <code>error(訊息, stack)</code> 記錄：訊息要有 request id，第二個參數是堆疊。用 <code>APP_FILTER</code> 登記，注意跟 <code>DomainExceptionFilter</code> 的先後。測試會加幾條測試路由：丟出含資料庫 constraint 名稱和密碼的 <code>Error</code>、程式 bug 的 <code>TypeError</code>、async handler 的錯誤、<code>throw 'oops'</code>，檢查回應不外洩任何細節、log 有堆疊。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="src/filters/all-exceptions.filter.ts">
+  <p>練習 3：catch-all 不能弄壞既有的 4xx。<code>exception instanceof HttpException</code> 時：</p>
+  <ul>
+    <li>狀態碼用 <code>getStatus()</code>；內容用 <code>getResponse()</code>，是物件就保留所有欄位（ValidationPipe 以欄位分組的 <code>message</code> 要原樣留著），是字串就變成 <code>{ statusCode, message }</code>。</li>
+    <li>補上 <code>requestId</code>，以及 <code>errorCode</code>：例外已經有 <code>errorCode</code>（例如 <code>GET /products/99</code> 的 <code>PRODUCT_NOT_FOUND</code>）就沿用；沒有的話 400→<code>VALIDATION_FAILED</code>、404→<code>NOT_FOUND</code>、其他→<code>HTTP_&lt;狀態碼&gt;</code>（例如 <code>HTTP_403</code>）。</li>
+    <li>4xx 不寫 error log。</li>
+    <li>5xx 的 HttpException（例如上面的 <code>BadGatewayException</code>）一樣保留狀態碼與內容，但要寫 error log，而且 log 裡要有 <code>exception.cause</code> 的內容（是 <code>Error</code> 就取它的 <code>stack</code>）；cause 不能出現在回應裡。</li>
+  </ul>
+  <p>測試也會再確認一次：庫存不足仍然是 409，沒有被 catch-all 搶走。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：沒有寫任何 filter，<code>OrdersService</code> 裡 <code>throw new Error('起司蛋糕庫存不足')</code>。前端收到什麼？</p>
+  <label data-key="a">400，<code>message</code> 是 <code>'起司蛋糕庫存不足'</code></label>
+  <label data-key="b">500，<code>message</code> 是 <code>'起司蛋糕庫存不足'</code></label>
+  <label data-key="c">500，<code>message</code> 是 <code>'Internal server error'</code>，原本的訊息只出現在伺服器的 log</label>
+  <label data-key="d">請求沒有回應，直到逾時</label>
+  <p class="why">✓ 不是 HttpException 的例外，Nest 內建的處理一律回 500 和固定字串，並把原本的錯誤（含堆疊）寫進 log。它分不出哪些訊息可以公開，所以都不送出（b 錯）。狀態碼不會被猜成 400（a 錯）；例外層一定會回應，請求不會卡住（d 錯）。想讓前端看到「庫存不足」，就丟領域錯誤並用 filter 轉成 409。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：同事說「前端用 <code>message === '庫存不足'</code> 判斷就好，何必多一個 errorCode」。最主要的問題是什麼？</p>
+  <label data-key="a">字串比對太慢</label>
+  <label data-key="b"><code>message</code> 是給人看的文案，會被改寫、翻譯，一改前端的判斷就默默失效；<code>errorCode</code> 是契約，不會因為改文案而變</label>
+  <label data-key="c"><code>message</code> 在正式環境不會送到前端</label>
+  <p class="why">✓ 文案屬於產品，會因為行銷、多語系而改；判斷邏輯需要穩定的識別值。效能沒有差別（a 錯）。HttpException 與領域錯誤的 <code>message</code> 都會送到前端，只有非預期的 500 才被換成固定字串（c 錯）。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：<code>OrdersController</code> 上有 <code>@UseFilters(A)</code>，全域也用 <code>APP_FILTER</code> 登記了 B，兩個都是 <code>@Catch(HttpException)</code>。<code>OrdersController</code> 的 handler 丟出 <code>NotFoundException</code>，誰處理？</p>
+  <label data-key="a">只有 A</label>
+  <label data-key="b">先 A 再 B，兩個都會執行</label>
+  <label data-key="c">只有 B，全域的優先</label>
+  <p class="why">✓ Nest 從最靠近的地方往外找：路由 → controller → 全域，第一個符合的處理，其他的都不執行（b 錯）。全域是最後才找的（c 錯）。所以 controller 的 filter 如果沒補 <code>requestId</code>、<code>errorCode</code>，這個 controller 的錯誤格式就跟其他端點不一樣，這也是錯誤格式要集中在全域的原因。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>service 依賴 HTTP 例外</strong>：佇列、排程、CLI 呼叫同一個 service 時拿到 <code>ConflictException</code>，意思不對。service 丟領域錯誤，由 filter 翻譯。</li>
+  <li><strong>只寫 res.json(…) 沒設狀態碼</strong>：filter 自己送回應，沒設就是 200，前端以為成功。</li>
+  <li><strong>把 exception.message 直接回給客戶端</strong>：資料庫、第三方套件的錯誤訊息會帶出資料表、constraint、主機與帳號。非預期的錯誤只回固定訊息和 request id，細節寫進 log。</li>
+  <li><strong>filter 裡又丟出例外</strong>：例如對 <code>unknown</code> 直接讀 <code>exception.stack</code>，遇到 <code>throw 'oops'</code> 就出錯。先用 <code>instanceof</code> 縮小型別。</li>
+  <li><strong>catch-all 把 HttpException 也變成 500</strong>：驗證失敗、找不到資源全變成「伺服器錯誤」，前端無法提示使用者，監控也滿是假的 5xx。用 <code>getStatus()</code>、<code>getResponse()</code> 保留原本的內容。</li>
+  <li><strong>4xx 也寫 error log</strong>：真正的 bug 被淹沒。5xx 寫 error，4xx 需要時用較低的等級。</li>
+  <li><strong>全域 filter 的順序放反</strong>：後登記的先比對，catch-all 放在後面會搶走所有例外。catch-all 先登記，專門的 filter 後登記。</li>
+  <li><strong>每個端點的錯誤格式都不一樣</strong>：有的用 controller 的 filter、有的自己 <code>try/catch</code> 回 <code>{ error: '…' }</code>。格式放在全域 filter，controller 不要自己組錯誤回應。</li>
+  <li><strong>錯誤格式只寫在 main.ts 的 useGlobalFilters</strong>：測試不執行 <code>main.ts</code>，測到的格式跟正式環境不同，filter 也不能注入依賴。用 <code>APP_FILTER</code>。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>沒寫 filter 時：HttpException 照它的狀態碼與內容回應、不寫 log；其他例外一律 500 加 <code>Internal server error</code>，寫 error log。所以 <code>throw new Error('庫存不足')</code> 到前端只剩 500。</li>
+  <li>錯誤回應是跟前端的契約：<code>{ statusCode, error, message, errorCode, details?, requestId }</code>。前端看 <code>errorCode</code>，不看 <code>message</code>。</li>
+  <li>Nest 12 的 HttpException 可以帶 <code>errorCode</code>（會送出）與 <code>cause</code>（不會送出，要自己記進 log）。</li>
+  <li>service 丟領域錯誤（<code>code</code>＋<code>details</code>），<code>@Catch(DomainError)</code> 的 filter 依 code 對照狀態碼；同一個 service 給 worker、排程用時意思不變。</li>
+  <li>catch-all 用 <code>@Catch()</code>＋<code>HttpAdapterHost</code>：HttpException 保留原狀，其他回 500 固定訊息，堆疊與 request id 只進 log；5xx 寫 error log，4xx 不寫。</li>
+  <li>filter 由近到遠找（路由 → controller → 全域），只有一個處理；全域的後登記先比對，所以 catch-all 先登記；middleware 的錯誤只有全域接得到。用 <code>APP_FILTER</code> 註冊。</li>
+  <li>選對狀態碼：庫存不足是 409（狀態變了就會成功），再送幾次都一樣的業務規則違反是 422；500 是自己的 bug，502／503／504 是上游或暫時性問題。</li>
+</ul>
+<p>下一課學 interceptor：包住 handler 的前後，用 RxJS 做計時、逾時與回應轉換。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

@@ -1,0 +1,547 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>8. RDS 與 Aurora：Multi-AZ、read replica、備份與 PITR、RDS Proxy、連線數</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="8" data-practice="aws">
+<header>
+  <div class="eyebrow">階段 4：資料與機密 · 第 8 課</div>
+  <h1>RDS 與 Aurora：Multi-AZ、read replica、備份與 PITR、RDS Proxy、連線數</h1>
+</header>
+<main>
+
+<p>開幕活動那天，第 6 課的訂單 Lambda 擴到幾百個環境，RDS for PostgreSQL 回 <code>too many connections</code>。會議上有三個提案：「Multi-AZ 有兩台，叫另一台分擔流量」「加一個 read replica，讀取都去那裡」「把 max_connections 調大」。結果加了 replica 之後，客服開始接到「結帳完馬上查訂單，卻說查無訂單」。隔週又有人在正式資料庫執行少了 WHERE 的 DELETE，要還原到十分鐘前。</p>
+<p>devops 課第 18 課已經介紹過 RDS 會幫你做什麼；PostgreSQL 課講過交易、連線、複寫與 PITR 的原理。這一課把它們接到 AWS 的設定上：Multi-AZ 與 read replica 各解決什麼、讀寫要怎麼分流、連線數的帳怎麼算、RDS Proxy 何時必要、時間點還原之後應用程式要改什麼。</p>
+<p>這課的路線：</p>
+<ul>
+  <li>RDS 與 Aurora 的架構：一台執行個體與一個叢集的差別，各有哪些端點。</li>
+  <li>Multi-AZ 與 read replica：一個管可用性、一個管讀取擴充；讀寫分流與「讀到自己的寫入」。</li>
+  <li>連線數：max_connections 從哪來、ECS 與 Lambda 一起用時怎麼算，以及 RDS Proxy。</li>
+  <li>備份與 PITR：還原一定是新的執行個體，網路與參數設定要自己帶過去。</li>
+  <li>參數群組、維護時段與 Aurora Serverless v2。</li>
+</ul>
+
+<div class="callout"><strong>這課會用到：</strong>PostgreSQL 課<a href="../../postgresql/lessons/36-connections-monitoring.html">第 36 課</a>的「一條連線就是一個程序」（連線吃記憶體，數量有上限）；PostgreSQL 課<a href="../../postgresql/lessons/37-backup-replication.html">第 37 課</a>的 WAL、PITR 與非同步複寫；<a href="05-ecs-fargate.html">第 5 課</a>的 maximumPercent（部署時 task 數暫時變多）與<a href="06-lambda-api-gateway.html">第 6 課</a>的並行數（每個執行環境各自一個連線池）。</div>
+
+<div class="callout warn"><strong>練習環境：</strong>模擬器的 RDS 只有中繼資料，沒有真的 PostgreSQL。所以讀寫分流與連線數用頁面上的練習，本機題只做「時間點還原」的 API 呼叫並檢查送出的參數。</div>
+
+<h2>RDS 與 Aurora：一台執行個體與一個叢集</h2>
+<p><strong>RDS</strong>（Relational Database Service）是 AWS 代管的關聯式資料庫：你選引擎（這門課用 PostgreSQL）、機型、儲存空間，AWS 負責安裝、修補、備份、故障切換；你仍然負責 schema、索引、查詢、連線數與參數。它的單位是一台<strong>DB 執行個體</strong>（DB instance），資料放在掛給它的磁碟上。</p>
+<p><strong>Aurora</strong> 是 AWS 自己做的、相容 PostgreSQL（與 MySQL）的資料庫，架構不一樣：它的單位是一個 <strong>DB 叢集</strong>（DB cluster），運算與儲存分開。依官方文件（2026-11-20 查證）：</p>
+<ul>
+  <li>資料放在<strong>叢集磁碟區</strong>（cluster volume），它在 region 內的三個 AZ 都有副本，跟有幾台執行個體無關。</li>
+  <li>一台<strong>寫入執行個體</strong>（writer）負責所有寫入；最多 15 台 <strong>Aurora Replica</strong>（reader）連到<strong>同一個</strong>叢集磁碟區，只能讀。</li>
+  <li>writer 掛掉時，Aurora 自動把一台 reader 升成新的 writer。</li>
+</ul>
+<p>應用程式連的是<strong>端點</strong>（endpoint，一個 DNS 名稱），不是某台機器的 IP。RDS 執行個體有自己的端點；Aurora 叢集有<strong>叢集端點</strong>（永遠指向目前的 writer）與<strong>讀取端點</strong>（reader endpoint，把連線分散到各台 reader）。切換時 AWS 改的是 DNS 背後指向誰，所以端點名稱不變，但既有的連線會斷（devops 第 18 課）。</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>RDS for PostgreSQL</th><th>Aurora PostgreSQL</th></tr>
+  <tr><td>資料的副本</td><td>單台執行個體的磁碟；Multi-AZ 時另一個 AZ 有同步備援</td><td>叢集磁碟區本身就跨三個 AZ</td></tr>
+  <tr><td>讀取擴充</td><td>read replica：各自有一份資料，用非同步複寫追上</td><td>Aurora Replica 共用同一份儲存，加一台不用複製整份資料</td></tr>
+  <tr><td>適合</td><td>規模中小、想要標準 PostgreSQL、成本好預估</td><td>需要多台讀取、更快的故障切換、儲存自動成長</td></tr>
+</table></div>
+<p>選哪個先看需求：咖啡店目前一台寫入就夠、讀取不多，RDS 加 Multi-AZ 最單純；讀取量大到要好幾台 reader，或對切換時間要求高，再評估 Aurora，並用官方定價頁比較兩者（Aurora 的儲存與 I/O 計費方式不同）。</p>
+
+<h2>Multi-AZ 與 read replica：可用性和讀取擴充是兩件事</h2>
+<p>回到會議上的第一個提案。RDS 的兩種「多一台」常被搞混：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Multi-AZ（單一備援）</th><th>read replica</th></tr>
+  <tr><td>目的</td><td>可用性：主機或 AZ 出事時自動切換</td><td>讀取擴充：把讀取分出去</td></tr>
+  <tr><td>複寫方式</td><td>同步：寫入要兩邊都完成才算 commit，所以不會掉資料，寫入延遲略增</td><td>非同步：主機 commit 之後再傳過去，會有延遲（replica lag）</td></tr>
+  <tr><td>能不能讀</td><td>不能：官方文件明講備援不能拿來分擔讀取</td><td>能，它有自己的端點</td></tr>
+  <tr><td>出事時</td><td>自動切換，端點不變、連線會斷</td><td>不會自動接手；要手動升格（promote）成獨立的資料庫</td></tr>
+</table></div>
+<p>所以第一個提案行不通：Multi-AZ 的備援平常不收任何連線。第二個提案（read replica）能分擔讀取，但帶來新問題：客人結帳（寫入主機）後馬上查訂單（讀 replica），replica 還沒追上那筆 commit，就查不到。這叫<strong>讀不到自己的寫入</strong>（read-your-writes，<a href="../../system-design/lessons/06-replication-consistency.html">系統設計課第 6 課</a>的複寫延遲異常）。</p>
+<p>常見的讀寫分流規則：</p>
+<ol>
+  <li><strong>寫入</strong>（INSERT、UPDATE、DELETE、DDL）一律走主機。</li>
+  <li><strong>交易裡的所有語句</strong>走主機：交易要在同一條連線上，而且常常是「先讀再寫」，讀的必須是最新值。</li>
+  <li><strong><code>SELECT … FOR UPDATE</code></strong> 這類要上鎖的讀取走主機，replica 是唯讀的，不能上這種鎖。</li>
+  <li><strong>同一個工作階段寫入後的一段時間內</strong>（例如 5 秒，要比平常的 replica lag 長），這個工作階段的讀取也走主機，之後才回到 replica。這叫 sticky（黏住主機）。</li>
+  <li>其他讀取走 replica。</li>
+</ol>
+<p>練習 1 把這套規則寫成路由函式。要看 replica 實際落後多少，看 CloudWatch 的 <code>ReplicaLag</code> 指標；它平常幾乎是 0，但大量寫入、replica 機型太小或長時間的查詢都會讓它拉長，sticky 的時間要依它來定。</p>
+<div class="callout practice"><strong>💡 實務上：加 replica 之前先問兩個問題</strong><br>資深工程師面對「資料庫太忙，加個 read replica 吧」時，會先問：忙的是讀還是寫？讀的部分能不能先用索引、快取（<a href="../../system-design/lessons/05-caching.html">系統設計課第 5 課</a>）解決？真的要加，再問：哪些畫面一定要讀到剛寫入的資料（結帳結果、訂單明細）？這些路徑要走主機或 sticky，報表、菜單、歷史紀錄這類可以接受幾秒延遲的才走 replica。另外，Multi-AZ 不是讀取擴充、replica 也不是備份：replica 會忠實地複寫你的誤刪。</div>
+
+<h2>連線數：max_connections 從哪來，以及 RDS Proxy</h2>
+<p>接著是第三個提案「把 max_connections 調大」。PostgreSQL 每條連線是一個程序、要吃記憶體（PostgreSQL 第 36 課），RDS 的預設值因此跟機型的記憶體綁在一起。依官方配額頁（2026-11-20 查證），RDS for PostgreSQL 的預設是：</p>
+<pre>max_connections = LEAST({DBInstanceClassMemory/9531392}, 5000)</pre>
+<p><code>DBInstanceClassMemory</code> 以 byte 計，而且已經扣掉作業系統與 RDS 管理程序用的記憶體，所以比機型標示的記憶體小。實際值以連上去執行 <code>SHOW max_connections;</code> 為準。在參數群組裡硬調大，連線多到記憶體不夠時，執行個體反而會出問題；要多少條連線，答案通常是換大機型或減少連線，而不是改數字。</p>
+<p>連線的帳要用<strong>尖峰</strong>算，不是平均：</p>
+<ul>
+  <li><strong>ECS 服務</strong>：task 數 × 每個 task 的連線池大小。部署時 task 數會暫時變成 desiredCount × maximumPercent（第 5 課的 100／200 就是兩倍），要用這個數字。</li>
+  <li><strong>Lambda</strong>：同時的環境數 × 每個環境的連線池大小。沒有設 reserved concurrency 的函式，環境數可能長到帳號上限，這筆帳根本算不出來。</li>
+  <li><strong>維運</strong>：migration、排程工作、人用 psql 連進來查問題，要預留幾條。PostgreSQL 本身也替超級使用者保留了幾條（<code>superuser_reserved_connections</code>）。</li>
+</ul>
+<p>練習 2 把這筆帳寫成函式。開場的情況：ECS 後台 3 個 task × 10 ＝ 30（部署時 60），Lambda 沒設上限 × 每個環境 5，第 6 課算過，尖峰 200 個環境就是 1,000 條。</p>
+<p><strong>RDS Proxy</strong> 是放在應用程式與資料庫之間的代管連線池。依官方文件（2026-11-20 查證）：</p>
+<ul>
+  <li>它維持一組到資料庫的連線並重複使用，應用程式的大量連線被<strong>多工</strong>到少數資料庫連線上；連線池用完時，新的請求排隊或被拒絕，而不是把資料庫打爆。</li>
+  <li>資料庫故障切換時，它連到新的主機，並盡量保持應用程式那一端的連線不斷。</li>
+  <li>可以要求應用程式用 IAM 認證連到 Proxy，Proxy 再用 Secrets Manager 裡的帳密（或 IAM）連資料庫，程式裡不用放資料庫密碼。</li>
+  <li>它必須跟資料庫在同一個 VPC，而且不能設成公開存取。</li>
+  <li>改變工作階段狀態的語句（例如 <code>SET</code>）會讓那條應用程式連線被<strong>綁定</strong>（pinning）在某一條資料庫連線上，多工的效果就沒了；詳細條件見官方的「Avoiding pinning」。</li>
+</ul>
+<p>Lambda 這種「環境數會暴增、每個環境各自連線」的用法，RDS Proxy 幾乎是必備；ECS 上 task 數穩定、應用程式自己有連線池時，不一定需要。</p>
+<div class="callout practice"><strong>💡 實務上：上線前先做一張連線數預算表</strong><br>每個會連資料庫的服務列一行：最多幾份（task 數乘 maximumPercent、Lambda 的 reserved concurrency）、每份的連線池大小、相乘的結果；加總後跟 max_connections 減掉維運保留的數字比。這張表放在設計文件裡，新服務要連同一個資料庫時就加一行。超過時的選項依序是：縮小每份的連線池、替 Lambda 設上限並加 RDS Proxy、換大機型。CloudWatch 的 <code>DatabaseConnections</code> 指標設告警，接近上限時就要處理，不要等到 <code>too many connections</code>。</div>
+
+<h2>備份與 PITR：還原一定是新的執行個體</h2>
+<p>開場最後一件事是少了 WHERE 的 DELETE。RDS 的<strong>自動備份</strong>每天做快照，並持續保存交易紀錄（PostgreSQL 的 WAL）。保留天數（<code>BackupRetentionPeriod</code>）設成 0 就沒有自動備份，也不能做時間點還原。依官方文件（2026-11-20 查證），RDS 每五分鐘把交易紀錄上傳到 S3，所以<strong>最晚可還原時間</strong>（<code>LatestRestorableTime</code>）通常在幾分鐘前；最早可以回到保留天數之內（也不會早於執行個體建立的時間），確切的範圍在主控台的 Automated backups 或 <code>aws rds describe-db-instance-automated-backups</code> 的 <code>RestoreWindow</code> 看。</p>
+<p><strong>時間點還原</strong>（PITR，point-in-time recovery，原理在 PostgreSQL 第 37 課）在 RDS 上有三個一定要知道的行為：</p>
+<ol>
+  <li><strong>還原出來的是一台新的執行個體</strong>，名稱要另取，原本那台完全不動。所以還原之後，應用程式要改連新的端點，或者把舊的改名、新的改成舊名稱；更常見的是不切換，只從新那台把被刪的資料查出來、補回原本的資料庫。</li>
+  <li><strong>網路與參數設定不會自動沿用</strong>：官方文件寫明，還原出來的執行個體預設使用預設的參數群組與選項群組；安全群組也可以選預設的 VPC 安全群組。要跟原本一樣，就要在還原時指定 DB 子網路群組、安全群組、參數群組。沒指定的話，應用程式連不上（安全群組不對），或者調過的參數全部回到預設。</li>
+  <li><strong>還原需要時間</strong>，資料量越大越久，完成後的一段時間磁碟還在背景載入資料，效能還沒到最好。</li>
+</ol>
+<pre>await rds.send(new RestoreDBInstanceToPointInTimeCommand({
+  SourceDBInstanceIdentifier: 'cafe-db',
+  TargetDBInstanceIdentifier: 'cafe-db-pitr-202611200605',     // 新名稱
+  RestoreTime: new Date('2026-11-20T06:05:00Z'),               // 誤刪前一刻，用 UTC
+  DBSubnetGroupName: 'cafe-db-private',
+  VpcSecurityGroupIds: ['sg-db'],
+  DBParameterGroupName: 'cafe-pg17',
+  PubliclyAccessible: false,
+}))</pre>
+<p>時間要特別小心：誤刪的時間常常是人說的「下午 2 點 5 分」（台灣時間），API 要的是一個確切的時間點。用 UTC 寫（台灣是 UTC+8，所以是 06:05Z），或帶時區的 ISO 字串，不要用沒有時區的字串讓程式自己猜。練習 3 寫一個先檢查範圍、再用正確設定還原的函式。</p>
+<div class="callout practice"><strong>💡 實務上：PITR 要演練，而且要記下花了多久</strong><br>「我們有自動備份」不等於「我們還原得回來」。資深的團隊每季在測試帳號演練一次：選一個時間點還原、確認資料正確、量出從決定還原到應用程式能用花了多久（這就是 RTO，devops 課<a href="../../devops/lessons/24-backup-dr.html">第 24 課</a>），並把步驟寫成 runbook：還原的指令、要帶哪些參數、怎麼把資料補回去、誰有權限做。真的出事時照 runbook 做，而不是在壓力下臨時查文件。另外記得自動備份跟著執行個體走：刪除執行個體時可以選擇保留，最好再定期複製快照到另一個帳號或 region。</div>
+
+<h2>參數群組、維護時段與 Aurora Serverless v2</h2>
+<p>最後三個每天會碰到的設定：</p>
+<ul>
+  <li><strong>參數群組</strong>（parameter group）：<code>postgresql.conf</code> 的設定都改在這裡（devops 第 18 課）。預設的參數群組不能修改，所以一開始就建自己的、掛上去。參數分兩種：動態的改了立即生效，靜態的（例如 <code>shared_buffers</code>）要重新開機才生效，參數群組會顯示 <code>pending-reboot</code>。</li>
+  <li><strong>維護時段</strong>（maintenance window）：AWS 套用修補與小版本升級的每週時段。選在離峰時間；Multi-AZ 的執行個體會先維護備援再切換，仍然會有一次連線中斷，應用程式要能重連（devops 第 18 課）。大版本升級（例如 PostgreSQL 16 到 17）不會自動做，要自己規劃與測試。</li>
+  <li><strong>Aurora Serverless v2</strong>：Aurora 的一種執行個體類型，容量以 ACU（Aurora capacity unit）為單位，依負載在你設定的最小與最大值之間自動調整，適合負載起伏大、不想自己選機型的情況。它調整的是 CPU 與記憶體，max_connections 仍然跟容量有關，連線數的帳一樣要算。</li>
+</ul>
+
+<h2>在真的 AWS 帳號上做一次（選做）</h2>
+<p>這一節不判分，也不影響進度。用第 1 課建議的獨立練習帳號。建一台最小的 RDS for PostgreSQL，做一次時間點還原，看還原出來的執行個體用了哪個安全群組與參數群組。整個過程要等二三十分鐘。</p>
+<div class="callout warn"><strong>費用：</strong>會產生費用。計費項目：兩台 DB 執行個體的執行時數（還原出來的那台也算）、儲存空間、超過免費額度的備份儲存、Secrets Manager 每個 secret 每月與 API 呼叫（<code>--manage-master-user-password</code> 會建一個）。做完馬上刪除。金額見 <a href="https://aws.amazon.com/rds/postgresql/pricing/">RDS for PostgreSQL 定價頁</a>與 <a href="https://aws.amazon.com/secrets-manager/pricing/">Secrets Manager 定價頁</a>。</div>
+<pre># 1. 建最小的執行個體：單一 AZ、保留 1 天備份、不公開，主帳號密碼交給 Secrets Manager 管理
+aws rds create-db-instance --db-instance-identifier cafe-learn-db --engine postgres \
+  --db-instance-class db.t4g.micro --allocated-storage 20 --master-username cafe \
+  --manage-master-user-password --backup-retention-period 1 --no-multi-az --no-publicly-accessible \
+  --profile learn-sandbox
+
+# 2. 等它可以用（約 10 分鐘），再看可還原的最晚時間
+aws rds wait db-instance-available --db-instance-identifier cafe-learn-db --profile learn-sandbox
+aws rds describe-db-instances --db-instance-identifier cafe-learn-db \
+  --query 'DBInstances[0].[LatestRestorableTime,DBParameterGroups[0].DBParameterGroupName,VpcSecurityGroups[0].VpcSecurityGroupId]' --profile learn-sandbox
+
+# 3. 還原到最晚可還原時間，成為新的執行個體（這裡故意不指定任何網路與參數設定）
+aws rds restore-db-instance-to-point-in-time --source-db-instance-identifier cafe-learn-db \
+  --target-db-instance-identifier cafe-learn-db-pitr --use-latest-restorable-time --profile learn-sandbox
+aws rds wait db-instance-available --db-instance-identifier cafe-learn-db-pitr --profile learn-sandbox
+
+# 4. 比較兩台：端點不同；參數群組與安全群組是不是第 2 步看到的那個？
+aws rds describe-db-instances --db-instance-identifier cafe-learn-db-pitr \
+  --query 'DBInstances[0].[Endpoint.Address,DBParameterGroups[0].DBParameterGroupName,VpcSecurityGroups[0].VpcSecurityGroupId]' --profile learn-sandbox</pre>
+<h3>清除</h3>
+<pre>aws rds delete-db-instance --db-instance-identifier cafe-learn-db-pitr --skip-final-snapshot --delete-automated-backups --profile learn-sandbox
+aws rds delete-db-instance --db-instance-identifier cafe-learn-db --skip-final-snapshot --delete-automated-backups --profile learn-sandbox
+aws rds wait db-instance-deleted --db-instance-identifier cafe-learn-db --profile learn-sandbox
+aws rds describe-db-instances --query 'DBInstances[?starts_with(DBInstanceIdentifier, `cafe-learn`)].DBInstanceIdentifier' --profile learn-sandbox   # 確認：空清單</pre>
+<p>RDS 替 <code>--manage-master-user-password</code> 建的 secret 會隨執行個體一起刪除；用主控台的 Secrets Manager 頁面確認一下沒有殘留。</p>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：寫 <code>createRouter(stickyMs)</code>，回傳 <code>route(session, sql, now)</code>，決定一個語句送到 <code>'primary'</code> 還是 <code>'replica'</code>。規則（SQL 先去掉前後空白、不分大小寫）：</p>
+  <ul>
+    <li><code>BEGIN</code> 或 <code>START TRANSACTION</code> 開頭：這個 session 進入交易，走 primary。</li>
+    <li><code>COMMIT</code> 或 <code>ROLLBACK</code> 開頭：結束交易、走 primary。交易裡有過寫入時，這個 session 的「最後寫入時間」記成 COMMIT 的時間（資料到 commit 才看得到）。</li>
+    <li>交易裡的其他語句一律走 primary；是寫入的話，記下「這個交易有寫入」。</li>
+    <li>交易外：讀取是 <code>SELECT</code> 開頭、而且不含 <code>FOR UPDATE</code>、<code>FOR SHARE</code>；其他都算寫入，走 primary 並把最後寫入時間記成 now。</li>
+    <li>交易外的讀取：這個 session 的最後寫入時間存在，而且 <code>now - 最後寫入時間 &lt; stickyMs</code>，走 primary；否則走 replica。</li>
+  </ul>
+  <p>每個 session 各自記錄，互不影響。</p>
+  <script type="start">
+type Target = 'primary' | 'replica'
+
+function createRouter(stickyMs: number) {
+  return (session: string, sql: string, now: number): Target => {
+    return 'replica'
+  }
+}
+
+const route = createRouter(5000)
+console.log(route('wang', 'INSERT INTO orders (customer_id, total) VALUES (1, 110)', 1000))
+console.log(route('wang', 'SELECT * FROM orders WHERE customer_id = 1', 1500))
+console.log(route('wang', 'SELECT * FROM orders WHERE customer_id = 1', 9000))
+</script>
+  <script type="answer">
+type Target = 'primary' | 'replica'
+
+function createRouter(stickyMs: number) {
+  const lastWrite = new Map<string, number>()
+  const tx = new Map<string, { wrote: boolean }>()   // 進行中的交易
+  return (session: string, sql: string, now: number): Target => {
+    const s = sql.trim().toUpperCase()
+    if (/^(BEGIN|START TRANSACTION)\b/.test(s)) { tx.set(session, { wrote: false }); return 'primary' }
+    if (/^(COMMIT|ROLLBACK)\b/.test(s)) {
+      if (s.startsWith('COMMIT') && tx.get(session)?.wrote) lastWrite.set(session, now)
+      tx.delete(session)
+      return 'primary'
+    }
+    const isRead = s.startsWith('SELECT') && !/\bFOR\s+(UPDATE|SHARE)\b/.test(s)
+    const t = tx.get(session)
+    if (t) { if (!isRead) t.wrote = true; return 'primary' }
+    if (!isRead) { lastWrite.set(session, now); return 'primary' }
+    const last = lastWrite.get(session)
+    return last !== undefined && now - last < stickyMs ? 'primary' : 'replica'
+  }
+}
+
+const route = createRouter(5000)
+console.log(route('wang', 'INSERT INTO orders (customer_id, total) VALUES (1, 110)', 1000))
+console.log(route('wang', 'SELECT * FROM orders WHERE customer_id = 1', 1500))
+console.log(route('wang', 'SELECT * FROM orders WHERE customer_id = 1', 9000))
+</script>
+  <script type="tests">
+const r = createRouter(5000)
+assert.equal(r('menu', 'SELECT * FROM products', 0), 'replica', '沒寫入過的 session 讀取走 replica')
+assert.equal(r('wang', 'INSERT INTO orders (customer_id, total) VALUES (1, 110)', 1000), 'primary', '寫入走 primary')
+assert.equal(r('wang', 'SELECT * FROM orders WHERE customer_id = 1', 1500), 'primary', '寫入後 5 秒內，同一個 session 的讀取走 primary（讀得到自己的寫入）')
+assert.equal(r('chen', 'SELECT * FROM orders WHERE customer_id = 2', 1500), 'replica', '別的 session 不受影響：sticky 是每個 session 各自的')
+assert.equal(r('wang', 'SELECT * FROM orders WHERE customer_id = 1', 6000), 'replica', 'now - 最後寫入 剛好等於 stickyMs：不再 sticky（用 <）')
+assert.equal(r('wang', '  select id from orders  ', 9000), 'replica', '去掉空白、不分大小寫')
+assert.equal(r('wang', 'update orders set total = 120 where id = 1', 10000), 'primary', '小寫的 update 也是寫入')
+assert.equal(r('wang', 'SELECT 1', 10001), 'primary', '小寫寫入之後也要 sticky')
+assert.equal(r('lin', 'SELECT * FROM products WHERE id = 2 FOR UPDATE', 0), 'primary', 'SELECT … FOR UPDATE 要上鎖，replica 做不到')
+assert.equal(r('lin', 'SELECT * FROM products WHERE id = 2 for share', 1), 'primary', 'FOR SHARE 也是')
+assert.equal(r('lin', 'SELECT * FROM products', 2), 'primary', 'FOR UPDATE 會被當成寫入記錄：之後的讀取 sticky')
+
+const t = createRouter(5000)
+assert.equal(t('zhang', 'BEGIN', 0), 'primary', 'BEGIN 走 primary')
+assert.equal(t('zhang', 'SELECT stock FROM products WHERE id = 3', 10), 'primary', '交易裡的 SELECT 也走 primary：交易要在同一條連線上')
+assert.equal(t('zhang', 'UPDATE products SET stock = stock - 1 WHERE id = 3', 20), 'primary')
+assert.equal(t('zhang', 'COMMIT', 3000), 'primary', 'COMMIT 走 primary')
+assert.equal(t('zhang', 'SELECT stock FROM products WHERE id = 3', 7500), 'primary', 'sticky 從 COMMIT 的時間（3000）起算，7500 還在 5 秒內')
+assert.equal(t('zhang', 'SELECT stock FROM products WHERE id = 3', 8000), 'replica', '8000 - 3000 = 5000，不再 sticky')
+assert.equal(t('li', 'START TRANSACTION', 0), 'primary')
+assert.equal(t('li', 'SELECT * FROM orders', 10), 'primary', 'START TRANSACTION 也算開始交易')
+assert.equal(t('li', 'ROLLBACK', 20), 'primary')
+assert.equal(t('li', 'SELECT * FROM orders', 30), 'replica', '只讀的交易、或 ROLLBACK 的交易不會讓 session sticky')
+</script>
+  <script type="wrong">
+type Target = 'primary' | 'replica'
+// 所有 SELECT 都走 replica
+function createRouter(stickyMs: number) {
+  const tx = new Set<string>()
+  return (session: string, sql: string, now: number): Target => {
+    const s = sql.trim().toUpperCase()
+    if (/^(BEGIN|START TRANSACTION)\b/.test(s)) { tx.add(session); return 'primary' }
+    if (/^(COMMIT|ROLLBACK)\b/.test(s)) { tx.delete(session); return 'primary' }
+    return s.startsWith('SELECT') && !/\bFOR\s+(UPDATE|SHARE)\b/.test(s) ? 'replica' : 'primary'
+  }
+}
+</script>
+  <script type="wrong">
+type Target = 'primary' | 'replica'
+// 交易裡的 SELECT 也送 replica
+function createRouter(stickyMs: number) {
+  const lastWrite = new Map<string, number>()
+  return (session: string, sql: string, now: number): Target => {
+    const s = sql.trim().toUpperCase()
+    if (/^(BEGIN|START TRANSACTION|COMMIT|ROLLBACK)\b/.test(s)) return 'primary'
+    const isRead = s.startsWith('SELECT') && !/\bFOR\s+(UPDATE|SHARE)\b/.test(s)
+    if (!isRead) { lastWrite.set(session, now); return 'primary' }
+    const last = lastWrite.get(session)
+    return last !== undefined && now - last < stickyMs ? 'primary' : 'replica'
+  }
+}
+</script>
+  <script type="wrong">
+type Target = 'primary' | 'replica'
+// 最後寫入時間全域共用：一個人寫入，所有人都被黏到 primary
+function createRouter(stickyMs: number) {
+  let lastWrite: number | undefined
+  const tx = new Map<string, { wrote: boolean }>()
+  return (session: string, sql: string, now: number): Target => {
+    const s = sql.trim().toUpperCase()
+    if (/^(BEGIN|START TRANSACTION)\b/.test(s)) { tx.set(session, { wrote: false }); return 'primary' }
+    if (/^(COMMIT|ROLLBACK)\b/.test(s)) { if (s.startsWith('COMMIT') && tx.get(session)?.wrote) lastWrite = now; tx.delete(session); return 'primary' }
+    const isRead = s.startsWith('SELECT') && !/\bFOR\s+(UPDATE|SHARE)\b/.test(s)
+    const t = tx.get(session)
+    if (t) { if (!isRead) t.wrote = true; return 'primary' }
+    if (!isRead) { lastWrite = now; return 'primary' }
+    return lastWrite !== undefined && now - lastWrite < stickyMs ? 'primary' : 'replica'
+  }
+}
+</script>
+  <script type="wrong">
+type Target = 'primary' | 'replica'
+// SELECT … FOR UPDATE 當成一般讀取
+function createRouter(stickyMs: number) {
+  const lastWrite = new Map<string, number>()
+  const tx = new Map<string, { wrote: boolean }>()
+  return (session: string, sql: string, now: number): Target => {
+    const s = sql.trim().toUpperCase()
+    if (/^(BEGIN|START TRANSACTION)\b/.test(s)) { tx.set(session, { wrote: false }); return 'primary' }
+    if (/^(COMMIT|ROLLBACK)\b/.test(s)) { if (s.startsWith('COMMIT') && tx.get(session)?.wrote) lastWrite.set(session, now); tx.delete(session); return 'primary' }
+    const isRead = s.startsWith('SELECT')
+    const t = tx.get(session)
+    if (t) { if (!isRead) t.wrote = true; return 'primary' }
+    if (!isRead) { lastWrite.set(session, now); return 'primary' }
+    const last = lastWrite.get(session)
+    return last !== undefined && now - last < stickyMs ? 'primary' : 'replica'
+  }
+}
+</script>
+  <script type="wrong">
+type Target = 'primary' | 'replica'
+// 交易裡寫入就記時間，沒等到 COMMIT
+function createRouter(stickyMs: number) {
+  const lastWrite = new Map<string, number>()
+  const tx = new Set<string>()
+  return (session: string, sql: string, now: number): Target => {
+    const s = sql.trim().toUpperCase()
+    if (/^(BEGIN|START TRANSACTION)\b/.test(s)) { tx.add(session); return 'primary' }
+    if (/^(COMMIT|ROLLBACK)\b/.test(s)) { tx.delete(session); return 'primary' }
+    const isRead = s.startsWith('SELECT') && !/\bFOR\s+(UPDATE|SHARE)\b/.test(s)
+    if (!isRead) lastWrite.set(session, now)
+    if (tx.has(session) || !isRead) return 'primary'
+    const last = lastWrite.get(session)
+    return last !== undefined && now - last < stickyMs ? 'primary' : 'replica'
+  }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：連線數預算。寫 <code>defaultMaxConnections(memoryBytes)</code>：照上面 RDS for PostgreSQL 的公式（無條件捨去）。再寫 <code>connectionBudget(input)</code>，回傳 <code>{ peaks, total, limit, ok, unbounded }</code>：</p>
+  <ul>
+    <li>ECS 服務的尖峰：<code>Math.floor(desiredCount × maximumPercent / 100) × poolSize</code>（部署時的 task 數）。</li>
+    <li>Lambda 的尖峰：<code>reservedConcurrency × poolSize</code>；沒設 reservedConcurrency 的函式尖峰是 <code>Infinity</code>，名稱放進 <code>unbounded</code>。</li>
+    <li><code>peaks</code> 是 <code>{ 服務名稱: 尖峰 }</code>，<code>total</code> 是加總，<code>limit</code> 是 <code>maxConnections - reservedForOps</code>，<code>ok</code> 是 <code>total &lt;= limit</code>。</li>
+  </ul>
+  <script type="start">
+type Service =
+  | { name: string, kind: 'ecs', desiredCount: number, maximumPercent: number, poolSize: number }
+  | { name: string, kind: 'lambda', reservedConcurrency?: number, poolSize: number }
+type Input = { maxConnections: number, reservedForOps: number, services: Service[] }
+type Budget = { peaks: Record<string, number>, total: number, limit: number, ok: boolean, unbounded: string[] }
+
+function defaultMaxConnections(memoryBytes: number): number {
+  return 0
+}
+
+function connectionBudget(input: Input): Budget {
+  return { peaks: {}, total: 0, limit: input.maxConnections, ok: true, unbounded: [] }
+}
+
+console.log(connectionBudget({
+  maxConnections: 400, reservedForOps: 20,
+  services: [
+    { name: 'cafe-api', kind: 'ecs', desiredCount: 3, maximumPercent: 200, poolSize: 10 },
+    { name: 'orders-fn', kind: 'lambda', poolSize: 5 },
+  ],
+}))
+</script>
+  <script type="answer">
+type Service =
+  | { name: string, kind: 'ecs', desiredCount: number, maximumPercent: number, poolSize: number }
+  | { name: string, kind: 'lambda', reservedConcurrency?: number, poolSize: number }
+type Input = { maxConnections: number, reservedForOps: number, services: Service[] }
+type Budget = { peaks: Record<string, number>, total: number, limit: number, ok: boolean, unbounded: string[] }
+
+function defaultMaxConnections(memoryBytes: number): number {
+  return Math.min(Math.floor(memoryBytes / 9531392), 5000)
+}
+
+function connectionBudget(input: Input): Budget {
+  const peaks: Record<string, number> = {}
+  const unbounded: string[] = []
+  for (const s of input.services) {
+    if (s.kind === 'ecs') {
+      peaks[s.name] = Math.floor(s.desiredCount * s.maximumPercent / 100) * s.poolSize
+    } else if (s.reservedConcurrency === undefined) {
+      peaks[s.name] = Infinity
+      unbounded.push(s.name)
+    } else {
+      peaks[s.name] = s.reservedConcurrency * s.poolSize
+    }
+  }
+  const total = Object.values(peaks).reduce((a, b) => a + b, 0)
+  const limit = input.maxConnections - input.reservedForOps
+  return { peaks, total, limit, ok: total <= limit, unbounded }
+}
+
+console.log(connectionBudget({
+  maxConnections: 400, reservedForOps: 20,
+  services: [
+    { name: 'cafe-api', kind: 'ecs', desiredCount: 3, maximumPercent: 200, poolSize: 10 },
+    { name: 'orders-fn', kind: 'lambda', poolSize: 5 },
+  ],
+}))
+</script>
+  <script type="tests">
+assert.equal(defaultMaxConnections(1073741824), 112, '1 GiB / 9531392 = 112.6…，無條件捨去')
+assert.equal(defaultMaxConnections(4 * 1073741824), 450, '4 GiB 約 450 條')
+assert.equal(defaultMaxConnections(64 * 1073741824), 5000, '公式有上限 5000：LEAST(…, 5000)')
+
+const api = { name: 'cafe-api', kind: 'ecs' as const, desiredCount: 3, maximumPercent: 200, poolSize: 10 }
+const b1 = connectionBudget({ maxConnections: 400, reservedForOps: 20, services: [api, { name: 'orders-fn', kind: 'lambda', reservedConcurrency: 50, poolSize: 2 }] })
+assert.equal(b1.peaks['cafe-api'], 60, 'ECS 要用部署時的 task 數：3 × 200% = 6 個 task × 10 = 60，不是平常的 30')
+assert.equal(b1.peaks['orders-fn'], 100, 'Lambda：reserved concurrency 50 × 每個環境 2 條 = 100')
+assert.equal(b1.total, 160, 'total 是各服務尖峰的加總')
+assert.equal(b1.limit, 380, 'limit 要扣掉留給維運的連線：400 - 20')
+assert.equal(b1.ok, true, '160 <= 380')
+assert.deepEqual(b1.unbounded, [], '每個 Lambda 都有上限時 unbounded 是空的')
+
+const b2 = connectionBudget({ maxConnections: 400, reservedForOps: 20, services: [api, { name: 'orders-fn', kind: 'lambda', poolSize: 5 }] })
+assert.equal(b2.peaks['orders-fn'], Infinity, '沒設 reserved concurrency 的 Lambda，尖峰算不出上限')
+assert.deepEqual(b2.unbounded, ['orders-fn'], '沒上限的函式要列在 unbounded')
+assert.equal(b2.ok, false, '有沒上限的函式就不可能 ok')
+
+const b3 = connectionBudget({ maxConnections: 200, reservedForOps: 15, services: [
+  { name: 'admin', kind: 'ecs', desiredCount: 3, maximumPercent: 150, poolSize: 20 },
+  { name: 'worker', kind: 'ecs', desiredCount: 2, maximumPercent: 100, poolSize: 5 },
+  { name: 'receipts-fn', kind: 'lambda', reservedConcurrency: 30, poolSize: 1 },
+] })
+assert.equal(b3.peaks.admin, 80, '3 × 150% = 4.5，無條件捨去成 4 個 task（maximumPercent 是捨去）× 20 = 80')
+assert.equal(b3.total, 120, '80 + 10 + 30')
+assert.equal(b3.limit, 185)
+assert.equal(b3.ok, true)
+const b4 = connectionBudget({ maxConnections: 200, reservedForOps: 15, services: [{ name: 'admin', kind: 'ecs', desiredCount: 5, maximumPercent: 200, poolSize: 20 }] })
+assert.equal(b4.ok, false, '10 × 20 = 200 > 185：平常 100 條沒事，部署時就爆')
+</script>
+  <script type="wrong">
+type Service =
+  | { name: string, kind: 'ecs', desiredCount: number, maximumPercent: number, poolSize: number }
+  | { name: string, kind: 'lambda', reservedConcurrency?: number, poolSize: number }
+type Input = { maxConnections: number, reservedForOps: number, services: Service[] }
+type Budget = { peaks: Record<string, number>, total: number, limit: number, ok: boolean, unbounded: string[] }
+function defaultMaxConnections(memoryBytes: number): number { return Math.min(Math.floor(memoryBytes / 9531392), 5000) }
+// ECS 用平常的 desiredCount，忘了部署時 task 會變多
+function connectionBudget(input: Input): Budget {
+  const peaks: Record<string, number> = {}, unbounded: string[] = []
+  for (const s of input.services) {
+    if (s.kind === 'ecs') peaks[s.name] = s.desiredCount * s.poolSize
+    else if (s.reservedConcurrency === undefined) { peaks[s.name] = Infinity; unbounded.push(s.name) }
+    else peaks[s.name] = s.reservedConcurrency * s.poolSize
+  }
+  const total = Object.values(peaks).reduce((a, b) => a + b, 0), limit = input.maxConnections - input.reservedForOps
+  return { peaks, total, limit, ok: total <= limit, unbounded }
+}
+</script>
+  <script type="wrong">
+type Service =
+  | { name: string, kind: 'ecs', desiredCount: number, maximumPercent: number, poolSize: number }
+  | { name: string, kind: 'lambda', reservedConcurrency?: number, poolSize: number }
+type Input = { maxConnections: number, reservedForOps: number, services: Service[] }
+type Budget = { peaks: Record<string, number>, total: number, limit: number, ok: boolean, unbounded: string[] }
+function defaultMaxConnections(memoryBytes: number): number { return Math.min(Math.floor(memoryBytes / 9531392), 5000) }
+// 沒扣掉留給維運的連線
+function connectionBudget(input: Input): Budget {
+  const peaks: Record<string, number> = {}, unbounded: string[] = []
+  for (const s of input.services) {
+    if (s.kind === 'ecs') peaks[s.name] = Math.floor(s.desiredCount * s.maximumPercent / 100) * s.poolSize
+    else if (s.reservedConcurrency === undefined) { peaks[s.name] = Infinity; unbounded.push(s.name) }
+    else peaks[s.name] = s.reservedConcurrency * s.poolSize
+  }
+  const total = Object.values(peaks).reduce((a, b) => a + b, 0), limit = input.maxConnections
+  return { peaks, total, limit, ok: total <= limit, unbounded }
+}
+</script>
+  <script type="wrong">
+type Service =
+  | { name: string, kind: 'ecs', desiredCount: number, maximumPercent: number, poolSize: number }
+  | { name: string, kind: 'lambda', reservedConcurrency?: number, poolSize: number }
+type Input = { maxConnections: number, reservedForOps: number, services: Service[] }
+type Budget = { peaks: Record<string, number>, total: number, limit: number, ok: boolean, unbounded: string[] }
+function defaultMaxConnections(memoryBytes: number): number { return Math.min(Math.floor(memoryBytes / 9531392), 5000) }
+// 沒上限的 Lambda 用「平常大概 10 個環境」估
+function connectionBudget(input: Input): Budget {
+  const peaks: Record<string, number> = {}, unbounded: string[] = []
+  for (const s of input.services) {
+    if (s.kind === 'ecs') peaks[s.name] = Math.floor(s.desiredCount * s.maximumPercent / 100) * s.poolSize
+    else peaks[s.name] = (s.reservedConcurrency ?? 10) * s.poolSize
+  }
+  const total = Object.values(peaks).reduce((a, b) => a + b, 0), limit = input.maxConnections - input.reservedForOps
+  return { peaks, total, limit, ok: total <= limit, unbounded }
+}
+</script>
+  <script type="wrong">
+type Service =
+  | { name: string, kind: 'ecs', desiredCount: number, maximumPercent: number, poolSize: number }
+  | { name: string, kind: 'lambda', reservedConcurrency?: number, poolSize: number }
+type Input = { maxConnections: number, reservedForOps: number, services: Service[] }
+type Budget = { peaks: Record<string, number>, total: number, limit: number, ok: boolean, unbounded: string[] }
+// 公式忘了上限 5000；task 數四捨五入
+function defaultMaxConnections(memoryBytes: number): number { return Math.floor(memoryBytes / 9531392) }
+function connectionBudget(input: Input): Budget {
+  const peaks: Record<string, number> = {}, unbounded: string[] = []
+  for (const s of input.services) {
+    if (s.kind === 'ecs') peaks[s.name] = Math.round(s.desiredCount * s.maximumPercent / 100) * s.poolSize
+    else if (s.reservedConcurrency === undefined) { peaks[s.name] = Infinity; unbounded.push(s.name) }
+    else peaks[s.name] = s.reservedConcurrency * s.poolSize
+  }
+  const total = Object.values(peaks).reduce((a, b) => a + b, 0), limit = input.maxConnections - input.reservedForOps
+  return { peaks, total, limit, ok: total <= limit, unbounded }
+}
+</script>
+</div>
+
+<div class="local" data-test="ex3" data-files="restore-plan.ts">
+  <p>練習 3：完成 <code>restore-plan.ts</code> 的 <code>restoreToPoint(rds, sourceId, time)</code>。(1) 用 <code>DescribeDBInstancesCommand</code> 讀來源；<code>BackupRetentionPeriod</code> 是 0 就丟錯。(2) 可還原範圍：最晚是 <code>LatestRestorableTime</code>；最早是「<code>InstanceCreateTime</code>」與「LatestRestorableTime 往前推 BackupRetentionPeriod 天」兩者較晚的那個（真的 AWS 直接看 automated backups 的 <code>RestoreWindow</code>，模擬器沒有這個欄位，所以這題用推算的）。time 不在範圍內就丟 <code>RangeError</code>，而且不能送出還原請求。(3) 新名稱是 <code>&lt;sourceId&gt;-pitr-&lt;UTC 年月日時分&gt;</code>，例如 <code>cafe-db-pitr-202611200605</code>（<code>time.toISOString()</code> 取到分鐘、去掉 <code>-</code>、<code>:</code>、<code>T</code>）。(4) <code>RestoreDBInstanceToPointInTimeCommand</code>：<code>RestoreTime</code> 用 time，沿用來源的 <code>DBInstanceClass</code>、DB 子網路群組名稱、安全群組 ID（<code>VpcSecurityGroupIds</code>）、第一個參數群組名稱，<code>PubliclyAccessible: false</code>。回傳 <code>{ id, endpoint }</code>，endpoint 是新執行個體的 <code>Endpoint.Address</code>。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 4：咖啡店的 RDS 開了 Multi-AZ。報表查詢讓主機 CPU 很高，同事提議「Multi-AZ 不是有另一台嗎，把報表連到備援那台」。你怎麼回？</p>
+  <label data-key="a">可以，備援的資料是同步的，最適合跑報表</label>
+  <label data-key="b">可以，但要先把備援改成唯讀模式</label>
+  <label data-key="c">不行，因為備援在另一個 AZ，跨 AZ 連線太慢</label>
+  <label data-key="d">不行：Multi-AZ 的備援只為了故障切換，平常不接受連線；要分擔讀取用 read replica（或 Aurora 的 reader），並處理複寫延遲</label>
+  <p class="why">✓ 官方文件明講單一備援的 Multi-AZ 不能拿來分擔讀取。a、b 是最常見的誤解：以為「多一台」就能讀；c 的理由不是重點，問題在於備援根本不收連線。報表這種可以接受幾秒延遲的讀取正適合 read replica。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 5：有人在 14:05（台灣時間）誤刪了 orders 的資料，你用 PITR 把 <code>cafe-db</code> 還原到 14:04。還原完成後，下列哪件事是對的？</p>
+  <label data-key="a">還原出來的是新的執行個體、有新的端點；要確認它用了正確的安全群組與參數群組，再決定是把資料補回原資料庫，還是讓應用程式改連新端點</label>
+  <label data-key="b">cafe-db 本身已經回到 14:04 的狀態，應用程式不用改任何設定</label>
+  <label data-key="c">新執行個體會自動沿用 cafe-db 的所有設定，包含安全群組與參數群組</label>
+  <label data-key="d">14:04 之後的新訂單也都還在新執行個體裡</label>
+  <p class="why">✓ PITR 一定是建新的執行個體，原本那台不動。b 是最多人以為的「覆蓋還原」；c 錯，參數群組預設用預設的，安全群組也要自己指定；d 錯，新執行個體只有到 14:04 為止的資料，之後的新訂單只在原本那台，所以常見的做法是把被刪的資料查出來補回原資料庫。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 6：訂單 Lambda 直接連 RDS，每個執行環境建一個大小 5 的連線池。平常很順，活動當天資料庫回 too many connections。下列哪個說法最正確？</p>
+  <label data-key="a">Lambda 每次呼叫都會重新連線，所以連線數等於每秒請求數</label>
+  <label data-key="b">把 max_connections 在參數群組調到 5000 就解決了</label>
+  <label data-key="c">連線數約等於同時的環境數 × 5，環境數會隨流量長到帳號上限；要設 reserved concurrency 限制環境數，並用 RDS Proxy 讓連線被共用</label>
+  <label data-key="d">把連線池調大到 20，請求就不用等連線</label>
+  <p class="why">✓ 每個執行環境各自一個連線池，所以連線數跟著並行數長。a 錯在連線池建在最外層時，熱啟動會重用連線，不是每次重連；b 是開場的第三個提案，max_connections 跟記憶體綁在一起，硬調大會讓執行個體記憶體不足；d 讓總連線數變成四倍。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>把 Multi-AZ 當成讀取擴充</strong>：備援不收連線。讀取擴充用 read replica 或 Aurora reader。</li>
+  <li><strong>把 read replica 當成備份</strong>：誤刪會被忠實地複寫過去。備份是自動備份與快照。</li>
+  <li><strong>所有 SELECT 都丟 replica</strong>：讀不到自己剛寫的資料、交易被拆到兩條連線、FOR UPDATE 失敗。寫入後 sticky、交易與鎖定讀取走主機。</li>
+  <li><strong>硬調大 max_connections</strong>：連線吃記憶體，數字跟機型綁在一起。減少連線或換機型。</li>
+  <li><strong>用平常的 task 數算連線</strong>：部署時是 desiredCount × maximumPercent；Lambda 沒設 reserved concurrency 就沒有上限。</li>
+  <li><strong>以為 PITR 會覆蓋原資料庫</strong>：它建新的執行個體，端點不同；之後的新資料只在原本那台。</li>
+  <li><strong>還原時不指定安全群組與參數群組</strong>：新執行個體用預設的設定，應用程式連不上或行為不同。</li>
+  <li><strong>用沒有時區的時間字串還原</strong>：可能差了 8 小時。用 UTC 或帶時區的 ISO 字串。</li>
+  <li><strong>BackupRetentionPeriod 設 0</strong>：沒有自動備份，也不能做時間點還原。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>RDS 的單位是一台執行個體；Aurora 的單位是叢集：一個跨三個 AZ 的叢集磁碟區、一台 writer、最多 15 台 reader，有叢集端點與讀取端點。應用程式連端點，切換時端點不變、連線會斷。</li>
+  <li>Multi-AZ 是同步備援、只為了可用性、不能讀；read replica 是非同步、能讀、會延遲。讀寫分流：寫入、交易、FOR UPDATE 走主機，寫入後一段時間 sticky，其他讀取走 replica。</li>
+  <li>RDS for PostgreSQL 的 max_connections 預設是 LEAST(DBInstanceClassMemory/9531392, 5000)。連線預算用尖峰算：ECS 用部署時的 task 數、Lambda 用 reserved concurrency，扣掉維運保留。</li>
+  <li>RDS Proxy 共用並多工連線、在切換時保持應用程式的連線，可用 IAM 認證；同 VPC、不能公開；改變工作階段狀態的語句會造成 pinning。Lambda 連 RDS 幾乎必備。</li>
+  <li>自動備份加交易紀錄支撐 PITR；還原一定是新的執行個體，要自己指定子網路群組、安全群組、參數群組，時間用 UTC；要定期演練並記錄 RTO。</li>
+  <li>自己建參數群組（靜態參數要重開機）、維護時段選離峰、大版本升級自己規劃；Aurora Serverless v2 依負載自動調整容量，連線數的帳一樣要算。</li>
+</ul>
+<p>下一課處理這兩課反覆出現的「密碼放哪裡」：KMS 的 envelope encryption、Secrets Manager 與 Parameter Store，以及密碼輪替時應用程式怎麼不中斷。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

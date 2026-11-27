@@ -1,0 +1,1955 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>17. 機器對機器：API key、client credentials 與 webhook 簽章</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="17">
+<header>
+  <div class="eyebrow">階段 4：更多登入方式：第三方、多因素與機器 · 第 17 課</div>
+  <h1>機器對機器：API key、client credentials 與 webhook 簽章</h1>
+</header>
+<main>
+
+<p>王小明在外送 App 點了一杯拿鐵。從他按下「送出」，到這杯拿鐵變成他的會員點數、再變成當晚的營收報表，中間要經過三段呼叫，每一段都是伺服器呼叫伺服器：</p>
+<ol>
+  <li>外送平台的伺服器呼叫咖啡店的 <code>POST /orders</code>，替王小明建單。</li>
+  <li>王小明付款後，咖啡店的訂單系統把「新訂單」事件 POST 到會員系統，讓會員系統替他加點數。</li>
+  <li>半夜，咖啡店的報表服務向訂單服務要前一天的營收。</li>
+</ol>
+<p>前面十幾課的登入，螢幕前都有一個人：他輸入密碼、按 passkey、點同意。這三段呼叫沒有人可以輸入密碼，也沒有瀏覽器可以放 cookie。可是每一段的接收方都必須知道「呼叫我的是誰、它能做什麼」：任何人都能對 <code>POST /orders</code> 送請求，任何人也都能對會員系統的網址 POST 一個假的「王小明買了 100 杯拿鐵」。</p>
+<p>這種沒有人在螢幕前操作、服務與服務之間的認證，叫<strong>機器對機器（machine-to-machine，M2M）</strong>認證。這一課的任務：讓這杯拿鐵經過的三段呼叫都能證明「我是誰」，而且任何一把秘密外洩時，損害有上限、換得掉，外送單也不會因為換 key 而斷線。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>三段呼叫各用什麼證明身分：服務帳號是什麼，API key、webhook 簽章、client credentials 各對應哪一段，mTLS 放在哪裡（開場問題的最小答案）。</li>
+  <li>第一段，外送平台的 API key：格式怎麼設計才能讓外洩的 key 被找到，資料庫只存什麼，每個請求怎麼驗。</li>
+  <li>key 要換、或懷疑外洩時，怎麼不讓外送單斷線；為什麼 key 不能放進 Vue 前台。</li>
+  <li>第二段，通知會員系統的 webhook：怎麼簽章讓對方確認是咖啡店送的，怎麼擋重放與重複加點數，secret 怎麼換。</li>
+  <li>第三段，內部的報表服務：都在內網為什麼還要認證，怎麼用 client credentials 換短效 token，不必每個服務發一把長期 key。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+  <ul>
+    <li><a href="02-crypto-toolbox.html">第 2 課</a>的 SHA-256、HMAC 與熵：SHA-256 把資料變成不能反推的雜湊；HMAC 用一把共用的秘密金鑰算出簽章，沒有金鑰算不出來；熵是隨機值有多難猜，用 bits 計；<strong>CSPRNG</strong>（密碼學安全的亂數產生器，例如瀏覽器與 Node 都有的 <code>crypto.getRandomValues</code>）產生的值無法從先前的輸出預測，<code>Math.random</code> 則不保證這一點，不能用來產生秘密。</li>
+    <li><a href="12-oauth-pkce.html">第 12 課</a>的 OAuth 角色：client（要拿 token 的程式）、授權伺服器（發 token）、資源伺服器（收 token、提供 API），以及換 token 的 token 端點。</li>
+    <li><a href="09-jwt-verification.html">第 9 課</a>的 JWT 驗證：驗完簽章還要檢查 <code>iss</code>（誰發的）、<code>aud</code>（發給誰）、<code>exp</code>（何時過期）。</li>
+  </ul>
+</div>
+
+<h2>三段呼叫，各用什麼證明「我是誰」？</h2>
+<p>人登入時，系統認的是帳號：一筆代表某個人的紀錄，綁著他的密碼與權限。機器也需要這樣一筆紀錄，叫<strong>服務帳號（service account）</strong>：代表一個程式而不是一個人的帳號。外送平台的伺服器是一個服務帳號，咖啡店的報表服務也是一個。</p>
+<p>為什麼不乾脆借某位員工的帳號給機器用？員工會離職、會改密碼、會被要求開 MFA，而機器不會輸入驗證碼；員工的權限通常也比機器需要的大得多。服務帳號的權限只開它需要的部分：外送平台的帳號能建單、查單，不能退款，也不能匯出顧客資料。這種「這個身分被允許做哪些事」的清單叫 <strong>scope</strong>，每一項寫成像 <code>orders:create</code> 這樣的字串。</p>
+<p>有了帳號，還要決定機器每次呼叫時，拿什麼證明「我就是這個帳號」。三段呼叫的情況不同，用的做法也不同：</p>
+<div class="table-wrap">
+<table>
+  <tr><th>呼叫</th><th>做法</th><th>怎麼運作</th><th>適合</th><th>代價</th></tr>
+  <tr><td>第一段：外送平台呼叫我們</td><td><strong>API key</strong></td><td>發一把長期的秘密字串，每個請求放在標頭裡</td><td>給外部合作夥伴、開發者用的公開 API</td><td>長期有效，外洩就一直能用到被撤銷；要自己做輪替、scope、到期</td></tr>
+  <tr><td>第二段：我們通知會員系統</td><td><strong>webhook 簽章</strong></td><td>方向相反：我們送出時用共用的 secret 算 HMAC，對方驗證</td><td>我們主動通知別人</td><td>接收方要正確實作驗證、防重放</td></tr>
+  <tr><td>第三段：報表服務呼叫訂單服務</td><td><strong>OAuth client credentials</strong></td><td>服務用自己的身分向授權伺服器換短效 access token，再拿 token 呼叫 API</td><td>已經有授權伺服器、很多服務要互相呼叫</td><td>多一台授權伺服器、多一次請求；token 要快取</td></tr>
+</table>
+</div>
+<p>第二段跟另外兩段方向相反。第一、三段是別人呼叫我們，我們是接收方，負責驗證對方；第二段是我們呼叫會員系統，換成我們要讓對方能驗證我們。所以 webhook 不是「會員系統發一把 key 給咖啡店」，而是咖啡店在每個送出的請求上用 secret 算出簽章，讓會員系統檢查。</p>
+<p>表裡沒有列出的第四種做法是 <strong>mTLS（雙向 TLS）</strong>。一般 HTTPS 連線只有伺服器出示 TLS 憑證，證明「我是這個網域」；TLS 憑證是由憑證機構簽發、把公鑰和身分綁在一起的檔案（這裡的憑證是 certificate，跟<a href="01-authn-authz.html">第 1 課</a>的憑證 credential 不同，只是中文同名）。mTLS 讓客戶端也出示自己的 TLS 憑證，伺服器驗證通過才接受連線。它適合自己管的內部基礎設施、金融機構之間，代價是要管憑證的簽發與更新，除錯也比較難。這一課的主線不實作它，第三段會再說明它和 client credentials 怎麼搭配。</p>
+<p>這幾種做法不互斥：咖啡店對外送平台發 API key、對會員系統送有簽章的 webhook、內部服務用 client credentials，三種同時存在。開場的問題到這裡有了最小答案，接下來照拿鐵經過的順序一段一段做。第一段最直覺的做法，是產生一串亂數當 key 交給外送平台。這樣做在平常沒問題，出事的時候卻會沒人發現。</p>
+
+<h2>第一段：一串亂數當 key，外洩了為什麼沒人發現？</h2>
+<p><strong>API key</strong> 是發給合作夥伴或服務的長期金鑰：咖啡店產生一串秘密字串交給外送平台，外送平台每次呼叫 <code>POST /orders</code> 都帶著它，咖啡店看到這串字就知道是外送平台。最簡單的做法是產生一串亂數就交出去。</p>
+<p>問題出在外洩之後。key 外洩多半不是被駭，而是自己人不小心：工程師把 key 貼進 GitHub、寫進 log、截圖放進客服單。外洩擋不完，能做的是讓外洩的 key 盡快被發現。負責發現的是 <strong>secret scanning</strong>：自動掃描程式碼、log、聊天訊息，找出外洩金鑰的工具。</p>
+<p>可是掃描工具要怎麼從大量程式碼裡認出「這是一把 key」？一串沒有特徵的亂數，跟 commit hash、檔案雜湊、隨機產生的 ID 長得差不多。掃描工具認不出它是 key，就沒人發現，這把 key 會一直有效，攻擊者可以一直用下去。</p>
+<p>GitHub 為了讓掃描工具認得自家的 token，把 token 格式設計成有特徵的樣子（改格式的時間見課末「補充與查表」）。前兩個特徵：</p>
+<ul>
+  <li><strong>可辨識的前綴</strong>：<code>ghp_</code> 是個人存取 token、<code>gho_</code> 是 OAuth access token 等。看到前綴就知道是誰家、哪一種 key，該通知誰。</li>
+  <li><strong>底線分隔</strong>：key 的隨機部分是 base62，本身不含底線（標準 base64 也沒有底線，但 JWT 用的 base64url 有），隨機字串剛好長得像 key 的機會變小；在編輯器裡雙擊也會選到整串。</li>
+</ul>
+<p>第三個特徵是最後 6 個字元的<strong>檢查碼（checksum）</strong>。檢查碼是從內容算出的短碼，用來偵測打錯或被截斷：內容改了一個字，算出來的檢查碼就不同。GitHub 用的是 <strong>CRC32</strong>，一種常見的檢查碼演算法，輸出 32 bits 的整數，zip、PNG 都用它。做法是對前面的內容算 CRC32，轉成 base62、左邊補 0 到 6 個字元，接在最後。</p>
+<p>CRC32 不是密碼學工具，任何人都算得出來，所以它不負責保密。它的用途是讓掃描工具<strong>不必查資料庫</strong>就能排除假的 key：一串字符合前綴，可能只是文件裡的範例；重算檢查碼對得上，才幾乎一定是真的 key。符合前綴但檢查碼對不上的字串，一定不是真的 key。前綴讓掃描工具找得到候選，檢查碼讓它丟掉誤報。</p>
+<p>咖啡店照這個做法設計自己的 key：</p>
+<figure>
+  <svg viewBox="0 0 700 200" role="img" aria-label="咖啡店 API key 的結構：cafe 前綴、live 或 test 環境、30 個 base62 隨機字元、6 個字元的 CRC32 檢查碼">
+    <rect class="d-soft" x="20" y="50" width="90" height="50" rx="8"/>
+    <text class="d-text" x="65" y="80" text-anchor="middle">cafe_</text>
+    <rect class="d-soft" x="115" y="50" width="90" height="50" rx="8"/>
+    <text class="d-text" x="160" y="80" text-anchor="middle">live_</text>
+    <rect class="d-box" x="210" y="50" width="330" height="50" rx="8"/>
+    <text class="d-text" x="375" y="80" text-anchor="middle">7Gx2kQ…（30 個 base62 字元）</text>
+    <rect class="d-box" x="545" y="50" width="135" height="50" rx="8"/>
+    <text class="d-accent" x="612" y="80" text-anchor="middle">0aZ3kP</text>
+    <text class="d-small" x="65" y="125" text-anchor="middle">誰家的 key</text>
+    <text class="d-small" x="160" y="125" text-anchor="middle">正式或測試</text>
+    <text class="d-small" x="375" y="125" text-anchor="middle">CSPRNG，約 178 bits 熵</text>
+    <text class="d-small" x="612" y="125" text-anchor="middle">CRC32 → base62</text>
+    <path class="d-line" d="M20,150 L540,150" fill="none"/>
+    <text class="d-small" x="280" y="172" text-anchor="middle">檢查碼對這一整段算（含前綴）</text>
+    <text class="d-small" x="20" y="30">共 46 個字元：cafe_live_ 10 個、隨機 30 個、檢查碼 6 個</text>
+  </svg>
+  <figcaption>前綴讓掃描工具找得到，檢查碼讓它不用查資料庫就能排除假的 key</figcaption>
+</figure>
+<p>圖裡另外兩個選擇也有理由：</p>
+<ul>
+  <li><strong>base62</strong> 是 <code>0-9 A-Z a-z</code> 共 62 個字元，沒有符號，貼到哪裡都不會被跳脫。30 個隨機字元的熵是 30 × log<sub>2</sub>(62) ≈ 178.6 bits，跟 GitHub 的 OAuth token 一樣多，遠超過第 2 課說的 128 bits 下限。</li>
+  <li><strong>test 與 live 用不同前綴</strong>：測試環境的 key 寫進測試程式、貼進文件比較常見，前綴不同就能一眼看出外洩的是哪一種，正式環境的 API 也能直接拒絕 <code>cafe_test_</code>。</li>
+</ul>
+<p>下面這格先組出一把 key，再扮演掃描工具檢查三串字。執行後看最後三行：只有原本的 key 是 <code>true</code>，打錯一個字的和文件裡的假範例都被檢查碼排除，過程中沒有查任何資料庫。</p>
+<div class="lab"><script type="code">
+const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+
+// CRC32（跟 zip、PNG 同一種）：回傳 0 ～ 2^32-1 的整數
+function crc32(text: string): number {
+  let crc = 0xffffffff
+  for (const byte of new TextEncoder().encode(text)) {
+    crc ^= byte
+    for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1))
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+
+function toBase62(n: number): string {
+  let s = ''
+  do { s = BASE62[n % 62] + s; n = Math.floor(n / 62) } while (n > 0)
+  return s
+}
+
+const body = 'cafe_live_7Gx2kQpL9mWzR4tYc8NvB1hJ5sDfE3'
+const checksum = toBase62(crc32(body)).padStart(6, '0')
+const key = body + checksum
+console.log('key：', key, `（${key.length} 個字元）`)
+
+// 掃描工具拿到一串可疑字串：重算檢查碼比對最後 6 碼，不需要查資料庫
+const looksReal = (s: string) => toBase62(crc32(s.slice(0, -6))).padStart(6, '0') === s.slice(-6)
+console.log('原本的 key：', looksReal(key))
+console.log('打錯一個字：', looksReal(key.replace('7Gx', '7Gy')))
+console.log('文件裡的假範例：', looksReal('cafe_live_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'))
+</script></div>
+<p>CRC32 的最大值 4,294,967,295 轉成 base62 最多 6 個字元，所以 6 碼一定裝得下；比較小的數字轉出來不到 6 碼，要用 <code>padStart</code> 補 0，否則 key 的長度會不固定。</p>
+<p>key 做好了。交給外送平台之前，咖啡店自己得留一份紀錄，之後每個請求進來才能比對。最直接的做法是把 key 原封不動存進資料庫，但那樣資料庫一外洩，所有合作夥伴的 key 就一起外洩了。</p>
+
+<h2>伺服器要留什麼，才能驗 key、外洩也不能用？</h2>
+<p>跟 session token 一樣（<a href="04-cookies-sessions.html">第 4 課</a>），資料庫只存 key 的 <strong>SHA-256 雜湊</strong>。驗證時，伺服器把請求帶來的 key 再算一次 SHA-256，拿結果去資料庫找。資料庫外洩時，攻擊者拿到的只是雜湊值：雜湊反推不回 key，而把雜湊值本身當成 key 送來，伺服器會再雜湊一次，找不到任何一筆。所以雜湊值不能直接拿來呼叫 API。</p>
+<p>為什麼密碼要用 Argon2id 這類慢雜湊，key 用 SHA-256 就夠？<a href="02-crypto-toolbox.html">第 2 課</a>說過，雜湊不能反推、但可以猜。密碼是人想的，可能性少，攻擊者照常見密碼清單一個一個試，慢雜湊是為了讓每一次試都很貴（<a href="03-password-storage.html">第 3 課</a>）。key 是 CSPRNG 產生的 178 bits，就算每秒試一兆次，試完一半也要遠超過宇宙年齡的時間。猜不到的東西不需要讓「猜」變慢，而 API 每個請求都要驗證，用慢雜湊反而讓伺服器自己變慢。</p>
+<p>只存雜湊，伺服器自己也看不到原始的 key，所以 key <strong>只在建立時顯示一次</strong>：後台顯示「請現在複製，關掉之後就看不到了」，忘了就建一把新的。使用者要辨認「這是哪一把」，就另外存一段前綴給他看。</p>
+<p>紀錄裡還要記這把 key 能做什麼，也就是開頭說過的 scope：一把 key 或一張 token 被允許做的事，例如 <code>orders:create</code>。外送平台的 key 只給 <code>orders:create</code> 和 <code>orders:read</code>，key 外洩時攻擊者也不能退款或匯出顧客資料。沒有 scope 的 key 等於全部權限。</p>
+<p>把這些需求放在一起，一把 key 的紀錄長這樣：</p>
+<div class="table-wrap">
+<table>
+  <tr><th>欄位</th><th>用途</th></tr>
+  <tr><td><code>id</code></td><td>主鍵</td></tr>
+  <tr><td><code>owner_id</code></td><td>屬於哪個服務帳號或合作夥伴</td></tr>
+  <tr><td><code>prefix</code></td><td>key 的前 14 個字元，例如 <code>cafe_live_7Gx2</code>，後台列表顯示用。14 個字元裡只有 4 個隨機字元，洩漏它不會讓 key 變好猜</td></tr>
+  <tr><td><code>key_hash</code></td><td>SHA-256 的 hex，加 <code>UNIQUE</code> 索引，驗證時用它查</td></tr>
+  <tr><td><code>scopes</code></td><td>這把 key 能做的事，例如 <code>orders:create</code></td></tr>
+  <tr><td><code>expires_at</code></td><td>到期時間，可以是空的（不過期），但後台要提醒長期沒換的 key</td></tr>
+  <tr><td><code>revoked_at</code></td><td>撤銷時間；設成未來的時間代表「這個時間之後失效」，輪替時會用到</td></tr>
+  <tr><td><code>last_used_at</code></td><td>最後使用時間：判斷 key 還有沒有人用、外洩後被用過沒有</td></tr>
+</table>
+</div>
+<p>紀錄存好了。外送平台尖峰時每秒有幾百個請求帶著 key 進來，每一個都要拿這份紀錄驗證；驗的順序，決定了它快不快、會不會被亂猜的 key 拖垮資料庫。</p>
+
+<h2>每秒幾百個請求，每個怎麼驗？</h2>
+<p>原則是便宜的檢查放前面，花資料庫的檢查放後面。亂猜或打錯的 key 越早被擋，資料庫越不會被它們拖累：</p>
+<ol>
+  <li><strong>格式</strong>：符合 <code>cafe_(live|test)_</code> 加 36 個 base62 字元，不符合直接拒絕。</li>
+  <li><strong>檢查碼</strong>：對不上直接拒絕。亂猜的 key、打錯的 key 在這裡就擋掉，不會打到資料庫。這是上一節的檢查碼第二個用途：掃描工具用它排除誤報，伺服器用它保護資料庫。</li>
+  <li><strong>雜湊查表</strong>：SHA-256 之後用 <code>key_hash</code> 查。用雜湊值查表，不是逐筆比對字串，也就沒有第 2 課的時序問題：攻擊者無法控制雜湊值的前幾個字元。</li>
+  <li><strong>狀態</strong>：已撤銷、已過期、scope 不夠，各自拒絕。</li>
+</ol>
+<p>驗證通過後要更新 <code>last_used_at</code>，但不要每個請求都寫資料庫：外送平台尖峰時每秒幾百個請求，每個都 <code>UPDATE</code> 同一列會變成熱點。常見做法是在記憶體記下「這把 key 用過了」，每分鐘批次寫一次；精確到分鐘就夠判斷 key 還有沒有人用。</p>
+<p>最後要跟外送平台約定 key 放在請求的哪裡：用標頭（<code>Authorization: Bearer cafe_live_…</code> 或自訂的 <code>X-API-Key</code>），<strong>不要放在網址的 query</strong>。網址會被寫進伺服器的存取 log、Proxy 的 log、瀏覽器歷史紀錄，等於把 key 抄到一堆你管不到的地方，前面花力氣讓資料庫只存雜湊也就白費了。</p>
+<div class="callout practice"><strong>💡 實務上：API key 管理頁是後台的標準配備</strong><br>對外開放 API 的產品幾乎都有一頁「API 金鑰」：建立、命名、看前綴與最後使用時間、撤銷。key 要綁在服務帳號或合作夥伴上，不要綁在某個員工的個人帳號，否則他離職、帳號停用，外送平台的單就全斷了。建立和撤銷 key 都要寫進<strong>稽核紀錄（audit log）</strong>，也就是記錄「誰、在什麼時間、做了什麼」的紀錄（<a href="25-threat-modeling.html">第 25 課</a>專門講）。資深工程師會先問：誰有權限建 key、能給哪些 scope、多久沒用要提醒。另外檢查 log 設定有沒有遮掉 <code>Authorization</code> 與 <code>X-API-Key</code> 標頭，key 最常外洩的地方就是自己的 log。</div>
+
+<h2>換 key 或懷疑外洩時，怎麼不讓外送單斷線？</h2>
+<p>驗證寫好之後，外送平台可以穩定下單，但這把 key 遲早要換：員工離職、合作夥伴換系統、定期更換，或者懷疑外洩了。如果一個合作夥伴同一時間只能有一把有效的 key，換 key 的流程就是「撤銷舊的 → 給新的 → 對方部署新的」，中間那段時間外送單全部失敗。結果是大家都不敢換，key 一用好幾年。</p>
+<p>解法是允許<strong>輪替的重疊期</strong>：新舊 key 同時有效的一段時間。資料表的 <code>revoked_at</code> 可以設成未來的時間，就是為了這件事。</p>
+<ol>
+  <li>建立新 key，交給合作夥伴。舊 key 照常可用。</li>
+  <li>合作夥伴部署新 key。你從 <code>last_used_at</code> 看到新 key 開始被使用、舊 key 不再被使用。</li>
+  <li>撤銷舊 key。也可以在第 1 步就把舊 key 的 <code>revoked_at</code> 設成 7 天後，到時自動失效。</li>
+</ol>
+<p>計畫中的輪替可以慢慢來，<strong>懷疑外洩時順序相反：先撤銷，再調查。</strong>多等一分鐘，攻擊者就多用一分鐘。調查靠的是上一節提到的稽核紀錄，加上 <code>last_used_at</code>。</p>
+<ol>
+  <li>立刻撤銷那把 key（<code>revoked_at</code> 設成現在），同時發一把新的給合作夥伴。服務中斷一小段時間，比資料被拿走好。</li>
+  <li>查 <code>last_used_at</code> 和稽核紀錄：外洩之後這把 key 做了什麼、從哪些 IP 來。</li>
+  <li>通知對方，找出外洩的來源（git 歷史、log、CI 設定），清掉，否則新 key 一樣會外洩。</li>
+</ol>
+<div class="callout practice"><strong>💡 實務上：外洩應變要在出事前準備好</strong><br>半夜收到 secret scanning 的通知時，沒人有空現想流程。上線前先確認三件事：撤銷一把 key 是後台按一個鈕，不是請 DBA 手動改資料庫；有一份寫好的應變步驟（誰負責、通知哪個合作夥伴窗口）；repo 開了 secret scanning，在 push 時就擋下含 key 的 commit。團隊內傳 key 也別貼在聊天群組或 <code>.env</code> 範例檔，改用密碼管理工具或雲端的 secret manager。</div>
+
+<h2>Vue 前台也要用 key：放進 .env 為什麼藏不住？</h2>
+<p>上一節的第 3 步要清掉外洩的來源。對前端工程師來說，最容易親手造成外洩的來源是前端程式碼本身。咖啡店官網要顯示門市地圖，最直覺的寫法是把地圖服務的 key 放在 <code>.env</code>：</p>
+<pre>VITE_MAP_API_KEY=sk_live_abc123</pre>
+<p>Vite 只把 <code>VITE_</code> 開頭的變數提供給前端程式碼，打包時會把 <code>import.meta.env.VITE_MAP_API_KEY</code> <strong>直接替換成字串</strong>寫進 JS 檔。任何人打開網站、在 DevTools 的 Sources 裡搜尋 <code>sk_live</code> 就找得到。Vite 文件（v8）明說：<code>VITE_</code> 變數不應該放 API key 這類敏感資訊，秘密要放在後端或 serverless 函式。</p>
+<p>這裡的迷思是把「環境變數」當成「秘密」。環境變數只代表值不寫在程式碼裡，不代表它是秘密；決定它是不是秘密的，是它最後跑在誰的電腦上。前端程式碼跑在每個訪客的瀏覽器裡，所以放進去的東西每個訪客都拿得到。手機 App 也一樣，安裝檔可以被解開、反組譯。</p>
+<p>前端需要呼叫要 key 的第三方服務時，走<strong>後端代理</strong>：Vue 呼叫自己的 <code>GET /api/map-tiles</code>，後端用存在伺服器環境變數（<a href="../../node/lessons/02-process-config.html">Node 課第 2 課</a>）裡的 key 呼叫地圖服務。後端還能順便加上限流與快取，key 外洩的風險只剩伺服器。有些服務提供專門給前端用的公開 key（限制來源網域、只能讀），那是服務商刻意設計成公開的，跟秘密 key 是兩回事，用之前看清楚文件。</p>
+<p>到這裡，第一段完成了：外送平台帶著有前綴、有檢查碼的 key 呼叫咖啡店，咖啡店只存雜湊、依序驗證、換 key 不斷線。接著是第二段：王小明付款後，訂單系統要通知會員系統加點數。這次方向反過來，是咖啡店呼叫別人，要證明身分的換成了咖啡店。</p>
+
+<h2>第二段：通知會員系統加點數，對方怎麼確認是咖啡店送的？</h2>
+<p><strong>webhook</strong> 是事件發生時，由我方主動 POST 到對方事先登記的網址。咖啡店有新訂單時，POST 到會員系統的 <code>https://members.example.com/hooks/cafe</code>，會員系統收到就替顧客加點數。這個網址是公開的，任何人都能 POST 一個假的「王小明買了 100 杯拿鐵」過去，所以接收方要能驗證三件事：</p>
+<ul>
+  <li><strong>來源與完整性</strong>：是咖啡店送的、內容沒被改過 → HMAC 簽章（<a href="02-crypto-toolbox.html">第 2 課</a>）。</li>
+  <li><strong>新鮮</strong>：不是攻擊者錄下一個真的請求、之後重送 → 時間戳。</li>
+  <li><strong>只處理一次</strong>：網路重試讓同一個事件送達兩次 → 事件 ID。</li>
+</ul>
+<p>這一節先處理第一件：簽章。咖啡店和會員系統事先共用一把 secret，咖啡店送出時對內容算 HMAC，會員系統用同一把 secret 再算一次，對得上就代表內容出自持有 secret 的咖啡店、沒被改過。</p>
+<p>簽什麼、簽章放在哪個標頭、怎麼編碼，每家服務商以前各做一套，接收方每串一家就要讀一份文件、寫一份驗證程式。<strong>Standard Webhooks</strong> 是一份公開的 webhook 規格，把這些細節統一下來；咖啡店照它設計，會員系統就可以直接用現成的函式庫驗證。規格定義了三個標頭：</p>
+<div class="table-wrap">
+<table>
+  <tr><th>標頭</th><th>內容</th></tr>
+  <tr><td><code>webhook-id</code></td><td>這個事件的唯一 ID，例如 <code>msg_p5jXN8AQM9LWM0D4loKWxJek</code>；重試時不變</td></tr>
+  <tr><td><code>webhook-timestamp</code></td><td>送出時間，Unix 秒數</td></tr>
+  <tr><td><code>webhook-signature</code></td><td><code>v1,</code> 加上 base64 的 HMAC-SHA256；可以有好幾個，用空白分隔</td></tr>
+</table>
+</div>
+<p>簽章怎麼算，規格也規定了：</p>
+<ul>
+  <li><strong>簽的內容</strong>是 <code>id.timestamp.payload</code>：三樣用 <code>.</code> 接起來。把 ID 和時間戳也簽進去，攻擊者就不能拿一個舊的簽章、換上新的時間戳。</li>
+  <li><strong>secret</strong> 是 24～64 bytes 的隨機位元組，base64 之後加上 <code>whsec_</code> 前綴交給對方。算 HMAC 時要先去掉前綴、base64 解碼，用解出來的位元組當金鑰，不是把整個字串當金鑰。</li>
+  <li><code>v1</code> 是 HMAC-SHA256；規格另外定義了 <code>v1a</code>（Ed25519 公鑰簽章），接收方只存公鑰。看不懂的版本就跳過。</li>
+</ul>
+<p>下面這格用規格的範例值算出簽章，再模擬一個常見的接收方寫法：先把 body 解析成物件，再轉回字串來驗。執行後比較最後兩行簽章。</p>
+<div class="lab"><script type="code">
+const enc = new TextEncoder()
+const fromBase64 = (b64: string) => {
+  const bin = atob(b64)
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return bytes
+}
+const toBase64 = (bytes: Uint8Array) => {
+  let bin = ''
+  for (const b of bytes) bin += String.fromCharCode(b)
+  return btoa(bin)
+}
+
+// 範例值：24 bytes 的 secret（可以用任何 Standard Webhooks 函式庫驗證這個結果）
+const secret = 'whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw'
+const id = 'msg_p5jXN8AQM9LWM0D4loKWxJek'
+const timestamp = 1614265330
+const payload = '{"test": 2432232314}'
+
+const key = await crypto.subtle.importKey(
+  'raw', fromBase64(secret.slice('whsec_'.length)),   // 去掉前綴、base64 解碼
+  { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
+)
+const sign = async (body: string) =>
+  'v1,' + toBase64(new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(`${id}.${timestamp}.${body}`))))
+
+console.log('webhook-signature：', await sign(payload))
+
+// 接收方先 JSON.parse 再 JSON.stringify：空白不見了，位元組不同，簽章也不同
+const reserialized = JSON.stringify(JSON.parse(payload))
+console.log('重新序列化後：', reserialized)
+console.log('對它算的簽章：', await sign(reserialized))
+</script></div>
+<p>第二個簽章對不上：<strong>簽章簽的是原始位元組</strong>。<code>JSON.parse</code> 再 <code>JSON.stringify</code> 會改掉空白、鍵的順序、數字的寫法（<code>1.0</code> 變 <code>1</code>），內容意思一樣，位元組不同。接收方必須拿到框架解析之前的原始 body 來驗證，NestJS 要開 <code>rawBody: true</code>（NestJS 課第 22 課）。驗證通過之後才解析 JSON。</p>
+<p>簽章驗過，代表這個請求出自咖啡店、內容沒被改過。開頭列的三件事解決了第一件，會員系統現在就可以放心加點數了嗎？</p>
+
+<h2>簽章驗過了，為什麼還會重複加點數？</h2>
+<p>簽章只證明「這是咖啡店某個時候送的」，不證明「是剛剛送的」。攻擊者在中間（例如一台被入侵的 Proxy）錄下一個合法的 webhook，明天重送，簽章照樣通過，會員系統就再加一次點數。這叫<strong>重放攻擊（replay attack）</strong>。</p>
+<p>不需要攻擊者也會重複：送出方沒收到回應就會重送，網路慢一點，同一個事件就可能到兩次。所以開頭列的第二、三件事都要做，兩道防線：</p>
+<ul>
+  <li><strong>時間戳容忍（timestamp tolerance）</strong>：只接受 <code>webhook-timestamp</code> 和現在相差一定範圍內的請求。Standard Webhooks 的 JavaScript 參考實作用 5 分鐘，太舊和太新（在未來）都拒絕。時間戳在簽章範圍內，攻擊者改不了。</li>
+  <li><strong>用 <code>webhook-id</code> 去重</strong>：處理過的 ID 記下來（例如 Redis，保存時間比容忍範圍長），同一個 ID 第二次來就直接回 200、不再處理。這也解決了正常的重試。webhook-id 在這裡就是<strong>冪等鍵（idempotency key）</strong>：讓同一個請求處理多次也只生效一次的識別碼（<a href="../../system-design/lessons/09-idempotency.html">系統設計課第 9 課</a>詳談）。</li>
+</ul>
+<p>時間戳把重放的窗口縮到幾分鐘，<code>webhook-id</code> 把窗口內的重送也擋掉，兩道缺一不可。送出方這一端要做的重試、逾時與防 SSRF，見課末「補充與查表」。</p>
+<div class="callout practice"><strong>💡 實務上：接 webhook 時先回 200，再慢慢處理</strong><br>串金流、物流、LINE 這類服務時，你多半是接收方（<a href="../../nestjs/lessons/22-uploads-webhooks.html">NestJS 課第 22 課</a>做過）。常見做法是驗完簽章、檢查時間戳，就把事件寫進資料庫或佇列並立刻回 200，加點數、寄信交給背景工作處理；在 handler 裡做太久，對方逾時就會重送，反而製造重複事件。去重最可靠的是在資料表對事件 ID 加 <code>UNIQUE</code>，不要只靠程式先查再寫。保留原始 body 也很有用：客服回報「點數沒加」時，查得到對方到底送了什麼。本機開發時，對方連不到你的 localhost，要用 ngrok 這類通道工具開一個臨時的公開網址，把 webhook 轉到自己電腦上測。</div>
+
+<h2>webhook 的 secret 要換時，怎麼不讓驗證全部失敗？</h2>
+<p>會員系統的接收端寫好後，還剩一件事：webhook 的 secret 跟 API key 一樣要能換。麻煩在於 secret 同時存在兩邊。咖啡店某一刻改用新 secret 簽章，會員系統如果還在用舊的，從那一刻起每個 webhook 都驗不過；兩家公司不可能在同一秒一起切換。</p>
+<p>Standard Webhooks 的解法是允許 <code>webhook-signature</code> 帶多個簽章，用空白分隔：輪替期間，送出方用新舊兩把 secret 各簽一次，</p>
+<pre>webhook-signature: v1,新secret的簽章 v1,舊secret的簽章</pre>
+<p>接收方不論目前設定的是新的還是舊的 secret，都有一個簽章對得上。接收方的程式也要支援「設定兩把 secret、任一把通過即可」，這樣接收方先換、送出方後換也沒問題。只看第一個簽章的實作，輪替一開始就會全部失敗。這跟 API key 的重疊期是同一個想法：新舊秘密並存一段時間，兩邊各自換完再拿掉舊的。</p>
+<p>第二段完成。最後是第三段：半夜，報表服務向訂單服務要前一天的營收。跟前兩段不同，這次呼叫的雙方都是咖啡店自己的程式，而且都在公司內網裡。</p>
+
+<h2>第三段：報表服務和訂單服務都在內網，還要認證嗎？</h2>
+<p>常見的想法是：「訂單服務只在內網，外面連不到，報表服務呼叫它不用認證。」問題是內網裡的東西比你以為的多：一台被入侵的伺服器或容器、一個設定錯誤對外開放的 port、一個帳號還沒停用、能從外面連進公司內網的離職員工，還有一個有 SSRF 漏洞的服務。SSRF（伺服器端請求偽造）是攻擊者讓你的伺服器替他去連某個網址，借你的伺服器進到內網，<a href="22-ssrf.html">第 22 課</a>詳講。只要攻擊者進到內網任何一個點，所有「內網就信任」的服務都敞開。</p>
+<p><strong>零信任（zero trust）</strong>的基本概念：不因為請求來自內網就信任，每個呼叫都要認證、都要檢查權限。具體做法就是這一課的工具：服務之間用 client credentials 的短效 token 或 mTLS，每個服務只拿到它需要的 scope。</p>
+<p>所以報表服務呼叫訂單服務也要認證。最直接的想法是沿用第一段的 API key：給報表服務發一把。可是咖啡店內部有訂單、報表、會員、庫存幾個服務，互相呼叫起來，每一對都要發 key、存雜湊、排輪替，而且每把都是長期有效的秘密，散落在每個服務的設定裡。服務一多，這套就管不動了。</p>
+
+<h2>內部服務一多，怎麼不必每個都發一把長期 key？</h2>
+<p>咖啡店已經有一台授權伺服器（<a href="12-oauth-pkce.html">第 12 課</a>的角色），而 OAuth 有專門給機器用的流程：<strong>client credentials grant</strong>。服務用自己的 <code>client_id</code> 和認證方式，直接向授權伺服器的 token 端點換 access token，再拿 token 呼叫 API。跟第 12 課的授權碼流程比，這裡沒有使用者、沒有轉址、沒有授權碼，因為要證明身分的就是服務自己。</p>
+<figure>
+  <svg viewBox="0 0 700 300" role="img" aria-label="client credentials 序列圖：報表服務用 client_id 與 secret 向授權伺服器換短效 access token，再用 token 呼叫訂單 API，訂單 API 驗證簽章、aud 與 scope">
+    <defs><marker id="arr-cc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="20" y="15" width="150" height="40" rx="8"/>
+    <text class="d-text" x="95" y="40" text-anchor="middle">報表服務</text>
+    <rect class="d-box" x="275" y="15" width="150" height="40" rx="8"/>
+    <text class="d-text" x="350" y="40" text-anchor="middle">授權伺服器</text>
+    <rect class="d-box" x="530" y="15" width="150" height="40" rx="8"/>
+    <text class="d-text" x="605" y="40" text-anchor="middle">訂單 API</text>
+    <line class="d-line" x1="95" y1="55" x2="95" y2="290" stroke-dasharray="4 4"/>
+    <line class="d-line" x1="350" y1="55" x2="350" y2="290" stroke-dasharray="4 4"/>
+    <line class="d-line" x1="605" y1="55" x2="605" y2="290" stroke-dasharray="4 4"/>
+    <path class="d-line" d="M95,90 L345,90" marker-end="url(#arr-cc)"/>
+    <text class="d-small" x="105" y="82">① POST /oauth/token：client_id＋認證</text>
+    <text class="d-small" x="105" y="108">grant_type=client_credentials、scope</text>
+    <path class="d-line" d="M350,140 L100,140" marker-end="url(#arr-cc)"/>
+    <text class="d-small" x="115" y="132">② access token（10 分鐘、aud=訂單 API）</text>
+    <path class="d-line" d="M95,190 L600,190" marker-end="url(#arr-cc)"/>
+    <text class="d-small" x="105" y="182">③ GET /reports/daily-sales　Authorization: Bearer …</text>
+    <text class="d-accent" x="595" y="225" text-anchor="end">④ 驗簽章、iss、aud、exp、scope</text>
+    <path class="d-line" d="M605,260 L100,260" marker-end="url(#arr-cc)"/>
+    <text class="d-small" x="115" y="252">⑤ 回應；token 快取到快過期前再換</text>
+  </svg>
+  <figcaption>client credentials：長期的 secret 只送到授權伺服器，呼叫 API 用的是短效 token</figcaption>
+</figure>
+<p>第 ① 步的請求（RFC 6749 §4.4）：</p>
+<pre>POST /oauth/token
+Authorization: Basic base64(client_id:client_secret)
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=client_credentials&amp;scope=orders:read</pre>
+<p>好處是長期的秘密只送到授權伺服器一個地方；訂單 API 只看到 10 分鐘就過期的 access token，外洩的損害有時間上限。這正是上一節的問題的解法：每個服務只需要一個身分，不必對每個要呼叫的服務各拿一把 key。</p>
+<p>token 要限定 <code>aud</code>（只能用在訂單 API），scope 只給這個服務需要的。拿到 token 的 API 照<a href="09-jwt-verification.html">第 9 課</a>完整驗證，不能因為「是內部服務」就省略，理由就是上一節的零信任。RFC 6749 規定這個流程<strong>不應該</strong>發 refresh token：服務隨時可以用自己的身分再換一張，不需要續期。</p>
+<p>授權伺服器這一端，驗證 client 的方式跟第一段驗 API key 很像：</p>
+<ul>
+  <li><strong>client secret 只存雜湊</strong>：secret 是授權伺服器產生的高熵亂數，SHA-256 就夠，理由跟 API key 相同。</li>
+  <li><strong>不存在的 client 和錯的 secret 回同一個錯誤</strong>（<code>invalid_client</code>），否則攻擊者能試出哪些 <code>client_id</code> 存在，這是<a href="16-account-flows.html">第 16 課</a>帳號列舉的機器版本。</li>
+  <li><strong>scope 只能是允許清單的子集</strong>：要求的 scope 只要有一個不在清單裡，整個請求就回 <code>invalid_scope</code>，不能「有一個對就給」。沒有指定 scope 時，給這個 client 預設的範圍（練習裡是全部允許的 scope）。</li>
+</ul>
+<p>client secret 還有一個弱點：它是共用的秘密，授權伺服器和服務都知道它，每次換 token 都要傳過去。OAuth 的安全最佳實務建議改用非對稱的 client 認證，伺服器只存公鑰：<strong>private_key_jwt</strong> 讓服務用自己的私鑰簽一個短效 JWT 代替 secret；開頭提過的 mTLS 則用 TLS 憑證證明 client 身分。client secret 最容易上手，另外兩種更安全但要管金鑰或憑證，兩者的細節與取捨見課末「補充與查表」。</p>
+<p>到這裡，王小明那杯拿鐵經過的三段呼叫都有了身分證明：外送平台帶 API key、咖啡店對會員系統簽 webhook、報表服務用 client credentials 換短效 token。還有一種情況這三段沒有涵蓋：服務要代表某個使用者往下呼叫另一個服務，標準做法 token exchange 也放在課末。</p>
+<div class="callout practice"><strong>💡 實務上：先看自己有沒有授權伺服器</strong><br>只有一個單體後端、加上一兩個排程工作的小團隊，為了 client credentials 自架授權伺服器多半不划算，一把有 scope 的 API key 就夠了。服務變多、已經在用 Keycloak、Auth0 這類身分平台時，client credentials 幾乎不用額外成本。最常見的坑是每個請求都去換一次 token，把授權伺服器打垮：token 要快取到快過期前再換。code review 時也注意有沒有人為了方便給服務「全部 scope」。</div>
+
+<h2>補充與查表</h2>
+<p>主線用不到、但設計 key 格式、選 client 認證方式、實作 webhook 送出端時會查的細節。</p>
+
+<h3>GitHub 的 token 格式</h3>
+<p>GitHub 在 2021 年 4 月改了自己的 token 格式（2023 年 5 月更新說明），讓 secret scanning 好認：可辨識的前綴（<code>ghp_</code>、<code>gho_</code> 等）、底線分隔、最後 6 個字元是 CRC32 檢查碼。GitHub 預估光靠前綴就能把 secret scanning 的誤報率降到 0.5%，加上檢查碼則幾乎沒有誤報。</p>
+
+<h3>比 client secret 更好的認證方式</h3>
+<p>client secret 是共用的秘密：授權伺服器和服務都知道它，它還要在每次換 token 時傳過去。RFC 9700（OAuth 安全最佳實務，2025 年 1 月）建議改用<strong>非對稱</strong>的 client 認證，伺服器只存公鑰：</p>
+<ul>
+  <li><strong>private_key_jwt</strong>（RFC 7523）：服務用自己的私鑰簽一個短效 JWT（<code>iss</code> 與 <code>sub</code> 是 <code>client_id</code>、<code>aud</code> 是 token 端點、帶 <code>jti</code> 和 <code>exp</code>），放在 <code>client_assertion</code> 參數送出。授權伺服器用登記的公鑰驗證（<a href="08-jwt-signatures.html">第 8 課</a>的 ES256）。私鑰從不離開服務，授權伺服器外洩也沒有 secret 可偷。</li>
+  <li><strong>mTLS</strong>（RFC 8705）：先認識 <strong>TLS 憑證（certificate）</strong>：由憑證機構簽發、把公鑰和網域（或客戶端身分）綁在一起的檔案。它跟<a href="01-authn-authz.html">第 1 課</a>的「憑證（credential）」是不同的東西，只是中文同名（<a href="../../devops/lessons/05-tls.html">部署課第 5 課</a>詳講）。一般 HTTPS 只有伺服器出示 TLS 憑證；<strong>mTLS（雙向 TLS）</strong>連客戶端也要出示，伺服器驗證通過才接受連線。RFC 8705 還能把 access token 綁定在客戶端的 TLS 憑證上，token 被偷了，沒有對應的私鑰也用不了。</li>
+</ul>
+<p>取捨：client secret 最容易上手；private_key_jwt 要管金鑰對，但不需要改網路設定；mTLS 最強，但憑證的簽發、更新、撤銷要一整套流程，通常是有專門平台團隊管理憑證的組織才用。</p>
+
+<h3>webhook 送出方的其他責任</h3>
+<p>失敗要用指數退避（每次重試的間隔加倍，<a href="../../system-design/lessons/08-timeouts-retries-backoff.html">系統設計課第 8 課</a>）重試好幾天、逾時設 15～30 秒、payload 盡量小（規格建議通常小於 20 KB），細節在<a href="../../system-design/lessons/16-events-webhooks.html">系統設計課第 16 課</a>。送出 webhook 等於讓你的伺服器去連一個別人給的網址，還要防 SSRF（伺服器端請求偽造：攻擊者登記一個內網網址，讓你的伺服器替他去連），那是<a href="22-ssrf.html">第 22 課</a>的主題。</p>
+
+<h3>代表使用者往下呼叫：token exchange</h3>
+<p>會員服務收到使用者的請求，要代表<strong>這個使用者</strong>呼叫訂單服務。直接把使用者的 access token 往下傳，那張 token 的 <code>aud</code> 是會員服務，訂單服務照第 9 課應該拒絕；改成用服務自己的 client credentials，又會失去「是哪個使用者」的資訊，訂單服務只能信任會員服務說的 user id。正式的做法是 <strong>token exchange</strong>（RFC 8693）：會員服務拿使用者的 token 向授權伺服器換一張新的，<code>aud</code> 是訂單服務、身分仍是那個使用者、scope 更小。這裡只需要知道有這個標準；第一次遇到時再查規格。</p>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：產生咖啡店的 API key。起始程式已經有 <code>crc32</code>、<code>toBase62</code>、<code>sha256Hex</code>，完成三個函式：</p>
+  <ul>
+    <li><code>randomBase62(length)</code>：用 <code>crypto.getRandomValues</code> 產生指定長度的 base62 字串。注意 256 不是 62 的倍數，直接 <code>% 62</code> 會讓前幾個字元出現得比較多：丟掉 248 以上的位元組（248 = 62 × 4）再取餘數。</li>
+    <li><code>createApiKey(env)</code>：key 是 <code>cafe_${env}_</code> 加 30 個隨機字元，再接 6 個字元的檢查碼：對<strong>前面整段</strong>（含前綴）算 CRC32，轉 base62，左邊補 <code>0</code> 到 6 個字元。回傳 <code>{ key, record }</code>，<code>record</code> 只有 <code>prefix</code>（key 的前 14 個字元）和 <code>keyHash</code>（key 的 SHA-256 hex），不能有原始的 key。</li>
+    <li><code>hasValidChecksum(key)</code>：格式不對或檢查碼對不上就回傳 <code>false</code>，不會丟錯。</li>
+  </ul>
+  <script type="start">
+const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+const KEY_FORMAT = /^cafe_(live|test)_[0-9A-Za-z]{36}$/
+
+function crc32(text: string): number {
+  let crc = 0xffffffff
+  for (const byte of new TextEncoder().encode(text)) {
+    crc ^= byte
+    for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1))
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+
+function toBase62(n: number): string {
+  let s = ''
+  do { s = BASE62[n % 62] + s; n = Math.floor(n / 62) } while (n > 0)
+  return s
+}
+
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('')
+}
+
+function randomBase62(length: number): string {
+  throw new Error('TODO')
+}
+
+async function createApiKey(env: 'live' | 'test'): Promise<{ key: string; record: { prefix: string; keyHash: string } }> {
+  throw new Error('TODO')
+}
+
+function hasValidChecksum(key: string): boolean {
+  throw new Error('TODO')
+}
+
+const { key, record } = await createApiKey('live')
+console.log(key, hasValidChecksum(key))
+console.log(record)
+</script>
+  <script type="answer">
+const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+const KEY_FORMAT = /^cafe_(live|test)_[0-9A-Za-z]{36}$/
+
+function crc32(text: string): number {
+  let crc = 0xffffffff
+  for (const byte of new TextEncoder().encode(text)) {
+    crc ^= byte
+    for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1))
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+
+function toBase62(n: number): string {
+  let s = ''
+  do { s = BASE62[n % 62] + s; n = Math.floor(n / 62) } while (n > 0)
+  return s
+}
+
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('')
+}
+
+function randomBase62(length: number): string {
+  let out = ''
+  while (out.length < length) {
+    for (const b of crypto.getRandomValues(new Uint8Array(length))) {
+      if (b < 248 && out.length < length) out += BASE62[b % 62]
+    }
+  }
+  return out
+}
+
+const checksumOf = (body: string) => toBase62(crc32(body)).padStart(6, '0')
+
+async function createApiKey(env: 'live' | 'test'): Promise<{ key: string; record: { prefix: string; keyHash: string } }> {
+  const body = `cafe_${env}_${randomBase62(30)}`
+  const key = body + checksumOf(body)
+  return { key, record: { prefix: key.slice(0, 14), keyHash: await sha256Hex(key) } }
+}
+
+function hasValidChecksum(key: string): boolean {
+  if (!KEY_FORMAT.test(key)) return false
+  return checksumOf(key.slice(0, -6)) === key.slice(-6)
+}
+
+const { key, record } = await createApiKey('live')
+console.log(key, hasValidChecksum(key))
+console.log(record)
+</script>
+  <script type="types">
+type _1 = Expect<Equal<typeof createApiKey, (env: 'live' | 'test') => Promise<{ key: string; record: { prefix: string; keyHash: string } }>>>  // createApiKey 的簽章要跟題目一樣
+type _2 = Expect<Equal<typeof hasValidChecksum, (key: string) => boolean>>  // hasValidChecksum 回傳 boolean
+type _3 = Expect<Equal<typeof randomBase62, (length: number) => string>>  // randomBase62 回傳 string
+</script>
+  <script type="tests">
+const T62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+const tcrc = (text: string) => {
+  let c = 0xffffffff
+  for (const byte of new TextEncoder().encode(text)) { c ^= byte; for (let i = 0; i < 8; i++) c = (c >>> 1) ^ (0xedb88320 & -(c & 1)) }
+  return (c ^ 0xffffffff) >>> 0
+}
+const t62 = (n: number) => { let s = ''; do { s = T62[n % 62] + s; n = Math.floor(n / 62) } while (n > 0); return s }
+const tsum = (body: string) => t62(tcrc(body)).padStart(6, '0')
+const tsha = async (t: string) => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(t))), b => b.toString(16).padStart(2, '0')).join('')
+
+const r = randomBase62(50)
+assert(/^[0-9A-Za-z]{50}$/.test(r), 'randomBase62(50) 要回傳 50 個 base62 字元：' + r)
+
+const live = await createApiKey('live')
+const test = await createApiKey('test')
+assert(/^cafe_live_[0-9A-Za-z]{36}$/.test(live.key), "createApiKey('live') 的格式要是 cafe_live_ 加 36 個 base62 字元：" + live.key)
+assert(/^cafe_test_[0-9A-Za-z]{36}$/.test(test.key), "createApiKey('test') 要用 cafe_test_ 前綴：" + test.key)
+assert.equal(live.key.slice(-6), tsum(live.key.slice(0, -6)), '最後 6 碼要是「前面整段（含 cafe_live_）」的 CRC32 轉 base62、左補 0')
+for (let i = 0; i < 30; i++) {
+  const k = (await createApiKey('test')).key
+  assert.equal(k.slice(-6), tsum(k.slice(0, -6)), '每一把 key 的檢查碼都要對（CRC32 比較小時要左補 0 到 6 碼）：' + k)
+}
+
+// 換掉 getRandomValues：先給 248～255（要丟掉），再給 'Latte271QQQ…' 的索引；這段的 CRC32 只有 4 碼 base62
+const FIXED = 'Latte271' + 'Q'.repeat(22)
+const stream = [...FIXED].flatMap((ch, i) => i % 3 === 0 ? [248 + (i % 8), T62.indexOf(ch)] : [T62.indexOf(ch)])
+const realGRV = crypto.getRandomValues
+let pos = 0
+;(crypto as any).getRandomValues = (arr: Uint8Array) => { for (let i = 0; i < arr.length; i++) arr[i] = stream[pos++ % stream.length]; return arr }
+let fixedKey = ''
+try {
+  fixedKey = (await createApiKey('test')).key
+} finally {
+  ;(crypto as any).getRandomValues = realGRV
+}
+assert.equal(fixedKey.slice(10, 40), FIXED, '把 crypto.getRandomValues 換成固定的位元組後，隨機段不對：要用 Uint8Array、丟掉 248 以上的位元組（不夠就再要一批），其餘用 BASE62[b % 62]')
+assert.equal(fixedKey, 'cafe_test_' + FIXED + '00gpLa', 'CRC32 轉成 base62 只有 4 碼時，要左補 0 到 6 碼（padStart(6, \'0\')）')
+assert.equal(hasValidChecksum('cafe_test_' + FIXED + '00gpLa'), true, '檢查碼開頭是 0 的 key 也要通過：比對時一樣要補 0 到 6 碼')
+
+assert.equal(live.record.keyHash, await tsha(live.key), 'record.keyHash 要是整把 key 的 SHA-256 hex')
+assert.equal(live.record.prefix, live.key.slice(0, 14), 'record.prefix 要是 key 的前 14 個字元')
+assert(!JSON.stringify(live.record).includes(live.key.slice(10, 40)), 'record 不能存原始的 key')
+
+assert.equal(hasValidChecksum(live.key), true, '真的 key 要通過檢查碼')
+const flip = (s: string, i: number) => s.slice(0, i) + (s[i] === 'a' ? 'b' : 'a') + s.slice(i + 1)
+assert.equal(hasValidChecksum(flip(live.key, 20)), false, '中間改一個字元，檢查碼要對不上')
+assert.equal(hasValidChecksum(flip(live.key, live.key.length - 1)), false, '檢查碼本身被改，也要回傳 false')
+assert.equal(hasValidChecksum('cafe_live_abc'), false, '長度不對要回傳 false，不能丟錯')
+assert.equal(hasValidChecksum('ghp_' + live.key.slice(4)), false, '前綴不對要回傳 false')
+
+const seen = new Set<string>()
+const realRandom = Math.random
+Math.random = () => 0.42
+try {
+  for (let i = 0; i < 20; i++) seen.add((await createApiKey('live')).key)
+} finally {
+  Math.random = realRandom
+}
+assert.equal(seen.size, 20, 'Math.random 被換成固定值之後，產生的 key 仍要每把都不同：要用 crypto.getRandomValues')
+</script>
+  <script type="wrong">
+const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+const KEY_FORMAT = /^cafe_(live|test)_[0-9A-Za-z]{36}$/
+function crc32(text: string): number {
+  let crc = 0xffffffff
+  for (const byte of new TextEncoder().encode(text)) {
+    crc ^= byte
+    for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1))
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+function toBase62(n: number): string {
+  let s = ''
+  do { s = BASE62[n % 62] + s; n = Math.floor(n / 62) } while (n > 0)
+  return s
+}
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('')
+}
+function randomBase62(length: number): string {
+  let out = ''
+  for (let i = 0; i < length; i++) out += BASE62[Math.floor(Math.random() * 62)]
+  return out
+}
+const checksumOf = (body: string) => toBase62(crc32(body)).padStart(6, '0')
+async function createApiKey(env: 'live' | 'test'): Promise<{ key: string; record: { prefix: string; keyHash: string } }> {
+  const body = `cafe_${env}_${randomBase62(30)}`
+  const key = body + checksumOf(body)
+  return { key, record: { prefix: key.slice(0, 14), keyHash: await sha256Hex(key) } }
+}
+function hasValidChecksum(key: string): boolean {
+  if (!KEY_FORMAT.test(key)) return false
+  return checksumOf(key.slice(0, -6)) === key.slice(-6)
+}
+</script>
+  <script type="wrong">
+const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+const KEY_FORMAT = /^cafe_(live|test)_[0-9A-Za-z]{36}$/
+function crc32(text: string): number {
+  let crc = 0xffffffff
+  for (const byte of new TextEncoder().encode(text)) {
+    crc ^= byte
+    for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1))
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+function toBase62(n: number): string {
+  let s = ''
+  do { s = BASE62[n % 62] + s; n = Math.floor(n / 62) } while (n > 0)
+  return s
+}
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('')
+}
+function randomBase62(length: number): string {
+  let out = ''
+  while (out.length < length) {
+    for (const b of crypto.getRandomValues(new Uint8Array(length))) {
+      if (b < 248 && out.length < length) out += BASE62[b % 62]
+    }
+  }
+  return out
+}
+const checksumOf = (body: string) => toBase62(crc32(body)).padStart(6, '0')
+async function createApiKey(env: 'live' | 'test'): Promise<{ key: string; record: { prefix: string; keyHash: string } }> {
+  const random = randomBase62(30)
+  const key = `cafe_${env}_${random}` + checksumOf(random)
+  return { key, record: { prefix: key.slice(0, 14), keyHash: await sha256Hex(key) } }
+}
+function hasValidChecksum(key: string): boolean {
+  if (!KEY_FORMAT.test(key)) return false
+  return checksumOf(key.slice(10, -6)) === key.slice(-6)
+}
+</script>
+  <script type="wrong">
+const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+const KEY_FORMAT = /^cafe_(live|test)_[0-9A-Za-z]{36}$/
+function crc32(text: string): number {
+  let crc = 0xffffffff
+  for (const byte of new TextEncoder().encode(text)) {
+    crc ^= byte
+    for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1))
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+function toBase62(n: number): string {
+  let s = ''
+  do { s = BASE62[n % 62] + s; n = Math.floor(n / 62) } while (n > 0)
+  return s
+}
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('')
+}
+function randomBase62(length: number): string {
+  let out = ''
+  while (out.length < length) {
+    for (const b of crypto.getRandomValues(new Uint8Array(length))) {
+      if (b < 248 && out.length < length) out += BASE62[b % 62]
+    }
+  }
+  return out
+}
+const checksumOf = (body: string) => toBase62(crc32(body)).padStart(6, '0')
+async function createApiKey(env: 'live' | 'test'): Promise<{ key: string; record: { prefix: string; keyHash: string } }> {
+  const body = `cafe_${env}_${randomBase62(30)}`
+  const key = body + checksumOf(body)
+  return { key, record: { prefix: key.slice(0, 14), keyHash: key } }
+}
+function hasValidChecksum(key: string): boolean {
+  if (!KEY_FORMAT.test(key)) return false
+  return checksumOf(key.slice(0, -6)) === key.slice(-6)
+}
+</script>
+  <script type="wrong">
+const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+const KEY_FORMAT = /^cafe_(live|test)_[0-9A-Za-z]{36}$/
+function crc32(text: string): number {
+  let crc = 0xffffffff
+  for (const byte of new TextEncoder().encode(text)) {
+    crc ^= byte
+    for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1))
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+function toBase62(n: number): string {
+  let s = ''
+  do { s = BASE62[n % 62] + s; n = Math.floor(n / 62) } while (n > 0)
+  return s
+}
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('')
+}
+function randomBase62(length: number): string {
+  let out = ''
+  while (out.length < length) {
+    for (const b of crypto.getRandomValues(new Uint8Array(length))) {
+      if (b < 248 && out.length < length) out += BASE62[b % 62]
+    }
+  }
+  return out
+}
+const checksumOf = (body: string) => toBase62(crc32(body))
+async function createApiKey(env: 'live' | 'test'): Promise<{ key: string; record: { prefix: string; keyHash: string } }> {
+  const body = `cafe_${env}_${randomBase62(30)}`
+  const key = body + checksumOf(body)
+  return { key, record: { prefix: key.slice(0, 14), keyHash: await sha256Hex(key) } }
+}
+function hasValidChecksum(key: string): boolean {
+  return checksumOf(key.slice(0, -6)) === key.slice(-6)
+}
+</script>
+  <script type="wrong">
+const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+const KEY_FORMAT = /^cafe_(live|test)_[0-9A-Za-z]{36}$/
+
+function crc32(text: string): number {
+  let crc = 0xffffffff
+  for (const byte of new TextEncoder().encode(text)) {
+    crc ^= byte
+    for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1))
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+
+function toBase62(n: number): string {
+  let s = ''
+  do { s = BASE62[n % 62] + s; n = Math.floor(n / 62) } while (n > 0)
+  return s
+}
+
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('')
+}
+
+function randomBase62(length: number): string {
+  let out = ''
+  while (out.length < length) {
+    for (const b of crypto.getRandomValues(new Uint8Array(length))) {
+      if (out.length < length) out += BASE62[b % 62]
+    }
+  }
+  return out
+}
+
+const checksumOf = (body: string) => toBase62(crc32(body)).padStart(6, '0')
+
+async function createApiKey(env: 'live' | 'test'): Promise<{ key: string; record: { prefix: string; keyHash: string } }> {
+  const body = `cafe_${env}_${randomBase62(30)}`
+  const key = body + checksumOf(body)
+  return { key, record: { prefix: key.slice(0, 14), keyHash: await sha256Hex(key) } }
+}
+
+function hasValidChecksum(key: string): boolean {
+  if (!KEY_FORMAT.test(key)) return false
+  return checksumOf(key.slice(0, -6)) === key.slice(-6)
+}
+
+const { key, record } = await createApiKey('live')
+console.log(key, hasValidChecksum(key))
+console.log(record)
+</script>
+  <script type="wrong">
+const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+const KEY_FORMAT = /^cafe_(live|test)_[0-9A-Za-z]{36}$/
+
+function crc32(text: string): number {
+  let crc = 0xffffffff
+  for (const byte of new TextEncoder().encode(text)) {
+    crc ^= byte
+    for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1))
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+
+function toBase62(n: number): string {
+  let s = ''
+  do { s = BASE62[n % 62] + s; n = Math.floor(n / 62) } while (n > 0)
+  return s
+}
+
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('')
+}
+
+function randomBase62(length: number): string {
+  let out = ''
+  for (const b of crypto.getRandomValues(new Uint8Array(length))) {
+    if (b < 248) out += BASE62[b % 62]
+  }
+  return out
+}
+
+const checksumOf = (body: string) => toBase62(crc32(body)).padStart(6, '0')
+
+async function createApiKey(env: 'live' | 'test'): Promise<{ key: string; record: { prefix: string; keyHash: string } }> {
+  const body = `cafe_${env}_${randomBase62(30)}`
+  const key = body + checksumOf(body)
+  return { key, record: { prefix: key.slice(0, 14), keyHash: await sha256Hex(key) } }
+}
+
+function hasValidChecksum(key: string): boolean {
+  if (!KEY_FORMAT.test(key)) return false
+  return checksumOf(key.slice(0, -6)) === key.slice(-6)
+}
+
+const { key, record } = await createApiKey('live')
+console.log(key, hasValidChecksum(key))
+console.log(record)
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：寫 <code>verifyApiKey(key, requiredScope, records, now)</code>。<code>records</code> 以 <code>keyHash</code> 為鍵；<code>now</code>、<code>expiresAt</code>、<code>revokedAt</code> 都是毫秒，<code>null</code> 代表沒設定。依序檢查，回傳第一個失敗的原因：</p>
+  <ol>
+    <li>格式不符 → <code>malformed</code>；檢查碼不對 → <code>bad_checksum</code>。這兩步<strong>不能查表</strong>。</li>
+    <li>用 SHA-256 查表，找不到 → <code>unknown</code>。</li>
+    <li><code>revokedAt</code> 到了（<code>revokedAt &lt;= now</code>）→ <code>revoked</code>；設在未來代表輪替中，還能用。</li>
+    <li><code>expiresAt &lt;= now</code> → <code>expired</code>。</li>
+    <li><code>scopes</code> 沒有 <code>requiredScope</code> → <code>insufficient_scope</code>。</li>
+  </ol>
+  <script type="start">
+const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+const KEY_FORMAT = /^cafe_(live|test)_[0-9A-Za-z]{36}$/
+
+function crc32(text: string): number {
+  let crc = 0xffffffff
+  for (const byte of new TextEncoder().encode(text)) {
+    crc ^= byte
+    for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1))
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+const checksumOf = (body: string) => {
+  let n = crc32(body), s = ''
+  do { s = BASE62[n % 62] + s; n = Math.floor(n / 62) } while (n > 0)
+  return s.padStart(6, '0')
+}
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('')
+}
+
+type ApiKeyRecord = { prefix: string; keyHash: string; scopes: string[]; expiresAt: number | null; revokedAt: number | null }
+type VerifyError = 'malformed' | 'bad_checksum' | 'unknown' | 'revoked' | 'expired' | 'insufficient_scope'
+type VerifyResult = { ok: true; record: ApiKeyRecord } | { ok: false; error: VerifyError }
+
+async function verifyApiKey(key: string, requiredScope: string, records: Map<string, ApiKeyRecord>, now: number): Promise<VerifyResult> {
+  throw new Error('TODO')
+}
+
+// 試用：外送平台的 key
+const body = 'cafe_live_7Gx2kQpL9mWzR4tYc8NvB1hJ5sDfE3'
+const key = body + checksumOf(body)
+const records = new Map<string, ApiKeyRecord>()
+const keyHash = await sha256Hex(key)
+records.set(keyHash, { prefix: key.slice(0, 14), keyHash, scopes: ['orders:create', 'orders:read'], expiresAt: null, revokedAt: null })
+console.log(await verifyApiKey(key, 'orders:create', records, Date.now()))
+console.log(await verifyApiKey(key, 'orders:refund', records, Date.now()))
+</script>
+  <script type="answer">
+const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+const KEY_FORMAT = /^cafe_(live|test)_[0-9A-Za-z]{36}$/
+
+function crc32(text: string): number {
+  let crc = 0xffffffff
+  for (const byte of new TextEncoder().encode(text)) {
+    crc ^= byte
+    for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1))
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+const checksumOf = (body: string) => {
+  let n = crc32(body), s = ''
+  do { s = BASE62[n % 62] + s; n = Math.floor(n / 62) } while (n > 0)
+  return s.padStart(6, '0')
+}
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('')
+}
+
+type ApiKeyRecord = { prefix: string; keyHash: string; scopes: string[]; expiresAt: number | null; revokedAt: number | null }
+type VerifyError = 'malformed' | 'bad_checksum' | 'unknown' | 'revoked' | 'expired' | 'insufficient_scope'
+type VerifyResult = { ok: true; record: ApiKeyRecord } | { ok: false; error: VerifyError }
+
+async function verifyApiKey(key: string, requiredScope: string, records: Map<string, ApiKeyRecord>, now: number): Promise<VerifyResult> {
+  if (!KEY_FORMAT.test(key)) return { ok: false, error: 'malformed' }
+  if (checksumOf(key.slice(0, -6)) !== key.slice(-6)) return { ok: false, error: 'bad_checksum' }
+  const record = records.get(await sha256Hex(key))
+  if (!record) return { ok: false, error: 'unknown' }
+  if (record.revokedAt !== null && record.revokedAt <= now) return { ok: false, error: 'revoked' }
+  if (record.expiresAt !== null && record.expiresAt <= now) return { ok: false, error: 'expired' }
+  if (!record.scopes.includes(requiredScope)) return { ok: false, error: 'insufficient_scope' }
+  return { ok: true, record }
+}
+
+// 試用：外送平台的 key
+const body = 'cafe_live_7Gx2kQpL9mWzR4tYc8NvB1hJ5sDfE3'
+const key = body + checksumOf(body)
+const records = new Map<string, ApiKeyRecord>()
+const keyHash = await sha256Hex(key)
+records.set(keyHash, { prefix: key.slice(0, 14), keyHash, scopes: ['orders:create', 'orders:read'], expiresAt: null, revokedAt: null })
+console.log(await verifyApiKey(key, 'orders:create', records, Date.now()))
+console.log(await verifyApiKey(key, 'orders:refund', records, Date.now()))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<typeof verifyApiKey, (key: string, requiredScope: string, records: Map<string, ApiKeyRecord>, now: number) => Promise<VerifyResult>>>  // verifyApiKey 的簽章要跟題目一樣
+</script>
+  <script type="tests">
+const T62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+const tcrc = (text: string) => {
+  let c = 0xffffffff
+  for (const byte of new TextEncoder().encode(text)) { c ^= byte; for (let i = 0; i < 8; i++) c = (c >>> 1) ^ (0xedb88320 & -(c & 1)) }
+  return (c ^ 0xffffffff) >>> 0
+}
+const tsum = (body: string) => { let n = tcrc(body), s = ''; do { s = T62[n % 62] + s; n = Math.floor(n / 62) } while (n > 0); return s.padStart(6, '0') }
+const tsha = async (t: string) => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(t))), b => b.toString(16).padStart(2, '0')).join('')
+const mk = (rand: string) => { const b = 'cafe_live_' + rand; return b + tsum(b) }
+
+class CountingMap extends Map<string, ApiKeyRecord> {
+  lookups = 0
+  get(k: string) { this.lookups++; return super.get(k) }
+  has(k: string) { this.lookups++; return super.has(k) }
+  values() { this.lookups++; return super.values() }
+  entries() { this.lookups++; return super.entries() }
+  keys() { this.lookups++; return super.keys() }
+  forEach(...args: Parameters<Map<string, ApiKeyRecord>['forEach']>) { this.lookups++; return super.forEach(...args) }
+  [Symbol.iterator]() { this.lookups++; return super[Symbol.iterator]() }
+}
+const NOW = 1_800_000_000_000
+const recs = new CountingMap()
+const add = async (rand: string, extra: Partial<ApiKeyRecord>) => {
+  const key = mk(rand), keyHash = await tsha(key)
+  recs.set(keyHash, { prefix: key.slice(0, 14), keyHash, scopes: ['orders:create', 'orders:read'], expiresAt: null, revokedAt: null, ...extra })
+  return key
+}
+const good = await add('A'.repeat(30), {})
+const revoked = await add('B'.repeat(30), { revokedAt: NOW - 1 })
+const rotating = await add('C'.repeat(30), { revokedAt: NOW + 7 * 86400_000 })
+const expired = await add('D'.repeat(30), { expiresAt: NOW })
+const later = await add('E'.repeat(30), { expiresAt: NOW + 1 })
+const both = await add('F'.repeat(30), { revokedAt: NOW - 1, expiresAt: NOW - 1 })
+const revokedNow = await add('G'.repeat(30), { revokedAt: NOW })
+const unknown = mk('Z'.repeat(30))
+
+const errOf = async (key: string, scope = 'orders:create') => {
+  const r = await verifyApiKey(key, scope, recs, NOW)
+  return r.ok ? 'ok' : r.error
+}
+
+recs.lookups = 0
+assert.equal(await errOf('cafe_live_short'), 'malformed', '長度不對要回 malformed')
+assert.equal(await errOf('Bearer ' + good), 'malformed', '前面多了東西要回 malformed')
+assert.equal(await errOf(good.replace('cafe_live_', 'cafe_prod_')), 'malformed', '前綴不是 live／test 要回 malformed')
+assert.equal(recs.lookups, 0, '格式錯誤時不能查表：先檢查格式')
+const tampered = good.slice(0, 20) + 'b' + good.slice(21)
+assert.equal(await errOf(tampered), 'bad_checksum', '中間改一個字元要回 bad_checksum')
+assert.equal(recs.lookups, 0, '檢查碼錯誤時不能查表：亂猜的 key 不應該打到資料庫')
+
+const okResult = await verifyApiKey(good, 'orders:create', recs, NOW)
+assert(okResult.ok && okResult.record.keyHash === await tsha(good), '有效的 key 要回 ok，並帶回那筆 record（用 SHA-256 查表）')
+assert.equal(await errOf(unknown), 'unknown', '格式與檢查碼都對、但表裡沒有 → unknown')
+assert.equal(await errOf(revoked), 'revoked', 'revokedAt 已經過了 → revoked')
+assert.equal(await errOf(revokedNow), 'revoked', 'revokedAt 等於 now 就算已撤銷（revokedAt <= now）')
+assert.equal(await errOf(rotating), 'ok', 'revokedAt 設在未來代表輪替的重疊期，現在還要能用')
+assert.equal(await errOf(expired), 'expired', 'expiresAt 等於 now 就算過期')
+assert.equal(await errOf(later), 'ok', 'expiresAt 還沒到要能用')
+assert.equal(await errOf(both), 'revoked', '同時撤銷又過期時，先回 revoked')
+assert.equal(await errOf(good, 'orders:refund'), 'insufficient_scope', 'scopes 裡沒有要求的權限 → insufficient_scope')
+assert.equal(await errOf(good, 'orders'), 'insufficient_scope', "'orders' 不是 'orders:create'：scope 要完全相同，不能用字串包含")
+assert.equal(await errOf(good, 'orders:read'), 'ok', 'scopes 裡有的權限要通過')
+</script>
+  <script type="wrong">
+const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+const KEY_FORMAT = /^cafe_(live|test)_[0-9A-Za-z]{36}$/
+function crc32(text: string): number {
+  let crc = 0xffffffff
+  for (const byte of new TextEncoder().encode(text)) {
+    crc ^= byte
+    for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1))
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+const checksumOf = (body: string) => {
+  let n = crc32(body), s = ''
+  do { s = BASE62[n % 62] + s; n = Math.floor(n / 62) } while (n > 0)
+  return s.padStart(6, '0')
+}
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('')
+}
+type ApiKeyRecord = { prefix: string; keyHash: string; scopes: string[]; expiresAt: number | null; revokedAt: number | null }
+type VerifyError = 'malformed' | 'bad_checksum' | 'unknown' | 'revoked' | 'expired' | 'insufficient_scope'
+type VerifyResult = { ok: true; record: ApiKeyRecord } | { ok: false; error: VerifyError }
+async function verifyApiKey(key: string, requiredScope: string, records: Map<string, ApiKeyRecord>, now: number): Promise<VerifyResult> {
+  const record = records.get(await sha256Hex(key))
+  if (!KEY_FORMAT.test(key)) return { ok: false, error: 'malformed' }
+  if (checksumOf(key.slice(0, -6)) !== key.slice(-6)) return { ok: false, error: 'bad_checksum' }
+  if (!record) return { ok: false, error: 'unknown' }
+  if (record.revokedAt !== null && record.revokedAt <= now) return { ok: false, error: 'revoked' }
+  if (record.expiresAt !== null && record.expiresAt <= now) return { ok: false, error: 'expired' }
+  if (!record.scopes.includes(requiredScope)) return { ok: false, error: 'insufficient_scope' }
+  return { ok: true, record }
+}
+</script>
+  <script type="wrong">
+const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+const KEY_FORMAT = /^cafe_(live|test)_[0-9A-Za-z]{36}$/
+function crc32(text: string): number {
+  let crc = 0xffffffff
+  for (const byte of new TextEncoder().encode(text)) {
+    crc ^= byte
+    for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1))
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+const checksumOf = (body: string) => {
+  let n = crc32(body), s = ''
+  do { s = BASE62[n % 62] + s; n = Math.floor(n / 62) } while (n > 0)
+  return s.padStart(6, '0')
+}
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('')
+}
+type ApiKeyRecord = { prefix: string; keyHash: string; scopes: string[]; expiresAt: number | null; revokedAt: number | null }
+type VerifyError = 'malformed' | 'bad_checksum' | 'unknown' | 'revoked' | 'expired' | 'insufficient_scope'
+type VerifyResult = { ok: true; record: ApiKeyRecord } | { ok: false; error: VerifyError }
+async function verifyApiKey(key: string, requiredScope: string, records: Map<string, ApiKeyRecord>, now: number): Promise<VerifyResult> {
+  if (!KEY_FORMAT.test(key)) return { ok: false, error: 'malformed' }
+  if (checksumOf(key.slice(0, -6)) !== key.slice(-6)) return { ok: false, error: 'bad_checksum' }
+  const record = records.get(await sha256Hex(key))
+  if (!record) return { ok: false, error: 'unknown' }
+  if (record.revokedAt !== null) return { ok: false, error: 'revoked' }
+  if (record.expiresAt !== null && record.expiresAt <= now) return { ok: false, error: 'expired' }
+  if (!record.scopes.includes(requiredScope)) return { ok: false, error: 'insufficient_scope' }
+  return { ok: true, record }
+}
+</script>
+  <script type="wrong">
+const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+const KEY_FORMAT = /^cafe_(live|test)_[0-9A-Za-z]{36}$/
+function crc32(text: string): number {
+  let crc = 0xffffffff
+  for (const byte of new TextEncoder().encode(text)) {
+    crc ^= byte
+    for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1))
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+const checksumOf = (body: string) => {
+  let n = crc32(body), s = ''
+  do { s = BASE62[n % 62] + s; n = Math.floor(n / 62) } while (n > 0)
+  return s.padStart(6, '0')
+}
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('')
+}
+type ApiKeyRecord = { prefix: string; keyHash: string; scopes: string[]; expiresAt: number | null; revokedAt: number | null }
+type VerifyError = 'malformed' | 'bad_checksum' | 'unknown' | 'revoked' | 'expired' | 'insufficient_scope'
+type VerifyResult = { ok: true; record: ApiKeyRecord } | { ok: false; error: VerifyError }
+async function verifyApiKey(key: string, requiredScope: string, records: Map<string, ApiKeyRecord>, now: number): Promise<VerifyResult> {
+  if (!KEY_FORMAT.test(key)) return { ok: false, error: 'malformed' }
+  if (checksumOf(key.slice(0, -6)) !== key.slice(-6)) return { ok: false, error: 'bad_checksum' }
+  const record = records.get(await sha256Hex(key))
+  if (!record) return { ok: false, error: 'unknown' }
+  if (record.revokedAt !== null && record.revokedAt <= now) return { ok: false, error: 'revoked' }
+  if (record.expiresAt !== null && record.expiresAt <= now) return { ok: false, error: 'expired' }
+  if (!record.scopes.some(s => s.startsWith(requiredScope))) return { ok: false, error: 'insufficient_scope' }
+  return { ok: true, record }
+}
+</script>
+  <script type="wrong">
+const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+const KEY_FORMAT = /^cafe_(live|test)_[0-9A-Za-z]{36}$/
+
+function crc32(text: string): number {
+  let crc = 0xffffffff
+  for (const byte of new TextEncoder().encode(text)) {
+    crc ^= byte
+    for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1))
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+const checksumOf = (body: string) => {
+  let n = crc32(body), s = ''
+  do { s = BASE62[n % 62] + s; n = Math.floor(n / 62) } while (n > 0)
+  return s.padStart(6, '0')
+}
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('')
+}
+
+type ApiKeyRecord = { prefix: string; keyHash: string; scopes: string[]; expiresAt: number | null; revokedAt: number | null }
+type VerifyError = 'malformed' | 'bad_checksum' | 'unknown' | 'revoked' | 'expired' | 'insufficient_scope'
+type VerifyResult = { ok: true; record: ApiKeyRecord } | { ok: false; error: VerifyError }
+
+async function verifyApiKey(key: string, requiredScope: string, records: Map<string, ApiKeyRecord>, now: number): Promise<VerifyResult> {
+  if (!KEY_FORMAT.test(key)) return { ok: false, error: 'malformed' }
+  if (checksumOf(key.slice(0, -6)) !== key.slice(-6)) return { ok: false, error: 'bad_checksum' }
+  const record = records.get(await sha256Hex(key))
+  if (!record) return { ok: false, error: 'unknown' }
+  if (record.revokedAt !== null && record.revokedAt < now) return { ok: false, error: 'revoked' }
+  if (record.expiresAt !== null && record.expiresAt <= now) return { ok: false, error: 'expired' }
+  if (!record.scopes.includes(requiredScope)) return { ok: false, error: 'insufficient_scope' }
+  return { ok: true, record }
+}
+
+// 試用：外送平台的 key
+const body = 'cafe_live_7Gx2kQpL9mWzR4tYc8NvB1hJ5sDfE3'
+const key = body + checksumOf(body)
+const records = new Map<string, ApiKeyRecord>()
+const keyHash = await sha256Hex(key)
+records.set(keyHash, { prefix: key.slice(0, 14), keyHash, scopes: ['orders:create', 'orders:read'], expiresAt: null, revokedAt: null })
+console.log(await verifyApiKey(key, 'orders:create', records, Date.now()))
+console.log(await verifyApiKey(key, 'orders:refund', records, Date.now()))
+</script>
+  <script type="wrong">
+const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+const KEY_FORMAT = /^cafe_(live|test)_[0-9A-Za-z]{36}$/
+
+function crc32(text: string): number {
+  let crc = 0xffffffff
+  for (const byte of new TextEncoder().encode(text)) {
+    crc ^= byte
+    for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1))
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+const checksumOf = (body: string) => {
+  let n = crc32(body), s = ''
+  do { s = BASE62[n % 62] + s; n = Math.floor(n / 62) } while (n > 0)
+  return s.padStart(6, '0')
+}
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('')
+}
+
+type ApiKeyRecord = { prefix: string; keyHash: string; scopes: string[]; expiresAt: number | null; revokedAt: number | null }
+type VerifyError = 'malformed' | 'bad_checksum' | 'unknown' | 'revoked' | 'expired' | 'insufficient_scope'
+type VerifyResult = { ok: true; record: ApiKeyRecord } | { ok: false; error: VerifyError }
+
+async function verifyApiKey(key: string, requiredScope: string, records: Map<string, ApiKeyRecord>, now: number): Promise<VerifyResult> {
+  const hash = await sha256Hex(key)
+  const record = [...records.values()].find(r => r.keyHash === hash)
+  if (!KEY_FORMAT.test(key)) return { ok: false, error: 'malformed' }
+  if (checksumOf(key.slice(0, -6)) !== key.slice(-6)) return { ok: false, error: 'bad_checksum' }
+  if (!record) return { ok: false, error: 'unknown' }
+  if (record.revokedAt !== null && record.revokedAt <= now) return { ok: false, error: 'revoked' }
+  if (record.expiresAt !== null && record.expiresAt <= now) return { ok: false, error: 'expired' }
+  if (!record.scopes.includes(requiredScope)) return { ok: false, error: 'insufficient_scope' }
+  return { ok: true, record }
+}
+
+// 試用：外送平台的 key
+const body = 'cafe_live_7Gx2kQpL9mWzR4tYc8NvB1hJ5sDfE3'
+const key = body + checksumOf(body)
+const records = new Map<string, ApiKeyRecord>()
+const keyHash = await sha256Hex(key)
+records.set(keyHash, { prefix: key.slice(0, 14), keyHash, scopes: ['orders:create', 'orders:read'], expiresAt: null, revokedAt: null })
+console.log(await verifyApiKey(key, 'orders:create', records, Date.now()))
+console.log(await verifyApiKey(key, 'orders:refund', records, Date.now()))
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：依 Standard Webhooks 寫送出與接收兩端。起始程式有 base64 與位元組互轉的函式。</p>
+  <ul>
+    <li><code>signWebhook(secret, msg)</code>：<code>secret</code> 是 <code>whsec_</code> 加 base64，先去掉前綴再解碼成金鑰；對 <code>${id}.${timestamp}.${payload}</code> 算 HMAC-SHA256，回傳 <code>v1,&lt;base64&gt;</code>。</li>
+    <li><code>verifyWebhook(headers, rawBody, secrets, nowSeconds, toleranceSeconds = 300)</code>：
+      <ul>
+        <li><code>webhook-id</code>、<code>webhook-timestamp</code>、<code>webhook-signature</code> 少一個 → <code>missing_headers</code>。</li>
+        <li>時間戳不是整數，或跟 <code>nowSeconds</code> 相差超過 <code>toleranceSeconds</code>（過去或未來都算）→ <code>stale</code>。</li>
+        <li><code>webhook-signature</code> 可能有好幾個（空白分隔），<code>secrets</code> 可能有兩把（輪替中）：任一組合通過就是 <code>{ ok: true }</code>，否則 <code>bad_signature</code>。不是 <code>v1</code> 的、base64 壞掉的簽章跳過，不能丟錯。</li>
+        <li>比對用 <code>crypto.subtle.verify</code>，簽的是 <code>rawBody</code> 原本的字串。</li>
+      </ul>
+    </li>
+  </ul>
+  <script type="start">
+type WebhookMessage = { id: string; timestamp: number; payload: string }
+type WebhookResult = { ok: true } | { ok: false; error: 'missing_headers' | 'stale' | 'bad_signature' }
+
+function base64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
+  const bin = atob(b64)                       // 不是合法的 base64 會丟錯
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return bytes
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = ''
+  for (const b of bytes) bin += String.fromCharCode(b)
+  return btoa(bin)
+}
+
+async function signWebhook(secret: string, msg: WebhookMessage): Promise<string> {
+  throw new Error('TODO')
+}
+
+async function verifyWebhook(
+  headers: Record<string, string>, rawBody: string, secrets: string[], nowSeconds: number, toleranceSeconds = 300,
+): Promise<WebhookResult> {
+  throw new Error('TODO')
+}
+
+const secret = 'whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw'
+const msg = { id: 'msg_p5jXN8AQM9LWM0D4loKWxJek', timestamp: 1614265330, payload: '{"test": 2432232314}' }
+const signature = await signWebhook(secret, msg)
+console.log(signature)   // v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE=
+const headers = { 'webhook-id': msg.id, 'webhook-timestamp': String(msg.timestamp), 'webhook-signature': signature }
+console.log(await verifyWebhook(headers, msg.payload, [secret], msg.timestamp + 10))
+</script>
+  <script type="answer">
+type WebhookMessage = { id: string; timestamp: number; payload: string }
+type WebhookResult = { ok: true } | { ok: false; error: 'missing_headers' | 'stale' | 'bad_signature' }
+
+function base64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
+  const bin = atob(b64)                       // 不是合法的 base64 會丟錯
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return bytes
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = ''
+  for (const b of bytes) bin += String.fromCharCode(b)
+  return btoa(bin)
+}
+
+function hmacKey(secret: string, usage: 'sign' | 'verify') {
+  const raw = base64ToBytes(secret.replace(/^whsec_/, ''))
+  return crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, [usage])
+}
+
+const signedContent = (id: string, timestamp: string, payload: string) =>
+  new TextEncoder().encode(`${id}.${timestamp}.${payload}`)
+
+async function signWebhook(secret: string, msg: WebhookMessage): Promise<string> {
+  const sig = await crypto.subtle.sign('HMAC', await hmacKey(secret, 'sign'), signedContent(msg.id, String(msg.timestamp), msg.payload))
+  return 'v1,' + bytesToBase64(new Uint8Array(sig))
+}
+
+async function verifyWebhook(
+  headers: Record<string, string>, rawBody: string, secrets: string[], nowSeconds: number, toleranceSeconds = 300,
+): Promise<WebhookResult> {
+  const id = headers['webhook-id']
+  const timestamp = headers['webhook-timestamp']
+  const signatures = headers['webhook-signature']
+  if (!id || !timestamp || !signatures) return { ok: false, error: 'missing_headers' }
+
+  if (!/^\d+$/.test(timestamp) || Math.abs(nowSeconds - Number(timestamp)) > toleranceSeconds) {
+    return { ok: false, error: 'stale' }
+  }
+
+  const content = signedContent(id, timestamp, rawBody)
+  for (const secret of secrets) {
+    const key = await hmacKey(secret, 'verify')
+    for (const entry of signatures.split(' ')) {
+      const [version, value] = entry.split(',')
+      if (version !== 'v1' || !value) continue
+      let sig: Uint8Array<ArrayBuffer>
+      try { sig = base64ToBytes(value) } catch { continue }
+      if (await crypto.subtle.verify('HMAC', key, sig, content)) return { ok: true }
+    }
+  }
+  return { ok: false, error: 'bad_signature' }
+}
+
+const secret = 'whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw'
+const msg = { id: 'msg_p5jXN8AQM9LWM0D4loKWxJek', timestamp: 1614265330, payload: '{"test": 2432232314}' }
+const signature = await signWebhook(secret, msg)
+console.log(signature)   // v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE=
+const headers = { 'webhook-id': msg.id, 'webhook-timestamp': String(msg.timestamp), 'webhook-signature': signature }
+console.log(await verifyWebhook(headers, msg.payload, [secret], msg.timestamp + 10))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<typeof signWebhook, (secret: string, msg: WebhookMessage) => Promise<string>>>  // signWebhook 的簽章要跟題目一樣
+type _2 = Expect<Equal<ReturnType<typeof verifyWebhook>, Promise<WebhookResult>>>  // verifyWebhook 回傳 Promise<WebhookResult>
+</script>
+  <script type="tests">
+const S1 = 'whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw'
+const M = { id: 'msg_p5jXN8AQM9LWM0D4loKWxJek', timestamp: 1614265330, payload: '{"test": 2432232314}' }
+const EXPECTED = 'v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE='
+assert.equal(await signWebhook(S1, M), EXPECTED, '範例的簽章不對：secret 要先去掉 whsec_ 再 base64 解碼，簽 id.timestamp.payload')
+
+const rnd = crypto.getRandomValues(new Uint8Array(32))
+let rb = ''
+for (const b of rnd) rb += String.fromCharCode(b)
+const S2 = 'whsec_' + btoa(rb)
+
+const subtle = crypto.subtle as any
+const realVerify = subtle.verify
+let verifyCalls = 0
+subtle.verify = (...args: any[]) => { verifyCalls++; return realVerify.apply(subtle, args) }
+
+const T = 1_800_000_000
+const body = '{"type":"order.created","data":{"customer":"王小明","items":[{"product":"拿鐵","quantity":2}],"total":220}}'
+const msg = { id: 'msg_order_1001', timestamp: T, payload: body }
+const sig1 = await signWebhook(S1, msg)
+const sig2 = await signWebhook(S2, msg)
+const h = (sig: string, ts = String(T), id = msg.id) => ({ 'webhook-id': id, 'webhook-timestamp': ts, 'webhook-signature': sig })
+const res = async (headers: Record<string, string>, raw = body, secrets = [S1], now = T + 5) => {
+  const r = await verifyWebhook(headers, raw, secrets, now)
+  return r.ok ? 'ok' : r.error
+}
+
+try {
+  assert.equal(await res(h(EXPECTED, String(M.timestamp), M.id), M.payload, [S1], M.timestamp), 'ok', '範例要驗證通過')
+  assert(verifyCalls > 0, '比對簽章要用 crypto.subtle.verify（常數時間），不要自己 sign 再用 === 比')
+  assert.equal(await res(h(sig1)), 'ok', '自己簽的 webhook 要驗證通過')
+  assert.equal(await res(h(EXPECTED, String(M.timestamp), M.id), '{"test":2432232314}', [S1], M.timestamp), 'bad_signature', 'body 少了空白就是不同的位元組，要回 bad_signature：簽的是原始 body，不能 parse 再 stringify')
+  assert.equal(await res(h(sig1), body.replace('220', '2200')), 'bad_signature', '金額被改過要回 bad_signature')
+  assert.equal(await res(h(sig1), body, [S1], T + 301), 'stale', '超過 300 秒的舊請求要回 stale')
+  assert.equal(await res(h(sig1), body, [S1], T - 301), 'stale', '時間戳在未來超過 300 秒也要回 stale')
+  assert.equal(await res(h(sig1), body, [S1], T + 300), 'ok', '剛好 300 秒還在容忍範圍內')
+  assert.equal((await verifyWebhook(h(sig1), body, [S1], T + 100, 60)).ok, false, 'toleranceSeconds 傳 60 時，相差 100 秒要拒絕：不能把 300 寫死')
+  assert.equal((await verifyWebhook(h(sig1), body, [S1], T + 100, 600)).ok, true, 'toleranceSeconds 傳 600 時，相差 100 秒要通過')
+  assert.equal(await res(h(sig1, 'abc')), 'stale', '時間戳不是數字要回 stale（NaN 的比較永遠是 false，小心被放過）')
+  const s30 = await signWebhook(S1, { ...msg, timestamp: T + 30 })
+  assert.equal(await res(h(s30, String(T))), 'bad_signature', '時間戳也在簽章範圍內：拿別的時間戳的簽章要回 bad_signature')
+  assert.equal(await res(h('v1,AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= ' + sig1)), 'ok', '多個簽章中只要有一個正確就通過（不能只看第一個）')
+  assert.equal(await res(h('v1a,abc ' + sig1)), 'ok', '不是 v1 的簽章要跳過，繼續看下一個')
+  assert.equal(await res(h('v1,!!!not-base64!!!')), 'bad_signature', 'base64 壞掉的簽章要回 bad_signature，不能丟錯')
+  assert.equal(await res(h(sig2), body, [S1, S2]), 'ok', '輪替中有兩把 secret，用第二把簽的也要通過')
+  assert.equal(await res(h(sig2 + ' ' + sig1), body, [S1]), 'ok', '送出方同時用新舊 secret 簽，接收方只有舊的也要通過')
+  assert.equal(await res(h(sig2), body, [S1]), 'bad_signature', '接收方沒有那把 secret 要回 bad_signature')
+  assert.equal(await res({ 'webhook-id': msg.id, 'webhook-signature': sig1 }), 'missing_headers', '少了 webhook-timestamp 要回 missing_headers')
+  assert.equal(await res({ 'webhook-timestamp': String(T), 'webhook-signature': sig1 }), 'missing_headers', '少了 webhook-id 要回 missing_headers')
+  assert.equal(await res({ 'webhook-id': msg.id, 'webhook-timestamp': String(T) }), 'missing_headers', '少了 webhook-signature 要回 missing_headers')
+} finally {
+  subtle.verify = realVerify
+}
+</script>
+  <script type="wrong">
+type WebhookMessage = { id: string; timestamp: number; payload: string }
+type WebhookResult = { ok: true } | { ok: false; error: 'missing_headers' | 'stale' | 'bad_signature' }
+function base64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
+  const bin = atob(b64)
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return bytes
+}
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = ''
+  for (const b of bytes) bin += String.fromCharCode(b)
+  return btoa(bin)
+}
+function hmacKey(secret: string, usage: 'sign' | 'verify') {
+  const raw = base64ToBytes(secret.replace(/^whsec_/, ''))
+  return crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, [usage])
+}
+const signedContent = (id: string, timestamp: string, payload: string) => new TextEncoder().encode(`${id}.${timestamp}.${payload}`)
+async function signWebhook(secret: string, msg: WebhookMessage): Promise<string> {
+  const sig = await crypto.subtle.sign('HMAC', await hmacKey(secret, 'sign'), signedContent(msg.id, String(msg.timestamp), msg.payload))
+  return 'v1,' + bytesToBase64(new Uint8Array(sig))
+}
+async function verifyWebhook(headers: Record<string, string>, rawBody: string, secrets: string[], nowSeconds: number, toleranceSeconds = 300): Promise<WebhookResult> {
+  const id = headers['webhook-id'], timestamp = headers['webhook-timestamp'], signatures = headers['webhook-signature']
+  if (!id || !timestamp || !signatures) return { ok: false, error: 'missing_headers' }
+  if (!/^\d+$/.test(timestamp) || Math.abs(nowSeconds - Number(timestamp)) > toleranceSeconds) return { ok: false, error: 'stale' }
+  const content = signedContent(id, timestamp, JSON.stringify(JSON.parse(rawBody)))
+  for (const secret of secrets) {
+    const key = await hmacKey(secret, 'verify')
+    for (const entry of signatures.split(' ')) {
+      const [version, value] = entry.split(',')
+      if (version !== 'v1' || !value) continue
+      let sig: Uint8Array<ArrayBuffer>
+      try { sig = base64ToBytes(value) } catch { continue }
+      if (await crypto.subtle.verify('HMAC', key, sig, content)) return { ok: true }
+    }
+  }
+  return { ok: false, error: 'bad_signature' }
+}
+</script>
+  <script type="wrong">
+type WebhookMessage = { id: string; timestamp: number; payload: string }
+type WebhookResult = { ok: true } | { ok: false; error: 'missing_headers' | 'stale' | 'bad_signature' }
+function base64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
+  const bin = atob(b64)
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return bytes
+}
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = ''
+  for (const b of bytes) bin += String.fromCharCode(b)
+  return btoa(bin)
+}
+function hmacKey(secret: string, usage: 'sign' | 'verify') {
+  const raw = base64ToBytes(secret.replace(/^whsec_/, ''))
+  return crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, [usage])
+}
+const signedContent = (id: string, timestamp: string, payload: string) => new TextEncoder().encode(`${id}.${timestamp}.${payload}`)
+async function signWebhook(secret: string, msg: WebhookMessage): Promise<string> {
+  const sig = await crypto.subtle.sign('HMAC', await hmacKey(secret, 'sign'), signedContent(msg.id, String(msg.timestamp), msg.payload))
+  return 'v1,' + bytesToBase64(new Uint8Array(sig))
+}
+async function verifyWebhook(headers: Record<string, string>, rawBody: string, secrets: string[], nowSeconds: number, toleranceSeconds = 300): Promise<WebhookResult> {
+  const id = headers['webhook-id'], timestamp = headers['webhook-timestamp'], signatures = headers['webhook-signature']
+  if (!id || !timestamp || !signatures) return { ok: false, error: 'missing_headers' }
+  const content = signedContent(id, timestamp, rawBody)
+  for (const secret of secrets) {
+    const key = await hmacKey(secret, 'verify')
+    for (const entry of signatures.split(' ')) {
+      const [version, value] = entry.split(',')
+      if (version !== 'v1' || !value) continue
+      let sig: Uint8Array<ArrayBuffer>
+      try { sig = base64ToBytes(value) } catch { continue }
+      if (await crypto.subtle.verify('HMAC', key, sig, content)) return { ok: true }
+    }
+  }
+  return { ok: false, error: 'bad_signature' }
+}
+</script>
+  <script type="wrong">
+type WebhookMessage = { id: string; timestamp: number; payload: string }
+type WebhookResult = { ok: true } | { ok: false; error: 'missing_headers' | 'stale' | 'bad_signature' }
+function base64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
+  const bin = atob(b64)
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return bytes
+}
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = ''
+  for (const b of bytes) bin += String.fromCharCode(b)
+  return btoa(bin)
+}
+function hmacKey(secret: string, usage: 'sign' | 'verify') {
+  const raw = base64ToBytes(secret.replace(/^whsec_/, ''))
+  return crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, [usage])
+}
+const signedContent = (id: string, timestamp: string, payload: string) => new TextEncoder().encode(`${id}.${timestamp}.${payload}`)
+async function signWebhook(secret: string, msg: WebhookMessage): Promise<string> {
+  const sig = await crypto.subtle.sign('HMAC', await hmacKey(secret, 'sign'), signedContent(msg.id, String(msg.timestamp), msg.payload))
+  return 'v1,' + bytesToBase64(new Uint8Array(sig))
+}
+async function verifyWebhook(headers: Record<string, string>, rawBody: string, secrets: string[], nowSeconds: number, toleranceSeconds = 300): Promise<WebhookResult> {
+  const id = headers['webhook-id'], timestamp = headers['webhook-timestamp'], signatures = headers['webhook-signature']
+  if (!id || !timestamp || !signatures) return { ok: false, error: 'missing_headers' }
+  if (!/^\d+$/.test(timestamp) || Math.abs(nowSeconds - Number(timestamp)) > toleranceSeconds) return { ok: false, error: 'stale' }
+  const content = signedContent(id, timestamp, rawBody)
+  const [version, value] = signatures.split(' ')[0].split(',')
+  if (version !== 'v1' || !value) return { ok: false, error: 'bad_signature' }
+  let sig: Uint8Array<ArrayBuffer>
+  try { sig = base64ToBytes(value) } catch { return { ok: false, error: 'bad_signature' } }
+  for (const secret of secrets) {
+    if (await crypto.subtle.verify('HMAC', await hmacKey(secret, 'verify'), sig, content)) return { ok: true }
+  }
+  return { ok: false, error: 'bad_signature' }
+}
+</script>
+  <script type="wrong">
+type WebhookMessage = { id: string; timestamp: number; payload: string }
+type WebhookResult = { ok: true } | { ok: false; error: 'missing_headers' | 'stale' | 'bad_signature' }
+function base64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
+  const bin = atob(b64)
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return bytes
+}
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = ''
+  for (const b of bytes) bin += String.fromCharCode(b)
+  return btoa(bin)
+}
+function hmacKey(secret: string, usage: 'sign' | 'verify') {
+  return crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, [usage])
+}
+const signedContent = (id: string, timestamp: string, payload: string) => new TextEncoder().encode(`${id}.${timestamp}.${payload}`)
+async function signWebhook(secret: string, msg: WebhookMessage): Promise<string> {
+  const sig = await crypto.subtle.sign('HMAC', await hmacKey(secret, 'sign'), signedContent(msg.id, String(msg.timestamp), msg.payload))
+  return 'v1,' + bytesToBase64(new Uint8Array(sig))
+}
+async function verifyWebhook(headers: Record<string, string>, rawBody: string, secrets: string[], nowSeconds: number, toleranceSeconds = 300): Promise<WebhookResult> {
+  const id = headers['webhook-id'], timestamp = headers['webhook-timestamp'], signatures = headers['webhook-signature']
+  if (!id || !timestamp || !signatures) return { ok: false, error: 'missing_headers' }
+  if (!/^\d+$/.test(timestamp) || Math.abs(nowSeconds - Number(timestamp)) > toleranceSeconds) return { ok: false, error: 'stale' }
+  const content = signedContent(id, timestamp, rawBody)
+  for (const secret of secrets) {
+    const key = await hmacKey(secret, 'verify')
+    for (const entry of signatures.split(' ')) {
+      const [version, value] = entry.split(',')
+      if (version !== 'v1' || !value) continue
+      let sig: Uint8Array<ArrayBuffer>
+      try { sig = base64ToBytes(value) } catch { continue }
+      if (await crypto.subtle.verify('HMAC', key, sig, content)) return { ok: true }
+    }
+  }
+  return { ok: false, error: 'bad_signature' }
+}
+</script>
+  <script type="wrong">
+type WebhookMessage = { id: string; timestamp: number; payload: string }
+type WebhookResult = { ok: true } | { ok: false; error: 'missing_headers' | 'stale' | 'bad_signature' }
+function base64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
+  const bin = atob(b64)
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return bytes
+}
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = ''
+  for (const b of bytes) bin += String.fromCharCode(b)
+  return btoa(bin)
+}
+function hmacKey(secret: string, usage: 'sign' | 'verify') {
+  const raw = base64ToBytes(secret.replace(/^whsec_/, ''))
+  return crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, [usage])
+}
+const signedContent = (id: string, timestamp: string, payload: string) => new TextEncoder().encode(`${id}.${timestamp}.${payload}`)
+async function signWebhook(secret: string, msg: WebhookMessage): Promise<string> {
+  const sig = await crypto.subtle.sign('HMAC', await hmacKey(secret, 'sign'), signedContent(msg.id, String(msg.timestamp), msg.payload))
+  return 'v1,' + bytesToBase64(new Uint8Array(sig))
+}
+async function verifyWebhook(headers: Record<string, string>, rawBody: string, secrets: string[], nowSeconds: number, toleranceSeconds = 300): Promise<WebhookResult> {
+  const id = headers['webhook-id'], timestamp = headers['webhook-timestamp'], signatures = headers['webhook-signature']
+  if (!id || !timestamp || !signatures) return { ok: false, error: 'missing_headers' }
+  if (nowSeconds - Number(timestamp) > toleranceSeconds) return { ok: false, error: 'stale' }
+  const content = signedContent(id, timestamp, rawBody)
+  for (const secret of secrets) {
+    const key = await hmacKey(secret, 'verify')
+    for (const entry of signatures.split(' ')) {
+      const [version, value] = entry.split(',')
+      if (version !== 'v1' || !value) continue
+      let sig: Uint8Array<ArrayBuffer>
+      try { sig = base64ToBytes(value) } catch { continue }
+      if (await crypto.subtle.verify('HMAC', key, sig, content)) return { ok: true }
+    }
+  }
+  return { ok: false, error: 'bad_signature' }
+}
+</script>
+  <script type="wrong">
+type WebhookMessage = { id: string; timestamp: number; payload: string }
+type WebhookResult = { ok: true } | { ok: false; error: 'missing_headers' | 'stale' | 'bad_signature' }
+
+function base64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
+  const bin = atob(b64)                       // 不是合法的 base64 會丟錯
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return bytes
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = ''
+  for (const b of bytes) bin += String.fromCharCode(b)
+  return btoa(bin)
+}
+
+function hmacKey(secret: string, usage: 'sign' | 'verify') {
+  const raw = base64ToBytes(secret.replace(/^whsec_/, ''))
+  return crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, [usage])
+}
+
+const signedContent = (id: string, timestamp: string, payload: string) =>
+  new TextEncoder().encode(`${id}.${timestamp}.${payload}`)
+
+async function signWebhook(secret: string, msg: WebhookMessage): Promise<string> {
+  const sig = await crypto.subtle.sign('HMAC', await hmacKey(secret, 'sign'), signedContent(msg.id, String(msg.timestamp), msg.payload))
+  return 'v1,' + bytesToBase64(new Uint8Array(sig))
+}
+
+async function verifyWebhook(
+  headers: Record<string, string>, rawBody: string, secrets: string[], nowSeconds: number, toleranceSeconds = 300,
+): Promise<WebhookResult> {
+  const id = headers['webhook-id']
+  const timestamp = headers['webhook-timestamp']
+  const signatures = headers['webhook-signature']
+  if (!id || !timestamp || !signatures) return { ok: false, error: 'missing_headers' }
+
+  if (!/^\d+$/.test(timestamp) || Math.abs(nowSeconds - Number(timestamp)) > 300) {
+    return { ok: false, error: 'stale' }
+  }
+
+  const content = signedContent(id, timestamp, rawBody)
+  for (const secret of secrets) {
+    const key = await hmacKey(secret, 'verify')
+    for (const entry of signatures.split(' ')) {
+      const [version, value] = entry.split(',')
+      if (version !== 'v1' || !value) continue
+      let sig: Uint8Array<ArrayBuffer>
+      try { sig = base64ToBytes(value) } catch { continue }
+      if (await crypto.subtle.verify('HMAC', key, sig, content)) return { ok: true }
+    }
+  }
+  return { ok: false, error: 'bad_signature' }
+}
+
+const secret = 'whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw'
+const msg = { id: 'msg_p5jXN8AQM9LWM0D4loKWxJek', timestamp: 1614265330, payload: '{"test": 2432232314}' }
+const signature = await signWebhook(secret, msg)
+console.log(signature)   // v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE=
+const headers = { 'webhook-id': msg.id, 'webhook-timestamp': String(msg.timestamp), 'webhook-signature': signature }
+console.log(await verifyWebhook(headers, msg.payload, [secret], msg.timestamp + 10))
+</script>
+  <script type="wrong">
+type WebhookMessage = { id: string; timestamp: number; payload: string }
+type WebhookResult = { ok: true } | { ok: false; error: 'missing_headers' | 'stale' | 'bad_signature' }
+
+function base64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
+  const bin = atob(b64)                       // 不是合法的 base64 會丟錯
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return bytes
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = ''
+  for (const b of bytes) bin += String.fromCharCode(b)
+  return btoa(bin)
+}
+
+function hmacKey(secret: string, usage: 'sign' | 'verify') {
+  const raw = base64ToBytes(secret.replace(/^whsec_/, ''))
+  return crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, [usage])
+}
+
+const signedContent = (id: string, timestamp: string, payload: string) =>
+  new TextEncoder().encode(`${id}.${timestamp}.${payload}`)
+
+async function signWebhook(secret: string, msg: WebhookMessage): Promise<string> {
+  const sig = await crypto.subtle.sign('HMAC', await hmacKey(secret, 'sign'), signedContent(msg.id, String(msg.timestamp), msg.payload))
+  return 'v1,' + bytesToBase64(new Uint8Array(sig))
+}
+
+async function verifyWebhook(
+  headers: Record<string, string>, rawBody: string, secrets: string[], nowSeconds: number, toleranceSeconds = 300,
+): Promise<WebhookResult> {
+  const id = headers['webhook-id']
+  const timestamp = headers['webhook-timestamp']
+  const signatures = headers['webhook-signature']
+  if (!id || !timestamp || !signatures) return { ok: false, error: 'missing_headers' }
+
+  if (!/^\d+$/.test(timestamp) || Math.abs(nowSeconds - Number(timestamp)) > toleranceSeconds) {
+    return { ok: false, error: 'stale' }
+  }
+
+  const content = signedContent(id, timestamp, rawBody)
+  for (const secret of secrets.slice(0, 1)) {
+    const key = await hmacKey(secret, 'verify')
+    for (const entry of signatures.split(' ')) {
+      const [version, value] = entry.split(',')
+      if (version !== 'v1' || !value) continue
+      let sig: Uint8Array<ArrayBuffer>
+      try { sig = base64ToBytes(value) } catch { continue }
+      if (await crypto.subtle.verify('HMAC', key, sig, content)) return { ok: true }
+    }
+  }
+  return { ok: false, error: 'bad_signature' }
+}
+
+const secret = 'whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw'
+const msg = { id: 'msg_p5jXN8AQM9LWM0D4loKWxJek', timestamp: 1614265330, payload: '{"test": 2432232314}' }
+const signature = await signWebhook(secret, msg)
+console.log(signature)   // v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE=
+const headers = { 'webhook-id': msg.id, 'webhook-timestamp': String(msg.timestamp), 'webhook-signature': signature }
+console.log(await verifyWebhook(headers, msg.payload, [secret], msg.timestamp + 10))
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 4：授權伺服器的 token 端點收到 client credentials 請求。寫 <code>issueClientToken(clients, req)</code>，決定能不能發 token、發哪些 scope（發 token 本身不用寫）：</p>
+  <ul>
+    <li><code>clients</code> 以 <code>client_id</code> 為鍵，<code>secretHash</code> 是 client secret 的 SHA-256 hex。把收到的 <code>clientSecret</code> 雜湊後，用起始程式的 <code>timingSafeEqual</code> 比對。</li>
+    <li>client 不存在、secret 錯，都回 <code>invalid_client</code>，不能丟錯或回不同的結果。</li>
+    <li><code>req.scope</code> 是空白分隔的字串（可能有多餘的空白）。每一個都要在 <code>allowedScopes</code> 裡，否則回 <code>invalid_scope</code>。</li>
+    <li>成功時回傳 <code>{ ok: true, scopes }</code>：<code>scopes</code> 依 <code>allowedScopes</code> 的順序、不重複；<code>scope</code> 是空字串時給全部允許的 scope（要是新的陣列）。</li>
+  </ul>
+  <script type="start">
+type ClientRecord = { secretHash: string; allowedScopes: string[] }
+type TokenRequest = { clientId: string; clientSecret: string; scope: string }
+type IssueResult = { ok: true; scopes: string[] } | { ok: false; error: 'invalid_client' | 'invalid_scope' }
+
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('')
+}
+
+// 第 2 課的常數時間比較
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false
+  let diff = 0
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  return diff === 0
+}
+
+async function issueClientToken(clients: Map<string, ClientRecord>, req: TokenRequest): Promise<IssueResult> {
+  throw new Error('TODO')
+}
+
+const clients = new Map<string, ClientRecord>([
+  ['report-service', { secretHash: await sha256Hex('s3cr3t-report'), allowedScopes: ['orders:read', 'reports:write'] }],
+])
+console.log(await issueClientToken(clients, { clientId: 'report-service', clientSecret: 's3cr3t-report', scope: 'orders:read' }))
+console.log(await issueClientToken(clients, { clientId: 'report-service', clientSecret: 's3cr3t-report', scope: 'orders:write' }))
+</script>
+  <script type="answer">
+type ClientRecord = { secretHash: string; allowedScopes: string[] }
+type TokenRequest = { clientId: string; clientSecret: string; scope: string }
+type IssueResult = { ok: true; scopes: string[] } | { ok: false; error: 'invalid_client' | 'invalid_scope' }
+
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('')
+}
+
+// 第 2 課的常數時間比較
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false
+  let diff = 0
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  return diff === 0
+}
+
+async function issueClientToken(clients: Map<string, ClientRecord>, req: TokenRequest): Promise<IssueResult> {
+  const client = clients.get(req.clientId)
+  const hash = await sha256Hex(req.clientSecret)          // client 不存在也算一次，花的時間差不多
+  if (!client || !timingSafeEqual(hash, client.secretHash)) return { ok: false, error: 'invalid_client' }
+
+  const requested = req.scope.split(' ').filter(s => s !== '')
+  if (requested.some(s => !client.allowedScopes.includes(s))) return { ok: false, error: 'invalid_scope' }
+
+  const scopes = requested.length === 0
+    ? [...client.allowedScopes]
+    : client.allowedScopes.filter(s => requested.includes(s))
+  return { ok: true, scopes }
+}
+
+const clients = new Map<string, ClientRecord>([
+  ['report-service', { secretHash: await sha256Hex('s3cr3t-report'), allowedScopes: ['orders:read', 'reports:write'] }],
+])
+console.log(await issueClientToken(clients, { clientId: 'report-service', clientSecret: 's3cr3t-report', scope: 'orders:read' }))
+console.log(await issueClientToken(clients, { clientId: 'report-service', clientSecret: 's3cr3t-report', scope: 'orders:write' }))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<typeof issueClientToken, (clients: Map<string, ClientRecord>, req: TokenRequest) => Promise<IssueResult>>>  // issueClientToken 的簽章要跟題目一樣
+</script>
+  <script type="tests">
+const tsha = async (t: string) => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(t))), b => b.toString(16).padStart(2, '0')).join('')
+const SECRET = 'q9Lw2xT7pZ4mR8vK3nB6cY1hJ5sD0fGa'
+const cs = new Map<string, ClientRecord>([
+  ['delivery-partner', { secretHash: await tsha(SECRET), allowedScopes: ['menu:read', 'orders:create', 'orders:read'] }],
+  ['pos-sync', { secretHash: await tsha('pos-only-secret-value-0000000000'), allowedScopes: ['reports:write'] }],
+])
+const call = async (clientId: string, clientSecret: string, scope: string) => {
+  try { return await issueClientToken(cs, { clientId, clientSecret, scope }) }
+  catch (e) { return { thrown: String(e) } }
+}
+
+const unknown = await call('nobody', SECRET, 'orders:read')
+const wrong = await call('delivery-partner', 'wrong-secret', 'orders:read')
+assert.deepEqual(unknown, { ok: false, error: 'invalid_client' }, '不存在的 client 要回 { ok: false, error: "invalid_client" }，不能丟錯')
+assert.deepEqual(wrong, { ok: false, error: 'invalid_client' }, 'secret 錯要回 invalid_client')
+assert.deepEqual(await call('delivery-partner', await tsha(SECRET), 'orders:read'), { ok: false, error: 'invalid_client' }, '直接送 secretHash 不能通過：要把收到的 secret 雜湊後再比')
+assert.deepEqual(await call('pos-sync', SECRET, 'reports:write'), { ok: false, error: 'invalid_client' }, '用別的 client 的 secret 不能通過')
+
+assert.deepEqual(await call('delivery-partner', SECRET, 'orders:read'), { ok: true, scopes: ['orders:read'] }, '要求允許的 scope 要通過')
+assert.deepEqual(await call('delivery-partner', SECRET, 'orders:read menu:read'), { ok: true, scopes: ['menu:read', 'orders:read'] }, 'scopes 要依 allowedScopes 的順序')
+assert.deepEqual(await call('delivery-partner', SECRET, ' orders:read  orders:read '), { ok: true, scopes: ['orders:read'] }, '多餘的空白要忽略、重複的 scope 只出現一次')
+assert.deepEqual(await call('delivery-partner', SECRET, 'orders:write'), { ok: false, error: 'invalid_scope' }, '要求不允許的 scope 要回 invalid_scope')
+assert.deepEqual(await call('delivery-partner', SECRET, 'orders:read orders:refund'), { ok: false, error: 'invalid_scope' }, '只要有一個 scope 不允許，整個請求就回 invalid_scope')
+assert.deepEqual(await call('delivery-partner', SECRET, 'orders'), { ok: false, error: 'invalid_scope' }, "'orders' 不是 'orders:read'：scope 要完全相同")
+
+const all = await call('delivery-partner', SECRET, '')
+assert.deepEqual(all, { ok: true, scopes: ['menu:read', 'orders:create', 'orders:read'] }, 'scope 是空字串時給全部允許的 scope')
+if ('scopes' in all) all.scopes.push('orders:refund')
+assert.deepEqual(cs.get('delivery-partner')!.allowedScopes, ['menu:read', 'orders:create', 'orders:read'], '回傳的 scopes 要是新的陣列：改它不能改到 client 的設定')
+</script>
+  <script type="wrong">
+type ClientRecord = { secretHash: string; allowedScopes: string[] }
+type TokenRequest = { clientId: string; clientSecret: string; scope: string }
+type IssueResult = { ok: true; scopes: string[] } | { ok: false; error: 'invalid_client' | 'invalid_scope' }
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('')
+}
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false
+  let diff = 0
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  return diff === 0
+}
+async function issueClientToken(clients: Map<string, ClientRecord>, req: TokenRequest): Promise<IssueResult> {
+  const client = clients.get(req.clientId)
+  if (!client) throw new Error('client not found: ' + req.clientId)
+  if (!timingSafeEqual(await sha256Hex(req.clientSecret), client.secretHash)) return { ok: false, error: 'invalid_client' }
+  const requested = req.scope.split(' ').filter(s => s !== '')
+  if (requested.some(s => !client.allowedScopes.includes(s))) return { ok: false, error: 'invalid_scope' }
+  const scopes = requested.length === 0 ? [...client.allowedScopes] : client.allowedScopes.filter(s => requested.includes(s))
+  return { ok: true, scopes }
+}
+</script>
+  <script type="wrong">
+type ClientRecord = { secretHash: string; allowedScopes: string[] }
+type TokenRequest = { clientId: string; clientSecret: string; scope: string }
+type IssueResult = { ok: true; scopes: string[] } | { ok: false; error: 'invalid_client' | 'invalid_scope' }
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('')
+}
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false
+  let diff = 0
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  return diff === 0
+}
+async function issueClientToken(clients: Map<string, ClientRecord>, req: TokenRequest): Promise<IssueResult> {
+  const client = clients.get(req.clientId)
+  if (!client || !timingSafeEqual(await sha256Hex(req.clientSecret), client.secretHash)) return { ok: false, error: 'invalid_client' }
+  const requested = req.scope.split(' ').filter(s => s !== '')
+  if (requested.length > 0 && !requested.some(s => client.allowedScopes.includes(s))) return { ok: false, error: 'invalid_scope' }
+  const scopes = requested.length === 0 ? [...client.allowedScopes] : client.allowedScopes.filter(s => requested.includes(s))
+  return { ok: true, scopes }
+}
+</script>
+  <script type="wrong">
+type ClientRecord = { secretHash: string; allowedScopes: string[] }
+type TokenRequest = { clientId: string; clientSecret: string; scope: string }
+type IssueResult = { ok: true; scopes: string[] } | { ok: false; error: 'invalid_client' | 'invalid_scope' }
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('')
+}
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false
+  let diff = 0
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  return diff === 0
+}
+async function issueClientToken(clients: Map<string, ClientRecord>, req: TokenRequest): Promise<IssueResult> {
+  const client = clients.get(req.clientId)
+  if (!client || !timingSafeEqual(req.clientSecret, client.secretHash)) return { ok: false, error: 'invalid_client' }
+  const requested = req.scope.split(' ').filter(s => s !== '')
+  if (requested.some(s => !client.allowedScopes.includes(s))) return { ok: false, error: 'invalid_scope' }
+  const scopes = requested.length === 0 ? [...client.allowedScopes] : client.allowedScopes.filter(s => requested.includes(s))
+  return { ok: true, scopes }
+}
+</script>
+  <script type="wrong">
+type ClientRecord = { secretHash: string; allowedScopes: string[] }
+type TokenRequest = { clientId: string; clientSecret: string; scope: string }
+type IssueResult = { ok: true; scopes: string[] } | { ok: false; error: 'invalid_client' | 'invalid_scope' }
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('')
+}
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false
+  let diff = 0
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  return diff === 0
+}
+async function issueClientToken(clients: Map<string, ClientRecord>, req: TokenRequest): Promise<IssueResult> {
+  const client = clients.get(req.clientId)
+  if (!client || !timingSafeEqual(await sha256Hex(req.clientSecret), client.secretHash)) return { ok: false, error: 'invalid_client' }
+  const requested = req.scope.split(' ')
+  if (requested.some(s => s !== '' && !client.allowedScopes.includes(s))) return { ok: false, error: 'invalid_scope' }
+  return { ok: true, scopes: req.scope === '' ? client.allowedScopes : requested }
+}
+</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：Vue 專案要顯示門市地圖，工程師把地圖服務的秘密 key 放在 <code>.env</code> 的 <code>VITE_MAP_API_KEY</code>，並且把 <code>.env</code> 加進 <code>.gitignore</code>。這樣安全嗎？</p>
+  <label data-key="a">安全：<code>.env</code> 沒有進 git，key 不會外洩</label>
+  <label data-key="b">安全：環境變數只在建置時讀取，不會出現在瀏覽器</label>
+  <label data-key="c">不安全：<code>VITE_</code> 變數打包時會直接寫進 JS，任何人打開網站都看得到；要改成由後端代理呼叫地圖服務</label>
+  <label data-key="d">不安全，但把 key 用 base64 編碼後再放進去就可以</label>
+  <p class="why">✓ Vite 會把 <code>import.meta.env.VITE_*</code> 替換成字串寫進打包後的 JS，Vite 文件明說不能放 API key。a、b 是同一個迷思：「環境變數」只代表值不寫在原始碼裡，最後跑在誰的電腦上才決定它是不是秘密，而前端程式碼跑在每個訪客的瀏覽器裡。d 錯：base64 是編碼，任何人都能解回來（第 2 課）。正確做法是讓後端拿 key 呼叫第三方，前端只呼叫自己的後端。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：會員系統接收咖啡店的「訂單完成」webhook，會依金額加點數。它驗證了 <code>webhook-signature</code>，但沒有檢查 <code>webhook-timestamp</code>，也沒有記錄處理過的 <code>webhook-id</code>。會出什麼事？</p>
+  <label data-key="a">不會出事：簽章對了就代表是咖啡店剛送出的</label>
+  <label data-key="b">攻擊者錄下一個合法的 webhook，之後重送多少次都會通過簽章，每次都加點數；正常的網路重試也會重複加點數</label>
+  <label data-key="c">攻擊者可以改金額再重送，因為沒檢查時間戳時簽章不會涵蓋 body</label>
+  <label data-key="d">只有咖啡店的 secret 外洩時才會出事</label>
+  <p class="why">✓ 簽章只證明「咖啡店某個時候送過這個內容」，不證明「是剛剛送的、是第一次」。重送原封不動的請求，簽章照樣正確（a、d 錯）。檢查時間戳把重放的時間窗口縮到幾分鐘，用 <code>webhook-id</code> 去重把窗口內的重送也擋掉，同時處理了送出方正常的重試。c 錯：簽章一定涵蓋 body，改了金額簽章就對不上，攻擊者能做的只是原樣重送。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 7：外送平台來信：「工程師可能把我們的咖啡店 API key 貼到公開的 GitHub repo 了，但還不確定。」你先做什麼？</p>
+  <label data-key="a">立刻撤銷那把 key 並發一把新的給對方，再查 <code>last_used_at</code> 和稽核紀錄，看外洩後被誰用來做了什麼</label>
+  <label data-key="b">先查稽核紀錄確認真的有異常使用，有的話再撤銷，避免無謂地中斷外送單</label>
+  <label data-key="c">請對方把 repo 改成私人的，key 就不用換</label>
+  <label data-key="d">把那把 key 的 scope 改成唯讀，觀察一週</label>
+  <p class="why">✓ 外洩的應變順序是先撤銷、再調查：每多等一分鐘，攻擊者就多一分鐘可以用。換 key 的中斷時間很短，資料被拿走卻收不回來。b 是迷思「先查清楚再撤銷」：查的期間 key 仍然有效，而且沒看到異常不代表沒被用。c 錯：公開過的內容可能已經被複製、被搜尋引擎或自動掃描工具抓走，改成私人的收不回來。d 錯：唯讀仍能讀到訂單與顧客資料。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>key 沒有前綴、沒有檢查碼</strong>：外洩了掃描工具認不出來。用 <code>cafe_live_</code> 這種可辨識的前綴，最後加 CRC32 檢查碼。</li>
+  <li><strong>API key 存明文，或用可逆的加密存</strong>：資料庫或備份外洩就等於 key 全部外洩。只存 SHA-256，原始 key 只在建立時顯示一次。</li>
+  <li><strong>對 API key 用慢雜湊</strong>：key 是 CSPRNG 產生的高熵亂數，猜不到，慢雜湊只會讓每個 API 請求變慢。慢雜湊是給人想的密碼用的。</li>
+  <li><strong>key 沒有 scope</strong>：一把 key 等於全部權限，外洩時損害最大。依用途只給需要的 scope。</li>
+  <li><strong>key 放在前端、放進 git、放在網址 query</strong>：<code>VITE_</code> 變數會打包進 JS，git 歷史刪不乾淨，網址會進各種 log。前端需要時走後端代理，key 只放伺服器的環境變數，傳送時用標頭。</li>
+  <li><strong>同一時間只能有一把有效的 key</strong>：換 key 一定停機，所以大家都不換。允許新舊 key 並存的重疊期，舊 key 設定未來的失效時間。</li>
+  <li><strong>懷疑外洩時先調查再撤銷</strong>：調查期間 key 仍有效。先撤銷、發新的，再調查。</li>
+  <li><strong>webhook 對 parse 後重新序列化的 JSON 驗證簽章</strong>：位元組不同，合法的請求全部失敗。用原始 body 驗證，通過之後才解析。</li>
+  <li><strong>webhook 不檢查時間戳、不去重</strong>：錄下來的請求可以一直重送。時間戳限制在前後 5 分鐘，用 <code>webhook-id</code> 去重。</li>
+  <li><strong>webhook 只看第一個簽章、只設定一把 secret</strong>：輪替一開始就全部失敗。逐一比對每個簽章與每把 secret。</li>
+  <li><strong>以為內網的服務互相呼叫不用認證</strong>：攻擊者進到內網任何一點就能呼叫所有服務。服務之間也要認證，只給需要的 scope。</li>
+  <li><strong>client credentials 的錯誤訊息洩漏 client 是否存在</strong>：不存在與 secret 錯都回 <code>invalid_client</code>。</li>
+  <li><strong>scope 只要有一個允許就整批通過</strong>：要求的每一個 scope 都要在允許清單裡，否則整個請求回 <code>invalid_scope</code>。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>機器之間沒有人可以輸入密碼，呼叫方用服務帳號：外部夥伴呼叫我們用 API key、我們通知別人用 webhook 簽章、有授權伺服器的內部服務用 client credentials；mTLS 門檻最高，適合自己管的基礎設施。</li>
+  <li>API key 的格式：可辨識的前綴（區分 live／test）＋ 30 個 base62 隨機字元（約 178 bits）＋ CRC32 檢查碼，讓外洩的 key 被掃描工具找到、假的 key 不用查資料庫就排除。</li>
+  <li>只存 SHA-256、只顯示一次；高熵的 key 不需要慢雜湊。驗證順序：格式 → 檢查碼 → 雜湊查表 → 撤銷、到期、scope。</li>
+  <li>輪替靠新舊並存的重疊期；外洩時先撤銷再調查。秘密不能放在前端，<code>VITE_</code> 變數會被打包進 JS。</li>
+  <li>Standard Webhooks：簽 <code>id.timestamp.payload</code>、<code>v1,</code> 加 base64 的 HMAC-SHA256、secret 去掉 <code>whsec_</code> 後 base64 解碼、多個簽章支援輪替；接收方用原始 body 驗證、限制時間差、用 webhook-id 去重。</li>
+  <li>不因為在內網就信任：服務之間也要認證。</li>
+  <li>client credentials 用服務的身分換短效、限定 <code>aud</code> 的 access token；授權伺服器只存 secret 的雜湊、不洩漏 client 是否存在、scope 只能是允許的子集。可以的話改用 private_key_jwt 或 mTLS；要代表使用者往下呼叫時用 token exchange。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 8 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="b">
+  <p>練習 8：咖啡店的手機 App 要串外送平台，App 沒有後端代理，用 <code>coffeeapp://oauth/callback</code> 當 redirect_uri。該怎麼拿 token？</p>
+  <label data-key="a">把 client_secret 混淆後放進 App，換 token 時照機密 client 的方式送出</label>
+  <label data-key="b">用授權碼流程加 PKCE（S256）：verifier 只留在 App，攔到 code 的人換不到 token</label>
+  <label data-key="c">用 implicit grant，token 直接導回 App，少一步換 token 也少一個被攔的機會</label>
+  <label data-key="d">讓顧客在 App 裡輸入外送平台的帳號密碼，App 直接用密碼授權換 token</label>
+  <p class="why">✓ App 是公開 client，打包後誰都拆得開，守不住 secret；任何 App 都能註冊同一個 scheme 攔下 code。PKCE 讓換 token 時必須送出只有發起者知道的 verifier，SHA-256 反推不回來，攔到 code 也沒用。a 是最常見的想法，但混淆只是拖時間，拆出來的 secret 對所有人都一樣。implicit 與密碼授權都被 RFC 9700 列為不應使用。（第 12 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 9：咖啡店後端收到 App 傳來的 Google ID token，簽章、<code>iss</code>、<code>exp</code> 都驗過了，但 <code>aud</code> 是另一個 App 的 client_id。該怎麼處理？</p>
+  <label data-key="a">接受：簽章有效就代表 Google 確認過這個人，<code>aud</code> 只是參考資訊</label>
+  <label data-key="b">接受，但再用 access token 呼叫 UserInfo，確認這個 <code>sub</code> 真的存在</label>
+  <label data-key="c">拒絕：這張是發給別的 App 的，那個 App 能拿顧客的 token 來登入咖啡店</label>
+  <label data-key="d">拒絕：<code>aud</code> 不符代表內容被改過，簽章其實應該驗不過才對</label>
+  <p class="why">✓ ID token 是給特定 client 的登入證明，<code>aud</code> 必須有自己的 client_id、其他受眾也都要信任。任何 App 都能讓顧客用 Google 登入、拿到一張合法的 ID token，不驗 <code>aud</code>，別人的 App 拿到的 token 就能冒用顧客登入你的網站；access token 不能當登入證明也是同一個道理。a 錯在簽章只證明 Google 發過這張 token，不證明是發給你的。（第 13 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 10：陳美華用 email＋密碼註冊、累積了 800 點，今天第一次按「用 LINE 登入」，ID token 的 <code>email</code> 跟她的會員 email 相同。後端該怎麼做？</p>
+  <label data-key="a">email 相同就是同一個人，直接把這個 LINE 身分連到她的帳號並登入</label>
+  <label data-key="b"><code>email_verified</code> 是 <code>true</code> 就自動連結並登入，不是就建新帳號</label>
+  <label data-key="c">用 <code>(iss, sub)</code> 找不到人，就直接建一個新帳號，不提示也不連結</label>
+  <label data-key="d">提示她先用原本的密碼登入，在已登入的狀態下確認後，才寫入 <code>(iss, sub)</code></label>
+  <p class="why">✓ 用 <code>(iss, sub)</code> 認人，不用 email；同 email 只是「可能已有帳號」的提示，連結要由已登入的本人確認。自動合併的話，攻擊者在不驗 email 的 OP 填上她的 email 就能永久接管帳號。b 錯在 <code>email_verified</code> 只代表 OP 某個時間點驗證過，仍然只能當提示；c 會讓她以為點數不見了，客服最常接到的就是這種案子。（第 13 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 11：滲透測試報告：拿登入第一步（密碼正確、還沒輸入驗證碼）拿到的 cookie，直接用 curl 呼叫 <code>/api/orders</code>，回 200。該怎麼修？</p>
+  <label data-key="a">密碼正確時 session 只記「待 MFA」，除了驗證端點一律回 401；通過後才標成已登入並換 session ID</label>
+  <label data-key="b">在 Vue 的路由守衛加檢查：還沒完成 MFA 的使用者，進任何頁面都導回驗證碼頁</label>
+  <label data-key="c">把驗證碼頁改成每次登入都不同的隨機網址，讓攻擊者猜不到下一步要去哪裡</label>
+  <label data-key="d">密碼正確後照常發完整的 session，但期限縮到 5 分鐘，逾時沒驗證就登出</label>
+  <p class="why">✓ MFA 必須是伺服器上的 session 狀態，不是前端的一個畫面：「待 MFA」只能呼叫驗證端點，通過後權限升級、換 session ID。b 是最多人的直覺，但攻擊者根本不經過前端，直接打 API 就跳過了路由守衛。d 只是縮短窗口，這 5 分鐘內照樣能讀訂單。（第 14 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 12：能退款的店長帳號已經開了 TOTP。上週有店長在仿冒網站輸入密碼和驗證碼，幾秒後帳號就被登入了。下一步加強哪個最有效？</p>
+  <label data-key="a">TOTP 的時間窗縮到只接受當下這一步，讓驗證碼更快失效</label>
+  <label data-key="b">改成簡訊驗證碼，綁定店長登記在公司的手機號碼</label>
+  <label data-key="c">驗證碼改成 8 位數，同時限制每個帳號的嘗試次數</label>
+  <label data-key="d">改用 passkey 或安全金鑰，簽章裡帶著瀏覽器看到的網站來源</label>
+  <p class="why">✓ 驗證碼是可以照抄的字串，不知道自己被輸入在哪個網站，釣魚網站幾秒內轉送就能用。passkey 綁定 RP ID，瀏覽器在假網域根本不會列出它，<code>clientDataJSON</code> 的 origin 也由瀏覽器填，假網站拿到的東西在真網站無效。a 最多人選，但即時轉送只要幾秒，縮時間窗擋不住；簡訊同樣是可轉送的碼。（第 14、15 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 13：王小明覺得帳號被盜，用「忘記密碼」改了新密碼。隔天帳號又被下了一筆訂單，密碼沒有再被改過。重設流程最可能漏了什麼？</p>
+  <label data-key="a">重設成功後，沒讓這位使用者所有的 session 與 refresh token 失效</label>
+  <label data-key="b">重設 token 用 SHA-256 存，被攻擊者從外洩的資料庫反推回來</label>
+  <label data-key="c">重設後沒有自動登入，系統沒機會用新的 session 蓋掉攻擊者的</label>
+  <label data-key="d">新密碼沒有跟舊密碼比對，小明改了一個跟舊密碼很像的密碼</label>
+  <p class="why">✓ 會來重設密碼，很可能就是帳號已經被別人登入；改密碼不會讓攻擊者手上的 session 失效，要在成功後呼叫 <code>destroyAllForUser</code>、撤銷 refresh token，並寄通知。b 錯在 token 是 32 bytes 的高熵亂數，SHA-256 猜不回來，而且用過就作廢。c 反了：重設後應該導回登入頁，自動登入是多一條跳過 MFA 的路。（第 16 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 14：設計 API key 的資料表時，同事說：「key 跟密碼一樣是秘密，應該用 Argon2id 存才安全。」怎麼回應？</p>
+  <label data-key="a">同意：SHA-256 算得太快，資料庫外洩後，攻擊者能很快暴力猜出 key</label>
+  <label data-key="b">不需要：key 是 CSPRNG 產生的高熵亂數猜不到，慢雜湊只會拖慢每個請求</label>
+  <label data-key="c">不需要雜湊：key 本來就是隨機的，存明文就好，外洩時再全部換掉</label>
+  <label data-key="d">改用 AES 加密存，後台可以再顯示一次，驗證時解密回來比對就好</label>
+  <p class="why">✓ 慢雜湊是為了讓「照清單猜」變貴，對付的是人想的密碼；約 178 bits 的 key 每秒試一兆次也試不完，API 每個請求都要驗證，用慢雜湊只是讓自己變慢。存 SHA-256、用雜湊查表、原始 key 只在建立時顯示一次。a 是最常見的直覺，把「秘密」和「可猜的秘密」混為一談；c、d 都讓資料庫外洩等於 key 全部外洩。（第 17 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 15：會員系統的 webhook 接收端這樣寫，上線後咖啡店送來的合法 webhook 幾乎全部驗證失敗。為什麼？</p>
+<pre>// req.body 已被框架解析成物件
+const payload = JSON.stringify(req.body)
+const signed = `${headers['webhook-id']}.${headers['webhook-timestamp']}.${payload}`
+if (!(await verifySignature(headers['webhook-signature'], signed))) {
+  return res.status(401).end()
+}</pre>
+  <label data-key="a">沒有先檢查 <code>webhook-timestamp</code>，超過 5 分鐘的請求簽章就會對不上</label>
+  <label data-key="b">比對簽章用了常數時間比較，遇到多個簽章時只會比到第一個就停</label>
+  <label data-key="c">解析後再序列化的 JSON 位元組變了，簽章簽的是原始 body，自然對不上</label>
+  <label data-key="d">網路重試時同一個 <code>webhook-id</code> 會帶不同簽章，要先去重才驗得過</label>
+  <p class="why">✓ 簽章簽的是原始位元組；<code>JSON.parse</code> 再 <code>JSON.stringify</code> 會改掉空白、鍵的順序、數字寫法，意思一樣、位元組不同。要拿框架解析之前的原始 body 驗證（NestJS 開 <code>rawBody: true</code>），通過後才解析。a 錯在時間戳是另一道檢查，用來擋重放，不影響簽章本身算不算得對。（第 17 課）</p>
+</div>
+<p>這個階段的重點整理成<a href="../sheets/stage-4.html">一頁圖解</a>。</p>
+<p>下一課進入授權：RBAC 用角色組合權限，讓「誰能退款」不再散落在程式各處的 <code>if</code> 裡。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

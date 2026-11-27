@@ -1,0 +1,1352 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>14. 大規模 key-value（資深）：DynamoDB 的分區鍵與 single-table 設計</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="14">
+<header>
+  <div class="eyebrow">階段 5：分析、規模與期末專題 · 第 14 課</div>
+  <h1>大規模 key-value（資深）：DynamoDB 的分區鍵與 single-table 設計</h1>
+</header>
+<main>
+
+<p>假設咖啡店三年後變成連鎖外送平台：全台 800 家門市，尖峰時每秒幾萬次「我的訂單到哪了」查詢、每秒幾千筆新訂單。PostgreSQL 主機已經升到最大規格，讀副本也加到第五台，團隊開始討論 Amazon DynamoDB。它的賣點是：只要你<strong>依 key 查詢</strong>，資料從 1 GB 長到 100 TB、流量從每秒 10 次長到每秒 10 萬次，單次讀寫的延遲都差不多，而且不用自己管機器。代價是你得放棄 SQL 的大部分自由：沒有 JOIN、沒有任意的 WHERE，查詢方式要在建表時就想好。</p>
+<p>這一課你要替外送平台設計<strong>訂單服務的表</strong>：它要回答五種查詢（「我的訂單到哪了」、訂單明細、顧客最近 5 筆、顧客某段期間的訂單、門市待做清單），撐住尖峰的新訂單，還要支援一個限量優惠碼活動。設計完之後，你也要能說出：<strong>咖啡店現在的規模，不該選 DynamoDB</strong>。練習在頁面上的模擬器裡做，不需要 AWS 帳號。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>第 1、2 節：DynamoDB 為什麼撐得住、代價是什麼。資料怎麼分到很多台機器、為什麼因此只能靠 key 讀；key 由哪兩部分組成，有哪三種讀法。</li>
+  <li>第 3 節：先列出訂單服務的五種存取模式，再決定 key。用 single-table 讓訂單和品項放進同一張表、一次讀出（開場任務的最小答案：模式 1、2）。</li>
+  <li>第 4 節：「顧客最近 5 筆訂單」這類查詢，主表的 key 幫不上忙，用 GSI 換一組 key。</li>
+  <li>第 5、6 節：今天的新訂單全寫在同一個 key 會被限流，怎麼分散；限量優惠碼被兩個人同時領，怎麼保證只有一個成功。</li>
+  <li>第 7 節：回到開頭，這套設計付出了什麼，咖啡店現在為什麼不該選。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="07-mongodb-modeling.html">第 7 課</a>的依存取模式建模：先列出查詢，一起讀的資料放在一起，有意地反正規化。</li>
+  <li><a href="../../system-design/lessons/07-sharding-consistent-hashing.html">系統設計課第 7 課</a>的分片與熱點：資料依 key 分散到多台，某個 key 特別熱門時，壓力全落在同一台。</li>
+</ul></div>
+
+<h2>DynamoDB 為什麼流量再大都撐得住？</h2>
+<p>先看開場的賣點從哪裡來。PostgreSQL 撐不住外送平台，卡在「所有寫入都進同一台主機」：讀取可以分給讀副本，寫入只能靠那台主機往上加規格，加到最大就沒有路了。要把寫入拆到好幾個資料庫也可以，但跨庫的 JOIN、交易都要自己處理，非常麻煩。DynamoDB 從設計上就讓寫入也能分給很多台機器。</p>
+<p>DynamoDB 是 AWS 的託管 key-value 資料庫，也能存文件形狀的資料。「託管」的意思是：沒有伺服器要開、沒有版本要升級，備份和複寫由 AWS 做，你只建立<strong>表（table）</strong>，然後讀寫。在背後，它把一張表的資料切成很多<strong>分區（partition）</strong>，每個分區放在不同的機器上；資料或流量變多，就多切幾個分區。</p>
+<p>每筆資料要放進哪個分區，由它的 key 決定。DynamoDB 把 key 的值丟進內部的雜湊函式，算出來的結果對應到一個分區。讀取時也一樣：給它 key，它算一次雜湊就知道要去哪個分區拿，不需要問其他機器。這就是它能一直加機器的原因：<strong>每一次讀寫都只碰到一個分區</strong>，不需要跨機器協調，分區從 10 個變成 1,000 個，單次讀寫要做的事都一樣多。這跟<a href="06-redis-operations.html">第 6 課</a> Redis Cluster 用 CRC16 算 slot 是同一個想法。</p>
+<p>同一個設計也帶來最大的限制：<strong>不知道 key，就不知道去哪裡找</strong>。「找出所有狀態是 pending 的訂單」這種條件，PostgreSQL 可以走索引或掃表；DynamoDB 不知道這些訂單散在哪些分區，只能把每個分區都讀一遍。所以它沒有 JOIN、沒有任意的 WHERE，每一種查法都要在設計 key 時就想好。兩者的對照：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>PostgreSQL</th><th>DynamoDB</th></tr>
+  <tr><td>查詢方式</td><td>任意 SQL：JOIN、WHERE、GROUP BY，事後加索引就好</td><td>只能依 key 查；新的查法要改 key 或加索引，有時要搬資料</td></tr>
+  <tr><td>擴展</td><td>一台主機往上加規格，讀副本分攤讀取；寫入要拆庫就很麻煩</td><td>自動加分區，寫入也能水平擴展</td></tr>
+  <tr><td>延遲</td><td>看查詢寫得好不好、資料多大</td><td>依 key 讀寫，資料量變大延遲也差不多</td></tr>
+  <tr><td>維運</td><td>自己或託管服務管版本、連線數、VACUUM</td><td>沒有伺服器可管；要管的是容量與成本</td></tr>
+  <tr><td>適合</td><td>大部分業務系統，需求常變</td><td>存取模式固定、流量極大的少數幾種查詢</td></tr>
+</table></div>
+<p>表的最後一列就是這課的取捨：DynamoDB 拿查詢的彈性換擴展能力。這筆交易值不值得，要先看規模。</p>
+<div class="callout warn">規模先估再說（<a href="../../system-design/lessons/02-estimation.html">系統設計課第 2 課</a>）：現在的咖啡店一天幾千筆訂單，換算每秒不到 1 筆寫入，PostgreSQL 連汗都不會流。DynamoDB 在這個規模只會帶來代價：查詢要先想好、報表要另外匯出、團隊要學一套新的建模方式。這課的情境是「假想的規模」，學的是大流量系統的設計方式，不是建議現在就換。</div>
+<p>既然一切都從 key 出發，下一個問題是：key 長什麼樣，拿著 key 又能怎麼讀？</p>
+
+<h2>一筆訂單怎麼存，拿著 key 能怎麼讀？</h2>
+<p>DynamoDB 的一筆資料叫 <strong>item</strong>，像一個 JSON 物件，最大 400 KB。item 裡的每個欄位叫屬性（attribute）。除了 key，每個 item 可以有不同的屬性，不需要事先定義欄位。以訂單 1043 為例：訂單本體是一個 item，有 <code>status</code>、<code>total</code> 這些屬性；它的兩個品項各是一個 item，有品名、數量、單價。</p>
+<p>每個 item 都有主鍵（primary key），它決定 item 放在哪裡、怎麼被找到。主鍵可以由兩部分組成。第一部分是 <strong>partition key（分區鍵，常簡稱 PK）</strong>，就是上一節拿去算雜湊的那個值，決定 item 住在哪個分區。因為要算雜湊，查詢時一定要給出完整、相等的值：「以 <code>ORDER#10</code> 開頭」這種條件算不出雜湊，也就不知道要去哪個分區。</p>
+<p>只有 partition key 的話，一個 key 只能對應一個 item。但訂單 1043 有本體和兩個品項，我們希望它們放在一起、一次讀出來。這就是第二部分 <strong>sort key（排序鍵，常簡稱 SK）</strong> 的用途：PK 相同的 item 存在同一個分區，並依 SK 排好序。查詢時 PK 要完全相等，SK 則可以加範圍條件：<code>=</code>、<code>&lt;</code>、<code>&lt;=</code>、<code>&gt;</code>、<code>&gt;=</code>、<code>between</code>（兩端都包含）、<code>begins_with</code>（以某段開頭）。</p>
+<p>PK＋SK 合起來必須唯一：兩個 item 的 PK、SK 都一樣，後寫的會蓋掉先寫的。同一個 PK 的所有 item 合稱一個 <strong>item collection</strong>，例如訂單 1043 的本體和兩個品項。它們放在一起、排好序，所以一次就能讀出一段。</p>
+<p>有了這兩把 key，讀取只有三種方式，差別在你手上有多少 key：</p>
+<div class="table-wrap"><table>
+  <tr><th>操作</th><th>要給什麼</th><th>做什麼</th><th>什麼時候用</th></tr>
+  <tr><td><strong>GetItem</strong></td><td>完整的 PK＋SK</td><td>讀一筆</td><td>已知確切是哪一筆，最便宜</td></tr>
+  <tr><td><strong>Query</strong></td><td>完整的 PK，SK 可以加範圍條件</td><td>讀一個 item collection 的一段，依 SK 排序（可以反向），可以限制筆數</td><td>大部分的列表查詢</td></tr>
+  <tr><td><strong>Scan</strong></td><td>什麼都不用給</td><td>把整張表一筆一筆讀過</td><td>幾乎不該出現在線上 API：表有 1 億筆就讀 1 億筆、照讀到的量付錢</td></tr>
+</table></div>
+<p>表上看不出來的是「讀太多」的代價。Query 和 Scan 都可以再加篩選條件（FilterExpression），但篩選發生在<strong>讀出來之後</strong>：讀了 1,000 筆、篩到剩 3 筆，還是付 1,000 筆的讀取費用。</p>
+<p>篩選也幫不了另一個上限：一次 Query 或 Scan 最多讀 1 MB 的資料，這個上限是在篩選<strong>之前</strong>算的。讀滿 1 MB、篩完可能只剩幾筆，甚至 0 筆。還有資料沒讀完時，回應會帶一個 <code>LastEvaluatedKey</code>（這次讀到的最後一個 key），下一次請求把它當成 <code>ExclusiveStartKey</code> 帶回去，才能從那裡接著讀，這就是 DynamoDB 的分頁。所以靠篩選的查詢，可能要來回好幾次才湊滿一頁畫面。</p>
+<p>所以「讀少一點」要靠 key 設計，不是靠篩選。後面設計每一種查詢時都會用到這個原則。</p>
+<p>還有一個細節會直接影響 Query 的結果：SK 怎麼排序。SK 是<strong>字串</strong>時，排序是逐字比較（照 UTF-8 位元組），不是照數字大小。訂單的品項如果用 <code>ITEM#1</code>、<code>ITEM#2</code>…<code>ITEM#10</code> 當 SK，第 10 個品項會排在第 2 個前面，明細頁的順序就亂了。這是 DynamoDB 設計最常踩的坑。下面用一個 Map 模擬 item collection，執行後比較「沒補零」和「補零」兩行的順序，以及兩種日期寫法：</p>
+<div class="lab"><script type="code">
+// 用 Map 模擬一張表：key 是 PK + SK，Query 時找出 PK 相同的、依 SK 排序
+const table = new Map<string, { PK: string, SK: string, [k: string]: unknown }>()
+const put = (item: { PK: string, SK: string, [k: string]: unknown }) => table.set(item.PK + '|' + item.SK, item)
+const query = (pk: string, beginsWith = '') =>
+  [...table.values()].filter(i => i.PK === pk && i.SK.startsWith(beginsWith)).sort((a, b) => a.SK < b.SK ? -1 : 1)
+
+for (const n of [1, 2, 10]) put({ PK: 'ORDER#1043', SK: `ITEM#${n}`, line: n })
+console.log('沒補零：', query('ORDER#1043', 'ITEM#').map(i => i.SK).join(', '))
+
+for (const n of [1, 2, 10]) put({ PK: 'ORDER#2051', SK: `ITEM#${String(n).padStart(3, '0')}`, line: n })
+console.log('補零：  ', query('ORDER#2051', 'ITEM#').map(i => i.SK).join(', '))
+
+// 日期也一樣：ISO 格式（年-月-日，都補零）的字串順序 = 時間順序
+console.log(['2026-11-1', '2026-10-15', '2026-10-9'].sort().join(' < '), '← 沒補零，順序亂了')
+console.log(['2026-11-01', '2026-10-15', '2026-10-09'].sort().join(' < '))
+</script></div>
+<p>規則：要拿來排序或做範圍查詢的數字一律補零到固定寬度，時間一律用 <code>toISOString()</code> 這種固定格式（UTC、補零）。</p>
+<p>知道了 key 的形狀和讀法，就能替訂單服務決定 key 了。但 key 要照顧到哪些查詢，得先問清楚這個服務會被怎麼查。</p>
+
+<h2>訂單服務會被怎麼查？先列存取模式，再定 key</h2>
+<p>PostgreSQL 的設計順序是「先把資料正規化成表，查詢之後再說」，因為之後加個索引就能支援新的查法。DynamoDB 反過來：<strong>先列出所有存取模式（access pattern），再設計 key</strong>。原因是上一節看到的：查詢只能從 key 出發，key 沒照顧到的查法就只剩 Scan。存取模式就是「誰、用什麼條件、要拿到什麼、多常發生」。外送平台的訂單服務有這五種：</p>
+<div class="table-wrap"><table>
+  <tr><th>#</th><th>存取模式</th><th>頻率</th><th>怎麼查</th></tr>
+  <tr><td>1</td><td>依訂單編號查訂單狀態（「我的訂單到哪了」）</td><td>極高</td><td>GetItem <code>PK=ORDER#1043, SK=ORDER</code></td></tr>
+  <tr><td>2</td><td>訂單明細頁：訂單＋所有品項</td><td>高</td><td>Query <code>PK=ORDER#1043</code>（一次拿到整個 item collection）</td></tr>
+  <tr><td>3</td><td>顧客最近 5 筆訂單</td><td>高</td><td>需要第二組 key：下一節的 GSI1</td></tr>
+  <tr><td>4</td><td>顧客某段日期的訂單</td><td>中</td><td>GSI1，SK 用 between</td></tr>
+  <tr><td>5</td><td>門市今天待做的訂單，舊的在前</td><td>高（每家店的平板每幾秒刷新）</td><td>需要第三組 key：GSI2</td></tr>
+</table></div>
+<p>這一節先解決模式 1、2。關聯式的直覺是 customers、orders、order_items 三張表。DynamoDB 沒有 JOIN，三張表就要查三次、在程式裡拼起來：明細頁一個請求變成三個，延遲和失敗的機會都跟著變多。常見的做法是 <strong>single-table 設計</strong>：把不同實體放在<strong>同一張表</strong>，用 key 的<strong>前綴</strong>區分是哪種實體，讓「一起讀的東西」落在同一個 item collection。</p>
+<p>具體來說，訂單本體和品項都用 <code>ORDER#1043</code> 當 PK，用不同的 SK 區分；顧客用 <code>CUSTOMER#12</code> 當 PK。這樣模式 1 是一次 GetItem（<code>PK=ORDER#1043, SK=ORDER</code>），模式 2 是一次 Query（<code>PK=ORDER#1043</code>），訂單和品項一起回來。每個 item 再加一個 <code>type</code> 屬性，程式讀回來時用它區分形狀（就是 <a href="../../typescript/lessons/16-narrowing.html">TypeScript 課第 16 課</a>的可辨識聯合）。整張表長這樣：</p>
+<figure>
+  <svg viewBox="0 0 700 330" role="img" aria-label="一張表裡放了顧客、訂單和訂單品項：ORDER#1043 這個 partition key 底下依序是 ITEM#001、ITEM#002 和 ORDER 三個 item，一次 Query 就能拿到">
+    <defs><marker id="a14" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="10" y="10" width="680" height="34" rx="4"/>
+    <text class="d-text" x="24" y="32">PK</text><text class="d-text" x="190" y="32">SK</text><text class="d-text" x="330" y="32">其他屬性（每個 item 可以不同）</text>
+    <rect class="d-box" x="10" y="50" width="680" height="34" rx="4"/>
+    <text class="d-accent" x="24" y="72">CUSTOMER#12</text><text class="d-text" x="190" y="72">PROFILE</text><text class="d-small" x="330" y="72">type=customer　name=陳美華</text>
+    <rect class="d-box" x="10" y="100" width="680" height="34" rx="4"/>
+    <text class="d-accent" x="24" y="122">ORDER#1043</text><text class="d-text" x="190" y="122">ITEM#001</text><text class="d-small" x="330" y="122">type=line　拿鐵 ×2　110</text>
+    <rect class="d-box" x="10" y="138" width="680" height="34" rx="4"/>
+    <text class="d-accent" x="24" y="160">ORDER#1043</text><text class="d-text" x="190" y="160">ITEM#002</text><text class="d-small" x="330" y="160">type=line　可頌 ×1　70</text>
+    <rect class="d-box" x="10" y="176" width="680" height="34" rx="4"/>
+    <text class="d-accent" x="24" y="198">ORDER#1043</text><text class="d-text" x="190" y="198">ORDER</text><text class="d-small" x="330" y="198">type=order　customerId=12　status=pending　total=290</text>
+    <rect class="d-box" x="10" y="226" width="680" height="34" rx="4"/>
+    <text class="d-accent" x="24" y="248">ORDER#1050</text><text class="d-text" x="190" y="248">ITEM#001</text><text class="d-small" x="330" y="248">type=line　美式咖啡 ×1　80</text>
+    <rect class="d-box" x="10" y="264" width="680" height="34" rx="4"/>
+    <text class="d-accent" x="24" y="286">ORDER#1050</text><text class="d-text" x="190" y="286">ORDER</text><text class="d-small" x="330" y="286">type=order　customerId=12　status=done　total=80</text>
+    <path class="d-line" d="M150,102 L150,208" fill="none"/>
+    <text class="d-small" x="24" y="320">ORDER#1043 的三個 item 是一個 item collection，依 SK 排好放在一起：Query PK=ORDER#1043 一次拿到訂單和品項</text>
+  </svg>
+  <figcaption>single-table：前綴（CUSTOMER#、ORDER#）讓不同實體不會撞 key；一起讀的資料放在同一個 PK 底下。</figcaption>
+</figure>
+<p>這張表裡每個選擇都有原因。先看前綴，它不能省。如果顧客寫成 <code>PK=12</code>、訂單也寫成 <code>PK=12</code>，「訂單 12 的明細」就會把「顧客 12 的資料」一起查出來，PK＋SK 剛好相同時還會互相覆蓋。加上 <code>CUSTOMER#</code>、<code>ORDER#</code> 之後，不同實體就算 id 相同，也落在不同的 item collection。</p>
+<p>再看 SK 的值，它決定 Query 回來的順序。品項編號補零（<code>ITEM#001</code>），理由是上一節的字串排序；訂單本體用 <code>ORDER</code>，因為 <code>I</code> 排在 <code>O</code> 前面，Query 的結果是品項在前、訂單在後。順序不重要時不用刻意調整，要用到時才設計。key 欄位的名稱就叫通用的 <code>PK</code>、<code>SK</code>，不叫 <code>orderId</code>，因為同一個欄位放的是不同實體的值。</p>
+<p>最後是反正規化：品項裡直接存品名和當時的單價（<a href="07-mongodb-modeling.html">第 7 課</a>的快照），訂單本體直接存 <code>total</code>。在沒有 JOIN 的資料庫裡，讀的時候再去查商品就是多一次請求；寫入時多存一份，讀取就只要一次。</p>
+<p>single-table 不是教條。實體之間沒有一起讀的需求、或由不同團隊負責時，分成幾張表反而清楚（各自的權限、備份、容量設定）。它解決的是「一次請求拿到要一起顯示的資料」，不是「表越少越好」。</p>
+<div class="callout practice"><strong>💡 實務上：設計審查先交存取模式表，再談 key</strong><br>用 DynamoDB 的新服務，設計審查時資深工程師第一個要看的是上面那種表：每一種查詢是誰發的、條件是什麼、每秒幾次、要多快。表裡沒有的查詢，上線後只能 Scan 或補 GSI，所以要先跟 PM、客服、營運把「後台要怎麼找訂單」問清楚，不要只列前台的頁面。key 的格式（前綴、日期格式、時區）寫成一份對照表放進 repo，新人才看得懂 console 裡混在一起的各種 item。</div>
+<p>模式 1、2 解決了，但它們都是「手上有訂單編號」的查詢。模式 3「顧客最近 5 筆訂單」手上只有顧客編號，主表的 key 幫不上忙。</p>
+
+<h2>顧客最近 5 筆訂單：主表的 key 查不到，怎麼辦？</h2>
+<p>模式 3 用主表查不到：訂單的 PK 是 <code>ORDER#…</code>，只知道顧客編號，就算不出訂單在哪個分區，只能 Scan 全表再篩出顧客 12 的訂單。解法是 <strong>GSI（global secondary index，全域次要索引）</strong>。</p>
+<p>GSI 的運作方式是：你指定另外兩個屬性當它的 partition key 和 sort key，DynamoDB 就維護一份用這組 key 重新組織的資料副本。主表寫入一筆帶有這兩個屬性的 item，DynamoDB 會在背後把它放進 GSI，依新的 partition key 分區、依新的 sort key 排序。查詢時指定要查哪個索引，用法跟查主表一樣：partition key 完全相等，sort key 可以加範圍條件。等於同一份資料換一組 key 再排一次。</p>
+<p>咖啡店的訂單本體加上四個屬性，就同時進了兩個 GSI：</p>
+<div class="table-wrap"><table>
+  <tr><th>索引</th><th>partition key</th><th>sort key</th><th>支援的存取模式</th></tr>
+  <tr><td>GSI1</td><td><code>GSI1PK = CUSTOMER#12</code></td><td><code>GSI1SK = ORDER#2026-10-31T08:15:00.000Z</code></td><td>3：<code>beginsWith ORDER#</code>，反向、取 5 筆<br>4：<code>between</code> 兩個日期</td></tr>
+  <tr><td>GSI2</td><td><code>GSI2PK = STORE#4#2026-10-20</code></td><td><code>GSI2SK = STATUS#pending#2026-10-20T09:12:00.000Z</code></td><td>5：<code>beginsWith STATUS#pending#</code></td></tr>
+</table></div>
+<p>逐一看這張表怎麼回答模式 3～5。模式 3：GSI1 的 partition key 是顧客，sort key 是 <code>ORDER#</code> 加上 ISO 時間，所以顧客 12 的訂單在 GSI1 裡依時間排好。Query <code>GSI1PK=CUSTOMER#12</code>、<code>beginsWith ORDER#</code>，反向、取 5 筆，就是最新的 5 筆。</p>
+<p>結果裡不會混進品項，因為品項沒有 GSI1PK、GSI1SK 屬性。沒有索引屬性的 item 不會進 GSI，這叫<strong>稀疏索引（sparse index）</strong>。這也是可以主動利用的技巧：只想索引一部分資料（例如只有待處理的），就只在那些 item 上寫索引屬性。</p>
+<p>模式 4 用同一個 GSI1，SK 改用 <code>between</code>。between 兩端都包含，上界要能包住整天：要查 10/05～10/12，下界 <code>ORDER#2026-10-05</code> 沒問題（當天任何時間的 SK 都比它大）；上界寫 <code>ORDER#2026-10-12</code> 會漏掉 10/12 當天，因為 <code>ORDER#2026-10-12T09:00…</code> 比它大。常見做法是上界加一個比日期後面所有字元都大的字元，例如 <code>ORDER#2026-10-12~</code>（<code>~</code> 在 ASCII 裡比數字、大寫字母都大）。</p>
+<p>模式 5 的門市待做清單，用上了第 2 節「讀少一點要靠 key 設計」的原則：把條件放進 sort key，而不是事後篩選。GSI2SK 開頭是狀態，<code>beginsWith STATUS#pending#</code> 只會讀到待做的訂單。如果 SK 只放時間、讀出來再用 JS 濾掉 done，讀取量（和費用）是那天的全部訂單。狀態改成 done 時，更新訂單本體的 GSI2SK，它在 GSI 裡的位置就跟著換。</p>
+<p>GSI 是一份由 DynamoDB 維護的副本，副本就有代價。第一個是一致性。GSI 是非同步更新、<strong>最終一致</strong>的：寫入主表成功後，GSI 通常在一秒內跟上，但在跟上之前查 GSI 可能看不到剛寫的訂單。主表的讀取預設也是最終一致，但可以用 <code>ConsistentRead: true</code> 要求強一致，保證讀到最新寫入；GSI 不支援強一致讀取。所以剛下單後要馬上顯示的頁面，用主表的 GetItem 或 Query 讀。</p>
+<p>第二個是成本與容量：每次寫主表，若影響到 GSI，GSI 也要消耗寫入容量；GSI 被限流時會反過來拖慢主表的寫入。每張表預設最多 20 個 GSI。「寫入容量」和「限流」是什麼，下一節會講。另外還有一種只換 sort key 的 LSI，大部分情況用不到，細節見課末。</p>
+<p>到這裡五種查詢都有了 key。但存取模式表只寫了「怎麼讀」，沒寫寫入集中在哪裡。營運接著要一張「今天全部訂單」的即時看板，有人提議讓今天的訂單都寫到 <code>PK=ORDERS#2026-11-01</code>，看板 Query 一次就拿到。這個設計在尖峰時會出事。</p>
+
+<h2>今天的訂單全寫進同一個 key，尖峰時會怎樣？</h2>
+<p>要看出問題，得先知道 DynamoDB 怎麼計算流量。它用<strong>容量單位（capacity unit）</strong>計費和限流，讀和寫分開算：</p>
+<ul>
+  <li><strong>RCU（read capacity unit）</strong>：每秒一次 4 KB 以內的強一致讀取，或兩次最終一致讀取。</li>
+  <li><strong>WCU（write capacity unit）</strong>：每秒一次 1 KB 以內的寫入。item 越大用得越多（3 KB 的 item 寫一次用 3 WCU）。</li>
+</ul>
+<p>每個分區有固定的吞吐上限：<strong>每秒 3,000 RCU、1,000 WCU</strong>。超過的請求會被<strong>限流（throttling）</strong>：DynamoDB 直接拒絕，SDK 收到 <code>ProvisionedThroughputExceededException</code> 或類似的錯誤，重試幾次後失敗。對使用者來說，就是 API 偶爾失敗、延遲飆高。</p>
+<p>容量單位也是計費的單位。DynamoDB 有兩種計費模式：<strong>provisioned</strong> 是預先設定這張表每秒要多少 RCU、WCU（可以搭配自動調整），照設定的量付錢，用不到也付，超過就可能被限流；<strong>on-demand</strong> 不用預先設定，照實際讀寫的次數付錢。要注意的是，上面那個每分區 3,000 RCU、1,000 WCU 的上限不管哪種計費模式都存在，計費模式只決定「表整體」的容量怎麼來。</p>
+<p>表的總量可以遠大於一個分區的上限，因為 DynamoDB 會自動處理流量不平均的情況。第一步，它會立即提高流量大的那個分區可用的容量（官方稱 adaptive capacity），但最多只到每分區的上限。流量持續偏高時，它會把那個分區切成兩個、放到不同機器上，讓每一半各自有完整的上限（官方稱 split for heat）。但同一個 partition key 的資料能不能拆，要看流量的形狀：官方文件說明，item collection 可以依 sort key 切成幾段放到不同分區，<strong>前提是流量不是跟著遞增的 sort key 走</strong>。看板的提議正好踩中：所有訂單寫到 <code>PK=ORDERS#2026-11-01</code>、SK 是時間，所有新寫入都打在同一個 key 的最尾端，切開也沒用。這就是<strong>熱分區（hot partition）</strong>：流量集中在一個分區，表的其他容量再多也幫不上。</p>
+<p>會出現熱分區的不只依日期分的 key（「今天」永遠最熱），還有低基數的值（只有 pending／done 兩種狀態、只有 3 家門市）和一個超級熱門的 key（活動商品）。</p>
+<p>讀到這裡你可能會回頭看上一節的 GSI2：<code>GSI2PK = STORE#4#2026-10-20</code> 也是「門市＋日期」，它是不是也會熱？不會，差別在單一 key 分到的流量。外送平台有 800 家門市，每家店每天一個 key，尖峰每秒 3,000 筆新訂單平均分到每家店大約每秒 4 筆，就算加上狀態更新，單一 key 的寫入也是每秒個位數，離每分區 1,000 WCU 很遠。熱不熱看的是「一個 key 每秒扛多少」，不是 key 裡有沒有日期。同樣的形狀，如果只有 3 家店、或改成 <code>STORE#全部#日期</code>，流量就會集中到少數幾個 key，那時要用下面同樣的分片後綴。</p>
+<p>解法是<strong>寫入分片（write sharding）</strong>：在 key 後面加一個後綴，把一個邏輯上的 key 拆成 N 個實際的 key，每個實際的 key 各自落在自己的分區、各自有 1,000 WCU。下面模擬尖峰每秒 3,000 筆新訂單，執行後看每種設計最熱的 key 每秒要扛幾筆：</p>
+<div class="lab"><script type="code">
+// 尖峰每秒 3,000 筆新訂單，看看不同的 partition key 設計，最熱的 key 每秒要扛多少寫入
+const PEAK = 3000
+const WCU_LIMIT = 1000   // 每個分區每秒的寫入上限（item ≤ 1 KB）
+function load(keyOf: (orderId: number) => string) {
+  const perKey = new Map<string, number>()
+  for (let id = 10_000; id < 10_000 + PEAK; id++) perKey.set(keyOf(id), (perKey.get(keyOf(id)) ?? 0) + 1)
+  return perKey
+}
+function report(name: string, perKey: Map<string, number>) {
+  const hottest = Math.max(...perKey.values())
+  console.log(`${name}：${perKey.size} 個 key，最熱的每秒 ${hottest} 筆`,
+    hottest > WCU_LIMIT ? `→ 超過上限，每秒約 ${hottest - WCU_LIMIT} 筆被限流` : '→ 在上限內')
+}
+report('PK=ORDERS#日期', load(() => 'ORDERS#2026-11-01'))
+report('分 4 片', load(id => `ORDERS#2026-11-01#${id % 4}`))
+report('分 10 片', load(id => `ORDERS#2026-11-01#${id % 10}`))
+</script></div>
+<p>不分片時 3,000 筆全在一個 key，每秒約 2,000 筆被限流；分 4 片後每片 750 筆，回到上限內。分幾片之外，後綴怎麼算，決定了之後讀不讀得回來：</p>
+<ul>
+  <li><strong>亂數後綴</strong>（<code>Math.random()</code>）：寫入最平均，但之後要找「訂單 1043」時不知道它在哪一片，只能 N 片都查。</li>
+  <li><strong>計算出來的後綴</strong>：用訂單編號算，例如 <code>orderId % N</code>，或對字串 id 算雜湊再取餘數。同一筆訂單永遠算出同一片，GetItem 一次就找到；只要 id 本身分布平均，寫入也一樣平均。id 有規律（例如都是 10 的倍數）時取餘數會集中，改用雜湊。</li>
+</ul>
+<p>代價在讀取：看板要「今天的所有訂單」，就得對 N 個 key <strong>平行</strong>送 N 個 Query，再把結果<strong>合併並重新排序</strong>（每一片各自依 SK 排好，接起來並不是整體有序）。N 怎麼選：尖峰每秒寫入量 ÷ 1,000 再留餘裕；N 越大寫入越分散、讀取要發的請求越多。如果熱的是讀取而不是寫入，解法則是在前面加快取，不是分片。AWS 有一個放在 DynamoDB 前面的記憶體快取服務叫 DAX，程式改連 DAX，熱門的讀取就由快取回應；也可以用 <a href="../../nestjs/lessons/19-caching-redis.html">NestJS 課第 19 課</a>的 Redis 快取。</p>
+<div class="callout practice"><strong>💡 實務上：被限流時先找出是哪個 key，不是先加容量</strong><br>告警通常是「API 偶爾 5xx、延遲飆高」，CloudWatch（AWS 的監控服務）上看到 throttle 指標在跳。直覺是調高容量或改成 on-demand，但前面說過，分區的吞吐上限不管哪種計費模式都存在，熱 key 加錢也救不了。先開 CloudWatch Contributor Insights（列出存取最多、被限流最多的 key；選「throttled keys」模式只在被限流時記錄，可以長期開著），看是同一筆 item 一直出現（熱 key：讀多加快取、寫多就分片），還是同一個 partition key 底下 SK 一直往後長（像上面的 <code>ORDERS#日期</code>：改 key 的設計，加分片後綴）。GSI 也會有自己的熱 key，像只放狀態或日期的 GSI partition key，要分開查。</div>
+<p>分片處理的是「寫得太集中」。外送平台還有另一種寫入問題：同一筆資料被兩個請求同時搶著寫。行銷部門要辦一個限量優惠碼活動。</p>
+
+<h2>限量優惠碼：兩個人同時領，怎麼保證只有一個成功？</h2>
+<p>活動規則是：每個碼只能被一個人領走，每位顧客也只能領一張。直覺寫法是先查有沒有人領過、沒有再寫入：</p>
+<pre>const used = await db.get({ PK: `COUPON#${code}`, SK: 'COUPON' })
+if (!used) await db.put({ PK: `COUPON#${code}`, SK: 'COUPON', customerId })   // ✗ 兩個請求可能同時查到「沒有」</pre>
+<p>這跟<a href="04-redis-atomicity.html">第 4 課</a>的「讀 → 判斷 → 寫」中間被插隊一樣：兩個請求同時查到沒有，就都寫進去，後寫的蓋掉先寫的，兩個人都以為自己領到了。問題出在「查」和「寫」是兩個請求，中間的空檔裡別的請求可以插進來。DynamoDB 的解法是<strong>條件寫入（condition expression）</strong>：把條件交給資料庫，在寫入的同一個動作裡檢查，中間沒有空檔。</p>
+<p>防重複用的條件是 <code>attribute_not_exists(PK)</code>：這個 PK＋SK 的 item 不存在才寫入。DynamoDB 會對「這次要寫的那個 key」評估條件，所以它的意思就是「這筆還沒有人寫過」。條件不成立時丟 <code>ConditionalCheckFailedException</code>，什麼都不寫。兩個人同時領同一個碼，只有一個人的寫入會成功。條件寫入也能做別的檢查，例如寫 <code>version = :expected</code>，更新時帶上讀到的版本號：這就是<strong>樂觀鎖</strong>，跟 <a href="09-mongodb-consistency.html">第 9 課</a>的做法相同。</p>
+<p>「每位顧客只能領一張」是另一個唯一條件，要再寫一個 <code>PK=CUSTOMER#12, SK=COUPON</code> 的 item 當作「這位顧客已經領過」的標記，也加上 <code>attribute_not_exists</code>。兩個 item 必須<strong>一起成功或一起失敗</strong>：如果分開寫，優惠碼寫成功、顧客標記失敗，就留下一張「被領走但對不上人」的碼。這要用 <strong>TransactWriteItems</strong>：最多 100 個寫入動作、合計不超過 4 MB，全部成功或全部不做。任何一個條件不成立，整個交易丟出 <code>TransactionCanceledException</code>，裡面的 <code>CancellationReasons</code> 依動作順序列出每一個的原因（例如 <code>[ConditionalCheckFailed, None]</code>）。同一個交易不能對同一個 item 做兩個動作。</p>
+<p>最後要處理重送。網路逾時後，前端或 SDK 可能重送同一個「領取」請求。第一次其實成功了，第二次會因為條件不成立而失敗，使用者卻看到「領取失敗」。所以條件失敗時要再讀一次：如果這張碼的主人就是自己，回報「已經領過」而不是錯誤。這跟<a href="03-redis-patterns.html">第 3 課</a>的冪等鍵是同一個想法：重送不能改變結果。用真正的 AWS SDK 怎麼寫 GetItem、查 GSI、交易，放在課末的「補充與查表」。</p>
+<p>到這裡，訂單服務的表設計完成了：五種查詢各有 key、尖峰寫入分散了、優惠碼不會重複。最後回到開場的另一半：這套設計付出了什麼，咖啡店現在該不該用？</p>
+
+<h2>回到開頭：咖啡店現在該選 DynamoDB 嗎？</h2>
+<p>前面幾節換來的是：只要依 key 查詢，流量再大延遲都差不多。代價都在彈性上，用<a href="01-choosing-a-store.html">第 1 課</a>的四個問題（存取模式、一致性、規模、維運成本）逐一檢查。每一條前面標的是它屬於哪個問題，規模留到這份清單之後的結論：</p>
+<ul>
+  <li><strong>存取模式：存取模式會變</strong>：新的查法要新的 GSI；如果需要的屬性舊資料沒有，就得寫程式掃過整張表補上（backfill）。key 本身設計錯，就是整張表搬家。需求每週都在變的後台，用 PostgreSQL 加個索引就好。</li>
+  <li><strong>存取模式：臨時查詢與報表</strong>：「上個月每家店每個品項賣了多少」在 DynamoDB 只能 Scan 全表。正確做法是把資料匯出到分析資料庫（匯出到 S3 再用<a href="13-olap-analytics.html">第 13 課</a>的 DuckDB，或 AWS 直接用 SQL 查 S3 檔案的 Athena），不在線上表上跑報表。</li>
+  <li><strong>一致性：交易與關聯</strong>：TransactWriteItems 有 100 個動作的上限，成本是一般寫入的兩倍；大量跨實體的一致性需求（例如結帳同時扣庫存、建立訂單、寫帳）還是關聯式資料庫的強項。</li>
+  <li><strong>維運成本：成本模型</strong>：第 5 節的兩種計費模式各有適合的流量。on-demand 不用預估，適合流量難預測的服務；provisioned 在流量穩定時比較便宜。不管哪種，Scan、大 item、過多的 GSI 都直接變成帳單。上線前要用存取模式表估算每秒讀寫量 × item 大小。</li>
+  <li><strong>維運成本：鎖定在 AWS</strong>：API、計費方式、監控工具都是 AWS 專屬的。Apache Cassandra、ScyllaDB 是模型相近的寬欄式資料庫，ScyllaDB 還提供相容 DynamoDB API 的 Alternator，但功能與維運方式不同，真的要搬仍是一個專案，選之前就要接受這個綁定。</li>
+</ul>
+<p>適合的情境：存取模式少而固定、流量極大或極不平均（購物車、session、裝置最新狀態、訂單狀態查詢）、團隊不想管資料庫伺服器、可以接受「報表另外處理」。</p>
+<p>所以開場的答案是：咖啡店現在不該選。第一節估過，一天幾千筆訂單換算每秒不到 1 筆寫入，上面這些代價每一個都會立刻付，擴展的好處卻用不到。就算真的長到外送平台的規模，也不是整個系統一起換。</p>
+<div class="callout practice"><strong>💡 實務上：搬到 DynamoDB 通常只搬一條熱路徑</strong><br>真的遇到規模問題時，團隊很少把整個系統搬過去。常見的順序是：先加快取、讀副本撐住；確定瓶頸是某一條固定、流量極大的路徑（例如「訂單狀態查詢」）後，只把那條搬到 DynamoDB，訂單、帳務仍以 PostgreSQL 為記錄系統。報表需求用官方的匯出到 S3（需要先開啟 point-in-time recovery，也就是可以還原到過去任一時間點的持續備份；匯出不消耗表的讀取容量）交給分析工具，不在線上表跑。提案時把「誰是權威資料、兩邊怎麼同步、出錯怎麼對帳」一起寫進去（<a href="11-search-sync.html">第 11 課</a>的 outbox 同樣適用）。</div>
+
+<h2>補充與查表</h2>
+<p><strong>LSI（local secondary index，本地次要索引）</strong>：partition key 跟主表相同、只換 sort key，支援強一致讀取，但只能在建表時建立，而且最多 5 個。大部分情況用 GSI。</p>
+<p><strong>真正的 AWS SDK 寫法</strong>：用 <code>@aws-sdk/lib-dynamodb</code> 3.1161.0（DocumentClient 會把 JS 物件轉成 DynamoDB 的格式），模式 1 的 GetItem、模式 3 的 GSI1 Query、優惠碼的交易寫起來像這樣：</p>
+<pre>import { DynamoDBClient } from '@aws-sdk/client-dynamodb'
+import { DynamoDBDocumentClient, GetCommand, QueryCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb'
+
+const doc = DynamoDBDocumentClient.from(new DynamoDBClient({ region: 'ap-northeast-1' }))
+
+await doc.send(new GetCommand({ TableName: 'coffee', Key: { PK: 'ORDER#1043', SK: 'ORDER' } }))
+
+await doc.send(new QueryCommand({
+  TableName: 'coffee',
+  IndexName: 'GSI1',
+  KeyConditionExpression: 'GSI1PK = :pk AND begins_with(GSI1SK, :prefix)',
+  ExpressionAttributeValues: { ':pk': 'CUSTOMER#12', ':prefix': 'ORDER#' },
+  ScanIndexForward: false,   // 由新到舊
+  Limit: 5,
+}))
+
+await doc.send(new TransactWriteCommand({
+  TransactItems: [
+    { Put: { TableName: 'coffee', Item: { PK: 'COUPON#LATTE50', SK: 'COUPON', customerId: 12 }, ConditionExpression: 'attribute_not_exists(PK)' } },
+    { Put: { TableName: 'coffee', Item: { PK: 'CUSTOMER#12', SK: 'COUPON', code: 'LATTE50' }, ConditionExpression: 'attribute_not_exists(PK)' } },
+  ],
+}))</pre>
+<p><strong>本機開發</strong>：可以用官方的 DynamoDB Local（Java 寫的，映像 <code>amazon/dynamodb-local:3.3.2</code>），程式只要把 endpoint 指過去，金鑰填任意值（只能是英數字）：</p>
+<pre>docker run --rm -p 127.0.0.1:8001:8000 amazon/dynamodb-local:3.3.2 -jar DynamoDBLocal.jar -inMemory
+
+const db = new DynamoDBClient({ endpoint: 'http://localhost:8001', region: 'local',
+  credentials: { accessKeyId: 'local', secretAccessKey: 'local' } })</pre>
+<p>容器預設用 8000 port，這裡對應到主機的 8001，避免跟課程網站衝突。它適合測 API 用法與 key 設計，但不會模擬分區上限、限流和 GSI 延遲，這些只能在真正的服務上觀察（CloudWatch 的 throttle 指標與 Contributor Insights 的熱 key 報表）。</p>
+
+<h2>練習</h2>
+<p>這頁的練習用一個模擬器 <code>db</code>，參數簡化成物件：<code>db.get({ PK, SK })</code>、<code>db.put(item, { condition })</code>、<code>db.query({ index, pk, beginsWith, between, reverse, limit })</code>、<code>db.scan()</code>、<code>db.transactWrite([{ put, condition }])</code>。<code>reverse: true</code> 對應真正 API 的 <code>ScanIndexForward: false</code>，<code>index</code> 對應 <code>IndexName</code>（見課末的 SDK 寫法）。模擬器的每個方法都會先 <code>await</code> 一次才讀寫，所以「先 get 再 put」的競態在並發測試裡一定會出現；它的 GSI 是立刻更新的，真正的 GSI 會晚一點。</p>
+<p>四題都在頁面上寫。模擬器的型別已經宣告好（編輯器裡打 <code>db.</code> 就會提示）；實作在隱藏測試裡，測試會建立一個新的 <code>db</code> 傳進你的函式，並記錄你呼叫了哪些方法、幾次。「執行」只會跑你自己的程式，「檢查答案」才會跑測試。</p>
+
+<div class="exercise">
+  <p>練習 1：照上面的 single-table 設計實作主表的 key。<code>customerItem(c)</code> 回傳顧客的 item（<code>type: 'customer'</code>，含 <code>customerId</code>、<code>name</code>）；<code>orderItems(o)</code> 回傳訂單本體 1 筆（<code>type: 'order'</code>，含 <code>orderId</code>、<code>customerId</code>、<code>storeId</code>、<code>at</code>、<code>status</code>，以及 <code>total</code> = 各品項 qty × price 的總和）和每個品項各 1 筆（<code>type: 'line'</code>，含 <code>orderId</code>、從 1 開始的品項序號 <code>n</code>、<code>productId</code>、<code>name</code>、<code>qty</code>、<code>price</code>）。再實作存取模式 1、2：<code>getOrder(db, orderId)</code> 只能呼叫 1 次 <code>get</code>；<code>orderDetail(db, orderId)</code> 只能呼叫 1 次 <code>query</code>，回傳訂單本體和全部品項，品項依序號排好（訂單本體在前在後都可以）。測試會寫入 16 位顧客、300 多筆訂單（有的訂單有 12 個品項，有的顧客編號跟訂單編號相同）。</p>
+  <script type="start">
+// 主表的 key：顧客 PK=CUSTOMER#<id> SK=PROFILE；訂單本體 PK=ORDER#<id> SK=ORDER；品項 PK=ORDER#<id> SK=ITEM#<補零的序號>
+
+function customerItem(c: Customer): Item {
+  // 寫在這裡
+  return { PK: '', SK: '' }
+}
+
+function orderItems(o: Order): Item[] {
+  // 寫在這裡
+  return []
+}
+
+async function getOrder(db: Db, orderId: number): Promise<Item | undefined> {
+  // 寫在這裡
+  return undefined
+}
+
+async function orderDetail(db: Db, orderId: number): Promise<Item[]> {
+  // 寫在這裡
+  return []
+}
+
+console.log(customerItem({ customerId: 12, name: '陳美華' }))
+console.log(orderItems({ orderId: 1043, customerId: 12, storeId: 4, at: '2026-10-31T08:15:00.000Z', status: 'pending',
+  lines: [{ productId: 2, name: '拿鐵', qty: 2, price: 110 }, { productId: 5, name: '可頌', qty: 1, price: 70 }] }))
+</script>
+  <script type="answer">
+// 主表的 key：顧客 PK=CUSTOMER#<id> SK=PROFILE；訂單本體 PK=ORDER#<id> SK=ORDER；品項 PK=ORDER#<id> SK=ITEM#<補零的序號>
+
+function customerItem(c: Customer): Item {
+  return { PK: `CUSTOMER#${c.customerId}`, SK: 'PROFILE', type: 'customer', customerId: c.customerId, name: c.name }
+}
+
+function orderItems(o: Order): Item[] {
+  const PK = `ORDER#${o.orderId}`
+  const total = o.lines.reduce((sum, l) => sum + l.qty * l.price, 0)
+  return [
+    { PK, SK: 'ORDER', type: 'order', orderId: o.orderId, customerId: o.customerId, storeId: o.storeId, at: o.at, status: o.status, total },
+    ...o.lines.map((l, i) => ({ PK, SK: `ITEM#${String(i + 1).padStart(3, '0')}`, type: 'line', orderId: o.orderId, n: i + 1, ...l })),
+  ]
+}
+
+async function getOrder(db: Db, orderId: number): Promise<Item | undefined> {
+  return db.get({ PK: `ORDER#${orderId}`, SK: 'ORDER' })
+}
+
+async function orderDetail(db: Db, orderId: number): Promise<Item[]> {
+  return db.query({ pk: `ORDER#${orderId}` })
+}
+
+console.log(customerItem({ customerId: 12, name: '陳美華' }))
+console.log(orderItems({ orderId: 1043, customerId: 12, storeId: 4, at: '2026-10-31T08:15:00.000Z', status: 'pending',
+  lines: [{ productId: 2, name: '拿鐵', qty: 2, price: 110 }, { productId: 5, name: '可頌', qty: 1, price: 70 }] }))
+</script>
+  <script type="tests">
+class Sim implements Db {
+  rows = new Map<string, Item>()
+  calls = { get: 0, put: 0, query: 0, scan: 0, transactWrite: 0 }
+  writes = new Map<string, number>()   // 主表每個 partition key 被寫了幾次
+  read = 0                             // query 一共回傳了幾筆
+  inFlight = 0
+  maxInFlight = 0
+  key(pk: string, sk: string) { return pk + '\u0000' + sk }
+  valid(item: Item) {
+    if (typeof item.PK !== 'string' || typeof item.SK !== 'string' || !item.PK || !item.SK) throw new Error(`item 的 PK、SK 要是非空字串：${JSON.stringify(item)}`)
+  }
+  wrote(pk: string) { this.writes.set(pk, (this.writes.get(pk) ?? 0) + 1) }
+  async get(k: { PK: string, SK: string }) {
+    this.calls.get++
+    await null
+    const it = this.rows.get(this.key(k.PK, k.SK))
+    return it && structuredClone(it)
+  }
+  async put(item: Item, opts: { condition?: Condition } = {}) {
+    this.calls.put++
+    this.valid(item)
+    const copy = structuredClone(item)
+    await null
+    const k = this.key(copy.PK, copy.SK)
+    if (opts.condition && this.rows.has(k)) throw Object.assign(new Error('The conditional request failed'), { name: 'ConditionalCheckFailedException' })
+    this.rows.set(k, copy)
+    this.wrote(copy.PK)
+  }
+  async query(q: QueryInput) {
+    this.calls.query++
+    this.inFlight++
+    this.maxInFlight = Math.max(this.maxInFlight, this.inFlight)
+    try {
+      await null
+      const pa = q.index ? q.index + 'PK' : 'PK', sa = q.index ? q.index + 'SK' : 'SK'
+      const sk = (it: Item) => it[sa] as string
+      let out = [...this.rows.values()].filter(it => it[pa] === q.pk && typeof it[sa] === 'string')
+      if (q.beginsWith !== undefined) { const p = q.beginsWith; out = out.filter(it => sk(it).startsWith(p)) }
+      if (q.between) { const [lo, hi] = q.between; out = out.filter(it => sk(it) >= lo && sk(it) <= hi) }
+      const cmp = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0
+      out.sort((a, b) => cmp(sk(a), sk(b)) || cmp(this.key(a.PK, a.SK), this.key(b.PK, b.SK)))
+      if (q.reverse) out.reverse()
+      if (q.limit !== undefined) out = out.slice(0, q.limit)
+      this.read += out.length
+      return out.map(it => structuredClone(it))
+    } finally {
+      this.inFlight--
+    }
+  }
+  async scan() {
+    this.calls.scan++
+    await null
+    return [...this.rows.values()].map(it => structuredClone(it))
+  }
+  async transactWrite(ops: { put: Item, condition?: Condition }[]) {
+    this.calls.transactWrite++
+    if (ops.length < 1 || ops.length > 100) throw new Error('一個交易要有 1～100 個動作')
+    ops.forEach(op => this.valid(op.put))
+    const keys = ops.map(op => this.key(op.put.PK, op.put.SK))
+    if (new Set(keys).size !== keys.length) throw Object.assign(new Error('同一個交易不能寫同一個 item 兩次'), { name: 'ValidationException' })
+    const copies = ops.map(op => structuredClone(op.put))
+    await null
+    const reasons = ops.map((op, i) => op.condition && this.rows.has(keys[i]) ? 'ConditionalCheckFailed' as const : 'None' as const)
+    if (reasons.includes('ConditionalCheckFailed')) throw Object.assign(new Error(`Transaction cancelled [${reasons.join(', ')}]`), { name: 'TransactionCanceledException', reasons })
+    copies.forEach((c, i) => { this.rows.set(keys[i], c); this.wrote(c.PK) })
+  }
+}
+const PRODUCTS: [number, string, number][] = [[1, '美式咖啡', 80], [2, '拿鐵', 110], [3, '卡布奇諾', 110], [4, '伯爵紅茶', 90], [5, '可頌', 70], [6, '起司蛋糕', 120]]
+const NAMES = ['王小明', '陳美華', '林志豪', '張雅婷', '李建國', '黃淑芬']
+let seed = 14
+const rnd = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return Math.floor(seed / 65536) % n }
+const T0 = Date.UTC(2026, 9, 1)
+const customers: Customer[] = Array.from({ length: 16 }, (_, i) => ({ customerId: 10 + i, name: NAMES[i % 6] }))
+const orders: Order[] = []
+const addOrder = (orderId: number, customerId: number, storeId: number, at: string, status: 'pending' | 'done', nLines: number) =>
+  orders.push({ orderId, customerId, storeId, at, status, lines: Array.from({ length: nLines }, (_, k) => {
+    const [productId, name, price] = PRODUCTS[(orderId + k) % 6]
+    return { productId, name, qty: 1 + rnd(2), price }
+  }) })
+for (let i = 0; i < 300; i++) addOrder(10 + i, 10 + rnd(16), 3 + rnd(3), new Date(T0 + i * 8_900_000 + rnd(60) * 1000).toISOString(), rnd(3) === 0 ? 'pending' : 'done', i % 25 === 0 ? 12 : 1 + rnd(3))
+// 邊界：剛好在範圍的頭尾、剛好在範圍外
+addOrder(400, 12, 3, '2026-10-05T00:00:00.000Z', 'done', 1)
+addOrder(401, 12, 3, '2026-10-12T23:59:59.999Z', 'done', 2)
+addOrder(402, 12, 3, '2026-10-04T23:59:59.999Z', 'done', 1)
+addOrder(403, 12, 3, '2026-10-13T00:00:00.000Z', 'done', 1)
+// 門市 4 在 10/20 很忙
+for (let k = 0; k < 12; k++) addOrder(410 + k, 10 + (k * 5) % 16, 4, `2026-10-20T${String(1 + k).padStart(2, '0')}:${String(k * 4).padStart(2, '0')}:00.000Z`, k % 3 === 2 ? 'done' : 'pending', 1 + (k % 2))
+const db = new Sim()
+let written = 0
+for (const c of customers) {
+  const it = customerItem(c)
+  assert(it.type === 'customer' && it.customerId === c.customerId && it.name === c.name, `customerItem 要有 type: 'customer'、customerId、name，拿到 ${JSON.stringify(it)}`)
+  assert(it.PK === `CUSTOMER#${c.customerId}` && it.SK === 'PROFILE', `顧客 ${c.customerId} 的 key 要是 PK=CUSTOMER#${c.customerId}、SK=PROFILE（照題目的 key 格式，加上實體前綴），拿到 PK=${it.PK}、SK=${it.SK}`)
+  await db.put(it); written++
+}
+for (const o of orders) {
+  const its = orderItems(o)
+  assert.equal(its.length, o.lines.length + 1, `訂單 ${o.orderId} 有 ${o.lines.length} 個品項，orderItems 要回傳 1 筆訂單本體＋每個品項各 1 筆`)
+  const body = its.find(i => i.type === 'order')
+  assert(body?.PK === `ORDER#${o.orderId}` && body.SK === 'ORDER', `訂單 ${o.orderId} 本體的 key 要是 PK=ORDER#${o.orderId}、SK=ORDER（照題目的 key 格式，加上實體前綴），拿到 PK=${body?.PK}、SK=${body?.SK}`)
+  assert(its.every(i => i.type === 'order' || (i.PK === body.PK && i.SK.startsWith('ITEM#'))), `訂單 ${o.orderId} 的品項要跟訂單本體同一個 PK、SK 以 ITEM# 開頭，才會在同一個 item collection`)
+  for (const it of its) { await db.put(it); written++ }
+}
+assert.equal(db.rows.size, written, `寫了 ${written} 筆，表裡只有 ${db.rows.size} 筆：有 item 的 PK＋SK 重複、被覆蓋了`)
+const snap = () => ({ ...db.calls })
+const diff = (a: Sim['calls']) => Object.entries(db.calls).filter(([k, v]) => v !== a[k as keyof Sim['calls']]).map(([k, v]) => `${k} ${v - a[k as keyof Sim['calls']]} 次`).join('、') || '沒有'
+for (const id of [10, 15, 22, 35, 160, 309]) {
+  const o = orders.find(x => x.orderId === id)!
+  const total = o.lines.reduce((s, l) => s + l.qty * l.price, 0)
+  let before = snap()
+  const head = await getOrder(db, id)
+  assert(db.calls.get - before.get === 1 && db.calls.query === before.query && db.calls.scan === before.scan, `getOrder 只能呼叫 1 次 get（GetItem），你呼叫了：${diff(before)}`)
+  assert(head !== undefined && head.type === 'order' && head.orderId === id, `getOrder(db, ${id}) 要拿到 type 為 'order'、orderId 為 ${id} 的訂單本體，拿到 ${JSON.stringify(head)}`)
+  assert(head.customerId === o.customerId && head.storeId === o.storeId && head.at === o.at && head.status === o.status, `訂單 ${id} 本體的 customerId、storeId、at、status 要照原本的訂單`)
+  assert.equal(head.total, total, `訂單 ${id} 的 total 要是各品項 qty × price 的總和`)
+  before = snap()
+  const detail = await orderDetail(db, id)
+  assert(db.calls.query - before.query === 1 && db.calls.get === before.get && db.calls.scan === before.scan, `orderDetail 只能呼叫 1 次 query、不能用 scan，你呼叫了：${diff(before)}`)
+  assert.equal(detail.length, o.lines.length + 1, `orderDetail(db, ${id}) 要回傳訂單本體＋${o.lines.length} 個品項，拿到 ${detail.length} 筆（${detail.map(i => i.type + ':' + i.PK).join('、')}）：PK 有沒有加上實體前綴？`)
+  assert.equal(detail.filter(i => i.type === 'order').length, 1, `orderDetail(db, ${id}) 裡要剛好有 1 筆訂單本體`)
+  const lines = detail.filter(i => i.type === 'line')
+  assert.deepEqual(lines.map(l => l.n), o.lines.map((_, k) => k + 1), `訂單 ${id} 的品項要依序號 1、2、3… 排好，拿到 ${lines.map(l => l.n).join(', ')}：SK 的序號有沒有補零？`)
+  lines.forEach((l, k) => assert(l.orderId === id && l.productId === o.lines[k].productId && l.name === o.lines[k].name && l.qty === o.lines[k].qty && l.price === o.lines[k].price, `訂單 ${id} 第 ${k + 1} 個品項的 orderId、productId、name、qty、price 要照原本的訂單`))
+}
+assert.equal(await getOrder(db, 999), undefined, '不存在的訂單，getOrder 要回傳 undefined')
+assert.equal((await orderDetail(db, 999)).length, 0, '不存在的訂單，orderDetail 要回傳空陣列')
+console.log('✓ 主表的 key 設計通過：get、query 各 1 次就拿到資料')
+</script>
+  <script type="wrong">
+// PK 沒有實體前綴：顧客 12 和訂單 12 擠在同一個 item collection
+function customerItem(c: Customer): Item {
+  return { PK: String(c.customerId), SK: 'PROFILE', type: 'customer', customerId: c.customerId, name: c.name }
+}
+function orderItems(o: Order): Item[] {
+  const PK = String(o.orderId)
+  const total = o.lines.reduce((sum, l) => sum + l.qty * l.price, 0)
+  return [
+    { PK, SK: 'ORDER', type: 'order', orderId: o.orderId, customerId: o.customerId, storeId: o.storeId, at: o.at, status: o.status, total },
+    ...o.lines.map((l, i) => ({ PK, SK: `ITEM#${String(i + 1).padStart(3, '0')}`, type: 'line', orderId: o.orderId, n: i + 1, ...l })),
+  ]
+}
+async function getOrder(db: Db, orderId: number): Promise<Item | undefined> {
+  return db.get({ PK: String(orderId), SK: 'ORDER' })
+}
+async function orderDetail(db: Db, orderId: number): Promise<Item[]> {
+  return db.query({ pk: String(orderId) })
+}
+</script>
+  <script type="wrong">
+// 只有顧客加前綴，訂單 PK 直接用編號：這次沒撞到，但下一種實體（門市 12）就會撞
+function customerItem(c: Customer): Item {
+  return { PK: `CUSTOMER#${c.customerId}`, SK: 'PROFILE', type: 'customer', customerId: c.customerId, name: c.name }
+}
+function orderItems(o: Order): Item[] {
+  const PK = String(o.orderId)
+  const total = o.lines.reduce((sum, l) => sum + l.qty * l.price, 0)
+  return [
+    { PK, SK: 'ORDER', type: 'order', orderId: o.orderId, customerId: o.customerId, storeId: o.storeId, at: o.at, status: o.status, total },
+    ...o.lines.map((l, i) => ({ PK, SK: `ITEM#${String(i + 1).padStart(3, '0')}`, type: 'line', orderId: o.orderId, n: i + 1, ...l })),
+  ]
+}
+async function getOrder(db: Db, orderId: number): Promise<Item | undefined> {
+  return db.get({ PK: String(orderId), SK: 'ORDER' })
+}
+async function orderDetail(db: Db, orderId: number): Promise<Item[]> {
+  return db.query({ pk: String(orderId) })
+}
+</script>
+  <script type="wrong">
+// 品項序號沒有補零：ITEM#10 排在 ITEM#2 前面
+function customerItem(c: Customer): Item {
+  return { PK: `CUSTOMER#${c.customerId}`, SK: 'PROFILE', type: 'customer', customerId: c.customerId, name: c.name }
+}
+function orderItems(o: Order): Item[] {
+  const PK = `ORDER#${o.orderId}`
+  const total = o.lines.reduce((sum, l) => sum + l.qty * l.price, 0)
+  return [
+    { PK, SK: 'ORDER', type: 'order', orderId: o.orderId, customerId: o.customerId, storeId: o.storeId, at: o.at, status: o.status, total },
+    ...o.lines.map((l, i) => ({ PK, SK: `ITEM#${i + 1}`, type: 'line', orderId: o.orderId, n: i + 1, ...l })),
+  ]
+}
+async function getOrder(db: Db, orderId: number): Promise<Item | undefined> {
+  return db.get({ PK: `ORDER#${orderId}`, SK: 'ORDER' })
+}
+async function orderDetail(db: Db, orderId: number): Promise<Item[]> {
+  return db.query({ pk: `ORDER#${orderId}` })
+}
+</script>
+  <script type="wrong">
+// 用 scan 再在 JS 裡篩選
+function customerItem(c: Customer): Item {
+  return { PK: `CUSTOMER#${c.customerId}`, SK: 'PROFILE', type: 'customer', customerId: c.customerId, name: c.name }
+}
+function orderItems(o: Order): Item[] {
+  const PK = `ORDER#${o.orderId}`
+  const total = o.lines.reduce((sum, l) => sum + l.qty * l.price, 0)
+  return [
+    { PK, SK: 'ORDER', type: 'order', orderId: o.orderId, customerId: o.customerId, storeId: o.storeId, at: o.at, status: o.status, total },
+    ...o.lines.map((l, i) => ({ PK, SK: `ITEM#${String(i + 1).padStart(3, '0')}`, type: 'line', orderId: o.orderId, n: i + 1, ...l })),
+  ]
+}
+async function getOrder(db: Db, orderId: number): Promise<Item | undefined> {
+  return db.get({ PK: `ORDER#${orderId}`, SK: 'ORDER' })
+}
+async function orderDetail(db: Db, orderId: number): Promise<Item[]> {
+  return (await db.scan()).filter(i => i.orderId === orderId).sort((a, b) => a.SK < b.SK ? -1 : 1)
+}
+</script>
+  <script type="wrong">
+// 明細分兩次讀：先 get 本體、再 query 品項
+function customerItem(c: Customer): Item {
+  return { PK: `CUSTOMER#${c.customerId}`, SK: 'PROFILE', type: 'customer', customerId: c.customerId, name: c.name }
+}
+function orderItems(o: Order): Item[] {
+  const PK = `ORDER#${o.orderId}`
+  const total = o.lines.reduce((sum, l) => sum + l.qty * l.price, 0)
+  return [
+    { PK, SK: 'ORDER', type: 'order', orderId: o.orderId, customerId: o.customerId, storeId: o.storeId, at: o.at, status: o.status, total },
+    ...o.lines.map((l, i) => ({ PK, SK: `ITEM#${String(i + 1).padStart(3, '0')}`, type: 'line', orderId: o.orderId, n: i + 1, ...l })),
+  ]
+}
+async function getOrder(db: Db, orderId: number): Promise<Item | undefined> {
+  return db.get({ PK: `ORDER#${orderId}`, SK: 'ORDER' })
+}
+async function orderDetail(db: Db, orderId: number): Promise<Item[]> {
+  const head = await db.get({ PK: `ORDER#${orderId}`, SK: 'ORDER' })
+  if (!head) return []
+  return [head, ...await db.query({ pk: `ORDER#${orderId}`, beginsWith: 'ITEM#' })]
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：主表的 key 已經寫好。在 <code>orderItems</code> 的訂單本體加上 GSI1、GSI2 的屬性（品項不要加），再實作存取模式 3～5，每個函式只能呼叫 1 次 <code>query</code>、不能用 <code>get</code>、<code>scan</code>，而且 query 讀到的每一筆都要是答案（不能讀出來再用 JS 篩選）。<code>recentOrders(db, customerId, n)</code>：最新的 n 筆訂單本體，新的在前。<code>ordersBetween(db, customerId, from, to)</code>：<code>from</code>、<code>to</code> 是 <code>YYYY-MM-DD</code>，兩天都包含，舊的在前。<code>pendingOrders(db, storeId, date)</code>：該門市在 <code>date</code> 那天（<code>at</code> 的前 10 個字，UTC）狀態是 pending 的訂單，舊的在前。測試的資料包含剛好落在日期邊界上的訂單。</p>
+  <script type="start">
+// GSI1：GSI1PK=CUSTOMER#<customerId>　GSI1SK=ORDER#<at>
+// GSI2：GSI2PK=STORE#<storeId>#<日期>　GSI2SK=STATUS#<status>#<at>
+
+function customerItem(c: Customer): Item {
+  return { PK: `CUSTOMER#${c.customerId}`, SK: 'PROFILE', type: 'customer', customerId: c.customerId, name: c.name }
+}
+
+function orderItems(o: Order): Item[] {
+  const PK = `ORDER#${o.orderId}`
+  const total = o.lines.reduce((sum, l) => sum + l.qty * l.price, 0)
+  return [
+    // 寫在這裡：訂單本體加上 GSI1PK、GSI1SK、GSI2PK、GSI2SK
+    { PK, SK: 'ORDER', type: 'order', orderId: o.orderId, customerId: o.customerId, storeId: o.storeId, at: o.at, status: o.status, total },
+    ...o.lines.map((l, i) => ({ PK, SK: `ITEM#${String(i + 1).padStart(3, '0')}`, type: 'line', orderId: o.orderId, n: i + 1, ...l })),
+  ]
+}
+
+async function recentOrders(db: Db, customerId: number, n: number): Promise<Item[]> {
+  // 寫在這裡
+  return []
+}
+
+async function ordersBetween(db: Db, customerId: number, from: string, to: string): Promise<Item[]> {
+  // 寫在這裡
+  return []
+}
+
+async function pendingOrders(db: Db, storeId: number, date: string): Promise<Item[]> {
+  // 寫在這裡
+  return []
+}
+
+console.log(orderItems({ orderId: 1043, customerId: 12, storeId: 4, at: '2026-10-31T08:15:00.000Z', status: 'pending',
+  lines: [{ productId: 2, name: '拿鐵', qty: 2, price: 110 }] })[0])
+</script>
+  <script type="answer">
+// GSI1：GSI1PK=CUSTOMER#<customerId>　GSI1SK=ORDER#<at>
+// GSI2：GSI2PK=STORE#<storeId>#<日期>　GSI2SK=STATUS#<status>#<at>
+
+function customerItem(c: Customer): Item {
+  return { PK: `CUSTOMER#${c.customerId}`, SK: 'PROFILE', type: 'customer', customerId: c.customerId, name: c.name }
+}
+
+function orderItems(o: Order): Item[] {
+  const PK = `ORDER#${o.orderId}`
+  const total = o.lines.reduce((sum, l) => sum + l.qty * l.price, 0)
+  return [
+    {
+      PK, SK: 'ORDER', type: 'order', orderId: o.orderId, customerId: o.customerId, storeId: o.storeId, at: o.at, status: o.status, total,
+      GSI1PK: `CUSTOMER#${o.customerId}`, GSI1SK: `ORDER#${o.at}`,
+      GSI2PK: `STORE#${o.storeId}#${o.at.slice(0, 10)}`, GSI2SK: `STATUS#${o.status}#${o.at}`,
+    },
+    ...o.lines.map((l, i) => ({ PK, SK: `ITEM#${String(i + 1).padStart(3, '0')}`, type: 'line', orderId: o.orderId, n: i + 1, ...l })),
+  ]
+}
+
+async function recentOrders(db: Db, customerId: number, n: number): Promise<Item[]> {
+  return db.query({ index: 'GSI1', pk: `CUSTOMER#${customerId}`, beginsWith: 'ORDER#', reverse: true, limit: n })
+}
+
+async function ordersBetween(db: Db, customerId: number, from: string, to: string): Promise<Item[]> {
+  return db.query({ index: 'GSI1', pk: `CUSTOMER#${customerId}`, between: [`ORDER#${from}`, `ORDER#${to}~`] })
+}
+
+async function pendingOrders(db: Db, storeId: number, date: string): Promise<Item[]> {
+  return db.query({ index: 'GSI2', pk: `STORE#${storeId}#${date}`, beginsWith: 'STATUS#pending#' })
+}
+
+console.log(orderItems({ orderId: 1043, customerId: 12, storeId: 4, at: '2026-10-31T08:15:00.000Z', status: 'pending',
+  lines: [{ productId: 2, name: '拿鐵', qty: 2, price: 110 }] })[0])
+</script>
+  <script type="tests">
+class Sim implements Db {
+  rows = new Map<string, Item>()
+  calls = { get: 0, put: 0, query: 0, scan: 0, transactWrite: 0 }
+  writes = new Map<string, number>()   // 主表每個 partition key 被寫了幾次
+  read = 0                             // query 一共回傳了幾筆
+  inFlight = 0
+  maxInFlight = 0
+  key(pk: string, sk: string) { return pk + '\u0000' + sk }
+  valid(item: Item) {
+    if (typeof item.PK !== 'string' || typeof item.SK !== 'string' || !item.PK || !item.SK) throw new Error(`item 的 PK、SK 要是非空字串：${JSON.stringify(item)}`)
+  }
+  wrote(pk: string) { this.writes.set(pk, (this.writes.get(pk) ?? 0) + 1) }
+  async get(k: { PK: string, SK: string }) {
+    this.calls.get++
+    await null
+    const it = this.rows.get(this.key(k.PK, k.SK))
+    return it && structuredClone(it)
+  }
+  async put(item: Item, opts: { condition?: Condition } = {}) {
+    this.calls.put++
+    this.valid(item)
+    const copy = structuredClone(item)
+    await null
+    const k = this.key(copy.PK, copy.SK)
+    if (opts.condition && this.rows.has(k)) throw Object.assign(new Error('The conditional request failed'), { name: 'ConditionalCheckFailedException' })
+    this.rows.set(k, copy)
+    this.wrote(copy.PK)
+  }
+  async query(q: QueryInput) {
+    this.calls.query++
+    this.inFlight++
+    this.maxInFlight = Math.max(this.maxInFlight, this.inFlight)
+    try {
+      await null
+      const pa = q.index ? q.index + 'PK' : 'PK', sa = q.index ? q.index + 'SK' : 'SK'
+      const sk = (it: Item) => it[sa] as string
+      let out = [...this.rows.values()].filter(it => it[pa] === q.pk && typeof it[sa] === 'string')
+      if (q.beginsWith !== undefined) { const p = q.beginsWith; out = out.filter(it => sk(it).startsWith(p)) }
+      if (q.between) { const [lo, hi] = q.between; out = out.filter(it => sk(it) >= lo && sk(it) <= hi) }
+      const cmp = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0
+      out.sort((a, b) => cmp(sk(a), sk(b)) || cmp(this.key(a.PK, a.SK), this.key(b.PK, b.SK)))
+      if (q.reverse) out.reverse()
+      if (q.limit !== undefined) out = out.slice(0, q.limit)
+      this.read += out.length
+      return out.map(it => structuredClone(it))
+    } finally {
+      this.inFlight--
+    }
+  }
+  async scan() {
+    this.calls.scan++
+    await null
+    return [...this.rows.values()].map(it => structuredClone(it))
+  }
+  async transactWrite(ops: { put: Item, condition?: Condition }[]) {
+    this.calls.transactWrite++
+    if (ops.length < 1 || ops.length > 100) throw new Error('一個交易要有 1～100 個動作')
+    ops.forEach(op => this.valid(op.put))
+    const keys = ops.map(op => this.key(op.put.PK, op.put.SK))
+    if (new Set(keys).size !== keys.length) throw Object.assign(new Error('同一個交易不能寫同一個 item 兩次'), { name: 'ValidationException' })
+    const copies = ops.map(op => structuredClone(op.put))
+    await null
+    const reasons = ops.map((op, i) => op.condition && this.rows.has(keys[i]) ? 'ConditionalCheckFailed' as const : 'None' as const)
+    if (reasons.includes('ConditionalCheckFailed')) throw Object.assign(new Error(`Transaction cancelled [${reasons.join(', ')}]`), { name: 'TransactionCanceledException', reasons })
+    copies.forEach((c, i) => { this.rows.set(keys[i], c); this.wrote(c.PK) })
+  }
+}
+const PRODUCTS: [number, string, number][] = [[1, '美式咖啡', 80], [2, '拿鐵', 110], [3, '卡布奇諾', 110], [4, '伯爵紅茶', 90], [5, '可頌', 70], [6, '起司蛋糕', 120]]
+const NAMES = ['王小明', '陳美華', '林志豪', '張雅婷', '李建國', '黃淑芬']
+let seed = 14
+const rnd = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return Math.floor(seed / 65536) % n }
+const T0 = Date.UTC(2026, 9, 1)
+const customers: Customer[] = Array.from({ length: 16 }, (_, i) => ({ customerId: 10 + i, name: NAMES[i % 6] }))
+const orders: Order[] = []
+const addOrder = (orderId: number, customerId: number, storeId: number, at: string, status: 'pending' | 'done', nLines: number) =>
+  orders.push({ orderId, customerId, storeId, at, status, lines: Array.from({ length: nLines }, (_, k) => {
+    const [productId, name, price] = PRODUCTS[(orderId + k) % 6]
+    return { productId, name, qty: 1 + rnd(2), price }
+  }) })
+for (let i = 0; i < 300; i++) addOrder(10 + i, 10 + rnd(16), 3 + rnd(3), new Date(T0 + i * 8_900_000 + rnd(60) * 1000).toISOString(), rnd(3) === 0 ? 'pending' : 'done', i % 25 === 0 ? 12 : 1 + rnd(3))
+// 邊界：剛好在範圍的頭尾、剛好在範圍外
+addOrder(400, 12, 3, '2026-10-05T00:00:00.000Z', 'done', 1)
+addOrder(401, 12, 3, '2026-10-12T23:59:59.999Z', 'done', 2)
+addOrder(402, 12, 3, '2026-10-04T23:59:59.999Z', 'done', 1)
+addOrder(403, 12, 3, '2026-10-13T00:00:00.000Z', 'done', 1)
+// 門市 4 在 10/20 很忙
+for (let k = 0; k < 12; k++) addOrder(410 + k, 10 + (k * 5) % 16, 4, `2026-10-20T${String(1 + k).padStart(2, '0')}:${String(k * 4).padStart(2, '0')}:00.000Z`, k % 3 === 2 ? 'done' : 'pending', 1 + (k % 2))
+const db = new Sim()
+for (const c of customers) await db.put(customerItem(c))
+for (const o of orders) for (const it of orderItems(o)) await db.put(it)
+const ids = (xs: Item[]) => xs.map(x => x.orderId).join(', ')
+const byAt = (a: Order, b: Order) => a.at < b.at ? -1 : 1
+async function once(name: string, fn: () => Promise<Item[]>) {
+  const before = { ...db.calls }, read = db.read
+  const out = await fn()
+  assert(db.calls.query - before.query === 1 && db.calls.get === before.get && db.calls.scan === before.scan,
+    `${name} 只能呼叫 1 次 query（不能用 get、scan），你呼叫了 query ${db.calls.query - before.query} 次、get ${db.calls.get - before.get} 次、scan ${db.calls.scan - before.scan} 次`)
+  assert.equal(db.read - read, out.length, `${name} 讀了 ${db.read - read} 筆、只回傳 ${out.length} 筆：讓 key 只選到答案，不要讀出來再篩選（多讀的都要付錢）`)
+  assert(out.every(x => x.type === 'order'), `${name} 只能回傳訂單本體，拿到了 ${out.filter(x => x.type !== 'order').map(x => x.type + ':' + x.SK).join('、')}：GSI 屬性只加在訂單本體上（稀疏索引）`)
+  return out
+}
+for (const [c, n] of [[10, 5], [12, 5], [25, 3], [17, 50]]) {
+  const want = orders.filter(o => o.customerId === c).sort(byAt).reverse().slice(0, n)
+  const got = await once(`recentOrders(db, ${c}, ${n})`, () => recentOrders(db, c, n))
+  assert.equal(ids(got), ids(want.map(o => ({ PK: '', SK: '', orderId: o.orderId }))), `recentOrders(db, ${c}, ${n}) 要是最新的 ${n} 筆、新的在前`)
+}
+for (const [c, from, to] of [[12, '2026-10-05', '2026-10-12'], [17, '2026-10-01', '2026-10-09'], [20, '2026-10-28', '2026-11-01']] as [number, string, string][]) {
+  const want = orders.filter(o => o.customerId === c && o.at.slice(0, 10) >= from && o.at.slice(0, 10) <= to).sort(byAt)
+  const got = await once(`ordersBetween(db, ${c}, '${from}', '${to}')`, () => ordersBetween(db, c, from, to))
+  assert.equal(ids(got), want.map(o => o.orderId).join(', '), `ordersBetween(db, ${c}, '${from}', '${to}') 要包含頭尾兩天整天的訂單、舊的在前：注意 between 的上界、日期格式要能照字串排序`)
+}
+for (const [s, date] of [[4, '2026-10-20'], [3, '2026-10-07'], [5, '2026-10-25']] as [number, string][]) {
+  const want = orders.filter(o => o.storeId === s && o.at.slice(0, 10) === date && o.status === 'pending').sort(byAt)
+  const got = await once(`pendingOrders(db, ${s}, '${date}')`, () => pendingOrders(db, s, date))
+  assert.equal(ids(got), want.map(o => o.orderId).join(', '), `pendingOrders(db, ${s}, '${date}') 要是門市 ${s} 在 ${date} 待做的訂單、舊的在前`)
+}
+console.log('✓ GSI 設計通過：三種查法都只用 1 次 query，而且沒有多讀')
+</script>
+  <script type="wrong">
+// 日期沒有補零：2026-10-5 在字串順序裡比 2026-10-12 大
+function customerItem(c: Customer): Item {
+  return { PK: `CUSTOMER#${c.customerId}`, SK: 'PROFILE', type: 'customer', customerId: c.customerId, name: c.name }
+}
+const day = (at: string) => { const d = new Date(at); return `${d.getUTCFullYear()}-${d.getUTCMonth() + 1}-${d.getUTCDate()}` }
+const unpad = (date: string) => date.split('-').map(Number).join('-')
+function orderItems(o: Order): Item[] {
+  const PK = `ORDER#${o.orderId}`
+  const total = o.lines.reduce((sum, l) => sum + l.qty * l.price, 0)
+  return [
+    {
+      PK, SK: 'ORDER', type: 'order', orderId: o.orderId, customerId: o.customerId, storeId: o.storeId, at: o.at, status: o.status, total,
+      GSI1PK: `CUSTOMER#${o.customerId}`, GSI1SK: `ORDER#${day(o.at)}#${o.at.slice(11)}`,
+      GSI2PK: `STORE#${o.storeId}#${o.at.slice(0, 10)}`, GSI2SK: `STATUS#${o.status}#${o.at}`,
+    },
+    ...o.lines.map((l, i) => ({ PK, SK: `ITEM#${String(i + 1).padStart(3, '0')}`, type: 'line', orderId: o.orderId, n: i + 1, ...l })),
+  ]
+}
+async function recentOrders(db: Db, customerId: number, n: number): Promise<Item[]> {
+  return db.query({ index: 'GSI1', pk: `CUSTOMER#${customerId}`, beginsWith: 'ORDER#', reverse: true, limit: n })
+}
+async function ordersBetween(db: Db, customerId: number, from: string, to: string): Promise<Item[]> {
+  return db.query({ index: 'GSI1', pk: `CUSTOMER#${customerId}`, between: [`ORDER#${unpad(from)}`, `ORDER#${unpad(to)}~`] })
+}
+async function pendingOrders(db: Db, storeId: number, date: string): Promise<Item[]> {
+  return db.query({ index: 'GSI2', pk: `STORE#${storeId}#${date}`, beginsWith: 'STATUS#pending#' })
+}
+</script>
+  <script type="wrong">
+// between 的上界沒有包住整天
+function customerItem(c: Customer): Item {
+  return { PK: `CUSTOMER#${c.customerId}`, SK: 'PROFILE', type: 'customer', customerId: c.customerId, name: c.name }
+}
+function orderItems(o: Order): Item[] {
+  const PK = `ORDER#${o.orderId}`
+  const total = o.lines.reduce((sum, l) => sum + l.qty * l.price, 0)
+  return [
+    {
+      PK, SK: 'ORDER', type: 'order', orderId: o.orderId, customerId: o.customerId, storeId: o.storeId, at: o.at, status: o.status, total,
+      GSI1PK: `CUSTOMER#${o.customerId}`, GSI1SK: `ORDER#${o.at}`,
+      GSI2PK: `STORE#${o.storeId}#${o.at.slice(0, 10)}`, GSI2SK: `STATUS#${o.status}#${o.at}`,
+    },
+    ...o.lines.map((l, i) => ({ PK, SK: `ITEM#${String(i + 1).padStart(3, '0')}`, type: 'line', orderId: o.orderId, n: i + 1, ...l })),
+  ]
+}
+async function recentOrders(db: Db, customerId: number, n: number): Promise<Item[]> {
+  return db.query({ index: 'GSI1', pk: `CUSTOMER#${customerId}`, beginsWith: 'ORDER#', reverse: true, limit: n })
+}
+async function ordersBetween(db: Db, customerId: number, from: string, to: string): Promise<Item[]> {
+  return db.query({ index: 'GSI1', pk: `CUSTOMER#${customerId}`, between: [`ORDER#${from}`, `ORDER#${to}`] })
+}
+async function pendingOrders(db: Db, storeId: number, date: string): Promise<Item[]> {
+  return db.query({ index: 'GSI2', pk: `STORE#${storeId}#${date}`, beginsWith: 'STATUS#pending#' })
+}
+</script>
+  <script type="wrong">
+// 門市待做訂單沒有自己的 GSI：逐一查每位顧客再篩選
+function customerItem(c: Customer): Item {
+  return { PK: `CUSTOMER#${c.customerId}`, SK: 'PROFILE', type: 'customer', customerId: c.customerId, name: c.name }
+}
+function orderItems(o: Order): Item[] {
+  const PK = `ORDER#${o.orderId}`
+  const total = o.lines.reduce((sum, l) => sum + l.qty * l.price, 0)
+  return [
+    {
+      PK, SK: 'ORDER', type: 'order', orderId: o.orderId, customerId: o.customerId, storeId: o.storeId, at: o.at, status: o.status, total,
+      GSI1PK: `CUSTOMER#${o.customerId}`, GSI1SK: `ORDER#${o.at}`,
+    },
+    ...o.lines.map((l, i) => ({ PK, SK: `ITEM#${String(i + 1).padStart(3, '0')}`, type: 'line', orderId: o.orderId, n: i + 1, ...l })),
+  ]
+}
+async function recentOrders(db: Db, customerId: number, n: number): Promise<Item[]> {
+  return db.query({ index: 'GSI1', pk: `CUSTOMER#${customerId}`, beginsWith: 'ORDER#', reverse: true, limit: n })
+}
+async function ordersBetween(db: Db, customerId: number, from: string, to: string): Promise<Item[]> {
+  return db.query({ index: 'GSI1', pk: `CUSTOMER#${customerId}`, between: [`ORDER#${from}`, `ORDER#${to}~`] })
+}
+async function pendingOrders(db: Db, storeId: number, date: string): Promise<Item[]> {
+  const all: Item[] = []
+  for (let c = 10; c < 26; c++) all.push(...await db.query({ index: 'GSI1', pk: `CUSTOMER#${c}`, beginsWith: `ORDER#${date}` }))
+  return all.filter(o => o.storeId === storeId && o.status === 'pending').sort((a, b) => String(a.at) < String(b.at) ? -1 : 1)
+}
+</script>
+  <script type="wrong">
+// GSI2 的 sort key 只放時間，讀出來再篩掉 done
+function customerItem(c: Customer): Item {
+  return { PK: `CUSTOMER#${c.customerId}`, SK: 'PROFILE', type: 'customer', customerId: c.customerId, name: c.name }
+}
+function orderItems(o: Order): Item[] {
+  const PK = `ORDER#${o.orderId}`
+  const total = o.lines.reduce((sum, l) => sum + l.qty * l.price, 0)
+  return [
+    {
+      PK, SK: 'ORDER', type: 'order', orderId: o.orderId, customerId: o.customerId, storeId: o.storeId, at: o.at, status: o.status, total,
+      GSI1PK: `CUSTOMER#${o.customerId}`, GSI1SK: `ORDER#${o.at}`,
+      GSI2PK: `STORE#${o.storeId}#${o.at.slice(0, 10)}`, GSI2SK: o.at,
+    },
+    ...o.lines.map((l, i) => ({ PK, SK: `ITEM#${String(i + 1).padStart(3, '0')}`, type: 'line', orderId: o.orderId, n: i + 1, ...l })),
+  ]
+}
+async function recentOrders(db: Db, customerId: number, n: number): Promise<Item[]> {
+  return db.query({ index: 'GSI1', pk: `CUSTOMER#${customerId}`, beginsWith: 'ORDER#', reverse: true, limit: n })
+}
+async function ordersBetween(db: Db, customerId: number, from: string, to: string): Promise<Item[]> {
+  return db.query({ index: 'GSI1', pk: `CUSTOMER#${customerId}`, between: [`ORDER#${from}`, `ORDER#${to}~`] })
+}
+async function pendingOrders(db: Db, storeId: number, date: string): Promise<Item[]> {
+  return (await db.query({ index: 'GSI2', pk: `STORE#${storeId}#${date}` })).filter(o => o.status === 'pending')
+}
+</script>
+  <script type="wrong">
+// 品項也加了 GSI1 屬性：顧客的訂單列表混進品項
+function customerItem(c: Customer): Item {
+  return { PK: `CUSTOMER#${c.customerId}`, SK: 'PROFILE', type: 'customer', customerId: c.customerId, name: c.name }
+}
+function orderItems(o: Order): Item[] {
+  const PK = `ORDER#${o.orderId}`
+  const total = o.lines.reduce((sum, l) => sum + l.qty * l.price, 0)
+  const gsi1 = { GSI1PK: `CUSTOMER#${o.customerId}`, GSI1SK: `ORDER#${o.at}` }
+  return [
+    {
+      PK, SK: 'ORDER', type: 'order', orderId: o.orderId, customerId: o.customerId, storeId: o.storeId, at: o.at, status: o.status, total, ...gsi1,
+      GSI2PK: `STORE#${o.storeId}#${o.at.slice(0, 10)}`, GSI2SK: `STATUS#${o.status}#${o.at}`,
+    },
+    ...o.lines.map((l, i) => ({ PK, SK: `ITEM#${String(i + 1).padStart(3, '0')}`, type: 'line', orderId: o.orderId, n: i + 1, ...l, ...gsi1 })),
+  ]
+}
+async function recentOrders(db: Db, customerId: number, n: number): Promise<Item[]> {
+  return db.query({ index: 'GSI1', pk: `CUSTOMER#${customerId}`, beginsWith: 'ORDER#', reverse: true, limit: n })
+}
+async function ordersBetween(db: Db, customerId: number, from: string, to: string): Promise<Item[]> {
+  return db.query({ index: 'GSI1', pk: `CUSTOMER#${customerId}`, between: [`ORDER#${from}`, `ORDER#${to}~`] })
+}
+async function pendingOrders(db: Db, storeId: number, date: string): Promise<Item[]> {
+  return db.query({ index: 'GSI2', pk: `STORE#${storeId}#${date}`, beginsWith: 'STATUS#pending#' })
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：營運要一張「今天全部訂單」的即時看板，有人提議用 <code>PK=ORDERS#&lt;日期&gt;</code>。改用寫入分片：實作 <code>shardKey(date, orderId, shards)</code>，回傳這筆訂單要寫入的 partition key（同一筆訂單每次都要算出同一個 key，不同日期的 key 不能相同）；再實作 <code>queryAllShards(db, date, shards)</code>，<strong>平行</strong>查詢那天的每一片（剛好 <code>shards</code> 次 query、不能用 scan），合併成依 SK 排序的一個陣列。測試寫入的 item 長這樣：<code>{ PK: shardKey(date, orderId, shards), SK: `${at}#${orderId}`, orderId, at }</code>；它會用 10 片寫入 10,000 筆同一天的訂單，檢查最熱的 key 佔全部寫入的比例低於 2 ÷ 片數，並用 <code>get</code> 依 key 找回指定的訂單。</p>
+  <script type="start">
+function shardKey(date: string, orderId: number, shards: number): string {
+  // 寫在這裡
+  return `ORDERS#${date}`
+}
+
+async function queryAllShards(db: Db, date: string, shards: number): Promise<Item[]> {
+  // 寫在這裡
+  return []
+}
+
+console.log(shardKey('2026-11-01', 1043, 10), shardKey('2026-11-01', 1044, 10))
+</script>
+  <script type="answer">
+function shardKey(date: string, orderId: number, shards: number): string {
+  return `ORDERS#${date}#${orderId % shards}`
+}
+
+async function queryAllShards(db: Db, date: string, shards: number): Promise<Item[]> {
+  const parts = await Promise.all(Array.from({ length: shards }, (_, i) => db.query({ pk: `ORDERS#${date}#${i}` })))
+  return parts.flat().sort((a, b) => a.SK < b.SK ? -1 : a.SK > b.SK ? 1 : 0)
+}
+
+console.log(shardKey('2026-11-01', 1043, 10), shardKey('2026-11-01', 1044, 10))
+</script>
+  <script type="tests">
+class Sim implements Db {
+  rows = new Map<string, Item>()
+  calls = { get: 0, put: 0, query: 0, scan: 0, transactWrite: 0 }
+  writes = new Map<string, number>()   // 主表每個 partition key 被寫了幾次
+  read = 0                             // query 一共回傳了幾筆
+  inFlight = 0
+  maxInFlight = 0
+  key(pk: string, sk: string) { return pk + '\u0000' + sk }
+  valid(item: Item) {
+    if (typeof item.PK !== 'string' || typeof item.SK !== 'string' || !item.PK || !item.SK) throw new Error(`item 的 PK、SK 要是非空字串：${JSON.stringify(item)}`)
+  }
+  wrote(pk: string) { this.writes.set(pk, (this.writes.get(pk) ?? 0) + 1) }
+  async get(k: { PK: string, SK: string }) {
+    this.calls.get++
+    await null
+    const it = this.rows.get(this.key(k.PK, k.SK))
+    return it && structuredClone(it)
+  }
+  async put(item: Item, opts: { condition?: Condition } = {}) {
+    this.calls.put++
+    this.valid(item)
+    const copy = structuredClone(item)
+    await null
+    const k = this.key(copy.PK, copy.SK)
+    if (opts.condition && this.rows.has(k)) throw Object.assign(new Error('The conditional request failed'), { name: 'ConditionalCheckFailedException' })
+    this.rows.set(k, copy)
+    this.wrote(copy.PK)
+  }
+  async query(q: QueryInput) {
+    this.calls.query++
+    this.inFlight++
+    this.maxInFlight = Math.max(this.maxInFlight, this.inFlight)
+    try {
+      await null
+      const pa = q.index ? q.index + 'PK' : 'PK', sa = q.index ? q.index + 'SK' : 'SK'
+      const sk = (it: Item) => it[sa] as string
+      let out = [...this.rows.values()].filter(it => it[pa] === q.pk && typeof it[sa] === 'string')
+      if (q.beginsWith !== undefined) { const p = q.beginsWith; out = out.filter(it => sk(it).startsWith(p)) }
+      if (q.between) { const [lo, hi] = q.between; out = out.filter(it => sk(it) >= lo && sk(it) <= hi) }
+      const cmp = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0
+      out.sort((a, b) => cmp(sk(a), sk(b)) || cmp(this.key(a.PK, a.SK), this.key(b.PK, b.SK)))
+      if (q.reverse) out.reverse()
+      if (q.limit !== undefined) out = out.slice(0, q.limit)
+      this.read += out.length
+      return out.map(it => structuredClone(it))
+    } finally {
+      this.inFlight--
+    }
+  }
+  async scan() {
+    this.calls.scan++
+    await null
+    return [...this.rows.values()].map(it => structuredClone(it))
+  }
+  async transactWrite(ops: { put: Item, condition?: Condition }[]) {
+    this.calls.transactWrite++
+    if (ops.length < 1 || ops.length > 100) throw new Error('一個交易要有 1～100 個動作')
+    ops.forEach(op => this.valid(op.put))
+    const keys = ops.map(op => this.key(op.put.PK, op.put.SK))
+    if (new Set(keys).size !== keys.length) throw Object.assign(new Error('同一個交易不能寫同一個 item 兩次'), { name: 'ValidationException' })
+    const copies = ops.map(op => structuredClone(op.put))
+    await null
+    const reasons = ops.map((op, i) => op.condition && this.rows.has(keys[i]) ? 'ConditionalCheckFailed' as const : 'None' as const)
+    if (reasons.includes('ConditionalCheckFailed')) throw Object.assign(new Error(`Transaction cancelled [${reasons.join(', ')}]`), { name: 'TransactionCanceledException', reasons })
+    copies.forEach((c, i) => { this.rows.set(keys[i], c); this.wrote(c.PK) })
+  }
+}
+const T = Date.UTC(2026, 10, 1)
+for (const [shards, count] of [[10, 10000], [8, 2000]]) {
+  const db = new Sim()
+  const date = '2026-11-01'
+  for (let i = 0; i < count; i++) {
+    const orderId = 10 + i, at = new Date(T + i * 8000).toISOString()
+    await db.put({ PK: shardKey(date, orderId, shards), SK: `${at}#${orderId}`, orderId, at })
+  }
+  for (let i = 0; i < 300; i++) {
+    const orderId = 50000 + i, at = new Date(T + 86_400_000 + i * 1000).toISOString()
+    await db.put({ PK: shardKey('2026-11-02', orderId, shards), SK: `${at}#${orderId}`, orderId, at })
+  }
+  for (const id of [10, 1043, 1044, 2009]) {
+    const k = shardKey(date, id, shards)
+    for (let r = 0; r < 3; r++) assert.equal(shardKey(date, id, shards), k, `shardKey('${date}', ${id}, ${shards}) 每次都要算出同一個 key：不能用 Math.random，否則之後找不到這筆訂單`)
+    const at = new Date(T + (id - 10) * 8000).toISOString()
+    const it = await db.get({ PK: k, SK: `${at}#${id}` })
+    assert(it?.orderId === id, `用 shardKey 算出的 key 要能 get 回訂單 ${id}`)
+  }
+  assert(shardKey(date, 1043, shards) !== shardKey('2026-11-02', 1043, shards), '不同日期的 key 不能相同：key 裡要有日期')
+  const keys = [...new Set([...db.rows.values()].filter(r => String(r.at).startsWith(date)).map(r => r.PK))]
+  const hottest = Math.max(...keys.map(k => db.writes.get(k)!))
+  assert(keys.length > 1, `${count} 筆同一天的訂單全部寫進同一個 key（${keys[0]}）：這就是熱分區，key 要加上分片後綴`)
+  assert(keys.length <= shards, `${shards} 片應該最多 ${shards} 個 key，你產生了 ${keys.length} 個：後綴要落在 0～${shards - 1}`)
+  assert(hottest / count < 2 / shards, `最熱的 key 寫了 ${hottest} 筆，佔 ${(hottest / count * 100).toFixed(1)}%，要低於 ${(200 / shards).toFixed(1)}%：後綴要讓訂單平均分散`)
+  db.maxInFlight = 0
+  const before = { ...db.calls }
+  const got = await queryAllShards(db, date, shards)
+  assert(db.calls.query - before.query === shards && db.calls.scan === before.scan && db.calls.get === before.get, `queryAllShards 要剛好 ${shards} 次 query、不能用 scan、get，你呼叫了 query ${db.calls.query - before.query} 次、scan ${db.calls.scan - before.scan} 次`)
+  assert.equal(db.maxInFlight, shards, `${shards} 個 query 要同時送出（Promise.all），你最多同時只有 ${db.maxInFlight} 個在跑`)
+  assert.equal(got.length, count, `${date} 有 ${count} 筆訂單，queryAllShards 拿到 ${got.length} 筆`)
+  for (let i = 1; i < got.length; i++) assert(got[i - 1].SK < got[i].SK, `合併後要依 SK 排序：第 ${i} 筆 ${got[i - 1].SK} 排在 ${got[i].SK} 前面。每一片各自有序，接起來不是整體有序`)
+}
+console.log('✓ 寫入分片通過：寫入平均分散，讀取平行查完再合併排序')
+</script>
+  <script type="wrong">
+// 用 Math.random 分片：寫入很平均，但之後找不到特定訂單
+function shardKey(date: string, orderId: number, shards: number): string {
+  return `ORDERS#${date}#${Math.floor(Math.random() * shards)}`
+}
+async function queryAllShards(db: Db, date: string, shards: number): Promise<Item[]> {
+  const parts = await Promise.all(Array.from({ length: shards }, (_, i) => db.query({ pk: `ORDERS#${date}#${i}` })))
+  return parts.flat().sort((a, b) => a.SK < b.SK ? -1 : a.SK > b.SK ? 1 : 0)
+}
+</script>
+  <script type="wrong">
+// 沒有分片：全部寫進同一個 key
+function shardKey(date: string, orderId: number, shards: number): string {
+  return `ORDERS#${date}`
+}
+async function queryAllShards(db: Db, date: string, shards: number): Promise<Item[]> {
+  const parts = await Promise.all(Array.from({ length: shards }, (_, i) => i === 0 ? db.query({ pk: `ORDERS#${date}` }) : Promise.resolve([] as Item[])))
+  return parts.flat()
+}
+</script>
+  <script type="wrong">
+// 合併時沒有重新排序
+function shardKey(date: string, orderId: number, shards: number): string {
+  return `ORDERS#${date}#${orderId % shards}`
+}
+async function queryAllShards(db: Db, date: string, shards: number): Promise<Item[]> {
+  const parts = await Promise.all(Array.from({ length: shards }, (_, i) => db.query({ pk: `ORDERS#${date}#${i}` })))
+  return parts.flat()
+}
+</script>
+  <script type="wrong">
+// 一片查完才查下一片
+function shardKey(date: string, orderId: number, shards: number): string {
+  return `ORDERS#${date}#${orderId % shards}`
+}
+async function queryAllShards(db: Db, date: string, shards: number): Promise<Item[]> {
+  const all: Item[] = []
+  for (let i = 0; i < shards; i++) all.push(...await db.query({ pk: `ORDERS#${date}#${i}` }))
+  return all.sort((a, b) => a.SK < b.SK ? -1 : a.SK > b.SK ? 1 : 0)
+}
+</script>
+  <script type="wrong">
+// key 裡沒有日期：今天和明天的訂單混在一起
+function shardKey(date: string, orderId: number, shards: number): string {
+  return `ORDERS#${orderId % shards}`
+}
+async function queryAllShards(db: Db, date: string, shards: number): Promise<Item[]> {
+  const parts = await Promise.all(Array.from({ length: shards }, (_, i) => db.query({ pk: `ORDERS#${i}`, beginsWith: date })))
+  return parts.flat().sort((a, b) => a.SK < b.SK ? -1 : a.SK > b.SK ? 1 : 0)
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 4：實作 <code>registerCoupon(db, code, customerId)</code>。一個優惠碼只能被一個人領，一位顧客只能領一張。用一次 <code>transactWrite</code> 同時寫兩個 item，兩個都加上 <code>condition: 'attribute_not_exists(PK)'</code>：<code>{ PK: `COUPON#${code}`, SK: 'COUPON', code, customerId }</code> 和 <code>{ PK: `CUSTOMER#${customerId}`, SK: 'COUPON', code, customerId }</code>。成功回傳 <code>'ok'</code>；交易被取消時讀一次這張碼，主人就是這位顧客（重送的請求）就回傳 <code>'already-mine'</code>，否則把錯誤丟出去。測試會同時送出 100 個請求（同碼不同人、同人不同碼、同一個請求重送），檢查每個請求的結果，以及表裡的優惠碼和顧客標記是否一一對應。</p>
+  <script type="start">
+async function registerCoupon(db: Db, code: string, customerId: number): Promise<'ok' | 'already-mine'> {
+  // 寫在這裡
+  return 'ok'
+}
+</script>
+  <script type="answer">
+async function registerCoupon(db: Db, code: string, customerId: number): Promise<'ok' | 'already-mine'> {
+  try {
+    await db.transactWrite([
+      { put: { PK: `COUPON#${code}`, SK: 'COUPON', code, customerId }, condition: 'attribute_not_exists(PK)' },
+      { put: { PK: `CUSTOMER#${customerId}`, SK: 'COUPON', code, customerId }, condition: 'attribute_not_exists(PK)' },
+    ])
+    return 'ok'
+  } catch (e) {
+    if ((e as DynamoError).name !== 'TransactionCanceledException') throw e
+    const coupon = await db.get({ PK: `COUPON#${code}`, SK: 'COUPON' })
+    if (coupon?.customerId === customerId) return 'already-mine'
+    throw e
+  }
+}
+</script>
+  <script type="tests">
+class Sim implements Db {
+  rows = new Map<string, Item>()
+  calls = { get: 0, put: 0, query: 0, scan: 0, transactWrite: 0 }
+  writes = new Map<string, number>()   // 主表每個 partition key 被寫了幾次
+  read = 0                             // query 一共回傳了幾筆
+  inFlight = 0
+  maxInFlight = 0
+  key(pk: string, sk: string) { return pk + '\u0000' + sk }
+  valid(item: Item) {
+    if (typeof item.PK !== 'string' || typeof item.SK !== 'string' || !item.PK || !item.SK) throw new Error(`item 的 PK、SK 要是非空字串：${JSON.stringify(item)}`)
+  }
+  wrote(pk: string) { this.writes.set(pk, (this.writes.get(pk) ?? 0) + 1) }
+  async get(k: { PK: string, SK: string }) {
+    this.calls.get++
+    await null
+    const it = this.rows.get(this.key(k.PK, k.SK))
+    return it && structuredClone(it)
+  }
+  async put(item: Item, opts: { condition?: Condition } = {}) {
+    this.calls.put++
+    this.valid(item)
+    const copy = structuredClone(item)
+    await null
+    const k = this.key(copy.PK, copy.SK)
+    if (opts.condition && this.rows.has(k)) throw Object.assign(new Error('The conditional request failed'), { name: 'ConditionalCheckFailedException' })
+    this.rows.set(k, copy)
+    this.wrote(copy.PK)
+  }
+  async query(q: QueryInput) {
+    this.calls.query++
+    this.inFlight++
+    this.maxInFlight = Math.max(this.maxInFlight, this.inFlight)
+    try {
+      await null
+      const pa = q.index ? q.index + 'PK' : 'PK', sa = q.index ? q.index + 'SK' : 'SK'
+      const sk = (it: Item) => it[sa] as string
+      let out = [...this.rows.values()].filter(it => it[pa] === q.pk && typeof it[sa] === 'string')
+      if (q.beginsWith !== undefined) { const p = q.beginsWith; out = out.filter(it => sk(it).startsWith(p)) }
+      if (q.between) { const [lo, hi] = q.between; out = out.filter(it => sk(it) >= lo && sk(it) <= hi) }
+      const cmp = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0
+      out.sort((a, b) => cmp(sk(a), sk(b)) || cmp(this.key(a.PK, a.SK), this.key(b.PK, b.SK)))
+      if (q.reverse) out.reverse()
+      if (q.limit !== undefined) out = out.slice(0, q.limit)
+      this.read += out.length
+      return out.map(it => structuredClone(it))
+    } finally {
+      this.inFlight--
+    }
+  }
+  async scan() {
+    this.calls.scan++
+    await null
+    return [...this.rows.values()].map(it => structuredClone(it))
+  }
+  async transactWrite(ops: { put: Item, condition?: Condition }[]) {
+    this.calls.transactWrite++
+    if (ops.length < 1 || ops.length > 100) throw new Error('一個交易要有 1～100 個動作')
+    ops.forEach(op => this.valid(op.put))
+    const keys = ops.map(op => this.key(op.put.PK, op.put.SK))
+    if (new Set(keys).size !== keys.length) throw Object.assign(new Error('同一個交易不能寫同一個 item 兩次'), { name: 'ValidationException' })
+    const copies = ops.map(op => structuredClone(op.put))
+    await null
+    const reasons = ops.map((op, i) => op.condition && this.rows.has(keys[i]) ? 'ConditionalCheckFailed' as const : 'None' as const)
+    if (reasons.includes('ConditionalCheckFailed')) throw Object.assign(new Error(`Transaction cancelled [${reasons.join(', ')}]`), { name: 'TransactionCanceledException', reasons })
+    copies.forEach((c, i) => { this.rows.set(keys[i], c); this.wrote(c.PK) })
+  }
+}
+const db = new Sim()
+const reqs: [string, number][] = []
+for (let i = 0; i < 100; i++) reqs.push(i % 10 === 9 ? reqs[i - 1] : [`LATTE${10 + (i * 7) % 23}`, 10 + (i * 11) % 31])
+const owner = new Map<string, number>(), has = new Set<number>()
+const want = reqs.map(([code, c]) => {
+  if (!owner.has(code) && !has.has(c)) { owner.set(code, c); has.add(c); return 'ok' }
+  return owner.get(code) === c ? 'already-mine' : 'error'
+})
+const got = await Promise.allSettled(reqs.map(([code, c]) => registerCoupon(db, code, c)))
+got.forEach((r, i) => {
+  const [code, c] = reqs[i]
+  const actual = r.status === 'fulfilled' ? r.value : 'error'
+  assert.equal(actual, want[i], `第 ${i + 1} 個請求（顧客 ${c} 領 ${code}）應該是 ${want[i] === 'error' ? '丟出錯誤' : `'${want[i]}'`}，結果是 ${actual === 'error' ? '丟出錯誤' : `'${actual}'`}`)
+  if (r.status === 'rejected') {
+    const name = (r.reason as Error)?.name
+    assert(name === 'TransactionCanceledException' || name === 'ConditionalCheckFailedException', `條件不成立時要把資料庫的錯誤丟出去，第 ${i + 1} 個請求丟出的是 ${name}：${(r.reason as Error)?.message}`)
+  }
+})
+const coupons = [...db.rows.values()].filter(r => r.PK.startsWith('COUPON#'))
+const marks = [...db.rows.values()].filter(r => r.PK.startsWith('CUSTOMER#') && r.SK === 'COUPON')
+assert.equal(coupons.length, owner.size, `表裡有 ${coupons.length} 張被領走的優惠碼，應該是 ${owner.size} 張`)
+for (const cp of coupons) {
+  const mark = marks.find(m => m.PK === `CUSTOMER#${cp.customerId}`)
+  assert(mark?.code === cp.code, `優惠碼 ${cp.code} 記錄的主人是顧客 ${cp.customerId}，但這位顧客的標記是 ${mark ? mark.code : '沒有'}：兩個 item 要在同一個交易裡一起成功或一起失敗`)
+}
+assert.equal(marks.length, coupons.length, '顧客標記和優惠碼的數量要一樣')
+assert(db.calls.transactWrite >= 100, '每個請求都要用 transactWrite 寫入')
+console.log(`✓ 唯一性通過：100 個並發請求，${owner.size} 張碼各有一位主人`)
+</script>
+  <script type="wrong">
+// 先 get 再 put：並發時兩個請求都查到「沒有人領過」
+async function registerCoupon(db: Db, code: string, customerId: number): Promise<'ok' | 'already-mine'> {
+  const coupon = await db.get({ PK: `COUPON#${code}`, SK: 'COUPON' })
+  const mark = await db.get({ PK: `CUSTOMER#${customerId}`, SK: 'COUPON' })
+  if (coupon?.customerId === customerId) return 'already-mine'
+  if (coupon || mark) throw Object.assign(new Error('已經被領走了'), { name: 'TransactionCanceledException' })
+  await db.transactWrite([
+    { put: { PK: `COUPON#${code}`, SK: 'COUPON', code, customerId } },
+    { put: { PK: `CUSTOMER#${customerId}`, SK: 'COUPON', code, customerId } },
+  ])
+  return 'ok'
+}
+</script>
+  <script type="wrong">
+// 只檢查優惠碼，沒檢查顧客
+async function registerCoupon(db: Db, code: string, customerId: number): Promise<'ok' | 'already-mine'> {
+  try {
+    await db.transactWrite([
+      { put: { PK: `COUPON#${code}`, SK: 'COUPON', code, customerId }, condition: 'attribute_not_exists(PK)' },
+      { put: { PK: `CUSTOMER#${customerId}`, SK: 'COUPON', code, customerId } },
+    ])
+    return 'ok'
+  } catch (e) {
+    const coupon = await db.get({ PK: `COUPON#${code}`, SK: 'COUPON' })
+    if (coupon?.customerId === customerId) return 'already-mine'
+    throw e
+  }
+}
+</script>
+  <script type="wrong">
+// 只檢查顧客，沒檢查優惠碼：後來的人把碼的主人蓋掉
+async function registerCoupon(db: Db, code: string, customerId: number): Promise<'ok' | 'already-mine'> {
+  try {
+    await db.transactWrite([
+      { put: { PK: `COUPON#${code}`, SK: 'COUPON', code, customerId } },
+      { put: { PK: `CUSTOMER#${customerId}`, SK: 'COUPON', code, customerId }, condition: 'attribute_not_exists(PK)' },
+    ])
+    return 'ok'
+  } catch (e) {
+    const coupon = await db.get({ PK: `COUPON#${code}`, SK: 'COUPON' })
+    if (coupon?.customerId === customerId) return 'already-mine'
+    throw e
+  }
+}
+</script>
+  <script type="wrong">
+// 交易失敗一律當成「已經領過」：別人的碼也回報成功
+async function registerCoupon(db: Db, code: string, customerId: number): Promise<'ok' | 'already-mine'> {
+  try {
+    await db.transactWrite([
+      { put: { PK: `COUPON#${code}`, SK: 'COUPON', code, customerId }, condition: 'attribute_not_exists(PK)' },
+      { put: { PK: `CUSTOMER#${customerId}`, SK: 'COUPON', code, customerId }, condition: 'attribute_not_exists(PK)' },
+    ])
+    return 'ok'
+  } catch {
+    return 'already-mine'
+  }
+}
+</script>
+  <script type="wrong">
+// 兩個 put 分開寫：第一個成功、第二個失敗時，留下對不上的資料
+async function registerCoupon(db: Db, code: string, customerId: number): Promise<'ok' | 'already-mine'> {
+  try {
+    await db.put({ PK: `COUPON#${code}`, SK: 'COUPON', code, customerId }, { condition: 'attribute_not_exists(PK)' })
+    await db.put({ PK: `CUSTOMER#${customerId}`, SK: 'COUPON', code, customerId }, { condition: 'attribute_not_exists(PK)' })
+    return 'ok'
+  } catch (e) {
+    const coupon = await db.get({ PK: `COUPON#${code}`, SK: 'COUPON' })
+    if (coupon?.customerId === customerId) return 'already-mine'
+    throw e
+  }
+}
+</script>
+  <script type="wrong">
+// 不處理重送：同一個請求再來一次就回報失敗
+async function registerCoupon(db: Db, code: string, customerId: number): Promise<'ok' | 'already-mine'> {
+  await db.transactWrite([
+    { put: { PK: `COUPON#${code}`, SK: 'COUPON', code, customerId }, condition: 'attribute_not_exists(PK)' },
+    { put: { PK: `CUSTOMER#${customerId}`, SK: 'COUPON', code, customerId }, condition: 'attribute_not_exists(PK)' },
+  ])
+  return 'ok'
+}
+</script>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：DynamoDB 表的設計應該從哪裡開始？</p>
+  <label data-key="a">先畫實體關係圖並正規化，一個實體一張表</label>
+  <label data-key="b">先列出所有存取模式，再設計 key 與索引</label>
+  <label data-key="c">先建表，上線後看慢查詢再加索引</label>
+  <label data-key="d">先決定要買多少 RCU、WCU</label>
+  <p class="why">✓ DynamoDB 只能有效率地依 key 查詢，不知道有哪些查詢就無法設計 key。a 是關聯式資料庫的順序，在沒有 JOIN 的 DynamoDB 會變成一次頁面要查好幾張表；c 在 DynamoDB 不成立：key 設計錯時加索引救不了，要搬資料；d 的容量要從存取模式的頻率估出來，是後面的步驟。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：每天的所有訂單都寫到 <code>PK = ORDERS#&lt;日期&gt;</code>、SK 是時間，尖峰每秒 3,000 筆。會發生什麼？</p>
+  <label data-key="a">沒問題，DynamoDB 會自動把分區拆開</label>
+  <label data-key="b">寫入集中在同一個 key 的尾端，超過單一分區每秒 1,000 WCU 的上限被限流</label>
+  <label data-key="c">日期是好的 partition key，因為每天都不一樣</label>
+  <label data-key="d">寫入會變成最終一致，但不會失敗</label>
+  <p class="why">✓ 自動拆分能分散的是不同的 key，或流量不是跟著遞增 sort key 走的 item collection；所有新訂單都寫在同一個 key 的最尾端，拆開也沒用。a 忽略了這個前提；c 的「每天不同」只代表歷史資料分散，今天的流量仍然全在一個 key；d 不存在這種行為，超過上限就是限流錯誤。解法是寫入分片。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：顧客剛下單，前端立刻呼叫「我的最近訂單」（查 GSI1），新訂單沒有出現。最可能的原因？</p>
+  <label data-key="a">寫入失敗了</label>
+  <label data-key="b">GSI 是非同步更新、最終一致，查詢時還沒跟上</label>
+  <label data-key="c">GSI 需要手動重建</label>
+  <label data-key="d">條件寫入把訂單擋下來了</label>
+  <p class="why">✓ 寫入主表成功後，GSI 稍後才更新，而且 GSI 不支援強一致讀取。a、d 的話主表也查不到，可以用 GetItem 確認；c 不需要，GSI 由 DynamoDB 自動維護。剛寫入就要讀到的畫面，用主表的 GetItem 或 Query（可以強一致讀），或把剛建立的訂單直接放進前端的列表。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 8：哪種情況最不適合選 DynamoDB？</p>
+  <label data-key="a">已知查詢方式、流量極大的訂單狀態查詢</label>
+  <label data-key="b">購物車與 session，依使用者 id 讀寫</label>
+  <label data-key="c">需求每週都變、常要新的臨時查詢與報表的內部後台</label>
+  <label data-key="d">IoT 裝置回報最新狀態，依裝置 id 讀寫</label>
+  <p class="why">✓ 存取模式不穩定時，每個新查法都要加 GSI、補資料甚至改 key 搬家；臨時報表只能 Scan。這種需求用 PostgreSQL，加索引、寫 SQL 就好。a、b、d 都是「已知 key、查法固定、量大」，正是 DynamoDB 擅長的。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>照關聯式的方式一個實體一張表，再在程式裡拼</strong>：一個頁面要查好幾次、沒有交易保護。先列存取模式，把一起讀的資料放在同一個 item collection。</li>
+  <li><strong>用 Scan 當查詢</strong>：表越大越慢、越貴，還會吃光容量讓其他請求被限流。查不到就是 key 或 GSI 設計少了一種存取模式。</li>
+  <li><strong>讀出來再篩選</strong>：FilterExpression 或 JS 的 filter 都是讀完才丟，費用照讀到的算。把篩選條件放進 sort key（例如 <code>STATUS#pending#…</code>）。</li>
+  <li><strong>sort key 的數字和日期沒補零</strong>：字串比較下 <code>ITEM#10</code> 排在 <code>ITEM#2</code> 前面、<code>2026-10-5</code> 排在 <code>2026-10-12</code> 後面。固定寬度、ISO 格式。</li>
+  <li><strong>key 沒有實體前綴</strong>：不同實體的 id 相同時混在同一個 item collection，甚至互相覆蓋。</li>
+  <li><strong>低基數或依日期的 partition key</strong>：狀態、門市、「今天」都會變成熱分區。用計算出來的後綴分片，讀取時平行查完再合併排序。</li>
+  <li><strong>以為 GSI 是強一致的</strong>：剛寫入時查 GSI 可能查不到。要讀自己剛寫的，用主表。</li>
+  <li><strong>先 get 再 put 檢查唯一性</strong>：並發時會重複。用 <code>attribute_not_exists</code> 條件寫入，多個 item 要一起成立就用 TransactWriteItems。</li>
+  <li><strong>為了「以後可能很大」在小規模專案選 DynamoDB</strong>：查詢彈性、報表、開發速度的代價是立刻付的，擴展的好處可能永遠用不到。</li>
+</ul>
+
+
+<h2>小結</h2>
+<ul>
+  <li>DynamoDB 對 partition key 算雜湊，把資料分散到很多分區，每次讀寫只碰一個分區；只要依 key 讀寫，資料和流量變大延遲都差不多。代價是只有 GetItem、Query（一個 PK 內依 SK 範圍）、Scan 三種讀法，沒有 JOIN 與任意 WHERE。</li>
+  <li>設計從存取模式表開始。single-table 用前綴（<code>CUSTOMER#</code>、<code>ORDER#</code>）區分實體，把一起讀的資料放進同一個 item collection；SK 是字串，數字補零、時間用 ISO。</li>
+  <li>主表 key 照顧不到的查法用 GSI：用另一組屬性重新組織資料。它是最終一致的，沒有索引屬性的 item 不會進去（稀疏索引）。條件要放進 key，而不是讀完再篩。</li>
+  <li>每個分區每秒最多 3,000 RCU、1,000 WCU；依日期或低基數的 key 會變成熱分區。用計算出來的後綴做寫入分片，讀取時平行查 N 片、合併後重新排序。</li>
+  <li>唯一性用 <code>attribute_not_exists</code> 條件寫入；多個 item 要一起成立用 TransactWriteItems（最多 100 個動作）。條件失敗時檢查是不是自己的重送，讓請求冪等。</li>
+  <li>存取模式常變、需要臨時報表、規模還小的時候，不要選 DynamoDB；真的需要時通常只搬一條熱路徑。本機可以用 <code>amazon/dynamodb-local:3.3.2</code> 測 API，但它不模擬限流。</li>
+</ul>
+<p>下一課是期末專題：把這門課的 PostgreSQL、Redis、Elasticsearch、物件儲存組成咖啡店的結帳系統，處理它們之間的一致性與故障。</p>
+
+<script type="dts">
+// 這一頁的 DynamoDB 模擬器（只有型別；實作在隱藏測試裡，以參數 db 傳進你的函式）
+type Item = { PK: string, SK: string, [attr: string]: unknown }
+type Condition = 'attribute_not_exists(PK)'
+type QueryInput = {
+  index?: 'GSI1' | 'GSI2'          // 不寫：查主表（PK、SK）；GSI1：查 GSI1PK、GSI1SK；GSI2：查 GSI2PK、GSI2SK
+  pk: string                       // partition key 一定要完全相等
+  beginsWith?: string              // sort key 以這段開頭
+  between?: [string, string]       // sort key 在兩者之間（兩端都包含）
+  reverse?: boolean                // true：sort key 由大到小（真正的 API 是 ScanIndexForward: false）
+  limit?: number                   // 最多回傳幾筆
+}
+interface Db {
+  get(key: { PK: string, SK: string }): Promise<Item | undefined>
+  put(item: Item, opts?: { condition?: Condition }): Promise<void>
+  query(q: QueryInput): Promise<Item[]>
+  scan(): Promise<Item[]>
+  transactWrite(ops: { put: Item, condition?: Condition }[]): Promise<void>
+}
+// 條件不成立時丟出的錯誤：put 是 ConditionalCheckFailedException；
+// transactWrite 是 TransactionCanceledException，reasons 依 ops 的順序列出每一筆的原因
+type DynamoError = Error & {
+  name: 'ConditionalCheckFailedException' | 'TransactionCanceledException'
+  reasons?: ('ConditionalCheckFailed' | 'None')[]
+}
+// 咖啡店的資料（練習 1、2 用）
+type Customer = { customerId: number, name: string }
+type Line = { productId: number, name: string, qty: number, price: number }
+type Order = { orderId: number, customerId: number, storeId: number, at: string, status: 'pending' | 'done', lines: Line[] }
+</script>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

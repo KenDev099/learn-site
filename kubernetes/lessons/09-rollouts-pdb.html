@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>9. 不停機部署：滾動更新、回滾與 PodDisruptionBudget（資深）</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="9" data-practice="kubernetes">
+<header>
+  <div class="eyebrow">階段 3：穩定上線 · 第 9 課</div>
+  <h1>不停機部署：滾動更新、回滾與 PodDisruptionBudget（資深）</h1>
+</header>
+<main>
+
+<p>第 7 課讓單一 Pod 啟動和關機都不掉請求。但一次部署會換掉所有 Pod，平台團隊升級節點時也會把整台節點清空。換的節奏太快，容量會在中途掉下來；新版本啟動就崩潰，要有人發現並退回去；三個副本剛好都在被維護的那台節點上，服務就整個中斷。</p>
+<p>這一課處理「一群 Pod」層級的不停機，學完你能在負載下完成更新、回滾、drain 一個節點，全程 0 錯誤。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>滾動更新的數學：<code>maxSurge</code>、<code>maxUnavailable</code> 決定換版途中最少、最多有幾個 Pod，容量會不會在中途掉下來。</li>
+  <li>壞版本會怎樣：新版一啟動就崩潰時，滾動更新停在哪裡，部署腳本怎麼偵測到並自動回滾。</li>
+  <li>新舊版本同時在線：哪些程式與資料庫變更能直接滾動更新，PR review 時先問什麼。</li>
+  <li>drain、PDB 與分散副本：平台團隊升級節點時，怎麼保證不會一次趕走所有副本，副本也不會全擠在同一台節點。</li>
+  <li>非自願中斷：節點真的當機時 PDB 管不到，靠什麼撐住服務。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="03-deployments.html">第 3 課</a>的 rollout：改 Pod 範本就建一個新的 ReplicaSet 換版，<code>rollout status</code> 等它換完、<code>rollout undo</code> 退回上一版；節點失聯要 300 秒後 Pod 才會被搬走。</li>
+  <li><a href="07-probes-shutdown.html">第 7 課</a>的 probe 與關機：readinessProbe 通過才收流量；Pod 被刪時先跑 preStop，應用在寬限期內排空。</li>
+  <li><a href="../../devops/lessons/17-deploy-migrations.html">devops 課第 17 課</a>的 expand／contract：不相容的資料庫變更拆成先加（expand）、等舊版下線再刪（contract）好幾次部署。</li>
+</ul></div>
+
+<h2>滾動更新的數學</h2>
+<p><strong>滾動更新</strong>（RollingUpdate）是 Deployment 預設的換版方式：一次換一部分 Pod，直到全部換成新版。第 3 課看過它的外觀，這裡算清楚它的節奏。節奏由兩個欄位決定：</p>
+<ul>
+  <li><strong>maxSurge</strong>：更新期間，Pod 總數最多可以比 <code>replicas</code> <strong>多</strong>幾個。</li>
+  <li><strong>maxUnavailable</strong>：更新期間，可用的 Pod 最多可以比 <code>replicas</code> <strong>少</strong>幾個。</li>
+</ul>
+<p>兩個都可以寫數字或百分比，預設都是 <code>25%</code>。百分比換算成個數時，maxSurge 無條件<strong>進位</strong>、maxUnavailable 無條件<strong>捨去</strong>；兩個不能同時是 0（既不能多、也不能少，就換不動了）。於是：</p>
+<div class="table-wrap"><table>
+  <tr><th>replicas</th><th>maxSurge／maxUnavailable</th><th>最多同時幾個 Pod</th><th>最少幾個可用</th></tr>
+  <tr><td>4</td><td>預設 25%／25%（＝1／1）</td><td>5</td><td>3</td></tr>
+  <tr><td>3</td><td>預設 25%／25%（＝1／0）</td><td>4</td><td>3</td></tr>
+  <tr><td>4</td><td>1／0</td><td>5</td><td>4</td></tr>
+  <tr><td>4</td><td>0／1</td><td>4</td><td>3</td></tr>
+  <tr><td>10</td><td>25%／25%（＝3／2）</td><td>13</td><td>8</td></tr>
+</table></div>
+<p>以 4 個副本、maxSurge 1、maxUnavailable 0 為例，過程是這樣：</p>
+<figure>
+  <svg viewBox="0 0 700 270" role="img" aria-label="4 個副本、maxSurge 1、maxUnavailable 0 的滾動更新：先多開 1 個 v2，總數 5、可用 4；v2 可用後關掉 1 個 v1，回到總數 4；重複直到 4 個都是 v2，可用的 Pod 始終是 4">
+    <text class="d-small" x="10" y="20">步驟</text>
+    <text class="d-small" x="450" y="20">總數／可用</text>
+    <g>
+      <text class="d-text" x="10" y="52">開始</text>
+      <rect class="d-soft" x="110" y="32" width="56" height="30" rx="4"/><text class="d-text" x="138" y="52" text-anchor="middle">v1</text>
+      <rect class="d-soft" x="176" y="32" width="56" height="30" rx="4"/><text class="d-text" x="204" y="52" text-anchor="middle">v1</text>
+      <rect class="d-soft" x="242" y="32" width="56" height="30" rx="4"/><text class="d-text" x="270" y="52" text-anchor="middle">v1</text>
+      <rect class="d-soft" x="308" y="32" width="56" height="30" rx="4"/><text class="d-text" x="336" y="52" text-anchor="middle">v1</text>
+      <text class="d-text" x="450" y="52">4／4</text>
+    </g>
+    <g>
+      <text class="d-text" x="10" y="100">多開 1 個</text>
+      <rect class="d-soft" x="110" y="80" width="56" height="30" rx="4"/><text class="d-text" x="138" y="100" text-anchor="middle">v1</text>
+      <rect class="d-soft" x="176" y="80" width="56" height="30" rx="4"/><text class="d-text" x="204" y="100" text-anchor="middle">v1</text>
+      <rect class="d-soft" x="242" y="80" width="56" height="30" rx="4"/><text class="d-text" x="270" y="100" text-anchor="middle">v1</text>
+      <rect class="d-soft" x="308" y="80" width="56" height="30" rx="4"/><text class="d-text" x="336" y="100" text-anchor="middle">v1</text>
+      <rect class="d-box" x="374" y="80" width="56" height="30" rx="4" stroke-dasharray="4 3"/><text class="d-accent" x="402" y="100" text-anchor="middle">v2…</text>
+      <text class="d-text" x="450" y="100">5／4</text>
+      <text class="d-small" x="520" y="100">v2 啟動中，還不算可用</text>
+    </g>
+    <g>
+      <text class="d-text" x="10" y="148">關 1 個舊的</text>
+      <rect class="d-soft" x="110" y="128" width="56" height="30" rx="4"/><text class="d-text" x="138" y="148" text-anchor="middle">v1</text>
+      <rect class="d-soft" x="176" y="128" width="56" height="30" rx="4"/><text class="d-text" x="204" y="148" text-anchor="middle">v1</text>
+      <rect class="d-soft" x="242" y="128" width="56" height="30" rx="4"/><text class="d-text" x="270" y="148" text-anchor="middle">v1</text>
+      <rect class="d-box" x="308" y="128" width="56" height="30" rx="4"/><text class="d-text" x="336" y="148" text-anchor="middle">v2</text>
+      <text class="d-text" x="450" y="148">4／4</text>
+      <text class="d-small" x="520" y="148">v2 已可用，才關 v1</text>
+    </g>
+    <g>
+      <text class="d-text" x="10" y="196">重複</text>
+      <rect class="d-soft" x="110" y="176" width="56" height="30" rx="4"/><text class="d-text" x="138" y="196" text-anchor="middle">v1</text>
+      <rect class="d-soft" x="176" y="176" width="56" height="30" rx="4"/><text class="d-text" x="204" y="196" text-anchor="middle">v1</text>
+      <rect class="d-box" x="242" y="176" width="56" height="30" rx="4"/><text class="d-text" x="270" y="196" text-anchor="middle">v2</text>
+      <rect class="d-box" x="308" y="176" width="56" height="30" rx="4"/><text class="d-text" x="336" y="196" text-anchor="middle">v2</text>
+      <text class="d-text" x="450" y="196">4／4</text>
+    </g>
+    <g>
+      <text class="d-text" x="10" y="244">完成</text>
+      <rect class="d-box" x="110" y="224" width="56" height="30" rx="4"/><text class="d-text" x="138" y="244" text-anchor="middle">v2</text>
+      <rect class="d-box" x="176" y="224" width="56" height="30" rx="4"/><text class="d-text" x="204" y="244" text-anchor="middle">v2</text>
+      <rect class="d-box" x="242" y="224" width="56" height="30" rx="4"/><text class="d-text" x="270" y="244" text-anchor="middle">v2</text>
+      <rect class="d-box" x="308" y="224" width="56" height="30" rx="4"/><text class="d-text" x="336" y="244" text-anchor="middle">v2</text>
+      <text class="d-text" x="450" y="244">4／4</text>
+    </g>
+  </svg>
+  <figcaption>maxUnavailable 0：新的可用了才關舊的，所以可用的 Pod 從頭到尾都是 4 個。</figcaption>
+</figure>
+<p>怎麼選：</p>
+<ul>
+  <li><strong>maxUnavailable 0、maxSurge 1</strong>：容量從不下降，代價是更新比較慢，而且叢集要有多放一個 Pod 的空間（第 8 課的 requests）。流量吃緊的 API 用這組，是安全的預設。</li>
+  <li><strong>maxUnavailable 大於 0</strong>：叢集已經滿了、多開不了 Pod 時才用。它表示「這段時間少一點容量也撐得住」，要先確定剩下的副本扛得住尖峰流量。</li>
+  <li><strong>maxSurge 調大（例如 50%）</strong>：副本很多、想快一點換完時用，代價是更新時多佔資源。</li>
+</ul>
+<p><strong>「可用」</strong>（available）不等於 Ready。<strong>minReadySeconds</strong> 是新 Pod Ready 之後還要穩定多久才算可用，預設 0。設成 5～10 秒，可以擋住「剛 Ready 幾秒就崩潰」的版本：它還沒算可用，Deployment 就不會關下一個舊 Pod，壞版本不會一路擴散。<code>kubectl get deploy</code> 的 AVAILABLE 欄位、<code>status.availableReplicas</code> 數的就是它。</p>
+<p>另一種策略是 <strong>Recreate</strong>：先把舊 Pod 全部關掉，再建新的，中間一定有一段時間沒有任何 Pod。只用在新舊版<strong>不能同時存在</strong>的情況，例如兩版同時寫同一個檔案會損壞資料，或者只能有一個程序持有某個鎖。一般的 API 不用它。</p>
+
+<h2>壞版本會怎樣：progressDeadlineSeconds 與自動回滾</h2>
+<p>課程映像 <code>learn-k8s/cafe-api:bad</code> 啟動就以 1 結束。用練習 1 的設定換成它：</p>
+<pre>kubectl create namespace try-09
+kubectl apply -n try-09 -f kubernetes/practice/work/09/ex2/        # 練習 2 的 Deployment（先把 TODO 做完）
+kubectl set image -n try-09 deployment/cafe-api api=learn-k8s/cafe-api:bad
+kubectl get pods -n try-09 -w</pre>
+<p>你會看到：多出 1 個新 Pod，在 <code>Error</code> 和 <code>CrashLoopBackOff</code> 之間循環（第 7 課），4 個舊 Pod 一個都沒少。原因是 maxSurge 只允許多 1 個，而新 Pod 永遠不會變成可用，maxUnavailable 0 又不准關舊的。<strong>滾動更新的設計讓壞版本吃不掉超過 maxUnavailable 的容量</strong>；如果 maxUnavailable 是 1，就會少 1 個舊 Pod，但也只有 1 個。</p>
+<p>然後呢？Kubernetes 會等。<strong>progressDeadlineSeconds</strong>（預設 600 秒）是「多久沒有進展就標成失敗」：沒有新的 Pod 變成可用、也沒有舊的被關掉，超過這個時間，Deployment 的 <code>Progressing</code> 條件變成 <code>False</code>，原因 <code>ProgressDeadlineExceeded</code>：</p>
+<pre>$ kubectl get deploy cafe-api -n try-09 -o jsonpath='{.status.conditions[?(@.type=="Progressing")]}'
+{"reason":"ProgressDeadlineExceeded","status":"False","message":"ReplicaSet \"cafe-api-…\" has timed out progressing.", …}</pre>
+<p>就這樣。<strong>Kubernetes 不會自動回滾</strong>，壞的 Pod 會一直留在那裡重啟，Deployment 控制器也會繼續嘗試。回不回滾要由部署流程決定。部署腳本的基本形狀：</p>
+<pre>set -euo pipefail
+kubectl set image -n "$NS" deployment/cafe-api api="learn-k8s/cafe-api:$TAG"
+if ! kubectl rollout status -n "$NS" deployment/cafe-api --timeout=120s; then
+  kubectl rollout undo -n "$NS" deployment/cafe-api                     # 回到上一個 revision
+  kubectl rollout status -n "$NS" deployment/cafe-api --timeout=120s    # 等回滾真的完成
+  exit 1                                                                 # 這次部署失敗：CI 要亮紅燈
+fi
+# 成功之後做煙霧測試，例如打一次 /version 確認是新版本</pre>
+<p>幾個細節，每個都是事故的來源：</p>
+<ul>
+  <li><strong><code>if !</code> 包住 rollout status</strong>：腳本開了 <code>set -e</code>，指令失敗會讓腳本立刻結束，後面的 undo 永遠不會執行。<code>if</code> 的條件裡失敗不會觸發 <code>set -e</code>。</li>
+  <li><strong>progressDeadlineSeconds 和 <code>--timeout</code> 兩個都設</strong>：前者讓 Deployment 自己的狀態變成「失敗」，<code>kubectl get</code>、監控、Argo CD 都看得到；後者讓腳本不會無限等。rollout status 在兩者之一先到時就以非 0 結束。progressDeadlineSeconds 要大於正常版本完成一次的時間，不然慢一點的正常部署也會被判失敗。</li>
+  <li><strong>undo 之後也要等</strong>：undo 只是送出「改回上一版」的請求。腳本立刻結束，CI 就以為已經回到好版本，下一個步驟（例如通知、下一個服務的部署）可能在回滾還沒完成時就開始。</li>
+  <li><strong>回滾成功仍然 exit 1</strong>：這次部署的目標沒有達成。回滾是止血，不是成功。</li>
+  <li><strong>不要刪掉 Deployment 再重建</strong>：所有 Pod 同時消失、服務中斷，rollout history 也沒了。</li>
+</ul>
+<p>Helm（第 13 課）的 <code>helm upgrade --rollback-on-failure</code>（Helm 3 叫 <code>--atomic</code>）做的是同一件事：等資源就緒，失敗就回到上一個 release。在 CI 裡，這段「部署＋等待＋回滾」不能被取消：跑到一半被新的 commit 取消，叢集會停在半套狀態（devops 課第 16 課）。</p>
+<div class="callout practice"><strong>💡 實務上：回滾是止血，接著要讓 git 跟上</strong><br>典型的情境：下午部署 v2 後錯誤率上升，值班的人先 <code>rollout undo</code>，五分鐘後服務恢復。這時 git 裡的 manifest 還是新版本（第 3 課提過），下一次有人合併別的 PR、CI 重新部署，壞版本又會被送上去。資深的做法是止血後馬上在事故頻道說明「已回到 v1，git 還沒改」，在 git 改好之前先暫停這個服務的自動部署，接著開 revert PR，或把修正和新的 tag 一起送 review。部署腳本回滾後仍以非 0 結束、CI 亮紅燈，也是在提醒大家「現在叢集和 git 不一致」。</div>
+
+<h2>新舊版本同時在線</h2>
+<p>滾動更新有一個常被忽略的後果：<strong>更新期間 v1 和 v2 同時在接流量</strong>。同一個使用者連續兩個請求，可能一個打到 v1、一個打到 v2；v2 寫進資料庫的資料，下一秒可能被 v1 讀出來。出事時回滾，又會變成 v2 寫的資料給 v1 用。所以每個變更都要問：<strong>新舊兩版同時跑、互相讀寫對方的資料，會不會出事？</strong></p>
+<div class="table-wrap"><table>
+  <tr><th>變更</th><th>能直接滾動更新嗎</th><th>做法</th></tr>
+  <tr><td>新增 API 端點、回應多一個欄位</td><td>可以</td><td>只增不改，舊客戶端不會用到</td></tr>
+  <tr><td>資料表新增可為 NULL 的欄位</td><td>可以</td><td>migration 在新版上線前跑完；舊版的 INSERT 不寫它也合法</td></tr>
+  <tr><td>刪掉回應欄位</td><td>不行</td><td>舊版前端、使用者手機上的舊版 App 還在讀；先讓所有客戶端不再讀，之後的部署才刪</td></tr>
+  <tr><td>欄位改名（例如 <code>total</code> → <code>amount</code>）</td><td>不行</td><td>expand：加 <code>amount</code> → 新版兩邊都寫、回填舊資料 → 全部換成新版後 contract：刪 <code>total</code></td></tr>
+  <tr><td>改佇列訊息格式</td><td>不行</td><td>佇列裡還有舊訊息，新舊 worker 同時在消費；訊息帶版本號，消費端先能讀兩種，生產端再換</td></tr>
+</table></div>
+<p>這就是 <a href="../../devops/lessons/17-deploy-migrations.html">devops 課第 17 課</a>的 <strong>expand／contract</strong>：一次不相容的變更，拆成好幾次相容的部署。順序是：</p>
+<ol>
+  <li><strong>migration 先跑</strong>：在新版 Pod 上線之前，用第 10 課的 Job 把 schema 擴充好（expand）。schema 只增不刪，舊版照常運作。</li>
+  <li><strong>滾動更新應用程式</strong>：新版能處理新舊兩種資料，舊版不受新 schema 影響。</li>
+  <li><strong>確認沒有舊版、回滾也不會回到舊版之後</strong>，下一次部署才 contract：刪掉舊欄位。</li>
+</ol>
+<p>前端也一樣：Vue 的 SPA 被使用者開著好幾天，它呼叫的 API 格式要比後端的部署活得更久（API 怎麼相容地演進，見 <a href="../../system-design/lessons/19-evolution-compatibility.html">系統設計課第 19 課</a>）。這也是為什麼「回滾」不一定安全：如果新版已經跑了 contract 的 migration，退回舊版會讀不到被刪掉的欄位。<strong>contract 和程式的變更不要放在同一次部署</strong>，回滾才永遠有路可退。</p>
+
+<div class="callout practice"><strong>💡 實務上：review 時先問「這次能不能直接滾動更新」</strong><br>後端 PR 改到 API 回應、資料表或佇列訊息時，reviewer 第一個問題就是上面那張表：新舊兩版同時跑會不會出事、出事時回滾有沒有路。很多團隊把它寫進 PR 範本，例如「有沒有 migration？是不是只做 expand？回滾到上一版安全嗎？」。PM 眼中很小的「欄位改名」，實際上要拆成兩、三次部署、跨好幾天，排時程時就要先講清楚。前端同事也要知道這件事：SPA 和手機 App 的舊版會比後端的部署活得更久。</div>
+
+<h2>不只是部署會中斷：drain 與 PodDisruptionBudget</h2>
+<p>Pod 被關掉不只在部署時。正式環境裡更常見的是節點維護：</p>
+<ul>
+  <li><strong>節點升級</strong>：EKS 的受管節點群組更新 Kubernetes 版本或 AMI 時，會一台一台把舊節點清空再關掉。</li>
+  <li><strong>節點整併</strong>：Karpenter（EKS 常用的節點自動調整工具，第 15 課）發現兩台節點都很空，會把一台上的 Pod 搬走、關掉那台省錢。</li>
+  <li><strong>手動維護</strong>：換掉有問題的節點、調整核心參數。</li>
+</ul>
+<p>這些都是<strong>自願中斷</strong>（voluntary disruption）：人或系統主動造成、事前可以控制節奏的中斷。相對的是<strong>非自願中斷</strong>：節點當機、硬體故障、核心崩潰，沒有人能先問一聲。</p>
+<p>清空節點的指令是 <strong>kubectl drain</strong>：</p>
+<pre>kubectl drain learn-k8s-worker --ignore-daemonsets --delete-emptydir-data --timeout=180s
+#   1. 先 cordon：把節點標成不可排程（新的 Pod 不會再放上來）
+#   2. 再逐一「驅逐」上面的 Pod，每個 Pod 走第 7 課的正常關機流程
+#   --ignore-daemonsets：DaemonSet 的 Pod 本來就每台一個，不驅逐
+#   --delete-emptydir-data：Pod 用了 emptyDir（第 11 課），驅逐後裡面的資料會消失，明確表示同意
+kubectl uncordon learn-k8s-worker       # 維護完，讓節點重新接受 Pod</pre>
+<p><strong>cordon</strong> 只做第 1 步：標成不可排程，現有的 Pod 不動。drain 的第 2 步用的是<strong>驅逐 API</strong>（eviction），不是直接刪除。差別在於：驅逐前，API server 會檢查這個 Pod 有沒有被 <strong>PodDisruptionBudget</strong>（PDB）保護；這次驅逐會讓可用的 Pod 低於預算，就回 <code>429 Too Many Requests</code> 拒絕，drain 每 5 秒重試一次，直到別處的新 Pod Ready、預算又夠了。</p>
+<pre>apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cafe-api
+spec:
+  maxUnavailable: 1            # 自願中斷時，最多只能有 1 個不可用
+  selector:
+    matchLabels:               # 跟 Deployment 的 Pod label 一樣（第 3 課）
+      app.kubernetes.io/name: cafe-api
+      app.kubernetes.io/instance: main</pre>
+<p>沒有 PDB 時，drain 一台放了 2 個 cafe-api 的節點，2 個會同時被驅逐，3 個副本瞬間剩 1 個扛全部流量。有了 PDB，第 2 個要等第 1 個的替代 Pod 在別的節點 Ready 才會被驅逐。</p>
+<p>PDB 有兩種寫法，只能擇一：</p>
+<ul>
+  <li><code>maxUnavailable: 1</code>：最多少 1 個。副本數變動（例如第 8 課的 HPA 擴縮）時不用跟著改，推薦。</li>
+  <li><code>minAvailable: 2</code>：至少留 2 個。也可以寫百分比。</li>
+</ul>
+<div class="callout warn"><strong>PDB 不能把路堵死</strong>：3 個副本設 <code>minAvailable: 3</code>（或 <code>maxUnavailable: 0</code>），等於「一個都不准驅逐」。drain 永遠卡住，平台團隊的節點升級跟著卡住，最後只能來找你，或是強制處理。PDB 要留出可以中斷的空間。<strong>單一副本的服務，PDB 也救不了</strong>：唯一的 Pod 被驅逐，服務就中斷；不准驅逐，節點就不能維護。正式服務至少 2～3 個副本。</div>
+<p>PDB 還有一個欄位 <code>unhealthyPodEvictionPolicy</code>（1.31 穩定）。預設 <code>IfHealthyBudget</code>：服務本來就有 Pod 不健康時，連那些壞掉的 Pod 也不能驅逐，drain 會被一個 CrashLoopBackOff 的 Pod 卡住。官方文件建議設成 <code>AlwaysAllow</code>：Running 但還沒 Ready 的 Pod 隨時可以驅逐，健康的 Pod 照常受預算保護。</p>
+<p>PDB 只管<strong>驅逐</strong>：drain、Karpenter、受管節點群組升級都走驅逐 API，所以都會遵守。它<strong>不管</strong>直接刪除（<code>kubectl delete pod</code>）、Deployment 自己的滾動更新（那是 maxUnavailable 的工作），也擋不住節點當機。</p>
+
+<div class="callout practice"><strong>💡 實務上：平台團隊升級節點那天</strong><br>EKS 升級、換 AMI 前，平台團隊會先跑 <code>kubectl get pdb -A</code>，看 <code>ALLOWED DISRUPTIONS</code> 欄：是 0 的服務，drain 就會卡在它身上。常見的原因是 PDB 寫成跟副本數一樣、只有 1 個副本，或服務本來就有 Pod 不健康。負責任的平台團隊不會直接強制刪除，而是來問你：「cafe-api 的 PDB 讓節點升級卡住了，可以調嗎？」。上線前自己先確認這個欄位平常至少是 1，比升級當天被追著跑好得多。</div>
+
+<h2>分散副本：topologySpreadConstraints</h2>
+<p>PDB 保護的是「一次少幾個」，但如果 3 個副本全在同一台節點上，PDB 也只能讓 drain 一個一個來；那台節點如果是當機，3 個同時消失。副本要<strong>分散</strong>到不同節點，正式環境還要分散到不同的<strong>可用區</strong>（AWS 的 AZ，一個機房區域停電不會拖垮全部）。</p>
+<pre>spec:
+  template:
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1                             # 任兩個節點的 Pod 數最多差 1
+          topologyKey: kubernetes.io/hostname    # 以「節點」為單位；EKS 跨可用區用 topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule       # 做不到就不排程（Pending）
+          nodeTaintsPolicy: Honor                # 不把放不了 Pod 的節點算進來
+          labelSelector:
+            matchLabels:                         # 數哪些 Pod：通常就是這個 Deployment 的 Pod
+              app.kubernetes.io/name: cafe-api
+              app.kubernetes.io/instance: main</pre>
+<p>scheduler 放每個新 Pod 時，會數每個節點（topologyKey 相同的一組節點叫一個「網域」）上已經有幾個符合 labelSelector 的 Pod，選一個放了之後最多和最少差不超過 maxSkew 的節點。<code>whenUnsatisfiable</code> 決定做不到時怎麼辦：<code>DoNotSchedule</code> 讓 Pod Pending，保證分散；<code>ScheduleAnyway</code> 只是盡量，做不到也照放。關鍵服務用 DoNotSchedule，不在意的用 ScheduleAnyway。</p>
+<p>還有一個陷阱。kind 的 control-plane 節點有一個 <strong>taint</strong>（污點：節點上的標記，沒有對應 toleration 的 Pod 不能放上去），cafe-api 放不上去。但分散規則預設 <code>nodeTaintsPolicy: Ignore</code>，計算時<strong>仍然把它當成一個網域</strong>。結果是：</p>
+<ol>
+  <li>前兩個 Pod 分別放在 worker 和 worker2，control-plane 是 0 個。</li>
+  <li>第 3 個 Pod 不管放哪個 worker，那個 worker 就是 2 個，和 control-plane 的 0 個差 2，超過 maxSkew 1。</li>
+  <li>它又不能放 control-plane，於是一直 Pending：<code>0/3 nodes are available: 1 node(s) had untolerated taint(s), 2 node(s) didn't match pod topology spread constraints</code>。</li>
+</ol>
+<p>drain 時也一樣：被 cordon 的節點會自動帶上 <code>node.kubernetes.io/unschedulable</code> 這個 taint，Ignore 會把它也算成 0 個 Pod 的網域，被驅逐的 Pod 在別處建不起來，PDB 不准下一個驅逐，drain 就卡住。<code>nodeTaintsPolicy: Honor</code>（1.33 穩定）讓計算時排除 Pod 不能容忍 taint 的節點。<code>nodeAffinityPolicy</code> 則是對 nodeSelector／nodeAffinity 做同樣的事，預設已經是 Honor。</p>
+<p>另一個常見的寫法是 <strong>反親和性</strong>（podAntiAffinity）：要求「不要跟同樣 label 的 Pod 放在同一個節點」。它的問題是副本數超過節點數時，多出來的 Pod 一律 Pending；topologySpreadConstraints 允許每個節點放好幾個、只要求平均，所以新寫的設定用分散規則。</p>
+
+<h2>非自願中斷：PDB 管不到的時候</h2>
+<p>節點當機時沒有人呼叫驅逐 API，PDB 完全不參與。這時候撐住服務的是另外三件事：</p>
+<ul>
+  <li><strong>多副本＋分散</strong>：一台節點消失，只損失三分之一的容量，而不是全部。</li>
+  <li><strong>readiness</strong>：失聯節點上的 Pod 會在控制平面把節點標成 NotReady 後從端點拿掉（第 4 課的 EndpointSlice），流量轉到其他節點。</li>
+  <li><strong>容量餘裕</strong>：第 3 課說過，Pod 要等約 50 秒確認節點失聯、再加 300 秒的容忍時間才會在別處重建。這 5、6 分鐘裡，剩下的副本要扛得住全部流量；HPA（第 8 課）會幫忙，前提是有節點放得下新 Pod。</li>
+</ul>
+<p>資深工程師的檢查清單：<strong>至少 3 個副本、分散到不同節點（正式環境不同可用區）、PDB maxUnavailable 1、readiness 正確、滾動更新 maxUnavailable 0</strong>。這幾樣都有了，部署、節點升級、單一節點故障都不會讓使用者看到錯誤。</p>
+
+<h2>練習</h2>
+<p>在 <code>learn</code> 資料夾執行頁面上的指令，起始檔會複製到 <code>kubernetes/practice/work/09/</code>。練習 1～3 先做靜態檢查，通過了才套用到叢集的專屬 namespace（<code>k8s-09-ex1</code> 這種名字），在 loadgen 每秒 10 個請求的負載下檢查，每題要幾分鐘。練習 4 只檢查檔案。自己想先試的話，用前面的 <code>try-09</code> namespace，用完 <code>kubectl delete namespace try-09</code>。</p>
+
+<div class="local" data-test="ex1" data-files="ex1/deployment.yaml">
+  <p>練習 1：<code>ex1/deployment.yaml</code> 是 4 個副本的 cafe-api，啟動要 3 秒，preStop 與寬限期已經設好。替它加上 readinessProbe（HTTP GET <code>/health/ready</code>，periodSeconds 不超過 5）、明確寫出 <code>strategy</code>（RollingUpdate 與 <code>rollingUpdate</code> 的兩個欄位），讓更新期間可用的 Pod 永遠不少於 4 個，並設 <code>minReadySeconds: 5</code>。映像、副本數、環境變數不要改，<code>ex1/service.yaml</code> 不用改。測試在持續負載下把映像從 v1 換成 v2，用 <code>kubectl get -w</code> 記錄 <code>status.availableReplicas</code> 的每一次變化：要 0 錯誤、最低值 ≥ 4、最後 4 個 Pod 都是 v2。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="ex2/deployment.yaml ex2/deploy.sh">
+  <p>練習 2：<code>ex2/deployment.yaml</code> 是練習 1 的答案，替它加上 <code>progressDeadlineSeconds: 60</code>。然後完成 <code>ex2/deploy.sh &lt;tag&gt;</code>（操作 namespace <code>k8s-09-ex2</code>，換映像的兩行已經寫好）：用 <code>rollout status --timeout=120s</code> 等它完成；沒完成時 <code>rollout undo</code>、再用 <code>rollout status --timeout</code> 等回滾完成，最後 <code>exit 1</code>。測試先套用你的 manifest，在負載下依序執行 <code>deploy.sh v2</code>（要以 0 結束、4 個 Pod 都是 v2）和 <code>deploy.sh bad</code>（要在 180 秒內以非 0 結束，結束時 Deployment 回到 v2、4 個 Ready 的 Pod 都是 v2），全程 0 錯誤。不能刪掉重建 Deployment。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="ex3/deployment.yaml ex3/pdb.yaml">
+  <p>練習 3：<code>ex3/deployment.yaml</code> 是 3 個副本的 cafe-api，probe 與 preStop 都設好了。在 Pod 範本加上 topologySpreadConstraints（<code>topologyKey: kubernetes.io/hostname</code>、<code>maxSkew: 1</code>、<code>whenUnsatisfiable: DoNotSchedule</code>、<code>nodeTaintsPolicy: Honor</code>、labelSelector 選到這個 Deployment 的 Pod），並在 <code>ex3/pdb.yaml</code> 寫名為 <code>cafe-api</code>、<code>maxUnavailable: 1</code> 的 PodDisruptionBudget，selector 選到同樣的 Pod。測試套用後確認兩個 worker 上都有 Pod、PDB 允許 1 次中斷，接著在負載下執行 <code>kubectl drain learn-k8s-worker --ignore-daemonsets --delete-emptydir-data --timeout=180s</code>：要成功、0 錯誤，最後 uncordon。測試另外加了 <code>--pod-selector</code>，只驅逐這一題的 Pod，不打擾叢集裡其他練習；真正維護節點時不加。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="ex4/review.json">
+  <p>練習 4：<code>ex4/review.json</code> 有 6 個變更情境。照「新舊版本同時在線」一節的想法，替每一個填 <code>safeForRollingUpdate</code>（能不能直接一次滾動更新）、<code>requiredSteps</code>（從檔案裡的 <code>steps</code> 選代碼；能直接更新的填 <code>[]</code>）和一句話的 <code>reason</code>。migration 一律在新版上線前跑完，requiredSteps 只填除此之外還要多做的事。測試比對每題的判斷與步驟集合，答錯時會給提示。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：4 個副本、maxSurge 1、maxUnavailable 0。更新期間最多同時存在幾個 Pod？可用的最少幾個？</p>
+  <label data-key="a">最多 4、最少 3</label>
+  <label data-key="b">最多 5、最少 4</label>
+  <label data-key="c">最多 8、最少 0</label>
+  <label data-key="d">最多 5、最少 3</label>
+  <p class="why">✓ maxSurge 允許多 1 個（4＋1＝5），maxUnavailable 0 表示可用的不能低於 4，新 Pod 可用了才關舊的。a 是 maxSurge 0、maxUnavailable 1 的結果；c 是 Recreate 加上同時建立全部新 Pod 的想像，滾動更新不會這樣；d 把兩個欄位都當成 1，那是 4 個副本用預設 25%／25% 的情況。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：部署了一個啟動就崩潰的版本，Kubernetes 會怎樣？</p>
+  <label data-key="a">自動回滾到上一版</label>
+  <label data-key="b">新 Pod 一直 CrashLoopBackOff；因為它不會變成可用，舊 Pod 最多只少 maxUnavailable 個；超過 progressDeadlineSeconds 後標記失敗，但不會自動回滾</label>
+  <label data-key="c">舊版全部被刪掉，服務中斷</label>
+  <label data-key="d">Deployment 被刪除</label>
+  <p class="why">✓ 滾動更新的設計讓壞版本吃不掉全部容量，但 Kubernetes 只會把 Progressing 標成 False（ProgressDeadlineExceeded），回滾要由部署流程執行（<code>rollout undo</code> 或 Helm 的 <code>--rollback-on-failure</code>）。a 是最常見的誤解；c 只會發生在 Recreate 策略；d 沒有任何機制會這樣做。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：3 個副本的服務設了 PDB <code>minAvailable: 3</code>。平台團隊升級節點時會發生什麼？</p>
+  <label data-key="a">升級正常</label>
+  <label data-key="b">drain 永遠無法驅逐任何一個 Pod，節點升級卡住，平台團隊會來找你</label>
+  <label data-key="c">PDB 會被忽略</label>
+  <label data-key="d">服務會自動多出第 4 個副本，讓驅逐可以進行</label>
+  <p class="why">✓ 驅逐任何一個都會讓可用數低於 3，驅逐 API 一律回 429，drain 不斷重試直到逾時。PDB 要留出可以中斷的空間，例如 maxUnavailable 1。a、c 錯在 drain 走的驅逐 API 一定會檢查 PDB；d 錯在 PDB 只是驅逐時的檢查，不會幫你開副本。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 8：下列哪個變更最不能直接一次滾動更新？</p>
+  <label data-key="a">新增一個 API 端點</label>
+  <label data-key="b">把資料表的 NOT NULL 欄位 total 改名為 amount，新版程式只讀寫 amount</label>
+  <label data-key="c">調整 log 等級</label>
+  <label data-key="d">新增一個可為 NULL 的欄位</label>
+  <p class="why">✓ 更新期間舊版仍在讀寫 total，新版寫的訂單舊版讀不到，回滾後也讀不到。要先新增 amount（expand）、新版兩邊都寫並回填、全部換成新版後再移除 total（contract）。a 只增不改；c 不影響資料與介面；d 舊版的 INSERT 不寫它也合法。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>以為 Kubernetes 會自動回滾</strong>：它只會停住並標記 ProgressDeadlineExceeded。部署流程要用 <code>rollout status --timeout</code> 偵測、<code>rollout undo</code> 回滾、等回滾完成，再以非 0 結束。</li>
+  <li><strong><code>set -e</code> 的腳本裡直接寫 rollout status</strong>：失敗時腳本立刻結束，後面的 undo 不會執行。用 <code>if ! …; then</code> 接住失敗。</li>
+  <li><strong>容量吃緊的服務用預設的 25%／25%</strong>：4 個副本以上時，更新期間會少 1 個以上的可用 Pod。流量吃緊時設 maxUnavailable 0。</li>
+  <li><strong>PDB 設得跟副本數一樣</strong>：minAvailable 等於副本數或 maxUnavailable 0，所有節點維護都會卡住。用 maxUnavailable 1。</li>
+  <li><strong>PDB 的 selector 選不到 Pod</strong>：PDB 存在但保護 0 個 Pod，drain 會同時驅逐全部。用 <code>kubectl get pdb</code> 看 ALLOWED DISRUPTIONS，和 Deployment 的 label 對照。</li>
+  <li><strong>副本都在同一個節點或可用區</strong>：一台節點出事就全滅。用 topologySpreadConstraints 分散。</li>
+  <li><strong>分散規則把不能排程的節點算進去</strong>：control-plane 或 cordon 中的節點有 taint，預設 nodeTaintsPolicy Ignore 會讓 DoNotSchedule 的 Pod Pending、drain 卡住。設 <code>nodeTaintsPolicy: Honor</code>。</li>
+  <li><strong>只測新版本，沒想到新舊並存</strong>：API 與 schema 要同時相容兩個版本，migration 照 expand／contract，contract 不和程式變更放在同一次部署。</li>
+  <li><strong>單副本跑正式服務</strong>：任何節點維護都會中斷，PDB 也救不了。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>滾動更新期間，Pod 總數最多 replicas＋maxSurge、可用的最少 replicas−maxUnavailable；百分比時 surge 進位、unavailable 捨去，預設都是 25%。maxUnavailable 0、maxSurge 1 是安全的預設。</li>
+  <li>minReadySeconds 讓新 Pod 穩定一段時間才算可用；Recreate 只用在新舊版不能並存時。</li>
+  <li>壞版本最多吃掉 maxUnavailable 的容量；progressDeadlineSeconds 到了只標成失敗，回滾由部署腳本負責：rollout status --timeout → undo → 等回滾 → exit 1。</li>
+  <li>更新期間兩個版本同時在線，API 只增不刪、schema 照 expand／contract、migration 在上線前跑完。</li>
+  <li>drain、節點升級、Karpenter 整併是自願中斷，走驅逐 API，受 PDB（maxUnavailable 1）保護；節點當機是非自願中斷，靠多副本、分散與 readiness。</li>
+  <li>topologySpreadConstraints 讓副本平均分散；有 taint 的節點要用 nodeTaintsPolicy: Honor 排除。</li>
+</ul>
+<p>下一課處理另一種工作負載：跑完就結束的 Job 與 CronJob，包括這一課一直提到的「migration 在新版上線前跑完」要怎麼做。</p>
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

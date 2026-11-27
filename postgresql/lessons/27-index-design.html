@@ -1,0 +1,627 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>27. 索引設計進階：複合、部分、運算式與覆蓋索引</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="27">
+<header>
+  <div class="eyebrow">階段 8：資深必備｜查詢效能 · 第 27 課</div>
+  <h1>索引設計進階：複合、部分、運算式與覆蓋索引</h1>
+</header>
+<main>
+
+<p><a href="20-indexes.html">第 20 課</a>學會了「哪一欄常被查，就幫它建索引」，<a href="26-capstone.html">第 26 課</a>的期末專題也在上線前替外鍵補了索引。回到咖啡店 App：上線幾個月、訂單累積到 3 萬筆之後，回報進來的問題不再是「少了一個索引」這麼單純：同一張 <code>orders</code> 表，有的畫面要篩兩個條件再依時間排序，有的畫面只看 1% 的資料，有的列表往下捲會看到重複的訂單。每一條查詢的「形狀」不一樣，適合的索引也不一樣，照第 20 課「哪欄常查就建哪欄」的做法，有時建了也沒用。</p>
+<p>這一課你接手一張工單清單：App 上線後回報的幾個效能與資料問題，都落在 <code>orders</code>、<code>customers</code>、<code>payments</code> 這三張表上。我們一張一張處理，每一張都先用 <code>EXPLAIN ANALYZE</code> 看清楚慢在哪裡，再設計剛好能解決它的索引，最後用 <code>EXPLAIN ANALYZE</code> 證明它真的有效，不靠感覺。處理完之後，你會有一套設計索引的方法：先拆解查詢，再決定欄位順序、索引要收哪些列、要存什麼值、要不要附帶欄位，以及哪些索引其實不該存在。</p>
+
+<div class="callout"><strong>這課的路線（也是這課的工單）：</strong>
+<ol>
+  <li>工單 1「我的訂單」很慢：複合索引的欄位該怎麼排。</li>
+  <li>工單 2 訂單列表往下捲會看到重複的訂單：<code>OFFSET</code> 為什麼會錯位，keyset 分頁怎麼修。</li>
+  <li>工單 3、4 咖啡師的「待製作」畫面、手機號碼不能重複但刪除帳號的不算：只索引需要的那部分列（部分索引）。</li>
+  <li>工單 5 email 大小寫不同就能重複註冊：讓索引存運算後的值（運算式索引）。</li>
+  <li>工單 6、7 報表要加總、收款表寫入越來越慢：讓查詢只讀索引（覆蓋索引），再算索引的成本，刪掉不該留的。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="20-indexes.html">第 20 課</a>的 B-tree 與複合索引：B-tree 是一棵排好序的樹；複合索引 <code>(a, b)</code> 對「<code>a</code>」或「<code>a</code> 加 <code>b</code>」的條件有效，只查 <code>b</code> 時幫助很小（最左前綴）。<code>UNIQUE</code> 索引擋下重複的值。</li>
+  <li><a href="21-explain.html">第 21 課</a>的 <code>EXPLAIN ANALYZE</code>：實際執行查詢，印出計畫和每一步做了多少事；計畫由縮排最深的那一層先做。<code>Index Scan</code> 在索引裡找到位置，再回表（回到表裡）拿整列資料。</li>
+  <li><a href="18-transactions.html">第 18 課</a>的 <code>BEGIN … ROLLBACK</code>：交易裡做的修改，<code>ROLLBACK</code> 後全部取消。</li>
+</ul></div>
+
+<div class="callout"><strong>這頁的環境：</strong>範例直接改這頁的資料庫（PGlite），不會自動回滾；<code>VACUUM</code> 必須單獨一格執行。這頁的字串排序規則（collation）是 <code>C</code>，跟正式環境常見的設定不同，影響見課末「補充與查表」。</div>
+
+<p><strong>這頁的資料：</strong><code>customers</code> 5,000 位；<code>orders</code> 30,000 筆，每 13 分鐘一筆，5 間分店（<code>store_id</code> 1～5），狀態 <code>paid</code> 約 90%、<code>cancelled</code> 約 9%、<code>pending</code>（待製作）約 1%。顧客 42 是常客，大約每 10 筆就有 1 筆是他的（約 3,000 筆）。<code>orders</code> 上<strong>除了主鍵沒有任何索引</strong>。<code>payments</code> 是收款紀錄，每筆已付款訂單一筆，約 2 萬 7 千筆，連主鍵共有 5 個索引（工單 7 才用到）。</p>
+
+<h2>工單 1：「我的訂單」很慢，複合索引的欄位該怎麼排？</h2>
+<p>App 的「我的訂單」頁列出這位顧客最近 5 筆已付款的訂單。常客回報打開要等一陣子。先看這句查詢在還沒有索引時怎麼執行，執行後看最上面三層：</p>
+<div class="lab" data-sql="EXPLAIN ANALYZE
+SELECT id, ordered_at, total FROM orders
+WHERE customer_id = 42 AND status = 'paid'
+ORDER BY ordered_at DESC LIMIT 5;"></div>
+<p>由上往下讀：<code>Limit</code> 只要 5 筆，但它下面的 <code>Sort</code> 得先把符合條件的訂單全部排好；<code>Sort</code> 下面的 <code>Seq Scan</code> 又得把 3 萬筆從頭讀到尾，才知道哪些是顧客 42 的已付款訂單。為了 5 筆，讀了整張表，也排了兩千多筆。</p>
+<p>每一層的結果裡都有 <code>Buffers</code>，它是這一步讀了幾個資料頁。資料頁是 PostgreSQL 在磁碟和記憶體之間搬資料的單位，讀的頁越多，做的事越多。毫秒數會受電腦當下忙不忙影響，同一句跑兩次就不一樣；<code>Buffers</code> 只跟做了多少事有關，所以這課都拿它比較索引的效果（PostgreSQL 18 的 <code>EXPLAIN ANALYZE</code> 會自動印出它，細節見課末「補充與查表」）。</p>
+<p>接下來要替這句查詢試好幾種索引，每次都要重看計畫，還要換不同的顧客比較。為了不用每次重打整句，seed 準備了小工具 <code>my_orders_plan(顧客 id)</code>：它就是上面那句 <code>EXPLAIN ANALYZE</code>，只是顧客 id 換成參數。</p>
+
+<h3>先拆解查詢：四個問題</h3>
+<p>索引怎麼建，取決於查詢怎麼使用這些欄位。設計之前，先把查詢拆成四個問題：</p>
+<div class="table-wrap">
+<table>
+  <tr><th>問題</th><th>「我的訂單」查詢的答案</th></tr>
+  <tr><td>哪些欄位用 <code>=</code> 比對？（<strong>等號欄位</strong>，equality column）</td><td><code>customer_id</code>、<code>status</code></td></tr>
+  <tr><td>哪些欄位用 <code>&lt;</code>、<code>&gt;</code>、<code>BETWEEN</code> 比對？（<strong>範圍欄位</strong>，range column）</td><td>沒有</td></tr>
+  <tr><td>依什麼排序？</td><td><code>ordered_at DESC</code>，而且只要前 5 筆</td></tr>
+  <tr><td>要回傳哪些欄位？</td><td><code>id</code>、<code>ordered_at</code>、<code>total</code></td></tr>
+</table>
+</div>
+<p>為什麼要這樣拆？因為 B-tree 索引是一份排好序的清單，而複合索引的排法跟電話簿一樣：先依第一欄排，第一欄相同的再依第二欄排，以此類推。這帶來一個關鍵性質：<strong>前面的欄位都固定成一個值之後，後面那一欄在這一段裡就是排好序的</strong>。電話簿裡「姓王的」是連續的一段，這一段裡的名字又是排好的；但如果只知道名字、不知道姓，就得翻遍整本。</p>
+<p>把這個性質套到四個問題上：等號欄位能把要讀的範圍縮成連續的一段，所以放前面；縮完之後，下一欄在這一段裡已經排好，正好拿來做範圍比對或排序。反過來，如果範圍欄位或排序欄位放在前面，等號欄位的值就散落在整個索引裡，沒辦法一次跳到。規則是：<strong>等號欄位放前面，範圍欄位或排序欄位放後面</strong>。</p>
+<p>「我的訂單」還有一個特點：它只要排在最前面的 5 筆。<code>ORDER BY … LIMIT N</code> 這種「只要排在最前面 N 筆」的查詢叫 <strong>Top-N 查詢</strong>（top-N query）。如果索引的順序正好就是 <code>ORDER BY</code> 要的順序，資料庫從正確的位置開始讀，讀到 N 筆就能停，不用排序，也不用看後面的資料。這就是工單 1 的目標：計畫裡沒有 <code>Sort</code>，<code>Buffers</code> 降到個位數。</p>
+
+<h3>三種常見但錯誤的索引</h3>
+<p>接下來會試好幾種索引。如果每試一種就留下一個，下一次測試時規劃器可能挑到前一次留下的那個，結果就看不準。所以範例都包在 <code>BEGIN; … ROLLBACK;</code> 裡：交易裡建的索引，在同一個交易裡就能用，<code>ROLLBACK</code> 後索引跟著消失，表回到沒有索引的狀態。正式環境也可以這樣在交易裡試索引，但 <code>CREATE INDEX</code> 會擋住這張表的寫入直到交易結束，這段時間下單會卡住；不擋寫入的做法是第 34 課的主題。</p>
+<p>先看三種常見但錯誤的索引，看懂它們各缺什麼，正確的索引就自然出來了。第一種，只幫等號欄位 <code>customer_id</code> 建索引。執行後看 <code>Sort</code> 和它下面的兩層：</p>
+<div class="lab" data-sql="BEGIN;
+CREATE INDEX ON orders (customer_id);
+SELECT * FROM my_orders_plan(42);
+ROLLBACK;"></div>
+<p>由上往下（執行順序相反，從縮排最深的那層做起）：</p>
+<ul>
+  <li><code>Sort</code>：把剩下的 2,700 多筆排序，最後只留 5 筆。</li>
+  <li><code>Bitmap Heap Scan</code>：把這些位置一筆筆回表讀出來（<code>Heap Blocks</code> 約 250 頁），<code>Rows Removed by Filter</code> 丟掉不是 <code>paid</code> 的。</li>
+  <li><code>Bitmap Index Scan</code>：在索引裡找到顧客 42 的 3,005 筆。</li>
+</ul>
+<p>索引確實幫上了忙：不用再讀整張表，只讀顧客 42 的那幾百頁。但它只解決了「找到」，沒有解決「排序」。<code>(customer_id)</code> 索引只依顧客排，同一位顧客的訂單在裡面不是依時間排的，所以還是要把 2,700 多筆全部取出來排序，才知道哪 5 筆最新。常客的訂單越多，這一步越慢，而常客正是最常打開「我的訂單」的人。</p>
+<p>既然缺的是排序，第二種想法是把時間放進索引，而且放在最前面：<code>(ordered_at, customer_id)</code>。這格跑兩次：上面是常客 42，下面是總共只有 7 筆訂單的顧客 7。執行後比較兩張結果的 <code>Buffers</code>：</p>
+<div class="lab" data-sql="BEGIN;
+CREATE INDEX ON orders (ordered_at, customer_id);
+SELECT * FROM my_orders_plan(42);
+SELECT * FROM my_orders_plan(7);
+ROLLBACK;"></div>
+<p>兩張的計畫都是 <code>Index Scan Backward</code>：從最新的時間往回讀索引，邊讀邊檢查是不是這位顧客。由上往下：</p>
+<ul>
+  <li><code>Index Cond</code>（在索引裡比對的條件）雖然出現 <code>customer_id = 42</code>，但第一欄 <code>ordered_at</code> 沒有條件，這個條件只能在索引裡一筆一筆比對，沒辦法直接跳到顧客 42。</li>
+  <li><code>Index Searches: 1</code>：只跳進索引一次，從頭讀到湊滿 5 筆為止。</li>
+  <li><code>Buffers</code>：顧客 42 每 10 筆就有 1 筆，很快湊滿 5 筆，只有 6 頁左右；顧客 7 要往回讀 70 多頁才湊滿 5 筆，是常客的十幾倍。</li>
+</ul>
+<p>這個索引依時間排好了，所以 <code>Sort</code> 不見了；但等號欄位落到第二欄，沒辦法用它縮小範圍，只能從最新的訂單一路往回讀、邊讀邊挑。顧客的訂單越舊越稀，讀得越多，快不快全看這位顧客的資料分布。這種索引最危險的地方是：拿常客測會覺得很快，上線後遇到訂單少的顧客才慢。</p>
+<p>第三種想法是把兩個等號欄位都放進去：<code>(customer_id, status)</code>。這次能直接定位到「顧客 42 的已付款訂單」，不必再丟掉 <code>cancelled</code> 的列，但同一段裡的訂單一樣沒有依時間排好，<code>Sort</code> 還在。你可以把上面第一格的索引改成這個試試。</p>
+<p>還有人會建兩個單欄索引 <code>(customer_id)</code> 和 <code>(status)</code>，讓規劃器自己組合。規劃器確實可以把兩個索引找到的位置取交集（計畫裡叫 Bitmap AND），但交集出來的是一堆資料位置，沒有任何順序，還是要回表、還是要 <code>Sort</code>。<strong>兩個單欄索引不等於一個複合索引。</strong></p>
+
+<h3>等號欄位在前、排序欄位在後</h3>
+<p>三種錯誤各缺一塊：第一種和第三種少了排序欄位，第二種把排序欄位放到等號欄位前面。照「等號欄位在前、排序欄位在後」組起來，就是 <code>(customer_id, status, ordered_at DESC)</code>。執行後看有沒有 <code>Sort</code>、<code>Index Cond</code> 和 <code>Buffers</code>：</p>
+<div class="lab" data-sql="BEGIN;
+CREATE INDEX ON orders (customer_id, status, ordered_at DESC);
+SELECT * FROM my_orders_plan(42);
+ROLLBACK;"></div>
+<p><code>Sort</code> 消失了，<code>Index Cond</code> 同時用上兩個等號條件，<code>Buffers</code> 只有個位數。B-tree 最底層一筆一筆存放索引項目的那一層叫<strong>葉節點</strong>（leaf node），上面幾層只負責導航；下圖畫的就是葉節點，也就是它在索引裡實際走的路：</p>
+<figure>
+  <svg viewBox="0 0 700 270" role="img" aria-label="索引 (customer_id, status, ordered_at DESC) 的排列：顧客 42、paid 這一段內依時間由新到舊排好，從這段開頭讀 5 筆就停">
+    <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <text class="d-small" x="20" y="22">索引葉節點（由左到右、由上到下就是排好的順序）</text>
+    <rect class="d-box" x="20" y="34" width="300" height="30" rx="5"/>
+    <text class="d-text" x="34" y="54">41 · paid · …</text>
+    <rect class="d-box" x="20" y="70" width="300" height="30" rx="5"/>
+    <text class="d-text" x="34" y="90">42 · cancelled · …</text>
+    <rect class="d-soft" x="20" y="106" width="300" height="30" rx="5"/>
+    <text class="d-text" x="34" y="126">42 · paid · 最新的一筆</text>
+    <rect class="d-soft" x="20" y="140" width="300" height="30" rx="5"/>
+    <text class="d-text" x="34" y="160">42 · paid · 第 2 新</text>
+    <rect class="d-soft" x="20" y="174" width="300" height="30" rx="5"/>
+    <text class="d-text" x="34" y="194">42 · paid · …（再 3 筆）</text>
+    <rect class="d-box" x="20" y="210" width="300" height="30" rx="5"/>
+    <text class="d-text" x="34" y="230">42 · paid · 更舊的 2,700 筆 …</text>
+    <path class="d-line" d="M470,121 L330,121" marker-end="url(#arr)"/>
+    <text class="d-accent" x="380" y="110">① 直接跳到「42 · paid」的開頭</text>
+    <path class="d-line" d="M350,125 L350,198"/>
+    <text class="d-text" x="370" y="165">② 往下讀 5 筆，順序已經是 DESC</text>
+    <text class="d-text" x="370" y="230">③ 夠了就停，後面不用讀，也不用 Sort</text>
+  </svg>
+  <figcaption>前兩欄固定之後，第三欄在這一段裡已經排好，所以 <code>LIMIT 5</code> 讀 5 筆就能停。</figcaption>
+</figure>
+<p>回頭看第一種索引：它對顧客 7 其實夠用。顧客 7 只有 7 筆訂單，就算只有 <code>(customer_id)</code> 索引，排序 7 筆也只要零點零幾毫秒，<code>Sort</code> 不是問題。所以驗證索引時，要挑「最常見、最慢」的那種參數，例如常客、大型分店，而不是隨手挑一個值測；隨手挑到顧客 7，哪個索引看起來都很好。</p>
+<div class="callout practice"><strong>💡 實務上：列表頁的篩選器越多，越要挑重點建索引</strong><br>咖啡店後台的訂單列表常有一排篩選器：分店、狀態、日期、付款方式，再加上可點的排序欄。組合有幾十種，不可能每種都建一個複合索引。實務上會先看哪幾種組合最常被用、哪幾種最慢（例如「某分店＋今天＋待製作，依時間排序」），為它們設計一兩個索引，讓其他組合共用開頭幾欄。資深工程師在加篩選器之前會先問 PM：「這個條件真的常用嗎？可以設預設值或限制日期範圍嗎？」很少人用的組合，慢一點通常可以接受。</div>
+<p>工單 1 的「我的訂單」只顯示第一頁的 5 筆。工單 2 是另一種列表：後台的訂單列表可以一直往下翻，翻到後面不只變慢，還會看到重複的訂單。這跟索引的欄位順序無關，問題出在翻頁的寫法。</p>
+
+<h2>工單 2：訂單列表往下翻會重複，OFFSET 錯在哪？</h2>
+<p>後台的訂單列表依時間由新到舊排，每頁 20 筆，用的是<a href="05-order-limit.html">第 5 課</a>的 <code>LIMIT 20 OFFSET 40</code> 這種寫法：要第 3 頁，就跳過前 40 筆。這個寫法有兩個問題。</p>
+<p>第一個是越後面越慢。<code>OFFSET</code> 是「跳過」，但資料庫沒辦法憑空知道第 20,001 筆在哪裡，只能把前 20,000 筆依序讀出來、數過、丟掉，再回傳接下來的 20 筆。頁數越後面，丟掉的越多，有索引也一樣。</p>
+<p>第二個就是工單回報的現象：<strong>翻頁期間有新資料進來，頁面會錯位</strong>。<code>OFFSET</code> 記的是「跳過幾筆」，而「第幾筆」是每次查詢當下重新算的。使用者看第 1 頁時排在第 18 名的訂單，等他按下一頁時，可能已經被新訂單擠到第 21 名。按「下一步」看一次：</p>
+<div class="tl">
+  <div class="table-wrap"><table>
+    <tr><th>步驟</th><th>發生什麼事</th><th>使用者看到</th></tr>
+    <tr data-note="訂單列表依 ordered_at DESC, id DESC 排序，每頁 20 筆。第 1 頁的最後一筆是 id 29996（2026-10-29 22:48）。"><td>1</td><td><code>LIMIT 20 OFFSET 0</code></td><td>第 1 頁：29995 … 29977、29996</td></tr>
+    <tr data-note="使用者還在看第 1 頁時，進來 3 筆新訂單。它們時間最新，排在最前面，把原本的每一筆都往後推了 3 個位置。"><td>2</td><td>新訂單 29998、29999、30000 寫入</td><td></td></tr>
+    <tr data-note="OFFSET 20 是「跳過現在排在最前面的 20 筆」。現在的前 20 筆包含 3 筆新訂單，所以第 1 頁的最後 3 筆被擠到第 21～23 名。"><td>3</td><td><code>LIMIT 20 OFFSET 20</code></td><td>第 2 頁開頭：29978、29977、29996 …</td></tr>
+    <tr data-note="使用者在第 2 頁又看到第 1 頁看過的 3 筆。反過來，如果翻頁期間有訂單被刪除，就會有資料被跳過、永遠看不到。"><td>4</td><td>結果</td><td><span class="wait">重複了 3 筆</span></td></tr>
+  </table></div>
+  <div class="bar"><button data-prev>◀ 上一步</button><button class="primary" data-next>下一步 ▶</button><span class="kbd" data-count></span></div>
+  <p class="note"></p>
+</div>
+<p>在這頁的資料上重現步驟 3：seed 裡 id 29998～30000 就是第 1 頁讀完之後才進來的 3 筆新訂單。執行後看開頭幾筆：</p>
+<div class="lab" data-sql="-- 現在的第 2 頁（OFFSET 寫法）：開頭幾筆在第 1 頁已經看過
+SELECT id, ordered_at FROM orders
+ORDER BY ordered_at DESC, id DESC
+LIMIT 20 OFFSET 20;"></div>
+<p>開頭幾筆在第 1 頁已經看過了。反過來，如果翻頁期間有訂單被刪除，後面的訂單會往前遞補，就會有一筆被跳過、使用者永遠看不到。兩種情況的根源一樣：<code>OFFSET</code> 用「位置」記錄讀到哪裡，而位置會隨資料變動而改變。</p>
+
+<h3>keyset 分頁：記住最後一筆，而不是跳過幾筆</h3>
+<p>修法是改記一個不會變的東西：上一頁的最後一筆本身。<strong>keyset 分頁</strong>（keyset pagination，也叫游標分頁 cursor pagination）的想法是：不記「跳過幾筆」，而是記「上一頁最後一筆的排序值」，下一頁從排序上緊接在它後面的那一筆開始拿。不管前面插進了多少新訂單，「比這一筆更舊的訂單」都是同一批，所以不會重複，也不會漏。前端常見的「無限捲動」API 回傳的 <code>nextCursor</code>，存的就是這個值。寫成 SQL：</p>
+<pre>WHERE (ordered_at, id) &lt; (上一頁最後一筆的 ordered_at, 上一頁最後一筆的 id)
+ORDER BY ordered_at DESC, id DESC
+LIMIT 20</pre>
+<p><code>WHERE</code> 裡的 <code>(ordered_at, id) &lt; (…, …)</code> 叫<strong>列值比較</strong>（row value comparison）：先比 <code>ordered_at</code>，時間不同就由時間決定大小；時間相同，再比 <code>id</code>。跟字典排序一樣，先比第一個字，相同才比第二個字。</p>
+<p>為什麼不只用時間，寫成 <code>WHERE ordered_at &lt; 上一頁最後一筆的時間</code> 就好？因為兩筆訂單可能在同一個時間成立。這頁的資料就有：第 1 頁的最後一筆是 id 29996，訂單 29976 跟它同一個時間，排在第 2 頁的開頭。只比時間的話，<code>&lt;</code> 會把 29976 一起排除，它就被跳過了；改成 <code>&lt;=</code> 又會把 29996 再拿一次。加上 <code>id</code> 之後，每一筆在排序裡都有唯一的位置，起點就不會模糊。這個用來打破平手、本身不會重複的欄位叫<strong>同分決勝欄位</strong>（tie-breaker），通常就是主鍵。<code>ORDER BY</code> 也要同樣寫成 <code>ordered_at DESC, id DESC</code>，排序和起點的定義才一致。</p>
+<p>keyset 分頁要快，還需要一個順序完全相同的索引 <code>(ordered_at DESC, id DESC)</code>：資料庫在索引裡直接跳到起點，往後讀 20 筆就停，跟工單 1 的 Top-N 查詢是同一個道理。這格跑兩次：上面是 keyset，下面是 OFFSET 的第 1001 頁。執行後比較兩個計畫讀了多少：</p>
+<div class="lab" data-sql="BEGIN;
+CREATE INDEX ON orders (ordered_at DESC, id DESC);
+-- keyset：從第 1 頁最後一筆之後開始
+EXPLAIN ANALYZE
+SELECT id, ordered_at FROM orders
+WHERE (ordered_at, id) &lt; ('2026-10-29 22:48+08', 29996)
+ORDER BY ordered_at DESC, id DESC LIMIT 20;
+-- OFFSET：第 1001 頁
+EXPLAIN ANALYZE
+SELECT id, ordered_at FROM orders
+ORDER BY ordered_at DESC, id DESC LIMIT 20 OFFSET 20000;
+ROLLBACK;"></div>
+<ul>
+  <li>keyset 那句：<code>Index Only Scan</code>，<code>Index Cond</code> 直接用列值比較定位，讀 3 個資料頁。</li>
+  <li>OFFSET 那句：實際讀了 20,020 列（<code>rows=20020</code>）才丟掉前 20,000 筆。</li>
+</ul>
+<p>keyset 讀的量跟第幾頁無關，永遠是「跳到起點、讀 20 筆」；OFFSET 讀的量跟頁數成正比。索引的方向要和 <code>ORDER BY</code> 一致：兩欄都 <code>DESC</code>，或兩欄都 <code>ASC</code>（倒著讀也行）。</p>
+<p>keyset 也有代價：它只知道「接在某一筆後面」，不能直接跳到「第 37 頁」，只能一頁接一頁。所以它適合無限捲動、「載入更多」、匯出全部資料、背景批次處理；需要頁碼的後台表格，資料量不大時用 OFFSET 仍然可以。</p>
+<div class="callout practice"><strong>💡 實務上：cursor 是 API 合約的一部分</strong><br>做「載入更多」的 API 時，常見做法是把最後一筆的 <code>ordered_at</code> 和 <code>id</code> 編碼成一個字串回傳成 <code>nextCursor</code>，前端只負責原封不動帶回來，不去解析它。這樣後端以後改排序欄位，前端不用跟著改。要注意排序欄位最好不會被修改：如果依「最後更新時間」排序，使用者捲動期間有訂單被更新，它就會跳到別的位置。後端也要驗證收到的 cursor 格式，被亂改時回 400，而不是丟出 500。</div>
+<p>到這裡，每個索引收的都是整張表的每一列。工單 3 的查詢卻只關心 1% 的訂單：為另外 99% 也建索引，划算嗎？</p>
+
+<h2>工單 3：「待製作」只佔 1%，能不能只索引這 1%？</h2>
+<p>咖啡師的平板上有一個「待製作」畫面，依下單時間列出還沒做的訂單：<code>WHERE status = 'pending' ORDER BY ordered_at LIMIT 20</code>。照工單 1 的規則，等號欄位在前、排序欄位在後，<code>(status, ordered_at)</code> 就能讓它不用 <code>Sort</code>。可是這個索引收了全部 3 萬筆，其中 99% 是 <code>paid</code> 和 <code>cancelled</code>，「待製作」畫面永遠不會查它們。這 99% 的索引項目不只佔空間，每寫入一筆已付款訂單，也都要在這個索引裡插一筆。</p>
+<p><strong>部分索引</strong>（partial index）就是為這種情況設計的：在 <code>CREATE INDEX</code> 後面加一個 <code>WHERE</code>，只有符合條件的列才會進索引。<code>ON orders (ordered_at) WHERE status = 'pending'</code> 只收待製作的訂單、依時間排好；條件已經寫在索引的定義裡，索引本身就不用再存 <code>status</code>。下面建一個部分索引和一個一般索引，執行後比較三個索引的大小：</p>
+<div class="lab" data-sql="BEGIN;
+CREATE INDEX orders_pending_at_idx ON orders (ordered_at) WHERE status = 'pending';
+CREATE INDEX orders_status_at_idx  ON orders (status, ordered_at);
+SELECT relname, pg_size_pretty(pg_relation_size(oid)) AS size
+FROM pg_class WHERE relname IN ('orders_pkey', 'orders_pending_at_idx', 'orders_status_at_idx');
+ROLLBACK;"></div>
+<p>部分索引只有 16 kB，一般的 <code>(status, ordered_at)</code> 要 960 kB，比主鍵的 672 kB 還大。小的索引更容易整個留在記憶體裡；而且寫入 <code>paid</code> 訂單時完全不用動它，因為那些列根本不符合索引的條件。</p>
+<p>建了不代表會被用。規劃器要能從查詢的 <code>WHERE</code> <strong>推出</strong>索引的條件，才會用部分索引：查詢寫 <code>WHERE status = 'pending'</code>，要找的列一定都在索引裡，推得出；查詢寫 <code>WHERE status = 'paid'</code>，要找的列根本不在索引裡，用了會漏資料，所以推不出、不會用。</p>
+<p>要確認計畫用了哪個索引，一層層讀 <code>EXPLAIN</code> 的輸出不太方便。seed 準備了小工具 <code>plan_nodes('查詢')</code>（寫法和第 21 課的 <code>plan()</code> 類似）：它把計畫攤平，每個節點一列，欄位是節點類型、表、用到的索引、條件。練習的判分也是用它「看見」計畫。下面兩個索引都建，看規劃器選哪個，執行後看 <code>index_name</code> 欄：</p>
+<div class="lab" data-sql="BEGIN;
+CREATE INDEX orders_pending_at_idx ON orders (ordered_at) WHERE status = 'pending';
+CREATE INDEX orders_status_at_idx  ON orders (status, ordered_at);
+SELECT * FROM plan_nodes('SELECT id, ordered_at FROM orders WHERE status = ''pending'' ORDER BY ordered_at LIMIT 20');
+ROLLBACK;"></div>
+<p>兩個索引都在，規劃器選了小的部分索引 <code>orders_pending_at_idx</code>。</p>
+
+<h3>status 用參數傳進來時，部分索引還用得上嗎？</h3>
+<p>上面的查詢把 <code>'pending'</code> 直接寫在 SQL 裡。實際的後端程式通常不這樣寫：ORM 和第 25 課的 <code>pg</code> 套件會送出 <code>WHERE status = $1</code>，值另外傳。而「推不推得出」是在<strong>規劃時</strong>判斷的，這裡就有一個陷阱。</p>
+<p>先認識一個名詞。<strong>prepared statement</strong> 是預先解析好、之後只換參數重複執行的 SQL：SQL 的 <code>PREPARE</code>、驅動程式的具名查詢、PL/pgSQL 函式裡的查詢都是。同一句 SQL 重複執行時，PostgreSQL 可以重用之前的成果，不必每次從頭來。</p>
+<p>計畫怎麼重用，有兩種做法。一種是每次都依這次傳進來的實際值重新規劃，叫 custom plan；另一種是規劃一份不看參數值、所有參數共用的計畫，叫 <strong>generic plan</strong>（第 29 課詳談）。PostgreSQL 18 文件寫的規則是：預設前 5 次依實際的值規劃，之後如果 generic plan 估計的成本差不多，就改用它。</p>
+<p>generic plan 要對任何參數值都正確，它不知道 <code>$1</code> 是不是 <code>'pending'</code>，所以不能用只收 pending 的部分索引。下面同一個 prepared statement 跑兩次：上面強制用 generic plan，下面是預設。執行後比較兩個計畫有沒有用索引：</p>
+<div class="lab" data-sql="DEALLOCATE ALL;
+BEGIN;
+CREATE INDEX ON orders (ordered_at) WHERE status = 'pending';
+PREPARE todo(text) AS
+  SELECT id, ordered_at FROM orders WHERE status = $1 ORDER BY ordered_at LIMIT 20;
+-- 強制用 generic plan
+SET LOCAL plan_cache_mode = force_generic_plan;
+EXPLAIN EXECUTE todo('pending');
+-- 預設（auto）：前 5 次會依實際的值規劃
+SET LOCAL plan_cache_mode = auto;
+EXPLAIN EXECUTE todo('pending');
+ROLLBACK;
+DEALLOCATE todo;"></div>
+<p>generic plan 是 <code>Seq Scan</code> 加 <code>Sort</code>；看得到值的計畫才用上索引。照上面的規則，同一個 prepared statement 前幾次都很快，換成 generic plan 之後才可能變慢，所以這種問題在測試時不容易發現。對策：部分索引的條件在 SQL 裡寫成常數（<code>WHERE status = 'pending'</code>），不要當參數傳。「待製作」畫面本來就只查 pending，寫死不會少任何彈性。</p>
+
+<h3>工單 4：手機不能重複，但刪除帳號的不算</h3>
+<p>部分索引除了讓查詢變快，還能表達「只對一部分列成立」的規則。工單 4 是會員系統的新規則：手機號碼不能重複，但已經刪除帳號的會員，手機號碼要能讓新會員使用。</p>
+<p>難處在<a href="06-update-delete.html">第 6 課</a>的軟刪除：刪除帳號時不真的 <code>DELETE</code>，而是在 <code>deleted_at</code> 記下刪除時間，資料還留在表裡。一般的 <code>UNIQUE</code> 約束對整張表的每一列成立，已刪除會員的手機號碼會一直佔著那個值，新會員就寫不進去。我們要的規則是「<strong>沒被刪除的</strong>會員，手機不能重複」。部分唯一索引正好表達這件事：<code>CREATE UNIQUE INDEX … ON customers (phone) WHERE deleted_at IS NULL</code>，只有還沒刪除的列進索引，唯一性也只在它們之間檢查。</p>
+<p>要看寫入成不成功，下面用 seed 的小工具 <code>try_sql('SQL')</code>：它執行一句 SQL，成功回傳 <code>ok</code>，失敗回傳 <strong>SQLSTATE</strong>（錯誤碼）。SQLSTATE 是每種錯誤固定的 5 碼代號，<a href="12-constraints.html">第 12 課</a>看過的 23505 就是「值重複」。程式判斷錯誤要比對代號，不要比對訊息文字，訊息會隨版本和語言改變。執行後看兩欄的結果：</p>
+<div class="lab" data-sql="BEGIN;
+UPDATE customers SET deleted_at = now() WHERE id = 3;   -- 會員 3 刪除帳號
+CREATE UNIQUE INDEX customers_phone_active_key ON customers (phone) WHERE deleted_at IS NULL;
+SELECT
+  try_sql('INSERT INTO customers (name, email, phone) VALUES (''新會員'', ''a@example.com'', ''0910000021'')') AS 用已刪除會員的手機,
+  try_sql('INSERT INTO customers (name, email, phone) VALUES (''新會員'', ''b@example.com'', ''0910000028'')') AS 用現有會員的手機;
+ROLLBACK;"></div>
+<p>第一筆 <code>ok</code>（會員 3 已刪除，不在索引裡），第二筆 23505（會員 4 還在）。第 38 課設計資料模型時會再用到這個寫法。</p>
+<p>部分索引決定索引<strong>收哪些列</strong>。工單 5 要的是另一件事：改變索引裡<strong>存什麼值</strong>。</p>
+
+<h2>工單 5：email 大小寫不同就能重複註冊，索引能不能存運算後的值？</h2>
+<p>會員的 email 是自己輸入的，同一個信箱可能寫成 <code>User42@Example.com</code>，也可能寫成 <code>user42@example.com</code>。使用者認為這是同一個信箱，但對 <code>UNIQUE</code> 索引來說是兩個不同的字串，所以同一個人可以註冊兩次。登入也一樣：用 <code>email = 輸入值</code> 比對，大小寫打得不一樣就找不到人。</p>
+<p>直覺的修法是在查詢裡兩邊都轉小寫：<code>WHERE lower(email) = lower($1)</code>。結果對了，但一般的 <code>(email)</code> 索引用不上：索引裡存的是原本的 email，也是依原本的字串排序，資料庫沒辦法在裡面找「轉小寫之後等於某個值」的列，只能整張表每一列算一次 <code>lower</code> 再比。</p>
+<p><strong>運算式索引</strong>（expression index）就是為這種情況設計的：索引裡存的不是欄位原本的值，而是運算結果。<code>CREATE INDEX ON customers (lower(email))</code> 在寫入時就把每一列的 <code>lower(email)</code> 算好、排好存起來，查詢 <code>WHERE lower(email) = …</code> 就能直接在索引裡找。<a href="21-explain.html">第 21 課</a>的練習已經建過這個索引。</p>
+<p>運算式索引也可以是唯一索引：<code>CREATE UNIQUE INDEX</code> 加上運算式，唯一性就以運算結果為準，<code>User42@Example.com</code> 和 <code>USER42@EXAMPLE.COM</code> 轉小寫後相同，第二筆就寫不進去。一個索引同時解決工單 5 的兩件事：擋下重複、加速登入（練習 4）。</p>
+<p>用運算式索引有一個前提：<strong>查詢要寫成同一個運算式</strong>才用得上。索引是 <code>lower(email)</code>，查詢寫 <code>email ILIKE 'user42@example.com'</code> 或 <code>upper(email) = …</code>，意思接近，但不是同一個運算式，都用不上。團隊要約定一種寫法，最好包在後端的同一個函式裡，讓所有用 email 找會員的地方都經過它。email 的前綴搜尋（<code>LIKE 'abc%'</code>）在正式環境還有排序規則的問題，見課末。</p>
+
+<h3>為什麼「依日期查訂單」的運算式索引建不起來？</h3>
+<p>運算式索引還有第二個限制，和 email 無關，但很常踩到。索引運算式只能用 <strong>IMMUTABLE</strong> 函式：相同輸入永遠得到相同結果，不受任何設定影響。原因是索引裡的值是寫入時算好的；如果同一個輸入今天算出 A、換個設定算出 B，索引裡存的 A 就和查詢時算出的 B 對不上了。</p>
+<p>最常踩到的情境是報表要依日期查訂單，於是想把 <code>ordered_at</code> 轉成日期建索引。<code>ordered_at</code> 是<a href="13-data-types.html">第 13 課</a>的 <code>timestamptz</code>：它記錄一個絕對的時間點，讀出時才依連線設定的時區顯示。執行後看錯誤碼：</p>
+<div class="lab" data-sql="CREATE INDEX ON orders ((ordered_at::date));"></div>
+<p>錯誤 42P17：<code>ordered_at::date</code> 的結果取決於連線的 <code>TimeZone</code> 設定，台北的 10/30 01:00 在 UTC 還是 10/29。同一筆訂單換一條時區不同的連線，就算出不同的日期，所以不是 IMMUTABLE。把時區寫死就沒有這個問題，執行後看計畫有沒有用上這個索引：</p>
+<div class="lab" data-sql="BEGIN;
+CREATE INDEX ON orders (((ordered_at AT TIME ZONE 'Asia/Taipei')::date));
+EXPLAIN SELECT count(*) FROM orders
+WHERE (ordered_at AT TIME ZONE 'Asia/Taipei')::date = '2026-10-01';
+ROLLBACK;"></div>
+<p>運算式外面要多包一層括號：<code>ON orders ((運算式))</code>。</p>
+<p>不過，只是要查某一天的訂單，其實不需要運算式索引：第 20 課教過的範圍寫法 <code>ordered_at &gt;= '2026-10-01 00:00+08' AND ordered_at &lt; '2026-10-02 00:00+08'</code> 用一般索引就夠，也不用約定運算式的寫法。運算式索引留給沒辦法改寫成範圍的情況，例如 <code>lower(email)</code>。</p>
+<p>到這裡的索引都只負責「找到」列，找到之後，查詢要的其他欄位還得回表去讀。工單 6 的報表一次要讀幾千列，回表成了主要的成本：能不能讓查詢只讀索引就好？</p>
+
+<h2>工單 6：報表要加總，能不能只讀索引、不回表？</h2>
+<p>後台有一張報表：列出一批顧客各自的消費總額。查詢只用到 <code>customer_id</code> 和 <code>total</code> 兩欄。如果只有 <code>(customer_id)</code> 索引，資料庫在索引裡找到每一筆訂單的位置後，還要逐筆回表讀 <code>total</code>；符合的訂單有幾千筆，就要回表幾千次。</p>
+<p><a href="21-explain.html">第 21 課</a>提過 <code>Index Only Scan</code>：查詢要的欄位都在索引裡，就不用回表。<strong>覆蓋索引</strong>（covering index）就是刻意讓索引「蓋住」查詢需要的每一個欄位，讓它走 <code>Index Only Scan</code>。</p>
+<p>做法要回到 B-tree 的結構：第 1 張工單看過，葉節點是最底層一筆一筆存放索引項目的那一層。<code>customer_id</code> 要用來搜尋，放在索引的欄位裡；<code>total</code> 不用來搜尋、只要回傳，用 <code>INCLUDE</code> 附在葉節點上。這格的索引不在交易裡，建好會留著，後面幾格接著用。執行後看掃描方式和 <code>Heap Fetches</code>：</p>
+<div class="lab" data-sql="CREATE INDEX IF NOT EXISTS orders_customer_total_idx ON orders (customer_id) INCLUDE (total);
+-- 顧客 1～50 的消費總額
+EXPLAIN ANALYZE
+SELECT customer_id, sum(total) FROM orders
+WHERE customer_id BETWEEN 1 AND 50
+GROUP BY customer_id;"></div>
+<p><code>Index Only Scan</code>、<code>Heap Fetches: 0</code>：完全沒碰表。</p>
+<p><code>INCLUDE</code> 和直接寫 <code>(customer_id, total)</code> 的差別：<code>INCLUDE</code> 的欄位只存在葉節點、不參與排序，所以<strong>不能當搜尋條件</strong>（<code>WHERE total &gt; 400</code> 用不上它），也不影響 <code>UNIQUE</code> 的判斷，例如 <code>UNIQUE (email) INCLUDE (name)</code> 仍然只保證 email 不重複。</p>
+
+<h3>Index Only Scan 為什麼還會回表？</h3>
+<p>「Index Only」這個名字容易讓人以為保證不讀表，其實不是。PostgreSQL 的索引不記錄「這一列對哪些交易可見」：一列被更新或刪除後，有些交易還該看到舊的樣子，有些不該，這個資訊只存在表裡（第 30 課的 MVCC 會講原因）。所以光看索引，不知道這一列對目前的交易算不算存在。</p>
+<p>為了不必每一筆都回表確認，PostgreSQL 維護一份<strong>可見性地圖</strong>（visibility map）：每個資料頁一個標記，表示「這一頁裡的資料對所有交易都可見」，由 <code>VACUUM</code> 設定。<code>Index Only Scan</code> 讀到一筆索引項目時，先看它所在的資料頁有沒有這個標記：有，就直接相信索引；沒有，就回表確認。回表的次數就是 <strong><code>Heap Fetches</code></strong>。這頁的 seed 最後跑過 <code>VACUUM</code>，所以剛才是 0。</p>
+<p>現在模擬「剛被大量更新過」。同一句查詢接下來還要再看兩次，seed 把它包成小工具 <code>totals_plan()</code>，就是上面那句 <code>EXPLAIN ANALYZE</code>。執行後看 <code>Heap Fetches</code> 和 <code>Buffers</code>：</p>
+<div class="lab" data-sql="UPDATE orders SET total = total WHERE customer_id BETWEEN 1 AND 50;
+SELECT * FROM totals_plan();"></div>
+<p>還是叫 <code>Index Only Scan</code>，但 <code>Heap Fetches</code> 變成幾千，<code>Buffers</code> 也大了很多：被更新過的頁失去了「全部可見」的標記，每一筆都回表確認。<code>VACUUM</code> 之後就恢復（照課首說的，單獨一格執行）：</p>
+<div class="lab" data-sql="VACUUM orders;"></div>
+<p>再看一次，<code>Heap Fetches</code> 回到 0：</p>
+<div class="lab" data-sql="SELECT * FROM totals_plan();"></div>
+<p>正式環境由 autovacuum 自動做這件事，但一直被更新的熱門表，可見性地圖常常跟不上，覆蓋索引的效果就打折。第 30 課會講 VACUUM 的細節。<code>INCLUDE</code> 的欄位也會讓索引變大，只放小而常用的欄位，不要把整列都塞進去。</p>
+<p>工單 1 到 6 每張都靠加索引解決。但索引不是免費的：收款表 <code>payments</code> 上線以來被不同的人各加了索引，現在寫入越來越慢，這就是工單 7。</p>
+
+<h2>工單 7：寫入越來越慢，索引的成本是什麼、哪些該刪？</h2>
+<p>每個索引都是一份額外的、要跟表保持同步的資料。讀的時候它替你省事，寫的時候就換你付出代價：</p>
+<ul>
+  <li><strong>寫入變慢</strong>：每次 <code>INSERT</code>，每個索引都要插一筆；<code>UPDATE</code> 改到索引欄位時也要。</li>
+  <li><strong>佔空間</strong>：索引常常比表還大，也和表搶記憶體快取。</li>
+  <li><strong>讓 HOT 更新失效</strong>：沒改到任何索引欄位的 <code>UPDATE</code> 可以不必動索引，叫 <strong>HOT 更新</strong>（Heap-Only Tuple）。如果幫一個常被更新的欄位（例如 <code>status</code>）建了索引，這些更新就都不能走 HOT 了。第 30 課詳談。</li>
+</ul>
+<p><code>payments</code> 是收款紀錄，每筆已付款訂單一筆，上線以來不同的人為了不同需求各加了索引，連主鍵一共 5 個。用它把成本算出來：同樣的 2 萬多筆收款，寫進沒有索引的表和有 5 個索引的表。執行後比較兩個 <code>Execution Time</code>，和最後一張結果的總大小：</p>
+<div class="lab" data-sql="BEGIN;
+CREATE TABLE pay_bare (LIKE payments);                     -- 只有欄位，沒有索引
+CREATE TABLE pay_idx  (LIKE payments INCLUDING INDEXES);   -- 連 5 個索引一起複製
+EXPLAIN (ANALYZE, BUFFERS OFF) INSERT INTO pay_bare SELECT * FROM payments;
+EXPLAIN (ANALYZE, BUFFERS OFF) INSERT INTO pay_idx  SELECT * FROM payments;
+SELECT relname, pg_size_pretty(pg_total_relation_size(oid)) AS total_size
+FROM pg_class WHERE relname IN ('pay_bare', 'pay_idx');
+ROLLBACK;"></div>
+<p>有索引的那張，寫入時間大約是好幾倍，總大小也將近 3 倍。所以看到慢查詢，第一個念頭不該是「再加一個索引」，而是「能不能調整現有的索引來涵蓋它」；已經存在的索引，也要定期檢查還值不值得留。</p>
+
+<h3>怎麼找出可以刪的索引？</h3>
+<p>要判斷一個索引值不值得留，先要知道它有沒有被用到。PostgreSQL 會自動累計各種使用次數，放在 <strong><code>pg_stat_*</code> 統計視圖</strong>裡。<code>pg_stat_user_indexes.idx_scan</code> 是每個索引被用來掃描過幾次，從上次重設統計以來一直累加。這頁的 seed 模擬了 <code>payments</code> 上線以來的使用情況：一開始只有 <code>(order_id)</code> 索引，查詢都用它；後來為了查某筆訂單最近一次付款，有人加了 <code>(order_id, paid_at DESC)</code>。執行後看每個索引的 <code>idx_scan</code>、<code>is_unique</code> 和定義：</p>
+<div class="lab" data-sql="SELECT s.indexrelname AS index_name, s.idx_scan, i.indisunique AS is_unique,
+       pg_get_indexdef(s.indexrelid) AS definition
+FROM pg_stat_user_indexes s JOIN pg_index i USING (indexrelid)
+WHERE s.relname = 'payments'
+ORDER BY s.indexrelname;"></div>
+<p>兩種索引可以考慮刪：</p>
+<ul>
+  <li><strong>被涵蓋的索引</strong>：A 的欄位正好是 B 的開頭幾欄（例如 <code>(order_id)</code> 和 <code>(order_id, paid_at DESC)</code>）。B 是先依 <code>order_id</code> 排的，所以能用 A 的查詢都能用 B。A 就算 <code>idx_scan</code> 不是 0 也可以刪，用過它的查詢 B 都能接手。反過來不行，B 能做的 A 做不到。</li>
+  <li><strong>從沒被用過的索引</strong>：<code>idx_scan = 0</code>，每次寫入都在付它的成本，卻沒有任何查詢受益。</li>
+</ul>
+<div class="callout warn">
+  <strong>刪之前先確認三件事：</strong>① 唯一索引和主鍵在保護資料正確性，<code>idx_scan = 0</code> 也不能刪（它每次 <code>INSERT</code> 都在檢查重複，只是不算「掃描」）。② 統計可能剛被重設過（看 <code>pg_stat_database.stats_reset</code>），也可能沒涵蓋月底報表這種低頻但重要的查詢。③ 統計只記錄在這一台：分擔讀取的唯讀副本 <strong>replica</strong>（第 37 課）上的查詢，不會算進主資料庫的 <code>idx_scan</code>。
+</div>
+<div class="callout practice"><strong>💡 實務上：每個新索引都要說得出是為哪一條查詢</strong><br>在 code review 看到 migration 新增索引時，資深工程師會問：這是為了哪一條查詢（最好附上 <code>EXPLAIN ANALYZE</code>）？現有的索引調整一下能不能涵蓋？這張表寫入頻繁嗎？刪索引則反過來，要在 PR 說明上面那三項都確認過了。另外，直接在正式環境的大表上 <code>CREATE INDEX</code> 會擋住寫入，安全的做法第 34 課會講。</div>
+
+<h2>補充與查表</h2>
+<ul>
+  <li><strong><code>Buffers</code> 自動出現</strong>：PostgreSQL 18 的 <code>EXPLAIN ANALYZE</code> 會自動附上 <code>Buffers</code>（讀了幾個資料頁），不必再寫 <code>BUFFERS</code> 選項；工單 7 的範例用 <code>BUFFERS OFF</code> 把它關掉，只看時間。</li>
+  <li><strong>LIKE 前綴搜尋與 collation</strong>：這頁的 PGlite 用 <code>C</code> collation，所以 <code>email LIKE 'User42%'</code> 能直接用一般 B-tree 索引。正式環境的資料庫常用 <code>en_US.UTF-8</code> 之類的 collation，這時一般索引幫不了 <code>LIKE 'abc%'</code>，要建 <code>CREATE INDEX ON customers (email text_pattern_ops)</code> 或指定 <code>COLLATE "C"</code> 的索引。上線前在真正的資料庫用 <code>EXPLAIN</code> 確認。</li>
+</ul>
+<h3>第一欄沒有條件時：PostgreSQL 18 的 skip scan</h3>
+<p>工單 1 的查詢都對第一欄有等號條件。第一欄沒有條件時呢？<a href="20-indexes.html">第 20 課</a>說過：複合索引 <code>(status, ordered_at)</code> 只查 <code>ordered_at</code> 時幫助很小，因為違反最左前綴；那一課也提到 PostgreSQL 18 新增的 <strong>skip scan</strong>，這裡實際看一次。skip scan 是在第一欄沒有條件時，對第一欄的每個值各跳進索引找一次，等於自動改寫成「<code>store_id = 1 AND ordered_at &gt;= …</code>、<code>store_id = 2 AND …</code>……」。執行後看 <code>Index Searches</code>（跳進索引找了幾次）：</p>
+<div class="lab" data-sql="BEGIN;
+CREATE INDEX ON orders (store_id, ordered_at);
+EXPLAIN ANALYZE
+SELECT id, store_id, ordered_at FROM orders
+WHERE ordered_at &gt;= '2026-10-29 20:00+08';
+ROLLBACK;"></div>
+<p><code>Index Searches</code> 不是 1，而是 6：5 間分店各一次，再加上一次找「下一間分店」、發現已經沒有了（換成只有 3 種值的欄位會是 4 次）。</p>
+<p>這只在第一欄的種類很少（這裡只有 5 間店）時划算；如果第一欄是 <code>customer_id</code>（5,000 種），跳 5,000 次還不如全表掃描。所以 skip scan 是補救，設計索引時仍然以最左前綴為準。</p>
+
+<h2>練習</h2>
+<p class="muted">練習 1、3、4、5 在另開的全新資料庫裡判分，上面範例建的索引不會影響結果；第一次按「檢查答案」要等幾秒建資料庫。</p>
+
+<div class="exercise" data-isolated
+  data-start="-- 先看目前的計畫，再建一個索引
+SELECT * FROM plan_nodes('SELECT id, ordered_at, total FROM orders WHERE customer_id = 42 AND status = ''paid'' ORDER BY ordered_at DESC LIMIT 5');"
+  data-answer="CREATE INDEX ON orders (customer_id, status, ordered_at DESC);"
+  data-check="SELECT
+  (SELECT count(*) FROM pg_index WHERE indrelid = 'orders'::regclass AND NOT indisprimary) AS extra_indexes,
+  EXISTS (SELECT 1 FROM plan_nodes('SELECT id, ordered_at, total FROM orders WHERE customer_id = 42 AND status = ''paid'' ORDER BY ordered_at DESC LIMIT 5') WHERE node LIKE '%Sort%') AS has_sort,
+  coalesce((SELECT bool_and(
+              (SELECT attname FROM pg_attribute WHERE attrelid = i.indrelid AND attnum = i.indkey[0]) IN ('customer_id', 'status')
+              AND array_position(i.indkey::int2[], (SELECT attnum FROM pg_attribute WHERE attrelid = i.indrelid AND attname = 'customer_id'))
+                &lt; coalesce(array_position(i.indkey::int2[], (SELECT attnum FROM pg_attribute WHERE attrelid = i.indrelid AND attname = 'ordered_at')), 99))
+            FROM plan_nodes('SELECT id, ordered_at, total FROM orders WHERE customer_id = 42 AND status = ''paid'' ORDER BY ordered_at DESC LIMIT 5') p
+            JOIN pg_index i ON i.indexrelid = to_regclass(p.index_name)), false) AS locates_customer;">
+  <p>練習 1：App 的「我的訂單」頁：<code>SELECT id, ordered_at, total FROM orders WHERE customer_id = 42 AND status = 'paid' ORDER BY ordered_at DESC LIMIT 5</code>。<strong>只建一個索引</strong>，讓計畫裡沒有 <code>Sort</code>，而且是用索引直接定位到顧客 42 的訂單（等號欄位要排在排序欄位前面，<code>customer_id</code> 也要在其中）。判分會檢查：orders 上主鍵以外的索引數、計畫裡有沒有 Sort、用到的索引的欄位順序。</p>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON orders (customer_id);</script>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON orders (ordered_at);</script>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON orders (ordered_at, customer_id);</script>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON orders (customer_id, status);</script>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON orders (status, ordered_at DESC);</script>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON orders (status, ordered_at DESC, customer_id);</script>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON orders (customer_id, status, ordered_at DESC);
+CREATE INDEX ON orders (status);</script>
+</div>
+
+<div class="exercise" data-ordered
+  data-forbid="\b(OFFSET|OVER|IN)\b" data-forbid-msg="這題要用 keyset 分頁：從第 1 頁最後一筆接著往下取，不能用 OFFSET、視窗函式或寫死的 id 清單。"
+  data-require="^(?=[\s\S]*ORDER\s+BY\s+ordered_at\s+DESC\s*,\s*id\s+DESC)(?=[\s\S]*(\(\s*ordered_at\s*,\s*id\s*\)\s*&lt;|\bid\s*&lt;\s*29996\b))"
+  data-require-msg="起點要同時看第 1 頁最後一筆的時間和 id（時間相同時還要比 id），排序也要和第 1 頁完全一樣。"
+  data-start="SELECT id, ordered_at FROM orders
+ORDER BY ordered_at DESC, id DESC
+LIMIT 20 OFFSET 20;"
+  data-answer="SELECT id, ordered_at FROM orders
+WHERE (ordered_at, id) &lt; ('2026-10-29 22:48+08', 29996)
+ORDER BY ordered_at DESC, id DESC
+LIMIT 20;">
+  <p>練習 2：訂單列表依 <code>ordered_at DESC, id DESC</code> 排序、每頁 20 筆。第 1 頁的最後一筆是 <code>ordered_at = '2026-10-29 22:48+08'</code>、<code>id = 29996</code>。之後進來了 3 筆新訂單，店員也補登了一筆時間較早的紙本訂單（id 比較大）。不用 <code>OFFSET</code>，寫出第 2 頁的查詢，回傳 <code>id, ordered_at</code>。注意：有另一筆訂單和第 1 頁最後一筆同一個時間。</p>
+  <script type="text/sql" data-role="wrong">SELECT id, ordered_at FROM orders
+ORDER BY ordered_at DESC, id DESC
+LIMIT 20 OFFSET 20;</script>
+  <script type="text/sql" data-role="wrong">SELECT id, ordered_at FROM orders
+WHERE ordered_at &lt; '2026-10-29 22:48+08'
+ORDER BY ordered_at DESC, id DESC
+LIMIT 20;</script>
+  <script type="text/sql" data-role="wrong">SELECT id, ordered_at FROM orders
+WHERE ordered_at &lt;= '2026-10-29 22:48+08' AND id &lt; 29996
+ORDER BY ordered_at DESC, id DESC
+LIMIT 20;</script>
+  <script type="text/sql" data-role="wrong">SELECT id, ordered_at FROM orders
+WHERE ordered_at &lt;= '2026-10-29 22:48+08' AND id &lt;&gt; 29996
+ORDER BY ordered_at DESC, id DESC
+LIMIT 20;</script>
+  <script type="text/sql" data-role="wrong">SELECT id, ordered_at FROM orders
+WHERE (ordered_at, id) &lt;= ('2026-10-29 22:48+08', 29996)
+ORDER BY ordered_at DESC, id DESC
+LIMIT 20;</script>
+  <script type="text/sql" data-role="wrong">SELECT id, ordered_at FROM (
+  SELECT id, ordered_at, row_number() OVER (ORDER BY ordered_at DESC, id DESC) AS rn FROM orders
+) t WHERE rn BETWEEN 24 AND 43 ORDER BY ordered_at DESC, id DESC;</script>
+  <script type="text/sql" data-role="wrong">SELECT id, ordered_at FROM orders
+WHERE id IN (29976, 29975, 29974, 29973, 29972, 29971, 29997, 29970, 29969, 29968, 29967, 29966, 29965, 29964, 29963, 29962, 29961, 29960, 29959, 29958)
+ORDER BY ordered_at DESC, id DESC;</script>
+</div>
+
+<div class="exercise" data-isolated
+  data-start="SELECT * FROM plan_nodes('SELECT id, ordered_at FROM orders WHERE status = ''pending'' ORDER BY ordered_at LIMIT 20');"
+  data-answer="CREATE INDEX ON orders (ordered_at) WHERE status = 'pending';"
+  data-check="SELECT
+  EXISTS (SELECT 1 FROM plan_nodes('SELECT id, ordered_at FROM orders WHERE status = ''pending'' ORDER BY ordered_at LIMIT 20') WHERE node LIKE '%Sort%') AS has_sort,
+  coalesce((SELECT bool_or(i.indpred IS NOT NULL)
+            FROM plan_nodes('SELECT id, ordered_at FROM orders WHERE status = ''pending'' ORDER BY ordered_at LIMIT 20') p
+            JOIN pg_index i ON i.indexrelid = to_regclass(p.index_name)), false) AS uses_partial_index,
+  (SELECT coalesce(bool_and(pg_relation_size(indexrelid) &lt; 65536), true)
+   FROM pg_index WHERE indrelid = 'orders'::regclass AND NOT indisprimary) AS all_small,
+  (SELECT count(*) FROM orders) AS order_count;">
+  <p>練習 3：咖啡師的「待製作」畫面：<code>SELECT id, ordered_at FROM orders WHERE status = 'pending' ORDER BY ordered_at LIMIT 20</code>。建一個<strong>部分索引</strong>，讓計畫沒有 <code>Sort</code>，而且 orders 上主鍵以外的索引都小於 64 kB。不能刪改資料。</p>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON orders (status, ordered_at);</script>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON orders (ordered_at) WHERE status = 'paid';</script>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON orders (status) WHERE status = 'pending';</script>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON orders (ordered_at) WHERE status IN ('pending', 'cancelled');</script>
+  <script type="text/sql" data-role="wrong">DELETE FROM payments;
+DELETE FROM orders WHERE status &lt;&gt; 'pending';
+CREATE INDEX ON orders (status, ordered_at);</script>
+</div>
+
+<div class="exercise" data-isolated
+  data-start="-- 現有會員的 email 是 User42@Example.com 這種大小寫混合的寫法
+SELECT id, email FROM customers WHERE id = 42;"
+  data-answer="CREATE UNIQUE INDEX ON customers (lower(email));"
+  data-check="SELECT
+  try_sql('INSERT INTO customers (name, email) VALUES (''測試'', ''USER42@EXAMPLE.COM'')') AS same_email_other_case,
+  try_sql('INSERT INTO customers (name, email) VALUES (''測試'', ''brand.new@example.com'')') AS new_email,
+  EXISTS (SELECT 1 FROM plan_nodes('SELECT id FROM customers WHERE lower(email) = ''user42@example.com''') WHERE index_name IS NOT NULL) AS login_uses_index,
+  (SELECT count(*) FROM pg_index WHERE indrelid = 'customers'::regclass AND NOT indisprimary) AS extra_indexes;">
+  <p>練習 4：會員用 email 登入，不分大小寫。建<strong>一個</strong>索引同時做到：① 只差大小寫的重複 email（例如已有 <code>User42@Example.com</code>，再寫入 <code>USER42@EXAMPLE.COM</code>）寫不進去；② 登入查詢 <code>WHERE lower(email) = lower($1)</code> 用得上索引。判分會嘗試寫入這兩種 email，並檢查 <code>WHERE lower(email) = 'user42@example.com'</code> 的計畫。</p>
+  <script type="text/sql" data-role="wrong">CREATE UNIQUE INDEX ON customers (email);</script>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON customers (lower(email));</script>
+  <script type="text/sql" data-role="wrong">CREATE UNIQUE INDEX ON customers (upper(email));</script>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON customers (lower(email));
+CREATE UNIQUE INDEX ON customers (upper(email));</script>
+</div>
+
+<div class="exercise" data-isolated
+  data-start="SELECT s.indexrelname AS index_name, s.idx_scan, i.indisunique AS is_unique,
+       pg_get_indexdef(s.indexrelid) AS definition
+FROM pg_stat_user_indexes s JOIN pg_index i USING (indexrelid)
+WHERE s.relname = 'payments'
+ORDER BY s.indexrelname;"
+  data-answer="DROP INDEX payments_order_id_idx, payments_amount_idx;"
+  data-check="SELECT string_agg(indexdef, E'\n' ORDER BY indexname) FROM pg_indexes WHERE tablename = 'payments';">
+  <p>練習 5：<code>payments</code> 上有 5 個索引，seed 也跑過一段工作量。先執行起始內容看每個索引的定義和 <code>idx_scan</code>，再用 <code>DROP INDEX</code> 刪掉「被另一個索引完全涵蓋」的索引，和「從沒被用過、也不是用來保證唯一」的索引，其他保留。判分會檢查剩下哪些索引和它們的定義。</p>
+  <script type="text/sql" data-role="wrong">DROP INDEX payments_order_paid_idx, payments_amount_idx;</script>
+  <script type="text/sql" data-role="wrong">DROP INDEX payments_order_id_idx, payments_amount_idx, payments_receipt_no_key;</script>
+  <script type="text/sql" data-role="wrong">DROP INDEX payments_amount_idx;</script>
+  <script type="text/sql" data-role="wrong">DROP INDEX payments_order_paid_idx, payments_amount_idx;
+ALTER INDEX payments_order_id_idx RENAME TO payments_order_paid_idx;</script>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：查詢是 <code>WHERE store_id = $1 AND ordered_at &gt;= $2 ORDER BY ordered_at</code>，哪個索引最適合？</p>
+  <label data-key="a"><code>(store_id, ordered_at)</code></label>
+  <label data-key="b"><code>(ordered_at, store_id)</code></label>
+  <label data-key="c"><code>(store_id)</code> 和 <code>(ordered_at)</code> 兩個單欄索引，效果一樣</label>
+  <label data-key="d">欄位順序不重要，兩種複合索引都一樣</label>
+  <p class="why">✓ 等號欄位 <code>store_id</code> 在前，固定之後 <code>ordered_at</code> 在這一段裡是排好的，範圍條件和排序都直接用上。<code>(ordered_at, store_id)</code> 要掃過所有分店在這段時間的資料再過濾。兩個單欄索引合併（Bitmap AND）得到的是沒有順序的位置，還要 Sort。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 7：ORM 送出 prepared statement <code>WHERE status = $1</code>，參數是 <code>'pending'</code>，表上有部分索引 <code>… WHERE status = 'pending'</code>。這個索引一定會被用到嗎？</p>
+  <label data-key="a">一定會，規劃器永遠知道參數的值</label>
+  <label data-key="b">一定不會，有參數的查詢都用不上任何索引</label>
+  <label data-key="c">不一定：用 generic plan 時規劃器看不到參數值，推不出 <code>status = 'pending'</code>，就不能用部分索引</label>
+  <p class="why">✓ 部分索引能不能用，是在規劃時判斷的。依實際值規劃（custom plan）時用得上；generic plan 要適用所有參數值，所以用不上。一般索引不受影響。要穩定用上部分索引，條件寫成 SQL 裡的常數。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 8：計畫顯示 <code>Index Only Scan using orders_customer_total_idx</code>，下面卻是 <code>Heap Fetches: 18000</code>。最可能的原因？</p>
+  <label data-key="a">索引沒有 INCLUDE 需要的欄位，所以每一筆都回表</label>
+  <label data-key="b">那些資料頁在可見性地圖裡沒有「全部可見」的標記（剛被大量寫入或更新、還沒 VACUUM），只好回表確認</label>
+  <label data-key="c">Heap Fetches 是讀索引的次數，數字大代表索引很有效率</label>
+  <p class="why">✓ 欄位不夠的話根本不會選 Index Only Scan。它只能跳過「已被 VACUUM 標記為全部可見」的資料頁，其他頁要回表確認可見性，次數就是 Heap Fetches。VACUUM（或 autovacuum 跟上）之後會降下來。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>把範圍或排序欄位放在等號欄位前面</strong>：<code>(ordered_at, customer_id)</code> 對「某位顧客最近的訂單」幾乎沒幫助，訂單少的顧客要讀完整個索引。等號欄位在前。</li>
+  <li><strong>keyset 分頁只用時間、沒有 id 決勝</strong>：同一時間的訂單會被跳過或重複。用 <code>(ordered_at, id) &lt; (…, …)</code>，ORDER BY 和索引都加上 id。</li>
+  <li><strong>查詢的寫法和索引運算式不一致</strong>：索引是 <code>lower(email)</code>，查詢卻寫 <code>email ILIKE …</code>，索引用不上。</li>
+  <li><strong>索引運算式用了不是 IMMUTABLE 的東西</strong>：<code>timestamptz::date</code>、<code>now()</code> 會得到 42P17。把時區寫死（<code>AT TIME ZONE 'Asia/Taipei'</code>），或改用範圍條件。</li>
+  <li><strong>部分索引的條件用參數傳</strong>：generic plan 用不上部分索引。條件寫成常數。</li>
+  <li><strong>看到慢查詢就加新索引</strong>：每個索引都拖慢寫入、佔空間、讓 HOT 更新失效。先看能不能調整既有的索引。</li>
+  <li><strong>只看 <code>idx_scan = 0</code> 就刪</strong>：唯一索引與主鍵在保護資料；統計可能剛重設；replica 上的查詢不算在主資料庫。</li>
+  <li><strong>以為有 skip scan 就不用在意欄位順序</strong>：只有第一欄種類很少時才划算。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>設計索引先拆解查詢：等號欄位、範圍欄位、排序、回傳欄位。複合索引像電話簿，前面的欄位固定後，後面那欄在這一段裡已經排好，所以等號欄位在前，範圍或排序欄位在後；用 <code>EXPLAIN ANALYZE</code> 確認 <code>Sort</code> 消失、<code>Buffers</code> 變少，並用「最常見、最慢」的參數測（工單 1）。</li>
+  <li><code>OFFSET</code> 用位置記錄讀到哪裡，越後面越慢，資料變動時會重複或漏掉。keyset 分頁改記上一頁最後一筆：<code>WHERE (ordered_at, id) &lt; (…)</code> 配 <code>(ordered_at DESC, id DESC)</code> 索引，<code>id</code> 負責同分決勝；代價是不能跳頁（工單 2）。</li>
+  <li>部分索引只收需要的列，又小又不拖慢其他寫入；查詢要推得出索引條件，條件用參數傳時 generic plan 用不上它，所以寫成常數。部分唯一索引可以表達「未刪除的才不能重複」（工單 3、4）。</li>
+  <li>運算式索引存運算結果，查詢要寫成同一個運算式；只能用 IMMUTABLE 函式，<code>timestamptz::date</code> 要先把時區寫死，能改寫成範圍條件就不必建（工單 5）。</li>
+  <li><code>INCLUDE</code> 做覆蓋索引，讓 <code>Index Only Scan</code> 不必回表；<code>Heap Fetches</code> 高代表可見性地圖還沒被 VACUUM 設好（工單 6）。</li>
+  <li>索引有寫入、空間、HOT 的成本；用 <code>pg_stat_user_indexes</code> 和欄位前綴找出可刪的索引，但保留唯一索引（工單 7）。第一欄沒有條件時，PostgreSQL 18 的 skip scan 只在第一欄種類少時能補救（見補充）。</li>
+</ul>
+<p>下一課換一種索引：GIN，用來加速 JSONB、陣列的「包含」查詢，以及全文檢索和模糊搜尋（<a href="28-gin-search.html">第 28 課</a>）。</p>
+
+</main>
+
+<script type="text/sql" id="seed">
+CREATE TABLE customers (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL,
+  email text NOT NULL,
+  phone text,
+  deleted_at timestamptz
+);
+INSERT INTO customers (name, email, phone)
+SELECT (ARRAY['王','陳','林','張','李','黃','吳','劉'])[1 + g % 8]
+       || (ARRAY['家豪','怡君','俊傑','雅雯','志明','淑芬','冠宇','佳穎','承恩','宜蓁'])[1 + (g / 8) % 10],
+       'User' || g || '@Example.com',
+       '09' || lpad((10000000 + g * 7)::text, 8, '0')
+FROM generate_series(1, 5000) g;
+
+-- 30,000 筆訂單；除了主鍵，故意不建任何索引
+CREATE TABLE orders (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  customer_id integer NOT NULL REFERENCES customers,
+  store_id integer NOT NULL,
+  status text NOT NULL,
+  ordered_at timestamptz NOT NULL,
+  total integer NOT NULL
+);
+-- 每 13 分鐘一筆；顧客 42 是常客（每 10 筆有 1 筆）；pending 約 1%、cancelled 約 9%
+INSERT INTO orders (customer_id, store_id, status, ordered_at, total)
+SELECT CASE WHEN g % 10 = 0 THEN 42 ELSE 1 + (g * 7919) % 5000 END,
+       1 + g % 5,
+       CASE WHEN (g * 37 + g / 10) % 100 = 0 THEN 'pending'
+            WHEN (g * 37 + g / 10) % 100 < 10 THEN 'cancelled'
+            ELSE 'paid' END,
+       timestamptz '2026-02-01 08:00+08' + g * interval '13 minutes',
+       70 + (g * 37) % 400
+FROM generate_series(1, 29995) g;
+-- 29996：和 29976 同一個時間（第 1 頁和第 2 頁的分界剛好同分）
+INSERT INTO orders (customer_id, store_id, status, ordered_at, total)
+SELECT 7, 2, 'paid', ordered_at, 110 FROM orders WHERE id = 29976;
+-- 29997：補登的紙本訂單，id 比較大、時間比較早
+INSERT INTO orders (customer_id, store_id, status, ordered_at, total)
+SELECT 8, 3, 'paid', ordered_at - interval '5 minutes', 190 FROM orders WHERE id = 29971;
+-- 29998～30000：第 1 頁讀完之後才進來的新訂單
+INSERT INTO orders (customer_id, store_id, status, ordered_at, total)
+SELECT 9 + k, 1, 'pending', ordered_at + k * interval '4 minutes', 80
+FROM orders, generate_series(1, 3) k WHERE id = 29995;
+
+CREATE TABLE payments (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  order_id integer NOT NULL REFERENCES orders,
+  receipt_no text NOT NULL,
+  paid_at timestamptz NOT NULL,
+  amount integer NOT NULL
+);
+INSERT INTO payments (order_id, receipt_no, paid_at, amount)
+SELECT id, 'R' || lpad(id::text, 6, '0'), ordered_at + interval '1 minute', total
+FROM orders WHERE status = 'paid';
+CREATE UNIQUE INDEX payments_receipt_no_key ON payments (receipt_no);
+CREATE INDEX payments_order_id_idx ON payments (order_id);
+CREATE INDEX payments_amount_idx ON payments (amount);
+ANALYZE;
+
+-- 小工具：計畫攤平成「節點、表、索引、條件」（function 的寫法第 23 課教過）
+CREATE FUNCTION plan_json(query text) RETURNS jsonb
+LANGUAGE plpgsql AS $$
+DECLARE j json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) ' || query INTO j;
+  RETURN (j::jsonb) -> 0 -> 'Plan';
+END
+$$;
+CREATE FUNCTION plan_nodes(query text)
+RETURNS TABLE (node text, table_name text, index_name text, cond text)
+LANGUAGE sql AS $$
+  WITH RECURSIVE t(p) AS (
+    SELECT plan_json(query)
+    UNION ALL
+    SELECT c FROM t, jsonb_array_elements(t.p -> 'Plans') c
+  )
+  SELECT p ->> 'Node Type', p ->> 'Relation Name', p ->> 'Index Name',
+         coalesce(p ->> 'Index Cond', p ->> 'Recheck Cond', p ->> 'Filter')
+  FROM t
+$$;
+-- 小工具：成功回傳 ok，失敗回傳 SQLSTATE
+CREATE FUNCTION try_sql(sql text) RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE sql;
+  RETURN 'ok';
+EXCEPTION WHEN OTHERS THEN
+  RETURN SQLSTATE;
+END
+$$;
+-- 小工具：「我的訂單」查詢的 EXPLAIN ANALYZE，顧客 id 是參數
+CREATE FUNCTION my_orders_plan(cust integer) RETURNS TABLE ("QUERY PLAN" text)
+LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN QUERY EXECUTE format(
+    'EXPLAIN ANALYZE SELECT id, ordered_at, total FROM orders WHERE customer_id = %s AND status = ''paid'' ORDER BY ordered_at DESC LIMIT 5', cust);
+END
+$$;
+-- 小工具：顧客 1～50 消費總額查詢的 EXPLAIN ANALYZE（覆蓋索引一節）
+CREATE FUNCTION totals_plan() RETURNS TABLE ("QUERY PLAN" text)
+LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN QUERY EXECUTE
+    'EXPLAIN ANALYZE SELECT customer_id, sum(total) FROM orders WHERE customer_id BETWEEN 1 AND 50 GROUP BY customer_id';
+END
+$$;
+</script>
+<script type="text/sql" id="seed-after">
+VACUUM ANALYZE orders;
+--;;
+-- 上線初期：payments 只有 (order_id) 索引
+SELECT * FROM payments WHERE order_id = 100;
+SELECT * FROM payments WHERE order_id = 101;
+SELECT * FROM payments WHERE id = 5;
+--;;
+-- 後來為了「最近一次付款」加了複合索引
+CREATE INDEX payments_order_paid_idx ON payments (order_id, paid_at DESC);
+--;;
+SELECT * FROM payments WHERE order_id = 200 ORDER BY paid_at DESC LIMIT 1;
+SELECT * FROM payments WHERE order_id = 201 ORDER BY paid_at DESC LIMIT 1;
+SELECT * FROM payments WHERE order_id = 202;
+</script>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

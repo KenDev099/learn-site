@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>6. Auth：登入、session、伺服器端驗證與 profiles</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="6" data-practice="supabase">
+<header>
+  <div class="eyebrow">階段 3：Auth 與檔案 · 第 6 課</div>
+  <h1>Auth：登入、session、伺服器端驗證與 profiles</h1>
+</header>
+<main>
+
+<p>咖啡店的點餐網站上線一週，客服收到三種回報。第一種：顧客登入後放著分頁去開會，回來按「我的訂單」就出現 401。第二種：資安同事發現用 Nuxt 寫的 <code>/api/me</code> 只要改瀏覽器裡的 cookie，就能變成別的顧客。第三種：新註冊的顧客在「會員資料」頁一片空白，因為 <code>profiles</code> 表裡沒有他那一列。三個問題都出在同一件事：沒弄清楚 Supabase Auth 登入後給了你什麼、誰該相信什麼。</p>
+<p>這一課講 Supabase Auth 的實際用法：登入後的 session 怎麼保存與更新、信箱驗證與 magic link、OAuth 要設定哪些東西、伺服器端怎麼可靠地知道「這個請求是誰」，以及怎麼在註冊時自動建立 profiles。token 的原理別門課教過，這裡只回顧一句，篇幅放在 Supabase 怎麼做。</p>
+
+<div class="callout"><strong>這課的路線</strong>
+<ul>
+  <li>登入之後手上有什麼：session 的兩個 token、誰負責更新它，回答「一小時後 401」。</li>
+  <li>信箱驗證與 magic link：本機的信寄到哪、怎麼換成 session。</li>
+  <li>OAuth 在 Supabase 要設定什麼：redirect 白名單與 PKCE。</li>
+  <li>伺服器端：session 放在 cookie 裡時，<code>getClaims</code>、<code>getUser</code>、<code>getSession</code> 各信得過什麼，回答「改 cookie 變成別人」。</li>
+  <li>profiles 與 trigger：<code>auth.users</code> 為什麼不能直接用，註冊時怎麼自動建一列；最後一段帶過 MFA、自訂 token 內容與匿名登入。</li>
+</ul></div>
+
+<div class="callout"><strong>這課會用到：</strong>access token 與 refresh token（短效的通行證＋換新通行證用的長效憑證，<a href="../../auth/lessons/10-refresh-rotation.html">認證課第 10 課</a>）；JWT 的簽章（簽章只有持有金鑰的人算得出來，改了內容簽章就對不上，<a href="../../auth/lessons/08-jwt-signatures.html">認證課第 8 課</a>）；請求怎麼變成資料庫角色（publishable key 是 <code>anon</code>，帶使用者 JWT 是 <code>authenticated</code>，<a href="03-keys-roles-grants.html">第 3 課</a>）；顧客只讀自己訂單的 policy（<code>customer_id = (select auth.uid())</code>，<a href="04-rls-basics.html">第 4 課</a>）。</div>
+
+<div class="callout warn"><strong>環境</strong>：這課用到資料庫、gateway、Data API、Auth 與 Mailpit（db、kong、rest、auth、mailpit），<code>npm run up</code> 預設都會開。練習 3 用到 @supabase/ssr 0.12.7，已經寫在 <code>supabase/practice/package.json</code>，第一次做先在 <code>supabase/practice</code> 執行 <code>npm ci</code>。</div>
+
+<h2>登入之後手上有什麼</h2>
+<p>先看登入這個動作本身。supabase-js 的登入與註冊各一行：</p>
+<pre>const supabase = createClient('http://localhost:55421', 'sb_publishable_…')
+
+await supabase.auth.signUp({ email: 'ming@example.com', password: '…', options: { data: { display_name: '王小明' } } })
+const { data, error } = await supabase.auth.signInWithPassword({ email: 'ming@example.com', password: '…' })</pre>
+<p>登入成功時 <code>data.session</code> 是一個 <strong>session</strong> 物件。把它印出來（節錄）：</p>
+<pre>{
+  access_token: 'eyJhbGciOiJFUzI1NiIs…',   // JWT，帶在每個請求的 Authorization header
+  expires_in: 3600,                         // 秒
+  expires_at: 1795155112,                   // 到期時間（Unix 秒）
+  refresh_token: 'u3kq…',                   // 換新 access token 用，只能用一次
+  user: { id: '6205ef23-…', email: 'ming@example.com', user_metadata: { display_name: '王小明' }, … }
+}</pre>
+<ul>
+  <li><strong>access token</strong>：Auth 簽發的 JWT，<code>sub</code> 是使用者 id、<code>role</code> 是 <code>authenticated</code>。第 3 課講過，PostgREST 驗過它的簽章後，用 <code>authenticated</code> 角色查詢，<code>auth.uid()</code> 讀到的就是 <code>sub</code>。有效期是 <code>config.toml</code> 的 <code>[auth] jwt_expiry = 3600</code>（一小時，雲端在 Dashboard 設）。</li>
+  <li><strong>refresh token</strong>：access token 過期前，拿它向 Auth 換一組新的 access token＋新的 refresh token。舊的 refresh token 換過就作廢（輪替，rotation）；<code>refresh_token_reuse_interval = 10</code> 是寬限秒數，讓同時發出的兩個換新請求不會互相打架。為什麼這樣設計，<a href="../../auth/lessons/10-refresh-rotation.html">認證課第 10 課</a>講過。</li>
+  <li><strong>user</strong>：登入當下的使用者資料。</li>
+</ul>
+<p>登入之後，<strong>同一個 client</strong> 發出的每個請求都會自動帶 <code>Authorization: Bearer &lt;access token&gt;</code>。supabase-js 也會在背景自動換新 token，並把 session 存起來：在瀏覽器存 localStorage，重新整理頁面還是登入狀態。</p>
+<p>所以開場「放著一小時就 401」，常見原因是有人繞過了這個機制：把 access token 複製出來自己組 fetch（token 過期了沒人換）、每次請求都 <code>createClient</code> 一個新的 client（新的 client 不知道 session）、或在伺服器端把 <code>autoRefreshToken</code> 關掉後忘了自己處理。原則是<strong>整個前端共用一個 client</strong>，讓它管 session。</p>
+<p>登入失敗時 <code>error.code</code> 會告訴你原因，畫面要依它給不同的提示：</p>
+<div class="table-wrap"><table>
+  <tr><th><code>error.code</code></th><th>意思</th><th>畫面該說</th></tr>
+  <tr><td><code>invalid_credentials</code></td><td>email 或密碼錯</td><td>「帳號或密碼錯誤」，不要說是哪一個錯（避免讓人試出哪些 email 有註冊）</td></tr>
+  <tr><td><code>email_not_confirmed</code></td><td>帳號存在、密碼對，但還沒點驗證信</td><td>「請先到信箱點驗證連結」，附「重寄驗證信」按鈕</td></tr>
+  <tr><td><code>over_request_rate_limit</code> 等</td><td>太頻繁，被限流</td><td>「稍後再試」</td></tr>
+</table></div>
+
+<h3>監聽登入狀態：onAuthStateChange</h3>
+<p>畫面要跟著登入狀態變（右上角顯示名字、登出後跳回首頁），用 <code>onAuthStateChange</code> 訂閱事件：</p>
+<pre>// stores/auth.ts（Pinia）
+export const useAuthStore = defineStore('auth', () =&gt; {
+  const user = ref&lt;User | null&gt;(null)
+  supabase.auth.onAuthStateChange((event, session) =&gt; {
+    // INITIAL_SESSION（剛載入）、SIGNED_IN、SIGNED_OUT、TOKEN_REFRESHED、USER_UPDATED、PASSWORD_RECOVERY
+    user.value = session?.user ?? null
+  })
+  return { user }
+})</pre>
+<p>callback 寫成同步函式，裡面只更新狀態。supabase-js 2.119.0 把 <code>async</code> 的 callback 標成不建議使用：在 callback 裡 <code>await</code> 其他會觸發換新 token 的呼叫，可能互相等待而卡住（deadlock）。要在登入後查資料，先存狀態，再由元件或 <code>watch</code> 去查。</p>
+<div class="callout practice"><strong>💡 實務上：token 過期的使用者體驗</strong><br>顧客的分頁開一整天很常見。共用一個 client、讓它自動換新，一般情況使用者感覺不到 token 過期。真的換新失敗（refresh token 被撤銷、帳號被停用）時，<code>onAuthStateChange</code> 會收到 <code>SIGNED_OUT</code>：在 Pinia 裡接這個事件，把使用者導回登入頁，並保留他原本要去的網址，登入後再導回去。客服回報「突然被登出」時，先在 Network 看 <code>/auth/v1/token?grant_type=refresh_token</code> 回了什麼錯。</div>
+
+<h2>信箱驗證與 magic link</h2>
+<p>知道了 session 長什麼樣，接著看另一條拿到 session 的路：靠信箱。<code>config.toml</code> 的 <code>[auth.email] enable_confirmations</code> 決定註冊後要不要先點驗證信才能登入。課程的本機設定是 <code>false</code>，所以 <code>signUp</code> 直接回傳 session；雲端新專案預設要驗證（Dashboard 的 Confirm email）。沒驗證的帳號用密碼登入，就是上一節表格裡的 <code>email_not_confirmed</code>。</p>
+<p><strong>magic link</strong>（神奇連結）是免密碼登入：輸入 email，收到一封信，點信裡的連結就登入。supabase-js 的寫法：</p>
+<pre>await supabase.auth.signInWithOtp({ email: 'ming@example.com', options: { shouldCreateUser: false } })</pre>
+<p>OTP 是 one-time password（一次性密碼）。<code>shouldCreateUser</code> 預設是 <code>true</code>：沒註冊過的 email 也會直接建立帳號。登入頁通常要設成 <code>false</code>，不然顧客打錯一個字就多一個帳號；設了之後沒註冊過的 email 會回錯誤 <code>otp_disabled</code>。</p>
+<p>本機 Auth 寄出的信不會真的寄出去，全部進 <strong>Mailpit</strong>（第 1 課看過的假信箱，網頁在 <code>http://localhost:55424</code>）。上面那行執行完，Mailpit 裡會多一封：</p>
+<pre>Your sign-in link
+
+Follow the link below to sign in. This link expires shortly and can only be used once.
+
+Sign in ( http://127.0.0.1:55421/auth/v1/verify?token=e7d6f66c…&amp;type=magiclink&amp;redirect_to=http://localhost:5173 )</pre>
+<p>連結指向 Auth 的 <code>/auth/v1/verify</code>：Auth 驗過 <code>token</code> 之後，把瀏覽器導回 <code>redirect_to</code>（預設是 <code>site_url</code>），並把 session 交給前端。這個 <code>token</code> 是 token hash（雜湊過的值），也可以不經過瀏覽器跳轉，直接交給 supabase-js 換成 session：</p>
+<pre>const { data, error } = await supabase.auth.verifyOtp({ token_hash: '&lt;信裡的 token&gt;', type: 'email' })
+// data.session 就是登入後的 session；同一個連結第二次用會得到 otp_expired</pre>
+<p>正式專案常把信的範本改成連到自己網站的 <code>/auth/confirm?token_hash=…&amp;type=email</code>，由那一頁呼叫 <code>verifyOtp</code>。這樣信件掃描器（有些公司的信箱會先「點一次」信裡的連結檢查安全性）不會把一次性的連結用掉。練習 2 用 Mailpit 的 API 收信，自動化地走一次這個流程。</p>
+<p>同一個 email 寄信有頻率限制（本機 <code>[auth.email] max_frequency = "1s"</code>），太快重寄會收到「For security purposes, you can only request this after N seconds」。</p>
+<div class="callout practice"><strong>💡 實務上：上線前一定要換自己的寄信服務</strong><br>Supabase 內建的寄信服務只適合開發測試，寄送量有很低的上限，上線前在 Dashboard 設定自己的 SMTP（例如公司已經在用的寄信服務）。同時改信件範本：寄件人名稱、中文內容、連到自己網域的確認頁。驗證信寄不到是上線第一週最常見的客訴之一，順序是先查 Auth 的 log 有沒有寄出、再查 SMTP 服務的退信紀錄。</div>
+
+<h2>OAuth 在 Supabase 要設定什麼</h2>
+<p>信箱登入之外，顧客更常用「用 Google 登入」。OAuth 授權碼流程與 PKCE 的原理在<a href="../../auth/lessons/12-oauth-pkce.html">認證課第 12 課</a>講過：瀏覽器跳到 Google，使用者同意後帶著一次性的 code 跳回你的網站，再用 code 換 token；PKCE 讓攔到 code 的人換不到 token。在 Supabase 裡，換 token 這件事由 Auth 服務做，你要做的是設定：</p>
+<ul>
+  <li><strong>provider</strong>：在 Dashboard（本機是 <code>config.toml</code> 的 <code>[auth.external.google]</code>）填 Google 給你的 client id 與 secret。本機沒辦法真的連 Google，這門課不實作。</li>
+  <li><strong>redirect 白名單</strong>：登入完成後，Auth 只會把使用者導回 <code>site_url</code> 或 <code>additional_redirect_urls</code> 列出的網址。課程本機設成 <code>http://localhost:5173</code> 與 <code>http://localhost:5173/**</code>（Vite 的預設 port）。正式環境要列出正式網域、預覽環境的網域，不要用太寬的萬用字元。</li>
+  <li><strong>PKCE</strong>：supabase-js 在瀏覽器預設用 PKCE 流程（<code>flowType: 'pkce'</code>），跳回來的網址帶 <code>?code=…</code>，由 <code>exchangeCodeForSession(code)</code> 換成 session。用 @supabase/ssr 時一律是 PKCE。</li>
+</ul>
+<pre>await supabase.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: 'http://localhost:5173/auth/callback' } })
+
+// /auth/callback 那一頁（或伺服器端的 route）
+const code = new URL(location.href).searchParams.get('code')
+if (code) await supabase.auth.exchangeCodeForSession(code)</pre>
+<p>為什麼一定要白名單：如果 Auth 願意把使用者導回任何網址，攻擊者就能寄一個「用 Google 登入」的連結，把 <code>redirectTo</code> 設成自己的網站，使用者登入後，code 或 token 就被送到攻擊者那裡。<code>redirectTo</code> 不在白名單時，Auth 會改導回 <code>site_url</code>。</p>
+
+<h2>伺服器端：session 放在 cookie 裡</h2>
+<p>前面的流程都在瀏覽器裡，session 存在 localStorage。改用 Nuxt、Next.js 這類有伺服器端渲染的框架時，伺服器也要知道「這個請求是誰」，但伺服器讀不到瀏覽器的 localStorage。做法是把 session 存在 <strong>cookie</strong>（瀏覽器每個請求都會自動帶上的小資料，<a href="../../auth/lessons/04-cookies-sessions.html">認證課第 4 課</a>），官方套件 <strong>@supabase/ssr</strong>（這門課用 0.12.7）就是做這件事：</p>
+<pre>import { createServerClient, parseCookieHeader } from '@supabase/ssr'
+
+// 每個請求建一個 client：cookie 從這個請求讀，要更新的 cookie 寫回這個回應
+const supabase = createServerClient(url, publishableKey, {
+  cookies: {
+    getAll: () =&gt; parseCookieHeader(req.headers.get('cookie') ?? ''),
+    setAll: (list) =&gt; { for (const c of list) res.headers.append('Set-Cookie', serialize(c.name, c.value, c.options)) },
+  },
+})</pre>
+<p>登入後，cookie 名稱是 <code>sb-&lt;專案代號&gt;-auth-token</code>（本機網址是 127.0.0.1，代號就是 <code>127</code>），內容是 <code>base64-</code> 開頭、把整個 session 物件用 base64url 編碼的字串。重點在這裡：<strong>cookie 的內容是瀏覽器送來的，使用者自己改得到</strong>。所以伺服器端從 client 取出身分有三個方法，可信度不同：</p>
+<div class="table-wrap"><table>
+  <tr><th>方法</th><th>做了什麼</th><th>能拿來做授權嗎</th></tr>
+  <tr><td><code>getSession()</code></td><td>把 cookie 裡的 session 讀出來（過期時會先換新），<strong>不驗簽章</strong></td><td>不行。<code>session.user</code> 就是 cookie 裡寫的內容</td></tr>
+  <tr><td><code>getClaims()</code></td><td>驗 access token 的簽章與到期時間，回傳裡面的 claims。專案用非對稱金鑰時在你的伺服器上就驗完（金鑰從 <code>/auth/v1/.well-known/jwks.json</code> 取一次後快取）</td><td>可以。伺服器端判斷身分的首選</td></tr>
+  <tr><td><code>getUser()</code></td><td>每次都把 token 送到 Auth 伺服器查</td><td>可以。還能發現「使用者已經被刪除或停用」，代價是每次多一個網路請求</td></tr>
+</table></div>
+<p>本機的金鑰是非對稱的，實際打一次就看得到：</p>
+<pre>curl http://localhost:55421/auth/v1/.well-known/jwks.json</pre>
+<pre>{"keys":[{"alg":"ES256","crv":"P-256","kty":"EC","use":"sig","kid":"b81269f1-…","x":"M5Sj…","y":"P6IX…"}]}</pre>
+<p>ES256 是橢圓曲線簽章：Auth 用私鑰簽，任何人都能用這把公鑰驗，但算不出新的簽章（<a href="../../auth/lessons/09-jwt-verification.html">認證課第 9 課</a>）。開場那個「改 cookie 變成別人」的 bug，就是 handler 用 <code>getSession()</code> 的 <code>user.id</code> 做授權：攻擊者把 cookie 裡的 <code>user.id</code> 改成別人的，<code>getSession()</code> 照單全收（supabase-js 還會在 console 印警告「could be insecure」）。換成 <code>getClaims()</code>，竄改過的 token 會得到 <code>Invalid JWT signature</code>。</p>
+<div class="callout practice"><strong>💡 實務上：Nuxt 的 server route 一律先 getClaims</strong><br>在 Nuxt 的 <code>server/api/*.ts</code>、middleware 裡，判斷「是誰、能不能做」一律用 <code>getClaims()</code> 的 <code>sub</code>；<code>getSession()</code> 只在需要把 access token 轉交給別的服務時用。要擋「剛被停權的人」（例如刪帳號、退款爭議）的高風險操作，改用 <code>getUser()</code> 多問 Auth 一次。code review 看到伺服器端程式出現 <code>getSession()</code> 再讀 <code>.user</code>，就要問一句。</div>
+
+<h2>profiles 與 trigger</h2>
+<p>伺服器知道了「是誰」，接著要放這個人的資料：暱稱、電話、生日。使用者存在 <code>auth.users</code>，但 <code>auth</code> 這個 schema 不對 Data API 開放（裡面有密碼雜湊等敏感欄位），前端讀不到也不該讀。慣例是在 public 另建一張 <code>profiles</code>，用同一個 id 一對一對應，並用 trigger 在註冊時自動建一列。trigger（觸發器）是「某張表發生某件事時自動執行的函式」，語法在 <a href="../../postgresql/lessons/23-views-functions-triggers.html">PostgreSQL 課第 23 課</a>：</p>
+<pre>create table public.profiles (
+  id uuid primary key references auth.users (id) on delete cascade,   -- 使用者刪掉時跟著刪
+  display_name text not null default ''
+);
+alter table public.profiles enable row level security;
+create policy "看自己的 profile" on public.profiles for select to authenticated using (id = (select auth.uid()));
+grant select on public.profiles to authenticated;
+
+create function public.handle_new_user() returns trigger
+language plpgsql
+security definer          -- 以函式擁有者的權限執行
+set search_path = ''      -- 不依賴呼叫者的 search_path，裡面的名字都寫完整
+as $$
+begin
+  insert into public.profiles (id, display_name)
+  values (new.id, coalesce(new.raw_user_meta_data -&gt;&gt; 'display_name', ''));
+  return new;
+end;
+$$;
+
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute function public.handle_new_user();</pre>
+<p>三個關鍵：</p>
+<ul>
+  <li><strong>為什麼要 <code>security definer</code></strong>：新增 <code>auth.users</code> 的是 Auth 服務，它用資料庫角色 <code>supabase_auth_admin</code> 連線，這個角色沒有 <code>public.profiles</code> 的權限。不加的話 trigger 失敗，<strong>整個註冊跟著失敗</strong>：前端只收到「Database error saving new user」。加了之後函式以擁有者（建函式的 <code>postgres</code>）的權限執行。</li>
+  <li><strong>為什麼要 <code>set search_path = ''</code></strong>：<code>security definer</code> 函式權限比呼叫者大，第 5 課講過：沒鎖住 search_path，呼叫者可能讓函式裡沒寫 schema 的名字解析到別的東西。鎖成空的，函式裡每個名字都寫完整（<code>public.profiles</code>）。</li>
+  <li><strong><code>raw_user_meta_data</code></strong>：<code>signUp</code> 的 <code>options.data</code> 存在這裡，就是使用者看得到、也改得到的 <code>user_metadata</code>。拿來當暱稱的初始值可以；第 5 課說過，授權用的角色不能放這裡。</li>
+</ul>
+<p>回傳 trigger 的函式不能被直接呼叫，所以它雖然在 public，也不會變成可以從 API 呼叫的 RPC。</p>
+<div class="callout practice"><strong>💡 實務上：trigger 出錯，註冊就全掛</strong><br>profiles 的 trigger 在註冊的同一個交易裡執行，它失敗，所有人都註冊不了。上線前會檢查：新增欄位時 trigger 裡的 insert 有沒有跟著改、<code>not null</code> 的欄位有沒有預設值、metadata 缺欄位時有沒有 <code>coalesce</code>。客服回報「註冊一直失敗」時，先去 Postgres 的 log 找 trigger 函式的錯誤訊息，前端那句「Database error saving new user」不會告訴你原因。</div>
+
+<h3>一段帶過：MFA、自訂 token 內容、匿名登入</h3>
+<p>這三件事都會改變 access token 的內容，進而影響 policy：</p>
+<ul>
+  <li><strong>MFA</strong>（多因素驗證，TOTP 的原理在<a href="../../auth/lessons/14-mfa-totp.html">認證課第 14 課</a>）：Supabase 的流程是 <code>mfa.enroll()</code>（綁定驗證器 App）→ <code>mfa.challenge()</code> → <code>mfa.verify()</code>，完成後 access token 的 <code>aal</code> claim 從 <code>aal1</code> 變成 <code>aal2</code>。第 5 課的 restrictive policy <code>(auth.jwt() -&gt;&gt; 'aal') = 'aal2'</code> 就是讀它。本機要先在 <code>config.toml</code> 開 <code>[auth.mfa.totp] enroll_enabled</code> 與 <code>verify_enabled</code>（課程預設關著）。</li>
+  <li><strong>Custom Access Token Hook</strong>：Auth 簽發 token 前呼叫你寫的資料庫函式，可以把資料庫裡的角色（例如 <code>store_members</code> 裡的店長身分）寫進 claims，policy 就不用每次查表。代價是角色改了，要等 token 換新才生效。</li>
+  <li><strong>匿名登入</strong>（<code>signInAnonymously()</code>，課程本機關著）：不用 email 就拿到一個帳號，常用在「先逛、先加購物車，結帳前再註冊」。陷阱是匿名使用者的角色也是 <code>authenticated</code>：policy 只寫 <code>to authenticated</code> 的表，匿名使用者全都碰得到。要區分就看 claims 的 <code>is_anonymous</code>。</li>
+</ul>
+
+<h2>練習</h2>
+<p>練習都在本機，題目資料夾是 <code>supabase/practice/work/06/</code>。每個函式收到一個 <code>cfg</code>（<code>harness.ts</code> 的 <code>Config</code>），像伺服器的環境變數：網址、兩把 key、你這一題專屬的 schema、Mailpit 的網址都在裡面，用哪一個是你要判斷的。測試會建立 <code>&lt;代號&gt;-a@learn.test</code> 這類測試帳號，跑完刪掉。</p>
+
+<div class="local" data-test="ex1" data-files="login.ts">
+  <p>練習 1：完成 <code>login(cfg, email, password)</code>：用 publishable key 建 client（<code>db.schema</code> 用 <code>cfg.schema</code>），用密碼登入，再用<strong>同一個 client</strong> 讀 <code>orders</code> 的 <code>id</code>、<code>total</code>（依 id 排序），回傳 <code>{ ok: true, userId, orders }</code>。登入失敗時依 <code>error.code</code> 回傳 <code>{ ok: false, reason: 'unconfirmed' }</code>（信箱還沒驗證）或 <code>'invalid'</code>（帳密錯），其他錯誤丟出。<code>orders</code> 已經套上第 4 課的 policy，測試會檢查你只讀到自己的訂單、每個請求用哪把 key。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="magic.ts">
+  <p>練習 2：完成 <code>magicLogin(cfg, email)</code>：寄出 magic link（只給已經註冊的人，沒註冊的 email 要丟出錯誤），用 Mailpit 的 API 找到<strong>寄給這個 email</strong> 的最新那封信，取出連結裡的 <code>token</code>，用 <code>verifyOtp</code> 換成 session，回傳 <code>{ userId, accessToken }</code>。測試在你收信的同時會寄一封信給另一位顧客，也會連續登入兩次。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="server.ts">
+  <p>練習 3：完成伺服器端的 <code>handleMe(req, cfg)</code>（<code>GET /api/me</code>）：用 @supabase/ssr 的 <code>createServerClient</code> 從請求的 cookie 讀 session，取得<strong>驗過簽章</strong>的身分，已登入回 200 <code>{ userId, email }</code>，沒登入或 token 不可信回 401。測試會送正常的 cookie、沒有 cookie，以及把內容改成另一位顧客的 cookie。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="profiles.sql">
+  <p>練習 4：在 <code>profiles.sql</code> 建 <code>public.profiles</code>（RLS：登入的人只讀得到自己那一列）、trigger 函式與 <code>after insert on auth.users</code> 的 trigger，讓從 API 註冊的人自動有一列 profile，<code>display_name</code> 取註冊時 <code>options.data</code> 傳的值（沒有就空字串）。照正式專案的寫法寫 <code>public.</code>；判分時測試會把 <code>public.</code> 換成你這一題的 schema、把 trigger 改名並限定只對這一題的測試帳號觸發，避免影響同時在跑的其他題目。測試會真的從 API 註冊，並檢查函式的設定。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 5：Nuxt 的 server route 要決定「這個請求能不能取消這張訂單」。下面哪個做法可以拿來做這個判斷，又不用每個請求都多打一次 Auth 伺服器？</p>
+  <label data-key="a"><code>getSession()</code> 的 <code>session.user.id</code>，因為 supabase-js 會自動換新 token</label>
+  <label data-key="b">自己把 cookie 裡的 access token 用 base64url 解開，讀 payload 的 <code>sub</code></label>
+  <label data-key="c"><code>getUser()</code> 的 <code>user.id</code></label>
+  <label data-key="d"><code>getClaims()</code> 的 <code>claims.sub</code></label>
+  <p class="why">✓ <code>getClaims()</code> 驗過簽章與到期時間才回傳內容，非對稱金鑰在你的伺服器上就能驗。a 最常見：<code>getSession()</code> 只是讀出 cookie，內容使用者改得到。b 一樣沒驗簽章。c 也安全，但每次都要打 Auth 伺服器，題目要的是不用多一次請求。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：後台把一位惡意顧客從 <code>auth.users</code> 刪掉了。他瀏覽器裡那個 30 分鐘前拿到的 access token（有效期 1 小時），接下來會怎樣？</p>
+  <label data-key="a">立刻失效：PostgREST 每個請求都會向 Auth 確認使用者還在</label>
+  <label data-key="b">到期前仍能通過 PostgREST 與 <code>getClaims()</code>；<code>getUser()</code> 會失敗，refresh token 也換不到新的</label>
+  <label data-key="c">永遠有效，直到他自己登出</label>
+  <label data-key="d">要等 refresh token 過期（預設 30 天）才會失效</label>
+  <p class="why">✓ JWT 只要簽章對、沒過期就會被接受，PostgREST 與 <code>getClaims()</code> 都只驗這兩件事（本機實測刪掉使用者後，舊 token 讀 API 仍是 200）。<code>getUser()</code> 會問 Auth，得到「使用者不存在」；refresh token 也已經作廢，所以最多撐到 access token 到期。a 是最常見的誤解。要更快踢人：縮短 <code>jwt_expiry</code>，或高風險操作改用 <code>getUser()</code>（取捨在<a href="../../auth/lessons/11-revocation-tradeoffs.html">認證課第 11 課</a>）。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 7：同事為了讓預覽環境也能用 Google 登入，想把 Auth 的 redirect 白名單設成 <code>https://**</code>。這樣做的風險是？</p>
+  <label data-key="a">攻擊者可以做一個 <code>redirectTo</code> 指向自己網站的登入連結，顧客登入後，code 或 token 被送到攻擊者那裡</label>
+  <label data-key="b">Google 會拒絕所有登入請求</label>
+  <label data-key="c">沒有風險：有 PKCE，所以導去哪裡都安全</label>
+  <label data-key="d">只會讓登入變慢，因為每次都要比對萬用字元</label>
+  <p class="why">✓ 白名單決定登入結果能送去哪裡；設成任何網址，等於讓任何人收得到登入結果。c 是最多人會選的：PKCE 保護的是「攔到 code 的人換不到 token」，但在某些流程（例如 magic link、隱式流程）導回的網址本身就帶著可以用的憑證，而且讓使用者在登入後落在釣魚網站本身就是問題。預覽環境要明確列出它的網域規則。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>每次請求都 <code>createClient</code> 一個新的</strong>：新的 client 沒有 session、也不會自動換新，一小時後開始 401。前端整個 app 共用一個 client。</li>
+  <li><strong>把 access token 複製出來自己組 fetch</strong>：token 過期沒人換。要嘛用 supabase-js 發請求，要嘛每次從 <code>getSession()</code> 取最新的 token。</li>
+  <li><strong>伺服器端用 <code>getSession()</code> 的 user 做授權</strong>：cookie 的內容使用者改得到。改用 <code>getClaims()</code>（或 <code>getUser()</code>）。</li>
+  <li><strong>在 <code>onAuthStateChange</code> 的 callback 裡 await 其他 supabase 呼叫</strong>：可能卡住。callback 只更新狀態，查資料放到外面。</li>
+  <li><strong><code>signInWithOtp</code> 沒加 <code>shouldCreateUser: false</code></strong>：登入頁打錯 email 就多一個帳號。</li>
+  <li><strong>profiles 的 trigger 沒有 <code>security definer</code></strong>：Auth 的角色沒有權限寫 profiles，所有人都註冊失敗。加了 <code>security definer</code> 也要 <code>set search_path = ''</code>。</li>
+  <li><strong>以為刪掉使用者就立刻登出他</strong>：手上的 access token 到期前都有效。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>登入後的 session＝access token（JWT，預設 3600 秒，帶在每個請求）＋refresh token（輪替，只能用一次）。共用一個 client，讓 supabase-js 自動換新與保存；用 <code>onAuthStateChange</code>（同步 callback）讓畫面跟著狀態變。</li>
+  <li>登入失敗看 <code>error.code</code>：<code>invalid_credentials</code> 與 <code>email_not_confirmed</code> 要給不同提示。magic link 用 <code>signInWithOtp({ shouldCreateUser: false })</code>，信裡的 token hash 用 <code>verifyOtp</code> 換成 session；本機的信在 Mailpit。</li>
+  <li>OAuth 在 Supabase 只要設定 provider、redirect 白名單（<code>site_url</code>、<code>additional_redirect_urls</code>）；瀏覽器用 PKCE，跳回來用 <code>exchangeCodeForSession</code>。</li>
+  <li>伺服器端用 @supabase/ssr 把 session 放 cookie。cookie 的內容不可信：授權用 <code>getClaims()</code>（本地驗簽章）或 <code>getUser()</code>（問 Auth），不用 <code>getSession()</code> 的 user。</li>
+  <li><code>auth.users</code> 不對 API 開放，用 <code>public.profiles</code>＋<code>after insert on auth.users</code> 的 trigger；函式要 <code>security definer</code>＋<code>set search_path = ''</code>，trigger 失敗會讓註冊失敗。</li>
+  <li>MFA 完成後 token 的 <code>aal</code> 是 <code>aal2</code>；Custom Access Token Hook 能把角色寫進 token；匿名使用者也是 <code>authenticated</code>。</li>
+</ul>
+<p>下一課處理顧客上傳的收據：Storage 的 bucket、檔案的權限（還是 RLS）、以及有期限的下載網址。</p>
+
+<div class="callout">版本：@supabase/supabase-js 2.119.0（auth-js 2.119.0）、@supabase/ssr 0.12.7、Auth（GoTrue）2.197.0、Mailpit 1.31.3。<code>onAuthStateChange</code> 的 async callback 不建議使用、<code>getClaims</code> 的行為照 auth-js 2.119.0 的型別說明；刪除使用者後舊 token 的行為、cookie 名稱與格式、JWKS 內容是 2026-11-20 在本機實測。</div>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

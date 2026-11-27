@@ -1,0 +1,1415 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>4. Cookie 與 Session：伺服器怎麼記住你</title>
+<link rel="stylesheet" href="../../style.css">
+<style>
+  .tl { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin: 1.2em 0; }
+  .tl table { width: 100%; }
+  .tl td { vertical-align: top; }
+  .tl tr.now td { background: var(--accent-soft); }
+  .tl tr.later { visibility: hidden; }
+  .tl .note { margin: 10px 0 0; min-height: 3.5em; }
+</style>
+</head>
+<body data-lesson="4">
+<header>
+  <div class="eyebrow">階段 2：瀏覽器裡的登入狀態：Cookie、Session 與跨站攻擊 · 第 4 課</div>
+  <h1>Cookie 與 Session：伺服器怎麼記住你</h1>
+</header>
+<main>
+
+<p>王小明在咖啡店會員網站輸入帳密，按下登入，伺服器用<a href="03-password-storage.html">第 3 課</a>的方法驗證密碼通過。接著他點「我的訂單」，這是一個全新的 HTTP 請求。伺服器怎麼知道這個請求也是王小明？</p>
+<p>這一課要替咖啡店會員網站做出完整的登入狀態：小明按下登入、之後每個請求都被認出來、一段時間沒用就過期、按下登出，或帳號被盜時由客服把他所有裝置登出。每走一步都問同一個問題：攻擊者能不能在這一步冒充小明？做完之後，你會知道 cookie 和 session 每個設定為什麼存在，看到「登入後一直被登出」這類回報時也知道從哪裡查。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>伺服器怎麼認出下一個請求也是小明：登入後發一個猜不到的 session ID，用 cookie 讓瀏覽器每次自動帶回來，伺服器查表就知道是誰（開場問題的最小答案）。</li>
+  <li>誰能拿走小明的號碼牌、cookie 會送到哪些網址：<code>HttpOnly</code>、<code>Secure</code>、<code>SameSite</code> 擋住三條偷取或借用的路，<code>Path</code>、<code>Domain</code>、<code>__Host-</code> 決定 cookie 送到哪裡，以及瀏覽器為什麼會默默拒收。</li>
+  <li>伺服器的名冊怎麼存、要有效多久：store 外洩了也不能拿來登入，開兩台伺服器也不會掉登入；閒置逾時和絕對逾時各擋什麼。</li>
+  <li>登入那一刻與登出那一刻：登入時為什麼一定要換新 ID，登出為什麼一定要刪伺服器端的 session，帳號被盜時怎麼登出所有裝置。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../node/lessons/12-http-protocol.html">Node 課第 12 課</a>的標頭：請求和回應都帶一組「名稱: 值」的標頭；伺服器用 <a href="../../node/lessons/13-http-server.html">第 13 課</a>的 <code>res.setHeader</code> 設定回應標頭。Node 課沒有教 cookie，這課從頭講。</li>
+  <li><a href="02-crypto-toolbox.html">第 2 課</a>的安全亂數與雜湊：<code>crypto.getRandomValues</code> 產生 32 bytes（256 bits）猜不到的 token；SHA-256 把它變成不能還原的指紋。</li>
+</ul></div>
+
+<h2>伺服器怎麼知道下一個請求也是王小明？</h2>
+<p>先看問題出在哪。HTTP 的每個請求都是獨立的：瀏覽器送出方法、網址、標頭和內容，伺服器回完就結束，不會留下「剛才是誰來過」的紀錄。這個性質叫<strong>無狀態</strong>（stateless）。對伺服器來說，小明登入用的 <code>POST /auth/login</code> 和下一秒的 <code>GET /orders</code> 是兩個互不相干的請求，第二個請求上沒有任何東西說「我就是剛剛登入的那個人」。所以「已登入」在 HTTP 裡不會自動延續，要我們自己把兩個請求連起來。</p>
+<p>最直覺的兩個辦法都不行。看它們錯在哪，正好能看出正確做法要滿足什麼條件：</p>
+<ul>
+  <li><strong>每個請求都帶帳密</strong>：伺服器每次重新驗證，確實認得出人。但密碼會在每個請求裡跑來跑去，前端得一直保存明文密碼，任何一個環節外洩就是密碼外洩；而且每個請求都要跑一次第 3 課的慢雜湊（每次幾十到幾百毫秒），每支 API 都被拖慢。</li>
+  <li><strong>帶 <code>userId=7</code></strong>：快，也不用碰密碼。但這個值是瀏覽器自己送的，任何人改成 8 就變成別人，伺服器分辨不出這個數字有沒有被改過。</li>
+</ul>
+<p>所以要帶在請求上的東西必須同時滿足兩件事：<strong>不是密碼本身</strong>，外洩了可以單獨作廢；而且<strong>猜不到、改不了</strong>，不能像 userId 一樣改一個數字就變成別人。</p>
+<p>實際的做法像咖啡店櫃台的取餐號碼牌。登入成功時，伺服器產生一個很長的隨機字串當號碼，在自己的名冊上記下「這個號碼是王小明、幾點登入」，再把號碼交給瀏覽器。之後瀏覽器每個請求都出示號碼，伺服器查名冊就知道是誰。號碼本身不含任何資訊，只有伺服器的名冊知道它代表誰；號碼又長又隨機，攻擊者猜不到別人的號碼。這套做法裡的三個角色，整課都用這三個名字：</p>
+<ul>
+  <li>號碼叫 <strong>session ID</strong>（也叫 session token）。</li>
+  <li>名冊上的那一筆資料（是誰、何時登入、最後一次活動時間）叫 <strong>session</strong>。</li>
+  <li>存放所有 session 的地方叫 <strong>session store</strong>，可以是記憶體、Redis 或資料庫，後面「名冊怎麼存」那一節會比較。</li>
+</ul>
+<p>還差一塊：號碼要放在瀏覽器裡，而且每次請求都要自動帶上，不能靠前端在每個 <code>fetch</code> 手動加。這是 <strong>cookie</strong> 的工作。cookie 是瀏覽器替某個網站保存的一小段「名稱=值」：伺服器在回應裡要求瀏覽器存下，之後瀏覽器對這個網站發請求時，自動把符合條件的 cookie 附上。對寫 Vue 的你來說，這代表 <code>fetch('/orders')</code> 什麼都不用加，號碼牌就跟著送出去了。</p>
+
+<figure>
+  <svg viewBox="0 0 700 300" role="img" aria-label="登入時伺服器回 Set-Cookie，瀏覽器存起來，之後的請求自動帶 Cookie 標頭，伺服器查 session store">
+    <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="20" y="15" width="130" height="40" rx="8"/><text class="d-text" x="85" y="40" text-anchor="middle">瀏覽器</text>
+    <rect class="d-soft" x="285" y="15" width="130" height="40" rx="8"/><text class="d-text" x="350" y="40" text-anchor="middle">API 伺服器</text>
+    <rect class="d-soft" x="550" y="15" width="130" height="40" rx="8"/><text class="d-text" x="615" y="40" text-anchor="middle">session store</text>
+    <path class="d-line" d="M85,55 V290 M350,55 V290 M615,55 V290" stroke-dasharray="4 4"/>
+    <path class="d-line" d="M85,80 H345" marker-end="url(#arr)"/><text class="d-small" x="95" y="74">① POST /auth/login（帳密）</text>
+    <path class="d-line" d="M350,105 H610" marker-end="url(#arr)"/><text class="d-small" x="360" y="99">② 存 hash(sid) → 小明</text>
+    <path class="d-line" d="M345,140 H90" marker-end="url(#arr)"/><text class="d-accent" x="95" y="133">③ Set-Cookie: sid=Zx9…; Path=/; HttpOnly</text>
+    <text class="d-small" x="95" y="160">瀏覽器依（名稱、網域、路徑）存起來</text>
+    <path class="d-line" d="M85,200 H345" marker-end="url(#arr)"/><text class="d-accent" x="95" y="193">④ GET /orders　Cookie: sid=Zx9…</text>
+    <path class="d-line" d="M350,225 H610" marker-end="url(#arr)"/><text class="d-small" x="360" y="219">⑤ 查 hash(sid)</text>
+    <path class="d-line" d="M610,255 H355" marker-end="url(#arr)"/><text class="d-small" x="400" y="249">是小明，還沒過期</text>
+    <path class="d-line" d="M345,280 H90" marker-end="url(#arr)"/><text class="d-small" x="95" y="274">⑥ 小明的訂單</text>
+  </svg>
+  <figcaption>cookie 負責「每次自動帶號碼」，session store 負責「號碼是誰」</figcaption>
+</figure>
+
+<p>這張圖就是開場問題的最小答案：登入時伺服器發一個猜不到的 session ID，用 cookie 存在瀏覽器，之後每個請求自動帶回，伺服器查 session store 認人。②和⑤存、查的是 <code>hash(sid)</code> 而不是號碼本身，原因留到「名冊怎麼存」那一節。先看③和④這兩個標頭實際長什麼樣子。</p>
+<p>兩個方向用不同的標頭，格式也不一樣：</p>
+<ul>
+  <li><strong><code>Set-Cookie</code></strong>（回應）：伺服器要求瀏覽器存一個 cookie。<strong>一個 cookie 一行</strong>，後面用分號接屬性：<code>Set-Cookie: sid=Zx9…; Path=/; HttpOnly</code>。屬性是給瀏覽器的指示：什麼時候送、送到哪、誰能讀，下兩節逐一講。要設兩個 cookie 就送兩行 <code>Set-Cookie</code>，不能用逗號合併成一行（<code>Expires</code> 的日期裡本來就有逗號）。Node 裡寫成 <code>res.setHeader('Set-Cookie', [a, b])</code>。</li>
+  <li><strong><code>Cookie</code></strong>（請求）：瀏覽器帶回符合條件的 cookie，<strong>只有名稱和值</strong>：<code>Cookie: sid=Zx9…; theme=dark</code>。屬性不會送回來，所以伺服器看不出某個 cookie 當初有沒有 Secure、何時到期、是哪個網域設的。</li>
+</ul>
+<p>伺服器收到的 <code>Cookie</code> 標頭只是一串文字，要自己拆。下面的範例拆出所有 cookie，執行後看結果裡有兩個 <code>sid</code>：瀏覽器用（名稱、網域、路徑）三個一起分辨 cookie，不同 Path 的同名 cookie 會被當成兩個，一起送來，伺服器分不出哪個是哪個。後面「登出」那一節會看到這種情況怎麼發生。</p>
+<div class="lab"><script type="code">
+function parseCookieHeader(header: string): [string, string][] {
+  return header.split(';')
+    .map(part => part.trim())
+    .filter(part => part.includes('='))
+    .map((part): [string, string] => {
+      const i = part.indexOf('=')            // 值裡面可能還有 =，只切第一個
+      return [part.slice(0, i), part.slice(i + 1)]
+    })
+}
+
+console.log(parseCookieHeader('sid=Zx9aB; theme=dark; sid=old123'))
+// 兩個 sid：瀏覽器不會告訴你哪個是哪個 Path 的
+</script></div>
+<p>寫伺服器時，這兩個標頭要能親眼看到。開 DevTools：<strong>Application → Cookies</strong> 列出這個網站存了哪些 cookie 和屬性；<strong>Network</strong> 點一個請求，看 Response Headers 的 <code>Set-Cookie</code>，被瀏覽器拒收的那一行旁邊會有警告圖示，滑鼠移上去會說原因。前端的 <code>document.cookie</code> 只看得到沒有 HttpOnly 的 cookie，下一節會說明這個差別。</p>
+<p>到這裡，小明已經能被認出來，新的風險也跟著出現：session ID 就是小明的登入憑證。誰拿到這串字，誰就是王小明，不需要密碼。下一節看它會從哪些地方被拿走。</p>
+
+<h2>誰能拿走王小明的號碼牌？HttpOnly、Secure、SameSite</h2>
+<p>session ID 一路上會經過三個地方：它存在瀏覽器裡，頁面上的 JavaScript 可能讀得到；它跟著每個請求在網路上傳，路上的人可能看得到；而且瀏覽器會自動附上它，連別的網站發起的請求也可能帶著。<code>Set-Cookie</code> 的三個屬性正好各堵一條路。</p>
+
+<h3>頁面上的腳本：HttpOnly</h3>
+<p>前端的 <code>document.cookie</code> 可以讀寫這個網站的 cookie。如果網站有漏洞，讓攻擊者把自己的 JavaScript 塞進咖啡店的頁面執行，這種攻擊叫 <strong>XSS</strong>（跨站腳本，第 7 課詳講）。這段腳本跟你寫的 Vue 程式碼跑在同一個頁面，權限一樣，一行程式就能把 <code>document.cookie</code> 送到攻擊者的伺服器，攻擊者在自己的瀏覽器設好這個 cookie，就以小明的身分登入了。</p>
+<p><code>HttpOnly</code> 讓 JavaScript 讀不到這個 cookie：<code>document.cookie</code> 裡看不到它，但瀏覽器發請求時照樣附上。session cookie 本來就只給伺服器看，前端沒有理由讀它，所以一定要設。</p>
+<p>要分清楚它擋住的範圍：<code>HttpOnly</code> 只擋「讀」。腳本還是能在你的頁面上用 <code>fetch</code> 發請求，瀏覽器照樣帶 cookie，攻擊者不用偷號碼也能以小明的身分操作。它把損害從「號碼被帶走、隨時隨地冒用」縮小到「只能趁受害者開著頁面時操作」，真正的修法是不讓 XSS 發生。練習 4 會考這個區別。</p>
+
+<h3>網路上的人：Secure</h3>
+<p>HTTP 本身是明文。HTTPS 在 HTTP 外面加一層 TLS 加密，路上的人看不到也改不了內容（<a href="../../devops/lessons/05-tls.html">部署課第 5 課</a>）。在公共 Wi-Fi 上，攻擊者可以夾在你和伺服器之間，看所有沒加密的流量，這種位置的攻擊者叫<strong>中間人</strong>（man-in-the-middle）。</p>
+<p>咖啡店全站都用 HTTPS 還不夠。沒有 <code>Secure</code> 的 cookie，在 http 請求上也會送出；中間人只要誘使瀏覽器對咖啡店發一個 http 請求，cookie 就跟著明文請求被看見，拿去冒用。這叫 <strong>session 劫持</strong>（session hijacking）。<code>Secure</code> 讓 cookie 只在 HTTPS 連線送出，這條路就斷了。</p>
+<div class="callout warn"><strong>本機正常，部署到測試機就一直被登出。</strong>瀏覽器把 <code>http://localhost</code> 當成安全的來源，所以本機開發時 <code>Secure</code> cookie 也收得下來。換成 <code>http://192.168.1.20</code> 這種一般主機，帶 <code>Secure</code> 的 cookie 會被直接拒收。瀏覽器拒收時<strong>不會通知伺服器</strong>，伺服器以為設好了，只有 DevTools 的 Network 面板會標出原因。測試機也要上 HTTPS。</div>
+
+<h3>別的網站：SameSite</h3>
+<p>第三條路不是偷，而是借。沒有額外限制時，瀏覽器帶不帶 cookie 只看請求要送到哪個網站，不管是哪個網站的頁面發起的。小明開著咖啡店的分頁，又在另一個分頁打開惡意網站，那個網站的頁面對咖啡店送出一個請求，瀏覽器照樣附上小明的 cookie，伺服器看到的就是「已登入的小明」在操作。這種攻擊叫 <strong>CSRF</strong>（跨站請求偽造），第 6 課詳講。</p>
+<p>從別的網站發出、目標是咖啡店的請求，叫<strong>跨站</strong>請求。<code>SameSite</code> 控制跨站請求帶不帶這個 cookie，值有三種：<code>Strict</code>、<code>Lax</code>、<code>None</code>，嚴格程度由高到低，差別第 6 課講，咖啡店的 session cookie 先用 <code>Lax</code>。<code>SameSite=None</code> 表示跨站也帶，這時必須同時有 <code>Secure</code>，否則整個 cookie 被拒收。</p>
+<p>這個屬性一定要明寫。各瀏覽器沒寫時的行為不一樣：只有 Chromium 系列（Chrome、Edge）把沒寫當成 <code>Lax</code>，Firefox、Safari 沒有這個預設，靠預設就等於有些使用者沒受保護。各瀏覽器的版本見課末「補充與查表」。</p>
+<p>這三個屬性處理了「誰拿得到、誰能借用」。另一類問題不是攻擊，而是 cookie 沒送到該送的地方，或送到了不該送的地方。這由 <code>Path</code> 和 <code>Domain</code> 決定。</p>
+
+<h2>cookie 會送到哪些網址？Path、Domain 與 __Host- 前綴</h2>
+<p>先看 <code>Path</code>。瀏覽器只在請求路徑落在這個路徑底下時才送：<code>Path=/docs</code> 會送到 <code>/docs/a</code>，不會送到 <code>/docsets</code>。沒寫時，預設是<strong>設定它的那個請求路徑的目錄</strong>。咖啡店的登入 API 是 <code>/auth/login</code>，它回的 cookie 沒寫 Path，就只會送到 <code>/auth</code> 底下；小明接著打開 <code>/orders</code>，請求沒帶 cookie，看起來就像「登入後馬上被登出」。所以 session cookie 要明寫 <code>Path=/</code>。另外，Path 只管送不送，不是安全邊界，同一個網站其他路徑上的程式一樣讀得到。</p>
+<p>再看 <code>Domain</code>。不寫時是 <strong>host-only</strong> cookie：只送回設定它的那台主機，<code>www.coffee.example</code> 設的就只回 <code>www.coffee.example</code>。寫了 <code>Domain=coffee.example</code>，就會送到<strong>所有子網域</strong>，包括外包做的活動頁 <code>promo.coffee.example</code>。那個活動頁只要有一個漏洞，小明的 session ID 就會出現在它的伺服器上。Domain 只能設成自己或上層網域。有些網域字尾是任何人都能在底下註冊網域的，例如 <code>com.tw</code>，這種字尾叫<strong>公共字尾</strong>（public suffix，第 5 課），Domain 不能設成它，否則一個網站就能把 cookie 送給所有 <code>.com.tw</code> 網站。</p>
+<p>結論是 session cookie 不寫 Domain。但光是咖啡店自己不寫還不夠：子網域也能<strong>寫</strong> cookie。被攻破的 <code>promo.coffee.example</code> 可以設一個 <code>Domain=coffee.example</code>、名稱也叫 <code>sid</code> 的 cookie，瀏覽器會把它送到 <code>www</code>。第一節看過，<code>Cookie</code> 標頭只有名稱和值，伺服器分不出哪個 <code>sid</code> 是自己設的。後面的 session fixation 就會利用這一點。</p>
+<p>要堵住它，靠 cookie 名稱的<strong>前綴</strong>：名稱以特定字串開頭時，瀏覽器會檢查屬性，不符合就拒收。</p>
+<ul>
+  <li><code>__Host-</code>：必須 <code>Secure</code>、從 HTTPS 設定、<code>Path=/</code>、不能有 <code>Domain</code>。這保證它是 host-only，<strong>子網域沒辦法寫一個同名 cookie 蓋掉它</strong>：子網域要讓 cookie 送到 <code>www</code>，就一定得寫 Domain，而帶 Domain 的 <code>__Host-</code> cookie 會被瀏覽器直接拒收。session cookie 首選這個。</li>
+  <li><code>__Secure-</code>：只要求 <code>Secure</code>、從 HTTPS 設定，不限 Path 和 Domain。Path 不是 <code>/</code> 的 cookie 只能用這個，例如第 10 課只送到 <code>/auth/refresh</code> 的 refresh cookie。</li>
+</ul>
+<p>前綴比對不分大小寫，<code>__host-sid</code> 一樣要符合規則。還有要求 HttpOnly 的較新前綴，瀏覽器支援還不齊，本課用 <code>__Host-</code>，細節見課末。</p>
+<p>兩節的屬性合起來，咖啡店會員網站的 session cookie 長這樣：</p>
+<pre>Set-Cookie: __Host-sid=Zx9…; Path=/; Secure; HttpOnly; SameSite=Lax</pre>
+<p>HttpOnly 擋腳本讀取，Secure 擋中間人，SameSite 擋跨站借用，<code>Path=/</code> 讓所有 API 都收得到，不寫 Domain 加上 <code>__Host-</code> 擋子網域。每個屬性的「沒設或設錯會怎樣」整理在課末的屬性速查表。</p>
+<p>這些規則有一個共同的麻煩：瀏覽器拒收 cookie 時不會告訴伺服器。伺服器回了 <code>Set-Cookie</code>，以為設好了，下一個請求卻沒帶 cookie，使用者看到的就是「登入後一直被登出」。能看到原因的只有 DevTools 的 Network 面板。練習 1 會把這節和上一節的規則寫成一個模擬瀏覽器的函式，同事回報這類問題時就能拿來對照。</p>
+
+<div class="callout practice"><strong>💡 實務上：上線前打開 DevTools 看真正送出的 Set-Cookie</strong><br>實際專案很少手寫 <code>Set-Cookie</code>，多半是在框架或 session 套件的設定裡填 <code>httpOnly</code>、<code>secure</code>、<code>sameSite</code>，而每個套件的預設值不一樣。所以 code review 時不要只看設定檔，要在測試機用 DevTools 的 Network 看回應裡實際送出的那一行，再到 Application → Cookies 確認瀏覽器真的收下了。前端和 API 放在不同網域（例如 <code>www.</code> 和 <code>api.</code>）時，還會牽涉到 SameSite 和 CORS，第 5、6 課會處理。資深工程師會把「session cookie 的屬性」寫進上線檢查清單，而不是靠每個人記得。</div>
+
+<p>cookie 這一側設好了，號碼牌只會在對的時候送到對的地方。另一半在伺服器：名冊本身也會外洩，備份、log、被入侵的 Redis 都可能，那時候名冊上的東西能不能直接拿來登入？</p>
+
+<h2>伺服器的名冊怎麼存，外洩了也不能拿來登入？</h2>
+<p>名冊要安全，先要號碼本身猜不到，再要名冊上存的東西不能直接當號碼用。先看號碼。session ID 就是登入憑證，所以要符合<a href="02-crypto-toolbox.html">第 2 課</a>對 token 的要求：用 <code>crypto.getRandomValues</code> 產生 32 bytes（256 bits）。遞增數字不行，看到自己是 1007 就會去試 1006；用 userId 組出來不行，知道規則就能組出別人的；<code>Math.random</code> 不行，它不是為安全設計的亂數，輸出可能被推算出來。OWASP 要求至少 64 bits 熵，自己產生時建議 128 bits 以上。</p>
+<p>號碼猜不到之後，再看名冊。最直接的存法是把 token 原樣當 key：<code>sessions['Zx9…'] = { userId: 7 }</code>。問題是名冊會外洩：資料庫或 Redis 的備份放錯地方、log 把整筆資料印出來、store 被入侵。原樣存的話，攻擊者拿到的就是一整疊有效的號碼牌，挑一個設進自己的 cookie 就登入了。</p>
+<p>所以存的時候，key 用 <strong>token 的 SHA-256</strong>，不存原始 token。瀏覽器拿著原始 token；伺服器收到請求時，把 token 再算一次 SHA-256 去查。外洩的名冊裡只有雜湊，攻擊者要從雜湊反推出原始 token 才能放進 cookie，而 SHA-256 不能還原。</p>
+<p>你可能會想到第 3 課：密碼要用慢雜湊，這裡為什麼 SHA-256 就夠？慢雜湊保護的是<strong>熵很低、猜得到</strong>的密碼，攻擊者可以拿常見密碼一個個算雜湊比對，慢雜湊讓每次猜測都變貴。256 bits 的隨機 token 根本猜不完，再快的雜湊也沒用；反過來，每個請求都要查一次 session，用慢雜湊會讓每支 API 多等幾十到幾百毫秒。</p>
+<p>執行下面的範例，比對兩行輸出：第一行是放進 cookie 的原始 token，第二行是 store 裡當 key 的雜湊，兩者看不出關聯。</p>
+<div class="lab"><script type="code">
+function base64url(bytes: Uint8Array<ArrayBuffer>): string {
+  let s = ''
+  for (const b of bytes) s += String.fromCharCode(b)
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+async function sha256(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return base64url(new Uint8Array(digest))
+}
+
+const token = base64url(crypto.getRandomValues(new Uint8Array(32)))
+console.log('放進 cookie：', token)                 // 只有瀏覽器拿著
+console.log('存進 store 的 key：', await sha256(token))  // 伺服器只存這個
+</script></div>
+<p>名冊的每一筆裡放什麼？放<strong>會用來判斷的最少資訊</strong>：<code>userId</code>、建立時間、最後活動時間、未登入時的購物車。如果網站有多因素認證，也就是除了密碼還要輸入手機上的驗證碼（第 14 課），session 要記下這次登入通過了沒有。<strong>不要</strong>把整份使用者資料或角色放進去：店長把小明的權限拿掉之後，session 裡的舊角色還在，要等他重新登入才會更新。權限每次從資料庫查（可以短暫快取），第 11 課會再談。</p>
+<p>名冊存什麼決定了。還有一個問題要等網站變大才會出現：名冊放在哪一台機器上？</p>
+
+<h3>開了第二台伺服器之後，小明為什麼一直被登出？</h3>
+<p>名冊放在哪台機器上，也會影響登入狀態。如果 session 存在 Node 程序記憶體裡的一個 <code>Map</code>，一台伺服器時沒問題。流量變大、開了兩台之後，前面會放一個<strong>負載平衡器</strong>（load balancer）：它站在多台伺服器前面，把每個請求分給其中一台。小明在 A 台登入，session 記在 A 台的記憶體；下一個請求被分到 B 台，B 台的 <code>Map</code> 裡沒有這個號碼，小明就被登出了。兩種解法：</p>
+<ul>
+  <li><strong>黏性 session</strong>（sticky session）：讓負載平衡器把同一個使用者固定送到同一台。簡單，但那台重啟或縮減時，上面的人全部被登出，流量也分不平均。</li>
+  <li><strong>共用 store</strong>：所有伺服器都查同一個 Redis（或資料庫）。這是常見做法。Redis 可以替每個 key 設存活時間（TTL），時間到自動刪除（<a href="../../nestjs/lessons/19-caching-redis.html">NestJS 課第 19 課</a>），剛好對應下一節的閒置逾時。伺服器本身不存狀態，才能隨意增減，<a href="../../devops/lessons/13-scaling.html">部署課第 13 課</a>會完整講。</li>
+</ul>
+
+<div class="callout practice"><strong>💡 實務上：session 交給成熟套件，store 用 Redis</strong><br>Node 專案通常用 <code>express-session</code> 這類套件搭配 Redis store，不會從零寫；這課自己實作，是為了讓你看得懂它的設定、知道該檢查哪些項目。導入時先讀文件確認：cookie 的預設屬性、session ID 怎麼產生、過期資料怎麼清。Redis 放 session 之後就變成登入的關鍵依賴：它掛掉時所有需要登入的 API 都會失敗，被清空時所有人同時被登出，維運要把它納入監控和備援。只有一台伺服器的小型內部工具，先用資料庫存 session 也完全可以，不必為了「以後可能擴充」多架一套 Redis。</div>
+
+<p>名冊存得安全、每台伺服器都查得到了。但名冊上的每一筆要有效多久？如果小明登入之後永遠有效，號碼牌一旦外洩，就永遠能用。</p>
+
+<h2>號碼牌要有效多久？閒置逾時與絕對逾時</h2>
+<p>session 永遠有效會出兩種事，對應兩種不同的期限。第一種：小明在網咖登入看訂單，走的時候忘了登出，下一個坐上那台電腦的人直接就是小明。第二種：小明的號碼牌被偷了，攻擊者拿著它想用多久就用多久。</p>
+<p>對付第一種用<strong>閒置逾時</strong>（idle timeout）：一段時間沒有任何請求就失效。實作方式是<strong>滑動到期</strong>（sliding expiration）：每次使用就把期限往後延。小明一直在用，就一直有效；他離開網咖 30 分鐘沒動作，session 就失效，下一個人拿不到。</p>
+<p>但滑動到期擋不住第二種。攻擊者拿到號碼後，只要每隔 20 分鐘用一次，期限就一直往後延，永遠不會過期。所以還要<strong>絕對逾時</strong>（absolute timeout）：從登入起算，不管多常使用，時間到就失效。號碼被偷了，最多也只能用到絕對逾時為止，之後小明重新登入拿到新號碼，偷來的那張就作廢了。</p>
+<figure>
+  <svg viewBox="0 0 700 220" role="img" aria-label="兩條時間軸：只有滑動逾時時，持續使用的 session 永遠不過期；加上絕對逾時後，8 小時一到就失效">
+    <text class="d-text" x="20" y="35">只有閒置逾時</text>
+    <path class="d-line" d="M20,60 H680" marker-end="url(#arr2)"/>
+    <defs><marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <g class="d-soft"><circle cx="40" cy="60" r="6"/><circle cx="120" cy="60" r="6"/><circle cx="200" cy="60" r="6"/><circle cx="280" cy="60" r="6"/><circle cx="360" cy="60" r="6"/><circle cx="440" cy="60" r="6"/><circle cx="520" cy="60" r="6"/><circle cx="600" cy="60" r="6"/></g>
+    <text class="d-small" x="40" y="85">登入</text>
+    <text class="d-accent" x="420" y="90">攻擊者每 20 分鐘用一次 → 永遠不會過期</text>
+    <text class="d-text" x="20" y="135">閒置 30 分＋絕對 8 小時</text>
+    <path class="d-line" d="M20,160 H680" marker-end="url(#arr2)"/>
+    <g class="d-soft"><circle cx="40" cy="160" r="6"/><circle cx="120" cy="160" r="6"/><circle cx="200" cy="160" r="6"/><circle cx="280" cy="160" r="6"/><circle cx="360" cy="160" r="6"/><circle cx="440" cy="160" r="6"/></g>
+    <path class="d-line" d="M480,140 V180"/>
+    <text class="d-accent" x="490" y="150">8 小時：一定失效</text>
+    <text class="d-small" x="40" y="185">登入</text>
+    <text class="d-small" x="490" y="200">要重新登入，偷來的 ID 也跟著作廢</text>
+  </svg>
+  <figcaption>每個點是一次請求。閒置逾時靠「每次使用就延期」，所以一定要再加一個不會延期的絕對逾時</figcaption>
+</figure>
+<p>要多長？OWASP 給的例子：閒置逾時，高價值的應用（網路銀行）2～5 分鐘、一般應用 15～30 分鐘；絕對逾時 4～8 小時。咖啡店會員網站能看訂單、改地址，選<strong>閒置 30 分鐘、絕對 8 小時</strong>：一個工作天內不用重新登入。「記住我」是另一種設計：長效 session，但改密碼、退款這類敏感操作要重新驗證（第 14 課）。</p>
+<p>實作時判斷順序很重要：<strong>先檢查，再更新最後活動時間</strong>。反過來的話，閒置了一整天的 session 會先被延期、再檢查，檢查時看到的是「剛剛才用過」，永遠不會過期。時間一律用注入的 <code>now()</code> 取得，不直接呼叫 <code>Date.now()</code>，測試才能直接把假時鐘推進 8 小時，不用真的等。下面的範例執行後看三行：29 分鐘還有效、31 分鐘因為閒置過期、一直在用的 session 在第 480 分鐘因為絕對逾時過期。</p>
+<div class="lab"><script type="code">
+const MIN = 60 * 1000
+const IDLE = 30 * MIN, ABSOLUTE = 8 * 60 * MIN
+
+function expired(s: { createdAt: number; lastSeenAt: number }, now: number): boolean {
+  return now - s.lastSeenAt >= IDLE || now - s.createdAt >= ABSOLUTE
+}
+
+const s = { createdAt: 0, lastSeenAt: 0 }
+console.log('29 分鐘後', expired(s, 29 * MIN))   // false
+console.log('31 分鐘後', expired(s, 31 * MIN))   // true：閒置太久
+
+const busy = { createdAt: 0, lastSeenAt: 470 * MIN }  // 一直在用
+console.log('第 480 分鐘', expired(busy, 480 * MIN))  // true：剛好 8 小時
+</script></div>
+<p>瀏覽器那一側也有期限，由 <code>Max-Age</code>（存活秒數）或 <code>Expires</code>（到期日期）決定，兩個都有時 <code>Max-Age</code> 優先，<code>Max-Age=0</code> 代表立刻刪除，登出時會用到。兩個都不寫，就是「瀏覽器關閉就消失」的 cookie（但「還原上次分頁」功能可能讓它留下來）。session cookie 通常不寫 <code>Max-Age</code>，真正的期限由伺服器判斷，因為 cookie 的期限存在使用者的瀏覽器裡，使用者可以自己改；伺服器的名冊說過期了，帶什麼 cookie 來都沒用。</p>
+
+<div class="callout practice"><strong>💡 實務上：逾時長度是產品決定，前端要接住「被登出」</strong><br>逾時太短，PM 和客服會收到「一直要重新登入」的抱怨；太長，資安會擔心。常見做法是分開設定：咖啡店會員網站寬鬆一點，能退款、改價格的店長後台嚴格一點。前端要處理 session 過期：API 回 401 時導到登入頁、記住原本的網址，登入後再導回去，必要時先把使用者填到一半的表單暫存起來。討論時資深工程師會先問「這個系統被冒用的後果多嚴重」，再決定數字，而不是直接套範例。</div>
+
+<p>到這裡，一個 session 從發出到過期的規則都有了。還漏了一個時間點：號碼牌是什麼時候發的？很多網站在小明登入之前就已經發給他一張了。</p>
+
+<h2>登入那一刻為什麼一定要換新號碼？Session fixation</h2>
+<p>咖啡店允許沒登入的人先把拿鐵放進購物車，購物車存在 session 裡，所以小明一打開網站就拿到一張匿名的號碼牌。登入成功時，最順手的寫法是沿用這張號碼牌，只把 <code>userId</code> 填進名冊。問題是：登入之前就知道這個號碼的人，現在手上拿的是一張已登入的號碼牌。如果那個人是攻擊者，他根本不用偷，號碼是他事先塞給小明的。這種攻擊叫 <strong>session fixation</strong>（固定 session 攻擊）：攻擊者先讓受害者用一個攻擊者知道的 session ID，等受害者登入。按「下一步」看過程：</p>
+<div class="tl">
+  <div class="table-wrap"><table>
+    <tr><th>步驟</th><th>攻擊者</th><th>王小明的瀏覽器</th><th>伺服器的 session</th></tr>
+    <tr data-note="攻擊者自己打開咖啡店網站，拿到一個匿名 session，ID 是 T。"><td>1</td><td>打開網站，拿到 <code>sid=T</code></td><td></td><td>T：未登入</td></tr>
+    <tr data-note="攻擊者想辦法讓小明的瀏覽器也存 sid=T。例如攻擊者控制了某個子網域（外包的活動頁 promo.coffee.example 有漏洞），從那裡設 Domain=coffee.example 的 cookie；或是舊系統接受網址裡的 ?sid=T。"><td>2</td><td>從子網域寫入 <code>sid=T</code></td><td>存了 <code>sid=T</code></td><td>T：未登入</td></tr>
+    <tr data-note="小明正常登入，帳密都對。伺服器沿用 T，只把 userId 填進去。"><td>3</td><td></td><td>登入成功</td><td>T：<strong>王小明</strong></td></tr>
+    <tr data-note="攻擊者手上一直有 T，現在 T 代表王小明，攻擊者不用知道密碼就以小明身分看訂單、改地址。"><td>4</td><td>帶 <code>sid=T</code> 看訂單 → 成功</td><td></td><td>T：王小明</td></tr>
+    <tr data-note="修法：登入成功時建立新的 session T2 並刪掉 T。攻擊者手上的 T 變成廢紙。__Host- 前綴則讓子網域根本寫不進同名 cookie，兩道防線一起用。"><td>✓</td><td>帶 <code>sid=T</code> → 未登入</td><td>收到新的 <code>sid=T2</code></td><td>T：已刪除<br>T2：王小明</td></tr>
+  </table></div>
+  <div class="bar"><button data-prev>◀ 上一步</button><button class="primary" data-next>下一步 ▶</button><span class="kbd" data-count></span></div>
+  <p class="note"></p>
+</div>
+<p>第 2 步是攻擊的關鍵，也是上一節 Domain 和 <code>__Host-</code> 派上用場的地方：攻擊者要能把 <code>sid=T</code> 寫進小明的瀏覽器。用 <code>__Host-</code> 前綴，子網域寫不進同名 cookie；登入時換新 ID，就算 T 被塞進去了也沒用。兩道防線擋的是同一個攻擊的不同步驟，一起用。</p>
+<p>換新 ID 的規則不只用在登入：<strong>權限改變時就換新 ID、刪掉舊的</strong>。包括登入成功、權限提升（例如店員切換成店長模式）、改密碼。換的時候，匿名 session 裡的購物車要搬到新 session，否則小明登入後發現購物車空了。session 存在資料庫時，「刪舊、建新」要放在同一個交易裡（<a href="../../postgresql/lessons/18-transactions.html">PostgreSQL 課第 18 課</a>），不能只成功一半。練習 3 會實作這個 <code>login</code>。</p>
+<p>登入換號碼處理了 session 的開始。最後是結束：小明按下登出時，到底要刪掉什麼？</p>
+
+<h2>登出時要刪掉什麼？登出與登出所有裝置</h2>
+<p><strong>登出要刪伺服器端的 session</strong>，清 cookie 只是順便。號碼有沒有效是名冊說了算：只清 cookie 的話，小明這台瀏覽器忘了號碼，但名冊上那一筆還在，號碼仍然有效。如果它早就被偷了（XSS 時沒設 HttpOnly、被裝了惡意擴充功能），攻擊者照樣用到絕對逾時為止。</p>
+<p>清 cookie 的寫法是送一個<strong>同名稱、同 Path、同 Domain</strong> 的 cookie，加上逾時那一節講過的 <code>Max-Age=0</code>：</p>
+<pre>Set-Cookie: __Host-sid=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0</pre>
+<p>第一節說過，瀏覽器用（名稱、網域、路徑）三個一起當作 cookie 的身分。Path 或 Domain 寫得跟設定時不一樣，瀏覽器會當成另一個 cookie：多存一個空的，原本的還在。這就是第一節範例裡同一個 <code>sid</code> 出現兩次的由來。</p>
+<p>有時候要登出的不只一台。<strong>登出所有裝置</strong>是依 userId 找出這個人所有的 session 全部刪掉，這些情況要做：</p>
+<ul>
+  <li>使用者按「登出所有裝置」、發現帳號異常。</li>
+  <li><strong>改密碼、重設密碼</strong>：可能就是因為密碼外洩才改的，其他地方的 session 也要失效，通常保留目前這一個，免得使用者剛改完就被登出。</li>
+  <li>帳號被停權：全部立即失效。</li>
+</ul>
+<p>要依 userId 找 session，名冊就要能用 userId 查。前面說過名冊的 key 是 token 的雜湊，不是 userId，所以要另外準備查法：資料庫版的 session 表要在 <code>user_id</code> 上建索引（<a href="../../postgresql/lessons/20-indexes.html">PostgreSQL 課第 20 課</a>），不然每次都要掃整張表；Redis 版通常另外維護一個「userId → 這個人的 session key」的集合。練習 3 的 <code>destroyAllForUser</code> 會碰到這個限制。</p>
+<p>到這裡，小明的登入狀態從發號碼牌、每次請求認人、過期、登入換號，到登出和全部登出，每一步都有對應的防線。</p>
+
+<div class="callout practice"><strong>💡 實務上：帳號被盜時，客服第一步就是登出所有裝置</strong><br>Google、GitHub 這類服務都有「目前登入的裝置」頁面，列出每個 session 的裝置、登入時間、最後活動時間，可以單獨登出某一個。要做這個功能，建立 session 時就要順便存 <code>User-Agent</code>（瀏覽器在請求標頭裡自報的瀏覽器和作業系統）和建立時間，事後補不回來。客服接到「我的帳號被盜」時，常見處理是讓該帳號所有 session 失效、要求重設密碼，所以後台最好有一個給客服用的按鈕，不要每次都請工程師手動刪資料。</div>
+
+<h2>補充與查表</h2>
+<p>主線用不到、但設定 cookie 或查「為什麼這個瀏覽器不收」時會用到的細節。</p>
+
+<h3>Session cookie 屬性速查</h3>
+<p>查表用，不用背。</p>
+<div class="table-wrap"><table>
+  <tr><th>屬性</th><th>作用與擋住什麼</th><th>沒設或設錯會怎樣</th></tr>
+  <tr><td><code>HttpOnly</code></td><td>JavaScript（<code>document.cookie</code>）讀不到。網站被注入惡意腳本（XSS，第 7 課）時，腳本偷不走 session ID。</td><td>XSS 一行程式就把 session ID 送到攻擊者手上。注意：設了也只擋「讀」，腳本還是能在你的頁面上發請求，瀏覽器照樣帶 cookie。</td></tr>
+  <tr><td><code>Secure</code></td><td>只在 HTTPS 連線送出。HTTPS／TLS 是在 HTTP 外面加一層加密，路上的人看不到也改不了（<a href="../../devops/lessons/05-tls.html">部署課第 5 課</a>）。</td><td>在公共 Wi-Fi 上，中間人只要誘使瀏覽器發一個 http 請求，就能看到 cookie，拿去冒用，這叫 session 劫持。</td></tr>
+  <tr><td><code>SameSite</code></td><td>控制跨站請求帶不帶這個 cookie：<code>Strict</code>、<code>Lax</code>、<code>None</code>。用來擋 CSRF（第 6 課）。</td><td>只有 Chromium（Chrome 80+、Edge 86+）沒寫時預設 <code>Lax</code>；Firefox 預設沒開、Safari 沒有這個預設。所以一定要明寫。<code>SameSite=None</code> 必須搭配 <code>Secure</code>，否則整個 cookie 被拒收。</td></tr>
+  <tr><td><code>Path</code></td><td>只有請求路徑在這個路徑底下才送。<code>Path=/docs</code> 會送到 <code>/docs/a</code>，不會送到 <code>/docsets</code>。</td><td>沒寫時預設是設定它的那個請求路徑的目錄：<code>/auth/login</code> 回的 cookie 只會送到 <code>/auth</code> 底下，<code>/orders</code> 收不到，看起來像「登入後馬上被登出」。Path 不是安全邊界，同一個網站的其他路徑一樣讀得到。</td></tr>
+  <tr><td><code>Domain</code></td><td>不寫時是 host-only cookie：只送回設定它的那台主機。</td><td>寫了 <code>Domain=coffee.example</code> 就會送到所有子網域，包括外包做的活動頁 <code>promo.coffee.example</code>。只能設成自己或上層網域，不能是 <code>com.tw</code> 這種公共字尾（第 5 課）。</td></tr>
+  <tr><td><code>Max-Age</code>／<code>Expires</code></td><td>存活秒數／到期日期，兩個都有時 <code>Max-Age</code> 優先；<code>Max-Age=0</code> 立刻刪除。</td><td>都不寫是「瀏覽器關閉就消失」的 cookie（但「還原上次分頁」功能可能讓它留下來）。rfc6265bis 草案規定期限不超過 400 天，寫得更長會被壓成 400 天。</td></tr>
+</table></div>
+
+<h3>規則寫在哪裡、各瀏覽器的差異</h3>
+<p>瀏覽器的完整規則寫在 RFC 6265（現行標準）和它的修訂草案 rfc6265bis（draft-22，2025-12，已送審但尚未成為 RFC）。前綴、400 天上限、<code>SameSite</code> 這些規則都只寫在草案裡。</p>
+<ul>
+  <li><strong>SameSite 沒寫時的預設</strong>：只有 Chromium（Chrome 80+、Edge 86+）預設 <code>Lax</code>；Firefox 預設沒開、Safari 沒有這個預設。</li>
+  <li><strong>期限上限</strong>：rfc6265bis 草案規定期限不超過 400 天，寫得更長會被壓成 400 天（練習 1 的 34560000 秒）。</li>
+  <li><strong>前綴不分大小寫</strong>：<code>__host-sid</code> 一樣要符合規則，這是 rfc6265bis 草案為了堵住大小寫繞過而規定的。</li>
+  <li><strong><code>__Http-</code>、<code>__Host-Http-</code> 前綴</strong>：另外要求 HttpOnly，保證只能由伺服器設定。Chrome／Edge 140+、Firefox 143+ 支援，Safari 還沒有，所以本課用 <code>__Host-</code>。</li>
+</ul>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：同事回報「登入後一直被登出」，你要寫一個除錯工具。<code>checkSetCookie(header, requestUrl)</code> 模擬瀏覽器收到一行 <code>Set-Cookie</code>（不含 <code>Set-Cookie: </code> 這幾個字）時收不收。依序檢查，第一個不符合的就回傳那個原因：</p>
+  <ol>
+    <li>第一段沒有 <code>=</code>，或名稱是空的 → <code>malformed</code>（名稱、值前後的空白去掉）</li>
+    <li>名稱加值超過 4096 bytes（UTF-8，用 <code>TextEncoder</code> 算）→ <code>too_large</code></li>
+    <li>有 <code>Secure</code>，但請求不是 <code>https:</code>，而且主機不是 <code>localhost</code> → <code>secure_on_http</code></li>
+    <li>名稱以 <code>__Secure-</code> 開頭（不分大小寫）卻沒有 <code>Secure</code> → <code>prefix_secure</code></li>
+    <li>名稱以 <code>__Host-</code> 開頭（不分大小寫），卻沒有 <code>Secure</code>、或 Path 不是 <code>/</code>、或有 Domain → <code>prefix_host</code></li>
+    <li><code>SameSite=None</code> 沒有 <code>Secure</code> → <code>samesite_none_insecure</code></li>
+    <li>Domain（去掉開頭的 <code>.</code>、轉小寫）既不等於請求的主機，也不是它的上層網域 → <code>domain_mismatch</code></li>
+  </ol>
+  <p>屬性名稱與 SameSite 的值不分大小寫。接受時：沒寫 Domain 就是 host-only，<code>domain</code> 填請求的主機；沒寫 Path（或不是 <code>/</code> 開頭）就用請求路徑到最後一個 <code>/</code> 之前的部分，沒有剩下東西時是 <code>/</code>；<code>Max-Age</code> 超過 400 天（34560000 秒）就壓成 34560000，沒寫是 <code>null</code>（這題不處理 <code>Expires</code>）；沒寫 SameSite 記成 <code>'unset'</code>。</p>
+  <script type="start">
+type SameSite = 'Strict' | 'Lax' | 'None' | 'unset'
+type Cookie = {
+  name: string; value: string; domain: string; hostOnly: boolean; path: string
+  secure: boolean; httpOnly: boolean; sameSite: SameSite; maxAge: number | null
+}
+type Reason = 'malformed' | 'too_large' | 'secure_on_http' | 'prefix_secure'
+  | 'prefix_host' | 'samesite_none_insecure' | 'domain_mismatch'
+type Result = { ok: true; cookie: Cookie } | { ok: false; reason: Reason }
+
+function checkSetCookie(header: string, requestUrl: string): Result {
+  const url = new URL(requestUrl)   // url.protocol 是 'https:'、url.hostname 是主機、url.pathname 是路徑
+  throw new Error('TODO')
+}
+
+console.log(checkSetCookie('sid=abc; Path=/; HttpOnly', 'https://shop.coffee.example/auth/login'))
+console.log(checkSetCookie('sid=abc; Secure', 'http://192.168.1.20:3000/auth/login'))
+</script>
+  <script type="answer">
+type SameSite = 'Strict' | 'Lax' | 'None' | 'unset'
+type Cookie = {
+  name: string; value: string; domain: string; hostOnly: boolean; path: string
+  secure: boolean; httpOnly: boolean; sameSite: SameSite; maxAge: number | null
+}
+type Reason = 'malformed' | 'too_large' | 'secure_on_http' | 'prefix_secure'
+  | 'prefix_host' | 'samesite_none_insecure' | 'domain_mismatch'
+type Result = { ok: true; cookie: Cookie } | { ok: false; reason: Reason }
+
+const MAX_AGE_LIMIT = 400 * 24 * 60 * 60   // 34560000
+
+function checkSetCookie(header: string, requestUrl: string): Result {
+  const url = new URL(requestUrl)
+  const host = url.hostname
+  const [pair, ...attrs] = header.split(';')
+  const eq = pair.indexOf('=')
+  const name = eq === -1 ? '' : pair.slice(0, eq).trim()
+  const value = pair.slice(eq + 1).trim()
+  if (name === '') return { ok: false, reason: 'malformed' }
+  if (new TextEncoder().encode(name + value).length > 4096) return { ok: false, reason: 'too_large' }
+
+  let secure = false, httpOnly = false, sameSite: SameSite = 'unset'
+  let path: string | null = null, domain: string | null = null, maxAge: number | null = null
+  for (const attr of attrs) {
+    const i = attr.indexOf('=')
+    const key = (i === -1 ? attr : attr.slice(0, i)).trim().toLowerCase()
+    const val = i === -1 ? '' : attr.slice(i + 1).trim()
+    if (key === 'secure') secure = true
+    else if (key === 'httponly') httpOnly = true
+    else if (key === 'samesite') {
+      const v = val.toLowerCase()
+      if (v === 'strict') sameSite = 'Strict'
+      else if (v === 'lax') sameSite = 'Lax'
+      else if (v === 'none') sameSite = 'None'
+    }
+    else if (key === 'path' && val.startsWith('/')) path = val
+    else if (key === 'domain' && val !== '') domain = val.replace(/^\./, '').toLowerCase()
+    else if (key === 'max-age' && /^-?\d+$/.test(val)) maxAge = Math.min(Number(val), MAX_AGE_LIMIT)
+  }
+
+  const lower = name.toLowerCase()
+  if (secure && url.protocol !== 'https:' && host !== 'localhost') return { ok: false, reason: 'secure_on_http' }
+  if (lower.startsWith('__secure-') && !secure) return { ok: false, reason: 'prefix_secure' }
+  if (lower.startsWith('__host-') && (!secure || path !== '/' || domain !== null)) return { ok: false, reason: 'prefix_host' }
+  if (sameSite === 'None' && !secure) return { ok: false, reason: 'samesite_none_insecure' }
+  if (domain !== null && domain !== host && !host.endsWith('.' + domain)) return { ok: false, reason: 'domain_mismatch' }
+
+  const dir = url.pathname.slice(0, url.pathname.lastIndexOf('/'))
+  return {
+    ok: true,
+    cookie: {
+      name, value, domain: domain ?? host, hostOnly: domain === null, path: path ?? (dir || '/'),
+      secure, httpOnly, sameSite, maxAge,
+    },
+  }
+}
+
+console.log(checkSetCookie('sid=abc; Path=/; HttpOnly', 'https://shop.coffee.example/auth/login'))
+console.log(checkSetCookie('sid=abc; Secure', 'http://192.168.1.20:3000/auth/login'))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<Parameters<typeof checkSetCookie>, [header: string, requestUrl: string]>>  // 參數是 (header: string, requestUrl: string)
+type _2 = Expect<Equal<ReturnType<typeof checkSetCookie>, { ok: true; cookie: { name: string; value: string; domain: string; hostOnly: boolean; path: string; secure: boolean; httpOnly: boolean; sameSite: 'Strict' | 'Lax' | 'None' | 'unset'; maxAge: number | null } } | { ok: false; reason: 'malformed' | 'too_large' | 'secure_on_http' | 'prefix_secure' | 'prefix_host' | 'samesite_none_insecure' | 'domain_mismatch' }>>  // 回傳型別要跟題目的 Result 一樣
+</script>
+  <script type="tests">
+const why = (h: string, u: string) => { const r = checkSetCookie(h, u); return r.ok ? 'ok' : r.reason }
+const get = (h: string, u: string) => { const r = checkSetCookie(h, u); assert(r.ok, `應該要收下：${h}（${u}）`); return r.cookie }
+const shop = 'https://shop.coffee.example/'
+assert.deepEqual(get('sid=abc; Path=/; HttpOnly', 'https://shop.coffee.example/login'), { name: 'sid', value: 'abc', domain: 'shop.coffee.example', hostOnly: true, path: '/', secure: false, httpOnly: true, sameSite: 'unset', maxAge: null }, '基本的 cookie：沒寫 Domain 是 host-only，沒寫 SameSite 是 unset、沒寫 Max-Age 是 null')
+const sp = get(' sid = abc ; Path=/', shop)
+assert.deepEqual([sp.name, sp.value], ['sid', 'abc'], '名稱和值前後的空白要去掉')
+assert.equal(get('sid=a=b', shop).value, 'a=b', '值裡面的 = 要保留，只用第一個 = 切開名稱和值')
+assert.equal(why('novalue', shop), 'malformed', '第一段沒有 = 要回 malformed')
+assert.equal(why('=abc; Path=/', shop), 'malformed', '名稱是空的要回 malformed')
+assert.equal(why('a=' + 'x'.repeat(4096), shop), 'too_large', '名稱加值 4097 bytes 要回 too_large')
+assert.equal(why('a=' + 'x'.repeat(4095), shop), 'ok', '名稱加值剛好 4096 bytes 要收下')
+assert.equal(why('n=' + '拿'.repeat(1366), shop), 'too_large', '要用 UTF-8 的 bytes 算長度：一個中文字 3 bytes')
+const local = get('__Host-sid=x; Secure; HttpOnly; SameSite=Lax; Path=/', 'http://localhost:5173/auth/login')
+assert.equal(local.secure, true, 'http://localhost 是例外：Secure cookie 在本機也要收下')
+assert.equal(local.domain, 'localhost', 'domain 是主機名稱，不含 port（用 url.hostname，不是 url.host）')
+assert.equal(why('sid=x; Secure', 'http://localhost.evil.example/'), 'secure_on_http', 'localhost 例外只限主機名稱剛好是 localhost，localhost.evil.example 不算')
+assert.equal(why('sid=x; Secure', 'http://192.168.1.20:3000/auth/login'), 'secure_on_http', 'http 的一般主機設 Secure cookie 要回 secure_on_http')
+assert.equal(why('__Host-sid=x; Secure; Path=/', 'http://192.168.1.20/'), 'secure_on_http', '先檢查 Secure 與 https，再檢查前綴')
+assert.equal(why('__Secure-rt=x; Path=/auth', shop), 'prefix_secure', '__Secure- 沒有 Secure 要回 prefix_secure')
+assert.equal(why('__SECURE-rt=x', shop), 'prefix_secure', '前綴不分大小寫：__SECURE- 也要檢查')
+const rt = get('__Secure-rt=x; Secure; HttpOnly; Path=/auth', 'https://api.coffee.example/auth/login')
+assert.equal(rt.path, '/auth', '__Secure- 不限制 Path，path 是 /auth')
+assert.equal(why('__Host-sid=x; Secure', shop), 'prefix_host', '__Host- 少了 Path=/ 要回 prefix_host')
+assert.equal(why('__host-sid=x; Path=/', shop), 'prefix_host', '前綴不分大小寫：__host- 少了 Secure 也要回 prefix_host')
+assert.equal(why('__Host-sid=x; Secure; Path=/auth', shop), 'prefix_host', '__Host- 的 Path 一定要是 /')
+assert.equal(why('__Host-sid=x; Secure; Path=/; Domain=shop.coffee.example', shop), 'prefix_host', '__Host- 不能有 Domain')
+assert.equal(why('pref=1; SameSite=None', shop), 'samesite_none_insecure', 'SameSite=None 沒有 Secure 要回 samesite_none_insecure')
+assert.equal(get('pref=1; SameSite=None; Secure', shop).sameSite, 'None', 'SameSite=None 加上 Secure 可以收下')
+const wide = get('sid=x; Domain=coffee.example', 'https://api.coffee.example/')
+assert.equal(wide.hostOnly, false, '寫了 Domain 就不是 host-only')
+assert.equal(wide.domain, 'coffee.example', 'domain 是 Domain 屬性的值')
+assert.equal(get('sid=x; Domain=.Coffee.Example', 'https://api.coffee.example/').domain, 'coffee.example', 'Domain 要去掉開頭的點、轉小寫')
+assert.equal(why('sid=x; Domain=evil.example', 'https://api.coffee.example/'), 'domain_mismatch', 'Domain=evil.example 不是上層網域')
+assert.equal(why('sid=x; Domain=beta.api.coffee.example', 'https://api.coffee.example/'), 'domain_mismatch', '不能把 Domain 設成子網域')
+assert.equal(why('sid=x; Domain=ffee.example', 'https://api.coffee.example/'), 'domain_mismatch', 'ffee.example 只是字尾相同，不是上層網域（要比對前面的點）')
+assert.equal(get('sid=x', 'https://api.coffee.example/auth/login').path, '/auth', '沒寫 Path：/auth/login 設的 cookie 預設 path 是 /auth')
+assert.equal(get('sid=x', 'https://api.coffee.example/login').path, '/', '沒寫 Path：/login 設的 cookie 預設 path 是 /')
+assert.equal(get('sid=x; Path=orders', 'https://api.coffee.example/a/b/c').path, '/a/b', 'Path 不是 / 開頭時當成沒寫')
+assert.equal(get('sid=x; Max-Age=99999999', shop).maxAge, 34560000, 'Max-Age 超過 400 天要壓成 34560000')
+assert.equal(get('sid=x; Max-Age=3600', shop).maxAge, 3600, 'Max-Age=3600 照原樣')
+assert.equal(get('sid=x; Max-Age=0', shop).maxAge, 0, 'Max-Age=0 是 0（立刻刪除）')
+const mixed = get('sid=x; secure; HTTPONLY; samesite=lax; path=/', shop)
+assert.deepEqual([mixed.secure, mixed.httpOnly, mixed.sameSite, mixed.path], [true, true, 'Lax', '/'], '屬性名稱與 SameSite 的值不分大小寫')
+assert.equal(get('sid=x; SameSite=Strict', shop).sameSite, 'Strict', 'SameSite=Strict')
+</script>
+  <script type="wrong">
+// 沒寫 Path 時預設成 /
+type SameSite = 'Strict' | 'Lax' | 'None' | 'unset'
+type Cookie = { name: string; value: string; domain: string; hostOnly: boolean; path: string; secure: boolean; httpOnly: boolean; sameSite: SameSite; maxAge: number | null }
+type Reason = 'malformed' | 'too_large' | 'secure_on_http' | 'prefix_secure' | 'prefix_host' | 'samesite_none_insecure' | 'domain_mismatch'
+type Result = { ok: true; cookie: Cookie } | { ok: false; reason: Reason }
+function checkSetCookie(header: string, requestUrl: string): Result {
+  const url = new URL(requestUrl), host = url.hostname
+  const [pair, ...attrs] = header.split(';')
+  const eq = pair.indexOf('=')
+  const name = eq === -1 ? '' : pair.slice(0, eq).trim(), value = pair.slice(eq + 1).trim()
+  if (name === '') return { ok: false, reason: 'malformed' }
+  if (new TextEncoder().encode(name + value).length > 4096) return { ok: false, reason: 'too_large' }
+  let secure = false, httpOnly = false, sameSite: SameSite = 'unset', path: string | null = null, domain: string | null = null, maxAge: number | null = null
+  for (const attr of attrs) {
+    const i = attr.indexOf('=')
+    const key = (i === -1 ? attr : attr.slice(0, i)).trim().toLowerCase(), val = i === -1 ? '' : attr.slice(i + 1).trim()
+    if (key === 'secure') secure = true
+    else if (key === 'httponly') httpOnly = true
+    else if (key === 'samesite') { const v = val.toLowerCase(); sameSite = v === 'strict' ? 'Strict' : v === 'lax' ? 'Lax' : v === 'none' ? 'None' : sameSite }
+    else if (key === 'path' && val.startsWith('/')) path = val
+    else if (key === 'domain' && val !== '') domain = val.replace(/^\./, '').toLowerCase()
+    else if (key === 'max-age' && /^-?\d+$/.test(val)) maxAge = Math.min(Number(val), 34560000)
+  }
+  const lower = name.toLowerCase()
+  if (secure && url.protocol !== 'https:' && host !== 'localhost') return { ok: false, reason: 'secure_on_http' }
+  if (lower.startsWith('__secure-') && !secure) return { ok: false, reason: 'prefix_secure' }
+  if (lower.startsWith('__host-') && (!secure || path !== '/' || domain !== null)) return { ok: false, reason: 'prefix_host' }
+  if (sameSite === 'None' && !secure) return { ok: false, reason: 'samesite_none_insecure' }
+  if (domain !== null && domain !== host && !host.endsWith('.' + domain)) return { ok: false, reason: 'domain_mismatch' }
+  return { ok: true, cookie: { name, value, domain: domain ?? host, hostOnly: domain === null, path: path ?? '/', secure, httpOnly, sameSite, maxAge } }
+}
+</script>
+  <script type="wrong">
+// 前綴比對大小寫敏感
+type SameSite = 'Strict' | 'Lax' | 'None' | 'unset'
+type Cookie = { name: string; value: string; domain: string; hostOnly: boolean; path: string; secure: boolean; httpOnly: boolean; sameSite: SameSite; maxAge: number | null }
+type Reason = 'malformed' | 'too_large' | 'secure_on_http' | 'prefix_secure' | 'prefix_host' | 'samesite_none_insecure' | 'domain_mismatch'
+type Result = { ok: true; cookie: Cookie } | { ok: false; reason: Reason }
+function checkSetCookie(header: string, requestUrl: string): Result {
+  const url = new URL(requestUrl), host = url.hostname
+  const [pair, ...attrs] = header.split(';')
+  const eq = pair.indexOf('=')
+  const name = eq === -1 ? '' : pair.slice(0, eq).trim(), value = pair.slice(eq + 1).trim()
+  if (name === '') return { ok: false, reason: 'malformed' }
+  if (new TextEncoder().encode(name + value).length > 4096) return { ok: false, reason: 'too_large' }
+  let secure = false, httpOnly = false, sameSite: SameSite = 'unset', path: string | null = null, domain: string | null = null, maxAge: number | null = null
+  for (const attr of attrs) {
+    const i = attr.indexOf('=')
+    const key = (i === -1 ? attr : attr.slice(0, i)).trim().toLowerCase(), val = i === -1 ? '' : attr.slice(i + 1).trim()
+    if (key === 'secure') secure = true
+    else if (key === 'httponly') httpOnly = true
+    else if (key === 'samesite') { const v = val.toLowerCase(); sameSite = v === 'strict' ? 'Strict' : v === 'lax' ? 'Lax' : v === 'none' ? 'None' : sameSite }
+    else if (key === 'path' && val.startsWith('/')) path = val
+    else if (key === 'domain' && val !== '') domain = val.replace(/^\./, '').toLowerCase()
+    else if (key === 'max-age' && /^-?\d+$/.test(val)) maxAge = Math.min(Number(val), 34560000)
+  }
+  if (secure && url.protocol !== 'https:' && host !== 'localhost') return { ok: false, reason: 'secure_on_http' }
+  if (name.startsWith('__Secure-') && !secure) return { ok: false, reason: 'prefix_secure' }
+  if (name.startsWith('__Host-') && (!secure || path !== '/' || domain !== null)) return { ok: false, reason: 'prefix_host' }
+  if (sameSite === 'None' && !secure) return { ok: false, reason: 'samesite_none_insecure' }
+  if (domain !== null && domain !== host && !host.endsWith('.' + domain)) return { ok: false, reason: 'domain_mismatch' }
+  const dir = url.pathname.slice(0, url.pathname.lastIndexOf('/'))
+  return { ok: true, cookie: { name, value, domain: domain ?? host, hostOnly: domain === null, path: path ?? (dir || '/'), secure, httpOnly, sameSite, maxAge } }
+}
+</script>
+  <script type="wrong">
+// Domain 用 endsWith 比對，沒有檢查前面的點
+type SameSite = 'Strict' | 'Lax' | 'None' | 'unset'
+type Cookie = { name: string; value: string; domain: string; hostOnly: boolean; path: string; secure: boolean; httpOnly: boolean; sameSite: SameSite; maxAge: number | null }
+type Reason = 'malformed' | 'too_large' | 'secure_on_http' | 'prefix_secure' | 'prefix_host' | 'samesite_none_insecure' | 'domain_mismatch'
+type Result = { ok: true; cookie: Cookie } | { ok: false; reason: Reason }
+function checkSetCookie(header: string, requestUrl: string): Result {
+  const url = new URL(requestUrl), host = url.hostname
+  const [pair, ...attrs] = header.split(';')
+  const eq = pair.indexOf('=')
+  const name = eq === -1 ? '' : pair.slice(0, eq).trim(), value = pair.slice(eq + 1).trim()
+  if (name === '') return { ok: false, reason: 'malformed' }
+  if (new TextEncoder().encode(name + value).length > 4096) return { ok: false, reason: 'too_large' }
+  let secure = false, httpOnly = false, sameSite: SameSite = 'unset', path: string | null = null, domain: string | null = null, maxAge: number | null = null
+  for (const attr of attrs) {
+    const i = attr.indexOf('=')
+    const key = (i === -1 ? attr : attr.slice(0, i)).trim().toLowerCase(), val = i === -1 ? '' : attr.slice(i + 1).trim()
+    if (key === 'secure') secure = true
+    else if (key === 'httponly') httpOnly = true
+    else if (key === 'samesite') { const v = val.toLowerCase(); sameSite = v === 'strict' ? 'Strict' : v === 'lax' ? 'Lax' : v === 'none' ? 'None' : sameSite }
+    else if (key === 'path' && val.startsWith('/')) path = val
+    else if (key === 'domain' && val !== '') domain = val.replace(/^\./, '').toLowerCase()
+    else if (key === 'max-age' && /^-?\d+$/.test(val)) maxAge = Math.min(Number(val), 34560000)
+  }
+  const lower = name.toLowerCase()
+  if (secure && url.protocol !== 'https:' && host !== 'localhost') return { ok: false, reason: 'secure_on_http' }
+  if (lower.startsWith('__secure-') && !secure) return { ok: false, reason: 'prefix_secure' }
+  if (lower.startsWith('__host-') && (!secure || path !== '/' || domain !== null)) return { ok: false, reason: 'prefix_host' }
+  if (sameSite === 'None' && !secure) return { ok: false, reason: 'samesite_none_insecure' }
+  if (domain !== null && !host.endsWith(domain)) return { ok: false, reason: 'domain_mismatch' }
+  const dir = url.pathname.slice(0, url.pathname.lastIndexOf('/'))
+  return { ok: true, cookie: { name, value, domain: domain ?? host, hostOnly: domain === null, path: path ?? (dir || '/'), secure, httpOnly, sameSite, maxAge } }
+}
+</script>
+  <script type="wrong">
+// 沒有 localhost 例外
+type SameSite = 'Strict' | 'Lax' | 'None' | 'unset'
+type Cookie = { name: string; value: string; domain: string; hostOnly: boolean; path: string; secure: boolean; httpOnly: boolean; sameSite: SameSite; maxAge: number | null }
+type Reason = 'malformed' | 'too_large' | 'secure_on_http' | 'prefix_secure' | 'prefix_host' | 'samesite_none_insecure' | 'domain_mismatch'
+type Result = { ok: true; cookie: Cookie } | { ok: false; reason: Reason }
+function checkSetCookie(header: string, requestUrl: string): Result {
+  const url = new URL(requestUrl), host = url.hostname
+  const [pair, ...attrs] = header.split(';')
+  const eq = pair.indexOf('=')
+  const name = eq === -1 ? '' : pair.slice(0, eq).trim(), value = pair.slice(eq + 1).trim()
+  if (name === '') return { ok: false, reason: 'malformed' }
+  if (new TextEncoder().encode(name + value).length > 4096) return { ok: false, reason: 'too_large' }
+  let secure = false, httpOnly = false, sameSite: SameSite = 'unset', path: string | null = null, domain: string | null = null, maxAge: number | null = null
+  for (const attr of attrs) {
+    const i = attr.indexOf('=')
+    const key = (i === -1 ? attr : attr.slice(0, i)).trim().toLowerCase(), val = i === -1 ? '' : attr.slice(i + 1).trim()
+    if (key === 'secure') secure = true
+    else if (key === 'httponly') httpOnly = true
+    else if (key === 'samesite') { const v = val.toLowerCase(); sameSite = v === 'strict' ? 'Strict' : v === 'lax' ? 'Lax' : v === 'none' ? 'None' : sameSite }
+    else if (key === 'path' && val.startsWith('/')) path = val
+    else if (key === 'domain' && val !== '') domain = val.replace(/^\./, '').toLowerCase()
+    else if (key === 'max-age' && /^-?\d+$/.test(val)) maxAge = Math.min(Number(val), 34560000)
+  }
+  const lower = name.toLowerCase()
+  if (secure && url.protocol !== 'https:') return { ok: false, reason: 'secure_on_http' }
+  if (lower.startsWith('__secure-') && !secure) return { ok: false, reason: 'prefix_secure' }
+  if (lower.startsWith('__host-') && (!secure || path !== '/' || domain !== null)) return { ok: false, reason: 'prefix_host' }
+  if (sameSite === 'None' && !secure) return { ok: false, reason: 'samesite_none_insecure' }
+  if (domain !== null && domain !== host && !host.endsWith('.' + domain)) return { ok: false, reason: 'domain_mismatch' }
+  const dir = url.pathname.slice(0, url.pathname.lastIndexOf('/'))
+  return { ok: true, cookie: { name, value, domain: domain ?? host, hostOnly: domain === null, path: path ?? (dir || '/'), secure, httpOnly, sameSite, maxAge } }
+}
+</script>
+  <script type="wrong">
+// 屬性名稱大小寫敏感；長度用字元數而不是 bytes
+type SameSite = 'Strict' | 'Lax' | 'None' | 'unset'
+type Cookie = { name: string; value: string; domain: string; hostOnly: boolean; path: string; secure: boolean; httpOnly: boolean; sameSite: SameSite; maxAge: number | null }
+type Reason = 'malformed' | 'too_large' | 'secure_on_http' | 'prefix_secure' | 'prefix_host' | 'samesite_none_insecure' | 'domain_mismatch'
+type Result = { ok: true; cookie: Cookie } | { ok: false; reason: Reason }
+function checkSetCookie(header: string, requestUrl: string): Result {
+  const url = new URL(requestUrl), host = url.hostname
+  const [pair, ...attrs] = header.split(';')
+  const eq = pair.indexOf('=')
+  const name = eq === -1 ? '' : pair.slice(0, eq).trim(), value = pair.slice(eq + 1).trim()
+  if (name === '') return { ok: false, reason: 'malformed' }
+  if ((name + value).length > 4096) return { ok: false, reason: 'too_large' }
+  let secure = false, httpOnly = false, sameSite: SameSite = 'unset', path: string | null = null, domain: string | null = null, maxAge: number | null = null
+  for (const attr of attrs) {
+    const i = attr.indexOf('=')
+    const key = (i === -1 ? attr : attr.slice(0, i)).trim(), val = i === -1 ? '' : attr.slice(i + 1).trim()
+    if (key === 'Secure') secure = true
+    else if (key === 'HttpOnly') httpOnly = true
+    else if (key === 'SameSite') sameSite = val === 'Strict' || val === 'Lax' || val === 'None' ? val : sameSite
+    else if (key === 'Path' && val.startsWith('/')) path = val
+    else if (key === 'Domain' && val !== '') domain = val.replace(/^\./, '').toLowerCase()
+    else if (key === 'Max-Age' && /^-?\d+$/.test(val)) maxAge = Math.min(Number(val), 34560000)
+  }
+  const lower = name.toLowerCase()
+  if (secure && url.protocol !== 'https:' && host !== 'localhost') return { ok: false, reason: 'secure_on_http' }
+  if (lower.startsWith('__secure-') && !secure) return { ok: false, reason: 'prefix_secure' }
+  if (lower.startsWith('__host-') && (!secure || path !== '/' || domain !== null)) return { ok: false, reason: 'prefix_host' }
+  if (sameSite === 'None' && !secure) return { ok: false, reason: 'samesite_none_insecure' }
+  if (domain !== null && domain !== host && !host.endsWith('.' + domain)) return { ok: false, reason: 'domain_mismatch' }
+  const dir = url.pathname.slice(0, url.pathname.lastIndexOf('/'))
+  return { ok: true, cookie: { name, value, domain: domain ?? host, hostOnly: domain === null, path: path ?? (dir || '/'), secure, httpOnly, sameSite, maxAge } }
+}
+</script>
+  <script type="wrong">
+// localhost 例外用 includes 判斷（localhost.evil.example 也被放行）
+type SameSite = 'Strict' | 'Lax' | 'None' | 'unset'
+type Cookie = { name: string; value: string; domain: string; hostOnly: boolean; path: string; secure: boolean; httpOnly: boolean; sameSite: SameSite; maxAge: number | null }
+type Reason = 'malformed' | 'too_large' | 'secure_on_http' | 'prefix_secure' | 'prefix_host' | 'samesite_none_insecure' | 'domain_mismatch'
+type Result = { ok: true; cookie: Cookie } | { ok: false; reason: Reason }
+function checkSetCookie(header: string, requestUrl: string): Result {
+  const url = new URL(requestUrl), host = url.hostname
+  const [pair, ...attrs] = header.split(';')
+  const eq = pair.indexOf('=')
+  const name = eq === -1 ? '' : pair.slice(0, eq).trim(), value = pair.slice(eq + 1).trim()
+  if (name === '') return { ok: false, reason: 'malformed' }
+  if (new TextEncoder().encode(name + value).length > 4096) return { ok: false, reason: 'too_large' }
+  let secure = false, httpOnly = false, sameSite: SameSite = 'unset', path: string | null = null, domain: string | null = null, maxAge: number | null = null
+  for (const attr of attrs) {
+    const i = attr.indexOf('=')
+    const key = (i === -1 ? attr : attr.slice(0, i)).trim().toLowerCase(), val = i === -1 ? '' : attr.slice(i + 1).trim()
+    if (key === 'secure') secure = true
+    else if (key === 'httponly') httpOnly = true
+    else if (key === 'samesite') { const v = val.toLowerCase(); sameSite = v === 'strict' ? 'Strict' : v === 'lax' ? 'Lax' : v === 'none' ? 'None' : sameSite }
+    else if (key === 'path' && val.startsWith('/')) path = val
+    else if (key === 'domain' && val !== '') domain = val.replace(/^\./, '').toLowerCase()
+    else if (key === 'max-age' && /^-?\d+$/.test(val)) maxAge = Math.min(Number(val), 34560000)
+  }
+  const lower = name.toLowerCase()
+  if (secure && url.protocol !== 'https:' && !url.hostname.includes('localhost')) return { ok: false, reason: 'secure_on_http' }
+  if (lower.startsWith('__secure-') && !secure) return { ok: false, reason: 'prefix_secure' }
+  if (lower.startsWith('__host-') && (!secure || path !== '/' || domain !== null)) return { ok: false, reason: 'prefix_host' }
+  if (sameSite === 'None' && !secure) return { ok: false, reason: 'samesite_none_insecure' }
+  if (domain !== null && domain !== host && !host.endsWith('.' + domain)) return { ok: false, reason: 'domain_mismatch' }
+  const dir = url.pathname.slice(0, url.pathname.lastIndexOf('/'))
+  return { ok: true, cookie: { name, value, domain: domain ?? host, hostOnly: domain === null, path: path ?? (dir || '/'), secure, httpOnly, sameSite, maxAge } }
+}
+</script>
+  <script type="wrong">
+// 用 url.host（含 port）當主機
+type SameSite = 'Strict' | 'Lax' | 'None' | 'unset'
+type Cookie = { name: string; value: string; domain: string; hostOnly: boolean; path: string; secure: boolean; httpOnly: boolean; sameSite: SameSite; maxAge: number | null }
+type Reason = 'malformed' | 'too_large' | 'secure_on_http' | 'prefix_secure' | 'prefix_host' | 'samesite_none_insecure' | 'domain_mismatch'
+type Result = { ok: true; cookie: Cookie } | { ok: false; reason: Reason }
+function checkSetCookie(header: string, requestUrl: string): Result {
+  const url = new URL(requestUrl), host = url.host
+  const [pair, ...attrs] = header.split(';')
+  const eq = pair.indexOf('=')
+  const name = eq === -1 ? '' : pair.slice(0, eq).trim(), value = pair.slice(eq + 1).trim()
+  if (name === '') return { ok: false, reason: 'malformed' }
+  if (new TextEncoder().encode(name + value).length > 4096) return { ok: false, reason: 'too_large' }
+  let secure = false, httpOnly = false, sameSite: SameSite = 'unset', path: string | null = null, domain: string | null = null, maxAge: number | null = null
+  for (const attr of attrs) {
+    const i = attr.indexOf('=')
+    const key = (i === -1 ? attr : attr.slice(0, i)).trim().toLowerCase(), val = i === -1 ? '' : attr.slice(i + 1).trim()
+    if (key === 'secure') secure = true
+    else if (key === 'httponly') httpOnly = true
+    else if (key === 'samesite') { const v = val.toLowerCase(); sameSite = v === 'strict' ? 'Strict' : v === 'lax' ? 'Lax' : v === 'none' ? 'None' : sameSite }
+    else if (key === 'path' && val.startsWith('/')) path = val
+    else if (key === 'domain' && val !== '') domain = val.replace(/^\./, '').toLowerCase()
+    else if (key === 'max-age' && /^-?\d+$/.test(val)) maxAge = Math.min(Number(val), 34560000)
+  }
+  const lower = name.toLowerCase()
+  if (secure && url.protocol !== 'https:' && url.hostname !== 'localhost') return { ok: false, reason: 'secure_on_http' }
+  if (lower.startsWith('__secure-') && !secure) return { ok: false, reason: 'prefix_secure' }
+  if (lower.startsWith('__host-') && (!secure || path !== '/' || domain !== null)) return { ok: false, reason: 'prefix_host' }
+  if (sameSite === 'None' && !secure) return { ok: false, reason: 'samesite_none_insecure' }
+  if (domain !== null && domain !== host && !host.endsWith('.' + domain)) return { ok: false, reason: 'domain_mismatch' }
+  const dir = url.pathname.slice(0, url.pathname.lastIndexOf('/'))
+  return { ok: true, cookie: { name, value, domain: domain ?? host, hostOnly: domain === null, path: path ?? (dir || '/'), secure, httpOnly, sameSite, maxAge } }
+}
+</script>
+  <script type="wrong">
+// 名稱和值沒有去掉空白
+type SameSite = 'Strict' | 'Lax' | 'None' | 'unset'
+type Cookie = { name: string; value: string; domain: string; hostOnly: boolean; path: string; secure: boolean; httpOnly: boolean; sameSite: SameSite; maxAge: number | null }
+type Reason = 'malformed' | 'too_large' | 'secure_on_http' | 'prefix_secure' | 'prefix_host' | 'samesite_none_insecure' | 'domain_mismatch'
+type Result = { ok: true; cookie: Cookie } | { ok: false; reason: Reason }
+function checkSetCookie(header: string, requestUrl: string): Result {
+  const url = new URL(requestUrl), host = url.hostname
+  const [pair, ...attrs] = header.split(';')
+  const eq = pair.indexOf('=')
+  const name = eq === -1 ? '' : pair.slice(0, eq), value = pair.slice(eq + 1)
+  if (name === '') return { ok: false, reason: 'malformed' }
+  if (new TextEncoder().encode(name + value).length > 4096) return { ok: false, reason: 'too_large' }
+  let secure = false, httpOnly = false, sameSite: SameSite = 'unset', path: string | null = null, domain: string | null = null, maxAge: number | null = null
+  for (const attr of attrs) {
+    const i = attr.indexOf('=')
+    const key = (i === -1 ? attr : attr.slice(0, i)).trim().toLowerCase(), val = i === -1 ? '' : attr.slice(i + 1).trim()
+    if (key === 'secure') secure = true
+    else if (key === 'httponly') httpOnly = true
+    else if (key === 'samesite') { const v = val.toLowerCase(); sameSite = v === 'strict' ? 'Strict' : v === 'lax' ? 'Lax' : v === 'none' ? 'None' : sameSite }
+    else if (key === 'path' && val.startsWith('/')) path = val
+    else if (key === 'domain' && val !== '') domain = val.replace(/^\./, '').toLowerCase()
+    else if (key === 'max-age' && /^-?\d+$/.test(val)) maxAge = Math.min(Number(val), 34560000)
+  }
+  const lower = name.toLowerCase()
+  if (secure && url.protocol !== 'https:' && host !== 'localhost') return { ok: false, reason: 'secure_on_http' }
+  if (lower.startsWith('__secure-') && !secure) return { ok: false, reason: 'prefix_secure' }
+  if (lower.startsWith('__host-') && (!secure || path !== '/' || domain !== null)) return { ok: false, reason: 'prefix_host' }
+  if (sameSite === 'None' && !secure) return { ok: false, reason: 'samesite_none_insecure' }
+  if (domain !== null && domain !== host && !host.endsWith('.' + domain)) return { ok: false, reason: 'domain_mismatch' }
+  const dir = url.pathname.slice(0, url.pathname.lastIndexOf('/'))
+  return { ok: true, cookie: { name, value, domain: domain ?? host, hostOnly: domain === null, path: path ?? (dir || '/'), secure, httpOnly, sameSite, maxAge } }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：實作 <code>SessionStore</code>。時間用建構子注入的 <code>now()</code>（毫秒），資料存在注入的 <code>db</code>。<code>base64url</code>、<code>sha256</code> 已經寫好（第 2 課）。</p>
+  <ul>
+    <li><code>create(userId)</code>：產生 32 bytes 的安全亂數 token（base64url），db 的 key 是 <code>sha256(token)</code>，回傳<strong>原始 token</strong>（要放進 cookie）。<code>userId</code> 是 <code>null</code> 代表還沒登入的匿名 session。</li>
+    <li><code>get(token)</code>：找不到回 <code>null</code>；距離上次使用 ≥ 30 分鐘，或距離建立 ≥ 8 小時，就算過期：從 db 刪除並回 <code>null</code>；否則把 <code>lastSeenAt</code> 更新成現在，回傳 session。</li>
+    <li><code>destroy(token)</code>：刪除這個 session（登出）。</li>
+  </ul>
+  <script type="start">
+type Session = { userId: number | null; createdAt: number; lastSeenAt: number; cart: string[] }
+
+const IDLE = 30 * 60 * 1000
+const ABSOLUTE = 8 * 60 * 60 * 1000
+
+// 已經寫好（第 2 課）
+function base64url(bytes: Uint8Array<ArrayBuffer>): string {
+  let s = ''
+  for (const b of bytes) s += String.fromCharCode(b)
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+async function sha256(text: string): Promise<string> {
+  return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))))
+}
+
+class SessionStore {
+  now: () => number
+  db: Map<string, Session>
+  constructor(now: () => number, db: Map<string, Session>) {
+    this.now = now
+    this.db = db
+  }
+
+  async create(userId: number | null): Promise<string> {
+    throw new Error('TODO')
+  }
+
+  async get(token: string): Promise<Session | null> {
+    throw new Error('TODO')
+  }
+
+  async destroy(token: string): Promise<void> {
+    throw new Error('TODO')
+  }
+}
+
+let t = 0
+const store = new SessionStore(() => t, new Map())
+const token = await store.create(1)
+t += 10 * 60 * 1000
+console.log(await store.get(token))
+</script>
+  <script type="answer">
+type Session = { userId: number | null; createdAt: number; lastSeenAt: number; cart: string[] }
+
+const IDLE = 30 * 60 * 1000
+const ABSOLUTE = 8 * 60 * 60 * 1000
+
+// 已經寫好（第 2 課）
+function base64url(bytes: Uint8Array<ArrayBuffer>): string {
+  let s = ''
+  for (const b of bytes) s += String.fromCharCode(b)
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+async function sha256(text: string): Promise<string> {
+  return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))))
+}
+
+class SessionStore {
+  now: () => number
+  db: Map<string, Session>
+  constructor(now: () => number, db: Map<string, Session>) {
+    this.now = now
+    this.db = db
+  }
+
+  async create(userId: number | null): Promise<string> {
+    const token = base64url(crypto.getRandomValues(new Uint8Array(32)))
+    const t = this.now()
+    this.db.set(await sha256(token), { userId, createdAt: t, lastSeenAt: t, cart: [] })
+    return token
+  }
+
+  async get(token: string): Promise<Session | null> {
+    const key = await sha256(token)
+    const session = this.db.get(key)
+    if (!session) return null
+    const t = this.now()
+    if (t - session.lastSeenAt >= IDLE || t - session.createdAt >= ABSOLUTE) {
+      this.db.delete(key)
+      return null
+    }
+    session.lastSeenAt = t
+    return session
+  }
+
+  async destroy(token: string): Promise<void> {
+    this.db.delete(await sha256(token))
+  }
+}
+
+let t = 0
+const store = new SessionStore(() => t, new Map())
+const token = await store.create(1)
+t += 10 * 60 * 1000
+console.log(await store.get(token))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<ReturnType<SessionStore['create']>, Promise<string>>>  // create 回傳 Promise<string>
+type _2 = Expect<Equal<ReturnType<SessionStore['get']>, Promise<Session | null>>>  // get 回傳 Promise<Session | null>
+type _3 = Expect<Equal<ReturnType<SessionStore['destroy']>, Promise<void>>>  // destroy 回傳 Promise<void>
+</script>
+  <script type="tests">
+const MIN = 60 * 1000
+const hash = async (s: string) => { let b = ''; for (const x of new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s)))) b += String.fromCharCode(x); return btoa(b).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+let clock = 5_000_000
+const db = new Map<string, Session>()
+const s = new SessionStore(() => clock, db)
+const tok = await s.create(7)
+assert(/^[A-Za-z0-9_-]{43}$/.test(tok), 'token 要是 32 bytes 安全亂數的 base64url（43 個字元）')
+const key = await hash(tok)
+assert(!db.has(tok), 'db 的 key 不能是原始 token：外洩時會被直接拿去登入')
+assert(db.has(key), 'db 的 key 要是 base64url(SHA-256(token))，用已經寫好的 sha256')
+assert.equal(db.get(key)?.createdAt, clock, 'createdAt 要用注入的 now()，不能用 Date.now()')
+assert.equal(await s.get('no-such-token'), null, '找不到的 token 回 null')
+clock += 29 * MIN
+const s1 = await s.get(tok)
+assert.equal(s1?.userId, 7, '閒置 29 分鐘還有效')
+assert.equal(s1?.lastSeenAt, clock, '有效時要把 lastSeenAt 更新成 now()')
+clock += 31 * MIN
+assert.equal(await s.get(tok), null, '閒置 31 分鐘要過期（先檢查，再更新 lastSeenAt）')
+assert(!db.has(key), '過期的 session 要從 db 刪掉')
+const tok30 = await s.create(8)
+clock += 30 * MIN
+assert.equal(await s.get(tok30), null, '閒置剛好 30 分鐘就算過期')
+const busy = await s.create(9)
+const start = clock
+for (let m = 20; m <= 460; m += 20) {
+  clock = start + m * MIN
+  assert.equal((await s.get(busy))?.userId, 9, `每 20 分鐘用一次，第 ${m} 分鐘仍然有效`)
+}
+clock = start + 480 * MIN
+assert.equal(await s.get(busy), null, '一直在用也一樣：從建立起剛好 8 小時就過期（絕對逾時）')
+assert(!db.has(await hash(busy)), '絕對逾時的 session 也要從 db 刪掉')
+const out = await s.create(1)
+await s.destroy(out)
+assert.equal(await s.get(out), null, 'destroy 之後 get 回 null')
+assert(!db.has(await hash(out)), 'destroy 要從 db 刪掉')
+const seen = new Set<string>()
+for (let i = 0; i < 1000; i++) seen.add(await s.create(1))
+assert.equal(seen.size, 1000, '1000 次 create 的 token 都不能重複')
+const origRV = crypto.getRandomValues
+let rvBytes = 0
+;(crypto as any).getRandomValues = (a: any) => { rvBytes += a.byteLength; return origRV.call(crypto, a) }
+try { await s.create(1) } finally { (crypto as any).getRandomValues = origRV }
+assert(rvBytes >= 32, 'create 要用 crypto.getRandomValues 產生 32 bytes 的安全亂數')
+const orig = Math.random
+Math.random = () => 0.5
+try {
+  const a = await s.create(1), b = await s.create(1)
+  assert(a !== b, 'token 要用 crypto.getRandomValues，不能用 Math.random')
+} finally { Math.random = orig }
+</script>
+  <script type="wrong">
+// 用原始 token 當 key
+type Session = { userId: number | null; createdAt: number; lastSeenAt: number; cart: string[] }
+const IDLE = 30 * 60 * 1000, ABSOLUTE = 8 * 60 * 60 * 1000
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+class SessionStore {
+  now: () => number; db: Map<string, Session>
+  constructor(now: () => number, db: Map<string, Session>) { this.now = now; this.db = db }
+  async create(userId: number | null): Promise<string> { const token = base64url(crypto.getRandomValues(new Uint8Array(32))); const t = this.now(); this.db.set(token, { userId, createdAt: t, lastSeenAt: t, cart: [] }); return token }
+  async get(token: string): Promise<Session | null> {
+    const s = this.db.get(token); if (!s) return null
+    const t = this.now()
+    if (t - s.lastSeenAt >= IDLE || t - s.createdAt >= ABSOLUTE) { this.db.delete(token); return null }
+    s.lastSeenAt = t; return s
+  }
+  async destroy(token: string): Promise<void> { this.db.delete(token) }
+}
+</script>
+  <script type="wrong">
+// 只有閒置（滑動）逾時，沒有絕對逾時
+type Session = { userId: number | null; createdAt: number; lastSeenAt: number; cart: string[] }
+const IDLE = 30 * 60 * 1000
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+async function sha256(text: string): Promise<string> { return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))) }
+class SessionStore {
+  now: () => number; db: Map<string, Session>
+  constructor(now: () => number, db: Map<string, Session>) { this.now = now; this.db = db }
+  async create(userId: number | null): Promise<string> { const token = base64url(crypto.getRandomValues(new Uint8Array(32))); const t = this.now(); this.db.set(await sha256(token), { userId, createdAt: t, lastSeenAt: t, cart: [] }); return token }
+  async get(token: string): Promise<Session | null> {
+    const key = await sha256(token); const s = this.db.get(key); if (!s) return null
+    const t = this.now()
+    if (t - s.lastSeenAt >= IDLE) { this.db.delete(key); return null }
+    s.lastSeenAt = t; return s
+  }
+  async destroy(token: string): Promise<void> { this.db.delete(await sha256(token)) }
+}
+</script>
+  <script type="wrong">
+// 只有絕對逾時，沒有閒置逾時
+type Session = { userId: number | null; createdAt: number; lastSeenAt: number; cart: string[] }
+const ABSOLUTE = 8 * 60 * 60 * 1000
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+async function sha256(text: string): Promise<string> { return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))) }
+class SessionStore {
+  now: () => number; db: Map<string, Session>
+  constructor(now: () => number, db: Map<string, Session>) { this.now = now; this.db = db }
+  async create(userId: number | null): Promise<string> { const token = base64url(crypto.getRandomValues(new Uint8Array(32))); const t = this.now(); this.db.set(await sha256(token), { userId, createdAt: t, lastSeenAt: t, cart: [] }); return token }
+  async get(token: string): Promise<Session | null> {
+    const key = await sha256(token); const s = this.db.get(key); if (!s) return null
+    const t = this.now()
+    if (t - s.createdAt >= ABSOLUTE) { this.db.delete(key); return null }
+    s.lastSeenAt = t; return s
+  }
+  async destroy(token: string): Promise<void> { this.db.delete(await sha256(token)) }
+}
+</script>
+  <script type="wrong">
+// 先更新 lastSeenAt 再檢查閒置
+type Session = { userId: number | null; createdAt: number; lastSeenAt: number; cart: string[] }
+const IDLE = 30 * 60 * 1000, ABSOLUTE = 8 * 60 * 60 * 1000
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+async function sha256(text: string): Promise<string> { return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))) }
+class SessionStore {
+  now: () => number; db: Map<string, Session>
+  constructor(now: () => number, db: Map<string, Session>) { this.now = now; this.db = db }
+  async create(userId: number | null): Promise<string> { const token = base64url(crypto.getRandomValues(new Uint8Array(32))); const t = this.now(); this.db.set(await sha256(token), { userId, createdAt: t, lastSeenAt: t, cart: [] }); return token }
+  async get(token: string): Promise<Session | null> {
+    const key = await sha256(token); const s = this.db.get(key); if (!s) return null
+    const t = this.now()
+    s.lastSeenAt = t
+    if (t - s.lastSeenAt >= IDLE || t - s.createdAt >= ABSOLUTE) { this.db.delete(key); return null }
+    return s
+  }
+  async destroy(token: string): Promise<void> { this.db.delete(await sha256(token)) }
+}
+</script>
+  <script type="wrong">
+// 用 Date.now() 而不是注入的 now
+type Session = { userId: number | null; createdAt: number; lastSeenAt: number; cart: string[] }
+const IDLE = 30 * 60 * 1000, ABSOLUTE = 8 * 60 * 60 * 1000
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+async function sha256(text: string): Promise<string> { return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))) }
+class SessionStore {
+  now: () => number; db: Map<string, Session>
+  constructor(now: () => number, db: Map<string, Session>) { this.now = now; this.db = db }
+  async create(userId: number | null): Promise<string> { const token = base64url(crypto.getRandomValues(new Uint8Array(32))); const t = Date.now(); this.db.set(await sha256(token), { userId, createdAt: t, lastSeenAt: t, cart: [] }); return token }
+  async get(token: string): Promise<Session | null> {
+    const key = await sha256(token); const s = this.db.get(key); if (!s) return null
+    const t = Date.now()
+    if (t - s.lastSeenAt >= IDLE || t - s.createdAt >= ABSOLUTE) { this.db.delete(key); return null }
+    s.lastSeenAt = t; return s
+  }
+  async destroy(token: string): Promise<void> { this.db.delete(await sha256(token)) }
+}
+</script>
+  <script type="wrong">
+// 判定過期但沒有刪除
+type Session = { userId: number | null; createdAt: number; lastSeenAt: number; cart: string[] }
+const IDLE = 30 * 60 * 1000, ABSOLUTE = 8 * 60 * 60 * 1000
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+async function sha256(text: string): Promise<string> { return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))) }
+class SessionStore {
+  now: () => number; db: Map<string, Session>
+  constructor(now: () => number, db: Map<string, Session>) { this.now = now; this.db = db }
+  async create(userId: number | null): Promise<string> { const token = base64url(crypto.getRandomValues(new Uint8Array(32))); const t = this.now(); this.db.set(await sha256(token), { userId, createdAt: t, lastSeenAt: t, cart: [] }); return token }
+  async get(token: string): Promise<Session | null> {
+    const key = await sha256(token); const s = this.db.get(key); if (!s) return null
+    const t = this.now()
+    if (t - s.lastSeenAt >= IDLE || t - s.createdAt >= ABSOLUTE) return null
+    s.lastSeenAt = t; return s
+  }
+  async destroy(token: string): Promise<void> { this.db.delete(await sha256(token)) }
+}
+</script>
+  <script type="wrong">
+// 用 Math.random 產生 token
+type Session = { userId: number | null; createdAt: number; lastSeenAt: number; cart: string[] }
+const IDLE = 30 * 60 * 1000, ABSOLUTE = 8 * 60 * 60 * 1000
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+async function sha256(text: string): Promise<string> { return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))) }
+class SessionStore {
+  now: () => number; db: Map<string, Session>
+  constructor(now: () => number, db: Map<string, Session>) { this.now = now; this.db = db }
+  async create(userId: number | null): Promise<string> { const token = base64url(new Uint8Array(32).map(() => Math.floor(Math.random() * 256))); const t = this.now(); this.db.set(await sha256(token), { userId, createdAt: t, lastSeenAt: t, cart: [] }); return token }
+  async get(token: string): Promise<Session | null> {
+    const key = await sha256(token); const s = this.db.get(key); if (!s) return null
+    const t = this.now()
+    if (t - s.lastSeenAt >= IDLE || t - s.createdAt >= ABSOLUTE) { this.db.delete(key); return null }
+    s.lastSeenAt = t; return s
+  }
+  async destroy(token: string): Promise<void> { this.db.delete(await sha256(token)) }
+}
+</script>
+  <script type="wrong">
+// Math.random 加計數器（不會重複，但猜得到）
+type Session = { userId: number | null; createdAt: number; lastSeenAt: number; cart: string[] }
+const IDLE = 30 * 60 * 1000, ABSOLUTE = 8 * 60 * 60 * 1000
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+async function sha256(text: string): Promise<string> { return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))) }
+let counter = 0
+class SessionStore {
+  now: () => number; db: Map<string, Session>
+  constructor(now: () => number, db: Map<string, Session>) { this.now = now; this.db = db }
+  async create(userId: number | null): Promise<string> { counter++; const bytes = new Uint8Array(32).map((_, i) => i < 4 ? (counter >> (i * 8)) & 255 : Math.floor(Math.random() * 256)); const token = base64url(bytes); const t = this.now(); this.db.set(await sha256(token), { userId, createdAt: t, lastSeenAt: t, cart: [] }); return token }
+  async get(token: string): Promise<Session | null> {
+    const key = await sha256(token); const s = this.db.get(key); if (!s) return null
+    const t = this.now()
+    if (t - s.lastSeenAt >= IDLE || t - s.createdAt >= ABSOLUTE) { this.db.delete(key); return null }
+    s.lastSeenAt = t; return s
+  }
+  async destroy(token: string): Promise<void> { this.db.delete(await sha256(token)) }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：在練習 2 的 <code>SessionStore</code>（已經寫好）加上兩個方法：</p>
+  <ul>
+    <li><code>login(currentToken, userId)</code>：登入成功時呼叫。<code>currentToken</code> 是瀏覽器目前帶來的 session（可能是 <code>null</code>）。建立一個新的 session，如果舊的還有效就把它的 <code>cart</code> 搬過去，然後刪掉舊的，回傳新的 token。不能沿用舊的 token（session fixation）。</li>
+    <li><code>destroyAllForUser(userId, exceptToken?)</code>：刪掉這位使用者所有的 session；有給 <code>exceptToken</code> 時保留那一個（改密碼時保留目前這台裝置）。注意 db 的 key 是雜湊。</li>
+  </ul>
+  <script type="start">
+type Session = { userId: number | null; createdAt: number; lastSeenAt: number; cart: string[] }
+
+const IDLE = 30 * 60 * 1000
+const ABSOLUTE = 8 * 60 * 60 * 1000
+
+function base64url(bytes: Uint8Array<ArrayBuffer>): string {
+  let s = ''
+  for (const b of bytes) s += String.fromCharCode(b)
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+async function sha256(text: string): Promise<string> {
+  return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))))
+}
+
+class SessionStore {
+  now: () => number
+  db: Map<string, Session>
+  constructor(now: () => number, db: Map<string, Session>) {
+    this.now = now
+    this.db = db
+  }
+
+  // ---- 練習 2，已經寫好 ----
+  async create(userId: number | null): Promise<string> {
+    const token = base64url(crypto.getRandomValues(new Uint8Array(32)))
+    const t = this.now()
+    this.db.set(await sha256(token), { userId, createdAt: t, lastSeenAt: t, cart: [] })
+    return token
+  }
+
+  async get(token: string): Promise<Session | null> {
+    const key = await sha256(token)
+    const session = this.db.get(key)
+    if (!session) return null
+    const t = this.now()
+    if (t - session.lastSeenAt >= IDLE || t - session.createdAt >= ABSOLUTE) {
+      this.db.delete(key)
+      return null
+    }
+    session.lastSeenAt = t
+    return session
+  }
+
+  async destroy(token: string): Promise<void> {
+    this.db.delete(await sha256(token))
+  }
+
+  // ---- 練習 3 ----
+  async login(currentToken: string | null, userId: number): Promise<string> {
+    throw new Error('TODO')
+  }
+
+  async destroyAllForUser(userId: number, exceptToken?: string): Promise<void> {
+    throw new Error('TODO')
+  }
+}
+
+const store = new SessionStore(() => 0, new Map())
+const anon = await store.create(null)
+;(await store.get(anon))?.cart.push('拿鐵')
+const loggedIn = await store.login(anon, 1)
+console.log(loggedIn === anon ? '沿用了舊 token！' : '換了新 token', await store.get(loggedIn))
+</script>
+  <script type="answer">
+type Session = { userId: number | null; createdAt: number; lastSeenAt: number; cart: string[] }
+
+const IDLE = 30 * 60 * 1000
+const ABSOLUTE = 8 * 60 * 60 * 1000
+
+function base64url(bytes: Uint8Array<ArrayBuffer>): string {
+  let s = ''
+  for (const b of bytes) s += String.fromCharCode(b)
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+async function sha256(text: string): Promise<string> {
+  return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))))
+}
+
+class SessionStore {
+  now: () => number
+  db: Map<string, Session>
+  constructor(now: () => number, db: Map<string, Session>) {
+    this.now = now
+    this.db = db
+  }
+
+  // ---- 練習 2，已經寫好 ----
+  async create(userId: number | null): Promise<string> {
+    const token = base64url(crypto.getRandomValues(new Uint8Array(32)))
+    const t = this.now()
+    this.db.set(await sha256(token), { userId, createdAt: t, lastSeenAt: t, cart: [] })
+    return token
+  }
+
+  async get(token: string): Promise<Session | null> {
+    const key = await sha256(token)
+    const session = this.db.get(key)
+    if (!session) return null
+    const t = this.now()
+    if (t - session.lastSeenAt >= IDLE || t - session.createdAt >= ABSOLUTE) {
+      this.db.delete(key)
+      return null
+    }
+    session.lastSeenAt = t
+    return session
+  }
+
+  async destroy(token: string): Promise<void> {
+    this.db.delete(await sha256(token))
+  }
+
+  // ---- 練習 3 ----
+  async login(currentToken: string | null, userId: number): Promise<string> {
+    const old = currentToken === null ? null : await this.get(currentToken)
+    const token = await this.create(userId)
+    const fresh = this.db.get(await sha256(token))
+    if (old && fresh) fresh.cart = old.cart
+    if (currentToken !== null) await this.destroy(currentToken)
+    return token
+  }
+
+  async destroyAllForUser(userId: number, exceptToken?: string): Promise<void> {
+    const keep = exceptToken === undefined ? null : await sha256(exceptToken)
+    for (const [key, session] of this.db) {
+      if (session.userId === userId && key !== keep) this.db.delete(key)
+    }
+  }
+}
+
+const store = new SessionStore(() => 0, new Map())
+const anon = await store.create(null)
+;(await store.get(anon))?.cart.push('拿鐵')
+const loggedIn = await store.login(anon, 1)
+console.log(loggedIn === anon ? '沿用了舊 token！' : '換了新 token', await store.get(loggedIn))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<ReturnType<SessionStore['login']>, Promise<string>>>  // login 回傳 Promise<string>
+type _2 = Expect<Equal<Parameters<SessionStore['destroyAllForUser']>, [userId: number, exceptToken?: string]>>  // destroyAllForUser(userId: number, exceptToken?: string)
+</script>
+  <script type="tests">
+const MIN = 60 * 1000
+let clock = 1_000_000
+const s = new SessionStore(() => clock, new Map())
+const T = await s.create(null)
+;(await s.get(T))?.cart.push('拿鐵', '可頌')
+clock += 20 * MIN
+const T2 = await s.login(T, 7)
+assert(T2 !== T, '登入後要換新的 token，不能沿用攻擊者可能知道的舊 token')
+assert.equal(await s.get(T), null, '登入後舊 token 要失效（刪掉舊 session）')
+const after = await s.get(T2)
+assert.equal(after?.userId, 7, '新 token 對應登入的使用者')
+assert.deepEqual(after?.cart, ['拿鐵', '可頌'], '匿名 session 的購物車要搬到新 session')
+assert.equal(after?.createdAt, clock, '新 session 的 createdAt 是登入的時間（用 create 建立全新的 session，絕對逾時從登入起算）')
+const fresh = await s.login(null, 8)
+assert.deepEqual((await s.get(fresh))?.cart, [], '沒有舊 session 時，購物車是空的')
+const phone = await s.login(null, 7)
+const laptop = await s.login(null, 7)
+await s.destroyAllForUser(7, laptop)
+assert.equal(await s.get(T2), null, '改密碼：使用者 7 其他裝置的 session 要失效')
+assert.equal(await s.get(phone), null, '改密碼：使用者 7 的手機 session 要失效')
+assert.equal((await s.get(laptop))?.userId, 7, 'exceptToken（目前這台裝置）要保留；db 的 key 是雜湊，要先 sha256 再比對')
+assert.equal((await s.get(fresh))?.userId, 8, '不能影響其他使用者的 session')
+await s.destroyAllForUser(7)
+assert.equal(await s.get(laptop), null, '沒給 exceptToken 時全部刪掉')
+assert.equal((await s.get(fresh))?.userId, 8, '其他使用者仍然不受影響')
+assert.equal(s.db.size, 1, 'db 裡只剩使用者 8 的 session')
+const s2 = new SessionStore(() => clock, new Map())
+const E = await s2.create(null)
+;(await s2.get(E))?.cart.push('起司蛋糕')
+clock += 31 * MIN
+const L = await s2.login(E, 9)
+assert.deepEqual((await s2.get(L))?.cart, [], '舊 session 已經過期（閒置 31 分鐘）時不能搬它的購物車：用 get 檢查，不要直接讀 db')
+assert.equal(s2.db.size, 1, '過期的舊 session 也要刪掉，db 裡只剩新的')
+</script>
+  <script type="wrong">
+// 登入後沿用同一個 token
+type Session = { userId: number | null; createdAt: number; lastSeenAt: number; cart: string[] }
+const IDLE = 30 * 60 * 1000, ABSOLUTE = 8 * 60 * 60 * 1000
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+async function sha256(text: string): Promise<string> { return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))) }
+class SessionStore {
+  now: () => number; db: Map<string, Session>
+  constructor(now: () => number, db: Map<string, Session>) { this.now = now; this.db = db }
+  async create(userId: number | null): Promise<string> { const token = base64url(crypto.getRandomValues(new Uint8Array(32))); const t = this.now(); this.db.set(await sha256(token), { userId, createdAt: t, lastSeenAt: t, cart: [] }); return token }
+  async get(token: string): Promise<Session | null> { const key = await sha256(token); const s = this.db.get(key); if (!s) return null; const t = this.now(); if (t - s.lastSeenAt >= IDLE || t - s.createdAt >= ABSOLUTE) { this.db.delete(key); return null } s.lastSeenAt = t; return s }
+  async destroy(token: string): Promise<void> { this.db.delete(await sha256(token)) }
+  async login(currentToken: string | null, userId: number): Promise<string> {
+    const old = currentToken === null ? null : await this.get(currentToken)
+    if (currentToken !== null && old) { old.userId = userId; return currentToken }
+    return this.create(userId)
+  }
+  async destroyAllForUser(userId: number, exceptToken?: string): Promise<void> {
+    const keep = exceptToken === undefined ? null : await sha256(exceptToken)
+    for (const [key, s] of this.db) if (s.userId === userId && key !== keep) this.db.delete(key)
+  }
+}
+</script>
+  <script type="wrong">
+// 建立新 session，但沒刪掉舊的
+type Session = { userId: number | null; createdAt: number; lastSeenAt: number; cart: string[] }
+const IDLE = 30 * 60 * 1000, ABSOLUTE = 8 * 60 * 60 * 1000
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+async function sha256(text: string): Promise<string> { return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))) }
+class SessionStore {
+  now: () => number; db: Map<string, Session>
+  constructor(now: () => number, db: Map<string, Session>) { this.now = now; this.db = db }
+  async create(userId: number | null): Promise<string> { const token = base64url(crypto.getRandomValues(new Uint8Array(32))); const t = this.now(); this.db.set(await sha256(token), { userId, createdAt: t, lastSeenAt: t, cart: [] }); return token }
+  async get(token: string): Promise<Session | null> { const key = await sha256(token); const s = this.db.get(key); if (!s) return null; const t = this.now(); if (t - s.lastSeenAt >= IDLE || t - s.createdAt >= ABSOLUTE) { this.db.delete(key); return null } s.lastSeenAt = t; return s }
+  async destroy(token: string): Promise<void> { this.db.delete(await sha256(token)) }
+  async login(currentToken: string | null, userId: number): Promise<string> {
+    const old = currentToken === null ? null : await this.get(currentToken)
+    const token = await this.create(userId)
+    const fresh = this.db.get(await sha256(token))
+    if (old && fresh) fresh.cart = old.cart
+    return token
+  }
+  async destroyAllForUser(userId: number, exceptToken?: string): Promise<void> {
+    const keep = exceptToken === undefined ? null : await sha256(exceptToken)
+    for (const [key, s] of this.db) if (s.userId === userId && key !== keep) this.db.delete(key)
+  }
+}
+</script>
+  <script type="wrong">
+// destroyAllForUser 連 exceptToken 也刪掉
+type Session = { userId: number | null; createdAt: number; lastSeenAt: number; cart: string[] }
+const IDLE = 30 * 60 * 1000, ABSOLUTE = 8 * 60 * 60 * 1000
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+async function sha256(text: string): Promise<string> { return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))) }
+class SessionStore {
+  now: () => number; db: Map<string, Session>
+  constructor(now: () => number, db: Map<string, Session>) { this.now = now; this.db = db }
+  async create(userId: number | null): Promise<string> { const token = base64url(crypto.getRandomValues(new Uint8Array(32))); const t = this.now(); this.db.set(await sha256(token), { userId, createdAt: t, lastSeenAt: t, cart: [] }); return token }
+  async get(token: string): Promise<Session | null> { const key = await sha256(token); const s = this.db.get(key); if (!s) return null; const t = this.now(); if (t - s.lastSeenAt >= IDLE || t - s.createdAt >= ABSOLUTE) { this.db.delete(key); return null } s.lastSeenAt = t; return s }
+  async destroy(token: string): Promise<void> { this.db.delete(await sha256(token)) }
+  async login(currentToken: string | null, userId: number): Promise<string> {
+    const old = currentToken === null ? null : await this.get(currentToken)
+    const token = await this.create(userId)
+    const fresh = this.db.get(await sha256(token))
+    if (old && fresh) fresh.cart = old.cart
+    if (currentToken !== null) await this.destroy(currentToken)
+    return token
+  }
+  async destroyAllForUser(userId: number, exceptToken?: string): Promise<void> {
+    for (const [key, s] of this.db) if (s.userId === userId) this.db.delete(key)
+  }
+}
+</script>
+  <script type="wrong">
+// 用原始 token 跟 db 的 key（雜湊）比對，永遠比不到
+type Session = { userId: number | null; createdAt: number; lastSeenAt: number; cart: string[] }
+const IDLE = 30 * 60 * 1000, ABSOLUTE = 8 * 60 * 60 * 1000
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+async function sha256(text: string): Promise<string> { return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))) }
+class SessionStore {
+  now: () => number; db: Map<string, Session>
+  constructor(now: () => number, db: Map<string, Session>) { this.now = now; this.db = db }
+  async create(userId: number | null): Promise<string> { const token = base64url(crypto.getRandomValues(new Uint8Array(32))); const t = this.now(); this.db.set(await sha256(token), { userId, createdAt: t, lastSeenAt: t, cart: [] }); return token }
+  async get(token: string): Promise<Session | null> { const key = await sha256(token); const s = this.db.get(key); if (!s) return null; const t = this.now(); if (t - s.lastSeenAt >= IDLE || t - s.createdAt >= ABSOLUTE) { this.db.delete(key); return null } s.lastSeenAt = t; return s }
+  async destroy(token: string): Promise<void> { this.db.delete(await sha256(token)) }
+  async login(currentToken: string | null, userId: number): Promise<string> {
+    const old = currentToken === null ? null : await this.get(currentToken)
+    const token = await this.create(userId)
+    const fresh = this.db.get(await sha256(token))
+    if (old && fresh) fresh.cart = old.cart
+    if (currentToken !== null) await this.destroy(currentToken)
+    return token
+  }
+  async destroyAllForUser(userId: number, exceptToken?: string): Promise<void> {
+    for (const [key, s] of this.db) if (s.userId === userId && key !== exceptToken) this.db.delete(key)
+  }
+}
+</script>
+  <script type="wrong">
+// 把舊 session 整個搬到新 key（createdAt 沿用匿名時的時間）
+type Session = { userId: number | null; createdAt: number; lastSeenAt: number; cart: string[] }
+const IDLE = 30 * 60 * 1000, ABSOLUTE = 8 * 60 * 60 * 1000
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+async function sha256(text: string): Promise<string> { return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))) }
+class SessionStore {
+  now: () => number; db: Map<string, Session>
+  constructor(now: () => number, db: Map<string, Session>) { this.now = now; this.db = db }
+  async create(userId: number | null): Promise<string> { const token = base64url(crypto.getRandomValues(new Uint8Array(32))); const t = this.now(); this.db.set(await sha256(token), { userId, createdAt: t, lastSeenAt: t, cart: [] }); return token }
+  async get(token: string): Promise<Session | null> { const key = await sha256(token); const s = this.db.get(key); if (!s) return null; const t = this.now(); if (t - s.lastSeenAt >= IDLE || t - s.createdAt >= ABSOLUTE) { this.db.delete(key); return null } s.lastSeenAt = t; return s }
+  async destroy(token: string): Promise<void> { this.db.delete(await sha256(token)) }
+  async login(currentToken: string | null, userId: number): Promise<string> {
+    const old = currentToken === null ? null : await this.get(currentToken)
+    const token = await this.create(userId)
+    if (old && currentToken !== null) { this.db.set(await sha256(token), { ...old, userId }); await this.destroy(currentToken) }
+    return token
+  }
+  async destroyAllForUser(userId: number, exceptToken?: string): Promise<void> {
+    const keep = exceptToken === undefined ? null : await sha256(exceptToken)
+    for (const [key, s] of this.db) if (s.userId === userId && key !== keep) this.db.delete(key)
+  }
+}
+</script>
+  <script type="wrong">
+// 直接從 db 讀舊 session，沒檢查過期（過期的購物車也搬）
+type Session = { userId: number | null; createdAt: number; lastSeenAt: number; cart: string[] }
+const IDLE = 30 * 60 * 1000, ABSOLUTE = 8 * 60 * 60 * 1000
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+async function sha256(text: string): Promise<string> { return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))) }
+class SessionStore {
+  now: () => number; db: Map<string, Session>
+  constructor(now: () => number, db: Map<string, Session>) { this.now = now; this.db = db }
+  async create(userId: number | null): Promise<string> { const token = base64url(crypto.getRandomValues(new Uint8Array(32))); const t = this.now(); this.db.set(await sha256(token), { userId, createdAt: t, lastSeenAt: t, cart: [] }); return token }
+  async get(token: string): Promise<Session | null> { const key = await sha256(token); const s = this.db.get(key); if (!s) return null; const t = this.now(); if (t - s.lastSeenAt >= IDLE || t - s.createdAt >= ABSOLUTE) { this.db.delete(key); return null } s.lastSeenAt = t; return s }
+  async destroy(token: string): Promise<void> { this.db.delete(await sha256(token)) }
+  async login(currentToken: string | null, userId: number): Promise<string> {
+    const old = currentToken === null ? undefined : this.db.get(await sha256(currentToken))
+    const token = await this.create(userId)
+    const fresh = this.db.get(await sha256(token))
+    if (old && fresh) fresh.cart = old.cart
+    if (currentToken !== null) await this.destroy(currentToken)
+    return token
+  }
+  async destroyAllForUser(userId: number, exceptToken?: string): Promise<void> {
+    const keep = exceptToken === undefined ? null : await sha256(exceptToken)
+    for (const [key, s] of this.db) if (s.userId === userId && key !== keep) this.db.delete(key)
+  }
+}
+</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：session cookie 設了 <code>HttpOnly</code>。網站有一個 XSS 漏洞，攻擊者的腳本在受害者的頁面上執行。下面哪一句正確？</p>
+  <label data-key="a">HttpOnly 擋住了 XSS，攻擊者什麼都做不了</label>
+  <label data-key="b">腳本可以用 <code>document.cookie</code> 讀出 session ID</label>
+  <label data-key="c">腳本讀不到 session ID，但可以用 <code>fetch</code> 以受害者身分發請求，瀏覽器會自動帶上 cookie</label>
+  <p class="why">✓ HttpOnly 只擋「讀取」：session ID 不會被偷走帶到別的地方用，這很有價值。但腳本就在你的網站上執行，它發的請求跟使用者自己發的一樣，cookie 照帶。所以 HttpOnly 是縮小損害，不是防 XSS；真正要做的是不讓 XSS 發生（第 7 課）。a 錯在把「偷不走」當成「用不了」；b 錯在 HttpOnly 正好讓 <code>document.cookie</code> 看不到這個 cookie。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：登出時，前端把 cookie 清掉、導回首頁，伺服器沒做任何事。這有什麼問題？</p>
+  <label data-key="a">沒問題，瀏覽器沒有 cookie 就等於登出了</label>
+  <label data-key="b">session 在伺服器上仍然有效，已經被偷走的 session ID 在逾時前都還能用</label>
+  <label data-key="c">只是浪費 session store 的空間，等逾時就會自動清掉</label>
+  <p class="why">✓ 「登出」要讓那個 session ID 失效，而 ID 有沒有效是伺服器說了算。瀏覽器清掉 cookie 只影響這台瀏覽器；如果 ID 早就外洩（公用電腦、惡意擴充功能），攻擊者手上的那份還能用到絕對逾時。c 只看到了空間，沒看到安全問題。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：在 <code>http://localhost:5173</code> 開發時登入正常。部署到內網測試機 <code>http://192.168.1.20</code> 後，登入成功卻馬上被當成未登入，伺服器 log 也沒有錯誤。最可能的原因？</p>
+  <label data-key="a">session cookie 帶了 <code>Secure</code>：localhost 是例外所以本機收得下，一般的 http 主機會被瀏覽器拒收</label>
+  <label data-key="b">測試機的 session store 壞了</label>
+  <label data-key="c">測試機的 CORS 設定錯了</label>
+  <p class="why">✓ 瀏覽器把 <code>http://localhost</code> 當成安全的來源，<code>Secure</code> cookie 照收；<code>http://192.168.1.20</code> 不是，帶 <code>Secure</code> 的 <code>Set-Cookie</code> 被直接丟掉，伺服器不會知道。打開 DevTools 的 Network 面板，看登入回應的 <code>Set-Cookie</code> 旁邊的警告就能確認。修法是讓測試機也走 HTTPS，而不是把 Secure 拿掉。b：store 壞了伺服器會有錯誤，而且瀏覽器根本沒存 cookie、請求就沒帶 sid，問題在 store 之前。c：CORS 擋住時登入請求本身就會在 console 報錯，前端拿不到「登入成功」。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>session ID 用遞增數字、userId 或 <code>Math.random</code> 組出來</strong>：猜得到就能冒用別人。用 <code>crypto.getRandomValues</code> 產生 128 bits 以上。</li>
+  <li><strong>登入後沿用同一個 session ID</strong>：session fixation。登入、權限提升、改密碼時都要換新 ID、刪掉舊的。</li>
+  <li><strong>登出只清 cookie</strong>：伺服器上的 session 還有效。登出要刪伺服器端的 session。</li>
+  <li><strong>只有滑動逾時</strong>：被偷的 session 可以一直續命。一定要加絕對逾時。</li>
+  <li><strong>在 session 裡快取角色或權限</strong>：降權之後要等重新登入才生效。session 只存 userId，權限從資料庫查。</li>
+  <li><strong>cookie 設 <code>Domain</code> 到上層網域</strong>：所有子網域（活動頁、外包網站）都收得到，也寫得進同名 cookie。不寫 Domain，用 <code>__Host-</code> 前綴。</li>
+  <li><strong>不寫 SameSite，交給瀏覽器預設</strong>：只有 Chromium 預設 Lax，Firefox、Safari 沒有。明寫 <code>SameSite=Lax</code> 或 <code>Strict</code>。</li>
+  <li><strong>session 存在單台機器的記憶體</strong>：部署兩台之後使用者一直被登出。放到 Redis 這類共用 store。</li>
+  <li><strong>沒寫 Path</strong>：<code>/auth/login</code> 設的 cookie 只會送到 <code>/auth</code> 底下，<code>/orders</code> 收不到。明寫 <code>Path=/</code>。</li>
+  <li><strong>清 cookie 時 Path 或 Domain 跟設定時不同</strong>：瀏覽器當成另一個 cookie，原本的沒被刪。用同樣的名稱、Path、Domain 送 <code>Max-Age=0</code>。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>HTTP 是無狀態的。登入後發一個猜不到的 session ID，伺服器在 session store 記下它代表誰；cookie 負責每次自動把 ID 帶回來。</li>
+  <li><code>Set-Cookie</code> 一個 cookie 一行、帶屬性；<code>Cookie</code> 只有名稱和值。瀏覽器用（名稱、網域、路徑）分辨 cookie，拒收時不會通知伺服器，要看 DevTools。</li>
+  <li>session cookie：<code>__Host-sid=…; Path=/; Secure; HttpOnly; SameSite=Lax</code>，不設 Domain。HttpOnly 只擋讀取，Secure 擋中間人，SameSite 擋跨站，<code>__Host-</code> 擋子網域覆蓋。</li>
+  <li>session store 只存 token 的 SHA-256；256 bits 的隨機 token 不需要慢雜湊。session 只放判斷要用的最少資訊，權限從資料庫查；多台伺服器時放 Redis 這類共用 store。</li>
+  <li>閒置逾時擋忘了登出，絕對逾時擋被偷的 ID 一直續命，兩個一起用；先檢查再延期；時間用注入的 <code>now()</code>。</li>
+  <li>登入、權限提升、改密碼時換新 ID 並刪掉舊的；登出刪伺服器端的 session；改密碼時讓其他裝置的 session 全部失效。</li>
+</ul>
+<p>下一課：同源政策與 CORS。這課的 cookie 會自動跟著請求送出，那麼瀏覽器同時開著咖啡店和惡意網站時，惡意網站的 JavaScript 能不能讀到咖啡店的回應？</p>
+
+</main>
+<script>
+// 時間軸：逐步顯示每一列，並在下方顯示目前步驟的說明
+document.querySelectorAll('.tl').forEach(tl => {
+  const rows = [...tl.querySelectorAll('tr[data-note]')]
+  const note = tl.querySelector('.note')
+  const count = tl.querySelector('[data-count]')
+  const prev = tl.querySelector('[data-prev]')
+  const next = tl.querySelector('[data-next]')
+  let cur = 0
+  const show = () => {
+    rows.forEach((r, i) => {
+      r.classList.toggle('now', i === cur)
+      r.classList.toggle('later', i > cur)
+    })
+    note.textContent = rows[cur].dataset.note
+    count.textContent = `步驟 ${cur + 1} / ${rows.length}`
+    prev.disabled = cur === 0
+    next.textContent = cur === rows.length - 1 ? '↺ 重新播放' : '下一步 ▶'
+  }
+  prev.onclick = () => { cur--; show() }
+  next.onclick = () => { cur = cur === rows.length - 1 ? 0 : cur + 1; show() }
+  show()
+})
+</script>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

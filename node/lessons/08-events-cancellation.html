@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>8. EventEmitter 與取消</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="8" data-practice="node">
+<header>
+  <div class="eyebrow">階段 2：非同步與 event loop · 第 8 課</div>
+  <h1>EventEmitter 與取消</h1>
+</header>
+<main>
+
+<p>咖啡店接了外送平台。流程是這樣：客人在平台上下單，平台打一支 API 到我們的伺服器，意思是「訂單 1024 做好了再回我」；伺服器收到後就開始等，等吧台把那一杯做好，再把結果回給平台。</p>
+<p>上線一週後出了兩件事。第一件：伺服器的記憶體一天比一天大，log 裡反覆出現一行 <code>MaxListenersExceededWarning</code>，重啟就降回去，過幾天又長回來。第二件：某天集點服務出問題，結果不只集點失敗，整台伺服器直接結束，所有客人都點不了餐。</p>
+<p>兩件事都出在同一個地方：我們用<strong>事件</strong>來串程式，卻沒想清楚三件事。第一件出在「等訂單 1024 做好」的那段 <code>handleRequest</code>，第二件出在結帳付款後通知吧台與集點的那段。沒想清楚的三件事是：事件的處理出錯時錯誤去哪裡、等完之後誰把掛上去的東西拿掉、平台不等了要怎麼停。這一課從頭把那段程式寫對，最後寫出 <code>waitForReady(board, orderId, { signal, timeoutMs })</code>（練習 1）：等到了、等太久、對方不等了，三種結局都乾淨收尾。同一個平台還會把新訂單一筆一筆推過來，這個需求在練習 3 處理。途中會學到 Node 裡最常見的兩樣工具：負責發事件、聽事件的 <code>EventEmitter</code>，和負責取消一件還在等的事的 <code>AbortSignal</code>。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>伺服器要怎麼「等」吧台：事件是什麼、EventEmitter 怎麼發和聽，以及上線那段程式長什麼樣子。</li>
+  <li>emit 之後監聽器什麼時候執行、集點服務掛了為什麼整台伺服器跟著結束：emit 是同步的，以及三種錯誤情況（第二件事故的答案）。</li>
+  <li>記憶體為什麼一天比一天大：監聽器洩漏與 <code>MaxListenersExceededWarning</code>（第一件事故的答案）。</li>
+  <li>能不能直接 <code>await</code>「訂單好了」、平台一直推新訂單怎麼一筆一筆處理：<code>events.once</code> 與 <code>events.on</code>。</li>
+  <li>平台不等了、等太久了怎麼停，三種結局怎麼都收尾：AbortSignal 與 cleanup；最後回頭判斷這件事該不該用事件。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="07-event-loop.html">第 7 課</a>的程序結束規則：event loop 裡沒有東西撐著程序時 Node 就結束；<code>unref()</code> 的計時器不撐住程序；頂層 await 的 Promise 永遠不會完成時，以結束碼 13 結束。</li>
+  <li><a href="../../typescript/lessons/11-timeouts-cancellation.html">TypeScript 課第 11 課</a>的 <code>AbortController</code>：呼叫 <code>abort()</code> 時，所有拿到它 <code>signal</code> 的工作都收到取消通知。</li>
+</ul></div>
+
+<p>範例在 <code>work/08/examples/</code>，先在 learn/ 執行一次 <code>node check.mjs node 08</code> 讓它複製出來，再到 <code>node/practice/work/08</code> 執行。</p>
+
+<h2>伺服器要怎麼「等」吧台做好訂單 1024？</h2>
+<p>先看清楚問題的形狀。處理外送請求的程式和吧台的程式是兩段不相干的程式碼：請求那邊想知道「1024 什麼時候好」，吧台那邊只知道「我剛做好一杯」，不知道誰在等、有幾個人在等。最笨的做法是請求那邊每 100ms 去問一次「好了沒」，這叫輪詢（polling）：問得太勤浪費資源，問得太疏又會晚知道。比較好的做法反過來：吧台每做好一杯就喊一聲，在乎的人自己聽。</p>
+<p>這一聲「發生了某件事」的通知就叫<strong>事件</strong>（event）。發出通知的物件叫<strong>發送者</strong>（emitter），收到通知時要執行的函式叫<strong>監聽器</strong>（listener）。你在前端天天用這個模式：<code>button.addEventListener('click', …)</code> 裡按鈕是發送者、你傳的函式是監聽器；Vue 子元件 <code>emit('update')</code>、父元件 <code>@update</code> 也是。這種寫法叫<strong>觀察者模式</strong>（observer pattern），重點在發送者只管喊「發生了」，不需要知道誰在聽、有幾個人在聽。吧台不用為了外送平台改程式，正是我們要的。</p>
+<p>Node 把這個模式做成內建模組 <code>node:events</code> 的 <code>EventEmitter</code>，而且核心 API 幾乎都建立在它上面：HTTP 伺服器每來一個請求就發 <code>request</code>（<a href="13-http-server.html">第 13 課</a>），stream 每讀到一段資料就發 <code>data</code>（<a href="16-streams-backpressure.html">第 16 課</a>），<code>process</code> 收到關機訊號時發 <code>SIGTERM</code>（<a href="21-graceful-shutdown.html">第 21 課</a>）。這課學的行為，之後每一課都會再遇到。</p>
+<p>咖啡店的出餐看板就是一個 emitter。最常見的寫法是讓自己的類別 <code>extends EventEmitter</code>（繼承，<a href="../../typescript/lessons/23-classes.html">TypeScript 課第 23 課</a>），這樣看板就有了發事件、聽事件的方法。TypeScript 可以在角括號裡寫出每個事件帶什麼參數，下面寫的是「<code>ready</code> 事件帶一個 <code>Order</code>」，之後 <code>emit('ready', …)</code> 和 <code>on('ready', …)</code> 的參數都會被檢查。練習用的 <code>order-board.ts</code> 就是這段：</p>
+<pre>import { EventEmitter } from 'node:events'
+
+type Order = { id: number, item: string }
+
+class OrderBoard extends EventEmitter&lt;{ ready: [order: Order] }&gt; {
+  ready(order: Order) {
+    this.emit('ready', order)
+  }
+}</pre>
+<p>吧台做好一杯就呼叫 <code>board.ready(order)</code>，裡面用 <code>emit</code> 喊出 <code>ready</code>。想聽的人用下面這幾個方法：</p>
+<div class="table-wrap"><table>
+  <tr><th>方法</th><th>作用</th></tr>
+  <tr><td><code>on(名稱, fn)</code></td><td>加一個監聽器，每次發生都呼叫（<code>addListener</code> 是同一個東西）</td></tr>
+  <tr><td><code>once(名稱, fn)</code></td><td>只聽一次：第一次呼叫前自動移除</td></tr>
+  <tr><td><code>off(名稱, fn)</code></td><td>移除監聽器。要傳<strong>同一個函式</strong>，所以監聽器要先存成變數，寫在 <code>on</code> 裡的匿名函式移不掉</td></tr>
+  <tr><td><code>emit(名稱, ...參數)</code></td><td>發出事件，依註冊順序呼叫每個監聽器；有人在聽回傳 <code>true</code></td></tr>
+  <tr><td><code>listenerCount(名稱)</code></td><td>目前有幾個監聽器，查洩漏時最常用</td></tr>
+</table></div>
+<p>有了這些，上線的那段程式就很好懂了。每個外送請求進來，就在共用的看板上 <code>on('ready')</code> 掛一個監聽器，每次有訂單好了就比對 id，是自己那張就通知（這是 <code>examples/leak.ts</code>，為了單獨執行，看板用的是一般的 EventEmitter，事件直接帶訂單 id）：</p>
+<pre>// examples/leak.ts
+const board = new EventEmitter()
+
+function handleRequest(orderId: number) {
+  board.on('ready', (id: number) =&gt; {
+    if (id === orderId) console.log('通知客人：訂單', id, '好了')
+  })
+}</pre>
+<p>這段程式跑得起來，訂單好了也真的會通知。第一件事故就藏在它裡面，但要看出來，得先弄清楚一件事：吧台呼叫 <code>emit</code> 的那一刻，這些監聽器到底是什麼時候執行的？</p>
+
+<h2>emit 之後，監聽器是什麼時候執行的？</h2>
+<p>看板之外，結帳也用事件：付款成功後 <code>shop.emit('paid', 訂單 id)</code>，吧台、集點、統計各掛一個監聽器。第二件事故就發生在這裡，所以接下來用 <code>shop</code> 來看 emit 的時機。</p>
+<p>前端的直覺多半是「emit 把事件丟出去，等一下再處理」，像 <code>setTimeout</code> 那樣排進佇列。不是這樣。<code>emit</code> 當場、依註冊順序把每個監聽器呼叫完，才執行 <code>emit</code> 的下一行。下面的範例在結帳時發 <code>paid</code>，掛了三個監聽器（第 2、3 個順便印出 <code>this</code>，細節見課末），執行後看「emit 之前」和「emit 之後」夾住了什麼：</p>
+<pre>// examples/sync-emit.ts
+shop.on('paid', (orderId: number) =&gt; console.log('1. 吧台收到訂單', orderId))
+shop.on('paid', function (this: EventEmitter, orderId: number) {
+  console.log('2. 集點：一般函式的 this 是 emitter 嗎？', this === shop)
+})
+shop.on('paid', () =&gt; console.log('3. 統計：箭頭函式沒有自己的 this'))
+
+console.log('emit 之前')
+const had = shop.emit('paid', 42)
+console.log('emit 之後，有沒有人在聽：', had)</pre>
+<pre>$ node examples/sync-emit.ts
+emit 之前
+1. 吧台收到訂單 42
+2. 集點：一般函式的 this 是 emitter 嗎？ true
+3. 統計：箭頭函式沒有自己的 this
+emit 之後，有沒有人在聽： true</pre>
+<p>三個監聽器全部夾在「emit 之前」和「emit 之後」中間，順序就是註冊順序。原因很單純：EventEmitter 內部替每個事件名稱存一個監聽器陣列，<code>emit</code> 做的事就是把那個陣列跑一遍、逐一呼叫，跟一般的 <code>for</code> 迴圈呼叫函式沒有兩樣。它完全沒有經過<a href="07-event-loop.html">第 7 課</a>的任何佇列，所以不管 event loop 當時在哪個 phase，結果都一樣。</p>
+<p>這帶來一個直接的後果：<strong>監聽器慢，發送者就慢</strong>。如果某個監聽器做了 200ms 的同步計算，<code>emit</code> 就卡 200ms 才回傳；這 200ms 裡執行緒被佔住，整個 event loop 也跟著停，其他請求都得等。吧台程式呼叫 <code>board.ready(order)</code> 時，實際花的時間是「所有監聽器的時間加總」，而吧台的作者完全看不到這件事。看板上掛的監聽器越多，每次出餐就越慢；下兩節會看到，這個數字在洩漏時是會一直長的。</p>
+<p>同步呼叫還有另一個後果，而且比變慢更嚴重：既然 <code>emit</code> 是在自己的呼叫堆疊裡直接呼叫監聽器，那監聽器 throw 的時候，錯誤會跑去哪裡？這就是集點服務那次事故。</p>
+
+<h2>集點服務掛了，為什麼整台伺服器跟著結束？</h2>
+<p>回到剛才的 <code>shop</code>：結帳在付款成功後 <code>emit('paid')</code>，吧台螢幕和集點服務各掛一個監聽器。監聽器出錯時有三種情況，行為都不一樣（v24.22.1 實測，範例 <code>examples/error-event.ts</code>、<code>examples/async-listener.ts</code>）。我們一種一種看，最後對回事故。</p>
+
+<h3>1. 監聽器同步 throw：錯誤從 emit 傳出來</h3>
+<pre>shop.on('paid', () =&gt; { throw new Error('吧台螢幕斷線') })
+shop.on('paid', () =&gt; console.log('集點（不會印出來）'))
+shop.emit('paid')   // ← 這裡丟出「吧台螢幕斷線」，集點的監聽器沒有執行</pre>
+<p>上一節說過，<code>emit</code> 就是一個依序呼叫函式的迴圈。第一個監聽器 throw 了，迴圈就斷了，後面的監聽器根本沒被呼叫，錯誤沿著呼叫堆疊往上丟回 <code>emit</code> 的呼叫者。放到咖啡店裡看：吧台螢幕壞掉，結果客人沒集到點；錯誤還丟回了結帳的程式，可是結帳根本不知道有誰在聽，更不知道怎麼處理「吧台螢幕斷線」。如果結帳沒有 try/catch，這個請求就失敗了。（瀏覽器那套 <code>EventTarget</code> 在這裡的行為不同，見課末。）</p>
+
+<h3>2. error 事件：沒人聽就 throw</h3>
+<p><code>error</code> 是 EventEmitter 特別處理的事件名稱，用來回報「這個物件本身出問題了」，例如連線斷了、檔案讀不到。<code>emit('error', err)</code> 時如果有 <code>error</code> 監聽器，就跟一般事件一樣呼叫它；如果<strong>沒有任何</strong> <code>error</code> 監聽器，Node 直接把 <code>err</code> throw 出來。沒人接住，程序就結束：</p>
+<pre>$ node examples/error-event.ts
+emit 丟出了： 吧台螢幕斷線
+接下來 emit error，沒有人監聽……
+file:///…/examples/error-event.ts:16
+shop.emit('error', new Error('刷卡機故障'))
+                   ^
+
+Error: 刷卡機故障
+Emitted 'error' event at: …</pre>
+<p>這是故意的設計。一般事件沒人聽就算了，但錯誤如果沒人聽時也安靜略過，你會在完全不知情的狀況下繼續用一個壞掉的連線。Node 寧可讓程序結束，逼你面對它。所以 Node 的規矩是：<strong>會發 error 的東西（伺服器、socket、stream、子程序），一定要掛 <code>error</code> 監聽器</strong>，至少記到 log。</p>
+
+<h3>3. async 監聽器 reject：沒有人在等它</h3>
+<p>監聽器寫成 <code>async</code> 函式時，呼叫它會回傳一個 Promise，函式裡的錯誤變成這個 Promise 的 reject。問題是 <code>emit</code> 只負責呼叫，不看回傳值，也不會 await。所以這個 Promise reject 時沒有任何人處理，變成 <strong>unhandled rejection</strong>（沒人處理的 rejection），而 Node 24 的預設行為是讓程序以結束碼 1 結束（<a href="18-error-handling.html">第 18 課</a>詳講）。執行後先看第一行，emit 已經回傳了，錯誤才在後面出現：</p>
+<pre>$ node examples/async-listener.ts
+emit 已經回傳了，async 監聽器的 Promise 還沒 settle
+…
+Error: 集點服務逾時
+$ echo $?
+1</pre>
+<p>這就是那次事故的全貌。集點的監聽器是 <code>async</code> 的，裡面 await 一個打到集點服務的請求。集點服務掛掉、請求逾時，Promise reject，沒人接，Node 依預設讓整個程序結束，伺服器上所有進行中的請求一起陪葬。集點只是「順便」的功能，卻拖垮了點餐。</p>
+<p>修法有兩層。第一層：在 async 監聽器裡自己 try/catch，把錯誤記到 log，不讓它變成 rejection。第二層是 EventEmitter 提供的安全網：建立 emitter 時傳 <code>{ captureRejections: true }</code>，Node 會接住 async 監聽器的 rejection，改成發 <code>error</code> 事件。這樣錯誤至少有地方去，但別忘了第 2 種情況，<code>error</code> 事件還是要有人聽：</p>
+<pre>$ node examples/async-listener.ts --capture
+emit 已經回傳了，async 監聽器的 Promise 還沒 settle
+error 事件收到： 集點服務逾時</pre>
+<div class="callout warn">emit 不等 async 監聽器，也就是說 emit 回傳時，async 監聽器的工作還沒做完。需要「每個監聽器都做完、各自的錯誤都有人處理」時，不要用 emit，自己逐一呼叫並 await（練習 2）。</div>
+<p>三種情況整理起來：同步 throw 會中斷後面的監聽器並丟回發送者；沒人聽的 <code>error</code> 會直接讓程序結束；async 監聽器的 rejection 沒人等，依預設也讓程序結束。共通點是，事件把錯誤和發送者切開了，你得替每一種錯誤安排好去處。</p>
+<div class="callout practice"><strong>💡 實務上：接手專案時，先找「會發 error 卻沒人聽」的物件</strong><br>工作中你很少自己 <code>emit('error')</code>，但天天在用會發 error 的東西：資料庫連線池、Redis（常拿來當快取）的 client、WebSocket、stream。咖啡店後台半夜 Redis 斷線一次，整個 Node 程序就跟著結束，常見原因就是 client 沒掛 <code>error</code> 監聽器。資深的人 code review 時會看兩件事：每個長期存在的連線物件有沒有 <code>.on('error', …)</code> 並記到 log；監聽器裡有沒有 async 函式卻沒有 try/catch，就像這次的集點監聽器。常見的資料庫和 Redis client 多半會自己重連，所以這個監聽器通常只要記 log；重點是不要讓一個外部服務的斷線變成整個程序結束。</div>
+<p>第二件事故有答案了。回到第一件：記憶體一天比一天大，log 裡一直出現 <code>MaxListenersExceededWarning</code>，這跟上線那段 <code>handleRequest</code> 有什麼關係？</p>
+
+<h2>記憶體為什麼一天比一天大？</h2>
+<p>再看一次 <code>handleRequest</code>：每個請求都在共用的 board 上 <code>on('ready')</code>，但整段程式沒有任何一個 <code>off</code>。請求結束、回應送出之後，那個監聽器還掛在 board 上。</p>
+<p>為什麼這會讓記憶體一直漲？JavaScript 的記憶體由垃圾回收（garbage collection，GC）管理：只要一個物件還能從某個「活著」的東西一路找到，GC 就不會回收它。board 是整個程序共用、一直活著的物件；它的監聽器陣列引用著每個監聽器；每個監聽器是閉包，記著外層的 <code>orderId</code>，以及它用到的其他東西，在真實程式裡常常包括整個請求物件。這一整串都還找得到，所以一個都收不掉。一天幾萬個請求，就有幾萬個早就沒用的監聽器堆在 board 上，記憶體一路漲。前面說過 emit 是同步逐一呼叫，所以每次出餐，吧台還要多呼叫幾萬個沒用的函式，越來越慢。這種「監聽器加了卻從不移除」的問題叫<strong>監聽器洩漏</strong>（listener leak）。</p>
+<p>Node 幫你設了一條警戒線：同一個 emitter 的同一個事件加到第 11 個監聽器時（預設上限 <code>EventEmitter.defaultMaxListeners</code> 是 10），印出一次警告。範例模擬 12 個請求：</p>
+<pre>$ node examples/leak.ts
+ready 監聽器數量： 12
+(node:7643) MaxListenersExceededWarning: Possible EventEmitter memory leak detected. 11 ready listeners added to [EventEmitter]. MaxListeners is 10. Use emitter.setMaxListeners() to increase limit
+(Use `node --trace-warnings ...` to show where the warning was created)</pre>
+<p>注意它只是<strong>警告</strong>：程序照常執行，第 12 個監聽器照樣加得上去，監聽器數量印出來就是 12。它是<em>線索</em>，告訴你「這裡可能有洩漏」，不是問題本身。遇到它時這樣查：</p>
+<ol>
+  <li>用 <code>node --trace-warnings examples/leak.ts</code> 執行，警告後面會印出 stack trace，其中 <code>at handleRequest (…/leak.ts:9:9)</code> 就是加上第 11 個監聽器的那一行。</li>
+  <li>想清楚這個監聽器「應該什麼時候拿掉」。只要一次就用 <code>once</code>；有明確的結束時機（請求結束、逾時、取消）就在那裡 <code>off</code>；或者交給下一節的 <code>events.once</code>／<code>events.on</code> 搭配 signal，它們結束時會自己移除。</li>
+  <li>用 <code>listenerCount</code> 寫測試確認：每種結束方式之後，數量都回到 0。</li>
+</ol>
+<p>警告訊息自己建議了 <code>emitter.setMaxListeners()</code>，但 <code>setMaxListeners(100)</code> 只是把警戒線往後挪，洩漏還在，只是你看不到了。只有在你確定「同時會有很多正當的監聽器」時才調高，例如一個 emitter 本來就要給 50 個模組各掛一個。外送請求的監聽器不是這種情況：同時在等的請求可能很多，但每一個等完就該離開。</p>
+<div class="callout practice"><strong>💡 實務上：洩漏通常是「重啟就好了」的那種問題</strong><br>監聽器洩漏在本機幾乎測不出來，因為你只發幾個請求；上線後的樣子就是這次的事故：監控圖上記憶體一路往上爬，重啟就降回去，過幾天又爬上來。很多團隊的第一反應是排程定期重啟，那只是把問題延後。遇到這種圖，先搜尋 log 有沒有 <code>MaxListenersExceededWarning</code>，再找「在請求或連線裡 <code>on</code>、掛在共用物件上」的程式碼。新寫這類程式時，在測試裡加一行 <code>listenerCount</code> 斷言，比上線後追查便宜得多。</div>
+<p>修法的核心是「每個監聽器都要有拿掉的時機」。在 <code>handleRequest</code> 裡手動 <code>off</code> 做得到，但結局一多（等到了、出錯了、平台不等了）就很容易漏掉某一條。Node 有沒有現成的工具，讓「等一次」這件事自己收尾？</p>
+
+<h2>能不能直接 await「訂單好了」，等完自動拿掉監聽器？</h2>
+<p>換個角度看 <code>handleRequest</code> 真正要的東西：它不是「每次有訂單好了都做某件事」，而是「等訂單好一次，然後繼續往下走，把結果回給平台」。「等一件事完成再繼續」正是 Promise 和 <code>await</code> 的形狀。所以問題變成：怎麼把一次事件變成一個 Promise？</p>
+<p>直覺的寫法是自己包：<code>new Promise(resolve =&gt; board.once('ready', resolve))</code>。它在事件發生時會 resolve，但漏了兩件事：等的過程中 board 發了 <code>error</code>，這個 Promise 不會 reject：有別的 <code>error</code> 監聽器時它永遠卡著，沒有的話就是上一節的第 2 種情況，程序直接結束；而且沒有辦法叫它停，平台不等了，監聽器還是掛在那裡。<code>node:events</code> 提供的 <code>events.once</code> 把這些都處理好了：</p>
+<h3>events.once：等一次</h3>
+<pre>import { once } from 'node:events'
+
+const [order] = await once(board, 'ready')   // 回傳的是參數陣列，所以要解構</pre>
+<p>它回傳的 Promise 在事件第一次發生時 resolve，值是 <code>emit</code> 傳的參數組成的陣列，所以要用 <code>[order]</code> 解構出第一個。它幫你處理了三件容易漏的事：</p>
+<ul>
+  <li><strong>自動移除</strong>：等到之後，它掛的監聽器就拿掉了，不會洩漏。</li>
+  <li><strong>error 變成 reject</strong>：等的過程中 emitter 發了 <code>error</code>，Promise 就以那個錯誤 reject。它在等的期間替你掛了 <code>error</code> 監聽器，所以不會變成上一節「沒人聽的 error」讓程序結束。</li>
+  <li><strong>可以取消</strong>：可以傳 <code>{ signal }</code>，取消時 reject，錯誤的 <code>name</code> 是 <code>AbortError</code>、<code>code</code> 是 <code>'ABORT_ERR'</code>，取消的原因放在 <code>err.cause</code>。signal 是什麼、從哪裡來，後面「平台不等了」那一節會講，這裡先知道它支援就好。</li>
+</ul>
+<p>但它有一個限制：它只看事件名稱。<code>once(board, 'ready')</code> 在<em>任何一張</em>訂單好了時就 resolve，不能只等訂單 1024。看板上同時有幾十張訂單在做，第一個好的多半不是你那張。要過濾，就得自己 <code>on</code>、自己比對 id、自己在每一種結局 <code>off</code>，這就是練習 1 的 <code>waitForReady</code>。它還缺 signal 這個零件，會在「平台不等了」那一節補齊。</p>
+<p>「等一張訂單」的形狀清楚了。在回到 <code>waitForReady</code> 之前，先處理外送平台的另一個需求（練習 3）：它會把新訂單一筆一筆推給我們，這不是等一次，而是一直來。處理完這個，再回到 <code>waitForReady</code> 補上取消。</p>
+
+<h2>events.on：一筆一筆處理平台推來的新訂單</h2>
+<p>平台的新訂單從一個 <code>feed</code> 物件進來：每來一筆就 <code>emit('order', 訂單)</code>，平台結束推送時 <code>emit('closed')</code>，斷線時 <code>emit('error', err)</code>。每筆訂單都要寫進資料庫、通知吧台，是一段 async 的處理。</p>
+<p>直接寫 <code>feed.on('order', async order =&gt; { await handle(order) })</code> 會踩到前面兩個坑。第一，emit 不等 async 監聽器，所以每來一筆就馬上開始處理一筆，十筆同時在跑，順序也不保證；如果下游（資料庫、吧台系統）一次只承受得住幾筆，就會被壓垮。第二，<code>handle</code> 出錯變成沒人處理的 rejection，就是集點那次事故。我們要的是「一次處理一筆，處理完才拿下一筆，出錯就停下來」。</p>
+<p><code>events.on</code> 就是做這件事的。它回傳一個 <strong>async iterator</strong>。先說 iterator：它是一個可以「一個一個取值」的物件，<code>for…of</code> 就是在跟它要下一個值；async iterator 是取值要 await 的版本，用 <code>for await…of</code> 走訪，每一圈等到下一個值才進入迴圈本體（<a href="../../typescript/lessons/10-iterators-generators.html">TypeScript 課第 10 課</a>）。<code>events.on</code> 把「每發生一次事件」變成「迴圈拿到一筆」：</p>
+<pre>import { on } from 'node:events'
+
+for await (const [order] of on(feed, 'order', { signal, close: ['closed'] })) {
+  await handle(order)   // 這一筆處理完，才會拿下一筆
+}</pre>
+<p>這幾行裡有四個重點：</p>
+<ul>
+  <li><strong>一次一筆</strong>：迴圈本體裡的 <code>await</code> 還沒結束，下一圈不會開始，所以訂單照收到的順序一筆一筆處理。跟 <code>feed.on('order', async …)</code> 每來一筆就同時開始一個完全不同。</li>
+  <li><strong><code>close</code></strong>：列出代表「結束」的事件名稱，發生時迴圈正常結束，程式繼續往下走。沒寫的話，迴圈不知道什麼時候算完，平台收工了它還在等下一筆。</li>
+  <li><strong>error 與 signal</strong>：emitter 發 <code>error</code>，迴圈丟出那個錯誤；signal 取消，迴圈丟出 <code>AbortError</code>。兩者都可以在迴圈外面用 try/catch 接住，錯誤不會沒人管。</li>
+  <li><strong>收尾</strong>：不論迴圈怎麼結束（close、error、取消、迴圈裡 throw 或 <code>break</code>），它都會移除自己掛的監聽器（本機驗證：三種事件的 <code>listenerCount</code> 都回到 0）。這正是上一節要的「自己收尾」。</li>
+</ul>
+<p>還有一種狀況要想：處理得比事件來得慢時呢？例如平台尖峰時段每 10ms 推一筆，我們每筆要處理 100ms。<code>for await</code> 讓我們一次只處理一筆，但平台那邊不會因此停下來，事件照樣 emit。處理不完的事件會排進 <code>events.on</code> 自己的暫存，而對一般的 EventEmitter，這個暫存<strong>沒有上限</strong>（控制上限的 <code>highWaterMark</code> 選項為什麼對它沒用，見課末）。執行後看最後一欄「排隊中」的數字怎麼變：</p>
+<pre>$ node examples/on-buffer.ts      # 每 10ms 來一筆，每筆處理 100ms；數字每次會有點不同
+處理完   2 筆，已經收到 18 筆，排隊中 16 筆（目前這筆 #2）
+處理完   4 筆，已經收到 36 筆，排隊中 32 筆（目前這筆 #4）
+處理完   6 筆，已經收到 54 筆，排隊中 48 筆（目前這筆 #6）
+…</pre>
+<p>排隊的數量一直漲，記憶體也是。<code>for await</code> 只是讓你「一次處理一筆」，不會讓發送的那一端慢下來。能叫上游慢下來的機制叫<strong>背壓</strong>（backpressure）：消費端處理不完時，回頭告訴生產端先暫停。EventEmitter 沒有這個機制，stream 才有，<a href="16-streams-backpressure.html">第 16 課</a>會學。所以 <code>events.on</code> 適合「事件來得不會比處理快太多」的情況；平台可能長時間推得比你快，就要改用有背壓的 stream 或佇列。</p>
+<p>最後一個本機驗證的細節，練習 3 會用到：<code>closed</code> 之後、signal 取消之後，<em>已經排在暫存裡</em>的事件還是會一筆一筆交出來。也就是說，平台不等了、你取消了，迴圈不會立刻停，還會把排隊中的訂單繼續交給你處理。要取消後立刻停，每一筆開始前要自己檢查 signal（練習 3）。這裡已經是第二次提到 signal 了，下一節正式來看它。</p>
+
+<h2>平台不等了、等太久了：怎麼取消還在等的工作？</h2>
+<p>回到 <code>waitForReady</code>。平台打來「訂單 1024 好了再回我」，它不會無限期等下去：平台自己有逾時，時間到就斷線；客人也可能在平台上取消訂單。對方已經不等了，我們這邊如果還在等，那個監聽器、那個計時器就白白掛著，又回到洩漏。所以等待一定要能被「從外面叫停」，而且要有上限。</p>
+<p>這就是 <a href="../../typescript/lessons/11-timeouts-cancellation.html">TypeScript 課第 11 課</a>你自己寫過的取消機制：<code>AbortController</code> 是按下取消的那一方；它的 <code>signal</code>（一個 <code>AbortSignal</code> 物件）交給要被取消的工作；工作監聽 signal 的 <code>abort</code> 事件，取消時停下來並 reject。<code>AbortSignal</code> 本身也是一種事件發送者，只是它只會發一次 <code>abort</code>。好消息是 Node 的內建 API 已經直接接受 <code>signal</code>，不用每個都自己接，只是取消時丟出的錯誤不完全一樣：</p>
+<div class="table-wrap"><table>
+  <tr><th>API</th><th>取消時 reject 的錯誤（v24.22.1 實測）</th></tr>
+  <tr><td><code>setTimeout</code>（<code>node:timers/promises</code>）</td><td><code>AbortError</code>，<code>cause</code> 是 <code>signal.reason</code></td></tr>
+  <tr><td><code>events.once</code>、<code>events.on</code></td><td><code>AbortError</code>，<code>cause</code> 是 <code>signal.reason</code></td></tr>
+  <tr><td><code>fs.promises.readFile</code> 等</td><td><code>AbortError</code>，<code>cause</code> 是 <code>signal.reason</code></td></tr>
+  <tr><td><code>fetch</code></td><td><code>signal.reason</code> 本身（逾時就是 <code>TimeoutError</code>）</td></tr>
+  <tr><td><code>child_process.spawn</code> 等</td><td>子程序被終止，發 <code>error</code> 事件（<a href="09-blocking-and-workers.html">第 9 課</a>）</td></tr>
+</table></div>
+<p><code>signal.reason</code> 是取消的原因：呼叫 <code>controller.abort(原因)</code> 時傳進去的值，沒傳就是一個名稱為 <code>AbortError</code> 的錯誤。表格的重點是：判斷「是不是被取消的」時，Node 內建 API 看 <code>err.name === 'AbortError'</code>，想知道原因再看 <code>err.cause</code>；<code>fetch</code> 是例外，直接丟出原因本身。<code>examples/abort-apis.ts</code> 會印出前三種和下面 <code>AbortSignal.any</code> 的錯誤。</p>
+
+<h3>逾時與合併：AbortSignal.timeout、AbortSignal.any</h3>
+<p><code>waitForReady</code> 要停下來的理由有兩種：平台斷線，和我們自己設的等待上限。Node 提供現成的工具把這兩種理由變成同一個 signal：</p>
+<ul>
+  <li><code>AbortSignal.timeout(ms)</code>：<code>ms</code> 毫秒後自動取消的 signal，<code>reason</code> 是名稱為 <code>TimeoutError</code> 的 <code>DOMException</code>。逾時（<code>TimeoutError</code>）和使用者取消（<code>AbortError</code>）分得開，呼叫端才能決定回 504 還是什麼都不回。</li>
+  <li><code>AbortSignal.any([a, b])</code>：任何一個來源取消，合併的 signal 就取消，<code>reason</code> 跟著先取消的那個。典型用法：「客人斷線」或「最多等 5 秒」，哪個先到都停。</li>
+  <li><code>signal.throwIfAborted()</code>：已經取消就丟出 <code>signal.reason</code>。適合放在每一步開始前，例如上一節 <code>for await</code> 迴圈每一筆的開頭。</li>
+</ul>
+<p>合起來，處理外送請求時就是這兩行。<code>req.signal</code> 是 Node 24 的 http 請求物件提供的 signal，連線在回應完成前斷掉時會 abort，<a href="13-http-server.html">第 13 課</a>細講：</p>
+<pre>const signal = AbortSignal.any([req.signal, AbortSignal.timeout(5_000)])
+const order = await waitForReady(board, 1024, { signal })   // 客人走了或 5 秒到了，都會停</pre>
+<div class="callout warn"><code>AbortSignal.timeout</code> 的計時器<strong>不撐住程序</strong>（<a href="07-event-loop.html">第 7 課</a>的 unref）。如果程式唯一在等的就是它，event loop 認為沒事可做，程序直接以結束碼 13（還有沒完成的頂層 await）結束，<code>catch</code> 根本不會執行。試試 <code>node examples/once-timeout.ts; echo $?</code>。在伺服器裡這不是問題，因為伺服器本身撐著程序。</div>
+<p>既然 signal 已經能帶逾時，為什麼練習 1 的 <code>waitForReady</code> 還要另外收 <code>timeoutMs</code>？因為這樣函式本身就保證有上限，呼叫端沒帶逾時也不會無限等；也藉這個機會練習自己清計時器。</p>
+<p>有了 signal，<code>waitForReady</code> 的零件都齊了：自己 <code>on('ready')</code> 過濾 id、自己的計時器處理 <code>timeoutMs</code>、監聽 signal 的 <code>abort</code>。剩下的問題是，三條路裡任何一條先到，另外兩條掛上去的東西怎麼辦？</p>
+
+<h2>等到、逾時、取消：waitForReady 怎麼確保三條路都收尾？</h2>
+<p>一個「等某件事」的函式有三種結局：等到了、逾時、被取消。為了等，它掛了三樣東西：board 上的 <code>ready</code> 監聽器、signal 上的 <code>abort</code> 監聽器、逾時用的計時器。不論哪一種結局先發生，這三樣都要拿掉。漏了一個就是洩漏：等到訂單卻忘了 <code>off</code>，監聽器留在 board 上，就是第一件事故；resolve 了卻沒 <code>clearTimeout</code>，計時器時間到還是會觸發，對一個已經結束的 Promise 再 reject 一次，白白撐著程序；被取消卻沒移除 <code>abort</code> 監聽器，它就跟著 signal 活著。</p>
+<p>最不容易漏的寫法是三條路共用同一個 <code>cleanup()</code>：任何一條路觸發時，先 cleanup，再 resolve 或 reject。這樣「要拿掉哪些東西」只寫在一個地方：</p>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="等到了、逾時、被取消三條路都先呼叫 cleanup，cleanup 移除 ready 監聽器、abort 監聽器並清掉計時器，然後才 resolve 或 reject">
+    <defs><marker id="arr8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="20" y="20" width="190" height="50" rx="8"/>
+    <text class="d-text" x="115" y="42" text-anchor="middle">ready（訂單 id 相符）</text>
+    <text class="d-small" x="115" y="60" text-anchor="middle">別的 id：不理，繼續等</text>
+    <rect class="d-soft" x="20" y="100" width="190" height="50" rx="8"/>
+    <text class="d-text" x="115" y="130" text-anchor="middle">逾時（setTimeout）</text>
+    <rect class="d-soft" x="20" y="180" width="190" height="50" rx="8"/>
+    <text class="d-text" x="115" y="210" text-anchor="middle">signal 的 abort</text>
+    <line class="d-line" x1="210" y1="45" x2="280" y2="110" marker-end="url(#arr8)"/>
+    <line class="d-line" x1="210" y1="125" x2="280" y2="125" marker-end="url(#arr8)"/>
+    <line class="d-line" x1="210" y1="205" x2="280" y2="140" marker-end="url(#arr8)"/>
+    <rect class="d-box" x="285" y="70" width="190" height="110" rx="8"/>
+    <text class="d-accent" x="380" y="96" text-anchor="middle">cleanup()</text>
+    <text class="d-small" x="380" y="122" text-anchor="middle">board.off('ready', …)</text>
+    <text class="d-small" x="380" y="142" text-anchor="middle">signal.removeEventListener</text>
+    <text class="d-small" x="380" y="162" text-anchor="middle">clearTimeout(timer)</text>
+    <line class="d-line" x1="475" y1="110" x2="530" y2="70" marker-end="url(#arr8)"/>
+    <line class="d-line" x1="475" y1="140" x2="530" y2="180" marker-end="url(#arr8)"/>
+    <rect class="d-box" x="535" y="45" width="145" height="45" rx="8"/>
+    <text class="d-text" x="607" y="73" text-anchor="middle">resolve(order)</text>
+    <rect class="d-box" x="535" y="160" width="145" height="45" rx="8"/>
+    <text class="d-text" x="607" y="188" text-anchor="middle">reject(錯誤)</text>
+  </svg>
+  <figcaption>三條路共用同一個 cleanup。signal 一開始就已取消時，abort 事件不會再發生，要在掛任何東西之前先檢查 <code>signal.aborted</code>。</figcaption>
+</figure>
+<p>圖說最後那一點很常被忘。<code>abort</code> 事件只發生一次，就在取消的那一刻。signal 傳進來時如果已經取消（例如客人在你開始等之前就斷線了），你再 <code>addEventListener('abort', …)</code> 永遠等不到它，只能乾等到逾時，白白佔著資源。所以函式的第一行先檢查：<code>if (signal?.aborted) return reject(signal.reason)</code>，或呼叫 <code>signal.throwIfAborted()</code>，確定還沒取消才開始掛東西。</p>
+<p>把這節和前面幾節合起來，就是練習 1 的 <code>waitForReady</code>：先檢查 signal；掛上 <code>ready</code> 監聽器（id 不符就不理）、計時器、<code>abort</code> 監聽器；三條路都先 cleanup 再結束。測試會用 <code>listenerCount</code> 和計時器檢查每一種結局都收乾淨了，這正好對應第一件事故的修法。</p>
+<div class="callout practice"><strong>💡 實務上：取消只是「不等了」，不是「沒做過」</strong><br>最常見的用法就是這課做的事：把逾時和客人斷線往下傳。API 要呼叫外部服務（外送平台、金流、地址查詢）時，一律帶 signal 和逾時，不讓一個慢的下游把你的請求全部卡住。逾時多長要看那個呼叫平常要多久，以及使用者願意等多久，可以問 PM 或看監控，不要每支 API 都抄同一個數字。要小心的是寫入：你取消了「等金流回應」，金流那邊可能已經扣款成功，所以讀取可以放心取消，付款、建立訂單這類寫入要能查得到結果或安全重試。同一個請求做兩次，結果跟做一次一樣，這個性質叫冪等，見<a href="../../system-design/lessons/09-idempotency.html">系統設計課第 9 課</a>。log 裡也要分得出逾時和使用者取消，排查時才知道是下游慢還是客人自己走了。</div>
+<p>兩件事故都修好了。最後退一步問一個設計問題：結帳之後通知吧台、集點，一開始就該用事件嗎？</p>
+
+<h2>回頭看：通知吧台和集點，該不該用事件？</h2>
+<p>事件的好處是<strong>解耦</strong>（decoupling）：兩段程式不直接互相呼叫，改動一邊不用改另一邊。結帳只要 <code>emit('paid', order)</code>，吧台、集點、統計各自監聽；之後新增一個「開發票」的功能，只要多掛一個監聽器，不用改結帳的程式。代價是這課一路看到的事：</p>
+<ul>
+  <li><strong>流程看不見</strong>：讀結帳的程式，看不出 paid 之後會發生什麼，要全專案搜尋 <code>'paid'</code>。出問題時很難追。</li>
+  <li><strong>錯誤容易遺失</strong>：上面三種錯誤情況，任何一種沒處理好，不是拖垮發送者，就是錯誤沒人知道。集點那次事故就是這樣。</li>
+  <li><strong>同步 emit 拖慢發送者</strong>：監聽器越多、越慢，結帳就越慢。</li>
+  <li><strong>只在同一個程序裡有效</strong>：EventEmitter 的事件只存在記憶體裡。開了兩個程序（<a href="24-scaling.html">第 24 課</a>）時，A 程序發的事件 B 程序聽不到；程序重啟時，還沒處理的事件就沒了，也沒有重試。要跨程序、不能遺失的通知要用佇列或 webhook（<a href="../../system-design/lessons/16-events-webhooks.html">系統設計課第 16 課</a>）。</li>
+</ul>
+<p>判斷方式：結帳<em>必須</em>知道結果的事（扣庫存、寫訂單），直接呼叫函式並 await，失敗就讓結帳失敗；發生了「順便通知一下」、失敗也不影響主流程的事，才適合用事件，而且要決定好錯誤去哪裡。照這個標準，集點用事件可以，但它的監聽器必須自己接住錯誤；如果集點不能遺失（例如會員點數牽涉到錢），就該改成寫進佇列，而不是靠記憶體裡的事件。</p>
+
+<h2>補充與查表</h2>
+<p>主線用不到、但查資料或讀別人的程式時會遇到的細節。</p>
+<h3>EventEmitter 與瀏覽器的 EventTarget</h3>
+<p>瀏覽器的 <code>EventTarget</code>（<code>addEventListener</code>／<code>dispatchEvent</code>）在 Node 裡也有，<code>AbortSignal</code> 就是一個 EventTarget。兩者都同步呼叫監聽器，差別在監聽器同步 throw 時：EventEmitter 的 <code>emit</code> 會中斷、錯誤從 <code>emit</code> 丟出；EventTarget 的 <code>dispatchEvent</code> 則讓其他監聽器照樣執行，錯誤改成在下一個 tick 丟出、變成未捕捉的例外，程序一樣以結束碼 1 結束。</p>
+<h3>監聽器裡的 this</h3>
+<p><a href="../../typescript/lessons/01-closures-this.html">TypeScript 課第 1 課</a>講過：一般函式的 <code>this</code> 由呼叫方式決定，箭頭函式沿用外層的。所以監聽器用一般 <code>function</code> 寫，<code>this</code> 是發出事件的 emitter（<code>sync-emit.ts</code> 第 2 個監聽器印出 <code>true</code>）；用箭頭函式寫，<code>this</code> 是外層的 <code>this</code>，在 ES module 頂層是 <code>undefined</code>。要拿 emitter 時，直接用變數比依賴 <code>this</code> 清楚。</p>
+<h3>events.on 的 highWaterMark</h3>
+<p><code>events.on</code> 的 <code>highWaterMark</code> 選項預設值是 <code>Number.MAX_SAFE_INTEGER</code>，而且只對有 <code>pause()</code>／<code>resume()</code> 的 emitter 有作用，一般 EventEmitter 等於沒有上限。</p>
+<h3>events.addAbortListener</h3>
+<p><code>events.addAbortListener(signal, fn)</code>：監聽取消，回傳一個 <code>Disposable</code>，也就是有 <code>[Symbol.dispose]()</code> 方法、用完要釋放的物件，呼叫它的 <code>[Symbol.dispose]()</code> 就移除監聽器。跟直接 <code>addEventListener('abort', …)</code> 比，別人在 signal 上呼叫 <code>stopImmediatePropagation()</code> 也擋不住它。</p>
+<h3>版本備註</h3>
+<ul>
+  <li><code>events.once</code> 的 <code>signal</code> 選項從 v15.0.0 開始支援。</li>
+  <li><code>events.on</code> 的 <code>close</code> 選項從 v20.0.0 起支援。</li>
+  <li><code>events.addAbortListener</code> 從 v24.0.0 起是 stable。</li>
+  <li>本課的輸出與錯誤行為都在 v24.22.1 實測。</li>
+</ul>
+
+<h2>練習</h2>
+
+<div class="local" data-test="ex1" data-files="wait-for-ready.ts">
+  <p>練習 1：完成 <code>wait-for-ready.ts</code> 的 <code>waitForReady(board, orderId, { signal, timeoutMs })</code>。<code>board</code> 是 <code>order-board.ts</code> 的 <code>OrderBoard</code>，訂單做好時 <code>emit('ready', order)</code>。</p>
+  <ul>
+    <li>收到 <code>order.id === orderId</code> 的訂單才 resolve 那張訂單；別的訂單好了繼續等。</li>
+    <li>超過傳進來的 <code>timeoutMs</code> 毫秒就 reject，錯誤的 <code>name</code> 是 <code>'TimeoutError'</code>（例如 <code>new DOMException('…', 'TimeoutError')</code>）。</li>
+    <li><code>signal</code> 取消時 reject <code>signal.reason</code>；<code>signal</code> 一開始就已取消時立刻 reject。<code>signal</code> 可以不傳。</li>
+    <li>不論哪一種結局，board 上的 <code>ready</code> 監聽器、signal 上的 <code>abort</code> 監聽器、計時器都要清掉。計時器要 <code>clearTimeout</code>，<code>unref()</code> 不算清掉（它只是不撐住程序，時間到還是會執行）。測試會檢查 <code>listenerCount</code>、<code>getEventListeners(signal, 'abort')</code> 和你開的計時器。</li>
+  </ul>
+</div>
+
+<div class="local" data-test="ex2" data-files="safe-hub.ts">
+  <p>練習 2：起始的 <code>safe-hub.ts</code> 直接用 EventEmitter，第一個訂閱者壞掉就拖垮全部。改寫 <code>SafeHub</code>：<code>subscribe(name, fn)</code> 登記一個訂閱者，<code>fn</code> 可能是同步或 async 函式；<code>publish(event)</code> 呼叫每一個訂閱者，回傳的 Promise 在<strong>所有</strong>訂閱者都結束後才 resolve，而且永遠不 reject。任何一個訂閱者同步 throw 或 async reject，都不能影響其他訂閱者，錯誤交給建構子傳入的 <code>onError(err, name)</code>，<code>name</code> 是它訂閱時的名稱。測試期間不能出現 unhandled rejection。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="order-feed.ts">
+  <p>練習 3：完成 <code>order-feed.ts</code> 的 <code>consumeOrders(feed, { signal, handle })</code>。外送平台的 <code>feed</code> 會 <code>emit('order', 訂單)</code>，結束時 <code>emit('closed')</code>，斷線時 <code>emit('error', err)</code>。</p>
+  <ul>
+    <li>每一筆都 <code>await handle(order)</code>，<strong>一次只處理一筆</strong>，依收到的順序；<code>closed</code> 時正常結束，回傳處理了幾筆。</li>
+    <li>feed 發 <code>error</code> 時以那個錯誤 reject；<code>handle</code> 丟錯時不再處理下一筆，以那個錯誤 reject。</li>
+    <li><code>signal</code> 取消時：正在處理的那筆做完，之後一筆都不開始，reject 名稱為 <code>AbortError</code> 的錯誤；沒有訂單、正在等下一筆時取消，也要馬上 reject；已取消的 signal 一筆都不處理。</li>
+    <li>不論怎麼結束，feed 上 <code>order</code>、<code>error</code>、<code>closed</code> 的監聽器都要是 0。</li>
+  </ul>
+  <p>提示：<code>events.on</code> 加上 <code>close</code> 和 <code>signal</code> 選項可以處理掉大部分；剩下的一件事，回頭看「events.on：一筆一筆處理」那一節的最後一段。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 4：下面的程式印出的順序是？</p>
+  <pre>shop.on('paid', () =&gt; console.log('A'))
+shop.emit('paid')
+console.log('B')</pre>
+  <label data-key="a">B、A：emit 把事件排進佇列，等目前的程式跑完才執行監聽器</label>
+  <label data-key="b">A、B：emit 當場同步呼叫監聽器，全部跑完才回到下一行</label>
+  <label data-key="c">不一定，看 event loop 當時在哪個 phase</label>
+  <p class="why">✓ <code>emit</code> 就是依序呼叫每個監聽器的普通函式呼叫，跟 event loop 的佇列無關，所以一定是 A 再 B。這也代表監聽器慢、監聽器 throw，都會直接影響 emit 的呼叫者。想延後執行要自己用 <code>setImmediate</code> 或 <code>process.nextTick</code>（<a href="07-event-loop.html">第 7 課</a>）。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：正式環境的 log 一直出現 <code>MaxListenersExceededWarning: … 11 ready listeners added</code>。同事說：「把 <code>setMaxListeners(100)</code> 加上去警告就沒了。」怎麼回應？</p>
+  <label data-key="a">好：這只是 Node 的預設值太保守，調高就解決了</label>
+  <label data-key="b">好：不然超過 10 個之後，新的監聽器會加不上去</label>
+  <label data-key="c">先別：這通常代表有監聽器加了沒移除。用 <code>--trace-warnings</code> 找出是哪一行加的，補上 off／once 或改用帶 signal 的 events.once</label>
+  <p class="why">✓ 警告本身不會擋住任何東西（b 錯，第 11、12 個照樣加得上去），它是「可能有洩漏」的線索。調高上限（a）只是把線索藏起來，記憶體照漲。只有在確定同時有很多正當的監聽器時才調高。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：一支腳本只有這一行，執行後會怎樣？</p>
+  <pre>await once(board, 'ready', { signal: AbortSignal.timeout(1000) })   // 沒有人會發 ready</pre>
+  <label data-key="a">程序馬上以結束碼 13 結束，不會等 1 秒</label>
+  <label data-key="b">1 秒後 reject，錯誤名稱是 TimeoutError</label>
+  <label data-key="c">1 秒後 reject，錯誤名稱是 AbortError，<code>cause</code> 是 TimeoutError</label>
+  <p class="why">✓ <code>AbortSignal.timeout</code> 的計時器不撐住程序，等 ready 的監聽器也不算，所以 event loop 沒有任何東西撐著，程序立刻結束，結束碼 13 代表頂層 await 沒完成。如果有別的東西撐著程序（例如伺服器），才會是 c：events.once 取消時丟 AbortError，原因在 <code>cause</code>；b 是 <code>fetch</code> 的行為。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>以為 emit 是非同步的</strong>：emit 當場呼叫完所有監聽器。監聽器裡的同步重活會卡住發送者和整個 event loop。</li>
+  <li><strong>async 監聽器 reject 沒人處理</strong>：emit 不 await 監聽器，rejection 變成 unhandled，程序以結束碼 1 結束。在監聽器裡 try/catch，或用 <code>captureRejections: true</code> 加 <code>error</code> 監聽器。</li>
+  <li><strong>會發 error 的東西沒掛 error 監聽器</strong>：一次 <code>emit('error')</code> 就讓程序當掉。伺服器、socket、stream、子程序都要掛。</li>
+  <li><strong>每個請求都 on 卻沒 off</strong>：監聽器和它記住的資料永遠收不掉。想清楚結束時機，在每一種結局都移除；<code>off</code> 要傳同一個函式。</li>
+  <li><strong>把 setMaxListeners 調大掩蓋洩漏</strong>：警告是線索。先用 <code>--trace-warnings</code> 找到來源。</li>
+  <li><strong>用 once 等事件卻沒處理 error 與取消</strong>：自己寫 <code>new Promise(r =&gt; emitter.once('ready', r))</code> 不會在 error 時 reject，也停不下來；用 <code>events.once</code> 加 <code>signal</code>，需要過濾時自己處理三種結局。</li>
+  <li><strong>忘了檢查已經取消的 signal</strong>：abort 事件只發生一次，已取消的 signal 不會再發，要先看 <code>signal.aborted</code>。</li>
+  <li><strong>以為 for await + events.on 會讓上游變慢</strong>：它只是排隊，暫存沒有上限；取消後已排隊的事件還會交出來。</li>
+  <li><strong>監聽器寫成箭頭函式又用 this 取 emitter</strong>：箭頭函式沒有自己的 <code>this</code>，直接用 emitter 的變數。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>事件讓吧台只管喊「做好了」、不用知道誰在等。EventEmitter 用 <code>on</code>／<code>once</code>／<code>off</code>／<code>emit</code>；emit 是同步的，依註冊順序當場呼叫每個監聽器，監聽器慢，發送者就慢。</li>
+  <li>集點服務拖垮整台伺服器，是因為錯誤沒有去處。三種情況：同步 throw 從 emit 傳出、後面的不執行；沒人聽的 <code>error</code> 直接 throw；async 監聽器的 rejection 沒人等。修法是監聽器自己 try/catch，或 <code>captureRejections</code> 加 <code>error</code> 監聽器。</li>
+  <li>記憶體一天比一天大，是每個請求都 <code>on</code> 卻沒 <code>off</code>。監聽器加了就要有拿掉的時機；<code>MaxListenersExceededWarning</code> 是洩漏的線索，用 <code>--trace-warnings</code> 找來源，不要只調高上限。</li>
+  <li><code>events.once</code> 把一次事件變成 Promise（會處理 error、支援 signal、自動移除），但不能過濾；<code>events.on</code> 搭配 <code>for await</code> 一次處理一筆，<code>close</code> 決定何時結束，但暫存沒有上限，取消後已排隊的事件還會交出來。</li>
+  <li>Node 內建 API 接受 <code>signal</code>，取消時丟 <code>AbortError</code>、原因在 <code>cause</code>；<code>AbortSignal.timeout</code> 逾時、<code>AbortSignal.any</code> 合併來源；timeout 的計時器不撐住程序。</li>
+  <li>「等某件事」的函式（像 <code>waitForReady</code>）要處理三種結局（等到、逾時、取消），共用一個 cleanup 全部收尾，還要先檢查已取消的 signal。</li>
+  <li>結帳必須知道結果的事直接呼叫並 await；「順便通知」才用事件，而且要決定錯誤去哪裡。要跨程序、不能遺失的通知用佇列。</li>
+</ul>
+<p>下一課看另一種讓伺服器變慢的原因：同步的重活卡住 event loop，以及怎麼把它們搬到 worker 或子程序去做。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>17. 呼叫外部 API：逾時、重試與併發</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="17" data-practice="node">
+<header>
+  <div class="eyebrow">階段 4：HTTP 服務 · 第 17 課</div>
+  <h1>呼叫外部 API：逾時、重試與併發</h1>
+</header>
+<main>
+
+<p>咖啡店的 API 下單前要問咖啡豆供應商「這個品項還有沒有貨」。某天下午供應商的伺服器變慢，每個請求要 30 秒才回；你的 API 沒設逾時，每個客人的請求都卡在等供應商，連線越積越多，最後連不需要問庫存的「看菜單」也開始變慢。供應商恢復後，你為了保險寫的「失敗就再試」讓所有卡住的請求在同一秒一起重送，又把它打掛一次。</p>
+<p>這次事故的兩個傷口，一個是「等太久」，一個是「重試得太整齊」，都出在同一段程式：向供應商查庫存的那個函式。這一課從它最天真的寫法開始，一次補一個洞，最後得到一個可以放心上線的 <code>getStock</code>，再用它做「重試」和「一次查 200 個品項」。你的服務一旦依賴別人的服務，對方的問題就會變成你的問題；這一課要做的，是讓這件事有上限。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>Node 的 fetch 跟瀏覽器的一樣嗎？最天真的 <code>getStock</code> 會以哪幾種方式失敗、錯誤長什麼樣子。</li>
+  <li>供應商變慢時 <code>getStock</code> 會等多久：加上逾時與取消；回 503 時為什麼還要處理 body，連線才會放回去。</li>
+  <li>失敗了該不該再試、隔多久再試：哪些失敗值得重試，指數退避加 jitter，怎麼避免供應商一恢復就被所有重送一起打掛。</li>
+  <li>店長按「檢查全部庫存」：200 個請求怎麼限制同時數量，一個失敗時怎麼停下其他的。</li>
+  <li>供應商回 200 就能相信嗎：驗證回應、把上游錯誤轉成自己的錯誤類別；最後回到事故，上線後出問題從哪裡查。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="08-events-cancellation.html">第 8 課</a>的 <code>AbortSignal</code>：<code>AbortSignal.timeout(ms)</code> 時間到自動取消，<code>AbortSignal.any([...])</code> 合併多個來源；被取消的 <code>await</code> 會丟 <code>AbortError</code>。</li>
+  <li><a href="12-http-protocol.html">第 12 課</a>的狀態碼與冪等方法：4xx 是請求本身有問題、5xx 是伺服器出錯；GET、PUT、DELETE 做兩次結果一樣，POST 不是。</li>
+</ul></div>
+
+<h2>下單前要問供應商：Node 的 fetch 跟瀏覽器的一樣嗎？</h2>
+<p>先把角色說清楚。你的程式去呼叫的服務叫<strong>上游</strong>（upstream），來呼叫你的程式的人叫<strong>下游</strong>（downstream）。對咖啡店 API 來說，供應商、金流、簡訊服務是上游；Vue 前端和 App 是下游。資料和請求像水一樣沿著這條鏈流動：下游等你，你等上游。所以上游一慢，你就慢，你一慢，下游也跟著慢。開場的事故就是這條鏈一路傳下來的結果，這一課在處理的就是你夾在中間的這一段。</p>
+<p>你在 Vue 裡用過 <code>fetch</code>，好消息是 Node 也有一個全域的 <code>fetch</code>，用法跟瀏覽器一樣：<code>res.ok</code>、<code>res.status</code>、<code>res.headers.get()</code>、<code>await res.json()</code>。所以練習資料夾裡 <code>supplier.ts</code> 一開始的 <code>getStock</code>，就是你在前端會寫的樣子：</p>
+<pre>const res = await fetch(`${baseUrl}/stock/${productId}`)
+const data = await res.json()
+return { productId, stock: data.stock }</pre>
+<p>寫法一樣，背後卻不一樣。瀏覽器的 fetch 由瀏覽器替你管理網路連線；Node 的 fetch 背後是 <strong>undici</strong>，一個 Node 團隊寫的 HTTP 客戶端。建立一條 TCP 連線要來回好幾趟，很花時間，所以 undici 用完一條連線不會馬上關掉，而是留著給下一個發往同一個上游的請求重用，也就是<a href="12-http-protocol.html">第 12 課</a>的 keep-alive。這些保留著、輪流借出去用的連線叫<strong>連線池</strong>（connection pool）。連線池讓呼叫變快，代價是：連線必須被「還回去」，下一個請求才借得到。在瀏覽器裡這件事你從來不用管；在 Node 裡，後面兩件事（逾時預設值、response body 要處理）都跟 undici 有關，要你自己操心。undici 的版本細節見課末。</p>
+<p>知道了 fetch 背後是誰，下一個問題是：上面這三行，在供應商出狀況時會以哪些方式壞掉？</p>
+
+<h2>最天真的 getStock 會在哪幾個地方出錯？</h2>
+<p>要寫出可靠的呼叫，得先看過它失敗的樣子。在 <code>work/17/</code> 執行 <code>node examples/fetch-errors.ts</code>，它在本機開一個假上游，把常見的失敗都試一次，印出 fetch 實際丟出什麼：</p>
+<pre>$ node examples/fetch-errors.ts
+1. 上游回 503：沒有 throw，res.ok = false，status = 503，Retry-After = 2
+2. 連 127.0.0.1 上沒人聽的 port
+  TypeError: fetch failed
+  cause → Error: ECONNREFUSED connect ECONNREFUSED 127.0.0.1:3999
+3. 連 localhost 上沒人聽的 port（IPv6 和 IPv4 都試了）
+  TypeError: fetch failed
+  cause → AggregateError: ECONNREFUSED
+    · ECONNREFUSED ::1
+    · ECONNREFUSED 127.0.0.1
+4. 網域查不到
+  TypeError: fetch failed
+  cause → Error: ENOTFOUND getaddrinfo ENOTFOUND no-such-host.invalid
+5. 逾時（AbortSignal.timeout(300)）
+  TimeoutError: The operation was aborted due to timeout
+6. 呼叫端取消（ac.abort()）
+  AbortError: This operation was aborted
+7. 回應不是 JSON
+  SyntaxError: Unexpected token '&lt;', "&lt;html&gt;維修中&lt;/html&gt;" is not valid JSON</pre>
+<p>第 1 行最容易讓前端出身的人意外：上游回了 503，fetch <strong>沒有 throw</strong>。fetch 的規則是「只要拿到 HTTP 回應，fetch 就算成功」，狀態碼是多少是你的事。天真版的 <code>getStock</code> 接著呼叫 <code>res.json()</code>，會把錯誤頁當成資料解析：運氣好是第 7 行的 <code>SyntaxError</code>，運氣不好錯誤頁剛好是 JSON，<code>data.stock</code> 變成 <code>undefined</code> 一路往下傳。</p>
+<p>第 2 到 4 行是另一類：根本拿不到回應。這時 fetch 丟的錯誤訊息全都是 <code>fetch failed</code>，只看這幾個字分不出是對方沒啟動、DNS 設錯還是防火牆擋住。真正的原因放在錯誤物件的 <strong><code>cause</code></strong> 屬性上。<code>cause</code> 是 ES2022 加進 JavaScript 的標準做法：建立錯誤時寫 <code>new Error(msg, { cause })</code>，把「造成這個錯誤的原始錯誤」掛在新錯誤上，外層可以換一個比較好懂的訊息，又不會弄丟底層的細節。fetch 就是這樣做的，所以 <code>err.cause.code</code> 才看得到 <code>ECONNREFUSED</code>（對方的 port 沒人在聽）或 <code>ENOTFOUND</code>（網域查不到）。第 3 行多一層：連 <code>localhost</code> 時 Node 會依序試 <code>::1</code>（IPv6）和 <code>127.0.0.1</code>，兩個都失敗，<code>cause</code> 就是一個裝著兩個錯誤的 <code>AggregateError</code>。</p>
+<p>第 5、6 行是被取消：時間到了，或呼叫的人不要了。下一節會詳細講，這裡先記住它們用 <code>err.name</code> 分辨。把這些整理成一張表：</p>
+<div class="table-wrap"><table>
+  <tr><th>種類</th><th>fetch 會怎樣</th><th>怎麼認</th></tr>
+  <tr><td><strong>HTTP 錯誤</strong>：上游有回應，但是 4xx／5xx</td><td><strong>不會 throw</strong>，正常回傳 Response</td><td><code>!res.ok</code>（status 不在 200–299）</td></tr>
+  <tr><td><strong>網路錯誤</strong>：連不上、DNS 查不到、連線中途斷掉</td><td>throw <code>TypeError: fetch failed</code>（讀 body 時才斷是 <code>TypeError: terminated</code>）</td><td>真正的原因在 <code>err.cause</code>：<code>ECONNREFUSED</code>、<code>ENOTFOUND</code>、<code>ECONNRESET</code>、<code>UND_ERR_SOCKET</code>…</td></tr>
+  <tr><td>逾時、取消</td><td>throw signal 的 reason</td><td><code>err.name</code> 是 <code>TimeoutError</code> 或 <code>AbortError</code></td></tr>
+  <tr><td><strong>格式錯誤</strong>：2xx 但內容不對</td><td><code>res.json()</code> 可能 throw <code>SyntaxError</code>，也可能成功拿到奇怪的值</td><td>自己驗證（後面「供應商回 200 就能相信嗎」那一節）</td></tr>
+</table></div>
+<p>表裡網路錯誤那一列有個括號：如果回應標頭已經到了、讀 body 時連線才斷，丟錯的不是 <code>fetch</code> 而是 <code>res.json()</code>，訊息是 <code>TypeError: terminated</code>，<code>cause</code> 一樣是 <code>UND_ERR_SOCKET</code>（other side closed）。所以「網路錯誤」不只發生在 <code>await fetch</code> 那一行，讀 body 的那一行也要一起考慮。</p>
+<p>這張表也決定了你寫 log 的方式。既然原因藏在 <code>cause</code> 裡，log 只記訊息就等於把原因丟掉：</p>
+<div class="callout warn">寫 log 時把整個錯誤物件交給 logger，或至少印出 <code>err.cause</code>。<code>console.error(err)</code> 會連 <code>[cause]</code> 一起印；<code>console.error(err.message)</code> 和 <code>`${err}`</code> 只會留下 <code>fetch failed</code>，半夜被叫起來時什麼都查不到。</div>
+<p>但回頭看開場的事故，供應商並沒有丟出上面任何一種錯誤。它只是慢，30 秒後還是回了。天真版的 <code>getStock</code> 就這樣一直等。它最多會等多久？</p>
+
+<h2>供應商變慢時，getStock 會等多久？加上逾時與取消</h2>
+<p>答案是很久。fetch 沒有「整個請求最多幾秒」的設定，undici 只有兩個很寬的保護：<code>headersTimeout</code>（等回應標頭最多多久）和 <code>bodyTimeout</code>（body 兩段資料之間最多隔多久），預設都是 300 秒（undici 7.30.1 文件）。也就是說，上游卡住時，你的請求會掛 5 分鐘。這 5 分鐘裡，那個客人的請求、它占著的記憶體和連線都還在你的伺服器上；客人一直進來，卡住的請求就一直累積，這就是開場「連看菜單都變慢」的由來。</p>
+<p>要解決它，得先分清楚兩個常被混用的詞。<strong>逾時</strong>（timeout）是「單次等待最多等多久」，例如這一次問供應商最多 1 秒。<strong>截止時間</strong>（deadline）是「整件事最晚什麼時候要結束」，例如一次下單最多 3 秒，裡面可能包含好幾次呼叫和重試。這一節先處理逾時，截止時間等講到重試時會用上。</p>
+<p>前端的逾時與取消在 <a href="../../typescript/lessons/11-timeouts-cancellation.html">TypeScript 課第 11 課</a>寫過，伺服器呼叫上游用的是同一套工具：把一個 <code>AbortSignal</code> 交給 fetch，signal 一取消，fetch 就停。這裡要合併兩個取消的來源：</p>
+<pre>const signal = AbortSignal.any([
+  AbortSignal.timeout(1000),     // 這一次呼叫最多 1 秒
+  req.signal,                    // 客人斷線了就不用再等（第 13 課）
+])
+const res = await fetch(`${SUPPLIER_URL}/stock/2`, { signal })</pre>
+<p>第一個來源是我們自己的逾時：1 秒到了就取消。第二個是呼叫端：客人關掉頁面，他的請求已經沒人要看結果，繼續等供應商只是浪費。<code>AbortSignal.any</code> 把兩者合成一個 signal，哪個先取消就用哪個的 reason（<a href="08-events-cancellation.html">第 8 課</a>）。</p>
+<p>這個 signal 管的是<strong>整個 fetch，包括讀 body</strong>。標頭在 1 秒內到了、body 卻遲遲沒送完，<code>res.json()</code> 也會在時間到時 throw。所以你不用另外替讀 body 設逾時。</p>
+<p>合併兩個來源帶來一個新問題：<code>catch</code> 到錯誤時，是哪一個取消的？兩種情況要做的事完全不同。如果是我們的逾時，代表上游太慢，該回 504 給下游或改用備案，也該記成上游的問題；如果是呼叫端自己取消，客人已經走了，什麼都不用回，也不該記成上游的錯。判斷方式是看呼叫端傳進來的那個 signal 有沒有 <code>aborted</code>，不要只看 <code>err.name</code>：呼叫端傳進來的也可能是一個 <code>AbortSignal.timeout</code>，那時它的 <code>err.name</code> 同樣是 <code>TimeoutError</code>，光看名字會認錯。</p>
+<p>最後是設多少。逾時要比下游願意等的時間短：前端 10 秒放棄，你等上游 30 秒就沒有意義，客人早就走了，你還占著連線。在這個上限之下，看上游平常多快。衡量「平常多快」不看平均，而是看 <strong>p99</strong>：把一段時間內所有回應時間由快到慢排好，第 99 百分位的那個值，意思是只有 1% 的請求比它慢。從上游的 p99 出發，加一點餘裕。設太長等於沒設，設太短正常的請求也會被砍掉。量測延遲分布的方法在<a href="../../system-design/lessons/03-latency-percentiles.html">系統設計課第 3 課</a>。</p>
+<div class="callout practice"><strong>💡 實務上：逾時之後要給客人看什麼，是產品決策</strong><br>設逾時只是第一步，接著要回答「時間到了怎麼辦」。咖啡店下單時查不到庫存，可以擋下訂單請客人稍後再試，也可以先收單、標成「待確認」，之後再由店員處理；前者保守，後者體驗好但偶爾要打電話道歉。這不是工程師一個人能決定的，要拿去問 PM 或店長。資深工程師串一個新的上游時，會先問：它平常多快、掛掉時我們的功能能不能降級（少了它，其他部分照常運作）、不能降級的話要對使用者說什麼。</div>
+<p>現在供應商再慢，<code>getStock</code> 最多等 1 秒。接著處理第一節看到的那個不會 throw 的 503：你可能會想，檢查 <code>res.ok</code>、不 ok 就 throw，事情就結束了。在 Node 裡還沒有。</p>
+
+<h2>回 503 就直接 throw，為什麼連線還被占著？</h2>
+<p>在瀏覽器裡，你可能只看 <code>res.ok</code> 就把 Response 丟掉，從來沒出過事，因為瀏覽器的垃圾回收很快會把那條連線收回去。Node 不一樣。第一節說過，undici 要等連線被「還回去」才能借給下一個請求，而一條連線要等它上面的回應 body 被讀完或被取消，才算用完。你沒讀也沒取消，就只能等垃圾回收哪天把 Response 物件清掉。undici 的 README 明寫：Node 的垃圾回收沒那麼積極也不確定，靠它釋放連線可能造成連線用量暴增、效能變差，甚至在連線用完時整個卡住，<strong>所以一定要讀完或取消 response body</strong>。</p>
+<p>執行 <code>node examples/body-leak.ts</code> 可以親眼看到。這個例子的上游回 500，body 一直沒送完；同樣發 5 個請求，一次只看 status、body 不管，一次在錯誤時取消 body：</p>
+<pre>$ node examples/body-leak.ts
+只看 status，body 不管：5 個請求都處理完了，上游還有 5 條連線被占著
+await res.body?.cancel()：5 個請求都處理完了，上游還有 0 條連線被占著</pre>
+<p>在你的程式看來，兩次的 5 個請求都「處理完了」；差別在上游那一側。沒處理 body 的那 5 條連線一直開著。<code>res.body</code> 是一個 ReadableStream（<a href="16-streams-backpressure.html">第 16 課</a>），<code>await res.body?.cancel()</code> 會取消這個 stream，告訴 undici「剩下的我不要了」，undici 就把連線關掉。如果供應商一直回 503，而你每次都只 throw 不 cancel，被占著、回不了連線池的連線會一條一條堆積，跟上一節沒設逾時的結局類似。</p>
+<p>所以每個 Response 拿到之後，都要走以下三條路之一：</p>
+<ul>
+  <li>要用內容：<code>await res.json()</code> 或 <code>res.text()</code> 讀完。</li>
+  <li>錯誤回應、不需要內容：<code>await res.body?.cancel()</code> 再 throw。要記錄上游的錯誤內容時，限制讀取的大小，不要無上限地讀。</li>
+  <li>只需要標頭（例如檢查檔案存不存在）：用 <code>HEAD</code> 方法，回應本來就沒有 body。</li>
+</ul>
+<p>到這裡，單次的 <code>getStock</code> 已經不會無限期地等，也不會漏掉連線：失敗了就乾淨地失敗。但很多失敗只是一瞬間，供應商部署時回 503，幾百毫秒後就好了，這時讓客人的訂單直接失敗很可惜。該不該再試一次？</p>
+
+<h2>失敗了該不該再試？先分出哪些能試</h2>
+<p><strong>重試</strong>（retry）是失敗後自動再呼叫一次。它只對<strong>暫時性的失敗</strong>有用：等一下再試可能就好了。再試幾次結果都一樣的失敗，重試只是浪費時間和對方的資源。用第二節那張失敗表一列一列看：</p>
+<div class="table-wrap"><table>
+  <tr><th>失敗</th><th>重試？</th><th>理由</th></tr>
+  <tr><td>網路錯誤、逾時</td><td>可以</td><td>對方重開機、網路抖一下，常常幾百毫秒就好</td></tr>
+  <tr><td>502 Bad Gateway、503 Service Unavailable、504 Gateway Timeout</td><td>可以</td><td>對方前面的代理連不到它、它過載或在部署</td></tr>
+  <tr><td>429 Too Many Requests</td><td>可以，但照 <code>Retry-After</code></td><td>你太快了，對方明確請你等</td></tr>
+  <tr><td>400、401、403、404、422</td><td>不要</td><td>請求本身有問題，再送一百次也一樣</td></tr>
+  <tr><td>2xx 但格式不對</td><td>不要</td><td>對方的程式或你的假設有問題，要人處理</td></tr>
+</table></div>
+<p>失敗的種類能重試，還不夠，還要看這次呼叫的<strong>方法</strong>。問題出在逾時：時間到了你放棄等待，但你不知道對方到底有沒有處理。可能請求根本沒到，也可能對方已經處理完、只是回應在路上丟了。對「查庫存」這種讀取來說沒差，再問一次而已。GET、PUT、DELETE 是冪等的（<a href="12-http-protocol.html">第 12 課</a>），做兩次結果跟做一次一樣，可以重試。POST 不是：下單的 POST 逾時後重送，對方如果其實收到了第一次，就會真的有兩張單。要重試 POST，就帶同一個 <code>Idempotency-Key</code>（<a href="14-rest-api-design.html">第 14 課</a>），讓對方認出這是同一次操作，直接回第一次的結果。</p>
+<p>咖啡店的 <code>getStock</code> 是 GET，逾時、網路錯誤和 502／503／504 都能重試。下一個問題是時機：失敗之後，隔多久再試？開場事故的後半段，就是答錯了這一題。</p>
+
+<h2>隔多久再試？為什麼供應商一恢復又被打掛</h2>
+<p>最直覺的做法是失敗後馬上重試，但對方多半還沒恢復，馬上再打只是多一次失敗。<strong>指數退避</strong>（exponential backoff）讓每次重試前的等待時間加倍：100ms、200ms、400ms…，給對方越來越多的恢復時間；再設一個上限（例如 1 秒），免得越等越久。</p>
+<p>只有退避還不夠，開場的事故正好說明為什麼。上游掛掉的那一刻，不只你的一個請求失敗，而是 1000 個客人的請求同時失敗。大家用同一套退避規則：一起等 100ms、一起重試、一起失敗，再一起等 200ms……每一輪重試，1000 個請求都在同一瞬間打到上游。剛恢復、還很脆弱的上游，就這樣被同步的重送再打掛一次。</p>
+<p>解法是把大家錯開。<strong>抖動</strong>（jitter）是在等待時間裡加入隨機值，讓每個請求等的時間不同。最常用的是 <strong>full jitter</strong>：不是固定等上限那麼久，而是在 0 到上限之間隨機挑一個時間。第 n 次重試（n 從 0 開始）前等待：</p>
+<pre>wait = random() × min(maxMs, baseMs × 2^n)      // random() 是 0 到 1 之間的亂數</pre>
+<p><code>baseMs × 2^n</code> 是指數退避，<code>min(maxMs, …)</code> 是上限，乘上 <code>random()</code> 是 jitter。執行 <code>node examples/jitter.ts</code>，模擬 1000 個請求同時失敗，比較兩種做法下每 100ms 有多少個重試打到上游：</p>
+<pre>$ node examples/jitter.ts
+指數退避，沒有 jitter（每格 100ms，# = 20 個請求）
+  100ms 1000 ##################################################
+  300ms 1000 ##################################################
+  700ms 1000 ##################################################
+
+指數退避 + full jitter（每格 100ms，# = 20 個請求）
+    0ms 1264 ################################################################
+  100ms  643 #################################
+  200ms  462 ########################
+  …（每次執行的數字略有不同）</pre>
+<p>沒有 jitter 時，每一輪重試都是 1000 個請求同時打到；有 jitter 時，同樣的重試被攤到不同的時間格裡，上游每一刻承受的量小得多。</p>
+<p>等待時間還有一個來源是對方自己。<code>Retry-After</code> 回應標頭是伺服器告訴你「多久之後再來」，常跟 503 和 429 一起出現，第二節的假上游回 503 時就帶了 <code>Retry-After = 2</code>。對方都說了，就至少等那麼久：等待時間取「退避算出來的」和「Retry-After」較大的那個。它的值有兩種寫法，見課末。</p>
+<p>最後要決定什麼時候放棄。重試一定要有兩個上限：<strong>次數</strong>和<strong>截止時間</strong>。只限次數不夠：3 次重試，加上每次 1 秒的逾時和中間的等待，最壞要花好幾秒，下游早就放棄了，你還在替一個沒人要的結果努力。這就是逾時那一節先定義、說好留到重試再用的截止時間。每次要等之前先算：等完會不會超過截止時間？會的話現在就放棄，丟出最後一個錯誤。Retry-After 要你等 60 秒、截止時間只剩 2 秒，就不要等。</p>
+<figure>
+  <svg viewBox="0 0 700 210" role="img" aria-label="重試的時間軸：第一次呼叫失敗，等待 0 到 100 毫秒之間的隨機時間後第二次呼叫，再失敗，等待 0 到 200 毫秒，第三次呼叫；如果下一次等待會超過截止時間，就直接放棄">
+    <defs><marker id="arr17" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <line class="d-line" x1="20" y1="110" x2="680" y2="110" marker-end="url(#arr17)"/>
+    <rect class="d-box" x="30" y="85" width="90" height="50" rx="6"/><text class="d-text" x="75" y="115" text-anchor="middle">呼叫 1 ✗</text>
+    <rect class="d-soft" x="130" y="95" width="70" height="30" rx="6"/><text class="d-small" x="165" y="114" text-anchor="middle">等 0–100</text>
+    <rect class="d-box" x="210" y="85" width="90" height="50" rx="6"/><text class="d-text" x="255" y="115" text-anchor="middle">呼叫 2 ✗</text>
+    <rect class="d-soft" x="310" y="95" width="110" height="30" rx="6"/><text class="d-small" x="365" y="114" text-anchor="middle">等 0–200</text>
+    <rect class="d-box" x="430" y="85" width="90" height="50" rx="6"/><text class="d-text" x="475" y="115" text-anchor="middle">呼叫 3 ✗</text>
+    <line class="d-line" x1="600" y1="40" x2="600" y2="170" stroke-dasharray="5 4"/>
+    <text class="d-accent" x="600" y="30" text-anchor="middle">截止時間</text>
+    <text class="d-small" x="540" y="165" text-anchor="middle">再等就超過 → 丟出最後的錯誤</text>
+    <text class="d-small" x="165" y="160" text-anchor="middle">429／503 有 Retry-After 時至少等那麼久</text>
+  </svg>
+  <figcaption>每次等待是 0 到上限之間的隨機值，上限每次加倍；次數和截止時間先到哪個都停。</figcaption>
+</figure>
+<p>重試設計得再好，還有一個放大效應要防：重試會放大流量，而且層層相乘。</p>
+<div class="callout warn">你的服務重試 3 次、呼叫你的服務也重試 3 次、前端再重試 3 次，上游掛掉時一個使用者動作會變成 64 個請求：每一層最多送 4 次（第 1 次加 3 次重試），三層相乘是 4 × 4 × 4 = 64。這叫<strong>重試風暴</strong>（retry storm）。對策是只在一層重試、設上限、加 jitter。上游持續失敗時，還可以乾脆先暫停呼叫它一段時間，讓它喘口氣，這個做法叫熔斷（circuit breaker）。這些設計在<a href="../../system-design/lessons/08-timeouts-retries-backoff.html">系統設計課第 8 課</a>和<a href="../../system-design/lessons/11-circuit-breaker-bulkhead.html">第 11 課</a>。</div>
+<div class="callout practice"><strong>💡 實務上：串第三方服務前，先把它的文件翻過一遍</strong><br>串金流、簡訊、物流這類服務時，重試規則不是你自己想就好，要先看對方怎麼說：有沒有限流、超過時回 429 還是直接封 IP、支不支援 <code>Idempotency-Key</code>、有沒有測試環境（sandbox）。金流的「建立付款」如果不支援冪等鍵，逾時後就不要盲目重送，改用對方的查詢 API 確認這筆有沒有成立。常見的坑是只在測試環境試過正常流程，上線後第一次遇到對方維護，才發現重試把對方打到限流。把這些答案寫在串接的 README 或 PR 說明裡，下一個接手的人才不用再查一次。</div>
+<p>現在單一次查庫存有逾時、會釋放連線、會有節制地重試。但這些都是「一個請求」的事。店長在後台按下「檢查全部庫存」時，一次要查 200 個品項，問題就變成「一次發多少個」。</p>
+
+<h2>店長按「檢查全部庫存」：200 個請求能不能一次發？</h2>
+<p>最直覺的寫法是 <code>Promise.all(ids.map(getStock))</code>：<code>map</code> 會立刻呼叫 200 次 <code>getStock</code>，200 個請求同時發出去，<code>Promise.all</code> 再等它們全部回來。執行 <code>node examples/flood.ts</code>，比較一次全發和同時最多 5 個：</p>
+<pre>$ node examples/flood.ts
+Promise.all 一次全發：上游同時最多 129 個請求，失敗 71 個（例如 ECONNRESET），花 129ms
+同時最多 5 個：上游同時最多 5 個請求，失敗 0 個，花 2125ms</pre>
+<p>一次全發快是快，但有 71 個失敗，原因是上游來不及接那麼多連線，作業系統直接拒絕（失敗的數字依作業系統而不同，上面是 macOS）。方向是一樣的：一次全發等於對上游發動小型攻擊，它可能把你限流（429）甚至封鎖，你自己也一次占用大量連線和記憶體。更糟的是，如果你有替失敗加上重試，這 71 個失敗會立刻變成更多請求，正好是上一節要避免的事。</p>
+<p>解法是設<strong>併發上限</strong>（concurrency limit）：同時進行中的請求最多 N 個，其餘的排隊。<a href="../../typescript/lessons/09-async-await.html">TypeScript 課第 9 課</a>寫過的 <code>mapWithLimit</code> 就是這樣：開 N 個 worker，每個 worker 做完一件就去拿下一件，直到清單拿完。上面「同時最多 5 個」慢了一些，但零失敗，對上游也友善。</p>
+<p>呼叫外部 API 時，worker 還要多做一件事。想像查到第 30 個品項時供應商回 500：這次「檢查全部庫存」已經確定要報錯了，剩下的 170 個查了也沒用，還在進行中的 4 個也一樣。<strong>fail fast</strong>（快速失敗）是指一發現結果注定失敗，就立刻停下來：用 <code>AbortController</code> 取消其他進行中的請求，也不再發新的，不浪費上游的資源，也讓呼叫端早點拿到錯誤。</p>
+<pre>const failFast = new AbortController()
+async function worker() {
+  while (next &lt; ids.length) {
+    failFast.signal.throwIfAborted()               // 已經有人失敗：不再拿新的
+    const i = next++
+    results[i] = await getStock(base, ids[i], { signal: failFast.signal })
+  }
+}
+try {
+  await Promise.all(Array.from({ length: 5 }, worker))
+} catch (err) {
+  failFast.abort(err)                              // 取消其他進行中的請求
+  throw err
+}</pre>
+<p>程式外層還有 <code>let next = 0</code> 和 <code>const results = []</code>，5 個 worker 共用。<code>while</code> 的檢查和 <code>const i = next++</code> 之間沒有 <code>await</code>，Node 是單執行緒，這兩行執行時不會被其他 worker 插進來，所以每個 <code>i</code> 只會被拿走一次。這段程式有三個地方值得逐一看。第一，<code>Promise.all(Array.from({ length: 5 }, worker))</code> 只開 5 個 worker，所以同時最多 5 個請求。第二，任何一個 <code>getStock</code> 失敗，那個 worker 就 reject，<code>Promise.all</code> 跟著 reject，進到 <code>catch</code> 呼叫 <code>failFast.abort(err)</code>：其他 worker 手上的請求因為拿的是同一個 signal 而被取消，下一輪迴圈的 <code>throwIfAborted()</code> 也讓它們不再拿新的。<code>Promise.all</code> 用的是第一個 reject 的錯誤，所以丟出的是真正的失敗（例如 500），不是後來被取消的那些 <code>AbortError</code>。第三，結果用索引 <code>results[i]</code> 放，順序才會跟輸入一樣；用 <code>push</code> 會變成完成的順序。</p>
+<p>fail fast 不是唯一的選擇，要看需求。「下單前確認每個品項都有貨」一個失敗就沒意義，用 fail fast。「每天晚上同步 200 個品項的庫存」，一個失敗不該讓另外 199 個白做，這時改用 <code>Promise.allSettled</code>，或在 worker 裡接住錯誤，最後回報哪些失敗。</p>
+<p>正式專案可以用成熟的套件來限制同時數量，見課末；這個練習資料夾不裝它，自己寫一次才知道它在做什麼。</p>
+<p>到這裡，對供應商發出的每個請求都有逾時、有上限、失敗時有節制。還剩最後一個假設沒檢查：供應商回了 200，回來的資料就是對的嗎？</p>
+
+<h2>供應商回 200 就能相信嗎？驗證回應，轉成自己的錯誤</h2>
+<p>不能。上游的回應是外部資料，跟使用者的輸入一樣要驗證（<a href="../../typescript/lessons/26-runtime-validation.html">TypeScript 課第 26 課</a>）。<code>res.json()</code> 的型別是 <code>any</code>，TypeScript 什麼都不會幫你擋：你寫了 <code>data.stock</code>，編譯器不會檢查它是不是數字。供應商某天改版，把 <code>stock</code> 改成 <code>"many"</code>，沒驗證的程式會把字串一路帶進資料庫或計算，等到出錯時離源頭已經很遠了。所以在 <code>getStock</code> 回傳之前就檢查：<code>stock</code> 是不是大於等於 0 的整數。驗證失敗就丟一個明確的錯誤，不要猜它的意思。</p>
+<p>講到這裡，<code>getStock</code> 可能丟出的錯誤已經很雜了：網路錯誤的 <code>TypeError</code>、逾時的 <code>TimeoutError</code>（一種 <code>DOMException</code>）、你自己檢查 <code>res.ok</code> 後丟的錯誤、驗證失敗。如果把這些原樣往上丟，呼叫 <code>getStock</code> 的每個地方都得知道 fetch 的所有細節。解法是在 <code>getStock</code> 裡把上游的錯誤轉成<strong>自己的錯誤類別</strong>。練習裡的 <code>errors.ts</code> 定義了四種，剛好對應第二節那張失敗表：</p>
+<div class="table-wrap"><table>
+  <tr><th>類別</th><th>什麼時候</th><th>你的 API 可以回給下游</th></tr>
+  <tr><td><code>UpstreamTimeoutError</code></td><td>超過我們的逾時</td><td>504</td></tr>
+  <tr><td><code>UpstreamUnavailableError</code></td><td>連不上，原始錯誤在 <code>cause</code></td><td>502 或 503</td></tr>
+  <tr><td><code>UpstreamHttpError</code></td><td>上游回非 2xx，帶 <code>status</code>、<code>retryAfter</code></td><td>看情況，通常 502</td></tr>
+  <tr><td><code>UpstreamBadResponseError</code></td><td>2xx 但內容不對</td><td>502</td></tr>
+</table></div>
+<p>這樣做有兩個好處。第一是呼叫端變簡單：它只要認得這幾個類別，不用知道 fetch 丟的是 <code>TypeError</code> 還是 <code>DOMException</code>；重試邏輯也只看這幾個類別，例如「<code>UpstreamTimeoutError</code> 可以重試、<code>UpstreamBadResponseError</code> 不要」，前面那張重試表就直接寫成程式。注意 <code>UpstreamUnavailableError</code> 用 <code>cause</code> 保留 fetch 的原始錯誤，第二節學到的 <code>ECONNREFUSED</code> 這些線索不會在轉換時遺失。</p>
+<p>第二是安全：不要把上游的狀態碼和錯誤內容原樣回給客戶端。上游回 401，意思是<strong>你</strong>的 API 金鑰過期了；原樣轉給前端，前端會以為是使用者沒登入，把客人踢回登入頁。上游的錯誤內容也可能帶著內部網址或堆疊。對外回你自己的 problem details（<a href="14-rest-api-design.html">第 14 課</a>），細節寫進 log。完整的錯誤分類和轉換方式在<a href="18-error-handling.html">第 18 課</a>。</p>
+<div class="callout practice"><strong>💡 實務上：每個上游包成一個小模組，業務程式碼不直接呼叫 fetch</strong><br>專案裡常見的做法是一個上游一個檔案，例如 <code>supplier-client.ts</code> 匯出 <code>getStock()</code>、<code>placeOrder()</code>，逾時、重試、驗證和錯誤轉換都收在裡面。路由和業務邏輯只拿到驗證過的資料或你自己的錯誤類別，測試時也只要換掉這一個模組。不用為了「以後可能換供應商」先多包一層抽象，一個函式對一個端點就夠了。code review 時看到路由裡直接寫 <code>fetch('https://...')</code>，通常就是該搬進這個模組的訊號。</div>
+<p><code>getStock</code> 現在完整了：逾時、釋放連線、有節制的重試、併發上限、驗證和自己的錯誤類別。但上游總有一天還是會出事，到時候你面對的是正式環境的 log。最後一節回到開場那種下午：出事了，從哪裡開始查？</p>
+
+<h2>上線後出事，從哪裡開始查？</h2>
+<p>下面四種症狀，每一種都對應這一課的某一節。照著症狀找到那一節，就知道該看什麼：</p>
+<ul>
+  <li><strong>log 只有 <code>fetch failed</code></strong>：印 <code>err.cause</code>，看 <code>code</code>。<code>ECONNREFUSED</code> 是對方沒在聽（沒啟動、port 錯）；<code>ENOTFOUND</code> 是網域查不到；<code>ECONNRESET</code> 是連線被對方重設（例如對方來不及接，作業系統直接拒絕）；<code>UND_ERR_SOCKET</code>（other side closed）是對方在回應途中關掉連線；<code>UND_ERR_HEADERS_TIMEOUT</code> 是 undici 自己的 300 秒逾時到了，代表你沒設逾時。</li>
+  <li><strong>先排除你自己</strong>：用 <code>curl -i</code> 從同一台機器打上游（<a href="12-http-protocol.html">第 12 課</a>），curl 也失敗就是網路或對方的問題。</li>
+  <li><strong>呼叫越來越慢、最後卡住</strong>：檢查有沒有沒處理的 body，和有沒有 <code>Promise.all</code> 一次發幾百個請求。</li>
+  <li><strong>上游的人說你在攻擊他們</strong>：看重試有沒有 jitter 和上限、有沒有好幾層都在重試。</li>
+</ul>
+<p>開場的事故用這張清單回頭看：「連看菜單都變慢」是沒設逾時，請求一直累積；「供應商恢復後又被打掛」是重試沒有 jitter。兩個都補上，下一次供應商變慢時，你的 API 會在 1 秒內給客人一個明確的答案，供應商恢復時也不會被你的重送淹沒。</p>
+
+<h2>補充與查表</h2>
+<p>主線用不到、但查資料或讀別人的程式時會遇到的細節。</p>
+<h3>Node 的 fetch 與 undici 版本</h3>
+<p>Node 18 起不用任何旗標就有全域的 <code>fetch</code>（Node 21 起標為穩定）。Node 24.22.1 內建 undici 7.30.1（<code>node -p process.versions.undici</code> 可以看）；Node 26 改成 undici 8。本課提到的 <code>headersTimeout</code>、<code>bodyTimeout</code> 預設 300 秒，出處是 undici 7.30.1 的文件。</p>
+<h3>Retry-After 的兩種寫法</h3>
+<p><code>Retry-After</code> 常跟 503（RFC 9110）和 429（RFC 6585）一起出現。值可以是秒數（<code>Retry-After: 2</code>）或 HTTP 日期（<code>Retry-After: Fri, 31 Oct 2026 07:28:00 GMT</code>）。練習 2 只處理秒數。</p>
+<h3>限制同時數量的套件</h3>
+<p>正式專案可以用成熟的套件，例如 <code>p-limit</code>（限制同時執行數）。它只管「同時幾個」，fail fast 的取消一樣要自己把 signal 傳下去。</p>
+
+<h2>練習</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs node 17</code> 建立 <code>work/17/</code>。<code>errors.ts</code> 是上面表格的錯誤類別，不用改。測試會在本機開假上游，不連外部網路。三題依序做：練習 2、3 都會呼叫練習 1 的 <code>getStock</code>。</p>
+
+<div class="local" data-test="ex1" data-files="supplier.ts">
+  <p>練習 1：完成 <code>supplier.ts</code> 的 <code>getStock(baseUrl, productId, { signal, timeoutMs = 1000 })</code>：<code>GET {baseUrl}/stock/{productId}</code>，上游回 <code>{"productId":2,"stock":13}</code>，回傳 <code>{ productId, stock }</code>。要求：超過 <code>timeoutMs</code> 丟 <code>UpstreamTimeoutError</code>；非 2xx 時不讀 body，先 <code>await res.body?.cancel()</code> 再丟 <code>UpstreamHttpError(status, Retry-After 標頭的值)</code>；不是 JSON、或 <code>stock</code> 不是 ≥ 0 的整數，丟 <code>UpstreamBadResponseError</code>；連不上丟 <code>UpstreamUnavailableError</code>，用 <code>{ cause }</code> 保留 fetch 丟出的原始錯誤；逾時要真的取消 fetch（把 signal 傳給 fetch），不能只用 <code>Promise.race</code> 先丟錯；呼叫端的 <code>signal</code> 取消時立刻停，原樣丟出它的 reason（通常是 <code>AbortError</code>；呼叫端傳的若是 <code>AbortSignal.timeout</code> 就是 <code>TimeoutError</code>），不要包成 Upstream 錯誤。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="retry.ts">
+  <p>練習 2：完成 <code>retry.ts</code> 的 <code>withRetry(fn, { retries, baseMs, maxMs, deadlineMs, random })</code>：只重試 <code>UpstreamUnavailableError</code>、<code>UpstreamTimeoutError</code>，和 status 是 429、502、503、504 的 <code>UpstreamHttpError</code>，其他錯誤原樣丟出。第 n 次重試（n 從 0 開始）前等 <code>random() × min(maxMs, baseMs × 2^n)</code>；429 或 503 帶 <code>Retry-After</code>（秒數）時至少等那麼久。最多重試 <code>retries</code> 次；從第一次呼叫算起，等完會超過 <code>deadlineMs</code> 就不再等。放棄時丟出最後一次的錯誤。再用它完成 <code>getStockWithRetry(baseUrl, productId)</code>：<code>retries: 3</code>、<code>baseMs: 100</code>、<code>maxMs: 1000</code>、<code>deadlineMs: 5000</code>。測試會傳入固定的 <code>random</code>，並用假時鐘（node:test 的 <code>mock.timers</code>）量每次重試的間隔，所以時間用 <code>Date.now()</code> 算，等待寫成 <code>await new Promise(r =&gt; setTimeout(r, ms))</code>。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="check-all.ts">
+  <p>練習 3：完成 <code>check-all.ts</code> 的 <code>checkAllStock(baseUrl, ids, { concurrency = 5, signal })</code>，用 <code>getStock</code> 查每個 id：同時最多 <code>concurrency</code> 個請求（而且要真的用到那麼多個，做完一件就拿下一件，一個慢的請求不能卡住其他的）；任何一個失敗，就取消其他進行中的請求、不再發新的，reject 那個錯誤；外部 <code>signal</code> 取消時全部停下，reject <code>AbortError</code>；結果的順序和 <code>ids</code> 一樣。測試的假上游會記錄同時進行的請求數，和哪些連線在回應前被關掉。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 4：<code>const res = await fetch(url)</code>，上游回了 HTTP 500。接下來會怎樣？</p>
+  <label data-key="a"><code>await fetch</code> throw 一個錯誤，<code>catch</code> 會接到 status 500</label>
+  <label data-key="b">不會 throw，<code>res.ok</code> 是 <code>false</code>、<code>res.status</code> 是 500；要自己檢查，並讀完或取消 body</label>
+  <label data-key="c">Node 的 fetch 會自動重試 3 次，都失敗才 throw</label>
+  <p class="why">✓ fetch 只在拿不到回應時 throw（網路錯誤、逾時、取消）。有回應就是成功的 fetch，不管狀態碼是多少，所以要檢查 <code>res.ok</code>。檢查完不用 body 時，Node 裡還要 <code>await res.body?.cancel()</code>，連線才會釋放。fetch 不會自動重試，重試策略要你自己決定。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：正式環境的 log 只有一行 <code>TypeError: fetch failed</code>。怎麼知道是對方沒啟動、DNS 設錯，還是連線被切斷？</p>
+  <label data-key="a">沒辦法，fetch 不提供更多資訊，只能用 curl 一個一個試</label>
+  <label data-key="b">看 <code>err.message</code> 的後半段</label>
+  <label data-key="c">看 <code>err.cause</code>：裡面是真正的錯誤，<code>code</code> 會是 <code>ECONNREFUSED</code>、<code>ENOTFOUND</code>、<code>ECONNRESET</code> 等；所以 log 要把 cause 印出來</label>
+  <p class="why">✓ fetch 拿到回應之前的網路錯誤，訊息都是 <code>fetch failed</code>，原因放在 <code>cause</code>（連 localhost 時可能是包著 IPv6 和 IPv4 兩個錯誤的 AggregateError）。只記 <code>err.message</code> 的 log 就會遺失原因。curl 可以幫忙排除，但答案本來就在錯誤物件裡。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：呼叫金流的 <code>POST /charges</code> 逾時了。為什麼不能直接重送一次？</p>
+  <label data-key="a">逾時不代表對方沒處理，可能已經扣款、只是回應沒回來；POST 不冪等，重送可能扣兩次。要帶同一個 <code>Idempotency-Key</code> 重送，讓對方認出是同一筆</label>
+  <label data-key="b">因為 fetch 的 POST 不支援 signal，重送會一直卡住</label>
+  <label data-key="c">可以直接重送，HTTP 規定伺服器要自動忽略重複的 POST</label>
+  <p class="why">✓ 逾時是「不知道結果」：請求可能沒到，也可能處理完了。GET、PUT、DELETE 冪等，重送沒差；POST 每次都可能建立新的扣款。Idempotency-Key 讓伺服器記住第一次的結果，重送時直接回那份（<a href="14-rest-api-design.html">第 14 課</a>）。fetch 的任何方法都支援 signal；HTTP 沒有「自動忽略重複 POST」的規定。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>外部呼叫沒有逾時</strong>：undici 的預設是 300 秒，上游卡住你就跟著卡住。每個呼叫都用 <code>AbortSignal.timeout</code>，並和呼叫端的 signal 用 <code>AbortSignal.any</code> 合併。</li>
+  <li><strong>以為 4xx／5xx 會 throw</strong>：fetch 不會。檢查 <code>res.ok</code>，否則會把錯誤頁當成資料解析。</li>
+  <li><strong>沒讀也沒取消 body</strong>：連線回不了連線池，最後連線用光卡住。錯誤時 <code>await res.body?.cancel()</code>，只要標頭就用 HEAD。</li>
+  <li><strong>重試不冪等的請求</strong>：POST 重送可能重複下單、重複扣款。只重試冪等方法，POST 要帶 Idempotency-Key。</li>
+  <li><strong>什麼錯誤都重試</strong>：400、404 再試也一樣。只重試網路錯誤、逾時、429、502、503、504。</li>
+  <li><strong>重試沒有 jitter、沒有上限</strong>：所有客戶端同時重試，把剛恢復的上游再打掛。用 full jitter，限制次數和截止時間，只在一層重試。</li>
+  <li><strong><code>Promise.all</code> 沒有上限</strong>：一次幾百個請求，上游限流或拒絕連線。用 worker 限制同時數量。</li>
+  <li><strong>一個失敗了，其他請求還繼續跑</strong>：結果已經確定要報錯，用 AbortController 取消其他的。</li>
+  <li><strong>把上游錯誤原樣回給客戶端</strong>：上游的 401 會被誤會成使用者沒登入，錯誤內容可能洩漏內部資訊。轉成自己的錯誤類別，對外回自己的格式。</li>
+  <li><strong>log 沒有印 cause</strong>：只剩 <code>fetch failed</code>，查不出原因。log 整個錯誤物件，或至少印 <code>err.cause</code>。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>Node 的 fetch 跟瀏覽器用法一樣，背後是 undici 和它的連線池。HTTP 錯誤不會 throw，要看 <code>res.ok</code>；網路錯誤是 <code>TypeError: fetch failed</code>，原因在 <code>err.cause</code>。</li>
+  <li>每個外部呼叫都要有逾時：<code>AbortSignal.any([AbortSignal.timeout(ms), 呼叫端的 signal])</code>，signal 也管讀 body 的時間。分清楚逾時和呼叫端取消。</li>
+  <li>body 一定要讀完或 <code>cancel()</code>，不然連線不會釋放。</li>
+  <li>只重試暫時性的失敗和冪等的請求；等待用指數退避加 full jitter，尊重 Retry-After，同時限制次數和截止時間。</li>
+  <li>同時發出的請求要有上限；一個失敗就取消其他的（fail fast），或用 allSettled 收集全部，看需求選。</li>
+  <li>上游的回應要驗證，上游的錯誤轉成自己的錯誤類別，不原樣回給客戶端。</li>
+  <li>出事時從症狀回推：只有 <code>fetch failed</code> 就看 <code>cause</code>；越來越慢看 body 和併發；被說在攻擊對方就看重試。</li>
+</ul>
+<p>下一課把錯誤處理擴大到整個服務：錯誤該在哪一層接、怎麼在 HTTP 邊界統一轉成回應、為什麼 log 只記一次，以及沒人接住的錯誤為什麼會讓整個程序結束。</p>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 8 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：<code>POST /orders</code> 這樣擋大請求，<code>LIMIT</code> 是 10240 位元組。哪裡會出事？</p>
+<pre>if (Number(req.headers['content-length']) &gt; LIMIT) {
+  return sendJson(res, 413, { error: 'PAYLOAD_TOO_LARGE' })
+}
+const chunks = []
+for await (const chunk of req) chunks.push(chunk)
+const data = parseJson(Buffer.concat(chunks))   // 壞 JSON 回 400</pre>
+  <label data-key="a">Content-Length 算的是字元數，中文多的訂單會被誤判成超過上限</label>
+  <label data-key="b">chunked 請求沒有 Content-Length，判斷不成立，多大的 body 都收進記憶體</label>
+  <label data-key="c">chunk 可能切在中文字中間，要每段先轉成字串再串接才不會亂碼</label>
+  <label data-key="d"><code>for await</code> 要等整個 body 收完才進迴圈，上限檢查來不及生效</label>
+  <p class="why">✓ 標頭是客戶端說的，chunked 請求根本沒有 Content-Length（<code>NaN &gt; LIMIT</code> 是 false），也可能謊報。要在迴圈裡邊讀邊累計位元組數，一超過就回 413。a 錯在 Content-Length 本來就是位元組數，這段的單位沒問題。（第 13 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 8：一位客人送了壞掉的 JSON，同一時間其他正在結帳的客人也全部收到 Empty reply。處理函式是 <code>async</code>，裡面直接 <code>JSON.parse</code>，沒有 try/catch。為什麼會波及別人？</p>
+  <label data-key="a">Node 是單執行緒，<code>JSON.parse</code> 出錯時卡住 event loop，其他請求等到逾時</label>
+  <label data-key="b">壞掉的 body 讓 keep-alive 連線的解析錯位，同一條連線上的請求都讀錯</label>
+  <label data-key="c"><code>node:http</code> 不會把錯誤轉成 500，throw 變成未處理的 rejection，整個程序結束</label>
+  <p class="why">✓ async 處理函式裡的 throw 變成 rejected Promise，沒人處理，Node 預設讓程序結束，所有進行中的連線一起斷掉。修法是最外層包一層錯誤處理，任何錯誤都轉成固定的 500，完整錯誤寫進 log。a 錯在 <code>JSON.parse</code> 失敗是立刻丟錯，不會卡住；Empty reply 是因為程序已經不在了。（第 13 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 9：顧客想取消一張已經取餐的訂單，前端送出 <code>PATCH /orders/42</code>，body 是 <code>{"status":"cancelled"}</code>。API 該回什麼？</p>
+  <label data-key="a">400：這個請求不合法，客戶端要改內容再送</label>
+  <label data-key="b">412：訂單的狀態和客戶端以為的不一樣</label>
+  <label data-key="c">200：body 裡寫 <code>success: false</code> 和原因</label>
+  <label data-key="d">409：和訂單目前的狀態衝突，detail 寫出兩個狀態</label>
+  <p class="why">✓ 請求本身沒錯，<code>cancelled</code> 是認得的狀態，換一張還沒做的訂單就能成功；衝突來自資源目前的狀態，所以是 409，<code>detail</code> 寫出目前與要求的狀態，前端才知道怎麼提示。a 錯在 400 是請求本身錯，這裡客戶端怎麼改內容都不會成功。（第 14 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 10：訂單列表的「載入更多」把上一頁最後一筆的 <code>createdAt</code> 當 cursor，下一頁取比它早的 10 筆。尖峰時段客服反映有些訂單在列表裡怎麼翻都找不到，為什麼？</p>
+  <label data-key="a">同一時間建立的訂單剛好跨頁時，還沒顯示的那幾筆不比 cursor 早，被跳過</label>
+  <label data-key="b">翻頁之間進來的新訂單把舊訂單往後擠，被擠過頁界的那幾筆就漏掉了</label>
+  <label data-key="c">每頁只拿 10 筆、沒有多拿一筆，最後一頁的訂單會被當成沒有下一頁</label>
+  <p class="why">✓ 尖峰時很多訂單同一時間建立，只用時間當 cursor 就分不出同時間的先後。排序要以唯一欄位收尾：依 <code>(createdAt, id)</code> 排序，cursor 也帶 <code>id</code>。b 是 offset 分頁的問題，cursor 從上一頁最後一筆之後接著讀，新資料不會讓它錯位。（第 14 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 11：<code>POST /orders</code> 這樣支援 <code>Idempotency-Key</code>。客人連按兩下，同一個 key 的兩個請求幾乎同時到，哪裡會出事？</p>
+<pre>const saved = keys.get(key)
+if (saved) return replay(res, saved)
+const order = await store.create(input)
+keys.set(key, { status: 201, body: order })
+return sendJson(res, 201, order)</pre>
+  <label data-key="a"><code>Map</code> 不是執行緒安全的，兩個請求同時 <code>set</code> 會讓資料壞掉</label>
+  <label data-key="b">兩個請求都在 <code>await</code> 之前查過 key，都以為自己是第一個，建了兩筆</label>
+  <label data-key="c"><code>store.create</code> 失敗時 key 沒有放掉，客戶端之後不能用同一個 key 重試</label>
+  <p class="why">✓ 第一個請求在 <code>await</code> 讓出執行權時還沒存 key，第二個請求查不到，也去建立。查到沒有就立刻存一筆「處理中」佔住，中間不能有 <code>await</code>；處理中又收到同一個 key 回 409，建立失敗時放掉 key。a 錯在 Node 單執行緒，同步的幾行不會被插隊，問題出在 <code>await</code>。（第 14 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 12：兩位店長同時打開後台編輯拿鐵，一位漲價、一位改名，各自用 <code>PUT</code> 存檔，最後漲價不見了，也沒有人看到錯誤。API 該怎麼做？</p>
+  <label data-key="a">把讀取品項和寫入品項包在同一個資料庫交易裡</label>
+  <label data-key="b">編輯頁的 GET 加上 <code>Cache-Control: no-store</code>，確保拿到最新資料</label>
+  <label data-key="c">PUT 要求帶讀到的 ETag 放在 <code>If-Match</code>，不符就回 412</label>
+  <p class="why">✓ 這是 HTTP 層的 lost update，用樂觀鎖：比對 <code>If-Match</code> 和目前的 ETag，相符才改並回新 ETag，不符回 412、沒帶回 428；前端收到 412 就重新載入，讓店長決定要不要再送。a 錯在讀和寫是兩個分開的 HTTP 請求，中間隔了好幾分鐘，資料庫交易包不住。（第 15 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 13：匯出 50 萬筆訂單的 CSV 這樣寫，客戶端網路一慢，伺服器的記憶體就多出好幾百 MB。為什麼？</p>
+<pre>for await (const order of listOrders()) res.write(toCsvLine(order))
+res.end()</pre>
+  <label data-key="a">沒理會 <code>write()</code> 回傳的 <code>false</code>，送不出去的資料堆在記憶體，迴圈照樣一直拉</label>
+  <label data-key="b"><code>for await</code> 會先把 <code>listOrders()</code> 的所有訂單讀進陣列，才開始跑迴圈</label>
+  <label data-key="c">highWaterMark 設得太小，緩衝區一直溢出，Node 只好另外配置記憶體</label>
+  <p class="why">✓ 下游比上游慢時要背壓：<code>write()</code> 回傳 <code>false</code> 就等 <code>'drain'</code>。實務上用 <code>pipeline</code>，它同時處理背壓和錯誤，客戶端斷線時也不會卡住。b 錯在 async generator 是一次拉一筆，問題是迴圈從來不等客戶端。（第 16 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 14：咖啡店的服務會向供應商查庫存（GET），也會建立出貨單（POST，對方不支援 Idempotency-Key）。哪一種自動重試的規則對？</p>
+  <label data-key="a">逾時和所有 5xx 都重試，建立出貨單的 POST 也照樣重送</label>
+  <label data-key="b">查庫存回 404 也重試一次，供應商的資料可能還沒同步</label>
+  <label data-key="c">逾時一律不重試，對方可能已經處理過，重送就會重複</label>
+  <label data-key="d">查庫存遇到逾時或 503 重試；建立出貨單逾時不自動重送</label>
+  <p class="why">✓ 只重試暫時性的失敗和冪等的請求，等待用指數退避加 full jitter，並限制次數和截止時間。逾時代表「不知道結果」：GET 重送沒差，POST 重送可能建出兩張出貨單，要改用對方的查詢 API 確認有沒有成立。a 錯在逾時不代表對方沒處理，重送等於賭對方沒收到。（第 17 課）</p>
+</div>
+
+<p>這個階段的重點整理成<a href="../sheets/stage-4.html">一頁圖解</a>。</p>
+<p>下一課整理錯誤處理的全貌：哪些錯誤該接、該轉換、該讓程序結束，以及錯誤怎麼一路變成給客戶端的回應。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

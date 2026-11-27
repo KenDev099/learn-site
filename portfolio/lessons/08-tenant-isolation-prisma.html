@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>8. 租戶隔離（一）：上下文與 Prisma extension</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="8" data-practice="nestjs" data-task="pf08">
+<header>
+  <div class="eyebrow">階段 B1：多租戶 SaaS 的平台地基 · 第 8 課</div>
+  <h1>租戶隔離（一）：上下文與 Prisma extension</h1>
+</header>
+<main>
+
+<p>第 6 課的 ADR 選了「所有租戶共用資料表，每一列用 <code>tenant_id</code> 標記屬於誰」。ADR 的「後果」一欄寫著這個選擇的代價：只要有一個查詢漏了 <code>tenant_id</code> 條件，A 公司就看得到 B 公司的資料。這一課要把這個代價處理掉。</p>
+<p>情境是這樣：A 公司的使用者打開自己的一個專案，網址是 <code>/api/v1/projects/&lt;A 的 id&gt;</code>。他把網址上的 id 換成 B 公司某個專案的 id 再送一次。如果 service 寫的是 <code>findUnique({ where: { id } })</code>，資料庫會照實把 B 的專案交出來。這課的任務是做出示範模組 <code>projects</code> 的五個端點，讓這種請求一律得到 404，而且<strong>業務程式裡一個 <code>tenantId</code> 都不用寫</strong>：條件由資料存取層自動加上，就沒有「這次忘了寫」這回事。做完你也會清楚知道這道防線擋不到哪些地方，那是第 9 課要用 PostgreSQL RLS 補的洞。</p>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../auth/lessons/20-multi-tenancy.html">auth 課第 20 課</a>的「讓忘了加 tenant_id 變成不可能」：把租戶條件收進資料存取層，業務程式碰不到。</li>
+  <li><a href="../../auth/lessons/19-object-level-authz.html">auth 課第 19 課</a>的 BOLA：改網址上的 id 就讀到別人的資料；條件要加在查詢裡，查不到就回 404。</li>
+  <li><a href="../../nestjs/lessons/24-observability-shutdown.html">NestJS 課第 24 課</a>的 <code>AsyncLocalStorage</code>：同一個請求裡任何地方都讀得到的情境。</li>
+  <li><a href="../../nestjs/lessons/14-prisma-crud-relations.html">NestJS 課第 14 課</a>的 Prisma CRUD：<code>findUnique</code>、<code>updateMany</code> 回傳 <code>count</code>、關聯與外鍵。</li>
+</ul></div>
+
+<p>這課的路線：</p>
+<ul>
+  <li>為什麼不能靠每個查詢記得加 <code>tenantId</code>：問題出在哪，最小的解法是什麼。</li>
+  <li>資料存取層怎麼知道現在是哪個租戶：<code>AsyncLocalStorage</code> 的請求上下文，讀不到就失敗；接著用 Prisma client extension 讓每個查詢自動加條件。</li>
+  <li>業務程式怎麼拿到擴充過的 client：包成 <code>TenantDb</code> 注入。</li>
+  <li>projects 模組與翻頁：別人的 id 一律 404、body 送來的 <code>tenantId</code> 不採用、游標不洩漏。</li>
+  <li>寫入的參照與剩下的洞：複合外鍵、擴充管不到的地方、套到你的業務模組。</li>
+</ul>
+
+<h2>為什麼不能靠每個查詢記得加 <code>tenantId</code>？</h2>
+<p>先看沒有任何防線時，service 會怎麼寫。這是第一次寫 CRUD 時最自然的樣子：</p>
+<pre>// 錯誤寫法：條件全靠寫的人記得
+async list(tenantId: string) {
+  return this.prisma.project.findMany({ where: { tenantId } })   // 這裡記得了
+}
+
+async get(id: string) {
+  return this.prisma.project.findUnique({ where: { id } })        // 這裡忘了
+}</pre>
+<p>列表記得加 <code>tenantId</code>，單筆查詢卻沒加。單筆查詢的直覺是「id 是唯一的，用 id 查就對了」，但唯一只代表整個資料表只有一列是這個 id，不代表那一列屬於這個請求的租戶。A 公司的使用者送 B 的 id 進來，這段程式就把 B 的專案回給他。這就是 auth 課第 19 課的 BOLA。</p>
+<p>這種錯為什麼一定會發生？一個 SaaS 的業務程式會有幾十個 service、上百個查詢，每一個都要寫對；每次改程式、每個新同事加的查詢也都要寫對。只要靠「每個人每次都記得」，漏掉只是時間問題。更麻煩的是漏掉時沒有任何錯誤訊息：開發時通常只有一個測試租戶，看到的都是自己的資料，本來就該看得到，所以測試也測不出來。</p>
+<p>所以解法的方向是把條件從業務程式拿走，收進一個所有查詢都必經的地方：資料存取層在查詢送出前，自動加上「目前這個請求的租戶」。業務程式寫 <code>findUnique({ where: { id } })</code>，真正送到資料庫的是 <code>findUnique({ where: { id, tenantId: 'A' } })</code>，B 的 id 查到 null，回 404。這就是這課的最小答案，後面每一節都是在把它做完整。</p>
+<p>要做到它需要兩樣東西。第一，資料存取層要知道「目前這個請求是哪個租戶」，而且不能靠業務程式一層層傳參數進來，否則又回到要人記得。第二，要有辦法攔下每一個 Prisma 查詢、改寫它的條件。下一節先解決第一件。</p>
+
+<h2>資料存取層怎麼知道現在是哪個租戶？</h2>
+<p>租戶的來源第 7 課就定好了：登入後拿到的 access token 裡有 <code>tid</code>，guard 驗過簽章才相信它。問題是 guard 在請求的最前面，查詢在最裡面，中間隔著 controller、service 好幾層。最直接的做法是每個函式都多一個 <code>tenantId</code> 參數一路傳下去，但這只是把「要記得加條件」換成「要記得傳參數」，一樣會漏。</p>
+<p>Node.js 內建的 <code>AsyncLocalStorage</code> 解決的就是這件事。它像一個跟著請求走的抽屜：呼叫 <code>run(store, fn)</code> 時，在 <code>fn</code> 裡執行的程式，以及從它延伸出去的所有非同步工作（<code>await</code> 之後的程式、它呼叫的函式），都讀得到同一個 store；同時進來的另一個請求在自己的 <code>run</code> 裡，拿到的是另一個 store，兩者互相看不到。用 Vue 來比，有點像 <code>provide</code>／<code>inject</code>：上層放進去，下層任何一層直接取用，不經過中間的 props；差別是它的範圍是一次請求的非同步呼叫鏈，而不是元件樹。</p>
+<p>這個專案已經有它了。第 6 課的中介軟體為每個請求開一個 store（裡面先只有 <code>requestId</code>），包在 <code>RequestContext</code> 這個 provider 裡；第 7 課的 guard 驗完 token 後，把 <code>sub</code>、<code>tid</code> 寫進同一個 store：</p>
+<pre>// src/tenancy/access.guard.ts（節錄）
+const store = this.ctx.store!
+store.userId = payload.sub
+store.tenantId = payload.tid   // 只從驗過簽章的 token 來，不看 header、body、query</pre>
+<p>註解那一句是整個隔離的根：header、body、query 都是使用者能任意改的，前端送一個「我現在是 B 公司」不能算數。要換租戶，得拿一張新的 token（第 10 課的 <code>switch-tenant</code>）。</p>
+<p>之後在這個請求裡，任何 service、甚至資料庫擴充，都能用 <code>RequestContext</code> 的 <code>ctx.tenantId</code> 讀到它，不用一層層傳參數。整條路的順序是：中介軟體（開 store）→ guard（填租戶）→ controller → service → 資料庫擴充（讀租戶）：</p>
+<figure>
+  <svg viewBox="0 0 700 270" role="img" aria-label="一個請求依序經過中介軟體、guard、controller、service、TenantDb 擴充，到 PostgreSQL。中介軟體建立這個請求專屬的 store，guard 把 tenantId 寫進去，擴充從同一個 store 讀出 tenantId 加進查詢條件。同時進來的請求 B 有自己的 store，互不干擾。">
+    <defs><marker id="als" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="var(--muted)"/></marker></defs>
+    <rect x="10" y="20" width="100" height="44" rx="4" class="d-box"/><text x="60" y="47" text-anchor="middle" class="d-text">中介軟體</text>
+    <rect x="126" y="20" width="100" height="44" rx="4" class="d-box"/><text x="176" y="47" text-anchor="middle" class="d-text">guard</text>
+    <rect x="242" y="20" width="100" height="44" rx="4" class="d-box"/><text x="292" y="47" text-anchor="middle" class="d-text">controller</text>
+    <rect x="358" y="20" width="100" height="44" rx="4" class="d-box"/><text x="408" y="47" text-anchor="middle" class="d-text">service</text>
+    <rect x="474" y="20" width="100" height="44" rx="4" class="d-box"/><text x="524" y="47" text-anchor="middle" class="d-text">TenantDb 擴充</text>
+    <rect x="590" y="20" width="100" height="44" rx="4" class="d-box"/><text x="640" y="47" text-anchor="middle" class="d-text">PostgreSQL</text>
+    <line x1="110" y1="42" x2="124" y2="42" class="d-line" marker-end="url(#als)"/>
+    <line x1="226" y1="42" x2="240" y2="42" class="d-line" marker-end="url(#als)"/>
+    <line x1="342" y1="42" x2="356" y2="42" class="d-line" marker-end="url(#als)"/>
+    <line x1="458" y1="42" x2="472" y2="42" class="d-line" marker-end="url(#als)"/>
+    <line x1="574" y1="42" x2="588" y2="42" class="d-line" marker-end="url(#als)"/>
+    <rect x="10" y="96" width="564" height="40" rx="4" class="d-soft"/>
+    <text x="292" y="121" text-anchor="middle" class="d-text">請求 A 的 store：{ requestId, userId, tenantId: A }</text>
+    <line x1="60" y1="64" x2="60" y2="94" class="d-line" marker-end="url(#als)"/>
+    <line x1="176" y1="64" x2="176" y2="94" class="d-line" marker-end="url(#als)"/>
+    <line x1="524" y1="96" x2="524" y2="66" class="d-line" marker-end="url(#als)"/>
+    <text x="60" y="156" text-anchor="middle" class="d-small">run() 建立</text>
+    <text x="176" y="156" text-anchor="middle" class="d-small">寫入 userId、tenantId</text>
+    <text x="350" y="156" text-anchor="middle" class="d-small">不用傳 tenantId</text>
+    <text x="524" y="156" text-anchor="middle" class="d-small">讀出 tenantId</text>
+    <text x="690" y="86" text-anchor="end" class="d-small">條件含 tenant_id = A</text>
+    <rect x="10" y="186" width="564" height="40" rx="4" class="d-soft"/>
+    <text x="292" y="211" text-anchor="middle" class="d-text">同時進來的請求 B：自己的 store { …, tenantId: B }</text>
+    <text x="10" y="254" class="d-accent">每個請求在 run() 裡跑的程式（包括 await 之後）只讀得到自己的 store</text>
+  </svg>
+  <figcaption>租戶只寫入一次（guard），只在一個地方讀出來（擴充）；中間的 controller、service 不經手。</figcaption>
+</figure>
+<p>讀的那一端還要決定一件事：讀不到租戶時怎麼辦？這會發生在沒經過 guard 填租戶的地方，例如標了 <code>@Public()</code> 的註冊、登入路由，或是第 13 課的背景 worker（它不是 HTTP 請求，沒有中介軟體幫它開 store，要自己呼叫 <code>ctx.run</code>）。如果讀不到時把租戶條件當成「沒有」照樣查，<code>where: { id }</code> 就變回沒有租戶條件的查詢，查到的是所有租戶的資料。一個用來防洩漏的機制，在出錯時反而全部放行。</p>
+<p>worker 自己呼叫 <code>ctx.run</code> 時有一個陷阱。Prisma 的 <code>findMany()</code> 這類呼叫只是建立查詢，回傳的 PrismaPromise 是 lazy 的：要等 <code>await</code>（或 <code>.then</code>）時才真的執行，擴充也是在那時才讀 <code>ctx.tenantId</code>。所以 <code>ctx.run</code> 的 callback 要寫成 <code>async</code>，在裡面 <code>await</code> 查詢；如果 callback 只是把 promise 回傳出去、在 <code>run</code> 外面才 <code>await</code>，執行時已經離開上下文，讀不到租戶。NestJS 的 HTTP 請求不會遇到，因為 handler 整段都在中介軟體開的上下文裡 <code>await</code>。</p>
+<p>所以讀的那一端要 <strong>fail closed</strong>。這個詞的意思是：出錯時選擇「關上」，也就是拒絕執行，而不是「打開」放行。讀不到租戶就直接丟錯：</p>
+<pre>// src/prisma/tenant-db.ts
+function currentTenant(ctx: RequestContext) {
+  const t = ctx.tenantId
+  if (!t) throw new Error('沒有租戶上下文：這個操作要在登入後的請求或 worker 的 ctx.run 裡面')
+  return t
+}</pre>
+<p>丟的是一般的 <code>Error</code>，所以使用者看到 500。這是刻意的：4xx 代表使用者送錯了什麼，這裡不是；這是程式在不該查租戶資料的地方查了，要修的是程式，500 會讓它出現在錯誤紀錄裡被你發現。</p>
+<p>到這裡，資料存取層有了可靠的租戶來源，也知道讀不到時怎麼辦。下一步是讓 Prisma 在每個查詢送出前讀它、加進條件。</p>
+
+<h2>怎麼讓 Prisma 自動替每個查詢加條件？</h2>
+<p>Prisma 提供的掛勾叫 client extension。呼叫 <code>prisma.$extends({ … })</code> 會回傳一個<strong>新的</strong> client，原本的 client 不受影響；新 client 多了什麼行為，由你傳進去的元件決定。這課用的是 <code>query</code> 元件：它讓你在 Prisma 把查詢送到資料庫之前，插一段自己的程式。</p>
+<p>寫在 <code>query.$allModels.$allOperations</code> 底下的函式，會在任何 model 的任何操作執行前被呼叫，拿到四樣東西：</p>
+<ul>
+  <li><code>model</code>：哪個 model，例如 <code>'Project'</code>。</li>
+  <li><code>operation</code>：哪種操作，例如 <code>'findUnique'</code>、<code>'create'</code>。</li>
+  <li><code>args</code>：service 傳進來的參數，也就是 <code>{ where, data, take, … }</code> 那個物件。</li>
+  <li><code>query</code>：真正送出查詢的函式。呼叫 <code>query(args)</code> 才會執行，而傳進去的 <code>args</code> 可以是你改過的。</li>
+</ul>
+<p>所以整個做法是：判斷這個 model 是不是屬於租戶的；是的話，依操作種類把 <code>tenantId</code> 放進 <code>where</code> 或 <code>data</code>，再交給 <code>query</code>。參考實作的 <code>scoped()</code>：</p>
+<pre>// src/prisma/tenant-db.ts
+const SCOPED = new Set(['Project', 'Tag', 'File', 'Export', 'AuditLog', 'Invitation'])
+const READS = new Set(['findMany', 'findFirst', 'findFirstOrThrow', 'findUnique', 'findUniqueOrThrow', 'count', 'aggregate', 'groupBy',
+  'update', 'updateMany', 'updateManyAndReturn', 'delete', 'deleteMany', 'upsert'])
+const CREATES = new Set(['create', 'createMany', 'createManyAndReturn'])
+
+function scoped(base: PrismaService, ctx: RequestContext) {
+  return base.$extends({
+    query: {
+      $allModels: {
+        async $allOperations({ model, operation, args, query }) {
+          if (!SCOPED.has(model)) return query(args)
+          const tenantId = currentTenant(ctx)
+          const a = (args ?? {}) as Record&lt;string, any&gt;
+          if (READS.has(operation)) a.where = { ...a.where, tenantId }
+          if (CREATES.has(operation)) a.data = Array.isArray(a.data) ? a.data.map((d: object) =&gt; ({ ...d, tenantId })) : { ...a.data, tenantId }
+          if (operation === 'upsert') a.create = { ...a.create, tenantId }
+          return query(a as typeof args)
+        },
+      },
+    },
+  })
+}</pre>
+<p>先用 A 公司的請求看它對幾個查詢做了什麼。第二列就是開場的情境：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>service 寫的</th><th>擴充改寫後真的送出的</th></tr></thead>
+  <tbody>
+    <tr><td><code>project.findMany({ take: 20 })</code></td><td><code>project.findMany({ take: 20, where: { tenantId: 'A' } })</code></td></tr>
+    <tr><td><code>project.findUnique({ where: { id } })</code></td><td><code>project.findUnique({ where: { id, tenantId: 'A' } })</code>：B 的 id 查到 null</td></tr>
+    <tr><td><code>project.create({ data: { name, tenantId: 'B' } })</code></td><td><code>project.create({ data: { name, tenantId: 'A' } })</code>：被覆寫</td></tr>
+    <tr><td><code>user.findUnique({ where: { email } })</code></td><td>不變：<code>User</code> 不在 <code>SCOPED</code></td></tr>
+  </tbody>
+</table></div>
+<p>程式裡每一段都是一個決定，逐一看為什麼這樣寫：</p>
+<ul>
+  <li><strong><code>SCOPED</code>：只有屬於租戶的 model 要加條件。</strong><code>User</code>、<code>Tenant</code> 是全域的，不屬於任何一個租戶。<code>Membership</code> 也不在裡面：登入時要用「這個人自己的」條件查他屬於哪些租戶，那時還沒有租戶上下文，加了條件反而查不到。成員模組的查詢會自己明寫 <code>tenantId</code>，第 9 課的 RLS 再擋一次。新增一個業務 model 時，第一件事就是把它加進這個集合。</li>
+  <li><strong><code>READS</code> 包含 update 與 delete。</strong>名字叫 READS，是因為它收的是「有 <code>where</code> 的操作」，而改和刪也靠 <code>where</code> 找到要動的列。只想到「讀」的話，A 公司改網址上的 id 就能改掉 B 的資料，而且是改完才回 404。</li>
+  <li><strong><code>findUnique</code> 也要加。</strong>這是最常漏的一個，理由就是第一節那個直覺：「用 id 查，id 是唯一的，不用加條件」。擴充直接在它的 <code>where</code> 加 <code>tenantId</code>，這依賴 Prisma 允許 <code>findUnique</code> 在唯一欄位之外再加一般欄位；版本與替代寫法見課末。</li>
+  <li><strong>建立時覆寫，不是補上。</strong><code>{ ...a.data, tenantId }</code> 把 <code>tenantId</code> 放在後面，後面的屬性會蓋掉前面同名的，所以程式（或被塞進來的 body）傳了別的值也會被換成目前的租戶，就是表格第三列。寫成 <code>{ tenantId, ...a.data }</code> 的意思變成「沒給才補」，等於把決定權交給了呼叫的人。</li>
+</ul>
+<p>擴充寫好了，但它現在只是一個函式 <code>scoped(base, ctx)</code>，回傳一個新的 client。業務程式要怎麼拿到這個 client？下一節把它接進 NestJS 的依賴注入。</p>
+
+<h2>業務程式怎麼拿到擴充過的 client？</h2>
+<p>NestJS 的 service 都是靠依賴注入拿到別的物件：在 constructor 宣告需要的型別，容器就把實例送進來。理想上，業務程式寫 <code>constructor(private db: 某個型別)</code> 就拿到擴充過的 client。麻煩在於 <code>$extends</code> 回傳的是一個新的物件，型別跟 <code>PrismaClient</code> 不同，也沒有對應的 class，不能直接拿來當 provider。</p>
+<p>參考實作的做法是自己寫一個 class 把它包起來。<code>TenantDb</code> 是 <code>@Injectable()</code>，在 constructor 呼叫 <code>scoped()</code>，把結果放在 <code>client</code> 屬性上。擴充過的 client 型別不用手寫，用 <code>ReturnType&lt;typeof scoped&gt;</code> 從函式的回傳值推出來：</p>
+<pre>// src/prisma/tenant-db.ts（第 8 課的版本）
+export type ScopedClient = ReturnType&lt;typeof scoped&gt;
+export type Tx = Parameters&lt;Parameters&lt;ScopedClient['$transaction']&gt;[0]&gt;[0]
+
+@Injectable()
+export class TenantDb {
+  readonly client: ScopedClient
+
+  constructor(base: PrismaService, private readonly ctx: RequestContext) {
+    this.client = scoped(base, ctx)
+  }
+
+  // 好幾個操作要一起成功或失敗時用；tx 也是擴充過的，裡面的操作一樣自動加條件
+  tx&lt;T&gt;(fn: (tx: Tx) =&gt; Promise&lt;T&gt;): Promise&lt;T&gt; {
+    return this.client.$transaction(fn)
+  }
+}
+
+// src/prisma/prisma.module.ts
+@Global()
+@Module({ providers: [PrismaService, TenantDb], exports: [PrismaService, TenantDb] })
+export class PrismaModule {}</pre>
+<p>這裡有個容易卡住的地方。<code>TenantDb</code> 是 <code>@Injectable()</code>，NestJS 預設整個應用程式只建一個實例，所以 constructor 只跑一次，<code>scoped(base, ctx)</code> 也只呼叫一次。那這唯一的 client 怎麼知道每個請求各自的租戶？答案是建 client 時根本沒有讀租戶。<code>currentTenant(ctx)</code> 寫在 <code>$allOperations</code> 裡面，每次有查詢進來才呼叫；<code>ctx.tenantId</code> 背後是 <code>AsyncLocalStorage</code> 的 <code>getStore()</code>，回傳的是「當下這段程式所屬請求」的 store。所以同一個 client 物件可以同時服務 A、B 兩個請求，A 的查詢讀到 A，B 的查詢讀到 B，就是上一節圖裡「每個請求只讀得到自己的 store」。</p>
+<p><code>tx()</code> 給「好幾個操作要一起成功或一起失敗」時用。交易是從擴充過的 client 開出來的，所以 callback 拿到的 <code>tx</code> 一樣會自動加條件；它的型別 <code>Tx</code> 也是從 <code>$transaction</code> 的參數推出來的，不用手寫。</p>
+<p>原本的 <code>PrismaService</code>（<code>extends PrismaClient</code>）留著當底層的 client，只有 <code>TenantDb</code> 與健康檢查直接用它；業務程式一律注入 <code>TenantDb</code>。<code>PrismaModule</code> 標了 <code>@Global()</code>，各業務模組不用自己 import 它就能注入。因為所有業務查詢都經過這個 class，第 9 課在 <code>TenantDb</code> 裡再加一層（RLS 的 <code>set_config</code>）時，業務程式一行都不用改。另一種常見寫法是 factory provider 加 injection token，比較放在課末。</p>
+
+<div class="callout practice"><strong>💡 實務上：讓錯的寫法很難寫出來</strong><br>工作上的團隊會有新人、會趕時間，「記得加 tenantId」靠的是每個人每次都記得。把條件收進 <code>TenantDb</code> 之後，業務程式的預設就是安全的；要繞過得刻意注入 <code>PrismaService</code>，code review 一眼看得到。很多團隊再加一條架構測試（NestJS 第 26 課）：<code>src/</code> 底下除了 <code>prisma/</code> 與 <code>health/</code>，任何檔案 import <code>PrismaService</code> 都讓 CI 失敗。</div>
+
+<h2>projects 模組：拿別人的 id 來會得到什麼？</h2>
+<p>注入方式定好了，現在寫示範模組。跟第一節的錯誤寫法對照，重點是 service 裡<strong>一個 <code>tenantId</code> 都沒有</strong>：</p>
+<pre>// src/projects/projects.service.ts（第 8 課用到的部分）
+@Injectable()
+export class ProjectsService {
+  constructor(private readonly db: TenantDb, private readonly ctx: RequestContext) {}
+
+  async list(cursor?: string, limit = PAGE) {
+    const rows = await this.db.client.project.findMany({
+      where: after(decodeCursor(cursor), 'asc'), orderBy: [{ createdAt: 'asc' }, { id: 'asc' }], take: limit + 1,
+    })
+    return page(rows, limit, projectView)
+  }
+
+  async get(id: string) {
+    const p = await this.db.client.project.findUnique({ where: { id } })
+    if (!p) throw notFound()   // 別的租戶的也是 404：不告訴對方「這個 id 存在」
+    return projectView(p)
+  }
+
+  async update(id: string, dto: UpdateProjectDto) {
+    return this.db.tx(async tx =&gt; {
+      const { count } = await tx.project.updateMany({ where: { id }, data: { name: dto.name, description: dto.description } })
+      if (!count) throw notFound()
+      return projectView(await tx.project.findUniqueOrThrow({ where: { id } }))
+    })
+  }
+
+  async remove(id: string) {
+    const { count } = await this.db.client.project.deleteMany({ where: { id } })
+    if (!count) throw notFound()
+  }
+}</pre>
+<p>參考實作的 <code>create</code>、<code>update</code>、<code>remove</code> 還多了稽核（第 11 課）與方案上限（第 14 課），結構一樣。</p>
+<p>回到開場：A 公司的使用者送 <code>GET /api/v1/projects/&lt;B 的 id&gt;</code>。<code>get()</code> 寫的是 <code>findUnique({ where: { id } })</code>，擴充把它改成 <code>{ id, tenantId: 'A' }</code>，資料庫找不到符合的列，回 null，service 丟 404。改和刪也一樣：<code>updateMany</code>、<code>deleteMany</code> 的條件經過同一個擴充，<code>count</code> 是 0，B 的資料一列都沒動。這段程式背後有三個決定，分開講清楚。</p>
+
+<h3>為什麼回 404，不回 403？</h3>
+<p>直覺上 403 比較「誠實」：資料存在，只是你沒權限。但回 403 就等於告訴對方「這個 id 存在」。攻擊者可以拿一堆 id 來試，從 403 和 404 的差別知道別的租戶有哪些資料。對外的回應不該透露其他租戶的任何事，所以別的租戶的資料一律當成不存在，回 404 <code>NOT_FOUND</code>，讓「別人的」和「不存在」看起來一樣。403 留給租戶內角色不夠的情況，例如 viewer 想刪除：那筆資源他本來就看得到，告訴他「你不能刪」沒有洩漏任何事。</p>
+
+<h3>改與刪為什麼用 <code>updateMany</code>、<code>deleteMany</code>？</h3>
+<p><code>update</code> 找不到要改的列時會丟 Prisma 的 P2025 錯誤，你得再把它轉成 404。<code>updateMany</code> 找不到時不丟錯，只回 <code>{ count: 0 }</code>，判斷 <code>count</code> 就知道要不要回 404，比較直接；它的 <code>where</code> 一樣經過擴充，安全性沒有差別。<code>update()</code> 包在 <code>tx</code> 裡，是因為改完要再讀一次回傳最新的資料，兩步要在同一個交易裡。</p>
+
+<h3>body 送來的 <code>tenantId</code> 怎麼辦？</h3>
+<p>這是 auth 課第 19 課講的 mass assignment：使用者在 body 多塞一個欄位，如果程式把整個 body 交給資料庫，就連不該讓他決定的欄位也寫進去了。這裡有兩層擋著。第一層是 DTO 根本沒有 <code>tenantId</code>，全域 <code>ValidationPipe</code> 開了 <code>forbidNonWhitelisted</code>，body 帶了 DTO 沒宣告的欄位，請求直接 400。第二層是就算哪天有人把它加進 DTO，擴充建立時也會覆寫成 token 的租戶。</p>
+<p>有一個小地方會卡住：Prisma 產生的型別要求 <code>create</code> 的 <code>data</code> 有 <code>tenantId</code>，不寫會編譯失敗。參考實作寫 <code>tenantId: this.ctx.tenantId!</code> 滿足型別，值跟擴充填的一樣，這也是 service 注入 <code>RequestContext</code> 的原因。</p>
+<p>單筆的讀、改、刪都擋住了。列表還有一個地方要想清楚：翻頁用的游標是使用者送來的，它會不會變成洩漏的入口？</p>
+
+<h2>翻頁的游標會不會變成洩漏的入口？</h2>
+<p>列表沿用階段 A 的游標分頁：游標是上一頁最後一筆的 <code>(createdAt, id)</code>，用 base64url 編碼成字串交給前端（<code>src/common/cursor.ts</code>）；前端翻下一頁時把它送回來，<code>after()</code> 把它轉成「排在這一筆之後」的條件。游標是使用者手上的字串，他可以自己拼一個，例如拿 B 的 project id 編成游標送來。</p>
+<p>這不會洩漏，因為游標只決定「從哪裡開始」，不決定「查誰的資料」。<code>list()</code> 的 <code>findMany</code> 一樣經過擴充，<code>where</code> 裡除了游標條件還有 <code>tenantId: 'A'</code>，所以拼出來的游標最多讓 A 看到自己在那個位置之後的資料。</p>
+<p>會出事的是另一種常見的改法：「為了效能，翻頁改用手寫 SQL」。</p>
+<pre>// 錯誤寫法：$queryRaw 不經過擴充，又忘了 tenant_id
+const rows = await this.db.client.$queryRaw`
+  SELECT … FROM projects WHERE (created_at, id) &gt; (${c.createdAt}, ${c.id}::uuid) ORDER BY created_at, id LIMIT ${limit + 1}`</pre>
+<p><code>$queryRaw</code> 送的是你寫好的 SQL 字串，不是 model 操作，<code>$allModels</code> 攔不到它，擴充沒有機會加條件。這段 SQL 沒寫 <code>tenant_id</code>，就是所有租戶的資料。手寫 SQL 的每一句都要自己加 <code>tenant_id = ${ctx.tenantId}::uuid</code>；第 9 課開了 RLS 之後，忘了加的這一句至少會變成「查不到」，而不是「查到別人的」。</p>
+<p>到這裡，所有經過擴充的查詢都帶著租戶條件。但隔離不只是「查得到什麼」，還有「寫進去的資料指向誰」：寫入時參照到別人的資料，擴充擋得住嗎？</p>
+
+<h2>寫入時參照到別人的資料，怎麼擋？</h2>
+<p>第 12 課的檔案屬於某個 project：<code>files.project_id</code> 指向 <code>projects.id</code>。這種「這一列指向另一張表的某一列」的關係，資料庫用外鍵保證：插入 <code>files</code> 時，資料庫會檢查 <code>project_id</code> 在 <code>projects</code> 裡真的存在，不存在就拒絕。</p>
+<p>問題是一般的外鍵只檢查「這個 project 存在」，不檢查「它跟這個檔案是同一個租戶」。擴充建立檔案時會把 <code>files.tenant_id</code> 填成 A，但 <code>project_id</code> 是程式或使用者給的。如果建立檔案的程式忘了先確認 project 屬於自己，A 就能把檔案掛到 B 的 project 底下：資料庫裡出現一列「A 的檔案、B 的專案」，之後誰讀到它都是錯的。</p>
+<p>做法是讓外鍵把租戶也包進去：子表用 <code>(tenant_id, project_id)</code> 這兩欄一起參照母表的 <code>(tenant_id, id)</code>。這叫複合外鍵，資料庫檢查的變成「母表裡有沒有一列，租戶和 id 都對得上」。外鍵指向的欄位必須有唯一約束，所以母表要先有 <code>(tenant_id, id)</code> 的唯一約束：</p>
+<pre>model Project {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  …
+  @@unique([tenantId, id])                  // 給複合外鍵參照用
+  @@index([tenantId, createdAt, id])        // 列表與游標分頁
+}
+
+model File {
+  id        String  @id @default(uuid()) @db.Uuid
+  tenantId  String  @map("tenant_id") @db.Uuid
+  projectId String  @map("project_id") @db.Uuid
+  project   Project @relation(fields: [tenantId, projectId], references: [tenantId, id], onDelete: Cascade)
+  …
+}</pre>
+<p>產生的 migration 是 <code>FOREIGN KEY ("tenant_id", "project_id") REFERENCES "projects"("tenant_id", "id")</code>。擴充把 <code>files.tenant_id</code> 填成 A，於是 <code>(A, B 的 project id)</code> 這個組合在 <code>projects</code> 裡不存在，資料庫直接拒絕（Prisma 回 P2003）。這道檢查在資料庫裡，不管程式哪裡寫漏都會執行。</p>
+<p><code>@@unique([tenantId, id])</code> 看起來多餘，<code>id</code> 本來就唯一，加上租戶當然也唯一。它不是為了防重複，用途只有一個：讓複合外鍵有東西可以指。另一個 <code>@@index([tenantId, createdAt, id])</code> 是給列表用的：每個列表查詢都是「這個租戶的、依時間與 id 排序」，索引的欄位順序跟它一致。</p>
+<p>查詢的條件由擴充加，參照由資料庫擋。剩下的問題是：這兩道各自有哪些地方管不到？</p>
+
+<h2>這道防線還有哪些洞？套到你的業務模組</h2>
+<p>擴充攔得到的只有「經過擴充過的 client 的 model 操作」，而且只改最外層的 <code>where</code> 和 <code>data</code>。凡是不符合這個描述的，它就管不到：</p>
+<div class="callout warn"><strong>這道防線管不到的地方</strong>（第 9 課要 RLS 的理由）：
+<ul>
+  <li><code>$queryRaw</code>、<code>$executeRaw</code>：不是 model 操作，<code>$allModels</code> 攔不到。</li>
+  <li><code>include</code> 進來的關聯、巢狀寫入裡的子資料：擴充只改最外層的 <code>where</code>／<code>data</code>。</li>
+  <li>直接注入沒擴充的 <code>PrismaService</code> 查詢：完全繞過。</li>
+  <li>新的 model 忘了加進 <code>SCOPED</code>：擴充對它沒有作用。</li>
+</ul></div>
+<p>這四種都是「程式寫錯」時才會出現的洞，而這課整個做法的出發點，就是不能假設程式不會寫錯。所以第 9 課要在資料庫再加一道不依賴應用程式的防線。在那之前，你的業務模組照這課的模式做，就能把洞減到最少：</p>
+<ol>
+  <li>每個屬於租戶的 model 都有 <code>tenantId</code>，並加進 <code>SCOPED</code>。</li>
+  <li>會被別的表參照的母表加 <code>@@unique([tenantId, id])</code>，子表用複合外鍵。</li>
+  <li>service 只注入 <code>TenantDb</code>，手寫 SQL 每一句自己寫 <code>tenant_id</code>。</li>
+</ol>
+<p>三個題目各有一個這個模式沒直接涵蓋的地方：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>題目</th><th>要注意</th></tr></thead>
+  <tbody>
+    <tr><td>客服工單</td><td>「指派給成員」：<code>assigneeId</code> 指向 user，user 是全域的，外鍵擋不住指派給別的租戶的人。指派前要確認 <code>(tenantId, assigneeId)</code> 在 <code>memberships</code> 裡；或讓工單參照 <code>memberships</code> 的複合主鍵 <code>(tenant_id, user_id)</code>。</td></tr>
+    <tr><td>預約排程</td><td>「時段不能重疊」的排除約束要包含租戶：<code>EXCLUDE USING gist (tenant_id WITH =, resource_id WITH =, during WITH &amp;&amp;)</code>，否則 A 診所的預約會擋住 B 診所同名資源的時段。這是手寫在 migration 的 SQL，Prisma schema 寫不出來（跟階段 A 的 CHECK 一樣）。</td></tr>
+    <tr><td>進銷存</td><td>報表常用 <code>$queryRaw</code> 做 <code>GROUP BY</code> 加總：每一句都要自己寫 <code>tenant_id</code> 條件，這是擴充管不到的地方。品項與異動用複合外鍵，擋住「把 B 的品項出庫」。</td></tr>
+  </tbody>
+</table></div>
+
+<div class="callout practice"><strong>💡 實務上：跨租戶的 bug 怎麼被發現</strong><br>這類 bug 很少在開發時被發現，因為開發者通常只有一個測試租戶，所有資料都是自己的。它通常是客戶回報「我看到不認識的公司名字」，那時已經是資安事件，要通知、要調查影響範圍。所以作品裡除了驗收測試，自己的 repo 也要有跨租戶的 E2E 測試（參考實作的 <code>test/tenant-isolation.e2e-spec.ts</code>）：每加一個有 <code>:id</code> 的端點就加一列，用兩個租戶互打，就是開場那個「把 id 換成 B 的」請求。第 18 課會把它擴大成 BOLA 探針。</div>
+
+<h2>補充與查表</h2>
+<p>主線用不到、但寫法有疑問或讀別人的程式時會遇到的細節。</p>
+
+<h3><code>findUnique</code> 的 <code>where</code> 加一般欄位</h3>
+<p>Prisma 從第 5 版起允許 <code>findUnique</code> 的 <code>where</code> 在唯一欄位之外再加一般欄位，所以擴充直接加 <code>tenantId</code> 就好。不想依賴這個行為的話，把 <code>findUnique</code> 改寫成 <code>findFirst</code>，或用 <code>@@unique([tenantId, id])</code> 的複合鍵查。</p>
+
+<h3>另一種注入寫法：factory provider 加 injection token</h3>
+<p>不包成 class，也可以用 factory provider 加 injection token：<code>{ provide: TENANT_DB, useFactory: … }</code> 註冊，使用的地方寫 <code>@Inject(TENANT_DB)</code>。效果一樣，但每個用到的地方都要記得 token 與型別；包成 class 比較好懂。</p>
+
+<h3>id 格式不對也回 404</h3>
+<p>契約的 <code>NOT_FOUND</code> 也涵蓋「id 格式不對」：<code>src/common/uuid.pipe.ts</code> 把非 UUID 的 id 轉成 404，不讓壞掉的 id 跑到資料庫變成 500。</p>
+
+<h2>練習</h2>
+
+<div class="local" data-test="ex1" data-files="">
+  <p>練習 1：做出 <code>POST/GET /api/v1/projects</code> 與 <code>GET/PATCH/DELETE /api/v1/projects/:id</code>。兩個租戶各建 project：列表只看到自己的；讀、改、刪別人的都回 404 <code>NOT_FOUND</code>，而且別人的資料沒有被改或刪；請求帶 <code>x-tenant-id: &lt;別的租戶&gt;</code> 標頭也換不了租戶。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="">
+  <p>練習 2：<code>POST /api/v1/projects</code> 的 body 帶 <code>tenantId: &lt;別的租戶&gt;</code>：回 400，或忽略它、建在自己的租戶；別的租戶的列表一定是空的。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="">
+  <p>練習 3：<code>GET /api/v1/projects?limit=1</code> 一頁一頁翻（<code>nextCursor</code>），翻完剛好是自己的全部 project、依建立時間由舊到新；拿別的租戶的 project id 拼成游標送來，回應裡不能有別人的資料。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 4：<code>TenantDb</code> 的擴充已經涵蓋所有 model 操作。下面哪一段程式<strong>仍然</strong>可能讀到別的租戶的資料？</p>
+  <label data-key="a"><code>this.db.client.project.findUnique({ where: { id } })</code>，id 來自網址</label>
+  <label data-key="b"><code>this.db.client.$queryRaw`SELECT name, count(*) FROM tickets GROUP BY name`</code>，給月報表用</label>
+  <label data-key="c"><code>this.db.client.project.deleteMany({ where: { archived: true } })</code>，清理封存的專案</label>
+  <label data-key="d"><code>this.db.tx(tx =&gt; tx.project.count())</code>，計算方案用量</label>
+  <p class="why">✓ <code>$queryRaw</code> 不是 model 操作，<code>$allModels</code> 攔不到，SQL 裡沒寫 <code>tenant_id</code> 就是所有租戶的資料。a、c、d 都是 model 操作，擴充會加上 <code>tenantId</code>；<code>tx</code> 也是擴充過的 client 開的交易。a 是最多人會選的：<code>findUnique</code> 只要在 <code>READS</code> 裡就有條件，問題只出在擴充漏了它。（第 8 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：A 租戶的使用者打 <code>GET /projects/&lt;B 的 id&gt;</code>。同事主張回 403 比較誠實：「資料存在，只是你沒權限。」為什麼契約選 404？</p>
+  <label data-key="a">403 只能用在角色不夠的情況，HTTP 規範不允許用在跨租戶</label>
+  <label data-key="b">回 404 前端比較好處理，不用多寫一種錯誤畫面</label>
+  <label data-key="c">403 等於確認這個 id 存在；攻擊者可以用它探測別的租戶有哪些資料，404 讓「別人的」與「不存在」看起來一樣</label>
+  <label data-key="d">查詢加了 <code>tenantId</code> 條件，程式分不出是不存在還是別人的，只能回 404</label>
+  <p class="why">✓ 對外的回應不該透露其他租戶的任何事，包括「這個 id 存在」。404 讓兩種情況無法區分。d 說的是這個做法的副作用而不是理由：真的想分也可以多查一次，但不該分。租戶內的角色不夠（viewer 想刪除）才回 403，因為資源本來就看得到。（第 8 課，auth 第 19 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：同事寫了一支整理資料的腳本，在 worker 裡為每個租戶跑一次。擴充一直丟「沒有租戶上下文」，可是他明明包在 <code>ctx.run</code> 裡了：</p>
+  <pre>for (const t of tenants) {
+  const rows = await ctx.run({ requestId: 'job', tenantId: t.id }, () =&gt; db.client.project.findMany())
+}</pre>
+  <label data-key="a">Prisma 的查詢要等 <code>await</code> 時才真的執行；<code>run</code> 回傳的 promise 是在 <code>run</code> 外面被 await 的，那時已經離開上下文。要寫成 <code>ctx.run(…, async () =&gt; await db.client.project.findMany())</code></label>
+  <label data-key="b"><code>AsyncLocalStorage</code> 在 worker 裡不能用，只能在 HTTP 請求裡用</label>
+  <label data-key="c"><code>ctx.run</code> 的 store 要有 <code>userId</code>，少了它擴充就判定沒有上下文</label>
+  <label data-key="d"><code>for</code> 迴圈裡的 <code>await</code> 會讓 <code>AsyncLocalStorage</code> 遺失，要改用 <code>Promise.all</code></label>
+  <p class="why">✓ Prisma 的查詢回傳 PrismaPromise，它是 lazy 的：<code>findMany()</code> 只是建立查詢，<code>await</code> 時才執行，擴充也是那時才讀 <code>ctx.tenantId</code>。在 callback 裡 <code>await</code>，執行就發生在上下文裡。NestJS 的請求不會遇到，因為 handler 整個在中介軟體開的上下文裡 await；worker、測試、腳本會。b 錯：ALS 跟 HTTP 無關，第 13 課的 worker 就是靠它。（第 8 課）</p>
+</div>
+
+<h2>自評清單</h2>
+<p>測試判不出來、但作品裡看得出來的事。每一項自己確認：</p>
+<ul>
+  <li><strong>你的跨租戶測試抓得到漏洞</strong>：把 <code>READS</code> 裡的 <code>findUnique</code> 暫時拿掉，你 repo 的 <code>npm test</code> 至少有一個測試失敗（不是只有 learn 的驗收測試）。</li>
+  <li><strong>業務程式不直接用底層 client</strong>：<code>grep -rn "PrismaService" src --include=*.ts</code> 只出現在 <code>prisma/</code>、<code>health/</code>。</li>
+  <li><strong>每個手寫 SQL 都有租戶條件</strong>：<code>grep -rn "queryRaw\|executeRaw" src</code> 找到的每一句都有 <code>tenant_id</code>，或是有註解說明為什麼不需要。</li>
+  <li><strong>沒有上下文時會失敗</strong>：在一個 <code>@Public()</code> 的路由裡呼叫 <code>this.db.client.project.count()</code>，要得到 500 而不是所有租戶的總數（試完刪掉）。</li>
+  <li><strong>複合外鍵真的擋得住</strong>：用 <code>psql</code> 手動插一筆 <code>files</code>（或你的子表），<code>tenant_id</code> 是 A、<code>project_id</code> 是 B 的，要得到 23503 外鍵錯誤。</li>
+</ul>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>擴充只處理 <code>findMany</code>、<code>findFirst</code></strong>：<code>findUnique</code>、<code>update</code>、<code>delete</code> 都有 <code>where</code>，漏一個就是一種 BOLA。照 <code>READS</code> 的完整清單寫。</li>
+  <li><strong>建立時「沒給才補」</strong>：<code>{ tenantId, ...data }</code> 讓呼叫的人決定租戶。一律覆寫：<code>{ ...data, tenantId }</code>。</li>
+  <li><strong>相信請求送來的租戶</strong>：前端切換租戶時送 <code>x-tenant-id</code>，guard 就採用。租戶只從 token 來；要換租戶就呼叫 <code>switch-tenant</code> 換 token（第 10 課）。</li>
+  <li><strong>沒有租戶時回空條件</strong>：<code>where: ctx.tenantId ? { tenantId } : {}</code> 等於沒有上下文就查全部。讀不到租戶一律丟錯。</li>
+  <li><strong>跨租戶回 403</strong>：透露了 id 存在。回 404 <code>NOT_FOUND</code>。</li>
+  <li><strong>新的 model 忘了加進 <code>SCOPED</code></strong>：擴充對它完全沒作用。新增 model 的 PR 檢查清單第一項就是它，第 9 課的 RLS 會讓漏掉時「查不到」而不是「查到別人的」。</li>
+  <li><strong>子表只用單欄外鍵</strong>：資料庫只確認母資料存在，不確認是同一個租戶。用 <code>(tenant_id, parent_id)</code> 的複合外鍵。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>靠每個查詢記得加 <code>tenantId</code> 一定會漏，而且單一租戶的測試測不出來；條件要收進所有查詢必經的資料存取層。</li>
+  <li>租戶只從驗過簽章的 token 進到 <code>AsyncLocalStorage</code> 的請求上下文；讀不到就丟錯（fail closed），不能當成沒有條件。</li>
+  <li>Prisma 7 的 client extension（<code>$allModels.$allOperations</code>）讓屬於租戶的 model：讀、改、刪自動加 <code>where.tenantId</code>，建立時覆寫 <code>tenantId</code>。最容易漏的是 <code>findUnique</code> 與 update、delete。</li>
+  <li>擴充過的 client 包成 <code>@Injectable() TenantDb</code>，型別從 <code>ReturnType</code> 取；業務程式只用它。</li>
+  <li>別的租戶的資料一律 404；DTO 沒有 <code>tenantId</code>；游標只決定起點，查詢一樣有條件。</li>
+  <li>子表用 <code>(tenant_id, parent_id)</code> 複合外鍵，讓資料庫擋住跨租戶的參照。</li>
+  <li>擴充管不到 <code>$queryRaw</code>、include 與巢狀寫入、直接用底層 client 的程式、忘了加進 <code>SCOPED</code> 的 model。</li>
+</ul>
+<p>下一課加上第二道防線：PostgreSQL 的 Row Level Security。應用程式改用一個不能繞過 policy 的資料庫角色，每個查詢在交易裡先告訴資料庫「現在是哪個租戶」，擴充漏掉的地方由資料庫擋下。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

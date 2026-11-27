@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>12. HTTP 協定與 curl</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="12" data-practice="node">
+<header>
+  <div class="eyebrow">階段 4：HTTP 服務 · 第 12 課</div>
+  <h1>HTTP 協定與 curl</h1>
+</header>
+<main>
+
+<p>咖啡店的 App 上，客人點了兩杯拿鐵，按下「送出訂單」。在前端，這只是一行 <code>fetch('/orders', { method: 'POST', body })</code>：瀏覽器替你找到伺服器、送出請求、等回應，再把回應包成你拿到的 <code>res</code>。換到後端，你變成收下這個請求、決定回什麼的那一方，瀏覽器以前替你藏起來的細節，現在每一個都可能變成 bug：</p>
+<ul>
+  <li>回應的 <code>Content-Length</code> 算錯，App 只收到半個 JSON，<code>JSON.parse</code> 直接爆掉。</li>
+  <li>失敗時狀態碼回錯，前端的錯誤處理、快取、監控全部跟著判斷錯。</li>
+  <li>用 GET 做「取消訂單」，某天爬蟲或瀏覽器的預先載入路過，訂單就被取消了。</li>
+</ul>
+<p>這課跟著這一張訂單的請求走完一趟，回答五個問題：它怎麼到達伺服器、伺服器實際收到的位元組長什麼樣、該用哪個方法送、伺服器怎麼回報結果、回應的 body 到哪裡結束。最後用 curl 在終端機重現同一個請求。途中你會用 Node 最底層的 <code>node:net</code> 親手解析請求、寫出回應；下一課改用 <code>node:http</code> 時，你會知道它替你做了哪些事。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>請求怎麼到達伺服器：從網址到回應經過哪四步，為什麼 TCP 逼得 HTTP 自己規定「訊息到哪裡結束」。</li>
+  <li>伺服器實際收到什麼：把原始位元組印出來，看懂請求行、標頭、空行、body，以及回應的狀態行。</li>
+  <li>下單該用哪個方法：安全與冪等是什麼，為什麼不能用 GET 改資料，哪些請求網路斷掉時可以放心重送。</li>
+  <li>伺服器怎麼回報結果：狀態碼的五個家族，該回 4xx 還是 5xx，前端和監控怎麼靠它判斷。</li>
+  <li>body 到哪裡結束、怎麼用 curl 重現：<code>Content-Length</code> 和 chunked、keep-alive，以及在終端機測 API、看標頭的常用寫法。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="11-buffer-encoding.html">第 11 課</a>的位元組與 Buffer：中文一個字在 UTF-8 是 3 個位元組，長度用 <code>Buffer.byteLength</code> 算；收到的片段用 <code>Buffer.concat</code> 接起來，<code>subarray</code> 切出一段。</li>
+</ul></div>
+
+<h2>按下「送出訂單」之後，請求怎麼到達伺服器？</h2>
+<p>要看懂伺服器收到什麼，得先知道請求是怎麼送過來的。這中間有兩個角色：發出請求的一方叫<strong>客戶端</strong>（client），可以是瀏覽器、手機 App、curl，也可以是另一台呼叫你 API 的後端；收下請求、送回回應的一方叫<strong>伺服器</strong>（server）。兩邊之所以能溝通，是因為都遵守同一套規則：<strong>HTTP</strong>（HyperText Transfer Protocol）。它規定請求和回應要寫成什麼格式、每個部分代表什麼意思。這課用的 HTTP/1.1，訊息就是一行一行的文字，後面可能再接一段內容本體（body）。</p>
+<p>客人打開 App 時，App 會先拿菜單，然後才能下單。先用菜單的網址看客戶端怎麼知道要找誰，它把五個部分都用上了：</p>
+<div class="table-wrap"><table>
+  <tr><th>部分</th><th><code>http://localhost:3000/menu?size=L</code></th><th>意思</th></tr>
+  <tr><td>scheme</td><td><code>http</code></td><td>用什麼協定。<code>https</code> 是在 TLS 加密之上的 HTTP</td></tr>
+  <tr><td>host</td><td><code>localhost</code></td><td>哪一台電腦，可以是網域名稱或 IP 位址</td></tr>
+  <tr><td>port</td><td><code>3000</code></td><td>那台電腦上的哪個程式。沒寫時 http 是 80、https 是 443</td></tr>
+  <tr><td>path</td><td><code>/menu</code></td><td>要哪個資源</td></tr>
+  <tr><td>query</td><td><code>?size=L</code></td><td>附加的參數</td></tr>
+</table></div>
+<p>網址只說了「找誰、要什麼」。真正把請求送到，客戶端依序做四件事：</p>
+<figure>
+  <svg viewBox="0 0 700 230" role="img" aria-label="一次 HTTP 請求的時間軸：先用 DNS 把名稱查成 IP 位址，再和伺服器的 port 建立 TCP 連線，接著在連線上送出請求文字，最後收到回應文字。連線可以留著給下一個請求用">
+    <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="10" y="30" width="150" height="80" rx="8"/>
+    <text class="d-accent" x="85" y="62" text-anchor="middle">1. DNS</text>
+    <text class="d-small" x="85" y="86" text-anchor="middle">名稱 → IP 位址</text>
+    <rect class="d-box" x="185" y="30" width="150" height="80" rx="8"/>
+    <text class="d-accent" x="260" y="62" text-anchor="middle">2. TCP 連線</text>
+    <text class="d-small" x="260" y="86" text-anchor="middle">連到 IP 的某個 port</text>
+    <rect class="d-soft" x="360" y="30" width="150" height="80" rx="8"/>
+    <text class="d-accent" x="435" y="62" text-anchor="middle">3. 送出請求</text>
+    <text class="d-small" x="435" y="86" text-anchor="middle">GET /menu HTTP/1.1</text>
+    <rect class="d-soft" x="535" y="30" width="155" height="80" rx="8"/>
+    <text class="d-accent" x="612" y="62" text-anchor="middle">4. 收到回應</text>
+    <text class="d-small" x="612" y="86" text-anchor="middle">HTTP/1.1 200 OK</text>
+    <line class="d-line" x1="160" y1="70" x2="183" y2="70" marker-end="url(#arr)"/>
+    <line class="d-line" x1="335" y1="70" x2="358" y2="70" marker-end="url(#arr)"/>
+    <line class="d-line" x1="510" y1="70" x2="533" y2="70" marker-end="url(#arr)"/>
+    <path class="d-line" d="M612,110 L612,150 L435,150 L435,112" fill="none" marker-end="url(#arr)"/>
+    <text class="d-small" x="523" y="170" text-anchor="middle">keep-alive：同一條連線送下一個請求</text>
+    <text class="d-text" x="350" y="210" text-anchor="middle">HTTP 只負責 3 和 4；1、2 是網路層的事，HTTPS 還會在 2 之後多一段 TLS 握手</text>
+  </svg>
+  <figcaption>一次請求的四個步驟。第 1、2 步只在建立新連線時發生。</figcaption>
+</figure>
+<p>第 1 步要解決「名稱對應到哪台電腦」。網路上找電腦靠的是 <strong>IP 位址</strong>，像 <code>127.0.0.1</code> 或 <code>::1</code>（這兩個都代表「這台電腦自己」）。人記不住數字，所以網址裡寫的是 <code>shop.example</code> 這種名稱，再由 <strong>DNS</strong>（Domain Name System）把名稱查成 IP 位址。<code>localhost</code> 不用問外面的 DNS，作業系統自己就知道它指向本機。DNS 的細節在<a href="../../devops/lessons/04-networking.html">部署課第 4 課</a>。</p>
+<p>找到電腦之後，還要找到電腦上的哪個程式。一台電腦同時跑著很多程式，<strong>port</strong> 就是用來區分它們的號碼：咖啡店的 API 在 3000 等請求，資料庫可能在 5432。IP 加 port，才指到唯一一個程式。</p>
+<p>第 2 步是建立 <strong>TCP 連線</strong>。TCP 是 HTTP 底下的傳輸規則：雙方先來回握手，建立一條連線，之後送出的位元組保證照順序、不遺失地到達對方。HTTP 的文字就是在這條連線上傳的。如果網址是 <code>https</code>，連線建立後還會先完成 TLS 加密的握手，再在加密通道裡傳一模一樣的 HTTP 文字（<a href="../../devops/lessons/05-tls.html">部署課第 5 課</a>）。</p>
+<p>第 3、4 步才是 HTTP 本身：客戶端寫出請求文字，伺服器讀完、處理，寫回回應文字。</p>
+<p>這裡有一個關鍵限制。TCP 只保證位元組的順序，不管「一則訊息」從哪裡開始、到哪裡結束。客戶端一次送出的請求，伺服器可能分兩段收到；兩個請求也可能黏在同一段裡到達。對 TCP 來說，那只是一條沒有斷點的位元組流。所以 HTTP 必須在文字格式裡自己標出邊界：標頭到哪裡結束、body 有幾個位元組。下一節就把伺服器實際收到的位元組印出來，看 HTTP 怎麼標。</p>
+
+<h2>伺服器實際收到的是什麼？</h2>
+<p>要看到原始的位元組，不能用 <code>node:http</code>，因為它收到後會先替你解析好。這裡改用 <code>node:net</code>：它是 Node 內建的 TCP 模組，比 <code>node:http</code> 低一層，只負責在連線上收發位元組，不理解 HTTP。練習資料夾的 <code>examples/show-request.ts</code> 用它開一個伺服器，把收到的東西原封不動印出來。開著它，另開一個終端機執行 <code>curl http://localhost:3000/menu</code>（curl 是在終端機發請求的工具，這課最後一節會詳細介紹）：</p>
+<pre>$ node examples/show-request.ts
+在 http://localhost:3000 等請求
+收到 81 個位元組：
+"GET /menu HTTP/1.1\r\nHost: localhost:3000\r\nUser-Agent: curl/8.7.1\r\nAccept: */*\r\n\r\n"</pre>
+<p>這 81 個位元組就是一個完整的 HTTP 請求。它有固定的結構，下單的請求也一樣，只是後面多了 body：</p>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="HTTP 訊息的結構：第一行是請求行或狀態行，接著是一行一個的標頭，然後是一個空行，最後是 body。每一行以 \r\n 結尾">
+    <rect class="d-soft" x="20" y="20" width="430" height="40" rx="6"/>
+    <text class="d-text" x="35" y="46">GET /menu HTTP/1.1 ⏎</text>
+    <rect class="d-box" x="20" y="70" width="430" height="80" rx="6"/>
+    <text class="d-text" x="35" y="96">Host: localhost:3000 ⏎</text>
+    <text class="d-text" x="35" y="120">Content-Type: application/json ⏎</text>
+    <text class="d-text" x="35" y="142">Content-Length: 26 ⏎</text>
+    <rect class="d-soft" x="20" y="160" width="430" height="30" rx="6"/>
+    <text class="d-text" x="35" y="181">⏎</text>
+    <rect class="d-box" x="20" y="200" width="430" height="40" rx="6"/>
+    <text class="d-text" x="35" y="226">{"drink":"拿鐵","qty":2}</text>
+    <text class="d-accent" x="470" y="46">請求行：方法 目標 版本</text>
+    <text class="d-accent" x="470" y="105">標頭：名稱: 值</text>
+    <text class="d-small" x="470" y="128">一行一個，名稱不分大小寫</text>
+    <text class="d-accent" x="470" y="181">空行：標頭到此結束</text>
+    <text class="d-accent" x="470" y="226">body：長度看 Content-Length</text>
+  </svg>
+  <figcaption>⏎ 代表 <code>\r\n</code>（CR LF 兩個位元組）。回應的結構相同，只是第一行換成狀態行。</figcaption>
+</figure>
+<p>由上往下對照剛才印出來的位元組：</p>
+<ul>
+  <li><strong>請求行</strong>（request line）：<code>方法 目標 版本</code>，用一個空白分隔，例如 <code>GET /menu HTTP/1.1</code>。方法說明想做什麼，目標通常是網址的 path 加 query，版本告訴伺服器用哪一版 HTTP 解讀後面的內容。</li>
+  <li><strong>標頭</strong>（header）：一行一個 <code>名稱: 值</code>，放這個請求的附加資訊，例如 body 的格式、客戶端能接受什麼。名稱<strong>不分大小寫</strong>，<code>Content-Type</code> 和 <code>content-type</code> 是同一個標頭，所以 Node 的 HTTP 伺服器把收到的標頭名稱一律轉成小寫（下一課的 <code>req.headers</code>）。HTTP/1.1 規定一定要有 <code>Host</code>：同一個 IP 上可能放了好幾個網站，伺服器要靠它知道客戶端要找哪一個。</li>
+  <li><strong>空行</strong>：每一行都用 <code>\r\n</code> 結尾，也就是 CR 和 LF 兩個位元組，不是只有 <code>\n</code>。連續兩個 <code>\r\n</code> 就是空行，代表標頭結束。這是上一節說的第一個邊界：伺服器一直讀，讀到 <code>\r\n\r\n</code> 就知道標頭讀完了。</li>
+  <li><strong>body</strong>：訊息的內容本體。拿菜單的 GET 通常沒有 body；下單的 POST 要把 <code>{"drink":"拿鐵","qty":2}</code> 送過去，就放在這裡。</li>
+</ul>
+<p>回應用同一種結構，只是第一行換成<strong>狀態行</strong>（status line），例如 <code>HTTP/1.1 200 OK</code>：版本、三位數的<strong>狀態碼</strong>（status code），和一段給人看的說明文字。<code>examples/raw-request.ts</code> 反過來站在客戶端那邊：自己用 <code>net.connect</code> 寫出請求文字，再把伺服器回的原始位元組印出來。為了不用另外開伺服器，這個範例自己先用 <code>node:http</code> 開了一個回菜單 JSON 的伺服器（下一課會詳講），<code>listen(0)</code> 讓系統挑一個空的 port，所以下面的 port 不是 3000，每次執行也不一樣。輸出分兩段：上半是伺服器解析後看到的標頭，名稱已經轉成小寫；下半是客戶端收到的原始回應，<code>\r\n</code> 顯示成 ⏎：</p>
+<pre>$ node examples/raw-request.ts
+伺服器看到的標頭（名稱都轉成小寫了）： {
+  host: 'localhost:57006',
+  accept: 'application/json',
+  connection: 'close'
+}
+---- 原始回應（\r\n 顯示成 ⏎）----
+HTTP/1.1 200 OK⏎
+Content-Type: application/json; charset=utf-8⏎
+Date: Sat, 31 Oct 2026 15:21:35 GMT⏎
+Connection: close⏎
+Content-Length: 30⏎
+⏎
+{"drink":"拿鐵","price":110}</pre>
+<p>注意 <code>Content-Length</code>。body 是 <code>{"drink":"拿鐵","price":110}</code>，在 JavaScript 裡 <code>.length</code> 是 26，<code>Content-Length</code> 卻是 30。因為 <code>Content-Length</code> 算的是 UTF-8 的<strong>位元組數</strong>，「拿鐵」兩個字各佔 3 個位元組，比字串長度多出 4（<a href="11-buffer-encoding.html">第 11 課</a>）。這個數字就是第二個邊界：告訴對方 body 有幾個位元組。它算錯會發生什麼事，留到「body 到哪裡結束」那一節細看。</p>
+<p>還有一個標頭決定伺服器怎麼讀 body：<code>Content-Type</code>。body 對伺服器來說只是一串位元組，要靠 <code>Content-Type</code> 才知道該當成 JSON 解析、當成表單拆欄位，還是當成圖片存起來。HTTP 本身不限定 body 的格式：<code>application/json</code>、<code>text/html</code>、<code>image/png</code>、表單送出的 <code>application/x-www-form-urlencoded</code>，都是正常的 HTTP。下單的請求要帶 <code>Content-Type: application/json</code>，伺服器才會把 body 當 JSON 讀。</p>
+<p>練習 2 會請你只用 <code>node:net</code> 寫出一個會回應的伺服器，需要的 API 只有這幾個：</p>
+<pre>import { createServer, connect } from 'node:net'
+
+// 伺服器：每有一條新連線，callback 收到一個 socket（代表這條連線）
+const server = createServer(socket => {
+  socket.on('data', chunk => { /* chunk 是 Buffer，一個請求可能分好幾段到 */ })
+  socket.write('…')   // 送出文字或 Buffer，連線還開著
+  socket.end('…')     // 送出最後一段，然後關閉這一邊的連線
+})
+server.listen(0)      // 0：讓系統挑一個空的 port
+server.on('listening', () => console.log(server.address()))   // { port: 5xxxx, … }
+
+// 客戶端：連到某個 port，連上後一樣用 write／end 送、on('data') 收
+const socket = connect(3000, '127.0.0.1', () => socket.end('GET / HTTP/1.1\r\nHost: x\r\n\r\n'))</pre>
+<p>注意 <code>on('data')</code> 的註解：一個請求可能分好幾段到，這正是第一節說的 TCP 不分訊息邊界。你的程式要先把片段累積起來，看到 <code>\r\n\r\n</code> 才算收完標頭。</p>
+<p>格式看懂了，再回到請求行的第一個字。拿菜單用 <code>GET</code>，下單用 <code>POST</code>，這只是習慣嗎？如果哪天有人用 GET 來下單或取消訂單，會出什麼事？</p>
+
+<h2>下單該用哪個方法？為什麼不能用 GET 改資料？</h2>
+<p>請求行的第一個字是<strong>方法</strong>（method），告訴伺服器你想對這個資源做什麼。方法不只是給你自己的伺服器看的：瀏覽器、快取、代理伺服器、爬蟲、HTTP 函式庫這些中間經手的程式，都會依方法決定能不能快取、能不能自動重送、能不能預先發出。</p>
+<p>這裡的<strong>代理伺服器</strong>（proxy）在後面會一直出現，先講清楚。正式環境裡，App 的請求通常不會直接打到你的 Node 程式，而是先到擋在它前面的一層程式：<strong>反向代理</strong>（reverse proxy，例如 Nginx）或<strong>負載平衡器</strong>（load balancer，例如雲端的 LB），由它決定轉給後面哪一台 Node，再把 Node 的回應轉回給 App。對代理來說，後面那台真正處理請求的伺服器叫<strong>上游</strong>（upstream）。換個角度看，代理對 App 是伺服器，對 Node 則是客戶端：它自己開連線、送請求給 Node、等 Node 回應。</p>
+<p>它們之所以能這樣做，是因為大家遵守同一份標準。HTTP 語意的標準是 <strong>RFC 9110</strong>。<strong>RFC</strong>（Request for Comments）是網際網路標準文件的編號系列，對 HTTP 行為有爭議時，以它為準。</p>
+<p>常用的方法和它們的兩個性質如下，表格後面逐一解釋「安全」和「冪等」：</p>
+<div class="table-wrap"><table>
+  <tr><th>方法</th><th>用途</th><th>安全</th><th>冪等</th></tr>
+  <tr><td><code>GET</code></td><td>讀取資源</td><td>是</td><td>是</td></tr>
+  <tr><td><code>HEAD</code></td><td>同 GET，但只回標頭（例如只想知道檔案多大）</td><td>是</td><td>是</td></tr>
+  <tr><td><code>OPTIONS</code></td><td>問伺服器支援什麼，瀏覽器的 CORS 預檢就是它</td><td>是</td><td>是</td></tr>
+  <tr><td><code>POST</code></td><td>送資料讓伺服器處理，常用於建立（下一張訂單）</td><td>否</td><td>否</td></tr>
+  <tr><td><code>PUT</code></td><td>用送來的內容整個取代資源</td><td>否</td><td>是</td></tr>
+  <tr><td><code>PATCH</code></td><td>修改資源的一部分</td><td>否</td><td>不保證</td></tr>
+  <tr><td><code>DELETE</code></td><td>刪除資源</td><td>否</td><td>是</td></tr>
+</table></div>
+<p><strong>安全</strong>（safe）的意思是：客戶端只是在讀，不要求伺服器改變任何狀態。正因為 GET 被約定成安全的，很多程式會在沒有人點擊的情況下自動發 GET：搜尋引擎的爬蟲會順著頁面上的連結一路發 GET，瀏覽器會預先載入使用者「可能會點」的連結，快取會替你重發 GET 確認內容有沒有更新。它們都假設 GET 不會改變任何東西。</p>
+<p>所以用 GET 修改資料，例如把「取消訂單」做成 <code>GET /orders/7/cancel</code>，就是在邀請這些程式幫你取消訂單。只要這個網址出現在某個頁面上，爬蟲或預先載入路過一次，訂單就被取消了，而且沒有任何人按過按鈕。改資料一定要用 POST、PUT、PATCH 或 DELETE。</p>
+<p><strong>冪等</strong>（idempotent）的意思是：同一個請求做一次和做很多次，伺服器最後的狀態一樣。拿訂單來看：</p>
+<ul>
+  <li><code>PUT /orders/7 {"status":"ready"}</code> 送三次，訂單狀態還是 ready，和送一次一樣。</li>
+  <li><code>DELETE /orders/7</code> 送三次，訂單還是只被刪掉一次。後兩次可能回 404，回應不同，但伺服器的狀態一樣。</li>
+  <li><code>POST /orders</code> 送三次，就是三張訂單。</li>
+</ul>
+<p>冪等跟「會不會改資料」是兩回事：PUT、DELETE 會改資料，但它們是冪等的。冪等關心的是「重複」：網路不穩時，客戶端常常不知道剛才的請求有沒有成功。例如客人按下送出，請求已經到了伺服器、訂單也建好了，但回應在路上斷掉，App 只看到連線錯誤。這時要不要重送？如果請求是冪等的，重送最多就是再做一次一樣的事，結果不變；如果是 POST，重送可能變成兩張訂單，付款的話就是扣兩次錢。</p>
+<p>這兩個性質會在後面的課反覆出現：安全的請求才能放心快取（<a href="15-http-caching.html">第 15 課</a>），冪等的請求才能在網路斷掉時自動重送（<a href="17-calling-external-apis.html">第 17 課</a>）。</p>
+<div class="callout practice"><strong>💡 實務上：設計 API 時先問「這個請求被送兩次會怎樣」</strong><br>咖啡店的「送出訂單」按鈕，客人網路慢會連點，手機切換網路時客戶端也可能自動重送，用 POST 建單就可能多出一張一樣的訂單。資深工程師看到會改資料的 API，第一個問題常是「重送兩次會怎樣」：查詢用 GET，改狀態盡量設計成冪等（例如 <code>PUT</code> 設定狀態，而不是「把狀態往下推一格」），建立訂單、付款這類非冪等的操作，前端先防連點，後端再用<strong>冪等鍵</strong>（idempotency key）防重複：客戶端替每一次下單產生一個唯一的 id，放在標頭裡一起送，重送時沿用同一個 id；伺服器看到這個 id 已經處理過，就直接回上次的結果，不再建第二張單（細節在<a href="14-rest-api-design.html">第 14 課</a>）。另外，Code Review（程式碼審查）時看到用 GET 做刪除、取消、寄信，直接退回，不用等出事。</div>
+<p>下單用 POST 送出去了。伺服器處理完，要告訴 App 結果：訂單建好了嗎？沒建好的話，是客人填錯了、沒登入，還是伺服器自己壞了？這就是回應第一行那三位數的工作。</p>
+
+<h2>伺服器怎麼告訴前端結果？狀態碼</h2>
+<p>狀態行裡的三位數狀態碼，是伺服器對「這個請求結果如何」的正式回答。為什麼不直接在 body 裡寫 <code>{"ok":false}</code> 就好？因為讀回應的不只是你寫的前端程式。前端的 <code>res.ok</code>、監控系統的錯誤率、快取、HTTP 函式庫的重試邏輯，都只看狀態碼，不會去解析你的 body。狀態碼是所有經手的程式都看得懂的共同語言。</p>
+<p>狀態碼的第一位數代表家族，先記住家族就夠了，個別的碼查表用，不用背：</p>
+<div class="table-wrap"><table>
+  <tr><th>家族</th><th>意思</th><th>常用的</th></tr>
+  <tr><td>1xx</td><td>資訊：還沒完，繼續</td><td>很少直接處理</td></tr>
+  <tr><td>2xx</td><td>成功</td><td><code>200 OK</code>、<code>201 Created</code>（建立成功，通常附 <code>Location</code> 標頭）、<code>204 No Content</code>（成功，沒有 body）</td></tr>
+  <tr><td>3xx</td><td>去別的地方拿</td><td><code>301</code> 永久搬家、<code>302</code> 暫時轉址、<code>304 Not Modified</code>（你手上的快取還能用，<a href="15-http-caching.html">第 15 課</a>）</td></tr>
+  <tr><td>4xx</td><td><strong>請求有問題</strong>，客戶端要改</td><td><code>400</code> 格式錯、<code>401</code> 沒登入、<code>403</code> 登入了但沒權限、<code>404</code> 找不到、<code>405</code> 方法不對、<code>409</code> 和目前狀態衝突、<code>413</code> body 太大、<code>415</code> Content-Type 不支援、<code>422</code> 格式對但內容不合規則、<code>429</code> 請求太頻繁</td></tr>
+  <tr><td>5xx</td><td><strong>伺服器的問題</strong>，客戶端沒做錯</td><td><code>500</code> 程式出錯、<code>502</code> 前面的代理（見方法一節）沒從上游拿到正常的回應（例如上游突然斷線，或回了不合格式的東西）、<code>503</code> 暫時無法服務（維護、過載）、<code>504</code> 代理等上游回應等到逾時</td></tr>
+</table></div>
+<p>套回下單的請求：訂單建好了，回 <code>201 Created</code>，並在 <code>Location</code> 標頭附上新訂單的網址；客人沒登入，回 <code>401</code>；body 不是合法的 JSON，回 <code>400</code>；JSON 沒問題但 <code>qty</code> 是 0，回 <code>422</code>；送來的 <code>Content-Type</code> 不是 JSON，回 <code>415</code>；程式自己丟出例外，回 <code>500</code>。</p>
+<p>最常要判斷的是 4xx 還是 5xx。判斷的方式是問：同一個請求原封不動再送一次，會不會成功？請求本身錯了（4xx），再送幾次都一樣，要改的是請求；伺服器的問題（5xx），客戶端沒做錯，過一陣子可能就好了。監控也是這樣分：4xx 變多，通常是客戶端改版或有人在亂試；5xx 變多，是你的伺服器該被叫醒了。</p>
+<div class="callout warn">不要所有回應都用 200，再在 body 裡寫 <code>{"ok":false}</code>。前端的 <code>res.ok</code>、監控的錯誤率、快取、重試邏輯都看狀態碼；錯誤回 200，快取會把錯誤存起來，監控也看不到錯誤。</div>
+<div class="callout practice"><strong>💡 實務上：狀態碼是前後端之間的約定</strong><br>前端通常會依狀態碼統一處理：<code>401</code> 導去登入頁、<code>403</code> 顯示「沒有權限」、<code>400</code> 或 <code>422</code> 把錯誤標在表單欄位上、<code>5xx</code> 跳「系統忙碌，請稍後再試」。所以後端回哪個碼不是個人喜好：權限不足卻回 <code>401</code>，前端就會把已經登入的使用者踢去重新登入。團隊實務上會在 API 文件寫清楚每支 API 可能回哪些狀態碼，並約定錯誤 body 的格式（<a href="14-rest-api-design.html">第 14 課</a>）。<code>400</code> 和 <code>422</code> 要怎麼分，各團隊做法不同，挑一種寫下來、全部 API 一致，比爭論哪種才標準重要。</div>
+<p>狀態碼和標頭都在 body 前面，App 讀到空行就拿到了。但它真正要的是 body 裡那份訂單 JSON，而 body 裡可能有任何位元組，包括 <code>\r\n</code>，不能再靠空行判斷結尾。開場那個「半個 JSON」，就是在這裡出事。</p>
+
+<h2>回應的 body 到哪裡結束？</h2>
+<p>回到第一節的限制：TCP 只是一串沒有斷點的位元組。標頭用空行標出結尾，body 則要另外說明自己有多長。HTTP/1.1 主要有兩種方式，最後再看第三種：送完就關掉連線。</p>
+<h3>方式一：先講好總長度，Content-Length</h3>
+<p><code>Content-Length</code> 標頭寫的是 body 的<strong>位元組數</strong>。客戶端讀完標頭，再讀滿這麼多位元組，就知道 body 結束了。上一節看到它跟字串長度不同，用錯會怎樣？<code>examples/content-length.ts</code> 用兩種長度回同一段 JSON：</p>
+<pre>$ node examples/content-length.ts
+body.length（UTF-16 單位）： 18
+Buffer.byteLength(body)： 26
+Content-Length 用字串長度（18）→ 收到：{"message":"歡迎
+Content-Length 用位元組數（26）→ 收到：{"message":"歡迎光臨"}</pre>
+<p>客戶端完全相信 <code>Content-Length</code>：它說 18，就只讀 18 個位元組，剩下的「光臨"}」被當成不屬於這個回應，<code>JSON.parse</code> 拿到半個 JSON 就爆了。反過來，寫得比實際大，客戶端會一直等那些不存在的位元組，直到逾時。所以 <code>Content-Length</code> 一定用 <code>Buffer.byteLength(body)</code> 算，不能用 <code>body.length</code>。</p>
+<h3>方式二：不知道總長度時，Transfer-Encoding: chunked</h3>
+<p>有時候送出第一個位元組時，還不知道 body 總共多長，例如邊查資料庫邊把結果送出去。這時改用 <code>Transfer-Encoding: chunked</code>：把 body 切成一段一段送，每段前面先寫這段的位元組數（十六進位），最後送一個長度 0 的段代表結束。Node 的 HTTP 伺服器（下一課）在你沒設 <code>Content-Length</code>、又分好幾次寫出 body 時，會自動這樣送；分次寫出用的是 <code>res.write</code>，它是 <code>node:http</code> 送出一段 body 但不結束回應的方法，下一課會用到。</p>
+<p>下面這個回應，每次 <code>write</code> 之間隔了一段時間（例如在等資料庫）。用 <code>curl -i --raw</code> 看原始格式，<code>--raw</code> 是叫 curl 不要幫你把段落拼回去：</p>
+<pre>HTTP/1.1 200 OK
+Content-Type: text/plain; charset=utf-8
+Date: Sat, 31 Oct 2026 19:31:08 GMT
+Connection: keep-alive
+Keep-Alive: timeout=5
+Transfer-Encoding: chunked
+
+7
+拿鐵
+
+7
+美式
+
+0</pre>
+<p>「拿鐵」加換行是 7 個位元組，所以每段前面是 <code>7</code>；最後的 <code>0</code> 告訴客戶端 body 結束了。段落在哪裡切由送的一方決定，例如同一段同步程式裡連續 <code>write</code>，Node 可能把它們併成一段送（實測結果見課末）。接收方不能假設段落和你的 <code>write</code> 一一對應，只能照每段標的長度讀。</p>
+<h3>兩種方式只能用一種：request smuggling</h3>
+<p><code>Content-Length</code> 和 <code>Transfer-Encoding: chunked</code> 不能同時出現。原因是正式環境裡，一個請求常常先經過前面的代理，再轉給後面的伺服器（方法一節說過的那一層），兩者都要各自判斷「這個請求到哪裡結束」。如果一個請求同時帶了兩種標頭，或格式寫得模稜兩可，代理可能照 <code>Content-Length</code> 讀、伺服器照 chunked 讀，兩邊切出的邊界不同。攻擊者就能在第一個請求的 body 尾端藏一段完整的第二個請求：代理以為那是 body 的一部分，一起放行；伺服器卻把它當成下一個獨立的請求來執行，繞過代理上的檢查。這種攻擊叫 <strong>request smuggling</strong>。</p>
+<p>所以正式的 HTTP 解析器對格式非常嚴格，有一點不合規就直接拒絕，不去猜對方的意思。Node 的解析器遇到只有 <code>\n</code> 的行尾、<code>Host : x</code>（名稱和冒號之間有空白）、<code>Content-Length: 0x10</code>，都直接回 <code>400 Bad Request</code>（實測版本見課末）。練習 1 的解析器也照這個標準：格式不對就丟錯，不要幫忙修正。</p>
+<h3>方式三：送完就關，Connection: close</h3>
+<p>回應加上 <code>Connection: close</code>，意思是「這個回應送完就關連線」。客戶端讀到連線被關閉，也就知道 body 結束了。練習 2 就這樣做，同時也帶上正確的 <code>Content-Length</code>。</p>
+<p>但每次都關連線很浪費：建立 TCP 連線要來回握手，HTTPS 還要再加 TLS 握手，App 拿菜單、下單、查訂單狀態，如果每個請求都重新連線，大部分時間都花在握手上。所以 HTTP/1.1 預設反過來，連線不關。</p>
+<h3>連線不關，下一個請求接著送：keep-alive</h3>
+<p>HTTP/1.1 預設<strong>持久連線</strong>（keep-alive）：回應送完不關連線，下一個請求繼續用同一條，第一節圖中第 1、2 步就只發生一次。</p>
+<p>這也是 body 結尾一定要講清楚的另一個原因。同一條連線上，下單請求的 body 後面緊接著就是下一個請求的請求行。<code>Content-Length</code> 寫得太大，伺服器會把下一個請求的開頭當成這一個的 body；寫得太小，剩下的 body 又會被當成下一個請求的開頭。</p>
+<p>持久連線不會永遠留著。伺服器和客戶端各自有一個<strong>閒置逾時</strong>：連線閒置超過這個時間，就由自己這一邊關掉或不再重用。Node 的 HTTP 伺服器預設 5 秒，回應裡的 <code>Keep-Alive: timeout=5</code> 就是在告訴客戶端這件事（各預設值與版本見課末）。</p>
+<div class="callout practice"><strong>💡 實務上：客戶端的閒置時間要比伺服器短，偶發 502 常是這裡出錯</strong><br>如果客戶端願意把連線留得比伺服器久，就會發生這種情況：伺服器剛因為閒置把連線關掉，客戶端還以為連線可用，拿它送出下一個請求，得到 <code>ECONNRESET</code>。咖啡店 API 前面放了負載平衡器時，負載平衡器就是 Node 的客戶端（方法一節說過，代理對上游來說是客戶端），所以 Node 的 <code>keepAliveTimeout</code> 要設得比負載平衡器的閒置時間長。設反了，症狀是正式環境偶爾冒出零星的 502，重試又好了，本機怎麼都重現不出來。這是正式環境偶發 502 的經典原因之一，查不到原因時，先比對兩邊的閒置時間。</div>
+<p>到這裡，下單請求和回應的每一個位元組你都看得懂了。但每次都開 <code>node:net</code> 印原始文字太麻煩；工作上要重現一支 API 的行為、確認它回了什麼，用的是 curl。</p>
+
+<h2>怎麼在終端機重現這個下單請求？curl</h2>
+<p><strong>curl</strong> 是在終端機發送 HTTP 請求的工具，macOS 內建（這台是 curl 8.7.1）。前端看請求用瀏覽器的 Network 面板，後端用 curl，因為它能做到面板做不到的事：指令可以複製給同事、可以寫進腳本自動跑，連到沒有瀏覽器的伺服器上也能用。</p>
+<h3>送出下單的 JSON：-d 和 --json 的差別</h3>
+<p>要用 curl 送出下單請求，最直覺的寫法是 <code>-d</code> 加上 JSON。但 <code>-d</code> 不看內容，不會因為內容長得像 JSON 就改 Content-Type。開著 <code>show-request.ts</code> 比較兩種寫法，看伺服器收到的 <code>Content-Type</code>：</p>
+<pre>$ curl -d '{"drink":"拿鐵"}' http://localhost:3000/orders
+"POST /orders HTTP/1.1\r\n…Content-Length: 18\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\n{\"drink\":\"拿鐵\"}"
+
+$ curl --json '{"drink":"拿鐵"}' http://localhost:3000/orders
+"POST /orders HTTP/1.1\r\n…Content-Type: application/json\r\nAccept: application/json\r\nContent-Length: 18\r\n\r\n{\"drink\":\"拿鐵\"}"</pre>
+<p>第一種告訴伺服器「這是表單」。還記得第二節說的，伺服器靠 <code>Content-Type</code> 決定怎麼讀 body：會檢查 Content-Type 的伺服器（下一課你就會寫）會回 <code>415</code>。送 JSON 用 <code>--json</code>（舊版 curl 的寫法見課末）。</p>
+<h3>看整段對話：-v</h3>
+<p>對回菜單 JSON 的伺服器用 <code>-v</code>，看到的完整對話：</p>
+<pre>$ curl -v -s http://localhost:3000/menu
+* Host localhost:3000 was resolved.
+* IPv6: ::1
+* IPv4: 127.0.0.1
+*   Trying [::1]:3000...
+* Connected to localhost (::1) port 3000
+&gt; GET /menu HTTP/1.1
+&gt; Host: localhost:3000
+&gt; User-Agent: curl/8.7.1
+&gt; Accept: */*
+&gt;
+* Request completely sent off
+&lt; HTTP/1.1 200 OK
+&lt; Content-Type: application/json; charset=utf-8
+&lt; Date: Sat, 31 Oct 2026 15:24:38 GMT
+&lt; Connection: keep-alive
+&lt; Keep-Alive: timeout=5
+&lt; Content-Length: 30
+&lt;
+{ [30 bytes data]
+* Connection #0 to host localhost left intact
+{"drink":"拿鐵","price":110}</pre>
+<p>從上往下，正好是第一節那四個步驟：<code>*</code> 開頭的幾行是解析名稱、建立 TCP 連線，<code>&gt;</code> 開頭是送出的請求，<code>&lt;</code> 開頭是收到的狀態行和標頭，最後是 body；結尾的 <code>left intact</code> 表示連線因為 keep-alive 留著沒關。API 出問題時先用 <code>curl -v</code> 重現，就能分清楚是連不上（停在 Trying）、伺服器回錯（看狀態碼），還是前端送錯（看 <code>&gt;</code> 那幾行）。</p>
+<div class="callout practice"><strong>💡 實務上：用「Copy as cURL」重現客服回報的 bug</strong><br>客服回報「客人結帳失敗」、前端查到是結帳 API 回 500 時，最有用的不是截圖，而是一行能重跑的 curl：在瀏覽器 DevTools 的 Network 面板對那個請求按右鍵，選 Copy → Copy as cURL，就能拿到包含方法、標頭、body 的完整指令。後端拿到後先在本機或測試環境重跑，確認能重現再改程式，改完再用同一行驗證。要注意的是複製出來的指令常帶著 <code>Cookie</code> 或 <code>Authorization</code> 標頭，等於使用者的登入憑證，貼到 Slack、issue 之前要先刪掉或換成測試帳號的。</div>
+<h3>只看狀態碼、送 PATCH 加標頭</h3>
+<p>有時候你只想知道一支 API 現在回幾號，例如部署完確認服務活著，或在腳本裡判斷成功失敗。body 和進度訊息都是雜訊，要一個一個關掉：</p>
+<pre>$ curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3000/menu
+200</pre>
+<ul>
+  <li><code>-o /dev/null</code>：<code>-o</code> 叫 curl 把 body 寫進指定的檔案，而不是印到 stdout。<code>/dev/null</code> 是系統裡一個「寫進去就消失」的特殊檔案，所以這等於把 body 丟掉。</li>
+  <li><code>-s</code>：安靜模式。body 不印到終端機時，curl 會改在 stderr 印一張進度表（下載多少位元組、速度多少），<code>-s</code> 把它關掉；它也會關掉錯誤訊息，連不上時你只會看到空白。</li>
+  <li><code>-w '%{http_code}\n'</code>：傳輸完成後，照你給的格式印出資訊。<code>%{http_code}</code> 會換成狀態碼，後面的 <code>\n</code> 讓它自己佔一行。</li>
+</ul>
+<p>三個合起來，stdout 只剩一個狀態碼，腳本可以直接拿來比較。</p>
+<p>另一個常見的需求是送 <code>GET</code>、<code>POST</code> 以外的方法，例如把訂單狀態改成「做好了」，還要帶一個追查用的標頭：</p>
+<pre>$ curl -i -X PATCH --json '{"status":"ready"}' -H 'X-Request-Id: abc' http://localhost:3000/orders/7
+HTTP/1.1 204 No Content
+Date: Wed, 25 Nov 2026 20:23:05 GMT
+Connection: keep-alive
+Keep-Alive: timeout=5
+</pre>
+<ul>
+  <li><code>-X PATCH</code>：指定方法。<code>--json</code> 預設會用 POST，<code>-X</code> 把它換成 PATCH，body 和 Content-Type 照樣由 <code>--json</code> 處理。</li>
+  <li><code>-H 'X-Request-Id: abc'</code>：加一個請求標頭，寫法就是請求裡那一行的 <code>名稱: 值</code>。要加好幾個，就寫好幾個 <code>-H</code>。</li>
+  <li><code>-i</code>：輸出也包含狀態行和標頭。這個伺服器回 <code>204 No Content</code>，成功但沒有 body，不加 <code>-i</code> 會什麼都看不到。</li>
+</ul>
+<p>用到的選項整理成表，查表用，不用背：</p>
+<div class="table-wrap"><table>
+  <tr><th>選項</th><th>作用</th></tr>
+  <tr><td><code>-i</code></td><td>輸出也包含回應的狀態行和標頭</td></tr>
+  <tr><td><code>-v</code></td><td>印出整段對話：連到哪個 IP、送出的請求（<code>&gt;</code> 開頭）、收到的回應標頭（<code>&lt;</code> 開頭）。這些印在 stderr</td></tr>
+  <tr><td><code>-X PATCH</code></td><td>指定方法。沒給 body 時預設 GET，給了 body 時預設 POST</td></tr>
+  <tr><td><code>-H 'X-Request-Id: abc'</code></td><td>加一個請求標頭，可以寫好幾個</td></tr>
+  <tr><td><code>-d '…'</code></td><td>送 body，方法自動變 POST，<strong>Content-Type 是 <code>application/x-www-form-urlencoded</code></strong></td></tr>
+  <tr><td><code>--json '…'</code></td><td>送 JSON body，自動加上 <code>Content-Type: application/json</code> 和 <code>Accept: application/json</code>，方法預設 POST</td></tr>
+  <tr><td><code>-s</code></td><td>安靜模式，不印進度條</td></tr>
+  <tr><td><code>-o 檔案</code></td><td>body 寫進檔案而不是 stdout；<code>-o /dev/null</code> 就是丟掉</td></tr>
+  <tr><td><code>-w '%{http_code}'</code></td><td>傳輸完成後印出指定的資訊，例如狀態碼</td></tr>
+</table></div>
+<h3>存成腳本，換環境只改網址</h3>
+<p>拿菜單、下單這幾個請求你會反覆送：本機改完程式送一次，部署到測試環境再送一次。把它們寫成 <code>.sh</code> 檔，一行一個指令，用 <code>sh requests.sh</code> 執行，換環境時只改 <code>BASE_URL</code>：</p>
+<pre># requests.sh
+curl -s "$BASE_URL/menu"
+curl -s --json '{"drink":"美式咖啡","qty":1}' "$BASE_URL/orders"
+
+$ BASE_URL=http://localhost:3000 sh requests.sh</pre>
+<p>注意網址用雙引號、JSON 用單引號，這不是隨便選的。shell 的兩種引號差在變數會不會展開（<a href="../../devops/lessons/02-shell.html">部署課第 2 課</a>詳講）：</p>
+<ul>
+  <li><strong>單引號</strong>裡的內容原封不動。JSON 放在單引號裡，裡面的雙引號就不用跳脫。但 <code>'$BASE_URL/menu'</code> 送出去的網址就是字面上的 <code>$BASE_URL/menu</code>。</li>
+  <li><strong>雙引號</strong>裡的 <code>$變數</code> 會被換成值。網址寫 <code>"$BASE_URL/menu"</code>。</li>
+</ul>
+<p>練習 3 就是把下單相關的三個請求寫成這樣的腳本。</p>
+
+<h2>補充與查表</h2>
+<p>主線用不到、但調整設定或查問題時會用到的細節。</p>
+<h3>keep-alive 的閒置時間（Node 24.22.1）</h3>
+<ul>
+  <li>Node 24.22.1 的 HTTP 伺服器閒置 <strong>5 秒</strong>就關（<code>server.keepAliveTimeout</code> 實測是 5000，回應裡也看得到 <code>Keep-Alive: timeout=5</code>）。v24.6.0 起真正關掉前會再多等 <code>keepAliveTimeoutBuffer</code> 的 1 秒，<a href="21-graceful-shutdown.html">第 21 課</a>關機時會用到。</li>
+  <li>Node 內建的 <code>fetch</code>（由 undici 實作）的客戶端預設閒置 <strong>4 秒</strong>就不再重用（undici 文件的 <code>keepAliveTimeout</code> 預設 4e3）。比伺服器的 5 秒短，符合「客戶端要比伺服器短」。</li>
+</ul>
+<h3>解析器與 chunked 的實測結果</h3>
+<ul>
+  <li>Node 24.22.1 的解析器是 llhttp 9.4.3。本機實測遇到只有 <code>\n</code> 的行尾、<code>Host : x</code>、<code>Content-Length: 0x10</code>，都回 <code>400 Bad Request</code>。</li>
+  <li>同一段同步程式裡連續兩次 <code>write</code>，本機 Node 24.22.1 實測併成一段 <code>e</code>（14 個位元組）送出。</li>
+</ul>
+<h3>舊版 curl 送 JSON</h3>
+<p><code>--json</code> 從 curl 7.82.0 開始支援。更舊的版本改寫成 <code>-H 'Content-Type: application/json' -d '…'</code>。</p>
+<h3>HTTP/2 與 HTTP/3</h3>
+<p>HTTP/1.1 的一條連線上，回應要照請求的順序一個一個回來，前一個慢，後面的全部卡住，瀏覽器只好同時開好幾條連線。<strong>HTTP/2</strong> 把訊息改成二進位的 frame，<strong>在一條連線上同時傳好幾個請求</strong>，標頭也會壓縮；<strong>HTTP/3</strong> 改走 QUIC（建立在 UDP 上），連線換網路（例如手機從 Wi-Fi 切到行動網路）也不用重建。方法、標頭、狀態碼的意思都和這課一樣，只是傳送格式不同。實務上 HTTP/2、HTTP/3 通常由前面的反向代理或 CDN 處理，Node 程式在後面講 HTTP/1.1，這門課也都用 HTTP/1.1。</p>
+
+<h2>練習</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs node 12</code> 建立 <code>work/12/</code>，裡面有內文的範例（<code>examples/</code>）和三題的起始檔。</p>
+
+<div class="local" data-test="ex1" data-files="parse-request.ts">
+  <p>練習 1：寫 <code>parse-request.ts</code> 的 <code>parseRequest(raw)</code>，把原始的 HTTP/1.1 請求（<code>Buffer</code>）解析成 <code>{ method, target, version, headers, body }</code>。規則寫在檔案開頭的註解：標頭區到第一個 <code>\r\n\r\n</code>，行尾必須是 <code>\r\n</code>；標頭名稱轉小寫、值去掉前後空白、同名的多個值用 <code>", "</code> 合併；body 依 <code>Content-Length</code> 的位元組數從原本的 <code>Buffer</code> 切，多出來的位元組不屬於這個請求，body 也可能是圖片這種不是文字的位元組；格式錯誤（缺空行、請求行不是三段、標頭行壞掉、<code>Content-Length</code> 不是數字、body 不足）就 <code>throw new HttpParseError(…)</code>。提示：<code>Buffer</code> 也有 <code>indexOf</code>，回傳的是位元組位置。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="raw-server.ts">
+  <p>練習 2：在 <code>raw-server.ts</code> 只用 <code>node:net</code> 完成 <code>createRawServer()</code>：把連線收到的資料累積起來，看到標頭結尾的空行之後，回應 <code>HTTP/1.1 200 OK</code>、<code>Content-Type: application/json; charset=utf-8</code>、正確的 <code>Content-Length</code>、<code>Connection: close</code>，body 是 <code>{"message":"歡迎光臨"}</code>，送完關閉連線。不能改用 <code>node:http</code> 的伺服器。測試會用 <code>fetch</code>、<code>node:http</code> 的 <code>get</code>，和一個把請求分三段慢慢送的客戶端來檢查。寫好可以執行 <code>node raw-server.ts</code>，再用 <code>curl -i http://localhost:3000/</code> 看看。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="requests.sh">
+  <p>練習 3：在 <code>requests.sh</code> 寫三個 curl 指令，網址都用 <code>$BASE_URL</code> 開頭：(a) <code>GET /menu</code>，stdout 只印出狀態碼；(b) <code>POST /orders</code> 送 JSON <code>{"drink":"拿鐵","qty":2}</code>，Content-Type 要正確；(c) <code>PATCH /orders/1</code> 送 <code>{"status":"ready"}</code>，並帶 <code>X-Request-Id: test-123</code> 標頭。測試會開一個記錄所有請求的伺服器，設好 <code>BASE_URL</code> 執行 <code>sh requests.sh</code>，檢查伺服器收到的方法、路徑、標頭、body，以及整個腳本的 stdout 只有 (a) 的狀態碼（(b)、(c) 的回應是沒有 body 的 204）。可以先開 <code>show-request.ts</code>，用 <code>BASE_URL=http://localhost:3000 sh requests.sh</code> 自己看看送出了什麼。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：<code>GET</code>、<code>POST</code>、<code>PUT</code>、<code>DELETE</code> 之中，哪些是冪等的？</p>
+  <label data-key="a">只有 GET，其他會改資料的都不冪等</label>
+  <label data-key="b">全部都是，同樣的請求伺服器一定回同樣的結果</label>
+  <label data-key="c">GET、PUT、DELETE 是；POST 不是</label>
+  <p class="why">✓ 冪等是說「做一次和做很多次，伺服器最後的狀態一樣」，跟會不會改資料無關。PUT 用同樣的內容取代三次，結果一樣；DELETE 刪三次，資源還是被刪掉一次（後面幾次可能回 404，但狀態相同）。POST 送三次會建立三張訂單。冪等也不是「回應一樣」，DELETE 第二次的回應可能不同。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：前端呼叫 API，一次拿到 <code>404</code>，另一次拿到 <code>500</code>。各該由誰處理？</p>
+  <label data-key="a">都是伺服器壞了，後端要修</label>
+  <label data-key="b">404 是請求有問題（網址或資源 id 錯了），客戶端要改；500 是伺服器內部出錯，後端要修</label>
+  <label data-key="c">404 是伺服器的路由壞了要修；500 是客戶端送錯資料</label>
+  <p class="why">✓ 4xx 代表請求本身有問題，原封不動重送還是會失敗，要改的是客戶端（或使用者輸入）；5xx 代表客戶端沒做錯，是伺服器出了問題。如果客戶端送錯資料，正確的伺服器應該回 400 或 422，回成 500 就是後端的 bug。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：<code>curl -d '{"a":1}' http://localhost:3000/orders</code> 送出的 Content-Type 是什麼？</p>
+  <label data-key="a">application/x-www-form-urlencoded，要送 JSON 改用 --json，或加 -H 'Content-Type: application/json'</label>
+  <label data-key="b">application/json，curl 看到大括號會自動判斷</label>
+  <label data-key="c">不會送 Content-Type 標頭</label>
+  <p class="why">✓ <code>-d</code> 不看內容，一律用表單格式 <code>application/x-www-form-urlencoded</code>（本機 curl 8.7.1 實測）。檢查 Content-Type 的伺服器會回 415，或把 body 當成表單解析。<code>--json</code> 會同時設好 <code>Content-Type</code> 和 <code>Accept</code>。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>以為 HTTP 就是 JSON</strong>：HTTP 只規定訊息的格式，body 是什麼由 <code>Content-Type</code> 說明，HTML、圖片、表單、純文字都可以。</li>
+  <li><strong><code>Content-Length</code> 用字串長度</strong>：中文一個字 3 個位元組，客戶端會讀到半個 JSON。用 <code>Buffer.byteLength(body)</code>。</li>
+  <li><strong>用 GET 修改資料</strong>：GET 是安全的方法，爬蟲、預先載入、快取都會自動發。修改用 POST、PUT、PATCH、DELETE。</li>
+  <li><strong>錯誤時回 200，在 body 裡寫失敗</strong>：前端的 <code>res.ok</code>、監控、快取、重試都看狀態碼。錯誤就回對應的 4xx 或 5xx。</li>
+  <li><strong>以為 4xx 代表伺服器壞了</strong>：4xx 是請求的問題。看到大量 4xx，先檢查客戶端送了什麼（<code>curl -v</code>）。</li>
+  <li><strong>客戶端的 keep-alive 閒置時間比伺服器長</strong>：客戶端會拿伺服器剛關掉的連線送請求，得到 <code>ECONNRESET</code>，前面有負載平衡器時就是偶發 502。讓 Node 的 <code>keepAliveTimeout</code> 比前面那一層的閒置時間長。</li>
+  <li><strong>curl 用 <code>-d</code> 送 JSON 忘了 Content-Type</strong>：預設是表單格式。用 <code>--json</code>。</li>
+  <li><strong>網址放在單引號裡</strong>：<code>'$BASE_URL/menu'</code> 的變數不會展開。網址用雙引號，JSON 用單引號。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>一次請求：DNS 把名稱換成 IP、和那個 port 建立 TCP 連線、送出請求文字、收到回應文字；HTTPS 在 TCP 上多一層 TLS。TCP 不分訊息邊界，所以 HTTP 要自己標出結尾。</li>
+  <li>HTTP/1.1 訊息：請求行（方法 目標 版本）或狀態行、一行一個標頭、空行、body；行尾是 <code>\r\n</code>，標頭名稱不分大小寫，<code>Content-Type</code> 說明 body 的格式。</li>
+  <li>GET、HEAD、OPTIONS 是安全的；GET、HEAD、OPTIONS、PUT、DELETE 是冪等的，POST 不是。這決定能不能快取和自動重送；改資料不能用 GET。</li>
+  <li>2xx 成功、3xx 轉址或用快取、4xx 客戶端要改、5xx 伺服器的問題。判斷方式是「原封不動重送會不會成功」。</li>
+  <li>body 的結尾看 <code>Content-Length</code>（位元組數）或 <code>Transfer-Encoding: chunked</code>，兩者不能同時出現；keep-alive 讓同一條連線送多個請求，Node 伺服器閒置 5 秒關閉，fetch 客戶端 4 秒，客戶端要比伺服器短。</li>
+  <li>curl：<code>-i</code>、<code>-v</code> 看標頭和對話，<code>-X</code> 指定方法，<code>-H</code> 加標頭，<code>--json</code> 送 JSON，<code>-s -o /dev/null -w '%{http_code}'</code> 只印狀態碼；<code>-d</code> 預設是表單格式。</li>
+</ul>
+<p>下一課改用 <code>node:http</code> 寫伺服器：解析請求、累積 body、組回應這些事它都幫你做好了，你專心處理路由、驗證和錯誤。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

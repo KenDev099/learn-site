@@ -1,0 +1,400 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>13. 無狀態與水平擴展</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="13" data-practice="devops">
+<header>
+  <div class="eyebrow">階段 3：流量與擴展 · 第 13 課</div>
+  <h1>無狀態與水平擴展</h1>
+</header>
+<main>
+
+<p>週末的買一送一活動，咖啡店的點餐量是平常的五倍。只有一個 cafe-api 在跑，CPU 頂在 100%，p99 從 200ms 變成 8 秒。你照著直覺在 Compose 裡把 api 開成 3 份，速度回來了，客服卻開始收到奇怪的回報：「購物車裡的拿鐵一下有一下沒有」「我明明登入了，重新整理又被登出」。</p>
+<p>這一課把 cafe-api 從一份變成好幾份，並讓它們真的能互相替代。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>擴展的兩個方向：換一台大機器還是多開幾份，為什麼 Node 服務靠多開副本。</li>
+  <li>狀態藏在哪裡、把狀態搬出去：購物車一下有一下沒有、重新整理就被登出的原因，怎麼把 session 和購物車搬到 Redis（開場問題的最小答案）。</li>
+  <li>nginx 負載平衡、健康檢查與排空：把流量分給所有副本，副本掛掉、換 IP、被縮減時都不掉請求。</li>
+  <li>容量規劃：活動尖峰需要幾個副本，資料庫連線夠不夠分。</li>
+  <li>Kubernetes：這一課手動做的事換到編排器上叫什麼，什麼規模才值得用。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../auth/lessons/04-cookies-sessions.html">Auth 課第 4 課</a>的 session：瀏覽器的 cookie 只帶一個 session ID，登入狀態存在伺服器那一端。</li>
+  <li><a href="10-compose.html">第 10 課</a>的 Compose：服務之間用服務名稱互連，<code>healthcheck</code> 讓 Docker 知道服務準備好了沒。</li>
+  <li><a href="12-nginx.html">第 12 課</a>的 nginx：<code>proxy_pass</code> 把請求轉給後端，upstream 連線閒置太久會被關掉，所以後端的閒置逾時要比 nginx 長。</li>
+</ul></div>
+
+<h2>擴展的兩個方向</h2>
+<p>服務撐不住時有兩種做法：</p>
+<ul>
+  <li><strong>垂直擴展</strong>（scale up）：換一台更大的機器，CPU 和記憶體變多，程式不用改。</li>
+  <li><strong>水平擴展</strong>（scale out）：同一個程式多跑幾份。每一份叫一個<strong>副本</strong>（replica），前面由<strong>負載平衡</strong>（load balancing）把請求分給它們。</li>
+</ul>
+<div class="table-wrap"><table>
+  <tr><th></th><th>垂直擴展</th><th>水平擴展</th></tr>
+  <tr><td>上限</td><td>最大的機器型號；再上去價格不成比例</td><td>理論上一直加，實際受限於共用的資料庫、Redis</td></tr>
+  <tr><td>程式要改嗎</td><td>不用</td><td>要：程序不能自己保存狀態</td></tr>
+  <tr><td>升級時</td><td>換機器通常要停機</td><td>一個一個換，其他副本照常服務</td></tr>
+  <tr><td>單點故障</td><td>機器掛了就全掛</td><td>掛一個，其他副本接手</td></tr>
+  <tr><td>適合</td><td>資料庫這類難以拆開的服務；流量還小時</td><td>API、網站這類無狀態服務</td></tr>
+</table></div>
+<p>Node 特別需要水平擴展：一個 Node 程序只有一條主執行緒執行你的 JavaScript（<a href="../../node/lessons/24-scaling.html">Node 課第 24 課</a>），機器換成 16 核心，一個程序也只用得到一核。所以 Node 服務的常見做法是「每個副本給 1 個 CPU 左右，用副本數擴展」。</p>
+<p>這一課用 Compose 加 nginx 手動做一次，弄懂每個環節；最後一節對照 Kubernetes，你會發現它只是把同樣的事自動化，名字換了而已。</p>
+
+<h2>狀態藏在哪裡</h2>
+<p><strong>無狀態</strong>（stateless）指程序本身不保存「下一個請求還需要」的資料。<a href="https://12factor.net/processes">12-factor 第 VI 條</a>的說法是：程序之間不共享任何東西，需要保存的資料一律放在後端服務（資料庫、Redis）裡。做到這點，任何一個副本都能處理任何一個請求，副本才能隨時加、隨時刪。</p>
+<p>狀態常常藏在你沒注意的地方：</p>
+<figure>
+  <svg viewBox="0 0 700 300" role="img" aria-label="一個副本裡藏狀態的四個地方：記憶體裡的 session、購物車、限流計數、快取；磁碟上的上傳檔；計時器跑的排程；長連線。右邊是各自要搬去的地方：Redis、PostgreSQL、S3、單一執行者">
+    <defs><marker id="arr13a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="15" y="15" width="330" height="270" rx="10"/>
+    <text class="d-accent" x="180" y="42" text-anchor="middle">一個 api 副本裡面</text>
+    <rect class="d-soft" x="35" y="58" width="290" height="50" rx="8"/>
+    <text class="d-text" x="50" y="80">記憶體</text>
+    <text class="d-small" x="50" y="98">session、購物車、限流計數、快取</text>
+    <rect class="d-soft" x="35" y="118" width="290" height="44" rx="8"/>
+    <text class="d-text" x="50" y="140">磁碟</text>
+    <text class="d-small" x="120" y="140">上傳的照片、產生的報表</text>
+    <rect class="d-soft" x="35" y="172" width="290" height="44" rx="8"/>
+    <text class="d-text" x="50" y="194">計時器</text>
+    <text class="d-small" x="120" y="194">每天 9 點寄日報、清過期訂單</text>
+    <rect class="d-soft" x="35" y="226" width="290" height="44" rx="8"/>
+    <text class="d-text" x="50" y="248">長連線</text>
+    <text class="d-small" x="120" y="248">WebSocket、SSE 的訂閱者清單</text>
+    <line class="d-line" x1="325" y1="83" x2="440" y2="70" marker-end="url(#arr13a)"/>
+    <line class="d-line" x1="325" y1="140" x2="440" y2="135" marker-end="url(#arr13a)"/>
+    <line class="d-line" x1="325" y1="194" x2="440" y2="198" marker-end="url(#arr13a)"/>
+    <line class="d-line" x1="325" y1="248" x2="440" y2="258" marker-end="url(#arr13a)"/>
+    <rect class="d-box" x="445" y="45" width="240" height="50" rx="8"/>
+    <text class="d-text" x="460" y="67">Redis（加 TTL）</text>
+    <text class="d-small" x="460" y="85">PostgreSQL：要永久保存的</text>
+    <rect class="d-box" x="445" y="112" width="240" height="46" rx="8"/>
+    <text class="d-text" x="460" y="140">S3 這類物件儲存</text>
+    <rect class="d-box" x="445" y="175" width="240" height="46" rx="8"/>
+    <text class="d-text" x="460" y="203">單一排程器或 advisory lock</text>
+    <rect class="d-box" x="445" y="235" width="240" height="46" rx="8"/>
+    <text class="d-text" x="460" y="263">Redis pub/sub 廣播給所有副本</text>
+  </svg>
+  <figcaption>副本裡的四種狀態，以及各自要搬去的地方</figcaption>
+</figure>
+<p>起始版的 cafe-api 把購物車放在一個 <code>Map</code> 裡。只有一個副本時完全正常；開成 3 個、nginx 輪流分配後，就會出現開頭的狀況：</p>
+<pre>$ curl -s -b sid=abc -X POST localhost:18130/cart/items -H 'content-type: application/json' -d '{"productId":2}'
+{"items":[2]}                     # 副本 1 的 Map 記住了
+$ curl -s -b sid=abc localhost:18130/cart
+{"items":[]}                      # 這次分到副本 2，它的 Map 是空的
+$ curl -s -b sid=abc localhost:18130/cart
+{"items":[]}                      # 副本 3，也是空的
+$ curl -s -b sid=abc localhost:18130/cart
+{"items":[2]}                     # 又輪回副本 1</pre>
+<p>每個副本是獨立的程序，各有各的記憶體。其他狀態也是同樣的問題：</p>
+<ul>
+  <li><strong>記憶體限流</strong>：每個副本各數各的，「每分鐘 100 次」在 3 個副本下變成大約 300 次。</li>
+  <li><strong>上傳檔</strong>存在容器的磁碟：只有收到上傳的那個副本有，而且容器重建就沒了。</li>
+  <li><strong>排程</strong>用 <code>setInterval</code> 寫在 app 裡：3 個副本各跑一次，日報寄了 3 封。</li>
+  <li><strong>記憶體快取</strong>：每個副本各一份，更新商品價格後，有的副本回新價、有的回舊價，直到快取過期。</li>
+</ul>
+
+<h2>把狀態搬出去</h2>
+<p>原則是：程序裡只放「丟了也沒關係」的東西，其他的放到所有副本都連得到的地方。</p>
+<div class="table-wrap"><table>
+  <tr><th>狀態</th><th>搬到哪裡</th><th>重點</th></tr>
+  <tr><td>session、購物車</td><td>Redis</td><td>一定要設 TTL，不然沒結帳的購物車永遠占著記憶體</td></tr>
+  <tr><td>訂單、會員資料</td><td>PostgreSQL</td><td>要永久保存、要交易保證的</td></tr>
+  <tr><td>限流計數</td><td>Redis（<code>INCR</code> 加 <code>EXPIRE</code>）或入口的 nginx</td><td>所有副本共用同一個計數</td></tr>
+  <tr><td>上傳檔</td><td>S3 這類物件儲存（<a href="../../nestjs/lessons/22-uploads-webhooks.html">NestJS 課第 22 課</a>）</td><td>容器裡的磁碟當作隨時會消失</td></tr>
+  <tr><td>排程</td><td>單一排程器（另一個只跑 1 份的服務），或每個副本搶 advisory lock</td><td>同一個工作只有一個執行者</td></tr>
+  <tr><td>快取</td><td>可以留在各副本，或改放 Redis</td><td>能接受幾秒不一致就留著，它最快</td></tr>
+</table></div>
+<p>購物車搬到 Redis 的寫法（ioredis 6.0.0，用法見 <a href="../../nestjs/lessons/19-caching-redis.html">NestJS 課第 19 課</a>）：key 用 <code>cart:&lt;sid&gt;</code>，值用 Redis 的 list（依加入順序排列的清單），每次加入商品都把期限重設成 1 天。</p>
+<pre>const key = (sid: string) =&gt; `cart:${sid}`
+
+export async function addItem(redis: Redis, sid: string, productId: number) {
+  // RPUSH 加在清單尾端；EXPIRE 把期限設成 86400 秒
+  await redis.rpush(key(sid), productId)
+  await redis.expire(key(sid), 86_400)
+}</pre>
+<p>兩個指令分開送，中間程序如果剛好被停掉，會留下一個沒有期限的 key。用 <code>redis.multi()</code> 把它們包成一組一起執行，練習 1 會用到。</p>
+<p><strong>排程</strong>：最簡單的是把它從 api 拆出去，變成只跑 1 份的 worker 服務。如果一定要留在 api 裡，就讓每個副本在執行前用 PostgreSQL 的 <code>pg_try_advisory_lock</code> 搶鎖，搶到的才執行（<a href="../../postgresql/lessons/33-job-queue.html">PostgreSQL 課第 33 課</a>）。</p>
+<div class="callout warn"><strong>黏性 session 不是解法。</strong><strong>黏性 session</strong>（sticky session）是讓負載平衡把同一個使用者固定送到同一個副本，例如 nginx 的 <code>ip_hash</code>，或 1.29.6 起開放原始碼版也能用的 <code>sticky</code>。購物車看起來好了，但只是把問題藏起來：那個副本重啟、被縮減或部署時，它記憶體裡的購物車一起消失；同一個公司或學校的人共用一個對外 IP，全部擠到同一台；新加的副本分不到舊客人。先把狀態搬出去，才談得上擴展。</div>
+<div class="callout practice"><strong>💡 實務上：加副本之前，先做一次「無狀態檢查」</strong><br>接手一個服務要開多副本時，先在程式裡搜尋 <code>new Map</code>、模組層級的陣列或物件、<code>setInterval</code>、cron 套件、寫到本機路徑的上傳設定，以及記憶體版的限流與 session 套件（很多套件的預設儲存就是記憶體）。每找到一個，就問同一個問題：「這個副本現在被砍掉，使用者會發現嗎？」會發現的就要搬出去。最可靠的驗證是在測試環境開 2 個以上副本跑一輪主要流程，中途重啟其中一個。購物車消失是 PM 會在意的營收問題，session 存在哪裡則是資安審查會問的事。</div>
+
+<h2>nginx 負載平衡</h2>
+<p><a href="12-nginx.html">第 12 課</a>的 <code>proxy_pass http://api:3000</code> 只寫了一個位址。要分給多個副本，用 <code>upstream</code> 區塊定義一組後端：</p>
+<pre>upstream api {
+    zone api 64k;                            # 這組後端的狀態放在共用記憶體，所有 worker 看到同一份
+    resolver 127.0.0.11 valid=5s ipv6=off;   # Docker 內建的 DNS 伺服器，查到的結果用 5 秒
+    least_conn;                              # 分給目前連線最少的副本
+    server api:3000 resolve max_fails=2 fail_timeout=5s;
+}
+
+server {
+    listen 80;
+    location / {
+        proxy_pass http://api;               # 名稱對到上面的 upstream
+        proxy_next_upstream error timeout http_502 http_503;
+        proxy_connect_timeout 2s;            # 內部網路建立連線只要幾毫秒，預設 60 秒太久
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Request-ID $request_id;
+    }
+}</pre>
+<p>一行一行看（以下依 <a href="https://nginx.org/en/docs/http/ngx_http_upstream_module.html">nginx 官方文件</a>，練習用 nginx 1.30.6）：</p>
+<ul>
+  <li><strong>分配方式</strong>：預設是 <strong>round robin</strong>，依序輪流分給每一台。<code>least_conn</code> 把請求給目前進行中連線最少的那台，平手時再輪流。請求花的時間差很多時（有的 10ms、有的 3 秒），least_conn 比較不會把請求堆在正在忙的那台。</li>
+  <li><strong>被動健康檢查</strong>（passive health check）：nginx 開放原始碼版不會主動去打健康檢查端點（主動的 <code>health_check</code> 是商業版功能），而是從真實請求的失敗判斷。<code>max_fails=2 fail_timeout=5s</code> 表示 5 秒內失敗 2 次，就把這台當成壞掉，接下來 5 秒不送過去。預設是 1 次、10 秒。</li>
+  <li><code>proxy_next_upstream</code>：這台失敗時換下一台再試。預設 <code>error timeout</code>，也就是連不上或逾時；加上 <code>http_502 http_503</code>，後端回 502、503 也換。</li>
+  <li><code>proxy_connect_timeout</code>：建立連線最多等多久，預設 60 秒。副本當掉（例如被 OOM 殺掉）時，它的 IP 常常不會回「拒絕連線」，而是完全沒有回應；送到它的請求會卡滿 60 秒才換下一台。同一個網路裡建立連線只要幾毫秒，設成 1～2 秒就夠。</li>
+  <li><code>resolve</code>：定期重新查 <code>api</code> 這個名字的 IP。</li>
+</ul>
+<h3>只重試冪等的請求</h3>
+<p><strong>冪等</strong>（idempotent）是「做一次和做很多次，結果相同」。GET 是冪等的，查幾次都一樣；POST /orders 不是，送兩次就是兩張訂單。</p>
+<p>想像副本 1 收到下單請求，訂單已經寫進資料庫，回應時才出錯，nginx 收到 503。如果這時把同一個 POST 重送給副本 2，客人就被扣了兩次錢。所以 nginx 預設（1.9.13 起）：POST、PATCH、LOCK 這類非冪等的請求，只要已經送到後端，就<strong>不會</strong>再送給下一台；只有「連線根本沒建立」這種確定沒送出去的情況才會換一台。<code>proxy_next_upstream</code> 有一個 <code>non_idempotent</code> 參數會解除這個保護，不要加。POST 要重試，交給客戶端帶冪等鍵（<code>Idempotency-Key</code>）自己重試，由後端判斷是不是同一筆。</p>
+<h3>容器重建後的 IP</h3>
+<p><code>server api:3000</code> 沒有 <code>resolve</code> 時，nginx 只在啟動（或 reload）時查一次 DNS，把查到的 3 個 IP 記下來。Compose 的服務名稱 <code>api</code> 會解析成所有副本的 IP，這部分沒問題；但容器被重建、副本增減時，Docker 不保證新容器拿到原本的 IP（舊位址被別的容器拿走時一定會換），換了之後 nginx 還在連舊的，全部變成 502；新加的副本也永遠分不到流量。</p>
+<p><code>resolve</code> 讓 nginx 依 <code>resolver</code> 的 <code>valid=5s</code> 每 5 秒重新查一次，副本增減、換 IP 都跟得上。它有兩個條件：要有 <code>resolver</code>（寫在 http 或這個 upstream 裡；<code>127.0.0.11</code> 是 Docker 給每個容器的內建 DNS），而且這組 upstream 要放在共用記憶體，也就是要有 <code>zone</code>。少了 <code>zone</code>，<code>nginx -t</code> 直接報錯。<code>resolve</code> 參數在 1.27.3 之前只有商業版有。</p>
+<p>Compose 這邊，副本數寫在 <code>deploy.replicas</code>，也可以臨時用 <code>--scale</code> 改：</p>
+<pre>docker compose up -d --wait --scale api=5     # 開到 5 個
+docker compose ps api                         # ld-13-api-1 … ld-13-api-5
+curl -si localhost:18130/products | grep -i x-instance   # cafe-api 會回報是哪個副本處理的</pre>
+<div class="callout">副本不能發布固定的主機 port：3 個容器都想要主機的 3000 port，第二個就啟動失敗。api 不發布 port，只讓同一個網路裡的 nginx 連。</div>
+
+<h2>健康檢查與排空</h2>
+<p>有了多個副本，部署和縮減就是「停掉一些副本、開新的」。停的方式不對，正在處理的請求就會失敗。先分清楚兩種健康檢查（<a href="../../node/lessons/21-graceful-shutdown.html">Node 課第 21 課</a>）：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>liveness（活著嗎）</th><th>readiness（能接流量嗎）</th></tr>
+  <tr><td>問的是</td><td>這個程序要不要被重啟</td><td>現在要不要送新請求給它</td></tr>
+  <tr><td>失敗時</td><td>編排器殺掉它、重開</td><td>先不送流量，程序照跑</td></tr>
+  <tr><td>檢查什麼</td><td>只看程序自己：事件迴圈還在動、沒有卡死</td><td>資料庫、Redis 連得上；不在排空中</td></tr>
+  <tr><td>不要檢查</td><td>資料庫、Redis 等外部依賴</td><td>—</td></tr>
+</table></div>
+<p>為什麼 liveness 不能檢查資料庫？資料庫維護 30 秒，所有副本的 liveness 同時失敗，編排器把它們全部重啟；重啟中的副本更接不了客，資料庫回來時又同時湧入一大批重新連線的請求。<a href="https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/">Kubernetes 文件</a>也警告：錯誤的 liveness 會造成連環故障。資料庫掛了，副本該做的是 readiness 回 503，等它回來。</p>
+<p><strong>排空</strong>（draining）是停止前先不接新請求、把手上的做完。<code>docker stop</code>、縮減副本、部署時，容器會先收到 SIGTERM，在 <code>stop_grace_period</code>（這裡設 10 秒）內沒結束就被 SIGKILL（exit 137）。收到 SIGTERM 後的順序：</p>
+<figure>
+  <svg viewBox="0 0 700 230" role="img" aria-label="時間軸：收到 SIGTERM 時 readiness 改回 503、回應開始帶 Connection: close；排空 DRAIN_MS 期間仍正常處理請求；之後 server.close 不再接新連線並關掉閒置連線；手上的請求做完後關閉資料庫與 Redis，exit 0；10 秒還沒結束就會被 SIGKILL">
+    <defs><marker id="arr13b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <line class="d-line" x1="30" y1="110" x2="680" y2="110" marker-end="url(#arr13b)"/>
+    <line class="d-line" x1="40" y1="95" x2="40" y2="125"/>
+    <text class="d-accent" x="40" y="85" text-anchor="middle">SIGTERM</text>
+    <rect class="d-soft" x="45" y="130" width="250" height="80" rx="8"/>
+    <text class="d-text" x="55" y="152">排空 DRAIN_MS（3 秒）</text>
+    <text class="d-small" x="55" y="172">readiness 回 503</text>
+    <text class="d-small" x="55" y="190">照常服務，回應帶 Connection: close</text>
+    <line class="d-line" x1="300" y1="95" x2="300" y2="125"/>
+    <text class="d-accent" x="300" y="85" text-anchor="middle">server.close()</text>
+    <rect class="d-soft" x="305" y="130" width="200" height="80" rx="8"/>
+    <text class="d-text" x="315" y="152">不再接新連線</text>
+    <text class="d-small" x="315" y="172">關掉閒置連線</text>
+    <text class="d-small" x="315" y="190">等手上的請求做完</text>
+    <line class="d-line" x1="510" y1="95" x2="510" y2="125"/>
+    <text class="d-accent" x="510" y="85" text-anchor="middle">關 pg、Redis</text>
+    <text class="d-text" x="560" y="152">exit 0</text>
+    <line class="d-line" x1="660" y1="95" x2="660" y2="125"/>
+    <text class="d-small" x="660" y="40" text-anchor="middle">10 秒</text>
+    <text class="d-small" x="660" y="58" text-anchor="middle">SIGKILL（137）</text>
+  </svg>
+  <figcaption>收到 SIGTERM 之後的順序；全部要在 stop_grace_period 內完成</figcaption>
+</figure>
+<ol>
+  <li><strong>readiness 改回 503</strong>：有主動健康檢查的負載平衡（Kubernetes、AWS ALB）看到就不再送新流量。這一步需要時間生效，所以要等。</li>
+  <li><strong>繼續服務一段時間</strong>（DRAIN_MS），回應加上 <code>Connection: close</code>：nginx 和後端之間的連線會被重用（第 12 課），這個標頭叫對方用完這條就關掉，不再把下一個請求送進來。</li>
+  <li><strong><code>server.close()</code></strong>：停止接受新連線；Node 19 起它也會關掉閒置的 keep-alive 連線；進行中的請求不受影響，全部做完才呼叫 callback。之後 nginx 連過來會被拒絕（connection refused），這算「還沒送出」，連 POST 都會被換到下一台。</li>
+  <li><strong>關資料庫連線池與 Redis</strong>，<code>process.exit(0)</code>。不關的話它們會讓程序一直不結束，最後被 SIGKILL。</li>
+</ol>
+<p>起始版的 SIGTERM 處理是直接 <code>process.exit(0)</code>：正在處理的下單請求被切斷，nginx 拿到不完整的回應，客人看到 502。</p>
+<p>做到這些，還剩一個很小的競爭：<code>server.close()</code> 關掉閒置連線的那一瞬間，nginx 可能剛好挑中這條連線送出請求，得到 <code>Connection reset by peer</code>。app 這邊沒辦法完全消除它，要靠前面的代理<strong>先</strong>把副本移出名單、app <strong>後</strong>關連線。Kubernetes 的做法是 readiness 失敗或 Pod 進入終止時就把它移出 Service，再用 <code>preStop</code> 多等幾秒讓移除生效；nginx 開放原始碼版不會看 readiness，所以練習 3 容許 1 個這樣的失敗。</p>
+<div class="callout warn"><strong>閒置逾時要前短後長</strong>（第 12 課）。nginx upstream 的 <code>keepalive_timeout</code> 預設 60 秒，Node 的 <code>server.keepAliveTimeout</code>（<a href="../../node/lessons/13-http-server.html">Node 課第 13 課</a>）預設 5 秒。Node 先關閒置連線時，nginx 可能剛好把請求寫進這條正在關的連線，得到偶發的 502。把 app 的 <code>keepAliveTimeout</code> 設成比前面的代理長，例如 65 秒；前面換成 AWS ALB 時也是一樣，要比 ALB 的閒置逾時長。</div>
+<div class="callout practice"><strong>💡 實務上：「每次部署都有幾個 502」通常是關機順序的問題</strong><br>這類回報常被當成「部署本來就會抖一下」而放著不管。查的順序：先看 nginx 的 error log，<code>connect() failed (111: Connection refused)</code> 或 <code>upstream prematurely closed connection</code> 集中在部署的那幾秒，就是副本關得太粗魯；再確認 SIGTERM 真的送到 Node：CMD 寫成 shell 形式或 <code>["npm", "start"]</code> 時，PID 1 可能不是 node，訊號不一定送得到（<a href="08-dockerfile.html">第 8 課</a>），結果是每次都等滿 grace period 被 SIGKILL（ExitCode 137）；最後對一下各層的閒置逾時是不是前短後長。資深工程師會把「部署期間錯誤率」放進部署後的檢查清單，而不是等客服轉來。</div>
+
+<h2>容量規劃</h2>
+<p><strong>容量規劃</strong>（capacity planning）是事先算出尖峰時需要幾個副本、多少資源。「感覺不夠就加」的問題是：等你感覺到時，客人已經在看 504。</p>
+<p><strong>第一步：量出一個副本的能力。</strong>用壓測工具（例如 autocannon；壓測時看 p99 而不是平均，見 <a href="../../node/lessons/23-profiling-memory.html">Node 課第 23 課</a>）逐步加壓一個副本，找出在目標內（例如 p95 &lt; 300ms）能撐的最大 RPS（每秒請求數）。假設 cafe-api 一個副本是 180 RPS。</p>
+<p><strong>第二步：算副本數。</strong>平常不把副本用滿，留一些餘裕應付突然的流量，這個上限叫<strong>目標使用率</strong>（例如 70%）；再多留至少一個<strong>備用副本</strong>（N+1），掛掉一個或部署時少一個還撐得住。</p>
+<pre>副本數 = 無條件進位( 尖峰 RPS ÷ (單副本 RPS × 目標使用率) ) + 備用副本
+       = ceil( 600 ÷ (180 × 0.7) ) + 1
+       = ceil( 600 ÷ 126 ) + 1 = ceil(4.76) + 1 = 6</pre>
+<p>用平均流量算是常見的錯：咖啡店平均 150 RPS，算出來 2 個副本，早上 8 點的尖峰就垮了。也不能四捨五入：4.2 個副本四捨五入成 4，就是 105% 的負載。用程式算時注意浮點數，JavaScript 裡 <code>180 * 0.7</code> 是 <code>125.99999999999999</code>，剛好整除的情況可能被多進位一個。</p>
+<p><strong>第三步：算資料庫連線。</strong><strong>Little's law</strong>：系統裡平均同時在處理的數量 ＝ 每秒到達數 × 平均停留秒數。套到連線池：一個副本每秒 180 個請求，每個請求占用資料庫連線 0.02 秒，平均同時有 180 × 0.02 = 3.6 條連線在用；流量不平均，再乘上安全係數 2，無條件進位成 8，每個副本的連線池設 8。</p>
+<p><strong>第四步：檢查資料庫的連線預算。</strong>PostgreSQL 的 <code>max_connections</code> 是所有副本共用的（<a href="../../postgresql/lessons/36-connections-monitoring.html">PostgreSQL 課第 36 課</a>）。部署時新副本先起來、舊的才停，會短暫多出幾個副本（Kubernetes 叫 <code>maxSurge</code>），也要算進去：</p>
+<pre>需要 = (副本數 + maxSurge) × 每個連線池 = (6 + 1) × 8 = 56
+可用 = max_connections − 保留給管理與 migration 的 = 100 − 10 = 90     → 56 ≤ 90，夠</pre>
+<p>超過時的症狀是部署到一半，新副本連資料庫失敗（<code>sorry, too many clients already</code>），或請求卡在等連線池而逾時。解法依序是：把連線池調小（Little's law 算出來的通常比你想的小）、在中間放 PgBouncer、或換更大的資料庫。副本數 × 連線池這筆帳，每次加副本都要重算。</p>
+<div class="callout practice"><strong>💡 實務上：活動前的容量規劃，是 PM 和工程師一起做的</strong><br>行銷排了買一送一，工程這邊最先要問的是：預估的尖峰是平常的幾倍、集中在哪個時段、會打到哪些 API（點餐比瀏覽菜單重得多）。拿到數字後，用上面的公式算副本數與連線預算，提前一兩天擴好，不要賭自動擴縮來得及：新副本從建立到通過 readiness 要時間，資料庫也不會跟著自動變大。活動結束後拿實際的流量與 p95 對照當初的估計，修正「一個副本能撐多少」這個數字，下一次就更準（指標怎麼收，見<a href="22-metrics-slo.html">第 22 課</a>）。</div>
+
+<h2>Kubernetes：同樣的概念換個名字</h2>
+<p>到這裡你手動做了編排器的工作：決定副本數、重建容器、健康檢查、排空、更新負載平衡的名單。<strong>編排器</strong>（orchestrator）是把這些自動化的系統，最常見的是 Kubernetes，AWS 上也有 ECS。對照一下：</p>
+<div class="table-wrap"><table>
+  <tr><th>這一課</th><th>Kubernetes</th></tr>
+  <tr><td>一個 api 容器</td><td><strong>Pod</strong>：最小的執行單位，一個或幾個容器</td></tr>
+  <tr><td>Compose 的 api 服務與 <code>replicas: 3</code></td><td><strong>Deployment</strong>：維持指定數量的 Pod，負責滾動更新</td></tr>
+  <tr><td>nginx 的 <code>upstream api</code> 加 <code>resolve</code></td><td><strong>Service</strong>：穩定的內部位址，自動跟上 Pod 的增減</td></tr>
+  <tr><td>入口的 nginx</td><td><strong>Ingress</strong>，新專案多用 Gateway API（<a href="../../kubernetes/lessons/05-gateway-api.html">Kubernetes 課第 5 課</a>）</td></tr>
+  <tr><td><code>/health/live</code>、<code>/health/ready</code></td><td>livenessProbe、readinessProbe，另有啟動慢時用的 startupProbe</td></tr>
+  <tr><td><code>stop_grace_period</code></td><td><code>terminationGracePeriodSeconds</code>（預設 30 秒）</td></tr>
+  <tr><td>容器的記憶體、CPU 限制</td><td><code>resources.requests</code>／<code>limits</code></td></tr>
+  <tr><td><code>--scale api=5</code></td><td><code>replicas</code>；<strong>HPA</strong> 依 CPU 等指標自動調整</td></tr>
+  <tr><td>環境變數、secret 檔（第 11 課）</td><td>ConfigMap、Secret</td></tr>
+</table></div>
+<p>什麼時候值得用？Kubernetes 本身要有人維運、要學一整套概念。只有一兩個服務、團隊三五個人時，Compose 跑在一台機器上、或 ECS、Cloud Run 這類託管平台通常更划算；服務多了、團隊多了、需要自動擴縮與自我修復時，再上 Kubernetes。概念是一樣的：這一課的無狀態、排空、閒置逾時、連線預算，換到 Kubernetes 上一個都不能少。想實際操作，從 <a href="../../kubernetes/lessons/01-why-kubernetes.html">Kubernetes 課</a>開始。</p>
+
+<h2>練習</h2>
+<p>練習在 <code>devops/practice</code> 做，需要 Docker 在跑。<code>compose.yaml</code> 已經寫好、不用改：PostgreSQL 18.6、Redis 8.10.3、3 個 cafe-api 副本（<code>app/</code>，第 9 課的多階段建置，<code>server.ts</code> 不用改），以及發布在 <code>127.0.0.1:18130</code> 的 nginx 1.30.6。每個回應都有 <code>X-Instance</code> 標頭，告訴你是哪個副本處理的。測試每次都會先收掉 <code>ld-13</code>、重新建置並啟動，跑完也會收掉；第一次會花幾分鐘下載映像與建置。三題依序做：後面的測試用的是你目前的整份程式。自己試：<code>docker compose up -d --wait --build</code>，<code>curl -si localhost:18130/products</code>，收掉用 <code>docker compose down -v</code>。</p>
+
+<div class="local" data-test="ex1" data-files="app/src/cart.ts">
+  <p>練習 1：把購物車從記憶體搬到 Redis。改 <code>app/src/cart.ts</code>：<code>addItem</code> 把商品編號加在 <code>cart:&lt;sid&gt;</code> 這個 list 的尾端，並把期限設成 1 天（86400 秒），兩個指令用 <code>redis.multi()</code> 一起送出；<code>getCart</code> 依加入順序回傳數字陣列。測試會用同一個 sid 加入 3 項隨機商品，連續 10 次 <code>GET /cart</code> 都要看到同樣的 3 項，重啟一個副本後再查一次，再用 <code>redis-cli</code> 檢查 key 是 list、期限約 1 天，並用 <code>MONITOR</code>（印出 Redis 收到的每個指令）確認 RPUSH 和 EXPIRE 包在同一個 MULTI／EXEC 裡；也會檢查 nginx 設定沒有用 <code>ip_hash</code>、<code>hash</code>、<code>sticky</code> 把問題藏起來。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="nginx/default.conf">
+  <p>練習 2：改 <code>nginx/default.conf</code> 的 upstream 與 location：用 least_conn；被動健康檢查 5 秒內失敗 2 次就停用 5 秒；用 Docker 的 DNS（127.0.0.11）每 5 秒重新解析 <code>api</code>；遇到連線錯誤、逾時、502、503 換下一台，建立連線最多等 2 秒，但不能讓 POST 被重送。測試會：用一個 2.5 秒的慢請求占住一個副本，確認新請求都分給別人；送 60 個 GET 確認 3 個副本都分得到；<code>docker kill</code> 一個副本後送 30 個 GET，最多只能失敗 1 個（<code>resolve</code> 剛好在換下一台的途中更新名單時，nginx 可能回一次 502）；先移除所有 api 容器、用佔位容器拿走舊 IP，再重新建立 api（IP 全換），10 秒內要恢復，再過一輪解析後 3 個新副本都要分得到；最後讓一個副本進入「訂單寫進資料庫後才回 503」的故障模式，送 30 個 POST /orders，每張訂單在資料庫裡最多只能有一筆。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="app/src/lifecycle.ts">
+  <p>練習 3：補完 <code>app/src/lifecycle.ts</code>，讓副本能優雅地被縮減。收到 SIGTERM：readiness 立刻回 503、liveness 維持 200、排空 <code>DRAIN_MS</code> 期間照常服務但回應帶 <code>Connection: close</code>，之後 <code>server.close()</code>，手上的請求做完再呼叫 <code>closeDeps()</code> 關掉 pg 與 Redis，<code>exit 0</code>。另外把 <code>server.keepAliveTimeout</code> 設成環境變數 <code>KEEPALIVE_TIMEOUT_MS</code>，沒設時 65 秒（測試會把它設成 75000，確認你真的讀了環境變數）。測試換上自己的 nginx 設定（<code>ex3.nginx.conf</code>，不受練習 2 影響），每 50ms 送一個要處理 1 秒的 POST /orders，同時 <code>docker stop</code> 第 3 個副本、從容器裡面打它的健康檢查，再擴回 3 個：整段期間最多只能失敗 1 個請求（原因見上面「健康檢查與排空」最後的說明），被停止的容器要在 10 秒內以 ExitCode 0 結束；也會用 <code>GET /config</code> 比較 app 與 nginx 的閒置逾時。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：cafe-api 在程序的記憶體裡計數，做「每個 IP 每分鐘 100 次」的限流，現在開了 3 個副本，nginx 用 round robin。同一個 IP 實際上每分鐘大約能打幾次？</p>
+  <label data-key="a">100 次，限流規則寫在程式裡，每個副本都一樣</label>
+  <label data-key="b">33 次左右，因為流量被分成三份</label>
+  <label data-key="c">大約 300 次，每個副本各自計數，各自允許 100 次</label>
+  <label data-key="d">無法限制，副本之間會互相重設計數</label>
+  <p class="why">✓ c。每個副本的記憶體各有一份計數器，round robin 把請求平均分過去，每個副本都看到大約三分之一的請求，各自放行到 100 次。a 把「規則一樣」誤當成「計數共用」；b 剛好說反，分流讓每個副本的計數變少、總量變多；d 副本之間根本不知道彼此存在。要全域限流，計數放在 Redis，或在入口的 nginx 做（第 12 課）。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：同事把資料庫連線檢查加進 <code>/health/live</code>：「檢查越多越安全。」資料庫做 30 秒的維護時會發生什麼事？</p>
+  <label data-key="a">沒事，liveness 失敗只會讓流量暫時不送過去</label>
+  <label data-key="b">所有副本的 liveness 同時失敗，編排器把它們全部重啟；資料庫回來時重啟中的副本接不了客，一次性的小狀況被放大成全面中斷</label>
+  <label data-key="c">比較安全，壞掉的副本會被提早替換</label>
+  <label data-key="d">liveness 只在啟動時檢查一次，之後不影響</label>
+  <p class="why">✓ b。liveness 的意思是「這個程序要不要被重啟」，資料庫掛了，重啟 api 一點用都沒有。依賴的狀態放在 readiness：失敗時只是不送流量，程序繼續跑，資料庫一回來就恢復。a 描述的是 readiness；c 副本本身沒壞，換了也一樣；d 說的是 startup probe，liveness 在整個生命週期都會檢查。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：nginx 設定 <code>proxy_next_upstream error timeout http_502 http_503;</code>。副本 1 收到 POST /orders，訂單已經寫進資料庫，接著回了 503。nginx 會怎麼做？</p>
+  <label data-key="a">把 503 回給客戶端，不會把 POST 送給副本 2，因為請求已經送出，非冪等的方法預設不重送</label>
+  <label data-key="b">把 POST 重送給副本 2，因為 http_503 在清單裡</label>
+  <label data-key="c">重送給副本 2，而且 nginx 會自動去掉重複的訂單</label>
+  <label data-key="d">一直重試副本 1，直到它回 201</label>
+  <p class="why">✓ a。POST、PATCH、LOCK 只要已經送到後端，就不會被傳給下一台，除非加了 <code>non_idempotent</code>；只有連線沒建立起來這種確定沒送出的情況才會換一台。b 忽略了冪等的規則，正是重複下單的來源；c nginx 不知道你的訂單是什麼；d nginx 換的是下一台，不會在同一台重試。要安全地重試 POST，用冪等鍵。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 7：壓測量到一個副本在 p95 &lt; 300ms 內能撐 200 RPS，尖峰是 500 RPS，目標使用率 0.8，要留 1 個備用副本。要開幾個副本？</p>
+  <label data-key="a">3 個：500 ÷ 200 = 2.5，進位成 3</label>
+  <label data-key="b">3 個：500 ÷ 160 = 3.125，四捨五入成 3</label>
+  <label data-key="c">4 個：500 ÷ 160 = 3.125，進位成 4</label>
+  <label data-key="d">5 個：500 ÷ (200 × 0.8) = 3.125，無條件進位成 4，再加 1 個備用</label>
+  <p class="why">✓ d。a 把副本用到 100%，一點餘裕都沒有；b 四捨五入會讓每個副本超過目標使用率；c 忘了備用副本，掛一個或部署時就超載。算完副本數，還要回頭檢查（副本數 + maxSurge）× 連線池有沒有超過資料庫的 <code>max_connections</code>。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>上傳檔存在副本的本機磁碟</strong>：只有一個副本有，容器重建就沒了。放 S3 這類物件儲存。</li>
+  <li><strong>每個副本各自跑排程</strong>：開 3 個副本，日報寄 3 次。拆成只跑 1 份的排程服務，或用 advisory lock 讓只有一個執行者。</li>
+  <li><strong>以為記憶體限流、記憶體快取是全域的</strong>：每個副本各一份。限流放 Redis 或 nginx；快取接受短暫不一致，或改放 Redis。</li>
+  <li><strong>用黏性 session 遮掩狀態問題</strong>：副本一重啟、縮減，session 和購物車就消失，負載也不平均。把狀態搬出去。</li>
+  <li><strong>Redis 裡的 session、購物車沒有 TTL</strong>：記憶體只增不減，最後 Redis 被塞滿。每次寫入都重設期限。</li>
+  <li><strong>liveness 檢查外部依賴</strong>：依賴一出事，所有副本被連環重啟。依賴放 readiness。</li>
+  <li><strong>proxy_connect_timeout 維持預設 60 秒</strong>：副本當掉時，送到它的請求每個都卡 60 秒。內部網路設 1～2 秒。</li>
+  <li><strong>nginx 只在啟動時解析一次 DNS</strong>：容器重建、換 IP 後一直 502。用 <code>resolve</code> 加 <code>resolver</code> 與 <code>zone</code>。</li>
+  <li><strong>加了 <code>non_idempotent</code></strong>：失敗的 POST 被重送，訂單重複。POST 的重試交給客戶端和冪等鍵。</li>
+  <li><strong>收到 SIGTERM 立刻結束</strong>：進行中的請求變 502。先排空，再 <code>server.close()</code>，最後關依賴。</li>
+  <li><strong>收到 SIGTERM 之後一直不結束</strong>：連線池、Redis 沒關，被 SIGKILL（137）。關機的每一步都要在 grace period 內完成。</li>
+  <li><strong>app 的 keepAliveTimeout 比前面代理的閒置逾時短</strong>：偶發 502。後面要比前面長。</li>
+  <li><strong>加副本卻忘了資料庫連線總數</strong>：部署時多出 maxSurge 個副本，<code>too many clients already</code>。每次調整都重算連線預算，必要時加 PgBouncer。</li>
+  <li><strong>副本數照平均流量算</strong>：尖峰與一台故障都沒算到。用尖峰、目標使用率與備用副本算，無條件進位。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>垂直擴展換大機器、有上限；水平擴展加副本，條件是程序無狀態（12-factor 第 VI 條）。Node 一個程序只用一核，特別依賴水平擴展。</li>
+  <li>狀態藏在記憶體（session、購物車、限流、快取）、磁碟（上傳檔）、計時器（排程）和長連線裡。session、購物車放 Redis 並設 TTL，永久資料放 PostgreSQL，檔案放 S3，排程只留一個執行者。</li>
+  <li>黏性 session 只是把狀態問題藏起來。</li>
+  <li>nginx 的 upstream：round robin 或 least_conn；<code>max_fails</code>／<code>fail_timeout</code> 是被動健康檢查；<code>proxy_next_upstream</code> 預設不重送已經送出的 POST，不要加 <code>non_idempotent</code>；<code>resolve</code> 搭配 <code>resolver</code> 與 <code>zone</code> 跟上變動的 IP。</li>
+  <li>liveness 只看程序自己，readiness 才看依賴。收到 SIGTERM：readiness 503、排空並帶 <code>Connection: close</code>、<code>server.close()</code>、關依賴、exit 0，全部在 grace period 內。app 的 <code>keepAliveTimeout</code> 要比前面的代理長。</li>
+  <li>副本數 ＝ 無條件進位(尖峰 ÷ (單副本能力 × 目標使用率)) ＋ 備用；連線池用 Little's law 估；（副本數 ＋ maxSurge）× 連線池不能超過資料庫可用的連線。</li>
+  <li>Kubernetes 的 Deployment、Service、probe、HPA 自動化的是同一套事情；服務和團隊夠多時才值得它的維運成本。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 6 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="d">
+  <p>練習 8：下午尖峰時結帳 API 回 504，nginx 的 error log 寫 <code>upstream timed out</code>，每次都剛好卡 60 秒。同事想把 <code>proxy_read_timeout</code> 調到 300 秒，你會先做什麼？</p>
+  <label data-key="a">照他的做，結帳本來就比其他 API 慢，給它足夠的時間</label>
+  <label data-key="b">重啟 api 容器，504 代表後端已經卡死，重開就會恢復</label>
+  <label data-key="c">把 <code>proxy_connect_timeout</code> 調短，讓 nginx 更快換到下一台</label>
+  <label data-key="d">拿 log 的 request ID 到後端查慢在哪：慢查詢、資料庫鎖或金流呼叫</label>
+  <p class="why">✓ 504 是後端在逾時內沒回，後端多半還活著，只是卡在某個地方；先找出慢的原因再修。log 加上 <code>$request_id</code> 和 <code>$upstream_response_time</code>，就能對到後端的同一個請求。a 錯在調大逾時只是讓客人多等 4 分鐘，慢的原因還在，連線也被占得更久。（第 12 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 9：nginx 直接面對客人，同事想「用客人的真實 IP」限流，寫成下面這樣。哪裡會出事？</p>
+<pre>limit_req_zone $http_x_forwarded_for zone=api:10m rate=5r/s;
+server {
+    limit_req_status 429;
+    location /api/ {
+        limit_req zone=api burst=10 nodelay;
+        proxy_pass http://api:3000/;
+    }
+}</pre>
+  <label data-key="a">沒有問題，X-Forwarded-For 是 nginx 加的，客人沒辦法改</label>
+  <label data-key="b">爬蟲每個請求帶不同的 X-Forwarded-For，每次都是新的用戶端</label>
+  <label data-key="c">被拒絕的請求會回 503，監控會以為服務掛了</label>
+  <p class="why">✓ key 決定誰是同一個用戶端，X-Forwarded-For 是客人自己能寫的標頭，換一個值就是一個新的桶子，限流形同虛設。key 改用 <code>$binary_remote_addr</code>，也就是 nginx 自己看到的連線位址。a 錯在 nginx 只是把真實位址接在客人送來的值後面，前面那段完全由客人決定。（第 12 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 10：cafe-api 從 1 個副本開成 3 個之後，客人反映「重新整理就被登出」「購物車一下有一下沒有」。怎麼修最好？</p>
+  <label data-key="a">session 和購物車搬到 Redis 並設 TTL，任何副本都能接任何請求</label>
+  <label data-key="b">nginx 改用 <code>ip_hash</code>，讓同一個客人固定打到同一個副本</label>
+  <label data-key="c">session 和購物車改存在副本的本機磁碟，重啟也不會遺失</label>
+  <p class="why">✓ 把狀態搬出程序，副本才能隨時加、隨時刪（12-factor 第 VI 條）；Redis 每次寫入都重設 TTL，不然記憶體只增不減。b 是黏性 session，只是把狀態問題藏起來：副本一重啟或被縮減，那群客人的 session 和購物車就消失，負載也不平均。（第 13 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 11：cafe-api 的 SIGTERM 處理寫成這樣，部署時哪裡會出事？</p>
+<pre>process.on('SIGTERM', async () =&gt; {
+  draining = true          // readiness 改回 503
+  await sleep(DRAIN_MS)    // 排空，回應帶 Connection: close
+  await closeDeps()        // 關 pg 與 Redis
+  server.close(() =&gt; process.exit(0))
+})</pre>
+  <label data-key="a">排空期間 liveness 也要回 503，編排器才知道這個副本要結束了</label>
+  <label data-key="b">readiness 回 503 後 nginx 馬上移除這個副本，sleep 是多餘的</label>
+  <label data-key="c">先關了 pg，排空結束時還沒做完的請求，查資料庫會失敗</label>
+  <p class="why">✓ 順序是先 <code>server.close()</code>，等進行中的請求全部做完（callback）才關 pg 與 Redis、exit 0，全部在 grace period 內。a 錯在 liveness 失敗代表「要重啟這個程序」，排空期間 liveness 要維持 200，只有 readiness 回 503。（第 13 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 12：每次部署都有幾個 <code>POST /orders</code> 回 502。同事提議在 <code>proxy_next_upstream</code> 加上 <code>non_idempotent</code>，讓失敗的 POST 自動換一台送。可以嗎？</p>
+  <label data-key="a">不行：第一台可能已經寫進訂單才失敗，換一台重送就重複下單</label>
+  <label data-key="b">可以：nginx 換下一台之前，會先確認第一台還沒寫入訂單</label>
+  <label data-key="c">可以：訂單寫入包在交易裡，重送的那一筆會自動回滾</label>
+  <p class="why">✓ nginx 不知道後端做到哪裡，已經送出的 POST 重送可能重複下單，所以預設不重送。部署的 502 要從關機順序修（先排空再 <code>server.close()</code>），POST 的重試交給客戶端帶冪等鍵。c 錯在交易只保證一筆訂單完整寫入，兩個請求就是兩筆各自成功的交易。（第 13 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 13：cafe-api 平常 4 個副本，<code>max_connections</code> 100、保留 10 條給管理與 migration。活動前把每個連線池從 8 調成 20，平常都正常，一部署（maxSurge 1）新副本就報 <code>too many clients already</code>。原因是什麼？</p>
+  <label data-key="a">慢查詢讓連線占得太久，部署時剛好遇到尖峰，連線不夠用</label>
+  <label data-key="b">部署時新舊副本同時在跑，(4 + 1) × 20 = 100，超過可用的 90</label>
+  <label data-key="c">連線池調大後每個副本接的請求變多，資料庫負載太高而拒絕連線</label>
+  <p class="why">✓ <code>max_connections</code> 是所有副本共用的，部署時新副本先起來、舊的才停，要用（副本數 ＋ maxSurge）× 連線池算。修法是用 Little's law 把連線池算回需要的大小，不夠再加 PgBouncer。a 錯在每個副本最多只開連線池那麼多條，慢查詢會讓請求排隊等連線而逾時，不會讓總數超過上限。（第 13 課）</p>
+</div>
+
+<p>這個階段的重點整理成<a href="../sheets/stage-3.html">一頁圖解</a>。</p>
+<p>下一課進入自動化交付，先把每天都在用的 Git 弄扎實：分支、合併，以及出事時怎麼用 revert 和 bisect 救回來。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

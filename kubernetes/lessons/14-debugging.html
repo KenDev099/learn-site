@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>14. 除錯工作流程：從 Pod 狀態到根因（資深）</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="14" data-practice="kubernetes">
+<header>
+  <div class="eyebrow">階段 5：正式環境與期末專題 · 第 14 課</div>
+  <h1>除錯工作流程：從 Pod 狀態到根因（資深）</h1>
+</header>
+<main>
+
+<p>前面每一課都教過一兩種壞法：映像 tag 打錯、Secret 少一個 key、記憶體 limit 太小、probe 打錯路徑、Service 的 selector 對不上 label。分開學的時候，症狀和原因是放在一起講的。真正值班時只會看到一句「cafe-api 掛了」，你不知道是哪一種，旁邊還有人在問什麼時候會好。這時候最常見的錯誤是亂猜、先重啟再說，結果證據跟著 Pod 一起消失。</p>
+<p>這一課把查法整理成一個固定的順序，找到根因後修在 manifest 裡，並寫一份讓同樣的事不再發生的事故紀錄。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>固定的查法：值班時只聽到「cafe-api 掛了」，第一步是蒐證，不是重啟。</li>
+  <li>狀態字速查、事件與上一次的 log：STATUS 欄出現 CrashLoopBackOff、Pending 這類字時該去哪裡看；容器重啟之後，上一次為什麼死的證據去哪找。</li>
+  <li>進到容器裡：沒有 shell、<code>exec</code> 進不去的映像，怎麼在旁邊加一個除錯容器。</li>
+  <li>縮小範圍：Pod 都是 Running、使用者還是看到錯誤時，從入口一路往 Pod 切一刀，看是哪半段壞了。</li>
+  <li>修在宣告裡、寫事故紀錄：為什麼 <code>kubectl edit</code> 救完火還不算修好，事故紀錄要寫什麼。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="02-pods-yaml.html">第 2 課</a>的 Pod 狀態與除錯指令：容器還沒跑是 Waiting、跑完是 Terminated，兩者都附一個 reason；<code>get</code>、<code>describe</code>、<code>logs</code>、<code>exec</code>、<code>port-forward</code> 這五個每天用的指令。</li>
+  <li><a href="04-services-dns.html">第 4 課</a>的 Service 排查順序：先看 EndpointSlice 有沒有 Pod，再看 selector 與 Ready、port 與 targetPort，最後是 DNS 名稱與 namespace。</li>
+  <li><a href="07-probes-shutdown.html">第 7 課</a>的 probe：readiness 失敗就不收流量，liveness 失敗就重啟容器；容器一直重啟會變成 CrashLoopBackOff。</li>
+  <li><a href="08-resources-autoscaling.html">第 8 課</a>的資源：requests 排不下就 Pending；記憶體超過 limit 被殺是 OOMKilled，exit code 137。</li>
+</ul></div>
+
+<h2>固定的查法：先蒐證，不要先重啟</h2>
+<p>除錯的方法和 <a href="../../system-design/lessons/21-debugging-incidents.html">system-design 課第 21 課</a>一樣：觀察、提出假設、一次只改一個變數去驗證。Kubernetes 的好處是「觀察」這一步有固定的入口，每個狀態都有對應該看的地方：</p>
+<figure>
+  <svg viewBox="0 0 700 380" role="img" aria-label="除錯流程：kubectl get pods 看 STATUS 與 READY，依狀態分成五條路：Pending 看 describe 的 FailedScheduling；ImagePullBackOff 與 CreateContainerConfigError 看事件；CrashLoopBackOff 與 OOMKilled 看 logs --previous 與 lastState；Running 但 0/1 看 Unhealthy 事件與 probe；Running 1/1 卻不通，從 EndpointSlice、port-forward、DNS、NetworkPolicy 往外查">
+    <defs><marker id="d14a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="220" y="10" width="260" height="50" rx="8"/>
+    <text class="d-text" x="350" y="32" text-anchor="middle">kubectl get pods -o wide</text>
+    <text class="d-small" x="350" y="50" text-anchor="middle">STATUS、READY、RESTARTS、NODE</text>
+    <path class="d-line" d="M350,60 L350,80 M70,80 L630,80" fill="none"/>
+    <path class="d-line" d="M70,80 L70,105" marker-end="url(#d14a)"/>
+    <path class="d-line" d="M210,80 L210,105" marker-end="url(#d14a)"/>
+    <path class="d-line" d="M350,80 L350,105" marker-end="url(#d14a)"/>
+    <path class="d-line" d="M490,80 L490,105" marker-end="url(#d14a)"/>
+    <path class="d-line" d="M630,80 L630,105" marker-end="url(#d14a)"/>
+    <rect class="d-soft" x="10" y="108" width="120" height="50" rx="6"/>
+    <text class="d-text" x="70" y="138" text-anchor="middle">Pending</text>
+    <rect class="d-soft" x="150" y="108" width="120" height="50" rx="6"/>
+    <text class="d-text" x="210" y="130" text-anchor="middle">ImagePull…</text>
+    <text class="d-text" x="210" y="149" text-anchor="middle">ConfigError</text>
+    <rect class="d-soft" x="290" y="108" width="120" height="50" rx="6"/>
+    <text class="d-text" x="350" y="130" text-anchor="middle">CrashLoop…</text>
+    <text class="d-text" x="350" y="149" text-anchor="middle">OOMKilled</text>
+    <rect class="d-soft" x="430" y="108" width="120" height="50" rx="6"/>
+    <text class="d-text" x="490" y="130" text-anchor="middle">Running</text>
+    <text class="d-text" x="490" y="149" text-anchor="middle">READY 0/1</text>
+    <rect class="d-soft" x="570" y="108" width="120" height="50" rx="6"/>
+    <text class="d-text" x="630" y="130" text-anchor="middle">Running 1/1</text>
+    <text class="d-text" x="630" y="149" text-anchor="middle">但請求失敗</text>
+    <path class="d-line" d="M70,158 L70,180" marker-end="url(#d14a)"/>
+    <path class="d-line" d="M210,158 L210,180" marker-end="url(#d14a)"/>
+    <path class="d-line" d="M350,158 L350,180" marker-end="url(#d14a)"/>
+    <path class="d-line" d="M490,158 L490,180" marker-end="url(#d14a)"/>
+    <path class="d-line" d="M630,158 L630,180" marker-end="url(#d14a)"/>
+    <rect class="d-box" x="10" y="183" width="120" height="110" rx="6"/>
+    <text class="d-small" x="70" y="205" text-anchor="middle">describe pod</text>
+    <text class="d-small" x="70" y="225" text-anchor="middle">FailedScheduling</text>
+    <text class="d-small" x="70" y="245" text-anchor="middle">資源、taint、</text>
+    <text class="d-small" x="70" y="263" text-anchor="middle">nodeSelector、</text>
+    <text class="d-small" x="70" y="281" text-anchor="middle">PVC、quota</text>
+    <rect class="d-box" x="150" y="183" width="120" height="110" rx="6"/>
+    <text class="d-small" x="210" y="205" text-anchor="middle">describe／events</text>
+    <text class="d-small" x="210" y="225" text-anchor="middle">Failed 事件的</text>
+    <text class="d-small" x="210" y="245" text-anchor="middle">完整訊息</text>
+    <text class="d-small" x="210" y="265" text-anchor="middle">tag、權限、</text>
+    <text class="d-small" x="210" y="283" text-anchor="middle">Secret 的 key</text>
+    <rect class="d-box" x="290" y="183" width="120" height="110" rx="6"/>
+    <text class="d-small" x="350" y="205" text-anchor="middle">logs --previous</text>
+    <text class="d-small" x="350" y="225" text-anchor="middle">lastState 的</text>
+    <text class="d-small" x="350" y="245" text-anchor="middle">reason、exit code</text>
+    <text class="d-small" x="350" y="265" text-anchor="middle">設定、依賴、</text>
+    <text class="d-small" x="350" y="283" text-anchor="middle">limit、liveness</text>
+    <rect class="d-box" x="430" y="183" width="120" height="110" rx="6"/>
+    <text class="d-small" x="490" y="205" text-anchor="middle">Unhealthy 事件</text>
+    <text class="d-small" x="490" y="225" text-anchor="middle">probe 的狀態碼</text>
+    <text class="d-small" x="490" y="245" text-anchor="middle">路徑、port、</text>
+    <text class="d-small" x="490" y="265" text-anchor="middle">依賴斷了</text>
+    <rect class="d-box" x="570" y="183" width="120" height="110" rx="6"/>
+    <text class="d-small" x="630" y="205" text-anchor="middle">EndpointSlice</text>
+    <text class="d-small" x="630" y="225" text-anchor="middle">port-forward</text>
+    <text class="d-small" x="630" y="245" text-anchor="middle">DNS、</text>
+    <text class="d-small" x="630" y="265" text-anchor="middle">NetworkPolicy、</text>
+    <text class="d-small" x="630" y="283" text-anchor="middle">auth can-i</text>
+    <rect class="d-soft" x="120" y="318" width="460" height="50" rx="8"/>
+    <text class="d-text" x="350" y="340" text-anchor="middle">找到根因 → 止血 → 修在 manifest／chart</text>
+    <text class="d-small" x="350" y="358" text-anchor="middle">走正常部署 → 寫事故紀錄</text>
+  </svg>
+  <figcaption>第一步永遠是 <code>get pods</code>，依狀態走不同的路。每條路的終點都一樣：修在宣告裡。</figcaption>
+</figure>
+<p>四個原則：</p>
+<ol>
+  <li><strong>先蒐證，再動手</strong>。<code>kubectl delete pod</code> 看起來能解決很多事，但新 Pod 有新的名字，舊 Pod 的事件、上一次容器的 log、lastState 全部跟著消失。Deployment 底下的 Pod 被刪掉，原本的問題（例如設定錯）在新 Pod 一樣會出現，你只是把證據丟了。</li>
+  <li><strong>先看最便宜的證據</strong>：<code>get</code>、<code>describe</code>、<code>logs</code> 不改變任何東西，幾秒鐘就有答案。exec、debug、改設定重試，都排在後面。</li>
+  <li><strong>一次只改一個變數</strong>。同時改了映像、limit 和 probe，就算好了也不知道是哪一個修好的，下次還會再犯。</li>
+  <li><strong>邊查邊記時間</strong>。幾點部署、幾點發現、幾點找到原因、幾點恢復。事後寫事故紀錄要用，查到一半交接給別人時也要用。</li>
+</ol>
+
+<div class="callout practice"><strong>💡 實務上：半夜被叫醒的前五分鐘</strong><br>告警響了，主管在頻道裡問「多久會好」，這時最想做的就是先重啟看看。資深的做法是先花一兩分鐘把證據存下來：<code>kubectl get pods -o wide</code>、有問題的 Pod 的 <code>describe</code> 和 <code>logs --previous</code>、<code>kubectl events</code>，存成檔案或貼進事故頻道，再去止血。接著問的第一個問題是「最近改了什麼」：剛剛的部署、設定或 Secret 的變更、平台團隊的節點升級，大部分事故都跟某個變更有關。如果剛好有一次部署，先回滾通常比當場找根因快。</div>
+
+<h2>狀態字速查：看到什麼、去哪裡看</h2>
+<p>第 2 課列過容器的 Waiting reason。這裡把它擴大成值班時用的表。<strong>根因（root cause）</strong>是讓問題發生的真正原因，例如「Secret 的 key 名稱打錯」；STATUS 欄的字只是症狀。同一個症狀可能有好幾種原因，所以表的重點是「去哪裡看」：</p>
+<div class="table-wrap"><table>
+  <tr><th>看到</th><th>去哪裡看</th><th>常見原因</th><th>修法</th></tr>
+  <tr><td><code>Pending</code></td><td><code>describe pod</code> 的 <code>FailedScheduling</code></td><td><code>Insufficient cpu／memory</code>：requests 太大或叢集滿了；<code>untolerated taint</code>；<code>didn't match Pod's node affinity/selector</code>；PVC 沒有綁定；quota 已滿（Pod 根本建不出來，看 ReplicaSet 的 <code>FailedCreate</code>）</td><td>依訊息調整 requests、nodeSelector、toleration、PVC 的 StorageClass 或 quota</td></tr>
+  <tr><td><code>ErrImagePull</code>、<code>ImagePullBackOff</code></td><td><code>describe pod</code> 的 <code>Failed</code> 事件</td><td>tag 打錯或沒有推上去；私有 registry 沒有 <code>imagePullSecrets</code> 或節點沒有權限；映像沒有這個平台（arm64／amd64）</td><td>修正 tag（用 CI 產生的 tag，不要手打）、補上拉映像的權限</td></tr>
+  <tr><td><code>CreateContainerConfigError</code></td><td><code>describe pod</code> 的 <code>Failed</code> 事件</td><td>引用的 ConfigMap、Secret 或其中某個 key 不存在（<a href="06-config-secrets.html">第 6 課</a>）</td><td>修正名稱或 key，或先建立它；不要用 <code>optional: true</code> 掩蓋</td></tr>
+  <tr><td><code>CrashLoopBackOff</code>、<code>Error</code></td><td><code>logs --previous</code>、lastState 的 reason 與 exit code</td><td>exit 1：應用自己結束（缺設定、連不到依賴、程式錯誤）；137：被 SIGKILL（OOM 或 liveness 失敗被殺）；139：segfault（原生模組）</td><td>依 log 修設定或程式；liveness 太嚴就放寬或改用 startupProbe（第 7 課）</td></tr>
+  <tr><td><code>OOMKilled</code></td><td>lastState：<code>OOMKilled</code>、<code>137</code></td><td>記憶體 limit 比實際需要小，或記憶體洩漏</td><td>依量測調整 limit 與 <code>--max-old-space-size</code>（第 8 課），洩漏要查程式</td></tr>
+  <tr><td><code>Running</code> 但 READY <code>0/1</code></td><td>事件裡的 <code>Unhealthy</code>：<code>Readiness probe failed</code></td><td>probe 路徑或 port 打錯；readiness 檢查的依賴（資料庫、Redis）斷了</td><td>修正 probe，或修好依賴；不要刪掉 probe</td></tr>
+  <tr><td><code>Running 1/1</code> 但請求失敗</td><td>EndpointSlice、port-forward、從叢集內 curl</td><td>Service 的 selector 或 targetPort 錯；DNS 名稱或 namespace 錯；NetworkPolicy 擋住</td><td>見後面「縮小範圍」</td></tr>
+  <tr><td><code>Terminating</code> 一直不消失</td><td><code>get pod -o yaml</code> 的 <code>finalizers</code>、節點狀態</td><td>有 finalizer 等著控制器清理；Pod 所在的節點 NotReady，kubelet 沒辦法回報容器已停止</td><td>修好負責清理的控制器或節點；強制刪除是最後手段</td></tr>
+</table></div>
+<p>表裡有幾個新名詞：</p>
+<ul>
+  <li><strong>taint／toleration（污點／容忍）</strong>：節點上的 taint 會拒絕一般 Pod，Pod 宣告了對應的 toleration 才能排上去。kind 的 control-plane 就有一個，所以練習的 Pod 不會排到它（第 9 課）。</li>
+  <li><strong>nodeSelector／affinity</strong>：Pod 指定「只能排到有某個 label 的節點」，例如 <code>nodeSelector: {disktype: ssd}</code>。沒有任何節點有這個 label，Pod 就永遠 Pending，事件寫 <code>0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector</code>。</li>
+  <li><strong>finalizer</strong>：寫在物件 <code>metadata.finalizers</code> 裡的標記，意思是「刪除前有人要先做清理」。物件會先被標上 <code>deletionTimestamp</code>（顯示 Terminating），等負責的控制器做完清理、把標記拿掉，才真的刪除。控制器壞了或被移除，物件就卡住。</li>
+</ul>
+<div class="callout warn">遇到 Terminating 卡住，網路上常見的解法是 <code>kubectl delete pod --grace-period=0 --force</code> 或把 finalizers 清空。官方文件提醒：強制刪除時 API server 不等 kubelet 確認容器已經停止，節點恢復後舊容器可能還在跑。對 StatefulSet 這種「同一個名字只能有一個」的工作負載，會造成兩個同名的程序同時寫資料。先確認節點真的不會回來、或負責 finalizer 的控制器為什麼沒做完，再決定要不要強制。</div>
+
+<h2>事件與上一次的 log</h2>
+<p>表裡大部分的「去哪裡看」都是兩個地方：事件，以及容器上一次結束的紀錄。</p>
+<h3>事件</h3>
+<p><code>describe pod</code> 最下面的 Events 只列這個 Pod 的事件。看整個 namespace、照時間排，用 <code>kubectl events</code>：</p>
+<pre>kubectl events -n k8s-14-a --types=Warning              # 只看警告
+LAST SEEN             TYPE      REASON   OBJECT                          MESSAGE
+80s (x4 over 2m58s)   Warning   Failed   Pod/cafe-api-855c47df6c-wg775   Failed to pull image "learn-k8s/cafe-api:v1.0": ... pull access denied, repository does not exist or may require authorization ...
+80s (x4 over 2m58s)   Warning   Failed   Pod/cafe-api-855c47df6c-wg775   Error: ErrImagePull
+13s (x10 over 2m57s)  Warning   Failed   Pod/cafe-api-855c47df6c-wg775   Error: ImagePullBackOff
+
+kubectl events -n k8s-14-c --for pod/cafe-api-748885bcc4-bjkh6    # 只看一個物件
+kubectl get events -n k8s-14-d --sort-by=.lastTimestamp           # 舊寫法，一樣能排序</pre>
+<p>讀法：真正的原因在第一行。<code>ErrImagePull</code>、<code>ImagePullBackOff</code> 只是後續的狀態；<code>pull access denied, repository does not exist</code> 的意思是 registry 找不到這個名字或 tag（它不會告訴你是不存在還是沒權限，兩個都要查）。<code>x4 over 2m58s</code> 是同一個事件重複了 4 次。</p>
+<p>事件有保存期限：kube-apiserver 的 <code>--event-ttl</code> 預設 1 小時，過了就被刪掉。半夜出的事，早上再查就只剩 log。所以正式環境會把事件也收進 log 系統（devops 課第 21 課），這是建置可觀測性時常被漏掉的一塊。</p>
+<h3>上一次的容器：logs --previous 與 lastState</h3>
+<p>容器一直重啟時，<code>kubectl logs</code> 看到的是<strong>目前這一次</strong>的容器，它可能剛啟動、什麼都還沒印。崩潰的原因在上一次：</p>
+<pre>kubectl logs -n k8s-14-c deploy/cafe-api --previous     # 上一次容器的 stdout／stderr
+kubectl describe pod -n k8s-14-c -l app.kubernetes.io/name=cafe-api
+    Last State:     Terminated
+      Reason:       OOMKilled
+      Exit Code:    137</pre>
+<p>這一組的 <code>logs --previous</code> 什麼都沒有：容器在 Node 還沒印出第一行就被核心殺掉了。<strong>沒有 log 本身就是線索</strong>：應用自己出錯（exit 1）幾乎都會留下錯誤訊息，被 SIGKILL 的程序沒機會寫任何東西。這時 lastState 的 reason 與 exit code 就是唯一的證據。</p>
+<p>exit code 的讀法：0 是正常結束；1～125 是程式自己決定的（Node 未處理的例外是 1）；大於 128 的是「被訊號結束」，減掉 128 就是訊號編號，137＝SIGKILL（9），143＝SIGTERM（15），139＝SIGSEGV（11，記憶體存取錯誤，常見於原生模組）。137 不一定是 OOM：liveness 失敗、寬限期到了還沒結束，kubelet 也是用 SIGKILL，所以要看 reason 是不是 <code>OOMKilled</code>。</p>
+
+<h2>進到容器裡：exec、臨時容器與節點</h2>
+<p>事件與 log 不夠時，才需要到容器裡面看：檔案在不在、環境變數是什麼、從這個容器連得到資料庫嗎。第 2 課的 <code>kubectl exec -it pod -- sh</code> 前提是映像裡有 shell。越來越多正式環境的映像是 <strong>distroless</strong>：只有應用與它的執行環境（例如 node），沒有 shell、套件管理器和常用工具。攻擊者進來能用的工具少，映像也小，代價就是 exec 進不去：</p>
+<pre>kubectl exec -n k8s-14-f deploy/cafe-hash -- sh
+error: ... OCI runtime exec failed: exec failed: unable to start container process: exec: "sh": executable file not found in $PATH</pre>
+<h3>ephemeral container（臨時容器）</h3>
+<p><strong>ephemeral container（臨時容器）</strong>是加進一個<strong>執行中</strong> Pod 的除錯容器，用你指定的映像（例如有 shell 和工具的 busybox），不需要重啟 Pod。1.25 起是 Stable。<code>--target</code> 讓它跟目標容器共用程序空間（process namespace），看得到對方的程序：</p>
+<pre>kubectl debug -it -n k8s-14-f pod/cafe-hash-5db76cc546-4nc4m --image=busybox:1.38.0 --target=api
+/ # ps
+PID   USER     TIME  COMMAND
+    1 65532     0:01 {MainThread} /nodejs/bin/node server.ts   ← api 容器的 node
+   28 root      0:00 ps
+/ # tr '\0' '\n' &lt; /proc/1/environ                  ← node 實際拿到的環境變數
+/ # ls /proc/1/root/app                               ← 透過 /proc 看 api 容器的檔案系統</pre>
+<p><code>/proc/1/environ</code> 是 PID 1 啟動時的環境變數，以 <code>\0</code> 分隔，所以用 <code>tr</code> 換成換行。這裡看到的是容器<strong>實際</strong>拿到的值：映像的 ENV、Pod 的 env、Service 自動注入的變數合在一起，比讀 manifest 可靠。</p>
+<p>讀別的使用者的 <code>/proc/1/environ</code> 需要 <code>SYS_PTRACE</code> 這個 capability。kubectl 用 <code>--profile</code> 決定臨時容器的權限，本課程的 kubectl 1.36 預設是 <code>general</code>，會加上 <code>SYS_PTRACE</code>；舊的 <code>legacy</code> 與 <code>baseline</code> 不加，讀的時候會得到 <code>Permission denied</code>。在這個叢集實測：</p>
+<div class="table-wrap"><table>
+  <tr><th>--profile</th><th>臨時容器的 securityContext</th><th>cat /proc/1/environ</th></tr>
+  <tr><td><code>general</code>（1.36 的預設）</td><td><code>capabilities.add: [SYS_PTRACE]</code></td><td>讀得到</td></tr>
+  <tr><td><code>baseline</code></td><td>沒有額外權限</td><td><code>Permission denied</code></td></tr>
+  <tr><td><code>legacy</code>（已棄用，預計 1.39 移除）</td><td>沒有額外權限</td><td><code>Permission denied</code></td></tr>
+</table></div>
+<p>臨時容器的限制：加上去就移除不了，會一直留在 Pod 的 <code>spec.ephemeralContainers</code>，直到 Pod 被刪除；它沒有 port、probe、resources，也不會被重啟。所以名字不能重複（不指定 <code>-c</code> 時 kubectl 會自動取 <code>debugger-xxxxx</code>）。</p>
+<p>不想互動、只要一次輸出時，不加 <code>-it</code>，改用 <code>--attach</code>：指令跑完容器就結束，太快結束 attach 不上時 kubectl 會改讀它的 log（會印一行 <code>falling back to streaming logs</code> 的 warning），一樣拿得到輸出。練習 2 就用這個寫成腳本。</p>
+<h3>複本與節點</h3>
+<ul>
+  <li><strong><code>kubectl debug pod/x --copy-to=x-debug ...</code></strong>：建一份 Pod 的複本，可以換映像（<code>--set-image</code>）或改容器的指令。適合一啟動就崩潰的容器：把指令換成 <code>sleep 3600</code>，進去手動執行看錯在哪。複本不屬於 Deployment，也不在 Service 的流量裡，查完要自己刪掉。</li>
+  <li><strong><code>kubectl debug node/learn-k8s-worker -it --image=busybox:1.38.0</code></strong>：在節點上建一個 Pod，跑在節點的程序與網路空間，節點的根目錄掛在 <code>/host</code>。可以看 <code>/host/var/log/pods/</code>、用 <code>chroot /host crictl ps</code> 看節點上的容器。這個 Pod 建在目前的 namespace（沒指定就是 default）、名字是 <code>node-debugger-…</code>，用完要自己 <code>kubectl delete pod</code>。</li>
+</ul>
+<div class="callout warn">exec、debug、port-forward 都是高權限操作：能 exec 就能讀容器裡的所有機密，能 debug node 幾乎等於拿到節點的 root。正式環境只給值班人員（<a href="12-security.html">第 12 課</a>的 RBAC：<code>pods/exec</code>、<code>pods/ephemeralcontainers</code>、<code>pods/portforward</code> 這些子資源），並開啟 API server 的稽核 log，事後查得到誰在什麼時候進去做了什麼。</div>
+
+<h2>縮小範圍：從入口一路往 Pod</h2>
+<p>Pod 都是 <code>1/1 Running</code>，使用者還是看到錯誤，問題就在 Pod 和使用者之間。請求的路徑是 Gateway → HTTPRoute → Service → EndpointSlice → Pod（第 4、5 課）。不要從中間亂猜，用「切一刀，看前半段還是後半段壞」的方式縮小範圍：</p>
+<ol>
+  <li><strong>直接打 Pod</strong>，跳過 Service 與 Gateway：
+<pre>kubectl port-forward -n k8s-14-e pod/cafe-api-5b97d7c48f-vzzcs 18140:3000
+curl localhost:18140/version          # 另開一個終端機
+{"version":"v1","instance":"cafe-api-5b97d7c48f-vzzcs"}</pre>
+  成功：應用本身沒問題，問題在 Pod 之外。失敗：回到上一節，看應用的 log。</li>
+  <li><strong>從叢集內打 Service</strong>：
+<pre>kubectl exec -n k8s-tools deploy/probe -- curl -sS -m 5 http://cafe-api.k8s-14-e.svc.cluster.local/version
+curl: (7) Failed to connect to cafe-api.k8s-14-e.svc.cluster.local:80 after 30 ms: Could not connect to server</pre>
+  Pod 好、Service 壞：看 EndpointSlice（第 4 課的順序）。
+<pre>kubectl get endpointslice -n k8s-14-e -l kubernetes.io/service-name=cafe-api
+NAME             ADDRESSTYPE   PORTS     ENDPOINTS   AGE
+cafe-api-69s9h   IPv4          &lt;unset&gt;   &lt;unset&gt;     2m58s
+kubectl describe service -n k8s-14-e cafe-api | grep Selector
+Selector:   app.kubernetes.io/name=cafe</pre>
+  ENDPOINTS 是空的，Selector 是 <code>cafe</code>，Pod 的 label 是 <code>cafe-api</code>。</li>
+  <li><strong>Service 也好，從外面還是失敗</strong>：問題在入口。看 Gateway、HTTPRoute 的 status 與 conditions（第 5 課）。</li>
+</ol>
+<p>注意 <code>kubectl port-forward svc/cafe-api</code> 不會經過 Service：kubectl 只是用 Service 的 selector 挑一個 Pod 直接連。selector 挑不到 Pod 時，它會等 <code>--pod-running-timeout</code>（預設 1 分鐘）後印出 <code>timed out waiting for the condition</code>。要測 Service 本身，從叢集裡的 Pod 用 Service 的名字 curl。</p>
+<p>反方向：Pod 是 <code>0/1</code>、log 寫著連不到資料庫或 Redis 時，從「呼叫端」那個 Pod 往外查：</p>
+<ul>
+  <li><strong>名字查不到</strong>（<code>ENOTFOUND</code>、<code>EAI_AGAIN</code>）：在同一個 namespace 的 Pod 裡 <code>nslookup postgres</code>（distroless 就用臨時容器）。查不到，看名字與 namespace 對不對；namespace 有預設拒絕的 NetworkPolicy 時，看有沒有放行到 CoreDNS 的 53 port（第 12 課）。</li>
+  <li><strong>查得到但連線逾時</strong>：多半是 NetworkPolicy 擋住。<code>kubectl get networkpolicy -n &lt;ns&gt;</code>，對照呼叫端與目標的 label。連線被拒（<code>ECONNREFUSED</code>）則是目標沒在聽那個 port。</li>
+  <li><strong>呼叫 Kubernetes API 得到 403 Forbidden</strong>：是 RBAC。用 <code>kubectl auth can-i get configmaps -n &lt;ns&gt; --as system:serviceaccount:&lt;ns&gt;:&lt;sa&gt;</code> 確認那個 ServiceAccount 的權限。</li>
+</ul>
+
+<div class="callout practice"><strong>💡 實務上：找平台團隊之前，先切出是哪一段壞</strong><br>Pod 都 Running，使用者還是看到 502，很容易直接說「叢集網路有問題」，請平台團隊來看。這種回報查到最後，很多是應用自己的 Service selector 或 NetworkPolicy 寫錯。先照上面的順序切一次：直接打 Pod 成功、從叢集內打 Service 失敗、EndpointSlice 是空的，問題就在你自己的 manifest。真的要找平台團隊時，帶著這幾步的結果，他們可以直接從 Gateway 或節點那一段開始查。</div>
+
+<h2>修在宣告裡，然後寫事故紀錄</h2>
+<p>找到根因後，最快的修法通常是 <code>kubectl edit deployment</code> 把錯的值改掉，服務也真的恢復了。問題是叢集的狀態跟 git 裡的 manifest 不一樣了：下一次 CI 部署會把錯誤的 manifest 再套用一次，同樣的事故再發生一次，而且這次沒人想得到原因（第 1 課：宣告的檔案才是真相）。正確的順序：</p>
+<ol>
+  <li><strong>止血</strong>：讓使用者先恢復。最常用的是 <code>kubectl rollout undo</code> 回到上一個好的版本（第 3、9 課），或把流量切走。止血可以在叢集上直接做，但要記下做了什麼。</li>
+  <li><strong>修在宣告裡</strong>：在 manifest 或 Helm chart（第 13 課）修正根因，經過 code review，走正常的 CI 部署。之後的 GitOps（第 15 課）還可以設定成自動把叢集上的手動修改改回去。</li>
+  <li><strong>驗證</strong>：部署後確認 Pod Ready、請求成功，不是「應該好了」。</li>
+  <li><strong>寫事故紀錄</strong>：<a href="../../devops/lessons/25-alerting-incidents.html">devops 課第 25 課</a>的格式。重點不是追究誰打錯字，而是讓同樣的錯進不了叢集。</li>
+</ol>
+<p>修的時候也要分清楚「修正根因」與「讓症狀消失」：</p>
+<div class="table-wrap"><table>
+  <tr><th>根因</th><th>讓症狀消失（不要這樣做）</th><th>修正根因</th></tr>
+  <tr><td>readinessProbe 打錯路徑</td><td>刪掉 readinessProbe，Pod 馬上變 Ready</td><td>改成正確的路徑；之後壞掉的 Pod 才會被移出流量</td></tr>
+  <tr><td>記憶體 limit 太小</td><td>拿掉 limit</td><td>依量測調到夠用，加上 heap 上限</td></tr>
+  <tr><td>Secret 的 key 打錯</td><td>加 <code>optional: true</code>，Pod 起得來</td><td>改成 Secret 裡真正的 key；密碼是空的，問題只是延後到連資料庫時才爆</td></tr>
+  <tr><td>liveness 太嚴，一直被殺</td><td>拿掉 liveness</td><td>改用 startupProbe 保護啟動期、放寬 failureThreshold（第 7 課）</td></tr>
+</table></div>
+<p>事故紀錄的六個部分：<strong>時間軸</strong>（幾點發生、發現、找到原因、止血、修好）、<strong>影響</strong>（誰、多久、多少請求）、<strong>偵測</strong>（怎麼發現的，是告警還是使用者回報；偵測慢本身就是一個問題）、<strong>根因</strong>、<strong>修正</strong>、<strong>行動項目</strong>（每一條有負責人，至少一條是自動化的檢查）。行動項目的好壞差很多：</p>
+<ul>
+  <li>「部署前多檢查」「大家注意 Secret 的 key」：靠人記得，下次換人就忘了。</li>
+  <li>「CI 加 kubeconform 與 policy 檢查」「部署步驟加 <code>kubectl rollout status --timeout</code>，沒完成就失敗並回滾」「Secret 的 key 改由 chart 的 values 統一產生」：讓同一類錯誤在進叢集前就被擋下，或發生時自動恢復。</li>
+</ul>
+
+<h2>練習</h2>
+<p>在 <code>learn</code> 資料夾先執行 <code>export KUBECONFIG="$PWD/kubernetes/practice/.kube/config"</code>，再執行一次頁面上的指令，起始檔會複製到 <code>kubernetes/practice/work/14/</code>。然後執行 <code>bash kubernetes/practice/work/14/break.sh</code>：它把六組壞掉的服務部署到 <code>k8s-14-a</code>～<code>k8s-14-f</code>（第一次要建置映像，約 2～3 分鐘）。用前面的流程查，查完在 <code>work/14/</code> 修檔案。你可以把改好的檔案 <code>kubectl apply</code> 到同一個 namespace 確認；測試則會在自己的 namespace（<code>k8s-14-ex1-a</code> 這種名字）重新套用你的檔案。全部做完執行 <code>kubectl delete namespace k8s-14-a k8s-14-b k8s-14-c k8s-14-d k8s-14-e k8s-14-f</code>。</p>
+<p>練習 1 的根因代碼，從這裡選（不是每個都會用到）：</p>
+<pre>image-tag-typo        image-pull-auth        missing-secret-key     missing-configmap
+oom-limit             readiness-wrong-path   liveness-too-strict    selector-mismatch
+target-port-wrong     networkpolicy-dns      node-selector-unsatisfiable
+quota-exceeded        pvc-wrong-storageclass</pre>
+
+<div class="local" data-test="ex1" data-files="diagnosis.json ex1/a/deployment.yaml ex1/a/service.yaml ex1/b/deployment.yaml ex1/b/service.yaml ex1/c/deployment.yaml ex1/c/service.yaml ex1/d/deployment.yaml ex1/d/service.yaml ex1/e/deployment.yaml ex1/e/service.yaml">
+  <p>練習 1：五個故障。<code>k8s-14-a</code>～<code>k8s-14-e</code> 各有一組壞掉的 cafe-api，來源 manifest 是 <code>ex1/a/</code>～<code>ex1/e/</code>。每一組照流程找出根因，在 <code>diagnosis.json</code> 填上 <code>cause</code>（上面的根因代碼）與 <code>evidence</code>（你看到證據的那一行 kubectl 指令），再修改該組資料夾的 manifest 讓服務恢復。要修正根因：不能拿掉 readinessProbe 或 limits.memory、不能把 Secret 參照設成 optional，第 a 組要部署的是 <code>learn-k8s/cafe-api:v1</code>。測試先檢查診斷與檔案，再把五組套用到全新的 namespace（第 b 組的 Secret 由測試建立），每組的 Pod 要 Ready，從叢集內經過 Service 的請求要成功。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="ex2/inspect.sh ex2/deployment.yaml">
+  <p>練習 2：沒有 shell 的映像。<code>k8s-14-f</code> 的 cafe-hash 是 distroless 映像，<code>GET /hash</code> 在併發時很慢；它的 <code>UV_THREADPOOL_SIZE</code>（libuv thread pool 的執行緒數，pbkdf2 在這裡算）與 <code>NODE_OPTIONS</code> 寫在映像的 ENV 裡，manifest 看不到。先手動用 <code>kubectl debug</code> 找出來，再把做法寫成 <code>ex2/inspect.sh</code>：<code>bash inspect.sh &lt;namespace&gt;</code> 找出 <code>app=cafe-hash</code> 的 Pod，用 busybox:1.38.0 的臨時容器（<code>--target=api</code>）讀 <code>/proc/1/environ</code>，印出 <code>UV_THREADPOOL_SIZE=…</code> 與 <code>NODE_OPTIONS=…</code> 兩行。然後在 <code>ex2/deployment.yaml</code> 不換映像，用 env 把 <code>UV_THREADPOOL_SIZE</code> 改成 <code>"4"</code>。測試會建置一個 ENV 是隨機值的映像來跑你的腳本（猜或寫死都過不了），確認 Pod 上真的加了臨時容器；再套用你的 deployment，<code>GET /config</code> 回報的 <code>UV_THREADPOOL_SIZE</code> 要是 4。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="INCIDENT.md">
+  <p>練習 3：事故紀錄。從 a～e 挑一組你覺得最嚴重的，假設它發生在正式環境，在 <code>INCIDENT.md</code> 照六個標題寫：時間軸至少 4 個時間點（例如 <code>- 14:05 部署</code>）；影響、偵測、修正都要有具體內容；根因寫出 <code>diagnosis.json</code> 裡那一組的根因代碼並說明它怎麼造成症狀；行動項目至少 2 條（用 <code>-</code> 開頭），其中至少一條是自動化的檢查（CI、kubeconform、policy…）。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 4：Pod 是 CrashLoopBackOff，<code>kubectl logs</code> 什麼都沒印出來。下一步最該看什麼？</p>
+  <label data-key="a">直接刪 Pod 讓它重建</label>
+  <label data-key="b"><code>kubectl logs --previous</code> 看上一次崩潰的輸出，以及 describe 裡 Last State 的 reason 與 exit code</label>
+  <label data-key="c">重啟節點</label>
+  <label data-key="d">把 restartPolicy 改成 Never</label>
+  <p class="why">✓ <code>logs</code> 看的是剛重啟、可能還沒輸出的這一次容器；崩潰的線索在上一次的 log 與 lastState（OOMKilled／137 是被殺，exit 1 是應用自己結束）。上一次也沒有 log 時，reason 與 exit code 就是唯一的證據。刪 Pod（a）會讓這些證據消失，重建的 Pod 一樣會壞；重啟節點（c）影響其他服務、也不解決設定錯誤；改 restartPolicy（d）只是讓它不再重啟，Deployment 的 Pod 也不允許設成 Never。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：Pod 一直 Pending，事件寫 <code>0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector</code>。最可能是？</p>
+  <label data-key="a">映像拉不下來</label>
+  <label data-key="b">nodeSelector 或 affinity 指定了沒有任何節點符合的 label</label>
+  <label data-key="c">記憶體不夠</label>
+  <label data-key="d">readinessProbe 失敗</label>
+  <p class="why">✓ 排程失敗的原因直接寫在 FailedScheduling 事件裡，這一句就是「沒有節點有你要的 label」。用 <code>kubectl get nodes --show-labels</code> 對照 Pod 的 nodeSelector。記憶體不夠（c）會寫 <code>Insufficient memory</code>；拉映像（a）與 readiness（d）都是排上節點之後才會發生的事，Pending 階段還輪不到它們。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：服務掛掉，你用 <code>kubectl edit</code> 把 Deployment 的錯誤映像改回來，服務恢復了。還缺什麼？</p>
+  <label data-key="a">不缺，已經修好</label>
+  <label data-key="b">把修正寫回 manifest／chart 並走正常部署，否則下次部署會把錯誤帶回來；再寫事故紀錄與預防措施</label>
+  <label data-key="c">把 Pod 全部刪掉再建一次</label>
+  <label data-key="d">重啟整個叢集</label>
+  <p class="why">✓ 叢集上的手動修改只是止血，git 裡的 manifest 還是錯的，下一次 CI 部署會再套用一次。修在宣告裡、走正常部署，再用事故紀錄的行動項目防止同類錯誤。a 會在下一次部署重演同一個事故；c、d 對已經恢復的服務沒有幫助，只會增加風險。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：映像是 distroless，<code>kubectl exec -it pod -- sh</code> 回傳 <code>executable file not found</code>。怎麼進去看？</p>
+  <label data-key="a">沒辦法，只能看 log</label>
+  <label data-key="b"><code>kubectl debug -it pod/x --image=busybox:1.38.0 --target=&lt;容器名&gt;</code>，加一個共用程序空間的臨時容器</label>
+  <label data-key="c">改用 <code>kubectl attach</code></label>
+  <label data-key="d">重建一個有 shell 的映像推上正式環境</label>
+  <p class="why">✓ 臨時容器（1.25 Stable）就是為這種情況設計的：不重啟 Pod，帶著自己的工具進去，<code>--target</code> 讓它看得到目標容器的程序與 <code>/proc/1/environ</code>。attach（c）只是接上主程序的輸入輸出，沒有 shell 可用；換映像（d）會改變你正在查的東西、要重新部署，也太慢。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>第一步就刪 Pod 或重啟</strong>：事件、上一次的 log、lastState 跟著消失，設定錯誤在新 Pod 照樣發生。先 <code>describe</code>、<code>logs --previous</code>，需要止血用 <code>rollout undo</code>。</li>
+  <li><strong>只看最新的 log</strong>：一直重啟的容器，崩潰原因在上一次的輸出；連上一次都沒有 log，就看 lastState 的 reason 與 exit code。</li>
+  <li><strong>把狀態字當成原因</strong>：CrashLoopBackOff、ImagePullBackOff 是症狀。事故紀錄與診斷要寫到「哪個設定錯了」。</li>
+  <li><strong>以為 Running 就是正常</strong>：看 READY 欄位與 EndpointSlice。<code>0/1</code> 的 Pod 不收流量，<code>1/1</code> 的 Pod 也可能沒被任何 Service 選到。</li>
+  <li><strong>用 port-forward svc/ 測 Service</strong>：它只是挑一個 Pod 直接連，不經過 Service。測 Service 要從叢集內的 Pod 用名字 curl。</li>
+  <li><strong>修在叢集上</strong>：<code>kubectl edit</code> 的修改，下一次部署就被蓋回去。修在 manifest／chart，走正常部署。</li>
+  <li><strong>用拿掉 probe、limit 或加 optional 讓問題消失</strong>：症狀不見了，根因還在，而且之後出事更難發現。</li>
+  <li><strong>以為事件會一直在</strong>：預設只保留 1 小時。正式環境要把事件收進 log 系統。</li>
+  <li><strong>強制刪除 Terminating 的 Pod 前不查原因</strong>：節點可能還在跑舊容器；先看 finalizers 與節點狀態。</li>
+  <li><strong>debug node 之後忘了清</strong>：<code>node-debugger-…</code> Pod 會一直留著，帶著節點的權限。用完就刪。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>固定順序：<code>get pods -o wide</code> → <code>describe</code> 與 <code>kubectl events</code> → <code>logs --previous</code> 與 lastState → exec 或 <code>kubectl debug</code> → Service、DNS、NetworkPolicy、RBAC。先蒐證、一次改一個變數、記下時間。</li>
+  <li>狀態字只指出去哪裡看：Pending 看 FailedScheduling；ImagePullBackOff、CreateContainerConfigError 看 Failed 事件；CrashLoopBackOff、OOMKilled 看上一次的 log 與 exit code（137＝SIGKILL）；0/1 看 Unhealthy 事件；1/1 卻不通看 EndpointSlice。</li>
+  <li>沒有 shell 的映像用臨時容器：<code>kubectl debug -it pod/x --image=busybox:1.38.0 --target=api</code>，從 <code>/proc/1/environ</code>、<code>/proc/1/root</code> 看目標容器；<code>--profile=general</code> 才有讀它需要的 SYS_PTRACE。<code>--copy-to</code> 建可以改指令的複本，<code>debug node/…</code> 看節點，用完要清掉。</li>
+  <li>縮小範圍：直接打 Pod（port-forward pod/）→ 從叢集內打 Service → 入口；呼叫端連不出去時查 DNS、NetworkPolicy、auth can-i。</li>
+  <li>止血可以在叢集上做，修正一定要回到 manifest／chart 走正常部署；事故紀錄寫時間軸、影響、偵測、根因、修正、行動項目，行動項目要有自動化的檢查。</li>
+</ul>
+<p>下一課看正式環境的叢集：用 GitOps 讓 git 成為唯一的部署入口（叢集上的手動修改可以被自動改回），以及 EKS 上節點、網路、權限是怎麼運作的。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>23. 效能分析與記憶體洩漏</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="23" data-practice="node">
+<header>
+  <div class="eyebrow">階段 6：資深工程師的功課 · 第 23 課</div>
+  <h1>效能分析與記憶體洩漏</h1>
+</header>
+<main>
+
+<p>咖啡店的 API 上線三個月，客服又轉來兩件事：月底匯出訂單 CSV 時，整個 API 卡住將近一秒；另外每隔四、五天，伺服器就會在半夜重啟一次，log 的最後一行是 <code>FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory</code>。同事的第一個反應是「把產生 CSV 的程式換成更快的套件」和「把記憶體上限調大」。兩個都是沒量就改：前者可能根本不是熱點，後者只是讓程序晚幾天才倒。</p>
+<p>這一課把這兩件事從客訴一路追到修好，用的是資深工程師處理效能問題的方式：先量、找到原因再改，改完再量一次。匯出卡住是 CPU 的問題，要找出時間花在哪個函式；半夜重啟是記憶體的問題，要找出是誰一直抓著不再需要的資料。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>「API 很慢」要怎麼變成能動手的問題：用數字描述問題，為什麼看 p99 不看平均。</li>
+  <li>匯出卡住的那一秒花在哪、為什麼這麼慢：錄 CPU profile、讀火焰圖和 self time，認出 O(n²) 和後端常見的熱點。</li>
+  <li>半夜的 heap out of memory 是怎麼來的：heap 和垃圾回收怎麼運作，怎麼確定真的是洩漏。</li>
+  <li>是誰抓著不放、怎麼修：用 heap snapshot 找保留者，常見的洩漏寫法與有上限的快取。</li>
+  <li>怎麼確認修好、下次早點發現：把兩件事走過的步驟收成一套流程。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="07-event-loop.html">第 7 課</a>的 event loop：Node 只有一條主執行緒，同步程式跑太久，其他請求和計時器都要排隊等。</li>
+  <li><a href="09-blocking-and-workers.html">第 9 課</a>的阻塞量測：<code>monitorEventLoopDelay</code> 量 event loop 被卡住多久，event loop 使用率（ELU）量它有多忙；CPU 密集的工作會把兩者都推高。</li>
+  <li><a href="../../typescript/lessons/01-closures-this.html">TypeScript 課第 1 課</a>的閉包：函式會一直保留它用到的外層變數，只要函式還在，那些變數就不會被回收。</li>
+</ul></div>
+
+<h2>「API 很慢」要怎麼變成能動手的問題？</h2>
+<p>兩件事都是從客服的一句話開始的，第一件是「月底匯出很卡」。這句話沒辦法直接拿來動手：不知道該改哪裡，改完也沒辦法判斷算不算修好。能動手的寫法要包含四件事：<strong>哪個端點、在多少流量下、多慢、要快到多少</strong>。例如「尖峰每秒 200 個請求時，<code>GET /orders</code> 有 1% 超過 2 秒，目標是 99% 在 300ms 內」。這句話裡有兩個描述效能的基本量。</p>
+<p>第一個是<strong>延遲</strong>（latency）：一個請求從送出到收到回應花多久。使用者感受到的「慢」就是它。第二個是<strong>吞吐量</strong>（throughput）：單位時間處理多少請求，常用每秒請求數（requests per second，RPS）表示，例如每秒 200 個。兩個要一起寫，因為同一支 API 在每秒 10 個請求和每秒 200 個請求時，延遲可能差很多；只說「要 2 秒」卻不說在多少流量下，別人重現不出來。</p>
+<p>接下來的問題是：每個請求的延遲都不一樣，要用哪一個數字代表「多慢」？直覺是算平均，但平均會出事。<strong>百分位數</strong>（percentile）的算法是：把所有請求的延遲由小到大排好，p50 是排在 50% 位置的值，代表一半的請求比它快；p99 是排在 99% 位置的值，代表 99% 的請求比它快，剩下 1% 比它慢。平均值會被少數極端值拉動，同時又把它們藏起來，百分位數則直接告訴你「最慢的那一群有多慢」。</p>
+<p>實際看一次差別。在 <code>learn/</code> 執行 <code>node check.mjs node 23</code> 建立 <code>work/23/</code>，再到 <code>work/23</code> 執行 <code>node examples/percentiles.ts</code>。它模擬 1000 個請求：98% 在 20～60ms，2% 卡了大約 2 秒。執行後比較平均和 p99：</p>
+<pre>平均 83ms
+p50  40ms
+p90  57ms
+p99  1990ms
+max  2168ms</pre>
+<ul>
+  <li><strong>平均 83ms</strong>：看起來離 300ms 的目標很遠，好像沒事。但沒有任何一個請求真的花了 83ms，它是 40ms 左右的大多數和 2 秒的少數混出來的數字。</li>
+  <li><strong>p50、p90</strong>：大多數請求確實很快。</li>
+  <li><strong>p99 1990ms</strong>：每 100 個請求就有 1～2 個要等 2 秒，這才是客服收到的抱怨。</li>
+</ul>
+<p>這 2% 對使用者的影響比數字看起來大。一個頁面打開時常常同時打好幾支 API，只要其中一支慢，整個頁面就慢。如果每支有 2% 的機率碰上慢請求，打 10 支都沒碰上的機率是 0.98 的 10 次方，大約 82%，也就是每 5 次開頁面就有將近 1 次會卡。所以正式環境的監控和目標都用 p50、p95、p99 來寫（<a href="../../system-design/lessons/03-latency-percentiles.html">系統設計課第 3 課</a>會詳細講怎麼算、怎麼設目標）。</p>
+<p>知道要量什麼之後，接著是用什麼量。下面這張表從小到大排，前兩個在找問題時最常用，查表用，不用背：</p>
+<div class="table-wrap"><table>
+  <tr><th>工具</th><th>量什麼</th><th>什麼時候用</th></tr>
+  <tr><td><code>performance.now()</code></td><td>一段程式花了幾毫秒（小數點以下也有）</td><td>比較修改前後的同一個函式</td></tr>
+  <tr><td>每個請求 log 的 <code>durationMs</code>（<a href="19-structured-logging.html">第 19 課</a>）</td><td>正式環境每個請求的延遲</td><td>算出每個端點的 p50／p99，找出哪個端點慢</td></tr>
+  <tr><td><code>monitorEventLoopDelay</code>、<code>performance.eventLoopUtilization()</code>（<a href="09-blocking-and-workers.html">第 9 課</a>）</td><td>event loop 被卡住多久、忙碌的比例</td><td>懷疑有同步的 CPU 工作卡住所有請求時</td></tr>
+  <tr><td>壓力測試（load test）工具，例如 autocannon（用法見課末「補充與查表」）</td><td>用很多條連線同時打一個端點，量出延遲百分位數與吞吐量</td><td>上線前、或修改前後在同樣負載下比較</td></tr>
+</table></div>
+<p>量出來的數字要能拿來比較，量測的條件就要像正式環境，下面四點各自對應一種會讓數字失真的狀況：</p>
+<div class="callout warn">量測要像正式環境：用正式環境等級的資料量（開發機 100 筆訂單測不出 O(n²) 的問題）；不要開著 debugger（<code>--inspect</code> 連上 DevTools 時程式會變慢）；先跑幾次暖身（warm-up），V8 會把常跑的函式重新編譯成更快的機器碼，第一次量到的通常偏慢；每次只改一個地方，改完重量。</div>
+<div class="callout practice"><strong>💡 實務上：先把「很慢」變成一張有數字的 ticket</strong><br>客服轉來「後台訂單頁很卡」時，資深工程師第一步不是打開程式碼，而是問：哪一頁、哪個時段、所有人都卡還是少數人卡。接著用 log 的 <code>durationMs</code> 依端點算出 p50／p99，把 ticket 改寫成「月底 <code>GET /orders/export</code> 的 p99 約 X 秒，目標 Y 秒」，PM 和維運才能判斷值不值得排進這個 sprint。也要問誰在用：一個月只有店長按一次的匯出，慢一點可能可以接受，或改成背景產生、做好再通知，比硬優化划算。修完把前後數字貼回 ticket，下次有人問「真的有變快嗎」就有答案。</div>
+<p>現在匯出那件事有了數字：匯出要將近 1 秒，而且這段期間其他請求都在排隊。但數字只說「多慢」，沒說這 1 秒花在哪裡。</p>
+
+<h2>匯出卡住的那一秒，花在哪個函式？</h2>
+<p>知道「CSV 匯出要 1 秒」之後，同事的直覺是產生 CSV 的那段程式太慢，換一個更快的 CSV 套件就好。這種猜法常常猜錯，因為一段程式慢不慢，看的不是它長得多複雜，而是它被執行了幾次、處理多少資料；一行看起來無害的程式，在迴圈裡跑幾萬次就可能吃掉大部分的時間。所以要用工具去看，而不是用讀程式碼去猜。</p>
+<p>這個工具是 <strong>CPU profile</strong>。它是 V8 的取樣記錄：每隔一小段時間（預設 1000 微秒，也就是 1ms）看一次「現在正在執行哪個函式、它是被誰呼叫的」，記下整條呼叫堆疊（call stack），也就是「main 呼叫了 A、A 呼叫了 B、現在正在 B 裡面」這一串。跑完之後，哪個函式被看到的次數越多，它花的時間就越多。用取樣而不是記錄每一次函式呼叫，是因為記錄每一次呼叫本身就很花時間，會讓程式慢到量不準；取樣的代價很小，代價是結果是統計出來的，每次跑的數字會有一點差異。</p>
+<p>想自己從 profile 找出兇手的話，先去做課末的練習 1 再回來讀，下面會直接揭曉答案。錄一次匯出的 profile：</p>
+<pre>cd work/23
+node --cpu-prof --cpu-prof-dir=profiles slow-report.ts
+# 30000 筆訂單，CSV 1343928 個字元，花了 752ms
+ls profiles
+# CPU.20261031.235205.73478.0.001.cpuprofile</pre>
+<p><code>--cpu-prof</code> 讓 Node 一啟動就開始記錄，程序結束前把結果寫成 <code>.cpuprofile</code> 檔（JSON）；<code>--cpu-prof-dir</code> 指定放在哪個資料夾，沒給就放在目前目錄。用 Node 直接跑 .ts 時，profile 裡的檔名和行號就是你的 .ts 原始檔（原因和版本見課末）。</p>
+<p><code>slow-report.ts</code> 跑完就結束，所以可以用 <code>--cpu-prof</code> 等它結束時寫檔。伺服器不會自己結束，就不能這樣做。這時用 <code>node --inspect server.ts</code> 啟動（預設只聽 <code>127.0.0.1:9229</code>，<a href="06-testing-debugging.html">第 6 課</a>用過），在 Chrome 打開 <code>chrome://inspect</code> → 點你的程序下面的 inspect → Performance 面板按錄製，用壓測工具打幾秒再停止。<code>--inspect</code> 不要在正式環境對外開：連上的人可以執行任意程式碼。</p>
+<p>.cpuprofile 是給工具讀的 JSON，有兩個地方可以打開它：</p>
+<ul>
+  <li><strong>Chrome DevTools</strong>：任何分頁按 F12 → Performance 面板 → 「Load profile」（向上的箭頭圖示），選 .cpuprofile 檔。</li>
+  <li><strong>VS Code</strong>：直接打開 .cpuprofile 檔，內建的檢視器會顯示依 self time／total time 排序的表格；表格右上角的火焰圖示可以切換成火焰圖，第一次會提示安裝另一個擴充功能（Flame Chart Visualizer）。</li>
+</ul>
+<p>打開後最直觀的畫法是火焰圖：把取樣到的呼叫堆疊一層一層疊起來，上面的呼叫下面的，框越寬代表在那條路徑上取樣到越多次。這次匯出的火焰圖長這樣：</p>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="slow-report 的火焰圖：main 在最上層佔滿整個寬度，下一層 removeDuplicates 佔了大部分寬度，toCsv、sortByTime、loadOrders 都很窄">
+    <rect class="d-soft" x="20" y="20" width="660" height="36" rx="4"/>
+    <text class="d-text" x="30" y="43">main（total 740ms，self 1ms）</text>
+    <rect class="d-soft" x="20" y="64" width="22" height="36" rx="4"/>
+    <rect class="d-box" x="46" y="64" width="560" height="36" rx="4"/>
+    <text class="d-accent" x="56" y="87">removeDuplicates（total 642ms，self 642ms）</text>
+    <rect class="d-soft" x="610" y="64" width="26" height="36" rx="4"/>
+    <rect class="d-soft" x="640" y="64" width="40" height="36" rx="4"/>
+    <text class="d-small" x="642" y="87">toCsv</text>
+    <rect class="d-soft" x="640" y="108" width="40" height="36" rx="4"/>
+    <text class="d-small" x="625" y="162">formatLine</text>
+    <text class="d-small" x="20" y="120">loadOrders</text>
+    <text class="d-small" x="530" y="162">sortByTime</text>
+    <line class="d-line" x1="590" y1="150" x2="620" y2="100"/>
+    <line class="d-line" x1="30" y1="108" x2="30" y2="100"/>
+    <text class="d-small" x="20" y="200">由上往下是呼叫關係：上面的呼叫下面的。寬度＝total time（自己＋呼叫的函式）。</text>
+    <text class="d-small" x="20" y="222">一個框底下沒被別的框蓋住的寬度＝self time。main 很寬，但底下幾乎被蓋滿，它自己不花時間。</text>
+  </svg>
+  <figcaption>火焰圖（flame graph）：把取樣到的呼叫堆疊疊起來畫（數字取自一次本機執行，每次會有差異）。找「又寬、底下又空」的框。這張圖把同一條呼叫路徑的樣本合併在一起畫；Chrome Performance 面板與 VS Code 的火焰圖，橫軸是時間，同一個函式會依執行的時段分成好幾段，讀法一樣：上面呼叫下面，看寬度。</figcaption>
+</figure>
+<p>圖上每個框都標了兩個時間，要分清楚：</p>
+<ul>
+  <li><strong>自身時間</strong>（self time）：取樣時正好在執行這個函式<strong>自己的程式碼</strong>的時間。</li>
+  <li><strong>總時間</strong>（total time）：自身時間加上它呼叫的所有函式的時間。<code>main</code> 的總時間永遠最高，因為所有東西都是它呼叫的，但它自己幾乎什麼都沒做。</li>
+</ul>
+<p>要改的是 self time 高的函式，因為那段時間真的花在它自己的程式碼上；total time 高只代表時間花在它底下的某處。花掉最多時間的那條程式路徑叫<strong>熱點</strong>（hot path）。找熱點的步驟是：先在 Bottom-Up（由下而上）表格依 Self Time 排序，看第一名是誰；再切到 Call Tree 或火焰圖，看它是被哪條路徑呼叫的。表格裡也會看到幾列不是你寫的程式：<code>(garbage collector)</code> 是垃圾回收、<code>(program)</code> 是 V8 自己的工作、<code>(idle)</code> 是 event loop 在等事件。如果遇到一個函式 self time 很高、程式碼卻很短，可能是 V8 把它呼叫的小函式併進來了，見課末「內聯」。</p>
+<p>回到匯出：740ms 裡有 642ms 是 <code>removeDuplicates</code> 自己的時間，產生 CSV 的 <code>toCsv</code> 只是右邊一條窄框。如果照同事的猜測去換 CSV 套件，就算換到快一倍，省下的也只是那條窄框的一半，客訴的那一秒幾乎不會變。</p>
+<p>熱點找到了，但還有一個問題：去掉重複的訂單聽起來是很簡單的事，為什麼要花 0.6 秒？</p>
+
+<h2>為什麼一個去重複就要 0.6 秒？O(n²) 與常見的 CPU 熱點</h2>
+<p>打開 <code>slow-report.ts</code> 看 <code>removeDuplicates</code>：它對每一筆訂單，都把目前已經留下的結果從頭掃一次，看有沒有相同的 id。3 萬筆訂單時，第 1 筆掃 0 筆、第 2 筆掃 1 筆……第 3 萬筆掃將近 3 萬筆，加起來是幾億次比較。每一次比較都很快，但次數太多。</p>
+<p>描述這種「資料變多，時間怎麼跟著變」的寫法叫<strong>時間複雜度</strong>，用大 O 表示。上面這種「每一筆都掃一次全部」是 <strong>O(n²)</strong>：資料變 10 倍，比較次數變 100 倍。只掃一次全部是 O(n)：資料變 10 倍，時間也只變 10 倍。O(1) 是不管資料多少，每次操作的時間都差不多，例如用 key 從 <code>Map</code> 取值。O(n²) 危險的地方在於資料少時完全看不出來：開發機上 100 筆訂單只要 5 千次比較，一眨眼就跑完；到了月底 3 萬筆，同一段程式就要卡住整個 API。</p>
+<p>修法是讓「這個 id 出現過沒有」不必再掃陣列。<code>Set</code> 內部用雜湊表（hash table）存資料：放進去時用值算出一個位置，查的時候用同一個算法直接跳到那個位置，不用從頭比對，所以 <code>has</code> 和 <code>add</code> 都是 O(1)。把已經看過的 id 放進一個 <code>Set</code>，每一筆訂單就從「掃一遍已留下的結果」變成「查一次 Set」：</p>
+<pre>// O(n)：每一筆只查一次 Set，保留第一次出現的那筆
+function removeDuplicates(orders: Order[]) {
+  const seen = new Set&lt;number&gt;()
+  const result: Order[] = []
+  for (const o of orders) {
+    if (!seen.has(o.id)) { seen.add(o.id); result.push(o) }
+  }
+  return result
+}</pre>
+<p>3 萬筆訂單從幾億次比較變成 3 萬次查找。用同一個指令再錄一次，在同一台機器上前後比較（這次重跑的環境和上面那次不同，原版印出約 450ms 而不是 752ms，所以前後要在同一台機器上比，不要拿另一次環境的數字來比）：</p>
+<pre>node --cpu-prof --cpu-prof-dir=profiles slow-report.ts
+# 改前：30000 筆訂單，CSV 1343928 個字元，花了 451ms
+# 改後：30000 筆訂單，CSV 1343928 個字元，花了 53ms</pre>
+<p>輸出的筆數和字元數一樣，代表結果沒變；時間少了將近九成。新的 profile 裡 <code>removeDuplicates</code> 已經不在前幾名，自己的程式碼裡 self time 第一名變成產生每一行 CSV 的 <code>formatLine</code>，大約 24ms，<code>sortByTime</code> 約 6ms。profile 裡排在附近的其他列，多半是 Node 啟動、載入 TypeScript 和垃圾回收，不是匯出本身。這時再去改 <code>formatLine</code>，最多也只能省二十幾 ms。</p>
+<p>同樣的問題更常以另一種樣子出現：迴圈裡去查<strong>另一個</strong>陣列。去重複是查「自己已經留下的結果」，而訂單對到客人資料是查「另一份清單」，寫法看起來不像，本質一樣是每一筆都掃一次全部。前端工程師常寫的 <code>items.find(i =&gt; i.id === id)</code> 就是這種，在 50 筆的畫面上沒問題，搬到後端處理一整個月的資料就是另一回事。修法也一樣：先花一次 O(n) 建一個 <code>Map</code>（要用 key 取出整筆資料時用 <code>Map</code>，只要知道「有沒有」時用 <code>Set</code>），之後每次查都不用再掃陣列：</p>
+<pre>// O(n²)：每一筆訂單都掃一次全部客人
+for (const o of orders) {
+  const c = customers.find(c =&gt; c.id === o.customerId)
+}
+
+// O(n)：先建一次 Map，之後每次查都很快
+const byId = new Map(customers.map(c =&gt; [c.id, c]))
+for (const o of orders) {
+  const c = byId.get(o.customerId)
+}</pre>
+<p>迴圈裡查陣列是最常見的一種熱點，但不是唯一一種。下次 profile 指到一個陌生的函式時，可以對照這張表，看它是不是其中一種。查表用，不用背：</p>
+<div class="table-wrap"><table>
+  <tr><th>寫法</th><th>為什麼慢</th><th>改成</th></tr>
+  <tr><td>迴圈裡用 <code>find</code>、<code>filter</code>、<code>some</code>、<code>includes</code> 查另一個陣列</td><td>每次查都掃整個陣列。5 千位客人 × 5 萬筆訂單＝2.5 億次比較，這就是 O(n²)：資料變 10 倍，時間變 100 倍</td><td>先掃一次建 <code>Map</code>／<code>Set</code>，之後每次查是 O(1)</td></tr>
+  <tr><td>重複的 <code>JSON.stringify</code>／<code>JSON.parse</code>（例如拿來比較、深拷貝、算快取的 key）</td><td>每次都走過整個物件</td><td>比較需要的欄位；<code>structuredClone</code>；或乾脆不要拷貝</td></tr>
+  <tr><td>複雜的正規表示式</td><td>特定輸入會讓它回溯（backtracking）到指數時間（<a href="09-blocking-and-workers.html">第 9 課</a>的 ReDoS）</td><td>簡化規則、限制輸入長度</td></tr>
+  <tr><td>同步的加解密，例如 <code>crypto.pbkdf2Sync</code>、<code>scryptSync</code></td><td>故意設計得很慢（密碼雜湊），而且卡住 event loop</td><td>用非同步版本（在 libuv 的 thread pool 跑，<a href="07-event-loop.html">第 7 課</a>）</td></tr>
+  <tr><td>每個請求寫很多 log、log 整個物件</td><td>序列化和寫出都要 CPU</td><td>只 log 需要的欄位，正式環境用 info 等級（<a href="19-structured-logging.html">第 19 課</a>）</td></tr>
+</table></div>
+<p>改完要再量一次，理由有兩個。第一，確認數字真的變好、輸出沒變。第二，修掉最大的熱點之後，第二名就變成第一名，它可能也要改，也可能已經夠快了。夠快的標準是一開始在 ticket 上定的目標，不是「越快越好」：已經達標了還為了省 2ms 把程式寫得難懂，就是<strong>過早最佳化</strong>（premature optimization），之後每個讀這段程式的人都要付出代價。</p>
+<div class="callout practice"><strong>💡 實務上：code review 時先看「迴圈裡的查找」</strong><br>這類 O(n²) 通常在 code review 就能抓到，不用等上線出事：看到 <code>for</code> 或 <code>map</code> 裡面又有 <code>find</code>、<code>filter</code>、<code>includes</code>，資深工程師會先問一句「這兩個陣列一年後會有多大？」。如果是菜單品項、會員等級這種固定幾十筆的清單，維持好讀的寫法就好，不用為了它建 <code>Map</code>。如果是訂單、客人、log 這種會跟著營業額一起長的資料，就值得改，或乾脆讓資料庫用 JOIN 和索引做掉。留言時寫清楚資料量和理由，比只寫「這樣比較快」更容易被接受。</div>
+<p>匯出那件事到這裡有了完整的答案：時間花在 <code>removeDuplicates</code>，因為它是 O(n²)；改成 <code>Set</code> 後在同一台機器上從約 450ms 降到約 50ms，第一名換成只花二十幾 ms 的 <code>formatLine</code>，再改的收益很小，就停在這裡。第二件事的性質不一樣：程序不是變慢，而是每隔幾天自己倒掉。</p>
+
+<h2>半夜那行 heap out of memory 是怎麼來的？</h2>
+<p>要看懂那行 log，先要知道 JavaScript 的資料放在哪裡、什麼時候被清掉。物件、陣列、字串、閉包都放在 V8 的 <strong>heap</strong>（堆積）這塊記憶體。寫 JavaScript 時你從來不用自己釋放記憶體，因為有<strong>垃圾回收</strong>（garbage collection，GC）：它定期從一組「根」出發，沿著引用一路走，走得到的物件留著，走不到的物件就回收。根是程式一定還會用到的起點：global 物件、正在執行的函式的區域變數、模組最外層的變數。判斷的依據只有「走不走得到」，不是「程式還會不會用到」。</p>
+<p>每次都把整個 heap 走一遍很花時間，所以 V8 把 heap 分成兩區。大部分物件活不久，例如一個請求裡建立的暫時物件，請求結束就沒人要了；所以新物件先放 <strong>new space</strong>，這一區小，經常、快速地清。活過幾次 GC 的物件代表它可能會用很久，就搬到 <strong>old space</strong>，這一區大，比較久才做一次完整的清理（Mark-Compact）。</p>
+<p>這就是為什麼有 GC 的語言還是會洩漏。<strong>記憶體洩漏</strong>（memory leak）在這裡的意思是：物件你已經不需要了，但從根出發還走得到它，所以 GC 永遠不會回收它。最典型的是一個模組最外層的 <code>Map</code>，每個請求都往裡面放東西、從來不刪：模組最外層的變數本身就是根，Map 裡的每一筆都走得到。</p>
+<p>heap 有上限。洩漏的物件越積越多，到了上限、GC 也清不出空間時，程序就以 <code>FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory</code> 結束，這種狀況叫 OOM（out of memory）。這正是半夜那行 log。但只看到 OOM 還不能斷定是洩漏，也可能只是某個請求一次載入太多資料。要先確認記憶體是不是真的「只進不出」。</p>
+<p>Node 的 <code>process.memoryUsage()</code> 回傳目前的記憶體用量（單位是位元組），它有五個欄位，找 JS 物件的洩漏主要看 <code>heapUsed</code>，查表用：</p>
+<div class="table-wrap"><table>
+  <tr><th>欄位</th><th>意思</th></tr>
+  <tr><td><code>rss</code></td><td>Resident Set Size：整個程序實際佔用的實體記憶體，包含 heap、程式碼、執行緒的 stack、C++ 物件。容器的記憶體上限看的是接近它的數字</td></tr>
+  <tr><td><code>heapTotal</code></td><td>V8 目前向作業系統要來的 heap 大小</td></tr>
+  <tr><td><code>heapUsed</code></td><td>heap 裡實際被物件用掉的部分。找 JS 物件的洩漏看它</td></tr>
+  <tr><td><code>external</code></td><td>V8 管理的 JS 物件所綁定的 C++ 物件用的記憶體</td></tr>
+  <tr><td><code>arrayBuffers</code></td><td><code>ArrayBuffer</code> 和 <code>Buffer</code> 用的記憶體（<a href="11-buffer-encoding.html">第 11 課</a>），也包含在 <code>external</code> 裡。Buffer 的內容不在 heap 裡</td></tr>
+</table></div>
+<p>看 <code>heapUsed</code> 時最容易誤判的一點：它一直上升<strong>不代表</strong>有洩漏。GC 不會一有垃圾就清，而是等到需要時才做，所以正常程式的 heapUsed 本來就是鋸齒狀：漲上去、GC 一次、掉下來。要看的是<strong>每次 GC 之後的低點</strong>是不是越來越高。低點穩定，代表垃圾都有被清掉；低點一路往上爬，代表每一輪都有清不掉的東西留下來。</p>
+<p>用一個模擬洩漏的程式看實際的數字。執行 <code>node --expose-gc examples/leak.ts</code>：它每一輪處理 2 萬個請求，每個請求的訂單都放進一個沒有上限的 <code>Map</code>，每輪結束強制 GC 再印出用量。<code>--expose-gc</code> 讓程式可以呼叫 <code>gc()</code> 強制回收，這樣印出來的就是 GC 後的低點（只在量測時用）。執行後看每一輪的 heapUsed：</p>
+<pre>第 1 輪  heapUsed 13.4 MB  heapTotal 30.3 MB  rss 88.3 MB  快取 20000 筆
+第 2 輪  heapUsed 19.5 MB  heapTotal 36.7 MB  rss 93.3 MB  快取 40000 筆
+第 3 輪  heapUsed 24.5 MB  heapTotal 58.2 MB  rss 99.9 MB  快取 60000 筆
+第 4 輪  heapUsed 31.3 MB  heapTotal 65.5 MB  rss 107.1 MB  快取 80000 筆
+第 5 輪  heapUsed 36.3 MB  heapTotal 71.0 MB  rss 109.5 MB  快取 100000 筆</pre>
+<p>強制 GC 之後，每 2 萬個請求 heapUsed 還是多 5～6MB，而且跟快取的筆數一起長：這就是洩漏。加上 <code>fixed</code> 參數（快取最多 500 筆）再跑一次，heapUsed 停在 7.8MB 左右不動。正式環境的伺服器一天處理的請求遠多於 10 萬個，同樣的漲法，幾天後碰到上限，就是每隔四、五天半夜重啟一次。</p>
+<p>那同事的第二個提議「把記憶體上限調大」呢？old space 的上限用 <code>--max-old-space-size=512</code> 設定，單位是 MiB（另一種依百分比設定的寫法見課末）。調大上限只會讓低點爬更久才碰頂，程序一樣會倒，只是從四天變成八天。在容器裡還有另一個風險：容器本身也有記憶體上限，而程序用的記憶體除了 heap，還有 Buffer、執行緒的 stack 這些 heap 以外的部分。所以 heap 上限要<strong>小於</strong>容器的記憶體上限，留空間給這些部分；不然整個程序先超過容器的上限，作業系統的 OOM killer（記憶體不夠時強制結束程序的機制）會直接把它砍掉，連那行 FATAL ERROR 都來不及印。</p>
+<p>到這裡確定了半夜重啟是洩漏：GC 後的低點一直上升。但 heapUsed 只是一個總數，它不會告訴你多出來的是哪種物件，更不會告訴你是程式碼裡的哪個變數抓著它們。</p>
+
+<h2>是誰抓著這些物件不放？heap snapshot</h2>
+<p>要回答「多出來的是什麼、被誰抓著」，需要看到 heap 裡面的內容。<strong>heap snapshot</strong> 是某一刻 heap 裡所有物件和它們之間引用關係的完整快照：有哪些物件、各是什麼建構子（constructor）建立的、多大、誰引用了誰。拍兩張比較，就能看出哪種物件變多了；再順著引用往回找，就能找到抓著它們的變數。產生 snapshot 有三種方法，差別在於要不要改程式、什麼時候拍：</p>
+<ul>
+  <li>程式裡呼叫 <code>v8.writeHeapSnapshot(檔名)</code>（<code>import { writeHeapSnapshot } from 'node:v8'</code>），回傳寫好的檔名。適合在本機重現時拍。</li>
+  <li>啟動時加 <code>--heapsnapshot-signal=SIGUSR2</code>，之後對程序送 <code>kill -USR2 &lt;pid&gt;</code> 就寫一份。正式環境不用改程式就能拿到。</li>
+  <li>啟動時加 <code>--heapsnapshot-near-heap-limit=1</code>：快要 OOM 時自動寫一份（最多 1 份），留下程序倒掉前的證據。半夜倒掉、沒人在旁邊的情況，這是最直接的辦法（版本見課末）。</li>
+</ul>
+<p>拍 snapshot 本身有代價，在正式環境拍之前要先知道：</p>
+<div class="callout warn">寫 snapshot 是同步的，會卡住 event loop，heap 越大卡越久；而且需要大約目前 heap 兩倍的記憶體（Node 文件），在快滿的容器裡可能直接被 OOM killer 砍掉。正式環境先把這台機器從負載平衡移出來再拍。snapshot 裡有記憶體中的所有字串，包含密碼、token、客人資料，要當成機密檔案處理。</div>
+<p>在本機練習時沒有這些顧慮。執行 <code>node examples/heap-snapshot.ts</code>，它先處理 1000 個請求拍第一張，再處理 2 萬個拍第二張，放在 <code>snapshots/</code>。分析的步驟：</p>
+<ol>
+  <li>Chrome 任何分頁按 F12 → Memory 面板 → 左側的「Load」，載入兩個 .heapsnapshot 檔。</li>
+  <li>選第二張，上方的檢視從 Summary 改成 <strong>Comparison</strong>，比較的基準選第一張。列表依建構子（constructor）分組，<code>#New</code> 是新增的數量、<code>Size Delta</code> 是增加的大小。這裡會看到 <code>CachedOrder</code> 多了 20000 個。</li>
+  <li>展開 <code>CachedOrder</code>，點其中一個物件，下方的 <strong>Retainers</strong> 面板列出<strong>保留者</strong>（retainer）：抓著這個物件、讓它無法被回收的引用。一路往下看就是從根到它的引用鏈。</li>
+</ol>
+<p>第 2 步回答「多出來的是什麼」，第 3 步回答「被誰抓著」。保留者就是上一節 GC 從根走過來的那條路倒過來看：GC 從根走到物件，Retainers 面板從物件走回根。這次的引用鏈是：</p>
+<figure>
+  <svg viewBox="0 0 700 200" role="img" aria-label="引用鏈：GC 根到模組作用域，到 orderCache 這個 Map，到 Map 的內部表，到 CachedOrder 物件">
+    <defs><marker id="arrow23" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="10" y="40" width="120" height="50" rx="6"/>
+    <text class="d-text" x="70" y="70" text-anchor="middle">GC 根</text>
+    <rect class="d-box" x="170" y="40" width="140" height="50" rx="6"/>
+    <text class="d-text" x="240" y="62" text-anchor="middle">模組的作用域</text>
+    <text class="d-small" x="240" y="80" text-anchor="middle">(context)</text>
+    <rect class="d-box" x="350" y="40" width="150" height="50" rx="6"/>
+    <text class="d-accent" x="425" y="62" text-anchor="middle">orderCache</text>
+    <text class="d-small" x="425" y="80" text-anchor="middle">Map，沒有上限</text>
+    <rect class="d-box" x="540" y="40" width="150" height="50" rx="6"/>
+    <text class="d-text" x="615" y="70" text-anchor="middle">CachedOrder × 2 萬</text>
+    <line class="d-line" x1="130" y1="65" x2="166" y2="65" marker-end="url(#arrow23)"/>
+    <line class="d-line" x1="310" y1="65" x2="346" y2="65" marker-end="url(#arrow23)"/>
+    <line class="d-line" x1="500" y1="65" x2="536" y2="65" marker-end="url(#arrow23)"/>
+    <text class="d-small" x="10" y="130">Retainers 面板由下往上讀：CachedOrder 被 Map 的內部表抓著，Map 是 orderCache 變數，</text>
+    <text class="d-small" x="10" y="150">orderCache 住在模組的作用域（context）裡，而模組永遠不會被回收。</text>
+    <text class="d-small" x="10" y="170">要修的是引用鏈上「不該一直抓著」的那一段：這裡是 Map 沒有上限。</text>
+  </svg>
+  <figcaption>從物件往回找保留者，找到第一個「你的程式碼裡的東西」（變數名稱、Map、陣列、閉包），那就是洩漏的位置。</figcaption>
+</figure>
+<p>正式環境的 snapshot 裡物件種類多得多，不一定一眼看得出兇手，這時要靠兩個大小欄位排序。<strong>Shallow Size</strong> 是物件自己佔的大小；<strong>Retained Size</strong> 是「如果這個物件被回收，總共能釋放多少」，包含只被它抓著的所有東西。兩者可以差非常多：一個 Map 自己很小，retained size 卻可能是幾百 MB，因為它抓著的所有項目都算在它頭上。依 Retained Size 排序，最上面的往往就是兇手。</p>
+<p>如果程序已經倒掉、事前也沒加 <code>--heapsnapshot-near-heap-limit</code>，還有<strong>診斷報告</strong>（diagnostic report）可以看。它是一份 JSON，記錄當下的 JavaScript 與 C++ stack、heap 各區的大小、開著的 handle（socket、計時器、檔案）、環境變數和版本。它沒有 snapshot 那麼詳細，看不到每個物件，但能看出 heap 是哪一區滿了、當時開著多少 socket 和計時器。啟動時加 <code>--report-on-fatalerror</code>，OOM 這類致命錯誤發生時會自動寫一份；程式裡也可以隨時呼叫 <code>process.report.writeReport()</code>，它會印出 <code>Writing Node.js report to file: report.….json</code>。報告裡有環境變數，同樣要當機密處理。</p>
+<p>咖啡店的兇手找到了：一個沒有上限的 <code>orderCache</code>。接下來要決定怎麼修，而沒有上限的快取只是幾種常見洩漏的其中一種。</p>
+
+<h2>找到保留者之後怎麼修？常見的洩漏</h2>
+<p>修洩漏的原則來自上一節的引用鏈：找出鏈上「不該一直抓著」的那一段，把它切斷或加上限，物件就走不到了，GC 自然會回收。下面五種是 Node 後端最常見的洩漏，每一種在 Retainers 面板裡會看到不同的保留者，查到時可以對照。修法欄出現的 LRU 與 TTL 是兩種限制快取的規則，表格後面會用 <code>orderCache</code> 逐一說明；<code>AbortSignal</code> 是<a href="08-events-cancellation.html">第 8 課</a>的取消訊號。</p>
+<div class="table-wrap"><table>
+  <tr><th>洩漏</th><th>保留者</th><th>修法</th></tr>
+  <tr><td>模組層級的 <code>Map</code> 當快取，沒有上限</td><td>模組作用域 → Map</td><td>有上限的 LRU 快取，加上 TTL</td></tr>
+  <tr><td>每個請求 <code>emitter.on()</code>，卻沒有 <code>off()</code>（<a href="08-events-cancellation.html">第 8 課</a>）</td><td>長壽的 emitter → 監聽器陣列 → 閉包</td><td><code>try/finally</code> 裡 <code>off()</code>；或用 <code>AbortSignal</code> 一次清掉</td></tr>
+  <tr><td>閉包抓著大物件，閉包又被存起來</td><td>存起來的 callback → 閉包的 context → 大物件</td><td>只把需要的欄位取出來給閉包用</td></tr>
+  <tr><td><code>setInterval</code> 沒有 <code>clearInterval</code></td><td>計時器 → callback → 它用到的一切</td><td>保存回傳值，結束時清掉；關機時一起清（<a href="21-graceful-shutdown.html">第 21 課</a>）</td></tr>
+  <tr><td>把 <code>req</code>、<code>res</code> 或整個請求存進陣列「之後再處理」</td><td>陣列 → 請求物件 → socket、body、headers</td><td>只存需要的資料；或用真正的佇列</td></tr>
+</table></div>
+<p>五種裡，閉包那一種最難看出來，因為程式碼看起來只用到一個小變數。原因在 V8 怎麼存閉包用到的變數：同一個函式裡建立的所有閉包，共用同一個 context，裡面放著<strong>任何一個</strong>閉包用到的變數。所以一個閉包活著，就會連帶留住同一個函式裡其他閉包用到的東西：</p>
+<pre>async function handle(req: Request) {
+  const body = await readHugeBody(req)              // 10MB
+  const total = sum(body.items)
+  orderEvents.on('refund', () =&gt; log(total))        // 只用到 total
+  setTimeout(() =&gt; audit(body), 1000)               // 用到 body
+}
+// 'refund' 的監聽器和 setTimeout 的 callback 共用一個 context，
+// 只要監聽器還掛著，這 10MB 的 body 就一直被抓著</pre>
+<p>這裡有兩個問題疊在一起：監聽器沒有移除（表格第二種），而它又透過共用的 context 留住了 10MB 的 body（表格第三種）。每個請求留下 10MB，洩漏的速度會比咖啡店的訂單快取快得多。</p>
+<p>回到咖啡店的 <code>orderCache</code>。最直接的修法是刪掉快取，但快取本來是為了讓查訂單變快才加的，所以要做的是讓它有上限。上限滿了要丟掉哪一筆，常用的規則是 <strong>LRU</strong>（Least Recently Used）：淘汰<strong>最久沒被用到</strong>的那一筆，因為最近一直被查的資料，接下來被查的機率也比較高。JavaScript 的 <code>Map</code> 正好適合實作它：<code>Map</code> 會記住插入順序，<code>map.keys().next().value</code> 就是最早放進去的 key；每次「用到」一筆時先 <code>delete</code> 再 <code>set</code>，它就移到最後面。這樣最前面永遠是最久沒用的，get 和 set 都是 O(1)。</p>
+<p>上限只解決「記憶體不會無限長大」，還有另一個問題：快取裡的資料會過時。店長改了價格，快取裡的舊價格還會一直被回傳，直到它剛好被淘汰為止。所以再加上 <strong>TTL</strong>（time to live，存活時間）：每筆資料記下存入的時間，超過 TTL 再被讀到時就當作不存在、刪掉，重新從資料庫讀。正式專案可以直接用成熟的套件，例如 npm 上的 <code>lru-cache</code>；練習 3 自己寫一次，才知道它在做什麼。</p>
+<p>講到「會自動回收的 Map」，常有人想到 <code>WeakMap</code>，但它解決的是另一個問題。<strong>WeakMap</strong> 的 key 是弱引用：GC 從根走的時候不把這種引用算進去，所以 key 物件在別的地方都沒被引用時，GC 會連同這一筆一起回收。它適合「替某個物件附加資料」，例如以 <code>req</code> 物件為 key 存它的計時資料，請求結束、<code>req</code> 被回收，這筆就跟著消失。但它<strong>不是快取</strong>：key 必須是物件（<code>new WeakMap().set(42, 1)</code> 丟出 <code>TypeError: Invalid value used as weak map key</code>），也不能列舉、不能知道有幾筆。以訂單編號為 key 的快取要用 LRU。</p>
+<div class="callout practice"><strong>💡 實務上：加一個 in-memory 快取前，先回答三個問題</strong><br>「查菜單很慢，在記憶體裡快取一下」是很常見的需求，也是很常見的洩漏來源。加之前先回答：<strong>最多放幾筆</strong>（沒有上限就是本課的 <code>orderCache</code>）、<strong>多久失效</strong>（店長改了價格，客人多久後看得到，這要問 PM，不是工程師自己決定）、<strong>有幾個程序</strong>（開了多個程序或多台機器，每個程序各有一份快取，內容可能不一樣）。如果資料又小又幾乎不變，例如幾十筆的菜單，快取的效益最大；如果是每個人都不一樣、量又大的資料，快取命中率低，只是多佔記憶體。加完之後在監控上多看一條 heapUsed 的線，確認 GC 後的低點停在一個高度，而不是一路往上爬。</div>
+<p>兩件事都找到原因、也改好了。最後一個問題是：怎麼證明真的修好，下次再出現類似的問題時，能不能在客服轉來之前就知道？</p>
+
+<h2>怎麼確認修好了，下次早點發現？</h2>
+<p>回頭看這兩件事，走過的步驟其實一樣。把它們整理成一套流程，下次碰到任何效能問題都可以照著走：</p>
+<ol>
+  <li><strong>定義問題</strong>：哪個端點、多少流量、p99 多少、目標多少。記憶體問題：多久漲多少、GC 後的低點是否上升。匯出那件是「月底匯出 p99 將近 1 秒」；重啟那件是「GC 後的低點每天往上爬，四、五天碰到上限」。</li>
+  <li><strong>在像正式環境的條件下重現</strong>：資料量、流量、Node 版本、記憶體上限。匯出要用一個月份的訂單量才看得到 O(n²)。</li>
+  <li><strong>量測找原因</strong>：CPU 看 profile 的 self time；記憶體比較兩個 heap snapshot，看 retainers。</li>
+  <li><strong>只改一個地方</strong>，用同樣的方法再量，確認數字真的變好、輸出沒變。</li>
+  <li><strong>留下防線</strong>：加一個效能測試或監控警報（p99、heapUsed、event loop 延遲），下次退步時會知道。</li>
+</ol>
+<p>第 5 步最常被省略，但它決定了下一次是由監控先發現，還是由客服先轉來。匯出那件可以留一個效能測試，用一個月份的資料量跑，超過目標時間就失敗，下次有人在迴圈裡加了 <code>find</code> 就會在 CI 上看到；重啟那件可以在 GC 後的 heapUsed 持續上升時發警報，在碰到上限之前就有人去拍 snapshot。練習 2、3 的測試就是這兩種防線的縮小版。</p>
+
+<h2>補充與查表</h2>
+<p>主線用不到、但實際錄 profile、設定正式環境時會碰到的細節。</p>
+
+<h3>CPU profile 的版本與行號</h3>
+<p><code>--cpu-prof</code> 和 <code>--cpu-prof-dir</code> 這兩個選項從 v22.4.0 起是 stable。用 Node 直接跑 .ts 時，type stripping 只把型別換成空白、不改變行號，所以 profile 裡的檔名和行號就是你的 .ts 原始檔（本機 24.22.1 驗證）。</p>
+
+<h3>內聯：時間算到呼叫者頭上</h3>
+<div class="callout">V8 會把小函式<strong>內聯</strong>（inline）：直接把它的程式碼複製進呼叫它的函式裡，省掉呼叫的成本。這時候 profile 可能把小函式的時間算在呼叫者頭上。本機 24.22.1 就實測過：一個在迴圈裡被呼叫 15 萬次的小函式，時間全部出現在外層的 <code>toCsv</code>。看到一個函式 self time 很高、程式碼卻很短時，看看它在迴圈裡呼叫了誰。</div>
+
+<h3>壓力測試：autocannon</h3>
+<p>autocannon 是 npm 上的壓力測試工具（最新版 8.0.0），這門課不安裝。需要時在另一個終端機執行 <code>npx autocannon@8.0.0 -c 50 -d 10 http://localhost:3000/orders</code>（50 條連線打 10 秒，<code>npx</code> 會先從 npm 下載）。它印出的表格有 2.5%、50%、97.5%、99% 的延遲和每秒請求數。</p>
+
+<h3>heap 上限與 snapshot 選項的版本</h3>
+<ul>
+  <li>除了 <code>--max-old-space-size=512</code>（單位 MiB），Node 24 也可以用 <code>--max-old-space-size-percentage=50</code> 依機器可用記憶體的百分比設定（本機 24.22.1 可用）。</li>
+  <li><code>--heapsnapshot-near-heap-limit</code> 在 v24.13.1 脫離實驗。</li>
+</ul>
+
+<h2>練習</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs node 23</code>，檔案在 <code>node/practice/work/23/</code>。</p>
+
+<div class="local" data-test="ex1" data-files="answer.json">
+  <p>練習 1：<code>slow-report.ts</code> 匯出一個月的訂單 CSV，要將近一秒。先不要讀程式碼找原因：在 <code>work/23</code> 執行 <code>node --cpu-prof --cpu-prof-dir=profiles slow-report.ts</code>，用 Chrome DevTools 或 VS Code 打開產生的 profile，找出 <code>slow-report.ts</code> 裡 <strong>self time</strong> 最高的具名函式。把結果寫進 <code>answer.json</code>：<code>{ "hotFunction": "函式名稱", "profile": "profiles/CPU.….cpuprofile" }</code>，profile 檔要留在資料夾裡。測試會讀你的 profile，確認它來自 <code>slow-report.ts</code>、樣本數夠，並自己算一次每個函式的 self time，第一名要等於 <code>hotFunction</code>。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="report.ts">
+  <p>練習 2：<code>report.ts</code> 的 <code>buildReport(orders, customers)</code> 產生月結報表：每位有訂單的客人一列（訂單數、總金額、最後下單時間，順序和 <code>customers</code> 相同），以及客人資料已被刪掉的訂單有幾筆。資料量一大就要好幾秒。讓它在 5 萬筆訂單、5 千位客人時 200ms 內完成，輸出完全不變，也不能改動傳進來的陣列。測試用 3 組不同的隨機資料和原本的結果比對，時間取中位數。改完一個地方就再跑一次測試看時間：可能不只一個熱點。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="lru.ts handler.ts">
+  <p>練習 3：<code>handler.ts</code> 的 <code>createHandler({ load, now })</code> 回傳查訂單的處理函式 <code>getOrder(id)</code>。它有兩個洩漏：每次查詢都在全域的 <code>orderEvents</code> 掛一個 <code>shutdown</code> 監聽器（用來在關機時取消查詢），卻從不移除；查到的訂單放進沒有上限的 <code>Map</code>。先完成 <code>lru.ts</code> 的 <code>LRU</code>：最多 <code>max</code> 筆，放第 <code>max + 1</code> 筆時淘汰最久沒用的（<code>get</code> 讀到、<code>set</code> 寫入都算用到；<code>set</code> 已存在的 key 要更新值），存入滿 <code>ttlMs</code> 毫秒就過期（<code>get</code> 回傳 <code>undefined</code> 並刪掉），時間一律用 <code>now()</code>。再修 <code>handler.ts</code>：快取改用 <code>LRU</code>（最多 500 筆、TTL 60 秒、用傳進來的 <code>now</code>）；查詢結束時（包含 <code>load</code> 丟錯）移除監聽器，關機時仍要能取消進行中的查詢。測試會在帶 <code>--expose-gc</code> 的子程序裡呼叫 2 萬次（每次不同 id，有一成會失敗），強制 GC 後 heapUsed 的增加要小於 5MB，監聽器數量要回到原本的值。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：<code>GET /orders</code> 的平均回應時間是 80ms，遠低於目標的 300ms，但客服一直收到「點餐頁很慢」的抱怨。最可能的解釋是什麼？</p>
+  <label data-key="a">客人的網路比較慢，伺服器這邊沒有問題</label>
+  <label data-key="b">平均 80ms 代表大部分請求都在 80ms 左右，抱怨的人是少數特例，可以忽略</label>
+  <label data-key="c">平均值會把少數非常慢的請求藏起來：p99 可能是 2 秒，每 100 個請求就有 1 個要等很久，一個頁面打好幾支 API 時更容易碰到</label>
+  <label data-key="d">80ms 是量測誤差，要改用更精確的計時器</label>
+  <p class="why">✓ c。平均值被大量快的請求拉低，看不出長尾。examples/percentiles.ts 的平均 83ms，p99 卻是 1990ms。a 沒有根據，應該先看伺服器端每個請求的 durationMs 分布；b 正好是「平均代表一般體驗」的誤解，分布可能是大部分 40ms 加上一小群 2 秒，沒有人真的是 80ms；d 的問題不在計時器精度，在統計方式。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：監控圖上，伺服器的 heapUsed 在一小時內從 40MB 漲到 180MB。這代表有記憶體洩漏嗎？</p>
+  <label data-key="a">是，heapUsed 只要持續上升就是洩漏，要馬上把 --max-old-space-size 調大</label>
+  <label data-key="b">不一定：GC 不會一有垃圾就清，heapUsed 本來就會漲上去再掉下來；要看每次 GC 之後的低點是不是持續上升</label>
+  <label data-key="c">不是，有 GC 的語言不會有記憶體洩漏</label>
+  <label data-key="d">要看 rss，heapUsed 不準</label>
+  <p class="why">✓ b。heapUsed 是鋸齒狀，V8 會等到需要時才做完整的 GC。洩漏的特徵是 GC 後的低點越來越高（像 examples/leak.ts 每輪多 5～6MB）。a 把正常的鋸齒當洩漏，而且調大上限只會延後倒掉的時間；c 錯在 GC 只回收「走不到」的物件，被 Map 或監聽器抓著的永遠走得到；d：rss 包含 heap 以外的東西，找 JS 物件的洩漏反而要看 heapUsed，兩個都要看，但都要看 GC 後的值。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 6：同事想用 <code>WeakMap</code> 當訂單快取，key 是訂單編號（數字），理由是「WeakMap 會自動回收，就不會洩漏了」。這樣可以嗎？</p>
+  <label data-key="a">可以，WeakMap 會在記憶體不夠時自動淘汰最舊的資料</label>
+  <label data-key="b">可以，但要記得定期呼叫 gc()</label>
+  <label data-key="c">可以，只是要把數字轉成字串再當 key</label>
+  <label data-key="d">不行：WeakMap 的 key 必須是物件，用數字會丟 TypeError；而且它的回收依據是「key 物件還有沒有被引用」，不是容量或時間，不能當快取用</label>
+  <p class="why">✓ d。<code>new WeakMap().set(42, 1)</code> 丟出 <code>TypeError: Invalid value used as weak map key</code>，字串也一樣不行，所以 c 錯。WeakMap 沒有容量或「最舊」的概念，a 錯；<code>gc()</code> 只有加 <code>--expose-gc</code> 才有，而且回收的條件跟呼不呼叫無關，b 錯。WeakMap 適合「替某個物件附加資料、物件消失時一起消失」；以編號為 key 的快取要用有上限的 LRU 加 TTL。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>沒量就改</strong>：憑感覺換套件、改寫法，常常改到不是熱點的地方，就像把產生 CSV 的程式換成更快的套件，卻沒動到真正花掉 642ms 的 <code>removeDuplicates</code>。先用 profile 找 self time 最高的函式，改完再量。</li>
+  <li><strong>只看平均值</strong>：平均會藏住長尾。延遲一律看 p50、p95、p99。</li>
+  <li><strong>在開發機的小資料上量</strong>：O(n²) 在 100 筆時看不出來。用正式環境等級的資料量和流量。</li>
+  <li><strong>開著 debugger 量效能</strong>：<code>--inspect</code> 連著 DevTools 會讓程式變慢、數字不準。錄 profile 可以，量時間不要。</li>
+  <li><strong>把 total time 最高的函式當熱點</strong>：<code>main</code>、路由處理函式的 total time 一定高，它們只是呼叫了別人。看 self time。</li>
+  <li><strong>用 <code>--max-old-space-size</code> 掩蓋洩漏</strong>：上限調大只是讓程序晚一點 OOM，在容器裡還可能超過容器上限被直接砍掉。找出保留者，修掉。</li>
+  <li><strong>快取沒有上限</strong>：任何以使用者輸入當 key 的 Map 都會無限長大。用 LRU 加上限和 TTL。</li>
+  <li><strong>監聽器用 <code>once</code> 就以為不會洩漏</strong>：事件沒發生時，<code>once</code> 的監聽器也一直掛著。在 <code>finally</code> 裡 <code>off()</code>。</li>
+  <li><strong>log 寫太多</strong>：每個請求 log 整個物件，序列化本身就是 CPU 熱點。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>先把客訴寫成能動手的問題：哪個端點、多少流量、p99 多少、目標多少。平均值會藏住少數很慢的請求，延遲看百分位數。</li>
+  <li>CPU 慢的問題用 profile 找：<code>node --cpu-prof --cpu-prof-dir=profiles app.ts</code> 產生 CPU profile，在 Chrome DevTools 或 VS Code 打開，看 self time 找熱點，不看 total time；伺服器用 <code>--inspect</code> 在執行中錄製。</li>
+  <li>最常見的 CPU 熱點是迴圈裡查陣列（O(n²)，資料變 10 倍、時間變 100 倍），先建 <code>Map</code>／<code>Set</code>。改完再量，達到目標就停。</li>
+  <li>GC 只回收從根走不到的物件，走得到但不再需要的就是洩漏。<code>process.memoryUsage()</code> 的 heapUsed 看 GC 之後的低點，低點持續上升才是洩漏。<code>--max-old-space-size</code> 要小於容器上限，但不能拿來修洩漏。</li>
+  <li>比較兩個 heap snapshot，依建構子看哪種物件變多，從 Retainers 找出抓著它的引用鏈；來不及拍時用 <code>--heapsnapshot-near-heap-limit</code> 或診斷報告留證據。snapshot 與報告都要當機密。</li>
+  <li>常見洩漏：沒有上限的快取（改 LRU＋TTL）、沒移除的監聽器（<code>finally</code> 裡 <code>off</code>）、閉包抓著大物件、沒清的計時器、存起來的請求物件。</li>
+  <li>修好之後留下防線：效能測試和監控警報（p99、heapUsed、event loop 延遲），讓下次由監控先發現，而不是客服。</li>
+</ul>
+<p>下一課把服務擴展到多核心、多個程序：一個程序只用得到一顆 CPU，而程序記憶體裡的快取和狀態在多程序下會壞掉。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

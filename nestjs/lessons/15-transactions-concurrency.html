@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>15. 交易與並發：庫存不能賣超</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="15" data-practice="nestjs">
+<header>
+  <div class="eyebrow">階段 3：資料庫（Docker、Prisma 7 ＋ PostgreSQL） · 第 15 課</div>
+  <h1>交易與並發：庫存不能賣超</h1>
+</header>
+<main>
+
+<p>早上八點，拿鐵只剩 5 杯，20 個上班族同時在 Vue 前台按下「結帳」。上一課寫好的 <code>POST /orders</code> 在本機一次只測一個請求，每次都對；正式環境一忙起來，卻賣出了 9 杯，店員只好一個個打電話道歉退款。程式邏輯沒有錯，錯在<strong>並發</strong>：好幾個請求在同一段時間裡讀寫同一筆資料，彼此看不到對方正在做的事。英文叫 concurrency，後端每個會被很多人同時呼叫的寫入 API 都要面對它。</p>
+<p>這一課從這次賣超事故出發，一路把咖啡店裡會被「同時」弄壞的寫入修好：先讓下單不賣超、不留下半筆訂單，再處理購物車造成的死結、後台兩個人同時改價格、集點卡被同時兌換。最後會知道每種衝突該用哪一種工具，以及哪些事不該放進交易。</p>
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>重現賣超，找出原因，再用一句帶條件的 <code>UPDATE</code> 擋住（開場問題的最小答案）。</li>
+  <li>一筆訂單有好幾項時，用 Prisma 的交易讓它們一起成功或一起失敗；購物車順序不同造成的死結，用固定順序上鎖避免。</li>
+  <li>搶的不是一個數量時：規則複雜就先鎖再判斷（<code>SELECT … FOR UPDATE</code>），後台有人編輯一分鐘就在寫入時檢查版本（樂觀鎖）。</li>
+  <li>集點兌換沒有一列可以鎖：交給 Serializable，並且重試整個交易。</li>
+  <li>扣款、寄信為什麼要放在交易外。</li>
+</ol></div>
+<p>練習的判分會真的同時送出 20 個請求，有一筆賣超或一個 500 都不算過。</p>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../postgresql/lessons/18-transactions.html">PostgreSQL 課第 18 課</a>的交易：<code>BEGIN</code> 到 <code>COMMIT</code> 之間的修改一起生效，<code>ROLLBACK</code> 一起取消。</li>
+  <li><a href="../../postgresql/lessons/19-concurrency.html">PostgreSQL 課第 19 課</a>的 lost update 與 <code>FOR UPDATE</code>：兩個交易讀到同一個值、後寫的蓋掉先寫的；<code>FOR UPDATE</code> 鎖住讀到的列，別人要等你結束。</li>
+  <li><a href="08-exception-filters.html">第 8 課</a>的領域錯誤：service 丟 <code>OutOfStockError</code> 這類錯誤，全域 filter 把它變成 409。</li>
+  <li><a href="14-prisma-crud-relations.html">第 14 課</a>的 Prisma CRUD：<code>findUnique</code>、<code>update</code>、錯誤代碼（P2025 找不到）與訂單明細的巢狀寫入。</li>
+</ul></div>
+
+<h2>20 個人搶 5 杯，為什麼會賣出 9 杯？</h2>
+<p>先看事故現場。練習專案的 <code>OrdersService.createOrder</code> 是很多人第一次會寫出來的樣子，對購物車裡的每一項做三件事：</p>
+<pre>for (const item of items) {
+  const product = await this.prisma.product.findUnique({ where: { id: item.productId } })   // ① 讀庫存
+  if (product.stock &lt; item.quantity) throw new OutOfStockError(…)                           // ② 判斷
+  await this.prisma.product.update({
+    where: { id: item.productId },
+    data: { stock: product.stock - item.quantity },                                         // ③ 寫回「讀到的數字 - 1」
+  })
+}</pre>
+<p>一個請求單獨跑，這段完全正確：讀到 5、判斷夠、寫回 4。問題出在 Node 怎麼同時處理 20 個請求。Node 只有一條主執行緒，它不是真的「同時」跑 20 份程式，而是在每個 <code>await</code> 的地方切換：請求 A 執行到 ① 的 <code>await</code>，查詢送出去之後，A 就停在那裡等資料庫回應，Node 轉身去跑請求 B，B 也執行到 ①、也送出查詢。這跟你在 Vue 元件裡同時觸發兩個 <code>async</code> 函式、各自 <code>await fetch</code> 是同一回事：誰先誰後，取決於回應什麼時候回來。</p>
+<p>所以 ① 和 ③ 之間是一段空檔，空檔裡別的請求可以做任何事。下面是 A、B 兩個請求最糟的交錯：</p>
+
+<figure>
+  <svg viewBox="0 0 700 270" role="img" aria-label="時間軸：請求 A 和 B 都讀到庫存 5，各自判斷夠，A 寫回 4，B 也寫回 4，賣出兩杯但庫存只少 1">
+    <defs><marker id="a15a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <text class="d-text" x="150" y="28" text-anchor="middle">請求 A</text>
+    <text class="d-text" x="350" y="28" text-anchor="middle">資料庫 stock</text>
+    <text class="d-text" x="550" y="28" text-anchor="middle">請求 B</text>
+    <line class="d-line" x1="350" y1="40" x2="350" y2="250"/>
+    <rect class="d-box" x="40" y="50" width="220" height="34" rx="8"/><text class="d-text" x="150" y="72" text-anchor="middle">① 讀到 5</text>
+    <rect class="d-box" x="440" y="90" width="220" height="34" rx="8"/><text class="d-text" x="550" y="112" text-anchor="middle">① 讀到 5</text>
+    <rect class="d-box" x="40" y="130" width="220" height="34" rx="8"/><text class="d-text" x="150" y="152" text-anchor="middle">③ 寫回 5 - 1 = 4</text>
+    <rect class="d-box" x="440" y="170" width="220" height="34" rx="8"/><text class="d-text" x="550" y="192" text-anchor="middle">③ 寫回 5 - 1 = 4</text>
+    <rect class="d-soft" x="310" y="54" width="80" height="26" rx="6"/><text class="d-text" x="350" y="72" text-anchor="middle">5</text>
+    <rect class="d-soft" x="310" y="134" width="80" height="26" rx="6"/><text class="d-text" x="350" y="152" text-anchor="middle">4</text>
+    <rect class="d-soft" x="310" y="174" width="80" height="26" rx="6"/><text class="d-text" x="350" y="192" text-anchor="middle">4</text>
+    <line class="d-line" x1="260" y1="147" x2="306" y2="147" marker-end="url(#a15a)"/>
+    <line class="d-line" x1="440" y1="187" x2="394" y2="187" marker-end="url(#a15a)"/>
+    <text class="d-accent" x="350" y="238" text-anchor="middle">賣出 2 杯，庫存只少 1：B 蓋掉了 A 的修改（lost update）</text>
+  </svg>
+  <figcaption>兩個請求都在對方寫回之前讀取。20 個請求同時進來，這種交錯會發生很多次。</figcaption>
+</figure>
+
+<p>A 和 B 都讀到 5，都判斷「夠」，都寫回「5 - 1 = 4」。兩杯拿鐵賣出去了，庫存卻只少 1：B 寫回的 4 是根據過期的 5 算出來的，把 A 的修改蓋掉了。這個現象叫 <strong>lost update（更新遺失）</strong>，就是 <a href="../../postgresql/lessons/19-concurrency.html">PostgreSQL 課第 19 課</a>看過的那一個，只是現在發生在 NestJS 裡。20 個請求同時進來時，這種交錯會一再發生：課程作者在本機用 PostgreSQL 18.6 和 Prisma 預設的連線池（10 條連線），讓 20 個請求同時搶 5 杯，5 次裡 5 次都賣超。你可以自己試，指令在練習段落。</p>
+<p>直覺的修法是「把三步包進交易」。這救不了，原因要從交易保證什麼說起。交易保證的是<strong>一起成功或一起失敗</strong>：中間任何一步出錯，前面的修改全部取消。它不保證「我在讀寫的這段期間，別人不能讀同一筆資料」。別人能看到多少、要不要等，由另一個設定決定，叫<strong>隔離等級</strong>（isolation level）。PostgreSQL 預設的隔離等級是 READ COMMITTED：交易裡的每一句查詢，都看得到這句開始之前別人已經 COMMIT 的資料，而普通的 <code>SELECT</code> 不上任何鎖。所以 A、B 各自在自己的交易裡，① 一樣都讀到 5，後面一樣都寫回 4。</p>
+<p>真正的病根是：「判斷」發生在程式裡，「寫入」發生在資料庫，兩者之間有空檔。要修，就得讓判斷和寫入變成資料庫保證不會被插隊的<strong>一件事</strong>。最小的修法是把扣庫存寫成一句帶條件的 <code>UPDATE</code>：「庫存還夠，才扣」，條件不成立就不扣，回 409。下一節把這一句寫出來，並看清楚它為什麼擋得住。</p>
+
+<h2>怎麼讓資料庫在一句 UPDATE 裡同時判斷和扣除？</h2>
+<p>上一節的 ①②③ 拆成三次往返，空檔就在往返之間。這一節把三步併成一句，交給資料庫一次做完：</p>
+<pre>const { count } = await this.prisma.product.updateMany({
+  where: { id: productId, stock: { gte: quantity } },   // 庫存夠才更新
+  data: { stock: { decrement: quantity } },             // stock = stock - quantity，用資料庫裡現在的值算
+})
+if (count === 0) throw new OutOfStockError(…)           // 一列都沒更新到 → 庫存不足（或商品不存在）</pre>
+<p>這段跟原本的寫法有兩個關鍵差別。第一，判斷從程式裡的 <code>if</code> 搬進了 <code>where</code>：<code>stock: { gte: quantity }</code> 是「庫存大於等於要買的數量」。第二，寫入不再是「我讀到的數字減 1」，而是 <code>decrement</code>：讓資料庫拿它<strong>當下</strong>的值去減。Prisma 送出的 SQL 是：</p>
+<pre>UPDATE products SET stock = stock - $1 WHERE id = $2 AND stock &gt;= $1</pre>
+<p>為什麼這一句擋得住？因為 PostgreSQL 執行 <code>UPDATE</code> 時，會先鎖住它要改的那一列，這把鎖一直抱到交易結束才放開（沒有自己開交易時，每一句 SQL 自己就是一個交易，這句執行完就放）。另一個請求同時要改同一列，只能排隊等。等前一個 COMMIT 之後，後到的那句會用<strong>最新的值</strong>重新檢查 <code>WHERE</code>，這是 PostgreSQL 課第 19 課教過的 READ COMMITTED 重新檢查。同樣兩個請求，現在的時間軸（庫存剩 1 杯）：</p>
+<div class="table-wrap"><table>
+  <tr><th>時間</th><th>請求 A</th><th>資料庫 stock</th><th>請求 B</th></tr>
+  <tr><td>1</td><td><code>UPDATE … WHERE stock &gt;= 1</code>：1 ≥ 1，扣成 0，鎖住這一列</td><td>0（A 還沒 COMMIT）</td><td></td></tr>
+  <tr><td>2</td><td></td><td>0</td><td>同一句 <code>UPDATE</code>：這一列被 A 鎖著，等待</td></tr>
+  <tr><td>3</td><td>COMMIT，放開鎖</td><td>0</td><td></td></tr>
+  <tr><td>4</td><td></td><td>0</td><td>拿到鎖，用最新的 0 重新檢查：0 ≥ 1 不成立，<code>count</code> 是 0 → 409</td></tr>
+</table></div>
+<p>跟開頭的時間軸比：B 沒有機會拿著「舊的 5」去算，因為讀、判斷、寫在同一句裡，中間沒有空檔。20 個請求搶 5 杯時，前 5 個依序扣成 4、3、2、1、0，後面 15 個重新檢查時都看到 0，全部拿到 <code>count</code> 0。</p>
+<p>寫這一句時有三個細節，各自對應一個實際的坑：</p>
+<ul>
+  <li><strong>用 <code>updateMany</code>，不用 <code>update</code></strong>。<code>update</code> 的 <code>where</code> 要能唯一找到一列，找不到就丟 P2025，庫存不足會變成一個跟「商品不存在」混在一起的例外；我們要的是「更新了幾列」。<code>updateMany</code> 回傳 <code>{ count }</code>，0 就代表條件不成立。</li>
+  <li><strong><code>count</code> 是 0 有兩種可能</strong>：庫存不足，或商品根本不存在。要回不同的錯誤（409 或 404），就在 <code>count</code> 是 0 之後再查一次商品；放進交易後（下一節），這一次查詢也要用同一個 <code>tx</code>。這時已經確定這筆要失敗，多一句查詢不影響正確性，查到的庫存也正好放進 <code>OutOfStockError</code> 告訴前端還剩幾杯。</li>
+  <li><strong>資料庫的最後一道防線</strong>：練習專案的 migration 加了 <code>CHECK (stock &gt;= 0)</code>，就算哪天有人寫出會賣超的程式，資料庫也會拒絕把庫存寫成負數（Prisma 7.10.1 丟 <code>P2039</code>，變成 500）。500 總比賣超好，但它只是保險，不能取代正確的程式。</li>
+</ul>
+<div class="callout practice"><strong>💡 實務上：扣數量的地方，第一個想到原子條件更新</strong><br>限量商品、優惠券剩幾張、活動報名名額、錢包或儲值金餘額，都是「夠才扣」，幾乎都能寫成一句 <code>UPDATE … WHERE 數量 &gt;= 要扣的</code>，這種「判斷和寫入在同一句」的寫法叫原子條件更新。前台顯示的「剩 3 杯」只是參考，畫面打開後別人可能已經買走，最後一定由後端這一句判斷。Code review 看到 <code>findUnique</code> 讀出數字、在程式裡加減、再 <code>update</code> 寫回，資深工程師會直接問：「兩個人同時按會怎樣？」也記得跟 PM、前端對好 409 時畫面要顯示什麼，例如「已售完，請選其他商品」，而不是一個看不懂的錯誤。</div>
+<p>單一商品的賣超擋住了。但一筆訂單常常不只一項：客人買拿鐵加可頌，拿鐵扣成功了，輪到可頌時發現不夠，丟出 409。這時拿鐵那一杯已經扣掉，訂單卻沒成立，庫存憑空少了一杯。好幾步要一起成功或一起失敗，就輪到交易上場。</p>
+
+<h2>拿鐵扣了、可頌不夠：好幾步怎麼一起成功或一起失敗？</h2>
+<p>上一節留下的問題，正是交易要解決的事：<strong>交易</strong>（transaction）把好幾個資料庫操作綁成一組，全部成功才一起生效（COMMIT），任何一步失敗就全部取消（ROLLBACK），外面的人看不到「做到一半」的狀態。注意它跟上一節的分工：原子條件更新負責「同時搶也不會算錯」，交易負責「多步驟不會只做一半」。下單兩個都需要。</p>
+<p>Prisma 7 的交易有兩種寫法，差別在「中間能不能看結果再決定下一步」：</p>
+<pre>// 批次交易：傳一個陣列，Prisma 用同一個交易依序執行，全部成功才 COMMIT
+const [order, _] = await this.prisma.$transaction([
+  this.prisma.order.create({ data: … }),
+  this.prisma.product.update({ where: { id: 2 }, data: { stock: { decrement: 1 } } }),
+])
+
+// 互動式交易：傳一個 async 函式，中間可以讀資料、做判斷；函式丟出例外就 ROLLBACK
+const order = await this.prisma.$transaction(async tx =&gt; {
+  const product = await tx.product.findUnique({ where: { id: 2 } })
+  if (!product) throw new ProductNotFoundError(2)
+  return tx.order.create({ data: … })
+})</pre>
+<div class="table-wrap"><table>
+  <tr><th></th><th>批次 <code>$transaction([a, b])</code></th><th>互動式 <code>$transaction(async tx =&gt; …)</code></th></tr>
+  <tr><td>什麼時候用</td><td>幾個操作互不依賴，參數事先都知道</td><td>後面的操作要看前面的結果決定</td></tr>
+  <tr><td>連線佔用</td><td>短：所有語句一次送出</td><td>從開始到 callback 結束都佔著一條連線，中間每次 <code>await</code> 都在佔</td></tr>
+  <tr><td>出錯</td><td>任何一句失敗，整批回滾</td><td>callback 丟出任何例外都回滾，包括你自己的領域錯誤</td></tr>
+</table></div>
+<p>下單要看每一項的 <code>count</code> 才知道要不要丟 <code>OutOfStockError</code>，所以用互動式交易：在 callback 裡逐項做原子條件更新、查價格、建立訂單與明細；任何一項丟出錯誤，Prisma 就 ROLLBACK，前面扣掉的庫存自動還原，也不會留下訂單。</p>
+<p>互動式交易好用，但要先理解它底下的<strong>連線池</strong>，否則會踩到三個坑。後端不會每個請求都重新連一次資料庫，而是事先開好幾條連線放在池子裡，誰要查詢就借一條、用完歸還；Prisma 預設的池子是 10 條。交易是綁在<strong>一條連線</strong>上的：<code>BEGIN</code> 在哪條連線上送出，後面的查詢就得在同一條連線上送，資料庫才知道它們屬於同一個交易。理解這一點，下面三個規則都是自然的結果：</p>
+<ul>
+  <li><strong>交易裡一律用 <code>tx</code></strong>。<code>tx</code> 就是「綁著交易那條連線」的 client。callback 裡如果寫成 <code>this.prisma.product.update(…)</code>，那一句會從池子另外借一條連線執行，不在交易裡，回滾時也不會還原，而且它沒有錯誤訊息，只會在出事時才發現。helper 函式也一樣：把 <code>tx</code> 當參數傳進去，型別寫 <code>Prisma.TransactionClient</code>（從 <code>'../generated/prisma/client.js'</code> import <code>type Prisma</code>）。</li>
+  <li><strong>交易有時間限制</strong>。互動式交易從開始到結束都佔著一條連線，Prisma 不讓它無限佔下去。Prisma 7.10.1 的預設值：<code>maxWait</code> 2000 毫秒是「從連線池借到連線」最多等多久，<code>timeout</code> 5000 毫秒是整個 callback 最多跑多久。超過任一個都丟 <code>P2028</code>，並回滾。怎麼調整見課末。</li>
+  <li><strong>不能巢狀</strong>：<code>tx</code> 上沒有 <code>$transaction</code>，因為一條連線同時只能有一個交易。helper 需要交易時，讓呼叫它的人開交易、把 <code>tx</code> 傳進來。</li>
+</ul>
+<div class="callout warn">P2028 是資源不夠的訊號：連線池 10 條全被長交易佔住，第 11 個請求等不到連線。很多請求同時搶同一列時，它們會在資料庫排隊，每個交易佔著連線的時間也跟著變長。解法是讓交易短，而不是把 <code>maxWait</code>、<code>timeout</code> 一直調大。</div>
+<p>現在下單是一個互動式交易，裡面逐項做原子條件更新。不過前面說過，<code>UPDATE</code> 鎖住的那一列要等交易結束才放開。一筆訂單有兩項，就會在同一個交易裡先後抱住兩把鎖，這會引出下一個事故。</p>
+
+<h2>購物車順序不同的兩筆訂單，為什麼會互相卡死？</h2>
+<p>沿用上一節的下單交易。A 客人的購物車是 [拿鐵, 可頌]，B 客人是 [可頌, 拿鐵]，兩筆同時進來，各自照購物車的順序扣庫存：</p>
+<figure>
+  <svg viewBox="0 0 700 220" role="img" aria-label="死結：A 鎖住拿鐵後等可頌，B 鎖住可頌後等拿鐵，互相等待，PostgreSQL 選一個交易中止並回報 40P01">
+    <defs><marker id="a15b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="30" y="30" width="170" height="50" rx="10"/><text class="d-text" x="115" y="60" text-anchor="middle">交易 A</text>
+    <rect class="d-box" x="500" y="30" width="170" height="50" rx="10"/><text class="d-text" x="585" y="60" text-anchor="middle">交易 B</text>
+    <rect class="d-soft" x="265" y="20" width="170" height="40" rx="10"/><text class="d-text" x="350" y="45" text-anchor="middle">拿鐵（id 2）</text>
+    <rect class="d-soft" x="265" y="110" width="170" height="40" rx="10"/><text class="d-text" x="350" y="135" text-anchor="middle">可頌（id 5）</text>
+    <line class="d-line" x1="200" y1="45" x2="261" y2="40" marker-end="url(#a15b)"/>
+    <text class="d-small" x="215" y="30">① 鎖住</text>
+    <line class="d-line" x1="500" y1="70" x2="439" y2="125" marker-end="url(#a15b)"/>
+    <text class="d-small" x="470" y="110">① 鎖住</text>
+    <line class="d-line" x1="200" y1="72" x2="261" y2="128" stroke-dasharray="5 4" marker-end="url(#a15b)"/>
+    <text class="d-small" x="160" y="112">② 等可頌</text>
+    <line class="d-line" x1="500" y1="45" x2="439" y2="42" stroke-dasharray="5 4" marker-end="url(#a15b)"/>
+    <text class="d-small" x="455" y="28">② 等拿鐵</text>
+    <text class="d-accent" x="350" y="190" text-anchor="middle">互相等 → 約 1 秒後 PostgreSQL 中止其中一個（40P01，Prisma 丟 P2034）</text>
+  </svg>
+  <figcaption>實線是已經拿到的鎖，虛線是正在等的鎖。<code>updateMany</code> 一樣會鎖住更新到的列，直到交易結束。</figcaption>
+</figure>
+<p>A 扣了拿鐵，鎖住拿鐵那一列；同一時間 B 扣了可頌，鎖住可頌。接著 A 要扣可頌，可頌被 B 鎖著，A 等；B 要扣拿鐵，拿鐵被 A 鎖著，B 也等。兩邊都在等對方放鎖，而對方要等自己的交易結束才會放，這個等待永遠不會結束。這種互相等待叫<strong>死結</strong>（deadlock）。</p>
+<p>PostgreSQL 不會讓它們永遠卡著。一個交易等鎖超過 <code>deadlock_timeout</code>（預設 1 秒），PostgreSQL 就去檢查是不是形成了互相等待的環；確認是死結，就挑其中一個交易中止，回報 SQLSTATE <code>40P01</code>，另一個交易拿到鎖繼續執行。SQLSTATE 是 PostgreSQL 統一的五碼錯誤代碼，程式靠它判斷是哪一類錯誤。Prisma 7.10.1 把一般查詢遇到的 40P01 轉成 <code>P2034</code>。沒有處理的話，被中止的那位客人白等了 1 秒，還收到 500，而他的訂單其實沒有任何問題。</p>
+<p>修法是讓每個交易<strong>用同一個順序拿鎖</strong>（<a href="../../postgresql/lessons/32-locks.html">PostgreSQL 課第 32 課</a>）：進交易前，把明細依 <code>productId</code> 由小到大排序。這樣大家都先鎖拿鐵（id 2）再鎖可頌（id 5）。B 會在拿鐵那裡排隊，而不是先拿走可頌；A 做完放鎖，B 接著做。死結需要「你等我、我等你」形成一個環，所有人都照同一個方向拿鎖，環就不可能出現。排序時要複製一份陣列再排（<code>[...items].sort(…)</code>），因為 <code>sort</code> 會直接改原陣列，呼叫者傳進來的 <code>items</code> 不該被你偷偷改掉順序。</p>
+<p>另一個想法是「遇到死結就重試」。排序和重試不衝突，但順序有先後：排序能讓這種死結完全不發生；重試只能事後補救，而且每次都要先白等 1 秒才知道出事。能事先避免的衝突就用排序，只有像後面 Serializable 那種無法事先避免的衝突，才靠重試。</p>
+<p>到這裡，下單的三個問題都解決了：原子條件更新擋賣超、交易擋半筆訂單、排序擋死結。它們有個共同點：要搶的是「一個數量」，判斷簡單到能塞進 <code>WHERE</code>，衝突也在幾毫秒的交易裡發生。咖啡店裡還有兩種寫入不符合這兩個條件。</p>
+
+<h2>規則複雜或要等人編輯時：先鎖再判斷，還是寫入時再檢查？</h2>
+<p>上一節的工具建立在兩個前提上：判斷能寫成一句 <code>WHERE</code>、交易很短。這一節分別看前提不成立的兩種情況：判斷太複雜時用悲觀鎖，衝突橫跨使用者編輯的那一分鐘時用樂觀鎖。兩者的名字來自對衝突的假設：悲觀鎖假設衝突常發生，先鎖起來再說；樂觀鎖假設衝突很少，寫入時才檢查。</p>
+
+<h3>悲觀鎖：判斷塞不進一句 UPDATE</h3>
+<p>假設咖啡店推出限量聯名杯：金卡會員每人最多買 2 個，一般會員 1 個，還要扣掉這位會員今天已經買過的數量。這種規則要先讀好幾樣資料、在程式裡判斷，塞不進一句 <code>UPDATE</code> 的 <code>WHERE</code>。但只要「先讀再判斷」，第一節的空檔就回來了。</p>
+<p>做法是把空檔關起來：讀的同時就把那一列鎖住，讓別人在你判斷、寫入完成之前都只能等。這叫<strong>悲觀鎖</strong>（pessimistic locking），SQL 寫法是 PostgreSQL 課第 19 課的 <code>SELECT … FOR UPDATE</code>。鎖會抱到交易結束，所以它一定要寫在交易裡：沒有交易時，這句 <code>SELECT</code> 自己就是一個交易，執行完鎖就放了，等於沒鎖。</p>
+<p>Prisma 的查詢 API 沒有 <code>FOR UPDATE</code>，要寫原生 SQL，工具是 <code>$queryRaw</code>。它的寫法是 JavaScript 的 <strong>tagged template</strong>：反引號字串前面直接接一個函式名稱，JavaScript 會把字串的固定片段和 <code>${}</code> 裡的值分開交給那個函式，而不是先拼成一個字串。Prisma 利用這一點，把每個 <code>${}</code> 換成 <code>$1</code>、<code>$2</code> 這種參數位置，值另外送給資料庫。資料庫拿到的值只會被當成資料比對，所以使用者輸入 <code>1; DROP TABLE products</code> 也只是一個比對不到的值。</p>
+<pre>await this.prisma.$transaction(async tx =&gt; {
+  const [row] = await tx.$queryRaw&lt;{ stock: number }[]&gt;`
+    SELECT stock FROM products WHERE id = ${productId} FOR UPDATE`
+  if (!row) throw new ProductNotFoundError(productId)
+  // 聯名杯的規則寫在這裡：再查會員等級與今天已購數量，超過限購就丟錯
+  if (row.stock &lt; quantity) throw new OutOfStockError(productId, quantity, row.stock)
+  await tx.product.update({ where: { id: productId }, data: { stock: { decrement: quantity } } })
+})</pre>
+<p>為了聚焦在上鎖，上面只保留庫存判斷，會員規則標在註解的位置：鎖住之後、扣除之前。這段的流程是：鎖住並讀出庫存 → 在程式裡判斷（真實情況會再查會員等級、今天買過幾個）→ 扣除。另一個請求執行到同一句 <code>SELECT … FOR UPDATE</code> 時會停在那裡等，等這個交易 COMMIT 才讀得到，讀到的已經是扣過的數字。注意查詢也是用 <code>tx.$queryRaw</code>，跟「交易裡一律用 <code>tx</code>」的規則一樣。</p>
+<div class="callout warn">不要用 <code>$queryRawUnsafe('SELECT … WHERE id = ' + id)</code>：它是字串拼接，使用者輸入會變成 SQL 的一部分，就是 <a href="../../postgresql/lessons/25-backend.html">PostgreSQL 課第 25 課</a>的 SQL injection。要動態組條件也有參數化的寫法，見課末。</div>
+<p>悲觀鎖的代價是等待：鎖住多久，別人就等多久。交易越長，排隊越久，前面提過的 P2028 越容易出現；一次鎖好幾列時，也要照上一節的方法固定順序。所以能用原子條件更新解決的，就不要用 <code>FOR UPDATE</code>。</p>
+
+<h3>樂觀鎖：衝突橫跨使用者編輯的那一分鐘</h3>
+<p>後台改價格是另一種並發。店長和店員同時打開拿鐵的編輯頁，看到的都是 110 元。店長改成 120 送出；店員一分鐘後改成 115 送出。店員的請求把整個價格覆寫成 115，店長的修改就這樣消失了，而且沒有人知道。這跟第一節的 lost update 是同一件事，只是空檔從幾毫秒變成了一分鐘。</p>
+<p>悲觀鎖在這裡用不上：讀和寫分在兩個 HTTP 請求，中間隔著使用者看畫面、打字的時間。你不可能在 <code>GET</code> 時開一個交易、鎖著資料等使用者按儲存：一來交易 5 秒就逾時，二來使用者可能開著頁面去吃午餐，這段時間誰都改不了這筆資料，還佔著一條連線。</p>
+<p>所以反過來：不先鎖，寫入時才檢查「資料是不是還是我當初讀到的那一版」，是的話才寫，不是就拒絕。這叫<strong>樂觀鎖</strong>（optimistic locking）。要知道「是不是同一版」，資料表加一個 <code>version</code> 欄位，每次更新都加 1：</p>
+<ol>
+  <li><code>GET</code> 時把 <code>version</code> 一起回給前端，前端改價格時原封不動送回來。</li>
+  <li>更新時用 <code>updateMany({ where: { id, version }, data: { price, version: { increment: 1 } } })</code>：比對和更新在同一句 SQL，跟第二節的原子條件更新是同一個道理，資料庫保證兩個帶著同一個 version 的請求只有一個會成功。</li>
+  <li><code>count</code> 是 0 代表別人已經改過（或商品不存在）→ 回 409，前端顯示「這筆資料已被修改，請重新整理」。</li>
+</ol>
+<p>套回店長和店員：兩人拿到的都是 version 3。店長先送出，<code>WHERE version = 3</code> 成立，價格變 120、version 變 4。店員送出時帶的還是 3，條件不成立，<code>count</code> 是 0，收到 409，重新整理後看到 120，再決定要不要改。修改不再無聲無息地消失。</p>
+<p>常見的錯法是先 <code>findUnique</code> 讀出 version、在 JavaScript 裡比對、再用 id 更新：比對和更新之間又出現了空檔，跟賣超是同一個問題。比對一定要寫在 <code>updateMany</code> 的 <code>where</code> 裡。</p>
+<div class="callout practice"><strong>💡 實務上：多人編輯的後台表單，要先問「蓋掉別人的修改有沒有關係」</strong><br>商品管理、排班表、CMS 文章、訂單備註這類「打開編輯頁、改完按儲存」的畫面，都會遇到兩個人同時編輯。不是每個表單都需要樂觀鎖：只有一個管理者、或內容被蓋掉也無所謂的設定頁，「後寫的贏」就夠了。價格、庫存設定、合約內容這類改錯會出事的資料才值得加 <code>version</code>。加了之後前端也要配合：收到 409 時保留使用者剛輸入的內容、提示重新載入，不然使用者會覺得「打了半天全不見」。</div>
+<p>到這裡用到的每一種做法，不管是條件更新、<code>FOR UPDATE</code> 還是 version，都有一個共同前提：衝突落在<strong>某一列</strong>上，資料庫可以在那一列上排隊或比對。集點卡兌換偏偏沒有這一列。</p>
+
+<h2>集點兌換沒有一列可以鎖，怎麼守住餘額？</h2>
+<p>先看集點卡的資料怎麼存。餘額不是一個欄位，而是 <code>point_transactions</code> 所有紀錄的加總（<a href="../../postgresql/lessons/26-capstone.html">PostgreSQL 課第 26 課</a>的設計）：加點是一筆正數紀錄，兌換是一筆負數紀錄。這種帳本式的設計好處是每一筆點數的來龍去脈都查得到。兌換的規則是「餘額夠，才新增一筆 -4」。</p>
+<p>前面的工具在這裡都失效了。沒有一個「餘額」欄位可以做原子條件更新；也沒有一列可以 <code>FOR UPDATE</code>：兌換不改任何舊紀錄，而是新增一筆<strong>新的</strong>列，新的列在別人讀的時候還不存在，鎖不住。結果就是下面的時間軸：</p>
+<div class="table-wrap"><table>
+  <tr><th>時間</th><th>交易 A（兌換 4 點）</th><th>交易 B（兌換 4 點）</th></tr>
+  <tr><td>1</td><td>讀加總：6 點，夠</td><td></td></tr>
+  <tr><td>2</td><td></td><td>讀加總：還是 6 點（看不到 A 還沒 COMMIT 的紀錄），夠</td></tr>
+  <tr><td>3</td><td>新增一筆 -4，COMMIT</td><td></td></tr>
+  <tr><td>4</td><td></td><td>新增一筆 -4，COMMIT（新增的是另一列，沒有鎖可以等）</td></tr>
+  <tr><td>結果</td><td colspan="2">加總 6 - 4 - 4 = -2，點數變負數</td></tr>
+</table></div>
+<p>單獨看 A，它讀到 6、扣 4，沒錯；單獨看 B，也沒錯。兩個交易沒有寫到同一列，資料庫也就沒有理由讓誰等誰。可是合起來，「餘額不能是負數」這條規則被打破了。這種異常叫<strong>寫入偏差</strong>（write skew），是 <a href="../../postgresql/lessons/31-isolation-upsert.html">PostgreSQL 課第 31 課</a>的內容：每個交易依據自己讀到的資料做決定，而它們讀的資料被對方改變了。</p>
+<p>這次換一個思路：不自己找東西來鎖，而是把隔離等級提高到最嚴格的 <strong>Serializable</strong>，讓資料庫替你判斷。Serializable 的保證是：不管交易怎麼交錯執行，結果都要跟「這些交易一個接一個執行」的某種順序一樣。PostgreSQL 在背後記錄每個交易讀了哪些資料、寫了哪些資料，發現 A 讀的東西被 B 改了、B 讀的東西也被 A 改了，排不出任何一種一個接一個的順序，就讓其中一個交易失敗，SQLSTATE 是 <code>40001</code>（序列化失敗）。Prisma 的寫法是在 <code>$transaction</code> 的第二個參數指定：</p>
+<pre>await this.prisma.$transaction(async tx =&gt; {
+  // 讀加總、判斷、新增負數紀錄
+}, { isolationLevel: 'Serializable' })</pre>
+<p>套回上面的時間軸：A、B 都讀了同一張卡的加總、都新增了會改變這個加總的紀錄。PostgreSQL 會讓其中一個成功，另一個收到 40001。</p>
+<h3>收到 40001 之後：重試整個交易</h3>
+<p>Serializable 失敗<strong>不是 bug</strong>，是資料庫告訴你「剛剛撞到了，重來一次就好」。所以它一定要搭配重試，否則正常的衝突會變成客人看到的 500。而且要重試的是<strong>整個交易</strong>：失敗的交易已經全部回滾，重來時會重新讀加總，這次讀到的就是對方兌換之後的數字，餘額不夠就會正常地丟 <code>InsufficientPointsError</code>。在 callback 裡面重試某一句沒有用：交易裡任何一句失敗後，PostgreSQL 就拒絕這個交易後面的每一句，只剩回滾一條路。</p>
+<p>不是每個錯誤都值得重試。只有兩種代表「同時撞到、重來可能成功」：<code>40001</code>（序列化失敗）和購物車那一節的 <code>40P01</code>（死結）。其他錯誤，例如 23505 唯一值衝突、點數不足，重試幾次結果都一樣，只是白白多跑幾次交易。</p>
+<p>難的是從錯誤物件認出這兩個代碼：它們被 Prisma 包過，依「是哪一句出錯」有三種長相：一般查詢（例如 <code>tx.product.updateMany</code>）丟出的會變成 <code>P2034</code>；<code>$queryRaw</code>／<code>$executeRaw</code> 丟出的會變成 <code>P2010</code>，真正的代碼寫在訊息裡的 <code>Code</code>；COMMIT 時才失敗的則是沒有 <code>code</code> 的 <code>DriverAdapterError</code>。最容易漏的是第三種。Serializable 的衝突常常要到 COMMIT 才被發現，這時 callback 裡的查詢全部成功了，丟出來的錯誤連 <code>code</code> 都沒有，只看 <code>P2034</code> 的判斷會把它當成一般錯誤直接丟出去。練習 4 的 <code>retry.ts</code> 已經寫好照這三種長相判斷的 <code>isRetryable(error)</code>，你要寫的是重試迴圈；完整對照表放在課末，查表用，不用背。</p>
+<p>重試迴圈本身要守四個規則（<a href="../../node/lessons/17-calling-external-apis.html">Node 課第 17 課</a>的退避）：</p>
+<ul>
+  <li><strong>有上限</strong>：例如最多重試 3 次（總共執行 4 次）。資料庫出問題時，無限重試會把負載放大好幾倍，請求也永遠不回應。次數用完就把最後一次的錯誤丟出去。</li>
+  <li><strong>隨機退避</strong>：每次重試前等一段隨機的時間，例如 0～20×2<sup>n</sup> 毫秒（n 是第幾次重試）。英文叫 jitter。一起失敗的請求如果等同樣久再同時重試，會再撞一次；隨機的等待把它們錯開。</li>
+  <li><strong>只重試可重試的錯誤</strong>：<code>isRetryable</code> 回 false 的錯誤，包括庫存不足、點數不足這類領域錯誤，要馬上丟出去。</li>
+  <li><strong>重試包在 <code>$transaction</code> 外面</strong>：<code>withRetry(() =&gt; this.prisma.$transaction(…))</code>，每次重試都是一個全新的交易。</li>
+</ul>
+<p>還要知道 Serializable 保護的範圍：它只保證「同樣用 Serializable 的交易之間」不出異常。同一份資料如果還有別的寫入路徑，例如後台手動加點，用的是預設的 READ COMMITTED，那條路徑就不在保護範圍內，要一起改成 Serializable。</p>
+<div class="callout practice"><strong>💡 實務上：Serializable 只開在需要的那幾個交易</strong><br>大部分專案整體維持 PostgreSQL 預設的 READ COMMITTED，只在「判斷依賴加總或某些列存不存在」的地方開 Serializable，例如點數、帳本式餘額、排班「同一時段最多 2 人」。不要為了保險整個專案都改成 Serializable：衝突和重試會變多，每個寫入路徑都得處理。上線後在重試時記 log（哪個交易、第幾次），重試次數突然變多，通常代表很多請求同時在搶同一批資料（例如同一張卡被連點兌換），或交易變長了。</div>
+<h3>四種做法怎麼選</h3>
+<p>這一課前面用了四種做法，各解一種衝突：搶同一列的數量用原子條件更新，規則複雜時用悲觀鎖，衝突橫跨使用者編輯時用樂觀鎖，判斷依賴一群列時用 Serializable。現在把它們並排比較。選擇的順序是：判斷能寫成一句 <code>WHERE</code> 就用原子條件更新；不行再看衝突的形狀：</p>
+<div class="table-wrap"><table>
+  <tr><th>做法</th><th>適合</th><th>代價</th></tr>
+  <tr><td>原子條件更新</td><td>判斷能寫成一句 <code>WHERE</code>：扣庫存、扣餘額、搶名額</td><td>幾乎沒有；複雜規則寫不進去</td></tr>
+  <tr><td><code>SELECT … FOR UPDATE</code></td><td>要先讀、做複雜判斷才能決定怎麼寫；衝突頻繁</td><td>別人要排隊；交易長就拖慢所有人；要注意上鎖順序</td></tr>
+  <tr><td>樂觀鎖（version）</td><td>衝突很少；人在畫面上編輯，中間隔很久</td><td>衝突時使用者要重做；不適合熱門庫存（大部分請求都會 409）</td></tr>
+  <tr><td>Serializable＋重試</td><td>判斷依賴「一群列」（加總、有沒有存在），鎖不住還沒出現的列</td><td>衝突時整個交易重做；一定要寫重試</td></tr>
+</table></div>
+<p>資料庫裡的並發到這裡都守住了。但每一節都在提醒同一件事：交易越長，鎖得越久、佔著連線越久，重試時要重做的也越多。下單流程裡偏偏有幾件很慢、又很想塞進交易的事。</p>
+
+<h2>扣款、寄信可以放進交易嗎？</h2>
+<p>下單時除了扣庫存、建立訂單，還要向金流扣款、發 LINE 通知給店員。很自然的想法是全部包進同一個交易：「扣款失敗就整筆回滾，最安全」。這個想法錯在兩個地方，都跟前面學過的事有關：</p>
+<ul>
+  <li><strong>外部的事無法回滾</strong>：交易只能取消資料庫自己的修改。金流 API 已經扣了款、信已經寄出，交易之後因為逾時或衝突回滾，資料庫裡沒有訂單，客人的錢卻扣了。上一節的重試會讓它更糟：整個交易重來一次，就再扣一次款。</li>
+  <li><strong>外部呼叫很慢</strong>：金流、LINE 通知、寄信可能要好幾秒。這段時間裡，交易抱著拿鐵那一列的鎖不放，其他要買拿鐵的客人全部排隊；連線池的連線也一直被佔著，很快就出現 P2028，甚至超過 5 秒的 <code>timeout</code> 讓整筆交易回滾。</li>
+</ul>
+<p>同樣的道理也適用在另外兩種事：<strong>等使用者</strong>，例如「先鎖庫存，等客人確認」，要用狀態欄位做（例如保留到幾點），不是開著交易等；<strong>大量計算或讀檔</strong>，先在交易外準備好資料，交易裡只做資料庫的讀寫。</p>
+<p>需要「資料庫成功後再通知外部」時，常見做法是先 COMMIT，再把要做的事交給佇列，由背景工作去呼叫外部服務。如果要保證「資料庫有寫入，就一定會通知」，不會因為程式在 COMMIT 後剛好當掉而漏掉，則用 transactional outbox：把「要通知」這件事也當成一筆資料，跟訂單寫在同一個交易裡，背景工作再去讀它（<a href="20-queues-bullmq.html">第 20 課</a>與 <a href="../../postgresql/lessons/33-job-queue.html">PostgreSQL 課第 33 課</a>）。</p>
+<div class="callout practice"><strong>💡 實務上：下單和付款通常拆成兩步，中間靠訂單狀態連起來</strong><br>電商和外送平台常見的做法：第一個交易扣庫存、建立狀態是「待付款」的訂單，COMMIT 後才把客人導去金流；金流成功的通知（webhook）進來時，再用另一個短交易把訂單改成「已付款」。付款逾時或失敗，就由排程把訂單取消、庫存加回去。設計時資深工程師會先問：金流通知重複送兩次怎麼辦？訂單卡在「待付款」誰來處理？這些都是寫狀態欄位與條件更新，不是把外部呼叫塞進交易。</div>
+<p>回到早上八點的事故：20 個人搶 5 杯，現在剛好 5 個人買到、15 個人看到「已售完」；購物車順序不同也不會卡死；店長的改價不會被無聲蓋掉；集點卡被連點也不會變負數；扣款留在交易外。練習就是把這些修法親手寫進 service，再讓判分用真的並發請求來驗證。</p>
+
+<h2>補充與查表</h2>
+<p>主線用不到、但寫重試判斷、調整設定或接手舊專案時會查的細節。</p>
+
+<h3>Prisma 7.10.1 裡 40001／40P01 的三種長相</h3>
+<p>課程作者查過 <code>@prisma/client</code> 與 <code>@prisma/adapter-pg</code> 7.10.1 的原始碼，三種都在 PostgreSQL 18.6 上實際觸發過。練習 4 的 <code>isRetryable(error)</code> 就是照這張表判斷。長相跟版本綁在一起，升級 Prisma 時要重新確認。</p>
+<div class="table-wrap"><table>
+  <tr><th>誰丟的</th><th>40001／40P01 變成</th><th>怎麼認</th></tr>
+  <tr><td>一般查詢：<code>tx.product.updateMany</code>、<code>tx.order.create</code>…</td><td><code>P2034</code></td><td><code>error.code === 'P2034'</code></td></tr>
+  <tr><td>原生 SQL：<code>$queryRaw</code>、<code>$executeRaw</code></td><td><code>P2010</code>（任何原生 SQL 的錯誤都是 P2010）</td><td>訊息是 <code>Raw query failed. Code: `40001`. Message: …</code>，要看 Code 是不是 40001 或 40P01</td></tr>
+  <tr><td>COMMIT：callback 跑完了，PostgreSQL 在提交時才發現衝突</td><td>不是 Prisma 的錯誤，是 adapter 直接丟出的 <code>DriverAdapterError</code></td><td><code>error.name === 'DriverAdapterError'</code>，<code>error.cause.originalCode</code> 是 <code>'40001'</code>（訊息只有 <code>TransactionWriteConflict</code>）</td></tr>
+</table></div>
+
+<h3>調整交易的時間限制</h3>
+<p><code>maxWait</code>（預設 2000 毫秒）和 <code>timeout</code>（預設 5000 毫秒）可以在 <code>$transaction</code> 的第二個參數針對單一交易調整，也可以用 <code>new PrismaClient({ transactionOptions })</code> 改全域預設。調整前先確認 P2028 是不是交易太長或太多請求搶同一列造成的；那種情況要縮短交易，而不是加大時間。</p>
+
+<h3>動態組 SQL 條件：Prisma.sql 與 Prisma.join</h3>
+<p>需要依條件組出不同 SQL 時，用 <code>Prisma.sql</code> 片段和 <code>Prisma.join</code>，例如 <code>tx.$queryRaw`SELECT … WHERE id IN (${Prisma.join(ids)})`</code>，一樣全部參數化。<code>${}</code> 只能放「值」，不能放欄位名或 <code>ASC</code>／<code>DESC</code>，那些要用白名單（<a href="16-query-performance.html">第 16 課</a>的報表會用到）。</p>
+
+<h3>Serializable 的衝突偵測與索引</h3>
+<p>PostgreSQL 的 Serializable 靠 <strong>predicate lock</strong> 偵測衝突：它記下每個交易實際讀過哪些資料（在 <code>pg_locks</code> 裡顯示成 <code>SIReadLock</code>），之後別的交易寫入會影響這些讀取結果時，就記成一條依賴。這種鎖不會讓別人等，只用來判斷要不要讓某個交易收到 40001。</p>
+<p>記下的範圍取決於查詢怎麼執行。<code>point_transactions(card_id)</code> 有索引時，查某張卡的加總走索引，記下的是索引裡那張卡附近的範圍；別人兌換別張卡，寫入落在別的範圍，不算衝突。沒有索引時只能循序掃描整張表，PostgreSQL 官方文件說明循序掃描一定會鎖住整個 relation 層級，等於記下「讀過整張表」，任何一張卡的兌換都可能被當成衝突，造成不必要的 40001 和重試。所以 <code>card_id</code> 有索引，衝突偵測才比較能分清楚「不同卡片」。</p>
+
+<h2>練習</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs nestjs 15</code> 建立 <code>work/15/</code>。專案已經有資料表與 migration（商品有 <code>stock</code>、<code>version</code>，還有 <code>orders</code>、<code>order_items</code>、<code>stamp_cards</code>、<code>point_transactions</code>），也有第 8 課的領域錯誤與 filter：<code>OutOfStockError</code>、<code>ProductNotFoundError</code>、<code>StaleVersionError</code>、<code>InsufficientPointsError</code> 都寫好了，丟出去就會變成對應的 404／409。你只需要改 service。</p>
+<p>想自己重現賣超：確認 Docker 的容器在跑（<a href="12-docker-services.html">第 12 課</a>），在 <code>work/15</code> 建立開發用資料庫並放入種子資料（拿鐵 id 2，庫存 5），啟動後同時送 20 個請求：</p>
+<pre>npx prisma migrate dev
+npx prisma db seed
+npm run start:dev
+
+# 另開一個終端機
+for i in $(seq 20); do
+  curl -s -o /dev/null -w '%{http_code}\n' localhost:3100/orders \
+    -H 'content-type: application/json' -d '{"items":[{"productId":2,"quantity":1}]}' &amp;
+done; wait
+docker exec learn-nestjs-postgres psql -U learn -d nest_15 -c 'SELECT id, name, stock FROM products'</pre>
+<p>改之前會看到超過 5 個 201。判分時每一句查詢之後都會刻意停幾毫秒，讓同時進來的請求一定交錯，所以「剛好沒撞到」的寫法過不了。</p>
+
+<div class="local" data-test="ex1" data-files="src/orders/orders.service.ts">
+  <p>練習 1：把 <code>createOrder</code> 改成一個互動式交易。</p>
+  <ul>
+    <li>扣庫存、查價格、建立訂單與明細，全部用同一個 <code>this.prisma.$transaction(async tx =&gt; …)</code> 的 <code>tx</code>。</li>
+    <li>每一項用原子條件更新扣庫存，<code>count</code> 是 0 時丟 <code>OutOfStockError(productId, quantity, 目前庫存)</code>（商品不存在丟 <code>ProductNotFoundError</code>）。任何一項失敗，前面扣掉的庫存都要還原，也不能留下訂單。</li>
+    <li>回傳 <code>{ id, total, items: [{ productId, quantity, unitPrice }] }</code>，<code>unitPrice</code> 是商品目前的價格。</li>
+  </ul>
+  <p>判分：拿鐵剩 5 杯時 20 個請求同時各買 1 杯，剛好 5 個 201、15 個 409 <code>OUT_OF_STOCK</code>、庫存 0；[拿鐵, 可頌] 但可頌不夠時回 409、<code>details.productId</code> 是可頌、<code>details.available</code> 是可頌目前的庫存，拿鐵庫存不變；含不存在的商品時回 404 <code>PRODUCT_NOT_FOUND</code>，一樣整筆回滾。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="src/orders/orders.service.ts">
+  <p>練習 2：同時送出 10 筆 [拿鐵, 可頌] 和 10 筆 [可頌, 拿鐵]（庫存都夠），全部要回 201，最後拿鐵、可頌的庫存都剛好少 20。不能有任何 500。提示：先跑一次判分，看失敗的原因是不是死結。排序時不能改到傳進來的 <code>items</code>，判分也會直接呼叫 <code>createOrder</code> 檢查這一點。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="src/products/products.service.ts">
+  <p>練習 3：<code>PATCH /products/:id/price</code>（body 是 <code>{ price, version }</code>）改成樂觀鎖：</p>
+  <ul>
+    <li><code>version</code> 跟資料庫一樣才更新價格，同時 <code>version + 1</code>；回傳 <code>{ id, price, version }</code>（更新後的 version）。</li>
+    <li><code>version</code> 不符 → 丟 <code>StaleVersionError(id, version)</code>（409 <code>STALE_VERSION</code>），價格不能被改；商品不存在 → <code>ProductNotFoundError</code>（404）。</li>
+  </ul>
+  <p>判分：兩個請求拿同一個 version 同時送出，剛好一個 200、一個 409。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="src/prisma/retry.ts src/stamp-cards/stamp-cards.service.ts">
+  <p>練習 4：集點卡兌換 <code>POST /stamp-cards/:id/redeem</code>（body 是 <code>{ points }</code>）。</p>
+  <ul>
+    <li>在 <code>retry.ts</code> 寫 <code>withRetry(run, retries = 3)</code>（同一個檔案裡的 <code>isRetryable(error)</code> 已經寫好，判斷錯誤能不能重試）：執行 <code>run()</code>；可重試的錯誤就隨機等一下再執行一次，最多重試 <code>retries</code> 次，用完就丟出最後一次的錯誤；其他錯誤馬上丟出。</li>
+    <li><code>redeem</code>：用 <code>withRetry</code> 包住一個 <code>isolationLevel: 'Serializable'</code> 的互動式交易，在交易裡算餘額、不夠就丟 <code>InsufficientPointsError</code>、夠就新增一筆 <code>points: -points, reason: '兌換'</code>；回傳 <code>{ cardId, balance }</code>（兌換後的餘額）。</li>
+  </ul>
+  <p>判分：餘額 10 點，5 個請求同時兌換 4 點，剛好 2 個 200、3 個 409 <code>INSUFFICIENT_POINTS</code>、餘額 2、沒有 500；另外直接測 <code>withRetry</code>：可重試的錯誤要重試、次數有上限、其他錯誤只執行一次就丟出。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：下單流程要扣庫存、建立訂單、呼叫金流 API 扣款。同事說「把扣款也包進交易，扣款失敗就整筆回滾，最安全」。問題在哪？</p>
+  <label data-key="a">沒有問題，這正是交易的用途</label>
+  <label data-key="b">Prisma 的交易裡不能用 <code>fetch</code>，會直接報錯</label>
+  <label data-key="c">扣款成功後如果交易因逾時或衝突回滾，錢已經扣了、資料庫卻沒有訂單；而且等金流回應的幾秒內，庫存那一列一直被鎖著，其他客人全部排隊</label>
+  <label data-key="d">應該改用批次交易 <code>$transaction([…])</code> 才能包住外部呼叫</label>
+  <p class="why">✓ c。交易只能回滾資料庫自己的修改，外部系統做過的事收不回來，重試交易時還可能扣第二次；外部呼叫又慢，會拉長鎖住的時間，連線池也被佔住。a 忽略了這兩點；b 錯，callback 是一般的 async 函式，<code>fetch</code> 可以執行，問題不在能不能，而在該不該；d 錯，批次交易只能放 Prisma 的查詢，更包不住外部呼叫。正確做法是交易只做資料庫的事，外部呼叫放在交易外（或用 outbox 交給背景工作）。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：「建立訂單後，把顧客的 <code>lastOrderAt</code> 更新成現在時間」，兩個操作的參數事先都知道，也不需要看前一個的結果。用哪一種交易比較好？</p>
+  <label data-key="a">互動式交易，因為它比較安全</label>
+  <label data-key="b">批次交易 <code>$transaction([create, update])</code>：操作互不依賴，一次送出，佔用連線的時間最短</label>
+  <label data-key="c">不用交易，分兩次呼叫就好，第二句失敗也沒關係</label>
+  <p class="why">✓ b。兩種交易一樣是全部成功或全部回滾，安全性相同；差別在互動式可以在中間讀資料、做判斷，代價是 callback 執行期間一直佔著連線。不需要中間判斷時，批次交易較簡單也較輕。c 會讓資料只寫一半：訂單建立了，顧客資料沒更新。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 7：同事把重試寫在 callback 裡面：<code>tx.pointTransaction.create</code> 丟出 P2034 時，在同一個 <code>tx</code> 上再呼叫一次，最多 3 次。Serializable 衝突時會怎樣？</p>
+  <label data-key="a">重試不會成功：出錯之後這個交易已經中止，PostgreSQL 會拒絕同一個交易裡後面的每一句（25P02），客人一樣收到 500</label>
+  <label data-key="b">第二次通常就會成功，只是比包在外面多等一點時間</label>
+  <label data-key="c">會成功，但新增的紀錄會用到第一次讀的舊餘額，點數可能變負數</label>
+  <p class="why">✓ a。交易裡任何一句失敗，整個交易就只剩回滾一條路，在裡面重試哪一句都沒用；衝突在 COMMIT 才發現時，callback 甚至已經跑完了。<code>withRetry</code> 要包住整個 <code>$transaction</code>，重來時重新讀餘額。b 以為交易還能繼續用；c 描述的是沒用 Serializable 的寫入偏差，跟重試寫在哪裡無關。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>先讀再寫</strong>：<code>findUnique</code> 讀出庫存、在程式裡算好再 <code>update</code>。包進交易也一樣會賣超。用 <code>updateMany</code> 的條件更新加 <code>decrement</code>，或先 <code>FOR UPDATE</code> 鎖住再讀。</li>
+  <li><strong>交易裡用了 <code>this.prisma</code></strong>：那一句從連線池拿另一條連線，不在交易裡，回滾時不會還原。callback 裡一律用 <code>tx</code>，helper 收 <code>tx: Prisma.TransactionClient</code> 參數。</li>
+  <li><strong>每一項各開一個交易</strong>：第二項失敗時，第一項的交易早就 COMMIT 了。整筆訂單是一個交易。</li>
+  <li><strong>多筆更新不排序</strong>：購物車順序不同的訂單會死結，每次都白等 1 秒再 500。依 <code>productId</code> 排序後再處理。</li>
+  <li><strong>樂觀鎖在程式裡比對 version</strong>：讀出來比、再用 id 更新，中間有空檔。比對要寫在 <code>updateMany</code> 的 <code>where</code>。</li>
+  <li><strong>Serializable 不寫重試，或無限重試</strong>：前者讓正常的衝突變成 500；後者在資料庫出問題時把負載放大、請求永遠不回應。有上限、有隨機退避、只重試可重試的錯誤。</li>
+  <li><strong>什麼錯誤都重試，或自己判斷時只看 P2034</strong>：前者讓點數不足、唯一值衝突這類錯誤白跑好幾次交易；後者漏掉 <code>$queryRaw</code>／<code>$executeRaw</code> 的 P2010 和 COMMIT 時才失敗的 <code>DriverAdapterError</code>。照課文的表，只重試 40001／40P01。</li>
+  <li><strong>重試寫在 callback 裡面</strong>：交易已經失敗，重試其中一句沒用。<code>withRetry</code> 包住整個 <code>$transaction</code>。</li>
+  <li><strong>用 <code>$queryRawUnsafe</code> 拼接使用者輸入</strong>：SQL injection。用 <code>$queryRaw</code> 的 tagged template、<code>Prisma.sql</code>、<code>Prisma.join</code>。</li>
+  <li><strong>交易裡呼叫外部服務</strong>：外部的事無法回滾，還拉長鎖住的時間。先 COMMIT，再做外部呼叫或交給佇列。</li>
+  <li><strong>遇到 P2028 就把 <code>timeout</code>、<code>maxWait</code> 調大</strong>：它代表交易太長或太多請求搶同一列。先縮短交易。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>「讀 → 判斷 → 寫回」在並發下會 lost update：Node 在每個 <code>await</code> 切換請求，讀和寫之間有空檔。READ COMMITTED 的交易擋不住，判斷和寫入要變成資料庫不會被插隊的一件事。</li>
+  <li>原子條件更新（<code>updateMany</code>＋<code>where</code> 條件＋<code>decrement</code>，看 <code>count</code>）是首選：<code>UPDATE</code> 鎖住那一列，後到的用最新值重新檢查條件。</li>
+  <li>多步驟要一起成功或一起失敗就用交易。批次 <code>$transaction([a, b])</code> 給互不依賴的操作；互動式 <code>$transaction(async tx =&gt; …)</code> 中間可以判斷，丟例外就回滾，裡面一律用 <code>tx</code>。預設 <code>maxWait</code> 2000 毫秒、<code>timeout</code> 5000 毫秒，超過丟 P2028。</li>
+  <li>鎖抱到交易結束；多列上鎖依固定順序（例如 <code>productId</code> 由小到大），死結就不會發生。</li>
+  <li>判斷太複雜時用 <code>$queryRaw</code> 的 <code>FOR UPDATE</code> 先鎖再判斷；<code>$queryRaw</code> 的 tagged template 會參數化，<code>$queryRawUnsafe</code> 拼字串就是 SQL injection。人在畫面上編輯的資料用 version 樂觀鎖，衝突回 409。</li>
+  <li>依賴一群列的判斷用 Serializable，並且有上限、有隨機退避地重試整個交易。只重試 40001／40P01；它們在 Prisma 7.10.1 有三種長相（P2034、P2010、COMMIT 時的 <code>DriverAdapterError</code>），升級 Prisma 時重新確認。</li>
+  <li>交易只做資料庫的事，越短越好：外部 API、寄信、等使用者都放在交易外。</li>
+</ul>
+<p>下一課處理另一種正式環境才會出現的問題：資料一多就變慢。量出一個請求送了幾句 SQL，修好 N+1、做 cursor 分頁、加索引，再寫原生 SQL 的報表。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

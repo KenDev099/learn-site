@@ -1,0 +1,1065 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>11. 逾時與取消：AbortController 與期限</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="11" data-lang="js">
+<header>
+  <div class="eyebrow">階段 2：非同步、迭代與並發 · 第 11 課</div>
+  <h1>逾時與取消：AbortController 與期限</h1>
+</header>
+<main>
+
+<p>結帳 API 要呼叫上游的付款服務。平常 200ms 回來，今天付款服務卡住了，每個請求都等 30 秒。你的伺服器每秒進來 50 個結帳請求，30 秒後就有 1500 個請求同時卡在「等」：每個都佔著記憶體、資料庫連線、對上游的連線，最後整台伺服器被拖垮，連不用付款的查菜單也一起變慢。反過來，客人已經關掉網頁，伺服器還在幫他查完三個上游服務，查完沒人要。</p>
+<p>這一課從頭到尾處理這個結帳 API：讓它在付款服務卡住時及時放手，客人離開時停下為他做的工作，整個結帳有一個總時間上限，停下時不留下沒清掉的計時器。要用到兩個能力。第一個是<strong>逾時</strong>（timeout）：等一件事最多等多久，超過就放棄。第二個是<strong>取消</strong>（cancellation）：通知一件進行中的工作「不用做了」，讓它真的停下來、放掉手上的資源。這課會看到，只有逾時、沒有取消，伺服器還是會被拖垮。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>付款服務卡住時，為什麼 Promise 自己停不下來；先用一行 <code>AbortSignal.timeout</code> 擋住（開場問題的最小答案）。</li>
+  <li>AbortController 怎麼把「停下來」的通知送到工作手上，自己寫的函式怎麼聽到它。</li>
+  <li>逾時怎麼寫，上游的工作才會真的停下；停下之後，catch 收到的錯誤怎麼分辨。</li>
+  <li>「客人離開」和「時間到」怎麼合成一個 signal；結帳三個步驟怎麼共用一個總期限，一路傳到扣款。</li>
+  <li>扣款結果不確定時，怎麼定期去問又停得乾淨；搬到 Node 伺服器上，這套機制接在哪裡。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="08-promises.html">第 8 課</a>的 Promise：Promise 只是號碼牌，丟掉號碼牌不會讓正在做的工作停手；<code>Promise.race</code> 採用最先定案的那個，其他工作照樣跑完。</li>
+  <li><a href="09-async-await.html">第 9 課</a>的 async／await：await 失敗會在那一行丟錯，用 <code>try／catch</code> 接住。</li>
+</ul></div>
+
+<div class="callout">這頁的練習區不連網路：範例用 <code>setTimeout</code> 假裝慢的上游（查菜單、做飲料、問狀態），換成真正的 <code>fetch</code> 道理一樣。練習區會等所有計時器結束才算執行完，留下沒清掉的計時器，程式會跑到 3 秒被強制停止。</div>
+
+<h2>付款服務卡住時，為什麼工作自己停不下來？</h2>
+<p>先看開場那 30 秒裡，每個結帳請求在做什麼。結帳函式執行到 <code>await</code> 呼叫付款服務的那一行就暫停了，等付款服務回應。這段時間裡，請求本身的資料、它拿著的資料庫連線、對付款服務開著的那條連線都還佔著。要讓它放手，得有人對這件工作說「不用等了」。問題是：現在的程式裡，沒有任何人能說這句話。</p>
+<p>需要「中途叫工作停下」的情況，在結帳 API 上每天都會遇到：</p>
+<ul>
+  <li><strong>客人不要了</strong>：客人在付款轉圈時關掉了頁面，伺服器上為他跑的查詢、呼叫已經沒有人要結果。前端也有同樣的事：搜尋框打「拿」再打「拿鐵」，第一個搜尋的結果已經沒用。</li>
+  <li><strong>上游太慢</strong>：付款服務卡住，結帳不能陪它等到天荒地老，要有逾時。</li>
+  <li><strong>伺服器要關機</strong>：部署新版本時，舊程序要通知正在跑的結帳收尾（<a href="../../node/lessons/21-graceful-shutdown.html">Node 課第 21 課</a>）。</li>
+</ul>
+<p>這些工作如果不停，代價有三個：連線和記憶體被沒人要的工作佔住，就是開場的 1500 個請求；付款服務已經很慢了，你還繼續送請求，加重它的負擔，讓它更難恢復；舊的結果晚回來，蓋掉新的結果，這是<a href="12-races-concurrency.html">第 12 課</a>要處理的競態。</p>
+<p>為什麼工作自己停不下來？第 8 課說過，Promise 是號碼牌，代表「將來會有一個結果」，不是工作本身。你手上拿著號碼牌，沒有辦法透過它叫正在做飲料的人停手；把號碼牌丟掉，做飲料的人也不知道。所以 <code>Promise.race</code> 或 <code>Promise.all</code> 先定案之後，其他工作照樣跑完。JavaScript 的 Promise 沒有「取消」這個操作。</p>
+<p>要讓工作停下來，只能另外給它一條通知管道：呼叫工作時多交給它一個物件，工作在等待時一直留意這個物件；外面的人想叫它停，就透過這個物件發出通知，工作收到後自己停下、放掉資源。瀏覽器和 Node 內建的這套管道叫 <strong>AbortController</strong>，它交給工作的那個物件叫 <strong>signal</strong>。</p>
+<p>開場的付款服務，用這套管道一行就能先擋住：</p>
+<pre>const res = await fetch(paymentUrl, { signal: AbortSignal.timeout(3000) })</pre>
+<p><code>AbortSignal.timeout(3000)</code> 建立一個 3 秒後自動發出「停下來」的 signal。<code>fetch</code> 收到這個 signal，3 秒內付款服務沒回應，<code>fetch</code> 會中斷這個 HTTP 請求、關掉連線，回傳的 Promise 以錯誤失敗；結帳函式在 catch 裡回錯誤給客人，這個請求佔著的東西就都放掉了。每秒 50 個請求、每個最多等 3 秒，同時卡住的請求最多約 150 個，不會再累積到 1500 個。</p>
+<p>這一行能運作，是因為 <code>fetch</code> 會「聽」signal。signal 到底是什麼、怎麼聽；結帳流程裡那些你自己寫的函式，又要怎麼聽到它，是下一節的問題。</p>
+
+<h2>AbortController：「停下來」的通知怎麼送到工作手上？</h2>
+<p>上一節說要另外給工作一條通知管道。這條管道有兩端，像外場和咖啡師之間的對講機：</p>
+<ul>
+  <li><strong>AbortController</strong>：發出取消的那一端，留在「有權決定不做了」的人手上。呼叫 <code>controller.abort()</code>，就是對講機喊「那杯不用做了」。</li>
+  <li><strong>AbortSignal</strong>：收聽的那一端，用 <code>controller.signal</code> 取得，交給工作。工作可以讀 <code>signal.aborted</code>（是否已取消）、<code>signal.reason</code>（取消的原因），呼叫 <code>signal.throwIfAborted()</code>（已取消就把 reason 丟出來），或監聽 <code>abort</code> 事件，在取消的那一刻收到通知。</li>
+</ul>
+<p>拆成兩個物件，是為了分清楚權限。結帳流程會把 signal 一路交給很多函式，如果每個函式都能喊取消，任何一個小函式都可能讓整個結帳停下。拆開之後，拿到 signal 的工作只能「聽」，不能替別人喊取消；喊取消的權力只在拿著 controller 的那一個地方。</p>
+<p>下面這格建立一個 controller，先看取消前後 signal 的狀態，再看重複取消和自訂原因。執行後照輸出由上往下對照：</p>
+<div class="lab"><script type="code">
+const controller = new AbortController()
+const { signal } = controller
+
+console.log('取消前：', signal.aborted, signal.reason)
+signal.addEventListener('abort', () => console.log('abort 事件：收到取消'), { once: true })
+
+controller.abort()
+console.log('取消後：', signal.aborted, signal.reason.name)
+console.log('reason 是 DOMException：', signal.reason instanceof DOMException)
+controller.abort()   // 第二次 abort 沒有作用，事件也不會再觸發
+
+try {
+  signal.throwIfAborted()
+} catch (e) {
+  console.log('throwIfAborted 丟出：', e.name)
+}
+
+const custom = new AbortController()
+custom.abort(new Error('客人改點別的'))
+console.log('自訂原因：', custom.signal.reason.message)
+</script></div>
+<p>從輸出看出三件事：</p>
+<ul>
+  <li><code>abort()</code> 沒給原因時，reason 是一個 <strong>DOMException</strong>，名稱（<code>name</code>）是 <code>'AbortError'</code>。DOMException 是瀏覽器與 Node 都內建的錯誤類別，取消和逾時的錯誤都是它（依據 MDN 的 AbortSignal.reason 說明）。之後判斷「這是不是取消」，就看這個名稱。</li>
+  <li><code>abort</code> 事件是<strong>同步</strong>觸發的：「abort 事件」那行印在「取消後」之前。也就是說，<code>abort()</code> 這一行還沒執行完，監聽器就已經跑過了。這點之後很有用：監聽器裡做的清理（清掉計時器、讓 Promise 失敗），在 <code>controller.abort()</code> 回傳之前就全部做完了。下一節範例在 <code>onAbort</code> 裡 <code>clearTimeout</code>，就是在取消的當下生效，不會晚一拍。</li>
+  <li>一個 signal 只會取消一次，第二次 <code>abort()</code> 沒有作用。要再做一次可以取消的工作，就建立新的 controller。</li>
+</ul>
+<p>瀏覽器和 Node 的 <code>fetch</code> 都接受 signal：<code>fetch(url, { signal })</code>。signal 取消時，請求會被中斷，<code>fetch</code> 回傳的 Promise 以 signal 的 reason 失敗。上一節那一行能擋住付款服務，靠的就是這個。</p>
+
+<h3>結帳流程裡自己寫的函式，要怎麼聽 signal？</h3>
+<p><code>fetch</code> 會聽 signal，是因為它的實作者寫了聽 signal 的程式。結帳流程裡還有你自己寫的非同步函式：查庫存、組訂單、包裝付款呼叫的函式。這些函式不會自動聽 signal，要你自己寫。</p>
+<p>最簡單的方式是在每一步開始前檢查一次：<code>signal.throwIfAborted()</code>，已經取消就丟出 reason，函式在這裡結束。下面用咖啡師連做四杯飲料當成一件多步驟的工作，每杯 30ms，外場在 70ms 時喊取消。執行後看最後一杯做好的時間，和「停下來了」出現的時間：</p>
+<div class="lab"><script type="code">
+const start = Date.now()
+const at = () => `${String(Date.now() - start).padStart(3)}ms`
+
+async function makeDrinks(orders, signal) {
+  const done = []
+  for (const name of orders) {
+    signal.throwIfAborted()                        // 每做一杯之前先看有沒有被取消
+    await new Promise(r => setTimeout(r, 30))      // 做一杯要 30ms
+    done.push(name)
+    console.log(at(), '做好', name)
+  }
+  return done
+}
+
+const controller = new AbortController()
+setTimeout(() => { console.log(at(), '外場喊：不用做了'); controller.abort() }, 70)
+try {
+  await makeDrinks(['美式咖啡', '拿鐵', '卡布奇諾', '伯爵紅茶'], controller.signal)
+} catch (e) {
+  console.log(at(), '停下來了：', e.name)
+}
+</script></div>
+<p>70ms 喊了取消，卡布奇諾還是做完（大約 100ms）才停。原因是 <code>throwIfAborted()</code> 只在步驟之間檢查，取消發生時，函式正停在 <code>await</code> 等那 30ms，<strong>正在等的那一段</strong>沒有人在聽。這裡只多做了 30ms，看起來無所謂；但換成開場的情況，正在等的那一段是「等付款服務回應 30 秒」，步驟之間檢查完全幫不上忙，取消要等 30 秒後才生效。</p>
+<p>所以等待本身也要能被打斷：負責等待的程式要監聽 <code>abort</code> 事件，取消的那一刻就停止等待、清掉手上的東西、讓 Promise 失敗。一個支援 signal 的非同步函式，要做到這四件事：</p>
+<div class="table-wrap"><table>
+  <tr><th>步驟</th><th>做什麼</th><th>漏掉會怎樣</th></tr>
+  <tr><td>1. 先檢查</td><td><code>signal.aborted</code> 已經是 true，就立刻以 <code>signal.reason</code> 失敗</td><td>已經取消的 signal 不會再觸發 <code>abort</code> 事件，工作會一直等到做完</td></tr>
+  <tr><td>2. 監聽 abort</td><td><code>signal.addEventListener('abort', onAbort, { once: true })</code></td><td>等待中聽不到取消</td></tr>
+  <tr><td>3. 取消時清理</td><td><code>onAbort</code> 裡清掉計時器（<code>clearTimeout</code>）、關掉連線，再 <code>reject(signal.reason)</code></td><td>Promise 失敗了，計時器還在，時間到還是會執行</td></tr>
+  <tr><td>4. 完成時移除監聽器</td><td>正常完成時 <code>signal.removeEventListener('abort', onAbort)</code></td><td>監聽器跟著 signal 一直留著</td></tr>
+</table></div>
+<p>第 1 步容易被跳過，因為看起來多餘：都已經監聽 abort 了，為什麼還要先檢查？原因是 abort 事件只在取消的那一刻觸發一次。如果 signal 在交給你之前就已經取消（例如結帳的總時間已經用完），你之後才掛上的監聽器永遠等不到事件，工作會照常做完。</p>
+<p>第 4 步最常被忘。伺服器上一個結帳請求的 signal 常常要傳給幾十個小工作，每個工作做完都把監聽器留在 signal 上，請求越久、留得越多。這叫<strong>資源洩漏</strong>（resource leak）：工作結束了，它用過的計時器或監聽器卻還留著，佔著記憶體。<code>{ once: true }</code> 只在事件觸發後自動移除，沒觸發就不會移除，所以正常完成時還是要自己移除。</p>
+<p>reject 時用 <code>signal.reason</code>，不要自己 <code>new Error('aborted')</code>。呼叫端要靠錯誤的 <code>name</code> 分辨「是自己取消的」還是「等太久了」，下一節會看到這兩種要分開處理；換成自己的 Error，名稱就不對了。下一節的範例就是照這四步寫的，練習 1 會把它們寫成可以重用的 <code>sleep</code>。</p>
+<div class="callout practice"><strong>💡 實務上：前端最常在「離開畫面」時 abort</strong><br>咖啡店後台的訂單頁，進頁面就送 <code>fetch</code>，使用者還沒等到結果就切去菜單頁。React 的寫法是在 <code>useEffect</code> 裡建立 controller，cleanup 時呼叫 <code>controller.abort()</code>（Vue 則放在 <code>onUnmounted</code>）；TanStack Query 這類資料抓取套件會把 signal 傳給你的 queryFn，你只要把它交給 <code>fetch</code>。自己包的 API client（例如 <code>api.get(url, { signal })</code>）一開始就要留 signal 這個選項，事後再補，得一個一個呼叫點去改。這跟本課的結帳 API 是同一件事的兩端：前端在離開畫面時 abort，後端在客戶端斷線時 abort（最後一節）。Code review 時看到「進畫面就抓資料」，資深會順手問一句：離開畫面時這個請求會停嗎？</div>
+<p>工具齊了，回到付款服務卡住的問題。逾時最常見的寫法不是 signal，而是 <code>Promise.race</code>；下一節先看它為什麼不夠。</p>
+
+<h2>逾時怎麼寫，上游的工作才會真的停下？</h2>
+<p>很多人寫逾時的第一個想法，是讓工作跟一個計時器比賽：計時器先到就失敗（<code>setTimeout</code> 只保證「至少」等這麼久，<a href="07-event-loop.html">第 7 課</a>）。下面用查菜單代替付款服務，上游要 200ms 才回來，逾時設 50ms。執行後看兩個時間：呼叫端什麼時候放棄，上游的連線什麼時候才釋放：</p>
+<div class="lab"><script type="code">
+const start = Date.now()
+const at = () => `${String(Date.now() - start).padStart(3)}ms`
+
+function fetchMenu() {
+  return new Promise(resolve => {
+    console.log(at(), '開始向上游查菜單（佔用一條連線）')
+    setTimeout(() => {
+      console.log(at(), '上游查完了，連線這時才釋放')
+      resolve(['美式咖啡', '拿鐵'])
+    }, 200)
+  })
+}
+const timeout = ms => new Promise((_, reject) => setTimeout(() => reject(new Error('逾時')), ms))
+
+try {
+  await Promise.race([fetchMenu(), timeout(50)])
+} catch (e) {
+  console.log(at(), '呼叫端放棄：', e.message)
+}
+</script></div>
+<p>呼叫端在 50ms 放棄了，但查詢一直跑到 200ms。<code>Promise.race</code> 只決定「呼叫端的這個 Promise 用誰的結果」，它沒有辦法通知 <code>fetchMenu</code>，<code>fetchMenu</code> 也沒有拿到任何 signal，根本不知道自己被放棄了。套回開場：結帳在 3 秒回錯誤給客人，但對付款服務的連線還是佔滿 30 秒，1500 條連線一條都沒少。上游卡住時，這種「放棄了但沒停下」的工作會越積越多，呼叫端還以為逾時已經保護了系統。</p>
+<p>要讓工作真的停下，逾時就要透過 signal 送到工作手上。<strong>AbortSignal.timeout(ms)</strong> 會建立一個 ms 毫秒後自動取消的 signal，reason 是名為 <code>'TimeoutError'</code> 的 DOMException（MDN）。它等於「建立 controller、設計時器、時間到呼叫 <code>abort()</code>」三件事的現成版本，而且 reason 的名稱跟一般取消不同，呼叫端分得出來。</p>
+<p>下面的 <code>fetchMenu</code> 照上一節的四步改寫：監聽 abort、取消時清掉計時器並以 <code>signal.reason</code> 失敗、正常完成時移除監聽器。執行後跟上一格比較：工作在約 50ms 就印出「收到取消」，不會再跑到 200ms：</p>
+<div class="lab"><script type="code">
+const start = Date.now()
+const at = () => `${String(Date.now() - start).padStart(3)}ms`
+
+function fetchMenu(signal) {
+  return new Promise((resolve, reject) => {
+    console.log(at(), '開始向上游查菜單')
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve(['美式咖啡', '拿鐵'])
+    }, 200)
+    function onAbort() {
+      clearTimeout(timer)
+      console.log(at(), '收到取消：停止查詢、釋放連線')
+      reject(signal.reason)
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+try {
+  await fetchMenu(AbortSignal.timeout(50))
+} catch (e) {
+  console.log(at(), '呼叫端收到：', e.name)
+}
+</script></div>
+<p>真實的付款呼叫寫成 <code>fetch(url, { signal: AbortSignal.timeout(5000) })</code> 就好，四步由 <code>fetch</code> 自己做。</p>
+
+<h3>工作停下之後，catch 收到的錯誤該怎麼分？</h3>
+<p>現在結帳函式的 catch 會收到三種失敗，原因不同，處理方式也不同。分辨的依據是錯誤的 <code>e.name</code>：</p>
+<div class="table-wrap"><table>
+  <tr><th><code>e.name</code></th><th>誰造成的</th><th>該怎麼處理</th></tr>
+  <tr><td><code>'AbortError'</code></td><td>呼叫端自己取消（使用者離開、換了搜尋字、伺服器關機）</td><td>安靜結束：不顯示錯誤、不送錯誤回報，最多記一筆 debug log</td></tr>
+  <tr><td><code>'TimeoutError'</code></td><td>對方太慢</td><td>告訴使用者「太慢了，再試一次」，或回 504（HTTP 的 Gateway Timeout：上游沒在時間內回應）；要記錄，逾時變多代表上游有問題</td></tr>
+  <tr><td>其他</td><td>真的出錯（網路斷、對方回 500）</td><td>照<a href="04-errors.html">第 4 課</a>的方式處理：顯示、回報、往上丟</td></tr>
+</table></div>
+<p>同樣的分類，前端和後端各寫一次，只是「怎麼處理」那一欄不同。先看前端載入菜單：</p>
+<pre>try {
+  const menu = await loadMenu({ signal })
+  render(menu)
+} catch (e) {
+  if (e.name === 'AbortError') return               // 使用者不要了：什麼都不顯示
+  if (e.name === 'TimeoutError') return showToast('菜單載入太慢了，再試一次')
+  throw e                                           // 其他錯誤照常處理
+}</pre>
+<p>換成本課的結帳 API，三列對應的處理是這樣（虛擬碼，回應的寫法依框架而定）：</p>
+<pre>try {
+  const order = await checkout(cart, { signal })
+  回傳 200 和 order
+} catch (e) {
+  if (e.name === 'AbortError') {                   // 客人已經離開：沒有人在等回應
+    記一筆 debug log；不回應
+    return
+  }
+  if (e.name === 'TimeoutError') {                 // 付款服務太慢
+    記錄逾時（監控要看得到）
+    回傳 504
+    return
+  }
+  throw e                                          // 其他錯誤往上丟，交給統一的錯誤處理
+}</pre>
+<p>為什麼 AbortError 要安靜結束？取消是呼叫端自己決定的，不是故障。把它當錯誤顯示，使用者每換一次搜尋字就看到一次「發生錯誤」；送進錯誤監控，真正的錯誤會被淹沒在幾千筆取消裡。TimeoutError 則相反，它代表上游出了狀況，一定要記錄下來，監控上逾時的數量突然變多，通常就是開場那種事故的第一個訊號。</p>
+<p>用 <code>abort(new Error('…'))</code> 自訂原因時，名稱就不是 AbortError 了，這時可以改用 <code>signal.aborted</code> 判斷「是不是自己取消的」。</p>
+<div class="callout practice"><strong>💡 實務上：每個對外呼叫都要有逾時，數字從監控來</strong><br><code>fetch</code> 沒有逾時的參數，不傳 signal 就會一直等到連線層自己放棄，所以呼叫付款、簡訊、物流這類外部服務時，逾時是必備的，不是加分題。數字不要憑感覺：先看監控裡這個上游平常多久回來，逾時設在「正常情況的慢」之上留點空間；設太短，上游只是偶爾慢一點就被你當成失敗。不同操作可以不同：查菜單逾時短、失敗就顯示快取，扣款寧可多等一點再去查結果。資深會把各服務的逾時集中寫在設定裡，方便出事時一眼看到「我們到底等對方多久」。</div>
+<p>到這裡，付款呼叫已經有了會真的停下的逾時。但結帳 API 停下的理由不只一個：客人也可能在等待中關掉頁面。<code>fetch</code> 只收一個 signal，兩個理由要怎麼同時交給它？</p>
+
+<h2>「客人離開」和「時間到」，怎麼合成一個 signal？</h2>
+<p>付款呼叫現在有兩個停下的理由：客人關掉頁面（一個由你呼叫 <code>abort()</code> 的 controller），和時間到了（<code>AbortSignal.timeout</code>）。<code>fetch</code> 的 <code>signal</code> 選項只收一個，任何一個理由發生都要停。</p>
+<p><strong>AbortSignal.any([signal1, signal2, …])</strong> 做的就是這件事：它回傳一個新的 signal，傳進去的任何一個來源取消，它就跟著取消，reason 是第一個取消的來源的 reason（MDN）。後半句很重要：合併之後，上一節的分類照樣能用，客人離開是 AbortError、時間到是 TimeoutError，catch 不需要知道 signal 是怎麼組出來的。</p>
+<p>下面兩種情況，逾時都是 100ms：第一種客人在 30ms 按了取消，第二種客人一直沒按。執行後看每一行印出的 reason 名稱和時間：</p>
+<div class="lab"><script type="code">
+function watch(label, signal) {
+  const start = Date.now()
+  signal.addEventListener('abort', () => {
+    console.log(`${label}：${signal.reason.name}（約 ${Date.now() - start}ms）`)
+  }, { once: true })
+}
+
+// 情況一：使用者 30ms 時按了取消，逾時是 100ms
+const user1 = new AbortController()
+watch('使用者先取消', AbortSignal.any([user1.signal, AbortSignal.timeout(100)]))
+setTimeout(() => user1.abort(), 30)
+
+// 情況二：使用者一直沒按，100ms 逾時
+const user2 = new AbortController()
+watch('時間先到', AbortSignal.any([user2.signal, AbortSignal.timeout(100)]))
+
+await new Promise(r => setTimeout(r, 150))
+</script></div>
+<p>第一行在約 30ms 印出 AbortError，第二行在約 100ms 印出 TimeoutError：誰先發生，合併後的 signal 就帶著誰的原因取消。後端的「客人離開」signal 從哪裡來，在最後一節。AbortSignal.any 是比較新的 API，各環境從哪一版開始支援，見課末的補充與查表。</p>
+<p>付款呼叫現在有了兩個停下的理由。但結帳不只付款這一步：前面要查庫存，後面要寫訂單，每一步都可能慢。每一步各自加上逾時，整個結帳就安全了嗎？</p>
+
+<h2>結帳有三步，怎麼限制整件事最多花多久？</h2>
+<p>結帳有三個步驟：查庫存、扣款、寫訂單。每一步都設了 1 秒逾時，看起來很安全。但三步各花 0.9 秒時，每一步都沒逾時，整個結帳卻花了 2.7 秒；最壞的情況接近 3 秒。前端的請求如果只等 1 秒，早就放棄了，後端還在做。每一步各自的逾時只保證「單一步驟不會卡死」，不保證「整件事多久結束」。</p>
+<p>要限制的是<strong>期限</strong>（deadline）：整件事最晚什麼時候要結束，跟「每一步最多等多久」不同。做法是在最外層建立<strong>一個</strong> signal，把同一個 signal 交給每一步。計時器只在最外層啟動一次，第一步用掉的時間，後面的步驟就少了那麼多；時間一到，正在進行的那一步收到取消，後面的步驟還沒開始就不會開始。</p>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="上排：三個步驟各有 1 秒逾時，每步 0.9 秒，總共 2.7 秒才結束。下排：整體期限 1 秒，第二步在 1 秒時收到取消，第三步沒有開始">
+    <text class="d-text" x="20" y="30">每一步各自 1 秒逾時</text>
+    <rect class="d-soft" x="20" y="45" width="162" height="34" rx="6"/>
+    <text class="d-small" x="101" y="67" text-anchor="middle">查庫存 0.9s</text>
+    <rect class="d-soft" x="184" y="45" width="162" height="34" rx="6"/>
+    <text class="d-small" x="265" y="67" text-anchor="middle">扣款 0.9s</text>
+    <rect class="d-soft" x="348" y="45" width="162" height="34" rx="6"/>
+    <text class="d-small" x="429" y="67" text-anchor="middle">寫訂單 0.9s</text>
+    <text class="d-accent" x="520" y="67">2.7 秒才結束</text>
+    <text class="d-text" x="20" y="140">整體期限 1 秒（同一個 signal）</text>
+    <rect class="d-soft" x="20" y="155" width="162" height="34" rx="6"/>
+    <text class="d-small" x="101" y="177" text-anchor="middle">查庫存 0.9s</text>
+    <rect class="d-box" x="184" y="155" width="18" height="34" rx="6"/>
+    <text class="d-small" x="210" y="177">扣款收到取消</text>
+    <text class="d-small" x="348" y="177">寫訂單沒有開始</text>
+    <text class="d-accent" x="520" y="177">1 秒停下</text>
+    <path class="d-line" d="M200,100 L200,215" stroke-dasharray="5 4"/>
+    <text class="d-small" x="200" y="235" text-anchor="middle">1 秒</text>
+    <path class="d-line" d="M20,215 L560,215"/>
+    <text class="d-small" x="20" y="235">0</text>
+  </svg>
+  <figcaption>每一步各自逾時，總時間是各步相加；整體期限用同一個 signal，時間一到，進行中的那一步停下、後面的不開始</figcaption>
+</figure>
+<p>下面的範例三步各 80ms，先跑「每一步各自 100ms 逾時」，再跑「整體期限 100ms」。執行後比較兩行最後的毫秒數：</p>
+<div class="lab"><script type="code">
+function step(name, ms, signal) {
+  return new Promise((resolve, reject) => {
+    signal.throwIfAborted()
+    const timer = setTimeout(() => { signal.removeEventListener('abort', onAbort); resolve(name) }, ms)
+    function onAbort() { clearTimeout(timer); console.log('  ', name, '收到取消'); reject(signal.reason) }
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
+const steps = [['查庫存', 80], ['扣款', 80], ['寫訂單', 80]]
+
+let start = Date.now()
+for (const [name, ms] of steps) await step(name, ms, AbortSignal.timeout(100))
+console.log('每一步各自 100ms 逾時：全部做完，花了', Date.now() - start, 'ms')
+
+start = Date.now()
+const deadline = AbortSignal.timeout(100)
+try {
+  for (const [name, ms] of steps) await step(name, ms, deadline)
+} catch (e) {
+  console.log('整體期限 100ms：', e.name, '，在', Date.now() - start, 'ms 停下')
+}
+</script></div>
+<p>第一行三步都做完，約 240ms：每一步各自都沒超過 100ms。第二行在約 100ms 以 TimeoutError 停下，停的時候扣款正在進行，所以印出「扣款收到取消」，寫訂單沒有開始。兩次的差別只在 <code>AbortSignal.timeout(100)</code> 寫在迴圈裡面還是外面。</p>
+
+<h3>signal 怎麼一路傳到扣款那一層？</h3>
+<p>整體期限要有效，有一個前提：每一步真的拿到了那個 signal。結帳函式收到 signal，但呼叫扣款時忘了傳下去，就會回到 <code>Promise.race</code> 的情況：外層放棄了，扣款請求還在跑，甚至在客人看到「逾時」之後才扣款成功。</p>
+<p>把同一個 signal 交給每一層呼叫，直到真正在等的那一層（<code>fetch</code>、資料庫查詢、計時器），叫<strong>傳遞取消</strong>（cancellation propagation）。中間任何一層漏傳，從那一層往下的工作就聽不到取消。慣例是把 signal 放在最後一個參數或選項物件裡：<code>checkout(order, { signal })</code>、<code>charge(card, amount, { signal })</code>。寫函式時看到裡面有 <code>await</code>，就問自己：這個 await 等的東西，收到 signal 了嗎？</p>
+<div class="callout practice"><strong>💡 實務上：期限要一層比一層短</strong><br>一個結帳請求會經過好幾層：瀏覽器、你的後端、付款服務，每一層都有自己的逾時。如果前端等 10 秒就放棄，後端卻沒設期限、繼續做了 20 秒，前端放棄之後的那 10 秒全是白做，佔著伺服器資源卻沒人在等結果。原則是越內層越短：後端的整體期限要比前端願意等的時間短，留時間把錯誤回傳出去。實作上常在請求進來的地方建立一個 signal（客戶端斷線或期限到就 abort），一路傳給商業邏輯、資料庫查詢、外部 API；新同事寫的函式漏傳 signal，是 code review 很常抓到的問題。</div>
+<div class="callout warn">取消只是<strong>通知</strong>，不是時光倒流。扣款請求已經送到付款服務，你在這邊 abort，只是不再等回應，對方可能已經扣款成功。所以會改變狀態的請求要搭配冪等鍵（idempotency key），讓重試不會扣第二次；逾時之後也要能查詢「剛剛那筆到底成功沒有」。這部分在 <a href="../../node/lessons/17-calling-external-apis.html">Node 課第 17 課</a>。</div>
+
+<h2>扣款結果不確定，怎麼定期去問、又停得乾淨？</h2>
+<p>上一節留下一個問題：扣款逾時了，錢可能扣了、也可能沒扣，只能去問付款服務。付款服務處理完之前，問一次不一定有答案，所以要每隔一段時間問一次，直到有結果。這叫<strong>輪詢</strong>（polling）。它不只出現在這裡：前端等拿鐵做好才顯示「請取餐」、後端等匯出檔案產生好，都是輪詢。下面的範例和練習 4 用「等拿鐵做好」當題材，換成後端等付款結果，程式結構一模一樣。</p>
+<p>直覺的寫法是 <code>setInterval</code>。但它只管「每隔多久觸發一次」，不管上一次的非同步工作做完了沒。下面每 10ms 問一次，每次問要 35ms，第 3 次問的時候拿鐵好了。執行後看兩個數字：一共問了幾次、同時最多有幾個請求在跑：</p>
+<div class="lab"><script type="code">
+let calls = 0, running = 0, maxRunning = 0
+async function isReady() {
+  const n = ++calls
+  running++
+  maxRunning = Math.max(maxRunning, running)
+  await new Promise(r => setTimeout(r, 35))     // 問一次狀態要 35ms
+  running--
+  return n === 3                                // 第 3 次問的時候拿鐵好了
+}
+
+const id = setInterval(async () => {
+  if (await isReady()) {
+    clearInterval(id)
+    console.log('拿鐵好了，clearInterval；這時已經問了', calls, '次，還有', running, '個請求在跑')
+  }
+}, 10)
+await new Promise(r => setTimeout(r, 150))
+console.log('全部結束：一共問了', calls, '次，同時最多有', maxRunning, '個請求在跑')
+</script></div>
+<p>這個寫法有三個問題：</p>
+<ul>
+  <li><strong>請求重疊</strong>：每 10ms 送一次、每次要 35ms，同時就有 3、4 個請求在跑；第 3 次問到「好了」時，後面已經多送了好幾次。上游越慢，同時在跑的就越多，等於在上游最需要喘息的時候加倍施壓。這正是開場付款服務卡住時最不想看到的事。</li>
+  <li><strong>停不掉已送出的</strong>：<code>clearInterval</code> 只停掉之後的觸發，已經送出的請求不會停。</li>
+  <li><strong>可能永遠不停</strong>：拿鐵一直沒好、或客人已經離開而沒人呼叫 <code>clearInterval</code>，它會永遠跑下去。</li>
+</ul>
+<p>改法是「做完一次，才排下一次」：用迴圈，問一次 → 還沒好就等 intervalMs → 再問一次。這樣同一時間永遠只有一個請求在跑，上游越慢，問的頻率自然越低。等待用支援 signal 的 sleep（練習 1），取消時計時器會被清掉；signal 也交給每次的檢查，讓進行中的那一次也能停下。這個 signal 就用前面學的組法：客人離開的 signal 和一個總期限用 <code>AbortSignal.any</code> 合起來，輪詢就一定有終點。練習 4 會寫出這個版本。</p>
+<p>練習區會在 3 秒時強制停止沒清掉的計時器（課首說明），在伺服器上沒有人幫你強制停止：每個請求留下一個計時器，記憶體和連線會一直累積，直到程序被重啟。Node 的 <code>setTimeout</code> 還會讓程序保持執行，沒清掉的計時器也會讓程序關不掉（<a href="../../node/lessons/21-graceful-shutdown.html">Node 課第 21 課</a>）。</p>
+<div class="callout practice"><strong>💡 實務上：輪詢要有終點，也要問「能不能不輪詢」</strong><br>「等拿鐵做好」「等報表匯出完成」這種要等幾秒到幾分鐘的事，輪詢最簡單，前後端都不用多架東西。上線前要確認三件事：有沒有總期限（拿鐵 10 分鐘還沒好就停，改顯示「請洽櫃台」）、間隔會不會對後端造成負擔（上千個客人同時開著頁面，每人每秒問一次就是每秒上千個請求）、客人離開頁面時有沒有停下。如果狀態要「一變就知道」，或同時在等的人很多，就該考慮 WebSocket、SSE 這類由伺服器主動推送的方式（後面的課會教）；第三方付款結果則通常以對方的 webhook 為主（付款完成時，由付款服務主動呼叫你的 API 通知），輪詢只當補漏。</div>
+<p>這一課的機制都在瀏覽器的練習區示範。真正的結帳 API 跑在 Node 上，最後一節看它在伺服器上接在哪裡。</p>
+
+<h2>搬到 Node 伺服器上，這套機制接在哪裡？</h2>
+<p>這一課的寫法在 Node 裡完全一樣，而且用得更多。開場的結帳 API 要用到的三個接點：</p>
+<ul>
+  <li><strong>對外呼叫和等待</strong>：Node 的 <code>fetch</code>、<code>timers/promises</code> 的 <code>setTimeout</code>、<code>fs</code>、<code>child_process</code> 等很多 API 都接受 <code>{ signal }</code>，把結帳的 signal 交給它們就能停下，在 <a href="../../node/lessons/08-events-cancellation.html">Node 課第 8 課</a>。</li>
+  <li><strong>客人離開</strong>：這就是前面一直說的「客人離開」signal 的來源。Node 的 HTTP 伺服器會替每個進來的請求準備一個 <code>req.signal</code>，連線在回應完成前斷掉時，它就被 abort，不用自己建 controller。結帳的處理函式把它和整體期限合起來：<code>AbortSignal.any([req.signal, AbortSignal.timeout(3000)])</code>，再把這個 signal 交給 <code>checkout</code>，一路傳到扣款。<code>req.signal</code> 從哪一版開始可靠、怎麼用 <code>res</code> 的 <code>'close'</code> 事件確認客戶端離開，在 <a href="../../node/lessons/13-http-server.html">Node 課第 13 課</a>；呼叫外部 API 時的逾時、重試與退避，在 <a href="../../node/lessons/17-calling-external-apis.html">Node 課第 17 課</a>。</li>
+  <li><strong>伺服器關機</strong>：部署時用同一個機制通知所有進行中的結帳收尾，在 <a href="../../node/lessons/21-graceful-shutdown.html">Node 課第 21 課</a>。</li>
+</ul>
+<p>回到開場：付款服務卡住時，結帳 API 有了總期限，3 秒內一定放手；放手時付款請求真的被中斷、計時器和監聽器都清掉；客人關掉頁面，為他做的工作也跟著停。伺服器上同時卡住的請求有了上限，查菜單不會再被拖慢。</p>
+<p>資深工程師設計一個會呼叫別人的函式時，會先回答三個問題，也就是這一課的三條主線：最多等多久（逾時或期限）？誰可以叫它停（signal 從哪裡來）？停下時要清掉什麼（計時器、監聽器、連線）？</p>
+
+<h2>補充與查表</h2>
+<p>這一課用到的 API，查表用，不用背：</p>
+<div class="table-wrap"><table>
+  <tr><th>寫法</th><th>做什麼</th></tr>
+  <tr><td><code>new AbortController()</code></td><td>建立發出取消的一端</td></tr>
+  <tr><td><code>controller.abort(reason?)</code></td><td>發出取消；沒給 reason 時是名為 AbortError 的 DOMException；只有第一次有效</td></tr>
+  <tr><td><code>controller.signal</code></td><td>取得收聽的一端，交給工作</td></tr>
+  <tr><td><code>signal.aborted</code>／<code>signal.reason</code></td><td>是否已取消／取消的原因</td></tr>
+  <tr><td><code>signal.throwIfAborted()</code></td><td>已取消就丟出 reason</td></tr>
+  <tr><td><code>signal.addEventListener('abort', fn, { once: true })</code></td><td>取消的那一刻同步呼叫 fn</td></tr>
+  <tr><td><code>AbortSignal.timeout(ms)</code></td><td>ms 毫秒後自動取消，reason 名為 TimeoutError</td></tr>
+  <tr><td><code>AbortSignal.any([s1, s2, …])</code></td><td>任一來源取消就取消，reason 是第一個取消的來源的 reason</td></tr>
+</table></div>
+<ul>
+  <li><strong>AbortSignal.any 的支援版本</strong>：從 Chrome 116、Firefox 124、Safari 17.4、Node 20.3 開始支援（MDN 的瀏覽器相容性資料）。</li>
+  <li><strong>AbortSignal.timeout 算的是「活動中」的時間</strong>：MDN 註明，瀏覽器的 worker 被暫停、頁面進了上一頁快取時，計時也會暫停。</li>
+</ul>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：寫出支援取消的 <code>sleep(ms, { signal } = {})</code>：ms 毫秒後成功；沒給 signal 時就是普通的 sleep。signal 已經取消時立刻以 <code>signal.reason</code> 失敗；等待中被取消時清掉計時器並以 <code>signal.reason</code> 失敗；正常完成後要移除 abort 監聽器。</p>
+  <script type="start">
+function sleep(ms, { signal } = {}) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+const controller = new AbortController()
+setTimeout(() => controller.abort(), 20)
+try {
+  await sleep(100, { signal: controller.signal })
+  console.log('睡滿 100ms')
+} catch (e) {
+  console.log('被取消：', e.name)
+}
+</script>
+  <script type="answer">
+function sleep(ms, { signal } = {}) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason)
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    function onAbort() {
+      clearTimeout(timer)
+      reject(signal.reason)
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+const controller = new AbortController()
+setTimeout(() => controller.abort(), 20)
+try {
+  await sleep(100, { signal: controller.signal })
+  console.log('睡滿 100ms')
+} catch (e) {
+  console.log('被取消：', e.name)
+}
+</script>
+  <script type="tests">
+let t0 = Date.now()
+await sleep(20)
+assert(Date.now() - t0 >= 15, '沒給 signal 時要睡滿 ms 毫秒')
+
+const before = new AbortController()
+before.abort()
+let err
+t0 = Date.now()
+try { await sleep(300, { signal: before.signal }) } catch (e) { err = e }
+assert(err !== undefined, 'signal 已經取消時要失敗（已取消的 signal 不會再觸發 abort 事件，要先檢查 signal.aborted）')
+assert(Date.now() - t0 < 50, 'signal 已經取消時要立刻失敗，不能等到 ms')
+assert.equal(err, before.signal.reason, '要以 signal.reason 失敗，不要自己 new Error')
+
+const during = new AbortController()
+setTimeout(() => during.abort(), 10)
+err = undefined
+t0 = Date.now()
+try { await sleep(5000, { signal: during.signal }) } catch (e) { err = e }
+assert.equal(err?.name, 'AbortError', '等待中被 abort() 要以 signal.reason（AbortError）失敗')
+assert(Date.now() - t0 < 60, '被取消後要馬上失敗，不能等到 ms')
+
+err = undefined
+try { await sleep(300, { signal: AbortSignal.timeout(30) }) } catch (e) { err = e }
+assert.equal(err?.name, 'TimeoutError', '用 AbortSignal.timeout 時要以 TimeoutError 失敗')
+
+const counted = new AbortController()
+const sig = counted.signal
+const live = new Set()
+let added = 0
+const add = sig.addEventListener.bind(sig)
+const remove = sig.removeEventListener.bind(sig)
+sig.addEventListener = (type, fn, opts) => { added++; live.add(fn); return add(type, fn, opts) }
+sig.removeEventListener = (type, fn, opts) => { live.delete(fn); return remove(type, fn, opts) }
+await sleep(10, { signal: sig })
+assert(added > 0, '要用 signal.addEventListener 監聽 abort 事件')
+assert.equal(live.size, 0, '正常完成後要移除 abort 監聽器：removeEventListener 要傳入當初 addEventListener 的同一個函式（{ once: true } 只在觸發後才移除）')
+</script>
+  <script type="wrong">
+// 忽略 signal
+function sleep(ms, { signal } = {}) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+</script>
+  <script type="wrong">
+// 用自己的 Error，名稱不對
+function sleep(ms, { signal } = {}) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new Error('aborted'))
+    const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve() }, ms)
+    function onAbort() { clearTimeout(timer); reject(new Error('aborted')) }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+</script>
+  <script type="wrong">
+// 沒檢查一開始就已取消
+function sleep(ms, { signal } = {}) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve() }, ms)
+    function onAbort() { clearTimeout(timer); reject(signal.reason) }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+</script>
+  <script type="wrong">
+// 完成後沒移除監聽器
+function sleep(ms, { signal } = {}) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason)
+    const timer = setTimeout(resolve, ms)
+    signal?.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason) }, { once: true })
+  })
+}
+</script>
+  <script type="wrong">
+// 移除時傳了另一個函式，監聽器其實沒被移除
+function sleep(ms, { signal } = {}) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason)
+    const timer = setTimeout(() => { signal?.removeEventListener('abort', () => {}); resolve() }, ms)
+    signal?.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason) }, { once: true })
+  })
+}
+</script>
+  <script type="wrong">
+// 取消時沒清掉計時器
+function sleep(ms, { signal } = {}) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason)
+    setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve() }, ms)
+    function onAbort() { reject(signal.reason) }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：<code>withTimeout(task, ms, parentSignal)</code> 現在用 <code>Promise.race</code> 做逾時，task 從來不知道自己被放棄了。<code>task</code> 是 <code>(signal) =&gt; Promise</code>。改成：用 <code>AbortSignal.timeout(ms)</code> 做逾時，有 <code>parentSignal</code> 時用 <code>AbortSignal.any</code> 合併，把合併後的 signal 傳給 task。逾時要以 TimeoutError 失敗、父 signal 取消要以 AbortError 失敗，而且 task 要真的收到取消。</p>
+  <script type="start">
+function withTimeout(task, ms, parentSignal) {
+  const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('逾時')), ms))
+  return Promise.race([task(), timeout])
+}
+
+const slowMenu = signal => new Promise((resolve, reject) => {
+  const timer = setTimeout(() => resolve(['美式咖啡', '拿鐵']), 200)
+  signal?.addEventListener('abort', () => { clearTimeout(timer); console.log('task 收到取消'); reject(signal.reason) }, { once: true })
+})
+try {
+  console.log(await withTimeout(slowMenu, 50))
+} catch (e) {
+  console.log('withTimeout 失敗：', e.name)
+}
+</script>
+  <script type="answer">
+function withTimeout(task, ms, parentSignal) {
+  const timeout = AbortSignal.timeout(ms)
+  const signal = parentSignal ? AbortSignal.any([parentSignal, timeout]) : timeout
+  return task(signal)
+}
+
+const slowMenu = signal => new Promise((resolve, reject) => {
+  const timer = setTimeout(() => resolve(['美式咖啡', '拿鐵']), 200)
+  signal?.addEventListener('abort', () => { clearTimeout(timer); console.log('task 收到取消'); reject(signal.reason) }, { once: true })
+})
+try {
+  console.log(await withTimeout(slowMenu, 50))
+} catch (e) {
+  console.log('withTimeout 失敗：', e.name)
+}
+</script>
+  <script type="tests">
+let got, cleaned = false
+const slow = signal => new Promise((resolve, reject) => {
+  got = signal
+  const timer = setTimeout(() => resolve('慢'), 200)
+  signal?.addEventListener('abort', () => { clearTimeout(timer); cleaned = true; reject(signal.reason) }, { once: true })
+})
+
+assert.equal(await withTimeout(async () => '快', 100), '快', '時間內完成的 task 要正常回傳結果')
+
+let err
+let t0 = Date.now()
+try { await withTimeout(slow, 50) } catch (e) { err = e }
+assert(got instanceof AbortSignal, '要把 signal 傳給 task：task(signal)')
+assert.equal(err?.name, 'TimeoutError', '逾時要以 TimeoutError 失敗（用 AbortSignal.timeout，不要自己 new Error）')
+assert(Date.now() - t0 < 150, '逾時要在大約 ms 毫秒時失敗')
+assert(got.aborted && cleaned, '逾時時 task 要真的收到取消，才能清掉自己的計時器、連線')
+
+const idle = new AbortController()
+err = undefined
+try { await withTimeout(slow, 50, idle.signal) } catch (e) { err = e }
+assert.equal(err?.name, 'TimeoutError', '有 parentSignal 但它沒取消時，逾時照樣要生效：合併兩個 signal，不是二選一')
+
+const parent = new AbortController()
+setTimeout(() => parent.abort(), 20)
+got = undefined
+cleaned = false
+err = undefined
+t0 = Date.now()
+try { await withTimeout(slow, 1000, parent.signal) } catch (e) { err = e }
+assert.equal(err?.name, 'AbortError', 'parentSignal 取消時要以 AbortError 失敗（用 AbortSignal.any 合併）')
+assert(cleaned, 'parentSignal 取消時 task 也要收到取消')
+assert(Date.now() - t0 < 120, 'parentSignal 取消後要馬上失敗')
+</script>
+  <script type="wrong">
+// race 版本：task 沒收到取消
+function withTimeout(task, ms, parentSignal) {
+  const timeout = new Promise((_, reject) => setTimeout(() => reject(new DOMException('逾時', 'TimeoutError')), ms))
+  return Promise.race([task(), timeout])
+}
+</script>
+  <script type="wrong">
+// 逾時丟自己的 Error，名稱不對
+function withTimeout(task, ms, parentSignal) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(new Error('timeout')), ms)
+  const signal = parentSignal ? AbortSignal.any([parentSignal, controller.signal]) : controller.signal
+  return task(signal).finally(() => clearTimeout(timer))
+}
+</script>
+  <script type="wrong">
+// 忽略 parentSignal
+function withTimeout(task, ms, parentSignal) {
+  return task(AbortSignal.timeout(ms))
+}
+</script>
+  <script type="wrong">
+// 有 parentSignal 就只用它，逾時被丟掉
+function withTimeout(task, ms, parentSignal) {
+  return task(parentSignal ?? AbortSignal.timeout(ms))
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：<code>runWithDeadline(steps, ms, parentSignal)</code> 依序執行 <code>steps</code>（每一步是 <code>(signal) =&gt; Promise</code>），全部完成時回傳每一步結果的陣列。加上<strong>整體期限</strong>：整件事最多 ms 毫秒，不是每一步各 ms。期限到了，進行中的那一步要收到取消、後面的步驟不能開始，並以 TimeoutError 失敗；有 parentSignal 時也要能被它取消（AbortError）。</p>
+  <script type="start">
+async function runWithDeadline(steps, ms, parentSignal) {
+  const results = []
+  for (const step of steps) {
+    results.push(await step())
+  }
+  return results
+}
+
+const brew = (name, ms) => signal => new Promise((resolve, reject) => {
+  const timer = setTimeout(() => resolve(name), ms)
+  signal?.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason) }, { once: true })
+})
+try {
+  console.log(await runWithDeadline([brew('查庫存', 60), brew('扣款', 60), brew('寫訂單', 60)], 100))
+} catch (e) {
+  console.log('結帳失敗：', e.name)
+}
+</script>
+  <script type="answer">
+async function runWithDeadline(steps, ms, parentSignal) {
+  const timeout = AbortSignal.timeout(ms)
+  const signal = parentSignal ? AbortSignal.any([parentSignal, timeout]) : timeout
+  const results = []
+  for (const step of steps) {
+    signal.throwIfAborted()
+    results.push(await step(signal))
+  }
+  return results
+}
+
+const brew = (name, ms) => signal => new Promise((resolve, reject) => {
+  const timer = setTimeout(() => resolve(name), ms)
+  signal?.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason) }, { once: true })
+})
+try {
+  console.log(await runWithDeadline([brew('查庫存', 60), brew('扣款', 60), brew('寫訂單', 60)], 100))
+} catch (e) {
+  console.log('結帳失敗：', e.name)
+}
+</script>
+  <script type="tests">
+const log = []
+const fake = (name, ms) => signal => new Promise((resolve, reject) => {
+  log.push(name + ' start')
+  const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); log.push(name + ' done'); resolve(name) }, ms)
+  function onAbort() { clearTimeout(timer); log.push(name + ' aborted'); reject(signal.reason) }
+  signal?.addEventListener('abort', onAbort, { once: true })
+})
+
+assert.deepEqual(await runWithDeadline([fake('a', 20), fake('b', 20)], 200), ['a', 'b'], '期限內做完時，回傳每一步結果的陣列')
+assert.deepEqual(log, ['a start', 'a done', 'b start', 'b done'], '步驟要依序執行，一步做完才開始下一步')
+
+log.length = 0
+let err
+let t0 = Date.now()
+try { await runWithDeadline([fake('a', 60), fake('b', 60), fake('c', 60)], 100) } catch (e) { err = e }
+assert.equal(err?.name, 'TimeoutError', '三步各 60ms、期限 100ms：要以 TimeoutError 失敗（期限是整件事，不是每一步）')
+assert(Date.now() - t0 < 140, '期限到了要馬上失敗，不能等進行中的步驟做完')
+assert(log.includes('b aborted'), '期限到時，進行中的第二步要收到取消：把同一個 signal 傳給每一步')
+assert(!log.includes('c start'), '期限過了，第三步不能開始')
+await new Promise(r => setTimeout(r, 150))
+assert(!log.includes('b done'), '逾時之後，第二步不能還在背景跑完')
+
+log.length = 0
+err = undefined
+const deaf = (name, ms) => () => new Promise(resolve => {
+  log.push(name + ' start')
+  setTimeout(() => { log.push(name + ' done'); resolve(name) }, ms)
+})
+try { await runWithDeadline([fake('a', 60), deaf('b', 60), fake('c', 60)], 100) } catch (e) { err = e }
+assert.equal(err?.name, 'TimeoutError', '有的步驟不理 signal、做完時已經過了期限：開始下一步之前要先檢查 signal（throwIfAborted），以 TimeoutError 失敗')
+assert(!log.includes('c start'), '期限已過，下一步不能開始：每一步開始前先檢查 signal')
+
+log.length = 0
+err = undefined
+try { await runWithDeadline([fake('a', 60), fake('b', 60), fake('c', 60)], 100, new AbortController().signal) } catch (e) { err = e }
+assert.equal(err?.name, 'TimeoutError', '有 parentSignal 但它沒取消時，期限照樣要生效：用 AbortSignal.any 合併，不是二選一')
+
+log.length = 0
+err = undefined
+const parent = new AbortController()
+setTimeout(() => parent.abort(), 30)
+try { await runWithDeadline([fake('a', 60), fake('b', 60)], 1000, parent.signal) } catch (e) { err = e }
+assert.equal(err?.name, 'AbortError', 'parentSignal 取消時要以 AbortError 失敗（用 AbortSignal.any 合併）')
+assert(log.includes('a aborted'), 'parentSignal 取消時，進行中的步驟要收到取消')
+assert(!log.includes('b start'), 'parentSignal 取消後，後面的步驟不能開始')
+</script>
+  <script type="wrong">
+// 每一步各自逾時
+async function runWithDeadline(steps, ms, parentSignal) {
+  const results = []
+  for (const step of steps) {
+    const timeout = AbortSignal.timeout(ms)
+    results.push(await step(parentSignal ? AbortSignal.any([parentSignal, timeout]) : timeout))
+  }
+  return results
+}
+</script>
+  <script type="wrong">
+// 只在步驟之間檢查，沒把 signal 傳給步驟
+async function runWithDeadline(steps, ms, parentSignal) {
+  const timeout = AbortSignal.timeout(ms)
+  const signal = parentSignal ? AbortSignal.any([parentSignal, timeout]) : timeout
+  const results = []
+  for (const step of steps) {
+    signal.throwIfAborted()
+    results.push(await step())
+  }
+  signal.throwIfAborted()
+  return results
+}
+</script>
+  <script type="wrong">
+// 用 Promise.race 跟計時器比賽
+async function runWithDeadline(steps, ms, parentSignal) {
+  const run = async () => {
+    const results = []
+    for (const step of steps) results.push(await step())
+    return results
+  }
+  const timer = new Promise((_, reject) => setTimeout(() => reject(new DOMException('逾時', 'TimeoutError')), ms))
+  return Promise.race([run(), timer])
+}
+</script>
+  <script type="wrong">
+// 步驟之間沒檢查 signal：不理 signal 的步驟做完後，過了期限還會開始下一步
+async function runWithDeadline(steps, ms, parentSignal) {
+  const timeout = AbortSignal.timeout(ms)
+  const signal = parentSignal ? AbortSignal.any([parentSignal, timeout]) : timeout
+  const results = []
+  for (const step of steps) results.push(await step(signal))
+  return results
+}
+</script>
+  <script type="wrong">
+// 有 parentSignal 就只用它，期限被丟掉
+async function runWithDeadline(steps, ms, parentSignal) {
+  const signal = parentSignal ?? AbortSignal.timeout(ms)
+  const results = []
+  for (const step of steps) {
+    signal.throwIfAborted()
+    results.push(await step(signal))
+  }
+  return results
+}
+</script>
+  <script type="wrong">
+// 忽略 parentSignal
+async function runWithDeadline(steps, ms, parentSignal) {
+  const signal = AbortSignal.timeout(ms)
+  const results = []
+  for (const step of steps) {
+    signal.throwIfAborted()
+    results.push(await step(signal))
+  }
+  return results
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 4：<code>pollUntil(check, { intervalMs, signal })</code> 要等拿鐵做好：呼叫 <code>check(signal)</code>（回傳 Promise），結果是 truthy 就以那個值成功；不是就等 intervalMs 再問一次。現在的版本用 <code>setInterval</code>，請求會重疊、也不能取消。改成：上一次 check 還沒結束不能開始下一次；signal 取消時以 <code>signal.reason</code> 失敗、清掉計時器、之後不再呼叫 check；一開始就已取消時直接失敗、一次都不呼叫 check；check 丟錯時以同一個錯誤失敗。練習 1 的 <code>sleep</code> 已經放在程式裡，可以直接用。</p>
+  <script type="start">
+function sleep(ms, { signal } = {}) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason)
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    function onAbort() {
+      clearTimeout(timer)
+      reject(signal.reason)
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+function pollUntil(check, { intervalMs, signal }) {
+  return new Promise(resolve => {
+    const id = setInterval(async () => {
+      const result = await check(signal)
+      if (result) {
+        clearInterval(id)
+        resolve(result)
+      }
+    }, intervalMs)
+  })
+}
+
+let asked = 0
+const latteReady = async () => ++asked === 3 ? '拿鐵好了，請取餐' : null
+console.log(await pollUntil(latteReady, { intervalMs: 10 }), '（問了', asked, '次）')
+</script>
+  <script type="answer">
+function sleep(ms, { signal } = {}) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason)
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    function onAbort() {
+      clearTimeout(timer)
+      reject(signal.reason)
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+async function pollUntil(check, { intervalMs, signal }) {
+  while (true) {
+    signal?.throwIfAborted()
+    const result = await check(signal)
+    if (result) return result
+    await sleep(intervalMs, { signal })
+  }
+}
+
+let asked = 0
+const latteReady = async () => ++asked === 3 ? '拿鐵好了，請取餐' : null
+console.log(await pollUntil(latteReady, { intervalMs: 10 }), '（問了', asked, '次）')
+</script>
+  <script type="tests">
+let calls = 0
+const v = await pollUntil(async () => ++calls === 3 ? '好了' : 0, { intervalMs: 5 })
+assert.equal(v, '好了', '第三次檢查成功時要以 check 的結果成功')
+assert.equal(calls, 3, '成功之後不能再呼叫 check')
+
+calls = 0
+let running = 0, maxRunning = 0, checkSignal
+const slowCheck = signal => new Promise((resolve, reject) => {
+  checkSignal = signal
+  calls++
+  running++
+  maxRunning = Math.max(maxRunning, running)
+  const timer = setTimeout(() => { running--; signal?.removeEventListener('abort', onAbort); resolve(false) }, 30)
+  function onAbort() { clearTimeout(timer); running--; reject(signal.reason) }
+  signal?.addEventListener('abort', onAbort, { once: true })
+})
+const c1 = new AbortController()
+setTimeout(() => c1.abort(), 80)
+let err
+let t0 = Date.now()
+try { await pollUntil(slowCheck, { intervalMs: 5, signal: c1.signal }) } catch (e) { err = e }
+assert.equal(maxRunning, 1, '上一次 check 還沒結束不能開始下一次（不要用 setInterval）')
+assert.equal(err?.name, 'AbortError', 'signal 取消時要以 signal.reason 失敗')
+assert(checkSignal?.aborted === true, '要把 signal 交給 check：check(signal)，進行中的那一次檢查才能被取消')
+assert(Date.now() - t0 < 130, 'signal 取消後要馬上失敗')
+const callsAtAbort = calls
+await new Promise(r => setTimeout(r, 50))
+assert.equal(calls, callsAtAbort, '取消之後不能再呼叫 check')
+
+calls = 0
+const c2 = new AbortController()
+setTimeout(() => c2.abort(), 20)
+err = undefined
+t0 = Date.now()
+try { await pollUntil(async () => { calls++; return false }, { intervalMs: 300, signal: c2.signal }) } catch (e) { err = e }
+assert.equal(err?.name, 'AbortError', '在兩次檢查之間被取消，也要以 signal.reason 失敗')
+assert(Date.now() - t0 < 80, '等待 intervalMs 的時候被取消，要馬上失敗：等待要能被取消、計時器要清掉')
+assert.equal(calls, 1, '取消之後不能再呼叫 check')
+
+const c3 = new AbortController()
+c3.abort()
+calls = 0
+err = undefined
+try { await pollUntil(async () => { calls++; return true }, { intervalMs: 5, signal: c3.signal }) } catch (e) { err = e }
+assert.equal(err, c3.signal.reason, 'signal 一開始就已取消時，要直接以 signal.reason 失敗')
+assert.equal(calls, 0, 'signal 一開始就已取消時，一次都不能呼叫 check')
+
+const boom = new Error('狀態服務掛了')
+err = undefined
+try { await pollUntil(async () => { throw boom }, { intervalMs: 5 }) } catch (e) { err = e }
+assert.equal(err, boom, 'check 丟錯時，pollUntil 要以同一個錯誤失敗')
+</script>
+  <script type="wrong">
+// 用 setInterval 呼叫 async 的 check，會重疊
+function pollUntil(check, { intervalMs, signal }) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason)
+    const id = setInterval(async () => {
+      try {
+        const result = await check(signal)
+        if (result) { clearInterval(id); resolve(result) }
+      } catch (e) { clearInterval(id); reject(e) }
+    }, intervalMs)
+    signal?.addEventListener('abort', () => { clearInterval(id); reject(signal.reason) }, { once: true })
+  })
+}
+</script>
+  <script type="wrong">
+// 取消時沒清掉計時器
+function pollUntil(check, { intervalMs, signal }) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason)
+    signal?.addEventListener('abort', () => reject(signal.reason), { once: true })
+    const tick = async () => {
+      try {
+        const result = await check(signal)
+        if (result) return resolve(result)
+        setTimeout(tick, intervalMs)
+      } catch (e) { reject(e) }
+    }
+    tick()
+  })
+}
+</script>
+  <script type="wrong">
+// 沒檢查一開始就已取消
+function sleep(ms, { signal } = {}) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason)
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    function onAbort() {
+      clearTimeout(timer)
+      reject(signal.reason)
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+async function pollUntil(check, { intervalMs, signal }) {
+  while (true) {
+    const result = await check(signal)
+    if (result) return result
+    await sleep(intervalMs, { signal })
+  }
+}
+</script>
+  <script type="wrong">
+// check 丟錯時沒有 reject
+function pollUntil(check, { intervalMs, signal }) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason)
+    let timer
+    signal?.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason) }, { once: true })
+    const tick = async () => {
+      const result = await check(signal)
+      if (result) return resolve(result)
+      if (!signal?.aborted) timer = setTimeout(tick, intervalMs)
+    }
+    tick()
+  })
+}
+</script>
+  <script type="wrong">
+// 沒把 signal 交給 check：進行中的檢查停不下來
+function sleep(ms, { signal } = {}) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason)
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    function onAbort() {
+      clearTimeout(timer)
+      reject(signal.reason)
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+async function pollUntil(check, { intervalMs, signal }) {
+  while (true) {
+    signal?.throwIfAborted()
+    const result = await check()
+    if (result) return result
+    await sleep(intervalMs, { signal })
+  }
+}
+</script>
+  <script type="wrong">
+// 等待時沒把 signal 交給 sleep
+function sleep(ms, { signal } = {}) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason)
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    function onAbort() {
+      clearTimeout(timer)
+      reject(signal.reason)
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+async function pollUntil(check, { intervalMs, signal }) {
+  while (true) {
+    signal?.throwIfAborted()
+    const result = await check(signal)
+    if (result) return result
+    await sleep(intervalMs)
+  }
+}
+</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：<code>await Promise.race([fetchMenu(), timeout(1000)])</code>，1 秒後 timeout 先失敗了。這時 <code>fetchMenu()</code> 送出的請求怎麼了？</p>
+  <label data-key="a">race 定案時會自動取消輸的那一個，請求被中斷</label>
+  <label data-key="b">請求跟著失敗，fetchMenu 的 Promise 變成 rejected</label>
+  <label data-key="c">請求照樣跑完，只是結果沒人要</label>
+  <p class="why">✓ Promise 沒有取消的能力，race 只是「誰先定案就用誰」，不會通知其他工作。fetchMenu 沒收到任何 signal，請求照樣佔著連線直到上游回應，所以 a、b 都不對。要讓它真的停下，寫成 <code>fetchMenu({ signal: AbortSignal.timeout(1000) })</code>，把 signal 傳到 fetch。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：結帳有三個步驟（查庫存、扣款、寫訂單），每一步都用 <code>AbortSignal.timeout(1000)</code> 設了 1 秒逾時。整個結帳最久大約會等多久？</p>
+  <label data-key="a">1 秒，每一步都有逾時，整件事就不會超過 1 秒</label>
+  <label data-key="b">接近 3 秒，每一步都可以用掉將近 1 秒</label>
+  <label data-key="c">沒有上限，逾時只對第一步有效</label>
+  <p class="why">✓ 每一步各自計時，三步各花 0.99 秒都不會逾時，加起來接近 3 秒。要限制整件事，在最外層建立一個 <code>AbortSignal.timeout(1000)</code>，把同一個 signal 傳給每一步，這才是整體期限。c 不對：每一步的逾時都有效，只是時間會相加。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 7：使用者在菜單載入到一半時切到別的頁面，程式呼叫了 <code>controller.abort()</code>，<code>fetch</code> 因此以 AbortError 失敗。catch 裡該怎麼處理？</p>
+  <label data-key="a">判斷 <code>e.name === 'AbortError'</code> 就安靜結束，不顯示也不回報</label>
+  <label data-key="b">顯示「發生錯誤，請重試」，並送到錯誤監控</label>
+  <label data-key="c">自動重試一次</label>
+  <p class="why">✓ 取消是呼叫端自己決定的，不是故障。顯示錯誤會讓使用者每換一頁就看到一次錯誤訊息；送進錯誤監控會淹沒真正的問題。重試更不對：使用者已經不要這個結果了。要提示或重試的是 TimeoutError（對方太慢）和其他真正的錯誤。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>用 Promise.race 做逾時，沒有取消輸家</strong>：呼叫端放棄了，工作還在跑、佔著連線。用 <code>AbortSignal.timeout(ms)</code>，把 signal 傳進工作。</li>
+  <li><strong>忘了檢查 signal 一開始就已取消</strong>：已經取消的 signal 不會再觸發 abort 事件，工作會一直等。開頭先 <code>if (signal?.aborted)</code> 或 <code>signal.throwIfAborted()</code>。</li>
+  <li><strong>abort 時沒清掉計時器，或完成後沒移除監聽器</strong>：Promise 定案了，計時器和監聽器還在，伺服器上越積越多。取消時 <code>clearTimeout</code>，完成時 <code>removeEventListener</code>。</li>
+  <li><strong>把 AbortError 當成錯誤顯示或回報</strong>：使用者自己取消的事變成滿畫面的錯誤訊息。依 <code>e.name</code> 分類：AbortError 安靜結束、TimeoutError 提示重試、其他照常處理。</li>
+  <li><strong>每一步各自設逾時，以為整件事就有期限</strong>：總時間是各步相加。整體期限用一個 signal，傳給每一步。</li>
+  <li><strong>signal 沒有一路傳下去</strong>：外層取消了，最底層的 fetch 或查詢還在跑。每一層呼叫都把 signal 交給下一層。</li>
+  <li><strong>用 setInterval 執行非同步工作</strong>：上一次還沒回來就送下一次，上游越慢越重疊；取消時也常忘了 clearInterval。改成迴圈：做完一次、等一段時間、再做下一次。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>付款服務卡住會拖垮結帳 API，因為 Promise 不能取消：放棄等待不等於工作停下。要停下工作，用 AbortController 發出取消，把 AbortSignal 傳給工作。</li>
+  <li>自己的非同步函式支援 signal 要做四件事：先檢查、監聽 abort、取消時清理並以 <code>signal.reason</code> 失敗、完成時移除監聽器。只在步驟之間檢查，正在等的那一段聽不到取消。</li>
+  <li>逾時用 <code>AbortSignal.timeout(ms)</code>，不用 <code>Promise.race</code>；reason 的名稱分出 AbortError（自己取消，安靜結束）與 TimeoutError（對方太慢，提示重試並記錄）。</li>
+  <li>「客人離開」和「時間到」用 <code>AbortSignal.any</code> 合成一個 signal。整體期限是最外層一個 signal 傳給每一步，不是每一步各自逾時；signal 要一路傳到真正在等的那一層。取消只是通知，已送出的扣款可能已經成功。</li>
+  <li>輪詢用「做完一次才排下一次」的迴圈，等待可以被取消、計時器一定清掉，並且有總期限。</li>
+</ul>
+<p>下一課處理取消之後的另一個問題：較早送出的請求較晚回來、兩個流程在 await 之間互相插隊，以及使用者連按兩次送出。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

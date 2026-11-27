@@ -1,0 +1,1284 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>12. 競態與並發控制：過期回應、插隊與重複送出</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="12" data-lang="js">
+<header>
+  <div class="eyebrow">階段 2：非同步、迭代與並發 · 第 12 課</div>
+  <h1>競態與並發控制：過期回應、插隊與重複送出</h1>
+</header>
+<main>
+
+<p>咖啡店的線上點餐頁上線後，第一個週五中午的尖峰一過，客服一口氣收到三張單。王小明說：「我在搜尋框打『拿鐵』，畫面卻顯示『拿』的結果。」店長說：「拿鐵只剩最後一杯，系統卻同時賣給了王小明和陳美華。」林志豪說：「我結帳時按了兩下，被建了兩張訂單。」你在本機怎麼試都試不出來，每一行程式單獨看也都沒有錯。</p>
+<p>這三個 bug 的原因是同一個：好幾件非同步工作同時在進行，程式的結果取決於<strong>它們完成的先後順序</strong>。這種「結果取決於誰先完成」的 bug 叫<strong>競態</strong>（race condition）。開發時 API 都很快、只有你一個人在點，順序幾乎固定，所以看不到；上線後網路有快有慢、很多人同時下單，順序一變，bug 就冒出來，而且很難重現。這一課沿著點餐流程，從搜尋、結帳扣庫存、加入購物車到送出訂單，把這三張客服單一張一張修掉，同時學會分辨哪些修法在前端就夠、哪些一定要交給後端。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>只有一條執行緒，為什麼結果會取決於誰先完成：三張單共同的原因是 <code>await</code>，競態有兩種基本形狀（開場問題的最小答案）。</li>
+  <li>第一張單，搜尋框：用請求序號和 AbortController 讓畫面只採用最新的結果；為什麼 debounce 不夠。</li>
+  <li>第二張單，最後一杯拿鐵：讓「檢查庫存＋扣庫存」不被插隊；後面的步驟失敗時，庫存怎麼正確還回去。</li>
+  <li>點餐流程裡做不到的一處，加入購物車：讀和寫中間一定要 await，沒辦法把 await 搬走時，改用依 key 排隊的鎖；伺服器開好幾個程序時，這把鎖為什麼擋不住。</li>
+  <li>第三張單，按兩下送出：用單一飛行讓同一件事只做一次，後端再用冪等鍵把關；最後整理成一張選擇表，以及上線後怎麼查。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="07-event-loop.html">第 7 課</a>的 event loop：同一時間只跑一段同步程式，一段跑完才從佇列拿下一個工作。</li>
+  <li><a href="08-promises.html">第 8 課</a>的 then 鏈：每個 then 回傳新的 Promise；catch 處理完之後，鏈恢復成功。</li>
+  <li><a href="09-async-await.html">第 9 課</a>的 async/await：await 只暫停目前的函式，別的流程可以先跑；沒人接的失敗叫 unhandled rejection；<code>finally</code> 不論成功或失敗都執行。</li>
+  <li><a href="11-timeouts-cancellation.html">第 11 課</a>的 <code>AbortController</code>：<code>abort()</code> 發出取消，工作透過 <code>signal</code> 收到通知，以 AbortError 失敗。</li>
+</ul></div>
+
+<h2>只有一條執行緒，為什麼結果會取決於誰先完成？</h2>
+<p>先處理一個常見的誤會。<a href="07-event-loop.html">第 7 課</a>講過，JavaScript 只有一條執行緒：同一時間只跑一段程式，一段同步程式一旦開始，就會一路跑到結束，中間不會被別的程式打斷。很多人因此以為 JavaScript 不會有競態，兩個請求「自然會排隊」。</p>
+<p>問題出在 <code>await</code>。<a href="09-async-await.html">第 9 課</a>講過，函式執行到 <code>await</code> 時會暫停，把執行緒讓出來；等到在等的 Promise 有了結果，函式才從 <code>await</code> 的下一行繼續。暫停的這段時間，event loop 會去跑別的工作：另一個請求的處理函式、使用者的下一次輸入。它們可能讀、也可能改你這個函式正在用的同一份資料。所以這課把程式裡的每一個 <code>await</code> 叫作<strong>插隊點</strong>：函式在這裡停下，等它回來時，外面的世界可能已經被別人改過了。單執行緒真正保證的只有一件事：<strong>兩個 await 之間的同步程式</strong>不會被打斷。</p>
+<p>有了插隊點這個觀念，三張客服單可以歸成兩種形狀。下面這張圖把前兩張單畫成時間軸，橫軸是時間；先看上半部的搜尋框，再看下半部的庫存。</p>
+<figure>
+  <svg viewBox="0 0 700 330" role="img" aria-label="上：搜尋「拿」花 600ms，搜尋「拿鐵」在 100ms 送出、150ms 回來，畫面最後被「拿」蓋掉。下：王小明和陳美華都讀到庫存 1，都等稽核紀錄，都寫回 0，賣出兩杯">
+    <defs><marker id="arr12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <text class="d-accent" x="10" y="20">(a) 過期回應</text>
+    <text class="d-text" x="10" y="52">搜尋「拿」</text>
+    <rect class="d-soft" x="120" y="36" width="450" height="24" rx="4"/><text class="d-small" x="345" y="52" text-anchor="middle">600ms</text>
+    <text class="d-text" x="10" y="86">搜尋「拿鐵」</text>
+    <rect class="d-soft" x="195" y="70" width="38" height="24" rx="4"/>
+    <text class="d-small" x="240" y="87">50ms</text>
+    <text class="d-small" x="250" y="118">150ms：畫面＝拿鐵 ✓</text>
+    <text class="d-accent" x="520" y="118">600ms：畫面＝拿 ✗</text>
+    <path class="d-line" d="M120,135 L680,135" marker-end="url(#arr12)"/>
+    <text class="d-small" x="120" y="150" text-anchor="middle">0</text>
+    <text class="d-small" x="570" y="150" text-anchor="middle">600ms</text>
+    <text class="d-accent" x="10" y="185">(b) 先檢查再行動被插隊</text>
+    <text class="d-text" x="10" y="217">王小明</text>
+    <rect class="d-box" x="120" y="200" width="120" height="26" rx="4"/><text class="d-small" x="180" y="217" text-anchor="middle">讀庫存＝1</text>
+    <rect class="d-soft" x="250" y="200" width="200" height="26" rx="4"/><text class="d-small" x="350" y="217" text-anchor="middle">await 寫稽核紀錄</text>
+    <rect class="d-box" x="460" y="200" width="120" height="26" rx="4"/><text class="d-small" x="520" y="217" text-anchor="middle">寫回 1−1＝0</text>
+    <text class="d-text" x="10" y="263">陳美華</text>
+    <rect class="d-box" x="140" y="246" width="120" height="26" rx="4"/><text class="d-small" x="200" y="263" text-anchor="middle">讀庫存＝1</text>
+    <rect class="d-soft" x="270" y="246" width="200" height="26" rx="4"/><text class="d-small" x="370" y="263" text-anchor="middle">await 寫稽核紀錄</text>
+    <rect class="d-box" x="480" y="246" width="120" height="26" rx="4"/><text class="d-small" x="540" y="263" text-anchor="middle">寫回 1−1＝0</text>
+    <text class="d-small" x="120" y="300">王小明停在 await 時，陳美華讀到的還是 1</text>
+    <text class="d-accent" x="460" y="320">結果：賣出 2 杯，庫存 0</text>
+  </svg>
+  <figcaption>(a) 比較早送出、比較晚回來的結果蓋掉新的；(b) await 之前讀、await 之後寫，中間被別人插隊。</figcaption>
+</figure>
+<p>上半部是第一種形狀：<strong>過期回應</strong>（stale response），也就是一個已經沒人需要的結果，比較晚才回來，蓋掉了比較新的結果。王小明先打「拿」，100ms 後打完「拿鐵」，兩次輸入各送出一次搜尋。伺服器不保證先送出的請求先回來：「拿」符合的商品多，查得比較慢，花了 600ms；「拿鐵」只花 50ms。於是畫面先正確顯示「拿鐵」，再被晚到的「拿」蓋掉。下面的程式用 <code>sleep</code> 模擬這兩個延遲。執行後看最後一行：使用者最後看到的是哪個字的結果：</p>
+<div class="lab"><script type="code">
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+const delays = { '拿': 600, '拿鐵': 50 }
+async function api(text) {
+  await sleep(delays[text])
+  return `「${text}」的結果`
+}
+
+let screen = ''
+async function search(text) {
+  screen = await api(text)
+  console.log('畫面更新為', screen)
+}
+
+search('拿')            // 打了「拿」
+await sleep(100)
+await search('拿鐵')     // 100ms 後打完「拿鐵」
+await sleep(600)
+console.log('使用者最後看到：', screen)
+</script></div>
+<p><code>search</code> 本身沒寫錯：拿到結果就更新畫面。錯在它假設「回來的結果一定是我現在要的」，但在它 await 的 600ms 裡，使用者已經換了搜尋條件。</p>
+<p>下半部是第二種形狀：被插隊的<strong>先檢查再行動</strong>（check-then-act）。很多程式都是這三步：先讀資料，根據讀到的值判斷能不能做，再寫回去。結帳扣庫存就是：讀拿鐵的庫存、確認至少有 1 杯、扣掉 1 杯。這三步各自都對，但咖啡店規定扣庫存前要寫一筆稽核紀錄，這一步要 await。王小明停在 await 的時候，陳美華的請求開始跑，她讀到的庫存還是 1，也通過了檢查。兩個人都根據「還剩 1 杯」做了決定。執行後看兩個人是不是都買到了，以及最後的庫存：</p>
+<div class="lab"><script type="code">
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+const stock = new Map([['拿鐵', 1]])
+
+async function buy(customer) {
+  const left = stock.get('拿鐵')          // 讀
+  if (left < 1) {                         // 檢查
+    console.log(`${customer}：賣完了`)
+    return
+  }
+  await sleep(20)                         // 寫稽核紀錄（插隊點）
+  stock.set('拿鐵', left - 1)             // 寫：用的是 20ms 前讀到的 left
+  console.log(`${customer}：買到了`)
+}
+
+await Promise.all([buy('王小明'), buy('陳美華')])
+console.log('庫存', stock.get('拿鐵'))
+</script></div>
+<p>兩個人都買到了，庫存卻是 0，不是 −1。原因是兩個人寫回去的都是「自己在 await 之前讀到的 1，減 1」，第二次寫入蓋掉了第一次，好像第一次扣減從來沒發生過。這跟 <a href="../../postgresql/lessons/19-concurrency.html">PostgreSQL 課第 19 課</a>的 lost update（更新遺失）是同一件事：每一行都合法，結果卻錯了。</p>
+<p>第三張單（結帳按兩下）是同一件事被觸發了兩次，不是讀寫順序被打亂，但根源一樣：第一次送出還停在 await 等伺服器回應時，第二次送出已經開始了。第 5 節再處理它。</p>
+<p>到這裡，開場問題有了最小答案：單執行緒不代表沒有競態，每一個 <code>await</code> 都是插隊點；在 await 之前讀到的東西，到 await 之後可能已經過期。修法要依形狀來選。下一節從最容易看見的第一張單開始：搜尋框怎麼只採用最新的結果？</p>
+
+<h2>搜尋框：怎麼讓畫面只採用最新的結果？</h2>
+<p>過期回應的問題不在請求本身，而在結果回來時，沒有確認自己還是不是最新的那一個。所以第一個修法，是讓每次搜尋記得自己的身分。</p>
+<h3>修法一：給每次搜尋一個序號</h3>
+<p>準備一個所有搜尋共用的計數器 <code>latest</code>。每次搜尋一開始就把它加 1，並把加完的值存進這次搜尋自己的區域變數 <code>id</code>。結果回來時比一下：<code>id</code> 已經不等於 <code>latest</code>，表示等待期間又有新的搜尋開始了，這個結果過期，直接丟掉。這能成立靠的是<a href="01-closures-this.html">第 1 課</a>的閉包：函式記得它被建立時周圍的變數，每次呼叫 <code>search</code> 都有自己的一份 <code>id</code>，就算 await 了 600ms，回來時拿到的還是當初那個號碼；<code>latest</code> 則永遠是最新那次搜尋的號碼。執行後看「丟掉過期的…」那一行，以及使用者最後看到什麼：</p>
+<div class="lab"><script type="code">
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+const delays = { '拿': 600, '拿鐵': 50 }
+async function api(text) {
+  await sleep(delays[text])
+  return `「${text}」的結果`
+}
+
+let screen = ''
+let latest = 0
+async function search(text) {
+  const id = ++latest                 // 這次搜尋的號碼，閉包會記住
+  const result = await api(text)
+  if (id !== latest) {
+    console.log(`丟掉過期的${result}`)
+    return
+  }
+  screen = result
+}
+
+search('拿')
+await sleep(100)
+await search('拿鐵')
+await sleep(600)
+console.log('使用者最後看到：', screen)
+</script></div>
+<p>畫面對了。但看時間：「拿」的請求照樣跑滿 600ms。伺服器還在替一個沒人要的結果查資料，瀏覽器的連線也一直被它佔著，結果只是在最後被丟掉。搜尋框每打一個字就可能送一次，浪費會一直累積。既然已經知道舊請求不要了，更好的做法是讓它停下來。</p>
+<h3>修法二：送出新請求前取消上一個</h3>
+<p>第 11 課的 <code>AbortController</code> 就是做這件事的。每次搜尋開一個新的 controller，把它的 <code>signal</code> 交給 api；下一次搜尋開始時，先對上一個 controller 呼叫 <code>abort()</code>。支援 signal 的 api 收到通知後停下工作（下面的模擬是 <code>clearTimeout</code>，真實的 <code>fetch</code> 會中斷連線），並讓自己回傳的 Promise 失敗。失敗用的錯誤是 <code>signal.reason</code>：<code>abort()</code> 沒給原因時，它是名稱為 <code>AbortError</code> 的 <code>DOMException</code>（MDN）。執行後看三件事：「拿」有沒有被叫停、畫面更新成什麼、第一次 <code>search</code> 最後怎麼結束：</p>
+<div class="lab"><script type="code">
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+function api(text, signal) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve(`「${text}」的結果`), text === '拿' ? 600 : 50)
+    signal.addEventListener('abort', () => {
+      clearTimeout(timer)                      // 真的停下工作
+      console.log(`api：「${text}」不查了`)
+      reject(signal.reason)
+    }, { once: true })
+  })
+}
+
+let controller = null
+async function search(text) {
+  controller?.abort()                          // 取消上一個
+  controller = new AbortController()
+  const result = await api(text, controller.signal)
+  console.log('畫面更新為', result)
+}
+
+const first = search('拿')
+await sleep(100)
+await search('拿鐵')
+await first.catch(e => console.log('第一次 search 失敗：', e.name))
+</script></div>
+<p>最後一行印出第一次 <code>search</code> 以 AbortError 失敗：被取消的那次搜尋沒有安靜消失。這是我們自己要求的結果，不是真的出錯；但搜尋框的事件處理函式通常不會去接 <code>search</code> 回傳的 Promise，沒人接的失敗就變成第 9 課講過的 unhandled rejection。所以被取消時要<strong>安靜結束</strong>：在 <code>catch</code> 裡判斷是不是自己取消的（例如看 <code>signal.aborted</code>），是就 <code>return</code>；其他錯誤，例如伺服器回 500，照樣丟出去讓呼叫者處理，不能一起吞掉。</p>
+<h3>有了取消，為什麼還要序號？</h3>
+<p>取消只在 api 理會 signal 時才有效，不是每個 api 都會理會。就算理會，結果也可能剛好在 <code>abort()</code> 之前就已經回來、排在 microtask 裡等著，<code>abort()</code> 改變不了一個已經回來的結果。這時能擋住舊結果的只有序號（或在寫進畫面前檢查 <code>signal.aborted</code>）。反過來，只有序號的話，舊請求會白白跑完。所以兩個修法要一起用，各管一件事：取消負責減少浪費，序號負責保證畫面正確。練習 1 會把兩個合在一起寫成 <code>createSearch</code>。</p>
+<h3>加了 debounce 還不夠嗎？</h3>
+<p>很多搜尋框已經有<strong>去抖動</strong>（debounce）：使用者打字時先不送，等他停下來一段時間（例如 300ms）都沒再輸入，才送出一次搜尋。它的目的是減少請求數：連續打五個字只送一次，不是五次。所以常有人以為加了 debounce 就不會有過期回應。</p>
+<p>debounce 控制的只是「什麼時候送」。只要使用者打字中途停頓超過 300ms，前一個字一樣會送出去，兩個請求誰先回來還是看伺服器。下圖是王小明打了「拿」、停了 400ms 才打完「拿鐵」：「拿」在 300ms 送出，900ms 才回來；「拿鐵」在 700ms 送出、750ms 就回來，畫面一樣被「拿」蓋掉：</p>
+<figure>
+  <svg viewBox="0 0 700 210" role="img" aria-label="debounce 300ms：打「拿」後停了 400ms，「拿」在 300ms 送出、900ms 才回來；「拿鐵」在 700ms 送出、750ms 回來，畫面還是被「拿」蓋掉">
+    <text class="d-text" x="10" y="40">輸入</text>
+    <text class="d-small" x="120" y="40">打「拿」</text>
+    <text class="d-small" x="360" y="40">打「拿鐵」</text>
+    <text class="d-text" x="10" y="85">「拿」</text>
+    <rect class="d-soft" x="300" y="68" width="360" height="24" rx="4"/><text class="d-small" x="480" y="85" text-anchor="middle">300ms 送出 → 900ms 回來</text>
+    <text class="d-text" x="10" y="125">「拿鐵」</text>
+    <rect class="d-soft" x="540" y="108" width="30" height="24" rx="4"/><text class="d-small" x="530" y="150" text-anchor="end">700ms 送出 → 750ms 回來</text>
+    <path class="d-line" d="M120,170 L680,170" marker-end="url(#arr12b)"/>
+    <defs><marker id="arr12b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <text class="d-small" x="120" y="190" text-anchor="middle">0</text>
+    <text class="d-small" x="360" y="190" text-anchor="middle">400</text>
+    <text class="d-small" x="660" y="190" text-anchor="middle">900ms</text>
+  </svg>
+  <figcaption>debounce 只決定「什麼時候送」，不決定「誰先回來」。</figcaption>
+</figure>
+<p>所以 debounce 是減輕伺服器負擔的好工具，可以跟序號、取消一起用，但不能取代它們。Vue 的 <code>watch</code> 也有對應的清理機制可以搭配取消，寫法和限制見課末「補充與查表」。</p>
+<div class="callout practice"><strong>💡 實務上：凡是「條件一變就重新載入」的畫面都有過期回應</strong><br>不只搜尋框：咖啡店後台的訂單列表切換「今天／本週」篩選、商品頁快速切換分頁、詳細頁從訂單 A 點到訂單 B，都是同一個問題。它在本機幾乎不會出現（API 都很快），上線後碰到慢網路或慢查詢才冒出來，客服回報常是「畫面顯示的不是我選的那個」。實務上多半交給資料請求套件（例如 TanStack Query 這類會依查詢條件管理結果的工具）或框架的清理機制處理，自己寫 <code>fetch</code> 時才要手動加序號和取消。資深工程師 code review 看到「await 回來就直接寫進畫面狀態」，會先問一句：這段等待期間，使用者可能已經換條件了嗎？</div>
+
+<h2>最後一杯拿鐵：怎麼讓檢查和扣減不被插隊？</h2>
+<p>搜尋框的過期結果還沒造成傷害，丟掉就好。第二張單不一樣：過期的庫存已經被拿來做了決定，賣出去的拿鐵收不回來，所以要從源頭讓它不被插隊。回到第 1 節那個賣出兩杯的 <code>buy</code>。直覺的修法是「await 回來之後，重新讀一次最新的庫存再扣」，這樣看起來就不會用到舊值了。執行後看兩個人的結果和庫存：</p>
+<div class="lab"><script type="code">
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+const stock = new Map([['拿鐵', 1]])
+
+async function buy(customer) {
+  if (stock.get('拿鐵') < 1) return console.log(`${customer}：賣完了`)
+  await sleep(20)                                  // 寫稽核紀錄
+  stock.set('拿鐵', stock.get('拿鐵') - 1)          // 重新讀，但檢查還在 await 之前
+  console.log(`${customer}：買到了`)
+}
+
+await Promise.all([buy('王小明'), buy('陳美華')])
+console.log('庫存', stock.get('拿鐵'))
+</script></div>
+<p>下表逐步列出兩個請求交錯的順序：</p>
+<div class="table-wrap"><table>
+  <tr><th>步驟</th><th>王小明</th><th>陳美華</th><th>庫存</th></tr>
+  <tr><td>1</td><td>檢查：1 ≥ 1，通過；停在 await</td><td></td><td>1</td></tr>
+  <tr><td>2</td><td>（等）</td><td>檢查：1 ≥ 1，通過；停在 await</td><td>1</td></tr>
+  <tr><td>3</td><td>回來：重新讀到 1，寫入 0</td><td>（等）</td><td>0</td></tr>
+  <tr><td>4</td><td></td><td>回來：重新讀到 0，寫入 −1</td><td>−1</td></tr>
+</table></div>
+<p>lost update 消失了：陳美華在第 4 步重新讀到王小明扣完的 0，沒有蓋掉他的扣減。但庫存變成 −1，因為兩個人的<strong>檢查</strong>都發生在第 1、2 步，也就是 await 之前；回來後重新讀到的值只拿來算扣減，沒有人再檢查它夠不夠。只要檢查和扣減之間隔著一個 await，就有一段時間讓別人插進來，在哪一步重新讀都一樣。</p>
+<p>要讓檢查和扣減不被插隊，它們必須是一段<strong>中間沒有 await 的同步程式</strong>。一組操作不會被別人從中間插進來，這個性質叫<strong>原子性</strong>（atomicity），PostgreSQL 課第 18 課的交易保證的也是這件事。在 JavaScript 裡不需要額外的工具：第 1 節講過，同步程式一旦開始就會跑完，所以一段沒有 await 的同步程式天生就是原子的。修法是把扣減搬到 await 之前，和檢查放在一起，扣完才去寫稽核紀錄。執行後看誰買到、庫存剩多少：</p>
+<div class="lab"><script type="code">
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+const stock = new Map([['拿鐵', 1]])
+
+async function buy(customer) {
+  // 檢查和扣減在同一段同步程式裡，中間沒有 await
+  if (stock.get('拿鐵') < 1) return console.log(`${customer}：賣完了`)
+  stock.set('拿鐵', stock.get('拿鐵') - 1)
+  await sleep(20)                                  // 扣完才寫稽核紀錄
+  console.log(`${customer}：買到了`)
+}
+
+await Promise.all([buy('王小明'), buy('陳美華')])
+console.log('庫存', stock.get('拿鐵'))
+</script></div>
+<p>王小明買到，陳美華得到「賣完了」，庫存 0。稽核紀錄照樣寫，只是改在扣完之後；陳美華在王小明的 await 期間插進來時，看到的已經是扣過的庫存。</p>
+<p>但順序一改，產生了一個新問題：庫存先扣了，稽核紀錄要是寫失敗呢？</p>
+<h3>扣完之後稽核失敗了：庫存怎麼還回去？</h3>
+<p>咖啡店規定沒有稽核紀錄的購買不算數，所以稽核失敗時這次購買要算失敗，扣掉的庫存要還回去。這種「後面的步驟失敗了，就把前面已經做過的事反向做回來」的做法叫<strong>補償</strong>（compensation）。直覺的寫法是扣之前先記下當時的庫存 <code>before</code>，失敗時把庫存設回 <code>before</code>。下面的程式讓兩種補償寫法各跑一次同樣的情境：庫存 10 杯，有人買 2 杯（稽核 40ms 後失敗），同時有人買 3 杯（稽核 10ms 後成功）。執行後比較兩行印出的庫存：</p>
+<div class="lab"><script type="code">
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+
+async function run(undo) {
+  const stock = new Map([['拿鐵', 10]])
+  async function buy(qty, auditMs, fail) {
+    const before = stock.get('拿鐵')
+    stock.set('拿鐵', before - qty)
+    try {
+      await sleep(auditMs)
+      if (fail) throw new Error('稽核服務掛了')
+    } catch (e) {
+      undo(stock, before, qty)
+    }
+  }
+  await Promise.all([buy(2, 40, true), buy(3, 10, false)])   // 買 2 杯的失敗，買 3 杯的成功
+  return stock.get('拿鐵')
+}
+
+console.log('寫回舊值：', await run((stock, before) => stock.set('拿鐵', before)))
+console.log('加回數量：', await run((stock, before, qty) => stock.set('拿鐵', stock.get('拿鐵') + qty)))
+</script></div>
+<p>下表是兩筆購買交錯的順序，最後一列是兩種補償寫法的差別：</p>
+<div class="table-wrap"><table>
+  <tr><th>時間</th><th>買 2 杯（稽核會失敗）</th><th>買 3 杯（稽核成功）</th><th>庫存</th></tr>
+  <tr><td>0ms</td><td>記下 before = 10，扣成 8，開始等稽核（40ms）</td><td></td><td>8</td></tr>
+  <tr><td>0ms</td><td></td><td>記下 before = 8，扣成 5，開始等稽核（10ms）</td><td>5</td></tr>
+  <tr><td>10ms</td><td>（等）</td><td>稽核成功，結束</td><td>5</td></tr>
+  <tr><td>40ms</td><td>稽核失敗，補償：寫回舊值 → 10 ✗；加回 2 → 7 ✓</td><td></td><td>10 或 7</td></tr>
+</table></div>
+<p>正確答案是 7：只有買 3 杯的成功，10 − 3。「寫回舊值」得到 10，因為買 2 杯的那位記下 <code>before = 10</code> 之後，停在 await 的 40ms 裡，買 3 杯的那位扣掉了 3 杯；把庫存設回 10，就連那 3 杯一起抹掉了。這跟第 1 節的 lost update 是同一個錯：<code>before</code> 是 await 之前讀到的值，await 回來時它已經過期。補償要做<strong>反向操作</strong>：扣了多少就以當下的庫存為準加回多少，而不是<strong>還原快照</strong>。練習 2 會把「檢查＋扣減放在同一段同步程式」和「失敗時加回數量」寫進同一個 <code>reserve</code>。</p>
+<p>這一節的庫存都存在程式的 <code>Map</code> 裡；正式環境的庫存在資料庫，下面說明怎麼對應。</p>
+<div class="callout">伺服器同時處理很多請求，每個請求都可能在 <code>await db.query(…)</code> 的地方被插隊，所以這種情況在資料庫上更常見。<a href="../../postgresql/lessons/19-concurrency.html">PostgreSQL 課第 19 課</a>的解法對應到這裡：<code>UPDATE products SET stock = stock - $1 WHERE id = $2 AND stock &gt;= $1</code> 把「檢查＋扣減」交給資料庫用一句完成（條件式 UPDATE）。庫存不夠時 <code>WHERE</code> 的 <code>stock &gt;= $1</code> 不成立，這句 UPDATE 影響 0 列、庫存不變；程式看到回傳的影響列數是 0，就當作賣完，是 1 才算扣成功。需要先讀出來、在程式裡算完再寫回時，用 <code>SELECT … FOR UPDATE</code> 鎖住那一列，其他交易要改同一列就得等這筆交易結束。</div>
+<p>把 await 搬走這一招有個前提：檢查和修改之間本來就不需要等待。點餐流程裡有一處做不到，就是加入購物車。</p>
+
+<h2>加入購物車：讀和寫中間一定要 await 時怎麼辦？</h2>
+<p>加入購物車要做三件事：讀出目前的購物車、問價格服務這樣商品多少錢、把商品和新的總額寫回去。問價格那一步必須 await，而新的總額又要用到那個價格，所以沒辦法像扣庫存那樣，把 await 搬到修改之後。王小明在 App 上幾乎同時點了拿鐵和可頌，兩個 <code>addItem</code> 同時開始。執行後看購物車裡有幾樣：</p>
+<div class="lab"><script type="code">
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+const prices = { 拿鐵: 110, 可頌: 70 }
+const getPrice = async name => { await sleep(name === '拿鐵' ? 30 : 10); return prices[name] }
+let cart = { items: [], total: 0 }
+
+async function addItem(name) {
+  const current = cart                          // 讀
+  const price = await getPrice(name)            // 一定要 await
+  cart = { items: [...current.items, name], total: current.total + price }   // 寫
+}
+
+await Promise.all([addItem('拿鐵'), addItem('可頌')])
+console.log(cart)                               // 少了一樣
+</script></div>
+<p>購物車只剩一樣。兩個 <code>addItem</code> 都在 await 之前讀到空的購物車；可頌的價格先回來，先寫入；拿鐵的價格後回來，用它當初讀到的空購物車算出新內容寫入，蓋掉了可頌。又是 lost update。</p>
+<p>既然這段程式非 await 不可，就換個方向：不讓兩個 <code>addItem</code> 同時進行。同一台購物車的修改<strong>排隊</strong>，前一個連同它的 await 整段做完，下一個才開始讀，這樣每次讀到的都是前一個寫完的結果。這種「同一時間只讓一個流程進入某段程式」的機制叫<strong>鎖</strong>（lock），其他語言常叫它 mutex。</p>
+<p>JavaScript 沒有內建的鎖，但<a href="08-promises.html">第 8 課</a>的 Promise 鏈就能做出來。想法是：用一個變數 <code>tail</code> 記住「目前排在最後的工作」的 Promise；新工作來的時候，用 <code>then</code> 接在 <code>tail</code> 後面，<code>then</code> 的 callback 要等 <code>tail</code> 完成才會執行，於是自然排在它後面；接著把 <code>tail</code> 換成這個新工作，下一個再接在它後面。執行後看購物車是不是兩樣都在、總額對不對：</p>
+<div class="lab"><script type="code">
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+const prices = { 拿鐵: 110, 可頌: 70 }
+const getPrice = async name => { await sleep(name === '拿鐵' ? 30 : 10); return prices[name] }
+let cart = { items: [], total: 0 }
+
+let tail = Promise.resolve()                    // 最後一個工作
+function withLock(fn) {
+  const result = tail.then(() => fn())          // 等前面的做完才開始
+  tail = result.catch(() => {})                 // 失敗也算做完，不能卡住後面
+  return result                                 // 呼叫者照樣拿到成功或失敗
+}
+
+async function addItem(name) {
+  const current = cart
+  const price = await getPrice(name)
+  cart = { items: [...current.items, name], total: current.total + price }
+}
+
+await Promise.all([withLock(() => addItem('拿鐵')), withLock(() => addItem('可頌'))])
+console.log(cart)
+</script></div>
+<p><code>withLock</code> 裡有兩個寫法要看懂。第一，<code>tail</code> 存的是 <code>result.catch(() =&gt; {})</code>，不是 <code>result</code>。前一個工作失敗時，<code>result</code> 是失敗的 Promise，如果直接存它，下一個 <code>tail.then(…)</code> 的 callback 不會執行，會直接跟著失敗，後面排隊的工作全部不做。第 8 課講過 catch 之後鏈恢復成功，所以加上 catch，失敗也算「做完了」，後面照常輪到。第二，回傳給呼叫者的仍是原本的 <code>result</code>：吞掉錯誤只發生在內部的 <code>tail</code> 上，呼叫者照樣知道自己的工作成功還是失敗。</p>
+<p>這個版本還不能上線，因為整個程式只有一條隊伍。王小明的購物車和陳美華的購物車毫不相干，卻要互相等。實際上要<strong>依 key 排隊</strong>：每台購物車（用購物車 id 當 key）各自一條隊伍，不同購物車互不等待，做法是用 <code>Map</code> 記住每個 key 的最後一個工作。還要記得清理：一個 key 的隊伍空了，就要把它從 Map 刪掉；不刪的話，伺服器跑幾天，Map 裡就是幾百萬台早就結帳的購物車，記憶體一直長。練習 3 實作這個依 key 排隊的鎖。</p>
+<h3>伺服器開了好幾個程序，這把鎖還擋得住嗎？</h3>
+<p>上面的鎖、<code>Map</code>、<code>tail</code>，全都存在這個 Node 程式的記憶體裡。作業系統裡每一個正在執行的程式叫一個<strong>程序</strong>（process），每個程序有自己的一份記憶體，看不到別的程序的變數。正式環境為了分擔流量，常常把同一個 Node 伺服器開成好幾個程序，或放在好幾台機器上（<a href="../../node/lessons/24-scaling.html">Node 課第 24 課</a>、<a href="../../devops/lessons/13-scaling.html">部署課第 13 課</a>）。王小明加拿鐵的請求可能被分到 A 程序，加可頌的請求被分到 B 程序；A、B 各有一份 Map、各有一把鎖，A 程序的鎖擋不住 B 程序，兩個請求照樣同時讀寫。</p>
+<p>多個程序要共用的資料（庫存、購物車）通常存在資料庫，排隊也就要交給資料庫：條件式 UPDATE、<code>SELECT … FOR UPDATE</code> 列鎖（<a href="../../postgresql/lessons/19-concurrency.html">PostgreSQL 課第 19 課</a>），或 advisory lock，也就是由應用程式自己決定鎖什麼、由資料庫保管的鎖（<a href="../../postgresql/lessons/33-job-queue.html">PostgreSQL 課第 33 課</a>）。程式裡的鎖只管得到一個程序裡的東西。</p>
+<p>就算只有一個程序，後端還有一個前端工程師容易忽略的地方。在 Vue 裡，每個使用者的瀏覽器各跑一份程式，元件裡的變數只屬於那一位使用者；後端剛好相反，一個程序同時服務所有使用者。NestJS 的 service 預設是<strong>單例</strong>：整個應用程式只建立一個實例，所有請求共用它的欄位（<a href="../../nestjs/lessons/03-providers-di.html">NestJS 課第 3 課</a>）。在 service 的欄位上做「讀 → await → 寫」，就是本課的插隊問題，而且同時有幾十個請求在插。</p>
+<div class="callout practice"><strong>💡 實務上：前端的「自動儲存」最常需要排隊</strong><br>後台編輯商品說明時每停頓一下就自動儲存，如果兩次 PATCH 同時在路上、舊的比較晚到，伺服器最後存的就是舊內容，使用者重新整理才發現字不見了。這種「每次都要生效、而且順序要對」的修改，排隊送出（前一個回來才送下一個）是最直接的修法。反過來，查詢類的請求不要排隊，那只會讓畫面變慢，用上一節的「只採用最新的」就好。真正在意資料不能被蓋掉時，資深工程師會再問：別的分頁、別的同事同時改同一筆怎麼辦？那已經超出前端的鎖，要靠後端比對版本或資料庫的鎖。</div>
+
+<h2>結帳按兩下：同一件事被觸發兩次，怎麼只做一次？</h2>
+<p>前兩張單修好了，剩下林志豪的第三張：結帳按了兩下，建了兩張訂單。這種情況叫<strong>重複送出</strong>（double submit）。它跟購物車不一樣：加入兩樣商品是兩個都要生效的修改，所以排隊各做一次；按兩下結帳，使用者只想要一張訂單，第二次根本不該做。下面模擬使用者在 10ms 內按了兩下，<code>createOrder</code> 被呼叫兩次。執行後看建出幾張訂單：</p>
+<div class="lab"><script type="code">
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+let orderNo = 0
+async function createOrder(cartId) {
+  await sleep(50)
+  return `訂單 #${++orderNo}（${cartId}）`
+}
+
+// 使用者在 10ms 內按了兩下
+const results = await Promise.all([createOrder('cart-1'), createOrder('cart-1')])
+console.log(results)
+</script></div>
+<p>第一個想到的修法是送出後把按鈕停用（disabled）。它擋得住大部分的連點，應該要做，但不夠：會觸發結帳的不只有按鈕，還有使用者在表單裡按 Enter、程式在逾時後自動重試、畫面沒反應時使用者重新整理再按一次，這些都繞過按鈕的狀態。所以在「呼叫結帳」這一層也要擋：不管誰呼叫、呼叫幾次，同一台購物車同時只能有一個結帳在進行。</p>
+<p>這個做法叫<strong>單一飛行</strong>（single-flight），意思是同一個 key 同時只有一個請求「在飛」。第一次呼叫時真的去執行，並把執行中的 Promise 依 key 記下來；在它結束之前再呼叫，不再執行，直接拿到<strong>同一個 Promise</strong>，所以兩次點擊的呼叫者都會等到同一張訂單。工作結束（成功或失敗）就清掉紀錄，下一次呼叫重新開始。</p>
+<p>寫的時候有兩個坑。第一，失敗也要清掉紀錄。只在成功時清的話，第一次結帳失敗之後，這個 key 的紀錄永遠留著，以後每次呼叫都拿到同一個舊的失敗，使用者再也結不了帳；用第 9 課的 <code>finally</code>，成功或失敗都會清。第二，不要用布林旗標「進行中就忽略」。第二個呼叫者會拿到 <code>undefined</code>，它的畫面不知道訂單成立了沒有；共用同一個 Promise，兩邊都拿得到訂單結果。練習 4 實作這個 <code>singleFlight</code>。</p>
+<p>單一飛行和上一節的鎖都用 key 記住一個 Promise，看起來很像，用途不同：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>鎖（排隊）</th><th>單一飛行</th></tr>
+  <tr><td>第二個呼叫</td><td>等前一個做完，自己再做一次</td><td>不做，共用前一個的結果</td></tr>
+  <tr><td>適合</td><td>每次都要生效的修改：加入購物車兩樣商品</td><td>做一次就夠的事：建立訂單、重新整理 token、載入同一份設定</td></tr>
+  <tr><td>結束後</td><td>隊伍空了刪掉 key</td><td>完成就刪掉 key，下一次重新執行</td></tr>
+</table></div>
+<p>前端的單一飛行只擋得住同一個分頁、同一份程式裡的重複。手機在隧道裡斷線、App 自動重送，請求還是會到伺服器兩次，而且可能落在不同程序上；上一節講過，程序之間看不到彼此的記憶體。所以最後一道防線在後端，靠的是<strong>冪等</strong>（idempotency）：同一個請求做幾次，結果都跟做一次一樣。建立訂單本身不是冪等的，每做一次就多一張訂單。常見的做法是客戶端每次結帳產生一個<strong>冪等鍵</strong>（idempotency key），放在請求標頭；伺服器看到用過的 key，就回傳第一次的結果，不建第二張訂單。設計細節在 <a href="../../node/lessons/14-rest-api-design.html">Node 課第 14 課</a>，<a href="../../system-design/lessons/09-idempotency.html">系統設計課第 9 課</a>會再深入。</p>
+<div class="callout practice"><strong>💡 實務上：token 重新整理是單一飛行的經典場景</strong><br>登入用的 access token 過期時，畫面上同時發出的五個 API 可能一起拿到 401，各自拿 refresh token 去換新的，結果換了五次。很多後端會「輪替」refresh token：每換一次就作廢舊的，這時只有第一個換得到，其他四個拿著作廢的 refresh token 失敗，使用者莫名其妙被登出（細節在 <a href="../../auth/lessons/10-refresh-rotation.html">Auth 課第 10 課</a>）。常見做法是在 HTTP 客戶端統一處理 401 的地方（例如 axios 的 interceptor）用單一飛行：第一個 401 去換，其他的等同一個 Promise，拿到新 token 再重送。結帳的重複送出也一樣要前後端一起擋，串金流時先查金流商的 API 是否支援冪等鍵。上線前資深工程師會親手試：結帳按兩下、送出後馬上重新整理、在弱網路下按，看會不會出現兩張訂單。</div>
+
+<h2>下次遇到競態：選哪個修法，上線後怎麼找出來？</h2>
+<p>三張客服單都修完了。回頭看，每個做法各管一種症狀，也各有極限。下次遇到競態，先判斷症狀屬於哪一列：</p>
+<div class="table-wrap"><table>
+  <tr><th>症狀</th><th>工具</th><th>極限</th></tr>
+  <tr><td>舊結果蓋掉新結果</td><td>請求序號＋取消上一個</td><td>只處理「同一個畫面只要最新的」</td></tr>
+  <tr><td>先檢查再修改被插隊</td><td>檢查＋修改放同一段同步程式；失敗就補償</td><td>資料在記憶體裡才有效；資料在資料庫就用條件式 UPDATE</td></tr>
+  <tr><td>讀和寫中間一定要 await</td><td>依 key 排隊的鎖</td><td>只在一個程序裡有效；排隊會變慢</td></tr>
+  <tr><td>同一件事被觸發兩次</td><td>單一飛行</td><td>只在一個程序裡有效；後端要冪等鍵</td></tr>
+</table></div>
+<p>選對工具之前，得先確定問題真的是競態，修完也要能確認它不再出現。這很難，因為競態取決於時間：同一份程式，順序剛好對了就沒事，開場那三張單在本機才會怎麼試都試不出來。下面三個習慣讓它變得可以重現、可以追查。</p>
+<p>第一，<strong>讓延遲可以從外面傳入</strong>。本課的練習都把 api、audit 當參數傳進去，測試就能故意讓「拿」比較慢，每次重現同一個順序。寫成直接呼叫 <code>fetch</code> 的函式，就只能靠運氣。</p>
+<p>第二，<strong>log 帶上請求的識別碼和時間</strong>。兩筆 log 都寫「庫存 1 → 0」時，有了識別碼和時間，你才看得出那是兩個請求交錯，而不是同一個請求跑了兩次（<a href="../../node/lessons/19-structured-logging.html">Node 課第 19 課</a>的 request context）。</p>
+<p>第三，<strong>用並發測試重現</strong>。同時送 20 個相同的請求，數數看賣出幾杯；<a href="../../nestjs/lessons/14-prisma-crud-relations.html">NestJS 課第 14 課</a>會在 API 上做這個測試。</p>
+<p>下面的練習把這課的四個做法各寫一次：搜尋框、扣庫存、依 key 排隊的鎖、單一飛行。</p>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：<code>createSearch(api, render)</code> 回傳 <code>search(text)</code>。<code>api(text, signal)</code> 回傳搜尋結果的 Promise。要求：只把<strong>最新一次</strong>搜尋的結果交給 <code>render</code>；送出新搜尋前取消上一個請求；被取消的那次 <code>search</code> 要安靜地完成（不丟錯、不呼叫 render）；其他錯誤要讓 <code>search</code> 以同一個錯誤失敗。注意：有些 api 不理會 signal，被取消了還是會回傳結果。</p>
+  <script type="start">
+function createSearch(api, render) {
+  return async function search(text) {
+    const result = await api(text)
+    render(result)
+  }
+}
+
+// 試試看：「拿」很慢，「拿鐵」很快
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+function api(text, signal) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve(`「${text}」的結果`), text === '拿' ? 300 : 50)
+    signal?.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason) }, { once: true })
+  })
+}
+const search = createSearch(api, r => console.log('render', r))
+const first = search('拿')
+await sleep(200)
+await search('拿鐵')
+await first
+console.log('結束')
+</script>
+  <script type="answer">
+function createSearch(api, render) {
+  let latest = 0
+  let controller = null
+  return async function search(text) {
+    const id = ++latest
+    controller?.abort()
+    controller = new AbortController()
+    const { signal } = controller
+    try {
+      const result = await api(text, signal)
+      if (id === latest) render(result)
+    } catch (e) {
+      if (signal.aborted) return        // 是我們自己取消的：安靜結束
+      throw e
+    }
+  }
+}
+
+// 試試看：「拿」很慢，「拿鐵」很快
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+function api(text, signal) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve(`「${text}」的結果`), text === '拿' ? 300 : 50)
+    signal?.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason) }, { once: true })
+  })
+}
+const search = createSearch(api, r => console.log('render', r))
+const first = search('拿')
+await sleep(200)
+await search('拿鐵')
+await first
+console.log('結束')
+</script>
+  <script type="tests">
+const wait = ms => new Promise(r => setTimeout(r, ms))
+const delays = { '拿': 200, '拿鐵': 20, '美式': 20, '可頌': 20 }
+async function scenario(honor) {
+  const signals = []
+  const fakeApi = (text, signal) => {
+    signals.push(signal)
+    return new Promise((resolve, reject) => {
+      const t = setTimeout(() => resolve(`${text}的結果`), delays[text])
+      if (honor && signal) signal.addEventListener('abort', () => { clearTimeout(t); reject(signal.reason) }, { once: true })
+    })
+  }
+  const rendered = []
+  const s = createSearch(fakeApi, r => rendered.push(r))
+  const p1 = s('拿').then(() => null, e => e)
+  await wait(150)
+  const err2 = await s('拿鐵').then(() => null, e => e)
+  const err1 = await p1
+  await wait(100)
+  return { rendered, signals, err1, err2 }
+}
+const a = await scenario(true)
+assert.equal(a.err2, null, '最新的那次 search 要正常完成')
+assert.equal(a.err1, null, '被取消的那次 search 要安靜地完成，不能把 AbortError 丟給呼叫者')
+assert.deepEqual(a.rendered, ['拿鐵的結果'], 'render 只能收到最新一次搜尋（拿鐵）的結果')
+assert(a.signals[0] instanceof AbortSignal && a.signals[0].aborted, '送出新搜尋前，要 abort 上一個請求的 signal（記得把 signal 傳給 api）')
+assert(a.signals[1] instanceof AbortSignal && !a.signals[1].aborted, '最新的請求不能被取消')
+const b = await scenario(false)
+assert.deepEqual(b.rendered, ['拿鐵的結果'], 'api 沒理會取消、舊結果還是回來了，也不能交給 render')
+const rendered = []
+const s2 = createSearch(async text => { await wait(20); return text }, r => rendered.push(r))
+await s2('美式')
+await s2('可頌')
+assert.deepEqual(rendered, ['美式', '可頌'], '前一次已經完成，再搜尋時兩次結果都要 render')
+const boom = new Error('500')
+let caught = null
+await createSearch(async () => { await wait(10); throw boom }, () => {})('拿鐵').catch(e => { caught = e })
+assert.equal(caught, boom, 'api 以別的錯誤失敗時，search 要以同一個錯誤失敗')
+const box1 = [], box2 = []
+const api2 = (text, signal) => new Promise((resolve, reject) => {
+  const t = setTimeout(() => resolve(text), 30)
+  signal?.addEventListener('abort', () => { clearTimeout(t); reject(signal.reason) }, { once: true })
+})
+const sA = createSearch(api2, r => box1.push(r))
+const sB = createSearch(api2, r => box2.push(r))
+await Promise.all([sA('拿鐵'), sB('可頌')])
+assert(box1.join() === '拿鐵' && box2.join() === '可頌', '每次 createSearch 要有自己的序號和 controller（放在 createSearch 裡面），一個搜尋框不能取消或蓋掉另一個')
+</script>
+  <script type="wrong">
+function createSearch(api, render) {
+  return async function search(text) {
+    render(await api(text))
+  }
+}
+</script>
+  <script type="wrong">
+function createSearch(api, render) {
+  let timer
+  return text => new Promise((resolve, reject) => {
+    clearTimeout(timer)
+    timer = setTimeout(() => api(text).then(render).then(resolve, reject), 100)   // debounce 100ms
+  })
+}
+</script>
+  <script type="wrong">
+function createSearch(api, render) {
+  let latest = 0
+  return async function search(text) {
+    const id = ++latest
+    const result = await api(text)
+    if (id === latest) render(result)
+  }
+}
+</script>
+  <script type="wrong">
+function createSearch(api, render) {
+  let latest = 0
+  let controller = null
+  return async function search(text) {
+    const id = ++latest
+    controller?.abort()
+    controller = new AbortController()
+    const result = await api(text, controller.signal)
+    if (id === latest) render(result)
+  }
+}
+</script>
+  <script type="wrong">
+function createSearch(api, render) {
+  let latest = 0
+  let controller = null
+  return async function search(text) {
+    const id = ++latest
+    controller?.abort()
+    controller = new AbortController()
+    try {
+      const result = await api(text, controller.signal)
+      if (id === latest) render(result)
+    } catch {
+      // 全部吞掉
+    }
+  }
+}
+</script>
+  <script type="wrong">
+let latest = 0
+let controller = null
+function createSearch(api, render) {
+  return async function search(text) {
+    const id = ++latest
+    controller?.abort()
+    controller = new AbortController()
+    const { signal } = controller
+    try {
+      const result = await api(text, signal)
+      if (id === latest) render(result)
+    } catch (e) {
+      if (signal.aborted) return
+      throw e
+    }
+  }
+}
+</script>
+  <script type="wrong">
+function createSearch(api, render) {
+  let controller = null
+  return async function search(text) {
+    controller?.abort()
+    controller = new AbortController()
+    const { signal } = controller
+    try {
+      render(await api(text, signal))
+    } catch (e) {
+      if (signal.aborted) return
+      throw e
+    }
+  }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：<code>createInventory(initial, { audit })</code>：<code>initial</code> 是 <code>[商品 id, 庫存]</code> 的陣列，回傳 <code>{ stockOf(id), reserve(id, qty) }</code>。起始程式的 <code>reserve</code> 先讀庫存、<code>await audit(id, qty)</code> 寫稽核紀錄、再寫回 <code>left - qty</code>，兩個人同時買最後一杯會賣出兩杯。修好它：同時有很多 <code>reserve</code> 時不能超賣、庫存不能變負數；庫存不足丟 <code>OutOfStockError</code>（不呼叫 audit）；只有扣到庫存的才寫稽核紀錄；<code>audit</code> 失敗時 <code>reserve</code> 以同一個錯誤失敗，並把這次扣的數量加回去（不能寫回當初讀到的值）。</p>
+  <script type="start">
+class OutOfStockError extends Error {
+  constructor(id) {
+    super(`商品 ${id} 庫存不足`)
+    this.name = 'OutOfStockError'
+  }
+}
+
+function createInventory(initial, { audit }) {
+  const stock = new Map(initial)
+  return {
+    stockOf: id => stock.get(id) ?? 0,
+    async reserve(id, qty) {
+      const left = stock.get(id) ?? 0
+      if (left < qty) throw new OutOfStockError(id)
+      await audit(id, qty)
+      stock.set(id, left - qty)
+    },
+  }
+}
+
+// 試試看：最後一杯拿鐵（id 2），兩個人同時買
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+const inv = createInventory([[2, 1]], { audit: () => sleep(20) })
+const results = await Promise.allSettled([inv.reserve(2, 1), inv.reserve(2, 1)])
+console.log(results.map(r => r.status), '庫存', inv.stockOf(2))
+</script>
+  <script type="answer">
+class OutOfStockError extends Error {
+  constructor(id) {
+    super(`商品 ${id} 庫存不足`)
+    this.name = 'OutOfStockError'
+  }
+}
+
+function createInventory(initial, { audit }) {
+  const stock = new Map(initial)
+  return {
+    stockOf: id => stock.get(id) ?? 0,
+    async reserve(id, qty) {
+      // 檢查和扣減在同一段同步程式裡
+      const left = stock.get(id) ?? 0
+      if (left < qty) throw new OutOfStockError(id)
+      stock.set(id, left - qty)
+      try {
+        await audit(id, qty)
+      } catch (e) {
+        stock.set(id, (stock.get(id) ?? 0) + qty)   // 補償：加回這次扣的數量
+        throw e
+      }
+    },
+  }
+}
+
+// 試試看：最後一杯拿鐵（id 2），兩個人同時買
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+const inv = createInventory([[2, 1]], { audit: () => sleep(20) })
+const results = await Promise.allSettled([inv.reserve(2, 1), inv.reserve(2, 1)])
+console.log(results.map(r => r.status), '庫存', inv.stockOf(2))
+</script>
+  <script type="tests">
+const wait = ms => new Promise(r => setTimeout(r, ms))
+let audits = 0
+const slowAudit = async () => { audits++; await wait(20) }
+const ok = rs => rs.filter(r => r.status === 'fulfilled').length
+
+const inv1 = createInventory([[2, 1]], { audit: slowAudit })
+const r1 = await Promise.allSettled([inv1.reserve(2, 1), inv1.reserve(2, 1)])
+assert.equal(ok(r1), 1, '庫存只有 1 杯，兩個人同時買，只能有一個成功')
+assert(r1.some(r => r.status === 'rejected' && r.reason instanceof OutOfStockError), '買不到的那個要以 OutOfStockError 失敗')
+assert.equal(inv1.stockOf(2), 0, '賣出一杯後庫存是 0')
+
+const inv2 = createInventory([[5, 3]], { audit: slowAudit })
+const r2 = await Promise.allSettled(Array.from({ length: 5 }, () => inv2.reserve(5, 1)))
+assert.equal(ok(r2), 3, '庫存 3，五個人同時買，剛好三個成功')
+assert.equal(inv2.stockOf(5), 0, '庫存不能變成負數')
+assert(r2.filter(r => r.status === 'rejected').every(r => r.reason instanceof OutOfStockError), '買不到的都要是 OutOfStockError')
+assert.equal(audits, 4, `成功扣到庫存的才寫稽核紀錄（應該 4 次，實際 ${audits} 次）`)
+
+const boom = new Error('稽核服務掛了')
+const audit3 = async (id, qty) => { await wait(qty === 2 ? 40 : 10); if (qty === 2) throw boom }
+const inv3 = createInventory([[1, 10]], { audit: audit3 })
+const r3 = await Promise.allSettled([inv3.reserve(1, 2), inv3.reserve(1, 3)])
+assert.equal(r3[0].reason, boom, 'audit 失敗時，reserve 要以同一個錯誤失敗')
+assert.equal(r3[1].status, 'fulfilled', '另一筆 reserve 不受影響')
+assert.equal(inv3.stockOf(1), 7, `audit 失敗要把扣掉的數量加回去，不能寫回舊值（應該是 7，實際 ${inv3.stockOf(1)}）`)
+const shopA = createInventory([[2, 1]], { audit: async () => {} })
+const shopB = createInventory([[2, 5]], { audit: async () => {} })
+await shopA.reserve(2, 1)
+assert(shopA.stockOf(2) === 0 && shopB.stockOf(2) === 5, '每次 createInventory 要有自己的庫存 Map，不能共用')
+</script>
+  <script type="wrong">
+class OutOfStockError extends Error {}
+function createInventory(initial, { audit }) {
+  const stock = new Map(initial)
+  return {
+    stockOf: id => stock.get(id) ?? 0,
+    async reserve(id, qty) {
+      const left = stock.get(id) ?? 0
+      if (left < qty) throw new OutOfStockError(id)
+      await audit(id, qty)
+      stock.set(id, left - qty)
+    },
+  }
+}
+</script>
+  <script type="wrong">
+class OutOfStockError extends Error {}
+function createInventory(initial, { audit }) {
+  const stock = new Map(initial)
+  return {
+    stockOf: id => stock.get(id) ?? 0,
+    async reserve(id, qty) {
+      if ((stock.get(id) ?? 0) < qty) throw new OutOfStockError(id)
+      await audit(id, qty)
+      stock.set(id, (stock.get(id) ?? 0) - qty)
+    },
+  }
+}
+</script>
+  <script type="wrong">
+class OutOfStockError extends Error {}
+function createInventory(initial, { audit }) {
+  const stock = new Map(initial)
+  return {
+    stockOf: id => stock.get(id) ?? 0,
+    async reserve(id, qty) {
+      const left = stock.get(id) ?? 0
+      if (left < qty) throw new OutOfStockError(id)
+      stock.set(id, left - qty)
+      await audit(id, qty)
+    },
+  }
+}
+</script>
+  <script type="wrong">
+class OutOfStockError extends Error {}
+function createInventory(initial, { audit }) {
+  const stock = new Map(initial)
+  return {
+    stockOf: id => stock.get(id) ?? 0,
+    async reserve(id, qty) {
+      const left = stock.get(id) ?? 0
+      if (left < qty) throw new OutOfStockError(id)
+      stock.set(id, left - qty)
+      try {
+        await audit(id, qty)
+      } catch (e) {
+        stock.set(id, left)
+        throw e
+      }
+    },
+  }
+}
+</script>
+  <script type="wrong">
+class OutOfStockError extends Error {}
+function createInventory(initial, { audit }) {
+  const stock = new Map(initial)
+  return {
+    stockOf: id => stock.get(id) ?? 0,
+    async reserve(id, qty) {
+      const left = stock.get(id) ?? 0
+      if (left < qty) throw new OutOfStockError(id)
+      stock.set(id, left - qty)
+      try {
+        await audit(id, qty)
+      } catch {
+        stock.set(id, (stock.get(id) ?? 0) + qty)   // 加回去了，但把錯誤吞掉
+      }
+    },
+  }
+}
+</script>
+  <script type="wrong">
+class OutOfStockError extends Error {}
+const stock = new Map()
+function createInventory(initial, { audit }) {
+  for (const [id, n] of initial) stock.set(id, n)
+  return {
+    stockOf: id => stock.get(id) ?? 0,
+    async reserve(id, qty) {
+      const left = stock.get(id) ?? 0
+      if (left < qty) throw new OutOfStockError(id)
+      stock.set(id, left - qty)
+      try {
+        await audit(id, qty)
+      } catch (e) {
+        stock.set(id, (stock.get(id) ?? 0) + qty)
+        throw e
+      }
+    },
+  }
+}
+</script>
+  <script type="wrong">
+class OutOfStockError extends Error {}
+function createInventory(initial, { audit }) {
+  const stock = new Map(initial)
+  return {
+    stockOf: id => stock.get(id) ?? 0,
+    async reserve(id, qty) {
+      await audit(id, qty)
+      const left = stock.get(id) ?? 0
+      if (left < qty) throw new OutOfStockError(id)
+      stock.set(id, left - qty)
+    },
+  }
+}
+</script>
+  <script type="wrong">
+class OutOfStockError extends Error {}
+function createInventory(initial, { audit }) {
+  const stock = new Map(initial)
+  return {
+    stockOf: id => stock.get(id) ?? 0,
+    async reserve(id, qty) {
+      const left = stock.get(id) ?? 0
+      if (left < qty) throw new OutOfStockError(id)
+      stock.set(id, left - qty)
+    },
+  }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：<code>createKeyedLock()</code> 回傳 <code>{ run(key, fn), size }</code>。<code>run(key, fn)</code> 等同一個 key 前面的工作都結束（成功或失敗）才執行 <code>fn</code>，回傳 <code>fn</code> 的結果（Promise）；不同 key 互不等待；前一個失敗不能卡住後面的；<code>size</code>（getter）是目前還有工作在跑或在排隊的 key 數量，全部結束後要回到 0。用 Promise 鏈實作：每個 key 記住最後一個工作。</p>
+  <script type="start">
+function createKeyedLock() {
+  const tails = new Map()   // key → 這個 key 最後一個工作
+  return {
+    run(key, fn) {
+      // 你的程式
+    },
+    get size() {
+      return tails.size
+    },
+  }
+}
+
+// 試試看：同一台購物車的三個工作要排隊，第二個會失敗
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+const lock = createKeyedLock()
+const job = (name, fail) => async () => {
+  console.log('開始', name)
+  await sleep(30)
+  if (fail) throw new Error(`${name} 失敗`)
+  return `${name} 完成`
+}
+const results = await Promise.allSettled([
+  lock.run('cart-1', job('A')),
+  lock.run('cart-1', job('B', true)),
+  lock.run('cart-1', job('C')),
+])
+console.log(results.map(r => r.value ?? r.reason?.message))
+await sleep(0)
+console.log('size', lock.size)
+</script>
+  <script type="answer">
+function createKeyedLock() {
+  const tails = new Map()   // key → 這個 key 最後一個工作
+  return {
+    run(key, fn) {
+      const prev = tails.get(key) ?? Promise.resolve()
+      const result = prev.then(() => fn())
+      const done = result.catch(() => {})        // 失敗也算結束，後面照樣執行
+      tails.set(key, done)
+      done.then(() => {
+        if (tails.get(key) === done) tails.delete(key)   // 我是最後一個：隊伍空了
+      })
+      return result
+    },
+    get size() {
+      return tails.size
+    },
+  }
+}
+
+// 試試看：同一台購物車的三個工作要排隊，第二個會失敗
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+const lock = createKeyedLock()
+const job = (name, fail) => async () => {
+  console.log('開始', name)
+  await sleep(30)
+  if (fail) throw new Error(`${name} 失敗`)
+  return `${name} 完成`
+}
+const results = await Promise.allSettled([
+  lock.run('cart-1', job('A')),
+  lock.run('cart-1', job('B', true)),
+  lock.run('cart-1', job('C')),
+])
+console.log(results.map(r => r.value ?? r.reason?.message))
+await sleep(0)
+console.log('size', lock.size)
+</script>
+  <script type="tests">
+const wait = ms => new Promise(r => setTimeout(r, ms))
+const lock = createKeyedLock()
+let active = 0, maxActive = 0
+const order = []
+const job = (name, fail) => async () => {
+  order.push(name)
+  active++
+  maxActive = Math.max(maxActive, active)
+  await wait(30)
+  active--
+  if (fail) throw new Error(`${name} 失敗`)
+  return `${name} 完成`
+}
+const p1 = lock.run('cart-1', job('A'))
+const p2 = lock.run('cart-1', job('B', true))
+const p3 = lock.run('cart-1', job('C'))
+assert(p1 instanceof Promise, 'run 要回傳 Promise')
+assert.equal(lock.size, 1, '同一個 key 有工作在跑或排隊時，size 是 1')
+await p1
+await wait(0)
+assert.equal(lock.size, 1, 'A 做完、B 和 C 還在排隊時，size 還是 1：只有這個 key 的最後一個工作結束才能刪 key')
+const p4 = lock.run('cart-1', job('D'))
+const [r1, r2, r3, r4] = await Promise.allSettled([p1, p2, p3, p4])
+assert.equal(maxActive, 1, `同一個 key 同時只能有一個工作在執行（實際最多 ${maxActive} 個）`)
+assert.deepEqual(order, ['A', 'B', 'C', 'D'], '要依呼叫順序執行，中途加入的 D 也要排在 C 後面')
+assert.equal(r4.value, 'D 完成', '中途加入的工作也要執行並回傳結果')
+assert.equal(r1.value, 'A 完成', 'run 要回傳 fn 的結果')
+assert(r2.status === 'rejected' && r2.reason.message === 'B 失敗', 'fn 失敗時，run 要以 fn 的錯誤失敗')
+assert.equal(r3.value, 'C 完成', '前一個失敗不能卡住後面的工作')
+await wait(0)
+assert.equal(lock.size, 0, '工作全部結束後，size 要回到 0（把 Map 的紀錄刪掉）')
+const t0 = Date.now()
+const q1 = lock.run('cart-1', () => wait(40))
+const q2 = lock.run('cart-2', () => wait(40))
+assert.equal(lock.size, 2, '兩個 key 都有工作時，size 是 2')
+await Promise.all([q1, q2])
+const took = Date.now() - t0
+assert(took < 70, `不同 key 不能互相等待（兩個 40ms 的工作花了 ${took}ms）`)
+await wait(0)
+assert.equal(lock.size, 0, '全部結束後 size 要回到 0')
+</script>
+  <script type="wrong">
+function createKeyedLock() {
+  const tails = new Map()
+  let tail = Promise.resolve()
+  return {
+    run(key, fn) {
+      const result = tail.then(() => fn())
+      const done = result.catch(() => {})
+      tail = done
+      tails.set(key, done)
+      done.then(() => { if (tails.get(key) === done) tails.delete(key) })
+      return result
+    },
+    get size() { return tails.size },
+  }
+}
+</script>
+  <script type="wrong">
+function createKeyedLock() {
+  const tails = new Map()
+  return {
+    run(key, fn) {
+      const prev = tails.get(key) ?? Promise.resolve()
+      const result = prev.then(() => fn())
+      tails.set(key, result)
+      result.then(() => { if (tails.get(key) === result) tails.delete(key) }, () => { if (tails.get(key) === result) tails.delete(key) })
+      return result
+    },
+    get size() { return tails.size },
+  }
+}
+</script>
+  <script type="wrong">
+function createKeyedLock() {
+  const tails = new Map()
+  return {
+    run(key, fn) {
+      const prev = tails.get(key) ?? Promise.resolve()
+      const result = prev.then(() => fn())
+      tails.set(key, result.catch(() => {}))
+      return result
+    },
+    get size() { return tails.size },
+  }
+}
+</script>
+  <script type="wrong">
+function createKeyedLock() {
+  const tails = new Map()
+  return {
+    run(key, fn) {
+      const prev = tails.get(key) ?? Promise.resolve()
+      const result = prev.then(() => fn())
+      const done = result.catch(() => {})
+      tails.set(key, done)
+      done.then(() => tails.delete(key))   // 沒確認自己是不是最後一個
+      return result
+    },
+    get size() { return tails.size },
+  }
+}
+</script>
+  <script type="wrong">
+function createKeyedLock() {
+  const tails = new Map()
+  return {
+    run(key, fn) {
+      const prev = tails.get(key) ?? Promise.resolve()
+      const done = prev.then(() => fn()).catch(() => {})
+      tails.set(key, done)
+      done.then(() => { if (tails.get(key) === done) tails.delete(key) })
+      return done                          // 錯誤被吞掉了
+    },
+    get size() { return tails.size },
+  }
+}
+</script>
+  <script type="wrong">
+function createKeyedLock() {
+  const tails = new Map()
+  return {
+    run(key, fn) {
+      const result = Promise.resolve().then(() => fn())
+      const done = result.catch(() => {})
+      tails.set(key, done)
+      done.then(() => { if (tails.get(key) === done) tails.delete(key) })
+      return result
+    },
+    get size() { return tails.size },
+  }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 4：<code>singleFlight(fn)</code> 回傳 <code>run(key)</code>。<code>fn(key)</code> 回傳 Promise。同一個 key 進行中時，再呼叫 <code>run(key)</code> 拿到同一個 Promise、<code>fn</code> 不會再執行；結束（成功或失敗）後同一個 key 可以重新開始；不同 key 互不影響。</p>
+  <script type="start">
+function singleFlight(fn) {
+  // 你的程式
+}
+
+// 試試看：結帳按兩下
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+let orderNo = 0
+const createOrder = async cartId => { await sleep(50); return `訂單 #${++orderNo}（${cartId}）` }
+const checkout = singleFlight(createOrder)
+console.log(await Promise.all([checkout('cart-1'), checkout('cart-1')]))
+console.log(await checkout('cart-1'))
+</script>
+  <script type="answer">
+function singleFlight(fn) {
+  const inflight = new Map()   // key → 進行中的 Promise
+  return function run(key) {
+    if (inflight.has(key)) return inflight.get(key)
+    const p = fn(key).finally(() => inflight.delete(key))   // 成功或失敗都清掉
+    inflight.set(key, p)
+    return p
+  }
+}
+
+// 試試看：結帳按兩下
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+let orderNo = 0
+const createOrder = async cartId => { await sleep(50); return `訂單 #${++orderNo}（${cartId}）` }
+const checkout = singleFlight(createOrder)
+console.log(await Promise.all([checkout('cart-1'), checkout('cart-1')]))
+console.log(await checkout('cart-1'))
+</script>
+  <script type="tests">
+const wait = ms => new Promise(r => setTimeout(r, ms))
+const calls = {}
+const fn = async key => {
+  calls[key] = (calls[key] ?? 0) + 1
+  await wait(30)
+  return `${key} 第 ${calls[key]} 次`
+}
+const run = singleFlight(fn)
+const a = run('cart-1')
+const b = run('cart-1')
+assert(a instanceof Promise, 'run 要回傳 Promise')
+assert.equal(b, a, '同一個 key 進行中時，再呼叫要拿到同一個 Promise')
+assert.deepEqual(await Promise.all([a, b]), ['cart-1 第 1 次', 'cart-1 第 1 次'], '兩個呼叫者拿到相同的結果')
+assert.equal(calls['cart-1'], 1, '進行中再呼叫，fn 不能再執行')
+assert.equal(await run('cart-1'), 'cart-1 第 2 次', '完成之後再呼叫，要重新執行 fn')
+const [x, y] = await Promise.all([run('cart-2'), run('cart-3')])
+assert(x === 'cart-2 第 1 次' && y === 'cart-3 第 1 次', '不同 key 各自執行一次')
+
+let tries = 0
+const boom = new Error('付款服務沒回應')
+const flaky = async () => { tries++; await wait(20); if (tries === 1) throw boom; return '成功' }
+const run2 = singleFlight(flaky)
+const e1 = run2('cart-9').catch(e => e)
+const e2 = run2('cart-9').catch(e => e)
+assert.equal(await e1, boom, 'fn 失敗時，呼叫者要收到同一個錯誤')
+assert.equal(await e2, boom, '共用 Promise 的第二個呼叫者也要收到同一個錯誤')
+assert.equal(await run2('cart-9').catch(e => e), '成功', '失敗之後再呼叫要重新執行，不能永遠拿到同一個失敗')
+assert.equal(tries, 2, 'fn 總共應該執行 2 次')
+</script>
+  <script type="wrong">
+function singleFlight(fn) {
+  const cache = new Map()
+  return function run(key) {
+    if (!cache.has(key)) cache.set(key, fn(key))
+    return cache.get(key)
+  }
+}
+</script>
+  <script type="wrong">
+function singleFlight(fn) {
+  const inflight = new Map()
+  return function run(key) {
+    if (inflight.has(key)) return inflight.get(key)
+    const p = fn(key).then(v => { inflight.delete(key); return v })
+    inflight.set(key, p)
+    return p
+  }
+}
+</script>
+  <script type="wrong">
+function singleFlight(fn) {
+  const busy = new Set()
+  return async function run(key) {
+    if (busy.has(key)) return
+    busy.add(key)
+    try {
+      return await fn(key)
+    } finally {
+      busy.delete(key)
+    }
+  }
+}
+</script>
+  <script type="wrong">
+function singleFlight(fn) {
+  const inflight = new Map()
+  return async function run(key) {
+    if (inflight.has(key)) return inflight.get(key)
+    const p = fn(key).finally(() => inflight.delete(key))
+    inflight.set(key, p)
+    return p
+  }
+}
+</script>
+  <script type="wrong">
+function singleFlight(fn) {
+  const inflight = new Map()
+  return function run(key) {
+    if (inflight.has(key)) return inflight.get(key)
+    const p = fn(key).finally(() => setTimeout(() => inflight.delete(key), 1000))
+    inflight.set(key, p)
+    return p
+  }
+}
+</script>
+  <script type="wrong">
+function singleFlight(fn) {
+  let current = null
+  return function run(key) {
+    if (current) return current
+    current = fn(key).finally(() => { current = null })
+    return current
+  }
+}
+</script>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：搜尋框加了 300ms 的 debounce。還會出現舊結果蓋掉新結果嗎？</p>
+  <label data-key="a">不會，debounce 保證同一時間只有一個請求</label>
+  <label data-key="b">會，使用者停頓超過 300ms 時兩個請求都會送出，誰先回來還是看伺服器</label>
+  <label data-key="c">不會，瀏覽器會依照送出的順序回傳結果</label>
+  <p class="why">✓ debounce 只決定「什麼時候送」：打「拿」、停 400ms、再打「拿鐵」，兩個請求都會送出，慢的「拿」照樣可以最後回來。它沒有讓前一個請求停下，所以 a 錯；HTTP 請求各自獨立，回來的順序取決於伺服器處理多久，瀏覽器不會幫你排序，所以 c 錯。debounce 減少請求數，順序要靠請求序號加上取消上一個。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 6：JavaScript 只有一條執行緒。async 函式裡「讀庫存 → <code>await</code> 寫稽核紀錄 → 扣庫存」，同時有兩個請求進來時會怎樣？</p>
+  <label data-key="a">不會出問題，一條執行緒一次只跑一段程式，兩個請求自然會排隊</label>
+  <label data-key="b">只有在 Worker 或多執行緒環境才會出問題</label>
+  <label data-key="c">可能超賣：第一個請求停在 await 時，第二個請求讀到同一個庫存</label>
+  <p class="why">✓ 單執行緒只保證兩個 await 之間的同步程式不會被打斷。函式停在 await 時，event loop 會去跑別的工作（第 7 課），第二個請求就在這時讀到還沒扣的庫存。整個 async 函式不會自動排隊，所以 a 錯；這跟 Worker 無關，一般的 Node 伺服器就會發生，所以 b 錯。修法：檢查和扣減放在同一段同步程式，或讓資料庫用條件式 UPDATE 一句完成。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 7：你用 Promise 鏈做了依 key 排隊的鎖，保護「讀購物車 → await 查價格 → 寫購物車」。部署時伺服器開成 3 個程序，購物車存在 PostgreSQL。這樣還安全嗎？</p>
+  <label data-key="a">不安全：每個程序各有一份記憶體和鎖，不同程序的請求不會互相排隊；要用資料庫的鎖或條件式 UPDATE</label>
+  <label data-key="b">安全：同一個 key 的鎖在 3 個程序之間是共用的</label>
+  <label data-key="c">安全：只要 3 個程序跑在同一台機器上就好</label>
+  <p class="why">✓ Map 和 Promise 都存在單一程序的記憶體裡，程序之間不共用（同一台機器也一樣，所以 b、c 錯）。同一台購物車的兩個請求如果被分到不同程序，各自拿到自己的鎖，照樣同時讀寫。資料在資料庫，就讓資料庫把關：<code>SELECT … FOR UPDATE</code>、條件式 UPDATE，或 advisory lock。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>以為單執行緒就不會有競態</strong>：每個 <code>await</code> 都是插隊點，函式暫停時別的流程可以讀寫同一份資料。</li>
+  <li><strong>以為 debounce 能解決過期回應</strong>：它只減少請求數，使用者一停頓，兩個請求照樣都送出。用請求序號只採用最新的，並取消上一個請求。</li>
+  <li><strong>取消之後把 AbortError 丟給呼叫者</strong>：自己取消的請求要安靜結束，不然變成 unhandled rejection；但其他錯誤不能一起吞掉。</li>
+  <li><strong>在 await 之前讀、await 之後寫共用的狀態</strong>：寫回去的值根據的是過期的資料。檢查和修改放在同一段同步程式；中間一定要 await 時用鎖，或交給資料庫。</li>
+  <li><strong>失敗時把舊值寫回去</strong>：會蓋掉別人在這段時間的修改。補償要做「反向操作」（加回扣掉的數量），不是「還原快照」。</li>
+  <li><strong>用程式裡的鎖保護多個程序共用的資料</strong>：每個程序各有一份鎖。共用的資料用資料庫的列鎖、條件式 UPDATE 或 advisory lock。</li>
+  <li><strong>鎖或去重的 Map 沒在失敗時清掉，或永遠不刪</strong>：失敗沒清，這個 key 永遠卡住或永遠拿到同一個錯誤；永遠不刪，長時間執行的伺服器記憶體一直長。用 <code>finally</code> 或 <code>.catch</code> 之後清。</li>
+  <li><strong>只在前端擋重複送出</strong>：重試和網路重送會繞過按鈕。後端用冪等鍵認出重送的請求。</li>
+</ul>
+
+<h2 id="appendix">補充與查表</h2>
+<h3>Vue 的 watch 怎麼搭配取消</h3>
+<p>Vue 的 <code>watch</code> 也在處理過期回應：Vue 3.5 起可以在 watch callback 裡呼叫 <code>onWatcherCleanup(() =&gt; controller.abort())</code>，監看的值改變、callback 要重跑之前會先取消上一次的請求；它必須在 callback 同步執行的時候呼叫，不能寫在 <code>await</code> 之後（Vue 官方文件）。細節在 <a href="../../vue/lessons/05-watchers.html">Vue 課第 5 課</a>和<a href="../../vue/lessons/17-async-data.html">第 17 課</a>。</p>
+
+<h2>小結</h2>
+<ul>
+  <li>競態是「結果取決於誰先完成」。JavaScript 單執行緒，但每個 <code>await</code> 都是插隊點：await 之前讀到的東西，回來時可能已經過期。</li>
+  <li>搜尋框的過期回應：請求序號只採用最新的，加上 <code>AbortController</code> 取消上一個；被取消的安靜結束。debounce 只決定什麼時候送，不保證順序。</li>
+  <li>最後一杯拿鐵的先檢查再行動：檢查和修改放在同一段沒有 await 的同步程式；後面的步驟失敗用補償（加回去），不寫回舊值。</li>
+  <li>購物車這種讀和寫中間一定要 await 的修改，用 Promise 鏈做依 key 排隊的鎖：失敗不能卡住後面，隊伍空了要刪 key。</li>
+  <li>結帳按兩下用單一飛行共用同一個 Promise，結束後在 <code>finally</code> 清掉；鎖是排隊各做一次，單一飛行是共用一次的結果。</li>
+  <li>程式裡的鎖和去重只在一個程序裡有效。多個程序、多台伺服器要靠資料庫（條件式 UPDATE、列鎖、advisory lock）和冪等鍵。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 8 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 8：店長按下「匯出整年訂單」之後，同一時間點餐、結帳的 API 全部變慢。這支匯出 API 在一個大迴圈裡組 CSV 字串，同事提議「把迴圈包進 <code>new Promise</code> 就不會擋到別人」。怎麼回應？</p>
+  <label data-key="a">可以，包成 Promise 之後迴圈會交給背景執行，主程式馬上往下</label>
+  <label data-key="b">每處理 1000 筆就 <code>await Promise.resolve()</code> 讓出一次，別的請求就插得進來</label>
+  <label data-key="c">迴圈是同步程式，佔住唯一的執行緒；要切塊用 <code>setTimeout</code> 讓出，或搬到 worker</label>
+  <p class="why">✓ executor 是同步執行的，Promise 不會多出一條執行緒，迴圈跑多久，所有請求就等多久。切塊時讓出到 task（<code>setTimeout</code>），或交給 worker、背景工作。b 錯在 <code>await Promise.resolve()</code> 只排進 microtask，event loop 會先清空 microtask 才輪到下一個 task，新請求、計時器還是等不到。（第 7 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 9：結帳寫成 <code>await Promise.all([charge(card, total), deductStock(items)])</code>。扣庫存因為缺貨失敗了，會怎樣？</p>
+  <label data-key="a">扣款照樣完成，訂單卻失敗；Promise 不能取消，副作用不會自動回復</label>
+  <label data-key="b"><code>Promise.all</code> 一失敗就會中斷扣款，所以不會扣到錢</label>
+  <label data-key="c">扣款會完成，但 <code>Promise.all</code> 失敗時會自動退款回去</label>
+  <label data-key="d">要等扣款也完成，<code>Promise.all</code> 才會失敗，並回傳兩個結果</label>
+  <p class="why">✓ <code>Promise.all</code> 遇到第一個失敗就跟著失敗，但其他工作照樣跑完，扣款、寄信這類副作用照樣發生。會改資料而且有先後關係的動作要依序做，或交給後端用交易處理。b 錯在 Promise 只是代表結果的物件，沒有取消的能力；要停下工作得自己傳 AbortSignal。（第 8 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 10：後台要把 3000 個商品同步到外送平台，每個商品呼叫一次對方的 API，對方文件寫了限流規定。該怎麼排？</p>
+  <label data-key="a"><code>await Promise.all(items.map(sync))</code>，全部同時送出最快</label>
+  <label data-key="b"><code>for…of</code> 加 <code>await</code> 一個一個送，最不會出事</label>
+  <label data-key="c"><code>items.forEach(async item =&gt; await sync(item))</code>，每個都會等</label>
+  <label data-key="d">用工作池限制同時 N 個，N 依對方的限流規定調整</label>
+  <p class="why">✓ 數量大、互不相依時用工作池：同時最多 N 個，做完一件立刻接下一件，實務上多半用 p-limit 這類套件。a 錯在 3000 個請求同時打出去，會被對方限流，也會佔滿自己的連線。（第 9 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 11：Node 24 的結帳 API 這樣寫，lint 沒有報錯，程式也沒有註冊 <code>unhandledRejection</code> 監聽器。<code>sendReceipt</code> 因為信箱打錯而失敗時，會怎樣？</p>
+<pre>async function checkout(order) {
+  await saveOrder(order)
+  void sendReceipt(order)
+  return { ok: true }
+}</pre>
+  <label data-key="a"><code>void</code> 表示不等結果，失敗會被忽略，伺服器照常運作</label>
+  <label data-key="b">rejection 沒人處理，Node 預設當成未捕捉的例外，整個程序結束</label>
+  <label data-key="c">錯誤會傳回 <code>checkout</code> 的呼叫者，由外層的 try/catch 接住</label>
+  <label data-key="d">結帳 API 回傳 500，訂單已經存了，但使用者以為失敗</label>
+  <p class="why">✓ <code>void</code> 只是讓 <code>no-floating-promises</code> 閉嘴，不處理 rejection，也不改變執行時的行為；Node 15 起預設會讓程序結束，正在處理的請求一起中斷。射後不理要寫 <code>sendReceipt(order).catch(err =&gt; log.error(err))</code>；收據一定要寄到，就先寫進工作佇列由背景工作重試。a 錯在把「不等」當成「處理過了」。（第 9 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 12：每晚把金流的交易一頁一頁拉回來對帳，共 200 頁。程式先把所有頁放進陣列再處理，資料量變大後程序開始記憶體不足。怎麼改最直接？</p>
+  <label data-key="a">改用 <code>async function*</code> 一頁一頁 yield，用 <code>for await…of</code> 處理完一頁才拿下一頁</label>
+  <label data-key="b">改用 <code>Promise.all</code> 同時抓 200 頁，縮短資料留在記憶體的時間</label>
+  <label data-key="c">每抓完一頁就 <code>JSON.stringify</code> 存成字串，比物件省記憶體</label>
+  <label data-key="d">把陣列改成 <code>Map</code>，用頁碼當 key，查詢和釋放都比較快</label>
+  <p class="why">✓ 全部載入陣列，所有頁同時在記憶體，第一筆也要等全部抓完。非同步產生器是拉取模式：消費者不拿，生產者就不動，記憶體只有目前這一頁，這就是背壓。b 錯在同時抓 200 頁，記憶體裡一樣是 200 頁，還多了 200 個同時進行的請求。（第 10 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 13：結帳 API 在入口建立 <code>AbortSignal.timeout(3000)</code>，時間到就回 504。上線後發現：回了 504 的訂單，事後在金流後台常常看到扣款成功。最可能的原因是？</p>
+  <label data-key="a"><code>AbortSignal.timeout</code> 是瀏覽器的 API，在 Node 裡時間到也不會觸發</label>
+  <label data-key="b">signal 觸發之後，還要再手動呼叫一次 <code>controller.abort()</code> 扣款才會停</label>
+  <label data-key="c">signal 沒有一路傳到 <code>charge</code> 裡的 <code>fetch</code>，呼叫端放棄了，扣款請求還在跑</label>
+  <label data-key="d">3 秒太短，金流還沒回應就被中斷，金流端把被中斷的請求當成成功處理</label>
+  <p class="why">✓ 逾時只會通知收到 signal 的那一層；中間任何一層沒把 signal 交給下一層，最底層的請求就照樣跑完。每一層都把 signal 傳下去，直到真正在等的那一層。d 錯在這裡的請求根本沒被中斷：它沒收到 signal，所以照樣跑完、照樣扣款。（第 11 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 14：下面的程式在稽核紀錄寫入失敗時「還原庫存」。單獨測試都正常，上線後偶爾庫存會變多。哪裡出事？</p>
+<pre>const before = stock.get(id)
+if (before &lt; qty) throw new Error('庫存不足')
+stock.set(id, before - qty)
+try {
+  await writeAudit(id, qty)
+} catch (e) {
+  stock.set(id, before)
+  throw e
+}</pre>
+  <label data-key="a">檢查和扣減之間沒有 <code>await</code>，會被別的請求插隊</label>
+  <label data-key="b">寫回 <code>before</code> 會蓋掉別人在 await 期間做的扣減，要改成加回 <code>qty</code></label>
+  <label data-key="c">catch 裡不該再 throw，錯誤已經處理過了</label>
+  <label data-key="d"><code>writeAudit</code> 失敗時應該重試，不該還原庫存</label>
+  <p class="why">✓ 停在 <code>await writeAudit</code> 的期間，別的請求可能扣過庫存；寫回當初讀到的值，就把它們的扣減一起抹掉了。補償做反向操作：<code>stock.set(id, stock.get(id) + qty)</code>。a 錯在講反了：檢查和扣減放在同一段沒有 await 的同步程式，正是不會被插隊的寫法。（第 12 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 15：訂單列表切換「今天／本週」時，你已經在送出新請求前 <code>abort()</code> 上一個。同事說「既然取消了，就不用再比對請求序號」。對嗎？</p>
+  <label data-key="a">對，<code>abort()</code> 之後舊請求的 Promise 不會再定案，結果不可能寫進畫面</label>
+  <label data-key="b">對，只要再加上 debounce，舊請求就不會比新請求晚回來</label>
+  <label data-key="c">不對，<code>abort()</code> 只對 GET 請求有效，其他方法的請求還是要靠序號</label>
+  <label data-key="d">不對，舊結果可能在 <code>abort()</code> 之前就已經回來，排在 microtask 裡等著</label>
+  <p class="why">✓ 取消減少浪費，但結果可能早一步回來，也不是每個 api 都理會 signal；序號（或檢查 <code>signal.aborted</code>）才保證畫面只採用最新的。被取消的請求以 AbortError 失敗，要安靜結束。a 錯在忽略了時間差：結果已經回來、在佇列裡等著時，<code>abort()</code> 改變不了它。（第 12 課）</p>
+</div>
+
+<p>這個階段的重點整理成<a href="../sheets/stage-2.html">一頁圖解</a>。</p>
+<p>下一課進入 TypeScript：它在程式執行之前幫你檢查什麼、檢查不到什麼。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

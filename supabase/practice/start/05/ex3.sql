@@ -1,0 +1,3 @@
+-- 練習 3：報表用的 view public.store_report(store_id, order_count, revenue)：每家分店的訂單數與營業額。
+-- 測試已經讓 orders 開好 RLS：店員只看得到 JWT 的 app_metadata.store_id 那家分店。
+-- 要做到：店員查這個 view 只看得到自己分店那一列；沒登入的人不能查

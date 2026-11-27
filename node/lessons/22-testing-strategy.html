@@ -1,0 +1,468 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>22. 測試策略：mock、假時鐘與假上游</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="22" data-practice="node">
+<header>
+  <div class="eyebrow">階段 5：上線前的準備 · 第 22 課</div>
+  <h1>測試策略：mock、假時鐘與假上游</h1>
+</header>
+<main>
+
+<p>咖啡店加了「飲料好了傳簡訊」的功能。測試全部通過，上線後客人一杯拿鐵收到三封簡訊；查下去，測試把整個簡訊模組換成假的，而且從頭到尾沒檢查它被呼叫幾次。同一週，CI 上的訂單測試偶爾變紅，大家習慣按「重跑」，直到某天凌晨真的有 bug 混了進去，因為紅燈已經沒人相信。</p>
+<p>兩件事的共同點是：測試有寫，卻沒有保護到任何東西。這一課從這次事故出發，替「飲料好了傳簡訊」這條流程和它背後的下單重寫測試，要做到三件事：重複傳簡訊這種 bug 在送 PR 時就變紅；整組測試幾秒內跑完，不用真的等 10 分鐘；紅燈每一次都代表程式真的有問題，而不是重跑就會過。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>這條流程該用哪一層測試保護：單元、整合、端對端各測多大一塊，通知功能的每一段該落在哪一層。</li>
+  <li>notifyWhenReady 寫死了簡訊和時間，怎麼換掉；換進去的假東西怎麼寫，才抓得到「三封簡訊」。</li>
+  <li>每 30 秒查一次、10 分鐘才放棄，怎麼用假時鐘在幾毫秒內測完。</li>
+  <li>查狀態要走 HTTP、下單要寫資料庫：這兩種外部依賴為什麼不換成假的，要怎麼用真的又不互相干擾。</li>
+  <li>CI 偶爾變紅的訂單測試：常見原因、怎麼重現、怎麼修好而不是重跑。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="06-testing-debugging.html">第 6 課</a>的 <code>node:test</code>：<code>test()</code> 定義測試、<code>assert</code> 檢查結果、<code>beforeEach</code> 這類 hook 做準備與清理。</li>
+  <li><a href="07-event-loop.html">第 7 課</a>的計時器與 microtask：<code>setTimeout</code> 的 callback 由 event loop 在時間到後執行；<code>await</code> 之後的程式是 microtask，要等目前的同步程式跑完才輪到。</li>
+  <li><a href="08-events-cancellation.html">第 8 課</a>的 <code>AbortSignal.timeout(ms)</code>：時間到自動取消的 signal。</li>
+</ul></div>
+
+<h2>「飲料好了傳簡訊」該用哪一層測試保護？</h2>
+<p>先看這個功能由哪幾段組成。客人下單時，<code>placeOrder</code> 在資料庫扣庫存、建訂單；之後 <code>notifyWhenReady</code> 每 30 秒向訂單服務查一次狀態，飲料做好就呼叫簡訊服務傳一封簡訊，等滿 10 分鐘還沒好就放棄。這裡面有三種性質完全不同的東西：一段迴圈邏輯（多久查一次、什麼時候停）、一個透過 HTTP 呼叫的外部服務、一段寫資料庫的 SQL。用同一種方式測它們，不是太慢就是抓不到 bug。</p>
+<p>測試依照「一次測多大一塊」分成三層。差別不在用的工具，而在被測的範圍有多大、外面的東西換掉多少：</p>
+<ul>
+  <li><strong>單元測試（unit test）</strong>：測一個函式或一個模組，外面的東西（時間、網路、資料庫）都換掉。幾毫秒跑完，壞了馬上知道是哪個函式。</li>
+  <li><strong>整合測試（integration test）</strong>：測幾個元件一起工作，通常包含真的資料庫或真的 HTTP。幾十到幾百毫秒，抓得到 SQL 寫錯、交易沒包好這種單元測試看不到的 bug。</li>
+  <li><strong>端對端測試（end-to-end，E2E）</strong>：把整個系統跑起來，從外面像使用者一樣呼叫（發 HTTP 請求、點瀏覽器）。最像正式環境，也最慢、最容易因為環境問題失敗。</li>
+</ul>
+<div class="table-wrap"><table>
+<thead><tr><th></th><th>單元</th><th>整合</th><th>端對端</th></tr></thead>
+<tbody>
+<tr><td>速度</td><td>毫秒</td><td>幾十～幾百毫秒</td><td>秒～分鐘</td></tr>
+<tr><td>失敗時好不好找原因</td><td>很好找</td><td>要看一下</td><td>難，可能是任何一層</td></tr>
+<tr><td>能給你多少信心</td><td>只證明這個函式的邏輯</td><td>證明元件接得起來</td><td>證明使用者真的用得了</td></tr>
+<tr><td>適合</td><td>計算、規則、狀態轉換、重試與逾時邏輯</td><td>SQL、交易、HTTP 路由、和上游的協定</td><td>最重要的幾條流程（下單、付款）</td></tr>
+</tbody>
+</table></div>
+<p>表的最後一列直接回答了通知功能怎麼分：<code>notifyWhenReady</code> 的迴圈是「重試與逾時邏輯」，寫單元測試，把時間和簡訊換掉，專心檢查「多久查一次、傳幾封、什麼時候停」；查訂單狀態是「和上游的協定」，寫整合測試，讓程式真的發 HTTP；<code>placeOrder</code> 是「SQL、交易」，寫整合測試，連真的資料庫。端對端只留給「下單到付款」這種一壞就賠錢的整條流程，數量很少。</p>
+<p>每一層各寫多少，業界有兩種常見的看法：<strong>測試金字塔</strong>（test pyramid）主張大量單元測試、少量整合、極少端對端；<strong>測試獎盃</strong>（testing trophy）主張整合測試最多，因為後端的 bug 大多出在「接起來」的地方，而現在用 Docker 開一個真的資料庫只要幾秒。</p>
+
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="左邊是測試金字塔，底部單元測試最寬，往上整合、端對端越來越窄；右邊是測試獎盃，中間的整合測試最寬，單元測試和端對端較窄">
+    <polygon class="d-soft" points="80,210 300,210 260,160 120,160"/>
+    <polygon class="d-soft" points="120,155 260,155 225,110 155,110"/>
+    <polygon class="d-soft" points="155,105 225,105 190,60"/>
+    <text class="d-text" x="190" y="192" text-anchor="middle">單元</text>
+    <text class="d-text" x="190" y="138" text-anchor="middle">整合</text>
+    <text class="d-small" x="190" y="96" text-anchor="middle">E2E</text>
+    <text class="d-accent" x="190" y="236" text-anchor="middle">測試金字塔</text>
+    <rect class="d-soft" x="450" y="180" width="140" height="30" rx="4"/>
+    <rect class="d-soft" x="400" y="105" width="240" height="70" rx="8"/>
+    <rect class="d-soft" x="470" y="60" width="100" height="40" rx="4"/>
+    <text class="d-text" x="520" y="200" text-anchor="middle">單元</text>
+    <text class="d-text" x="520" y="145" text-anchor="middle">整合</text>
+    <text class="d-small" x="520" y="85" text-anchor="middle">E2E</text>
+    <text class="d-accent" x="520" y="236" text-anchor="middle">測試獎盃</text>
+  </svg>
+  <figcaption>兩種形狀都同意：端對端最少。差別在單元和整合誰多。</figcaption>
+</figure>
+
+<p>實務上不用選邊，照上面的分法就好：<strong>邏輯複雜的地方寫單元測試</strong>（折扣規則、重試的等待時間、通知的輪詢），<strong>和外部系統接觸的地方寫整合測試</strong>（SQL、交易、HTTP 客戶端），端對端只留給下單這種一壞就賠錢的流程。</p>
+<p>不管哪一層，還有一條共同的原則：測<strong>行為</strong>，不測<strong>實作</strong>。行為是從外面看得到的結果，例如「庫存不夠時丟 <code>OutOfStockError</code>、庫存沒變」；實作是程式內部怎麼做到的，例如「呼叫了 <code>client.query</code> 三次」。測實作的測試把內部步驟寫死了，你把三次查詢合併成一次這種完全正確的重構，它會整片變紅，程式明明沒壞。紅燈一多，大家就開始不看紅燈，這正是開場那個團隊走到的地方。</p>
+<div class="callout practice"><strong>💡 實務上：接手沒有測試的舊專案，先替最賺錢的流程補整合測試</strong><br>很多團隊的現況不是「金字塔還是獎盃」，而是幾乎沒有測試。這時不要從單元測試一個個補起，先挑「壞了會被老闆或客服找」的流程，例如咖啡店的下單和扣庫存，用整合測試把現在的行為固定下來，之後重構才敢動。新功能則跟著 PR 一起交測試，review 時資深會先問：「這個 bug 修好了，有沒有一個測試在修之前是紅的？」不要追求測試數量或「每個函式都要有單元測試」，三行的 getter 不值得寫，折扣規則和退款流程才值得。</div>
+<p>分好層之後，第一個要動手的是 <code>notifyWhenReady</code> 的單元測試。但單元測試的前提是能把時間和簡訊換掉，而現在的寫法做不到。</p>
+
+<h2>notifyWhenReady 寫死了簡訊和時間，測試要怎麼換掉它們？</h2>
+<p>這是目前的寫法。它直接 import 簡訊模組、直接讀現在時間、直接 <code>setTimeout</code>：</p>
+<pre>// 難測：依賴寫死在函式裡
+import { sendSms } from './sms.ts'
+import { getStatus } from './orders-api.ts'
+
+export async function notifyWhenReady(orderId: number) {
+  const start = Date.now()
+  while (Date.now() - start &lt; 10 * 60_000) { … await getStatus(orderId) … await sendSms(orderId) … }
+}</pre>
+<p>想替它寫測試，每一個寫死的依賴都會卡住你：</p>
+<ul>
+  <li><code>sendSms</code>：測試一跑就真的傳出簡訊，花錢，還可能傳到真的客人手機上。而且你沒辦法知道它被呼叫了幾次，「三封簡訊」也就無從檢查。</li>
+  <li><code>getStatus</code>：真的去打訂單服務。你沒辦法讓它「先回 pending 兩次、第三次回 ready」，也沒辦法讓它丟錯，測不到這些情況。</li>
+  <li><code>Date.now()</code> 和 <code>setTimeout</code>：真的時間。測「10 分鐘後放棄」就要真的等 10 分鐘。</li>
+</ul>
+<p>解法是<strong>依賴注入</strong>（dependency injection）。名字聽起來很大，做的事很簡單：函式需要的外部東西不在函式裡 import 或寫死，而是從參數傳進來。函式只認「有一個能查狀態的函式、有一個能傳簡訊的函式」，不在乎傳進來的是真的還是假的。正式程式傳真的，測試傳假的。<a href="13-http-server.html">第 13 課</a>的 <code>createApp(menu)</code> 就是一例：菜單從參數傳進去，測試就能給一份自己的菜單。</p>
+<pre>export type NotifyDeps = {
+  getStatus: (orderId: number) =&gt; Promise&lt;'pending' | 'ready'&gt;
+  sendSms: (orderId: number) =&gt; Promise&lt;void&gt;
+  log: { warn: (message: string) =&gt; void }
+}
+
+export async function notifyWhenReady(orderId: number, deps: NotifyDeps) { … deps.getStatus(orderId) … }
+
+// 正式程式
+await notifyWhenReady(order.id, { getStatus: ordersApi.getStatus, sendSms: sms.send, log: logger })</pre>
+<p><code>NotifyDeps</code> 這個型別就是 <code>notifyWhenReady</code> 和外界的約定。它還有一個好處：測試傳進去的假物件少了一個函式、或參數型別不對，TypeScript 會直接報錯，假的和真的不會悄悄長得不一樣。</p>
+<p>時間這個依賴這次沒有放進參數，因為 <code>node:test</code> 有辦法直接接管全域的 <code>setTimeout</code> 和 <code>Date</code>，下下節會講。其他程式裡常見要注入的東西：時鐘（<code>now()</code>）、亂數（<code>random()</code>）、HTTP 的位址（<code>baseUrl</code>，<a href="17-calling-external-apis.html">第 17 課</a>的 <code>getStock(baseUrl, …)</code> 就是這樣設計的）、資料庫連線池（<a href="20-postgres-pool-transactions.html">第 20 課</a>的 <code>placeOrder(pool, …)</code>）。不需要框架，一個參數物件就夠。</p>
+<p>另一條路是不改函式，在測試裡把整個 <code>sms.ts</code> 模組換掉（module mock）。在 Node 24 它還要加實驗旗標、而且有設定順序的坑，這門課一律用參數注入，細節見課末。</p>
+<p>現在測試可以把自己的 <code>getStatus</code> 和 <code>sendSms</code> 傳進去了。下一個問題是傳什麼：當初那組測試也傳了假的簡訊模組，卻還是讓三封簡訊上線了。</p>
+
+<h2>換進去的假東西要怎麼寫，才抓得到「三封簡訊」？</h2>
+<p>先還原當初的測試做了什麼：它把 <code>sendSms</code> 換成一個什麼都不做的空函式，讓 <code>getStatus</code> 回 <code>'ready'</code>，然後只檢查 <code>notifyWhenReady</code> 回傳了 <code>true</code>。不管重複傳簡訊的 bug 出在哪一行，這個測試都不會發現，因為它從來沒問過「簡訊被傳了幾次」。假的簡訊函式被呼叫一次還是三次，它都一樣安靜地回傳。</p>
+<p>問題不在「用了假的」，而在用了哪一種假的。測試裡代替真實依賴的東西統稱<strong>測試替身</strong>（test double），依照它幫你做的事分成四種：</p>
+<div class="table-wrap"><table>
+<thead><tr><th>名稱</th><th>做什麼</th><th>咖啡店的例子</th></tr></thead>
+<tbody>
+<tr><td>stub</td><td>固定回傳某個值</td><td><code>getStatus</code> 一律回 <code>'pending'</code></td></tr>
+<tr><td>spy</td><td>記錄被呼叫幾次、參數是什麼</td><td>事後檢查 <code>sendSms</code> 剛好被呼叫 1 次、參數是 7</td></tr>
+<tr><td>mock</td><td>預先寫好期望的呼叫，不符合就失敗</td><td>「<code>sendSms</code> 必須以 7 呼叫一次」寫在替身裡</td></tr>
+<tr><td>fake</td><td>簡化但真的能用的實作</td><td>用 <code>Map</code> 做的記憶體版訂單庫、測試裡開的假上游伺服器</td></tr>
+</tbody>
+</table></div>
+<p>當初的空函式只是 stub：它負責讓程式跑得下去，不負責記錄。要抓到三封簡訊，<code>sendSms</code> 必須是 spy，測試結束前檢查「剛好 1 次、參數是 7」。<code>getStatus</code> 則是 stub，由測試決定它回什麼，才能安排「前兩次 pending、第三次 ready」或「這一次丟錯」這些情況。日常說「mock」常常泛指這四種，聽到時要看上下文判斷對方指的是哪一種。</p>
+<p><code>node:test</code> 的 <code>mock.fn()</code> 同時是 stub 和 spy：給它一個實作，它就照做，並記下每一次呼叫。</p>
+<pre>import test, { mock } from 'node:test'
+
+const sendSms = mock.fn(async (_orderId: number) =&gt; {})
+await sendSms(7)
+
+sendSms.mock.callCount()           // 1
+sendSms.mock.calls[0].arguments    // [7]
+
+const getStatus = mock.fn(async (_id: number): Promise&lt;'pending' | 'ready'&gt; =&gt; 'pending')
+getStatus.mock.mockImplementation(async () =&gt; 'ready')                          // 之後每次都回 'ready'
+getStatus.mock.mockImplementationOnce(async () =&gt; { throw new Error('連不上') })  // 只有下一次丟錯</pre>
+<p><code>sendSms.mock.callCount()</code> 就是當初缺的那一行檢查：<code>assert.equal(deps.sendSms.mock.callCount(), 1)</code>。有了它，任何讓簡訊多傳一次的改動都會讓測試變紅。斷言寫得具體也一樣重要：只檢查「有呼叫」，呼叫三次也會過；要檢查次數和參數。</p>
+<p>有時候要換的不是你傳進去的參數，而是某個已經存在的物件上的方法，例如想確認程式有呼叫 <code>console.warn</code>，又不想讓它真的印出來。這時用 <code>t.mock.method(物件, '方法名', 新實作)</code>：</p>
+<pre>test('寫 log', (t) =&gt; {
+  const warn = t.mock.method(console, 'warn', () =&gt; {})   // 測試結束自動還原
+  …
+  assert.equal(warn.mock.callCount(), 1)
+})</pre>
+<p>注意它是從 <code>t.mock</code> 呼叫的。<code>t</code> 是這個測試自己的 context，用 <code>t.mock</code> 建立的替身在這個測試結束時自動還原，下一個測試拿到的是原本的 <code>console.warn</code>。用最上面 import 的 <code>mock</code> 建的替身不會自動還原，要自己呼叫 <code>mock.restoreAll()</code>；忘了還原，前一個測試的假函式會留到下一個測試，造成「單獨跑會過、一起跑會錯」，最後一節會再看到這種問題。</p>
+<p>替身解決了簡訊和查詢狀態。但 <code>notifyWhenReady</code> 還有一個依賴沒處理：時間。要測「ready 之後只傳一次」，就得讓迴圈多跑幾輪，確認之後沒再傳；要測「10 分鐘後放棄」，就得讓 10 分鐘過去。</p>
+
+<h2>每 30 秒查一次、10 分鐘才放棄，怎麼不用真的等 10 分鐘？</h2>
+<p><code>notifyWhenReady</code> 每 30 秒查一次、10 分鐘放棄。用真的時間測，一個測試就要 10 分鐘，CI 跑不起，開發時也沒人願意等。</p>
+<p><strong>假時鐘</strong>（fake timers）的做法是把全域的 <code>setTimeout</code> 和 <code>Date</code> 換成假的。假的 <code>setTimeout</code> 不會真的設計時器，只把「哪個 callback、在第幾毫秒執行」記在一張清單上；假的 <code>Date.now()</code> 回傳的是一個由測試控制的虛擬時間。時間只在你呼叫 <code>tick(ms)</code> 時前進：虛擬時間往前加 <code>ms</code>，清單上到期的 callback 當場執行。真的時間只過了幾毫秒，程式看到的卻是過了 30 秒。<code>node:test</code> 內建這個功能：</p>
+<pre>test('30 秒後觸發', (t) =&gt; {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })   // 這個測試結束時自動還原
+  let fired = false
+  setTimeout(() =&gt; { fired = true }, 30_000)
+  t.mock.timers.tick(29_999)
+  assert.equal(fired, false)
+  t.mock.timers.tick(1)
+  assert.equal(fired, true)
+  assert.equal(Date.now(), 30_000)   // 假的 Date 從 0（1970-01-01）開始；要別的起點用 enable({ …, now: 某個時間 })
+})</pre>
+<p>這個例子檢查了邊界：差 1 毫秒時還沒觸發，到了才觸發。測 <code>notifyWhenReady</code> 也要這樣想，例如「第 29 秒時 <code>getStatus</code> 還是只被呼叫 1 次、第 30 秒變成 2 次」，才抓得到「間隔變成 3 秒」這種 bug。另外 <code>t.mock.timers.runAll()</code> 會一口氣執行所有排好的計時器，適合不在乎中間過程、只要全部跑完的情況。</p>
+
+<h3>假時鐘遇到 async 迴圈</h3>
+<p>上面的例子是同步的：設好計時器、tick、檢查。<code>notifyWhenReady</code> 不一樣，它是「await 查詢 → await 等 30 秒 → 再查」的 async 迴圈，直接 <code>tick(30_000)</code> 會發現什麼都沒發生。</p>
+<p>原因在 <code>tick</code> 是同步的：它執行到期的 callback，但 callback 之後 <code>await</code> 接下去的程式是 microtask，要等目前的程式讓出來才會跑。<code>notifyWhenReady</code> 的下一個計時器，是在「查詢的 await 回來之後」那段 microtask 裡才排上去的。你 tick 的當下，下一個計時器根本還不在清單上，時間走過去也觸發不了它。所以前進時間要一小步一小步走，每一步都讓排隊的 Promise 跑完：</p>
+<pre>async function advance(t: TestContext, ms: number) {
+  await new Promise(resolve =&gt; setImmediate(resolve))      // 先讓還沒跑完的 await 跑完
+  for (let passed = 0; passed &lt; ms; passed += 1000) {
+    t.mock.timers.tick(1000)
+    await new Promise(resolve =&gt; setImmediate(resolve))    // setImmediate 沒被接管，用它等一輪
+  }
+}</pre>
+<p>每次 tick 1 秒之後，用 <code>setImmediate</code> 等一輪 event loop。<code>setImmediate</code> 不在 <code>apis</code> 清單裡，沒有被假時鐘接管，所以它會真的在下一輪執行；等它的這段空檔，前面排隊的 microtask 都會跑完，下一個 <code>setTimeout</code> 也就排上清單了。</p>
+<p>第一行很容易漏。少了它，<code>notifyWhenReady</code> 的第一個 <code>setTimeout</code> 會在 tick 之後才排上去，整個時間軸晚 1 秒，「10 分鐘後放棄」在第 601 秒才發生，測試等到逾時。寫這一課時就踩到了這個坑。</p>
+
+<h3>假時鐘管不到的東西</h3>
+<p>假時鐘只接管你在 <code>apis</code> 裡指定的全域函式。換一種方式取得計時器，它就可能管不到，程式會真的去等。在 work/22 執行 <code>node --test examples/fake-clock.spec.ts</code> 看實際結果（查表用，不用背）：</p>
+<div class="table-wrap"><table>
+<thead><tr><th>寫法</th><th>被假時鐘控制嗎（v24.22.1）</th></tr></thead>
+<tbody>
+<tr><td>全域 <code>setTimeout</code>、<code>Date</code></td><td>會</td></tr>
+<tr><td><code>import timersPromises from 'node:timers/promises'</code> 再呼叫 <code>timersPromises.setTimeout(ms)</code></td><td>會</td></tr>
+<tr><td><code>import { setTimeout } from 'node:timers/promises'</code>（解構 import）</td><td>不會，真的等。官方文件寫明不支援解構 import</td></tr>
+<tr><td><code>AbortSignal.timeout(ms)</code></td><td>不會：假時鐘走了 10 秒，<code>signal.aborted</code> 還是 <code>false</code></td></tr>
+</tbody>
+</table></div>
+<p>解構 import 這一列最容易誤踩：程式看起來一樣是 <code>setTimeout</code>，測試卻真的在等，所以要測的程式從 <code>node:timers/promises</code> 取計時器時，改成透過模組物件呼叫。最後一列對這門課影響最大：<a href="17-calling-external-apis.html">第 17 課</a>的 <code>getStock</code> 用 <code>AbortSignal.timeout</code> 做逾時，查訂單狀態的 <code>getStatus</code> 也是同一種寫法，它們的逾時沒辦法用假時鐘快轉。測逾時就用很短的真實時間（<code>timeoutMs: 100</code>），或讓呼叫端把 signal 傳進去，測試自己決定什麼時候 abort。</p>
+<p>到這裡，<code>notifyWhenReady</code> 的迴圈邏輯可以在幾毫秒內測完。但它呼叫的 <code>getStatus</code> 本身還沒測過：它要透過 HTTP 打訂單服務，對方可能很慢、可能回 500，這些情況要怎麼在測試裡製造出來？</p>
+
+<h2>查狀態要走 HTTP 打別的服務，逾時和 500 怎麼測？</h2>
+<p><code>getStatus</code> 和第 17 課的 <code>getStock</code> 是同一種程式：用 fetch 呼叫另一個服務、設逾時、檢查狀態碼、驗證回應格式。練習用已經寫好的 <code>getStock</code> 示範，道理完全一樣。最直覺的測法是像上一節換掉 <code>sendSms</code> 那樣，把全域 <code>fetch</code> 換成假的。這一步要停下來：</p>
+<div class="callout warn"><strong>不要 mock 不屬於你的東西。</strong>把全域 <code>fetch</code> 換成一個「立刻回傳 JSON」的假函式很容易，但真的 fetch 會逾時、會在 body 沒讀完時佔著連線、對 500 不會 throw。假的 fetch 這些都不會，所以「沒設逾時」「沒取消 body」的 bug 在這種測試裡永遠抓不到。你的替身只能和你自己定義的介面一樣，對別人的 API 只會「看起來一樣」。要測和外部的互動，用下面的假伺服器，讓真的 fetch 走真的 HTTP。</div>
+<p><code>sendSms</code> 可以換，是因為 <code>NotifyDeps</code> 是你自己定的約定，假的照著約定寫就和真的一樣。<code>fetch</code> 的行為由 Node 和網路決定，假的只能模仿你想得到的部分，而 bug 偏偏藏在你沒想到的部分。</p>
+<p>所以換的不是 fetch，而是 fetch 另一端的伺服器。HTTP 的測試分兩個方向：</p>
+<ul>
+  <li><strong>測你自己的伺服器</strong>：在測試裡 <code>listen(0)</code>（<a href="13-http-server.html">第 13 課</a>），讓系統挑一個沒人用的 port，用 <code>server.address().port</code> 拿到號碼，再用 fetch 打它。這樣測到路由、狀態碼、標頭、JSON 格式，全部是真的。</li>
+  <li><strong>測你呼叫上游的程式</strong>：在測試裡開一個<strong>假伺服器</strong>（fake server）扮演上游。它記下收到的請求，回應由你控制：正常、500、不回應、回一半、格式錯誤。被測的程式用真的 fetch 打它。</li>
+</ul>
+<p><code>getStatus</code> 和 <code>getStock</code> 屬於第二種。下面的 <code>fakeUpstream</code> 在測試裡開一個伺服器，回應的方式由每個測試傳進來的 <code>handle</code> 決定，並記下每一個收到的請求：</p>
+<pre>async function fakeUpstream(t: TestContext, handle: (req: IncomingMessage, res: ServerResponse) =&gt; void) {
+  const requests: string[] = []
+  const server = createServer((req, res) =&gt; {
+    requests.push(`${req.method} ${req.url}`)
+    handle(req, res)
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  t.after(() =&gt; { server.closeAllConnections(); server.close() })   // 測試失敗也會關
+  return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, requests }
+}
+
+test('上游不回應：逾時', { timeout: 2000 }, async (t) =&gt; {
+  const up = await fakeUpstream(t, () =&gt; {})   // 收到請求，永遠不回
+  await assert.rejects(getStock(up.url, 2, { timeoutMs: 100 }), UpstreamTimeoutError)
+})</pre>
+<p>這段程式有三個地方是為了讓測試穩定：</p>
+<ul>
+  <li><code>listen(0)</code> 而不是固定的 port：兩份測試同時跑、或本機剛好有別的程式佔著某個 port，都不會撞在一起。</li>
+  <li><code>await once(server, 'listening')</code>：等伺服器真的開始接連線才回傳網址，不用猜要等多久。</li>
+  <li><code>t.after(…)</code>：測試結束時一定關掉伺服器，失敗也一樣。<code>closeAllConnections()</code> 先切斷還開著的連線，否則像「永遠不回」那種還掛著的連線，會讓 <code>server.close()</code> 等它們結束才算關好。</li>
+</ul>
+<p>「上游不回應」這個測試本身，就是第 17 課逾時的證明：假上游收到請求後什麼都不做，<code>getStock</code> 要在 100 毫秒後丟 <code>UpstreamTimeoutError</code>。這裡用的是真實的 100 毫秒，正是上一節說的「<code>AbortSignal.timeout</code> 用很短的真實時間測」。檢查的是錯誤類別，不只是「有丟錯」：丟錯的原因不對，測試也要失敗。</p>
+<p>測試本身也要設 <code>{ timeout: 2000 }</code>。<code>node:test</code> 預設沒有逾時，如果 <code>getStock</code> 漏了逾時處理，這個測試會一直卡著等假上游回應，而不是失敗。加上 timeout，漏掉逾時處理會在 2 秒後變成一個清楚的紅燈。</p>
+<p>回到前面清單的第一個方向：測你自己的伺服器（<code>listen(0)</code> 再用 fetch 打它）。假設測試對自己的伺服器送出 <code>POST /orders</code>，<code>res</code> 就是 fetch 拿到的回應，檢查它時常遇到一個問題：回應裡常有 <code>id</code>、<code>createdAt</code> 這種每次都不一樣、這個測試也不在乎的欄位。只想檢查關心的欄位，用 <code>assert.partialDeepStrictEqual(實際, 預期)</code>：預期裡有的欄位要相等，實際多出來的欄位不管；陣列則是預期的元素要依序出現在實際的陣列裡。</p>
+<pre>// 回應裡還有 createdAt、id，這個測試不在乎
+assert.partialDeepStrictEqual(await res.json(), { status: 'brewing', items: [{ productId: 2 }] })</pre>
+<div class="callout practice"><strong>💡 實務上：假上游測你的處理，對方改格式要另外抓</strong><br>咖啡店串金流或外送平台時，假上游能把逾時、500、回一半這些「對方出狀況」的情況都測過，而且每次結果一樣。它測不到的是「對方改了欄位名稱」，因為假上游回的格式是你自己寫的。常見做法是另外留幾個打對方 sandbox（測試環境）的檢查，排程跑或上線前手動跑，不放進每次 PR 的 CI，免得對方 sandbox 掛掉時大家的 PR 都卡住。假上游回的 JSON 最好從對方文件或真實回應複製，不要憑印象寫。</div>
+<p>通知流程的三個依賴都有了測法：簡訊用 spy、時間用假時鐘、上游用假伺服器。剩下開場的另一半：CI 上時好時壞的訂單測試，它測的是 <code>placeOrder</code>，碰的是資料庫。</p>
+
+<h2>下單扣庫存的 SQL，為什麼不能也換成假的？</h2>
+<p>照上一節的思路，資料庫也是「不屬於你的東西」。把 <code>pool.query</code> mock 掉，讓它回傳你預先寫好的列，測到的只是「你以為 SQL 會回什麼」。SQL 寫錯、少了 <code>AND stock &gt;= $1</code>、交易沒包好、連線沒還，這些全都要真的資料庫才看得出來。例如「兩個人同時買最後一杯拿鐵」：假的 <code>client.query</code> 只會回你寫給它的 <code>rowCount</code>，先查再寫的錯誤寫法也照樣通過；只有連真的 PostgreSQL、並且在測試裡讓兩筆下單同時送出（例如 <code>Promise.all</code>），第二個 UPDATE 才會等第一個、再用最新的庫存判斷，先查再寫的錯誤寫法才會現形。</p>
+<p><a href="20-postgres-pool-transactions.html">第 20 課</a>已經用 Docker 開了 PostgreSQL，整合測試直接連它。先在 learn/node/practice 執行 <code>docker compose up -d --wait</code>。</p>
+<p>用真的資料庫，馬上會碰到一個假替身沒有的問題：資料會留下來。<strong>測試隔離</strong>（test isolation）指的是每個測試不受其他測試影響，不管它單獨跑、和別的測試一起跑、或排在第幾個跑，結果都一樣。共用一個資料庫時這件事很容易壞：測試 A 把拿鐵庫存扣到 8，測試 B 預期是 10，B 的結果就取決於 A 有沒有先跑，時好時壞。開場那個「偶爾變紅」的訂單測試，很可能就是這樣來的。</p>
+<p>隔離的做法要先認識一個名詞：<strong>schema</strong> 是資料庫裡的命名空間，像資料夾一樣把表分開放。<code>test_a.orders</code> 和 <code>test_b.orders</code> 是兩張不同的表；連線的 <code>search_path</code> 設成 <code>test_a</code>，SQL 裡寫 <code>orders</code> 就是指 <code>test_a.orders</code>。兩個測試檔同時跑，各用各的 schema，互不干擾。常見的三種隔離做法：</p>
+<div class="table-wrap"><table>
+<thead><tr><th>做法</th><th>怎麼做</th><th>代價</th></tr></thead>
+<tbody>
+<tr><td>每個測試檔一個資料庫</td><td><code>CREATE DATABASE 隨機名稱</code>，跑完 <code>DROP</code>。這門課的判分（<code>helpers/db.ts</code>）就是這樣</td><td>建資料庫要幾十毫秒，要有建立資料庫的權限</td></tr>
+<tr><td>每個測試檔一個 schema</td><td>同一個資料庫裡建 <code>test_隨機名稱</code> schema，連線的 <code>search_path</code> 指向它。練習 4 的 <code>createTestSchema()</code></td><td>快，只要建 schema 的權限；表要在每個 schema 裡重建</td></tr>
+<tr><td>每個測試一個交易，最後 ROLLBACK</td><td>測試開頭 <code>BEGIN</code>，結尾 <code>ROLLBACK</code>，資料不會留下</td><td>最快。但被測的程式必須用測試給的那條連線；像 <code>placeOrder</code> 自己從池子借連線、自己 COMMIT，就不能這樣測</td></tr>
+</tbody>
+</table></div>
+<p>第三種最快，為什麼這課不用？因為 ROLLBACK 只能撤銷「測試開的那個交易」裡的東西。<code>placeOrder</code> 從池子借自己的連線、開自己的交易、自己 COMMIT，它的寫入早就提交了，測試的 ROLLBACK 管不到。所以練習用第二種：每個測試檔一個 schema。</p>
+<p>schema 把測試檔彼此隔開，但同一個檔裡的測試還是共用同一份資料。所以測試資料用<strong>工廠函式</strong>建立：每個測試呼叫一個小函式，當場建一個只屬於自己的商品，而不是依賴種子資料裡的「拿鐵庫存 100」。名稱加上隨機字串，別的測試扣了拿鐵的庫存，也碰不到你的商品。</p>
+<pre>async function newProduct(price: number, stock: number) {
+  const { rows } = await pool.query&lt;{ id: number }&gt;(
+    'INSERT INTO products (name, price, stock) VALUES ($1, $2, $3) RETURNING id', [`測試豆 ${crypto.randomUUID()}`, price, stock])
+  return rows[0].id
+}
+
+test('庫存不夠：丟 OutOfStockError，庫存沒變，連線有還', async () =&gt; {
+  const cake = await newProduct(120, 2)
+  await assert.rejects(placeOrder(pool, 1, [{ productId: cake, quantity: 3 }]), OutOfStockError)
+  assert.equal(await stockOf(cake), 2)
+  assert.equal(pool.idleCount, pool.totalCount, '借出去的連線都要還回來')
+})</pre>
+<p>這個測試檢查的全是行為：丟的是哪一種錯誤、庫存有沒有被動到、連線有沒有還。最後一行檢查「池子裡閒置的連線數 = 全部的連線數」，也就是沒有連線借了沒還；漏了 <code>release()</code> 的程式在這裡就會變紅，不用等到正式環境午餐尖峰卡住才發現。<a href="20-postgres-pool-transactions.html">第 20 課</a>的判分用的就是這招。</p>
+<div class="callout practice"><strong>💡 實務上：CI 裡也開一個真的資料庫，而且絕對連不到正式環境</strong><br>本機用 Docker 跑得起來，CI 也一樣：GitHub Actions 這類 CI 可以在 job 裡起一個 PostgreSQL 容器，跑完就丟，不用共用一台「測試資料庫」。最危險的坑是測試的連線字串讀錯環境變數，結果 <code>DROP</code> 或清資料打到 staging（上線前的預備環境）甚至正式資料庫。資深會在測試的 setup 先檢查連線的主機或資料庫名稱，不是預期的測試庫就直接中止。另外，測試用的 migration 要和上線用的是同一份，不要另外手寫一份測試用的建表 SQL，否則兩邊會慢慢不一樣。</div>
+<p>共用資料只是測試時好時壞的原因之一。開場那個訂單測試，大家已經重跑了好幾週；要修好它，得先知道還有哪些地方會讓測試不穩定，以及怎麼把「偶爾」變成「每次都重現」。</p>
+
+<h2>CI 上的訂單測試偶爾變紅，怎麼找出原因修好？</h2>
+<p><strong>不穩定的測試</strong>（flaky test）是程式沒改，有時過、有時不過的測試。它的傷害比沒有測試還大。測試的價值在於紅燈代表「有東西壞了」；一個測試每 20 次隨機紅一次，大家很快就學會「紅了就重跑」，接著連真正的紅燈也一起重跑掉。開場那個凌晨混進去的 bug，就是這樣過關的。</p>
+<p>不穩定的根源都是同一件事：測試的結果取決於某個測試沒控制的東西。把常見的來源列出來，看到症狀就知道往哪裡找：</p>
+<div class="table-wrap"><table>
+<thead><tr><th>原因</th><th>症狀</th><th>修法</th></tr></thead>
+<tbody>
+<tr><td>固定 port</td><td>本機開著別的伺服器、或 CI 同時跑兩份時 <code>EADDRINUSE</code></td><td><code>listen(0)</code>，從 <code>server.address()</code> 拿 port</td></tr>
+<tr><td>真的 sleep</td><td>慢；機器忙的時候 2100ms 不夠</td><td>假時鐘；或等一個事件（<code>once(server, 'listening')</code>），不要猜時間</td></tr>
+<tr><td>共享的模組狀態</td><td>單獨跑會過，一起跑不過（或反過來）</td><td>每個測試建自己的物件（<code>createStore()</code>），不用模組層級的單例</td></tr>
+<tr><td>依賴執行順序</td><td>測試 B 靠測試 A 留下的資料</td><td>每個測試自己準備需要的資料</td></tr>
+<tr><td>依賴現在時間或亂數</td><td>某天、某個時段、某個時區才失敗</td><td>把時間、亂數當參數傳進去，預期值寫死</td></tr>
+<tr><td>沒清理的資源</td><td>伺服器、計時器、連線沒關，測試跑完程序不結束，或影響下一個測試</td><td><code>t.after(…)</code> 清理，失敗時也會執行</td></tr>
+</tbody>
+</table></div>
+<p>練習 3 用一個更小的取餐櫃台測試檔 <code>flaky.spec.ts</code>，把這些原因集中在一起示範；訂單測試時好時壞，和它是同一類問題，下面的例子都取自這個檔案。這張表的修法，前面幾節都已經用過了：<code>listen(0)</code> 和 <code>once(server, 'listening')</code> 在假上游裡，假時鐘取代真的 sleep，工廠函式和每個測試自己 <code>createStore()</code> 避免共享狀態，<code>t.mock</code> 自動還原避免替身殘留，<code>t.after</code> 負責清理。剩下最隱密的一種是「依賴時間」。下面這個斷言在台灣白天都會過：</p>
+<pre>assert.equal(receiptTitle(), `收據 ${new Date().toISOString().slice(0, 10)}`)</pre>
+<p><code>receiptTitle</code> 用本地日期，<code>toISOString()</code> 是 UTC。台灣是 UTC+8，在時區設成台北的機器上（例如開發者的電腦），凌晨 0 點到 8 點兩個日期差一天，測試只在這段時間失敗；CI 若用 UTC，兩個日期永遠一樣，反而永遠會過，問題被藏起來。白天上班的人重跑永遠會過，問題就一直找不到。練習 3 判分時會用 <code>TZ</code> 把時區設成台北、時間固定在凌晨 1:30，專門抓這種寫法。修法是把時間傳進去，預期值寫死：<code>assert.equal(receiptTitle(new Date(2026, 0, 2, 1, 30)), '收據 2026-01-02')</code>。挑凌晨的時間，就是在測這個邊界。</p>
+<p>其他原因要先能重現才能修。「依賴執行順序」最常見，用 <code>--test-randomize</code> 打亂測試的執行順序把它逼出來。它會在最後印出這次用的 seed（決定打亂方式的數字），失敗時用同一個 seed 再跑，順序就完全一樣，偶爾的失敗變成每次都會失敗，才能開始查：</p>
+<pre>$ node --test --test-randomize flaky.spec.ts
+…
+ℹ Randomized test order seed: 3443163050
+
+$ node --test --test-random-seed=3443163050 flaky.spec.ts    # 同樣的順序再跑一次</pre>
+<p>單獨跑一個測試也很有用：<code>node --test --test-name-pattern="櫃台上有 1 張訂單" flaky.spec.ts</code>。單獨跑會失敗，就是在靠別的測試留下的東西。</p>
+<div class="callout warn"><strong>重跑不是修。</strong>CI 設成「失敗自動重跑三次」會讓紅燈消失，原因還在：可能是測試寫錯，也可能是程式真的有競爭條件，在正式環境也會發生。看到不穩定的測試，先找出不確定的來源（時間、順序、共享狀態、port、網路），修好；暫時修不了就隔離起來並開一張單，不要讓它繼續混在正常的測試裡。</div>
+<p>回到開場的兩件事：三封簡訊，現在有 <code>callCount</code> 的斷言在 PR 就擋下；時好時壞的訂單測試，用 <code>--test-randomize</code> 和 seed 重現、找出不確定的來源修好，紅燈就重新代表「真的壞了」。接下來的練習，就是把這兩件事親手做一遍。</p>
+
+<h2>補充與查表</h2>
+<ul>
+  <li><strong>版本備註</strong>（這門課的練習要求 Node 24.16.0 以上，下面的實測版本是 v24.22.1）：
+    <ul>
+      <li><code>t.mock.timers</code> 自 v23.1.0 起是穩定功能。</li>
+      <li><code>assert.partialDeepStrictEqual</code> 在 v24.0.0 成為穩定功能。</li>
+      <li><code>--test-randomize</code> 在 v24.16.0 加入，官方標為 Stability 1.0，還在早期開發。</li>
+    </ul></li>
+  <li><strong>module mock</strong>：不改函式、在測試裡把整個模組換掉的另一條路。<code>node:test</code> 有 <code>t.mock.module()</code>，但在 Node 24 要加 <code>--experimental-test-module-mocks</code> 才能用，執行時會印 ExperimentalWarning（這台 v24.22.1 實測，沒加旗標時 <code>t.mock.module</code> 是 <code>undefined</code>）。它還要在 import 被測模組之前設定好，順序錯了就沒效果。能用參數注入就用參數，簡單、型別也檢查得到。</li>
+  <li><strong>覆蓋率</strong>（coverage）：測試執行時跑過了幾成的程式碼。Node 24 用 <code>node --test --experimental-test-coverage</code> 產生報告，這個功能還是實驗性的。覆蓋率低代表有程式完全沒被測到，很有用；覆蓋率高不代表有在檢查，一個斷言都沒有的測試也能跑到 100%。當初那組只檢查回傳 <code>true</code> 的通知測試，覆蓋率可以很高，卻抓不到三封簡訊。判斷測試好不好，<a href="06-testing-debugging.html">第 6 課</a>的變異測試比覆蓋率準。</li>
+  <li><strong>NestJS 的對應</strong>：NestJS 課會用 Vitest 做同樣的分層：<a href="../../nestjs/lessons/05-unit-testing.html">第 5 課</a>的單元測試和<a href="../../nestjs/lessons/10-e2e-testing.html">第 10 課</a>的 E2E 測試。觀念一樣，只是工具不同。</li>
+</ul>
+
+<h2>練習</h2>
+<p>練習 1、2、4 是寫測試，判分方式和<a href="06-testing-debugging.html">第 6 課</a>一樣是變異測試：你的測試要在正確的程式上全部通過，在每一個故意改壞的版本上至少失敗一個。練習 3 是修一個不穩定的測試檔。你寫的測試檔叫 <code>*.spec.ts</code>，不要取名 <code>*.test.ts</code>（那是 check.mjs 的判分檔）。自己跑：在 work/22 執行 <code>node --test notify.spec.ts</code>。練習 4 要先開 Docker：在 learn/node/practice 執行 <code>docker compose up -d --wait</code>。</p>
+
+<div class="local" data-test="ex1" data-files="notify.spec.ts">
+  <p>練習 1：在 <code>notify.spec.ts</code> 為 <code>notify.ts</code> 的 <code>notifyWhenReady(orderId, deps)</code> 寫測試。它立刻查一次狀態，之後每 30 秒查一次；變成 <code>'ready'</code> 時傳一次簡訊並回傳 <code>true</code>；查詢丟錯時下一輪再查；從開始算滿 10 分鐘還沒 ready，呼叫 <code>log.warn</code>、回傳 <code>false</code>、不再查。起始檔已經有 <code>fakeDeps()</code>、<code>advance()</code> 和第一個測試。至少寫 4 個測試，抓得到這些 bug：間隔變成 3 秒、ready 之後重複傳簡訊、10 分鐘後沒停、<code>getStatus</code> 丟錯就整個停下。所有測試加起來要在 3 秒內跑完（真的等 30 秒一定超過），所以一定要用假時鐘。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="stock.spec.ts">
+  <p>練習 2：在 <code>stock.spec.ts</code> 為 <code>stock.ts</code>（<a href="17-calling-external-apis.html">第 17 課</a>的 <code>getStock</code>）寫測試。用起始檔的 <code>fakeUpstream()</code> 開假上游，<strong>不能替換或 mock 全域的 <code>fetch</code></strong>：判分時 fetch 被鎖住，改它會直接丟 TypeError。至少 4 個測試，抓得到這些 bug：沒有逾時、把 5xx 當成功、非 2xx 時沒有取消 body（上游送一半的 body 不結束，<code>getStock</code> 丟錯之後 <code>await up.connectionClosed</code>；這個測試的 <code>timeoutMs</code> 要比測試的 timeout 長，例如 5000，不然逾時的 signal 也會關掉連線，蓋過這個 bug）、沒有驗證回應格式。用錯誤類別檢查錯誤的種類，不要只檢查「有丟錯」。所有測試加起來 3 秒內跑完。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="flaky.spec.ts">
+  <p>練習 3：<code>flaky.spec.ts</code> 測的是 <code>pickup.ts</code>（取餐櫃台），它有四個問題：固定 port 3000、真的等 2 秒、測試共用模組裡的 <code>store</code> 而且依賴執行順序、斷言依賴今天的日期。修好它（只改測試檔，不改 <code>pickup.ts</code>）。判分會：打亂順序跑 5 次（<code>--test-random-seed=1…5</code>）、每個測試單獨跑、兩份同時跑、把時間固定在台北凌晨 1:30 跑，全部都要通過；固定 port、真的等 1 秒以上的計時器（模組頂層也算）會直接被擋下；所有測試加起來 2 秒內跑完。修完還要抓得到 bug：編號從 0 開始、沖煮完沒變 ready、收據月份少 1、收據用 UTC 日期、查不到的訂單回 200。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="place-order.spec.ts">
+  <p>練習 4：在 <code>place-order.spec.ts</code> 為 <code>orders.ts</code>（<a href="20-postgres-pool-transactions.html">第 20 課</a>的 <code>placeOrder</code>）寫整合測試，用 <code>test-db.ts</code> 的 <code>createTestSchema()</code> 拿到只屬於這個測試檔的 pool。至少 3 個測試，抓得到這些 bug：超賣（沒檢查庫存）、沒有開交易（第二項商品不夠時，第一項已經扣掉的庫存沒有還原）、失敗時連線沒還回池子。判分時資料庫的 public schema 是空的，而且你的測試檔會在同一個資料庫連跑兩次、兩份同時跑，都要通過。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：<code>getStock</code> 的測試把全域 fetch 換成「立刻回傳 <code>{"stock":13}</code>」的假函式，全部通過。上線後上游當機、連線不回應，訂單 API 跟著卡住。最可能的原因是？</p>
+  <label data-key="a">mock 寫得不夠多，應該連 <code>AbortSignal</code> 也 mock 掉</label>
+  <label data-key="b">測試數量太少，覆蓋率不到 100%</label>
+  <label data-key="c">假的 fetch 永遠立刻回應，和真的不一樣，所以「沒設逾時」這種 bug 在測試裡不可能出現</label>
+  <label data-key="d">正式環境的 Node 版本和測試不同</label>
+  <p class="why">✓ c。替身只會做你寫給它的事。假的 fetch 不會慢、不會斷線、不會回一半，所以和這些情況有關的程式碼即使錯了，測試也照樣通過。mock 更多（a）只會讓測試離現實更遠；覆蓋率（b）只說明程式被執行過，不說明有沒有被正確檢查。對外部的 HTTP，用假上游伺服器讓真的 fetch 走真的連線，才測得到逾時。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：測試裡呼叫 <code>t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })</code>，接著 <code>const signal = AbortSignal.timeout(1000)</code>，再 <code>t.mock.timers.tick(5000)</code>。<code>signal.aborted</code> 是什麼？</p>
+  <label data-key="a"><code>true</code>：假時鐘走了 5 秒，超過 1 秒的逾時</label>
+  <label data-key="b"><code>false</code>：<code>AbortSignal.timeout</code> 不受假時鐘控制，要真的過 1 秒才會 abort</label>
+  <label data-key="c">丟出錯誤：開了假時鐘就不能用 <code>AbortSignal.timeout</code></label>
+  <p class="why">✓ b。假時鐘只接管你指定的 API（全域 <code>setTimeout</code>、<code>Date</code> 等），<code>AbortSignal.timeout</code> 不在接管範圍內（v24.22.1 實測）。所以測 <code>getStock</code> 的逾時，用很短的真實時間（<code>timeoutMs: 100</code>）配假上游；或設計成讓呼叫端傳入 signal，測試自己決定何時 abort。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 7：CI 上有個訂單測試大約每 20 次失敗一次，重跑就過。最好的處理是？</p>
+  <label data-key="a">找出不確定的來源（時間、順序、共享狀態、固定 port、真的 sleep），用 <code>--test-randomize</code> 和印出的 seed 重現，修好它</label>
+  <label data-key="b">CI 設成失敗自動重跑 3 次，反正最後會過</label>
+  <label data-key="c">把那個測試刪掉，它在浪費大家的時間</label>
+  <label data-key="d">把測試的 timeout 調到 60 秒</label>
+  <p class="why">✓ a。不穩定的原因不會因為重跑而消失（b），而且可能是程式真的有競爭條件，正式環境也會發生。刪掉（c）等於放棄這個行為的保護。調 timeout（d）只對「太慢」有用，順序依賴、時區、port 衝突都不是時間不夠。暫時修不了就隔離並追蹤，不要讓它混在正常測試裡。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>mock 太多，測試只在測 mock</strong>：每個依賴都換成假的，斷言檢查的是「假的有被呼叫」，真的程式接起來會不會動完全不知道。只替換慢的、不確定的、會產生副作用的東西（時間、外部服務、簡訊），SQL 和 HTTP 協定用真的測。</li>
+  <li><strong>mock 不屬於你的 API</strong>：直接換掉全域 fetch 或 <code>pg</code> 的方法，替身的行為和真的不一樣。用假伺服器、真的資料庫。</li>
+  <li><strong>斷言太鬆</strong>：只檢查「有丟錯」，丟錯的原因不對也會過；只檢查「有呼叫」，呼叫三次也會過。檢查錯誤類別、呼叫次數、具體的值。</li>
+  <li><strong>解構 import 的 timers/promises</strong>：<code>import { setTimeout } from 'node:timers/promises'</code> 不受假時鐘控制，測試以為時間前進了，其實還在真的等。</li>
+  <li><strong>測試沒設 timeout</strong>：<code>node:test</code> 預設不會逾時，程式漏了逾時處理時測試永遠卡住。等外部的測試加 <code>{ timeout: 2000 }</code>。</li>
+  <li><strong>固定 port</strong>：<code>listen(3000)</code> 在別的程式佔用、或兩份測試同時跑時失敗。一律 <code>listen(0)</code>。</li>
+  <li><strong>真的 sleep</strong>：<code>await sleep(2100)</code> 讓測試又慢又不穩。用假時鐘，或等一個明確的事件。</li>
+  <li><strong>測試之間共享狀態</strong>：模組層級的單例、上一個測試留下的資料庫資料。每個測試建自己的物件和資料，用 <code>--test-randomize</code> 和單獨執行確認。</li>
+  <li><strong>遇到不穩定的測試就重跑</strong>：紅燈失去意義，真正的 bug 跟著溜過去。找出原因修好。</li>
+  <li><strong>把覆蓋率當成品質</strong>：100% 覆蓋率只代表每一行都被執行過。用變異測試或自己故意改壞程式，確認測試會失敗。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>先分層再寫：迴圈、規則這類邏輯寫單元測試；SQL、交易、呼叫上游寫整合測試；端對端只留給最重要的流程。不管哪一層，測行為，不測實作。</li>
+  <li>依賴從參數傳進來（簡訊、查詢、baseUrl、pool），測試就能換成假的；型別會檢查假的和真的長得一樣。</li>
+  <li>替身要選對：stub 決定回什麼，spy 記錄呼叫。抓「傳了三封簡訊」靠的是 <code>mock.fn()</code> 加上 <code>callCount</code> 的斷言。<code>t.mock</code> 建的替身在測試結束時自動還原。</li>
+  <li><code>t.mock.timers</code> 控制 <code>setTimeout</code> 和 <code>Date</code>，10 分鐘幾毫秒測完；async 迴圈要一步一步 tick，每一步讓 microtask 跑完。解構 import 的 timers/promises 和 <code>AbortSignal.timeout</code> 不受控制。</li>
+  <li>不屬於你的東西不 mock：測呼叫上游的程式，用測試裡的假伺服器控制回應、延遲和斷線，讓真的 fetch 走真的 HTTP；被測的伺服器 <code>listen(0)</code> 再用 fetch 打。</li>
+  <li>資料庫用真的，每個測試檔一個資料庫或 schema 隔開，測試資料用工廠函式建立，最後檢查連線都有還。</li>
+  <li>不穩定的測試來自固定 port、真的 sleep、共享狀態、順序依賴、時間與亂數、沒清理的資源；用 <code>--test-randomize</code> 和 seed 重現，修好而不是重跑。</li>
+</ul>
+<p>下一課處理測試抓不到的另一類問題：結果是對的，卻太慢或吃光記憶體。用 CPU profile 找出時間花在哪個函式，用 heap snapshot 找出誰抓著記憶體不放。</p>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 8 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="b">
+  <p>練習 8：建立訂單時程式讀到 <code>undefined.price</code>，丟出 <code>TypeError</code>，一路傳到 HTTP 邊界。邊界該怎麼處理？</p>
+  <label data-key="a">回 400，告訴前端送來的訂單資料有缺，請使用者重新填寫</label>
+  <label data-key="b">回 500 和通用訊息加 errorId，完整錯誤連同同一個 errorId 寫進 log</label>
+  <label data-key="c">回 500，body 帶上 <code>err.message</code> 和 stack，前端回報時比較好查</label>
+  <label data-key="d">自動重試整個請求三次，三次都失敗才回 500 給客戶端</label>
+  <p class="why">✓ 這是 bug，客戶端做什麼都修不了，只能記下完整資訊再修程式。客人把 errorId 交給客服，工程師用它在 log 找到那一行。c 錯在 message 和 stack 會把程式內部的資訊交給攻擊者，細節只寫進 log。（第 18 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 9：下單的處理函式這樣寫，<code>saveOrder</code> 是 async 函式。哪裡會出事？</p>
+<pre>async function createOrder(req, res) {
+  try {
+    saveOrder(order)
+    sendJson(res, 201, { ok: true })
+  } catch (err) {
+    sendJson(res, 503, { error: '請稍後再試' })
+  }
+}</pre>
+  <label data-key="a"><code>sendJson</code> 也在 try 裡面，回應送出失敗時會被改回 503</label>
+  <label data-key="b">寫入失敗時 catch 接到錯誤，但 201 已經送出，第二次回應會丟錯</label>
+  <label data-key="c">try/catch 包住 async 函式的呼叫，會讓 <code>saveOrder</code> 變成同步執行</label>
+  <label data-key="d">沒有 await，客人先拿到 201，寫入失敗時錯誤逃出 try/catch，沒有人接</label>
+  <p class="why">✓ 沒 await 的 Promise 是浮動 Promise，try/catch 接不到它的 rejection。客人以為下單成功，寫入失敗變成 unhandled rejection，預設會讓程序結束。修法是 <code>await saveOrder(order)</code>，並開 <code>no-floating-promises</code> 讓 CI 擋下來。b 錯在 catch 根本接不到這個錯誤。（第 18 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 10：本機測試時每一行 log 的 <code>requestId</code> 都對；上線後到了尖峰時段，同一個請求的幾行 log 常帶著別人的 <code>requestId</code>。最可能的原因是？</p>
+  <label data-key="a">request id 存在模組層級的變數，請求在 <code>await</code> 交錯時被別的請求改掉</label>
+  <label data-key="b">log 寫到 stdout 是非同步的，尖峰時寫入的順序亂掉，欄位跟著錯位</label>
+  <label data-key="c">客戶端送來重複的 <code>x-request-id</code>，伺服器沒有檢查就照單沿用</label>
+  <label data-key="d">尖峰時 Node 開了多個執行緒處理請求，執行緒之間的變數互相覆蓋</label>
+  <p class="why">✓ 本機一次只有一個請求，變數不會被搶；尖峰時 A 在等資料庫，B 就把變數改掉，A 回來讀到 B 的 id。用 <code>AsyncLocalStorage.run</code> 讓每個請求有自己的 store，整串非同步流程都讀得到。d 錯在 JavaScript 只在一條執行緒上跑，交錯發生在每個 <code>await</code>，不是平行執行。（第 19 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 11：午餐尖峰，點餐頁一直轉圈，log 裡沒有任何錯誤。監控上 pool 的 <code>waitingCount</code> 一直大於 0，<code>idleCount</code> 是 0。先做什麼？</p>
+  <label data-key="a">把 <code>max</code> 從 10 調到 100，讓排隊的請求都借得到連線</label>
+  <label data-key="b">重新啟動所有程序，把卡住的連線清掉，再觀察一次</label>
+  <label data-key="c">查誰佔著連線（慢查詢、漏了 release），並設借連線的逾時</label>
+  <label data-key="d">把查詢都改成 <code>pool.connect()</code> 借 client，不再用 <code>pool.query</code></label>
+  <p class="why">✓ 請求卡在借連線：<code>connectionTimeoutMillis</code> 預設 0，借不到就一直等，所以沒有錯誤也沒有 log。要找出佔著連線的原因，並設逾時讓它快速失敗、回 503。a 錯在調大池子只是把壓力推給資料庫，而且 <code>max</code> × 程序數不能超過資料庫的上限。（第 20 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 12：扣庫存這樣寫，三句都在同一個交易、同一個 client 裡。兩位客人同時點最後一杯拿鐵，會發生什麼事？</p>
+<pre>const { rows } = await client.query('SELECT stock FROM products WHERE id = $1', [id])
+if (rows[0].stock &lt; qty) throw new OutOfStockError(id)
+await client.query('UPDATE products SET stock = $1 WHERE id = $2', [rows[0].stock - qty, id])</pre>
+  <label data-key="a">交易讓第二位客人的 SELECT 等第一位 COMMIT，只有一人買到</label>
+  <label data-key="b">兩個交易都讀到庫存 1、都通過檢查、都寫入 0，賣出兩杯</label>
+  <label data-key="c">第二個交易的 UPDATE 違反 <code>CHECK (stock &gt;= 0)</code>，回 400</label>
+  <label data-key="d">PostgreSQL 偵測到兩個交易衝突，丟出 40001 讓其中一個重試</label>
+  <p class="why">✓ 預設的 READ COMMITTED 不會擋「先查再寫」，包在交易裡也一樣超賣。讓檢查和扣除在同一句完成：<code>SET stock = stock - $1 WHERE id = $2 AND stock &gt;= $1</code>，<code>rowCount</code> 是 0 就是庫存不夠。a 錯在一般的 SELECT 不上鎖，不會等別的交易。（第 20 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 13：會員註冊要擋重複的手機號碼，前端要顯示「這支手機已經註冊過」。哪個做法在並發下也正確？</p>
+  <label data-key="a">INSERT 前先 SELECT 有沒有同號碼的會員，有就回 409</label>
+  <label data-key="b">INSERT 失敗時看 <code>err.message</code> 有沒有 duplicate，有就回 409</label>
+  <label data-key="c">用交易包住「先查再 INSERT」，查到重複就 ROLLBACK 回 409</label>
+  <label data-key="d">交給 UNIQUE 約束擋，依 <code>err.code</code> 23505 和約束名稱翻成 409</label>
+  <p class="why">✓ 兩個請求同時查都說沒有，然後都 INSERT，只有約束擋得住。存取層看 SQLSTATE 和 <code>constraint</code> 翻成 ConflictError（<code>cause</code> 保留原始錯誤），邊界再轉成 409。a 和 c 錯在查和寫之間有空檔，包進 READ COMMITTED 的交易也擋不住；b 的訊息會隨語系和版本改變。（第 20 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 14：每次部署，監控都跳出一小撮 500，錯誤是 <code>Cannot use a pool after calling end on the pool</code>。關機程式這樣寫，問題在哪？</p>
+<pre>process.on('SIGTERM', async () =&gt; {
+  await pool.end()
+  server.close()
+})</pre>
+  <label data-key="a">先關了 pool，進行中的請求查資料庫就失敗，要等伺服器關好再關 pool</label>
+  <label data-key="b">監聽器是 async 函式，Node 不會等它跑完，要改成同步的寫法</label>
+  <label data-key="c">最後少了 <code>process.exit(0)</code>，程序不會結束，要在最後補上</label>
+  <label data-key="d">應該用 <code>Promise.all</code> 同時關伺服器和 pool，關機比較快</label>
+  <p class="why">✓ 順序是 readiness 回 503 → <code>server.close()</code> → 等請求完成並處理 keep-alive → <code>pool.end()</code> → 自然結束。先關 pool，進行中的請求就拿到這個錯誤，客人收到 500；同時關（d）也一樣。c 錯在 <code>process.exit</code> 會切斷還沒做完的請求和 log，資源都關好時程序會自己結束。（第 21 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 15：要證明「兩人同時點最後一杯拿鐵，只賣出一杯」，哪一種測試最能抓到 bug？</p>
+  <label data-key="a">單元測試：把 <code>client.query</code> 換成回傳 <code>rowCount: 0</code> 的假函式，檢查有丟 OutOfStockError</label>
+  <label data-key="b">端對端測試：開瀏覽器從兩個分頁同時按下單，檢查畫面上顯示的結果</label>
+  <label data-key="c">整合測試：連真的 PostgreSQL，同時跑兩個 <code>placeOrder</code>，檢查只有一個成功</label>
+  <label data-key="d">單元測試：mock 掉整個 pg 模組，檢查 UPDATE 的 SQL 字串有 <code>stock &gt;= $1</code></label>
+  <p class="why">✓ 超賣是 SQL 和並發的行為，只有真的資料庫會讓第二個 UPDATE 等第一個、再用最新的庫存判斷。a 的假 client 只會回你寫給它的 <code>rowCount</code>，先查再寫的錯誤寫法也照樣通過；d 測的是實作，不是行為。端對端（b）慢又不穩，留給最重要的整條流程。（第 22 課）</p>
+</div>
+
+<p>這個階段的重點整理成<a href="../sheets/stage-5.html">一頁圖解</a>。</p>
+<p>下一課進入效能：用 CPU profile 找出慢在哪裡，用 heap snapshot 找出記憶體為什麼一直長。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

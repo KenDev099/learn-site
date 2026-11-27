@@ -1,0 +1,9 @@
+#!/bin/bash
+# 用法：bash whoami.sh <預期的帳號 ID>
+# 1. 用 aws sts get-caller-identity 查出目前的帳號 ID
+# 2. 跟第一個參數不同：把錯誤訊息印到 stderr（echo "…" >&2）並 exit 1，之後不能再呼叫任何 aws 指令
+# 3. 相同：第 1 行印帳號 ID，接著每個可用區一行「名稱 AZ-ID」，例如 ap-northeast-1a apne1-az4
+set -euo pipefail
+expected="${1:?用法：bash whoami.sh <預期的帳號 ID>}"
+
+# 在這裡寫

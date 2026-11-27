@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>4. RLS 實戰：auth.uid()、USING 與 WITH CHECK，以及 API 看到的結果</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="4" data-practice="supabase">
+<header>
+  <div class="eyebrow">階段 2：權限：Row Level Security · 第 4 課</div>
+  <h1>RLS 實戰：auth.uid()、USING 與 WITH CHECK，以及 API 看到的結果</h1>
+</header>
+<main>
+
+<p>咖啡店的訂單明細頁網址是 <code>/orders/6</code>。顧客王小明好奇把 6 改成 7，看到了陳美華的訂單：買了什麼、什麼時候買的。前端程式明明只會用登入者自己的訂單編號，但 API 不管你的前端怎麼寫，它只看請求。這叫 <strong>IDOR</strong>（Insecure Direct Object Reference，直接用 id 存取到別人的物件），是 API 最常見的漏洞（<a href="../../auth/lessons/19-object-level-authz.html">認證課第 19 課</a>的 BOLA 是同一件事）。</p>
+<p>上一課的第一道門 GRANT 只能說「authenticated 能讀 orders」，分不出是哪個顧客。這一課寫第二道門：用 <code>auth.uid()</code> 寫 RLS，讓每個顧客只讀得到、只改得到自己的訂單，並看清楚每種寫法從 API 看是什麼結果。</p>
+
+<div class="callout"><strong>這課的路線</strong>
+<ul>
+  <li>先修好 IDOR：一個擁有者 policy，以及它在 API 上的樣子。</li>
+  <li>USING 與 WITH CHECK：一個管「看得到哪些既有的列」，一個管「寫進去的新列」。</li>
+  <li>UPDATE 的兩個陷阱：把資料轉給別人、改了 0 列卻沒有錯誤。</li>
+  <li>不用 API 也能測：在 SQL 裡模擬一個登入的請求。</li>
+  <li>效能：policy 是加在每一列的條件，怎麼寫才快。</li>
+</ul></div>
+
+<div class="callout"><strong>這課會用到：</strong>第 3 課的請求怎麼變成角色（帶使用者 JWT 的請求是 <code>authenticated</code>，<code>auth.uid()</code> 讀 JWT 的 <code>sub</code>）；兩道門（沒 GRANT 是 42501，RLS 沒放行時讀取是 <code>[]</code>）；RLS 的語法（<code>enable row level security</code>、<code>create policy … using … with check</code>，<a href="../../postgresql/lessons/24-rls.html">PostgreSQL 課第 24 課</a>，下一節有一段回顧）。</div>
+
+<div class="callout warn"><strong>環境</strong>：這課用到資料庫、gateway、Data API、Auth（db、kong、rest、auth）。練習的測試會建兩個真的使用者 A、B，用他們登入後的 JWT 打 API，表建在你專屬的 schema。</div>
+
+<h2>先修好 IDOR：擁有者 policy</h2>
+<p>先回顧 RLS 的語法（<a href="../../postgresql/lessons/24-rls.html">PostgreSQL 課第 24 課</a>有完整說明）：表開了 RLS 之後，每一列預設都看不到；每個 policy 說「對哪個動作、對哪些角色、哪些列可以」；同一個動作有好幾個 policy 時，任何一個放行就算放行（OR）。表的擁有者與有 BYPASSRLS 的角色（Supabase 的 <code>postgres</code>、<code>service_role</code>）不受 RLS 限制。</p>
+<p>咖啡店的 orders 用 <code>customer_id</code> 記下單的人，存的是 Auth 使用者的 id（uuid）。修好 IDOR 只要一個 policy：</p>
+<pre>alter table orders enable row level security;
+
+create policy "顧客讀自己的訂單" on orders
+  for select                                   -- 管讀取
+  to authenticated                             -- 只套用在登入的請求
+  using (customer_id = (select auth.uid()));   -- 這一列的主人是發請求的人
+
+grant select on orders to authenticated;</pre>
+<p><code>auth.uid()</code> 是第 3 課看過的函式：讀這個請求 JWT 裡的 <code>sub</code>。所以同一句 SQL，王小明發的請求只會看到 <code>customer_id</code> 是王小明的列。<code>(select auth.uid())</code> 外面那層 select 是效能寫法，最後一節解釋，先照寫。</p>
+<p>從 API 看，王小明把網址改成陳美華的訂單時：</p>
+<pre>const { data, error } = await supabase.from('orders').select('id, total').eq('id', 7).maybeSingle()
+// data → null，error → null</pre>
+<p>不是 403，也不是「你沒有權限」，而是<strong>查不到</strong>：對王小明來說，陳美華的那一列不存在。讀取被 RLS 擋下時一律是這樣，列表變成 <code>[]</code>、單筆變成 <code>null</code>（用 <code>single()</code> 則是 PGRST116）。這對安全是好事（攻擊者分不出「沒有這張訂單」和「有但不是你的」），對除錯是陷阱：「資料不見了」的回報，常常是 policy 的條件不符合，而不是資料真的不在。</p>
+<p>沒登入的請求呢？policy 寫了 <code>to authenticated</code>，對 <code>anon</code> 來說這張表沒有任何 policy，加上沒有 GRANT，回的是 42501。就算忘了寫 <code>to authenticated</code>（預設是 <code>to public</code>，也就是所有角色），未登入時 <code>auth.uid()</code> 是 NULL，<code>customer_id = NULL</code> 的結果是 NULL 而不是 true，一樣看不到。但明確寫 <code>to authenticated</code> 讓意圖清楚，Postgres 也能在 anon 的請求裡直接跳過這個 policy。舊的教學會寫 <code>using (auth.role() = 'authenticated')</code>，現在官方不建議用，改用 <code>to authenticated</code>。</p>
+
+<h3>「有登入」不等於「是主人」</h3>
+<p>最常見的錯誤 policy 長這樣：</p>
+<pre>create policy "登入的人讀訂單" on orders for select to authenticated using (true);</pre>
+<p>看起來有限制（只有登入的人），實際上任何一個註冊過的帳號都能讀所有人的訂單。開放註冊的 app 裡，「登入」不是門檻：攻擊者註冊一個帳號就過了。第 3 課說過所有登入的人共用 <code>authenticated</code> 一個角色，分辨是誰只能靠 <code>auth.uid()</code>。</p>
+<div class="callout practice"><strong>💡 實務上：每張 public 的表都要回答四個問題</strong><br>上線前或審 PR 時，對每張前端會碰到的表逐一問：(1) 開 RLS 了嗎；(2) 誰能讀哪幾列（擁有者？同團隊？所有人？）；(3) 誰能新增，新增時哪些欄位要被鎖住（例如 customer_id 只能是自己）；(4) 誰能改、能刪，改的時候能不能把資料變成別人的。答不出來的格子，就是還沒寫的 policy。這張表本身也是很好的文件，可以放進 PR 描述給審的人看。</div>
+
+<h2>USING 與 WITH CHECK</h2>
+<p>讀取只需要一個條件，寫入就有兩個問題要分開問：「你能動哪些既有的列」和「你寫進去的列合不合規矩」。這就是 policy 的兩個子句：</p>
+<div class="table-wrap"><table>
+  <tr><th>子句</th><th>檢查的是</th><th>不符合時 API 看到</th></tr>
+  <tr><td><code>USING</code></td><td>既有的列：看得到、能被改、能被刪的是哪幾列</td><td>那幾列像不存在一樣：讀取 <code>[]</code>，改刪 0 列</td></tr>
+  <tr><td><code>WITH CHECK</code></td><td>寫入後的新列：新增的列、改完之後的列</td><td>錯誤 <code>42501 new row violates row-level security policy</code></td></tr>
+</table></div>
+<p>每個動作用到哪幾個：</p>
+<ul>
+  <li><strong>SELECT、DELETE</strong>：只有既有的列，只寫 USING。</li>
+  <li><strong>INSERT</strong>：只有新列，只寫 WITH CHECK。寫 USING 會直接報錯（only WITH CHECK expression allowed for INSERT）。</li>
+  <li><strong>UPDATE</strong>：兩個都有。USING 決定能改哪幾列，WITH CHECK 決定改完的樣子合不合法。</li>
+</ul>
+<p>新增訂單的 policy，重點是 customer_id 只能填自己：</p>
+<pre>create policy "顧客新增自己的訂單" on orders for insert to authenticated
+  with check (customer_id = (select auth.uid()));
+
+grant insert on orders to authenticated;</pre>
+<p>王小明送出 <code>insert({ customer_id: 陳美華的 id, total: 1 })</code> 時，新列不符合 WITH CHECK，整個請求失敗、一列都不會寫入，<code>error.code</code> 是 <code>42501</code>。跟讀取不同，寫入被擋是明確的錯誤。另一種常見寫法是讓欄位預設值等於 <code>auth.uid()</code>（<code>customer_id uuid not null default auth.uid()</code>），前端就不用傳；但 WITH CHECK 仍然要寫，因為使用者還是可以自己帶 customer_id。</p>
+
+<h2>UPDATE 的兩個陷阱</h2>
+<p>INSERT 只有一個條件，UPDATE 的兩個條件各有一個陷阱。換一張表看比較清楚：商品評論 <code>reviews(id, product_id, author_id, rating, body)</code>，所有人都看得到全部評論，作者能改自己寫的：</p>
+<pre>create policy "評論公開可讀" on reviews for select to anon, authenticated using (true);
+
+create policy "作者改自己的評論" on reviews for update to authenticated
+  using (author_id = (select auth.uid()))
+  with check (author_id = (select auth.uid()));
+
+grant select on reviews to anon, authenticated;
+grant update (rating, body) on reviews to authenticated;</pre>
+<p><strong>陷阱 1：WITH CHECK 寫成 <code>true</code>，資料就能轉給別人。</strong>USING 只限制「能改哪幾列」，改成什麼樣子由 WITH CHECK 管。寫成 <code>with check (true)</code>，王小明就能對自己的負評送 <code>update({ author_id: 陳美華的 id })</code>，讓那則負評變成陳美華寫的；換成訂單、退款、積分紀錄也是同一個洞。兩個細節：</p>
+<ul>
+  <li>UPDATE policy 如果<strong>完全不寫</strong> WITH CHECK，Postgres 會拿 USING 的條件當 WITH CHECK 用，所以只寫 USING 也擋得住；出事的是「寫了，但寫得比 USING 寬鬆」。明確寫出兩個條件，審的人才不用記這條規則。</li>
+  <li>UPDATE 用到 WHERE 時，改完的新列也要通過 SELECT policy。所以如果 orders 的 select policy 是「只看得到自己的」，把訂單轉給別人會因為「改完自己就看不到了」而失敗（42501）。評論的 select 是公開的，這層就幫不上忙。不要依賴這種巧合，WITH CHECK 照樣寫好。</li>
+</ul>
+<p>上面還多了一層：<code>grant update (rating, body)</code> 只開放這兩欄。GRANT 可以細到欄位，作者只該改評分和內容，就只給這兩欄；這樣 RLS 寫錯時還有 GRANT 擋著，想改 author_id 直接是 42501。</p>
+<p><strong>陷阱 2：沒有 SELECT policy，update 改了 0 列，而且沒有錯誤。</strong>只寫了 update policy、沒寫 select policy 時，前端的 <code>update({ body: '…' }).eq('id', 6)</code> 回 HTTP 204，<code>error</code> 是 null，資料庫卻沒變。原因跟上面一樣：<code>where id = 6</code> 要讀那一列才能比對，UPDATE 用到 WHERE 時 SELECT 的 policy 也要通過；看不到的列，自然改不到。改不到不是錯誤，跟讀取一樣是「那一列不存在」。所以能改的，一定也要能讀。除錯時 update 沒反應，先接 <code>.select()</code> 看回傳幾列：<code>[]</code> 就是被 RLS 過濾掉了。</p>
+<div class="callout practice"><strong>💡 實務上：「改了沒反應」先查三件事</strong><br>前端回報「按儲存沒有錯誤，重新整理資料又變回來」，九成是 RLS：(1) update 接 <code>.select()</code>，看回傳是不是 <code>[]</code>；(2) 有沒有 select policy、條件跟 update 的 USING 是否一致；(3) GRANT 有沒有包含要改的欄位（欄位層級的 GRANT 漏了會是 42501，比較好查）。在 PR 裡新增 update policy 時，順手確認同一張表的 select policy 也涵蓋那些列。</div>
+
+<h2>不用 API 也能測：在 SQL 裡模擬一個請求</h2>
+<p>每改一次 policy 就開前端點一次太慢。第 3 課說過 PostgREST 做的事就是兩行：切換角色、放 claims。自己在交易裡做一樣的事，就能在 SQL 裡扮演任何一個使用者。用課程容器裡的 psql 連進資料庫（或貼到 Studio 的 SQL Editor）：</p>
+<pre>docker exec -it supabase_db_learn-supabase psql -U postgres</pre>
+<pre>begin;
+set local role authenticated;
+select set_config('request.jwt.claims', '{"sub":"6f1c2a4e-0b7d-4c2e-9a51-3d8e7f6a2b10","role":"authenticated"}', true);
+
+select auth.uid(), current_user;   -- 6f1c2a4e-…、authenticated
+select id, total from orders;      -- 只會看到這個使用者的訂單
+rollback;</pre>
+<ul>
+  <li><code>set local role</code> 和 <code>set_config(…, true)</code> 的 <code>local</code>／<code>true</code> 都是「只到交易結束」：<code>rollback</code> 之後恢復成 postgres，不會影響之後的查詢。</li>
+  <li>claims 的 <code>sub</code> 換成另一個 uuid，就是另一個使用者；不 set_config 就是未登入（<code>auth.uid()</code> 是 NULL）。</li>
+  <li>測試寫入時，在 rollback 前查一次結果，資料也不會真的留下。</li>
+</ul>
+<p>第 5 課會把這個做法整理成一套 RLS 測試：每張表測「自己看得到、別人看不到、不能改成別人的」。</p>
+
+<h2>效能：policy 是加在每一列的條件</h2>
+<p>最後回到 <code>(select auth.uid())</code>。RLS 的 policy 等於 Postgres 自動在每個查詢加上 WHERE：顧客查 <code>select * from orders</code>，實際執行的是 <code>select * from orders where customer_id = (select auth.uid())</code>。所以有兩件事決定它快不快：</p>
+<ul>
+  <li><strong>函式只算一次</strong>：直接寫 <code>customer_id = auth.uid()</code>，Postgres 可能對每一列都呼叫一次 <code>auth.uid()</code>（它每次都要解析 claims 的 JSON）。包成 <code>(select auth.uid())</code>，它變成一個子查詢，整個查詢只算一次、結果重複使用。官方的 RLS 效能建議（docs: row-level-security#rls-performance-recommendations）實測在大表上差距很大。<code>auth.jwt()</code> 也一樣包。</li>
+  <li><strong>條件用到的欄位要有索引</strong>：<code>customer_id</code> 沒有索引，每次查詢都要掃過整張訂單表再過濾。<code>create index on orders (customer_id)</code>。索引怎麼運作在 <a href="../../postgresql/lessons/20-indexes.html">PostgreSQL 課第 20 課</a>。</li>
+</ul>
+<p>前端查詢時也加上 <code>.eq('customer_id', userId)</code>：結果跟只靠 RLS 一樣，但查詢本身就帶著條件，Postgres 能更直接地用索引。RLS 是安全網，不是查詢條件的替代品。怎麼用 EXPLAIN 確認查詢真的用到索引，回顧 <a href="../../postgresql/lessons/21-explain.html">PostgreSQL 課第 21 課</a>。</p>
+<div class="callout practice"><strong>💡 實務上：RLS 讓查詢變慢時的檢查順序</strong><br>上線一陣子後列表頁變慢，資料量一大 RLS 很常是原因。資深工程師會先看：policy 裡的函式有沒有包 <code>(select …)</code>；policy 條件的欄位有沒有索引；policy 裡有沒有對其他表的子查詢（第 5 課的多租戶寫法）、那張表的欄位有沒有索引。Supabase 的 Performance Advisor（<code>npx supabase db advisors --type performance</code>）會標出沒包 select 的 <code>auth.uid()</code>（<code>auth_rls_initplan</code>）與缺少的外鍵索引。</div>
+
+<h2>練習</h2>
+<p>練習 1、2 的測試會在你專屬的 schema 建 <code>orders(id, customer_id uuid, total, note, ordered_at)</code>，放 3 張訂單：使用者 A 兩張、B 一張，再套用你的 SQL。SQL 不要寫 <code>public.</code> 前綴。</p>
+
+<div class="local" data-test="ex1" data-files="ex1.sql">
+  <p>練習 1：表還沒開 RLS、也沒有任何 GRANT。在 <code>ex1.sql</code> 讓登入的顧客只讀得到自己的訂單（A 讀不到 B 的、改網址的 id 也一樣），沒登入的人什麼都讀不到。policy 只給 authenticated、<code>auth.uid()</code> 包一層 <code>(select …)</code>，並替 policy 用到的欄位加索引。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="ex2.sql">
+  <p>練習 2：測試已經開好 RLS，也讓擁有者讀得到自己的訂單。在 <code>ex2.sql</code> 讓登入的顧客能新增自己的訂單（新增後能用 <code>.select()</code> 拿回那一列），但 A 送出 <code>customer_id</code> 是 B 的訂單時要被拒絕（42501），沒登入的人不能新增。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="ex3.sql">
+  <p>練習 3：這一題換成商品評論 <code>reviews(id, product_id, author_id uuid, rating, body)</code>，A 寫了兩則、B 一則；表已經開了 RLS，但沒有任何 policy、沒有任何 GRANT。在 <code>ex3.sql</code> 讓任何人（含沒登入）都讀得到所有評論；作者能改自己評論的 <code>rating</code>、<code>body</code>；改不到別人的評論（0 列）；也不能把自己的評論改成別人寫的（改 <code>author_id</code> 要失敗）。測試會直接查資料庫確認真的改了。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 4：顧客的訂單列表突然變成空的，API 沒有任何錯誤，<code>data</code> 是 <code>[]</code>。資料庫裡確認有他的訂單。最可能的原因？</p>
+  <label data-key="a">沒有 <code>grant select on orders to authenticated</code></label>
+  <label data-key="b">RLS 開著，但沒有任何 select policy 讓這個請求看到那些列（例如條件寫錯，或請求沒帶到使用者的 JWT）</label>
+  <label data-key="c">PostgREST 的 schema cache 還沒更新</label>
+  <label data-key="d">safeupdate 擋下了沒有 WHERE 的查詢</label>
+  <p class="why">✓ RLS 擋下讀取時不是錯誤，是空結果：對這個請求來說那些列不存在。先確認請求帶了使用者的 JWT（沒帶就是 anon），再用 SQL 模擬那個使用者查一次。a 是第一道門，會是 42501 錯誤而不是 <code>[]</code>。d 只管 UPDATE、DELETE。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：評論所有人都看得到，作者能改自己的評論。審 PR 時你該指出哪個問題？</p>
+<pre>create policy "評論公開可讀" on reviews for select to anon, authenticated using (true);
+create policy "改自己的評論" on reviews for update to authenticated
+  using (author_id = (select auth.uid()))
+  with check (true);
+grant update on reviews to authenticated;</pre>
+  <label data-key="a">UPDATE 不能同時寫 USING 和 WITH CHECK</label>
+  <label data-key="b">使用者會改到別人的評論，因為 USING 只管讀取</label>
+  <label data-key="c">作者能把自己的評論改成 <code>author_id</code> 是別人的：WITH CHECK 檢查改完的新列，<code>true</code> 等於不檢查</label>
+  <label data-key="d">沒有問題，USING 已經限制了只能改自己的</label>
+  <p class="why">✓ USING 決定能改哪幾列，WITH CHECK 決定改完的樣子；<code>true</code> 讓作者能冒名成任何人。改成跟 USING 一樣的作者條件，GRANT 也只給 <code>update (rating, body)</code>。d 是最多人會選的：只想到「改哪一列」，沒想到「改成什麼」。b 錯在 UPDATE 的 USING 本身就限制了能改哪幾列。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：同一個 policy 寫成 <code>using (customer_id = (select auth.uid()))</code> 比 <code>using (customer_id = auth.uid())</code> 快，原因是？</p>
+  <label data-key="a">包成子查詢後 Postgres 整個查詢只算一次 <code>auth.uid()</code>，不用每一列都算</label>
+  <label data-key="b"><code>select</code> 讓 Postgres 跳過 RLS 檢查</label>
+  <label data-key="c">子查詢的結果會被 PostgREST 快取到下一個請求</label>
+  <label data-key="d">兩個一樣快，只是寫法不同</label>
+  <p class="why">✓ policy 等於加在每一列的條件；直接呼叫函式可能每一列算一次，包成 <code>(select …)</code> 後算一次、重複使用。結果完全一樣，只差在效能，表大時很明顯；policy 用到的欄位也要有索引。b 錯在 RLS 照樣檢查。c 錯在只在同一個查詢裡重用，不跨請求。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong><code>using (true)</code> 或只寫 <code>to authenticated</code></strong>：有登入不等於是主人，任何註冊的人都看得到全部。要有擁有者條件 <code>customer_id = (select auth.uid())</code>。</li>
+  <li><strong>INSERT 寫 USING</strong>：新增沒有既有的列，只能寫 WITH CHECK，寫 USING 會報錯。</li>
+  <li><strong>WITH CHECK 寫成 <code>true</code></strong>：USING 管得了改哪幾列，管不了改成什麼；擁有者能把資料轉給別人或冒名。不要依賴 select policy 剛好擋住。</li>
+  <li><strong>只寫 update policy、沒有 select policy</strong>：update 默默改了 0 列，沒有錯誤。能改的列一定要能讀。</li>
+  <li><strong>把空結果當成資料不存在</strong>：RLS 擋下讀取時是 <code>[]</code>／<code>null</code>，不是錯誤。先用 SQL 模擬那個使用者查一次。</li>
+  <li><strong>用 <code>auth.role()</code> 判斷有沒有登入</strong>：已經不建議用，改寫 <code>to authenticated</code>。</li>
+  <li><strong><code>auth.uid()</code> 沒包 <code>(select …)</code>、policy 欄位沒索引</strong>：資料量大時每個查詢都慢。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>擁有者 policy：<code>for select to authenticated using (customer_id = (select auth.uid()))</code>，配上 GRANT。未登入時 <code>auth.uid()</code> 是 NULL，比對結果不是 true，看不到。</li>
+  <li>從 API 看：讀取被擋是 <code>[]</code>／<code>null</code>（像那一列不存在），寫入被擋是 <code>42501 new row violates row-level security policy</code>。</li>
+  <li>USING 管既有的列（看得到、改得到、刪得到哪些），WITH CHECK 管寫入後的新列。INSERT 只有 WITH CHECK；UPDATE 兩個都有，WITH CHECK 不能比擁有者條件寬鬆（不寫時沿用 USING）。</li>
+  <li>UPDATE 要先看得到：用到 WHERE 時既有的列與改完的列都要通過 SELECT policy，沒有 SELECT policy 時改了 0 列、沒有錯誤。GRANT 可以細到欄位（<code>grant update (rating, body)</code>）。</li>
+  <li>在交易裡 <code>set local role authenticated</code>＋<code>set_config('request.jwt.claims', …, true)</code>，就能在 SQL 裡扮演任何使用者測 policy。</li>
+  <li>policy 是加在每一列的條件：<code>(select auth.uid())</code> 只算一次、條件欄位加索引、查詢也帶上 <code>.eq('customer_id', …)</code>。</li>
+</ul>
+<p>下一課處理擁有者之外的情況：店員看自己分店的訂單、店長看全部、報表用的 view，以及上線前要逐條檢查的漏洞清單。</p>
+
+<div class="callout">版本備註：PostgreSQL 17.11（<code>supabase/postgres:17.11.0.018</code>）、PostgREST 16.5、Supabase CLI 3.1.0。update 在沒有 select policy 時回 204、0 列，以及改完的列要通過 select policy（擁有者 select policy 會讓轉移失敗、公開的 select policy 不會），在本機 2026-11-20 實測；<code>(select auth.uid())</code> 的建議出自官方文件 guides/database/postgres/row-level-security（RLS performance recommendations，2026-11-20 查）。</div>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

@@ -1,0 +1,697 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>5. 容器上 AWS：ECR、ECS Fargate、task role 與 execution role</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="5" data-practice="aws">
+<header>
+  <div class="eyebrow">階段 3：運算 · 第 5 課</div>
+  <h1>容器上 AWS：ECR、ECS Fargate、task role 與 execution role</h1>
+</header>
+<main>
+
+<p>咖啡店的多租戶後台（<a href="../../portfolio/index.html">作品專案課</a>做的 NestJS API，以下叫 cafe-api）已經有 Dockerfile，在本機用 <code>docker compose up</code> 跑得好好的。搬上 AWS 的第一次部署，主控台一直顯示 task 從 PENDING 變成 STOPPED，再自動補一個，又 STOPPED。第一次的訊息是 <code>CannotPullContainerError … i/o timeout</code>，修好之後換成 <code>ResourceInitializationError: unable to pull secrets or registry auth … AccessDeniedException</code>。同事把 S3 權限加進「那個 role」，還是不行。</p>
+<p>這一課把容器放上 AWS 的那一段補完整：映像放在 <strong>ECR</strong>，用 <strong>ECS</strong> 的 <strong>Fargate</strong> 跑起來，讀懂 task definition 與 service 的每個重要欄位，分清楚兩個長得很像的 role，學會 task 停下來時先看哪裡。最後比較「自己管 EC2 機器」與 Fargate 的取捨。</p>
+<p>這課的路線：</p>
+<ul>
+  <li>ECS 的四個名詞與 ECR：從 compose 對應過來，映像要用不會變的參照。</li>
+  <li>task definition：CPU 與記憶體、網路模式、log、secret 怎麼寫。</li>
+  <li>execution role 與 task role：誰在什麼時候用哪一個；task STOPPED 時怎麼判斷是哪一層的問題。</li>
+  <li>service：維持 N 個 task、滾動部署的 100／200、circuit breaker 自動回滾。</li>
+  <li>EC2 還是 Fargate：自己管機器要多做哪些事（instance profile、IMDSv2、Session Manager）。</li>
+</ul>
+
+<div class="callout"><strong>這課會用到：</strong>devops 課<a href="../../devops/lessons/18-aws-architecture.html">第 18 課</a>的 ECS 對照表（ECR＝映像倉庫、task definition＝compose 的 service 定義、service＝維持 N 個 task、ALB＋target group＝反向代理）；devops 課<a href="../../devops/lessons/19-aws-iam.html">第 19 課</a>的 role（信任政策說誰能扮演、權限政策說能做什麼）；<a href="03-vpc-connectivity.html">第 3 課</a>的私有子網路（對外要經過 NAT gateway 或 VPC endpoint）；<a href="04-edge.html">第 4 課</a>的 ALB target group 與健康檢查。</div>
+
+<div class="callout warn"><strong>練習環境：</strong>模擬器只記錄 ECS 的設定，不會真的拉映像、跑容器，也不檢查 role 的權限。所以本機題檢查「設定寫對沒有」，task 會不會停下來用頁面上的練習推論。</div>
+
+<h2>從 compose 到 ECS：四個名詞與 ECR</h2>
+<p>devops 第 18 課已經把 compose 和 ECS 一一對上，這裡只補上這課要用的精確定義：</p>
+<div class="table-wrap"><table>
+  <tr><th>名詞</th><th>是什麼</th><th>compose 裡對應的東西</th></tr>
+  <tr><td><strong>cluster</strong></td><td>一群 task 的邏輯分組，用 Fargate 時它只是個名字，沒有機器要管</td><td>一個 compose 專案</td></tr>
+  <tr><td><strong>task definition</strong></td><td>描述「怎麼跑」的 JSON：映像、CPU、記憶體、port、環境變數、log、role。每次修改都產生新的 <strong>revision</strong>（<code>cafe-api:1</code>、<code>cafe-api:2</code>），舊的不會被覆蓋</td><td><code>services.api</code> 那一段</td></tr>
+  <tr><td><strong>task</strong></td><td>照某個 revision 跑起來的一份實體（裡面可以有一個或多個容器）</td><td>一個執行中的容器</td></tr>
+  <tr><td><strong>service</strong></td><td>讓 N 個 task 一直活著：掛掉就補、部署時逐步換版、把 task 註冊進 ALB 的 target group</td><td><code>--scale api=3</code> 加上 <code>restart: always</code></td></tr>
+</table></div>
+<p><strong>Fargate</strong> 是 ECS 的一種執行方式（launch type）：你只說「這個 task 要 0.5 vCPU、1 GB」，AWS 找地方跑它，你看不到也不用修補底下的機器。另一種是 EC2 launch type，task 跑在你自己管的 EC2 機器上，最後一節比較。</p>
+<p>映像放在 <strong>ECR</strong>（Elastic Container Registry），每個應用程式一個 <strong>repository</strong>，網址長這樣：</p>
+<pre>123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/cafe-api:2026-11-20-a1b2c3d     用 tag
+123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/cafe-api@sha256:3f8a…          用 digest</pre>
+<p>tag 是可以移動的標籤，digest 是映像內容的雜湊（devops 課<a href="../../devops/lessons/16-cd.html">第 16 課</a>）。task definition 裡寫 <code>:latest</code> 的問題是：同一個 revision 在不同時間啟動的 task 可能拉到不同的映像，出事時說不清楚正式環境跑的是哪一版，回滾到「上一個 revision」也拉回同一個 <code>latest</code>。repository 有三個設定值得一開始就開：</p>
+<ul>
+  <li><strong>tag 不可變</strong>（<code>imageTagMutability: IMMUTABLE</code>）：已經存在的 tag 不能再被推上不同的映像，<code>:2026-11-20-a1b2c3d</code> 永遠指同一個東西。要部署新版就推新 tag。</li>
+  <li><strong>push 時掃描</strong>（<code>scanOnPush</code>）：推上去時檢查作業系統套件的已知漏洞。結果在 <code>aws ecr describe-image-scan-findings</code> 看，CI 可以在發現嚴重漏洞時擋下部署。</li>
+  <li><strong>lifecycle policy</strong>：自動刪舊映像，例如「沒有 tag 的映像 7 天後刪除」「只保留最新 30 個」。不設的話，每次 CI 推一版，儲存費用就一直累積。</li>
+</ul>
+<pre>import { CreateRepositoryCommand } from '@aws-sdk/client-ecr'
+
+await ecr.send(new CreateRepositoryCommand({
+  repositoryName: 'cafe-api',
+  imageTagMutability: 'IMMUTABLE',
+  imageScanningConfiguration: { scanOnPush: true },
+}))</pre>
+<div class="callout practice"><strong>💡 實務上：CI 推映像、部署用 digest</strong><br>常見的做法是 CI 用 git commit 當 tag 推到 ECR（作品專案課<a href="../../portfolio/lessons/17-ci-cd-deploy.html">第 17 課</a>的流程），推完從回應拿到 digest，註冊新的 task definition 時寫 <code>repository@sha256:…</code>。這樣 task definition 的每個 revision 都精確對應一個映像，回滾就是「service 改回上一個 revision」。被問「線上現在跑哪一版」時，<code>aws ecs describe-services</code> 查 revision、再查它的 image，一路追得到 commit。</div>
+
+<h2>task definition：CPU、記憶體、網路、log 與 secret</h2>
+<p>有了映像，接著寫「怎麼跑它」。下面是 cafe-api 的 task definition（只列這課要講的欄位）：</p>
+<pre>{
+  "family": "cafe-api",
+  "requiresCompatibilities": ["FARGATE"],
+  "networkMode": "awsvpc",
+  "cpu": "512",                      ← 0.5 vCPU（1024 單位＝1 vCPU）
+  "memory": "1024",                  ← MiB
+  "executionRoleArn": "arn:aws:iam::123456789012:role/cafe-api-execution",
+  "taskRoleArn": "arn:aws:iam::123456789012:role/cafe-api-task",
+  "containerDefinitions": [{
+    "name": "api",
+    "image": "123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/cafe-api@sha256:3f8a…",
+    "portMappings": [{ "containerPort": 3100 }],
+    "environment": [{ "name": "PORT", "value": "3100" }],
+    "secrets": [{ "name": "APP_DATABASE_URL",
+                  "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:cafe/db-AbCdEf" }],
+    "logConfiguration": { "logDriver": "awslogs", "options": {
+      "awslogs-group": "/ecs/cafe-api", "awslogs-region": "ap-northeast-1", "awslogs-stream-prefix": "api" } }
+  }]
+}</pre>
+<p>由上往下：</p>
+<ul>
+  <li><strong>cpu 與 memory</strong>：Fargate 只接受規定的組合，寫錯會在註冊時被拒絕。下表照官方「Task CPU and memory」（2026-11-20 查證），查表用，不用背；練習 2 會用到：
+    <div class="table-wrap"><table>
+      <tr><th>cpu</th><th>可以搭配的 memory</th></tr>
+      <tr><td>256（.25 vCPU）</td><td>512 MiB、1 GB、2 GB</td></tr>
+      <tr><td>512（.5 vCPU）</td><td>1 GB～4 GB，每次 1 GB</td></tr>
+      <tr><td>1024（1 vCPU）</td><td>2 GB～8 GB，每次 1 GB</td></tr>
+      <tr><td>2048（2 vCPU）</td><td>4 GB～16 GB，每次 1 GB</td></tr>
+      <tr><td>4096（4 vCPU）</td><td>8 GB～30 GB，每次 1 GB</td></tr>
+      <tr><td>8192（8 vCPU）</td><td>16 GB～60 GB，每次 4 GB（Linux 平台 1.4.0 以上）</td></tr>
+      <tr><td>16384（16 vCPU）</td><td>32 GB～120 GB，每次 8 GB（Linux 平台 1.4.0 以上）</td></tr>
+      <tr><td>32768（32 vCPU）</td><td>60 GB、120 GB、244 GB（Linux 平台 1.4.0 以上）</td></tr>
+    </table></div>
+  </li>
+  <li><strong>networkMode: awsvpc</strong>：Fargate 只能用這個模式。每個 task 拿到自己的網路介面（ENI，Elastic Network Interface）和私有 IP，所以安全群組直接套在 task 上，跟第 3 課的 EC2 一樣判斷。</li>
+  <li><strong>environment 與 secrets</strong>：<code>environment</code> 是明文，寫在 task definition 裡，任何能讀 task definition 的人都看得到。密碼、連線字串放 <code>secrets</code>：<code>valueFrom</code> 寫 Secrets Manager 的 secret 或 Parameter Store 參數的 ARN，task 啟動時 ECS 去讀出來，變成容器裡的環境變數。程式完全不用改，<code>process.env.APP_DATABASE_URL</code> 照樣讀得到。Secrets Manager 本身留到<a href="09-kms-secrets.html">第 9 課</a>。</li>
+  <li><strong>logConfiguration</strong>：<code>awslogs</code> 把容器的 stdout／stderr 送到 CloudWatch Logs 的 <code>/ecs/cafe-api</code>。沒設的話 task 一停，最後那幾行錯誤就跟著消失，下一節的除錯就斷了線索。log group 記得設保留天數，不然 log 永遠留著、永遠收費。</li>
+</ul>
+<p>同一個 family 再註冊一次就是新 revision，service 指向哪個 revision，跑的就是哪一份設定。</p>
+
+<h2>execution role 與 task role：誰在什麼時候用哪一個</h2>
+<p>上面的 task definition 有兩個 role，開場事故就卡在這裡。差別在於<strong>是誰在呼叫 AWS</strong>：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>execution role（<code>executionRoleArn</code>）</th><th>task role（<code>taskRoleArn</code>）</th></tr>
+  <tr><td>誰用</td><td>ECS／Fargate 的代理程式（agent），在你的容器啟動之前</td><td>你的程式，在容器裡執行時</td></tr>
+  <tr><td>用來做什麼</td><td>從私有 ECR 拉映像、把 log 寫進 CloudWatch Logs、讀 <code>secrets</code> 裡的值</td><td>上傳收據到 S3、送訊息到 SQS、呼叫任何 AWS API</td></tr>
+  <tr><td>權限從哪來</td><td>官方的 <code>AmazonECSTaskExecutionRolePolicy</code>（ECR 與 Logs），讀 secret 要另外加 <code>secretsmanager:GetSecretValue</code>；用自訂 KMS key 加密的 secret 再加 <code>kms:Decrypt</code></td><td>你依程式需要寫的最小權限</td></tr>
+  <tr><td>沒給或權限不夠時</td><td>task 起不來：STOPPED，原因是 <code>CannotPullContainerError</code> 或 <code>ResourceInitializationError</code></td><td>task 跑得起來，程式呼叫 AWS 時拿到 <code>AccessDenied</code>，看程式自己的 log</td></tr>
+</table></div>
+<p>兩個 role 的信任政策都是讓 <code>ecs-tasks.amazonaws.com</code> 扮演（devops 第 19 課）。程式怎麼拿到 task role 的憑證，就是<a href="01-aws-big-picture.html">第 1 課</a>憑證鏈的 container 那一步：ECS 在容器裡設好 <code>AWS_CONTAINER_CREDENTIALS_RELATIVE_URI</code>，SDK 自動去那裡拿臨時憑證，程式碼 <code>new S3Client({})</code> 不用寫任何金鑰。execution role 的憑證則只給代理程式用，容器裡拿不到（官方文件明講）。</p>
+<p>所以開場的同事加錯地方了：<code>ResourceInitializationError … unable to pull secrets</code> 是 execution role 讀不到 Secrets Manager，跟 task role 的 S3 權限無關。分清楚兩個 role 之後，task STOPPED 時照這個順序判斷：</p>
+<ol>
+  <li><strong>看 stoppedReason</strong>：<code>aws ecs describe-tasks --cluster cafe --tasks &lt;id&gt; --query 'tasks[0].[stoppedReason,containers[0].reason,containers[0].exitCode]'</code>，或主控台 task 頁面的 Stopped reason。STOPPED 的 task 只保留一段時間就查不到，部署出錯時要盡快看。</li>
+  <li><strong>記憶體</strong>：<code>OutOfMemoryError: Container killed due to memory usage</code>，或容器的 exit code 是 137（被 SIGKILL 砍掉，devops 課<a href="../../devops/lessons/03-processes-signals.html">第 3 課</a>）：程式用的記憶體超過 task 的 memory。</li>
+  <li><strong>啟動前失敗</strong>：<code>CannotPullContainerError</code>、<code>ResourceInitializationError</code>。訊息裡有 <code>AccessDenied</code>、<code>not authorized</code> 是 execution role；是 <code>i/o timeout</code>、<code>context deadline exceeded</code> 這類逾時是網路（下一段）；網路與權限都對，多半是映像名稱或 tag 打錯。</li>
+  <li><strong>啟動後才停</strong>：<code>Essential container in task exited</code>，表示程式自己結束了。去 CloudWatch Logs 看最後幾行：程式呼叫 AWS 被拒（<code>AccessDenied</code>）是 task role，其他是程式本身的錯（連不上資料庫、設定缺漏）。</li>
+</ol>
+<p>啟動前的「網路」要多想一步：拉映像、讀 secret、寫 log 都是 task 對 AWS 服務發出的 HTTPS 請求，走的是 task 所在子網路的路由（第 3 課）。task 要能連到這些服務，有三種情況：</p>
+<ul>
+  <li><strong>公有子網路</strong>：task 必須拿到公開 IP（<code>assignPublicIp: ENABLED</code>），才能經過 internet gateway 出去。設成 DISABLED 就連不出去，這是最常見的拉不到映像。</li>
+  <li><strong>私有子網路＋NAT gateway</strong>：經過 NAT 出去，不需要公開 IP。</li>
+  <li><strong>私有子網路、沒有 NAT</strong>：要有 VPC endpoint。拉 ECR 映像需要 <code>ecr.api</code>、<code>ecr.dkr</code> 兩個 interface endpoint，加上 S3 的 gateway endpoint（ECR 的映像層存在 S3）；用 awslogs 還要 <code>logs</code>，有 secrets 還要 <code>secretsmanager</code>（或 <code>ssm</code>）。少一個就卡在那一步。</li>
+</ul>
+<p>練習 1 把這整套判斷寫成函式。</p>
+<div class="callout practice"><strong>💡 實務上：兩個 role 搞混是最常見的 STOPPED 原因</strong><br>新手最常見的修法是「把所有權限都加到同一個 role，兩個欄位填同一個」。能動，但等於讓應用程式的程式碼也拿得到讀所有 secret 的權限；應用程式被打進去時，損害範圍一起變大。資深的做法是兩個分開、各自最小：execution role 只能讀這個服務自己的 secret（Resource 寫到那幾個 ARN），task role 只有程式真的會呼叫的動作。資安審查會問的就是「這個 task 被攻破，攻擊者拿得到什麼」。</div>
+
+<h2>service：維持 N 個 task、滾動部署與自動回滾</h2>
+<p>task definition 說怎麼跑一個 task，service 負責「一直有 N 個在跑」。cafe-api 的 service：</p>
+<pre>await ecs.send(new CreateServiceCommand({
+  cluster: 'cafe', serviceName: 'cafe-api',
+  taskDefinition: 'arn:aws:ecs:ap-northeast-1:123456789012:task-definition/cafe-api:7',
+  desiredCount: 4,
+  launchType: 'FARGATE',
+  networkConfiguration: { awsvpcConfiguration: {
+    subnets: ['subnet-private-a', 'subnet-private-c'],     // 兩個 AZ 的私有子網路
+    securityGroups: ['sg-app'],                           // 只允許 ALB 的 SG 連進來（第 3 課）
+    assignPublicIp: 'DISABLED',
+  } },
+  loadBalancers: [{ targetGroupArn: '…/cafe-api', containerName: 'api', containerPort: 3100 }],
+  healthCheckGracePeriodSeconds: 60,
+  deploymentConfiguration: {
+    minimumHealthyPercent: 100, maximumPercent: 200,
+    deploymentCircuitBreaker: { enable: true, rollback: true },
+  },
+}))</pre>
+<ul>
+  <li><strong>subnets</strong>：給兩個 AZ 的子網路，ECS 會把 task 分散放，一個 AZ 出事還有另一半。</li>
+  <li><strong>loadBalancers</strong>：service 自動把每個 task 的 IP 註冊進第 4 課的 target group，task 停掉時先移出、等 deregistration delay 再停（devops 第 18 課）。<code>healthCheckGracePeriodSeconds</code> 是剛啟動的 task 有多久不被 ALB 健康檢查判死，NestJS 啟動要連資料庫、跑初始化時要給夠。</li>
+  <li><strong>minimumHealthyPercent／maximumPercent</strong>：滾動部署時，健康的 task 數不能低於 desiredCount 的百分之幾（無條件進位），所有 task 加起來不能超過百分之幾（無條件捨去）。</li>
+  <li><strong>deploymentCircuitBreaker</strong>：新版的 task 一直起不來或健康檢查一直失敗，累積到門檻就把這次部署標成 FAILED；<code>rollback: true</code> 會自動退回最近一次成功（COMPLETED）的部署。預設門檻是 desiredCount 的 50%、最少 3 次、最多 200 次（官方文件，2026-11-20 查證）。沒開的話，壞掉的版本會一直被重啟，停在一半舊一半新。</li>
+</ul>
+<p>按執行，看 desiredCount 4、100／200 的部署怎麼進行（簡化：每一步新 task 都健康）：</p>
+<div class="lab"><script type="code">
+// desiredCount 4，minimumHealthyPercent 100、maximumPercent 200 的一次部署（示範）
+const desired = 4
+const minHealthy = Math.ceil(desired * 100 / 100)   // 進位：至少 4 個健康
+const maxTotal = Math.floor(desired * 200 / 100)    // 捨去：最多 8 個同時存在
+let oldTasks = 4, newTasks = 0, step = 0
+while (oldTasks > 0) {
+  const canStart = Math.min(maxTotal - (oldTasks + newTasks), desired - newTasks)
+  newTasks += canStart
+  console.log(`第 ${++step} 步：啟動 ${canStart} 個新版 → 舊 ${oldTasks}、新 ${newTasks}（共 ${oldTasks + newTasks}）`)
+  const canStop = Math.min(oldTasks, oldTasks + newTasks - minHealthy)
+  oldTasks -= canStop
+  console.log(`         新版健康後停掉 ${canStop} 個舊版 → 舊 ${oldTasks}、新 ${newTasks}`)
+}
+</script></div>
+<p>100／200 是「先開新的、再關舊的」，部署中服務容量不會下降，代價是那段時間要付雙倍的 task 費用。改成 50／100 就是「先關一半舊的、再開新的」，不用多付錢，但部署中只剩一半容量。尖峰時段部署選前者。</p>
+<div class="callout practice"><strong>💡 實務上：部署卡住時先看 service 的 events</strong><br>CI 顯示「部署中」一直不結束，先跑 <code>aws ecs describe-services --cluster cafe --services cafe-api --query 'services[0].events[:5]'</code>：ECS 會寫出「已啟動 task」「task 健康檢查失敗」「無法放置 task」這類事件，比翻主控台快。<code>deployments[0].rolloutState</code> 是 <code>IN_PROGRESS</code>、<code>COMPLETED</code> 或 <code>FAILED</code>，CI 的部署腳本可以等它變成 COMPLETED 才算成功，FAILED 就讓 pipeline 變紅。這也是為什麼 circuit breaker 要開：沒開的話部署永遠不會「失敗」，只會一直卡著。</div>
+
+<h2>EC2 還是 Fargate</h2>
+<p>上面都是 Fargate。ECS 也可以把 task 放在你自己的 EC2 機器上（devops 第 18 課介紹過 EC2）。差別在於機器這一層歸誰管：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Fargate</th><th>EC2 launch type</th></tr>
+  <tr><td>作業系統修補、機器擴充</td><td>AWS</td><td>你：要管 AMI 更新、Auto Scaling group、機器數量跟 task 數量一起調</td></tr>
+  <tr><td>計費</td><td>依 task 的 vCPU、記憶體與執行時間</td><td>依機器，不管上面塞了多少 task</td></tr>
+  <tr><td>適合</td><td>大多數 API 與背景工作、團隊沒有專人管機器</td><td>需要 GPU、特殊機型、能長期把機器塞滿以壓低成本</td></tr>
+</table></div>
+<p>選 EC2 就多了三件 Fargate 不用管的事：</p>
+<ul>
+  <li><strong>instance profile</strong>：把 role 掛在機器上，機器上的程式從 IMDS（instance metadata service，<code>169.254.169.254</code>）拿臨時憑證，就是第 1 課憑證鏈的最後一步。注意它是<strong>整台機器</strong>共用的：機器上每個容器預設都拿得到，所以 ECS on EC2 仍然要給每個 task 自己的 task role。</li>
+  <li><strong>IMDSv2</strong>：舊的 IMDSv1 一個 GET 就拿得到憑證，有 SSRF 漏洞（<a href="../../auth/lessons/22-ssrf.html">Auth 課第 22 課</a>）的程式會被騙去讀它。IMDSv2 要先用 PUT 帶特定標頭拿 session token，之後的 GET 都要帶 token，一般 SSRF 只能控制 GET 的網址，做不到這一步。設定 <code>--http-tokens required</code> 強制只用 v2。另一個設定 <code>HttpPutResponseHopLimit</code> 是 token 回應能經過幾個網路跳點，限制它可以讓容器拿不到機器的 token（容器多經過一層網路）；反過來，容器裡的程式真的需要時要調高。</li>
+  <li><strong>Session Manager</strong>：要進機器查問題時，用 Systems Manager 的 Session Manager（<code>aws ssm start-session --target i-…</code>）取代 SSH：不用開 22 port、不用管 SSH 金鑰，誰在什麼時候進去都記在 CloudTrail（第 2 課）。Fargate 的容器則用 ECS Exec 進去。</li>
+</ul>
+<pre># 要求這台機器只能用 IMDSv2（指令照官方文件，2026-11-20 查證）
+aws ec2 modify-instance-metadata-options --instance-id i-0abc… \
+    --http-tokens required --http-endpoint enabled</pre>
+<p>還有一個選項是 EKS（AWS 代管的 Kubernetes，<a href="../../kubernetes/lessons/15-gitops-eks.html">Kubernetes 課第 15 課</a>）。ECS 是 AWS 自己的編排器，概念少、跟 IAM、ALB 整合得緊；EKS 是標準的 Kubernetes，生態系大、可攜，但多了控制平面的費用與升級工作。團隊已經熟 Kubernetes、或要跨雲時選 EKS，否則 ECS 加 Fargate 是負擔最小的起點。</p>
+<div class="callout practice"><strong>💡 實務上：先問「誰會在半夜被叫起來修機器」</strong><br>選 EC2 的理由常是「比較便宜」，但只算了機器的錢。自己管機器要有人負責 AMI 修補、機器擴充、磁碟滿了、ECS agent 版本，這些都是人力。小團隊的資深工程師通常先用 Fargate 上線，等帳單上 Fargate 真的佔很大一塊、流量也穩定可預測，再評估換成 EC2 或買 Savings Plans。</div>
+
+<h2>在真的 AWS 帳號上做一次（選做）</h2>
+<p>這一節不判分，也不影響進度。用第 1 課建議的獨立練習帳號，不要用公司帳號。這次用公開的 nginx 映像，在預設 VPC 的公有子網路跑一個 task，再故意關掉公開 IP，親眼看到 STOPPED 的原因。</p>
+<div class="callout warn"><strong>費用：</strong>會產生費用。計費項目：Fargate task 依 vCPU 與記憶體的執行時間、task 的公開 IPv4 位址每小時、CloudWatch Logs 的寫入與儲存量。做完馬上清除。金額依 region 不同，見 <a href="https://aws.amazon.com/fargate/pricing/">Fargate 定價頁</a>與 <a href="https://aws.amazon.com/vpc/pricing/">VPC 定價頁</a>的公開 IPv4 位址部分。</div>
+<p>先在目前資料夾建兩個檔案。<code>ecs-trust.json</code>：</p>
+<pre>{ "Version": "2012-10-17",
+  "Statement": [{ "Effect": "Allow", "Principal": { "Service": "ecs-tasks.amazonaws.com" }, "Action": "sts:AssumeRole" }] }</pre>
+<p><code>td.json</code>（把 <code>&lt;帳號ID&gt;</code> 換成你的帳號，region 換成你 profile 的 region）：</p>
+<pre>{ "family": "cafe-learn", "requiresCompatibilities": ["FARGATE"], "networkMode": "awsvpc",
+  "cpu": "256", "memory": "512",
+  "executionRoleArn": "arn:aws:iam::&lt;帳號ID&gt;:role/cafe-learn-ecs-exec",
+  "containerDefinitions": [{ "name": "web", "image": "public.ecr.aws/nginx/nginx:stable", "essential": true,
+    "portMappings": [{ "containerPort": 80 }],
+    "logConfiguration": { "logDriver": "awslogs", "options": {
+      "awslogs-group": "/ecs/cafe-learn", "awslogs-region": "ap-northeast-1", "awslogs-stream-prefix": "web" } } }] }</pre>
+<pre># 1. execution role：讓 ECS 代理程式能寫 log（這個映像是公開的，不需要 ECR 權限也拉得到）
+aws iam create-role --role-name cafe-learn-ecs-exec --assume-role-policy-document file://ecs-trust.json --profile learn-sandbox
+aws iam attach-role-policy --role-name cafe-learn-ecs-exec --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy --profile learn-sandbox
+
+# 2. log group，保留 1 天
+aws logs create-log-group --log-group-name /ecs/cafe-learn --profile learn-sandbox
+aws logs put-retention-policy --log-group-name /ecs/cafe-learn --retention-in-days 1 --profile learn-sandbox
+
+# 3. cluster 與 task definition
+aws ecs create-cluster --cluster-name cafe-learn --profile learn-sandbox
+aws ecs register-task-definition --cli-input-json file://td.json --profile learn-sandbox
+
+# 4. 找預設 VPC 的一個子網路（公有子網路）
+SUBNET=$(aws ec2 describe-subnets --filters Name=default-for-az,Values=true --query 'Subnets[0].SubnetId' --output text --profile learn-sandbox)
+
+# 5. 有公開 IP：task 應該會變成 RUNNING
+aws ecs run-task --cluster cafe-learn --launch-type FARGATE --task-definition cafe-learn \
+  --network-configuration "awsvpcConfiguration={subnets=[$SUBNET],assignPublicIp=ENABLED}" \
+  --query 'tasks[0].taskArn' --output text --profile learn-sandbox
+
+# 6. 等一兩分鐘再看狀態（&lt;taskArn&gt; 換成上一步印出的）
+aws ecs describe-tasks --cluster cafe-learn --tasks &lt;taskArn&gt; --query 'tasks[0].[lastStatus,stoppedReason]' --profile learn-sandbox
+
+# 7. 故意不給公開 IP：公有子網路連不出去，看 stoppedReason 寫什麼
+aws ecs run-task --cluster cafe-learn --launch-type FARGATE --task-definition cafe-learn \
+  --network-configuration "awsvpcConfiguration={subnets=[$SUBNET],assignPublicIp=DISABLED}" \
+  --query 'tasks[0].taskArn' --output text --profile learn-sandbox</pre>
+<h3>清除</h3>
+<pre># 停掉還在跑的 task（第 5 步那個）
+aws ecs stop-task --cluster cafe-learn --task &lt;taskArn&gt; --profile learn-sandbox
+aws ecs deregister-task-definition --task-definition cafe-learn:1 --profile learn-sandbox
+aws ecs delete-cluster --cluster cafe-learn --profile learn-sandbox
+aws logs delete-log-group --log-group-name /ecs/cafe-learn --profile learn-sandbox
+aws iam detach-role-policy --role-name cafe-learn-ecs-exec --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy --profile learn-sandbox
+aws iam delete-role --role-name cafe-learn-ecs-exec --profile learn-sandbox
+aws ecs list-clusters --query 'clusterArns' --profile learn-sandbox     # 確認：清單裡沒有 cafe-learn</pre>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：寫 <code>canReachAws(net, td)</code> 與 <code>diagnoseStopped(s, td, net)</code>。<code>canReachAws</code>：公有子網路要 <code>assignPublicIp</code> 是 <code>'ENABLED'</code>；私有子網路有 NAT gateway 就可以，沒有的話 <code>endpoints</code> 要包含 <code>ecr.api</code>、<code>ecr.dkr</code>、<code>s3</code>，<code>td.usesAwslogs</code> 時還要 <code>logs</code>，<code>td.usesSecrets</code> 時還要 <code>secretsmanager</code>。<code>diagnoseStopped</code> 依序判斷，回傳第一個成立的：</p>
+  <ol>
+    <li>exit code 是 137，或 <code>stoppedReason</code> 含 <code>OutOfMemoryError</code> → <code>'memory'</code></li>
+    <li><code>stoppedReason</code> 以 <code>CannotPullContainerError</code> 或 <code>ResourceInitializationError</code> 開頭（啟動前失敗）：沒有 execution role，或訊息含 <code>AccessDenied</code>、<code>not authorized</code>（不分大小寫）→ <code>'execution-role'</code>；<code>canReachAws</code> 是 false → <code>'network'</code>；都不是 → <code>'image'</code></li>
+    <li>容器的最後一行 log（<code>lastLog</code>，可能沒有）含 <code>AccessDenied</code> 或 <code>not authorized</code> → <code>'task-role'</code></li>
+    <li>其他 → <code>'app'</code></li>
+  </ol>
+  <script type="start">
+type Net = { subnet: 'public' | 'private', assignPublicIp: 'ENABLED' | 'DISABLED', natGateway: boolean, endpoints: string[] }
+type TaskDef = { executionRoleArn?: string, usesAwslogs: boolean, usesSecrets: boolean }
+type Stopped = { stoppedReason: string, exitCode?: number, lastLog?: string }
+type Cause = 'memory' | 'execution-role' | 'network' | 'image' | 'task-role' | 'app'
+
+function canReachAws(net: Net, td: TaskDef): boolean {
+  return true
+}
+
+function diagnoseStopped(s: Stopped, td: TaskDef, net: Net): Cause {
+  return 'app'
+}
+
+const td: TaskDef = { executionRoleArn: 'arn:aws:iam::123456789012:role/cafe-api-execution', usesAwslogs: true, usesSecrets: true }
+const net: Net = { subnet: 'public', assignPublicIp: 'DISABLED', natGateway: false, endpoints: [] }
+console.log(diagnoseStopped({ stoppedReason: 'CannotPullContainerError: pull image manifest has been retried 5 time(s): dial tcp 52.0.0.1:443: i/o timeout' }, td, net))
+</script>
+  <script type="answer">
+type Net = { subnet: 'public' | 'private', assignPublicIp: 'ENABLED' | 'DISABLED', natGateway: boolean, endpoints: string[] }
+type TaskDef = { executionRoleArn?: string, usesAwslogs: boolean, usesSecrets: boolean }
+type Stopped = { stoppedReason: string, exitCode?: number, lastLog?: string }
+type Cause = 'memory' | 'execution-role' | 'network' | 'image' | 'task-role' | 'app'
+
+function canReachAws(net: Net, td: TaskDef): boolean {
+  if (net.subnet === 'public') return net.assignPublicIp === 'ENABLED'
+  if (net.natGateway) return true
+  const need = ['ecr.api', 'ecr.dkr', 's3']
+  if (td.usesAwslogs) need.push('logs')
+  if (td.usesSecrets) need.push('secretsmanager')
+  return need.every(e => net.endpoints.includes(e))
+}
+
+const denied = (text = '') => /accessdenied|not authorized/i.test(text)
+
+function diagnoseStopped(s: Stopped, td: TaskDef, net: Net): Cause {
+  if (s.exitCode === 137 || s.stoppedReason.includes('OutOfMemoryError')) return 'memory'
+  if (/^(CannotPullContainerError|ResourceInitializationError)/.test(s.stoppedReason)) {
+    if (!td.executionRoleArn || denied(s.stoppedReason)) return 'execution-role'
+    if (!canReachAws(net, td)) return 'network'
+    return 'image'
+  }
+  if (denied(s.lastLog)) return 'task-role'
+  return 'app'
+}
+
+const td: TaskDef = { executionRoleArn: 'arn:aws:iam::123456789012:role/cafe-api-execution', usesAwslogs: true, usesSecrets: true }
+const net: Net = { subnet: 'public', assignPublicIp: 'DISABLED', natGateway: false, endpoints: [] }
+console.log(diagnoseStopped({ stoppedReason: 'CannotPullContainerError: pull image manifest has been retried 5 time(s): dial tcp 52.0.0.1:443: i/o timeout' }, td, net))
+</script>
+  <script type="tests">
+const full: TaskDef = { executionRoleArn: 'arn:aws:iam::123456789012:role/cafe-api-execution', usesAwslogs: true, usesSecrets: true }
+const pubOn: Net = { subnet: 'public', assignPublicIp: 'ENABLED', natGateway: false, endpoints: [] }
+const pubOff: Net = { subnet: 'public', assignPublicIp: 'DISABLED', natGateway: false, endpoints: [] }
+const privNat: Net = { subnet: 'private', assignPublicIp: 'DISABLED', natGateway: true, endpoints: [] }
+const privAll: Net = { subnet: 'private', assignPublicIp: 'DISABLED', natGateway: false, endpoints: ['ecr.api', 'ecr.dkr', 's3', 'logs', 'secretsmanager'] }
+const privNoS3: Net = { ...privAll, endpoints: ['ecr.api', 'ecr.dkr', 'logs', 'secretsmanager'] }
+const privNoLogs: Net = { ...privAll, endpoints: ['ecr.api', 'ecr.dkr', 's3', 'secretsmanager'] }
+const pull = 'CannotPullContainerError: pull image manifest has been retried 5 time(s): failed to resolve ref 123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/cafe-api@sha256:3f8a: dial tcp 52.0.0.1:443: i/o timeout'
+const secretDenied = 'ResourceInitializationError: unable to pull secrets or registry auth: execution resource retrieval failed: unable to retrieve secret from asm: AccessDeniedException: User: arn:aws:sts::123456789012:assumed-role/cafe-api-execution/abc is not authorized to perform: secretsmanager:GetSecretValue'
+const notFound = 'CannotPullContainerError: pull image manifest has been retried 5 time(s): failed to resolve ref 123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/cafe-api:2026-11-20-typo: not found'
+
+assert.equal(canReachAws(pubOn, full), true, '公有子網路＋公開 IP：可以經過 internet gateway 出去')
+assert.equal(canReachAws(pubOff, full), false, '公有子網路但 assignPublicIp 是 DISABLED：沒有公開 IP，連不出去')
+assert.equal(canReachAws(privNat, full), true, '私有子網路有 NAT gateway：可以出去')
+assert.equal(canReachAws(privAll, full), true, '私有子網路沒有 NAT，但需要的 endpoint 都有')
+assert.equal(canReachAws(privNoS3, full), false, '少了 s3 的 gateway endpoint：ECR 的映像層存在 S3，拉不下來')
+assert.equal(canReachAws(privNoLogs, full), false, '用 awslogs 卻沒有 logs endpoint')
+assert.equal(canReachAws(privNoLogs, { ...full, usesAwslogs: false }), true, '沒用 awslogs 時不需要 logs endpoint')
+assert.equal(canReachAws({ ...privAll, endpoints: ['ecr.api', 'ecr.dkr', 's3', 'logs'] }, { ...full, usesSecrets: false }), true, '沒有 secrets 時不需要 secretsmanager endpoint')
+
+assert.equal(diagnoseStopped({ stoppedReason: 'OutOfMemoryError: Container killed due to memory usage' }, full, pubOn), 'memory', 'OutOfMemoryError 是記憶體')
+assert.equal(diagnoseStopped({ stoppedReason: 'Essential container in task exited', exitCode: 137 }, full, pubOn), 'memory', 'exit code 137 是被 SIGKILL 砍掉，通常是記憶體超過上限')
+assert.equal(diagnoseStopped({ stoppedReason: pull }, full, pubOff), 'network', '公有子網路沒給公開 IP，拉映像逾時：網路')
+assert.equal(diagnoseStopped({ stoppedReason: pull }, full, privNoS3), 'network', '私有子網路少了 s3 endpoint，拉映像逾時：網路')
+assert.equal(diagnoseStopped({ stoppedReason: secretDenied }, full, privNat), 'execution-role',
+  'ResourceInitializationError 裡的 AccessDenied 是 execution role 讀不到 secret，不是 task role')
+assert.equal(diagnoseStopped({ stoppedReason: pull }, { ...full, executionRoleArn: undefined }, privNat), 'execution-role',
+  '沒有 execution role，Fargate 拉不了私有 ECR 的映像')
+assert.equal(diagnoseStopped({ stoppedReason: notFound }, full, privNat), 'image', '網路通、權限也對，還是拉不到：映像名稱或 tag 打錯')
+assert.equal(diagnoseStopped({ stoppedReason: 'Essential container in task exited', exitCode: 1, lastLog: 'AccessDenied: User: arn:aws:sts::123456789012:assumed-role/cafe-api-task/abc is not authorized to perform: s3:PutObject' }, full, privNat), 'task-role',
+  '容器跑起來之後，程式呼叫 S3 被拒：task role')
+assert.equal(diagnoseStopped({ stoppedReason: 'Essential container in task exited', exitCode: 1, lastLog: 'Error: connect ETIMEDOUT 10.0.21.5:5432' }, full, privNat), 'app', '其他程式自己的錯誤：app')
+assert.equal(diagnoseStopped({ stoppedReason: 'Essential container in task exited', exitCode: 1 }, full, privNat), 'app', '沒有 log 時也要能判斷（lastLog 可能沒有）')
+</script>
+  <script type="wrong">
+type Net = { subnet: 'public' | 'private', assignPublicIp: 'ENABLED' | 'DISABLED', natGateway: boolean, endpoints: string[] }
+type TaskDef = { executionRoleArn?: string, usesAwslogs: boolean, usesSecrets: boolean }
+type Stopped = { stoppedReason: string, exitCode?: number, lastLog?: string }
+type Cause = 'memory' | 'execution-role' | 'network' | 'image' | 'task-role' | 'app'
+// 看到 AccessDenied 就歸給 task role，不管是在啟動前還是啟動後
+function canReachAws(net: Net, td: TaskDef): boolean {
+  if (net.subnet === 'public') return net.assignPublicIp === 'ENABLED'
+  if (net.natGateway) return true
+  const need = ['ecr.api', 'ecr.dkr', 's3', ...(td.usesAwslogs ? ['logs'] : []), ...(td.usesSecrets ? ['secretsmanager'] : [])]
+  return need.every(e => net.endpoints.includes(e))
+}
+function diagnoseStopped(s: Stopped, td: TaskDef, net: Net): Cause {
+  if (s.exitCode === 137 || s.stoppedReason.includes('OutOfMemoryError')) return 'memory'
+  if (/accessdenied|not authorized/i.test(s.stoppedReason + (s.lastLog ?? ''))) return 'task-role'
+  if (/^(CannotPullContainerError|ResourceInitializationError)/.test(s.stoppedReason)) {
+    if (!td.executionRoleArn) return 'execution-role'
+    return canReachAws(net, td) ? 'image' : 'network'
+  }
+  return 'app'
+}
+</script>
+  <script type="wrong">
+type Net = { subnet: 'public' | 'private', assignPublicIp: 'ENABLED' | 'DISABLED', natGateway: boolean, endpoints: string[] }
+type TaskDef = { executionRoleArn?: string, usesAwslogs: boolean, usesSecrets: boolean }
+type Stopped = { stoppedReason: string, exitCode?: number, lastLog?: string }
+type Cause = 'memory' | 'execution-role' | 'network' | 'image' | 'task-role' | 'app'
+// 以為公有子網路一定連得出去：忽略 assignPublicIp
+function canReachAws(net: Net, td: TaskDef): boolean {
+  if (net.subnet === 'public') return true
+  if (net.natGateway) return true
+  const need = ['ecr.api', 'ecr.dkr', 's3', ...(td.usesAwslogs ? ['logs'] : []), ...(td.usesSecrets ? ['secretsmanager'] : [])]
+  return need.every(e => net.endpoints.includes(e))
+}
+function diagnoseStopped(s: Stopped, td: TaskDef, net: Net): Cause {
+  if (s.exitCode === 137 || s.stoppedReason.includes('OutOfMemoryError')) return 'memory'
+  if (/^(CannotPullContainerError|ResourceInitializationError)/.test(s.stoppedReason)) {
+    if (!td.executionRoleArn || /accessdenied|not authorized/i.test(s.stoppedReason)) return 'execution-role'
+    return canReachAws(net, td) ? 'image' : 'network'
+  }
+  if (/accessdenied|not authorized/i.test(s.lastLog ?? '')) return 'task-role'
+  return 'app'
+}
+</script>
+  <script type="wrong">
+type Net = { subnet: 'public' | 'private', assignPublicIp: 'ENABLED' | 'DISABLED', natGateway: boolean, endpoints: string[] }
+type TaskDef = { executionRoleArn?: string, usesAwslogs: boolean, usesSecrets: boolean }
+type Stopped = { stoppedReason: string, exitCode?: number, lastLog?: string }
+type Cause = 'memory' | 'execution-role' | 'network' | 'image' | 'task-role' | 'app'
+// 以為有 ECR 的兩個 endpoint 就夠了：忘了 s3、logs、secretsmanager
+function canReachAws(net: Net, td: TaskDef): boolean {
+  if (net.subnet === 'public') return net.assignPublicIp === 'ENABLED'
+  if (net.natGateway) return true
+  return ['ecr.api', 'ecr.dkr'].every(e => net.endpoints.includes(e))
+}
+function diagnoseStopped(s: Stopped, td: TaskDef, net: Net): Cause {
+  if (s.exitCode === 137 || s.stoppedReason.includes('OutOfMemoryError')) return 'memory'
+  if (/^(CannotPullContainerError|ResourceInitializationError)/.test(s.stoppedReason)) {
+    if (!td.executionRoleArn || /accessdenied|not authorized/i.test(s.stoppedReason)) return 'execution-role'
+    return canReachAws(net, td) ? 'image' : 'network'
+  }
+  if (/accessdenied|not authorized/i.test(s.lastLog ?? '')) return 'task-role'
+  return 'app'
+}
+</script>
+  <script type="wrong">
+type Net = { subnet: 'public' | 'private', assignPublicIp: 'ENABLED' | 'DISABLED', natGateway: boolean, endpoints: string[] }
+type TaskDef = { executionRoleArn?: string, usesAwslogs: boolean, usesSecrets: boolean }
+type Stopped = { stoppedReason: string, exitCode?: number, lastLog?: string }
+type Cause = 'memory' | 'execution-role' | 'network' | 'image' | 'task-role' | 'app'
+// 只看訊息文字，不看 exit code 137
+function canReachAws(net: Net, td: TaskDef): boolean {
+  if (net.subnet === 'public') return net.assignPublicIp === 'ENABLED'
+  if (net.natGateway) return true
+  const need = ['ecr.api', 'ecr.dkr', 's3', ...(td.usesAwslogs ? ['logs'] : []), ...(td.usesSecrets ? ['secretsmanager'] : [])]
+  return need.every(e => net.endpoints.includes(e))
+}
+function diagnoseStopped(s: Stopped, td: TaskDef, net: Net): Cause {
+  if (s.stoppedReason.includes('OutOfMemoryError')) return 'memory'
+  if (/^(CannotPullContainerError|ResourceInitializationError)/.test(s.stoppedReason)) {
+    if (!td.executionRoleArn || /accessdenied|not authorized/i.test(s.stoppedReason)) return 'execution-role'
+    return canReachAws(net, td) ? 'image' : 'network'
+  }
+  if (/accessdenied|not authorized/i.test(s.lastLog ?? '')) return 'task-role'
+  return 'app'
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：上線前的 task definition 檢查。寫 <code>validateTaskDef(td)</code>，回傳問題代碼的陣列（不重複、依字母排序），沒問題回傳 <code>[]</code>：</p>
+  <ul>
+    <li><code>'cpu-memory'</code>：cpu 不在表裡，或 memory 不是那個 cpu 可以搭配的值（<code>FARGATE</code> 表的值是陣列時要在陣列裡；是範圍時要在 min～max 之間，而且 <code>(memory - min)</code> 是 step 的倍數）。cpu、memory 都是 MiB 字串。</li>
+    <li><code>'network-mode'</code>：networkMode 不是 <code>awsvpc</code>。</li>
+    <li><code>'image-tag'</code>：某個容器的 image 沒有用 digest（不含 <code>@sha256:</code>），而且 tag 是 <code>latest</code> 或沒寫 tag。tag 是最後一個 <code>/</code> 之後、冒號後面的部分：<code>localhost:5000/cafe-api</code> 的 <code>5000</code> 是 port，這個 image 沒有 tag。</li>
+    <li><code>'secret-in-env'</code>：某個容器的 environment 有名稱含 <code>PASSWORD</code>、<code>SECRET</code>、<code>TOKEN</code> 或 <code>DATABASE_URL</code> 的變數（不分大小寫）。</li>
+    <li><code>'secret-arn'</code>：某個 secret 的 valueFrom 不是以 <code>arn:</code> 開頭（團隊規定一律寫完整 ARN）。</li>
+    <li><code>'no-logs'</code>：某個容器沒有 logConfiguration。</li>
+  </ul>
+  <script type="start">
+type Container = { name: string, image: string, environment?: { name: string, value: string }[], secrets?: { name: string, valueFrom: string }[], logConfiguration?: { logDriver: string } }
+type TaskDef = { cpu: string, memory: string, networkMode: string, containerDefinitions: Container[] }
+
+// Fargate 的 CPU／記憶體組合（MiB），照官方 Task CPU and memory 表
+const FARGATE: Record<string, number[] | { min: number, max: number, step: number }> = {
+  '256': [512, 1024, 2048],
+  '512': [1024, 2048, 3072, 4096],
+  '1024': [2048, 3072, 4096, 5120, 6144, 7168, 8192],
+  '2048': { min: 4096, max: 16384, step: 1024 },
+  '4096': { min: 8192, max: 30720, step: 1024 },
+  '8192': { min: 16384, max: 61440, step: 4096 },
+  '16384': { min: 32768, max: 122880, step: 8192 },
+  '32768': [61440, 122880, 249856],
+}
+
+function validateTaskDef(td: TaskDef): string[] {
+  const problems = new Set<string>()
+  return [...problems].sort()
+}
+
+console.log(validateTaskDef({ cpu: '512', memory: '512', networkMode: 'bridge', containerDefinitions: [{ name: 'api', image: '123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/cafe-api:latest' }] }))
+</script>
+  <script type="answer">
+type Container = { name: string, image: string, environment?: { name: string, value: string }[], secrets?: { name: string, valueFrom: string }[], logConfiguration?: { logDriver: string } }
+type TaskDef = { cpu: string, memory: string, networkMode: string, containerDefinitions: Container[] }
+
+// Fargate 的 CPU／記憶體組合（MiB），照官方 Task CPU and memory 表
+const FARGATE: Record<string, number[] | { min: number, max: number, step: number }> = {
+  '256': [512, 1024, 2048],
+  '512': [1024, 2048, 3072, 4096],
+  '1024': [2048, 3072, 4096, 5120, 6144, 7168, 8192],
+  '2048': { min: 4096, max: 16384, step: 1024 },
+  '4096': { min: 8192, max: 30720, step: 1024 },
+  '8192': { min: 16384, max: 61440, step: 4096 },
+  '16384': { min: 32768, max: 122880, step: 8192 },
+  '32768': [61440, 122880, 249856],
+}
+
+function validSize(cpu: string, memory: string): boolean {
+  const rule = FARGATE[cpu]
+  const m = Number(memory)
+  if (!rule || !Number.isInteger(m)) return false
+  if (Array.isArray(rule)) return rule.includes(m)
+  return m >= rule.min && m <= rule.max && (m - rule.min) % rule.step === 0
+}
+
+function hasMutableTag(image: string): boolean {
+  if (image.includes('@sha256:')) return false
+  const last = image.slice(image.lastIndexOf('/') + 1)   // 最後一段才可能有 tag，前面的冒號是 port
+  const colon = last.lastIndexOf(':')
+  return colon === -1 || last.slice(colon + 1) === 'latest'
+}
+
+function validateTaskDef(td: TaskDef): string[] {
+  const problems = new Set<string>()
+  if (!validSize(td.cpu, td.memory)) problems.add('cpu-memory')
+  if (td.networkMode !== 'awsvpc') problems.add('network-mode')
+  for (const c of td.containerDefinitions) {
+    if (hasMutableTag(c.image)) problems.add('image-tag')
+    if ((c.environment ?? []).some(e => /password|secret|token|database_url/i.test(e.name))) problems.add('secret-in-env')
+    if ((c.secrets ?? []).some(s => !s.valueFrom.startsWith('arn:'))) problems.add('secret-arn')
+    if (!c.logConfiguration) problems.add('no-logs')
+  }
+  return [...problems].sort()
+}
+
+console.log(validateTaskDef({ cpu: '512', memory: '512', networkMode: 'bridge', containerDefinitions: [{ name: 'api', image: '123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/cafe-api:latest' }] }))
+</script>
+  <script type="tests">
+const repo = '123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/cafe-api'
+const ok: Container = {
+  name: 'api', image: `${repo}@sha256:3f8a9c`, environment: [{ name: 'PORT', value: '3100' }],
+  secrets: [{ name: 'APP_DATABASE_URL', valueFrom: 'arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:cafe/db-AbCdEf' }],
+  logConfiguration: { logDriver: 'awslogs' },
+}
+const td = (over: Partial<TaskDef> = {}, c: Partial<Container> = {}): TaskDef =>
+  ({ cpu: '512', memory: '1024', networkMode: 'awsvpc', containerDefinitions: [{ ...ok, ...c }], ...over })
+
+assert.deepEqual(validateTaskDef(td()), [], '全部正確時回傳 []')
+assert.deepEqual(validateTaskDef(td({ memory: '512' })), ['cpu-memory'], '0.5 vCPU 最少要 1 GB（1024）')
+assert.deepEqual(validateTaskDef(td({ memory: '5120' })), ['cpu-memory'], '0.5 vCPU 最多 4 GB：5120 不行，不能只檢查 cpu 存不存在')
+assert.deepEqual(validateTaskDef(td({ cpu: '768' })), ['cpu-memory'], '768 不是 Fargate 的 cpu 值')
+assert.deepEqual(validateTaskDef(td({ cpu: '2048', memory: '16384' })), [], '2 vCPU 的上限 16 GB 要算在範圍內')
+assert.deepEqual(validateTaskDef(td({ cpu: '2048', memory: '4608' })), ['cpu-memory'], '2 vCPU 要以 1 GB 為單位：4608 不是 1024 的倍數')
+assert.deepEqual(validateTaskDef(td({ cpu: '8192', memory: '20480' })), [], '8 vCPU：16 GB 起每 4 GB 一級，20 GB 可以')
+assert.deepEqual(validateTaskDef(td({ cpu: '8192', memory: '18432' })), ['cpu-memory'], '8 vCPU：18 GB 不是 16 GB 加上 4 GB 的倍數')
+assert.deepEqual(validateTaskDef(td({ networkMode: 'bridge' })), ['network-mode'], 'Fargate 只能用 awsvpc')
+assert.deepEqual(validateTaskDef(td({}, { image: `${repo}:latest` })), ['image-tag'], ':latest 會變，不能用')
+assert.deepEqual(validateTaskDef(td({}, { image: repo })), ['image-tag'], '沒寫 tag 就是 latest')
+assert.deepEqual(validateTaskDef(td({}, { image: `${repo}:2026-11-20-a1b2c3d` })), [], '固定的 tag（搭配 IMMUTABLE repository）可以')
+assert.deepEqual(validateTaskDef(td({}, { image: 'localhost:5000/cafe-api' })), ['image-tag'], 'localhost:5000 的 5000 是 port 不是 tag：這個 image 沒有 tag')
+assert.deepEqual(validateTaskDef(td({}, { image: 'localhost:5000/cafe-api:v7' })), [], 'localhost:5000/cafe-api:v7 的 tag 是 v7')
+assert.deepEqual(validateTaskDef(td({}, { environment: [{ name: 'PORT', value: '3100' }, { name: 'jwt_secret', value: 'abc' }] })), ['secret-in-env'], '名稱含 secret（不分大小寫）的不能放 environment')
+assert.deepEqual(validateTaskDef(td({}, { environment: [{ name: 'APP_DATABASE_URL', value: 'postgresql://…' }] })), ['secret-in-env'], '資料庫連線字串含密碼，要放 secrets')
+assert.deepEqual(validateTaskDef(td({}, { secrets: [{ name: 'APP_DATABASE_URL', valueFrom: 'cafe/db' }] })), ['secret-arn'], 'valueFrom 要寫完整 ARN')
+assert.deepEqual(validateTaskDef(td({}, { logConfiguration: undefined })), ['no-logs'], '沒有 logConfiguration：task 停掉後 log 就沒了')
+const two = td()
+two.containerDefinitions.push({ name: 'sidecar', image: 'public.ecr.aws/aws-observability/aws-otel-collector' })
+assert.deepEqual(validateTaskDef(two), ['image-tag', 'no-logs'], '每個容器都要檢查，不能只看第一個')
+assert.deepEqual(validateTaskDef(td({ cpu: '256', memory: '256', networkMode: 'host' }, { image: `${repo}:latest`, logConfiguration: undefined })),
+  ['cpu-memory', 'image-tag', 'network-mode', 'no-logs'], '多個問題時全部列出，依字母排序')
+</script>
+  <script type="wrong">
+type Container = { name: string, image: string, environment?: { name: string, value: string }[], secrets?: { name: string, valueFrom: string }[], logConfiguration?: { logDriver: string } }
+type TaskDef = { cpu: string, memory: string, networkMode: string, containerDefinitions: Container[] }
+const FARGATE: Record<string, number[] | { min: number, max: number, step: number }> = {
+  '256': [512, 1024, 2048], '512': [1024, 2048, 3072, 4096], '1024': [2048, 3072, 4096, 5120, 6144, 7168, 8192],
+  '2048': { min: 4096, max: 16384, step: 1024 }, '4096': { min: 8192, max: 30720, step: 1024 },
+  '8192': { min: 16384, max: 61440, step: 4096 }, '16384': { min: 32768, max: 122880, step: 8192 }, '32768': [61440, 122880, 249856],
+}
+// 只檢查 cpu 在不在表裡，沒檢查 memory
+function validateTaskDef(td: TaskDef): string[] {
+  const problems = new Set<string>()
+  if (!FARGATE[td.cpu]) problems.add('cpu-memory')
+  if (td.networkMode !== 'awsvpc') problems.add('network-mode')
+  for (const c of td.containerDefinitions) {
+    const last = c.image.slice(c.image.lastIndexOf('/') + 1)
+    if (!c.image.includes('@sha256:') && (!last.includes(':') || last.endsWith(':latest'))) problems.add('image-tag')
+    if ((c.environment ?? []).some(e => /password|secret|token|database_url/i.test(e.name))) problems.add('secret-in-env')
+    if ((c.secrets ?? []).some(s => !s.valueFrom.startsWith('arn:'))) problems.add('secret-arn')
+    if (!c.logConfiguration) problems.add('no-logs')
+  }
+  return [...problems].sort()
+}
+</script>
+  <script type="wrong">
+type Container = { name: string, image: string, environment?: { name: string, value: string }[], secrets?: { name: string, valueFrom: string }[], logConfiguration?: { logDriver: string } }
+type TaskDef = { cpu: string, memory: string, networkMode: string, containerDefinitions: Container[] }
+const FARGATE: Record<string, number[] | { min: number, max: number, step: number }> = {
+  '256': [512, 1024, 2048], '512': [1024, 2048, 3072, 4096], '1024': [2048, 3072, 4096, 5120, 6144, 7168, 8192],
+  '2048': { min: 4096, max: 16384, step: 1024 }, '4096': { min: 8192, max: 30720, step: 1024 },
+  '8192': { min: 16384, max: 61440, step: 4096 }, '16384': { min: 32768, max: 122880, step: 8192 }, '32768': [61440, 122880, 249856],
+}
+// 範圍只看上下限，沒看級距
+function validateTaskDef(td: TaskDef): string[] {
+  const problems = new Set<string>()
+  const rule = FARGATE[td.cpu], m = Number(td.memory)
+  const sizeOk = !!rule && (Array.isArray(rule) ? rule.includes(m) : m >= rule.min && m <= rule.max)
+  if (!sizeOk) problems.add('cpu-memory')
+  if (td.networkMode !== 'awsvpc') problems.add('network-mode')
+  for (const c of td.containerDefinitions) {
+    const last = c.image.slice(c.image.lastIndexOf('/') + 1)
+    if (!c.image.includes('@sha256:') && (!last.includes(':') || last.endsWith(':latest'))) problems.add('image-tag')
+    if ((c.environment ?? []).some(e => /password|secret|token|database_url/i.test(e.name))) problems.add('secret-in-env')
+    if ((c.secrets ?? []).some(s => !s.valueFrom.startsWith('arn:'))) problems.add('secret-arn')
+    if (!c.logConfiguration) problems.add('no-logs')
+  }
+  return [...problems].sort()
+}
+</script>
+  <script type="wrong">
+type Container = { name: string, image: string, environment?: { name: string, value: string }[], secrets?: { name: string, valueFrom: string }[], logConfiguration?: { logDriver: string } }
+type TaskDef = { cpu: string, memory: string, networkMode: string, containerDefinitions: Container[] }
+const FARGATE: Record<string, number[] | { min: number, max: number, step: number }> = {
+  '256': [512, 1024, 2048], '512': [1024, 2048, 3072, 4096], '1024': [2048, 3072, 4096, 5120, 6144, 7168, 8192],
+  '2048': { min: 4096, max: 16384, step: 1024 }, '4096': { min: 8192, max: 30720, step: 1024 },
+  '8192': { min: 16384, max: 61440, step: 4096 }, '16384': { min: 32768, max: 122880, step: 8192 }, '32768': [61440, 122880, 249856],
+}
+// 用整個字串的最後一個冒號找 tag：localhost:5000/cafe-api 被當成 tag 是 5000/cafe-api
+function validateTaskDef(td: TaskDef): string[] {
+  const problems = new Set<string>()
+  const rule = FARGATE[td.cpu], m = Number(td.memory)
+  const sizeOk = !!rule && (Array.isArray(rule) ? rule.includes(m) : m >= rule.min && m <= rule.max && (m - rule.min) % rule.step === 0)
+  if (!sizeOk) problems.add('cpu-memory')
+  if (td.networkMode !== 'awsvpc') problems.add('network-mode')
+  for (const c of td.containerDefinitions) {
+    const colon = c.image.lastIndexOf(':')
+    if (!c.image.includes('@sha256:') && (colon === -1 || c.image.slice(colon + 1) === 'latest')) problems.add('image-tag')
+    if ((c.environment ?? []).some(e => /password|secret|token|database_url/i.test(e.name))) problems.add('secret-in-env')
+    if ((c.secrets ?? []).some(s => !s.valueFrom.startsWith('arn:'))) problems.add('secret-arn')
+    if (!c.logConfiguration) problems.add('no-logs')
+  }
+  return [...problems].sort()
+}
+</script>
+  <script type="wrong">
+type Container = { name: string, image: string, environment?: { name: string, value: string }[], secrets?: { name: string, valueFrom: string }[], logConfiguration?: { logDriver: string } }
+type TaskDef = { cpu: string, memory: string, networkMode: string, containerDefinitions: Container[] }
+const FARGATE: Record<string, number[] | { min: number, max: number, step: number }> = {
+  '256': [512, 1024, 2048], '512': [1024, 2048, 3072, 4096], '1024': [2048, 3072, 4096, 5120, 6144, 7168, 8192],
+  '2048': { min: 4096, max: 16384, step: 1024 }, '4096': { min: 8192, max: 30720, step: 1024 },
+  '8192': { min: 16384, max: 61440, step: 4096 }, '16384': { min: 32768, max: 122880, step: 8192 }, '32768': [61440, 122880, 249856],
+}
+// 只檢查第一個容器
+function validateTaskDef(td: TaskDef): string[] {
+  const problems = new Set<string>()
+  const rule = FARGATE[td.cpu], m = Number(td.memory)
+  const sizeOk = !!rule && (Array.isArray(rule) ? rule.includes(m) : m >= rule.min && m <= rule.max && (m - rule.min) % rule.step === 0)
+  if (!sizeOk) problems.add('cpu-memory')
+  if (td.networkMode !== 'awsvpc') problems.add('network-mode')
+  const c = td.containerDefinitions[0]
+  const last = c.image.slice(c.image.lastIndexOf('/') + 1)
+  if (!c.image.includes('@sha256:') && (!last.includes(':') || last.endsWith(':latest'))) problems.add('image-tag')
+  if ((c.environment ?? []).some(e => /password|secret|token|database_url/i.test(e.name))) problems.add('secret-in-env')
+  if ((c.secrets ?? []).some(s => !s.valueFrom.startsWith('arn:'))) problems.add('secret-arn')
+  if (!c.logConfiguration) problems.add('no-logs')
+  return [...problems].sort()
+}
+</script>
+</div>
+
+<div class="local" data-test="ex3" data-files="deploy-api.ts">
+  <p>練習 3：完成 <code>deploy-api.ts</code> 的 <code>deployApi({ ecr, ecs }, opts)</code>，把 cafe-api 部署到 Fargate。repository、cluster、task definition 的 family、service 都用 <code>opts.name</code>。步驟：(1) <code>CreateRepositoryCommand</code> 建 repository，tag 不可變、push 時掃描；已經存在（錯誤的 <code>name</code> 是 <code>RepositoryAlreadyExistsException</code>）就用 <code>DescribeRepositoriesCommand</code> 拿它的 <code>repositoryUri</code>。(2) <code>RegisterTaskDefinitionCommand</code>：FARGATE、awsvpc、cpu <code>'512'</code>、memory <code>'1024'</code>，兩個 role 照 opts 分開填；一個名稱是 <code>api</code> 的容器，image 是 <code>&lt;repositoryUri&gt;@&lt;opts.digest&gt;</code>、port 3100、<code>APP_DATABASE_URL</code> 用 <code>secrets</code> 從 <code>opts.dbSecretArn</code> 注入、awslogs 寫到 <code>/ecs/&lt;name&gt;</code>（region 用 <code>await ecs.config.region()</code>，stream prefix 自訂）。(3) <code>CreateClusterCommand</code>。(4) 用 <code>DescribeServicesCommand</code> 看 service 在不在（<code>services</code> 裡有 <code>status</code> 為 <code>ACTIVE</code> 的就是在）：不在就 <code>CreateServiceCommand</code>（FARGATE、opts 的子網路與安全群組、<code>assignPublicIp: 'DISABLED'</code>、circuit breaker 開啟並回滾、100／200），在就 <code>UpdateServiceCommand</code> 換成這次註冊的 task definition ARN。回傳 <code>{ imageUri, taskDefinitionArn, serviceArn }</code>。測試會用新的 digest 再部署一次，確認第二次是換版而不是重建。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：cafe-api 部署成功、task 都是 RUNNING，但客人上傳收據時 API 回 500，log 寫著 <code>AccessDenied … is not authorized to perform: s3:PutObject</code>。同事說「execution role 已經有 <code>AmazonECSTaskExecutionRolePolicy</code> 了，再加 S3 權限給它就好」。你怎麼做？</p>
+  <label data-key="a">照同事說的，把 s3:PutObject 加到 execution role</label>
+  <label data-key="b">把 execution role 也填進 taskRoleArn，兩個用同一個 role</label>
+  <label data-key="c">加到 task role：容器裡的程式用的是 task role 的憑證，execution role 只給 ECS 代理程式在啟動前用</label>
+  <label data-key="d">在 task definition 的 environment 加上 AWS_ACCESS_KEY_ID 與 AWS_SECRET_ACCESS_KEY</label>
+  <p class="why">✓ task 已經跑起來、是程式呼叫 S3 被拒，所以是 task role 的權限不夠。a 改了也沒用，容器拿不到 execution role 的憑證；b 能動，但讓應用程式也拿到讀 secret 的權限，擴大被攻破時的損害；d 把長期金鑰放進明文的 task definition，是最不該做的事。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：cafe-api 的 service 是 desiredCount 4、minimumHealthyPercent 100、maximumPercent 200，現在要部署新版。部署過程中會發生什麼？</p>
+  <label data-key="a">先停掉 4 個舊的，再啟動 4 個新的，中間有一段時間沒有 task</label>
+  <label data-key="b">最多可以先多開 4 個新的（共 8 個），新的健康後才停舊的，健康的 task 一直不少於 4 個</label>
+  <label data-key="c">一次只換一個：停 1 個舊的、開 1 個新的，重複 4 次</label>
+  <label data-key="d">200 表示部署完成後會有 8 個 task</label>
+  <p class="why">✓ minimumHealthyPercent 100 是下限：健康的 task 不能少於 4 個，所以不能先停；maximumPercent 200 是上限：最多同時 8 個，所以可以先開 4 個新的。a 是 0／100 這類設定的行為；d 把上限當成目標，部署完成後仍是 desiredCount 4 個。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：資安要求所有 EC2 機器都設成 IMDSv2 required。主管問：「SSRF 能讓伺服器去 GET 任何網址，為什麼改成 v2 就擋得住偷憑證？」</p>
+  <label data-key="a">v2 要先送一個帶特定標頭的 PUT 拿 session token，GET 時再帶上 token；一般的 SSRF 只能讓伺服器送出 GET 到指定網址，做不到這兩步</label>
+  <label data-key="b">v2 的位址不是 169.254.169.254，攻擊者猜不到</label>
+  <label data-key="c">v2 回傳的憑證是加密的，攻擊者拿到也解不開</label>
+  <label data-key="d">v2 只允許 root 使用者讀取，應用程式的使用者讀不到</label>
+  <p class="why">✓ IMDSv2 把「拿憑證」變成兩步：PUT 拿 token、帶 token 的 GET。SSRF 通常只控制得了一個 GET 的網址。b 錯，位址一樣是 169.254.169.254；c 錯，拿到 token 的程式讀到的就是可用的臨時憑證，所以重點是不讓攻擊者拿到 token。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>task definition 寫 <code>:latest</code></strong>：同一個 revision 可能跑出不同映像，回滾也回不去。用 digest，或搭配 IMMUTABLE repository 的固定 tag。</li>
+  <li><strong>兩個 role 填同一個</strong>：能動，但應用程式拿到讀 secret、拉映像的權限。分開、各自最小。</li>
+  <li><strong>啟動前失敗卻去改 task role</strong>：<code>CannotPullContainerError</code>、<code>ResourceInitializationError</code> 發生在容器跑起來之前，跟 task role 無關，先看 execution role 與網路。</li>
+  <li><strong>公有子網路的 task 沒給公開 IP</strong>：連不到 ECR，一直 STOPPED。要嘛給公開 IP，要嘛放私有子網路走 NAT 或 VPC endpoint。</li>
+  <li><strong>只建 ECR 的 endpoint、忘了 S3</strong>：映像層存在 S3，沒有 S3 gateway endpoint 一樣拉不下來；用 awslogs、secrets 還要對應的 endpoint。</li>
+  <li><strong>密碼放 environment</strong>：task definition 是明文，放 <code>secrets</code>，由 execution role 在啟動時讀出來。</li>
+  <li><strong>沒開 circuit breaker</strong>：壞掉的版本一直重啟，部署永遠不會失敗也不會結束。</li>
+  <li><strong>只看機器費用就選 EC2</strong>：還有修補、擴充、IMDS 設定的人力成本。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>ECS 的四個名詞：cluster、task definition（每次修改是新 revision）、task、service。Fargate 讓你只管 task 的 vCPU 與記憶體，不管機器。</li>
+  <li>ECR repository 開 tag 不可變、push 時掃描、lifecycle policy；task definition 的 image 用 digest。</li>
+  <li>Fargate 的 cpu 與 memory 只能用官方表裡的組合；networkMode 一定是 awsvpc，每個 task 有自己的 ENI 與安全群組。</li>
+  <li>execution role 是 ECS 代理程式在啟動前用的（拉映像、寫 log、讀 secrets）；task role 是你的程式在執行時用的。密碼放 <code>secrets</code>，不放 environment。</li>
+  <li>task STOPPED 的判斷順序：記憶體（OOM、137）→ 啟動前失敗（權限是 execution role、逾時是網路、其他多半是映像參照）→ 啟動後結束（看 log，AccessDenied 是 task role）。</li>
+  <li>service 維持 N 個 task、整合 ALB；100／200 先開新再關舊；circuit breaker 開啟並回滾。</li>
+  <li>EC2 launch type 要自己管機器、instance profile、IMDSv2（http-tokens required）與 Session Manager；團隊沒有專人管機器時先用 Fargate。ECS 與 EKS 的差別在概念數量與可攜性。</li>
+</ul>
+<p>下一課換另一種運算方式：不用管容器，只寫一個函式，由 Lambda 依請求數自動擴充，前面用 API Gateway 當 HTTP 入口。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

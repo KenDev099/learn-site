@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>6. Lambda 與 API Gateway：handler、冷啟動、並行、HTTP API 與授權</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="6" data-practice="aws">
+<header>
+  <div class="eyebrow">階段 3：運算 · 第 6 課</div>
+  <h1>Lambda 與 API Gateway：handler、冷啟動、並行、HTTP API 與授權</h1>
+</header>
+<main>
+
+<p>咖啡店想把兩件事改成無伺服器（serverless）：結帳後產生收據檔，以及手機點餐的訂單 API。理由很合理：平常沒什麼流量，不想讓容器整天開著。開幕活動當天出了三件事：一部分點餐請求拿到錯誤，訊息是被節流（throttled）；另一部分等了 30 秒拿到 504；資料庫回 <code>too many connections</code>，連原本在 ECS 上跑的後台也一起掛了。</p>
+<p>這一課學 <strong>Lambda</strong>（只上傳一個函式，AWS 依請求數自動開執行環境來跑它，按呼叫次數與執行時間計費）與 <strong>API Gateway</strong>（Lambda 前面的 HTTP 入口）。學完你會知道 handler 外面的程式什麼時候執行、並行數怎麼算、為什麼會被節流、504 從哪裡來，以及怎麼讓 API 只接受登入的使用者。</p>
+<p>這課的路線：</p>
+<ul>
+  <li>handler 與執行環境：函式長什麼樣子、冷啟動是什麼、哪些程式只執行一次。</li>
+  <li>並行與節流：一個執行環境一次只處理一個請求，所以尖峰時要開很多個；上限、保留與被擋下時會怎樣。</li>
+  <li>逾時、記憶體、打包與兩種權限：函式能呼叫什麼、誰能呼叫函式。</li>
+  <li>API Gateway：HTTP API 與 REST API 怎麼選、事件格式、JWT 授權、CORS、節流與逾時。</li>
+  <li>Lambda 還是 Fargate：這個階段兩課的取捨。</li>
+</ul>
+
+<div class="callout"><strong>這課會用到：</strong><a href="05-ecs-fargate.html">第 5 課</a>的 execution role 與 task role（ECS 代理程式用的、你的程式用的）；Node 的 event loop 與 async（<a href="../../node/lessons/07-event-loop.html">Node 課第 7 課</a>：handler 回傳的 Promise 完成，這次呼叫才算結束）；JWT 的 iss、aud、exp 與簽章驗證（<a href="../../auth/lessons/09-jwt-verification.html">Auth 課第 9 課</a>）；CORS（<a href="../../auth/lessons/05-same-origin-cors.html">Auth 課第 5 課</a>）。</div>
+
+<div class="callout warn"><strong>練習環境：</strong>模擬器只保存 Lambda 與 API Gateway 的設定，不會真的執行函式。本機題直接在 Node 裡 import 你的 handler、傳入假事件呼叫它；並行與冷啟動用頁面上的練習模擬。</div>
+
+<h2>handler 與執行環境：哪些程式只跑一次</h2>
+<p>Lambda 的程式是一個匯出的函式，叫 <strong>handler</strong>。Node.js 的 runtime（這課用 <code>nodejs24.x</code>）呼叫它時傳兩個參數：</p>
+<pre>// index.mjs（.mjs 或 package.json 寫 "type": "module" 才是 ESM）
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'
+
+const s3 = new S3Client({})                    // ← handler 外面：只在執行環境建立時跑一次
+
+export const handler = async (event, context) => {
+  // event：觸發來源送來的資料，格式依來源而定（API Gateway、SQS、S3…）
+  // context：這次呼叫的資訊，例如 context.awsRequestId、context.getRemainingTimeInMillis()
+  await s3.send(new PutObjectCommand({ … }))
+  return { ok: true }                          // ← 回傳的 Promise 完成，這次呼叫才結束
+}</pre>
+<p>函式設定的 handler 寫 <code>index.handler</code>，意思是「<code>index</code> 檔案匯出的 <code>handler</code>」。</p>
+<p>關鍵在 handler 外面那一行。Lambda 執行你的程式的單位叫<strong>執行環境</strong>（execution environment）：一個隔離的小型虛擬機，裡面跑著 Node。它的生命週期是：</p>
+<ol>
+  <li><strong>Init</strong>：建立執行環境、載入你的程式，執行模組最外層的程式碼（import、<code>new S3Client</code>、讀設定）。這段時間加上第一次呼叫，就是<strong>冷啟動</strong>（cold start）。</li>
+  <li><strong>Invoke</strong>：呼叫 handler。回傳後，環境被凍結（freeze），CPU 不再執行它。</li>
+  <li><strong>重用</strong>：下一個請求來時，如果有閒置的環境就解凍直接呼叫 handler，不再跑最外層，這叫<strong>熱啟動</strong>（warm）。一段時間沒用的環境會被回收，你無法控制。</li>
+</ol>
+<p>所以開場的第一個最小答案是：<strong>貴的東西放在 handler 外面</strong>。SDK client、資料庫連線池、讀一次就好的設定都建在最外層，熱啟動直接重用，也重用底下的 HTTPS 連線。反過來，每個請求自己的資料（目前的使用者、這張訂單）絕對不能放在最外層的變數，下一個請求會讀到上一個人的資料。</p>
+<p>按執行，看三次呼叫中最外層跑了幾次（用一個函式模擬「模組最外層」）：</p>
+<div class="lab"><script type="code">
+let inits = 0
+// 模擬一個執行環境：createEnv 的本體＝模組最外層，回傳的函式＝handler
+function createEnv() {
+  inits++
+  const client = { id: `client-${inits}` }        // handler 外：只在 init 建一次
+  return async (event: { orderId: number }) => `用 ${client.id} 處理訂單 ${event.orderId}`
+}
+
+const handler = createEnv()                          // 冷啟動
+console.log(await handler({ orderId: 1 }))
+console.log(await handler({ orderId: 2 }))           // 熱啟動：重用同一個 client
+console.log(await handler({ orderId: 3 }))
+console.log('最外層執行了', inits, '次')
+</script></div>
+<p>練習 1 就用這個寫法：<code>createHandler</code> 的本體扮演模組最外層。冷啟動的長短主要看兩件事：程式包多大、最外層做了多少事（載入很重的套件、在 init 時就連一堆服務）。所以 Node 的 Lambda 常用 esbuild 把程式和用到的套件打包成一個小檔案。真的需要穩定的低延遲時，有兩個付費選項：</p>
+<ul>
+  <li><strong>provisioned concurrency</strong>：預先建好 N 個已經跑完 Init 的環境，請求來時直接是熱的。要另外付費，不管有沒有請求。</li>
+  <li><strong>SnapStart</strong>：發佈版本時先跑完 Init 並存成快照，之後從快照恢復。依官方文件（2026-11-20 查證），支援 Java 11 以上、Python 3.12 以上、.NET 8 以上，Node.js 執行環境都不支援（本課用的 <code>nodejs24.x</code> 也一樣）。</li>
+</ul>
+<div class="callout practice"><strong>💡 實務上：在 handler 外建 SDK client，但不要在外面放請求的資料</strong><br>code review 看 Lambda 時，資深工程師會先掃最外層：有沒有在 handler 裡每次 <code>new XxxClient()</code>（浪費冷啟動以外的每一次呼叫），有沒有把 <code>currentUser</code>、<code>cart</code> 這類變數放在最外層（熱啟動會漏到下一個請求）。另一個常見的坑是 handler 已經 return，背景還有沒 await 的 Promise：環境被凍結，那段工作可能下次被解凍時才繼續，或永遠不會完成。所有工作都要在 return 之前 await 完。</div>
+
+<h2>並行與節流：一個環境一次只處理一個請求</h2>
+<p>上一節的執行環境還有一個關鍵特性：<strong>一個環境同一時間只處理一個請求</strong>。正在處理時又來一個請求，Lambda 就開一個新環境（又是冷啟動）。同一時間在處理請求的環境數，叫<strong>並行數</strong>（concurrency）。官方文件給的估算方式：</p>
+<pre>並行數 ≈ 每秒請求數 × 平均執行秒數
+開幕活動：每秒 400 個請求 × 每個 0.5 秒 ＝ 約 200 個環境同時在跑</pre>
+<p>並行數有上限。依官方 Lambda 配額頁（2026-11-20 查證）：</p>
+<ul>
+  <li><strong>帳號在每個 region 的並行上限</strong>預設 1,000，所有函式共用（新帳號可能更低，AWS 會依使用量自動調高）。一個函式暴衝，會把同帳號其他函式的額度吃光。</li>
+  <li><strong>reserved concurrency</strong>（保留並行數）：替某個函式保留 N 個，同時也是它的<strong>上限</strong>：保留 50，它最多就 50 個環境，其他函式也不能用這 50 個。要保留至少 100 給沒有設定保留的函式；設成 0 等於把函式停掉。不額外收費。</li>
+</ul>
+<p>超過上限的請求會被<strong>節流</strong>（throttle），不會排隊等：</p>
+<ul>
+  <li><strong>同步呼叫</strong>（API Gateway 等著回應的那種）：直接回 429 錯誤，呼叫端要自己決定要不要重試。開場第一件事就是這個。</li>
+  <li><strong>非同步呼叫</strong>（S3 事件、EventBridge 這類丟了就走的）：Lambda 把事件放回自己的佇列，最多重試 6 小時；函式本身出錯則預設再試兩次。所以同一個事件可能被處理不只一次，handler 要冪等（<a href="../../system-design/lessons/09-idempotency.html">系統設計課第 9 課</a>）。重試完還失敗的事件，設定 on-failure destination 或 DLQ 收起來，不然就被丟掉。</li>
+  <li><strong>SQS 觸發</strong>：Lambda 從佇列一次拿一批訊息給 handler。整批丟例外，整批都會再被送一次，已經成功的也一樣；要回傳 <code>batchItemFailures</code> 只列出失敗的那幾筆（event source mapping 要開 <code>ReportBatchItemFailures</code>）。練習 1 會寫，SQS 本身在<a href="10-messaging.html">第 10 課</a>。</li>
+</ul>
+<p>開場的第三件事也出在並行：每個環境各自有一個資料庫連線池，200 個環境 × 每個 5 條連線 ＝ 1,000 條，PostgreSQL 撐不住，同一個資料庫的 ECS 後台跟著拿不到連線。兩個修法一起用：用 reserved concurrency 替函式設上限，以及用 RDS Proxy 共用連線（<a href="08-rds-aurora.html">第 8 課</a>）。練習 2 模擬環境的建立、重用與節流。</p>
+<div class="callout practice"><strong>💡 實務上：reserved concurrency 是保護下游的閥門</strong><br>上線前資深工程師會問：這個函式最多可以同時開幾個？它後面的東西（資料庫、第三方 API、要寄信的服務）撐得住幾個？答案通常是用 reserved concurrency 把函式限在下游撐得住的數字，寧可部分請求被節流、前端重試，也不要把資料庫打掛讓所有服務一起停擺。CloudWatch 的 <code>Throttles</code> 與 <code>ConcurrentExecutions</code> 指標要設告警，被節流時才知道該調高上限還是該擴充下游。</div>
+
+<h2>逾時、記憶體、打包與兩種權限</h2>
+<p>並行決定同時跑幾個，接著看每一次呼叫能跑多久、用多少資源。依官方配額頁（2026-11-20 查證）：</p>
+<div class="table-wrap"><table>
+  <tr><th>設定</th><th>範圍</th><th>注意</th></tr>
+  <tr><td>Timeout</td><td>最長 900 秒（15 分鐘）；少數例外見下方說明</td><td>超過就被強制結束；要配合呼叫它的服務（下一節的 API Gateway 只等 30 秒）</td></tr>
+  <tr><td>Memory</td><td>128～10,240 MB</td><td>CPU 依記憶體等比例分配，1,769 MB 約等於 1 個 vCPU：CPU 吃重的工作調高記憶體常常反而更便宜，因為跑得更快</td></tr>
+  <tr><td>zip 程式包</td><td>直接上傳 50 MB；解壓後含 layer 250 MB</td><td>更大的用 container image（最大 10 GB）</td></tr>
+  <tr><td>同步呼叫的請求與回應</td><td>各 6 MB</td><td>大檔案改用 S3 presigned URL（data-stores 課<a href="../../data-stores/lessons/12-object-storage.html">第 12 課</a>）</td></tr>
+</table></div>
+<p>Timeout 的例外：Kafka 事件來源觸發的函式可以設到 30 分鐘；跑在 Lambda Managed Instances 上的非同步與事件來源呼叫可以到 90 分鐘（2026-09 推出）。一般用法（API Gateway、直接呼叫、S3／SQS 事件）都是 15 分鐘，設計時以 15 分鐘為準。</p>
+<p>逾時被強制結束時，handler 做到一半的工作就斷在那裡。批次處理的函式應該自己看時間：<code>context.getRemainingTimeInMillis()</code> 回傳還剩幾毫秒，剩不多就停下來，把還沒處理的交還給呼叫端。練習 1 照這個做。</p>
+<p>權限有兩個方向，第 5 課的名詞在這裡要小心：</p>
+<ul>
+  <li><strong>Lambda 的 execution role</strong>：函式執行時拿到的憑證，決定<strong>函式能呼叫什麼</strong>（寫 S3、讀 DynamoDB、寫 CloudWatch Logs）。名字跟 ECS 的 execution role 一樣，作用卻對應到 ECS 的 <strong>task role</strong>。信任政策讓 <code>lambda.amazonaws.com</code> 扮演。</li>
+  <li><strong>resource-based policy</strong>：掛在函式本身，決定<strong>誰能呼叫函式</strong>。API Gateway、S3、EventBridge 要觸發函式，都要先用 <code>AddPermission</code> 在這裡加一條。加的時候帶 <code>SourceArn</code> 限定是哪一個 API 或 bucket；只寫 <code>Principal: apigateway.amazonaws.com</code> 的話，任何帳號的 API Gateway 都能被設定成呼叫你的函式。</li>
+</ul>
+
+<h2>API Gateway：HTTP 入口、事件格式與授權</h2>
+<p>函式準備好，接著要讓手機 App 透過 HTTPS 呼叫它。API Gateway 有兩種產品，依官方比較頁（2026-11-20 查證）：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>HTTP API</th><th>REST API</th></tr>
+  <tr><td>定位</td><td>功能精簡、價格較低</td><td>功能完整</td></tr>
+  <tr><td>授權</td><td>IAM、Lambda authorizer、JWT</td><td>IAM、Lambda authorizer、JWT、resource policy</td></tr>
+  <tr><td>只有 REST API 有的</td><td>—</td><td>API key 與使用量方案、依客戶端節流、AWS WAF、回應快取、請求驗證、私有端點</td></tr>
+  <tr><td>只有 HTTP API 有的</td><td>自動部署（stage 的 AutoDeploy）</td><td>—</td></tr>
+  <tr><td>整合逾時</td><td>最長 30 秒（不能調高）</td><td>另見官方配額頁</td></tr>
+</table></div>
+<p>咖啡店的點餐 API 不需要 API key 或 WAF，選 HTTP API。它把每個請求轉成一個事件呼叫 Lambda，格式由 <strong>payload format version</strong> 決定，新的整合用 <code>2.0</code>。重要欄位：</p>
+<pre>{
+  "routeKey": "POST /orders",                 ← 比對到的 route：「方法 路徑」
+  "rawPath": "/orders",
+  "pathParameters": { "id": "o-1" },          ← GET /orders/{id} 才有
+  "queryStringParameters": { "page": "2" },
+  "headers": { "content-type": "application/json" },   ← 標頭名稱一律小寫
+  "body": "{\"items\":[…]}",                  ← 一定是字串（或沒有），要自己 JSON.parse
+  "isBase64Encoded": false,                   ← true 時 body 是 base64，要先解開
+  "requestContext": {
+    "http": { "method": "POST", "sourceIp": "203.0.113.5" },
+    "authorizer": { "jwt": { "claims": { "sub": "cust-wang", … }, "scopes": [] } }
+  }
+}</pre>
+<p>handler 回傳 <code>{ statusCode, headers, body }</code>，body 也要是字串。2.0 格式有一個方便的規則：回傳的是合法 JSON、又沒有 <code>statusCode</code>，API Gateway 會當成 200 並自動 JSON 化；但只要需要 201、404 這類狀態碼，就要回傳完整的格式。</p>
+<p>誰能呼叫 API，交給 <strong>authorizer</strong>（授權器）在請求到達函式之前決定：</p>
+<ul>
+  <li><strong>JWT authorizer</strong>：設定 issuer 與 audience，API Gateway 從 issuer 的 JWKS 拿公鑰驗證 token 的簽章、<code>iss</code>、<code>aud</code>、<code>exp</code>（Auth 課第 9 課做過的那一套），驗過才呼叫函式，並把 claims 放在 <code>requestContext.authorizer.jwt.claims</code>。函式裡的使用者身分<strong>只能</strong>從這裡拿，不能信 query string 或 body 裡客人自己填的 userId。</li>
+  <li><strong>Lambda authorizer</strong>：自己寫一個函式判斷要不要放行，適合 token 不是 JWT、或要查資料庫的情況。結果可以快取一段時間（依 identity source 當快取鍵），省掉每次呼叫，代價是權限變更（例如帳號被停用）要等快取過期才生效。</li>
+  <li><strong>IAM</strong>：呼叫端用 SigV4 簽名（第 1 課），適合服務對服務。</li>
+</ul>
+<p>authorizer 是掛在 <strong>route</strong> 上的，每個 route 各自設定；新增一個 route 忘了掛，它就是公開的。最後三個設定：</p>
+<ul>
+  <li><strong>CORS</strong>：HTTP API 可以直接設定 <code>AllowOrigins</code>、<code>AllowHeaders</code>、<code>AllowCredentials</code>，由 API Gateway 回應預檢請求。要讓瀏覽器帶 Authorization 標頭或 cookie，origin 就要寫明咖啡店前端的網址，不能是 <code>*</code>（Auth 課第 5 課）。</li>
+  <li><strong>節流</strong>：stage 上可以設預設的 rate（每秒請求數）與 burst（瞬間容量），也可以對單一 route 設定。API Gateway 帳號層級的預設上限是每秒 10,000 個請求，Lambda 的預設並行卻是 1,000（兩個數字都出自官方 Lambda 配額頁），前面放得進來、後面接不住。用 stage 節流把流量限在 Lambda 與資料庫撐得住的範圍；演算法本身是<a href="../../system-design/lessons/10-rate-limiting.html">系統設計課第 10 課</a>的 token bucket。</li>
+  <li><strong>整合逾時</strong>：HTTP API 等 Lambda 最多 30 秒，等不到就回 504 給客人，這是開場的第二件事。函式的 Timeout 要比整合逾時短，函式自己先逾時，CloudWatch Logs 裡才看得到是誰、卡在哪一步；反過來設，客人已經拿到 504，函式還在背景繼續跑完。</li>
+</ul>
+<div class="callout practice"><strong>💡 實務上：API 回 504，先查函式的 Duration</strong><br>客服回報「下單一直轉圈，最後出現錯誤」，資深工程師的查法是：先看 API Gateway 的 <code>IntegrationLatency</code> 與 Lambda 的 <code>Duration</code> 指標，接近 30 秒就是函式太慢或卡在下游（資料庫鎖、第三方 API 沒設逾時）；再看 Lambda 的 <code>Throttles</code>、<code>Errors</code>。這些都在 CloudWatch，不用登入任何機器。另外，要做超過 30 秒的工作（產生大報表、轉檔），不要讓 API 等它：API 只負責收件、丟進佇列，回 202，背景再處理。</div>
+<p>練習 3 寫這個 API 後面的 handler，練習 4 用 SDK 把整套設定建出來。</p>
+
+<h2>Lambda 還是 Fargate</h2>
+<p>這個階段的兩課講了兩種跑程式的方式。選擇時先看工作的形狀：</p>
+<div class="table-wrap"><table>
+  <tr><th>情況</th><th>選</th><th>原因</th></tr>
+  <tr><td>事件觸發、短時間的工作：收據產生、圖片縮圖、S3 上傳後處理</td><td>Lambda</td><td>沒事件就不收費，並行自動擴充</td></tr>
+  <tr><td>流量低又不穩定的 API</td><td>Lambda</td><td>不用整天開著容器；要接受冷啟動</td></tr>
+  <tr><td>流量穩定的 API、需要長連線（WebSocket）、要在記憶體裡保持狀態</td><td>Fargate</td><td>容器一直活著，沒有冷啟動，連線池穩定</td></tr>
+  <tr><td>超過 15 分鐘的工作、需要大量 CPU 或特殊環境</td><td>Fargate</td><td>Lambda 的 Timeout 上限是 15 分鐘，記憶體上限 10 GB</td></tr>
+  <tr><td>已經是完整的 NestJS 應用程式</td><td>多半 Fargate</td><td>不用為了 Lambda 改寫啟動流程；Nest 的啟動時間會變成冷啟動時間</td></tr>
+</table></div>
+<p>咖啡店最後的分工：多租戶後台與訂單 API 放 Fargate，收據產生與其他事件處理放 Lambda。兩者都要面對同一個資料庫，所以都要算進連線數（第 8 課）。</p>
+
+<h2>在真的 AWS 帳號上做一次（選做）</h2>
+<p>這一節不判分，也不影響進度。用第 1 課建議的獨立練習帳號。建一個 Lambda 函式，用 HTTP API 的快速建立接上它，再用 curl 呼叫。</p>
+<div class="callout warn"><strong>費用：</strong>計費項目：Lambda 依請求數與執行時間（GB-秒）、HTTP API 依請求數、CloudWatch Logs 的寫入與儲存量。這一節只呼叫幾次。各服務的免費額度與金額以官方定價頁為準：<a href="https://aws.amazon.com/lambda/pricing/">Lambda 定價頁</a>、<a href="https://aws.amazon.com/api-gateway/pricing/">API Gateway 定價頁</a>。</div>
+<p>先建兩個檔案。<code>lambda-trust.json</code>：</p>
+<pre>{ "Version": "2012-10-17",
+  "Statement": [{ "Effect": "Allow", "Principal": { "Service": "lambda.amazonaws.com" }, "Action": "sts:AssumeRole" }] }</pre>
+<p><code>index.mjs</code>：</p>
+<pre>let invocations = 0                     // 在最外層：熱啟動時會一直累加
+export const handler = async (event) => {
+  invocations++
+  return { statusCode: 200, headers: { 'content-type': 'application/json' },
+           body: JSON.stringify({ path: event.rawPath, invocations }) }
+}</pre>
+<pre># 1. execution role，附上只能寫 CloudWatch Logs 的官方 policy
+aws iam create-role --role-name cafe-learn-lambda --assume-role-policy-document file://lambda-trust.json --profile learn-sandbox
+aws iam attach-role-policy --role-name cafe-learn-lambda --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole --profile learn-sandbox
+
+# 2. 打包並建立函式（剛建的 role 要幾秒才生效，失敗就等一下再跑一次）
+zip function.zip index.mjs
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text --profile learn-sandbox)
+aws lambda create-function --function-name cafe-learn-hello --runtime nodejs24.x --handler index.handler \
+  --role arn:aws:iam::$ACCOUNT:role/cafe-learn-lambda --zip-file fileb://function.zip \
+  --timeout 10 --memory-size 256 --profile learn-sandbox
+
+# 3. HTTP API 快速建立：所有路徑都轉給這個函式，印出 ApiId 與網址
+FN=$(aws lambda get-function --function-name cafe-learn-hello --query Configuration.FunctionArn --output text --profile learn-sandbox)
+aws apigatewayv2 create-api --name cafe-learn-api --protocol-type HTTP --target $FN \
+  --query '[ApiId,ApiEndpoint]' --output text --profile learn-sandbox
+
+# 4. 讓「這個 API」可以呼叫函式（&lt;ApiId&gt; 換成上一步印出的；region 換成你的）
+aws lambda add-permission --function-name cafe-learn-hello --statement-id cafe-learn-api \
+  --action lambda:InvokeFunction --principal apigateway.amazonaws.com \
+  --source-arn "arn:aws:execute-api:ap-northeast-1:$ACCOUNT:&lt;ApiId&gt;/*" --profile learn-sandbox
+
+# 5. 連續呼叫幾次：invocations 一直增加代表是熱啟動、同一個環境
+curl &lt;ApiEndpoint&gt;/orders
+curl &lt;ApiEndpoint&gt;/orders</pre>
+<h3>清除</h3>
+<pre>aws apigatewayv2 delete-api --api-id &lt;ApiId&gt; --profile learn-sandbox
+aws lambda delete-function --function-name cafe-learn-hello --profile learn-sandbox
+aws logs delete-log-group --log-group-name /aws/lambda/cafe-learn-hello --profile learn-sandbox
+aws iam detach-role-policy --role-name cafe-learn-lambda --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole --profile learn-sandbox
+aws iam delete-role --role-name cafe-learn-lambda --profile learn-sandbox
+aws lambda list-functions --query 'Functions[?starts_with(FunctionName, `cafe-learn`)].FunctionName' --profile learn-sandbox   # 確認：空清單</pre>
+
+<h2>練習</h2>
+
+<div class="local" data-test="ex1" data-files="receipt.ts">
+  <p>練習 1：完成 <code>receipt.ts</code> 的 <code>createHandler(makeS3, bucket)</code>。它的本體扮演模組最外層，回傳的函式是 handler，處理 SQS 送來的一批收據工作。要求：(1) 用 <code>makeS3()</code> 建 S3 client，整個環境只能建一次。(2) 每筆 record 的 <code>body</code> 是 JSON <code>{ orderId }</code>，用 <code>PutObjectCommand</code> 寫入 <code>receipts/&lt;orderId&gt;.txt</code>，內容是 <code>訂單 &lt;orderId&gt; 收據</code>。(3) <strong>開始處理每一筆之前</strong>看 <code>context.getRemainingTimeInMillis()</code>：少於 1000 就停下，這一筆和後面的全部放進 <code>batchItemFailures</code>（<code>{ itemIdentifier: messageId }</code>）。(4) 單筆失敗（JSON 壞掉、PutObject 失敗）只把那一筆放進 <code>batchItemFailures</code>，不要丟例外。回傳 <code>{ batchItemFailures }</code>。</p>
+</div>
+
+<div class="exercise">
+  <p>練習 2：寫 <code>simulate(arrivals, opts)</code> 模擬一個函式的執行環境。<code>arrivals</code> 是請求到達的時間（毫秒，已由小到大排好）。每個請求依序處理：有<strong>閒置</strong>的環境（它上一個請求的結束時間小於或等於現在）就重用，結果是 <code>'warm'</code>，這個環境忙到「現在＋durationMs」；沒有閒置的、而且環境數還沒到 <code>reserved</code>，就建新環境，結果是 <code>'cold'</code>，忙到「現在＋initMs＋durationMs」；都不行就是 <code>'throttled'</code>（不排隊）。回傳 <code>{ results, environments }</code>，<code>environments</code> 是總共建了幾個環境。這個模擬裡環境不會被回收。</p>
+  <script type="start">
+type Result = 'cold' | 'warm' | 'throttled'
+type Opts = { durationMs: number, initMs: number, reserved: number }
+
+function simulate(arrivals: number[], opts: Opts): { results: Result[], environments: number } {
+  const busyUntil: number[] = []   // 每個環境忙到什麼時候
+  const results: Result[] = []
+  return { results, environments: busyUntil.length }
+}
+
+// 開幕活動前 1 秒：同時湧進 5 個請求，之後每 300 毫秒一個
+console.log(simulate([0, 0, 0, 0, 0, 300, 600, 900], { durationMs: 200, initMs: 400, reserved: 3 }))
+</script>
+  <script type="answer">
+type Result = 'cold' | 'warm' | 'throttled'
+type Opts = { durationMs: number, initMs: number, reserved: number }
+
+function simulate(arrivals: number[], opts: Opts): { results: Result[], environments: number } {
+  const busyUntil: number[] = []   // 每個環境忙到什麼時候
+  const results: Result[] = []
+  for (const t of arrivals) {
+    const idle = busyUntil.findIndex(end => end <= t)
+    if (idle !== -1) {
+      busyUntil[idle] = t + opts.durationMs
+      results.push('warm')
+    } else if (busyUntil.length < opts.reserved) {
+      busyUntil.push(t + opts.initMs + opts.durationMs)
+      results.push('cold')
+    } else {
+      results.push('throttled')
+    }
+  }
+  return { results, environments: busyUntil.length }
+}
+
+// 開幕活動前 1 秒：同時湧進 5 個請求，之後每 300 毫秒一個
+console.log(simulate([0, 0, 0, 0, 0, 300, 600, 900], { durationMs: 200, initMs: 400, reserved: 3 }))
+</script>
+  <script type="tests">
+const o = (durationMs: number, initMs: number, reserved: number): Opts => ({ durationMs, initMs, reserved })
+assert.deepEqual(simulate([0, 1000, 2000], o(100, 200, 10)), { results: ['cold', 'warm', 'warm'], environments: 1 },
+  '請求間隔夠長：第一個冷啟動，之後都重用同一個環境')
+assert.deepEqual(simulate([0, 300], o(100, 200, 10)), { results: ['cold', 'warm'], environments: 1 },
+  '環境在 300 毫秒結束（init 200＋執行 100），300 毫秒到的請求可以重用：結束時間「小於或等於」現在就算閒置')
+assert.deepEqual(simulate([0, 100, 200], o(100, 200, 10)), { results: ['cold', 'cold', 'cold'], environments: 3 },
+  '冷啟動讓第一個環境忙到 300：在那之前來的請求都要開新環境，冷啟動會連鎖')
+assert.deepEqual(simulate([0, 0, 0], o(100, 0, 2)), { results: ['cold', 'cold', 'throttled'], environments: 2 },
+  'reserved 是上限：已經有 2 個環境在忙，第 3 個被節流，不會排隊')
+assert.deepEqual(simulate([0, 0, 0, 0, 0, 300, 600, 900], o(200, 400, 3)),
+  { results: ['cold', 'cold', 'cold', 'throttled', 'throttled', 'throttled', 'warm', 'warm'], environments: 3 },
+  '0 毫秒的 5 個請求只有 3 個拿到環境；300 毫秒時三個都還在忙（忙到 600）；600 起可以重用')
+assert.deepEqual(simulate([0, 50, 100], o(100, 100, 0)), { results: ['throttled', 'throttled', 'throttled'], environments: 0 },
+  'reserved 設 0 等於把函式停掉：全部被節流')
+assert.deepEqual(simulate([], o(100, 100, 5)), { results: [], environments: 0 }, '沒有請求就不建環境')
+</script>
+  <script type="wrong">
+type Result = 'cold' | 'warm' | 'throttled'
+type Opts = { durationMs: number, initMs: number, reserved: number }
+// 從不重用：每個請求都開新環境，直到上限
+function simulate(arrivals: number[], opts: Opts): { results: Result[], environments: number } {
+  const busyUntil: number[] = []
+  const results: Result[] = []
+  for (const t of arrivals) {
+    if (busyUntil.length < opts.reserved) { busyUntil.push(t + opts.initMs + opts.durationMs); results.push('cold') }
+    else {
+      const idle = busyUntil.findIndex(end => end <= t)
+      if (idle === -1) results.push('throttled')
+      else { busyUntil[idle] = t + opts.durationMs; results.push('warm') }
+    }
+  }
+  return { results, environments: busyUntil.length }
+}
+</script>
+  <script type="wrong">
+type Result = 'cold' | 'warm' | 'throttled'
+type Opts = { durationMs: number, initMs: number, reserved: number }
+// 把 reserved 當成最低保證：超過也繼續開環境，從不節流
+function simulate(arrivals: number[], opts: Opts): { results: Result[], environments: number } {
+  const busyUntil: number[] = []
+  const results: Result[] = []
+  for (const t of arrivals) {
+    const idle = busyUntil.findIndex(end => end <= t)
+    if (idle !== -1) { busyUntil[idle] = t + opts.durationMs; results.push('warm') }
+    else { busyUntil.push(t + opts.initMs + opts.durationMs); results.push('cold') }
+  }
+  return { results, environments: busyUntil.length }
+}
+</script>
+  <script type="wrong">
+type Result = 'cold' | 'warm' | 'throttled'
+type Opts = { durationMs: number, initMs: number, reserved: number }
+// 冷啟動沒有算 init 的時間
+function simulate(arrivals: number[], opts: Opts): { results: Result[], environments: number } {
+  const busyUntil: number[] = []
+  const results: Result[] = []
+  for (const t of arrivals) {
+    const idle = busyUntil.findIndex(end => end <= t)
+    if (idle !== -1) { busyUntil[idle] = t + opts.durationMs; results.push('warm') }
+    else if (busyUntil.length < opts.reserved) { busyUntil.push(t + opts.durationMs); results.push('cold') }
+    else results.push('throttled')
+  }
+  return { results, environments: busyUntil.length }
+}
+</script>
+  <script type="wrong">
+type Result = 'cold' | 'warm' | 'throttled'
+type Opts = { durationMs: number, initMs: number, reserved: number }
+// 閒置判斷用「小於」：剛好結束的那一刻不算閒置
+function simulate(arrivals: number[], opts: Opts): { results: Result[], environments: number } {
+  const busyUntil: number[] = []
+  const results: Result[] = []
+  for (const t of arrivals) {
+    const idle = busyUntil.findIndex(end => end < t)
+    if (idle !== -1) { busyUntil[idle] = t + opts.durationMs; results.push('warm') }
+    else if (busyUntil.length < opts.reserved) { busyUntil.push(t + opts.initMs + opts.durationMs); results.push('cold') }
+    else results.push('throttled')
+  }
+  return { results, environments: busyUntil.length }
+}
+</script>
+</div>
+
+<div class="local" data-test="ex3" data-files="orders-handler.ts">
+  <p>練習 3：完成 <code>orders-handler.ts</code> 的 <code>createOrdersHandler(store)</code>，回傳 HTTP API（payload 2.0）後面的訂單 handler。(1) 使用者是 <code>requestContext.authorizer.jwt.claims.sub</code>，沒有就回 401。(2) <code>routeKey</code> 是 <code>GET /orders/{id}</code>：用 <code>store.get(pathParameters.id)</code> 讀，不存在或 <code>customerId</code> 不是 sub 都回 404，是本人的回 200 和訂單。(3) <code>POST /orders</code>：<code>isBase64Encoded</code> 時先把 body 用 base64 解開，再 <code>JSON.parse</code>；壞掉的 JSON 回 400；<code>items</code> 要是非空陣列，每項的 <code>productId</code> 是整數、<code>quantity</code> 是 1～20 的整數，否則回 400；用 <code>store.create({ customerId: sub, items })</code> 建立（不管 body 裡有沒有 customerId），回 201 和建好的訂單。(4) 其他 routeKey 回 404。每個回應的 body 都是 <code>JSON.stringify</code> 的字串，headers 有 <code>content-type: application/json</code>。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="create-api.ts">
+  <p>練習 4：完成 <code>create-api.ts</code> 的 <code>createOrdersApi({ iam, lambda, apigw }, opts)</code>，名稱都用 <code>opts.name</code>。(1) <code>CreateRoleCommand</code>：信任政策只讓 <code>lambda.amazonaws.com</code> 扮演。(2) <code>CreateFunctionCommand</code>：<code>nodejs24.x</code>、<code>index.handler</code>、<code>Code: { ZipFile: opts.zip }</code>、<code>arm64</code>、記憶體 512、Timeout 10。(3) <code>CreateApiCommand</code>：HTTP，CORS 的 AllowOrigins 只有 <code>opts.frontendOrigin</code>、AllowCredentials true、AllowHeaders 包含 <code>authorization</code>。(4) <code>CreateIntegrationCommand</code>：<code>AWS_PROXY</code>、IntegrationUri 是函式 ARN、payload <code>2.0</code>，<code>TimeoutInMillis</code> 比函式的 10 秒長、不超過 30 秒。(5) <code>CreateAuthorizerCommand</code>：JWT，IdentitySource <code>['$request.header.Authorization']</code>，issuer、audience 用 opts；<code>GET /orders/{id}</code> 與 <code>POST /orders</code> 兩個 route（<code>CreateRouteCommand</code>，Target 是 <code>integrations/&lt;IntegrationId&gt;</code>）都掛上它。(6) <code>CreateStageCommand</code>：<code>$default</code>、AutoDeploy、DefaultRouteSettings 的 burst 100、rate 50。(7) <code>AddPermissionCommand</code>：principal 是 <code>apigateway.amazonaws.com</code>，SourceArn 是 <code>arn:aws:execute-api:&lt;region&gt;:&lt;帳號&gt;:&lt;apiId&gt;/*</code>，region 與帳號從函式 ARN 拆出來（第 1 課的 ARN 格式）。回傳 <code>{ apiId, functionArn }</code>。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 5：收據函式的最外層有一行 <code>const startedAt = Date.now()</code>，handler 裡把它寫進收據當成「處理時間」。上線後客人發現好幾張收據的處理時間一模一樣，而且是好幾分鐘前。為什麼？</p>
+  <label data-key="a">Lambda 的時鐘不準，要改用 API Gateway 傳來的時間</label>
+  <label data-key="b">每次呼叫都會重新執行整個檔案，所以應該每張不同，是程式別處的錯</label>
+  <label data-key="c">Lambda 會快取回傳值，同樣的輸入回傳同樣的結果</label>
+  <label data-key="d">最外層只在執行環境建立（冷啟動）時跑一次，熱啟動重用環境時不會再跑，所以每次都讀到同一個舊值</label>
+  <p class="why">✓ handler 外的程式只在 Init 執行一次，熱啟動直接呼叫 handler。每個請求自己的值要在 handler 裡算。b 是最常見的誤解：以為 Lambda 每次都從頭執行；c 錯，Lambda 不快取函式結果。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：凌晨資料庫要做維護，維運想在這段時間讓訂單函式完全不處理請求，又不想刪掉它。怎麼做最直接？</p>
+  <label data-key="a">把 reserved concurrency 設成 0：函式的上限變成 0，所有呼叫都被節流</label>
+  <label data-key="b">把 Timeout 設成 1 秒，請求很快就會失敗</label>
+  <label data-key="c">把 reserved concurrency 設成帳號上限 1,000，其他函式就搶不到</label>
+  <label data-key="d">把記憶體設成 128 MB，函式就跑不動</label>
+  <p class="why">✓ reserved concurrency 同時是保留量與上限，設 0 就是官方文件說的「刻意節流」，事後移除設定就恢復。b 和 d 函式還是會被呼叫、還是會碰資料庫；c 錯在 reserved 不能把帳號額度全拿走，至少要留 100 給其他函式，而且這是讓它跑更多，不是停掉。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：點餐 API（HTTP API → Lambda）尖峰時有些請求回 504。你最先查什麼？</p>
+  <label data-key="a">JWT authorizer 的 issuer 設定，504 代表 token 驗證失敗</label>
+  <label data-key="b">函式的 Duration 與 API 的 IntegrationLatency 是不是接近 30 秒：HTTP API 最多等 30 秒，等不到就回 504，常見原因是函式卡在資料庫或外部 API</label>
+  <label data-key="c">Lambda 的 Throttles：504 就是被節流</label>
+  <label data-key="d">CORS 設定：瀏覽器擋下回應時會顯示 504</label>
+  <p class="why">✓ 504 是閘道等不到後端回應（逾時）。HTTP API 的整合逾時最長 30 秒、不能調高，所以要看函式為什麼跑這麼久，並讓函式的 Timeout 比它短。a 驗證失敗回的是 401；c 被節流是 429 那一類的錯誤，不是逾時；d 的 CORS 錯誤是瀏覽器端看不到回應，伺服器並沒有回 504。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>在 handler 裡 new SDK client</strong>：每次呼叫都重建，連線也不能重用。放在最外層。</li>
+  <li><strong>把請求的資料放在最外層變數</strong>：熱啟動時下一個請求讀到上一個人的資料。</li>
+  <li><strong>return 之後還有沒 await 的工作</strong>：環境被凍結，工作不保證完成。</li>
+  <li><strong>把 reserved concurrency 當成最低保證就不管上限</strong>：它同時是上限，超過的請求直接被節流。</li>
+  <li><strong>Lambda 直接連資料庫又不設上限</strong>：每個環境一個連線池，尖峰時連線數爆掉。設 reserved concurrency、用 RDS Proxy（第 8 課）。</li>
+  <li><strong>SQS 觸發的函式整批丟例外</strong>：已經成功的訊息也會被重送。回傳 <code>batchItemFailures</code>。</li>
+  <li><strong>把 body 當物件</strong>：payload 2.0 的 body 一定是字串，<code>isBase64Encoded</code> 時還要先解 base64。</li>
+  <li><strong>從 query string 或 body 拿使用者身分</strong>：只能信 authorizer 驗過的 claims。</li>
+  <li><strong>新增 route 忘了掛 authorizer</strong>：authorizer 是每個 route 各自設定的。</li>
+  <li><strong>AddPermission 不帶 SourceArn</strong>：任何帳號的 API Gateway 都可能被設定來呼叫你的函式。</li>
+  <li><strong>函式的 Timeout 比整合逾時長</strong>：客人拿到 504，函式還在跑；log 也看不出問題在哪。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>handler 是匯出的 async 函式，接收 event 與 context。最外層只在執行環境建立（冷啟動）時跑一次，熱啟動直接呼叫 handler：SDK client 放外面，請求的資料放裡面，所有工作在 return 前 await 完。</li>
+  <li>一個執行環境同時只處理一個請求；並行數約等於每秒請求數乘以執行秒數。帳號每個 region 預設 1,000，reserved concurrency 是保留也是上限，設 0 等於停用。</li>
+  <li>超過上限：同步呼叫回 429、非同步呼叫會重試（所以要冪等）、SQS 觸發要回傳 batchItemFailures。</li>
+  <li>Timeout 最長 15 分鐘、記憶體決定 CPU；批次工作用 getRemainingTimeInMillis 提早停下。Lambda 的 execution role 決定函式能呼叫什麼，resource-based policy（AddPermission＋SourceArn）決定誰能呼叫函式。</li>
+  <li>HTTP API 比 REST API 精簡便宜；payload 2.0 的 body 是字串、可能是 base64；身分從 JWT authorizer 驗過的 claims 拿；authorizer 掛在每個 route 上；CORS 要寫明 origin。</li>
+  <li>HTTP API 的整合逾時最長 30 秒，函式 Timeout 要比它短；stage 節流把流量限在下游撐得住的範圍。</li>
+  <li>事件觸發、低流量的短工作用 Lambda；穩定流量、長連線、長時間的工作用 Fargate。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 7 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 8：cafe-api 的新版 task 一直 STOPPED，原因是 <code>ResourceInitializationError: unable to pull secrets or registry auth … AccessDeniedException … secretsmanager:GetSecretValue</code>。要改哪裡？</p>
+  <label data-key="a">task role：加上 secretsmanager:GetSecretValue</label>
+  <label data-key="b">安全群組：開放 443 出站</label>
+  <label data-key="c">execution role：加上這個 secret 的 secretsmanager:GetSecretValue（自訂 KMS key 加密時再加 kms:Decrypt）</label>
+  <label data-key="d">把 secret 改放到 environment，就不用讀 Secrets Manager</label>
+  <p class="why">✓ secrets 是 ECS 代理程式在容器啟動前讀的，用的是 execution role；訊息是 AccessDenied，代表網路通了、權限不夠。a 是最多人選的：task role 是容器跑起來之後程式用的，這時候容器還沒啟動。d 把密碼變成明文。（第 5 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 9：為了省 NAT gateway 的費用，cafe-api 的 task 放在沒有 NAT 的私有子網路，建了 <code>ecr.api</code> 與 <code>ecr.dkr</code> 兩個 interface endpoint，task 還是 <code>CannotPullContainerError … i/o timeout</code>。最可能少了什麼？</p>
+  <label data-key="a">task 要給公開 IP</label>
+  <label data-key="b">S3 的 gateway endpoint：ECR 的映像層存在 S3，沒有它還是拉不下來（用 awslogs、secrets 也各要 endpoint）</label>
+  <label data-key="c">execution role 少了 ECR 權限</label>
+  <label data-key="d">ECR repository 要改成公開</label>
+  <p class="why">✓ 逾時是網路問題，不是權限；拉 ECR 映像需要 ecr.api、ecr.dkr 加上 S3 gateway endpoint。a 在私有子網路沒有用，公開 IP 要配 internet gateway 的路由；c 權限不足會是 AccessDenied，不是逾時。（第 5 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 10：週六中午是咖啡店的尖峰，同事要在這時部署 desiredCount 6 的 cafe-api，deploymentConfiguration 是 minimumHealthyPercent 50、maximumPercent 100。你建議什麼？</p>
+  <label data-key="a">改成 100／200 再部署：先開新的再關舊的，容量不會下降；代價是部署期間要付較多的 task 費用</label>
+  <label data-key="b">照原設定部署就好，ECS 會自動避開尖峰</label>
+  <label data-key="c">把 desiredCount 降到 3 再部署，比較快</label>
+  <label data-key="d">關掉 circuit breaker，部署才不會被中斷</label>
+  <p class="why">✓ 50／100 會先停掉一半舊的才開新的，尖峰時只剩 3 個 task 扛流量。100／200 讓健康的 task 數不低於 6。b 錯，ECS 不看流量；d 關掉 circuit breaker 只會讓壞版本卡在一半，跟容量無關。（第 5 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 11：面試官看了你的 Lambda 程式，問：「為什麼 <code>new DynamoDBClient()</code> 寫在 handler 外面？」最好的回答是？</p>
+  <label data-key="a">因為 handler 裡不能用 await</label>
+  <label data-key="b">寫在外面才有權限，裡面拿不到 execution role 的憑證</label>
+  <label data-key="c">Lambda 規定所有 import 和 client 都要在最外層</label>
+  <label data-key="d">最外層只在執行環境建立時跑一次，熱啟動時重用 client 和它的連線，省下每次呼叫建立的時間；請求自己的資料才放在 handler 裡</label>
+  <p class="why">✓ 這是執行環境生命週期的直接結果：Init 跑一次、Invoke 跑很多次。b 錯，handler 裡建的 client 也拿得到同樣的憑證，只是每次都重建；c 錯，寫在裡面也能動，只是浪費。（第 6 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 12：開幕活動時，訂單 Lambda 擴到幾百個環境，PostgreSQL 回 <code>too many connections</code>，同一個資料庫的 ECS 後台也掛了。下列哪個修法方向正確？</p>
+  <label data-key="a">把 Lambda 的記憶體調高，每個請求跑快一點就好</label>
+  <label data-key="b">用 reserved concurrency 限制函式同時的環境數，並改連 RDS Proxy 讓連線被共用</label>
+  <label data-key="c">把每個環境的連線池開大一點，請求就不用等連線</label>
+  <label data-key="d">改用 provisioned concurrency，預先建好環境就不會開太多連線</label>
+  <p class="why">✓ 連線數＝環境數 × 每個環境的連線池大小，要從環境數（reserved concurrency）與連線共用（RDS Proxy）下手。c 是最常見的直覺，卻讓總連線數更多；a 可能減少並行，但不保證上限；d 只解決冷啟動，環境數一樣會長上去。（第 6 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 13：SQS 觸發的收據函式一次拿到 10 筆訊息，第 7 筆的資料格式壞掉。下面這段寫法上線後，客人反應收到重複的收據。問題在哪？</p>
+  <pre>export const handler = async (event) => {
+  for (const r of event.Records) {
+    await sendReceipt(JSON.parse(r.body))   // 第 7 筆 JSON.parse 丟錯
+  }
+}</pre>
+  <label data-key="a">應該用 Promise.all 平行處理，才不會卡在第 7 筆</label>
+  <label data-key="b">應該把 Timeout 調長，讓整批有時間處理完</label>
+  <label data-key="c">一筆丟例外就是整批失敗，前 6 筆已經寄出的也會被重送；要逐筆 try／catch，回傳 batchItemFailures 只列出失敗的那筆</label>
+  <label data-key="d">SQS 本來就會重送，重複收據無法避免，只能請客人忽略</label>
+  <p class="why">✓ SQS 觸發時，handler 丟例外代表整批失敗，訊息全部回到佇列。回報部分失敗，只有壞掉的那筆會再送。a 的 Promise.all 遇到一筆失敗一樣整批 reject；d 只對一半：重送仍可能發生，所以 sendReceipt 本身也要冪等，但這個 bug 是自己製造的整批重送。（第 6 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 14：咖啡店要做「每晚匯出全部門市的月報 PDF」，資料量大時要跑 40 分鐘；另外還有一個每秒幾十個請求、全天都有流量的會員 API。怎麼分配？</p>
+  <label data-key="a">兩個都放 Fargate：月報超過 Lambda 15 分鐘的 Timeout 上限，會員 API 流量穩定，容器常駐沒有冷啟動</label>
+  <label data-key="b">兩個都放 Lambda：無伺服器一定比較便宜</label>
+  <label data-key="c">月報放 Lambda、會員 API 放 Fargate：Lambda 適合批次工作</label>
+  <label data-key="d">月報放 Lambda，把 Timeout 設成 60 分鐘</label>
+  <p class="why">✓ Lambda 的 Timeout 最長 15 分鐘，40 分鐘的工作放不進去；全天穩定流量的 API 也拿不到 Lambda「沒請求就不收費」的好處。c 和 d 都忽略了 Timeout 上限；b 把「按用量計費」誤解成一定便宜。（第 6 課）</p>
+</div>
+
+<p>這個階段的重點整理成<a href="../sheets/stage-3.html">一頁圖解</a>。</p>
+<p>下一個階段處理資料與機密：先把 S3 的權限、版本、加密與靜態網站做完整，再看 RDS 的高可用、備份與連線數。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

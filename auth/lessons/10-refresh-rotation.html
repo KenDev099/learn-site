@@ -1,0 +1,1371 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>10. Access token 與 refresh token：輪替與重用偵測</title>
+<link rel="stylesheet" href="../../style.css">
+<style>
+  .tl { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin: 1.2em 0; }
+  .tl table { width: 100%; }
+  .tl td { vertical-align: top; }
+  .tl tr.now td { background: var(--accent-soft); }
+  .tl tr.later { visibility: hidden; }
+  .tl .note { margin: 10px 0 0; min-height: 3.5em; }
+</style>
+</head>
+<body data-lesson="10">
+<header>
+  <div class="eyebrow">階段 3：Token 與 JWT · 第 10 課</div>
+  <h1>Access token 與 refresh token：輪替與重用偵測</h1>
+</header>
+<main>
+<p>咖啡店的店員用 POS App 接單。它是一個 Vue 寫的網頁，開在櫃檯的平板和店員的電腦上。店員登入後，伺服器發一張 JWT 給 App，App 之後呼叫訂單 API 都帶著它；API 用<a href="09-jwt-verification.html">第 9 課</a>寫好的 <code>verifyAccessToken</code> 驗簽章和期限，通過就放行。這套驗證有一個<a href="08-jwt-signatures.html">第 8 課</a>就提過、還沒處理的問題：API 驗 JWT 時不查資料庫，只要簽章對、還沒到 <code>exp</code> 就一定放行，所以 JWT 一旦發出去，伺服器就收不回來。</p>
+<p>這讓效期怎麼設都兩難。設一天：店員李建國的 token 被偷走，攻擊者就能用他的身分查訂單、退款一整天，伺服器沒有任何辦法阻止。設 15 分鐘：外洩的傷害小了，但李建國每 15 分鐘就要在客人面前重新輸入一次密碼。這一課的任務是替 POS App 設計登入狀態，同時做到兩件事：李建國一整天不用重新登入；他的 token 被偷時，伺服器能發現並收回。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>一張 token 為什麼不夠：拆成短命的 access token 和長命、存在伺服器上的 refresh token（開場問題的最小答案）。</li>
+  <li>refresh token 放在瀏覽器哪裡：比較四個位置，決定 access token 放記憶體、refresh token 放 HttpOnly cookie。</li>
+  <li>refresh token 還是被偷了怎麼辦：輪替讓每張只能用一次，重用偵測從「用過的又出現」發現小偷，然後撤銷整個家族。</li>
+  <li>為什麼李建國一直被登出：兩個分頁同時 refresh 被誤判成攻擊，前端和後端各要怎麼排隊。</li>
+  <li>一次登入最久能撐多久：閒置期限和絕對期限，登出、改密碼、停權時撤銷什麼、管不到什麼。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="04-cookies-sessions.html">第 4 課</a>的 session store 與 cookie：store 只存 token 的 SHA-256；閒置逾時從最後一次使用算、絕對逾時從登入算；cookie 用 <code>HttpOnly</code>、<code>Secure</code>、<code>SameSite</code>、<code>Path</code> 限制誰讀得到、何時送出。</li>
+  <li><a href="09-jwt-verification.html">第 9 課</a>的 <code>verifyAccessToken</code>：API 收到 access token 時檢查簽章、期限、iss、aud，失敗回 401。</li>
+  <li><a href="../../typescript/lessons/12-races-concurrency.html">TypeScript 課第 12 課</a>的重複送出：同時有好幾個呼叫時，共用同一個進行中的 Promise，結束後清掉。</li>
+  <li><a href="../../postgresql/lessons/19-concurrency.html">PostgreSQL 課第 19 課</a>的並發更新：兩個交易同時改同一列，後到的會等前一個結束；<a href="../../nestjs/lessons/15-transactions-concurrency.html">NestJS 課第 15 課</a>用 <code>updateMany</code> 回傳的 <code>count</code> 判斷誰搶到。</li>
+</ul></div>
+
+<h2>一張 token 為什麼不夠？</h2>
+<p>開場的兩難，根源在於 POS App 只有一張 token，而這張 token 同時做兩件事。第一件是<strong>向 API 證明「我是李建國」</strong>：每個請求都要做，一天幾百次，送到每一個 API。第二件是<strong>維持「李建國已經登入」這個狀態</strong>：讓他不用一直輸入密碼。第一件事要求 token 驗得快，最好不查資料庫，這正是 JWT 的長處；第二件事要求 token 活得久，而活得久的東西就必須收得回來，這正是 JWT 的短處。一張 token 沒辦法同時又短命又長命。</p>
+<p>要先理解為什麼「活得久又收不回來」那麼危險。JWT 是<a href="08-jwt-signatures.html">第 8 課</a>說的 bearer token：伺服器只看「你拿著它」，不看「你是誰」。誰拿到這串字，誰就是李建國。所以 token 的效期，就是它外洩之後攻擊者可以使用的最長時間；而 JWT 又沒辦法提早作廢，效期是唯一能控制傷害的旋鈕。</p>
+<p>解法是把兩件事拆給兩張 token：</p>
+<ul>
+  <li><strong>access token</strong>：負責第一件事，呼叫 API 用。每個請求都帶在 <code>Authorization: Bearer …</code> 標頭，通常是 JWT，API 驗簽章就知道是誰，不用查資料庫。壽命短，常見 5～15 分鐘。</li>
+  <li><strong>refresh token</strong>：負責第二件事，它唯一的用途是換新的 access token。只送到一個端點 <code>POST /auth/refresh</code>，壽命長（幾天到幾十天），而且伺服器會記錄每一張，所以隨時能撤銷。</li>
+</ul>
+<p>這樣分工之後，兩張 token 各自的效期都合理了。access token 外洩的機會高：它跟著每個請求跑遍每一個 API，請求在到達訂單 API 之前，還可能經過負責路由、限流的 API gateway 這類轉送層，任何一層都可能不小心把標頭寫進 log。所以讓它短命，外洩了最多被用 15 分鐘。refresh token 只走一條路，外洩機會低；而且它每次使用伺服器都會查資料庫，發現不對就能讓它失效。查資料庫的成本也不高：一般請求照樣不查，只有每 15 分鐘一次的 refresh 才查。</p>
+<p>那李建國為什麼不用每 15 分鐘登入一次？因為換 access token 這件事由 App 自動完成。access token 過期後，下一個 API 請求會收到 401，App 拿 refresh token 去換一張新的，再重送原本的請求：</p>
+<figure>
+  <svg viewBox="0 0 700 300" role="img" aria-label="access token 過期時：API 回 401，前端呼叫 /auth/refresh 換到新的 access token 與新的 refresh cookie，再重送原本的請求">
+    <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="40" y="12" width="140" height="36" rx="6"/><text class="d-text" x="110" y="35" text-anchor="middle">Vue 前端（POS）</text>
+    <rect class="d-box" x="280" y="12" width="140" height="36" rx="6"/><text class="d-text" x="350" y="35" text-anchor="middle">訂單 API</text>
+    <rect class="d-soft" x="520" y="12" width="140" height="36" rx="6"/><text class="d-text" x="590" y="35" text-anchor="middle">/auth/refresh</text>
+    <line class="d-line" x1="110" y1="48" x2="110" y2="290" stroke-dasharray="4 4"/>
+    <line class="d-line" x1="350" y1="48" x2="350" y2="290" stroke-dasharray="4 4"/>
+    <line class="d-line" x1="590" y1="48" x2="590" y2="290" stroke-dasharray="4 4"/>
+    <text class="d-small" x="230" y="74" text-anchor="middle">GET /orders（access token 已過期）</text>
+    <line class="d-line" x1="110" y1="82" x2="346" y2="82" marker-end="url(#arr)"/>
+    <text class="d-small" x="230" y="108" text-anchor="middle">401 invalid_token</text>
+    <line class="d-line" x1="350" y1="116" x2="114" y2="116" marker-end="url(#arr)"/>
+    <text class="d-small" x="350" y="142" text-anchor="middle">POST /auth/refresh（瀏覽器自動帶 cookie：RT1）</text>
+    <line class="d-line" x1="110" y1="150" x2="586" y2="150" marker-end="url(#arr)"/>
+    <text class="d-accent" x="350" y="176" text-anchor="middle">新 access token（body）＋ Set-Cookie: RT2</text>
+    <line class="d-line" x1="590" y1="184" x2="114" y2="184" marker-end="url(#arr)"/>
+    <text class="d-small" x="230" y="210" text-anchor="middle">重送 GET /orders（新 access token）</text>
+    <line class="d-line" x1="110" y1="218" x2="346" y2="218" marker-end="url(#arr)"/>
+    <text class="d-small" x="230" y="244" text-anchor="middle">200 訂單資料</text>
+    <line class="d-line" x1="350" y1="252" x2="114" y2="252" marker-end="url(#arr)"/>
+    <text class="d-small" x="590" y="276" text-anchor="middle">RT1 標記為已使用</text>
+  </svg>
+  <figcaption>access token 過期時的流程。使用者看不到這一段，畫面只是慢了一點。</figcaption>
+</figure>
+<p>圖裡的 refresh token 叫 RT1，換完之後伺服器回了一張新的 RT2，並把 RT1 標記為已使用。這是第 3 節的「輪替」，現在先知道有這一步就好。到這裡，開場問題的最小答案已經出來了：李建國感覺不到 access token 每 15 分鐘換一次；access token 被偷，最多被用 15 分鐘；能長期維持登入的只有 refresh token，而它存在伺服器上，收得回來。</p>
+<p>還剩一個設計問題：refresh token 本身要做成什麼樣子？直覺會想把它也做成 JWT。但 JWT 的好處是「不用查資料庫就能信任」，而 refresh token 每次使用都必須查資料庫（有沒有用過、所屬的登入有沒有被撤銷），這個好處完全用不到。剩下的只有缺點：比較長、內容可以被任何人解碼、簽章金鑰外洩時攻擊者能自己做出 refresh token。所以 <strong>refresh token 不做成 JWT</strong>，只要一串猜不到的隨機值：用<a href="02-crypto-toolbox.html">第 2 課</a>的方法產生 32 bytes 安全亂數，再用 base64url 編碼。這就是第 8 課的<strong>不透明 token</strong>：本身沒有任何內容，要拿去問發行的伺服器才知道代表誰。</p>
+<p>拆成兩張 token 之後，風險集中到了 refresh token 身上：它能活幾十天，拿到它就能一直換出新的 access token，是攻擊者最想偷的東西。下一步要決定它在瀏覽器裡放在哪裡，才最不容易被偷。</p>
+
+<h2>refresh token 要放在瀏覽器的哪裡？</h2>
+<p>瀏覽器裡偷 token 的方式主要有兩種，選位置之前要先知道它們各怕什麼。第一種是 XSS（<a href="07-xss-csp.html">第 7 課</a>）：攻擊者想辦法讓自己的腳本在你的頁面上執行，這段腳本能做你的 JS 能做的所有事，包括讀 <code>localStorage</code>、讀變數、自己發 <code>fetch</code>。第二種是 CSRF（<a href="06-csrf.html">第 6 課</a>）：攻擊者在他自己的網站上讓瀏覽器對你的網站發請求，瀏覽器會自動帶上你網站的 cookie。這兩種攻擊方向相反：JS 讀得到的地方怕 XSS，會被自動送出的地方怕 CSRF。</p>
+<p>瀏覽器裡能放 token 的地方有四種，用這兩種攻擊來比較：</p>
+<div class="table-wrap"><table>
+  <tr><th>放在哪</th><th>XSS 的腳本能讀走嗎</th><th>會被跨站請求自動帶上嗎</th><th>重新整理後還在嗎</th></tr>
+  <tr><td><code>localStorage</code></td><td>能，而且一直留著</td><td>不會</td><td>在，關掉瀏覽器也在</td></tr>
+  <tr><td><code>sessionStorage</code></td><td>能</td><td>不會</td><td>在（同一個分頁）</td></tr>
+  <tr><td>JS 變數（記憶體）</td><td>能（例如改寫 <code>fetch</code> 攔截標頭），但只在頁面開著時</td><td>不會</td><td>不在</td></tr>
+  <tr><td><code>HttpOnly</code> cookie</td><td>不能讀（但能借瀏覽器發請求）</td><td>看 <code>SameSite</code></td><td>在</td></tr>
+</table></div>
+<p>表裡最關鍵的差別是「讀走」和「借用」。token 被讀走，攻擊者就能把它帶到自己的電腦上，用到它過期為止，李建國關掉頁面也沒用。token 只能被借用（腳本叫瀏覽器幫它發請求，瀏覽器自動附上 cookie），攻擊者就只能趁李建國的頁面開著時動手，頁面一關攻擊就停。對活幾十天的 refresh token 來說，這個差別決定了外洩的傷害是幾分鐘還是幾十天。</p>
+<p>依這個邏輯，兩張 token 分開放：</p>
+<ul>
+  <li><strong>access token 放在 JS 變數</strong>。它要放進 <code>Authorization</code> 標頭，標頭是 JS 設定的，所以 JS 一定要讀得到它；在 JS 讀得到的位置裡，記憶體留得最短。代價是重新整理頁面就沒了，所以頁面載入時先呼叫一次 <code>/auth/refresh</code> 拿新的。</li>
+  <li><strong>refresh token 放在 cookie</strong>，由伺服器用 <code>Set-Cookie</code> 設定，JS 完全碰不到：</li>
+</ul>
+<pre>Set-Cookie: __Secure-rt=Qm9s…; Path=/auth/refresh; Secure; HttpOnly; SameSite=Strict; Max-Age=5184000</pre>
+<p>這一行的每個屬性都在縮小 refresh token 能被拿到、被送出的範圍：</p>
+<ul>
+  <li><code>HttpOnly</code>：JS 讀不到這個 cookie，XSS 只能借用、偷不走。</li>
+  <li><code>SameSite=Strict</code>：從別的網站發起的請求不帶這個 cookie，擋住 CSRF。refresh 端點仍然要做第 6 課的 CSRF 防護（檢查 <code>Origin</code>），這叫縱深防禦：一層失效時還有下一層。</li>
+  <li><code>Path=/auth/refresh</code>：只有請求這個路徑時瀏覽器才送它。其他 API 的請求不帶它，所以它也不會出現在那些請求經過的地方，例如擋在 API 前面轉送請求的反向代理（像 Nginx）的 log。它<strong>不是</strong>安全邊界，只是讓 token 少出現在一些地方。</li>
+  <li><code>__Secure-</code> 前綴（第 4 課）：cookie 名稱用這個前綴，瀏覽器就會拒收沒有 <code>Secure</code> 的設定，防止它在 HTTP 上被設定。不能改用更嚴格的 <code>__Host-</code>，因為它要求 <code>Path=/</code>，跟上一點衝突。</li>
+  <li><code>Max-Age</code> 設成絕對期限（這裡 60 天，第 5 節會講這個數字怎麼來）。它只決定瀏覽器什麼時候丟掉 cookie，真正的期限還是由伺服器判斷。</li>
+</ul>
+<div class="callout warn"><strong>refresh token 放 <code>localStorage</code></strong> 是最常見的錯誤：任何一個 XSS、任何一個被汙染的 npm 套件，都能把它讀走，帶到攻擊者自己的電腦上用幾十天。HttpOnly cookie 擋不住 XSS 借用瀏覽器發請求，但至少攻擊在使用者關掉頁面時就停了。更徹底的做法是讓瀏覽器完全不碰 token：在前端和 API 之間放一台專門替前端保管 token 的伺服器，瀏覽器只拿到一般的 session cookie。這種架構叫 BFF（Backend for Frontend），<a href="11-revocation-tradeoffs.html">第 11 課</a>講。</div>
+<p>放進 HttpOnly cookie 之後，refresh token 很難被讀走，但「很難」不是「不可能」：使用者裝了惡意的瀏覽器擴充功能、電腦中了毒、某一層伺服器把 cookie 標頭寫進 log，都還可能讓它外洩。下一節處理它真的被偷之後的事。</p>
+<div class="callout practice"><strong>💡 實務上：接手專案先打開 DevTools 看 token 放在哪</strong><br>很多專案是照教學文章或套件預設做的，token 放在哪沒人討論過。接手時打開 DevTools 的 Application 面板，看 <code>localStorage</code> 和 Cookies：refresh token 在 <code>localStorage</code>、或 cookie 沒有 <code>HttpOnly</code>，就是要排進修正的項目。用 Auth0、Supabase 這類身分服務的前端 SDK 時，也要查它的文件確認預設把 token 存在哪，不要假設它一定安全。改成 cookie 時，前端和 API 如果不同源，記得 fetch 要加 <code>credentials: 'include'</code>、CORS 要允許帶憑證（第 5 課），否則常見的結果是本機能跑、上線後 cookie 送不出去。</div>
+
+<h2>refresh token 還是被偷了怎麼辦？輪替：用一次就換</h2>
+<p>假設攻擊者還是拿到了李建國的 refresh token。到目前為止的設計，攻擊者能拿它一直換 access token，直到它過期，最長幾十天。更麻煩的是伺服器察覺不到：攻擊者送來的請求跟李建國的一模一樣，同一張 token、合法的格式。問題的核心是<strong>同一張 token 有兩個人拿著，伺服器分不出來</strong>。</p>
+<p><strong>輪替</strong>（rotation）讓這件事變得分得出來。做法是：每次用 refresh token 換 access token 時，伺服器同時發一張<strong>新的 refresh token</strong>，舊的標記為已使用、不能再用。這樣每張 refresh token 一生只能成功使用一次。單看這一步，攻擊者還是可能搶先用掉偷來的那張、換到新的；輪替真正的價值在於它建立了一條規則：「正常情況下，一張 refresh token 不會出現第二次」。一旦有人違反這條規則，就代表有兩個人拿著同一張 token。下一節的重用偵測就是靠這條規則抓人。</p>
+<p>下一節會看到，發現 token 被偷時，只收回那一張不夠，要收回這次登入輪替出來的全部 token。為了做得到，伺服器得知道哪些 token 屬於同一次登入：同一次登入一路輪替出來的所有 refresh token，叫一個 <strong>token 家族</strong>（token family），用同一個 <code>family_id</code> 串起來。登入時開一個新家族，之後每次輪替都在同一個家族裡發新 token。一台裝置一次登入就是一個家族，所以李建國的手機和電腦是兩個家族。</p>
+<p>落到資料庫（PostgreSQL），家族一張表、token 一張表。撤銷是「整個家族」的事，所以撤銷時間記在家族上；絕對期限從登入的時間算，登入時間也就是家族建立的時間，同樣記在家族上：</p>
+<pre>CREATE TABLE token_families (
+  id          uuid        PRIMARY KEY,                -- 登入時由程式產生
+  user_id     bigint      NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now(),     -- 登入時間：絕對期限從這裡算
+  revoked_at  timestamptz                             -- 整個家族被撤銷的時間；NULL 代表有效
+);
+CREATE INDEX ON token_families (user_id);
+
+CREATE TABLE refresh_tokens (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  family_id   uuid        NOT NULL REFERENCES token_families (id),
+  token_hash  text        NOT NULL UNIQUE,            -- SHA-256，不存原始 token
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  expires_at  timestamptz NOT NULL,
+  used_at     timestamptz                             -- 換過新 token 的時間；NULL 代表還沒用
+);
+CREATE INDEX ON refresh_tokens (family_id);</pre>
+<p><code>token_hash</code> 跟第 4 課的 session 一樣只存 SHA-256：資料庫備份外洩時，攻擊者拿到的雜湊換不到 token。這裡不需要密碼用的慢雜湊，因為慢雜湊是為了對付「密碼太好猜、可以一個一個試」，而 32 bytes 的隨機值根本猜不到。另一個重點是用過的列<strong>不能刪</strong>，要留著 <code>used_at</code>：用過的 token 再出現時，伺服器要查得到「它用過了、屬於哪個家族」，下一節的重用偵測就靠它。</p>
+<p>下面用一個 <code>Map</code> 代替資料表，走一次「登入發 RT1 → 輪替成 RT2」。執行後看最後兩行：資料庫裡的 key 跟給瀏覽器的 token 完全不同，原始 token 不在資料庫裡。</p>
+<div class="lab"><script type="code">
+// 已經寫好（第 2 課）
+function base64url(bytes: Uint8Array<ArrayBuffer>): string {
+  let s = ''
+  for (const b of bytes) s += String.fromCharCode(b)
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+async function sha256(text: string): Promise<string> {
+  return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))))
+}
+
+const db = new Map<string, { familyId: string; usedAt: number | null }>()
+async function issue(familyId: string): Promise<string> {
+  const token = base64url(crypto.getRandomValues(new Uint8Array(32)))
+  db.set(await sha256(token), { familyId, usedAt: null })
+  return token   // 原始 token 只出現在給瀏覽器的回應裡
+}
+
+const family = crypto.randomUUID()
+const rt1 = await issue(family)
+// refresh：RT1 標記已使用，發同一家族的 RT2
+db.get(await sha256(rt1))!.usedAt = Date.now()
+const rt2 = await issue(family)
+
+console.log('給瀏覽器的 RT1：', rt1)
+console.log('給瀏覽器的 RT2：', rt2)
+console.log('資料庫裡的 key：', [...db.keys()])
+console.log('資料庫裡有沒有原始 token：', db.has(rt1) || db.has(rt2))
+</script></div>
+<p>RT1 現在留在資料庫裡，標著已使用。如果它又出現了，代表什麼？伺服器該怎麼反應？</p>
+
+<h2>偷來的 token 怎麼露出馬腳？重用偵測</h2>
+<p>上一節的規則是：輪替之後，每張 refresh token 只能用一次。所以一張<strong>已經用過</strong>的 token 又出現，代表同一張 token 至少有兩個人拿著：正牌使用者和攻擊者。伺服器用這個訊號發現 token 被偷，叫<strong>重用偵測</strong>（reuse detection）。按「下一步」看攻擊者偷走李建國的 RT1 之後發生什麼事：</p>
+<div class="tl">
+  <div class="table-wrap"><table>
+    <tr><th>步驟</th><th>攻擊者</th><th>李建國的 POS App</th><th>伺服器（家族 F）</th></tr>
+    <tr data-note="攻擊者透過惡意瀏覽器擴充功能，偷到小明目前的 refresh token RT1。"><td>1</td><td>偷到 RT1</td><td>持有 RT1</td><td>RT1：有效</td></tr>
+    <tr data-note="小明的 access token 過期，App 正常拿 RT1 去換，得到 RT2。RT1 標記為已使用。"><td>2</td><td></td><td>用 RT1 換到 RT2</td><td>RT1：已使用<br>RT2：有效</td></tr>
+    <tr data-note="攻擊者拿 RT1 來換。伺服器發現 RT1 已經用過：同一張 token 有兩個人在用，一定有一個是偷的。"><td>3</td><td>用 RT1 → ？</td><td></td><td>RT1 已使用 → 重用！</td></tr>
+    <tr data-note="伺服器分不出剛才那個請求是攻擊者還是小明（也可能是小明的舊分頁），所以撤銷整個家族 F：RT2 也失效。"><td>4</td><td>得到 401</td><td></td><td>家族 F 全部撤銷</td></tr>
+    <tr data-note="小明下次 refresh 時 RT2 失效，要重新登入，得到新家族 G。攻擊者手上沒有任何有效 token 了。小明在另一台電腦的家族不受影響。"><td>5</td><td>RT1、RT2 都沒用</td><td>重新登入 → 家族 G</td><td>F：已撤銷<br>G：有效</td></tr>
+  </table></div>
+  <div class="bar"><button data-prev>◀ 上一步</button><button class="primary" data-next>下一步 ▶</button><span class="kbd" data-count></span></div>
+  <p class="note"></p>
+</div>
+<p>第 4 步是整個設計的關鍵：為什麼不只拒絕這一次，而要連李建國手上那張正常的 RT2 一起撤銷？因為重用只告訴伺服器「這張 token 有兩個人拿著」，不告訴它誰是誰。把時間軸的順序反過來就看得出問題：攻擊者先用偷來的 RT1 換到 RT2，李建國之後才拿 RT1 來換，同樣觸發重用。這時如果只拒絕這一次請求，被拒絕的是李建國，攻擊者手上的 RT2 照樣有效，還能一直輪替下去。伺服器不知道自己面對的是哪一種順序，唯一兩種情況都安全的做法，就是讓這個家族裡所有還有效的 token 一起失效，<strong>一定要撤銷整個家族</strong>。</p>
+<p>這也是 <a href="https://www.rfc-editor.org/rfc/rfc9700.html">RFC 9700</a>（OAuth 2.0 安全最佳實務，2025 年 1 月）§4.14.2 寫的做法：伺服器分不出哪一方送了失效的 token，所以撤銷目前有效的 refresh token。代價是正牌使用者要重新登入一次，換來的是攻擊者手上什麼都不剩。RFC 9700 對瀏覽器、手機 App 這類客戶端的要求見課末「補充與查表」。</p>
+<p>撤銷範圍是<strong>這個家族</strong>，不是這個使用者的所有家族。重用只證明「這一次登入」的 token 外洩了：李建國手機上的 token 被偷，不代表他電腦上的也被偷，不該讓他的電腦也被登出。想讓一個人所有裝置都登出是另一類事件（改密碼、停權），最後一節會講。</p>
+<p>偵測到重用時，除了撤銷，也要在正式環境記一筆安全事件：使用者、家族、IP、User-Agent，<strong>不記 token 本身</strong>（log 也可能外洩）。同一個使用者短時間內一直發生，就通知他本人或客服。<a href="25-threat-modeling.html">第 25 課</a>講稽核紀錄。</p>
+<p>重用偵測有一個前提：正常使用者不會把同一張 token 用兩次。這個前提在真實的瀏覽器裡不一定成立，下一節就是它被打破的情況。</p>
+<div class="callout practice"><strong>💡 實務上：多半不用自己寫，但要會檢查設定</strong><br>如果團隊用 Auth0、Supabase、Keycloak 這類身分服務，輪替和重用偵測通常是後台的一個開關，加上一個寬限期設定。你的工作是確認它有打開、寬限期設多長，並看文件確認偵測到重用時撤銷的是哪些 token。自己寫的情況多半是公司有自己的帳號系統，例如咖啡店後台自己管店員帳號；這時這一課的資料表和流程就是你要交出去的設計。資安或稽核問「token 被偷怎麼辦」時，「有輪替、重用會撤銷家族、有安全事件紀錄」就是能直接回答的內容。</div>
+
+<h2>為什麼李建國一直被登出？兩個分頁同時 refresh</h2>
+<p>重用偵測很靈敏，靈敏到會誤傷自己人。李建國在電腦上開了兩個 POS 分頁，一個看訂單、一個看庫存，都放著 20 分鐘沒動。回來後他點了一下，兩個分頁同時發現 access token 過期，都拿 cookie 裡的 RT1 去 refresh：第一個換到 RT2，第二個送來的 RT1 已經用過，被判定重用，整個家族撤銷，李建國被登出。沒有任何攻擊者，只是兩個請求同時出發。這是 refresh token 輪替上線後最常見的客訴：「一直被登出」。</p>
+<p>這是一個競態：結果取決於兩個請求誰先到。要讓它不發生，就要讓同一張 refresh token 永遠只被送出一次。重複送出可能發生在三個地方，每一層的成因不同，所以要從三層處理。</p>
+<p><strong>第一層：同一個分頁裡，用 single-flight。</strong>同一頁面上五個元件同時呼叫 API、同時發現過期，如果每個都自己去 refresh，同一張 RT1 就被送了五次。<strong>single-flight</strong> 的意思是同一時間只讓一個請求「在飛」：第一個發現過期的呼叫者去 refresh，並把這個進行中的 Promise 存起來，其他呼叫者直接等同一個 Promise，大家拿到同一張新 access token。做法跟 <a href="../../typescript/lessons/12-races-concurrency.html">TypeScript 課第 12 課</a>防重複送出一樣。練習 2 會寫。</p>
+<p><strong>第二層：多個分頁之間，用 Web Locks API。</strong>single-flight 擋不住李建國的兩個分頁，因為每個分頁有自己的 JS 記憶體，A 分頁存起來的 Promise，B 分頁看不到；但 cookie 是所有分頁共用的，兩邊都會送出同一張 RT1。要讓分頁之間排隊，需要一把所有分頁都看得到的鎖。瀏覽器的 <code>navigator.locks.request(名稱, callback)</code> 就是這把鎖：同源（第 5 課：協定、網域、port 都相同）的所有分頁和 Worker，用同一個名稱請求時會搶同一把鎖，拿到鎖才執行 callback，callback 結束才放開給下一個。把 refresh 包在鎖裡，B 分頁要等 A 分頁換完才能進去，這時 cookie 已經是 RT2，送出的就不是用過的 token。瀏覽器支援與另一種跨分頁做法見課末「補充與查表」。</p>
+<p>Worker（Web Worker）是瀏覽器在主頁面之外另開的一條 JS 執行緒，有自己的記憶體，跟另一個分頁一樣看不到主頁面的變數，所以這裡用它來扮演第二個分頁。下面的範例在 Worker 裡模擬兩個分頁，<code>jar</code> 代表兩個分頁共用的 cookie。執行後比較兩段輸出：沒有鎖時，分頁 B 送出的是已經用過的 RT1；用 Web Locks 排隊後，分頁 B 送出的是 RT2。</p>
+<div class="lab"><script type="code">
+const used = new Set<string>()
+let n = 1
+const jar = { rt: 'RT1' }   // 瀏覽器的 cookie：所有分頁共用
+
+async function serverRefresh(rt: string): Promise<string> {
+  await new Promise(r => setTimeout(r, 20))   // 網路延遲
+  if (used.has(rt)) return '已使用過 → 判定重用，撤銷家族，使用者被登出'
+  used.add(rt)
+  jar.rt = 'RT' + ++n   // Set-Cookie 換成新的 refresh token
+  return '成功，cookie 換成 ' + jar.rt
+}
+async function tabRefresh(name: string): Promise<void> {
+  const rt = jar.rt   // 瀏覽器送出請求時帶的 cookie
+  console.log(name, '送出', rt, '→', await serverRefresh(rt))
+}
+
+console.log('--- 沒有鎖：兩個分頁同時 refresh ---')
+await Promise.all([tabRefresh('分頁 A'), tabRefresh('分頁 B')])
+
+used.clear(); n = 1; jar.rt = 'RT1'
+console.log('--- 用 Web Locks 排隊 ---')
+await Promise.all(['分頁 A', '分頁 B'].map(name =>
+  navigator.locks.request('coffee-refresh', () => tabRefresh(name))))
+</script></div>
+<p><strong>第三層：後端，用原子操作。</strong>前端做得再好，還是有前端控制不了的情況：兩台裝置用同一份同步過來的 cookie、網路重送、攻擊者故意把偷來的 token 和正牌使用者同時送。咖啡店的 API 也不只一台伺服器，兩個請求可能同時落在兩台上。這時問題出在後端 rotate 的寫法。如果寫成「先查 <code>used_at</code> 是不是空的 → 再更新」，兩個同時到的請求都會在對方寫入之前讀到「還沒用過」，兩個都換到新 token。重用偵測在最需要它的時候失效了：攻擊者跟正牌使用者同時送，兩邊都過關，伺服器什麼都沒發現。</p>
+<p>修法是讓「檢查」和「標記」變成同一個資料庫操作，中間沒有空隙讓別人插進來。這種不能被從中間打斷的操作，叫原子操作（atomic）：</p>
+<pre>UPDATE refresh_tokens
+SET used_at = now()
+WHERE token_hash = $1 AND used_at IS NULL
+RETURNING family_id;</pre>
+<p>這一句的意思是「只有在還沒用過的情況下，才標記為已使用」。改到 1 列的就是贏家，接著確認家族沒被撤銷、沒過期，就可以發新 token；改到 0 列，再查一次原因：不存在（invalid），或已使用（重用，撤銷家族）。為什麼兩個請求同時跑這一句也安全：PostgreSQL 18 文件說明，在預設的 Read Committed 隔離等級下，第二個 <code>UPDATE</code> 遇到被別人更新中的列會等對方 commit，然後<strong>用更新後的列重新檢查 WHERE</strong>，這時 <code>used_at</code> 已經不是 NULL，所以改到 0 列。用 Prisma 的話是 <code>updateMany</code> 加上條件，看回傳的 <code>count</code>（NestJS 課第 15 課）。練習 3 會改一個先讀後寫的版本。</p>
+<p>同樣的空隙也解釋了為什麼撤銷要記在 <code>token_families</code>，而不是記在每一張 token 上。如果撤銷是「把家族裡每一張 token 標成撤銷」，輸家在標記的同時，贏家可能正在插入新 token；剛插入的那一列沒被標到，攻擊者就留下一張有效的 token。撤銷記在家族上，rotate 時一律查家族，不管新 token 何時插入都會被擋下。</p>
+<p>最後還有一種重送前端無法避免：回應在路上掉了，客戶端沒收到 RT2，只好拿 RT1 重試。有些系統用<strong>寬限期</strong>（grace period）容忍這種情況：RT1 被使用後的幾秒內再看到 RT1，不當成攻擊，而是再發一張同家族的新 token，或請客戶端重試。代價是這幾秒內，攻擊者用偷來的舊 token 也不會被抓到。要用就設得很短（幾秒），先把前端的 single-flight 與 Web Locks 做好，寬限期只是最後一道。</p>
+<p>到這裡，輪替、重用偵測和排隊都做好了，POS App 的 refresh token 可以一直換新。但一直換新也代表一件事：只要李建國每隔幾天用一次，這次登入就永遠不會結束。</p>
+<div class="callout practice"><strong>💡 實務上：「一直被登出」的客訴，先懷疑競態而不是攻擊</strong><br>上線輪替之後，如果重用事件突然變多，而且集中在正常使用的時段、同一批使用者，通常是自己的前端在搶 refresh，不是被攻擊。常見來源：axios 或 fetch 攔截器沒做 single-flight、頁面載入時好幾個元件各自觸發 refresh、App 從背景回來時同時發好幾個請求。上線前讓 QA 開兩三個分頁放到 access token 過期再一起操作，這個情境很容易漏測。資深會在上線後盯著重用事件的數量，先確認誤判夠少，再決定要不要通知使用者或加上自動封鎖。</div>
+
+<h2>一次登入最久能撐多久？什麼時候要主動收回？</h2>
+<p>輪替讓 refresh token 不斷換新，如果每張新 token 都重新給 14 天，李建國只要兩週內用過一次，這次登入就能活一輩子；平板被人拿走，那個人也能一直用下去。所以跟第 4 課的 session 一樣，要兩種期限一起管：</p>
+<ul>
+  <li><strong>閒置期限</strong>：例如 14 天沒用就失效，處理「裝置被放著不用」。從<strong>這張</strong> token 簽發的時間算，因為每次輪替都會發新的，所以等於從上一次使用算起。RFC 9700 說客戶端閒置一段時間後 refresh token SHOULD 失效。</li>
+  <li><strong>絕對期限</strong>：例如登入後 60 天一定要重新登入，不管中間輪替多少次，處理「一直在用的登入也不能永遠有效」。從<strong>家族</strong>建立的時間算，輪替時不能重新起算；這也是上一節把 <code>created_at</code> 放在家族表的原因。</li>
+</ul>
+<p>寫進資料表時，新 token 的 <code>expires_at</code> 取「現在＋14 天」和「家族建立時間＋60 天」比較早的那個，查詢時只要看一個欄位。</p>
+<p>期限是被動的，到了自然失效。有些事件發生時不能等期限，要主動撤銷。RFC 9700 說改密碼、登出時 MAY 撤銷，實務上都該做。每種事件要撤銷的範圍不同，判斷標準是「哪些登入可能已經不可信」：</p>
+<div class="table-wrap"><table>
+  <tr><th>事件</th><th>撤銷範圍</th></tr>
+  <tr><td>按「登出」</td><td>這台裝置的家族，並清掉 refresh cookie（同名、同 Path、<code>Max-Age=0</code>）</td></tr>
+  <tr><td>偵測到重用</td><td>那個家族</td></tr>
+  <tr><td>改密碼、重設密碼、「登出所有裝置」</td><td>這個使用者的所有家族（改密碼時通常保留目前這台）</td></tr>
+  <tr><td>帳號停權</td><td>所有家族，access token 的問題見下面</td></tr>
+</table></div>
+<p>登出時清 cookie 要用同名、同 Path：瀏覽器用名稱、網域和 Path 一起分辨 cookie，Path 不同會被當成另一個 cookie，原本那個不會被清掉。</p>
+<p>表裡的最後一列留了一個洞。撤銷 refresh token 管不到已經發出去的 access token：它是 JWT，API 只驗簽章、不查資料庫，到 <code>exp</code> 之前都有效。撤銷只是讓人換不到<strong>下一張</strong> access token。所以被停權的店員，最壞還能用到他手上那張 access token 過期為止，也就是最多 15 分鐘。這就是開場那個「JWT 收不回來」的問題剩下的部分：這一課把它從「一天」縮到「access token 的效期」，但沒有縮到零。縮短這段時間的方法（短效期、黑名單、版本號）是第 11 課的主題。</p>
+<div class="callout practice"><strong>💡 實務上：期限長短是產品決定，要跟 PM 一起訂</strong><br>期限越短越安全，但使用者越常被要求登入，這個取捨不該由工程師一個人決定。咖啡店的店員 POS 可能是多人共用的平板，適合短一點的閒置期限，下班交接時也要有明顯的登出；顧客點餐 App 則希望一直保持登入，期限可以長一些。金融、後台管理這類高風險功能，常見做法是整體期限維持寬鬆，但進入敏感操作前要求再輸入一次密碼。訂好之後把數字和理由寫進文件，客服被問「為什麼又要我登入」時才有答案。</div>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：實作 <code>RefreshTokenService</code>。時間用注入的 <code>now()</code>（毫秒），資料存在注入的 <code>store</code>，key 是 token 的 <code>sha256</code>（已經寫好，回傳 base64url）。</p>
+  <ul>
+    <li><code>issue(userId)</code>：登入時呼叫。開一個新家族（<code>familyId</code> 用 <code>crypto.randomUUID()</code>），產生 32 bytes 安全亂數的 token（base64url），回傳 <code>{ refreshToken, familyId }</code>。</li>
+    <li><code>rotate(token)</code>，依序判斷：
+      <ol>
+        <li>store 裡找不到 → <code>invalid</code></li>
+        <li>家族已撤銷（<code>revokedAt</code> 不是 null）→ <code>invalid</code></li>
+        <li>已經用過（<code>usedAt</code> 不是 null）→ 撤銷整個家族，回 <code>reused</code></li>
+        <li>距離這張 token 簽發 ≥ 14 天，或距離家族建立 ≥ 60 天 → <code>expired</code></li>
+        <li>否則把 <code>usedAt</code> 設成現在，發一張同家族的新 token，回 <code>{ ok: true, refreshToken, userId }</code></li>
+      </ol>
+    </li>
+    <li><code>revokeFamily(familyId)</code>：把這個家族每一張 token 的 <code>revokedAt</code> 設成現在（登出也會用到它）。</li>
+  </ul>
+  <p>這題的 <code>store</code> 是單一程序裡的 <code>Map</code>，沒有家族表，所以 <code>revokedAt</code> 直接記在每一筆 token 上；單一程序不會有上一節的「贏家正在插入新 token」競態。正式環境照上一節，把撤銷記在 <code>token_families</code>。</p>
+  <script type="start">
+type RefreshRecord = {
+  userId: number
+  familyId: string
+  issuedAt: number          // 這張 token 簽發的時間
+  familyCreatedAt: number   // 這個家族建立（登入）的時間
+  usedAt: number | null     // 換過新 token 的時間
+  revokedAt: number | null  // 家族被撤銷的時間
+}
+type RotateResult =
+  | { ok: true; refreshToken: string; userId: number }
+  | { ok: false; error: 'invalid' | 'expired' | 'reused' }
+
+const DAY = 24 * 60 * 60 * 1000
+const IDLE = 14 * DAY
+const ABSOLUTE = 60 * DAY
+
+// 已經寫好（第 2 課）
+function base64url(bytes: Uint8Array<ArrayBuffer>): string {
+  let s = ''
+  for (const b of bytes) s += String.fromCharCode(b)
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+async function sha256(text: string): Promise<string> {
+  return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))))
+}
+
+class RefreshTokenService {
+  now: () => number
+  store: Map<string, RefreshRecord>
+  constructor(now: () => number, store: Map<string, RefreshRecord>) {
+    this.now = now
+    this.store = store
+  }
+
+  async issue(userId: number): Promise<{ refreshToken: string; familyId: string }> {
+    throw new Error('TODO')
+  }
+
+  async rotate(token: string): Promise<RotateResult> {
+    throw new Error('TODO')
+  }
+
+  revokeFamily(familyId: string): void {
+    throw new Error('TODO')
+  }
+}
+
+let t = 0
+const service = new RefreshTokenService(() => t, new Map())
+const { refreshToken: rt1 } = await service.issue(1)
+const r = await service.rotate(rt1)
+console.log(r)
+console.log('再用一次 RT1：', await service.rotate(rt1))
+if (r.ok) console.log('RT2：', await service.rotate(r.refreshToken))
+</script>
+  <script type="answer">
+type RefreshRecord = {
+  userId: number
+  familyId: string
+  issuedAt: number          // 這張 token 簽發的時間
+  familyCreatedAt: number   // 這個家族建立（登入）的時間
+  usedAt: number | null     // 換過新 token 的時間
+  revokedAt: number | null  // 家族被撤銷的時間
+}
+type RotateResult =
+  | { ok: true; refreshToken: string; userId: number }
+  | { ok: false; error: 'invalid' | 'expired' | 'reused' }
+
+const DAY = 24 * 60 * 60 * 1000
+const IDLE = 14 * DAY
+const ABSOLUTE = 60 * DAY
+
+// 已經寫好（第 2 課）
+function base64url(bytes: Uint8Array<ArrayBuffer>): string {
+  let s = ''
+  for (const b of bytes) s += String.fromCharCode(b)
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+async function sha256(text: string): Promise<string> {
+  return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))))
+}
+
+class RefreshTokenService {
+  now: () => number
+  store: Map<string, RefreshRecord>
+  constructor(now: () => number, store: Map<string, RefreshRecord>) {
+    this.now = now
+    this.store = store
+  }
+
+  async mint(userId: number, familyId: string, familyCreatedAt: number): Promise<string> {
+    const token = base64url(crypto.getRandomValues(new Uint8Array(32)))
+    this.store.set(await sha256(token), {
+      userId, familyId, issuedAt: this.now(), familyCreatedAt, usedAt: null, revokedAt: null,
+    })
+    return token
+  }
+
+  async issue(userId: number): Promise<{ refreshToken: string; familyId: string }> {
+    const familyId = crypto.randomUUID()
+    const refreshToken = await this.mint(userId, familyId, this.now())
+    return { refreshToken, familyId }
+  }
+
+  async rotate(token: string): Promise<RotateResult> {
+    const record = this.store.get(await sha256(token))
+    if (!record || record.revokedAt !== null) return { ok: false, error: 'invalid' }
+    if (record.usedAt !== null) {
+      this.revokeFamily(record.familyId)
+      return { ok: false, error: 'reused' }
+    }
+    const t = this.now()
+    if (t - record.issuedAt >= IDLE || t - record.familyCreatedAt >= ABSOLUTE) {
+      return { ok: false, error: 'expired' }
+    }
+    record.usedAt = t
+    const refreshToken = await this.mint(record.userId, record.familyId, record.familyCreatedAt)
+    return { ok: true, refreshToken, userId: record.userId }
+  }
+
+  revokeFamily(familyId: string): void {
+    const t = this.now()
+    for (const record of this.store.values()) {
+      if (record.familyId === familyId) record.revokedAt = t
+    }
+  }
+}
+
+let t = 0
+const service = new RefreshTokenService(() => t, new Map())
+const { refreshToken: rt1 } = await service.issue(1)
+const r = await service.rotate(rt1)
+console.log(r)
+console.log('再用一次 RT1：', await service.rotate(rt1))
+if (r.ok) console.log('RT2：', await service.rotate(r.refreshToken))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<ReturnType<RefreshTokenService['rotate']>, Promise<{ ok: true; refreshToken: string; userId: number } | { ok: false; error: 'invalid' | 'expired' | 'reused' }>>>  // rotate 回傳 Promise<RotateResult>
+type _2 = Expect<Equal<ReturnType<RefreshTokenService['issue']>, Promise<{ refreshToken: string; familyId: string }>>>  // issue 回傳 Promise<{ refreshToken; familyId }>
+</script>
+  <script type="tests">
+const hash = async (s: string) => {
+  let b = ''
+  for (const x of new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s)))) b += String.fromCharCode(x)
+  return btoa(b).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+const D = 24 * 60 * 60 * 1000
+let clock = 0
+const store = new Map<string, RefreshRecord>()
+const svc = new RefreshTokenService(() => clock, store)
+const err = (r: RotateResult) => r.ok ? 'ok' : r.error
+const next = (r: RotateResult, msg: string) => { assert(r.ok, msg + `（得到 ${err(r)}）`); return r.ok ? r.refreshToken : '' }
+
+const a = await svc.issue(1)
+assert(/^[A-Za-z0-9_-]{43}$/.test(a.refreshToken), 'refresh token 要是 32 bytes 安全亂數的 base64url（43 個字元）')
+assert(store.has(await hash(a.refreshToken)), 'store 的 key 要是 sha256(token)')
+assert(![...store.keys()].includes(a.refreshToken), 'store 不能用原始 token 當 key')
+assert(![...store.values()].some(v => JSON.stringify(v).includes(a.refreshToken)), 'store 的資料裡不能有原始 token')
+const other = await svc.issue(1)
+assert(other.familyId !== a.familyId, '每次 issue 都要開新的家族')
+
+let tok = a.refreshToken
+const seen = [tok]
+for (let i = 1; i <= 5; i++) {
+  clock += D
+  const r = await svc.rotate(tok)
+  tok = next(r, `第 ${i} 次輪替要成功`)
+  assert(r.ok && r.userId === 1, 'rotate 成功時要回傳 userId')
+  assert(!seen.includes(tok), '每次輪替都要發一張新的 token')
+  seen.push(tok)
+}
+assert.equal(err(await svc.rotate(seen[2])), 'reused', '用過的舊 token 再出現要回 reused')
+assert.equal(err(await svc.rotate(tok)), 'invalid', '偵測到重用後，整個家族都要撤銷：最新的 token 也要回 invalid')
+assert.equal(err(await svc.rotate(seen[2])), 'invalid', '家族已撤銷時，舊 token 再來回 invalid')
+next(await svc.rotate(other.refreshToken), '同一個使用者的另一個家族（另一台裝置）不能被撤銷')
+assert.equal(err(await svc.rotate('not-a-real-token')), 'invalid', '不認得的 token 要回 invalid')
+
+clock = 0
+const b = await svc.issue(2)
+clock = 14 * D - 1
+const rb = await svc.rotate(b.refreshToken)
+const b2 = next(rb, '閒置 14 天差 1 毫秒時還能輪替')
+assert(rb.ok && rb.userId === 2, 'rotate 成功時要回傳這張 token 所屬使用者的 userId，不能寫死')
+clock += 14 * D
+assert.equal(err(await svc.rotate(b2)), 'expired', '這張 token 簽發後 14 天沒用要回 expired')
+
+clock = 0
+const c = await svc.issue(3)
+let ct = c.refreshToken
+for (const day of [13, 26, 39, 52]) {
+  clock = day * D
+  ct = next(await svc.rotate(ct), `第 ${day} 天輪替要成功`)
+}
+clock = 60 * D
+assert.equal(err(await svc.rotate(ct)), 'expired', '一直輪替也不能超過絕對期限：家族建立 60 天後要回 expired')
+
+clock = 0
+const d = await svc.issue(4)
+clock = 1 * D
+const d2 = next(await svc.rotate(d.refreshToken), '家族 d 第一次輪替要成功')
+clock = 20 * D
+assert.equal(err(await svc.rotate(d.refreshToken)), 'reused', '用過的舊 token 就算已經超過 14 天，再出現也要先判定 reused（照題目的順序：先查已使用，再查期限）')
+assert.equal(err(await svc.rotate(d2)), 'invalid', '舊 token 重用後，同家族最新的 token 也要失效')
+
+clock = 0
+const e = await svc.issue(5), keep = await svc.issue(5)
+const e2 = next(await svc.rotate(e.refreshToken), '家族 e 第一次輪替要成功')
+clock = 5
+svc.revokeFamily(e.familyId)
+const famE = [...store.values()].filter(v => v.familyId === e.familyId)
+assert(famE.length === 2 && famE.every(v => v.revokedAt === 5), 'revokeFamily 要把這個家族每一張 token 的 revokedAt 設成現在，不能刪掉紀錄')
+assert.equal(err(await svc.rotate(e2)), 'invalid', 'revokeFamily（登出）之後，這個家族的 token 要回 invalid')
+next(await svc.rotate(keep.refreshToken), 'revokeFamily 只撤銷指定的家族，同一使用者的其他家族要能繼續輪替')
+
+const realRandom = Math.random
+Math.random = () => 0.5
+try {
+  const x = await svc.issue(9), y = await svc.issue(9)
+  assert(x.refreshToken !== y.refreshToken, 'token 要用 crypto.getRandomValues 產生，不能用 Math.random')
+} finally { Math.random = realRandom }
+</script>
+  <script type="wrong">
+// 用過就刪除：重用時只會得到 invalid
+type RefreshRecord = { userId: number; familyId: string; issuedAt: number; familyCreatedAt: number; usedAt: number | null; revokedAt: number | null }
+type RotateResult = { ok: true; refreshToken: string; userId: number } | { ok: false; error: 'invalid' | 'expired' | 'reused' }
+const DAY = 24 * 60 * 60 * 1000, IDLE = 14 * DAY, ABSOLUTE = 60 * DAY
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+async function sha256(text: string): Promise<string> { return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))) }
+class RefreshTokenService {
+  now: () => number
+  store: Map<string, RefreshRecord>
+  constructor(now: () => number, store: Map<string, RefreshRecord>) { this.now = now; this.store = store }
+  async mint(userId: number, familyId: string, familyCreatedAt: number): Promise<string> {
+    const token = base64url(crypto.getRandomValues(new Uint8Array(32)))
+    this.store.set(await sha256(token), { userId, familyId, issuedAt: this.now(), familyCreatedAt, usedAt: null, revokedAt: null })
+    return token
+  }
+  async issue(userId: number): Promise<{ refreshToken: string; familyId: string }> { const familyId = crypto.randomUUID(); return { refreshToken: await this.mint(userId, familyId, this.now()), familyId } }
+  async rotate(token: string): Promise<RotateResult> {
+    const key = await sha256(token)
+    const record = this.store.get(key)
+    if (!record || record.revokedAt !== null) return { ok: false, error: 'invalid' }
+    const t = this.now()
+    if (t - record.issuedAt >= IDLE || t - record.familyCreatedAt >= ABSOLUTE) return { ok: false, error: 'expired' }
+    this.store.delete(key)
+    return { ok: true, refreshToken: await this.mint(record.userId, record.familyId, record.familyCreatedAt), userId: record.userId }
+  }
+  revokeFamily(familyId: string): void { for (const r of this.store.values()) if (r.familyId === familyId) r.revokedAt = this.now() }
+}
+</script>
+  <script type="wrong">
+// 重用時只拒絕這一次，沒撤銷家族
+type RefreshRecord = { userId: number; familyId: string; issuedAt: number; familyCreatedAt: number; usedAt: number | null; revokedAt: number | null }
+type RotateResult = { ok: true; refreshToken: string; userId: number } | { ok: false; error: 'invalid' | 'expired' | 'reused' }
+const DAY = 24 * 60 * 60 * 1000, IDLE = 14 * DAY, ABSOLUTE = 60 * DAY
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+async function sha256(text: string): Promise<string> { return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))) }
+class RefreshTokenService {
+  now: () => number
+  store: Map<string, RefreshRecord>
+  constructor(now: () => number, store: Map<string, RefreshRecord>) { this.now = now; this.store = store }
+  async mint(userId: number, familyId: string, familyCreatedAt: number): Promise<string> {
+    const token = base64url(crypto.getRandomValues(new Uint8Array(32)))
+    this.store.set(await sha256(token), { userId, familyId, issuedAt: this.now(), familyCreatedAt, usedAt: null, revokedAt: null })
+    return token
+  }
+  async issue(userId: number): Promise<{ refreshToken: string; familyId: string }> { const familyId = crypto.randomUUID(); return { refreshToken: await this.mint(userId, familyId, this.now()), familyId } }
+  async rotate(token: string): Promise<RotateResult> {
+    const record = this.store.get(await sha256(token))
+    if (!record || record.revokedAt !== null) return { ok: false, error: 'invalid' }
+    if (record.usedAt !== null) return { ok: false, error: 'reused' }
+    const t = this.now()
+    if (t - record.issuedAt >= IDLE || t - record.familyCreatedAt >= ABSOLUTE) return { ok: false, error: 'expired' }
+    record.usedAt = t
+    return { ok: true, refreshToken: await this.mint(record.userId, record.familyId, record.familyCreatedAt), userId: record.userId }
+  }
+  revokeFamily(familyId: string): void { for (const r of this.store.values()) if (r.familyId === familyId) r.revokedAt = this.now() }
+}
+</script>
+  <script type="wrong">
+// 重用時撤銷這個使用者的所有家族（另一台裝置也被登出）
+type RefreshRecord = { userId: number; familyId: string; issuedAt: number; familyCreatedAt: number; usedAt: number | null; revokedAt: number | null }
+type RotateResult = { ok: true; refreshToken: string; userId: number } | { ok: false; error: 'invalid' | 'expired' | 'reused' }
+const DAY = 24 * 60 * 60 * 1000, IDLE = 14 * DAY, ABSOLUTE = 60 * DAY
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+async function sha256(text: string): Promise<string> { return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))) }
+class RefreshTokenService {
+  now: () => number
+  store: Map<string, RefreshRecord>
+  constructor(now: () => number, store: Map<string, RefreshRecord>) { this.now = now; this.store = store }
+  async mint(userId: number, familyId: string, familyCreatedAt: number): Promise<string> {
+    const token = base64url(crypto.getRandomValues(new Uint8Array(32)))
+    this.store.set(await sha256(token), { userId, familyId, issuedAt: this.now(), familyCreatedAt, usedAt: null, revokedAt: null })
+    return token
+  }
+  async issue(userId: number): Promise<{ refreshToken: string; familyId: string }> { const familyId = crypto.randomUUID(); return { refreshToken: await this.mint(userId, familyId, this.now()), familyId } }
+  async rotate(token: string): Promise<RotateResult> {
+    const record = this.store.get(await sha256(token))
+    if (!record || record.revokedAt !== null) return { ok: false, error: 'invalid' }
+    if (record.usedAt !== null) {
+      for (const r of this.store.values()) if (r.userId === record.userId) r.revokedAt = this.now()
+      return { ok: false, error: 'reused' }
+    }
+    const t = this.now()
+    if (t - record.issuedAt >= IDLE || t - record.familyCreatedAt >= ABSOLUTE) return { ok: false, error: 'expired' }
+    record.usedAt = t
+    return { ok: true, refreshToken: await this.mint(record.userId, record.familyId, record.familyCreatedAt), userId: record.userId }
+  }
+  revokeFamily(familyId: string): void { for (const r of this.store.values()) if (r.familyId === familyId) r.revokedAt = this.now() }
+}
+</script>
+  <script type="wrong">
+// 每次輪替都重新起算期限（沒有絕對期限）
+type RefreshRecord = { userId: number; familyId: string; issuedAt: number; familyCreatedAt: number; usedAt: number | null; revokedAt: number | null }
+type RotateResult = { ok: true; refreshToken: string; userId: number } | { ok: false; error: 'invalid' | 'expired' | 'reused' }
+const DAY = 24 * 60 * 60 * 1000, IDLE = 14 * DAY, ABSOLUTE = 60 * DAY
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+async function sha256(text: string): Promise<string> { return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))) }
+class RefreshTokenService {
+  now: () => number
+  store: Map<string, RefreshRecord>
+  constructor(now: () => number, store: Map<string, RefreshRecord>) { this.now = now; this.store = store }
+  async mint(userId: number, familyId: string): Promise<string> {
+    const token = base64url(crypto.getRandomValues(new Uint8Array(32)))
+    this.store.set(await sha256(token), { userId, familyId, issuedAt: this.now(), familyCreatedAt: this.now(), usedAt: null, revokedAt: null })
+    return token
+  }
+  async issue(userId: number): Promise<{ refreshToken: string; familyId: string }> { const familyId = crypto.randomUUID(); return { refreshToken: await this.mint(userId, familyId), familyId } }
+  async rotate(token: string): Promise<RotateResult> {
+    const record = this.store.get(await sha256(token))
+    if (!record || record.revokedAt !== null) return { ok: false, error: 'invalid' }
+    if (record.usedAt !== null) { this.revokeFamily(record.familyId); return { ok: false, error: 'reused' } }
+    const t = this.now()
+    if (t - record.issuedAt >= IDLE || t - record.familyCreatedAt >= ABSOLUTE) return { ok: false, error: 'expired' }
+    record.usedAt = t
+    return { ok: true, refreshToken: await this.mint(record.userId, record.familyId), userId: record.userId }
+  }
+  revokeFamily(familyId: string): void { for (const r of this.store.values()) if (r.familyId === familyId) r.revokedAt = this.now() }
+}
+</script>
+  <script type="wrong">
+// store 的 key 是原始 token
+type RefreshRecord = { userId: number; familyId: string; issuedAt: number; familyCreatedAt: number; usedAt: number | null; revokedAt: number | null }
+type RotateResult = { ok: true; refreshToken: string; userId: number } | { ok: false; error: 'invalid' | 'expired' | 'reused' }
+const DAY = 24 * 60 * 60 * 1000, IDLE = 14 * DAY, ABSOLUTE = 60 * DAY
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+class RefreshTokenService {
+  now: () => number
+  store: Map<string, RefreshRecord>
+  constructor(now: () => number, store: Map<string, RefreshRecord>) { this.now = now; this.store = store }
+  async mint(userId: number, familyId: string, familyCreatedAt: number): Promise<string> {
+    const token = base64url(crypto.getRandomValues(new Uint8Array(32)))
+    this.store.set(token, { userId, familyId, issuedAt: this.now(), familyCreatedAt, usedAt: null, revokedAt: null })
+    return token
+  }
+  async issue(userId: number): Promise<{ refreshToken: string; familyId: string }> { const familyId = crypto.randomUUID(); return { refreshToken: await this.mint(userId, familyId, this.now()), familyId } }
+  async rotate(token: string): Promise<RotateResult> {
+    const record = this.store.get(token)
+    if (!record || record.revokedAt !== null) return { ok: false, error: 'invalid' }
+    if (record.usedAt !== null) { this.revokeFamily(record.familyId); return { ok: false, error: 'reused' } }
+    const t = this.now()
+    if (t - record.issuedAt >= IDLE || t - record.familyCreatedAt >= ABSOLUTE) return { ok: false, error: 'expired' }
+    record.usedAt = t
+    return { ok: true, refreshToken: await this.mint(record.userId, record.familyId, record.familyCreatedAt), userId: record.userId }
+  }
+  revokeFamily(familyId: string): void { for (const r of this.store.values()) if (r.familyId === familyId) r.revokedAt = this.now() }
+}
+</script>
+  <script type="wrong">
+// 先查期限再查重用：過期的舊 token 再出現只會得到 expired，家族沒被撤銷
+type RefreshRecord = { userId: number; familyId: string; issuedAt: number; familyCreatedAt: number; usedAt: number | null; revokedAt: number | null }
+type RotateResult = { ok: true; refreshToken: string; userId: number } | { ok: false; error: 'invalid' | 'expired' | 'reused' }
+const DAY = 24 * 60 * 60 * 1000, IDLE = 14 * DAY, ABSOLUTE = 60 * DAY
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+async function sha256(text: string): Promise<string> { return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))) }
+class RefreshTokenService {
+  now: () => number
+  store: Map<string, RefreshRecord>
+  constructor(now: () => number, store: Map<string, RefreshRecord>) { this.now = now; this.store = store }
+  async mint(userId: number, familyId: string, familyCreatedAt: number): Promise<string> {
+    const token = base64url(crypto.getRandomValues(new Uint8Array(32)))
+    this.store.set(await sha256(token), { userId, familyId, issuedAt: this.now(), familyCreatedAt, usedAt: null, revokedAt: null })
+    return token
+  }
+  async issue(userId: number): Promise<{ refreshToken: string; familyId: string }> { const familyId = crypto.randomUUID(); return { refreshToken: await this.mint(userId, familyId, this.now()), familyId } }
+  async rotate(token: string): Promise<RotateResult> {
+    const record = this.store.get(await sha256(token))
+    if (!record || record.revokedAt !== null) return { ok: false, error: 'invalid' }
+    const t = this.now()
+    if (t - record.issuedAt >= IDLE || t - record.familyCreatedAt >= ABSOLUTE) return { ok: false, error: 'expired' }
+    if (record.usedAt !== null) { this.revokeFamily(record.familyId); return { ok: false, error: 'reused' } }
+    record.usedAt = t
+    return { ok: true, refreshToken: await this.mint(record.userId, record.familyId, record.familyCreatedAt), userId: record.userId }
+  }
+  revokeFamily(familyId: string): void { for (const r of this.store.values()) if (r.familyId === familyId) r.revokedAt = this.now() }
+}
+</script>
+  <script type="wrong">
+// userId 寫死成 1
+type RefreshRecord = { userId: number; familyId: string; issuedAt: number; familyCreatedAt: number; usedAt: number | null; revokedAt: number | null }
+type RotateResult = { ok: true; refreshToken: string; userId: number } | { ok: false; error: 'invalid' | 'expired' | 'reused' }
+const DAY = 24 * 60 * 60 * 1000, IDLE = 14 * DAY, ABSOLUTE = 60 * DAY
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+async function sha256(text: string): Promise<string> { return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))) }
+class RefreshTokenService {
+  now: () => number
+  store: Map<string, RefreshRecord>
+  constructor(now: () => number, store: Map<string, RefreshRecord>) { this.now = now; this.store = store }
+  async mint(userId: number, familyId: string, familyCreatedAt: number): Promise<string> {
+    const token = base64url(crypto.getRandomValues(new Uint8Array(32)))
+    this.store.set(await sha256(token), { userId, familyId, issuedAt: this.now(), familyCreatedAt, usedAt: null, revokedAt: null })
+    return token
+  }
+  async issue(userId: number): Promise<{ refreshToken: string; familyId: string }> { const familyId = crypto.randomUUID(); return { refreshToken: await this.mint(userId, familyId, this.now()), familyId } }
+  async rotate(token: string): Promise<RotateResult> {
+    const record = this.store.get(await sha256(token))
+    if (!record || record.revokedAt !== null) return { ok: false, error: 'invalid' }
+    if (record.usedAt !== null) { this.revokeFamily(record.familyId); return { ok: false, error: 'reused' } }
+    const t = this.now()
+    if (t - record.issuedAt >= IDLE || t - record.familyCreatedAt >= ABSOLUTE) return { ok: false, error: 'expired' }
+    record.usedAt = t
+    return { ok: true, refreshToken: await this.mint(record.userId, record.familyId, record.familyCreatedAt), userId: 1 }
+  }
+  revokeFamily(familyId: string): void { for (const r of this.store.values()) if (r.familyId === familyId) r.revokedAt = this.now() }
+}
+</script>
+  <script type="wrong">
+// revokeFamily 直接刪掉家族的紀錄
+type RefreshRecord = { userId: number; familyId: string; issuedAt: number; familyCreatedAt: number; usedAt: number | null; revokedAt: number | null }
+type RotateResult = { ok: true; refreshToken: string; userId: number } | { ok: false; error: 'invalid' | 'expired' | 'reused' }
+const DAY = 24 * 60 * 60 * 1000, IDLE = 14 * DAY, ABSOLUTE = 60 * DAY
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+async function sha256(text: string): Promise<string> { return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))) }
+class RefreshTokenService {
+  now: () => number
+  store: Map<string, RefreshRecord>
+  constructor(now: () => number, store: Map<string, RefreshRecord>) { this.now = now; this.store = store }
+  async mint(userId: number, familyId: string, familyCreatedAt: number): Promise<string> {
+    const token = base64url(crypto.getRandomValues(new Uint8Array(32)))
+    this.store.set(await sha256(token), { userId, familyId, issuedAt: this.now(), familyCreatedAt, usedAt: null, revokedAt: null })
+    return token
+  }
+  async issue(userId: number): Promise<{ refreshToken: string; familyId: string }> { const familyId = crypto.randomUUID(); return { refreshToken: await this.mint(userId, familyId, this.now()), familyId } }
+  async rotate(token: string): Promise<RotateResult> {
+    const record = this.store.get(await sha256(token))
+    if (!record || record.revokedAt !== null) return { ok: false, error: 'invalid' }
+    if (record.usedAt !== null) { this.revokeFamily(record.familyId); return { ok: false, error: 'reused' } }
+    const t = this.now()
+    if (t - record.issuedAt >= IDLE || t - record.familyCreatedAt >= ABSOLUTE) return { ok: false, error: 'expired' }
+    record.usedAt = t
+    return { ok: true, refreshToken: await this.mint(record.userId, record.familyId, record.familyCreatedAt), userId: record.userId }
+  }
+  revokeFamily(familyId: string): void { for (const [k, r] of this.store) if (r.familyId === familyId) this.store.delete(k) }
+}
+</script>
+  <script type="wrong">
+// 重用時在 rotate 裡自己撤銷，revokeFamily 沒實作
+type RefreshRecord = { userId: number; familyId: string; issuedAt: number; familyCreatedAt: number; usedAt: number | null; revokedAt: number | null }
+type RotateResult = { ok: true; refreshToken: string; userId: number } | { ok: false; error: 'invalid' | 'expired' | 'reused' }
+const DAY = 24 * 60 * 60 * 1000, IDLE = 14 * DAY, ABSOLUTE = 60 * DAY
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+async function sha256(text: string): Promise<string> { return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))) }
+class RefreshTokenService {
+  now: () => number
+  store: Map<string, RefreshRecord>
+  constructor(now: () => number, store: Map<string, RefreshRecord>) { this.now = now; this.store = store }
+  async mint(userId: number, familyId: string, familyCreatedAt: number): Promise<string> {
+    const token = base64url(crypto.getRandomValues(new Uint8Array(32)))
+    this.store.set(await sha256(token), { userId, familyId, issuedAt: this.now(), familyCreatedAt, usedAt: null, revokedAt: null })
+    return token
+  }
+  async issue(userId: number): Promise<{ refreshToken: string; familyId: string }> { const familyId = crypto.randomUUID(); return { refreshToken: await this.mint(userId, familyId, this.now()), familyId } }
+  async rotate(token: string): Promise<RotateResult> {
+    const record = this.store.get(await sha256(token))
+    if (!record || record.revokedAt !== null) return { ok: false, error: 'invalid' }
+    if (record.usedAt !== null) {
+      for (const r of this.store.values()) if (r.familyId === record.familyId) r.revokedAt = this.now()
+      return { ok: false, error: 'reused' }
+    }
+    const t = this.now()
+    if (t - record.issuedAt >= IDLE || t - record.familyCreatedAt >= ABSOLUTE) return { ok: false, error: 'expired' }
+    record.usedAt = t
+    return { ok: true, refreshToken: await this.mint(record.userId, record.familyId, record.familyCreatedAt), userId: record.userId }
+  }
+  revokeFamily(familyId: string): void { throw new Error('TODO') }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：寫 Vue 前端用的 <code>createTokenClient(deps)</code>，回傳一個有 <code>getAccessToken()</code> 的物件：</p>
+  <ul>
+    <li>手上的 access token 還有效（<code>now() &lt; expiresAt</code>）就直接回傳，不呼叫 refresh。</li>
+    <li>沒有 token 或已過期時呼叫 <code>deps.refresh()</code>。<strong>同時</strong>有多個呼叫時只呼叫一次 refresh，大家拿到同一個結果（single-flight）。</li>
+    <li>refresh 失敗時，所有等待中的呼叫都收到同一個錯誤；下一次呼叫要能重新 refresh。</li>
+  </ul>
+  <script type="start">
+type TokenSet = { accessToken: string; expiresAt: number }
+type Deps = { refresh: () => Promise<TokenSet>; now: () => number }
+
+function createTokenClient(deps: Deps): { getAccessToken(): Promise<string> } {
+  return {
+    getAccessToken() {
+      throw new Error('TODO')
+    },
+  }
+}
+
+let calls = 0
+const client = createTokenClient({
+  refresh: async () => {
+    calls++
+    await new Promise(r => setTimeout(r, 10))
+    return { accessToken: 'AT' + calls, expiresAt: 15 * 60 * 1000 }
+  },
+  now: () => 0,
+})
+console.log(await Promise.all([client.getAccessToken(), client.getAccessToken(), client.getAccessToken()]))
+console.log('refresh 次數', calls)
+</script>
+  <script type="answer">
+type TokenSet = { accessToken: string; expiresAt: number }
+type Deps = { refresh: () => Promise<TokenSet>; now: () => number }
+
+function createTokenClient(deps: Deps): { getAccessToken(): Promise<string> } {
+  let current: TokenSet | null = null
+  let inflight: Promise<string> | null = null
+  return {
+    getAccessToken() {
+      if (current && deps.now() < current.expiresAt) return Promise.resolve(current.accessToken)
+      if (!inflight) {
+        inflight = deps.refresh()
+          .then(tokens => {
+            current = tokens
+            return tokens.accessToken
+          })
+          .finally(() => { inflight = null })   // 成功或失敗都清掉，下一次才能重試
+      }
+      return inflight
+    },
+  }
+}
+
+let calls = 0
+const client = createTokenClient({
+  refresh: async () => {
+    calls++
+    await new Promise(r => setTimeout(r, 10))
+    return { accessToken: 'AT' + calls, expiresAt: 15 * 60 * 1000 }
+  },
+  now: () => 0,
+})
+console.log(await Promise.all([client.getAccessToken(), client.getAccessToken(), client.getAccessToken()]))
+console.log('refresh 次數', calls)
+</script>
+  <script type="types">
+type _1 = Expect<Equal<ReturnType<ReturnType<typeof createTokenClient>['getAccessToken']>, Promise<string>>>  // getAccessToken 回傳 Promise<string>
+</script>
+  <script type="tests">
+const deferred = () => {
+  let resolve!: (v: TokenSet) => void
+  let reject!: (e: unknown) => void
+  const promise = new Promise<TokenSet>((res, rej) => { resolve = res; reject = rej })
+  return { promise, resolve, reject }
+}
+let clock = 0, count = 0, pending = deferred()
+const c = createTokenClient({ refresh: () => { count++; return pending.promise }, now: () => clock })
+
+const first = Array.from({ length: 10 }, () => c.getAccessToken())
+assert.equal(count, 1, '10 個同時的 getAccessToken() 只能呼叫 refresh 一次')
+pending.resolve({ accessToken: 'AT1', expiresAt: 1000 })
+assert.deepEqual(await Promise.all(first), Array(10).fill('AT1'), '10 個呼叫都要拿到同一個 access token')
+
+clock = 999
+assert.equal(await c.getAccessToken(), 'AT1', 'expiresAt 之前要直接用快取的 token')
+assert.equal(count, 1, 'token 還有效時不能呼叫 refresh')
+
+clock = 1000
+pending = deferred()
+const p1 = c.getAccessToken()
+await new Promise(r => setTimeout(r, 0))
+const p2 = c.getAccessToken()
+assert.equal(count, 2, '到了 expiresAt 要 refresh；refresh 還沒完成時再來的呼叫要等同一個，不能再 refresh')
+pending.resolve({ accessToken: 'AT2', expiresAt: 2000 })
+assert.deepEqual([await p1, await p2], ['AT2', 'AT2'], '等待中的呼叫都要拿到新的 token')
+
+clock = 2000
+pending = deferred()
+const boom = new Error('refresh 失敗')
+const failing = Array.from({ length: 10 }, () => c.getAccessToken())
+assert.equal(count, 3, '過期後同時 10 個呼叫只 refresh 一次')
+pending.reject(boom)
+const settled = await Promise.allSettled(failing)
+assert(settled.every(s => s.status === 'rejected' && s.reason === boom), 'refresh 失敗時，10 個呼叫都要收到同一個錯誤')
+
+pending = deferred()
+const retry = c.getAccessToken()
+assert.equal(count, 4, 'refresh 失敗後，下一次呼叫要重新 refresh，不能一直拿到同一個失敗')
+pending.resolve({ accessToken: 'AT3', expiresAt: 3000 })
+assert.equal(await retry, 'AT3', '重試成功要拿到新的 token')
+</script>
+  <script type="wrong">
+// 每個呼叫各自 refresh
+type TokenSet = { accessToken: string; expiresAt: number }
+type Deps = { refresh: () => Promise<TokenSet>; now: () => number }
+function createTokenClient(deps: Deps): { getAccessToken(): Promise<string> } {
+  let current: TokenSet | null = null
+  return {
+    async getAccessToken() {
+      if (current && deps.now() < current.expiresAt) return current.accessToken
+      current = await deps.refresh()
+      return current.accessToken
+    },
+  }
+}
+</script>
+  <script type="wrong">
+// 把失敗的 Promise 永遠快取起來
+type TokenSet = { accessToken: string; expiresAt: number }
+type Deps = { refresh: () => Promise<TokenSet>; now: () => number }
+function createTokenClient(deps: Deps): { getAccessToken(): Promise<string> } {
+  let current: TokenSet | null = null
+  let inflight: Promise<string> | null = null
+  return {
+    getAccessToken() {
+      if (current && deps.now() < current.expiresAt) return Promise.resolve(current.accessToken)
+      if (!inflight) {
+        inflight = deps.refresh().then(tokens => { current = tokens; inflight = null; return tokens.accessToken })
+      }
+      return inflight
+    },
+  }
+}
+</script>
+  <script type="wrong">
+// refresh 完成前就清掉進行中的 Promise
+type TokenSet = { accessToken: string; expiresAt: number }
+type Deps = { refresh: () => Promise<TokenSet>; now: () => number }
+function createTokenClient(deps: Deps): { getAccessToken(): Promise<string> } {
+  let current: TokenSet | null = null
+  let inflight: Promise<string> | null = null
+  return {
+    getAccessToken() {
+      if (current && deps.now() < current.expiresAt) return Promise.resolve(current.accessToken)
+      if (inflight) return inflight
+      inflight = deps.refresh().then(tokens => { current = tokens; return tokens.accessToken })
+      const p = inflight
+      inflight = null
+      return p
+    },
+  }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：咖啡店的 API 部署了兩台伺服器，兩個 <code>RefreshTokenService</code> 實例共用同一個資料庫。下面的 <code>rotate</code> 是「先讀、再判斷、再寫」，<code>FakeDb</code> 的每個操作都會 <code>await</code>（模擬資料庫來回）。兩台同時收到同一張 refresh token 時，兩個都換到新 token，重用偵測失效。改寫 <code>rotate</code>，用資料庫提供的原子操作 <code>markUsedIfUnused(hash, at)</code>（等於 <code>UPDATE … WHERE used_at IS NULL</code>，回傳有沒有改到），讓同時兩個 rotate 只有一個成功、另一個判定為 <code>reused</code> 並撤銷家族。這題不處理期限；<code>FakeDb</code> 和 <code>issue</code> 不用改。</p>
+  <script type="start">
+type Row = { userId: number; familyId: string; usedAt: number | null }
+type RotateResult =
+  | { ok: true; refreshToken: string; userId: number }
+  | { ok: false; error: 'invalid' | 'reused' }
+
+// 已經寫好（第 2 課）
+function base64url(bytes: Uint8Array<ArrayBuffer>): string {
+  let s = ''
+  for (const b of bytes) s += String.fromCharCode(b)
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+async function sha256(text: string): Promise<string> {
+  return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))))
+}
+
+const io = () => new Promise<void>(r => setTimeout(r, 0))   // 模擬一次資料庫來回
+
+class FakeDb {
+  rows = new Map<string, Row>()
+  revokedFamilies = new Set<string>()   // 等於另一張 token_families 表的 revoked_at
+  async find(hash: string): Promise<(Row & { revoked: boolean }) | null> {
+    await io()
+    const row = this.rows.get(hash)
+    return row ? { ...row, revoked: this.revokedFamilies.has(row.familyId) } : null
+  }
+  async insert(hash: string, row: Row): Promise<void> {
+    await io()
+    this.rows.set(hash, { ...row })
+  }
+  async markUsed(hash: string, at: number): Promise<void> {
+    await io()
+    const row = this.rows.get(hash)
+    if (row) row.usedAt = at
+  }
+  // UPDATE refresh_tokens SET used_at = $2 WHERE token_hash = $1 AND used_at IS NULL：回傳有沒有改到一列
+  async markUsedIfUnused(hash: string, at: number): Promise<boolean> {
+    await io()
+    const row = this.rows.get(hash)
+    if (!row || row.usedAt !== null) return false
+    row.usedAt = at
+    return true
+  }
+  async revokeFamily(familyId: string): Promise<void> {
+    await io()
+    this.revokedFamilies.add(familyId)
+  }
+}
+
+class RefreshTokenService {
+  now: () => number
+  db: FakeDb
+  constructor(now: () => number, db: FakeDb) {
+    this.now = now
+    this.db = db
+  }
+
+  async issue(userId: number, familyId: string = crypto.randomUUID()): Promise<string> {
+    const token = base64url(crypto.getRandomValues(new Uint8Array(32)))
+    await this.db.insert(await sha256(token), { userId, familyId, usedAt: null })
+    return token
+  }
+
+  async rotate(token: string): Promise<RotateResult> {
+    const hash = await sha256(token)
+    const row = await this.db.find(hash)
+    if (!row || row.revoked) return { ok: false, error: 'invalid' }
+    if (row.usedAt !== null) {
+      await this.db.revokeFamily(row.familyId)
+      return { ok: false, error: 'reused' }
+    }
+    await this.db.markUsed(hash, this.now())
+    const refreshToken = await this.issue(row.userId, row.familyId)
+    return { ok: true, refreshToken, userId: row.userId }
+  }
+}
+
+const db = new FakeDb()
+const serverA = new RefreshTokenService(() => 0, db)
+const serverB = new RefreshTokenService(() => 0, db)
+const rt1 = await serverA.issue(1)
+const results = await Promise.all([serverA.rotate(rt1), serverB.rotate(rt1)])
+console.log(results.map(r => r.ok ? 'ok' : r.error))
+</script>
+  <script type="answer">
+type Row = { userId: number; familyId: string; usedAt: number | null }
+type RotateResult =
+  | { ok: true; refreshToken: string; userId: number }
+  | { ok: false; error: 'invalid' | 'reused' }
+
+// 已經寫好（第 2 課）
+function base64url(bytes: Uint8Array<ArrayBuffer>): string {
+  let s = ''
+  for (const b of bytes) s += String.fromCharCode(b)
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+async function sha256(text: string): Promise<string> {
+  return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))))
+}
+
+const io = () => new Promise<void>(r => setTimeout(r, 0))   // 模擬一次資料庫來回
+
+class FakeDb {
+  rows = new Map<string, Row>()
+  revokedFamilies = new Set<string>()   // 等於另一張 token_families 表的 revoked_at
+  async find(hash: string): Promise<(Row & { revoked: boolean }) | null> {
+    await io()
+    const row = this.rows.get(hash)
+    return row ? { ...row, revoked: this.revokedFamilies.has(row.familyId) } : null
+  }
+  async insert(hash: string, row: Row): Promise<void> {
+    await io()
+    this.rows.set(hash, { ...row })
+  }
+  async markUsed(hash: string, at: number): Promise<void> {
+    await io()
+    const row = this.rows.get(hash)
+    if (row) row.usedAt = at
+  }
+  // UPDATE refresh_tokens SET used_at = $2 WHERE token_hash = $1 AND used_at IS NULL：回傳有沒有改到一列
+  async markUsedIfUnused(hash: string, at: number): Promise<boolean> {
+    await io()
+    const row = this.rows.get(hash)
+    if (!row || row.usedAt !== null) return false
+    row.usedAt = at
+    return true
+  }
+  async revokeFamily(familyId: string): Promise<void> {
+    await io()
+    this.revokedFamilies.add(familyId)
+  }
+}
+
+class RefreshTokenService {
+  now: () => number
+  db: FakeDb
+  constructor(now: () => number, db: FakeDb) {
+    this.now = now
+    this.db = db
+  }
+
+  async issue(userId: number, familyId: string = crypto.randomUUID()): Promise<string> {
+    const token = base64url(crypto.getRandomValues(new Uint8Array(32)))
+    await this.db.insert(await sha256(token), { userId, familyId, usedAt: null })
+    return token
+  }
+
+  async rotate(token: string): Promise<RotateResult> {
+    const hash = await sha256(token)
+    const row = await this.db.find(hash)
+    if (!row || row.revoked) return { ok: false, error: 'invalid' }
+    // 檢查和標記在同一個操作裡完成：同時來的兩個請求只有一個會改到
+    const won = await this.db.markUsedIfUnused(hash, this.now())
+    if (!won) {
+      await this.db.revokeFamily(row.familyId)
+      return { ok: false, error: 'reused' }
+    }
+    const refreshToken = await this.issue(row.userId, row.familyId)
+    return { ok: true, refreshToken, userId: row.userId }
+  }
+}
+
+const db = new FakeDb()
+const serverA = new RefreshTokenService(() => 0, db)
+const serverB = new RefreshTokenService(() => 0, db)
+const rt1 = await serverA.issue(1)
+const results = await Promise.all([serverA.rotate(rt1), serverB.rotate(rt1)])
+console.log(results.map(r => r.ok ? 'ok' : r.error))
+</script>
+  <script type="tests">
+const label = (r: RotateResult) => r.ok ? 'ok' : r.error
+const tick = () => new Promise<void>(r => setTimeout(r, 0))
+// 測試用自己的資料庫（跟題目的 FakeDb 一樣），改 FakeDb 不會影響判分
+class RefDb {
+  rows = new Map<string, Row>()
+  revokedFamilies = new Set<string>()
+  async find(hash: string): Promise<(Row & { revoked: boolean }) | null> {
+    await tick()
+    const row = this.rows.get(hash)
+    return row ? { ...row, revoked: this.revokedFamilies.has(row.familyId) } : null
+  }
+  async insert(hash: string, row: Row): Promise<void> { await tick(); this.rows.set(hash, { ...row }) }
+  async markUsed(hash: string, at: number): Promise<void> { await tick(); const row = this.rows.get(hash); if (row) row.usedAt = at }
+  async markUsedIfUnused(hash: string, at: number): Promise<boolean> {
+    await tick()
+    const row = this.rows.get(hash)
+    if (!row || row.usedAt !== null) return false
+    row.usedAt = at
+    return true
+  }
+  async revokeFamily(familyId: string): Promise<void> { await tick(); this.revokedFamilies.add(familyId) }
+}
+const db2 = new RefDb()
+const s1 = new RefreshTokenService(() => 0, db2), s2 = new RefreshTokenService(() => 0, db2)
+let atomic = 0
+const orig = db2.markUsedIfUnused.bind(db2)
+db2.markUsedIfUnused = async (h: string, at: number) => { atomic++; return orig(h, at) }
+
+const t1 = await s1.issue(1)
+const both = await Promise.all([s1.rotate(t1), s2.rotate(t1)])
+assert.deepEqual(both.map(label).sort(), ['ok', 'reused'], `兩台伺服器同時 rotate 同一張 token，要剛好一個 ok、一個 reused（得到 ${both.map(label).join('、')}）`)
+assert(atomic >= 2, '要用資料庫的 markUsedIfUnused 判斷誰搶到，不能靠伺服器自己記')
+const winner = both.find(r => r.ok)
+if (winner && winner.ok) assert.equal(label(await s1.rotate(winner.refreshToken)), 'invalid', '判定重用後要撤銷家族：贏家拿到的新 token 也要失效')
+
+const t2 = await s2.issue(2)
+const r1 = await s1.rotate(t2)
+assert(r1.ok, '循序輪替：第一次要成功')
+const r2 = r1.ok ? await s2.rotate(r1.refreshToken) : r1
+assert(r2.ok, '循序輪替：換另一台伺服器再輪替也要成功')
+assert(r2.ok && r2.userId === 2, 'rotate 成功時要回傳 userId')
+assert.equal(label(await s1.rotate(t2)), 'reused', '循序情況下用過的 token 再出現也要回 reused')
+if (r2.ok) assert.equal(label(await s2.rotate(r2.refreshToken)), 'invalid', '循序情況下判定重用也要撤銷家族：家族裡最新的 token 要失效')
+assert.equal(label(await s1.rotate('nope')), 'invalid', '不認得的 token 回 invalid')
+
+const t3 = await s1.issue(3)
+const three = await Promise.all([s1.rotate(t3), s2.rotate(t3), s1.rotate(t3)])
+assert.equal(three.filter(r => r.ok).length, 1, '三個請求同時到，也只能有一個成功')
+</script>
+  <script type="wrong">
+// 呼叫了 markUsedIfUnused 但沒看回傳值
+type Row = { userId: number; familyId: string; usedAt: number | null }
+type RotateResult = { ok: true; refreshToken: string; userId: number } | { ok: false; error: 'invalid' | 'reused' }
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+async function sha256(text: string): Promise<string> { return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))) }
+const io = () => new Promise<void>(r => setTimeout(r, 0))
+class FakeDb {
+  rows = new Map<string, Row>()
+  revokedFamilies = new Set<string>()
+  async find(hash: string): Promise<(Row & { revoked: boolean }) | null> { await io(); const row = this.rows.get(hash); return row ? { ...row, revoked: this.revokedFamilies.has(row.familyId) } : null }
+  async insert(hash: string, row: Row): Promise<void> { await io(); this.rows.set(hash, { ...row }) }
+  async markUsed(hash: string, at: number): Promise<void> { await io(); const row = this.rows.get(hash); if (row) row.usedAt = at }
+  async markUsedIfUnused(hash: string, at: number): Promise<boolean> { await io(); const row = this.rows.get(hash); if (!row || row.usedAt !== null) return false; row.usedAt = at; return true }
+  async revokeFamily(familyId: string): Promise<void> { await io(); this.revokedFamilies.add(familyId) }
+}
+class RefreshTokenService {
+  now: () => number
+  db: FakeDb
+  constructor(now: () => number, db: FakeDb) { this.now = now; this.db = db }
+  async issue(userId: number, familyId: string = crypto.randomUUID()): Promise<string> {
+    const token = base64url(crypto.getRandomValues(new Uint8Array(32)))
+    await this.db.insert(await sha256(token), { userId, familyId, usedAt: null })
+    return token
+  }
+  async rotate(token: string): Promise<RotateResult> {
+    const hash = await sha256(token)
+    const row = await this.db.find(hash)
+    if (!row || row.revoked) return { ok: false, error: 'invalid' }
+    if (row.usedAt !== null) { await this.db.revokeFamily(row.familyId); return { ok: false, error: 'reused' } }
+    await this.db.markUsedIfUnused(hash, this.now())
+    return { ok: true, refreshToken: await this.issue(row.userId, row.familyId), userId: row.userId }
+  }
+}
+</script>
+  <script type="wrong">
+// 用實例上的 Set 上鎖：兩台伺服器各有一份，擋不住
+type Row = { userId: number; familyId: string; usedAt: number | null }
+type RotateResult = { ok: true; refreshToken: string; userId: number } | { ok: false; error: 'invalid' | 'reused' }
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+async function sha256(text: string): Promise<string> { return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))) }
+const io = () => new Promise<void>(r => setTimeout(r, 0))
+class FakeDb {
+  rows = new Map<string, Row>()
+  revokedFamilies = new Set<string>()
+  async find(hash: string): Promise<(Row & { revoked: boolean }) | null> { await io(); const row = this.rows.get(hash); return row ? { ...row, revoked: this.revokedFamilies.has(row.familyId) } : null }
+  async insert(hash: string, row: Row): Promise<void> { await io(); this.rows.set(hash, { ...row }) }
+  async markUsed(hash: string, at: number): Promise<void> { await io(); const row = this.rows.get(hash); if (row) row.usedAt = at }
+  async markUsedIfUnused(hash: string, at: number): Promise<boolean> { await io(); const row = this.rows.get(hash); if (!row || row.usedAt !== null) return false; row.usedAt = at; return true }
+  async revokeFamily(familyId: string): Promise<void> { await io(); this.revokedFamilies.add(familyId) }
+}
+class RefreshTokenService {
+  now: () => number
+  db: FakeDb
+  busy = new Set<string>()
+  constructor(now: () => number, db: FakeDb) { this.now = now; this.db = db }
+  async issue(userId: number, familyId: string = crypto.randomUUID()): Promise<string> {
+    const token = base64url(crypto.getRandomValues(new Uint8Array(32)))
+    await this.db.insert(await sha256(token), { userId, familyId, usedAt: null })
+    return token
+  }
+  async rotate(token: string): Promise<RotateResult> {
+    const hash = await sha256(token)
+    const row = await this.db.find(hash)
+    if (!row || row.revoked) return { ok: false, error: 'invalid' }
+    if (row.usedAt !== null || this.busy.has(hash)) { await this.db.revokeFamily(row.familyId); return { ok: false, error: 'reused' } }
+    this.busy.add(hash)
+    await this.db.markUsed(hash, this.now())
+    return { ok: true, refreshToken: await this.issue(row.userId, row.familyId), userId: row.userId }
+  }
+}
+</script>
+  <script type="wrong">
+// 循序重用時只回 reused、沒撤銷家族（只有並發輸家才撤銷）
+type Row = { userId: number; familyId: string; usedAt: number | null }
+type RotateResult = { ok: true; refreshToken: string; userId: number } | { ok: false; error: 'invalid' | 'reused' }
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+async function sha256(text: string): Promise<string> { return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))) }
+const io = () => new Promise<void>(r => setTimeout(r, 0))
+class FakeDb {
+  rows = new Map<string, Row>()
+  revokedFamilies = new Set<string>()
+  async find(hash: string): Promise<(Row & { revoked: boolean }) | null> { await io(); const row = this.rows.get(hash); return row ? { ...row, revoked: this.revokedFamilies.has(row.familyId) } : null }
+  async insert(hash: string, row: Row): Promise<void> { await io(); this.rows.set(hash, { ...row }) }
+  async markUsed(hash: string, at: number): Promise<void> { await io(); const row = this.rows.get(hash); if (row) row.usedAt = at }
+  async markUsedIfUnused(hash: string, at: number): Promise<boolean> { await io(); const row = this.rows.get(hash); if (!row || row.usedAt !== null) return false; row.usedAt = at; return true }
+  async revokeFamily(familyId: string): Promise<void> { await io(); this.revokedFamilies.add(familyId) }
+}
+class RefreshTokenService {
+  now: () => number
+  db: FakeDb
+  constructor(now: () => number, db: FakeDb) { this.now = now; this.db = db }
+  async issue(userId: number, familyId: string = crypto.randomUUID()): Promise<string> {
+    const token = base64url(crypto.getRandomValues(new Uint8Array(32)))
+    await this.db.insert(await sha256(token), { userId, familyId, usedAt: null })
+    return token
+  }
+  async rotate(token: string): Promise<RotateResult> {
+    const hash = await sha256(token)
+    const row = await this.db.find(hash)
+    if (!row || row.revoked) return { ok: false, error: 'invalid' }
+    if (row.usedAt !== null) return { ok: false, error: 'reused' }
+    if (!(await this.db.markUsedIfUnused(hash, this.now()))) { await this.db.revokeFamily(row.familyId); return { ok: false, error: 'reused' } }
+    return { ok: true, refreshToken: await this.issue(row.userId, row.familyId), userId: row.userId }
+  }
+}
+</script>
+  <script type="wrong">
+// 改 FakeDb：把 markUsed 改成條件更新，rotate 沒用 markUsedIfUnused
+type Row = { userId: number; familyId: string; usedAt: number | null }
+type RotateResult = { ok: true; refreshToken: string; userId: number } | { ok: false; error: 'invalid' | 'reused' }
+function base64url(bytes: Uint8Array<ArrayBuffer>): string { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+async function sha256(text: string): Promise<string> { return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))) }
+const io = () => new Promise<void>(r => setTimeout(r, 0))
+class FakeDb {
+  rows = new Map<string, Row>()
+  revokedFamilies = new Set<string>()
+  async find(hash: string): Promise<(Row & { revoked: boolean }) | null> { await io(); const row = this.rows.get(hash); return row ? { ...row, revoked: this.revokedFamilies.has(row.familyId) } : null }
+  async insert(hash: string, row: Row): Promise<void> { await io(); this.rows.set(hash, { ...row }) }
+  async markUsed(hash: string, at: number): Promise<void> { await io(); const row = this.rows.get(hash); if (!row || row.usedAt !== null) throw new Error('used'); row.usedAt = at }
+  async markUsedIfUnused(hash: string, at: number): Promise<boolean> { await io(); const row = this.rows.get(hash); if (!row || row.usedAt !== null) return false; row.usedAt = at; return true }
+  async revokeFamily(familyId: string): Promise<void> { await io(); this.revokedFamilies.add(familyId) }
+}
+class RefreshTokenService {
+  now: () => number
+  db: FakeDb
+  constructor(now: () => number, db: FakeDb) { this.now = now; this.db = db }
+  async issue(userId: number, familyId: string = crypto.randomUUID()): Promise<string> {
+    const token = base64url(crypto.getRandomValues(new Uint8Array(32)))
+    await this.db.insert(await sha256(token), { userId, familyId, usedAt: null })
+    return token
+  }
+  async rotate(token: string): Promise<RotateResult> {
+    const hash = await sha256(token)
+    const row = await this.db.find(hash)
+    if (!row || row.revoked) return { ok: false, error: 'invalid' }
+    try { await this.db.markUsed(hash, this.now()) } catch { await this.db.revokeFamily(row.familyId); return { ok: false, error: 'reused' } }
+    return { ok: true, refreshToken: await this.issue(row.userId, row.familyId), userId: row.userId }
+  }
+}
+</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：伺服器收到一張已經用過的 refresh token，判定為重用。為什麼連正牌使用者手上最新的 refresh token 也要一起撤銷？</p>
+  <label data-key="a">因為正牌使用者一定比攻擊者先用，伺服器知道後來的那個就是攻擊者，順便讓使用者重新登入比較保險</label>
+  <label data-key="b">不需要，只要拒絕這一次請求，攻擊者就拿不到新 token 了</label>
+  <label data-key="c">伺服器分不出這次請求和之前換到新 token 的請求哪個是攻擊者；如果攻擊者才是先換的那一方，只有撤銷整個家族才能讓他手上的新 token 失效</label>
+  <p class="why">✓ 重用只告訴你「這張 token 有兩個人拿著」，不告訴你誰是誰。攻擊者可能先用偷來的 RT1 換到 RT2，正牌使用者之後拿 RT1 才觸發偵測；這時只拒絕這一次，攻擊者手上的 RT2 會一直輪替下去。RFC 9700 §4.14.2 的做法就是撤銷目前有效的 token，代價是使用者重新登入。a 的「一定先用」不成立；b 正好放過了先換到 token 的攻擊者。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 5：access token 效期 15 分鐘（JWT，API 只驗簽章）。店長在 10:00 把一位店員停權，系統立刻撤銷了他所有的 refresh token。最壞情況下，這位店員還能呼叫 API 到幾點？</p>
+  <label data-key="a">大約 10:15：他手上的 access token 可能 10:00 前一刻才換到，到 exp 之前都有效</label>
+  <label data-key="b">10:00：撤銷 refresh token 會讓 access token 一起失效</label>
+  <label data-key="c">到 refresh token 的絕對期限（最多 60 天）</label>
+  <p class="why">✓ 撤銷 refresh token 只是讓他換不到<strong>下一張</strong> access token；手上那張 JWT 簽章仍然正確，API 不查資料庫就不知道他被停權了。所以 b 錯。c 錯在 refresh token 已經撤銷，換不到新的。要縮短這段時間：把 access token 效期再縮短、高風險操作（退款、改價格）每次從資料庫查使用者狀態、或用黑名單、版本號（第 11 課）。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：refresh token 的 cookie 設了 <code>Path=/auth/refresh</code>。這樣做的效果是什麼？</p>
+  <label data-key="a">同網站其他頁面的 JavaScript 讀不到它，可以取代 HttpOnly</label>
+  <label data-key="b">瀏覽器只在呼叫 <code>/auth/refresh</code> 時送它，其他 API 的請求、反向代理和 API 的 log 都不會出現它，減少外洩的地方</label>
+  <label data-key="c">跨站的網站無法對 <code>/auth/refresh</code> 發請求，可以取代 CSRF 防護</label>
+  <p class="why">✓ Path 只決定「瀏覽器在哪些路徑的請求帶這個 cookie」，讓 refresh token 不會跟著每個 <code>/orders</code> 請求到處跑。它不是安全邊界：防讀取要靠 HttpOnly（a 錯），跨站請求要靠 SameSite 加上第 6 課的 Origin 檢查（c 錯）。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>refresh token 放 <code>localStorage</code></strong>：XSS 可以讀走、帶到別的地方用很久。放 HttpOnly cookie 或用 BFF。</li>
+  <li><strong>refresh cookie 用 <code>Path=/</code></strong>：每個 API 請求都帶著它，出現在更多 log 和中間層。設 <code>Path=/auth/refresh</code>。</li>
+  <li><strong>資料庫存 refresh token 明文</strong>：備份外洩等於所有人的登入外洩。只存 SHA-256，原始值只出現在給客戶端的回應裡。</li>
+  <li><strong>用過的 refresh token 直接刪除</strong>：舊 token 再出現時只查得到「不存在」，無法分辨是亂猜還是被偷，也不知道要撤銷哪個家族。留著 <code>used_at</code>，等家族過期再清理。</li>
+  <li><strong>重用時只拒絕這一次</strong>：先換到新 token 的那一方繼續用下去。要撤銷整個家族。</li>
+  <li><strong>重用時撤銷使用者所有裝置</strong>：範圍太大，一台裝置出事其他裝置都被登出。撤銷這個家族就好；全部登出留給改密碼、停權。</li>
+  <li><strong>前端每個請求各自 refresh</strong>：同一張 refresh token 被送好幾次，觸發重用，使用者一直被登出。同分頁 single-flight，跨分頁用 Web Locks。</li>
+  <li><strong>rotate 寫成先讀後寫</strong>：兩個同時到的請求都成功，重用偵測失效。用 <code>UPDATE … WHERE used_at IS NULL</code> 看影響列數。</li>
+  <li><strong>refresh token 永不過期，也不輪替</strong>：被偷一次就永遠能用。輪替、閒置期限、絕對期限三個都要。</li>
+  <li><strong>以為撤銷 refresh token 就等於登出</strong>：已經發出去的 access token 到 exp 前都有效。access token 要短，高風險操作要即時查狀態。</li>
+</ul>
+
+<h2 id="appendix">補充與查表</h2>
+<h3>跨分頁排隊：瀏覽器支援與 BroadcastChannel</h3>
+<p>依 MDN 相容性資料，Web Locks API 在 Chrome 69、Firefox 96、Safari 15.4 起支援。除了用鎖讓分頁排隊，也可以用 <strong>BroadcastChannel</strong>：它讓同源的分頁互傳訊息，第一個分頁 refresh 完之後，把新的 access token 廣播給其他分頁，其他分頁就不用再 refresh 一次。</p>
+<h3>RFC 9700 對公開 client 的要求與 sender-constrained token</h3>
+<p>OAuth 把瀏覽器、手機 App 這種存不住秘密的客戶端叫做<strong>公開 client</strong>（<a href="12-oauth-pkce.html">第 12 課</a>）。RFC 9700 §2.2.2 規定，發給公開 client 的 refresh token <strong>必須</strong>輪替，或做成 sender-constrained token。</p>
+<p><strong>sender-constrained token</strong>（綁定持有者的 token）是比輪替更強的做法：token 綁定客戶端持有的一把私鑰，每個請求都要附上用私鑰簽的證明，偷走 token 沒有私鑰也不能用。例如 DPoP（<a href="https://www.rfc-editor.org/rfc/rfc9449.html">RFC 9449</a>）在應用層做這件事，mTLS（RFC 8705）用 TLS 的客戶端憑證做。這課知道名字與用途就好，需要時再查規格與函式庫。</p>
+
+<h2>小結</h2>
+<ul>
+  <li>一張 JWT 收不回來，效期怎麼設都兩難，所以拆成兩張：access token 短命（5～15 分鐘）、每個請求都帶；refresh token 長命、只送到 <code>/auth/refresh</code>、存在伺服器所以能撤銷，做成不透明 token，不用 JWT。</li>
+  <li>access token 放記憶體＋<code>Authorization</code> 標頭；refresh token 放 <code>__Secure-</code>、<code>HttpOnly</code>、<code>SameSite=Strict</code>、<code>Path=/auth/refresh</code> 的 cookie，XSS 只能借用、偷不走。</li>
+  <li>輪替：每次 refresh 都發新的，舊的標記已使用、不刪除；資料庫只存 SHA-256，用 <code>family_id</code> 串起同一次登入。</li>
+  <li>重用偵測：用過的 token 再出現，代表有兩個人拿著它，伺服器分不出誰是誰，所以撤銷整個家族（RFC 9700 §4.14.2），但只撤銷那個家族。</li>
+  <li>「一直被登出」多半是競態：同分頁 single-flight、跨分頁 Web Locks、後端用條件更新的影響列數決定誰贏，撤銷記在家族上；寬限期只能很短。</li>
+  <li>閒置期限從這張 token 算，絕對期限從家族建立算；登出、改密碼、停權時依範圍撤銷。撤銷管不到已發出的 access token，最壞還能用到它的 exp。</li>
+</ul>
+<p>下一課：登出與撤銷。按下登出、改密碼、停權時，session 和 JWT 各要怎麼做才能真的讓人「出去」，以及什麼時候該選哪一個。</p>
+
+</main>
+<script>
+// 時間軸：逐步顯示每一列，並在下方顯示目前步驟的說明
+document.querySelectorAll('.tl').forEach(tl => {
+  const rows = [...tl.querySelectorAll('tr[data-note]')]
+  const note = tl.querySelector('.note')
+  const count = tl.querySelector('[data-count]')
+  const prev = tl.querySelector('[data-prev]')
+  const next = tl.querySelector('[data-next]')
+  let cur = 0
+  const show = () => {
+    rows.forEach((r, i) => {
+      r.classList.toggle('now', i === cur)
+      r.classList.toggle('later', i > cur)
+    })
+    note.textContent = rows[cur].dataset.note
+    count.textContent = `步驟 ${cur + 1} / ${rows.length}`
+    prev.disabled = cur === 0
+    next.textContent = cur === rows.length - 1 ? '↺ 重新播放' : '下一步 ▶'
+  }
+  prev.onclick = () => { cur--; show() }
+  next.onclick = () => { cur = cur === rows.length - 1 ? 0 : cur + 1; show() }
+  show()
+})
+</script>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

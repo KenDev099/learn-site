@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>17. 資料庫整合測試與測試資料</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="17" data-practice="nestjs">
+<header>
+  <div class="eyebrow">階段 3：資料庫（Docker、Prisma 7 ＋ PostgreSQL） · 第 17 課</div>
+  <h1>資料庫整合測試與測試資料</h1>
+</header>
+<main>
+
+<p>第 15 課把下單改成「條件式更新＋交易」，早上八點 20 個人同時搶最後 5 杯拿鐵，也只會賣出 5 杯。想像下個月有位同事送了一個「重構」的 PR：他覺得 <code>$transaction</code> 包一層很囉嗦，把它拿掉；或者覺得 <code>updateMany</code> 加 <code>WHERE</code> 不好讀，改回「先查庫存、再扣」。程式照樣能跑，手動點幾次下單也都正常，單元測試全部通過，PR 就這樣合併了。直到某天限量商品開賣，庫存變成負數。</p>
+<p>這一課的任務：替 <code>OrdersService.createOrder</code> 寫一套測試，讓上面這種改動在送出 PR 的當下就變紅。做法是讓測試連到真的 PostgreSQL。過程中會一路解決「連哪個資料庫」「測試之間的資料怎麼不互相干擾」「每個測試怎麼快速建好資料」「並發怎麼測」這幾個問題，最後在練習 3 寫出能抓到五種改壞版本的 <code>orders.int-spec.ts</code>。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>同事拿掉了交易，為什麼 mock 的測試還是綠的：bug 發生在資料庫裡，測試必須連真的資料庫（開場問題的最小答案）。</li>
+  <li>測試要連哪個資料庫：為什麼不能用開發的那一個，<code>npm test</code> 用的 <code>nest_17_spec</code> 怎麼準備。</li>
+  <li>上一個測試留下的資料怎麼辦：測試隔離的三種做法，為什麼這門課選「每個測試前清空」。</li>
+  <li><code>resetDb()</code> 怎麼把每張表清乾淨，以及每個測試要的資料怎麼用工廠一行建好。</li>
+  <li>寫出「改壞就變紅」的測試：拿掉交易靠檢查資料庫最後的狀態抓，改回先讀再寫靠同時送出 10 張訂單抓。</li>
+  <li>PR 送出時誰來跑這些測試：CI 上的 PostgreSQL 從哪裡來。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="15-transactions-concurrency.html">第 15 課</a>的互動式交易與條件式更新：下單包在 <code>$transaction</code> 裡，丟例外就整筆回滾；扣庫存用 <code>WHERE stock &gt;= 數量</code> 的 <code>UPDATE</code>，不先讀再寫。</li>
+  <li><a href="10-e2e-testing.html">第 10 課</a>的整合測試與 flaky test：測試接上真的元件一起跑；測試之間共用狀態，結果就會時過時不過。</li>
+  <li><a href="12-docker-services.html">第 12 課</a>的 Docker Compose：課程的 PostgreSQL 跑在容器裡，<code>docker compose up -d</code> 啟動。</li>
+  <li><a href="13-prisma-setup.html">第 13 課</a>的 <code>prisma migrate deploy</code>：只套用已經 commit 的 migration 檔，不產生新的，部署和測試都用它建表。</li>
+</ul></div>
+
+<h2>同事拿掉了交易，為什麼 mock 的測試還是綠的？</h2>
+<p>先看團隊原本的測試。它是<a href="05-unit-testing.html">第 5 課</a>那種單元測試：把 <code>PrismaService</code> 換成 <code>vi.fn()</code> 組成的假物件（mock），每個方法要回傳什麼，由測試事先設定：</p>
+<pre>const prisma = {
+  $transaction: vi.fn(fn =&gt; fn(prisma)),          // 「交易」：直接把自己傳進去
+  product: { findUnique: vi.fn(), updateMany: vi.fn() },
+  order: { create: vi.fn() },
+}
+
+it('成功下單', async () =&gt; {
+  prisma.product.findUnique.mockResolvedValue({ price: 110 })
+  prisma.product.updateMany.mockResolvedValue({ count: 1 })
+  prisma.order.create.mockResolvedValue({ id: 1, total: 220 })
+  expect((await orders.createOrder(1, [{ productId: 1, quantity: 2 }])).total).toBe(220)
+})</pre>
+<p>現在把同事的 PR 套上去，<code>createOrder</code> 不再呼叫 <code>$transaction</code>，直接用 <code>this.prisma</code> 查商品、扣庫存、建訂單。這個測試會怎樣？<code>findUnique</code> 照樣回傳 <code>{ price: 110 }</code>，<code>updateMany</code> 照樣回傳 <code>{ count: 1 }</code>，<code>order.create</code> 照樣回傳總額 220。每個方法回傳的都是測試事先寫好的值，跟有沒有交易無關，所以測試照樣通過。把條件式更新改回「先讀再寫」也一樣：只要 mock 回傳的值照舊，測試就看不出差別。</p>
+<p>問題出在 mock 的本質：它只會回傳你設定的值，不會做資料庫真正做的事。而第 15 課保護下單的那幾招，全部是資料庫做的事：</p>
+<ul>
+  <li><strong>約束</strong>：<code>UNIQUE</code>、外鍵、<code>CHECK (stock &gt;= 0)</code> 是資料庫檢查的。違反唯一約束時 Prisma 會丟 P2002（<a href="14-prisma-crud-relations.html">第 14 課</a>），mock 不會。</li>
+  <li><strong>交易</strong>：回滾是資料庫做的。mock 的 <code>$transaction</code> 只是呼叫函式，失敗時沒有東西會被還原。</li>
+  <li><strong>並發</strong>：兩個請求搶同一列、鎖、<code>WHERE stock &gt;= 1</code> 在等鎖之後重新判斷，都只發生在真的資料庫。</li>
+  <li><strong>SQL 的語意</strong>：<code>orderBy</code>、<code>include</code>、時區、<code>NULL</code> 的比較，mock 只會照你寫的順序回傳。</li>
+</ul>
+<p>mock 還有一個反方向的代價：它綁死了實作細節。測試寫明了「會呼叫 <code>findUnique</code>」，哪天有人把 <code>findUnique</code> 改成 <code>findFirst</code>，行為完全一樣，mock 測試卻全部壞掉。結果是該紅的時候綠、該綠的時候紅，團隊很快就不信任這些測試。</p>
+<p>所以要抓到同事的 PR，測試必須讓 <code>OrdersService</code> 連到真的 PostgreSQL：真的建商品、真的下單、再真的查庫存。這種「service 接上真的資料庫一起跑」的測試，就是第 10 課提過的<strong>整合測試</strong>。這也讓第 10 課的測試邊界更明確：<strong>資料庫是你自己的</strong>，schema、migration、查詢都是你寫的，用真的測；mock 留給你控制不了的外部系統（金流、寄信、第三方 API），還有「資料庫出錯時程式怎麼反應」這種用真的資料庫很難製造的狀況。</p>
+<p>整合測試的代價是慢：每個測試要真的寫入、查詢資料庫，要幾十到幾百毫秒。所以兩種測試分工：純邏輯（計價、狀態轉換）用單元測試；查詢、交易、約束用整合測試。</p>
+
+<div class="callout practice"><strong>💡 實務上：先問「bug 會發生在哪一層」，再決定要不要 mock</strong><br>Code review 看到改了查詢、交易、migration 或唯一約束的 PR，資深工程師會先問：「有沒有連真資料庫的測試？」咖啡店系統裡的下單、扣庫存、優惠券只能用一次、會員點數，這類「錢和數量」的路徑最值得寫整合測試，因為出錯就是客訴和對帳問題。反過來，單純的計價公式、狀態轉換規則用單元測試就夠，不必每個 CRUD 都連資料庫。常見的坑是團隊全部用 mock，CI 一片綠，上線後才發現唯一約束或回滾根本沒生效，就像本課開場那個 PR。</div>
+<p>決定要連真的資料庫之後，第一個問題是：連哪一個？</p>
+
+<h2>測試要連哪個資料庫？</h2>
+<p>最直覺的答案是連開發時用的那個（這門課是 <code>nest_17</code>，<code>npm run start:dev</code> 用的）。這行不通。下一節會看到，整合測試每次開始前都要把資料表清空；跟開發共用的話，你在開發時手動建的商品、訂單，每跑一次測試就消失一次。反方向也會出事：你手動留下的資料，會讓測試的計數多出幾筆而失敗。</p>
+<p>所以需要一個<strong>測試資料庫</strong>：只給測試用、裡面的資料隨時可以清空重建的資料庫。同一台 PostgreSQL 可以有很多個資料庫，所以不用多開一個容器，只要多建一個名稱不同的資料庫。這一課的專案準備了兩個測試資料庫：圖的上半是判分（<code>node check.mjs nestjs 17</code>）用的 <code>nest_17_test</code>，下半是你自己執行 <code>npm test</code> 用的 <code>nest_17_spec</code>；開發用的 <code>nest_17</code> 兩邊都不碰。兩個分開，是因為判分每次都要整個重建，你自己的那個則要保留資料，讓你在測試失敗後連進去看。</p>
+<figure>
+  <svg viewBox="0 0 700 300" role="img" aria-label="判分流程：check.mjs 執行 prepare.mjs，刪掉並重建 nest_17_test，套用 migration，再跑測試；npm test 則由 vitest.config.ts 把資料庫名稱換成 nest_17_spec，global-setup 在不存在時建立並套用 migration；開發用的 nest_17 兩邊都不碰">
+    <defs><marker id="a17" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <text class="d-accent" x="10" y="24">判分：node check.mjs nestjs 17</text>
+    <rect class="d-box" x="10" y="38" width="150" height="56" rx="8"/>
+    <text class="d-text" x="85" y="62" text-anchor="middle">prepare.mjs</text>
+    <text class="d-small" x="85" y="80" text-anchor="middle">型別檢查</text>
+    <rect class="d-soft" x="190" y="38" width="170" height="56" rx="8"/>
+    <text class="d-text" x="275" y="62" text-anchor="middle">DROP＋CREATE</text>
+    <text class="d-small" x="275" y="80" text-anchor="middle">nest_17_test</text>
+    <rect class="d-box" x="390" y="38" width="140" height="56" rx="8"/>
+    <text class="d-text" x="460" y="62" text-anchor="middle">migrate deploy</text>
+    <text class="d-small" x="460" y="80" text-anchor="middle">套用你的 migration</text>
+    <rect class="d-box" x="560" y="38" width="130" height="56" rx="8"/>
+    <text class="d-text" x="625" y="62" text-anchor="middle">跑測試</text>
+    <text class="d-small" x="625" y="80" text-anchor="middle">ex1、ex2、ex3</text>
+    <line class="d-line" x1="160" y1="66" x2="186" y2="66" marker-end="url(#a17)"/>
+    <line class="d-line" x1="360" y1="66" x2="386" y2="66" marker-end="url(#a17)"/>
+    <line class="d-line" x1="530" y1="66" x2="556" y2="66" marker-end="url(#a17)"/>
+    <text class="d-accent" x="10" y="144">你的測試：npm test</text>
+    <rect class="d-box" x="10" y="158" width="150" height="56" rx="8"/>
+    <text class="d-text" x="85" y="182" text-anchor="middle">vitest.config.ts</text>
+    <text class="d-small" x="85" y="200" text-anchor="middle">名稱換成 _spec</text>
+    <rect class="d-soft" x="190" y="158" width="170" height="56" rx="8"/>
+    <text class="d-text" x="275" y="182" text-anchor="middle">不存在才 CREATE</text>
+    <text class="d-small" x="275" y="200" text-anchor="middle">nest_17_spec</text>
+    <rect class="d-box" x="390" y="158" width="140" height="56" rx="8"/>
+    <text class="d-text" x="460" y="182" text-anchor="middle">migrate deploy</text>
+    <text class="d-small" x="460" y="200" text-anchor="middle">global-setup.ts</text>
+    <rect class="d-box" x="560" y="158" width="130" height="56" rx="8"/>
+    <text class="d-text" x="625" y="182" text-anchor="middle">每個測試前</text>
+    <text class="d-small" x="625" y="200" text-anchor="middle">resetDb()</text>
+    <line class="d-line" x1="160" y1="186" x2="186" y2="186" marker-end="url(#a17)"/>
+    <line class="d-line" x1="360" y1="186" x2="386" y2="186" marker-end="url(#a17)"/>
+    <line class="d-line" x1="530" y1="186" x2="556" y2="186" marker-end="url(#a17)"/>
+    <rect class="d-soft" x="190" y="240" width="340" height="44" rx="8"/>
+    <text class="d-text" x="360" y="267" text-anchor="middle">開發用 nest_17：npm run start:dev 用，測試都不碰</text>
+  </svg>
+  <figcaption>判分每次都重建，保證乾淨；你自己的測試資料庫只建一次、不刪，測試失敗後還能連進去看留下的資料，每個測試前用 <code>resetDb()</code> 清空。</figcaption>
+</figure>
+<p>圖的下半是你自己執行 <code>npm test</code> 時發生的事，由專案裡已經寫好的兩個檔案負責。第一步要讓測試連到 <code>nest_17_spec</code> 而不是 <code>nest_17</code>。應用程式從環境變數 <code>DATABASE_URL</code> 讀連線網址，所以 <code>vitest.config.ts</code> 在讀完 <code>.env</code> 之後，把網址裡的資料庫名稱換掉：</p>
+<pre>config({ quiet: true })   // dotenv：讀 .env；已經有的環境變數優先
+const url = new URL(process.env.DATABASE_URL)
+url.pathname = url.pathname.replace(/(_test|_spec)?$/, '_spec')   // nest_17 → nest_17_spec
+process.env.DATABASE_URL = url.href</pre>
+<p>測試裡啟動的 <code>ConfigModule</code> 讀到的也是這個改過的值，因為已經存在的環境變數優先於 <code>.env</code>（<a href="11-configuration.html">第 11 課</a>）。</p>
+<p>第二步是確保這個資料庫存在、而且有最新的資料表。<code>test/support/global-setup.ts</code> 登記在 Vitest 的 <code>globalSetup</code> 設定裡，意思是在所有測試檔開始前、在 Vitest 的主程序執行一次。它做三件事：</p>
+<ol>
+  <li>檢查資料庫名稱是不是 <code>_spec</code> 結尾，不是就拒絕執行。這是最後一道保險：設定寫錯時，寧可測試跑不起來，也不要清空開發用的資料。</li>
+  <li>資料庫不存在就 <code>CREATE DATABASE</code>。已經存在就不動它，所以測試失敗後，你還能連進去看當時留下的資料。</li>
+  <li>執行 <code>prisma migrate deploy</code>，套用還沒套用的 migration。</li>
+</ol>
+<p>為什麼建表用 <code>migrate deploy</code>，而不是更省事的 <code>db push</code>？<code>deploy</code> 套用的是你 commit 的 migration 檔，跟正式環境部署時一樣（第 13 課）。這樣測試同時也在測 migration：migration 寫錯，測試就先失敗，而不是到部署那天才發現。</p>
+<p>圖的上半是判分（<code>node check.mjs nestjs 17</code>）。它的思路一樣，只是更嚴格：每次都把 <code>nest_17_test</code> 整個刪掉重建，保證每次判分都從同一個起點開始。判分還有幾個設計細節，見課末「補充與查表」。</p>
+<p>現在測試有了自己的資料庫，但這個資料庫在整個 <code>npm test</code> 期間是同一個：第一個測試建的商品，第二個測試也看得到。下一節處理這件事。</p>
+
+<h2>上一個測試留下的資料，怎麼不影響下一個測試？</h2>
+<p>先看會出什麼事。練習 3 有「庫存不足：不建立訂單」這個測試，它的斷言是 <code>expect(await prisma.order.count()).toBe(0)</code>。如果它前面的「成功下單」測試已經建了一張訂單，資料庫裡就有 1 張，這個斷言失敗。可是單獨跑「庫存不足」時，它又會通過。同一個測試，結果取決於前面跑了什麼，這就是第 10 課說的 flaky test，而共用的資料庫正是最典型的共用狀態。</p>
+<p>要避免這種事，測試需要<strong>測試隔離（test isolation）</strong>：每個測試的結果不受其他測試影響。單獨跑、一起跑、換順序跑，結果都一樣。對資料庫來說，就是每個測試開始時，資料庫都處在同一個已知的狀態（通常是空的）。常見的三種做法如下，表中的 worker 與 template 資料庫，下面會說明：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>做法</th><th>怎麼做</th><th>優點</th><th>代價</th></tr></thead>
+  <tbody>
+    <tr><td>每個測試前清空</td><td><code>beforeEach</code> 執行 <code>TRUNCATE</code> 所有資料表</td><td>簡單；資料真的 commit，交易、並發都測得到</td><td>同一個資料庫的測試檔不能平行跑；表多時每次清空要幾十毫秒</td></tr>
+    <tr><td>每個測試包在交易裡，最後回滾</td><td>測試開始時 <code>BEGIN</code>，結束時 <code>ROLLBACK</code>，程式要用這個交易的連線</td><td>最快，不用清空</td><td>測不到 COMMIT 之後的行為與並發；程式自己開的交易要另外處理</td></tr>
+    <tr><td>每個 worker 一個資料庫</td><td>每個平行執行的 worker 用自己的資料庫，常用 template 資料庫快速複製</td><td>可以平行跑，速度隨核心數增加</td><td>設定多；資料庫多，要記得清理</td></tr>
+  </tbody>
+</table></div>
+<p>第二種「交易回滾」看起來最划算：不用清空，測試裡建的資料隨著 <code>ROLLBACK</code> 一起消失。但它跟本課的任務衝突。要抓到「改回先讀再寫」，測試得同時送出 10 張訂單（後面「改壞就變紅」那一節會寫），而第 15 課的超賣，只在多個交易同時 commit 時才會發生。10 個請求各自用自己的連線、自己的交易，看不到測試那個還沒 commit 的交易裡建的商品，所以根本找不到資料。反過來，如果讓 10 個請求都共用測試那一條連線，它們就變成一個接一個執行，「同時」也就不存在了。另外，本課的 <code>createOrder</code> 自己會呼叫 <code>$transaction</code> 開交易；要讓它跑在測試的交易裡，就得把 <code>PrismaService</code> 換成包著測試交易的版本，或改用 savepoint，這又多一層要維護的東西。</p>
+<p>第三種「每個 worker 一個資料庫」要先知道 worker 是什麼。Vitest 預設會開好幾個子程序，每個子程序負責跑一部分的測試檔，讓不同的測試檔同時跑，這些子程序叫 worker。每個 worker 用自己的資料庫，就能平行又互不干擾，代價是要管理一批資料庫。</p>
+<p>這門課選第一種：每個測試前清空，資料真的 commit，交易和並發都測得到。代價是同一個資料庫上的測試檔不能同時跑，所以 <code>vitest.config.ts</code> 設了 <code>fileParallelism: false</code>，讓測試檔一個一個跑。專案變大、測試變慢時，再換成每個 worker 一個資料庫：PostgreSQL 的 <code>CREATE DATABASE x TEMPLATE y</code> 可以從一個已經套用好 migration 的資料庫複製出新的，比每次跑 migration 快。</p>
+<div class="callout warn"><strong>共用同一個資料庫又平行跑</strong>：A 檔案的 <code>beforeEach</code> 清空資料表的瞬間，B 檔案的測試剛建好商品，B 就莫名其妙找不到資料。這種錯誤時有時無，重跑又好了，是最難查的那一種。</div>
+<p>決定了「每個測試前清空」，接下來要寫出負責清空的那個函式。</p>
+
+<h2>resetDb() 怎麼把每張表清乾淨？</h2>
+<p>清空資料表有兩種寫法（<a href="../../postgresql/lessons/06-update-delete.html">PostgreSQL 課第 6 課</a>）：<code>DELETE</code> 逐列刪除，<code>TRUNCATE</code> 直接丟掉整份資料。測試要的是 <code>TRUNCATE</code>，再加兩個選項：</p>
+<ul>
+  <li><code>RESTART IDENTITY</code>：自動編號（<code>SERIAL</code> 背後的 sequence）從 1 重新開始。<code>DELETE</code>／<code>deleteMany()</code> 不會重設，測試跑越多次 id 越大。</li>
+  <li><code>CASCADE</code>：連同「有外鍵指向這些表」的表一起清空。一句 <code>TRUNCATE</code> 列出所有表時其實用不到；有了它，就算漏列某張子表也不會因為外鍵而失敗。</li>
+</ul>
+<pre>TRUNCATE "orders", "order_items", "products" RESTART IDENTITY CASCADE;</pre>
+<p>下一個問題是要清哪些表。常見的寫法是一張一張寫 <code>deleteMany()</code>。問題是下個月加了 <code>audit_logs</code>，沒人記得回來改，這張表的舊資料就留在測試之間，又回到上一節的 flaky test。更好的做法是每次從 <code>pg_tables</code> 查。<code>pg_tables</code> 是 PostgreSQL 自己維護的系統目錄，列出這個資料庫裡的每一張表；新增一張表，它就自動多一列，不用任何人記得改程式：</p>
+<pre>SELECT tablename FROM pg_tables WHERE schemaname = 'public';</pre>
+<p>查出來的表裡有一張不能清：<code>_prisma_migrations</code>。Prisma 在這張表記錄哪些 migration 套用過；清掉之後，下次 <code>migrate deploy</code> 會以為一個都沒套用，重跑 <code>CREATE TABLE</code> 然後失敗。</p>
+<p>最後是怎麼在 Prisma 裡執行。第 15 課用過 <code>$queryRaw`… ${x}`</code>：<code>${}</code> 會變成參數 <code>$1</code>，值另外傳給資料庫，所以不會有 SQL injection。可是<strong>參數只能放值</strong>，不能放表名、欄位名。表名、欄位名這類用來指名資料庫物件的名字叫識別字（identifier），資料庫要先知道句子動到哪張表，才能規劃怎麼執行，所以識別字必須寫在 SQL 本身裡。因此 <code>TRUNCATE</code> 那一句只能把表名組成字串，用 <code>$executeRawUnsafe(sql)</code> 執行。這裡是安全的，因為表名來自資料庫本身，不是使用者輸入。</p>
+<p>組字串時，每個表名還是要用雙引號包起來。PostgreSQL 會把沒加引號的識別字轉成小寫，Prisma 的 model 沒寫 <code>@@map</code> 時表名是 <code>Category</code> 這種有大寫的名稱，<code>TRUNCATE Category</code> 會去找 <code>category</code>，找不到就出錯；寫成 <code>"Category"</code> 才對。</p>
+<p>練習 1 請你把這些組成 <code>resetDb(prisma)</code>。練習 3 的測試檔已經在 <code>beforeEach</code> 呼叫它，所以每個測試都從空的資料表開始。</p>
+<p>可是資料表空了，每個測試就得自己建它需要的分類、商品、顧客，這會讓測試變得又長又難讀。</p>
+
+<h2>每個測試都要自己建資料：怎麼只寫在乎的欄位？</h2>
+<p>以「庫存不足」為例，它只需要一個庫存是 0 的商品。但商品要有分類（外鍵），名稱還要唯一。每個測試都把這些寫一遍，測試的重點就淹沒在雜訊裡：</p>
+<pre>// 每個測試都這樣寫：看不出這個測試在乎的是哪個欄位
+const category = await prisma.category.create({ data: { name: '飲料' } })
+const latte = await prisma.product.create({ data: { name: '拿鐵', price: 110, stock: 0, isAvailable: true, categoryId: category.id } })</pre>
+<p>讀這兩行的人得逐欄判斷：價格 110 重要嗎？<code>isAvailable</code> 重要嗎？其實只有 <code>stock: 0</code> 重要。而且 schema 哪天多一個必填欄位，所有這樣寫的測試都要改。</p>
+<p>解法是<strong>測試資料工廠</strong>（factory，也叫 builder）：一組專門替測試建資料的函式，每個欄位都有合理的預設值，測試只傳它在乎的欄位，其他交給預設值：</p>
+<pre>const latte = await createProduct(prisma, { stock: 0 })   // 一眼看出：這個測試在乎的是庫存 0</pre>
+<p>工廠看起來只是包一層 <code>create</code>，但寫不好會讓測試以奇怪的方式失敗。好的工廠要做到這幾點，每一點都對應一種實際會遇到的失敗：</p>
+<ul>
+  <li><strong>回傳寫進資料庫的紀錄</strong>（有 id），測試拿 <code>latte.id</code> 去用，不寫死 <code>productId: 1</code>。寫死的 id 只在「剛好是第一筆」時成立，前面多建一筆資料就錯。</li>
+  <li><strong>唯一欄位每次都不同</strong>：用一個遞增的計數器組名稱（<code>商品 1</code>、<code>商品 2</code>）。固定的名稱，第二次呼叫就撞 <code>UNIQUE</code>，丟 P2002。</li>
+  <li><strong>需要的關聯自己建</strong>：沒給 <code>categoryId</code> 就先建一個分類；給了就用給的，不要多建。</li>
+  <li><strong>覆寫要照用，包括 0 和 <code>false</code></strong>：<code>stock: overrides.stock || 10</code> 在傳入 0 時會變回 10，這個工廠就永遠建不出庫存 0 的商品。用展開 <code>{ ...defaults, ...overrides }</code> 或 <code>??</code>。</li>
+  <li><strong>只準備資料，不跑業務規則</strong>：<code>createOrder</code> 直接寫入訂單，不扣庫存。要測下單規則就呼叫 <code>OrdersService</code>；工廠是用來建「前提」的。</li>
+</ul>
+<p>覆寫參數的型別可以直接用 Prisma 產生的 <code>Partial&lt;Prisma.ProductUncheckedCreateInput&gt;</code>。Prisma 為每個 model 產生兩種建立資料的型別：一般版用巢狀物件表示關聯（<code>category: { connect: { id } }</code>），<code>Unchecked</code> 版直接用外鍵欄位（<code>categoryId</code>）。工廠的呼叫端手上通常已經有 id，所以 <code>Unchecked</code> 版比較順手。</p>
+<p>計數器放在模組層級，同一次 <code>npm test</code> 裡會一直遞增，<code>resetDb()</code> 之後也不會重複，因為資料都清掉了。練習 2 請你完成四個工廠。</p>
+
+<div class="callout practice"><strong>💡 實務上：修 bug 前先用工廠寫一個會失敗的測試</strong><br>客服回報「下架的商品還能加進訂單」，與其手動在後台點來點去重現，不如寫一個 <code>createProduct(prisma, { isAvailable: false })</code> 的測試，確認它現在會失敗，修好後變綠，之後也不會再壞。工廠通常放在 <code>test/support/</code> 給整個團隊共用；schema 新增一個必填欄位時，只要改工廠的預設值，不用改幾十個測試。要小心工廠預設值太「聰明」，例如自動幫你建好訂單和付款，測試就看不出自己依賴了哪些前提。</div>
+<p>到這裡工具都齊了：獨立的測試資料庫、每個測試前清空的 <code>resetDb()</code>、一行建好資料的工廠。回到開場的任務，寫出能抓到同事 PR 的測試。</p>
+
+<h2>怎麼寫出「改壞就變紅」的測試？</h2>
+<p>判斷一個測試有沒有用，標準只有一個：把程式改壞，它會不會失敗。第 15 課的下單有兩道保護，同事的 PR 可能拆掉其中一道，所以要分別設計測試。</p>
+
+<h3>拿掉交易：斷言資料庫最後的狀態</h3>
+<p>交易保護的是「一張訂單有好幾項商品，任何一項失敗，前面扣掉的庫存要還原」。所以測試要製造一個「第二項才失敗」的情境：拿鐵庫存 5、起司蛋糕庫存 1，下單拿鐵 1 杯、蛋糕 3 個。</p>
+<p>有交易時，<code>createOrder</code> 先扣拿鐵（5 → 4），再扣蛋糕時發現不夠，丟 <code>OutOfStockError</code>，整個交易回滾，拿鐵回到 5。拿掉交易後，拿鐵那句 <code>UPDATE</code> 已經自己 commit 了，蛋糕失敗時沒有東西會還原它，拿鐵停在 4。注意兩個版本都會丟 <code>OutOfStockError</code>，所以只檢查「有丟錯」分不出它們。差別只在資料庫裡，測試就要去資料庫裡看：</p>
+<pre>it('第二項庫存不足：整筆回滾，第一項的庫存也沒被扣', async () =&gt; {
+  const customer = await createCustomer(prisma)
+  const latte = await createProduct(prisma, { stock: 5 })
+  const cake = await createProduct(prisma, { stock: 1 })
+
+  await expect(orders.createOrder(customer.id, [
+    { productId: latte.id, quantity: 1 },
+    { productId: cake.id, quantity: 3 },
+  ])).rejects.toBeInstanceOf(OutOfStockError)
+
+  // 只看「有丟錯」不夠：沒有交易的版本也會丟錯，但拿鐵已經被扣成 4
+  expect((await prisma.product.findUniqueOrThrow({ where: { id: latte.id } })).stock).toBe(5)
+  expect(await prisma.order.count()).toBe(0)
+})</pre>
+<p>這就是整合測試的斷言重點：<strong>資料庫最後的狀態</strong>，不只是函式的回傳值。練習 3 的其他測試也照這個原則，例如「成功下單」除了看回傳的總額，還要查商品確認庫存真的扣了。</p>
+
+<h3>改回先讀再寫：同時送出 10 張訂單</h3>
+<p>另一道保護是條件式更新。先讀再寫的版本，一個人下單時完全正常：讀到庫存 5，扣成 4，沒有問題。它只在兩個請求同時讀到同一個庫存、各自扣減時才會賣超（第 15 課）。所以測試也必須真的同時送出請求：拿鐵庫存 5，同時送出 10 張各買 1 杯的訂單，正確的程式應該剛好 5 張成功、庫存變 0。</p>
+<p>這種測試要做到三件事：<strong>真的同時送出</strong>、<strong>等全部結束</strong>、<strong>斷言最後的狀態</strong>。</p>
+<pre>const results = await Promise.allSettled(
+  Array.from({ length: 10 }, () =&gt; orders.createOrder(customer.id, [{ productId: latte.id, quantity: 1 }])),
+)
+expect(results.filter(r =&gt; r.status === 'fulfilled')).toHaveLength(5)</pre>
+<ul>
+  <li>先建好 10 個 Promise 再一起等，才是同時送出。<code>for</code> 迴圈裡一個一個 <code>await</code>，請求就變成依序執行，先讀再寫的版本也會過。</li>
+  <li>用 <code>Promise.allSettled</code>，不是 <code>Promise.all</code>：預期有 5 個會失敗，<code>Promise.all</code> 遇到第一個失敗就 reject，其他請求還在跑，你就開始斷言了，甚至跑進下一個測試的 <code>resetDb()</code>。</li>
+  <li>失敗的那 5 個要確認是 <code>OutOfStockError</code>，而不是逾時或其他錯誤；最後再查一次資料庫，確認庫存是 0。</li>
+</ul>
+<p>為什麼是 10 個，不是 100 個？PrismaPg 的連線池預設最多 10 條（第 16 課），10 個互動式交易剛好用完。並發數超過連線池時，多出來的交易要排隊；排超過 <code>maxWait</code>（預設 2000 毫秒）就會失敗，測試失敗的原因就變成連線池，而不是你想測的庫存。</p>
+<p>請求的先後順序每次都不同，這個測試在 CI 上能穩定重跑嗎？可以。資料每次從空表開始，對正確的程式來說，不管誰先誰後，「剛好 5 張成功、庫存 0」永遠成立；只有錯的程式才會有時賣超、有時不會。所以並發測試偶爾失敗時，要先懷疑程式，不是按重跑。</p>
+
+<div class="callout practice"><strong>💡 實務上：搶購、限量、只能用一次，都是同一類並發問題</strong><br>限量商品開賣、優惠碼只能兌換一次、同一張訂單被重複付款，都是「多個請求同時改同一筆資料」，本機一個人點永遠點不出來。修這類 bug 時，先寫出像上面那樣的並發測試，在舊程式上確認它會失敗，再修程式讓它通過；沒看過它失敗，就不知道它真的抓得到。修法通常就是第 14、15 課那幾招：條件式更新（<code>WHERE stock &gt;= 1</code>）或唯一約束，讓資料庫替你擋，而不是在程式裡先查再判斷。</div>
+<p>測試寫好了，但開場的問題還剩最後一半：同事送出 PR 時，誰來跑這些測試？</p>
+
+<h2>PR 送出時，誰來跑這些測試？</h2>
+<p>靠每個人記得在本機跑 <code>npm test</code> 是不夠的，開場那位同事可能根本沒跑。團隊的做法是持續整合（continuous integration，CI）：一個在每次 push 或送出 PR 時，自動把程式抓下來、安裝套件、跑測試的服務。測試沒過，PR 上就會顯示紅叉，大家在合併前就看得到。開場那個拿掉交易的 PR，就會在這一步被擋下。</p>
+<p>整合測試搬到 CI 上，要多解決一件事：CI 的機器上也需要一個 PostgreSQL。GitHub Actions 可以宣告 <strong>service container</strong>：工作開始前先啟動 <code>postgres:18.6-alpine</code> 容器，測試用 <code>localhost</code> 連過去，DevOps 課會實作（<a href="../../devops/lessons/15-ci.html">DevOps 課第 15 課</a>）。之後的流程跟本機一樣：建資料庫 → <code>migrate deploy</code> → 跑測試。</p>
+<p>這跟這門課本機的做法是同一個思路：資料庫容器事先啟動好，測試直接連。另一種做法是 Testcontainers，在測試程式裡自己啟動資料庫容器；兩者的取捨見課末「補充與查表」。</p>
+<p>到這裡，開場的任務完成了：拿掉交易，回滾測試變紅；改回先讀再寫，並發測試變紅；而 CI 讓這些紅燈在合併前就出現。</p>
+
+<h2>補充與查表</h2>
+<h3>判分的設計細節</h3>
+<ul>
+  <li><strong>不用 <code>prisma migrate reset</code></strong>：它會刪掉整個資料庫的資料，而且 Prisma 7.10.1 偵測到在 AI agent 底下執行時會直接拒絕（<code>migrate deploy</code> 不受影響）。判分用 SQL 的 <code>DROP DATABASE</code>／<code>CREATE DATABASE</code> 重建，並且只刪名稱符合 <code>nest_…_test</code> 的資料庫，打錯設定也刪不到開發資料庫。</li>
+  <li><strong>每一題、每個資料夾一個資料庫</strong>：<code>work/17</code> 用 <code>nest_17_test</code>，出題檢查的 <code>verify/17-answer</code> 用 <code>nest_17_answer_test</code>，可以同時跑、互不干擾。</li>
+  <li><strong>工廠的計數器與平行執行</strong>：要讓多個 worker 共用一個資料庫時，名稱還要加上 worker 的編號才不會撞；這門課一次只跑一個檔，用不到。</li>
+</ul>
+<h3>Testcontainers</h3>
+<p><strong>Testcontainers</strong> 是在測試程式裡啟動資料庫容器、測試結束時自動移除的做法。它的 PostgreSQL 模組（<code>@testcontainers/postgresql</code>）可以 <code>new PostgreSqlContainer('postgres:18.6-alpine').start()</code>，再用 <code>getConnectionUri()</code> 拿連線網址；還有 <code>snapshot()</code>／<code>restoreSnapshot()</code>，背後就是前面說的 template 資料庫。這門課沒有安裝它，只要知道取捨：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th></th><th>事先啟動的容器（這門課、CI service）</th><th>Testcontainers</th></tr></thead>
+  <tbody>
+    <tr><td>啟動</td><td>開發時啟動一次，測試直接連</td><td>每次測試都啟動容器，多幾秒</td></tr>
+    <tr><td>設定在哪</td><td>compose.yaml、CI 設定檔</td><td>測試程式裡，<code>npm test</code> 一個指令就能跑</td></tr>
+    <tr><td>適合</td><td>大家都有同一套 Docker 環境</td><td>每個專案要不同版本的資料庫、不想要求先啟動服務</td></tr>
+  </tbody>
+</table></div>
+<h3>測試資料庫的 fsync</h3>
+<p>測試資料庫還可以為了速度關掉 PostgreSQL 的 <code>fsync</code>：資料不會每次 commit 都寫到磁碟，機器當機時資料可能損壞。對隨時可以重建的測試資料庫可以接受，正式環境絕對不行。</p>
+
+<h2>練習</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs nestjs 17</code> 建立 <code>work/17/</code>（Docker 的容器要先啟動，第 12 課）。<code>OrdersService</code> 是第 15 課做完的版本，這一課<strong>不改 <code>src/</code></strong>，只寫測試用的程式。資料表有 <code>categories</code>、<code>products</code>（<code>stock</code>、<code>is_available</code>）、<code>customers</code>（<code>phone</code> 唯一）、<code>orders</code>、<code>order_items</code>，已經有 migration。</p>
+<p>自己的測試在 <code>work/17</code> 執行 <code>npm test</code>，用的是 <code>nest_17_spec</code>；想看資料可以用 <code>docker exec -it learn-nestjs-postgres psql -U learn -d nest_17_spec</code>。三題依序做：練習 3 會用到練習 1、2 寫的函式。</p>
+
+<div class="local" data-test="ex1" data-files="test/support/reset-db.ts">
+  <p>練習 1：寫 <code>resetDb(prisma)</code>：從 <code>pg_tables</code> 查出 <code>public</code> schema 裡除了 <code>_prisma_migrations</code> 以外的所有表，用一句 <code>TRUNCATE … RESTART IDENTITY CASCADE</code> 清空，自動編號從 1 重新開始。</p>
+  <p>判分會在資料庫裡多建一張你沒看過的表（名稱每次不同、有大寫，像 Prisma 的 model 沒寫 <code>@@map</code> 時的表名），每張表都放資料，呼叫你的 <code>resetDb</code> 之後檢查：每張表都是 0 筆、新增的第一筆 id 是 1、<code>_prisma_migrations</code> 沒被動到、連續呼叫兩次不會出錯。寫死表名、表名沒加雙引號、用 <code>DELETE</code>／<code>deleteMany()</code> 都不會過。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="test/support/factories.ts">
+  <p>練習 2：完成四個工廠，簽名已經寫好：<code>createCategory</code>、<code>createProduct</code>（預設可販售、庫存 10、價格大於 0；沒給 <code>categoryId</code> 就自己建分類）、<code>createCustomer</code>、<code>createOrder</code>（沒給 <code>customerId</code> 就建一位顧客；沒給 <code>items</code> 就建一個商品、買 1 個；<code>quantity</code> 預設 1；單價從商品複製、總額自己算；回傳帶 <code>items</code> 的訂單；不扣庫存）。</p>
+  <p>判分會在自動編號不是從 1 開始的資料庫裡呼叫你的工廠：每個工廠呼叫多次都不能撞到唯一欄位、傳入的值要蓋過預設值（包括 <code>stock: 0</code> 和 <code>isAvailable: false</code>）、給了 <code>categoryId</code>／<code>customerId</code>／<code>productId</code> 就不能多建資料。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="test/orders.int-spec.ts">
+  <p>練習 3：<code>test/orders.int-spec.ts</code> 已經寫好建立應用、取得 <code>OrdersService</code> 與 <code>PrismaService</code>、每個測試前 <code>resetDb</code> 的部分，以及五個 <code>it.todo</code>。把每個 <code>it.todo</code> 改成真的測試：成功下單（總額、明細、扣掉的庫存）、庫存不足（丟 <code>OutOfStockError</code>、沒有訂單）、第二項庫存不足時整筆回滾、單價快照（下單後改商品價格，<code>findOrder</code> 的單價與總額不變）、庫存 5 時同時送出 10 張訂單。資料一律用練習 2 的工廠建立。</p>
+  <p>這題只寫測試。判分會拿你的測試跑五個改壞的 <code>OrdersService</code>：沒有交易、扣庫存沒用 <code>tx</code>、改回先讀再寫、單價在查詢時才從商品讀、庫存不足時沒丟錯，每一個都要讓你的測試失敗。mock <code>PrismaService</code>、沒有並發測試、只看回傳值不看資料庫、拿掉 <code>beforeEach</code> 的 <code>resetDb</code>、<code>it.todo</code>／<code>it.skip</code> 都不會過。判分要跑六次你的測試，需要一兩分鐘。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：同事說「每個測試包在交易裡、最後回滾最快，乾脆全部改成這樣」。為什麼這樣就測不出第 15 課的超賣 bug？</p>
+  <label data-key="a">回滾會把 <code>CHECK (stock &gt;= 0)</code> 約束一起關掉</label>
+  <label data-key="b">交易裡不能執行 <code>UPDATE</code></label>
+  <label data-key="c">並發的請求各自用自己的連線與交易，看不到測試那個還沒 commit 的交易裡的資料；要它們共用那條連線，又會變成依序執行，超賣只在多個交易同時 commit 時才出現</label>
+  <label data-key="d">PostgreSQL 不支援在交易裡開另一個交易，測試會直接報錯</label>
+  <p class="why">✓ 回滾隔離的前提是「所有東西都在同一個交易裡」，這正好跟並發測試要的「多個交易同時跑、各自 commit」相反。約束在交易裡照樣有效（a 錯），交易裡當然可以 <code>UPDATE</code>（b 錯）。d 錯：在交易裡再下 <code>BEGIN</code>，PostgreSQL 只會發出警告、不會報錯，也可以用 savepoint 做出「交易裡的交易」；但這些操作還是擠在同一條連線上依序執行，一樣測不到並發。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：一個 repository 的測試把 Prisma 換成 mock，「因為比較快，而且一樣準」。下面哪一組 bug 是這種測試一定抓不到的？</p>
+  <label data-key="a">計價時忘了算加價、四捨五入錯誤</label>
+  <label data-key="b">名稱重複時資料庫丟 P2002、外鍵指向不存在的商品、交易沒有回滾、<code>orderBy</code> 寫錯欄位</label>
+  <label data-key="c">函式忘了 <code>await</code> mock 回傳的 Promise</label>
+  <p class="why">✓ b 的每一個都是資料庫的行為：約束、外鍵、交易、SQL 的語意。mock 只回傳你設定的值，所以這些情況根本不會發生，測試照樣通過。a 是純邏輯，用單元測試就抓得到，也不需要資料庫。c 在 mock 下也會出錯（拿到 Promise 而不是值），抓得到。mock 的「準」只是對你自己的假設準。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：專案有 <code>orders.int-spec.ts</code> 和 <code>products.int-spec.ts</code>，都在 <code>beforeEach</code> 呼叫 <code>resetDb()</code>，共用同一個測試資料庫。有人把 <code>fileParallelism: false</code> 拿掉想加快速度，之後測試偶爾失敗、重跑又好。最可能的原因？</p>
+  <label data-key="a">兩個檔案在不同的 worker 同時跑：一個檔案清空資料表時，另一個檔案的測試剛建好的資料也被清掉了</label>
+  <label data-key="b">Vitest 平行執行時不會執行 <code>beforeEach</code></label>
+  <label data-key="c">每個測試檔各自 <code>resetDb()</code>，所以彼此一定獨立，問題出在別處</label>
+  <p class="why">✓ 每個檔案「自己」清空資料，不代表兩個檔案互不影響：它們共用的是同一個資料庫。平行跑時，A 的 <code>TRUNCATE</code> 會清掉 B 正在用的資料（c 錯）。要平行就讓每個 worker 用自己的資料庫；不然就一次跑一個檔。<code>beforeEach</code> 在平行時一樣會執行（b 錯），問題正是它清的範圍超出自己的檔案。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>mock 掉資料庫，以為測過了交易</strong>：mock 的 <code>$transaction</code> 只是呼叫函式，不會回滾。交易、約束、並發用真的資料庫測。</li>
+  <li><strong>測試依賴上一個測試留下的資料</strong>：單獨跑或換順序就壞。每個測試前 <code>resetDb()</code>，需要的資料在測試裡用工廠建。</li>
+  <li><strong>寫死要清空的表名</strong>：新增的表不會被清空，舊資料留在測試之間。從 <code>pg_tables</code> 查，排除 <code>_prisma_migrations</code>。</li>
+  <li><strong>用 <code>DELETE</code>／<code>deleteMany()</code> 清空</strong>：編號不會重設，還要自己排好刪除順序。用 <code>TRUNCATE … RESTART IDENTITY CASCADE</code>。</li>
+  <li><strong>測試共用開發用的資料庫</strong>：跑一次測試，手動建的資料就消失。測試用自己的資料庫，並且在程式裡檢查名稱，不對就拒絕執行。</li>
+  <li><strong>測試寫死 id 或名稱</strong>：<code>productId: 1</code> 只在剛好是第一筆時成立，固定名稱第二次就 P2002。用工廠回傳的紀錄，名稱用計數器。</li>
+  <li><strong>並發測試沒有等全部完成就斷言</strong>：用 <code>Promise.all</code> 遇到第一個失敗就往下走，或在迴圈裡一個一個 <code>await</code> 變成依序執行。先建好所有 Promise，用 <code>Promise.allSettled</code> 等全部結束。</li>
+  <li><strong>只斷言回傳值或丟出的錯誤</strong>：沒有交易的版本也會丟 <code>OutOfStockError</code>。查資料庫確認庫存、訂單數。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>開場的 PR 拿掉交易、改回先讀再寫，mock 測試照樣通過：約束、交易、並發、SQL 語意都發生在資料庫裡，mock 只回傳你設定的值。資料庫是你自己的程式，用真的 PostgreSQL 測，mock 留給外部服務。</li>
+  <li>測試資料庫跟開發資料庫分開（<code>nest_17_spec</code>），程式裡檢查名稱，不對就拒絕執行；表用 <code>migrate deploy</code> 套用 commit 的 migration 建立，順便測到 migration。</li>
+  <li>隔離方式：每個測試前清空（簡單、測得到並發）、交易回滾（快、測不到 commit 後與並發）、每個 worker 一個資料庫（可平行、設定多）。這門課選清空，所以同一個資料庫的測試檔不能平行跑（<code>fileParallelism: false</code>）。</li>
+  <li><code>resetDb()</code>：從 <code>pg_tables</code> 查表名、排除 <code>_prisma_migrations</code>、一句 <code>TRUNCATE … RESTART IDENTITY CASCADE</code>；識別字不能當參數，只能組字串，表名加雙引號。</li>
+  <li>工廠：預設值＋覆寫（0 與 <code>false</code> 也照用）、唯一欄位用計數器、自己建需要的關聯、回傳有 id 的紀錄、不跑業務規則。</li>
+  <li>「改壞就變紅」：拿掉交易要靠斷言資料庫最後的狀態抓（兩個版本都會丟錯）；先讀再寫要靠並發測試抓：同時送出、<code>Promise.allSettled</code> 等全部結束，再檢查成功數與庫存。</li>
+  <li>CI 在每個 PR 自動跑這些測試，CI 上的 PostgreSQL 用 service container 提供，紅燈在合併前就出現。</li>
+</ul>
+<p>下一課把肥大的 service 拆成清楚的分層，並決定交易的邊界該放在哪一層：這一課的整合測試，就是重構時不怕改壞的保障。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

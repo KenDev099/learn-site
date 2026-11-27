@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>10. 搜尋引擎入門：倒排索引、分析器、中文分詞與相關性</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="10" data-practice="data-stores">
+<header>
+  <div class="eyebrow">階段 4：搜尋與檔案 · 第 10 課</div>
+  <h1>搜尋引擎入門：倒排索引、分析器、中文分詞與相關性</h1>
+</header>
+<main>
+
+<p>咖啡店 App 加了搜尋框，上線第一週，客服轉來三則回報：客人打「拿鐵」，結果第一個是肉桂捲（描述寫著「配拿鐵」）；打「起士蛋糕」（把「起司」打錯了），什麼都沒有；打「鐵」，竟然找到一整排拿鐵。後端的寫法是 <code>WHERE name LIKE '%拿鐵%' OR description LIKE '%拿鐵%'</code>：沒有排序依據、打錯一個字就落空、商品多了以後每次都掃整張表。</p>
+<p>這一課的任務是用 Elasticsearch 9.5 重做菜單搜尋，讓這三個查詢都得到合理的結果。最後把它們和之後的客服回報整理成一組固定的案例，每次調整都跑一遍，用數字確認搜尋變好，而不是修好一個、弄壞另一個。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>LIKE 與倒排索引（第 1 節〈LIKE 為什麼修不好這三則回報？〉、第 2 節〈搜尋引擎怎麼從一個詞直接找到商品？〉）：三個怪結果各錯在哪，搜尋引擎怎麼從詞直接找到商品（開場問題的最小答案）。</li>
+  <li>選引擎並啟動（第 3 節〈要加哪一套搜尋引擎？先把它跑起來〉）：要不要多加一套系統、加哪一套，把 Elasticsearch 跑起來。</li>
+  <li>分析器與 mapping（第 4 節〈搜「鐵」為什麼會找到拿鐵？〉、第 5 節〈怎麼讓每個欄位用對的切法？〉）：修「鐵」和「起士蛋糕」：中文怎麼切成詞，每個欄位怎麼設定才會用對的切法。</li>
+  <li>查詢（第 6 節〈搜「拿鐵」為什麼肉桂捲排第一？〉）：修「拿鐵排出肉桂捲」：讓名稱比描述重要、只搜上架商品、列出各分類有幾項。</li>
+  <li>相關性（第 7 節〈^3 調得對嗎？〉）：分數怎麼算出來、怎麼加入銷量，又怎麼用案例集確認沒有越調越糟。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../postgresql/lessons/28-gin-search.html">PostgreSQL 課第 28 課</a>的全文檢索與 GIN 倒排索引：從「詞」查到「哪些列有這個詞」；pg_trgm 用三字片段做模糊比對。</li>
+  <li><a href="../../node/lessons/12-http-protocol.html">Node 課第 12 課</a>的 HTTP：請求由方法、路徑、標頭、body 組成，JSON body 要帶 <code>Content-Type: application/json</code>。</li>
+</ul></div>
+
+<h2>LIKE 為什麼修不好這三則回報？</h2>
+<p>先把三則回報對回 LIKE 本身。它們都不是 SQL 寫錯，而是 <code>LIKE</code> 這個工具只做一件事：檢查一段字串裡有沒有另一段字串。凡是超出這件事的需求，它都不處理。</p>
+<ul>
+  <li><strong>沒有排序 → 肉桂捲排第一</strong>：LIKE 只回答「有沒有包含」，不回答「多相關」。名稱就叫拿鐵的，和描述裡順便提到拿鐵的，地位一樣。沒有 <code>ORDER BY</code> 時資料庫不保證回傳順序，肉桂捲排第一純屬碰巧；就算加上 <code>ORDER BY</code>，也沒有一個欄位能代表「多相關」。</li>
+  <li><strong>不懂詞 → 「鐵」找到拿鐵、「起士蛋糕」落空</strong>：LIKE 比的是字元，不知道「拿鐵」是一個詞。「鐵」這個字在「拿鐵」裡，所以算包含；「起士蛋糕」跟「起司蛋糕」差一個字，整串就比不到。同樣的道理，搜「latte」也找不到拿鐵。</li>
+  <li><strong>慢 → 商品一多就拖垮資料庫</strong>：開頭是 <code>%</code>，B-tree 索引用不上，只能把每一列的字串從頭比到尾。<a href="../../postgresql/lessons/28-gin-search.html">PostgreSQL 課第 28 課</a>的 pg_trgm 可以加速，但它只解決速度，排序和詞的問題還在。</li>
+</ul>
+<p>那 PostgreSQL 自己的全文檢索呢？PostgreSQL 課第 28 課教過，它把文字切成詞存成 <code>tsvector</code>，用 GIN 索引從詞查到列，還能用 <code>ts_rank</code> 排序，前兩個問題它都處理。卡住的地方在「切成詞」這一步：英文靠空白就能切，中文沒有空白，內建的解析器把「燕麥奶拿鐵」整串當成一個詞，搜「拿鐵」是 false。要在 PostgreSQL 裡搜中文，得裝 zhparser、pg_bigm 這類不在 contrib 裡的擴充功能，很多代管服務不提供。</p>
+<p>所以咖啡店考慮搜尋引擎的起點是：<strong>中文分詞、可調整的相關性排序、分類統計</strong>，三個一起要的時候。只要其中一兩項，通常還有更輕的做法，選引擎那一節會回到這個判斷。</p>
+<p>還要先講清楚搜尋引擎在架構裡的位置。搜尋引擎裡的資料是從 PostgreSQL 複製過去的<strong>衍生資料</strong>（<a href="01-choosing-a-store.html">第 1 課</a>）：商品的正式資料仍在 <code>products</code> 表，搜尋引擎只是為了搜尋另外整理的一份，壞了可以從 PostgreSQL 整份重建。這一課先學怎麼建、怎麼查；怎麼跟資料庫保持同步是下一課的主題。</p>
+<p>接下來的問題是：搜尋引擎憑什麼能同時解決排序、詞、速度這三件事？答案在它存資料的方式。</p>
+
+<h2>搜尋引擎怎麼從一個詞直接找到商品？</h2>
+<p>上一節的三個問題有同一個根源：LIKE 拿著搜尋字，一列一列去比字串。搜尋引擎把方向反過來，事先整理好「每個詞出現在哪些商品裡」，查詢時直接翻這份清單。</p>
+<p>先認識兩個名詞。搜尋引擎裡的一筆資料叫<strong>文件</strong>（document），是一個 JSON 物件，例如一項商品的名稱、描述、分類、價格。一群結構相同的文件放在同一個<strong>索引</strong>（index）裡，地位像資料庫的一張表，咖啡店的菜單就是一個索引。這裡的「索引」指的是放文件的容器，跟下面要講的倒排索引是兩回事：一個索引裡，每個要搜尋的欄位各有自己的倒排索引。</p>
+<p>一般的表是「一列資料 → 裡面有哪些字」。<strong>倒排索引</strong>（inverted index）反過來存：「一個詞 → 有這個詞的文件清單」。下圖用三個商品的名稱示範：</p>
+<figure>
+  <svg viewBox="0 0 700 270" role="img" aria-label="三個商品的名稱切成兩字一組的詞之後，建成詞到文件編號的對照表；查拿鐵就是查表裡的一個 key，得到 11 和 14">
+    <defs><marker id="arr10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <text class="d-accent" x="130" y="22" text-anchor="middle">文件（name 欄位）</text>
+    <rect class="d-box" x="20" y="40" width="220" height="44" rx="6"/><text class="d-text" x="130" y="60" text-anchor="middle">11：拿鐵</text><text class="d-small" x="130" y="77" text-anchor="middle">→ 拿鐵</text>
+    <rect class="d-box" x="20" y="100" width="220" height="44" rx="6"/><text class="d-text" x="130" y="120" text-anchor="middle">14：焦糖拿鐵</text><text class="d-small" x="130" y="137" text-anchor="middle">→ 焦糖、糖拿、拿鐵</text>
+    <rect class="d-box" x="20" y="160" width="220" height="44" rx="6"/><text class="d-text" x="130" y="180" text-anchor="middle">34：焦糖布丁</text><text class="d-small" x="130" y="197" text-anchor="middle">→ 焦糖、糖布、布丁</text>
+    <line class="d-line" x1="250" y1="122" x2="390" y2="122" marker-end="url(#arr10)"/>
+    <text class="d-small" x="320" y="112" text-anchor="middle">分析後建表</text>
+    <text class="d-accent" x="540" y="22" text-anchor="middle">倒排索引（詞 → 文件）</text>
+    <rect class="d-soft" x="400" y="40" width="280" height="30" rx="4"/><text class="d-text" x="540" y="60" text-anchor="middle">拿鐵 → 11, 14</text>
+    <rect class="d-box" x="400" y="74" width="280" height="30" rx="4"/><text class="d-text" x="540" y="94" text-anchor="middle">焦糖 → 14, 34</text>
+    <rect class="d-box" x="400" y="108" width="280" height="30" rx="4"/><text class="d-text" x="540" y="128" text-anchor="middle">糖拿 → 14</text>
+    <rect class="d-box" x="400" y="142" width="280" height="30" rx="4"/><text class="d-text" x="540" y="162" text-anchor="middle">糖布 → 34</text>
+    <rect class="d-box" x="400" y="176" width="280" height="30" rx="4"/><text class="d-text" x="540" y="196" text-anchor="middle">布丁 → 34</text>
+    <text class="d-small" x="540" y="236" text-anchor="middle">搜「拿鐵」= 查一個 key，不用看每一份文件</text>
+    <text class="d-small" x="540" y="256" text-anchor="middle">詞依字典順序排好，也記錄出現次數與位置</text>
+  </svg>
+  <figcaption>建索引時先把每份文件切成詞，再把「詞 → 文件」記下來。查詢時把搜尋字用同一套規則切開，每個詞查一次表，再合併、算分數。</figcaption>
+</figure>
+<p>圖的左邊是三份文件的 name 欄位，每個名稱先被切成兩字一組的詞（怎麼切是後面分析器那一節的主題）。右邊是建好的倒排索引：「拿鐵」這個詞出現在 11 和 14，「焦糖」出現在 14 和 34。搜「拿鐵」時，搜尋引擎不看任何一份文件，直接找到「拿鐵」這一列，就知道答案是 11 和 14。</p>
+<p>這個結構把開場的三個問題逐一變成可以處理的事：</p>
+<p><strong>速度</strong>：不論有幾萬份文件，搜一個詞就是在排好序的詞表裡查一個 key，不用逐列比對。這是 LIKE 做不到、GIN 做得到的部分。</p>
+<p><strong>排序</strong>：倒排索引除了「哪些文件有這個詞」，也記錄了每個詞在每份文件出現幾次、全部有多少份文件有它。有了這些數字，搜尋引擎就能替每份文件算出一個「多相關」的分數，最後一節看懂分數時會拆開它。LIKE 的結果沒有這種資訊，所以只能亂排。</p>
+<p><strong>詞</strong>：表裡有哪些詞，完全由建索引時的切詞規則決定。如果「拿鐵」被切成「拿」「鐵」兩個詞，表裡就有「鐵」這個 key，搜「鐵」就會找到所有拿鐵，跟 LIKE 一樣；如果切成「拿鐵」一個詞，表裡沒有「鐵」，搜「鐵」就找不到。切詞的規則叫<strong>分析器</strong>，是中文搜尋好不好的關鍵，後面分析器那一節專門講。</p>
+<p>這個結構也有代價：<strong>改一份文件等於重新索引整份</strong>。倒排索引是為了查詢排好的結構，一份文件的詞分散在許多個詞的文件清單裡（例如焦糖拿鐵同時在「焦糖」「糖拿」「拿鐵」三份清單裡），這些清單又是排好序的，沒辦法只改其中一處。所以 Elasticsearch 更新文件時，其實是把舊文件標記為刪除，再寫入一份新文件。設定 mapping 那一節講區段時，會再看到這個「不能就地修改」的特性。這讓它適合讀多寫少的資料，例如菜單；每秒都在變的庫存數字就不適合放在這裡當主要資料。</p>
+<p>PostgreSQL 的 GIN 也是倒排索引（<a href="../../postgresql/lessons/28-gin-search.html">PostgreSQL 課第 28 課</a>），原理相同。搜尋引擎多出來的是：可以替每個欄位設定分析器、內建相關性演算法與調整工具、分散到多台機器，以及分類統計用的聚合。</p>
+<p>到這裡，開場問題的最小答案已經有了：把菜單建成倒排索引、用對的規則切中文、依分數排序。接下來要選一套搜尋引擎，把它實際跑起來。</p>
+
+<h2>要加哪一套搜尋引擎？先把它跑起來</h2>
+<p>知道搜尋引擎能做什麼之後，第一個決定其實是「要不要加」。多一套 Elasticsearch 代表多一套要監控、升級、同步的系統（<a href="01-choosing-a-store.html">第 1 課</a>），所以先問「PostgreSQL 撐得住嗎」：商品幾百項、只要搜名稱，pg_trgm 加上 pg_bigm 可能就夠。咖啡店這次三個需求都要（中文分詞、相關性、分類統計），才往下選引擎。</p>
+<p>常見的選項比較如下，這張表是做決定時查的，不用背：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>PostgreSQL FTS／pg_trgm</th><th>Elasticsearch 9.5</th><th>OpenSearch 3.9</th><th>Meilisearch 1.56</th></tr>
+  <tr><td>中文</td><td>要裝 zhparser、pg_bigm 等擴充功能</td><td>內建 cjk 分析器；smartcn、ICU 是官方外掛</td><td>跟 Elasticsearch 同源，分析器大致相同</td><td>內建中文分詞</td></tr>
+  <tr><td>相關性調整</td><td>ts_rank，可調的地方少</td><td>BM25、欄位加權、function_score、同義詞、explain</td><td>同左</td><td>內建排序規則，可調順序，彈性較小</td></tr>
+  <tr><td>分類統計（聚合）</td><td>自己寫 GROUP BY</td><td>完整的聚合功能</td><td>同左</td><td>facet 統計</td></tr>
+  <tr><td>資源</td><td>不多一台機器</td><td>跑在 JVM（Java 虛擬機）上，記憶體約 1 GB 起</td><td>JVM，同左</td><td>Rust 單一執行檔，小資料量幾百 MB</td></tr>
+  <tr><td>授權</td><td>PostgreSQL License</td><td>原始碼可選 AGPLv3、SSPL 1.0、Elastic License 2.0；預設發行版免費使用</td><td>Apache 2.0</td><td>社群版 MIT</td></tr>
+  <tr><td>託管</td><td>各家雲端資料庫</td><td>Elastic Cloud</td><td>Amazon OpenSearch Service</td><td>Meilisearch Cloud</td></tr>
+</table></div>
+<p>課程用 Elasticsearch，Elasticsearch 的查詢用 JSON 描述，這套格式叫 Query DSL。課程用 Elasticsearch，理由是職缺與既有系統最常見，而且它的 Query DSL 跟 OpenSearch 大致相通，學會一個，另一個很快上手；AWS 上的公司多半用 OpenSearch。Meilisearch 適合「打字即搜、資料量中小、不想調參數」的產品搜尋。其他選擇與授權細節見課末「補充與查表」。</p>
+<p>啟動課程的 Elasticsearch（第一次要下載約 700 MB 的映像）：</p>
+<pre>$ cd learn/data-stores/practice
+$ docker compose --profile search up -d --wait
+$ curl -s localhost:16492
+{ "name" : "…", "version" : { "number" : "9.5.5", … }, "tagline" : "You Know, for Search" }</pre>
+<p>看到 <code>"number" : "9.5.5"</code> 就代表它在跑。這個容器是單節點，JVM 的 heap 設成 512 MB；heap 是 JVM 用來放物件的那塊記憶體，Elasticsearch 是 Java 程式，所以要替它設這個上限。容器也<strong>關閉了安全功能</strong>，不用帳號密碼就能操作。這只適合本機練習：正式環境一定要開帳號、TLS 與權限控管，Elasticsearch 被掃到沒設密碼，資料就會被整份讀走或刪掉。</p>
+<p>Elasticsearch 的操作全是 REST API，也就是 Node 課教過的 HTTP 請求：<code>PUT /索引名稱</code> 建索引、<code>POST /索引名稱/_search</code> 搜尋，body 是 JSON。可以用 curl 直接打，也可以用官方的 Node 套件 <code>@elastic/elasticsearch</code> 9.5.1。client 的主版本要跟伺服器相同，這個版本需要 Node 22 以上：</p>
+<pre>import { Client } from '@elastic/elasticsearch'
+const es = new Client({ node: 'http://127.0.0.1:16492' })
+const r = await es.search({ index: 'menu', query: { match: { name: '拿鐵' } } })
+console.log(r.hits.total, r.hits.hits)     // 9.x 的 client 直接回傳 body，參數也直接放在第一層</pre>
+<p>這段程式對 <code>menu</code> 索引搜「拿鐵」，<code>hits.total</code> 是符合的筆數，<code>hits.hits</code> 是依分數排好的文件。後面每一節的程式都是這個形狀，只換 <code>search</code> 裡的參數。自己實驗用 <code>play-</code> 開頭的索引名稱；練習的測試用 <code>t10-</code> 開頭，每次判分前會刪掉。</p>
+<div class="callout practice"><strong>💡 實務上：「加搜尋引擎」是架構決定，先把問題寫清楚</strong><br>需求通常來自 PM 的一句「搜尋要像蝦皮一樣好用」。動手前先問四件事：要搜的資料有多少筆、會怎麼成長；客人實際打什麼（從現有的搜尋紀錄撈前 100 名）；要不要分類統計、錯字容忍、同義詞；誰負責半夜它掛掉。答案是「幾百項商品、只搜名稱」時，先在 PostgreSQL 做到最好，把省下的時間花在別處。決定要加時，也一併跟維運談好託管或自架、記憶體預算與備份方式，並在文件寫下「搜尋壞掉時，App 退回什麼行為」（例如顯示「搜尋暫時無法使用」，而不是整頁錯誤）。</div>
+<p>引擎跑起來了，但如果現在直接把菜單寫進去，用的是預設的切詞規則，開場的「鐵」照樣會找到一整排拿鐵。下一節看中文到底被切成了什麼。</p>
+
+<h2>搜「鐵」為什麼會找到拿鐵？分析器怎麼切中文</h2>
+<p>倒排索引那一節說過，表裡有哪些詞，由建索引時的切詞規則決定。這套規則叫<strong>分析器</strong>（analyzer），它把一段文字變成一串詞，分兩步做。</p>
+<p>第一步由 <strong>tokenizer</strong> 把整段文字切成一個個片段。切出來的最小單位叫 <strong>token</strong>（詞元），倒排索引裡的「詞」指的就是 token。第二步讓這些 token 依序經過幾個 <strong>token filter</strong> 加工，例如英文轉小寫、全形字轉半形，或是去掉 the、a 這種到處都有、對搜尋沒有幫助的字。這類字叫<strong>停用詞</strong>（stop words）。</p>
+<p>寫入文件時用分析器建倒排索引，查詢時再用同一個分析器處理搜尋字。兩邊一定要用同一套規則：如果文件被切成「拿鐵」、搜尋字卻被切成「拿」「鐵」，兩邊的詞就對不上，明明有的商品也搜不到。</p>
+<p>分析器是看不見的，要知道它切出什麼，用 <code>_analyze</code> API 直接問。選分析器、查「為什麼搜不到」都靠它。下面拿同一段文字，分別交給兩個分析器：</p>
+<pre>$ curl -s localhost:16492/_analyze -H 'content-type: application/json' \
+    -d '{ "analyzer": "standard", "text": "焦糖拿鐵 Caramel Latte" }'
+→ 焦、糖、拿、鐵、caramel、latte
+
+$ curl -s localhost:16492/_analyze -H 'content-type: application/json' \
+    -d '{ "analyzer": "cjk", "text": "焦糖拿鐵 Caramel Latte" }'
+→ 焦糖、糖拿、拿鐵、caramel、latte</pre>
+<p>先看第一個。<strong>standard</strong> 是沒有指定分析器時的預設值，它把每個中日韓文字當成一個詞，所以「拿鐵」被拆成「拿」「鐵」。這就是開場「鐵」找到一整排拿鐵的原因：索引裡真的有「鐵」這個詞。反過來，搜「拿鐵」會被切成「拿」和「鐵」，連「拿」和「鐵」分散在不同位置、根本不相連的文件也會被找到。英文的部分沒問題，靠空白切開再轉小寫。</p>
+<p>第二個 <strong>cjk</strong> 分析器是內建的，不用裝外掛。它同樣先用 standard tokenizer 切開，再經過幾個 token filter：<code>cjk_width</code> 把全形半形統一（同一個字的不同寫法見 <a href="../../typescript/lessons/06-dates-text.html">TypeScript 課第 6 課</a>）、<code>lowercase</code> 轉小寫、去掉英文停用詞，關鍵的是 <code>cjk_bigram</code>。它把連續的中文字兩兩一組重新組合，這種切法叫 <strong>bigram</strong>：「焦糖拿鐵」→ 焦糖、糖拿、拿鐵。</p>
+<p>bigram 不認識詞，所以會多出「糖拿」這種不是詞的組合。但只要搜尋字也用同樣的方式切，兩個字以上的詞都對得上：搜「拿鐵」切出「拿鐵」，正好是索引裡的一個詞。把開場的查詢拿到 9.5.5 實際試，結果如下：</p>
+<div class="table-wrap"><table>
+  <tr><th>搜尋字</th><th>cjk 切出</th><th>結果</th></tr>
+  <tr><td>冰拿鐵</td><td>冰拿、拿鐵</td><td>冰拿鐵兩個詞都中，排第一；其他拿鐵只中「拿鐵」，排後面</td></tr>
+  <tr><td>起士蛋糕（錯字）</td><td>起士、士蛋、蛋糕</td><td>靠「蛋糕」找到起司蛋糕、抹茶蛋糕、巧克力蛋糕</td></tr>
+  <tr><td>鐵</td><td>鐵（單獨一個字時保留單字）</td><td>索引裡只有「拿鐵」，沒有「鐵」：找不到，這是我們要的</td></tr>
+  <tr><td>茶</td><td>茶</td><td>同樣找不到「紅茶」「抹茶」：單字搜尋是 bigram 的缺點</td></tr>
+</table></div>
+<p>由上往下讀這張表：</p>
+<ul>
+  <li><strong>冰拿鐵</strong>：搜尋字切出兩個詞，冰拿鐵本身兩個都中，分數最高；其他拿鐵只中一個，排在後面。排序開始有依據了。</li>
+  <li><strong>起士蛋糕</strong>：「起士」對不上「起司」，但「蛋糕」對得上，所以不再是零結果。起司蛋糕會不會排第一，要看分數，最後一節的案例集會把它當成一組案例來檢查。</li>
+  <li><strong>鐵</strong>：開場的第三則回報修好了。</li>
+  <li><strong>茶</strong>：同一個機制的副作用。單獨一個字只能對上單字，而索引裡的「紅茶」「抹茶」都是兩字一組，所以搜不到。</li>
+</ul>
+<p>起士蛋糕這個例子會讓人想到錯字容忍。<code>match</code> 查詢可以加 <code>fuzziness: 'AUTO'</code> 容許打錯，但它的計算單位是「一個詞裡改幾個字元」，而 AUTO 對 1～2 個字元的詞要求完全相同。bigram 每個詞剛好兩個字，所以實測「起士」加了 fuzziness 還是找不到「起司」。中文錯字要靠 bigram 的部分重疊（上表的「蛋糕」）、同義詞，或常見錯字對照表。</p>
+<p>開場 LIKE 那一節還留著一個問題：搜「latte」找不到拿鐵。這要靠<strong>同義詞</strong>（synonym）：在自訂分析器裡加上 <code>synonym_graph</code> filter，設定「拿鐵, latte」「鮮奶, 牛奶」這樣的對照，搜其中一個也找得到另一個。同義詞放在查詢時用的分析器，設定方式見課末。</p>
+<p>bigram 的取捨可以這樣總結：不用詞典、不會漏掉新詞（新品名、品牌名都切得到），代價是索引比較大、有「糖拿」這種雜訊、單字搜不到。想要真正的「詞」，要用<strong>詞典式分詞</strong>：靠一份詞典判斷哪幾個字組成一個詞，要另外裝外掛（有哪些外掛、各自的限制見課末）。菜單這種短文字，cjk 通常夠用，課程也只用 cjk。</p>
+<div class="callout practice"><strong>💡 實務上：客服說「搜不到」，第一步是看詞</strong><br>典型回報：「客人搜『鮮奶茶』找不到鮮奶茶」。查的順序：先確認文件真的在索引裡（用 id 取 <code>GET 索引/_doc/id</code>，排除同步問題）；再用 <code>POST 索引/_analyze</code> 帶 <code>{ "field": "name", "text": "鮮奶茶" }</code>，用欄位實際設定的分析器，分別切文件的值與搜尋字，看兩邊的詞有沒有交集；最後才看篩選條件（是不是被 <code>available</code> 擋掉了）與分數。修法多半是加同義詞或錯字對照，而不是改程式。把每一個這樣的案例記下來，正好變成練習 4 的案例集。</div>
+<p>到這裡我們只是用 <code>_analyze</code> 試切。要讓菜單的 name 欄位真的用 cjk 建倒排索引，必須在建索引時告訴 Elasticsearch：哪個欄位用哪個分析器。這就是下一節的 mapping。</p>
+
+<h2>怎麼讓每個欄位用對的切法？設定 mapping</h2>
+<p>上一節決定了中文要用 cjk 切。這個決定要寫進索引的 <strong>mapping</strong>：它定義索引裡每個欄位的型別與分析方式，就像建表時的欄位定義。沒有寫 mapping，Elasticsearch 會自己猜，猜出來的就是 standard 分析器，「鐵」的問題又回來了。</p>
+<p>先看字串欄位。不是每個字串都該切詞，所以 Elasticsearch 有兩個最重要的字串型別：</p>
+<div class="table-wrap"><table>
+  <tr><th>型別</th><th>怎麼存</th><th>用在</th></tr>
+  <tr><td><code>text</code></td><td>經過分析器切成詞</td><td>全文搜尋：商品名稱、描述</td></tr>
+  <tr><td><code>keyword</code></td><td>整個值當一個詞，不分析</td><td>精確篩選、排序、聚合：分類、狀態、標籤、email</td></tr>
+</table></div>
+<p>商品名稱要用 text，因為客人打的是名稱的一部分。分類就不一樣：搜尋頁要「只看茶飲」、要算「茶飲有幾項」，要的是整個值完全相同，所以用 keyword，「茶飲」整串就是一個詞。</p>
+<p>同一個值有時兩種用途都要：名稱要能全文搜尋，後台列表也要能依名稱排序。排序需要整個值，切過的詞做不到。這時用 <strong>multi-field</strong>：主欄位是 text，在 <code>fields</code> 底下再加一個 keyword 子欄位，寫入時 Elasticsearch 自動存兩份。查詢用 <code>name</code>，排序用 <code>name.keyword</code>。咖啡店菜單的 mapping：</p>
+<pre>await es.indices.create({
+  index: 'play-menu',
+  mappings: {
+    dynamic: 'strict',                       // 不在下面的欄位一律拒絕寫入
+    properties: {
+      name: { type: 'text', analyzer: 'cjk', fields: { keyword: { type: 'keyword' } } },
+      description: { type: 'text', analyzer: 'cjk' },
+      category: { type: 'keyword' },          // 咖啡、茶飲、甜點、輕食
+      price: { type: 'integer' },             // 新台幣元
+      available: { type: 'boolean' },
+      sales: { type: 'integer' },             // 近 30 天銷量
+    },
+  },
+})</pre>
+<p>name 和 description 用 cjk，這就是上一節的修法真正生效的地方。其他幾個欄位的決定各有理由。</p>
+<p><strong>category 用 keyword</strong>：如果用 text，「茶飲」會被切成 bigram，「term: 茶飲」的精確篩選與 terms 聚合都不對（text 欄位做 terms 聚合會直接報錯）。後面組查詢時的篩選和分類統計都建立在這個欄位是 keyword 上。</p>
+<p><strong>price 用 integer</strong>：新台幣以元計價、沒有小數。float 是二進位浮點數，110.1 存不精確，「120 元以下」這種範圍篩選會在邊界出錯。有小數的幣別用 <code>scaled_float</code>（設 <code>scaling_factor: 100</code>，實際存成整數），或像 <a href="../../typescript/lessons/05-numbers-money.html">TypeScript 課第 5 課</a>那樣存最小單位。</p>
+<p><strong>dynamic: 'strict'</strong>：Elasticsearch 預設是 dynamic mapping，第一次看到 mapping 裡沒有的欄位時，自動替它決定型別：字串會變成 text（standard 分析器）加一個 keyword 子欄位，數字看第一筆是整數還是小數。這很方便，也很危險：一筆打錯欄位名稱的資料，就讓索引永久多出一個欄位，型別還可能是錯的。strict 讓這種寫入直接失敗（<code>strict_dynamic_mapping_exception</code>），錯誤在開發時就看得到。</p>
+<div class="callout warn"><strong>mapping 建好之後，已有欄位大多不能改。</strong>倒排索引已經依照舊的分析器建好了，把 name 從 standard 改成 cjk，等於每份文件都要重新切詞。可以做的只有新增欄位、調整少數設定。要改型別或分析器，就建一個新索引、把資料重新匯入，再讓程式改用新索引；用別名（alias）讓這個切換不停機，是下一課的內容。所以第一次就把 mapping 想清楚，並且永遠保留從 PostgreSQL 重建索引的能力。</div>
+<p>mapping 建好，就可以寫入菜單。單筆用 <code>es.index({ index, id, document })</code>，大量寫入用 <code>es.bulk</code>。第一次寫的人常會遇到一件怪事：寫完馬上搜，搜不到。</p>
+<pre>await es.index({ index: 'play-menu', id: '99', document: { name: '季節限定柚子拿鐵', … } })
+await es.search({ index: 'play-menu', query: { match: { name: '柚子' } } })   // total: 0</pre>
+<p>寫入沒有失敗，原因在於 Elasticsearch 是<strong>近即時</strong>（near real-time）：寫入成功和搜得到之間有一小段延遲。倒排索引那一節說過它是排好的結構，不能每來一筆就重排整張表。所以新文件先放進記憶體的緩衝，再定期把緩衝整理成一小塊新的倒排索引。這一小塊叫<strong>區段</strong>（segment），一個索引由很多個區段組成，搜尋時每個區段都查。把緩衝整理成區段的動作叫 <strong>refresh</strong>，預設每 1 秒一次，refresh 之前寫入的文件還搜不到。</p>
+<p>測試與「寫完要馬上看到」的後台頁面，寫入時加 <code>refresh: 'wait_for'</code>，Elasticsearch 會等下一次 refresh 完成才回應。正式環境不要每次寫入都強制 refresh：每次 refresh 都會產生一個小區段，大量的小區段會拖慢整個索引的搜尋。refresh 還有一個閒置時的行為，見課末。</p>
+<p>菜單用對的分析器寫進去了，「鐵」和「起士蛋糕」都修好。剩下第一則回報：搜「拿鐵」時肉桂捲排第一。要處理它，得開始寫正式的查詢。</p>
+
+<h2>搜「拿鐵」為什麼肉桂捲排第一？組出搜尋頁的查詢</h2>
+<p>前面一直用的 <code>match</code> 是基本的全文查詢：把搜尋字用欄位的分析器切開，任一個詞命中就算符合（預設是 OR），中的詞越多、越重要，分數越高。但它一次只搜一個欄位。肉桂捲的「配拿鐵」寫在描述裡，搜尋頁需要名稱和描述一起搜，這時用 <code>multi_match</code>：</p>
+<pre>{ multi_match: { query: '拿鐵', fields: ['name^3', 'description'] } }</pre>
+<p>在 LIKE 裡肉桂捲排第一是碰巧；換成搜尋引擎、名稱和描述一起搜之後，它會因為一個實際的原因再次排到第一。先看沒有 <code>^3</code> 的情況，也就是 <code>fields: ['name', 'description']</code>。這時「肉桂捲（描述：肉桂糖霜，配拿鐵）」會排在「拿鐵」前面，開場的回報重現了。原因是分數按欄位各自計算：菜單裡描述提到「拿鐵」的文件很少，這個詞在描述欄位顯得很稀有，命中稀有的詞分數就高，肉桂捲在描述欄位拿到的分數反而比拿鐵在名稱欄位拿到的高。為什麼「稀有」會加分，最後一節拆開分數時會看到。<code>multi_match</code> 預設取各欄位裡最高的那個分數（<code>best_fields</code>），所以肉桂捲贏了。</p>
+<p>修法是告訴 Elasticsearch「名稱命中比描述命中重要」。在欄位名稱後面加 <code>^數字</code>，這叫<strong>加權</strong>（boost）：<code>name^3</code> 讓名稱命中的分數乘 3，名稱叫拿鐵的就排回前面。描述仍然要搜，因為客人搜「焦糖」時，描述裡有焦糖醬的飲品也該出現，只是排在名稱有焦糖的後面。</p>
+<p>關鍵字的排序有了，但搜尋頁不只有關鍵字：客人還會選分類、設價格上限，下架的商品也不該出現。這些條件跟關鍵字的性質不同，要用 <strong>bool 查詢</strong>組合起來。bool 查詢有四種子句，差別在「一定要符合嗎」和「算不算分數」：</p>
+<div class="table-wrap"><table>
+  <tr><th>子句</th><th>意思</th><th>算分數嗎</th></tr>
+  <tr><td><code>must</code></td><td>一定要符合</td><td>算</td></tr>
+  <tr><td><code>should</code></td><td>符合的話加分；沒有 must 也沒有 filter 時，至少要符合一個（有 filter 時預設一個都不用符合，要自己設 <code>minimum_should_match</code>）</td><td>算</td></tr>
+  <tr><td><code>filter</code></td><td>一定要符合</td><td>不算，而且常用的條件會被快取</td></tr>
+  <tr><td><code>must_not</code></td><td>一定不能符合</td><td>不算</td></tr>
+</table></div>
+<p>咖啡店搜尋頁的查詢，執行後只會回傳 120 元以下、有供應的咖啡，依關鍵字分數排序：</p>
+<pre>const r = await es.search({
+  index: 'play-menu',
+  size: 10,
+  _source: ['name'],                                   // 只回傳需要的欄位
+  query: {
+    bool: {
+      must: [{ multi_match: { query: '拿鐵', fields: ['name^3', 'description'] } }],
+      filter: [
+        { term: { category: '咖啡' } },                // keyword 欄位用 term 精確比對
+        { range: { price: { lte: 120 } } },            // 小於等於 120
+        { term: { available: true } },
+      ],
+    },
+  },
+})</pre>
+<p>關鍵字放 must，分類、價格、供應狀態放 filter。分類和價格只回答「要不要」，跟「多相關」無關。如果把它們放在 must，結果一樣會被篩掉，但條件會被算進分數，價格條件就會影響排序，而且失去 filter 的快取。<code>term</code> 是精確比對，用在 keyword、數字、布林這類不切詞的欄位，這也是上一節 category 必須是 keyword 的原因。<code>_source</code> 限制回傳的欄位：列表頁只顯示名稱，就不要把描述和所有欄位都傳回來。</p>
+<p>還有一個常見的誘惑：用 <code>wildcard</code>（<code>*拿鐵*</code>）或 <code>regexp</code> 取代全文搜尋，因為它看起來跟 LIKE 一樣好懂。但開頭是萬用字元時，它要走過索引裡所有的詞，資料一多就慢，結果也沒有相關性分數，等於把開場 LIKE 的問題原封不動搬進搜尋引擎。</p>
+<p>搜尋結果之外，搜尋頁左邊通常還有一排「咖啡 (7)、茶飲 (2)、甜點 (2)」，這叫<strong>分類統計</strong>（facet）。它用<strong>聚合</strong>（aggregation）算：聚合是在符合查詢的文件上做統計，其中 <code>terms</code> 聚合依 keyword 欄位的值分組計數，相當於 SQL 的 GROUP BY。它跟搜尋結果在同一個請求裡拿到：</p>
+<pre>aggs: { categories: { terms: { field: 'category' } } }
+→ r.aggregations.categories.buckets = [{ key: '咖啡', doc_count: 7 }, { key: '茶飲', doc_count: 2 }, …]</pre>
+<p>聚合是對 <code>query</code> 符合的文件算的，這會造成一個問題。客人點了「茶飲」，如果把分類條件放進 query 的 filter，聚合也只剩茶飲，左邊的分類列表只剩一項，客人沒辦法切回咖啡。解法是 <code>post_filter</code>：它在聚合算完之後才篩選回傳的文件，所以分類筆數依關鍵字計算，不受目前選的分類影響。練習 3 會做這件事。</p>
+<div class="callout practice"><strong>💡 實務上：查詢由後端組，前端只送參數</strong><br>App 的搜尋 API 長得像 <code>GET /api/menu/search?q=拿鐵&amp;category=咖啡&amp;page=2</code>，後端驗證參數後用 <code>buildQuery</code>（下面練習 2 會寫）這類函式組出 Query DSL。不要讓前端直接送 Query DSL 給 Elasticsearch，也不要讓 Elasticsearch 對外開放：任何人都能送出昂貴的聚合或讀到不該看的欄位，這是資安會擋下的設計。後端也要限制 <code>size</code> 與頁數，翻頁的上限與替代做法見課末。Vue 這端的搜尋框做 debounce（停止打字約 300 毫秒才送出），並取消上一個還沒回來的請求，免得舊結果蓋掉新結果。</div>
+<p>三則回報到這裡都有了修法。但 <code>^3</code> 這個數字是怎麼來的？如果改成 <code>^5</code>，會不會修好拿鐵、卻弄壞另一個查詢？要回答這些，得先看懂分數，再用一組固定的案例檢查。</p>
+
+<h2>^3 調得對嗎？看懂分數，用案例集檢查</h2>
+<p>上一節用加權把拿鐵排回第一，但只看了一個查詢。要放心地調，得先知道分數是怎麼算的。回傳結果裡的 <code>_score</code> 叫<strong>相關性分數</strong>（relevance score），表示文件跟查詢有多相關。Elasticsearch 預設用 <strong>BM25</strong> 演算法算它，公式不用背，記住三個直覺：</p>
+<ol>
+  <li><strong>越稀有的詞越重要</strong>（IDF）：40 項商品裡 9 項名稱有「拿鐵」，「焦糖」只有 3 項，所以命中「焦糖」比命中「拿鐵」加更多分。肉桂捲的事故就是這一條：在描述欄位，有「拿鐵」的文件很少，「拿鐵」成了稀有詞。</li>
+  <li><strong>出現次數有上限</strong>（tf 飽和）：一個詞出現 2 次比 1 次分數高，但 10 次不會是 1 次的 10 倍，在描述裡塞關鍵字沒什麼用。</li>
+  <li><strong>短欄位加分</strong>（長度正規化）：名稱就叫「拿鐵」的，比「黑糖拿鐵」更貼近搜尋字。</li>
+</ol>
+<p>這三個直覺可以直接在 Elasticsearch 的輸出裡驗證。查詢加上 <code>explain: true</code>，會回傳每份文件分數的計算過程。搜 <code>name: 拿鐵</code>，第一名「拿鐵」的說明（9.5.5 實際輸出，精簡過）：</p>
+<pre>weight(name:拿鐵) = 2.0010152 = boost × idf × tf
+  boost 2.2       = k1 + 1（查詢本身沒有加權時；加了 name^3 這裡會乘 3）
+  idf 1.4622803   log(1 + (N - n + 0.5) / (n + 0.5))，N = 40 份文件、n = 9 份有這個詞
+  tf  0.62200963  freq / (freq + k1 × (1 - b + b × dl / avgdl))
+                  freq 1（出現 1 次）、k1 1.2、b 0.75、dl 1（這個欄位只有 1 個詞）、avgdl 2.925（平均 2.925 個詞）</pre>
+<p>由上往下對照三個直覺：</p>
+<ul>
+  <li><strong>boost</strong>：查詢的加權。上一節的 <code>name^3</code> 就是乘在這裡。</li>
+  <li><strong>idf</strong>：N 是文件總數、n 是有這個詞的文件數，n 越小 idf 越大，這是「稀有的詞重要」。</li>
+  <li><strong>tf</strong>：freq 是出現次數，分母裡也有 freq，所以次數再多，tf 也只會逼近上限，這是「次數有上限」；dl 是這個欄位的詞數、avgdl 是平均詞數，dl 越小 tf 越大，這是「短欄位加分」。k1 控制次數多快飽和、b 控制長度影響多大，預設 1.2 與 0.75，幾乎不需要改。</li>
+</ul>
+<p>看懂分數之後，調整的手段依常用程度有三種。第一種是<strong>欄位加權</strong>，上一節的 <code>name^3</code>，最常用、最好懂。第二種是<strong>分析器與同義詞</strong>：詞切錯了，分數怎麼調都沒用，先用 <code>_analyze</code> 確認。第三種是<strong>商業訊號</strong>：文字分數相近時，讓熱銷的、評價高的排前面。例如客人搜「拿鐵」，好幾項拿鐵的文字分數差不多，店長希望賣得最好的那杯在最上面。這用 <code>function_score</code>，把欄位值加進分數：</p>
+<pre>query: {
+  function_score: {
+    query: { bool: { … } },                                     // 原本的查詢
+    functions: [{ field_value_factor: { field: 'sales', modifier: 'log1p', missing: 0 } }],
+    boost_mode: 'sum',                                          // 文字分數 + log10(1 + 銷量)
+  },
+}</pre>
+<p><code>log1p</code> 取 log10(1 + 值)：銷量 450 加約 2.65 分、50 加約 1.71 分，差距被壓小，熱銷品不會把不相關的商品推上來。如果直接加銷量，450 分會蓋過所有文字分數，客人搜「拿鐵」可能先看到熱銷的可頌。<code>boost_mode</code> 決定怎麼跟文字分數合併：<code>sum</code> 相加、<code>multiply</code>（預設）相乘。</p>
+<p>手段有了，最後是怎麼確認調對了。調分數最容易犯的錯，是看到一個查詢結果不好就改一個參數，結果另外三個查詢變差了，而且沒有人發現。做法跟寫程式一樣，先寫測試：整理一組<strong>「搜這個，第一個應該看到它」</strong>的案例，例如「拿鐵 → 拿鐵」「起士蛋糕 → 起司蛋糕」「冰拿鐵 → 冰拿鐵」，開場的三則回報就是最早的三組，之後從客服回報與搜尋紀錄裡最常見的查詢持續補充。每次調整都跑一遍，看 <strong>Precision@1</strong> 有沒有變好：它是「第一名正確的案例數 ÷ 案例總數」，例如 7 組裡 6 組第一名正確，就是 6/7。練習 4 就是這個流程。</p>
+<div class="callout practice"><strong>💡 實務上：記錄搜尋行為，從「零結果查詢」開始改</strong><br>搜尋上線後，在後端記下每次的搜尋字、結果筆數、客人點了第幾個（不要記會員個資，搜尋字也可能含電話號碼，要依公司的個資規範處理）。每週看兩張表：<strong>零結果的搜尋字</strong>（缺同義詞、錯字、或是客人想要但店裡沒賣的品項，後者是給 PM 的商品情報）與<strong>有結果卻沒人點</strong>的搜尋字（排序有問題）。新的加權或同義詞先跑案例集，再上線觀察點擊率。資深工程師跟 PM 溝通時用這些數字，而不是「我覺得排序變好了」。</div>
+<p>下面的練習把這一課走一遍：建 mapping、組查詢、算分類統計，最後寫案例集並用銷量調整排序。</p>
+
+<h2>練習</h2>
+<p>先確認 Elasticsearch 有在跑（<code>docker compose --profile search up -d --wait</code>），每一題都在 <code>learn/</code> 執行 <code>node check.mjs data-stores 10</code> 判分。測試用的索引都以 <code>t10-</code> 開頭，每個測試檔開始前會刪掉。<code>menu.ts</code> 是測試用的 40 項菜單（id 10～49），練習 2～4 的測試用你在練習 1 寫的 <code>createMenuIndex</code> 建索引再放進這份菜單，所以先完成練習 1。</p>
+
+<div class="local" data-test="ex1" data-files="mapping.ts">
+  <p>練習 1：在 <code>mapping.ts</code> 寫 <code>createMenuIndex(es, index)</code>，用參數的名稱建立菜單索引：<code>name</code>、<code>description</code> 是用 cjk 分析器的 text，<code>name</code> 另有 keyword 子欄位 <code>name.keyword</code>；<code>category</code> 是 keyword；<code>price</code>、<code>sales</code> 是 integer；<code>available</code> 是 boolean；寫入其他欄位要失敗。測試會讀 mapping、用 <code>_analyze</code> 確認「焦糖拿鐵」切出「拿鐵」而沒有「鐵」，再寫入文件實際搜尋。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="search.ts">
+  <p>練習 2：在 <code>search.ts</code> 寫 <code>buildQuery(p)</code>（純函式，回傳 <code>es.search</code> 的參數，不含 index）與 <code>searchMenu(es, index, p)</code>（回傳前 10 筆 <code>{ id, name, score }</code>）。<code>q</code> 同時搜名稱與描述，名稱命中要排在只有描述命中的前面；<code>category</code>、<code>maxPrice</code>（含，0 也是有給）是篩選條件，沒給就不篩；<code>onlyAvailable</code> 是 true 時只留有供應的，false 或沒給都不篩；回傳的文件內容只要 name。測試會直接檢查 <code>buildQuery</code> 的結構（篩選條件在哪裡、有沒有 wildcard），也會在 40 項菜單上跑幾組查詢比對順序與篩選結果。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="facets.ts">
+  <p>練習 3：在 <code>facets.ts</code> 寫 <code>searchWithFacets(es, index, { q, category? })</code>，回傳 <code>{ hits, total, facets }</code>：hits 是符合關鍵字與分類的商品 id（最多 10 筆，依分數排序）、total 是總筆數、facets 是符合關鍵字的商品在每個分類的筆數，<strong>不受使用者選的分類影響</strong>。只能呼叫一次 <code>es.search</code>，測試會把 client 包起來數呼叫次數。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="cases.json relevance.ts search.ts">
+  <p>練習 4：在 <code>cases.json</code> 寫至少 6 組不重複的 <code>{ "q": "搜尋字", "expect": "期望第一名的 id" }</code>（id 對照 <code>menu.ts</code>），在 <code>relevance.ts</code> 寫 <code>evaluate(es, index, cases)</code>，用 <code>searchMenu</code> 跑每一組，回傳 Precision@1。測試會跑你的案例和店長整理的 7 組隱藏案例，全部都要第一名正確；其中有「文字分數一樣時，賣得好的排前面」的案例，回到 <code>search.ts</code> 用 <code>function_score</code> 把 <code>sales</code> 加進分數（加完要確認練習 2 仍然通過）。隱藏案例也會在一個 id 全部加 100 的索引上再跑一次，依查詢字串寫死結果的程式過不了。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：<code>name</code> 欄位沒有指定分析器（用預設的 standard），寫入「拿鐵」之後，倒排索引裡會有哪些詞？</p>
+  <label data-key="a">拿鐵</label>
+  <label data-key="b">拿、鐵</label>
+  <label data-key="c">拿鐵、latte</label>
+  <label data-key="d">沒有詞，中文要裝外掛才能索引</label>
+  <p class="why">✓ standard tokenizer 把每個中日韓文字當成一個詞，所以搜「鐵」也會命中拿鐵。cjk 分析器改成兩字一組（bigram），才會有「拿鐵」這個詞（a）。latte 要靠自己設定的同義詞才會出現（c）。中文不裝外掛也能索引，只是切得不好（d）。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 6：搜尋頁的「價格 120 元以下」「只看有供應的」應該放在 bool 查詢的哪裡？</p>
+  <label data-key="a">must</label>
+  <label data-key="b">should</label>
+  <label data-key="c">filter</label>
+  <label data-key="d">must_not</label>
+  <p class="why">✓ 這些條件只決定要不要，跟相關程度無關。filter 不算分數，常用的條件還會被快取。放在 must 結果一樣會被篩掉，但條件會被算進分數，讓不相干的條件影響排序（a）；should 是「符合就加分」，不符合的不會被排除（b）；must_not 是排除符合的文件，方向相反（d）。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：已經上線的菜單索引，想把 name 從 standard 改成 cjk 分析器，怎麼做？</p>
+  <label data-key="a">用 PUT _mapping 直接改 name 的 analyzer</label>
+  <label data-key="b">用新的 mapping 建立新索引、把資料重新匯入，再讓程式改用新索引</label>
+  <label data-key="c">重新啟動 Elasticsearch，讓它用新設定重建</label>
+  <label data-key="d">刪掉 name 欄位再加回來</label>
+  <p class="why">✓ 已有文件的詞是用舊分析器切好的，改分析器等於要重新切每一份文件，Elasticsearch 不允許直接改（a 會回錯誤）。重啟不會改變已建好的索引（c）；mapping 裡的欄位不能刪除（d）。正確做法是建新索引重新匯入，並用別名讓切換不停機，下一課會實作。</p>
+</div>
+
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>中文欄位用預設的 standard 分析器</strong>：每個字一個詞，搜「鐵」找到拿鐵、搜「拿鐵」找到不相連的「拿」和「鐵」。建索引時就指定 cjk（或詞典式分詞外掛），並用 <code>_analyze</code> 確認。</li>
+  <li><strong>用 wildcard、regexp 取代全文搜尋</strong>：<code>*拿鐵*</code> 要走過所有的詞，慢而且沒有相關性分數。全文搜尋用 match／multi_match。</li>
+  <li><strong>篩選條件放在 must</strong>：分類、價格被算進分數，排序變得奇怪，也用不到 filter 的快取。關鍵字放 must，其他放 filter。</li>
+  <li><strong>需要排序、聚合的字串沒有 keyword</strong>：text 欄位不能做 terms 聚合（會報錯），排序也不對。分類這類欄位直接用 keyword；名稱這類兩種都要的用 multi-field。</li>
+  <li><strong>讓 dynamic mapping 決定型別</strong>：第一筆資料決定欄位型別，打錯欄位名稱就多一個永久欄位。設 <code>dynamic: 'strict'</code>，mapping 寫在程式裡、跟著版本控制。</li>
+  <li><strong>寫入後馬上搜尋就以為寫入失敗</strong>：Elasticsearch 是近即時，預設約 1 秒 refresh 一次。測試用 <code>refresh: 'wait_for'</code>，正式環境不要每次寫入都強制 refresh。</li>
+  <li><strong>憑感覺調分數</strong>：改一個加權修好一個查詢，弄壞另外三個。先建立固定的案例集，每次調整都跑一遍 Precision@1。</li>
+  <li><strong>把 Elasticsearch 當記錄系統</strong>：它沒有交易，mapping 改了要重建索引，只有它有的資料等於無法重建。正式資料留在 PostgreSQL，搜尋索引隨時可以從那裡重建。</li>
+  <li><strong>highlight 的結果直接用 <code>v-html</code> 顯示</strong>：預設的 highlight 不會跳脫原文裡的 HTML，後台輸入的描述就可能變成 XSS。設 <code>encoder: 'html'</code> 或在前端自己跳脫，見課末。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>開場三則回報的根源是 LIKE 只比字串：不排序、不懂詞、開頭是 <code>%</code> 時很慢；PostgreSQL 全文檢索卡在中文沒有空白。需要中文分詞、相關性排序、分類統計時，才考慮搜尋引擎，而且它存的是可以從 PostgreSQL 重建的衍生資料。</li>
+  <li>倒排索引存「詞 → 文件清單」，搜一個詞就是查一個 key，記下的次數用來算分數；改文件等於重新索引整份，適合讀多寫少的菜單。</li>
+  <li>分析器決定「詞」是什麼：standard 對中文一字一詞（「鐵」找到拿鐵的原因），cjk 兩字一組（bigram），詞典式分詞要裝外掛；寫入與查詢用同一個分析器，用 <code>_analyze</code> 看實際結果。中文錯字靠 bigram 的部分重疊與同義詞，fuzziness 幫不上忙。</li>
+  <li>mapping：全文搜尋用 text、篩選聚合用 keyword、兩者都要用 multi-field；金額用 integer 或 scaled_float；<code>dynamic: 'strict'</code>；已有欄位大多不能改，要建新索引重新匯入。寫入後要等 refresh 才搜得到。</li>
+  <li>bool 查詢：關鍵字放 must，篩選放 filter；multi_match 用 <code>name^3</code> 加權，讓肉桂捲排回拿鐵後面；terms 聚合做分類統計，<code>post_filter</code> 讓統計不受已選分類影響。</li>
+  <li>BM25：稀有的詞重要、次數有上限、短欄位加分；用 explain 看分數，用 function_score 加入銷量，先有案例集、看 Precision@1，再調整。</li>
+</ul>
+<p>下一課處理搜尋與資料庫的同步：商品改了價格、下架了，怎麼保證搜尋結果跟著更新，以及改 mapping 時怎麼重建索引而不停機。</p>
+
+<h2>補充與查表</h2>
+
+<h3>其他搜尋引擎選擇與授權</h3>
+<p>如果已經在用 Redis 而需求很簡單，Redis 8 內建的查詢引擎（<code>FT.SEARCH</code>）也是一個選項，課程的 redis:8.10.3-alpine 映像已經包含。授權細節以 <a href="https://www.elastic.co/pricing/faq/licensing">Elastic 官方授權說明</a>為準：AGPLv3 是 2024 年 8 月底宣布加入的選項。</p>
+
+<h3>詞典式分詞外掛</h3>
+<p>官方外掛 <code>analysis-smartcn</code>（以簡體中文詞典為主，繁體效果較差）、<code>analysis-icu</code>（ICU 的斷詞規則），或社群維護的 IK 分詞器。外掛要自己建映像安裝、跟著 Elasticsearch 版本升級，課程不使用。</p>
+
+<h3>同義詞的設定</h3>
+<p>自訂分析器加上 <code>synonym_graph</code> filter，設定「拿鐵, latte」「鮮奶, 牛奶」。<code>synonym_graph</code> 只能放在查詢時用的分析器（欄位的 <code>search_analyzer</code>），寫入時仍用原本的分析器。filter 設 <code>updateable: true</code> 之後，改了同義詞清單只要重新載入查詢分析器（同義詞 API 或 <code>_reload_search_analyzers</code>），不用重建索引。</p>
+
+<h3>refresh 的閒置行為</h3>
+<p>預設每 1 秒 refresh 一次；但超過 30 秒沒有收到搜尋的索引會暫停背景 refresh，直到下一次搜尋。</p>
+
+<h3>highlight 與 XSS</h3>
+<p><strong>highlight</strong> 回傳命中的片段，前端用來把關鍵字標粗：</p>
+<pre>highlight: { fields: { description: {} } }
+→ "highlight": { "description": ["自製&lt;em&gt;焦糖&lt;/em&gt;醬加上濃縮咖啡與蒸奶"] }</pre>
+<div class="callout warn">highlight 回傳的是 HTML 片段。如果描述是使用者或後台輸入的內容，前端不能直接用 <code>v-html</code> 塞進頁面，預設的 highlight 不會跳脫原文裡的 HTML。設 <code>highlight: { encoder: 'html', … }</code> 讓 Elasticsearch 先跳脫原文再加 <code>&lt;em&gt;</code>，或在前端自己跳脫，否則就是 XSS。</div>
+
+<h3>翻頁的上限</h3>
+<p><code>from + size</code> 預設上限 10,000（<code>index.max_result_window</code>），翻得越深越吃記憶體。需要往下一直捲的列表改用 <code>search_after</code>：帶上一頁最後一筆的排序值，從那之後接著取，不用從頭數。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

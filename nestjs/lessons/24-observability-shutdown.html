@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>24. 日誌、健康檢查與優雅關機</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="24" data-practice="nestjs">
+<header>
+  <div class="eyebrow">階段 5：上線、維運與架構（資深） · 第 24 課</div>
+  <h1>日誌、健康檢查與優雅關機</h1>
+</header>
+<main>
+
+
+<p>咖啡店 API 上線後的第一個星期六。下午兩點部署了新版本，兩點十分客服傳來訊息：「王小明說他兩點整付了款，信用卡也扣了，但沒收到收據，App 上訂單還是『未付款』。」同一時間還有兩位客人回報付款時看到「連線中斷」。你打開伺服器的 log，看到幾千行 <code>付款完成</code>、<code>收據工作已排入</code>、<code>收據已寄出</code> 彼此交錯，好幾個程序、幾十個客人的紀錄混在一起，分不出哪一行屬於王小明那一次付款，也就回答不了客服最基本的問題：他的付款走到哪一步，為什麼停在那裡？</p>
+<p>這一課的任務就是處理這件事：先讓 log 查得出王小明那筆付款發生了什麼，再修好造成它的原因，讓下一次部署不會再有人「款扣了、訂單沒變」。這兩件事都不是程式邏輯的 bug，而是程式在正式環境裡「怎麼活、怎麼死」沒處理好：活著的時候，log 要能把同一個請求串起來；被叫停的時候，要把手上的事做完再走。用到的工具是 Nest 12 內建的 <code>ConsoleLogger</code>、<code>@nestjs/terminus</code> 12.1.0 和 Node 的 <code>AsyncLocalStorage</code>。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>上線後只剩 log 看得到：log 要怎麼寫，搜尋工具才找得到王小明那張訂單；Nest 的 <code>ConsoleLogger</code> 怎麼改成一行一個 JSON。</li>
+  <li>同一張訂單有好幾次請求，怎麼分出哪一行屬於哪一次：給每個請求一個 requestId，以及為什麼它不能當參數一層層傳。</li>
+  <li><code>AsyncLocalStorage</code>：service 裡的 log 怎麼自動帶上「這一次請求」的 requestId。查到這裡，會發現王小明的付款是被部署中斷的。</li>
+  <li>健康檢查：部署平台怎麼決定送流量給誰、重啟誰，再用 Terminus 做出 <code>/health/live</code> 與 <code>/health/ready</code>。</li>
+  <li>優雅關機：收到停止訊號後，讓進行中的付款和收據做完再結束。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../node/lessons/19-structured-logging.html">Node 課第 19 課</a>的結構化 log 與 <code>AsyncLocalStorage</code>：log 一行一個 JSON、欄位名稱固定；<code>als.run(store, fn)</code> 裡的所有非同步工作都讀得到同一份 store。</li>
+  <li><a href="../../node/lessons/21-graceful-shutdown.html">Node 課第 21 課</a>的優雅關機與健康檢查：收到 <code>SIGTERM</code> 先停止接新請求、做完手上的再結束；liveness 回答「活著嗎」，readiness 回答「能接請求嗎」。</li>
+  <li><a href="04-modules.html">第 4 課</a>的生命週期 hook：<code>app.close()</code> 時依序呼叫 <code>onModuleDestroy</code>、<code>beforeApplicationShutdown</code>、<code>onApplicationShutdown</code>，要先 <code>enableShutdownHooks()</code> 才會在收到訊號時觸發。</li>
+  <li><a href="06-middleware-guards.html">第 6 課</a>的 middleware：請求進來後最早執行的一層，用 <code>forRoutes</code> 指定套用到哪些路由。</li>
+</ul></div>
+
+<h2>上線後只剩 log：怎麼寫才搜得到王小明那筆付款？</h2>
+<p>開發時程式跑在你的電腦上，出問題可以看終端機、可以下中斷點。上線後程式跑在部署平台的機器上，而且通常同時跑好幾個程序，你沒辦法停下它、也沒辦法看它的變數。你唯一看得到的，是它自己寫出來的 <strong>log</strong>（日誌）：程式執行到某個地方時留下的一行紀錄。程序把 log 寫到標準輸出，平台把所有程序的輸出收進一個集中的搜尋工具，出事時值班的人在那裡搜。</p>
+<p>所以 log 真正的讀者不是一行一行看的人，而是搜尋工具。客服問「王小明的訂單 7 怎麼了」，你要的是在搜尋框打一個條件，就列出訂單 7 的所有紀錄。這件事做不做得到，取決於 log 寫成什麼樣子。如果寫成 <code>`訂單 ${id} 付款完成`</code> 這種把值拼進句子的文字，搜尋工具只看到一串字，你只能用關鍵字或正規表示式去猜，「訂單 7」還會順便撈到「訂單 70」；每個人拼句子的方式不同，欄位名稱也不固定。Node 課第 19 課的做法是<strong>結構化 log</strong>：一行一個 JSON，訊息是固定的一句話，會變動的值放在有名字的欄位裡。搜尋工具會把每一行解析成欄位，你就能下「<code>params.orderId = 7</code>」這種精確的條件。</p>
+<p>Nest 的 <code>Logger</code> 你從第 1 課就在用：<code>new Logger(OrdersService.name)</code>，然後 <code>this.logger.log('訂單建立', { orderId, total })</code>。<code>Logger</code> 本身不負責輸出，它只是一個轉接頭，把呼叫轉給應用程式設定的那個 logger；預設是 <code>ConsoleLogger</code>，由它決定一行 log 長什麼樣子。<code>ConsoleLogger</code> 預設印成給人看的彩色文字，搜尋工具解析不了。Nest 12 的 <code>ConsoleLogger</code> 有 <code>json</code> 選項，開了就改成一行一個 JSON：</p>
+<pre>new ConsoleLogger({ json: true })
+
+// this.logger.log('訂單建立', { orderId: 7, total: 190 }) 印出：
+{"level":"log","pid":44658,"timestamp":1793514655225,"message":"訂單建立","context":"OrdersService","params":{"orderId":7,"total":190}}</pre>
+<p>這一行從左到右：</p>
+<ul>
+  <li><code>level</code>：層級。<code>log</code> 是一般紀錄，另外還有 <code>warn</code>、<code>error</code>、<code>debug</code> 等，值班時常先篩 <code>error</code>。</li>
+  <li><code>pid</code>：印出這行的程序編號。同時跑好幾個程序時，靠它分辨是哪一個程序寫的，這一課稍後就會用到。</li>
+  <li><code>timestamp</code>：毫秒時間戳記。</li>
+  <li><code>message</code>：固定的訊息，<code>context</code>：哪個類別印的（建立 <code>Logger</code> 時傳的名字）。</li>
+  <li><code>params</code>：呼叫時傳的第二個參數，會變動的值都在這裡。</li>
+</ul>
+<p>第二個參數要傳<strong>物件</strong>才會進 <code>params</code>；傳字串進去，Nest 會把它當成 context（類別名稱），例如 <code>logger.log('付款完成', orderId)</code> 的 orderId 會跑到 context 欄位，不會被當成資料。所以寫法固定是：訊息是不變的一句話，<code>orderId</code>、<code>total</code> 放在物件裡。這樣搜 <code>params.orderId = 7</code> 就能找出這張訂單的所有紀錄。</p>
+<p>剩下的問題是讓整個應用程式都用這個 JSON 格式，包含 Nest 自己啟動時印的那些 log。做法是寫一個 <code>AppLogger extends ConsoleLogger</code> 的 provider，在 <code>main.ts</code> 用 <code>app.useLogger(app.get(AppLogger))</code> 換上去。把它做成 provider，而不是直接 <code>new ConsoleLogger({ json: true })</code>，是因為 provider 可以注入別的東西，下一節要注入 <code>RequestContext</code>。這裡有一個時間差：<code>NestFactory.create</code> 的過程就已經在印 log，那時 <code>AppLogger</code> 還沒建好，這幾行會用預設的彩色格式印出，上線後收集工具只有這幾行解析失敗。<code>bufferLogs: true</code> 讓 Nest 先把 log 存著，等 <code>useLogger</code> 換好之後再用新的 logger 一起印：</p>
+<pre>const app = await NestFactory.create(AppModule, { bufferLogs: true })
+app.useLogger(app.get(AppLogger))   // 練習專案放在 configureApp 裡，main.ts 和測試共用（第 10 課）</pre>
+<div class="callout warn">log 裡不要放個資與密鑰：email、電話、密碼、token、信用卡號。log 會被收進搜尋工具、保留很久、被很多人看到。練習專案的 <code>Mailer</code> 寄收據時只記 <code>orderId</code>，不記 email，就是這個原因。Node 課第 19 課的「不能記的東西」整節都適用。</div>
+<p>現在搜 <code>params.orderId = 7</code>，王小明這張訂單的紀錄都找得到了，但還不夠。同一張訂單常常有好幾次請求：建立訂單一次、付款一次，客人看到連線中斷又按一次付款，前端也可能自動重試。這些請求印出的行都帶 <code>orderId: 7</code>，時間又挨在一起，你分不出哪幾行屬於同一次付款。還有一些 log 根本沒有 orderId，例如驗證失敗、guard 擋下的紀錄，這種行用 orderId 撈不到。缺的是一個代表「這一次請求」的編號。</p>
+<div class="callout practice"><strong>💡 實務上：log 是寫給出事時值班的人看的</strong><br>上線後 log 會被收進集中的搜尋工具（雲端平台的 log 服務、Grafana Loki、Datadog 之類），值班的人用 <code>orderId</code>、<code>level</code> 這些欄位篩選，不會一行一行讀。該記的是狀態改變和失敗：訂單建立、付款成功或失敗、收據寄送失敗；每個請求都印整個 request body 只會讓量和費用暴增，真正的線索反而被淹沒。正式環境通常只開 <code>log</code>、<code>warn</code>、<code>error</code> 這幾個層級（<code>logLevels</code> 選項），更細的 <code>debug</code> 留給本機。資深在 code review 時會問一句：「客服明天來問這筆訂單，只看 log 答得出來嗎？」王小明這種客訴，就是這個問題的實際考題。</div>
+
+<h2>同一張訂單有好幾次請求：怎麼分出哪一行屬於哪一次？</h2>
+<p>上一節留下的缺口，做法是每個請求一進來就給它一個編號，叫 <strong>requestId</strong>。這個請求執行過程中印的每一行 log 都帶上它，回應時也放在標頭 <code>X-Request-Id</code> 裡回給前端。這樣一來，「哪幾行屬於同一次付款」就變成「哪幾行的 requestId 相同」，搜一下就全部列出來，從請求進來到排入收據工作，按時間排好。</p>
+<p>回應標頭這一步是讓編號能交到人手上。前端在錯誤畫面顯示這串編號，客服請客人截圖，工程師拿去搜，就不用再靠「大概兩點左右」去猜。反方向也可以：前端自己產生編號，放在請求標頭 <code>X-Request-Id</code> 送來，API 沿用它，Vue 前台、Nginx、API 三邊的 log 就能用同一個編號對起來。</p>
+<p>編號要在請求一進來就決定，後面每一層才用得到，所以產生它的位置是 middleware（第 6 課）：它是請求進來後最早執行的一層，比 guard、pipe、controller 都早。</p>
+<pre>@Injectable()
+export class RequestIdMiddleware implements NestMiddleware {
+  use(req: Request, res: Response, next: NextFunction) {
+    const incoming = req.get('x-request-id')
+    // 只接受 1–64 個英數、-、_：換行會讓人偽造 log 行，超長的值會塞爆 log
+    req.requestId = incoming &amp;&amp; VALID_ID.test(incoming) ? incoming : randomUUID()
+    res.setHeader('X-Request-Id', req.requestId)
+    next()
+  }
+}</pre>
+<p>注意它沒有直接採用前端送來的值。請求標頭是任何人都能填的輸入：如果值裡有換行字元，印進 log 之後會變成兩行，第二行可以被偽造成一筆看起來真實的紀錄；值超長則會把 log 塞爆。所以先用正規表示式檢查格式，不合格就自己用 <code>randomUUID()</code> 產生一個。練習專案已經有這段，也已經用 <code>consumer.apply(RequestIdMiddleware).forRoutes('*')</code> 套到所有路由。</p>
+<p>難的是下一步。middleware 把編號放在 <code>req.requestId</code>，但印 log 的地方不在 middleware：<code>OrdersService.pay</code> 裡的 <code>this.logger.log('付款完成', …)</code>，還有它呼叫的 <code>ReceiptsProducer.enqueue</code> 裡的 log，手上都沒有 <code>req</code>。它們要怎麼知道「現在這個請求」的 requestId？直覺會想到三種做法，都有問題。</p>
+<p>下面表格的第三種做法會用到<a href="03-providers-di.html">第 3 課</a>的一個名詞，先補上：provider 預設是 <strong>singleton</strong>：整個應用程式只建一個實例，所有請求共用。另一種是 <strong>request scope</strong>：用 <code>@Injectable({ scope: Scope.REQUEST })</code> 宣告，每個請求進來都建一個新的實例，所以它可以用 <code>@Inject(REQUEST)</code> 注入「這一次的請求物件」。</p>
+<div class="table-wrap"><table>
+  <tr><th>做法</th><th>問題</th></tr>
+  <tr><td>當參數一層一層傳：<code>pay(id, requestId)</code></td><td>每個 service 方法都多一個參數；漏傳一層（<code>ReceiptsProducer</code>）那一層的 log 就沒有。requestId 是基礎設施的事，不該出現在業務方法的簽名裡</td></tr>
+  <tr><td>存在模組層級的變數：<code>let current = id</code></td><td>Node 是一個執行緒處理所有請求：A 在 <code>await</code> 付款服務的 1 秒裡，B 進來把變數改成 B 的 id，A 醒來後印出的 log 全帶著 B 的編號</td></tr>
+  <tr><td>request scope 的 logger：<code>@Injectable({ scope: Scope.REQUEST })</code> 加 <code>@Inject(REQUEST)</code></td><td>注入它的 <code>OrdersService</code>、再注入 <code>OrdersService</code> 的 controller，整條鏈都變成每個請求重新建立一次：慢，而且 <code>app.get(OrdersService)</code> 會直接丟錯，測試和排程都拿不到它</td></tr>
+</table></div>
+<p>第二種做法最容易讓人誤會，值得多說一句。「Node 只有一條執行緒」常被理解成「一次只處理一個請求」，所以放一個全域變數應該沒事。其實單一執行緒只代表同一瞬間只有一段 JavaScript 在跑；請求 A 一遇到 <code>await</code>（等付款服務、等資料庫），執行緒就去處理請求 B，等 A 的結果回來才接著跑 A。請求是交錯進行的，一個全域變數同時只能存一個值，誰最後寫入就是誰的。開場那幾千行交錯的 log，就是這種交錯執行的結果。</p>
+<p>所以要找的東西有三個條件：不用改業務方法的參數、每個請求各自一份不會互相蓋掉、而且所有 provider 維持 singleton。Node 內建了一個剛好做這件事的工具。</p>
+
+<h2>AsyncLocalStorage：service 怎麼拿到「這一次請求」的 requestId？</h2>
+<p>那個工具是 <code>AsyncLocalStorage</code>（從 <code>node:async_hooks</code> 匯入），Node 課第 19 課用過。它是一個「跟著非同步流程走」的儲存空間：<code>als.run(store, fn)</code> 執行 <code>fn</code>，在 <code>fn</code> 裡面、以及 <code>fn</code> 引發的所有非同步工作裡（<code>await</code> 之後的程式、它建立的 Promise、計時器、callback），呼叫 <code>als.getStore()</code> 都拿到這份 <code>store</code>；在 <code>run</code> 外面拿到 <code>undefined</code>。</p>
+<p>它能解決上一節的問題，關鍵在「引發的所有非同步工作」這幾個字。Node 會記住每個非同步工作是在哪一次 <code>run</code> 裡建立的，等它之後被執行，<code>getStore()</code> 回傳的就是當初那份 store，跟這段時間裡有沒有別的請求插進來無關。請求 A 和請求 B 各自 <code>run</code> 一次，就算交錯執行，A 的程式醒來讀到的永遠是 A 的 store，B 讀到 B 的。它不是全域變數，所以不會被蓋掉；它也不用當參數傳，因為讀的人直接問 <code>getStore()</code> 就好。</p>
+<p>把它包成一個 singleton 的 provider，整個應用程式只有一個，誰需要就注入：</p>
+<pre>@Injectable()
+export class RequestContext {
+  private readonly als = new AsyncLocalStorage&lt;{ requestId: string }&gt;()
+
+  run&lt;T&gt;(requestId: string, fn: () =&gt; T): T {
+    return this.als.run({ requestId }, fn)
+  }
+
+  get requestId(): string | undefined {
+    return this.als.getStore()?.requestId   // 情境外（啟動、排程、worker）是 undefined
+  }
+}</pre>
+<p><code>RequestContext</code> 只有一個實例，卻能回答「這次請求的 id」，因為每個請求的資料不存在實例的欄位裡，而是存在 <code>AsyncLocalStorage</code> 為每次 <code>run</code> 各自保留的 store 裡。下面把「某次 <code>run</code> 範圍內」稱為<strong>情境</strong>：在情境裡讀得到 requestId，在情境外讀到 <code>undefined</code>。</p>
+<p>接著要決定在哪裡開這個情境。我們要的是「這個請求接下來的所有處理」都在情境裡，而 middleware 的 <code>next()</code> 正好代表「接下來的所有處理」：guard、pipe、controller、service 都是從 <code>next()</code> 開始往下跑的。所以把 <code>next</code> 本身交給 <code>run</code>：</p>
+<pre>this.context.run(req.requestId, next)   // guard、pipe、handler、service 全都在這個情境裡執行</pre>
+<p>常見的失手是寫成 <code>this.context.run(id, () =&gt; {})</code>，然後另外呼叫 <code>next()</code>。情境只涵蓋傳給 <code>run</code> 的那個函式，那個空的 callback 一結束情境就結束了；<code>next</code> 在情境外面執行，整個請求讀到的都是 <code>undefined</code>。</p>
+<p>最後讓 logger 自動帶上它，這樣 <code>OrdersService</code> 這些地方完全不用改。<code>ConsoleLogger</code> 在 json 模式下，每一行都會先經過 <code>getJsonLogObject(message, options)</code> 組成物件再轉成 JSON。覆寫這個方法，在父類別組好的物件上多加一個欄位：</p>
+<pre>@Injectable()
+export class AppLogger extends ConsoleLogger {
+  constructor(private readonly requestContext: RequestContext) {
+    super({ json: true })
+  }
+
+  protected override getJsonLogObject(message: unknown, options: Parameters&lt;ConsoleLogger['getJsonLogObject']&gt;[1]) {
+    return { ...super.getJsonLogObject(message, options), requestId: this.requestContext.requestId }
+  }
+}</pre>
+<p>情境外 <code>requestId</code> 是 <code>undefined</code>，而 <code>JSON.stringify</code> 會直接省略值是 <code>undefined</code> 的欄位，所以啟動、排程、worker 的 log 不會多出空字串，也不會帶到上一個請求的編號。<code>OrdersService</code>、<code>ReceiptsProducer</code> 一行都不用改，繼續 <code>new Logger(…)</code>，它們印的每一行都會經過 <code>AppLogger</code>，自動帶上當下情境的 requestId。下圖是兩個請求交錯時的樣子：</p>
+
+<figure>
+  <svg viewBox="0 0 700 260" role="img" aria-label="請求 A 與請求 B 交錯執行。A 的 middleware 用 run 開了情境 A，B 開了情境 B。A 等付款服務的 1 秒期間 B 進來，B 醒來印 log 時讀到 B 的 id，A 醒來時讀到 A 的 id。情境外的啟動 log 沒有 requestId">
+    <defs><marker id="a24a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <text class="d-small" x="20" y="30">時間 →</text>
+    <line class="d-line" x1="80" y1="26" x2="680" y2="26" marker-end="url(#a24a)"/>
+    <rect class="d-soft" x="80" y="50" width="600" height="70" rx="10"/>
+    <text class="d-text" x="92" y="74">請求 A：run('a-1', next)</text>
+    <rect class="d-box" x="92" y="84" width="130" height="28" rx="6"/>
+    <text class="d-small" x="157" y="103" text-anchor="middle">訂單建立 a-1</text>
+    <text class="d-small" x="300" y="103" text-anchor="middle">await 付款服務 1 秒…</text>
+    <rect class="d-box" x="400" y="84" width="130" height="28" rx="6"/>
+    <text class="d-small" x="465" y="103" text-anchor="middle">付款完成 a-1</text>
+    <rect class="d-box" x="540" y="84" width="130" height="28" rx="6"/>
+    <text class="d-small" x="605" y="103" text-anchor="middle">收據已排入 a-1</text>
+    <rect class="d-soft" x="230" y="135" width="330" height="70" rx="10"/>
+    <text class="d-text" x="242" y="159">請求 B：run('b-7', next)</text>
+    <rect class="d-box" x="242" y="169" width="130" height="28" rx="6"/>
+    <text class="d-small" x="307" y="188" text-anchor="middle">訂單建立 b-7</text>
+    <rect class="d-box" x="400" y="169" width="130" height="28" rx="6"/>
+    <text class="d-small" x="465" y="188" text-anchor="middle">付款完成 b-7</text>
+    <rect class="d-box" x="80" y="220" width="200" height="28" rx="6"/>
+    <text class="d-small" x="180" y="239" text-anchor="middle">啟動 log：沒有 requestId</text>
+    <text class="d-accent" x="480" y="239" text-anchor="middle">同一條執行緒，各自的情境</text>
+  </svg>
+  <figcaption>A 等外部服務時 B 進來，兩個請求的 log 交錯印出，但各自讀到自己情境裡的 requestId。模組層級的變數做不到這件事。</figcaption>
+</figure>
+
+<p>有了這套 log，回頭查王小明。不過 requestId 是這次事故之後才加上的，兩點那次付款的舊 log 裡沒有它；請求斷在半路、回應一直沒送出，App 也從來沒拿到 <code>X-Request-Id</code>。所以這一次只能用當時就有的線索：搜 <code>params.orderId = 7</code>，找得到這張訂單建立的紀錄，但付款那一段沒有「付款完成」，也沒有「收據工作已排入」，信用卡卻已經扣款。再看兩點整前後那幾行 log 的 <code>pid</code>：寫這幾行的是舊版本的程序，它在兩點整之後再也沒寫過任何 log，下一批 log 是新版本的啟動紀錄，換了另一個 pid。結論是：付款服務已經扣款，但在寫回訂單狀態之前，部署把舊程序停掉了，請求斷在半路。另外兩位看到「連線中斷」的客人，也是同一秒在那個程序上的請求。這次是靠 orderId 加時間和 pid 一點一點拼出來的；有了 requestId 之後，下次同類客訴只要前端在錯誤畫面顯示 <code>X-Request-Id</code>（或由前端自己產生、送出並記下），一次搜尋就能列出那一次請求的每一行。</p>
+<div class="callout practice"><strong>💡 實務上：把 requestId 交到客服和下游手上</strong><br>前端出錯時把 <code>X-Request-Id</code> 顯示在錯誤訊息或回報表單裡，客服拿到這串編號，工程師就能直接搜到那一次請求的所有 log，王小明這種客訴從「大概兩點左右」變成一次搜尋。<code>AsyncLocalStorage</code> 只管得到同一個程序裡的這一次請求：排進 BullMQ 的工作由 worker（<a href="20-queues-bullmq.html">第 20 課</a>）另外執行，要把 requestId 放進 job 的資料、worker 處理時再印出來，收據那一段才接得上。呼叫其他內部服務時也把它放在標頭往下傳。服務一多，團隊通常會改用 OpenTelemetry 這類追蹤工具做同一件事，概念就是這一節的 requestId。</div>
+<p>查清楚了，接下來要修。問題不在付款的程式，而在程序被停掉的方式。要修好它，得先知道部署平台怎麼跟你的程序溝通：它用健康檢查決定要不要把請求送給某個程序、要不要重啟它，用停止訊號通知程序該結束了。先看前者。</p>
+
+<h2>部署平台怎麼決定送流量給誰、重啟誰？</h2>
+<p>先看健康檢查要解決的處境。Node 課第 21 課講過，正式環境的服務不會只跑一個程序。前面有一個<strong>負載平衡器</strong>（load balancer）或容器平台，所有請求先到它那裡，再由它分給後面的好幾個程序（部署課會講 Nginx、Docker、雲端平台）。它要分得好，就得隨時知道每個程序的狀況，但它看不到你的程式內部，只能從外面問。做法是你的程式提供一個 HTTP 端點，平台每隔幾秒打一次，用回應的狀態碼判斷：這就是<strong>健康檢查端點</strong>。</p>
+<p>平台想知道的其實是兩個不同的問題，答錯的後果也不同，所以要兩個端點：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>liveness：還活著嗎</th><th>readiness：能接客嗎</th></tr>
+  <tr><td>路徑</td><td><code>/health/live</code></td><td><code>/health/ready</code></td></tr>
+  <tr><td>檢查什麼</td><td>程序能回應就是 200，<strong>不碰任何依賴</strong></td><td>資料庫、Redis 都連得上才 200，任何一項壞就 503</td></tr>
+  <tr><td>失敗時平台做什麼</td><td>重啟這個程序</td><td>暫停送流量給它，程序不動</td></tr>
+  <tr><td>該在什麼時候失敗</td><td>事件迴圈卡死（下一課）</td><td>依賴斷線、啟動中、關機中</td></tr>
+</table></div>
+<p>判斷一個檢查該放在哪一邊，問自己一句：「這種狀況，重啟程序修得好嗎？」程序的事件迴圈卡死了、不回應任何請求，重啟可以修好，這是 liveness 的事。資料庫斷線，重啟程序修不好，程序本身沒壞，只是暫時沒辦法服務，正確的反應是「先別把請求送給我」，這是 readiness 的事。</p>
+<p>最常見也最傷的錯，就是 liveness 也查資料庫。資料庫重開晃了 30 秒，所有程序的 liveness 同時失敗，平台把它們全部重啟；重啟修不好資料庫，反而讓所有程序同時啟動、同時重連，把剛恢復的資料庫再打一次。原本 30 秒的小狀況，變成整個服務一起掛掉。</p>
+<p>readiness 表格最後一格的「關機中」跟王小明的事直接有關。部署時，平台會先讓新版本的程序起來，等它的 readiness 回 200 才開始送流量給它；舊程序要結束前，則要先讓它的 readiness 回 503，平台不再送新請求過去，它只需要把手上的請求做完。新舊交接時沒有請求被丟到不能處理的程序上，部署對客人來說才是無感的。最後一節會回來接上這一步。</p>
+<p>概念清楚了，接下來用 Nest 的套件把這兩個端點做出來。實作時有一個陷阱要特別處理：依賴不是壞掉，而是卡住不回應。</p>
+
+<h2>用 Terminus 做出 /health/live 與 /health/ready</h2>
+<p><code>@nestjs/terminus</code> 是 Nest 官方的健康檢查套件。它把每一項檢查（資料庫通不通、Redis 通不通）稱為一個<strong>健康指標</strong>（health indicator），你列出要檢查哪些指標，它負責執行、彙整成固定格式的回應、決定狀態碼。12.1.0 的用法：</p>
+<pre>// health.module.ts
+@Module({ imports: [TerminusModule], controllers: [HealthController], providers: [RedisHealthIndicator] })
+
+// health.controller.ts
+@Controller('health')
+export class HealthController {
+  constructor(
+    private readonly health: HealthCheckService,
+    private readonly db: PrismaHealthIndicator,
+    private readonly prisma: PrismaService,
+    private readonly redis: RedisHealthIndicator,
+  ) {}
+
+  @Get('live')
+  @HealthCheck()
+  live() { return this.health.check([]) }            // 什麼都不查：能執行到這裡就是活著
+
+  @Get('ready')
+  @HealthCheck()
+  ready() {
+    return this.health.check([
+      () =&gt; this.db.pingCheck('database', this.prisma).withTimeout(1000),
+      () =&gt; this.redis.pingCheck('redis').withTimeout(1000),
+    ])
+  }
+}</pre>
+<p><code>HealthCheckService.check</code> 接一組函式，每個函式執行一項指標、回傳它的結果。<code>live</code> 傳空陣列，什麼都不查：請求能一路執行到這個 handler 並回應，本身就證明事件迴圈還在轉，這正是 liveness 要回答的。<code>ready</code> 傳兩項，結果是：</p>
+<ul>
+  <li>全部 up：回 200，格式是 <code>{ status: 'ok', info, error, details }</code>。</li>
+  <li>任何一項 down：它丟 <code>ServiceUnavailableException</code>，也就是 503；<code>details.database.status</code> 這類欄位寫著 <code>'down'</code>，<code>error</code> 裡有原因。</li>
+  <li><code>@HealthCheck()</code> 裝飾器另外加上 <code>Cache-Control: no-cache</code>，避免中間的代理把一分鐘前的「健康」快取起來。</li>
+</ul>
+<p>資料庫的指標是內建的。<code>PrismaHealthIndicator</code> 的 <code>pingCheck(key, prismaClient)</code> 對資料庫跑一句 <code>SELECT 1</code>，它需要一個 Prisma client 來下這句查詢，所以要把注入的 <code>PrismaService</code> 傳給它。第一個參數 <code>'database'</code> 是這項在回應裡的名字，也就是 <code>details.database</code> 的 <code>database</code>。</p>
+<p>Redis 沒有內建的指標，要自己寫。Terminus 12 的寫法是注入 <code>HealthIndicatorService</code>，用 <code>check(key).attempt(fn)</code>：<code>fn</code> 正常結束就是 up，丟錯就是 down：</p>
+<pre>@Injectable()
+export class RedisHealthIndicator {
+  constructor(private readonly indicator: HealthIndicatorService, private readonly redis: RedisService) {}
+
+  pingCheck&lt;const Key extends string&gt;(key: Key) {
+    return this.indicator.check(key).attempt(async () =&gt; {
+      await this.redis.client.ping()   // 一定要真的問 Redis；什麼都不做的 attempt 永遠 up
+    })
+  }
+}</pre>
+<p><code>fn</code> 裡一定要真的碰到依賴。<code>attempt(async () =&gt; {})</code> 永遠正常結束，指標永遠 up，Redis 掛了 readiness 也不會知道。網路上很多範例是 Terminus 11 以前的另一套寫法，在 12 照抄會編譯失敗，差異見課末「補充與查表」。</p>
+<p>接著是上一節預告的陷阱：<code>.withTimeout(1000)</code> 為什麼是必要的。依賴壞掉有兩種樣子。一種是直接失敗，例如連線被拒絕，<code>ping()</code> 馬上丟錯，指標標 down，沒問題。另一種是卡住：連線還在，但 Redis 不回應，<code>ping()</code> 永遠不 resolve。沒有逾時的話，<code>/health/ready</code> 也跟著永遠不回應。平台等到它自己的逾時（例如 5 秒）就判定不健康、停掉流量，這部分結果是對的；但健康檢查本身卡住，你就看不到 <code>details</code>，分辨不出是資料庫壞還是 Redis 壞。加了逾時，1 秒後 Redis 那項標 down、整體 503，<code>details</code> 裡清楚寫著是 Redis，資料庫那項照樣顯示 up。</p>
+<div class="callout practice"><strong>💡 實務上：readiness 只放「沒有它就完全不能服務」的依賴</strong><br>健康檢查的路徑會填進部署平台或負載平衡器的設定裡，維運和你都會看它。咖啡店的資料庫壞了什麼都做不了，放進 readiness 合理；但寄信服務或第三方付款閘道掛了，如果也讓 readiness 失敗，所有程序同時被拔掉流量，連只是想看菜單的客人都進不來。這類外部服務交給錯誤處理、重試，或 Terminus 12 的 <code>degraded</code> 狀態（見課末）。另外，健康檢查端點不要被登入 guard 或限流擋住，平台的探測請求不會帶 token；<code>details</code> 會透露內部用了哪些元件，不必對外公開。</div>
+<p>平台現在有辦法知道該不該把請求送給一個程序了。但王小明的付款不是被送錯程序，而是程序在處理它的途中被停掉。剩下的問題是：平台叫程序結束的那一刻，程序該怎麼反應。</p>
+
+<h2>收到 SIGTERM 之後：怎麼讓進行中的付款做完再走？</h2>
+<p>平台叫程序結束的方式是送一個<strong>訊號</strong>。訊號是作業系統送給程序的通知（Node 課第 21 課）。部署新版本、縮減機器數量、平台搬遷程序，都是同一個動作：先送 <code>SIGTERM</code>（「請你結束」），等一段寬限時間（Kubernetes 預設 30 秒，Docker 預設 10 秒），程序還沒結束就送 <code>SIGKILL</code>，這個訊號程序攔不住，會被直接終止。換句話說，平台給了你一段時間收拾，問題是程式有沒有利用這段時間。</p>
+<p>Node 預設收到 <code>SIGTERM</code> 就立刻結束，正在處理的請求斷在半路。王小明的付款請求正好在 <code>await this.payments.charge()</code> 回來之後、<code>prisma.order.update</code> 之前：錢已經扣了，訂單還來不及改成 paid，收據工作也還沒排入，程序就沒了。平台給的 30 秒完全沒用到。</p>
+<p><strong>優雅關機</strong>（graceful shutdown）就是好好利用這段時間，依序做三件事：不再接新工作，把手上的做完，最後按依賴順序關閉資源。順序很重要：資料庫連線如果先關掉，手上的工作就沒辦法寫結果。</p>
+<p>第一步是讓 Nest 接手這個訊號。Nest 的關機流程是 <code>app.close()</code>，但 <code>SIGTERM</code> 預設<strong>不會</strong>觸發它。要在 <code>main.ts</code> 加一行：</p>
+<pre>app.enableShutdownHooks()   // 收到 SIGTERM、SIGINT 等訊號時呼叫 app.close()，跑完 hook 才結束程序</pre>
+<p>不要自己寫 <code>process.on('SIGTERM', () =&gt; process.exit(0))</code>，這是反效果：<code>process.exit</code> 立刻結束程序，跟 Node 的預設行為一樣把請求切斷，還多寫了一段程式。也不要在任何 hook 裡呼叫 <code>process.exit</code>。hook 都跑完、沒有東西佔著事件迴圈時，Node 會自己結束；如果結束不了，表示有連線或計時器沒關，那是要找出來修的問題，不是用 <code>exit</code> 蓋掉的問題。</p>
+<p>開啟之後，收到 <code>SIGTERM</code> 時 <code>app.close()</code> 會依序呼叫第 4 課的三個關機 hook，每個階段都等前一個階段的所有 provider 做完才往下走，中間還有一步是 Nest 自己關閉 HTTP 伺服器。優雅關機的三件事，就是分配到這幾個階段裡做：</p>
+<div class="table-wrap"><table>
+  <tr><th>順序</th><th>階段</th><th>適合做什麼</th></tr>
+  <tr><td>1</td><td><code>onModuleDestroy()</code></td><td>停止接新工作：關排程、停止拉新 job</td></tr>
+  <tr><td>2</td><td><code>beforeApplicationShutdown(signal)</code></td><td>等進行中的工作做完：<code>await worker.close()</code></td></tr>
+  <tr><td>—</td><td>關閉 HTTP 伺服器</td><td>Nest 自己做：不再接新連線，等進行中的請求回應完</td></tr>
+  <tr><td>3</td><td><code>onApplicationShutdown(signal)</code></td><td>最後才斷連線：Prisma <code>$disconnect()</code>、Redis <code>quit()</code></td></tr>
+</table></div>
+<p>表格看起來理所當然，但練習專案裡有兩個資源，照目前的寫法都會在關機時出事，這正是順序要講究的原因。</p>
+<p>第一個是 BullMQ 的 worker（第 20 課），也就是在背景寄收據的那一個。<code>@nestjs/bullmq</code> 會在 <code>onApplicationShutdown</code> 關閉 worker，但 <code>PrismaService</code> 的 <code>$disconnect</code> 也在那個階段，同一個階段裡誰先誰後取決於模組階層，你不能依賴它。正在寄的收據寄完之後要寫 <code>receiptSentAt</code>，如果 Prisma 已經斷線就寫不進去，收據寄了、紀錄卻沒寫，之後可能重寄。所以自己提早一個階段關：在 <code>beforeApplicationShutdown</code> 裡 <code>await this.worker.close()</code>。<code>close()</code> 會停止拿新工作，等手上的工作做完才 resolve；一定要 <code>await</code> 它，不 <code>await</code> 的話關機流程不會等，直接往下走。</p>
+<p>第二個是 Prisma。很多範例把 <code>$disconnect</code> 寫在 <code>onModuleDestroy</code>，看起來「模組銷毀時斷線」很合理，但那是第一個階段，HTTP 請求還在處理。王小明那種付款請求接著執行 <code>prisma.order.update</code>，Prisma 發現已經斷線，會自動重新連線，於是關機流程留下一個沒有人會再關的連線池，程序因此結束不了，等到寬限時間用完被 <code>SIGKILL</code>。放到 <code>onApplicationShutdown</code>，那時 HTTP 已經關了、worker 也關了，不會再有人查資料庫。</p>
+
+<figure>
+  <svg viewBox="0 0 700 270" role="img" aria-label="收到 SIGTERM 後的時間軸：readiness 開始回 503，負載平衡器停止送新請求；onModuleDestroy；beforeApplicationShutdown 等 worker 做完手上的工作；HTTP 伺服器等進行中的請求回應完；onApplicationShutdown 斷開 Prisma 與 Redis；程序結束。整段要在平台的時限內完成">
+    <defs><marker id="a24b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <line class="d-line" x1="20" y1="40" x2="680" y2="40" marker-end="url(#a24b)"/>
+    <text class="d-accent" x="20" y="28">SIGTERM</text>
+    <text class="d-small" x="600" y="28">時限（30 秒）→ SIGKILL</text>
+    <rect class="d-box" x="20" y="60" width="150" height="56" rx="8"/>
+    <text class="d-text" x="95" y="84" text-anchor="middle">onModuleDestroy</text>
+    <text class="d-small" x="95" y="104" text-anchor="middle">不再接新工作</text>
+    <rect class="d-box" x="185" y="60" width="170" height="56" rx="8"/>
+    <text class="d-text" x="270" y="84" text-anchor="middle">beforeApplicationShutdown</text>
+    <text class="d-small" x="270" y="104" text-anchor="middle">await worker.close()</text>
+    <rect class="d-soft" x="370" y="60" width="150" height="56" rx="8"/>
+    <text class="d-text" x="445" y="84" text-anchor="middle">關閉 HTTP</text>
+    <text class="d-small" x="445" y="104" text-anchor="middle">等進行中的請求回應</text>
+    <rect class="d-box" x="535" y="60" width="145" height="56" rx="8"/>
+    <text class="d-text" x="607" y="84" text-anchor="middle">onApplicationShutdown</text>
+    <text class="d-small" x="607" y="104" text-anchor="middle">$disconnect、quit</text>
+    <rect class="d-soft" x="20" y="150" width="330" height="44" rx="8"/>
+    <text class="d-small" x="185" y="177" text-anchor="middle">/health/ready → 503：負載平衡器停止送新請求</text>
+    <rect class="d-soft" x="370" y="150" width="310" height="44" rx="8"/>
+    <text class="d-small" x="525" y="177" text-anchor="middle">正在寄的收據、正在付款的請求都做完了</text>
+    <text class="d-text" x="350" y="235" text-anchor="middle">hook 都跑完、沒有東西佔著事件迴圈 → 程序自己結束（不要 process.exit）</text>
+  </svg>
+  <figcaption>關機是一條有順序的流程：先停止接新的，再等手上的做完，最後才斷連線。每一步都在平台給的時限內。</figcaption>
+</figure>
+
+<p>圖的下半部是程序之外、要跟平台配合的兩件事。第一件接上健康檢查那一節：關機期間 readiness 要回 503。Terminus 的 <code>HealthCheckService</code> 在 <code>app.close()</code> 開始後會回 <code>status: 'shutting_down'</code> 與 503，不用你自己寫；負載平衡器看到就不再送新請求過來，程序剩下要處理的只有進行中的那些。第二件是整段流程要比平台的寬限時間短。worker 手上一個要 1 秒的工作沒問題，一個要 5 分鐘的報表就會被 <code>SIGKILL</code> 切斷；這種工作要設計成能被中斷、重跑時能從中斷的地方續做，第 21 課對帳工作的檢查點就是為了這個。</p>
+<p>把這些放回兩點整的那次部署：平台送 <code>SIGTERM</code> 給舊程序，readiness 改回 503，新的付款請求都送到新版本；王小明那個已經在處理的付款請求繼續跑完，扣款回來、訂單改成 paid、收據工作排入，回 200 給他的 App；worker 把手上那封收據寄完、寫好 <code>receiptSentAt</code>；最後 Prisma 和 Redis 斷線，程序自己結束。整段在寬限時間內完成，客服那則訊息就不會出現。</p>
+<div class="callout practice"><strong>💡 實務上：每次部署都在考驗你的關機流程</strong><br>如果團隊發現「每次部署都有幾個請求失敗」「部署後偶爾有收據重寄或沒寄」，第一個要查的就是優雅關機，王小明的客訴就是這種症狀。上線前的檢查清單：<code>enableShutdownHooks</code> 有沒有開、平台的關機時限和最長的工作哪個長、在本機用 <code>kill -TERM &lt;pid&gt;</code> 實際送一次訊號，看 log 是不是照順序把事情做完才結束。再小心也擋不住機器斷電或 <code>SIGKILL</code>，所以 job 和付款流程本身還是要能安全重跑；優雅關機減少意外，不是保證不出意外。</div>
+
+<h2>練習</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs nestjs 24</code> 建立 <code>work/24/</code>。這一題同時用到 PostgreSQL 和 Redis，先確認容器在跑（在 <code>learn/nestjs/practice</code> 執行 <code>docker compose up -d --wait</code>，第 12 課）。專案是第 20 課的咖啡店 API，已經有：</p>
+<ul>
+  <li><code>POST /orders</code> 建訂單、<code>POST /orders/:id/pay</code> 付款：先呼叫 <code>PaymentGateway.charge</code>（模擬外部付款服務，要 1 秒），再改成 paid、排入收據工作。<code>OrdersService</code>、<code>ReceiptsProducer</code> 都已經用 <code>new Logger(…)</code> 記 log，訊息固定、值在第二個參數的物件裡。</li>
+  <li><code>LoggingModule</code>（<code>@Global</code>）：<code>RequestContext</code> 與 <code>AppLogger</code> 的骨架，<code>configureApp</code> 已經 <code>app.useLogger(app.get(AppLogger))</code>，<code>main.ts</code> 已經 <code>bufferLogs: true</code>。</li>
+  <li><code>RequestIdMiddleware</code>：驗證或產生 requestId、設定 <code>X-Request-Id</code> 回應標頭，已套用到所有路由。</li>
+  <li><code>RedisService</code>：應用程式自己的 ioredis 連線，<code>this.redis.client</code> 可以下指令。<code>ReceiptsProcessor</code>：第 20 課的 worker，<code>Mailer</code> 寄一封要 1 秒。</li>
+</ul>
+<p>想親手看：在 <code>work/24</code> 執行 <code>npx prisma migrate dev</code>、<code>npm run start:dev</code>，用 <code>curl -i -X POST localhost:3100/orders -H 'content-type: application/json' -d '{"customerId":1,"total":190}'</code> 看回應標頭的 <code>X-Request-Id</code> 和終端機裡帶同一個 id 的 JSON log；做完練習 3 後，付款途中按 Ctrl+C（送 <code>SIGINT</code>），看請求照樣回 200、程序才結束。</p>
+
+<div class="local" data-test="ex1" data-files="src/logging/request-context.ts src/logging/app.logger.ts src/request-id.middleware.ts">
+  <p>練習 1：讓同一個請求的每一行 log 都帶同一個 <code>requestId</code>。</p>
+  <ul>
+    <li><code>RequestContext</code>：用 <code>AsyncLocalStorage</code> 實作 <code>run(requestId, fn)</code> 與 <code>requestId</code> getter。<code>run</code> 裡面（包含 <code>await</code> 之後）讀到這次的 id，外面讀到 <code>undefined</code>。</li>
+    <li><code>RequestIdMiddleware</code>：注入 <code>RequestContext</code>，讓請求接下來的處理都在情境裡執行。</li>
+    <li><code>AppLogger</code>：覆寫 <code>getJsonLogObject</code>，每一行 JSON 的最上層多一個 <code>requestId</code>；請求以外的 log 不帶這個欄位。</li>
+    <li><code>OrdersService</code>、<code>ReceiptsProducer</code> 不改，而且要維持 singleton。</li>
+  </ul>
+  <p>判分：攔下 stdout，檢查「訂單建立」「付款完成」「收據工作已排入」每一行的 <code>requestId</code> 等於該請求的 <code>X-Request-Id</code>，<code>orderId</code>、<code>total</code> 留在 <code>params</code>；6 個請求同時進來、各自付款，每一行都帶自己的 id；<code>new Logger('Startup').log(…)</code> 沒有 <code>requestId</code>；<code>app.get(OrdersService)</code> 不會丟錯。用參數傳、模組變數、request scope 的 logger 都過不了。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="src/health/health.module.ts src/health/health.controller.ts src/health/redis.health.ts">
+  <p>練習 2：用 <code>@nestjs/terminus</code> 12 提供 <code>GET /health/live</code> 與 <code>GET /health/ready</code>。</p>
+  <ul>
+    <li><code>HealthModule</code> 匯入 <code>TerminusModule</code>，登記 <code>RedisHealthIndicator</code>。</li>
+    <li><code>live</code>：<code>this.health.check([])</code>，不查任何依賴。</li>
+    <li><code>ready</code>：<code>PrismaHealthIndicator.pingCheck('database', this.prisma)</code> 與 <code>RedisHealthIndicator.pingCheck('redis')</code>，兩項都 <code>.withTimeout(1000)</code>。</li>
+    <li><code>RedisHealthIndicator</code>：注入 <code>HealthIndicatorService</code> 與 <code>RedisService</code>，用 <code>check(key).attempt(…)</code> 真的對 Redis <code>ping()</code>。</li>
+  </ul>
+  <p>判分：正常時兩個端點都 200，<code>details.database</code>、<code>details.redis</code> 都是 up；把 Prisma 的查詢換成失敗 → ready 503、database down、redis 仍 up、live 仍 200；把 <code>ping()</code> 換成永遠不回應 → ready 在 1 秒左右回 503、redis down，live 不受影響。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="src/main.ts src/receipts/receipts.processor.ts src/prisma/prisma.service.ts">
+  <p>練習 3：優雅關機。進行中的請求與工作做完，worker 先關，資料庫最後才斷線。</p>
+  <ul>
+    <li><code>main.ts</code>：<code>app.enableShutdownHooks()</code>。不要自己監聽 <code>SIGTERM</code> 呼叫 <code>process.exit</code>。</li>
+    <li><code>ReceiptsProcessor</code>：在 <code>beforeApplicationShutdown</code> 裡 <code>await this.worker.close()</code>。</li>
+    <li><code>PrismaService</code>：<code>$disconnect()</code> 從 <code>onModuleDestroy</code> 搬到 <code>onApplicationShutdown</code>。</li>
+  </ul>
+  <p>判分：worker 正在寄一封要 1 秒的收據、同時有一個要 1 秒的付款請求進行中，這時 <code>app.close()</code>：請求要回 200、訂單 paid、收據的 <code>receiptSentAt</code> 有值；記錄每一步的順序，<code>worker.close</code> 要在 HTTP 關閉前結束、<code>$disconnect</code> 要在 HTTP 關閉後才開始；關機後 <code>pg_stat_activity</code> 裡不能剩下這個資料庫的連線。最後 <code>nest build</code>、啟動 <code>dist/main.js</code>，付款途中送 <code>SIGTERM</code>：請求要回 200，程序在 15 秒內結束。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：同事把 <code>/health/live</code> 改成也檢查資料庫，理由是「多檢查一項更安全」。哪個說法正確？</p>
+  <label data-key="a">對，liveness 檢查越多越能提早發現問題</label>
+  <label data-key="b">對，但要加 <code>withTimeout</code> 才行</label>
+  <label data-key="c">不對：資料庫一晃，所有程序的 liveness 同時失敗，平台把它們全部重啟；重啟修不好資料庫，反而讓所有程序同時重連把它再打一次。依賴的狀態是 readiness 的事</label>
+  <label data-key="d">不對，因為 Terminus 的 <code>check([])</code> 不能傳指標進去</label>
+  <p class="why">✓ c。liveness 失敗的後果是「重啟程序」，只有重啟能修好的狀況（事件迴圈卡死）才該讓它失敗。資料庫斷線重啟程序沒有用，正確的反應是 readiness 回 503、暫停送流量。a 把兩個問題混在一起。b 的逾時只是讓它失敗得快一點，後果一樣。d 錯：<code>check</code> 可以傳任何指標，問題在不該傳。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：為什麼 <code>RequestContext</code> 用 <code>AsyncLocalStorage</code>，而不是把 logger 設成 <code>Scope.REQUEST</code> 然後 <code>@Inject(REQUEST)</code> 讀 <code>req.requestId</code>？後者看起來更「Nest」。</p>
+  <label data-key="a">request scope 在 Nest 12 已經被移除</label>
+  <label data-key="b">注入 request-scoped provider 的每一層（service、controller）都會跟著變成 request scope：每個請求重建整條鏈，而且 <code>app.get(OrdersService)</code> 會丟錯，測試和排程都拿不到它。<code>AsyncLocalStorage</code> 讓所有東西維持 singleton</label>
+  <label data-key="c">因為 <code>REQUEST</code> 在 middleware 裡讀不到</label>
+  <label data-key="d">兩種做法效果一樣，只是風格不同</label>
+  <p class="why">✓ b。request scope 會沿著注入鏈往上傳染，代價是效能和可用性（<code>app.get</code> 失效、排程與 worker 裡沒有請求可以注入）。a 錯：request scope 還在，只是要知道代價。c 不是原因。d 錯：差別正是在 singleton 與否。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 6：<code>PrismaService</code> 在 <code>onModuleDestroy</code> 裡 <code>$disconnect()</code>，關機時平台等了 30 秒還是把程序 <code>SIGKILL</code>。最可能的原因是？</p>
+  <label data-key="a">沒有呼叫 <code>enableShutdownHooks</code>，hook 根本沒跑</label>
+  <label data-key="b"><code>$disconnect</code> 本身要花 30 秒</label>
+  <label data-key="c">Prisma 不能在 hook 裡斷線，要在 <code>main.ts</code> 的 <code>process.on('exit')</code> 裡斷</label>
+  <label data-key="d"><code>onModuleDestroy</code> 是第一個階段，HTTP 請求還在處理。請求接著查資料庫，Prisma 自動重連，留下一個關機後沒人關的連線池，程序結束不了。<code>$disconnect</code> 要放在最後的 <code>onApplicationShutdown</code></label>
+  <p class="why">✓ d。斷線太早不會讓請求失敗（Prisma 會重連），而是讓程序卡著結束不了，這種「沒有錯誤訊息的卡住」最難查。a 如果成立，hook 完全不跑，程序會立刻結束而不是卡 30 秒。b 錯：斷線是毫秒級的事。c 錯：<code>'exit'</code> 事件裡不能做非同步的事，而且 Nest 的 hook 就是為此設計的。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>把值拼進訊息字串</strong>：<code>`訂單 ${id} 建立`</code> 搜不到、也沒辦法用欄位篩選。訊息固定，值放第二個參數的物件裡，它會進 <code>params</code>。</li>
+  <li><strong>第二個參數傳字串</strong>：<code>logger.log('付款完成', orderId)</code> 的字串會被當成 context，不是資料。要傳物件。</li>
+  <li><strong>忘了 <code>bufferLogs</code></strong>：啟動初期的 log 用預設的彩色格式印，上線後 log 收集工具只有這幾行解析失敗。<code>NestFactory.create(AppModule, { bufferLogs: true })</code>。</li>
+  <li><strong>相信外面送來的 <code>X-Request-Id</code></strong>：含換行的值可以偽造出假的 log 行，超長的值塞爆 log。先用正規表示式驗證，不合格就自己產生。</li>
+  <li><strong><code>run</code> 只包了空的 callback，<code>next()</code> 在外面呼叫</strong>：情境在 callback 結束時就結束，整個請求讀到 <code>undefined</code>。把 <code>next</code> 本身交給 <code>run</code>。</li>
+  <li><strong>用模組層級的變數存「目前的 requestId」</strong>：第二個請求進來就蓋掉第一個的。單一執行緒不代表沒有並發。</li>
+  <li><strong>request scope 的 logger</strong>：整條注入鏈變成 request scope，<code>app.get</code> 失效、效能變差。用 <code>AsyncLocalStorage</code>。</li>
+  <li><strong>liveness 查資料庫</strong>：資料庫一晃，全部程序一起重啟。live 什麼都不查，依賴交給 ready。</li>
+  <li><strong>健康指標沒有逾時</strong>：一個卡住的依賴讓整個健康檢查卡住。每項 <code>.withTimeout()</code>。</li>
+  <li><strong>照抄 Terminus 11 的範例</strong>：<code>extends HealthIndicator</code>、<code>HealthCheckError</code> 在 12 已經移除。用 <code>HealthIndicatorService</code> 的 <code>check(key).attempt(fn)</code>。</li>
+  <li><strong>指標沒有真的碰依賴</strong>：<code>attempt(async () =&gt; {})</code> 永遠 up。要 <code>ping()</code>、<code>SELECT 1</code>。</li>
+  <li><strong>沒有 <code>enableShutdownHooks</code></strong>：<code>SIGTERM</code> 來了 Nest 直接結束，三個關機 hook 一個都不會跑。本機 Ctrl+C 看起來正常，上線才出事。</li>
+  <li><strong>自己 <code>process.on('SIGTERM', () =&gt; process.exit())</code></strong>：立刻結束，進行中的請求被切斷。交給 Nest。</li>
+  <li><strong><code>$disconnect</code> 放在 <code>onModuleDestroy</code></strong>：HTTP 還在跑，Prisma 自動重連留下連線池，程序結束不了被 <code>SIGKILL</code>。放到 <code>onApplicationShutdown</code>。</li>
+  <li><strong>關 worker 沒有 <code>await</code></strong>：關機流程不等手上的工作做完就往下走，資料庫斷線後工作才寫結果。<code>await this.worker.close()</code>。</li>
+  <li><strong>關機流程比平台時限長</strong>：一個要跑 5 分鐘的 job 擋在 <code>worker.close()</code>，30 秒後被 <code>SIGKILL</code>。長工作要能被中斷、能續做。</li>
+</ul>
+
+<h2 id="appendix">補充與查表</h2>
+<p>主線用不到、但遇到時要知道的細節。</p>
+<ul>
+  <li><strong>課程驗證的版本</strong>：練習專案用 <code>@nestjs/core</code> 12.3.2、<code>@nestjs/terminus</code> 12.1.0、<code>@nestjs/bullmq</code> 12.0.0。</li>
+  <li><strong>Terminus 11 以前的自訂指標寫法</strong>：網路上大量範例是 <code>extends HealthIndicator</code>、用 <code>this.getStatus(key, true)</code> 回報結果、失敗時丟 <code>HealthCheckError</code>。這兩個類別在 12 已經移除，照抄會編譯失敗。12 的寫法是本課的 <code>HealthIndicatorService</code> 加 <code>check(key).attempt(fn)</code>。</li>
+  <li><strong><code>attempt</code> 的取消訊號</strong>：<code>attempt</code> 的 callback 會收到 <code>{ signal }</code>（<code>AbortSignal</code>，<a href="../../node/lessons/08-events-cancellation.html">Node 課第 8 課</a>），<code>.withTimeout()</code> 逾時時會被 abort，支援 signal 的呼叫（例如 <code>fetch</code>）可以順手取消，不會在背景繼續等。</li>
+  <li><strong><code>degraded</code> 狀態</strong>：Terminus 12 多了這個狀態，代表還在服務、但有損（例如快取失效只能查資料庫）。整體狀態變成 <code>'degraded'</code>，HTTP 仍是 200，流量照送，但監控看得到。這一課的練習不用它。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>上線後只剩 log 看得到，而 log 的讀者是搜尋工具：<code>ConsoleLogger({ json: true })</code> 一行一個 JSON，訊息固定、值放第二個參數的物件裡進 <code>params</code>；<code>app.useLogger</code> 換上自己的 <code>AppLogger</code>，<code>bufferLogs: true</code> 讓啟動的 log 也走它。</li>
+  <li>同一張訂單有好幾次請求，要靠 <code>requestId</code> 分開：middleware 驗證或產生、回 <code>X-Request-Id</code>。參數傳會漏、模組變數會被交錯的請求蓋掉、request scope 會讓整條注入鏈每個請求重建。</li>
+  <li><code>AsyncLocalStorage</code> 的 store 跟著非同步流程走：包成 singleton 的 <code>RequestContext</code>，middleware 把 <code>next</code> 交給 <code>run</code>，<code>AppLogger</code> 覆寫 <code>getJsonLogObject</code> 自動帶上，業務程式一行不改。</li>
+  <li>健康檢查回答兩個問題：liveness 什麼都不查，失敗代表要重啟；readiness 查依賴，失敗代表先別送流量。判斷標準是「重啟修得好嗎」。Terminus 12：<code>HealthCheckService.check</code>、內建 <code>PrismaHealthIndicator</code>、自訂指標用 <code>HealthIndicatorService.check(key).attempt(fn)</code>，每項 <code>.withTimeout()</code>。</li>
+  <li>部署會送 <code>SIGTERM</code>、給一段寬限時間再 <code>SIGKILL</code>。<code>app.enableShutdownHooks()</code> 讓 <code>SIGTERM</code> 走 <code>app.close()</code>：<code>onModuleDestroy</code> 停接新工作 → <code>beforeApplicationShutdown</code> 等 worker 做完 → Nest 關 HTTP → <code>onApplicationShutdown</code> 才斷 Prisma、Redis。不要 <code>process.exit</code>，流程要比平台時限短。王小明那種「款扣了、訂單沒變」就是這條流程沒做好的結果。</li>
+</ul>
+<p>服務活著、也能好好關掉了，下一課處理「它活著但不對」的時候怎麼辦：從 Nest 的錯誤訊息找出循環 import 與 scope 問題，再用事件迴圈的角度看為什麼一個報表會讓所有請求變慢。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

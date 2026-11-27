@@ -1,0 +1,3 @@
+-- 練習 1：給 cafe_app「只能讀寫資料」的權限。
+-- 這個檔在 01-roles.sql 之後、任何 migration 之前執行（由 postgres 超級使用者執行）。
+-- 表是之後由 cafe_migrator 跑 migration 建的，現在還不存在：想想怎麼讓「之後建的表」自動給 cafe_app 權限。

@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>9. 多階段建置與映像安全</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="9" data-practice="devops">
+<header>
+  <div class="eyebrow">階段 2：容器化 · 第 9 課</div>
+  <h1>多階段建置與映像安全</h1>
+</header>
+<main>
+
+<p>第 8 課的映像能跑，但打開來看：裡面有 TypeScript 編譯器、所有 <code>.ts</code> 原始碼、<code>@types</code>、npm 的快取。哪天 API 有漏洞被人拿到 shell，這些都是現成的工具。更糟的是，同事為了裝公司的私有套件，在 Dockerfile 加了 <code>ARG NPM_TOKEN</code>，映像推上 registry 之後，任何能拉映像的人用 <code>docker history</code> 就看得到那個 token。</p>
+<p>這一課把映像變小、變乾淨，並讓容器用最少的權限執行。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>單一階段的映像與多階段建置：第 8 課的映像為什麼帶著編譯器和原始碼，怎麼只把執行需要的東西留在最終映像。</li>
+  <li>選擇基底映像：Alpine、slim、distroless 各留下什麼，沒有 shell 的映像出事怎麼查。</li>
+  <li>機密不能進映像：<code>ARG NPM_TOKEN</code> 為什麼用 <code>docker history</code> 就看得到，怎麼讓機密在建置時用完就消失。</li>
+  <li>釘版本、掃描與跨架構建置：釘住基底映像又不漏掉安全更新，在 Mac 上替 amd64 的伺服器建置映像。</li>
+  <li>執行期加固：就算 API 被人拿到 shell，讓攻擊者能做的事越少越好。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="07-containers.html">第 7 課</a>的映像：由好幾層疊成，每一層都留在映像裡；tag 會移動、digest 不會；映像要符合主機的 CPU 架構（平台）。</li>
+  <li><a href="08-dockerfile.html">第 8 課</a>的單一階段 Dockerfile：先複製 lockfile 再 <code>npm ci</code> 以重用層快取，<code>USER node</code> 不用 root 執行，<code>docker build --check</code> 檢查常見錯誤。</li>
+  <li><a href="../../node/lessons/03-npm-packages.html">Node 課第 3 課</a>的依賴分類：dependencies 是執行時要的套件，devDependencies 只在開發和建置時用。</li>
+</ul></div>
+
+<h2>單一階段的映像裡有什麼</h2>
+<p>先量一下第 8 課那種寫法。用 <code>docker history</code> 看每一層多大（由新到舊，最下面幾層是基底映像 <code>node:24.22.2-alpine3.24</code>）：</p>
+<pre>docker history &lt;第 8 課建出的映像&gt;
+CREATED BY                                   SIZE
+CMD ["node" "dist/server.js"]                0B
+…
+RUN /bin/sh -c npm run build                 6.65kB
+COPY src ./src                               2.97kB
+RUN /bin/sh -c npm ci                        44.6MB   ← 這一層最大
+COPY package.json package-lock.json ./       18.7kB
+…（以下是基底映像的層，約 167MB）</pre>
+<p>44.6MB 的 <code>npm ci</code> 那層裡，執行時真正需要的只有 pino 和它的幾個依賴，大約 1MB。其餘是：</p>
+<ul>
+  <li>TypeScript 7 的原生編譯器（<code>@typescript/typescript-linux-arm64</code>，二十幾 MB）和 <code>typescript</code> 本身</li>
+  <li><code>@types/node</code> 等型別定義：只有編譯時要用</li>
+  <li><code>/root/.npm</code>：npm 下載套件時留下的快取</li>
+</ul>
+<p>再加上 <code>src/</code> 裡的原始碼和 <code>tsconfig.json</code>。這些東西有三個代價：映像大，部署和擴展時拉得慢；裡面的套件越多，被發現漏洞的機會越多；攻擊者進到容器之後，能利用的工具越多。最後這點叫<strong>攻擊面</strong>（attack surface）：攻擊者能拿來利用的東西總和，包括多餘的套件、shell、編譯器、套件管理器。</p>
+<div class="callout warn">在同一個 Dockerfile 最後加一行 <code>RUN npm prune --omit=dev &amp;&amp; rm -rf src /root/.npm</code> 沒有用。第 7 課說過，映像是一層一層疊起來的，後面的層刪檔案只是加上一個「這個檔案被刪了」的標記，前面那層的 44.6MB 還在映像裡，照樣要下載，也照樣能從那一層把檔案拿出來。</div>
+
+<h2>多階段建置</h2>
+<p><strong>多階段建置</strong>（multi-stage build）：一個 Dockerfile 寫好幾個 <code>FROM</code>，每個 <code>FROM</code> 開始一個新的<strong>階段</strong>（stage），各自從乾淨的基底開始。最後一個階段就是產出的映像，前面的階段只是工作區，用 <code>COPY --from=階段名稱</code> 把需要的成果複製過來，其他東西都不會進最終映像。</p>
+<figure>
+  <svg viewBox="0 0 700 270" role="img" aria-label="三個階段：build 階段完整安裝依賴並編譯出 dist；deps 階段只安裝正式依賴；最終階段從乾淨的 node 映像開始，只複製 package.json、deps 的 node_modules 和 build 的 dist">
+    <defs><marker id="arr9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="10" y="15" width="220" height="110" rx="10"/>
+    <text class="d-accent" x="25" y="40">build 階段</text>
+    <text class="d-small" x="25" y="62">npm ci（含 devDependencies）</text>
+    <text class="d-small" x="25" y="80">typescript、@types、src/</text>
+    <text class="d-small" x="25" y="98">npm 快取</text>
+    <text class="d-text" x="25" y="116">→ 產出 dist/</text>
+    <rect class="d-soft" x="10" y="145" width="220" height="90" rx="10"/>
+    <text class="d-accent" x="25" y="170">deps 階段</text>
+    <text class="d-small" x="25" y="192">npm ci --omit=dev</text>
+    <text class="d-text" x="25" y="220">→ 產出正式的 node_modules</text>
+    <rect class="d-box" x="420" y="60" width="270" height="140" rx="10"/>
+    <text class="d-accent" x="435" y="85">最終階段（產出的映像）</text>
+    <text class="d-small" x="435" y="108">FROM node:24.22.2-alpine3.24</text>
+    <text class="d-text" x="435" y="132">package.json</text>
+    <text class="d-text" x="435" y="154">node_modules（只有 pino 等）</text>
+    <text class="d-text" x="435" y="176">dist/</text>
+    <text class="d-small" x="435" y="194">USER node、HEALTHCHECK、CMD</text>
+    <path class="d-line" d="M230,105 C320,105 330,170 418,170" fill="none" marker-end="url(#arr9)"/>
+    <path class="d-line" d="M230,200 C320,200 330,150 418,150" fill="none" marker-end="url(#arr9)"/>
+    <text class="d-small" x="262" y="96">COPY --from=build</text>
+    <text class="d-small" x="262" y="225">COPY --from=deps</text>
+    <text class="d-small" x="10" y="262">左邊兩個階段的其他內容（編譯器、原始碼、快取）都不會出現在最終映像</text>
+  </svg>
+  <figcaption>多階段建置：建置工具留在建置階段，最終映像只拿成果</figcaption>
+</figure>
+<pre># syntax=docker/dockerfile:1
+
+# 階段 1：編譯。需要 devDependencies
+FROM node:24.22.2-alpine3.24 AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build
+
+# 階段 2：只裝正式依賴
+FROM node:24.22.2-alpine3.24 AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
+# 階段 3：最終映像
+FROM node:24.22.2-alpine3.24
+ENV NODE_ENV=production
+WORKDIR /app
+COPY package.json ./
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+EXPOSE 3000
+USER node
+HEALTHCHECK …（同第 8 課）
+CMD ["node", "dist/server.js"]</pre>
+<p>逐行看重點：</p>
+<ul>
+  <li><code>AS build</code> 幫階段取名字，<code>COPY --from=build</code> 用名字指定從哪個階段複製。名字要小寫（build check 的 StageNameCasing 規則）。</li>
+  <li>為什麼要另外一個 <code>deps</code> 階段，而不是在 build 階段 <code>npm prune</code> 後整包複製？兩種都可以；分開的好處是 deps 階段只跟 <code>package*.json</code> 有關，改原始碼時它整個走快取。<strong>不能</strong>直接複製 build 階段的 <code>node_modules</code>，那裡面有 typescript。</li>
+  <li><code>package.json</code> 一定要帶：它的 <code>"type": "module"</code> 告訴 Node 用 ES module 載入 <code>dist/*.js</code>，少了它程式會直接出錯。</li>
+  <li><code>USER</code>、<code>ENV</code>、<code>HEALTHCHECK</code> 只對寫在它的那個階段有效。最終階段是新的開始，前面階段寫過的設定都要重寫。</li>
+  <li>BuildKit 會分析階段之間的依賴，<code>build</code> 和 <code>deps</code> 兩個階段互不相關，會同時建置。</li>
+</ul>
+<p>結果：最終映像只比基底多 1MB 左右，裡面沒有編譯器、沒有原始碼、沒有 npm 快取。</p>
+<p><code>docker build --target build -t cafe-api:build .</code> 只建到指定的階段為止。用途是：在 CI 裡用 build 階段跑測試（它有 devDependencies），或另外做一個帶 migration 工具的映像（第 17 課）。</p>
+
+<h2>選擇基底映像</h2>
+<p>最終階段 <code>FROM</code> 的那個映像決定了你的映像裡還剩什麼。Node 常見的選擇：</p>
+<div class="table-wrap"><table>
+<tr><th>基底</th><th>C 函式庫</th><th>shell、套件管理器</th><th>特色</th><th>除錯</th></tr>
+<tr><td><code>node:24.22.2-alpine3.24</code></td><td>musl</td><td>有（busybox sh、apk）</td><td>小（arm64 約 167MB，大部分是 Node 本身）</td><td><code>docker exec … sh</code></td></tr>
+<tr><td><code>node:24-bookworm-slim</code>／<code>node:24-trixie-slim</code></td><td>glibc</td><td>有（bash、apt）</td><td>Debian 精簡版，相容性最好</td><td><code>docker exec … bash</code>，可以臨時 <code>apt-get install</code></td></tr>
+<tr><td><code>gcr.io/distroless/nodejs24-debian13</code></td><td>glibc</td><td>沒有</td><td>Google 維護，只有 Node 和執行需要的檔案；<code>:nonroot</code> 版本預設以 uid 65532 執行</td><td>看 log、共用命名空間的除錯容器，或 <code>:debug</code> 版本</td></tr>
+<tr><td>Docker Hardened Images（<code>dhi.io/node</code>）</td><td>依版本（Alpine 或 Debian）</td><td>runtime 版沒有，<code>-dev</code> 版有</td><td>Docker 維護、以低 CVE 為目標；2025-12-17 起以 Apache 2.0 免費提供，拉取要先 <code>docker login dhi.io</code></td><td>同 distroless；建置階段用 <code>-dev</code> 版</td></tr>
+</table></div>
+<p>幾個名詞：</p>
+<ul>
+  <li><strong>musl／glibc</strong>：Linux 程式都會用到一個 C 標準函式庫。Debian、Ubuntu 用 glibc；Alpine 用 musl，比較小，但行為有些差異。純 JavaScript 的套件不受影響；有原生模組的套件（例如 <code>bcrypt</code>、<code>sharp</code>）要有對應 musl 的預先編譯版本，否則要在映像裡自己編譯，或者乾脆不能用。</li>
+  <li><strong>distroless</strong>：「沒有發行版」的映像，裡面沒有 shell、沒有套件管理器，只有執行環境。攻擊者就算能執行程式碼，也沒有 <code>sh</code>、<code>wget</code> 可以用。代價是你也沒有。注意它的 ENTRYPOINT 已經是 <code>node</code>，所以 <code>CMD</code> 只寫 <code>["dist/server.js"]</code>，HEALTHCHECK 也不能用 <code>CMD-SHELL</code>。</li>
+  <li><strong>CVE</strong>（Common Vulnerabilities and Exposures）：公開漏洞的編號，例如 CVE-2026-33634。映像裡的套件越多，對到的 CVE 通常越多，但「數量」不等於「風險」：沒有被執行到的套件，漏洞也很難被利用。</li>
+</ul>
+<p>沒有 shell 的映像出問題怎麼查？先看 <code>docker logs</code>。還不夠，就開一個有工具的<strong>除錯容器</strong>，讓它加入目標容器的網路和程序<strong>命名空間</strong>（<a href="07-containers.html">第 7 課</a>）：</p>
+<pre># 借用 ld-09-app 的網路與程序命名空間：看到的 localhost、程序清單都是它的
+docker run --rm -it --network container:ld-09-app --pid container:ld-09-app alpine:3.24 sh
+/ # ps                       # 看得到 ld-09-app 裡的 node（PID 1）
+/ # wget -qO- http://localhost:3000/health/live</pre>
+<p>除錯工具在另一個容器裡，用完就丟，正式的映像一直保持乾淨。</p>
+<p>這門課選 <code>node:24.22.2-alpine3.24</code>：小、有 shell 方便學習時進去看，cafe-api 只有純 JS 的依賴，不受 musl 影響。正式環境要更嚴格時，最終階段換成 distroless 或 DHI，建置階段不用改。原則是：先確定依賴在那個 libc 上能跑、團隊會用除錯容器，再追求更小。</p>
+
+<h2>機密不能進映像</h2>
+<p>咖啡店有一個私有套件 <code>@cafe/loyalty</code>，放在公司的私有 npm registry，下載要帶 token。建置時需要 token，執行時不需要。常見的三種寫法都會外洩：</p>
+<div class="table-wrap"><table>
+<tr><th>寫法</th><th>token 留在哪裡</th><th>怎麼看到</th></tr>
+<tr><td><code>ARG NPM_TOKEN</code> ＋ <code>--build-arg NPM_TOKEN=…</code></td><td>映像的建置紀錄：用到它的每一個 <code>RUN</code> 都記著值</td><td><code>docker history --no-trunc</code> 出現 <code>RUN |1 NPM_TOKEN=npm_… /bin/sh -c …</code></td></tr>
+<tr><td><code>ENV NPM_TOKEN=…</code></td><td>映像設定，而且每個容器執行時都有這個環境變數</td><td><code>docker image inspect</code> 的 <code>Env</code>；容器裡 <code>env</code></td></tr>
+<tr><td><code>COPY .npmrc</code>，用完 <code>RUN rm .npmrc</code></td><td><code>COPY</code> 那一層的檔案內容</td><td><code>docker save</code> 匯出後解開那一層</td></tr>
+</table></div>
+<p>自己驗證第一種（token 是假的）：</p>
+<pre>docker build --build-arg NPM_TOKEN=npm_FAKE123 -f Dockerfile.private -t demo .
+docker history --no-trunc --format '{{.CreatedBy}}' demo | grep FAKE
+RUN |1 NPM_TOKEN=npm_FAKE123 /bin/sh -c node scripts/fetch-private.mjs # buildkit
+ARG NPM_TOKEN=npm_FAKE123</pre>
+<p>映像推到 registry 之後，任何拉得到映像的人（同事、CI、外包、駭進 registry 的人）都能看到。Docker 官方文件也明說 build arg 和環境變數不適合傳機密，因為它們會留在最終映像裡。</p>
+<p>正確做法是 <strong>build secret</strong>：只在某一個 <code>RUN</code> 執行期間掛進去、不寫進任何一層的機密。</p>
+<pre># Dockerfile
+RUN --mount=type=secret,id=npm_token,env=NPM_TOKEN node scripts/fetch-private.mjs
+
+# 建置指令：把目前 shell 的環境變數 NPM_TOKEN 當成 id=npm_token 的 secret 交給 BuildKit
+docker build --secret id=npm_token,env=NPM_TOKEN -f Dockerfile.private .</pre>
+<ul>
+  <li><code>--mount=type=secret</code> 預設把 secret 掛成檔案 <code>/run/secrets/&lt;id&gt;</code>；加 <code>env=NPM_TOKEN</code> 改成這一步的環境變數（Dockerfile 語法 1.10 起）。檔案形式也可以用 <code>target=/root/.npmrc</code> 指定位置，npm 會直接讀它。</li>
+  <li><code>--secret</code> 的來源可以是 <code>env=變數名</code> 或 <code>src=檔案路徑</code>。</li>
+  <li>secret 的值不算在層快取裡：換了 token，那一步照樣走快取。Docker 文件建議的做法是另外加一個不是機密的 <code>ARG CACHEBUST</code>，換 token 時一起改它的值。</li>
+  <li>它只保證「不進映像」。你自己在那一步把 token 寫進檔案（例如 <code>echo … &gt; .npmrc</code> 卻沒刪），一樣會進那一層。</li>
+</ul>
+<p><code>docker build --check</code> 會用 <strong>SecretsUsedInArgOrEnv</strong> 規則擋下名稱看起來像機密的 <code>ARG</code>、<code>ENV</code>（<code>TOKEN</code>、<code>PASSWORD</code>、<code>SECRET</code>、<code>KEY</code> 之類）：</p>
+<pre>WARNING: SecretsUsedInArgOrEnv - …
+Do not use ARG or ENV instructions for sensitive data (ARG "NPM_TOKEN")</pre>
+<div class="callout warn">多階段建置不能當成機密的防護：把 <code>ARG NPM_TOKEN</code> 放在建置階段，最終映像的 history 確實看不到，但 token 還在建置快取、<code>--target</code> 建出的中間映像、CI 的 log 裡，而且 build check 照樣會警告。一律用 secret mount。執行期才需要的機密（資料庫密碼）根本不該在建置時出現，第 11 課在執行時注入。</div>
+<p>token 一旦進過映像，就當作已經外洩：撤銷、換新，再重建。刪掉映像不夠，你不知道誰已經拉過。</p>
+<div class="callout practice"><strong>💡 實務上：外洩的 token 通常在 code review 時就該被擋下</strong><br>真實的事故常是「某個舊映像的 history 裡有 token」，被資安掃描或外部回報才發現。資深工程師 review Dockerfile 時會先看三件事：有沒有 <code>ARG</code>／<code>ENV</code> 的名字像機密、有沒有 <code>COPY</code> 進 <code>.npmrc</code>、<code>.env</code> 這類檔案、<code>.dockerignore</code> 有沒有排除它們。再把 <code>docker build --check</code> 放進 CI，讓規則自動把關。發現外洩時先撤銷 token，再追查誰拉過映像，順序不能反。</div>
+
+<h2>釘版本、重建與掃描</h2>
+<p>第 7 課講過，tag 可以被移動，digest 不會。基底映像可以寫成：</p>
+<pre>FROM node:24.22.2-alpine3.24@sha256:&lt;index digest&gt;</pre>
+<p>tag 給人看，digest 保證每次建置用的是同一份內容。但釘死之後，基底映像出了安全更新你也不會拿到，所以要搭配自動更新工具：<strong>Dependabot</strong>（GitHub 內建）或 <strong>Renovate</strong>，它們會定期檢查 Dockerfile 的 <code>FROM</code>、<code>package.json</code>，有新版本就開 PR 改 digest，CI 跑過再合併（第 15 課）。</p>
+<p><strong>映像掃描</strong>（image scanning）：把映像裡每個套件的版本拿去跟漏洞資料庫比對，列出已知的 CVE。常用工具：</p>
+<ul>
+  <li><code>docker scout cves 映像</code>：Docker 內建，要先登入 Docker 帳號；加 <code>--exit-code</code> 時發現漏洞會以結束碼 2 結束，可以讓 CI 失敗；<code>--only-severity critical,high</code>、<code>--only-fixed</code> 過濾。</li>
+  <li>Trivy（Aqua Security 的開源工具）：<code>trivy image 映像</code>，不用帳號。</li>
+</ul>
+<p>兩個資深工程師要知道的事：</p>
+<ul>
+  <li><strong>掃描結果每天都會變</strong>。映像內容沒變，但漏洞資料庫每天新增 CVE，今天 0 個 critical，下個月可能有 3 個。所以要定期（例如每週）重新掃描已部署的映像，並定期重建，讓基底的更新進來。也因為結果會變，這一課的練習不拿掃描結果判分。</li>
+  <li><strong>掃描工具本身也是供應鏈的一環</strong>。<strong>供應鏈攻擊</strong>（supply chain attack）是不直接攻擊你，而是從你依賴的套件、映像、工具下手（npm 套件的例子見 <a href="../../node/lessons/25-security.html">Node 課第 25 課</a>）。2026-03-19，<code>aquasecurity/trivy-action</code> 的 77 個版本 tag 有 76 個被改指向竊取 CI 機密的程式，還發布了惡意的 Trivy v0.69.4；2026-03-22 Docker Hub 上又出現惡意的 v0.69.5、v0.69.6 和 <code>latest</code>（CVE-2026-33634）。用 tag 或 <code>latest</code> 引用掃描工具的 CI，就在跑竊密程式。掃描工具一樣要釘 digest 或 commit SHA。</li>
+</ul>
+<p>兩種描述「映像是什麼、怎麼來的」的資料，BuildKit 可以在建置時產生，附在映像上，統稱 attestation：</p>
+<ul>
+  <li><strong>SBOM</strong>（Software Bill of Materials，軟體物料清單）：映像裡所有套件與版本的清單。下次又有像 log4j 那樣的漏洞公布，你查 SBOM 就知道哪些映像受影響，不用一個個打開。</li>
+  <li><strong>provenance</strong>（建置來源證明）：記錄映像從哪個 repo、哪個 commit、用什麼建置流程產生。部署前可以驗證「這個映像真的是我們的 CI 建出來的」。</li>
+</ul>
+<pre>docker buildx build --sbom=true --provenance=mode=max -t registry.example.com/cafe-api:1.4.0 --push .</pre>
+<p>attestation 掛在映像的 <strong>index</strong>（一個映像名稱底下的清單，列出各平台的映像和附加資料）上。傳統的映像儲存放不下 index：這台 Mac 的 <code>docker info</code> 顯示 Storage Driver 是 <code>overlay2</code>，就是傳統儲存，這時預設的建置器加上 <code>--sbom</code>／<code>--provenance</code> 會直接失敗。解法是在 Docker Desktop 開啟 containerd 映像儲存，或用 <code>docker buildx create --driver docker-container</code> 建一個獨立的建置器再 <code>--push</code> 到 registry。實務上這件事在 CI 裡做（第 15、16 課）。另外 <code>mode=max</code> 的 provenance 會記下 build arg 的值（secret mount 不會），又是一個不能用 ARG 傳機密的理由。</p>
+<div class="callout practice"><strong>💡 實務上：資安問卷和漏洞公告都會來找你要清單</strong><br>大客戶的資安問卷常問「你們怎麼管理第三方元件的漏洞」，新的重大漏洞公告出來時，主管會問「我們有沒有受影響」。有 SBOM、有定期掃描的紀錄，這些問題十分鐘答得出來；沒有的話要一個個映像打開翻。資深工程師會先決定門檻：critical／high 而且有修正版的才擋 CI，其他排進待辦，否則團隊很快就學會忽略掃描結果。</div>
+
+<h2>為伺服器的架構建置</h2>
+<p>你的 Mac 是 arm64，很多雲端主機是 amd64（x86_64）。在 Mac 上直接 <code>docker build</code>，產出的是 arm64 映像，放到 amd64 主機上會出現 <code>exec format error</code>。</p>
+<p>指定目標平台：<code>docker build --platform linux/amd64 …</code>。Mac 上沒有 amd64 的 CPU，Docker Desktop 用<strong>模擬</strong>（emulation，QEMU 或 Rosetta）一條條翻譯 amd64 指令來執行，結果正確，但慢很多。於是整個建置（<code>npm ci</code>、<code>tsc</code>）都在模擬裡跑。</p>
+<p>BuildKit 自動提供兩個 build arg：</p>
+<ul>
+  <li><code>BUILDPLATFORM</code>：執行建置的機器的平台，這台 Mac 是 <code>linux/arm64</code>。</li>
+  <li><code>TARGETPLATFORM</code>：要產出的平台，就是 <code>--platform</code> 給的值；沒給就等於 <code>BUILDPLATFORM</code>。</li>
+</ul>
+<p>TypeScript 編譯出來的 JavaScript 跟 CPU 架構無關，所以編譯可以在 Mac 原生的架構上做，只有最終階段要是 amd64：</p>
+<pre>FROM --platform=$BUILDPLATFORM node:24.22.2-alpine3.24 AS build   # 原生 arm64，不用模擬
+…
+FROM --platform=$BUILDPLATFORM node:24.22.2-alpine3.24 AS deps    # pino 是純 JS，也可以
+…
+FROM node:24.22.2-alpine3.24                                      # 沒寫 = TARGETPLATFORM
+COPY --from=deps …
+COPY --from=build …</pre>
+<ul>
+  <li>最終階段只有 <code>COPY</code>，沒有 <code>RUN</code>，所以完全不需要模擬，只是下載 amd64 的基底映像。</li>
+  <li>有原生模組的依賴（<code>bcrypt</code>、<code>sharp</code>）不能這樣做：在 arm64 上裝出來的是 arm64 的二進位檔。這時 deps 階段不要加 <code>--platform</code>，讓它在目標平台（模擬）裡安裝。</li>
+  <li>不要在 Dockerfile 寫死 <code>FROM --platform=linux/amd64</code>：這個 Dockerfile 就只能產出 amd64，build check 會報 <strong>FromPlatformFlagConstDisallowed</strong>。平台寫在建置指令上。</li>
+</ul>
+<p>同時產出兩種架構：<code>docker buildx build --platform linux/amd64,linux/arm64 -t … --push .</code>，結果是一個 multi-platform index，主機拉取時自動選自己的架構。跟 attestation 一樣要 index：傳統映像儲存的預設建置器會回 <code>Multi-platform build is not supported for the docker driver</code>，要開 containerd 映像儲存或改用 docker-container 建置器。</p>
+<div class="callout practice"><strong>💡 實務上：「我電腦上好好的」常常是架構不同</strong><br>團隊裡有人用 Apple Silicon、有人用 Intel，CI 和正式主機又是另一種，新同事最常遇到的部署事故就是 <code>exec format error</code>。資深的做法是讓 CI 統一建置與推送映像，而且寫明要哪些平台；本機建的映像只拿來開發，不推到正式的 registry。換成 AWS Graviton 這類 arm64 主機省成本時，有 multi-platform 映像就只是改機型，不用改建置流程。</div>
+
+<h2>執行期加固</h2>
+<p>映像乾淨了，執行方式也要收緊：就算 API 有漏洞讓攻擊者能執行程式碼，他能做的事也越少越好。</p>
+<p><strong>capability</strong>：Linux 把 root 的權限拆成幾十項，例如 <code>CHOWN</code>（改檔案擁有者）、<code>NET_BIND_SERVICE</code>（聽 1024 以下的 port）、<code>NET_RAW</code>（送任意封包）。Docker 預設給容器 14 項：</p>
+<pre>docker run --rm alpine:3.24 grep CapEff /proc/self/status
+CapEff:	00000000a80425fb        # 預設的 14 項
+docker run --rm --cap-drop ALL alpine:3.24 grep CapEff /proc/self/status
+CapEff:	0000000000000000        # 全部拿掉
+docker run --rm --cap-drop ALL alpine:3.24 chown nobody /etc/hostname
+chown: /etc/hostname: Operation not permitted</pre>
+<p>cafe-api 聽 3000 port、不改檔案擁有者，一項都不需要。加固的四個選項：</p>
+<div class="table-wrap"><table>
+<tr><th>選項</th><th>作用</th><th>擋下什麼</th></tr>
+<tr><td><code>--read-only</code></td><td><strong>唯讀根檔案系統</strong>：容器不能修改映像裡的任何檔案</td><td>攻擊者改程式碼、放後門、寫入 crontab</td></tr>
+<tr><td><code>--tmpfs /tmp</code></td><td>在 <code>/tmp</code> 掛一個記憶體裡的可寫目錄（預設 <code>noexec</code>，放進去的檔案不能執行）</td><td>讓需要暫存檔的程式能動，又不打開整個檔案系統</td></tr>
+<tr><td><code>--cap-drop ALL</code></td><td>拿掉所有 capability；真的需要才用 <code>--cap-add</code> 加回一項</td><td>即使是 root，也做不了 chown、送原始封包等事</td></tr>
+<tr><td><code>--security-opt no-new-privileges</code></td><td>程序和它的子程序不能再取得更多權限</td><td>透過 setuid 程式（執行時自動取得檔案擁有者權限的程式，例如 <code>su</code>）從 node 使用者變成 root</td></tr>
+</table></div>
+<p>加上映像裡的 <code>USER node</code>（不要在執行時用 <code>--user 0</code> 蓋掉），就是一般 Web API 該有的基本設定。Docker 預設還會套用一份 <strong>seccomp</strong> 設定檔，擋掉一般程式用不到的系統呼叫（程式向 Linux 核心要求服務的入口），不要為了省事加 <code>--security-opt seccomp=unconfined</code> 把它關掉。另外兩個常見的錯誤方向：遇到權限錯誤就加 <code>--privileged</code>，它會給容器幾乎全部的主機權限，包括存取主機的裝置；或者乾脆不用 <code>--read-only</code>。正確的做法是找出程式要寫哪裡，只給那裡可寫。</p>
+<p>cafe-api 的 <code>POST /uploads</code> 會先把檔案寫到 <code>TMP_DIR</code>（預設 <code>/home/node/uploads</code>）再處理。開了 <code>--read-only</code> 之後那裡寫不進去，回 500。修法是 <code>--tmpfs /tmp</code> 加上 <code>-e TMP_DIR=/tmp</code>：兩個都要，只有 tmpfs 程式還是寫原本的地方，只有環境變數則 <code>/tmp</code> 也是唯讀的。</p>
+<div class="callout practice"><strong>💡 實務上：加固設定最好在第一次部署就定下來</strong><br>服務上線後才補 <code>--read-only</code>，常會發現某個功能偷偷寫入本機檔案（上傳暫存、快取、log 檔），要回頭改程式。所以新服務一開始就用唯讀加 tmpfs 跑，寫入位置都用環境變數設定。資安稽核和容器平台的安全政策（例如不允許 privileged、要求非 root）也會檢查這幾項，早點做好，之後搬平台不必重來。</div>
+<p>第 10 課用 Compose 時，對應的寫法是 <code>read_only: true</code>、<code>tmpfs: [/tmp]</code>、<code>cap_drop: [ALL]</code>、<code>security_opt: [no-new-privileges:true]</code>。</p>
+
+<h2>練習</h2>
+<p>四題都在 <code>devops/practice/work/09/</code> 裡做，需要 Docker Desktop 在執行，第一次建置要連網路下載 npm 套件。<code>app/</code> 是精簡版的 cafe-api，<code>app/Dockerfile</code> 是第 8 課的單一階段寫法。用到的 port 是 <code>127.0.0.1:18090</code>～<code>18094</code>。練習 3 第一次會下載 amd64 的 node 映像。</p>
+
+<div class="local" data-test="ex1" data-files="app/Dockerfile">
+  <p>練習 1：把 <code>app/Dockerfile</code> 改成多階段建置。最終階段 <code>FROM node:24.22.2-alpine3.24</code>，只放 <code>package.json</code>、正式依賴（<code>node_modules</code> 裡不能有 <code>typescript</code>、<code>@types</code>）和 <code>dist/</code>，不能有 <code>.ts</code> 原始碼；仍然以 <code>node</code> 使用者執行、保有 HEALTHCHECK。測試建置 <code>learn-devops/cafe-api:09-1</code>，用 <code>docker history</code> 算出你在基底上加了多少（上限 20MB），在映像裡檢查檔案，啟動容器確認 <code>/health/live</code>、uid 不是 0、狀態變成 healthy，另外用 <code>docker save</code> 匯出映像，檢查每一層（不只最後看到的檔案）都沒有 <code>.ts</code> 原始碼和 typescript，並要求 <code>docker build --check</code> 沒有警告。自己試：<code>docker build -t learn-devops/cafe-api:09-1 app &amp;&amp; docker history learn-devops/cafe-api:09-1</code>。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="app/Dockerfile.private build-secret.sh">
+  <p>練習 2：<code>app/Dockerfile.private</code> 建置時執行 <code>scripts/fetch-private.mjs</code> 下載私有套件，它從環境變數 <code>NPM_TOKEN</code>（或檔案 <code>/run/secrets/npm_token</code>）讀 token。現在的 <code>build-secret.sh</code> 用 build arg 傳 token。改這兩個檔案，改用 build secret（腳本不能再有 <code>--build-arg</code>，換個名字或放到建置階段都一樣會留下痕跡）。測試每次產生一個隨機 token，放在環境變數 <code>NPM_TOKEN</code> 執行 <code>sh build-secret.sh</code>，確認私有套件有下載到，再到 <code>docker history --no-trunc</code>、<code>docker image inspect</code>、<code>docker save</code> 匯出的每一層裡找這個 token，一處都不能有；<code>docker build --check -f app/Dockerfile.private app</code> 也不能有警告。先執行一次起始版本，自己用 <code>docker history --no-trunc learn-devops/cafe-api:09-private</code> 找到 token。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="app/Dockerfile build-amd64.sh">
+  <p>練習 3：咖啡店的正式伺服器是 amd64。調整 <code>app/Dockerfile</code>，讓編譯 TypeScript 的階段用 <code>FROM --platform=$BUILDPLATFORM</code> 在原生架構上執行，再完成 <code>build-amd64.sh</code>，產出 linux/amd64 的 <code>learn-devops/cafe-api:09-amd64</code>。測試執行腳本，確認映像的架構是 amd64、以 <code>--platform linux/amd64</code> 執行時 <code>node -p process.arch</code> 印出 <code>x64</code>、<code>/health/live</code> 回 200，而且 build check 沒有警告（不能把平台寫死在 Dockerfile）。練習 1 也會用這個 Dockerfile，改完兩題都要通過。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="run-hardened.sh">
+  <p>練習 4：改 <code>run-hardened.sh</code>，在背景執行 <code>learn-devops/cafe-api:09-1</code>（名稱 <code>ld-09-hardened</code>，發布在 <code>127.0.0.1:18094</code>）：唯讀根檔案系統、只有 <code>/tmp</code> 是 tmpfs、拿掉所有 capability、禁止取得新權限，並設定讓上傳功能正常運作。測試先用你的 <code>app/Dockerfile</code> 建置映像，執行腳本後用 <code>docker inspect</code> 檢查設定，確認程式不是以 root 執行、沒有 <code>--privileged</code>、沒有加回 capability、沒有另外掛可寫的目錄、沒有關掉 seccomp，最後實際上傳一個隨機大小的檔案到 <code>POST /uploads</code>。自己試：<code>curl -X POST --data-binary @app/package-lock.json http://localhost:18094/uploads</code>。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：Dockerfile 用 <code>ARG NPM_TOKEN</code> 接收 token，裝完私有套件後，最後一步 <code>RUN rm -f .npmrc &amp;&amp; unset NPM_TOKEN</code>。映像推到 registry 之後，token 安全嗎？</p>
+  <label data-key="a">安全：最後一步已經刪掉檔案、清掉變數，最終映像裡沒有</label>
+  <label data-key="b">不安全：ARG 的值記在用到它的 RUN 的建置紀錄裡，寫過 .npmrc 的那一層也還留著檔案</label>
+  <label data-key="c">安全：ARG 只在建置時存在，不會進入執行中的容器</label>
+  <label data-key="d">只要 registry 是私有的就安全</label>
+  <p class="why">✓ b。<code>docker history --no-trunc</code> 直接看得到 <code>RUN |1 NPM_TOKEN=…</code>；後面的 <code>rm</code> 只在新的一層加上刪除標記，前面那層的檔案還在。a 誤解了層的運作；c 說的是容器的環境變數，但 token 是從映像的 metadata 和層外洩的；d 忽略了所有能拉映像的人和 CI，私有不等於只有你看得到。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 6：正式環境改用 distroless 映像後，某個容器開始回 502，<code>docker exec ld-09-app sh</code> 回應找不到 <code>sh</code>。最合適的下一步是？</p>
+  <label data-key="a">換回有 shell 的基底映像重新部署，方便除錯</label>
+  <label data-key="b">沒有 shell 就沒辦法查，只能重啟容器</label>
+  <label data-key="c">先看 <code>docker logs</code>，再開一個有工具的除錯容器，用 <code>--network container:ld-09-app --pid container:ld-09-app</code> 加入它的命名空間</label>
+  <label data-key="d">用 <code>docker cp</code> 把 busybox 複製進容器再 exec</label>
+  <p class="why">✓ c。除錯容器共用目標的網路和程序命名空間，看得到它的 localhost 和程序，工具不必放進正式映像。a 為了除錯放棄了攻擊面的好處，而且重新部署可能讓問題消失、查不到原因；b 不對，還有 log 和除錯容器；d 改動了正在出問題的容器，加了唯讀檔案系統時也做不到。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 7：CI 每次建置都用 <code>docker scout cves --exit-code --only-severity critical</code> 掃描，上個月建的 <code>cafe-api:1.4.0</code> 當時是 0 個 critical，一直沒改程式所以沒有重建。現在這個映像？</p>
+  <label data-key="a">可能已經有 critical：漏洞資料庫每天新增 CVE，要定期重新掃描已部署的映像並重建</label>
+  <label data-key="b">還是 0 個：映像內容沒變，掃描結果就不會變</label>
+  <label data-key="c">還是 0 個：只要基底映像釘了 digest，就不會有新的漏洞</label>
+  <p class="why">✓ a。映像內容確實沒變，但「已知的漏洞」一直在增加，同一個套件版本今天沒事、明天就可能有 CVE。b 把掃描當成一次性的；c 正好相反，釘 digest 讓建置可重現，但也代表沒有自動拿到安全更新，要靠 Dependabot／Renovate 和定期重建。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 8：團隊討論基底映像，有人說「Alpine 最小，所以所有服務都換成 Alpine」。你的看法？</p>
+  <label data-key="a">同意：越小越安全，沒有例外</label>
+  <label data-key="b">不同意：Alpine 的 CVE 一定比 Debian 多</label>
+  <label data-key="c">同意，但要把 shell 移除</label>
+  <label data-key="d">看情況：Alpine 用 musl，有原生模組的依賴可能沒有對應版本或行為不同；也要考慮除錯方式和團隊熟悉度。純 JS 的服務適合，有 <code>sharp</code> 這類依賴的服務可能用 slim 比較省事</label>
+  <p class="why">✓ d。大小只是其中一個因素，相容性、除錯、維護成本也是。a 忽略了 musl 相容性，而且映像的攻擊面要看裡面有什麼（shell、套件管理器、是否 root），不只看大小；b 沒有根據，CVE 數量依版本與內容而定；c 無法對 Alpine 本身做到，要沒有 shell 應該選 distroless 或 DHI。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>用 <code>rm</code> 刪掉機密或大檔案，以為就沒了</strong>：前面的層還在。機密用 secret mount，大檔案用多階段建置留在建置階段。</li>
+  <li><strong>把建置階段整包 <code>node_modules</code> 複製到最終階段</strong>：typescript、<code>@types</code> 全部跟著進去。另外用 <code>npm ci --omit=dev</code> 準備正式依賴。</li>
+  <li><strong>最終階段忘了 <code>USER node</code>、<code>HEALTHCHECK</code></strong>：每個階段的設定互相獨立，最終階段要重寫。</li>
+  <li><strong>只看映像大小，不看裡面有什麼</strong>：有沒有 shell、套件管理器、以不以 root 執行，比少幾 MB 重要。<code>docker history</code>、在容器裡 <code>ls</code> 看一次。</li>
+  <li><strong>在 Dockerfile 寫死 <code>--platform=linux/amd64</code></strong>：只能產出一種架構，check 會警告。平台寫在建置指令上，建置階段用 <code>$BUILDPLATFORM</code>。</li>
+  <li><strong>有原生模組的依賴也在 <code>$BUILDPLATFORM</code> 上安裝</strong>：產出 arm64 的二進位檔，amd64 主機一載入就失敗。這類依賴要在目標平台的階段安裝。</li>
+  <li><strong>掃描工具和 CI action 用 tag 或 <code>latest</code></strong>：2026-03 的 Trivy 事件裡，tag 被改指向竊密程式。釘 digest 或 commit SHA。</li>
+  <li><strong>只在第一次建置時掃描</strong>：CVE 每天在增加，要定期重新掃描與重建。</li>
+  <li><strong>容器出現權限錯誤就加 <code>--privileged</code> 或改用 root</strong>：找出程式真正需要寫的目錄或 capability，只開那一項。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>單一階段的映像帶著編譯器、原始碼、npm 快取；後面的層刪檔案不會讓映像變小。</li>
+  <li>多階段建置：build 階段編譯、deps 階段裝正式依賴，最終階段從乾淨的基底 <code>COPY --from</code> 需要的東西，並重寫 <code>USER</code>、<code>HEALTHCHECK</code>。</li>
+  <li>基底映像在大小、libc 相容性、除錯方便和攻擊面之間取捨；沒有 shell 的映像用共用命名空間的除錯容器查問題。</li>
+  <li>ARG、ENV、COPY 後再刪都會讓機密留在映像裡；用 <code>RUN --mount=type=secret</code> 和 <code>--secret</code>，build check 的 SecretsUsedInArgOrEnv 幫你把關。</li>
+  <li>基底映像釘 digest、用 Dependabot／Renovate 更新、定期重建與掃描；掃描工具也要釘版本；SBOM 和 provenance 要推到 registry 才保留得住。</li>
+  <li>為 amd64 建置：<code>--platform</code> 寫在指令上，純 JS 的階段用 <code>$BUILDPLATFORM</code> 避免模擬。</li>
+  <li>執行時用 <code>--read-only</code>、<code>--tmpfs</code>、<code>--cap-drop ALL</code>、<code>no-new-privileges</code> 和非 root 使用者，把被入侵時的損害降到最小。</li>
+</ul>
+<p>下一課用 Docker Compose 把 cafe-api 和 PostgreSQL 寫進同一個檔案，一個指令啟動整套服務。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

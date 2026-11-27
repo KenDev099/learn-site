@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>20. 佇列與背景工作：BullMQ</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="20" data-practice="nestjs">
+<header>
+  <div class="eyebrow">階段 4：快取、背景工作與外部整合 · 第 20 課</div>
+  <h1>佇列與背景工作：BullMQ</h1>
+</header>
+<main>
+
+<p>客人在 Vue 前台按下「付款」，後端要做三件事：把訂單改成已付款、寄電子收據、通知廚房。只有第一件是客人要等的。寄信要呼叫外部的寄信服務，平常 300 毫秒，尖峰時 5 秒，偶爾直接回 503。全部放在同一個請求裡，客人就得盯著轉圈圈，寄信服務一掛，付款也跟著失敗。</p>
+<p>這一課的任務是重寫「付款後寄收據」，做到三件事：客人不用等寄信；寄信服務掛了，付款照樣成功；每張付了款的訂單最後都會收到收據，而且只收到一封。做法是把寄收據搬到背景：API 只把工作放進<strong>佇列</strong>，馬上回應；另一段程式在背景慢慢做，失敗了自己重試。這一課用 <code>@nestjs/bullmq</code> 12.0.0 和 BullMQ 6.5.3 實作。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>付款時哪些事要讓客人等：只有改訂單；寄收據記下來交給佇列，晚點再做（開場問題的最小答案）。</li>
+  <li>用 <code>@nestjs/bullmq</code> 把寄收據交給背景：API 怎麼放工作，worker 怎麼取工作來做。</li>
+  <li>寄信服務回 503、客人連按兩次：讓工作隔一陣子自己重試，讓同一張訂單只有一個寄收據的工作。</li>
+  <li>同一個工作還是可能做兩次、有些錯誤重試也沒用：怎麼不寄出兩封收據，哪些錯誤該放棄，放棄的工作誰來看。</li>
+  <li>付了款，收據一定寄得出去嗎：改訂單和放工作之間的空檔，用 outbox 補起來。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="15-transactions-concurrency.html">第 15 課</a>的互動式交易：<code>$transaction(async tx =&gt; …)</code> 裡的操作一起 commit 或一起回滾；交易裡不要呼叫寄信這類外部服務。</li>
+  <li><a href="../../postgresql/lessons/33-job-queue.html">PostgreSQL 課第 33 課</a>的工作佇列與 outbox：用一張表當佇列，<code>FOR UPDATE SKIP LOCKED</code> 讓多個 worker 各拿不同的列，不互相等待。</li>
+  <li><a href="12-docker-services.html">第 12 課</a>與<a href="19-caching-redis.html">第 19 課</a>的 Redis：compose 裡的 Redis 在 <code>127.0.0.1:6380</code>，連線網址從環境變數 <code>REDIS_URL</code> 讀。</li>
+</ul></div>
+
+<h2>付款時，哪些事該讓客人等？</h2>
+<p>回到開場的三件事，先問客人按下付款之後，畫面上需要知道什麼。他需要知道付款成功了沒：成功就顯示「付款完成」，失敗就請他再試一次。所以「把訂單改成已付款」的結果必須出現在這次的回應裡，客人得等它。收據不一樣。客人不會盯著信箱等它進來，他只需要它幾秒、甚至幾分鐘內到就好。通知廚房也是。</p>
+<p>所以最小的答案是：付款請求只做「改訂單」，做完就回應；寄收據這件事先「記下來」，由別的程式晚點去做。寄信服務慢，客人感覺不到；寄信服務壞了，付款也不受影響，等它恢復再寄就好。</p>
+<p>「記下來晚點做」要記在哪裡？一個直覺的寫法是呼叫 <code>mailer.sendReceipt()</code> 但不 <code>await</code>，讓它自己在背景跑。這樣回應確實變快了，但那個 Promise 只活在這個 Node 程序的記憶體裡：部署重啟時它就消失了，寄信失敗了也沒有人會再試一次，收據就這樣不見了。要「晚點一定會做」，工作必須記在程序以外、重啟也不會消失的地方，而且要有程式負責把它取出來做、失敗了再試。</p>
+<p>這就是<strong>佇列</strong>（queue）：一份「先放進去、之後再處理」的工作清單。這課的佇列存在第 19 課用過的那台 Redis 裡。圍繞著佇列有三個角色：</p>
+<ul>
+  <li><strong>生產者</strong>（producer）：把工作放進佇列的程式。這課是付款 API：改完訂單，放一個「寄收據」的工作進去，就回應客人。</li>
+  <li><strong>消費者</strong>（consumer）：從佇列取出工作來做的程式，通常叫 <strong>worker</strong>。這課的 worker 取出工作後查訂單、呼叫寄信服務。</li>
+  <li><strong>job</strong>：佇列裡的每一筆工作。它有名稱（<code>name</code>，例如 <code>send-receipt</code>）、資料（<code>data</code>，例如要寄哪張訂單）和選項（<code>opts</code>，例如失敗了要重試幾次）。</li>
+</ul>
+<p>前端類比：你在 Vue 裡按「上傳影片」後，畫面先顯示「處理中」，伺服器在背景轉檔，好了再通知你。你不用等，伺服器也能照自己的速度做。佇列就是後端用來實作這種流程的元件。</p>
+<p>一個寄收據的 job 從放進去到做完，會經過下面這些狀態。圖下方的 delayed 和 failed 是失敗時才會走到的路，後面講重試和錯誤處理時會一一用到：</p>
+
+<figure>
+  <svg viewBox="0 0 700 270" role="img" aria-label="API 當生產者把 job 放進 Redis 的佇列，worker 取出來做；失敗時等一下再試，超過次數進 failed 清單">
+    <defs><marker id="a20a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="20" y="60" width="170" height="70" rx="10"/>
+    <text class="d-text" x="105" y="90" text-anchor="middle">API（生產者）</text>
+    <text class="d-small" x="105" y="112" text-anchor="middle">queue.add(…) 後馬上回應</text>
+    <rect class="d-soft" x="265" y="50" width="170" height="90" rx="10"/>
+    <text class="d-text" x="350" y="80" text-anchor="middle">Redis：receipts 佇列</text>
+    <text class="d-small" x="350" y="102" text-anchor="middle">waiting → active</text>
+    <text class="d-small" x="350" y="122" text-anchor="middle">→ completed</text>
+    <rect class="d-box" x="510" y="60" width="170" height="70" rx="10"/>
+    <text class="d-text" x="595" y="90" text-anchor="middle">worker（消費者）</text>
+    <text class="d-small" x="595" y="112" text-anchor="middle">process(job)：寄收據</text>
+    <line class="d-line" x1="190" y1="95" x2="261" y2="95" marker-end="url(#a20a)"/>
+    <line class="d-line" x1="435" y1="95" x2="506" y2="95" marker-end="url(#a20a)"/>
+    <rect class="d-soft" x="265" y="185" width="170" height="44" rx="10"/>
+    <text class="d-text" x="350" y="212" text-anchor="middle">delayed：等一下再試</text>
+    <rect class="d-soft" x="510" y="185" width="170" height="44" rx="10"/>
+    <text class="d-text" x="595" y="212" text-anchor="middle">failed：要有人看</text>
+    <path class="d-line" d="M560,130 L440,190" fill="none" marker-end="url(#a20a)"/>
+    <path class="d-line" d="M300,185 L300,144" fill="none" marker-end="url(#a20a)"/>
+    <line class="d-line" x1="620" y1="130" x2="620" y2="181" marker-end="url(#a20a)"/>
+    <text class="d-small" x="455" y="168" text-anchor="middle">丟出錯誤</text>
+    <text class="d-small" x="650" y="160">超過次數</text>
+    <text class="d-accent" x="350" y="258" text-anchor="middle">API 和 worker 不必在同一個程序，Redis 把它們接起來</text>
+  </svg>
+  <figcaption>job 的一生：放進 waiting，被 worker 取走變 active，成功變 completed；失敗時還有次數就進 delayed，時間到再回 waiting，用完次數進 failed。</figcaption>
+</figure>
+
+<p>寄收據適合丟到背景，不代表什麼都該丟。判斷的標準是剛才那個問題：客人需不需要在這次回應裡知道結果。</p>
+<div class="table-wrap"><table>
+  <tr><th>適合丟到背景</th><th>不適合丟到背景</th></tr>
+  <tr><td>寄收據、推播、簡訊：客人不需要等它完成</td><td>扣庫存、改訂單狀態：回應裡就要告訴客人成功或失敗</td></tr>
+  <tr><td>呼叫慢或常壞的外部服務：可以自動重試</td><td>很快、不會失敗的小事：多一個佇列只是多一個會壞的元件</td></tr>
+  <tr><td>大量計算：產報表、轉圖片尺寸</td><td>需要立刻讀到結果的計算</td></tr>
+</table></div>
+<p>佇列也有代價，要算清楚：多了 Redis 這個要維運的服務；工作「什麼時候做完」不再確定；工作出錯時不會出現在 API 回應裡，沒有人會在畫面上看到錯誤，要另外監控。所以只把真的需要的工作搬出去。</p>
+
+<div class="callout practice"><strong>💡 實務上：工作搬到背景，畫面也要跟著改</strong><br>咖啡店後台常見的例子是「匯出本月訂單 CSV」：原本按下去要轉圈很久，改用佇列後，API 先回「已收到」和一個工作 id，畫面顯示「處理中」，做完再通知使用者下載。這個流程要先和 PM、前端講好，包括做到一半失敗時畫面要顯示什麼。把訂單同步到電子發票這類外部系統也常搬到背景，對方暫時掛掉時可以自動重試，不會讓結帳跟著失敗。資深工程師在設計會議上會先問三件事：延遲多久可以接受、失敗時誰會發現、跑兩次會不會出事。</div>
+<p>決定了寄收據要交給佇列，下一步是在 Nest 裡真的寫出來：付款 API 怎麼放工作進去，worker 又怎麼把它取出來做。</p>
+
+<h2>怎麼把寄收據交給背景？生產者與消費者</h2>
+<p>這課用的佇列套件是 <strong>BullMQ</strong>：它把 job 和各種狀態存在 Redis 裡，也提供 worker 從 Redis 取工作的程式。<code>@nestjs/bullmq</code> 再把 BullMQ 包成 Nest 的模組與裝飾器，讓佇列和 worker 可以像其他 provider 一樣用依賴注入取得。練習專案已經裝好這些套件；自己的專案要安裝什麼，見課末的<a href="#appendix">補充與查表</a>。</p>
+<p>接下來分三步：設定 Redis 連線、寫生產者、寫消費者。</p>
+<p>第一步，在 <code>AppModule</code> 設定所有佇列共用的 Redis 連線。和<a href="11-configuration.html">第 11 課</a>一樣，設定從 <code>ConfigService</code> 讀：</p>
+<pre>BullModule.forRootAsync({
+  inject: [ConfigService],
+  useFactory: (config: ConfigService&lt;Env, true&gt;) =&gt; ({
+    connection: { url: config.get('REDIS_URL', { infer: true }) },   // redis://127.0.0.1:6380/0
+    prefix: config.get('REDIS_PREFIX', { infer: true }),              // Redis 裡所有 key 的開頭
+  }),
+}),</pre>
+<p><code>connection</code> 是連到哪台 Redis。<code>prefix</code> 是 BullMQ 在 Redis 裡建立的每個 key 前面都會加的開頭，預設是 <code>bull</code>。它的用途是隔開共用同一台 Redis 的應用程式：兩個應用程式都用預設的 <code>bull</code>、又剛好都有叫 <code>receipts</code> 的佇列，就會讀寫同一批 key，搶到對方的工作。用不同的 prefix，兩邊的 key 就分開了。練習的判分也是靠它讓你的開發資料和判分資料分開。</p>
+<p>第二步，在功能模組註冊佇列，然後寫生產者。<code>registerQueue({ name: 'receipts' })</code> 宣告這個模組要用一個叫 <code>receipts</code> 的佇列；之後在任何 provider 用 <code>@InjectQueue('receipts')</code> 注入，拿到的是 BullMQ 的 <code>Queue</code> 物件，呼叫它的 <code>add</code> 就是放工作：</p>
+<pre>// receipts.module.ts
+@Module({
+  imports: [BullModule.registerQueue({ name: 'receipts' })],
+  providers: [ReceiptsProducer, ReceiptsProcessor, Mailer],
+  exports: [ReceiptsProducer],
+})
+
+// receipts.producer.ts
+@Injectable()
+export class ReceiptsProducer {
+  constructor(@InjectQueue('receipts') private readonly queue: Queue&lt;{ orderId: number }&gt;) {}
+
+  enqueue(orderId: number) {
+    return this.queue.add('send-receipt', { orderId })   // 工作名稱、data，第三個參數是選項
+  }
+}</pre>
+<p>把 <code>queue.add</code> 包在 <code>ReceiptsProducer</code> 裡，付款的 service 只要呼叫 <code>enqueue(orderId)</code>，不用知道工作叫什麼名字、選項怎麼設。<code>exports</code> 它，訂單模組才能注入。</p>
+<p>第三步，寫消費者。類別加 <code>@Processor('receipts')</code>、繼承 <code>WorkerHost</code>、實作 <code>process(job)</code>，並放進模組的 <code>providers</code>。<code>WorkerHost</code> 是 <code>@nestjs/bullmq</code> 提供的基底類別：Nest 啟動時看到 <code>@Processor</code>，會替這個類別建立一個 BullMQ <code>Worker</code> 並交給它，這個 Worker 會一直等 <code>receipts</code> 佇列裡的工作，收到的每個 job 都轉給你實作的 <code>process</code>。繼承 <code>WorkerHost</code>，Nest 才知道收到工作時要呼叫哪個方法：</p>
+<pre>@Processor('receipts')
+export class ReceiptsProcessor extends WorkerHost {
+  constructor(private readonly prisma: PrismaService, private readonly mailer: Mailer) {
+    super()   // 繼承了 WorkerHost，constructor 要先呼叫 super()
+  }
+
+  async process(job: Job&lt;{ orderId: number }&gt;) {
+    // 一個佇列有好幾種工作時，用 switch (job.name) 分開處理
+    …
+    return { sent: true }   // 回傳值會存在 job.returnvalue
+  }
+}</pre>
+<p>BullMQ 判斷一個工作成功或失敗，只看 <code>process</code> 怎麼結束：正常結束（return，或 async 函式回傳的 Promise resolve），工作就是 completed；丟出錯誤，工作就算這一次失敗。它不知道你在裡面寄了信沒有，只認這兩種結局。後面所有的重試和錯誤處理都建立在這條規則上。</p>
+<p>到這裡，付款 API 放工作、worker 寄收據的路已經通了。但現在的 <code>add</code> 沒有傳任何選項，而預設只做一次：寄信服務回一次 503，<code>process</code> 丟出錯誤，這張訂單的收據就不會再寄了。</p>
+
+<h2>寄信服務回 503 時，怎麼讓工作自己再試？</h2>
+<p>寄信服務的 503 多半是暫時的：對方正在重啟、或尖峰時忙不過來，過幾秒再試就好了。要讓 BullMQ 自動重試，在 <code>add</code> 的第三個參數傳兩個選項：</p>
+<pre>await this.queue.add('send-receipt', { orderId }, {
+  attempts: 3,                                     // 最多做 3 次（預設 1：失敗就不再試）
+  backoff: { type: 'exponential', delay: 1000 },   // 重試前等多久
+})</pre>
+<p><code>attempts</code> 是這個工作最多做幾次，包含第一次。設成 3，第一次失敗後還有兩次機會；預設是 1，也就是失敗就不再試。</p>
+<p><code>backoff</code>（退避）決定每次重試前要等多久。為什麼要等，而不是失敗了馬上再試？<a href="../../node/lessons/17-calling-external-apis.html">Node 課第 17 課</a>教過：對方正在出問題時，你立刻再打，多半還是失敗，而且所有失敗的工作同時一直打，只會讓對方更難恢復。所以重試要等一下，而且越等越久。BullMQ 的指數退避（<code>exponential</code>）在第 n 次失敗後等 <code>2^(n-1) × delay</code> 毫秒。以 <code>delay: 1000</code>、<code>attempts: 3</code> 來說：</p>
+<ol>
+  <li>第一次執行失敗，等 2^0 × 1000 = 1 秒。這段時間 job 在圖上的 delayed，時間到再回 waiting 等 worker 取。</li>
+  <li>第二次執行失敗，等 2^1 × 1000 = 2 秒。</li>
+  <li>第三次執行又失敗，次數用完，進 failed。</li>
+</ol>
+<p>重試帶出一個容易忽略的問題：job 的 data 要放什麼。工作放進去之後，可能要等幾秒、幾分鐘才被處理，失敗了還會隔一陣子重試好幾次。如果 data 放的是整個訂單和顧客物件，worker 拿到的是「放進去那一刻」的快照：這段時間顧客改了 email，收據還是寄到舊地址；訂單被取消了，也照樣寄。而且同一份資料在 Redis 又多存一份。所以 data 只放 <code>orderId</code>，worker 處理時再去資料庫查最新的資料。多一次查詢的成本，跟寄錯地址比起來很小。</p>
+<p>重試解決了 503。但「放工作」這一步本身也可能重複：例如客人連按兩次付款，<code>enqueue</code> 就會被呼叫兩次，佇列裡出現兩個寄同一張訂單收據的工作。</p>
+
+<h2>同一張訂單放進兩次，怎麼只留一個工作？</h2>
+<p>每個 job 都有一個 id。不指定時，BullMQ 會自己產生一個新的，所以呼叫兩次 <code>add</code> 就是兩個不同的工作。去重的做法是自己指定 <code>jobId</code>，用「這個工作代表的事」來命名：一張訂單只該有一個寄收據的工作，就叫 <code>receipt-7</code>。只要同一個 id 的 job 還留在 Redis（不論是 waiting、active、delayed，還是已經 completed、failed），這次 <code>add</code> 會被忽略，不會產生第二個工作。</p>
+<p>自訂 id 的格式有限制：BullMQ 6.5.3 不接受純數字和含冒號的 id，所以不寫 <code>7</code> 或 <code>receipt:7</code>，而寫 <code>receipt-7</code>。會丟什麼錯誤、為什麼有這個限制，見課末的<a href="#appendix">補充與查表</a>。</p>
+<p>「還留在 Redis」是關鍵。預設 BullMQ 會把完成和失敗的 job 一直留著，所以完成的工作留多久，直接決定去重有效多久；另一方面，全部留著，Redis 的記憶體又會一直長：一天一萬筆訂單，就多一萬筆 completed。所以要設定保留多久：</p>
+<pre>await this.queue.add('send-receipt', { orderId }, {
+  jobId: `receipt-${orderId}`,                     // 自訂 id：同一個 id 還留在 Redis，這次 add 會被忽略
+  attempts: 3,                                     // 最多做 3 次（預設 1：失敗就不再試）
+  backoff: { type: 'exponential', delay: 1000 },   // 重試前等多久
+  removeOnComplete: { age: 24 * 3600 },            // 完成的工作留 1 天（單位：秒）
+  removeOnFail: { age: 7 * 24 * 3600 },            // 失敗的留 7 天
+})</pre>
+<p><code>removeOnComplete</code> 和 <code>removeOnFail</code> 都可以寫成 <code>{ age, count }</code>：<code>age</code> 是保留幾秒，<code>count</code> 是最多保留幾筆。失敗的通常留得比較久，因為要留給人查原因、修好後重做（後面講 failed 時會用到）。清除的時機不是時間一到就準時刪，細節見課末。</p>
+<p>保留時間和 jobId 去重是綁在一起的：去重靠的是舊工作還留在 Redis，舊工作一被移除，同一個 id 就能再加進來。</p>
+<div class="callout warn">jobId 去重只在舊的工作還留在 Redis 時有效。設成 <code>removeOnComplete: true</code>，工作一完成就被刪掉，同一個 id 馬上可以再加進來（官方文件 Job Ids 一節明講）。保留時間就是去重的有效期間，所以就算有 jobId，worker 自己也要能承受重複執行。</div>
+<p>警告的最後一句是下一節的主題：jobId 擋的是「放進去兩次」，擋不住「同一個工作被做兩次」。</p>
+
+<h2>同一個工作還是可能做兩次：怎麼不寄出兩封收據？</h2>
+<p>BullMQ 保證的是<strong>至少一次</strong>（at-least-once）：放進去的工作一定會被執行，但可能不只一次。為什麼會這樣？因為「寄出信」和「告訴 Redis 做完了」是兩個步驟，中間可能出事。常見的兩種情況：</p>
+<ul>
+  <li><strong>做完、還沒回報就當機</strong>：worker 寄完信，還沒告訴 Redis「這個工作完成了」，程序就被停掉（部署重啟、記憶體不足被系統砍掉）。worker 拿到工作時，會在 Redis 替這個工作設一把有期限的鎖（預設 <code>lockDuration</code> 30 秒），處理期間 worker 會定期自動替鎖續期，意思是「我還活著、還在做」。程序不在了就沒人續期，鎖過期後 BullMQ 會把這個工作當成卡住了，叫做 <strong>stalled</strong>，移回等待區交給下一個 worker 重做。信已經寄過一次，又寄一次。stalled 的工作最多重做幾次由 <code>maxStalledCount</code> 決定（預設 1，超過就進 failed），跟 attempts 無關。</li>
+  <li><strong>其實成功了，只是看起來失敗</strong>：寄信服務收到請求、寄出了信，但回應在路上逾時。<code>process</code> 只看到逾時錯誤，丟出錯誤，BullMQ 依上一節的 attempts 再做一次。</li>
+</ul>
+<p>這兩種情況，佇列都不可能分辨「信到底寄出了沒」，它只能選「再做一次」，因為漏掉比重複更糟。所以防止重複的責任落在 worker 身上：worker 要寫成<strong>冪等</strong>（idempotent），意思是同一件事做一次或做很多次，結果都一樣。</p>
+<p>寄收據要冪等，worker 得在做之前知道「這張訂單寄過了沒」。這個資訊不能只記在程序的記憶體裡（程序重啟就沒了，換一個 worker 也看不到），要記在資料庫。做法是訂單上有一個 <code>receiptSentAt</code> 欄位，寄出後記下時間：</p>
+<pre>const order = await this.prisma.order.findUnique({ where: { id: orderId }, select: { receiptSentAt: true, customer: { select: { email: true } } } })
+if (order.receiptSentAt) return                        // ① 已經寄過：直接結束，不是錯誤
+await this.mailer.sendReceipt(order.customer.email, orderId)   // ② 寄出
+await this.prisma.order.update({ where: { id: orderId }, data: { receiptSentAt: new Date() } })   // ③ 寄成功才標記</pre>
+<p>① 遇到已經寄過的訂單是正常 return，不是丟錯誤。依上一節的規則，丟錯誤會讓 BullMQ 以為失敗而重試，但「已經寄過」是我們想要的結果，工作應該是 completed。</p>
+<p>② 和 ③ 的順序是刻意的取捨。先標記再寄：寄信失敗時，重試看到「已寄」就跳過，客人永遠收不到。先寄再標記：寄成功、標記前當機，重試會再寄一封。兩種都不完美，但「偶爾多一封」比「偶爾漏掉」好得多。</p>
+<p>要連那一封也避免，就得靠對方支援冪等鍵（idempotency key）：呼叫時帶一個代表這件事的鍵，對方記住處理過哪些鍵，同一個鍵只處理一次。例如寄信服務接受 <code>Idempotency-Key: receipt-7</code>，同一個鍵只寄一次。外部系統不支援時，「剛好一次」做不到，只能選偏向哪一邊。</p>
+<p>上面的檢查在一個 worker、一次只做一個工作時成立。開多個 worker 或調高同時處理的數量後，① 和 ③ 之間會出現空檔，需要再加一道防線，見課末的<a href="#appendix">補充與查表</a>。</p>
+
+<div class="callout practice"><strong>💡 實務上：code review 看到 worker，先問「跑兩次會怎樣」</strong><br>寄兩封收據頂多被客人抱怨，但加兩次點數、發兩張優惠券、對外扣兩次款就是真的損失。常見的防線有三種：資料庫的唯一約束（例如點數紀錄表的 <code>(order_id, type)</code> 不能重複）、條件更新（只在 <code>receiptSentAt IS NULL</code> 時更新）、外部服務的冪等鍵（例如金流服務 Stripe 的 API 接受 <code>Idempotency-Key</code> 標頭）。寫測試時直接把同一個 job 的 <code>process</code> 呼叫兩次，斷言副作用只發生一次，比靠人腦推演可靠。</div>
+<p>重試加上冪等，寄信服務暫時出問題時，收據最後會寄出、也不會多寄。但不是每種失敗都會因為再試一次而好轉。</p>
+
+<h2>重試也沒用的錯誤，和重試用完的工作怎麼處理？</h2>
+<p>想像顧客註冊時 email 打錯了，寄信服務每次都回「收件地址格式錯誤」。這種錯誤，等 1 秒、2 秒再試，結果都一樣。所以失敗要先分成兩種，處理方式相反：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>暫時性錯誤</th><th>永久性錯誤</th></tr>
+  <tr><td>例子</td><td>逾時、503、連線被拒</td><td>email 格式錯、訂單不存在、對方回 400</td></tr>
+  <tr><td>再試會好嗎</td><td>可能會</td><td>不會，試幾次都一樣</td></tr>
+  <tr><td>怎麼做</td><td>丟一般的 <code>Error</code>，讓 BullMQ 依 attempts 重試</td><td>丟 <code>UnrecoverableError</code>（從 <code>bullmq</code> import），直接進 failed，不管 attempts 設多少</td></tr>
+</table></div>
+<p>在 worker 裡，把寄信包在 <code>try</code> 裡，依錯誤的種類決定丟什麼。練習的 <code>Mailer</code> 遇到地址格式錯時丟 <code>InvalidRecipientError</code>，這是永久性的，換成 <code>UnrecoverableError</code>；其他錯誤不知道會不會好，原樣丟出讓它重試：</p>
+<pre>try {
+  await this.mailer.sendReceipt(email, orderId)
+} catch (error) {
+  if (error instanceof InvalidRecipientError) throw new UnrecoverableError(error.message)
+  throw error   // 其他錯誤原樣丟出，交給 BullMQ 重試
+}</pre>
+<p>這裡有兩種常見的錯法，都來自忘了「BullMQ 只看 <code>process</code> 怎麼結束」。第一種是用 <code>catch</code> 把錯誤吞掉、正常 <code>return</code>：BullMQ 會以為寄成功了，不會重試，也不會留下失敗紀錄，收據就安靜地消失了。第二種是永久性錯誤也丟一般 <code>Error</code>：白白重試到次數用完，每次都在 log 裡留一筆一樣的錯。</p>
+<p>不論哪一種失敗，都要留下紀錄，之後才查得到。<code>@OnWorkerEvent('failed')</code> 標在 processor 的方法上，每一次失敗都會呼叫它（包含之後還會重試的那幾次），參數是 job 和錯誤。<code>failed</code> 事件有時發生在拿不到 job 的情況，所以型別是 <code>Job | undefined</code>，取值要用 <code>?.</code>。<code>this.logger</code> 是 processor 自己的欄位，用第 4 課的 <code>Logger</code>（從 <code>@nestjs/common</code> import）建立：</p>
+<pre>private readonly logger = new Logger(ReceiptsProcessor.name)
+
+@OnWorkerEvent('failed')
+onFailed(job: Job&lt;{ orderId: number }&gt; | undefined, error: Error) {
+  this.logger.error(`訂單 ${job?.data.orderId} 的收據寄送失敗（第 ${job?.attemptsMade} 次）：${error.message}`)
+}</pre>
+<p>永久性錯誤、以及重試次數用完的暫時性錯誤，最後都進 failed。進了 failed 的工作不會自己消失，也不會自己重做：這張訂單的收據就停在那裡，直到有人處理。所以 failed 一定要有人看，做法有兩件：</p>
+<ul>
+  <li><strong>監控數量</strong>：<code>queue.getJobCounts('failed', 'waiting')</code> 可以拿到各狀態的工作數量，接到監控系統（第 24 課）。failed 變多代表有工作放棄了；waiting 一直變多代表 worker 做不完，或根本沒在跑。</li>
+  <li><strong>修好原因後重做</strong>：例如寄信服務的 API 金鑰過期，所有收據都失敗。換好金鑰之後，用 <code>job.retry()</code> 把失敗的工作送回佇列重做。能這樣做的前提是失敗的工作還在，這就是 <code>removeOnFail</code> 要保留一段時間（上一節設 7 天）的原因。</li>
+</ul>
+<p>worker 要跑在哪裡（跟 API 同一個程序還是獨立出來）、同時處理幾個工作，也會影響它做不做得完。這兩個設定的取捨放在課末的<a href="#appendix">補充與查表</a>。</p>
+
+<div class="callout practice"><strong>💡 實務上：佇列上線前先講好「誰看 failed」</strong><br>背景工作壞掉時沒有使用者會看到錯誤畫面，最常見的狀況是客服接到「沒收到收據」，翻了才發現 failed 堆了三天。上線前就把 waiting 和 failed 的數量接到監控與告警，並寫一份簡短的處理步驟：看錯誤原因、修好、重做。團隊常會加一個查看佇列的後台頁面（例如 Bull Board），記得放在管理員登入後面，因為 job 的 data 和錯誤訊息可能含 email 等個資。</div>
+<p>到這裡，只要工作進了佇列，它會被重試、不會重複寄、失敗了有人看得到。剩下最後一個缺口在更前面：付款的 API 到底有沒有成功把工作放進佇列？</p>
+
+<h2>付了款，收據一定寄得出去嗎？雙寫問題與 outbox</h2>
+<p>付款 API 要做兩次寫入：改資料庫裡的訂單，以及把工作寫進 Redis。資料庫和 Redis 是兩個系統，第 15 課的交易只管得到資料庫，沒有一個交易能同時包住兩邊，讓它們一起成功或一起失敗。這叫<strong>雙寫問題</strong>（dual write）。<code>queue.add</code> 放在交易的哪個位置，都有洞：</p>
+<ul>
+  <li><strong>在交易裡、commit 之前 <code>queue.add</code></strong>：工作已經進了 Redis，之後交易卻回滾了（條件更新衝突、commit 失敗）。worker 替一張沒付款的訂單寄收據。</li>
+  <li><strong>commit 之後才 <code>queue.add</code></strong>（練習專案現在的寫法）：commit 成功後，程序剛好被重啟、或 Redis 暫時連不上，<code>add</code> 沒有成功，訂單付了款卻永遠不會寄收據；而且 Redis 一斷，付款 API 還回 500，客人以為沒付成功又付一次。這也違反了這課的任務：寄信相關的元件壞了，付款不該跟著失敗。</li>
+</ul>
+<p>問題的根源是「要寄收據」這個事實寫在資料庫以外的地方。解法是 <strong>transactional outbox</strong>：付款時不直接寫 Redis，而是在付款的同一個交易裡，把「要送出的訊息」寫進資料庫的 <code>outbox_events</code> 表。outbox 就是「寄件匣」：訊息先放進寄件匣，之後再寄出去。訂單和這筆訊息在同一個交易，一起 commit 或一起回滾，不可能只有一邊。</p>
+<p>寄件匣裡的訊息要有人送出去。這段程式叫 <strong>relay</strong>（轉送）：它定期把還沒送出的訊息取出來、放進佇列、標記已送出。relay 送失敗了也沒關係，訊息還在 outbox 裡，下一輪再送。PostgreSQL 課第 33 課用 SQL 寫過同一件事，這裡用 Prisma 和 BullMQ 接起來：</p>
+
+<figure>
+  <svg viewBox="0 0 700 300" role="img" aria-label="付款交易同時寫 orders 和 outbox_events；relay 在另一個交易裡用 FOR UPDATE SKIP LOCKED 取出未送出的事件，queue.add 之後標記 published_at；worker 從佇列取出寄收據">
+    <defs><marker id="a20b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="20" y="20" width="300" height="120" rx="10"/>
+    <text class="d-text" x="170" y="46" text-anchor="middle">付款的交易（一起 commit／回滾）</text>
+    <rect class="d-box" x="40" y="62" width="120" height="58" rx="8"/>
+    <text class="d-text" x="100" y="86" text-anchor="middle">orders</text>
+    <text class="d-small" x="100" y="106" text-anchor="middle">status = paid</text>
+    <rect class="d-box" x="180" y="62" width="120" height="58" rx="8"/>
+    <text class="d-text" x="240" y="86" text-anchor="middle">outbox_events</text>
+    <text class="d-small" x="240" y="106" text-anchor="middle">published_at null</text>
+    <rect class="d-box" x="380" y="20" width="300" height="120" rx="10"/>
+    <text class="d-text" x="530" y="46" text-anchor="middle">relay（另一個交易）</text>
+    <text class="d-small" x="530" y="70" text-anchor="middle">① SELECT … LIMIT 50</text>
+    <text class="d-small" x="530" y="88" text-anchor="middle">FOR UPDATE SKIP LOCKED</text>
+    <text class="d-small" x="530" y="106" text-anchor="middle">② queue.add（jobId 去重）</text>
+    <text class="d-small" x="530" y="124" text-anchor="middle">③ 設定 published_at</text>
+    <line class="d-line" x1="300" y1="91" x2="376" y2="80" marker-end="url(#a20b)"/>
+    <rect class="d-soft" x="380" y="190" width="140" height="56" rx="10"/>
+    <text class="d-text" x="450" y="223" text-anchor="middle">Redis 佇列</text>
+    <rect class="d-box" x="560" y="190" width="120" height="56" rx="10"/>
+    <text class="d-text" x="620" y="215" text-anchor="middle">worker</text>
+    <text class="d-small" x="620" y="234" text-anchor="middle">冪等地寄收據</text>
+    <line class="d-line" x1="450" y1="140" x2="450" y2="186" marker-end="url(#a20b)"/>
+    <line class="d-line" x1="520" y1="218" x2="556" y2="218" marker-end="url(#a20b)"/>
+    <text class="d-accent" x="20" y="180">② 成功、③ 之前當機 → 交易回滾、下次重送</text>
+    <text class="d-accent" x="20" y="204">→ jobId 擋掉重複；就算漏擋，worker 也冪等</text>
+    <text class="d-small" x="20" y="240">relay 掛了或 Redis 斷線：事件留在 outbox，</text>
+    <text class="d-small" x="20" y="260">恢復後補送，付款 API 完全不受影響</text>
+  </svg>
+  <figcaption>資料庫是唯一的真相：只要付款 commit 了，outbox 裡就一定有這筆事件，遲早會被送出。</figcaption>
+</figure>
+
+<p>relay 在一個交易裡做三件事，對應圖上的 ① ② ③：</p>
+<pre>// relay：在交易裡取一批、送出、標記
+return this.prisma.$transaction(async tx =&gt; {
+  const events = await tx.$queryRaw&lt;{ id: number; payload: { orderId: number } }[]&gt;`
+    SELECT id, payload FROM outbox_events
+    WHERE published_at IS NULL AND type = 'receipt.requested'
+    ORDER BY id LIMIT 50
+    FOR UPDATE SKIP LOCKED`
+  for (const e of events) await this.receipts.enqueue(e.payload.orderId)
+  await tx.outboxEvent.updateMany({ where: { id: { in: events.map(e =&gt; e.id) } }, data: { publishedAt: new Date() } })
+  return events.length
+})</pre>
+<p><strong>① 為什麼要 <code>FOR UPDATE SKIP LOCKED</code>？</strong>relay 通常每台伺服器都跑一個（第 21 課用 <code>@Interval</code> 每秒呼叫），所以同一時間可能有好幾個 relay 在讀 outbox。普通 <code>SELECT</code> 不上鎖，兩個 relay 會拿到同一批、各送一次。只寫 <code>FOR UPDATE</code> 不會重複，但第二個 relay 會停在那裡等第一個 commit，等於排隊。加上 <code>SKIP LOCKED</code>，別人鎖住的列直接跳過，每一列只會被一個 relay 拿到，也不用等。Prisma 的查詢 API 沒有這個語法，所以用第 15 課的 <code>$queryRaw</code>。</p>
+<p><strong>② ③ 為什麼先送、後標記？</strong>送進佇列之後才設定 <code>published_at</code>。反過來（先標記或先刪掉、commit 後才送），送失敗時事件已經不在待送清單裡，就漏了。這和上一節 worker「寄成功才標記」是同一個道理：寧可多送，不能漏送。</p>
+<p><strong>所以 relay 也可能重送。</strong><code>add</code> 成功、標記前當機，交易回滾，這批事件又變回「未送出」，下一輪再送一次。這時前面設的 jobId 讓第二次 <code>add</code> 被忽略；就算舊工作已經被清掉、jobId 擋不住，worker 也是冪等的。outbox 給的是「至少一次」，不是「剛好一次」，最後一道防線永遠是冪等的 worker。</p>
+<p><strong>交易裡呼叫 Redis，不是違反第 15 課嗎？</strong>第 15 課說交易裡不要呼叫外部服務，因為交易拉得越長，鎖住的列就被佔得越久，別人得一直等。這裡是有意識的例外：鎖的只是 outbox 那幾列，沒有人在等它們（其他 relay 會跳過），一批最多 50 筆也不大，所以可以接受。付款交易本身仍然只碰資料庫。</p>
+<p>回頭對照這課的任務：付款交易只寫資料庫，Redis 斷線時付款照樣回 200；只要付款 commit 了，outbox 裡就有這筆事件，relay 遲早會送出；重送與重做都由 jobId 和冪等的 worker 收尾，客人只會收到一封收據。</p>
+<p>outbox 也有代價：多一張表、多一段要持續執行的 relay、工作會延遲到 relay 下一輪才出去（通常一秒內）。已經送出的列要定期清掉（例如保留 7 天）。所以不是每個背景工作都值得：「掉了也沒關係」的通知用 commit 後直接 <code>add</code>、甚至第 21 課的程序內事件就夠了；跟錢、收據、點數有關的才用 outbox。</p>
+
+<h2>練習</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs nestjs 20</code> 建立 <code>work/20/</code>。這一題同時用到 PostgreSQL 和 Redis，先確認容器在跑（在 <code>learn/nestjs/practice</code> 執行 <code>docker compose up -d --wait</code>，第 12 課）。專案已經有：</p>
+<ul>
+  <li>資料表 <code>customers</code>（有 <code>email</code>）、<code>orders</code>（有 <code>status</code>、<code>receipt_sent_at</code>）、<code>outbox_events</code>（<code>type</code>、<code>payload</code> JSONB、<code>published_at</code>），migration 都寫好了。</li>
+  <li><code>AppModule</code> 的 <code>BullModule.forRootAsync</code>、<code>ReceiptsModule</code> 的 <code>registerQueue({ name: 'receipts' })</code>。</li>
+  <li><code>Mailer</code>（<code>src/receipts/mailer.ts</code>）模擬外部寄信服務：<code>sendReceipt(to, orderId)</code>，地址格式錯時丟 <code>InvalidRecipientError</code>。判分會換成假的 Mailer，所以一定要用注入的 <code>this.mailer</code>。</li>
+  <li><code>POST /orders/:id/pay</code>：第 18 課的條件更新，commit 之後呼叫 <code>ReceiptsProducer.enqueue</code>（練習 4 要改掉）。</li>
+</ul>
+<p>想親手看工作跑起來：在 <code>work/20</code> 執行 <code>npx prisma migrate dev</code>（建立開發用資料庫 nest_20 並套用 migration）、<code>npx prisma db seed</code>、<code>npm run start:dev</code>，另開終端機 <code>curl -X POST localhost:3100/orders/1/pay</code>，看 log 裡的收據（做完練習 4 之後，付款只會寫進 outbox，要呼叫 <code>OutboxRelay.publishPending()</code> 才會送進佇列，第 21 課會讓它每秒自動跑）；再用 <code>docker exec learn-nestjs-redis redis-cli --scan --pattern 'nest-20:*'</code> 看 BullMQ 在 Redis 裡存了哪些 key。</p>
+
+<div class="local" data-test="ex1" data-files="src/receipts/receipts.producer.ts">
+  <p>練習 1：改 <code>ReceiptsProducer.enqueue(orderId)</code>，放入名稱為 <code>send-receipt</code> 的工作：</p>
+  <ul>
+    <li>jobId 是 <code>receipt-&lt;orderId&gt;</code>（例如 <code>receipt-7</code>），同一張訂單呼叫兩次，佇列裡只有一個工作。</li>
+    <li>最多做 3 次，指數退避（<code>delay</code> 自己決定，大於 0）。</li>
+    <li>data 只有 <code>{ orderId }</code>。</li>
+    <li>設定 <code>removeOnComplete</code>，完成的工作不要全部留著，但也要保留一段時間（<code>{ age }</code> 或 <code>{ count }</code>）；寫 <code>true</code> 會一完成就刪掉，jobId 去重跟著失效。</li>
+  </ul>
+  <p>判分：直接呼叫 <code>enqueue</code>，再從 Redis 讀出工作檢查 id、data、<code>opts</code>（這一題不啟動 worker）。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="src/receipts/receipts.processor.ts">
+  <p>練習 2：寫 <code>ReceiptsProcessor.process(job)</code>：</p>
+  <ul>
+    <li>用 <code>job.data.orderId</code> 查出訂單和顧客的 email，用 <code>this.mailer.sendReceipt(email, orderId)</code> 寄出，寄成功後把 <code>receiptSentAt</code> 設成現在時間。</li>
+    <li>冪等：<code>receiptSentAt</code> 已經有值就直接結束（正常 return，不是丟錯誤）。</li>
+  </ul>
+  <p>判分：同一張訂單用不同的 jobId 放兩個工作，假的 Mailer 只能被呼叫一次；資料庫裡已經有 <code>receiptSentAt</code> 的訂單不能再寄（所以要看資料庫，不能只記在程序的記憶體裡）；Mailer 第一次失敗、第二次成功時，要真的寄出並標記。測試資料的訂單編號和顧客編號不同，email 要從訂單關聯的顧客查。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="src/receipts/receipts.processor.ts">
+  <p>練習 3：在同一個 processor 加上錯誤處理：</p>
+  <ul>
+    <li>暫時性錯誤（Mailer 丟的其他錯誤）照樣丟出，讓 BullMQ 重試；用完次數要進 failed，不能被當成完成。</li>
+    <li><code>InvalidRecipientError</code> 是永久性錯誤：換成 <code>bullmq</code> 的 <code>UnrecoverableError</code> 丟出（訊息保留原因），不再重試。</li>
+    <li>加一個 <code>@OnWorkerEvent('failed')</code> 的方法，用 processor 的 <code>this.logger.error</code> 記下訂單編號與錯誤訊息。</li>
+  </ul>
+  <p>判分用 10 毫秒的固定退避自己放工作：前兩次失敗、第三次成功 → completed、<code>attemptsMade</code> 3；一直失敗 → failed、<code>attemptsMade</code> 3；email 格式錯 → failed、<code>attemptsMade</code> 1，而且 error log 裡有那張訂單的編號。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="src/orders/orders.service.ts src/outbox/outbox.relay.ts">
+  <p>練習 4：用 transactional outbox 可靠地寄收據。</p>
+  <ul>
+    <li><code>OrdersService.pay</code>：在同一個交易裡把訂單改成 paid，並用 <code>tx.outboxEvent.create</code> 寫一筆 <code>type: 'receipt.requested'</code>、<code>payload: { orderId }</code>。pay 裡不再呼叫 <code>enqueue</code>（拿掉之後，constructor 裡的 <code>ReceiptsProducer</code> 也可以刪）。</li>
+    <li><code>OutboxRelay.publishPending()</code>：在一個互動式交易裡，用 <code>$queryRaw</code> 加 <code>FOR UPDATE SKIP LOCKED</code> 取最多 50 筆未送出的 <code>receipt.requested</code>（依 id 排序），逐筆呼叫 <code>ReceiptsProducer.enqueue(orderId)</code>，全部成功後設定 <code>published_at</code>；回傳送出的筆數。</li>
+  </ul>
+  <p>判分：交易在 COMMIT 時失敗 → 沒有 outbox、沒有工作；Redis 連不上 → 付款仍回 200、事件留著，恢復後 relay 送出；送進佇列後、標記前當機 → 重送後仍只有一個工作；兩個 relay 同時處理 20 筆 → 每張訂單只被送一次。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：同事說：「BullMQ 很可靠，工作只會被執行一次，worker 裡不用檢查有沒有寄過。」哪個說法正確？</p>
+  <label data-key="a">對，有設定 jobId 就保證只執行一次</label>
+  <label data-key="b">對，只要 attempts 設成 1 就不會重複</label>
+  <label data-key="c">不對：BullMQ 是至少一次。worker 做完、回報完成前當機，工作會被當成 stalled 重做；所以 worker 要冪等，例如先看 receiptSentAt</label>
+  <label data-key="d">不對，但只有開多個 worker 時才會重複，單一 worker 不用擔心</label>
+  <p class="why">✓ c。佇列只能保證工作「至少被做一次」，做完和回報之間的當機、回應逾時造成的重試，都會讓同一件事再做一次。a 錯：jobId 只擋「同一個 id 的工作還留在 Redis 時又加入一次」，擋不住同一個工作被重做，舊工作被清掉後也擋不住新的。b 錯：stalled 的工作要不要重做由 <code>maxStalledCount</code>（預設 1）決定，跟 attempts 無關；attempts 1 只會讓暫時性錯誤也不重試。d 錯：單一 worker 的程序重啟一樣會造成重做。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：寄收據的 job data 為什麼只放 <code>{ orderId }</code>，不放整個訂單和顧客物件？放整個物件，worker 不就省了一次查詢？</p>
+  <label data-key="a">BullMQ 的 data 只能放數字</label>
+  <label data-key="b">工作可能過幾秒、幾分鐘、重試好幾次才處理，那時資料可能已經變了（顧客改了 email、訂單被取消）；只放 id，處理時查最新的，Redis 也不用存一份重複的資料</label>
+  <label data-key="c">放整個物件會讓 jobId 去重失效</label>
+  <p class="why">✓ b。job data 是放進去那一刻的快照，處理時可能已經過時；查詢的成本跟寄錯地址、替已取消的訂單寄收據比起來很小。a 錯：data 可以是任何能轉成 JSON 的物件（Date 會變字串）。c 錯：去重只看 jobId，跟 data 無關。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 7：付款時「在交易 commit 之前就 <code>queue.add</code>」有問題，所以改成「commit 成功之後才 <code>queue.add</code>」。這樣就安全了嗎？</p>
+  <label data-key="a">安全了：順序對了，交易回滾就不會有工作出去</label>
+  <label data-key="b">安全了，只要 <code>add</code> 失敗時回 500 讓客人再付一次</label>
+  <label data-key="c">不安全，應該把 <code>queue.add</code> 移回交易裡，失敗就整個回滾</label>
+  <label data-key="d">還不安全：commit 和 add 之間程序當機、或 Redis 暫時連不上，訂單已付款卻永遠不會寄收據。要在同一個交易寫 outbox，再由 relay 送進佇列</label>
+  <p class="why">✓ d。commit 之後才 add 解決了「回滾了工作卻出去」，但兩個系統之間的空檔還在，這就是雙寫問題。a 忽略了這個空檔。b 錯：訂單已經 commit 成 paid，客人再付一次只會拿到 409，收據還是沒有；程序當機時也根本沒有機會回 500。c 回到原本的問題：交易之後還可能在 commit 時失敗，工作卻已經出去。outbox 讓「付款」和「要寄收據」在同一個交易裡，送進佇列的事交給可以重試的 relay。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>worker 不冪等</strong>：以為佇列只會執行一次。重試、stalled、relay 重送都會讓同一件事再做一次。做之前先檢查（<code>receiptSentAt</code>），做完再標記；外部服務支援的話，帶上冪等鍵。</li>
+  <li><strong>先標記再做</strong>：做失敗時，重試看到「已完成」就跳過，那件事永遠沒做。標記放在成功之後。</li>
+  <li><strong>在交易 commit 前放進佇列，或以為 commit 之後再放就萬無一失</strong>：前者回滾了工作照樣出去；後者在兩步之間出事就漏掉。一定要完成的工作用 outbox。</li>
+  <li><strong>把暫時性與永久性錯誤混為一談</strong>：<code>catch</code> 起來 <code>return</code>，BullMQ 以為成功；永久性錯誤丟一般 <code>Error</code>，白白重試。前者原樣丟出，後者丟 <code>UnrecoverableError</code>。</li>
+  <li><strong>沒有 jobId 去重</strong>：重複點擊、relay 重送，就放進好幾個一樣的工作。用有意義的 id（<code>receipt-7</code>），不能是純數字、不能含冒號。</li>
+  <li><strong>以為 jobId 去重永遠有效</strong>：完成的工作被 <code>removeOnComplete</code> 移除後，同一個 id 可以再加入。保留時間就是去重的有效期間。</li>
+  <li><strong>保留所有完成的工作</strong>：沒設 <code>removeOnComplete</code>，Redis 記憶體一直長。設定 <code>{ age, count }</code>。</li>
+  <li><strong>job data 放整個物件</strong>：worker 拿到的是放進去那一刻的舊資料，顧客改了 email 也不知道。data 只放 id，處理時查最新的。</li>
+  <li><strong>忘了安裝 ioredis</strong>：BullMQ 6 起它是選用的 peer，不會自動安裝。<code>npm install bullmq ioredis</code>。</li>
+  <li><strong>concurrency 開太大</strong>：每個同時處理的工作都要資料庫連線，加上 API 的請求超過連線池，整個服務一起變慢。依連線池大小算。</li>
+  <li><strong>failed 沒人看</strong>：失敗的工作安安靜靜躺在 Redis。監控 failed 數量，修好原因後 <code>job.retry()</code>。</li>
+  <li><strong>relay 用普通 SELECT</strong>：多台伺服器的 relay 會送同一批。用 <code>FOR UPDATE SKIP LOCKED</code>。</li>
+</ul>
+
+<h2 id="appendix">補充與查表</h2>
+<h3>安裝：ioredis 要自己裝</h3>
+<p>BullMQ 6 起，Redis 客戶端套件 <code>ioredis</code> 變成選用的 peer dependency，<code>npm install bullmq</code> 不會自動裝它，要自己裝（練習的 package.json 已經鎖好 <code>bullmq@6.5.3</code>、<code>ioredis@6.0.0</code>）：</p>
+<pre>npm install @nestjs/bullmq bullmq ioredis</pre>
+<h3>自訂 jobId 的格式限制</h3>
+<p>BullMQ 6.5.3 的自訂 id 有兩個限制：不能是純數字（<code>'7'</code> 會丟 <code>Custom Id cannot be integers</code>），不能含冒號（<code>'receipt:7'</code> 會丟 <code>Custom Id cannot contain :</code>，冒號是它自己 key 的分隔符號）。所以用 <code>receipt-7</code>。</p>
+<h3>removeOnComplete／removeOnFail 什麼時候真的刪</h3>
+<p>清除不是準時刪，而是之後有別的工作完成時順便清掉過期的（failed 那邊在有工作失敗時清）。</p>
+<h3>多個 worker 同時處理時的冪等</h3>
+<p>預設 worker 一次只做一個工作（<code>concurrency: 1</code>），同一張訂單的兩個工作不會同時跑到 ① 和 ③ 之間。調高 concurrency 或開多個 worker 時，① 的檢查和 ③ 的標記之間就會有空檔，這時要用<a href="15-transactions-concurrency.html">第 15 課</a>的條件更新先「搶」這筆（例如另一個 <code>receipt_sending_at</code> 欄位），這課不展開。</p>
+<h3>concurrency 與連線池</h3>
+<p><code>@Processor('receipts', { concurrency: 5 })</code> 讓一個 worker 同時做 5 個工作。每個工作都會查資料庫，同時處理的工作數 × 每個工作用到的連線數，加上 API 本身的請求，不能超過連線池（<a href="16-query-performance.html">第 16 課</a>，Prisma 預設 10 條）。開到 50，API 的請求就會等不到連線。</p>
+<h3>worker 放在哪個程序</h3>
+<p>worker 放在哪裡是取捨。放在 API 同一個程序最簡單，練習就是這樣；但寄信、產報表吃 CPU 時會拖慢 API，也沒辦法分開擴充。正式環境常把 worker 拆成獨立程序：另一個入口檔用 <code>NestFactory.createApplicationContext(WorkerModule)</code> 啟動，只有 DI 容器、不開 HTTP port，API 那邊只匯入 <code>registerQueue</code> 和生產者。不論在哪，<code>app.close()</code> 都會在 <code>onApplicationShutdown</code>（<a href="04-modules.html">第 4 課</a>的生命週期）關閉 worker；關機時怎麼讓手上的工作先做完，第 24 課會處理。</p>
+
+<h2>小結</h2>
+<ul>
+  <li>客人要在回應裡知道結果的事（改訂單）留在請求裡；慢的、會失敗、客人不用等的事（寄收據）放進佇列：API 當生產者 <code>queue.add</code> 後馬上回應，worker 在背景 <code>process(job)</code>。不 await 的 Promise 不能取代佇列，程序一重啟就消失。</li>
+  <li><code>@nestjs/bullmq</code>：<code>BullModule.forRootAsync({ connection, prefix })</code>、<code>registerQueue</code>、<code>@InjectQueue</code>、<code>@Processor</code> ＋ <code>extends WorkerHost</code>。BullMQ 只看 <code>process</code> 怎麼結束：正常結束是 completed，丟錯誤是這次失敗。BullMQ 6 要自己裝 ioredis。</li>
+  <li>job 選項：<code>attempts</code>＋指數 <code>backoff</code> 重試，<code>jobId</code> 去重（舊工作還在時才有效），<code>removeOnComplete／removeOnFail</code> 控制保留量，data 只放 id。</li>
+  <li>佇列是至少一次，所以 worker 要冪等：先檢查、做成功再標記，偏向「偶爾多一封」而不是「偶爾漏掉」。</li>
+  <li>暫時性錯誤丟出讓它重試，永久性錯誤丟 <code>UnrecoverableError</code>，<code>@OnWorkerEvent('failed')</code> 記 log；failed 清單要監控，修好原因後 <code>job.retry()</code>。</li>
+  <li>資料庫和佇列無法一起成功或失敗（雙寫問題）。transactional outbox：同一個交易寫 <code>outbox_events</code>，relay 用 <code>FOR UPDATE SKIP LOCKED</code> 取一批、送進佇列、再標記；重送靠 jobId 和冪等的 worker 收尾。</li>
+</ul>
+<p>下一課讓程式自己動起來：用 <code>@Cron</code> 每天清過期的點數、用 <code>@Interval</code> 定時跑這一課的 relay，並比較程序內事件和佇列各適合什麼工作。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

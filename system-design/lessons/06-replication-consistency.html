@@ -1,0 +1,1708 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>6. 複寫與一致性：讀副本、複寫延遲與 CAP</title>
+<link rel="stylesheet" href="../../style.css">
+<style>
+  .tl { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin: 1.2em 0; }
+  .tl table { width: 100%; }
+  .tl td { vertical-align: top; }
+  .tl tr.now td { background: var(--accent-soft); }
+  .tl tr.later { visibility: hidden; }
+  .tl .note { margin: 10px 0 0; min-height: 3.5em; }
+</style>
+</head>
+<body data-lesson="6">
+<header>
+  <div class="eyebrow">階段 2：擴展：冗餘、快取與資料 · 第 6 課</div>
+  <h1>複寫與一致性：讀副本、複寫延遲與 CAP</h1>
+</header>
+<main>
+
+<p>咖啡店的 App 上線後，<a href="05-caching.html">第 5 課</a>的快取接住了菜單，但資料庫還是九成的時間在處理讀取：顧客查「我的訂單」、門市看今天的單、總部跑報表。這些都是會變動、不能放快取的資料，第 5 課說過訂單不放快取，所以每一次都直接查 PostgreSQL。一台資料庫開始吃不消時，最常見的下一步是加幾台<strong>讀副本（read replica）</strong>：把同一份資料複製到其他機器上，讀取分過去。</p>
+<p>你照做了，把「我的訂單」改成讀副本。上線第二天，客服轉來一張單：「顧客說剛下的單在『我的訂單』裡看不到，重新整理一次出現，再整理一次又不見了，他以為沒下成功，又下了一次。」資料庫沒有壞，SQL 也沒有錯。這課從這張客服單出發：先弄懂副本怎麼運作、為什麼一定會落後，再修好這個 bug，最後把同樣的判斷用到咖啡店的每一種讀取，以及機房之間斷線的時候。</p>
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>一台資料庫撐不住讀取，副本怎麼分擔？複寫怎麼運作、為什麼副本一定會落後（客服單的最小答案在這一節）。</li>
+  <li>COMMIT 回成功時，資料在哪幾台？同步與非同步複寫，在下單延遲和「主機壞掉會掉幾筆」之間取捨，以及為什麼同步複寫修不好客服單。</li>
+  <li>剛下的單為什麼一下有、一下沒有？用時間軸重現客服單，認識三種異常，再用 LSN 把讀取導向夠新的副本。</li>
+  <li>每一種讀取都要這麼嚴格嗎？一致性模型給你跟 PM 討論「這個畫面可以舊多久」的詞彙；機房斷線時，CAP 與 PACELC 告訴你要選一致還是可用。</li>
+  <li>選讀兩節：沒有 primary 的資料庫怎麼用 quorum 讀到新資料；多個地方都能寫入時，衝突怎麼用版本向量判斷。跳過不影響後面的課。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../postgresql/lessons/37-backup-replication.html">PostgreSQL 課第 37 課</a>的串流複寫：primary 把 WAL 持續傳給 replica 重播；<code>synchronous_commit</code> 決定 COMMIT 要不要等 replica 確認；replica 會落後一點。</li>
+  <li><a href="../../typescript/lessons/05-numbers-money.html">TypeScript 課第 5 課</a>的 bigint：超過 2<sup>53</sup> 的整數用 number 會不精確，要用 bigint。</li>
+</ul></div>
+
+<h2>一台資料庫撐不住讀取：副本怎麼分擔？</h2>
+<p>把同一份資料存在多台機器上，叫<strong>複寫（replication）</strong>。這課的起點是分擔讀取，但同一套機制一次解決三件事，所以正式環境的資料庫幾乎都會開：</p>
+<ul>
+  <li><strong>分擔讀取</strong>：「我的訂單」、報表這些讀取分給其他機器，主資料庫專心處理寫入。</li>
+  <li><strong>高可用</strong>：主資料庫壞了，把一台副本升格接手，也就是<a href="04-redundancy-load-balancing.html">第 4 課</a>的故障轉移。</li>
+  <li><strong>異地備援</strong>：整個機房出事，另一個區域還有一份。</li>
+</ul>
+<p>要讓另一台機器的資料跟主資料庫一樣，PostgreSQL 用的是它本來就有的一份日誌。PostgreSQL 每改一筆資料，都會先把「改了什麼」依序寫進日誌，再去改真正的資料檔；當機重開時照著日誌補做，資料就不會停在改一半的狀態。因為是「先寫日誌、後寫資料」，這份日誌叫 <strong>WAL</strong>（write-ahead log，預寫日誌）。</p>
+<p>既然 WAL 已經依序記下每一個變更，另一台機器只要拿到同一份 WAL、照順序做一遍，資料就會跟原本那台一樣。這個「照著做一遍」叫<strong>重播（replay）</strong>。PostgreSQL 的串流複寫就是這樣運作：接受寫入的那台叫 <strong>primary</strong>，它把 WAL 持續傳給其他機器；收到 WAL、重播、只能讀不能寫的機器叫 <strong>replica</strong>。所有寫入都送到 primary，讀取可以分給 replica。這種「一台收寫入、其他台跟著重播」的架構，一般的叫法是 leader／follower，中文也叫主從；這課統一用 PostgreSQL 的 primary 和 replica，開場說的讀副本就是 replica。</p>
+<figure>
+  <svg viewBox="0 0 700 260" role="img" aria-label="App 的寫入送到 primary，primary 用 WAL 串流把變更傳給兩台 replica；菜單與報表的讀取走 replica">
+    <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="20" y="40" width="150" height="56" rx="8"/>
+    <text class="d-text" x="95" y="66" text-anchor="middle">App：下單</text>
+    <text class="d-small" x="95" y="84" text-anchor="middle">INSERT orders</text>
+    <rect class="d-box" x="20" y="170" width="150" height="56" rx="8"/>
+    <text class="d-text" x="95" y="196" text-anchor="middle">App：菜單、報表</text>
+    <text class="d-small" x="95" y="214" text-anchor="middle">SELECT …</text>
+    <rect class="d-soft" x="265" y="40" width="150" height="56" rx="8"/>
+    <text class="d-text" x="340" y="66" text-anchor="middle">primary</text>
+    <text class="d-small" x="340" y="84" text-anchor="middle">讀寫都可以</text>
+    <path class="d-line" d="M170,68 L260,68" marker-end="url(#arr)"/>
+    <text class="d-small" x="215" y="60" text-anchor="middle">寫入</text>
+    <rect class="d-box" x="520" y="40" width="160" height="56" rx="8"/>
+    <text class="d-text" x="600" y="66" text-anchor="middle">replica A</text>
+    <text class="d-small" x="600" y="84" text-anchor="middle">只能讀，重播 WAL</text>
+    <rect class="d-box" x="520" y="170" width="160" height="56" rx="8"/>
+    <text class="d-text" x="600" y="196" text-anchor="middle">replica B</text>
+    <text class="d-small" x="600" y="214" text-anchor="middle">只能讀，重播 WAL</text>
+    <path class="d-line" d="M415,68 L515,68" marker-end="url(#arr)"/>
+    <path class="d-line" d="M415,80 C470,80 460,190 515,190" marker-end="url(#arr)"/>
+    <text class="d-accent" x="465" y="58" text-anchor="middle">WAL 串流</text>
+    <path class="d-line" d="M170,198 L515,198" marker-end="url(#arr)"/>
+    <text class="d-small" x="330" y="190" text-anchor="middle">讀取</text>
+    <text class="d-small" x="340" y="130" text-anchor="middle">replica 收到 WAL 需要時間，所以會落後一點</text>
+  </svg>
+  <figcaption>寫入只到 primary；replica 重播 primary 傳來的 WAL，分擔讀取</figcaption>
+</figure>
+<p>圖中間那行字是這一課所有問題的來源：replica 一定會落後。WAL 從 primary 出發，要經過網路送到 replica、寫進 replica 的磁碟、再重播，每一步都要時間。平常可能只有幾毫秒；primary 一次大量寫入（例如批次匯入）、replica 自己在跑很重的報表查詢、網路抖動時，就可能落後好幾秒甚至幾分鐘。replica 落後 primary 的時間或資料量，叫<strong>複寫延遲（replication lag）</strong>。</p>
+<div class="callout practice"><strong>💡 實務上：加 replica 之前，先確認真的需要</strong><br>replica 會帶來這一課講的整套一致性問題，所以它不該是第一個手段。先看是不是有慢查詢可以補索引，熱門又不常變的資料能不能放快取（第 5 課），這兩件事做完，常常就不必加 replica。還要注意 replica 只分擔讀取：每台 replica 都要重播一樣多的寫入，寫入太多的問題它幫不上忙，那是<a href="07-sharding-consistent-hashing.html">第 7 課</a>分片要處理的。</div>
+<p>客服單的最小答案已經在這裡：顧客的訂單寫進了 primary，「我的訂單」讀的是 replica，讀的那一刻 replica 還沒重播到這筆。既然問題是 replica 慢了一步，直覺的修法是讓 primary 等 replica 跟上再回「成功」。下一節就來看這個做法，叫同步複寫。</p>
+
+<h2>COMMIT 回成功時，資料在哪幾台？同步與非同步複寫</h2>
+<p>要讓 primary「等 replica 跟上」，先要決定 primary 收到 COMMIT 之後，什麼時候回「成功」給 App。有兩種做法：</p>
+<ul>
+  <li><strong>非同步複寫</strong>：primary 自己寫好就回成功，WAL 之後再慢慢送。快，但 primary 若在送出前壞掉，最後幾筆已經回成功的交易會不見。</li>
+  <li><strong>同步複寫</strong>：要等指定的 replica 確認收到才回成功。慢一點（多一次網路往返），但 primary 壞掉時資料還在 replica 上。</li>
+</ul>
+<p>比較兩者之前先認識一個詞：<strong>RPO</strong> 是 recovery point objective 的縮寫，意思是「出事時最多能接受掉多少資料」，例如「最多掉最近 1 秒的訂單」或「一筆都不能掉」。它是業務決定的目標，決定了你需不需要同步複寫。</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>非同步</th><th>同步</th></tr>
+  <tr><td>COMMIT 的延遲</td><td>只有本機寫入</td><td>多等一次 replica 的確認（跨區域可能幾十毫秒）</td></tr>
+  <tr><td>primary 壞掉時會掉資料嗎（RPO）</td><td>可能掉最後幾筆</td><td>已回成功的不會掉</td></tr>
+  <tr><td>同步的 replica 壞掉時</td><td>寫入照常</td><td>寫入卡住，直到它回來或改設定</td></tr>
+</table></div>
+<p>最後一列最常被忽略。同步複寫的意思是 primary 一定要等到那台 replica 確認，所以那台 replica 當機或網路斷了，COMMIT 就一直等下去，咖啡店的下單跟著卡住。PostgreSQL 18 文件明寫，同步副本當機時，等它確認的 COMMIT「可能永遠不會完成」，所以通常會設兩台以上的同步候選，一台掛了還有別台可以確認。</p>
+<p>那同步複寫能修好開場的客服單嗎？大多數情況不能，原因有兩個。第一，「replica 確認收到」不等於「replica 上查得到」。PostgreSQL 用 <code>synchronous_commit</code> 決定 COMMIT 要等到哪一步，預設值 <code>on</code> 等的是同步 replica 把 WAL 寫進磁碟；寫進磁碟之後還要重播，重播之前查詢看不到這筆。只有 <code>remote_apply</code> 這個等級會等到 replica 重播完、查得到（各等級的差別整理在課末「補充與查表」）。第二，這些等級只管「同步」的 replica，非同步的 replica 不在等待名單裡，哪一個等級都不保證它追上。</p>
+<p>就算把所有 replica 都設成同步、等級設成 <code>remote_apply</code>，每一筆 COMMIT 都要等每台 replica 重播完，下單變慢，任何一台 replica 卡住，寫入就跟著卡住。這等於用整個系統的寫入速度和可用性，去換「我的訂單」看得到剛下的單，代價太高。所以分擔讀取的 replica 通常是非同步的，落後是常態。要修的不是複寫，而是讀取：每次讀之前，要知道該讀哪一台。下一節先把客服單完整重現，看清楚讀錯台時到底發生什麼事。</p>
+<div class="callout practice"><strong>💡 實務上：先問「最多能掉幾筆」，再決定同步或非同步</strong><br>這個問題要拿去問 PM 和財務，不是工程師自己猜：咖啡店的訂單和付款紀錄掉一筆就要人工對帳，瀏覽紀錄掉幾筆沒人在意。雲端代管資料庫（例如 AWS RDS）的「讀副本」和「高可用備援」通常是兩個不同的選項，複寫方式也不一樣，開之前先看文件確認你買到的是哪一種。資深工程師會在設計文件寫下 RPO，並確認兩件事：同步 replica 掛掉時寫入會不會卡住、failover 會升格哪一台。</div>
+
+<h2>剛下的單為什麼一下有、一下沒有？複寫延遲的三種異常</h2>
+<p>上一節的結論是：replica 會落後，問題出在讀到哪一台。把客服單完整重現一次。王小明下單後，App 的讀取由負載平衡器（<a href="04-redundancy-load-balancing.html">第 4 課</a>）隨機分給兩台 replica。表格裡 <code>0/5000</code> 這類數字是 WAL 裡的位置，數字越大代表越新的變更，下一節會正式介紹；現在只要看每台 replica 重播到哪裡，比訂單 #501 的 <code>0/5000</code> 小，就是還沒收到這筆。</p>
+<div class="tl">
+  <div class="table-wrap"><table>
+    <tr><th>步驟</th><th>王小明的 App</th><th>primary</th><th>replica A</th><th>replica B</th></tr>
+    <tr data-note="下單寫到 primary，COMMIT 成功。訂單 #501 的變更在 WAL 的位置是 0/5000。兩台 replica 都還沒重播到這裡。"><td>1</td><td>下單 → 成功</td><td>寫入 #501<br>到 0/5000</td><td>到 0/4F00</td><td>到 0/4E00</td></tr>
+    <tr data-note="App 跳到「我的訂單」，讀取被分到 replica A。A 還沒重播到 #501，畫面上沒有剛下的單。這違反了讀己之寫：自己剛寫的東西，自己讀不到。"><td>2</td><td>我的訂單 → <strong>沒有 #501</strong></td><td></td><td>讀取（落後）</td><td></td></tr>
+    <tr data-note="A 重播到 0/5000。王小明重新整理，這次又分到 A，看到 #501 了。"><td>3</td><td>重新整理 → 有 #501</td><td></td><td>到 0/5000<br>讀取</td><td></td></tr>
+    <tr data-note="再重新整理一次，這次分到更落後的 B，#501 又消失了。資料看起來在「倒退」，這違反了單調讀：讀到新的之後，不該再讀到更舊的。"><td>4</td><td>重新整理 → <strong>#501 又不見了</strong></td><td></td><td></td><td>讀取（到 0/4E00）</td></tr>
+    <tr data-note="每一台資料庫都沒壞，SQL 也沒錯。問題出在「讀哪一台」：讀取導向的方式沒有考慮複寫延遲。"><td>5</td><td colspan="4">結論：資料庫沒有 bug，是讀取導向的問題</td></tr>
+  </table></div>
+  <div class="bar"><button data-prev>◀ 上一步</button><button class="primary" data-next>下一步 ▶</button><span class="kbd" data-count></span></div>
+  <p class="note"></p>
+</div>
+<p>客服單把兩件事混在一起講，但它們是兩種不同的異常，修法也不一樣，要分開看。</p>
+<p>第 2 步是<strong>讀不到自己剛寫的</strong>：王小明自己下的單，自己卻讀不到。使用者對系統最基本的期待是「我做的事，我自己馬上看得到」，這個保證叫<strong>讀己之寫（read-your-writes）</strong>：一個人寫入之後，他自己之後的讀取一定看得到這筆。注意它只管「自己」：陳美華晚幾秒才在門市後台看到這張單，不違反讀己之寫。</p>
+<p>第 4 步是<strong>資料倒退</strong>：王小明已經看過 #501，下一次讀卻回到更舊的狀態，好像訂單被刪掉了。對應的保證叫<strong>單調讀（monotonic reads）</strong>：讀到某個版本之後，之後的讀取不會再看到比它更舊的版本。「單調」是數學用語，指只增不減。這個異常的成因是兩次讀取分到落後程度不同的 replica，每一台自己都只會越來越新，是「換台」讓時間倒流。</p>
+<p>第三種異常不在時間軸裡，但同樣常見：<strong>因果顛倒</strong>，結果比原因先被看到。例如付款服務確認付款後送出推播「訂單已付款」，王小明點開推播，App 讀到落後的 replica，畫面顯示「待付款」。他看到了結果（推播），卻看不到原因（付款紀錄），以為扣款失敗又付一次。推播走的是另一條路，比 replica 重播還快到，所以「先發生的事」反而晚被看到。</p>
+<p>三種異常有一個共同點：每一台資料庫都沒壞，SQL 也沒錯，錯在讀取被送到哪一台。這也是它在本機重現不了的原因：本機只有一台資料庫，讀寫都在同一台。所以修法要放在「選哪一台來讀」這一層，下一節就來設計它。</p>
+
+<h2>怎麼保證讀得到自己剛寫的？從讀 primary 到記住 LSN</h2>
+<p>要讓每次讀取挑到一台夠新的機器，常見的做法有三種，由粗到細。</p>
+<p>第一種是<strong>寫入後幾秒內讀 primary</strong>。primary 永遠是最新的，所以使用者剛寫過資料，就讓他接下來一段時間的讀取都走 primary。這是最簡單的做法，問題在「幾秒」是猜的：設 3 秒，replica 某天落後 10 秒就失效；而且尖峰時大家都在下單，大家的讀取都回到 primary，剛好在最需要 replica 的時候失去它。</p>
+<p>第二種是<strong>讓 session 黏在同一台 replica</strong>。同一台 replica 只會越來越新，只要一直讀它，就不會出現時間軸第 4 步的倒退，單調讀解決了。但它解決不了讀己之寫：你黏的那台可能還沒收到你剛寫的那筆，時間軸第 2 步照樣發生。那台 replica 掛掉、換到別台時，連單調讀也保不住。</p>
+<p>第三種是<strong>記住 LSN</strong>，最精確。<strong>LSN（log sequence number）</strong>是 WAL 裡的位置，也就是時間軸裡 <code>0/5000</code> 那種數字。WAL 是依序寫的，位置越後面代表越新的變更，所以 primary 寫到哪、每台 replica 重播到哪，都可以用一個 LSN 表示，兩個 LSN 比大小就知道誰比較新。PostgreSQL 18 文件說 LSN 在內部是 64 位元整數，文字格式是兩個最多 8 位的十六進位數字中間加斜線，例如 <code>16/B374D848</code>，代表 0x16 × 2^32 + 0xB374D848。在 PostgreSQL 裡可以這樣拿到：</p>
+<pre>-- primary，寫入的交易 COMMIT 之後
+SELECT pg_current_wal_lsn();        -- 例如 0/5000
+
+-- 每一台 replica
+SELECT pg_last_wal_replay_lsn();    -- 已經重播到哪裡，例如 0/4F00</pre>
+<p>有了 LSN，讀取導向這樣做：</p>
+<ol>
+  <li>寫入的交易 COMMIT 之後，在 primary 上查 <code>pg_current_wal_lsn()</code>，記成這個使用者的「最後寫入位置」。這筆寫入一定在這個位置以前。</li>
+  <li>讀取時，挑一台 <code>pg_last_wal_replay_lsn()</code> 大於或等於這個位置的 replica。它已經重播過這筆寫入，一定查得到，讀己之寫成立。</li>
+  <li>每次讀完，也記下讀的那台重播到哪，當成「最後讀取位置」。下次需要的位置取兩者中較大的，就不會讀到比上次更舊的 replica，單調讀也成立。</li>
+  <li>沒有任何 replica 追上，就讀 primary。</li>
+</ol>
+<p>拿時間軸驗證：第 2 步需要 <code>0/5000</code>，A 只到 <code>0/4F00</code>、B 只到 <code>0/4E00</code>，兩台都不夠新，改讀 primary，王小明看得到 #501。第 4 步需要的位置至少是 <code>0/5000</code>，B 不會被選到，倒退也不會發生。和第一種做法比，它不必猜要等幾秒：replica 追上了就讀 replica，沒追上才讀 primary，primary 只扛真正必要的讀取。實作時不會每個請求都去問每台 replica，通常由程式定期查一次各台重播到哪，存在記憶體裡比對。</p>
+<p>同一個機制也修得好第三種異常，推播的因果顛倒。問題出在推播帶著「已付款」這個結果，卻沒帶著「結果建立在哪筆寫入之上」。所以讓它帶上：付款服務把付款紀錄寫進 primary、COMMIT 之後，查 <code>pg_current_wal_lsn()</code>，把這個 LSN 放進推播內容（或推播點開的連結參數）。王小明點開推播時，App 把這個 LSN 交給後端，後端把它當成這次讀取需要的位置去做上面的導向：有 replica 重播到這個位置就讀它，沒有就讀 primary。這樣只要他看得到「已付款」的推播，點進去就一定讀得到付款紀錄，不會再看到「待付款」而重複付款。這裡的 LSN 不是王小明自己寫入的位置，而是「造成這則推播的那筆寫入」的位置：把原因的位置跟著結果一起傳遞，結果就不會比原因先被看到。這正是下一節表裡「因果一致」要保證的事。</p>
+<p>這個 LSN 要跟著使用者走：存在伺服器端的 session、cookie，或由 App 每次請求帶上都可以。拿到文字之後，在程式裡比大小有兩個陷阱：</p>
+<div class="lab"><script type="code">
+// 陷阱一：字串比較是逐字比，'9' > '1'，所以 0/9 被當成比 0/10 新
+console.log("'0/9' > '0/10' →", '0/9' > '0/10')
+
+// 陷阱二：64 位元的值超過 number 能精確表示的 2^53
+const high = 0xFFFFFFFF
+const a = high * 2 ** 32 + 1
+const b = high * 2 ** 32 + 2
+console.log('用 number 時 a === b →', a === b)
+
+// bigint 可以精確表示 64 位元
+const big = (BigInt(high) << 32n)
+console.log('用 bigint 時 a === b →', big + 1n === big + 2n)
+</script></div>
+<p>練習 1 會把 LSN 解析成 bigint，再寫出讀取導向。</p>
+<p>LSN 導向還有一個隱藏的前提：replica 通常只落後一點點。如果某台 replica 落後好幾分鐘，剛寫過資料的使用者都會被導回 primary，負載悄悄堆回 primary 身上；隨機讀那台的其他讀取，則會看到好幾分鐘前的資料。所以「最終會追上」不能只是一句承諾，要量、要有上限：</p>
+<div class="callout warn"><strong>「replica 最後會追上」要有上限和監控。</strong>只說「最後會追上」等於沒說：要在 primary 上查 <code>pg_stat_replication</code>（每台連上來的 replica 一列）的 <code>replay_lag</code>（PostgreSQL 18 文件：對非同步 replica，它近似「最近的交易要多久才查得到」），超過門檻就告警，嚴重落後的 replica 要從讀取名單拿掉。</div>
+<div class="callout practice"><strong>💡 實務上：客服說「重新整理才出現」，先懷疑複寫延遲</strong><br>這類 bug 在本機重現不了，上線後也只是偶爾出現，所以看到「剛改的資料有時看不到」就要先想到 replica：查那個時間點的 <code>replay_lag</code>，再確認那個畫面的查詢是不是走 replica。多數團隊一開始不會做到 LSN 導向，而是用框架內建的讀寫分離，它們通常是第一種做法「寫入後改讀 primary」的變形（例子見課末「補充與查表」）。上線前先確認你用的框架是哪一種行為、保證到哪裡為止。</div>
+<p>到這裡「我的訂單」修好了。但咖啡店不只這一種讀取：菜單、結帳時的價格、付款狀態、總部報表，每一種都要套 LSN 導向嗎？下一節建立判斷的詞彙。</p>
+
+<h2>每一種讀取都要這麼嚴格嗎？一致性模型：選夠用的最弱保證</h2>
+<p>不需要。菜單晚幾秒更新沒人在意，報表晚一分鐘也沒關係，這些讀取用 LSN 導向只是白白把負載推回 primary。要逐一判斷「這個讀取需要多新」，先要有一組精確的詞彙。<strong>一致性模型（consistency model）</strong>是系統對「讀到什麼」的承諾，上一節的讀己之寫和單調讀就是其中兩種。把比它們更強和更弱的也放進來，由強到弱：</p>
+<div class="table-wrap"><table>
+  <tr><th>模型</th><th>保證</th><th>咖啡店的例子</th></tr>
+  <tr><td><strong>線性一致</strong>（linearizability）</td><td>像只有一份資料：寫入完成後，<em>所有人</em>都讀得到</td><td>讀 primary</td></tr>
+  <tr><td><strong>因果一致</strong>（causal）</td><td>有因果關係的事件，每個人看到的順序都一樣</td><td>看得到「已完成」就一定看得到「已付款」</td></tr>
+  <tr><td><strong>讀己之寫</strong>（read-your-writes）</td><td>自己寫的，自己之後一定讀得到（別人不一定）</td><td>下單後「我的訂單」有這筆</td></tr>
+  <tr><td><strong>單調讀</strong>（monotonic reads）</td><td>讀到新的之後，不會再讀到更舊的</td><td>重新整理不會倒退</td></tr>
+  <tr><td><strong>最終一致</strong>（eventual consistency）</td><td>不再有寫入時，副本最後會一致；中間可能讀到舊的</td><td>菜單晚幾秒更新沒關係</td></tr>
+</table></div>
+<p>表裡的新面孔有三個。<strong>線性一致</strong>是最強的：整個系統表現得像只有一份資料，任何人在寫入完成之後讀，都一定讀到它。咖啡店只有一台 primary 收寫入，讀 primary 就有這個保證。<strong>因果一致</strong>處理的是上一節的第三種異常：推播「已付款」是因為付款紀錄已經寫入，有因果關係，所以任何人看得到推播的結果，就一定要看得到付款紀錄。<strong>最終一致</strong>是最弱的：只承諾「不再有寫入時，副本最後會一樣」，沒說「最後」是多久，中間讀到什麼都有可能。</p>
+<p>越強的保證需要越多協調：線性一致要每次都問 primary（或等多數副本確認），延遲高、primary 壓力大；最終一致隨便讀一台都行。保證越強，能回答請求的機器也越少：讀己之寫要找夠新的那幾台，最終一致任何一台活著都能回答。這一點到下一節機房斷線時會變得很重要（更精確的說法見課末「補充與查表」）。</p>
+<p>資深工程師的做法：<strong>每一種讀取選「夠用的最弱模型」</strong>，並在設計文件裡寫清楚哪些讀取可以容忍過時、可以舊多久。全部讀 primary 很安全，replica 就白買了；全部讀 replica 很省，結帳就可能用到舊價格。練習 4 會替咖啡店的 8 種讀取做這個決定。</p>
+<div class="callout practice"><strong>💡 實務上：前端也能幫忙做到讀己之寫</strong><br>下單成功後，前端可以把 API 回傳的那筆訂單直接放進「我的訂單」列表，不必馬上重新查詢，使用者在這個畫面就感覺不到 replica 落後。但這只顧得到這個分頁：換一台裝置或重新整理頁面，還是要靠後端的讀取導向。跟 PM 討論時把「要即時」換成具體問題：「這個畫面舊 5 秒可以嗎？舊 1 分鐘呢？誰會因此受損？」答案寫進設計文件，之後有人想把某個查詢改走 replica 時才有依據。</div>
+<p>到目前為止都假設機器之間的網路是通的，replica 只是慢了一點，等一下就會追上。如果網路整個斷了，replica 再也收不到新的 WAL，它還該回答問題嗎？</p>
+
+<h2>機房之間斷線時，高雄的 replica 該不該回答？CAP 與 PACELC</h2>
+<p>咖啡店為了異地備援，在高雄機房放了一台 replica，平常也分擔南部門市的讀取。某天台北和高雄兩個機房之間的線路斷了：兩邊的機器都還活著，只是彼此連不上。這種狀況叫<strong>網路分割（network partition）</strong>。高雄的 replica 收不到台北傳來的 WAL，資料停在斷線那一刻。這時它收到讀取請求，只有兩個選擇：</p>
+<ul>
+  <li>回答手上的資料，請求有回應，系統是<strong>可用的</strong>（Availability，簡稱 A），但資料可能是舊的；</li>
+  <li>拒絕或等待，直到確認是最新的，保住<strong>一致</strong>（Consistency，簡稱 C，指的是上一節的線性一致），但使用者會看到錯誤。</li>
+</ul>
+<p>沒有第三個選項：它連不上台北，就沒辦法知道自己是不是最新的。這就是 <strong>CAP</strong>，P 是分割（Partition）。常聽到的「C、A、P 三選二」是誤導，Brewer 自己在 2012 年〈CAP Twelve Years Later〉裡澄清：</p>
+<ul>
+  <li><strong>分割不是可以不選的</strong>。只要資料在兩台以上的機器上，網路就可能斷。所以真正的選擇只有「分割時選 C 還是 A」。</li>
+  <li><strong>沒有分割的時候，C 和 A 可以兼得。</strong></li>
+  <li><strong>可以依操作選。</strong>同一個系統裡，付款選 C、菜單選 A。</li>
+  <li><strong>逾時就是在做選擇。</strong>系統沒辦法分辨「對方很慢」和「網路斷了」；等多久放棄、放棄後回舊資料還是回錯誤，就是 C 與 A 的選擇（第 8 課會講逾時）。</li>
+</ul>
+<p>CAP 只講分割的時候，但分割很少發生，這一課前面做的決定都發生在網路正常的時候。Abadi 2012 年提出的 <strong>PACELC</strong> 補上平常的情況：<strong>P</strong>artition 時在 <strong>A</strong> 與 <strong>C</strong> 間選，<strong>E</strong>lse（沒有分割）時在 <strong>L</strong>atency（延遲）與 <strong>C</strong> 間選。回頭看，第二節的同步複寫就是平常用延遲換一致；「我的訂單」改讀 replica，是用一點過時換低延遲、低負載；LSN 導向則是在兩者之間找到剛好夠用的點。</p>
+<p>回到高雄機房，依操作選：</p>
+<div class="table-wrap"><table>
+  <tr><th>咖啡店的資料</th><th>分割時選</th><th>理由</th></tr>
+  <tr><td>付款狀態、退款</td><td>C</td><td>寧可請顧客稍後再試，也不能重複退款</td></tr>
+  <tr><td>庫存扣減</td><td>C</td><td>超賣要退錢、道歉</td></tr>
+  <tr><td>菜單、門市營業時間</td><td>A</td><td>舊幾分鐘沒關係，顯示錯誤頁反而損失訂單</td></tr>
+  <tr><td>推薦商品</td><td>A</td><td>不準也沒人會發現</td></tr>
+</table></div>
+<p>這張表和上一節「每種讀取選夠用的最弱模型」是同一件事的兩面：平常決定每種讀取可以舊多久，斷線時決定每種讀取要回舊資料還是回錯誤。主線到這裡結束，接下來兩節是選讀。</p>
+
+<h2>沒有 primary 的資料庫怎麼讀到新資料？Quorum：R + W &gt; N（選讀）</h2>
+<p>這節是選讀：PostgreSQL 這類只有一台 primary 收寫入的資料庫用不到 quorum，等你要用 Cassandra 這類沒有 primary 的資料庫，或面試被問到 Dynamo 的設計時再回來看。跳過不影響後面的課。</p>
+<p>到這裡為止，判斷「誰比較新」都靠 LSN，前提是寫入只有 primary 一個入口，所有變更排在同一份 WAL 裡。另一類系統沒有 primary，任何副本都能收寫入，例如 Amazon 2007 年發表的 Dynamo 論文（Amazon 購物車背後的儲存系統）和受它啟發的開源資料庫 Cassandra。這類系統一筆寫入不會傳到每一台，讀取也不知道該問哪一台，它們用 <strong>quorum</strong>（法定人數）保證讀得到新資料。因為沒有共同的 WAL，每筆寫入會自己帶一個<strong>版本號</strong>（例如遞增的計數或時間戳），讀取時比版本號決定誰新；用時間戳當版本號會出什麼問題，留到下一節的「最後寫入者勝」。</p>
+<ul>
+  <li>每份資料存 <strong>N</strong> 份。</li>
+  <li>寫入要等 <strong>W</strong> 份確認才算成功。</li>
+  <li>讀取要等 <strong>R</strong> 份回應，取其中版本最新的。</li>
+</ul>
+<p>只要 <strong>R + W &gt; N</strong>，讀到的 R 份和寫入的 W 份一定至少重疊一份，所以一定讀得到最新的寫入。原因是機器不夠分：如果讀和寫完全沒有重疊，總共需要 R + W 台不同的機器，但只有 N 台。Dynamo 論文裡常見的設定是 (N, R, W) = (3, 2, 2)。用程式把所有組合列出來確認，看最後一欄：R + W &gt; N 的組合，讀不到新值的組合數都是 0：</p>
+<div class="lab"><script type="code">
+// 從 0..n-1 中選 k 個的所有組合
+function choose(n: number, k: number, from = 0): number[][] {
+  if (k === 0) return [[]]
+  const out: number[][] = []
+  for (let i = from; i <= n - k; i++)
+    for (const rest of choose(n, k - 1, i + 1)) out.push([i, ...rest])
+  return out
+}
+
+// 寫入集合與讀取集合「沒有交集」的比例 = 可能讀不到新值的比例
+function missRate(n: number, r: number, w: number) {
+  const writes = choose(n, w)
+  const reads = choose(n, r)
+  let miss = 0
+  for (const ws of writes) for (const rs of reads) if (!rs.some(x => ws.includes(x))) miss++
+  return `${miss}/${writes.length * reads.length}`
+}
+
+for (const [n, r, w] of [[3, 2, 2], [3, 1, 3], [3, 1, 1], [5, 3, 3], [5, 2, 3]])
+  console.log(`N=${n} R=${r} W=${w}  R+W>N: ${r + w > n}  讀不到新值的組合: ${missRate(n, r, w)}`)
+</script></div>
+<p>讀到的 R 份裡，版本有新有舊。取最新的回傳之外，可以順便把新值寫回落後的副本，這叫 <strong>read repair</strong>。只靠 read repair 的話，沒人讀的資料永遠不會修好，所以這類系統另外有背景比對（anti-entropy）。</p>
+<div class="callout">調 R 和 W 就是在調取捨：W = N 寫入最慢、任何一台壞了就寫不進去；R = 1 讀取最快。(3, 2, 2) 允許壞一台，讀寫都還能進行。R + W &gt; N 也不是萬能：寫入失敗時部分副本可能已經寫了、用機器時鐘決定版本時會出錯（下一節），實際的保證要看各系統的文件。</div>
+<p>quorum 解決了「讀到哪一份」，但留下另一個問題：任何副本都能收寫入時，兩個人同時改同一筆資料，誰算數？</p>
+
+<h2>多個寫入點同時改同一筆，誰算數？最後寫入者勝與版本向量（選讀）</h2>
+<p>這節是選讀：咖啡店只有一個 primary 收寫入，不會有寫入衝突；等你要做離線也能用的 App、多人同時編輯，或多個區域都能寫入的資料庫時再回來看。跳過不影響後面的課。</p>
+<p>只有一個 primary 時，寫入的先後由 primary 決定，WAL 裡誰在前面誰就先。但有些情況下，多個地方都能寫：離線也能點餐的 App（手機先存、上線再同步）、台北與高雄兩個區域各有一個可寫的資料庫。兩邊同時改同一筆資料，就會<strong>衝突</strong>，而且沒有一份共同的 WAL 可以排先後。</p>
+<p>最省事的解法是<strong>最後寫入者勝（LWW，last write wins）</strong>：每筆寫入帶時間戳，時間大的贏。問題是時間戳來自各台機器的時鐘，而時鐘會偏移。主機的時鐘靠 NTP（網路校時協定）定期校正，兩次校正之間會慢慢走快或走慢，幾台機器的時間不會完全一樣。執行下面的程式，看 LWW 留下了哪一筆：</p>
+<div class="lab"><script type="code">
+type Write = { region: string; note: string; ts: number }
+
+// 真實時間：台北在第 1000 毫秒寫入，高雄在第 1500 毫秒才改（高雄比較晚）
+// 但台北主機的時鐘快了 2 秒，蓋上去的時間戳多了 2000
+const taipei: Write = { region: '台北', note: '拿鐵 少冰', ts: 1000 + 2000 }
+const kaohsiung: Write = { region: '高雄', note: '拿鐵 少冰 改 熱的', ts: 1500 }
+
+const lww = (a: Write, b: Write) => (b.ts > a.ts ? b : a)
+const winner = lww(taipei, kaohsiung)
+console.log('LWW 留下：', winner.region, winner.note)
+console.log('高雄比較晚的修改被丟掉了，而且沒有任何錯誤訊息')
+</script></div>
+<p>LWW 只適合「丟掉一個也無所謂」的資料。要知道兩個寫入到底是先後關係還是同時發生，不能看時鐘，要看「寫的人有沒有看過對方的修改」。<strong>版本向量（version vector）</strong>就是記錄這件事的工具：每個寫入點一個計數器，自己寫一次就把自己的計數器加 1，同步時逐個取最大。例如購物車一開始在 App 寫了一次，版本是 <code>{ app: 1 }</code>；App 再改一次變成 <code>{ app: 2 }</code>；同時網頁版從 <code>{ app: 1 }</code> 那一版開始改，變成 <code>{ app: 1, web: 1 }</code>。比較兩個版本：</p>
+<div class="table-wrap"><table>
+  <tr><th>A</th><th>B</th><th>關係</th><th>原因</th></tr>
+  <tr><td><code>{ app: 1 }</code></td><td><code>{ app: 2 }</code></td><td>A 在 B 之前（before）</td><td>A 的每一格都 ≤ B，至少一格 &lt;；B 是在看過 A 之後寫的</td></tr>
+  <tr><td><code>{ app: 2 }</code></td><td><code>{ app: 1, web: 1 }</code></td><td>並行（concurrent）</td><td>A 的 app 比較大，B 的 web 比較大；兩邊都沒看過對方的修改</td></tr>
+  <tr><td><code>{ app: 1 }</code></td><td><code>{ app: 1, web: 0 }</code></td><td>相同（equal）</td><td>沒有的 key 視為 0</td></tr>
+</table></div>
+<p>先後關係很好處理：後面的直接取代前面的。<strong>並行</strong>的版本沒有誰對誰錯，只能合併：</p>
+<ul>
+  <li><strong>購物車取聯集</strong>：Dynamo 論文的做法。好處是「加入購物車」不會遺失；代價是在並行的另一支裡還留著的品項，刪掉後可能「復活」。</li>
+  <li><strong>交給使用者選</strong>：像 Git 的合併衝突。</li>
+  <li><strong>CRDT</strong>（conflict-free replicated data type）：把資料結構設計成怎麼合併結果都一樣，例如每個寫入點各記一個計數再相加的計數器、記得刪除紀錄的集合。</li>
+</ul>
+<p>能用單一 primary 就用單一 primary。多寫入點的衝突處理會滲進每一個功能，是很貴的選擇；咖啡店只有購物車這種「合併錯了也不嚴重」的資料值得這樣做。</p>
+<div class="callout practice"><strong>💡 實務上：前端最常在離線與多人協作遇到衝突</strong><br>離線也能用的 App（PWA、行動 App 先存本機再同步）和多人同時編輯的功能，都是多寫入點，衝突一定會發生。動手前先問：衝突時丟掉一邊可以嗎？要讓使用者自己選嗎？多人協作編輯通常直接用現成的 CRDT 函式庫（例如 Yjs、Automerge），不要自己寫合併邏輯。如果需求只是「離線時暫存、上線後送出」，把離線的操作排進佇列、上線後依序送到單一 primary，通常就夠了，不需要真的做多寫入點。</div>
+
+<h2>補充與查表</h2>
+<h3><code>synchronous_commit</code> 的等級（查表用，不用背）</h3>
+<p>細節在 <a href="../../postgresql/lessons/37-backup-replication.html">PostgreSQL 課第 37 課</a>。這裡只列和「同步 replica 上查不查得到」有關的三個等級：</p>
+<div class="table-wrap"><table>
+  <tr><th>等級</th><th>COMMIT 等到</th><th>同步 replica 上查得到嗎</th></tr>
+  <tr><td><code>remote_write</code></td><td>replica 把 WAL 寫進作業系統</td><td>不一定；replica 的作業系統當機時還可能掉</td></tr>
+  <tr><td><code>on</code>（預設值）</td><td>replica 把 WAL 寫進磁碟</td><td>不一定，可能還沒重播</td></tr>
+  <tr><td><code>remote_apply</code></td><td>replica 重播完</td><td>查得到</td></tr>
+</table></div>
+<p>只有 <code>remote_apply</code> 保證<strong>同步</strong> replica 上<strong>查得到</strong>剛寫的資料；<code>on</code> 和 <code>remote_write</code> 只保證資料已經送到 replica。非同步的 replica 不在等待名單裡，哪一個等級都不保證它追上。</p>
+<h3>框架內建的讀寫分離</h3>
+<p>例如 Laravel 讀寫分離的 <code>sticky</code> 選項、Rails 的自動切換連線，都是「寫入後改讀 primary」的變形：前者限同一個請求內，後者是寫入後一段時間內。它們都要猜一個範圍，保證不到 LSN 導向那麼精確。</p>
+<h3>保證越強，能回答的機器越少：sticky available</h3>
+<p>Jepsen（專門測試分散式資料庫一致性的專案）的整理指出，讀己之寫以及更強的模型，最多只能做到 <strong>sticky available</strong>：client 要一直連同一台（或同一批）副本，那台活著就能回應；換到別台就可能失去保證。更弱的模型才做得到「連到任何一台活著的副本都能回應」。</p>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：寫三個函式，讓讀取同時做到讀己之寫和單調讀。</p>
+  <ul>
+    <li><code>parseLsn(text)</code>：把 <code>'X/Y'</code>（兩段各 1～8 位十六進位，大小寫都可以）轉成 bigint，值是 X × 2^32 + Y。格式不對就丟 Error。</li>
+    <li><code>routeRead(session, replicas, primary)</code>：需要的 LSN 是 <code>lastWriteLsn</code> 和 <code>lastReadLsn</code> 中較大的（null 忽略，兩個都是 null 就是 0）。依陣列順序選第一台 <code>replayLsn</code> ≥ 需要的 LSN 的 replica；沒有就讀 primary。回傳 <code>{ target, session }</code>：target 是選中的名稱；session 是<strong>新的物件</strong>（不能改傳入的），<code>lastReadLsn</code> 改成選中節點的 LSN 文字（replica 的 <code>replayLsn</code> 或 primary 的 <code>currentLsn</code>）。</li>
+    <li><code>afterWrite(session, commitLsn)</code>：回傳新的 session，<code>lastWriteLsn</code> 取原本的和 <code>commitLsn</code> 中較大的那個（保留原本的文字）。</li>
+  </ul>
+  <script type="start">
+type Session = { lastWriteLsn: string | null; lastReadLsn: string | null }
+type Replica = { name: string; replayLsn: string }
+type Primary = { name: string; currentLsn: string }
+
+function parseLsn(text: string): bigint {
+  throw new Error('TODO')
+}
+
+function routeRead(session: Session, replicas: ReadonlyArray<Replica>, primary: Primary): { target: string; session: Session } {
+  throw new Error('TODO')
+}
+
+function afterWrite(session: Session, commitLsn: string): Session {
+  throw new Error('TODO')
+}
+
+// 自己試試看：剛寫到 0/5000，replica-a 只到 0/4F00，應該讀 primary
+let s: Session = { lastWriteLsn: null, lastReadLsn: null }
+s = afterWrite(s, '0/5000')
+console.log(routeRead(s, [{ name: 'replica-a', replayLsn: '0/4F00' }], { name: 'primary', currentLsn: '0/5000' }))
+</script>
+  <script type="answer">
+type Session = { lastWriteLsn: string | null; lastReadLsn: string | null }
+type Replica = { name: string; replayLsn: string }
+type Primary = { name: string; currentLsn: string }
+
+function parseLsn(text: string): bigint {
+  const m = /^([0-9A-Fa-f]{1,8})\/([0-9A-Fa-f]{1,8})$/.exec(text)
+  if (!m) throw new Error(`LSN 格式不對：${text}`)
+  return (BigInt('0x' + m[1]) << 32n) + BigInt('0x' + m[2])
+}
+
+function routeRead(session: Session, replicas: ReadonlyArray<Replica>, primary: Primary): { target: string; session: Session } {
+  let need = 0n
+  for (const lsn of [session.lastWriteLsn, session.lastReadLsn]) {
+    if (lsn !== null && parseLsn(lsn) > need) need = parseLsn(lsn)
+  }
+  const replica = replicas.find(r => parseLsn(r.replayLsn) >= need)
+  if (replica) return { target: replica.name, session: { ...session, lastReadLsn: replica.replayLsn } }
+  return { target: primary.name, session: { ...session, lastReadLsn: primary.currentLsn } }
+}
+
+function afterWrite(session: Session, commitLsn: string): Session {
+  const old = session.lastWriteLsn
+  const keepOld = old !== null && parseLsn(old) >= parseLsn(commitLsn)
+  return { ...session, lastWriteLsn: keepOld ? old : commitLsn }
+}
+
+let s: Session = { lastWriteLsn: null, lastReadLsn: null }
+s = afterWrite(s, '0/5000')
+console.log(routeRead(s, [{ name: 'replica-a', replayLsn: '0/4F00' }], { name: 'primary', currentLsn: '0/5000' }))
+</script>
+  <script type="tests">
+const throws = (fn: () => unknown) => { try { fn() } catch { return true } return false }
+const freeze = <T,>(x: T): T => { if (x && typeof x === 'object') { Object.values(x).forEach(freeze); Object.freeze(x) } return x }
+
+assert.equal(typeof parseLsn('0/0'), 'bigint', 'parseLsn 要回傳 bigint')
+assert.equal(parseLsn('16/B374D848'), 0x16B374D848n, "'16/B374D848' 要等於 0x16 × 2^32 + 0xB374D848")
+assert.equal(parseLsn('a/b'), (0xAn << 32n) + 0xBn, '小寫的十六進位也要接受')
+assert(parseLsn('0/10') > parseLsn('0/9'), "'0/10' 比 '0/9' 大：要當十六進位數字比，不是字串")
+assert(parseLsn('1/0') > parseLsn('0/FFFFFFFF'), "'1/0' 比 '0/FFFFFFFF' 大：前半段是高 32 位元")
+assert.equal(parseLsn('FFFFFFFF/2') - parseLsn('FFFFFFFF/1'), 1n, '高位很大時只差 1 也要分得出來：不能先用 number 算再轉 bigint')
+assert.equal(parseLsn('FFFFFFFF/FFFFFFFF'), 2n ** 64n - 1n, 'FFFFFFFF/FFFFFFFF 是 2^64 − 1')
+for (const bad of ['', '16', '16/', '/1', '1/2/3', '123456789/0', '0/123456789', 'G/0', '0x1/0', ' 1/0', '1/0 ', '-1/0', '1.5/0'])
+  assert(throws(() => parseLsn(bad)), `格式不對要丟 Error：${JSON.stringify(bad)}`)
+
+const P = freeze({ name: 'primary', currentLsn: '0/60' })
+const fresh: Session = freeze({ lastWriteLsn: null, lastReadLsn: null })
+let r = routeRead(fresh, freeze([{ name: 'a', replayLsn: '0/20' }, { name: 'b', replayLsn: '0/50' }]), P)
+assert.equal(r.target, 'a', '沒寫過也沒讀過：讀陣列裡第一台 replica')
+assert.equal(r.session.lastReadLsn, '0/20', 'lastReadLsn 要更新成讀到的 replica 的 replayLsn')
+assert(r.session !== fresh, '要回傳新的 session 物件')
+
+const wrote = freeze(afterWrite(fresh, '0/10'))
+assert.deepEqual(wrote, { lastWriteLsn: '0/10', lastReadLsn: null }, 'afterWrite 之後 lastWriteLsn 是 0/10，lastReadLsn 不變')
+r = routeRead(wrote, freeze([{ name: 'a', replayLsn: '0/9' }]), P)
+assert.equal(r.target, 'primary', "剛寫到 0/10、replica 只到 0/9：要讀 primary（用字串比較會以為 '0/9' 比較新）")
+assert.equal(r.session.lastReadLsn, '0/60', '讀 primary 時 lastReadLsn 要更新成 primary 的 currentLsn')
+r = routeRead(wrote, freeze([{ name: 'a', replayLsn: '0/9' }, { name: 'b', replayLsn: '0/10' }]), P)
+assert.equal(r.target, 'b', 'replica b 已經重播到 0/10，就讀 b，不用打 primary')
+
+const seen = freeze(routeRead(fresh, freeze([{ name: 'a', replayLsn: '0/40' }]), P).session)
+r = routeRead(seen, freeze([{ name: 'b', replayLsn: '0/30' }, { name: 'a', replayLsn: '0/41' }]), P)
+assert.equal(r.target, 'a', '已經讀過 0/40 的資料，不能再被導到只到 0/30 的 replica（單調讀）')
+
+const wroteHigh = freeze(afterWrite(fresh, '1/0'))
+r = routeRead(wroteHigh, freeze([{ name: 'a', replayLsn: '0/FFFFFFFF' }]), freeze({ name: 'primary', currentLsn: '1/10' }))
+assert.equal(r.target, 'primary', "寫到 '1/0'，replica 只到 '0/FFFFFFFF'：還沒追上")
+
+assert.equal(afterWrite(freeze({ lastWriteLsn: '0/10', lastReadLsn: '0/3' }), '0/9').lastWriteLsn, '0/10', 'afterWrite 要保留較大的 LSN：0/10 比 0/9 新')
+assert.deepEqual(afterWrite(freeze({ lastWriteLsn: '0/10', lastReadLsn: '0/3' }), '0/11'), { lastWriteLsn: '0/11', lastReadLsn: '0/3' }, 'afterWrite 寫到更新的 0/11 時要換成 0/11，lastReadLsn 不變')
+
+// 300 組隨機情境，跟參考實作比對
+const rand = (seed: number) => () => { seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296 }
+const rnd = rand(6)
+const hex = (n: bigint) => n.toString(16).toUpperCase()
+const fmt = (n: bigint) => `${hex(n >> 32n)}/${hex(n & 0xFFFFFFFFn)}`
+const highs = [0n, 1n, 0x2An, 0xFFFFFFFEn]
+const randLsn = () => (highs[Math.floor(rnd() * highs.length)] << 32n) + BigInt(Math.floor(rnd() * 64))
+const toBig = (t: string) => { const [h, l] = t.split('/'); return (BigInt('0x' + h) << 32n) + BigInt('0x' + l) }
+const ref = (se: Session, rs: ReadonlyArray<Replica>, p: Primary) => {
+  const need = [se.lastWriteLsn, se.lastReadLsn].reduce((m, x) => (x !== null && toBig(x) > m ? toBig(x) : m), 0n)
+  const hit = rs.find(x => toBig(x.replayLsn) >= need)
+  return { target: hit ? hit.name : p.name, session: { ...se, lastReadLsn: hit ? hit.replayLsn : p.currentLsn } }
+}
+for (let i = 0; i < 300; i++) {
+  const se: Session = { lastWriteLsn: rnd() < 0.3 ? null : fmt(randLsn()), lastReadLsn: rnd() < 0.3 ? null : fmt(randLsn()) }
+  const rs = Array.from({ length: Math.floor(rnd() * 4) }, (_, k) => ({ name: `r${k}`, replayLsn: fmt(randLsn()) }))
+  const p = { name: 'primary', currentLsn: fmt((0xFFFFFFFFn << 32n) + BigInt(Math.floor(rnd() * 100))) }
+  const input = JSON.stringify([se, rs, p])
+  assert.deepEqual(routeRead(freeze(se), freeze(rs), freeze(p)), ref(se, rs, p), `隨機情境的導向不對：${input}`)
+}
+</script>
+  <script type="wrong">
+type Session = { lastWriteLsn: string | null; lastReadLsn: string | null }
+type Replica = { name: string; replayLsn: string }
+type Primary = { name: string; currentLsn: string }
+
+function parseLsn(text: string): bigint {
+  const m = /^([0-9A-Fa-f]{1,8})\/([0-9A-Fa-f]{1,8})$/.exec(text)
+  if (!m) throw new Error(`LSN 格式不對：${text}`)
+  return (BigInt('0x' + m[1]) << 32n) + BigInt('0x' + m[2])
+}
+
+// 錯：LSN 用字串比較
+function routeRead(session: Session, replicas: ReadonlyArray<Replica>, primary: Primary): { target: string; session: Session } {
+  let need = '0/0'
+  for (const lsn of [session.lastWriteLsn, session.lastReadLsn]) {
+    if (lsn !== null && lsn > need) need = lsn
+  }
+  const replica = replicas.find(r => r.replayLsn >= need)
+  if (replica) return { target: replica.name, session: { ...session, lastReadLsn: replica.replayLsn } }
+  return { target: primary.name, session: { ...session, lastReadLsn: primary.currentLsn } }
+}
+
+function afterWrite(session: Session, commitLsn: string): Session {
+  const old = session.lastWriteLsn
+  return { ...session, lastWriteLsn: old !== null && old >= commitLsn ? old : commitLsn }
+}
+</script>
+  <script type="wrong">
+type Session = { lastWriteLsn: string | null; lastReadLsn: string | null }
+type Replica = { name: string; replayLsn: string }
+type Primary = { name: string; currentLsn: string }
+
+// 錯：先用 number 算再轉 bigint，超過 2^53 就不精確
+function parseLsn(text: string): bigint {
+  const m = /^([0-9A-Fa-f]{1,8})\/([0-9A-Fa-f]{1,8})$/.exec(text)
+  if (!m) throw new Error(`LSN 格式不對：${text}`)
+  return BigInt(parseInt(m[1], 16) * 2 ** 32 + parseInt(m[2], 16))
+}
+
+function routeRead(session: Session, replicas: ReadonlyArray<Replica>, primary: Primary): { target: string; session: Session } {
+  let need = 0n
+  for (const lsn of [session.lastWriteLsn, session.lastReadLsn]) {
+    if (lsn !== null && parseLsn(lsn) > need) need = parseLsn(lsn)
+  }
+  const replica = replicas.find(r => parseLsn(r.replayLsn) >= need)
+  if (replica) return { target: replica.name, session: { ...session, lastReadLsn: replica.replayLsn } }
+  return { target: primary.name, session: { ...session, lastReadLsn: primary.currentLsn } }
+}
+
+function afterWrite(session: Session, commitLsn: string): Session {
+  const old = session.lastWriteLsn
+  const keepOld = old !== null && parseLsn(old) >= parseLsn(commitLsn)
+  return { ...session, lastWriteLsn: keepOld ? old : commitLsn }
+}
+</script>
+  <script type="wrong">
+type Session = { lastWriteLsn: string | null; lastReadLsn: string | null }
+type Replica = { name: string; replayLsn: string }
+type Primary = { name: string; currentLsn: string }
+
+function parseLsn(text: string): bigint {
+  const m = /^([0-9A-Fa-f]{1,8})\/([0-9A-Fa-f]{1,8})$/.exec(text)
+  if (!m) throw new Error(`LSN 格式不對：${text}`)
+  return (BigInt('0x' + m[1]) << 32n) + BigInt('0x' + m[2])
+}
+
+// 錯：永遠讀第一台 replica，剛寫的讀不到
+function routeRead(session: Session, replicas: ReadonlyArray<Replica>, primary: Primary): { target: string; session: Session } {
+  const replica = replicas[0]
+  if (replica) return { target: replica.name, session: { ...session, lastReadLsn: replica.replayLsn } }
+  return { target: primary.name, session: { ...session, lastReadLsn: primary.currentLsn } }
+}
+
+function afterWrite(session: Session, commitLsn: string): Session {
+  const old = session.lastWriteLsn
+  const keepOld = old !== null && parseLsn(old) >= parseLsn(commitLsn)
+  return { ...session, lastWriteLsn: keepOld ? old : commitLsn }
+}
+</script>
+  <script type="wrong">
+type Session = { lastWriteLsn: string | null; lastReadLsn: string | null }
+type Replica = { name: string; replayLsn: string }
+type Primary = { name: string; currentLsn: string }
+
+function parseLsn(text: string): bigint {
+  const m = /^([0-9A-Fa-f]{1,8})\/([0-9A-Fa-f]{1,8})$/.exec(text)
+  if (!m) throw new Error(`LSN 格式不對：${text}`)
+  return (BigInt('0x' + m[1]) << 32n) + BigInt('0x' + m[2])
+}
+
+// 錯：永遠讀 primary，replica 形同虛設
+function routeRead(session: Session, replicas: ReadonlyArray<Replica>, primary: Primary): { target: string; session: Session } {
+  return { target: primary.name, session: { ...session, lastReadLsn: primary.currentLsn } }
+}
+
+function afterWrite(session: Session, commitLsn: string): Session {
+  const old = session.lastWriteLsn
+  const keepOld = old !== null && parseLsn(old) >= parseLsn(commitLsn)
+  return { ...session, lastWriteLsn: keepOld ? old : commitLsn }
+}
+</script>
+  <script type="wrong">
+type Session = { lastWriteLsn: string | null; lastReadLsn: string | null }
+type Replica = { name: string; replayLsn: string }
+type Primary = { name: string; currentLsn: string }
+
+function parseLsn(text: string): bigint {
+  const m = /^([0-9A-Fa-f]{1,8})\/([0-9A-Fa-f]{1,8})$/.exec(text)
+  if (!m) throw new Error(`LSN 格式不對：${text}`)
+  return (BigInt('0x' + m[1]) << 32n) + BigInt('0x' + m[2])
+}
+
+// 錯：只看 lastWriteLsn，沒有把讀過的位置算進去（違反單調讀）
+function routeRead(session: Session, replicas: ReadonlyArray<Replica>, primary: Primary): { target: string; session: Session } {
+  const need = session.lastWriteLsn === null ? 0n : parseLsn(session.lastWriteLsn)
+  const replica = replicas.find(r => parseLsn(r.replayLsn) >= need)
+  if (replica) return { target: replica.name, session: { ...session, lastReadLsn: replica.replayLsn } }
+  return { target: primary.name, session: { ...session, lastReadLsn: primary.currentLsn } }
+}
+
+function afterWrite(session: Session, commitLsn: string): Session {
+  const old = session.lastWriteLsn
+  const keepOld = old !== null && parseLsn(old) >= parseLsn(commitLsn)
+  return { ...session, lastWriteLsn: keepOld ? old : commitLsn }
+}
+</script>
+  <script type="wrong">
+type Session = { lastWriteLsn: string | null; lastReadLsn: string | null }
+type Replica = { name: string; replayLsn: string }
+type Primary = { name: string; currentLsn: string }
+
+function parseLsn(text: string): bigint {
+  const m = /^([0-9A-Fa-f]{1,8})\/([0-9A-Fa-f]{1,8})$/.exec(text)
+  if (!m) throw new Error(`LSN 格式不對：${text}`)
+  return (BigInt('0x' + m[1]) << 32n) + BigInt('0x' + m[2])
+}
+
+// 錯：直接修改傳入的 session
+function routeRead(session: Session, replicas: ReadonlyArray<Replica>, primary: Primary): { target: string; session: Session } {
+  let need = 0n
+  for (const lsn of [session.lastWriteLsn, session.lastReadLsn]) {
+    if (lsn !== null && parseLsn(lsn) > need) need = parseLsn(lsn)
+  }
+  const replica = replicas.find(r => parseLsn(r.replayLsn) >= need)
+  session.lastReadLsn = replica ? replica.replayLsn : primary.currentLsn
+  return { target: replica ? replica.name : primary.name, session }
+}
+
+function afterWrite(session: Session, commitLsn: string): Session {
+  const old = session.lastWriteLsn
+  if (old === null || parseLsn(commitLsn) > parseLsn(old)) session.lastWriteLsn = commitLsn
+  return session
+}
+</script>
+  <script type="wrong">
+type Session = { lastWriteLsn: string | null; lastReadLsn: string | null }
+type Replica = { name: string; replayLsn: string }
+type Primary = { name: string; currentLsn: string }
+// 錯：沒有檢查格式，split 之後直接轉，超過 8 位或多一段都不會丟錯
+function parseLsn(text: string): bigint {
+  const [h, l] = text.split('/')
+  return (BigInt('0x' + h) << 32n) + BigInt('0x' + l)
+}
+function routeRead(session: Session, replicas: ReadonlyArray<Replica>, primary: Primary): { target: string; session: Session } {
+  let need = 0n
+  for (const lsn of [session.lastWriteLsn, session.lastReadLsn]) {
+    if (lsn !== null && parseLsn(lsn) > need) need = parseLsn(lsn)
+  }
+  const replica = replicas.find(r => parseLsn(r.replayLsn) >= need)
+  if (replica) return { target: replica.name, session: { ...session, lastReadLsn: replica.replayLsn } }
+  return { target: primary.name, session: { ...session, lastReadLsn: primary.currentLsn } }
+}
+function afterWrite(session: Session, commitLsn: string): Session {
+  const old = session.lastWriteLsn
+  const keepOld = old !== null && parseLsn(old) >= parseLsn(commitLsn)
+  return { ...session, lastWriteLsn: keepOld ? old : commitLsn }
+}
+</script>
+  <script type="wrong">
+type Session = { lastWriteLsn: string | null; lastReadLsn: string | null }
+type Replica = { name: string; replayLsn: string }
+type Primary = { name: string; currentLsn: string }
+function parseLsn(text: string): bigint {
+  const m = /^([0-9A-Fa-f]{1,8})\/([0-9A-Fa-f]{1,8})$/.exec(text)
+  if (!m) throw new Error(`LSN 格式不對：${text}`)
+  return (BigInt('0x' + m[1]) << 32n) + BigInt('0x' + m[2])
+}
+// 錯：讀 primary 時沒有更新 lastReadLsn
+function routeRead(session: Session, replicas: ReadonlyArray<Replica>, primary: Primary): { target: string; session: Session } {
+  let need = 0n
+  for (const lsn of [session.lastWriteLsn, session.lastReadLsn]) {
+    if (lsn !== null && parseLsn(lsn) > need) need = parseLsn(lsn)
+  }
+  const replica = replicas.find(r => parseLsn(r.replayLsn) >= need)
+  if (replica) return { target: replica.name, session: { ...session, lastReadLsn: replica.replayLsn } }
+  return { target: primary.name, session: { ...session } }
+}
+function afterWrite(session: Session, commitLsn: string): Session {
+  const old = session.lastWriteLsn
+  const keepOld = old !== null && parseLsn(old) >= parseLsn(commitLsn)
+  return { ...session, lastWriteLsn: keepOld ? old : commitLsn }
+}
+</script>
+  <script type="wrong">
+type Session = { lastWriteLsn: string | null; lastReadLsn: string | null }
+type Replica = { name: string; replayLsn: string }
+type Primary = { name: string; currentLsn: string }
+function parseLsn(text: string): bigint {
+  const m = /^([0-9A-Fa-f]{1,8})\/([0-9A-Fa-f]{1,8})$/.exec(text)
+  if (!m) throw new Error(`LSN 格式不對：${text}`)
+  return (BigInt('0x' + m[1]) << 32n) + BigInt('0x' + m[2])
+}
+function routeRead(session: Session, replicas: ReadonlyArray<Replica>, primary: Primary): { target: string; session: Session } {
+  let need = 0n
+  for (const lsn of [session.lastWriteLsn, session.lastReadLsn]) {
+    if (lsn !== null && parseLsn(lsn) > need) need = parseLsn(lsn)
+  }
+  const replica = replicas.find(r => parseLsn(r.replayLsn) >= need)
+  if (replica) return { target: replica.name, session: { ...session, lastReadLsn: replica.replayLsn } }
+  return { target: primary.name, session: { ...session, lastReadLsn: primary.currentLsn } }
+}
+// 錯：afterWrite 直接換成這次的 LSN，沒有取較大的
+function afterWrite(session: Session, commitLsn: string): Session {
+  return { ...session, lastWriteLsn: commitLsn }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2（選讀，對應「Quorum」一節）：實作 quorum 讀取。<code>replies</code> 依抵達順序排列，<code>null</code> 代表那台逾時或失敗。<code>quorumRead(replies, r)</code> 只用<strong>前 r 個成功的回應</strong>（讀到 r 個就回傳，不再等後面的）；不到 r 個就丟 <code>QuorumError</code>。回傳這 r 個裡版本最大的 <code>value</code>、<code>version</code>，以及 <code>repair</code>：這 r 個回應裡版本比較舊的副本名稱，依抵達順序。另寫 <code>isQuorum(n, r, w)</code>：三個都是正整數、R 和 W 都不超過 N，而且 R + W &gt; N 時回傳 true。</p>
+  <script type="start">
+type Reply = { replica: string; value: string; version: number }
+
+class QuorumError extends Error {
+  name = 'QuorumError'
+}
+
+function quorumRead(replies: ReadonlyArray<Reply | null>, r: number): { value: string; version: number; repair: string[] } {
+  throw new Error('TODO')
+}
+
+function isQuorum(n: number, r: number, w: number): boolean {
+  throw new Error('TODO')
+}
+
+// 自己試試看：r1 是舊價格，r2 是新價格，r3 雖然更新但第三個才到
+console.log(quorumRead([
+  { replica: 'r1', value: '拿鐵 110', version: 1 },
+  { replica: 'r2', value: '拿鐵 120', version: 2 },
+  { replica: 'r3', value: '拿鐵 125', version: 3 },
+], 2))
+console.log(isQuorum(3, 2, 2), isQuorum(3, 1, 1))
+</script>
+  <script type="answer">
+type Reply = { replica: string; value: string; version: number }
+
+class QuorumError extends Error {
+  name = 'QuorumError'
+}
+
+function quorumRead(replies: ReadonlyArray<Reply | null>, r: number): { value: string; version: number; repair: string[] } {
+  const got = replies.filter((x): x is Reply => x !== null).slice(0, r)
+  if (got.length < r) throw new QuorumError(`只收到 ${got.length} 個回應，需要 ${r} 個`)
+  const newest = got.reduce((a, b) => (b.version > a.version ? b : a))
+  return {
+    value: newest.value,
+    version: newest.version,
+    repair: got.filter(x => x.version < newest.version).map(x => x.replica),
+  }
+}
+
+function isQuorum(n: number, r: number, w: number): boolean {
+  const ok = (x: number) => Number.isInteger(x) && x > 0
+  return ok(n) && ok(r) && ok(w) && r <= n && w <= n && r + w > n
+}
+
+console.log(quorumRead([
+  { replica: 'r1', value: '拿鐵 110', version: 1 },
+  { replica: 'r2', value: '拿鐵 120', version: 2 },
+  { replica: 'r3', value: '拿鐵 125', version: 3 },
+], 2))
+console.log(isQuorum(3, 2, 2), isQuorum(3, 1, 1))
+</script>
+  <script type="tests">
+const A = (replica: string, value: string, version: number): Reply => ({ replica, value, version })
+const freeze = <T,>(x: T): T => { if (x && typeof x === 'object') { Object.values(x).forEach(freeze); Object.freeze(x) } return x }
+const quorumFails = (fn: () => unknown) => { try { fn() } catch (e) { return e instanceof QuorumError && e.name === 'QuorumError' } return false }
+
+assert.deepEqual(quorumRead(freeze([A('r1', '拿鐵 110', 1), A('r2', '拿鐵 120', 2), A('r3', '拿鐵 125', 3)]), 2), { value: '拿鐵 120', version: 2, repair: ['r1'] }, 'R=2：只能用前 2 個回應；r3 雖然更新，但沒有在讀到的 2 個裡')
+assert.deepEqual(quorumRead(freeze([A('r2', 'v2', 2), A('r1', 'v1', 1)]), 2), { value: 'v2', version: 2, repair: ['r1'] }, '新的先到時也要取版本最大的，不是第一個')
+assert.deepEqual(quorumRead(freeze([null, A('r2', 'v1', 1), null, A('r3', 'v2', 2), A('r1', 'v5', 5)]), 2), { value: 'v2', version: 2, repair: ['r2'] }, 'null 要跳過，往後找到 2 個成功的回應就停')
+assert.deepEqual(quorumRead(freeze([A('r1', 'v2', 2), A('r2', 'v2', 2), A('r3', 'v1', 1)]), 2), { value: 'v2', version: 2, repair: [] }, 'r3 第三個才到、沒有被讀到，不能放進 repair')
+assert.deepEqual(quorumRead(freeze([A('r1', 'v3', 3), A('r2', 'v3', 3)]), 2), { value: 'v3', version: 3, repair: [] }, '版本都一樣時不用修復')
+assert.deepEqual(quorumRead(freeze([A('r3', 'v1', 1), A('r1', 'v1', 1), A('r2', 'v4', 4)]), 3), { value: 'v4', version: 4, repair: ['r3', 'r1'] }, 'repair 依抵達順序列出所有讀到的舊副本')
+assert(quorumFails(() => quorumRead(freeze([A('r1', 'v1', 1), null, null]), 2)), '只有 1 個成功、需要 2 個：要丟 QuorumError，不能回傳部分結果')
+assert(quorumFails(() => quorumRead(freeze([]), 1)), '沒有任何回應時要丟 QuorumError')
+
+assert.equal(isQuorum(3, 2, 2), true, '(3, 2, 2)：2 + 2 > 3')
+assert.equal(isQuorum(3, 1, 3), true, '(3, 1, 3)：1 + 3 > 3')
+assert.equal(isQuorum(3, 1, 1), false, '(3, 1, 1)：1 + 1 沒有大於 3')
+assert.equal(isQuorum(3, 2, 1), false, '(3, 2, 1)：2 + 1 = 3，等於 N 不夠，要大於')
+assert.equal(isQuorum(3, 4, 1), false, '(3, 4, 1)：R 不能超過 N')
+assert.equal(isQuorum(3, 1, 4), false, '(3, 1, 4)：W 不能超過 N')
+assert.equal(isQuorum(5, 3, 3), true, '(5, 3, 3)')
+assert.equal(isQuorum(3, 0, 4), false, 'R 要是正整數')
+assert.equal(isQuorum(3, 2.5, 2), false, 'R 要是整數')
+assert.equal(isQuorum(3, 2, 1.5), false, 'W 要是整數')
+assert.equal(isQuorum(3.5, 2, 2), false, 'N 要是整數')
+
+const rand = (seed: number) => () => { seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296 }
+const rnd = rand(2)
+for (let i = 0; i < 300; i++) {
+  const n = 1 + Math.floor(rnd() * 5)
+  const replies = Array.from({ length: n }, (_, k) => (rnd() < 0.25 ? null : (() => { const v = Math.floor(rnd() * 4); return A(`r${k}`, `v${v}`, v) })()))
+  const r = 1 + Math.floor(rnd() * n)
+  const got = replies.filter((x): x is Reply => x !== null).slice(0, r)
+  const input = JSON.stringify(replies)
+  if (got.length < r) { assert(quorumFails(() => quorumRead(freeze(replies), r)), `回應不足要丟 QuorumError：r=${r} ${input}`); continue }
+  const best = got.reduce((a, b) => (b.version > a.version ? b : a))
+  assert.deepEqual(quorumRead(freeze(replies), r), { value: best.value, version: best.version, repair: got.filter(x => x.version < best.version).map(x => x.replica) }, `隨機情境不對：r=${r} ${input}`)
+}
+</script>
+  <script type="wrong">
+type Reply = { replica: string; value: string; version: number }
+class QuorumError extends Error {
+  name = 'QuorumError'
+}
+// 錯：直接取第一個回應
+function quorumRead(replies: ReadonlyArray<Reply | null>, r: number): { value: string; version: number; repair: string[] } {
+  const got = replies.filter((x): x is Reply => x !== null).slice(0, r)
+  if (got.length < r) throw new QuorumError('回應不足')
+  const first = got[0]
+  return { value: first.value, version: first.version, repair: got.filter(x => x.version < first.version).map(x => x.replica) }
+}
+function isQuorum(n: number, r: number, w: number): boolean {
+  const ok = (x: number) => Number.isInteger(x) && x > 0
+  return ok(n) && ok(r) && ok(w) && r <= n && w <= n && r + w > n
+}
+</script>
+  <script type="wrong">
+type Reply = { replica: string; value: string; version: number }
+class QuorumError extends Error {
+  name = 'QuorumError'
+}
+// 錯：用到前 r 個以外的回應
+function quorumRead(replies: ReadonlyArray<Reply | null>, r: number): { value: string; version: number; repair: string[] } {
+  const all = replies.filter((x): x is Reply => x !== null)
+  if (all.length < r) throw new QuorumError('回應不足')
+  const newest = all.reduce((a, b) => (b.version > a.version ? b : a))
+  return { value: newest.value, version: newest.version, repair: all.slice(0, r).filter(x => x.version < newest.version).map(x => x.replica) }
+}
+function isQuorum(n: number, r: number, w: number): boolean {
+  const ok = (x: number) => Number.isInteger(x) && x > 0
+  return ok(n) && ok(r) && ok(w) && r <= n && w <= n && r + w > n
+}
+</script>
+  <script type="wrong">
+type Reply = { replica: string; value: string; version: number }
+class QuorumError extends Error {
+  name = 'QuorumError'
+}
+// 錯：repair 把沒讀到的副本也算進去
+function quorumRead(replies: ReadonlyArray<Reply | null>, r: number): { value: string; version: number; repair: string[] } {
+  const all = replies.filter((x): x is Reply => x !== null)
+  const got = all.slice(0, r)
+  if (got.length < r) throw new QuorumError('回應不足')
+  const newest = got.reduce((a, b) => (b.version > a.version ? b : a))
+  return { value: newest.value, version: newest.version, repair: all.filter(x => x.version < newest.version).map(x => x.replica) }
+}
+function isQuorum(n: number, r: number, w: number): boolean {
+  const ok = (x: number) => Number.isInteger(x) && x > 0
+  return ok(n) && ok(r) && ok(w) && r <= n && w <= n && r + w > n
+}
+</script>
+  <script type="wrong">
+type Reply = { replica: string; value: string; version: number }
+class QuorumError extends Error {
+  name = 'QuorumError'
+}
+// 錯：回應不足時回傳部分結果
+function quorumRead(replies: ReadonlyArray<Reply | null>, r: number): { value: string; version: number; repair: string[] } {
+  const got = replies.filter((x): x is Reply => x !== null).slice(0, r)
+  if (got.length === 0) throw new QuorumError('沒有回應')
+  const newest = got.reduce((a, b) => (b.version > a.version ? b : a))
+  return { value: newest.value, version: newest.version, repair: got.filter(x => x.version < newest.version).map(x => x.replica) }
+}
+function isQuorum(n: number, r: number, w: number): boolean {
+  const ok = (x: number) => Number.isInteger(x) && x > 0
+  return ok(n) && ok(r) && ok(w) && r <= n && w <= n && r + w > n
+}
+</script>
+  <script type="wrong">
+type Reply = { replica: string; value: string; version: number }
+class QuorumError extends Error {
+  name = 'QuorumError'
+}
+function quorumRead(replies: ReadonlyArray<Reply | null>, r: number): { value: string; version: number; repair: string[] } {
+  const got = replies.filter((x): x is Reply => x !== null).slice(0, r)
+  if (got.length < r) throw new QuorumError('回應不足')
+  const newest = got.reduce((a, b) => (b.version > a.version ? b : a))
+  return { value: newest.value, version: newest.version, repair: got.filter(x => x.version < newest.version).map(x => x.replica) }
+}
+// 錯：R + W ≥ N
+function isQuorum(n: number, r: number, w: number): boolean {
+  const ok = (x: number) => Number.isInteger(x) && x > 0
+  return ok(n) && ok(r) && ok(w) && r <= n && w <= n && r + w >= n
+}
+</script>
+  <script type="wrong">
+type Reply = { replica: string; value: string; version: number }
+class QuorumError extends Error {
+  name = 'QuorumError'
+}
+function quorumRead(replies: ReadonlyArray<Reply | null>, r: number): { value: string; version: number; repair: string[] } {
+  const got = replies.filter((x): x is Reply => x !== null).slice(0, r)
+  if (got.length < r) throw new QuorumError('回應不足')
+  const newest = got.reduce((a, b) => (b.version > a.version ? b : a))
+  return { value: newest.value, version: newest.version, repair: got.filter(x => x.version < newest.version).map(x => x.replica) }
+}
+// 錯：沒有檢查是不是正整數
+function isQuorum(n: number, r: number, w: number): boolean {
+  return r > 0 && w > 0 && r <= n && w <= n && r + w > n
+}
+</script>
+  <script type="wrong">
+type Reply = { replica: string; value: string; version: number }
+class QuorumError extends Error {
+  name = 'QuorumError'
+}
+// 錯：回應不足時丟一般的 Error，呼叫端分不出是 quorum 不足還是其他錯
+function quorumRead(replies: ReadonlyArray<Reply | null>, r: number): { value: string; version: number; repair: string[] } {
+  const got = replies.filter((x): x is Reply => x !== null).slice(0, r)
+  if (got.length < r) throw new Error('回應不足')
+  const newest = got.reduce((a, b) => (b.version > a.version ? b : a))
+  return { value: newest.value, version: newest.version, repair: got.filter(x => x.version < newest.version).map(x => x.replica) }
+}
+function isQuorum(n: number, r: number, w: number): boolean {
+  const ok = (x: number) => Number.isInteger(x) && x > 0
+  return ok(n) && ok(r) && ok(w) && r <= n && w <= n && r + w > n
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3（選讀，對應「多個寫入點」一節）：寫版本向量的工具，再用它合併並行的購物車。</p>
+  <ul>
+    <li><code>compareVV(a, b)</code>：沒有的 key 視為 0。每一格都相等是 <code>'equal'</code>；a 的每一格都 ≤ b、至少一格 &lt; 是 <code>'before'</code>；反過來是 <code>'after'</code>；互有大小是 <code>'concurrent'</code>。</li>
+    <li><code>mergeVV(a, b)</code>：每個 key 取較大的值。<code>bump(vv, node)</code>：回傳 node 加 1 的新物件，不改輸入。</li>
+    <li><code>resolveSiblings(siblings)</code>：先丟掉被其他版本支配的（compareVV 是 <code>'before'</code>），剩下的版本 vv 全部合併、items 取聯集。items 一律去重、用 <code>sort()</code> 排序。</li>
+  </ul>
+  <script type="start">
+type VV = Readonly<Record<string, number>>
+type Order = 'equal' | 'before' | 'after' | 'concurrent'
+type Sibling = { vv: VV; items: readonly string[] }
+
+function compareVV(a: VV, b: VV): Order {
+  throw new Error('TODO')
+}
+
+function mergeVV(a: VV, b: VV): Record<string, number> {
+  throw new Error('TODO')
+}
+
+function bump(vv: VV, node: string): Record<string, number> {
+  throw new Error('TODO')
+}
+
+function resolveSiblings(siblings: ReadonlyArray<Sibling>): { vv: Record<string, number>; items: string[] } {
+  throw new Error('TODO')
+}
+
+// 自己試試看：手機和網頁同時改了購物車
+const phone: Sibling = { vv: { app: 2 }, items: ['拿鐵', '可頌'] }
+const web: Sibling = { vv: { app: 1, web: 1 }, items: ['拿鐵', '美式咖啡'] }
+console.log(compareVV(phone.vv, web.vv))
+console.log(resolveSiblings([phone, web]))
+</script>
+  <script type="answer">
+type VV = Readonly<Record<string, number>>
+type Order = 'equal' | 'before' | 'after' | 'concurrent'
+type Sibling = { vv: VV; items: readonly string[] }
+
+function compareVV(a: VV, b: VV): Order {
+  let less = false
+  let greater = false
+  for (const key of new Set([...Object.keys(a), ...Object.keys(b)])) {
+    const x = a[key] ?? 0
+    const y = b[key] ?? 0
+    if (x < y) less = true
+    if (x > y) greater = true
+  }
+  if (less && greater) return 'concurrent'
+  if (less) return 'before'
+  if (greater) return 'after'
+  return 'equal'
+}
+
+function mergeVV(a: VV, b: VV): Record<string, number> {
+  const out: Record<string, number> = { ...a }
+  for (const [key, n] of Object.entries(b)) out[key] = Math.max(out[key] ?? 0, n)
+  return out
+}
+
+function bump(vv: VV, node: string): Record<string, number> {
+  return { ...vv, [node]: (vv[node] ?? 0) + 1 }
+}
+
+function resolveSiblings(siblings: ReadonlyArray<Sibling>): { vv: Record<string, number>; items: string[] } {
+  const alive = siblings.filter(s => !siblings.some(o => compareVV(s.vv, o.vv) === 'before'))
+  return {
+    vv: alive.reduce<Record<string, number>>((acc, s) => mergeVV(acc, s.vv), {}),
+    items: [...new Set(alive.flatMap(s => s.items))].sort(),
+  }
+}
+
+const phone: Sibling = { vv: { app: 2 }, items: ['拿鐵', '可頌'] }
+const web: Sibling = { vv: { app: 1, web: 1 }, items: ['拿鐵', '美式咖啡'] }
+console.log(compareVV(phone.vv, web.vv))
+console.log(resolveSiblings([phone, web]))
+</script>
+  <script type="tests">
+const freeze = <T,>(x: T): T => { if (x && typeof x === 'object') { Object.values(x).forEach(freeze); Object.freeze(x) } return x }
+const cases: [VV, VV, Order, string][] = [
+  [{}, {}, 'equal', '兩個空的向量相等'],
+  [{ app: 1 }, { app: 1 }, 'equal', '完全相同'],
+  [{ app: 1, web: 0 }, { app: 1 }, 'equal', '沒有的 key 視為 0，所以 { app: 1, web: 0 } 等於 { app: 1 }'],
+  [{ app: 1 }, { app: 2 }, 'before', '{ app: 1 } 在 { app: 2 } 之前'],
+  [{ app: 2 }, { app: 1 }, 'after', '{ app: 2 } 在 { app: 1 } 之後'],
+  [{ app: 1 }, { app: 1, web: 1 }, 'before', 'a 沒有 web（視為 0），所以在 b 之前，不是並行'],
+  [{ app: 1, web: 1 }, { app: 1 }, 'after', 'b 沒有 web（視為 0），所以 a 在 b 之後'],
+  [{ app: 2 }, { web: 1 }, 'concurrent', '互有大小是並行：不能用總和比大小'],
+  [{ app: 3, web: 0 }, { app: 1, web: 2 }, 'concurrent', '總和 3 = 3 也不代表相等'],
+  [{ app: 1, web: 2, pos: 1 }, { app: 2, web: 2, pos: 1 }, 'before', '三個節點，只差一格'],
+]
+for (const [a, b, want, msg] of cases) assert.equal(compareVV(freeze(a), freeze(b)), want, `compareVV(${JSON.stringify(a)}, ${JSON.stringify(b)})：${msg}`)
+
+assert.deepEqual(mergeVV(freeze({ app: 1, web: 3 }), freeze({ app: 2, pos: 1 })), { app: 2, web: 3, pos: 1 }, 'mergeVV 每個 key 取較大的值')
+const v = freeze({ app: 1 })
+assert.deepEqual(bump(v, 'app'), { app: 2 }, 'bump 把該節點加 1')
+assert.deepEqual(bump(v, 'web'), { app: 1, web: 1 }, '沒有的節點從 0 開始加 1')
+assert.deepEqual(v, { app: 1 }, 'bump 不能修改輸入')
+
+assert.deepEqual(
+  resolveSiblings(freeze<Sibling[]>([{ vv: { app: 1 }, items: ['拿鐵', '可頌'] }, { vv: { app: 2 }, items: ['拿鐵'] }])),
+  { vv: { app: 2 }, items: ['拿鐵'] },
+  '新版刪掉了可頌，舊版被新版支配要丟掉，可頌不能復活')
+assert.deepEqual(
+  resolveSiblings(freeze<Sibling[]>([{ vv: { app: 2 }, items: ['拿鐵'] }, { vv: { app: 1 }, items: ['拿鐵', '可頌'] }])),
+  { vv: { app: 2 }, items: ['拿鐵'] },
+  '順序反過來也一樣：被支配的版本要丟掉')
+assert.deepEqual(
+  resolveSiblings(freeze<Sibling[]>([{ vv: { app: 2 }, items: ['拿鐵', '可頌'] }, { vv: { app: 1, web: 1 }, items: ['拿鐵', '美式咖啡'] }])),
+  { vv: { app: 2, web: 1 }, items: ['可頌', '拿鐵', '美式咖啡'].sort() },
+  '兩支並行的購物車：items 取聯集（去重、排序），vv 合併')
+assert.deepEqual(
+  resolveSiblings(freeze<Sibling[]>([{ vv: { app: 1 }, items: ['拿鐵', '可頌'] }, { vv: { app: 2 }, items: ['拿鐵'] }, { vv: { app: 1, web: 1 }, items: ['拿鐵', '伯爵紅茶'] }])),
+  { vv: { app: 2, web: 1 }, items: ['伯爵紅茶', '拿鐵'].sort() },
+  '最舊的版本被另外兩支支配，要先丟掉；剩下兩支並行才取聯集，可頌不能復活')
+assert.deepEqual(
+  resolveSiblings(freeze<Sibling[]>([{ vv: { app: 1 }, items: ['起司蛋糕', '拿鐵', '拿鐵'] }])),
+  { vv: { app: 1 }, items: ['拿鐵', '起司蛋糕'].sort() },
+  '只有一個版本時也要去重、排序')
+
+const rand = (seed: number) => () => { seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296 }
+const rnd = rand(3)
+const nodes = ['app', 'web', 'pos']
+const menu = ['美式咖啡', '拿鐵', '卡布奇諾', '伯爵紅茶', '可頌', '起司蛋糕']
+const refCompare = (a: VV, b: VV): Order => {
+  const ks = [...new Set([...Object.keys(a), ...Object.keys(b)])]
+  const lt = ks.some(k => (a[k] ?? 0) < (b[k] ?? 0))
+  const gt = ks.some(k => (a[k] ?? 0) > (b[k] ?? 0))
+  return lt && gt ? 'concurrent' : lt ? 'before' : gt ? 'after' : 'equal'
+}
+const randVV = () => { const o: Record<string, number> = {}; for (const k of nodes) if (rnd() < 0.7) o[k] = Math.floor(rnd() * 3); return o }
+// items 由 vv 決定，所以 vv 相同的版本 items 也相同
+const itemsOf = (vv: VV) => menu.filter((_, i) => nodes.reduce((h, k, j) => h + (vv[k] ?? 0) * (j + 2), i) % 3 === 0)
+for (let i = 0; i < 300; i++) {
+  const a = randVV(), b = randVV()
+  assert.equal(compareVV(freeze({ ...a }), freeze({ ...b })), refCompare(a, b), `compareVV(${JSON.stringify(a)}, ${JSON.stringify(b)}) 不對`)
+  const sibs = Array.from({ length: 1 + Math.floor(rnd() * 4) }, () => { const vv = randVV(); return { vv, items: itemsOf(vv) } })
+  const alive = sibs.filter(s => !sibs.some(o => refCompare(s.vv, o.vv) === 'before'))
+  const want = { vv: {} as Record<string, number>, items: [...new Set(alive.flatMap(s => s.items))].sort() }
+  for (const s of alive) for (const [k, n] of Object.entries(s.vv)) want.vv[k] = Math.max(want.vv[k] ?? 0, n)
+  assert.deepEqual(resolveSiblings(freeze(structuredClone(sibs))), want, `resolveSiblings 不對：${JSON.stringify(sibs)}`)
+}
+</script>
+  <script type="wrong">
+type VV = Readonly<Record<string, number>>
+type Order = 'equal' | 'before' | 'after' | 'concurrent'
+type Sibling = { vv: VV; items: readonly string[] }
+// 錯：用總和比大小
+function compareVV(a: VV, b: VV): Order {
+  const sum = (v: VV) => Object.values(v).reduce((x, y) => x + y, 0)
+  return sum(a) < sum(b) ? 'before' : sum(a) > sum(b) ? 'after' : 'equal'
+}
+function mergeVV(a: VV, b: VV): Record<string, number> {
+  const out: Record<string, number> = { ...a }
+  for (const [key, n] of Object.entries(b)) out[key] = Math.max(out[key] ?? 0, n)
+  return out
+}
+function bump(vv: VV, node: string): Record<string, number> {
+  return { ...vv, [node]: (vv[node] ?? 0) + 1 }
+}
+function resolveSiblings(siblings: ReadonlyArray<Sibling>): { vv: Record<string, number>; items: string[] } {
+  const alive = siblings.filter(s => !siblings.some(o => compareVV(s.vv, o.vv) === 'before'))
+  return { vv: alive.reduce<Record<string, number>>((acc, s) => mergeVV(acc, s.vv), {}), items: [...new Set(alive.flatMap(s => s.items))].sort() }
+}
+</script>
+  <script type="wrong">
+type VV = Readonly<Record<string, number>>
+type Order = 'equal' | 'before' | 'after' | 'concurrent'
+type Sibling = { vv: VV; items: readonly string[] }
+// 錯：key 不一樣就當成並行
+function compareVV(a: VV, b: VV): Order {
+  const ka = Object.keys(a).sort().join()
+  const kb = Object.keys(b).sort().join()
+  if (ka !== kb) return 'concurrent'
+  let less = false
+  let greater = false
+  for (const key of Object.keys(a)) {
+    if (a[key] < b[key]) less = true
+    if (a[key] > b[key]) greater = true
+  }
+  return less && greater ? 'concurrent' : less ? 'before' : greater ? 'after' : 'equal'
+}
+function mergeVV(a: VV, b: VV): Record<string, number> {
+  const out: Record<string, number> = { ...a }
+  for (const [key, n] of Object.entries(b)) out[key] = Math.max(out[key] ?? 0, n)
+  return out
+}
+function bump(vv: VV, node: string): Record<string, number> {
+  return { ...vv, [node]: (vv[node] ?? 0) + 1 }
+}
+function resolveSiblings(siblings: ReadonlyArray<Sibling>): { vv: Record<string, number>; items: string[] } {
+  const alive = siblings.filter(s => !siblings.some(o => compareVV(s.vv, o.vv) === 'before'))
+  return { vv: alive.reduce<Record<string, number>>((acc, s) => mergeVV(acc, s.vv), {}), items: [...new Set(alive.flatMap(s => s.items))].sort() }
+}
+</script>
+  <script type="wrong">
+type VV = Readonly<Record<string, number>>
+type Order = 'equal' | 'before' | 'after' | 'concurrent'
+type Sibling = { vv: VV; items: readonly string[] }
+function compareVV(a: VV, b: VV): Order {
+  let less = false
+  let greater = false
+  for (const key of new Set([...Object.keys(a), ...Object.keys(b)])) {
+    if ((a[key] ?? 0) < (b[key] ?? 0)) less = true
+    if ((a[key] ?? 0) > (b[key] ?? 0)) greater = true
+  }
+  return less && greater ? 'concurrent' : less ? 'before' : greater ? 'after' : 'equal'
+}
+function mergeVV(a: VV, b: VV): Record<string, number> {
+  const out: Record<string, number> = { ...a }
+  for (const [key, n] of Object.entries(b)) out[key] = Math.max(out[key] ?? 0, n)
+  return out
+}
+function bump(vv: VV, node: string): Record<string, number> {
+  return { ...vv, [node]: (vv[node] ?? 0) + 1 }
+}
+// 錯：沒有丟掉被支配的版本，刪掉的品項復活
+function resolveSiblings(siblings: ReadonlyArray<Sibling>): { vv: Record<string, number>; items: string[] } {
+  return { vv: siblings.reduce<Record<string, number>>((acc, s) => mergeVV(acc, s.vv), {}), items: [...new Set(siblings.flatMap(s => s.items))].sort() }
+}
+</script>
+  <script type="wrong">
+type VV = Readonly<Record<string, number>>
+type Order = 'equal' | 'before' | 'after' | 'concurrent'
+type Sibling = { vv: VV; items: readonly string[] }
+function compareVV(a: VV, b: VV): Order {
+  let less = false
+  let greater = false
+  for (const key of new Set([...Object.keys(a), ...Object.keys(b)])) {
+    if ((a[key] ?? 0) < (b[key] ?? 0)) less = true
+    if ((a[key] ?? 0) > (b[key] ?? 0)) greater = true
+  }
+  return less && greater ? 'concurrent' : less ? 'before' : greater ? 'after' : 'equal'
+}
+function mergeVV(a: VV, b: VV): Record<string, number> {
+  const out: Record<string, number> = { ...a }
+  for (const [key, n] of Object.entries(b)) out[key] = Math.max(out[key] ?? 0, n)
+  return out
+}
+// 錯：直接修改輸入
+function bump(vv: VV, node: string): Record<string, number> {
+  const m = vv as Record<string, number>
+  m[node] = (m[node] ?? 0) + 1
+  return m
+}
+function resolveSiblings(siblings: ReadonlyArray<Sibling>): { vv: Record<string, number>; items: string[] } {
+  const alive = siblings.filter(s => !siblings.some(o => compareVV(s.vv, o.vv) === 'before'))
+  return { vv: alive.reduce<Record<string, number>>((acc, s) => mergeVV(acc, s.vv), {}), items: [...new Set(alive.flatMap(s => s.items))].sort() }
+}
+</script>
+  <script type="wrong">
+type VV = Readonly<Record<string, number>>
+type Order = 'equal' | 'before' | 'after' | 'concurrent'
+type Sibling = { vv: VV; items: readonly string[] }
+// 錯：只看 a 有的 key，b 多出來的節點被忽略
+function compareVV(a: VV, b: VV): Order {
+  let less = false
+  let greater = false
+  for (const key of Object.keys(a)) {
+    if (a[key] < (b[key] ?? 0)) less = true
+    if (a[key] > (b[key] ?? 0)) greater = true
+  }
+  return less && greater ? 'concurrent' : less ? 'before' : greater ? 'after' : 'equal'
+}
+function mergeVV(a: VV, b: VV): Record<string, number> {
+  const out: Record<string, number> = { ...a }
+  for (const [key, n] of Object.entries(b)) out[key] = Math.max(out[key] ?? 0, n)
+  return out
+}
+function bump(vv: VV, node: string): Record<string, number> {
+  return { ...vv, [node]: (vv[node] ?? 0) + 1 }
+}
+function resolveSiblings(siblings: ReadonlyArray<Sibling>): { vv: Record<string, number>; items: string[] } {
+  const alive = siblings.filter(s => !siblings.some(o => compareVV(s.vv, o.vv) === 'before'))
+  return { vv: alive.reduce<Record<string, number>>((acc, s) => mergeVV(acc, s.vv), {}), items: [...new Set(alive.flatMap(s => s.items))].sort() }
+}
+</script>
+  <script type="wrong">
+type VV = Readonly<Record<string, number>>
+type Order = 'equal' | 'before' | 'after' | 'concurrent'
+type Sibling = { vv: VV; items: readonly string[] }
+function compareVV(a: VV, b: VV): Order {
+  let less = false
+  let greater = false
+  for (const key of new Set([...Object.keys(a), ...Object.keys(b)])) {
+    if ((a[key] ?? 0) < (b[key] ?? 0)) less = true
+    if ((a[key] ?? 0) > (b[key] ?? 0)) greater = true
+  }
+  return less && greater ? 'concurrent' : less ? 'before' : greater ? 'after' : 'equal'
+}
+// 錯：mergeVV 只看 a 有的 key
+function mergeVV(a: VV, b: VV): Record<string, number> {
+  const out: Record<string, number> = {}
+  for (const key of Object.keys(a)) out[key] = Math.max(a[key], b[key] ?? 0)
+  return out
+}
+function bump(vv: VV, node: string): Record<string, number> {
+  return { ...vv, [node]: (vv[node] ?? 0) + 1 }
+}
+function resolveSiblings(siblings: ReadonlyArray<Sibling>): { vv: Record<string, number>; items: string[] } {
+  const alive = siblings.filter(s => !siblings.some(o => compareVV(s.vv, o.vv) === 'before'))
+  return { vv: alive.reduce<Record<string, number>>((acc, s) => mergeVV(acc, s.vv), {}), items: [...new Set(alive.flatMap(s => s.items))].sort() }
+}
+</script>
+  <script type="wrong">
+type VV = Readonly<Record<string, number>>
+type Order = 'equal' | 'before' | 'after' | 'concurrent'
+type Sibling = { vv: VV; items: readonly string[] }
+function compareVV(a: VV, b: VV): Order {
+  let less = false
+  let greater = false
+  for (const key of new Set([...Object.keys(a), ...Object.keys(b)])) {
+    if ((a[key] ?? 0) < (b[key] ?? 0)) less = true
+    if ((a[key] ?? 0) > (b[key] ?? 0)) greater = true
+  }
+  return less && greater ? 'concurrent' : less ? 'before' : greater ? 'after' : 'equal'
+}
+function mergeVV(a: VV, b: VV): Record<string, number> {
+  const out: Record<string, number> = { ...a }
+  for (const [key, n] of Object.entries(b)) out[key] = Math.max(out[key] ?? 0, n)
+  return out
+}
+function bump(vv: VV, node: string): Record<string, number> {
+  return { ...vv, [node]: (vv[node] ?? 0) + 1 }
+}
+// 錯：並行時只留第一個版本（像 LWW 一樣丟掉另一支的加入）
+function resolveSiblings(siblings: ReadonlyArray<Sibling>): { vv: Record<string, number>; items: string[] } {
+  const alive = siblings.filter(s => !siblings.some(o => compareVV(s.vv, o.vv) === 'before'))
+  return { vv: alive.reduce<Record<string, number>>((acc, s) => mergeVV(acc, s.vv), {}), items: [...new Set(alive[0].items)].sort() }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 4：替咖啡店的 8 種讀取選「夠用的最弱」保證，填好 <code>READ_POLICY</code>：<code>'primary'</code>（一定要最新）、<code>'read-your-writes'</code>（至少看得到自己剛寫的）、<code>'replica-ok'</code>（舊一點沒關係）。每個 <code>why</code> 寫一句自己的理由（至少 8 個字，不能重複）。再寫 <code>routeFor</code>：<code>primary</code> 永遠讀 primary；<code>read-your-writes</code> 用練習 1 的 <code>routeRead</code>（已經寫好）；<code>replica-ok</code> 讀陣列裡第一台 replica，沒有 replica 才讀 primary。<code>primary</code> 和 <code>replica-ok</code> 都回傳原本的 session，不更新。</p>
+  <script type="start">
+type Session = { lastWriteLsn: string | null; lastReadLsn: string | null }
+type Replica = { name: string; replayLsn: string }
+type Primary = { name: string; currentLsn: string }
+
+// ── 練習 1 的答案，已經寫好 ──
+function parseLsn(text: string): bigint {
+  const m = /^([0-9A-Fa-f]{1,8})\/([0-9A-Fa-f]{1,8})$/.exec(text)
+  if (!m) throw new Error(`LSN 格式不對：${text}`)
+  return (BigInt('0x' + m[1]) << 32n) + BigInt('0x' + m[2])
+}
+function routeRead(session: Session, replicas: ReadonlyArray<Replica>, primary: Primary): { target: string; session: Session } {
+  let need = 0n
+  for (const lsn of [session.lastWriteLsn, session.lastReadLsn]) {
+    if (lsn !== null && parseLsn(lsn) > need) need = parseLsn(lsn)
+  }
+  const replica = replicas.find(r => parseLsn(r.replayLsn) >= need)
+  if (replica) return { target: replica.name, session: { ...session, lastReadLsn: replica.replayLsn } }
+  return { target: primary.name, session: { ...session, lastReadLsn: primary.currentLsn } }
+}
+// ── 以下是這一題 ──
+
+type ReadName =
+  | 'checkoutPrice'            // 結帳時算金額用的商品價格
+  | 'stockCheck'               // 扣庫存前判斷還有沒有貨
+  | 'paymentStatusForRefund'   // 退款前確認這筆付款的狀態
+  | 'menu'                     // App 首頁的菜單
+  | 'myOrdersAfterCheckout'    // 結帳後跳轉的「我的訂單」
+  | 'stampBalanceAfterRedeem'  // 兌換集點後顯示的剩餘點數
+  | 'dailyReport'              // 店長看的每日營收報表
+  | 'recommendations'          // 「你可能也喜歡」推薦商品
+type Need = 'primary' | 'read-your-writes' | 'replica-ok'
+
+const READ_POLICY: Record<ReadName, { need: Need; why: string }> = {
+  checkoutPrice: { need: 'replica-ok', why: '' },
+  stockCheck: { need: 'replica-ok', why: '' },
+  paymentStatusForRefund: { need: 'replica-ok', why: '' },
+  menu: { need: 'replica-ok', why: '' },
+  myOrdersAfterCheckout: { need: 'replica-ok', why: '' },
+  stampBalanceAfterRedeem: { need: 'replica-ok', why: '' },
+  dailyReport: { need: 'replica-ok', why: '' },
+  recommendations: { need: 'replica-ok', why: '' },
+}
+
+function routeFor(name: ReadName, session: Session, replicas: ReadonlyArray<Replica>, primary: Primary): { target: string; session: Session } {
+  throw new Error('TODO')
+}
+
+// 自己試試看：剛寫到 0/40，replica-a 落後在 0/10
+const s: Session = { lastWriteLsn: '0/40', lastReadLsn: null }
+const replicas = [{ name: 'replica-a', replayLsn: '0/10' }]
+const primary = { name: 'primary', currentLsn: '0/50' }
+console.log(routeFor('menu', s, replicas, primary).target)
+console.log(routeFor('myOrdersAfterCheckout', s, replicas, primary).target)
+</script>
+  <script type="answer">
+type Session = { lastWriteLsn: string | null; lastReadLsn: string | null }
+type Replica = { name: string; replayLsn: string }
+type Primary = { name: string; currentLsn: string }
+
+function parseLsn(text: string): bigint {
+  const m = /^([0-9A-Fa-f]{1,8})\/([0-9A-Fa-f]{1,8})$/.exec(text)
+  if (!m) throw new Error(`LSN 格式不對：${text}`)
+  return (BigInt('0x' + m[1]) << 32n) + BigInt('0x' + m[2])
+}
+function routeRead(session: Session, replicas: ReadonlyArray<Replica>, primary: Primary): { target: string; session: Session } {
+  let need = 0n
+  for (const lsn of [session.lastWriteLsn, session.lastReadLsn]) {
+    if (lsn !== null && parseLsn(lsn) > need) need = parseLsn(lsn)
+  }
+  const replica = replicas.find(r => parseLsn(r.replayLsn) >= need)
+  if (replica) return { target: replica.name, session: { ...session, lastReadLsn: replica.replayLsn } }
+  return { target: primary.name, session: { ...session, lastReadLsn: primary.currentLsn } }
+}
+
+type ReadName =
+  | 'checkoutPrice'
+  | 'stockCheck'
+  | 'paymentStatusForRefund'
+  | 'menu'
+  | 'myOrdersAfterCheckout'
+  | 'stampBalanceAfterRedeem'
+  | 'dailyReport'
+  | 'recommendations'
+type Need = 'primary' | 'read-your-writes' | 'replica-ok'
+
+const READ_POLICY: Record<ReadName, { need: Need; why: string }> = {
+  checkoutPrice: { need: 'primary', why: '價格剛調整時用舊價格結帳會收錯錢' },
+  stockCheck: { need: 'primary', why: '用落後的庫存判斷會超賣，要退款道歉' },
+  paymentStatusForRefund: { need: 'primary', why: '付款狀態讀到舊的可能重複退款，錢拿不回來' },
+  menu: { need: 'replica-ok', why: '菜單晚幾秒更新沒有人會發現，量又最大' },
+  myOrdersAfterCheckout: { need: 'read-your-writes', why: '顧客一定要看到自己剛下的單，別人的不急' },
+  stampBalanceAfterRedeem: { need: 'read-your-writes', why: '剛兌換完點數沒變少，顧客會以為沒成功又按一次' },
+  dailyReport: { need: 'replica-ok', why: '報表查詢很重，落後幾秒不影響店長判斷' },
+  recommendations: { need: 'replica-ok', why: '推薦本來就不精確，舊一點也沒差' },
+}
+
+function routeFor(name: ReadName, session: Session, replicas: ReadonlyArray<Replica>, primary: Primary): { target: string; session: Session } {
+  const need = READ_POLICY[name].need
+  if (need === 'primary') return { target: primary.name, session }
+  if (need === 'read-your-writes') return routeRead(session, replicas, primary)
+  return { target: replicas[0]?.name ?? primary.name, session }
+}
+
+const s: Session = { lastWriteLsn: '0/40', lastReadLsn: null }
+const replicas = [{ name: 'replica-a', replayLsn: '0/10' }]
+const primary = { name: 'primary', currentLsn: '0/50' }
+console.log(routeFor('menu', s, replicas, primary).target)
+console.log(routeFor('myOrdersAfterCheckout', s, replicas, primary).target)
+</script>
+  <script type="tests">
+const want: Record<ReadName, Need> = {
+  checkoutPrice: 'primary', stockCheck: 'primary', paymentStatusForRefund: 'primary',
+  myOrdersAfterCheckout: 'read-your-writes', stampBalanceAfterRedeem: 'read-your-writes',
+  menu: 'replica-ok', dailyReport: 'replica-ok', recommendations: 'replica-ok',
+}
+const names = Object.keys(want) as ReadName[]
+const off = names.filter(k => READ_POLICY[k]?.need !== want[k])
+assert.deepEqual(off, [], `這幾種讀取的保證還要再想想：${off.join('、')}（想想讀到舊資料會發生什麼事，以及它是不是「自己剛寫的」）`)
+const short = names.filter(k => [...(READ_POLICY[k].why ?? '').trim()].length < 8)
+assert.deepEqual(short, [], `這幾個 why 要寫一句至少 8 個字的理由：${short.join('、')}`)
+assert.equal(new Set(names.map(k => READ_POLICY[k].why.trim())).size, names.length, '每個 why 都要寫各自的理由，不能重複')
+
+const freeze = <T,>(x: T): T => { if (x && typeof x === 'object') { Object.values(x).forEach(freeze); Object.freeze(x) } return x }
+const P = freeze({ name: 'primary', currentLsn: '0/50' })
+const s = freeze({ lastWriteLsn: '0/40', lastReadLsn: null } as Session)
+const lagging = freeze([{ name: 'a', replayLsn: '0/10' }])
+const caught = freeze([{ name: 'b', replayLsn: '0/45' }])
+
+for (const k of ['checkoutPrice', 'stockCheck', 'paymentStatusForRefund'] as const) {
+  const r = routeFor(k, s, caught, P)
+  assert.equal(r.target, 'primary', `${k} 要讀 primary，即使 replica 已經追上`)
+  assert.deepEqual(r.session, { lastWriteLsn: '0/40', lastReadLsn: null }, `${k} 讀 primary 時 session 不變`)
+}
+let r = routeFor('myOrdersAfterCheckout', s, lagging, P)
+assert.equal(r.target, 'primary', '剛寫到 0/40、replica 只到 0/10：「我的訂單」要讀 primary，不然看不到剛下的單')
+r = routeFor('myOrdersAfterCheckout', s, caught, P)
+assert.equal(r.target, 'b', 'replica 已經追上 0/40，「我的訂單」就讀 replica')
+assert.equal(r.session.lastReadLsn, '0/45', 'read-your-writes 要用 routeRead，session 會更新')
+r = routeFor('stampBalanceAfterRedeem', s, lagging, P)
+assert.equal(r.target, 'primary', '剛兌換點數、replica 落後：要讀 primary')
+for (const k of ['menu', 'dailyReport', 'recommendations'] as const) {
+  r = routeFor(k, s, lagging, P)
+  assert.equal(r.target, 'a', `${k} 可以讀落後的 replica，不要打 primary`)
+  assert.deepEqual(r.session, { lastWriteLsn: '0/40', lastReadLsn: null }, `${k} 不能更新 session：不然下一個「我的訂單」會被迫等更新的 replica`)
+}
+assert.equal(routeFor('menu', s, freeze([]), P).target, 'primary', '沒有 replica 時才讀 primary')
+</script>
+  <script type="wrong">
+type Session = { lastWriteLsn: string | null; lastReadLsn: string | null }
+type Replica = { name: string; replayLsn: string }
+type Primary = { name: string; currentLsn: string }
+type ReadName = 'checkoutPrice' | 'stockCheck' | 'paymentStatusForRefund' | 'menu' | 'myOrdersAfterCheckout' | 'stampBalanceAfterRedeem' | 'dailyReport' | 'recommendations'
+type Need = 'primary' | 'read-your-writes' | 'replica-ok'
+// 錯：全部讀 primary，安全但 replica 形同虛設
+const READ_POLICY: Record<ReadName, { need: Need; why: string }> = {
+  checkoutPrice: { need: 'primary', why: '價格剛調整時用舊價格結帳會收錯錢' },
+  stockCheck: { need: 'primary', why: '用落後的庫存判斷會超賣，要退款道歉' },
+  paymentStatusForRefund: { need: 'primary', why: '付款狀態讀到舊的可能重複退款' },
+  menu: { need: 'primary', why: '菜單也讀 primary 比較保險一點' },
+  myOrdersAfterCheckout: { need: 'primary', why: '顧客一定要看到自己剛下的單' },
+  stampBalanceAfterRedeem: { need: 'primary', why: '剛兌換完點數沒變少顧客會緊張' },
+  dailyReport: { need: 'primary', why: '報表的數字要準確才能做決定' },
+  recommendations: { need: 'primary', why: '推薦也統一讀 primary 好管理' },
+}
+function routeFor(name: ReadName, session: Session, replicas: ReadonlyArray<Replica>, primary: Primary): { target: string; session: Session } {
+  return { target: primary.name, session }
+}
+</script>
+  <script type="wrong">
+type Session = { lastWriteLsn: string | null; lastReadLsn: string | null }
+type Replica = { name: string; replayLsn: string }
+type Primary = { name: string; currentLsn: string }
+type ReadName = 'checkoutPrice' | 'stockCheck' | 'paymentStatusForRefund' | 'menu' | 'myOrdersAfterCheckout' | 'stampBalanceAfterRedeem' | 'dailyReport' | 'recommendations'
+type Need = 'primary' | 'read-your-writes' | 'replica-ok'
+// 錯：全部讀 replica，結帳會用到舊價格
+const READ_POLICY: Record<ReadName, { need: Need; why: string }> = {
+  checkoutPrice: { need: 'replica-ok', why: '價格很少變，讀 replica 就好' },
+  stockCheck: { need: 'replica-ok', why: '庫存差一點點應該沒關係吧' },
+  paymentStatusForRefund: { need: 'replica-ok', why: '付款狀態通常早就同步好了' },
+  menu: { need: 'replica-ok', why: '菜單晚幾秒更新沒有人會發現' },
+  myOrdersAfterCheckout: { need: 'replica-ok', why: '訂單列表讀 replica 減輕負擔' },
+  stampBalanceAfterRedeem: { need: 'replica-ok', why: '點數晚一點更新顧客會再整理' },
+  dailyReport: { need: 'replica-ok', why: '報表查詢很重，落後幾秒不影響' },
+  recommendations: { need: 'replica-ok', why: '推薦本來就不精確，舊一點也沒差' },
+}
+function routeFor(name: ReadName, session: Session, replicas: ReadonlyArray<Replica>, primary: Primary): { target: string; session: Session } {
+  return { target: replicas[0]?.name ?? primary.name, session }
+}
+</script>
+  <script type="wrong">
+type Session = { lastWriteLsn: string | null; lastReadLsn: string | null }
+type Replica = { name: string; replayLsn: string }
+type Primary = { name: string; currentLsn: string }
+function parseLsn(text: string): bigint {
+  const m = /^([0-9A-Fa-f]{1,8})\/([0-9A-Fa-f]{1,8})$/.exec(text)
+  if (!m) throw new Error(`LSN 格式不對：${text}`)
+  return (BigInt('0x' + m[1]) << 32n) + BigInt('0x' + m[2])
+}
+function routeRead(session: Session, replicas: ReadonlyArray<Replica>, primary: Primary): { target: string; session: Session } {
+  let need = 0n
+  for (const lsn of [session.lastWriteLsn, session.lastReadLsn]) {
+    if (lsn !== null && parseLsn(lsn) > need) need = parseLsn(lsn)
+  }
+  const replica = replicas.find(r => parseLsn(r.replayLsn) >= need)
+  if (replica) return { target: replica.name, session: { ...session, lastReadLsn: replica.replayLsn } }
+  return { target: primary.name, session: { ...session, lastReadLsn: primary.currentLsn } }
+}
+type ReadName = 'checkoutPrice' | 'stockCheck' | 'paymentStatusForRefund' | 'menu' | 'myOrdersAfterCheckout' | 'stampBalanceAfterRedeem' | 'dailyReport' | 'recommendations'
+type Need = 'primary' | 'read-your-writes' | 'replica-ok'
+// 錯：「我的訂單」選了 replica-ok，剛下的單看不到
+const READ_POLICY: Record<ReadName, { need: Need; why: string }> = {
+  checkoutPrice: { need: 'primary', why: '價格剛調整時用舊價格結帳會收錯錢' },
+  stockCheck: { need: 'primary', why: '用落後的庫存判斷會超賣，要退款道歉' },
+  paymentStatusForRefund: { need: 'primary', why: '付款狀態讀到舊的可能重複退款' },
+  menu: { need: 'replica-ok', why: '菜單晚幾秒更新沒有人會發現' },
+  myOrdersAfterCheckout: { need: 'replica-ok', why: '訂單列表讀 replica 減輕負擔' },
+  stampBalanceAfterRedeem: { need: 'read-your-writes', why: '剛兌換完點數沒變少顧客會緊張' },
+  dailyReport: { need: 'replica-ok', why: '報表查詢很重，落後幾秒不影響' },
+  recommendations: { need: 'replica-ok', why: '推薦本來就不精確，舊一點也沒差' },
+}
+function routeFor(name: ReadName, session: Session, replicas: ReadonlyArray<Replica>, primary: Primary): { target: string; session: Session } {
+  const need = READ_POLICY[name].need
+  if (need === 'primary') return { target: primary.name, session }
+  if (need === 'read-your-writes') return routeRead(session, replicas, primary)
+  return { target: replicas[0]?.name ?? primary.name, session }
+}
+</script>
+  <script type="wrong">
+type Session = { lastWriteLsn: string | null; lastReadLsn: string | null }
+type Replica = { name: string; replayLsn: string }
+type Primary = { name: string; currentLsn: string }
+function parseLsn(text: string): bigint {
+  const m = /^([0-9A-Fa-f]{1,8})\/([0-9A-Fa-f]{1,8})$/.exec(text)
+  if (!m) throw new Error(`LSN 格式不對：${text}`)
+  return (BigInt('0x' + m[1]) << 32n) + BigInt('0x' + m[2])
+}
+function routeRead(session: Session, replicas: ReadonlyArray<Replica>, primary: Primary): { target: string; session: Session } {
+  let need = 0n
+  for (const lsn of [session.lastWriteLsn, session.lastReadLsn]) {
+    if (lsn !== null && parseLsn(lsn) > need) need = parseLsn(lsn)
+  }
+  const replica = replicas.find(r => parseLsn(r.replayLsn) >= need)
+  if (replica) return { target: replica.name, session: { ...session, lastReadLsn: replica.replayLsn } }
+  return { target: primary.name, session: { ...session, lastReadLsn: primary.currentLsn } }
+}
+type ReadName = 'checkoutPrice' | 'stockCheck' | 'paymentStatusForRefund' | 'menu' | 'myOrdersAfterCheckout' | 'stampBalanceAfterRedeem' | 'dailyReport' | 'recommendations'
+type Need = 'primary' | 'read-your-writes' | 'replica-ok'
+const READ_POLICY: Record<ReadName, { need: Need; why: string }> = {
+  checkoutPrice: { need: 'primary', why: '價格剛調整時用舊價格結帳會收錯錢' },
+  stockCheck: { need: 'primary', why: '用落後的庫存判斷會超賣，要退款道歉' },
+  paymentStatusForRefund: { need: 'primary', why: '付款狀態讀到舊的可能重複退款' },
+  menu: { need: 'replica-ok', why: '菜單晚幾秒更新沒有人會發現' },
+  myOrdersAfterCheckout: { need: 'read-your-writes', why: '顧客一定要看到自己剛下的單' },
+  stampBalanceAfterRedeem: { need: 'read-your-writes', why: '剛兌換完點數沒變少顧客會緊張' },
+  dailyReport: { need: 'replica-ok', why: '報表查詢很重，落後幾秒不影響' },
+  recommendations: { need: 'replica-ok', why: '推薦本來就不精確，舊一點也沒差' },
+}
+// 錯：replica-ok 也更新了 session
+function routeFor(name: ReadName, session: Session, replicas: ReadonlyArray<Replica>, primary: Primary): { target: string; session: Session } {
+  const need = READ_POLICY[name].need
+  if (need === 'primary') return { target: primary.name, session }
+  if (need === 'read-your-writes') return routeRead(session, replicas, primary)
+  const replica = replicas[0]
+  return replica
+    ? { target: replica.name, session: { ...session, lastReadLsn: replica.replayLsn } }
+    : { target: primary.name, session: { ...session, lastReadLsn: primary.currentLsn } }
+}
+</script>
+  <script type="wrong">
+type Session = { lastWriteLsn: string | null; lastReadLsn: string | null }
+type Replica = { name: string; replayLsn: string }
+type Primary = { name: string; currentLsn: string }
+function parseLsn(text: string): bigint {
+  const m = /^([0-9A-Fa-f]{1,8})\/([0-9A-Fa-f]{1,8})$/.exec(text)
+  if (!m) throw new Error(`LSN 格式不對：${text}`)
+  return (BigInt('0x' + m[1]) << 32n) + BigInt('0x' + m[2])
+}
+function routeRead(session: Session, replicas: ReadonlyArray<Replica>, primary: Primary): { target: string; session: Session } {
+  let need = 0n
+  for (const lsn of [session.lastWriteLsn, session.lastReadLsn]) {
+    if (lsn !== null && parseLsn(lsn) > need) need = parseLsn(lsn)
+  }
+  const replica = replicas.find(r => parseLsn(r.replayLsn) >= need)
+  if (replica) return { target: replica.name, session: { ...session, lastReadLsn: replica.replayLsn } }
+  return { target: primary.name, session: { ...session, lastReadLsn: primary.currentLsn } }
+}
+type ReadName = 'checkoutPrice' | 'stockCheck' | 'paymentStatusForRefund' | 'menu' | 'myOrdersAfterCheckout' | 'stampBalanceAfterRedeem' | 'dailyReport' | 'recommendations'
+type Need = 'primary' | 'read-your-writes' | 'replica-ok'
+// 錯：why 全部寫同一句
+const why = '依照資料的重要程度來決定'
+const READ_POLICY: Record<ReadName, { need: Need; why: string }> = {
+  checkoutPrice: { need: 'primary', why },
+  stockCheck: { need: 'primary', why },
+  paymentStatusForRefund: { need: 'primary', why },
+  menu: { need: 'replica-ok', why },
+  myOrdersAfterCheckout: { need: 'read-your-writes', why },
+  stampBalanceAfterRedeem: { need: 'read-your-writes', why },
+  dailyReport: { need: 'replica-ok', why },
+  recommendations: { need: 'replica-ok', why },
+}
+function routeFor(name: ReadName, session: Session, replicas: ReadonlyArray<Replica>, primary: Primary): { target: string; session: Session } {
+  const need = READ_POLICY[name].need
+  if (need === 'primary') return { target: primary.name, session }
+  if (need === 'read-your-writes') return routeRead(session, replicas, primary)
+  return { target: replicas[0]?.name ?? primary.name, session }
+}
+</script>
+  <script type="wrong">
+type Session = { lastWriteLsn: string | null; lastReadLsn: string | null }
+type Replica = { name: string; replayLsn: string }
+type Primary = { name: string; currentLsn: string }
+type ReadName = 'checkoutPrice' | 'stockCheck' | 'paymentStatusForRefund' | 'menu' | 'myOrdersAfterCheckout' | 'stampBalanceAfterRedeem' | 'dailyReport' | 'recommendations'
+type Need = 'primary' | 'read-your-writes' | 'replica-ok'
+const READ_POLICY: Record<ReadName, { need: Need; why: string }> = {
+  checkoutPrice: { need: 'primary', why: '價格剛調整時用舊價格結帳會收錯錢' },
+  stockCheck: { need: 'primary', why: '用落後的庫存判斷會超賣，要退款道歉' },
+  paymentStatusForRefund: { need: 'primary', why: '付款狀態讀到舊的可能重複退款' },
+  menu: { need: 'replica-ok', why: '菜單晚幾秒更新沒有人會發現' },
+  myOrdersAfterCheckout: { need: 'read-your-writes', why: '顧客一定要看到自己剛下的單' },
+  stampBalanceAfterRedeem: { need: 'read-your-writes', why: '剛兌換完點數沒變少顧客會緊張' },
+  dailyReport: { need: 'replica-ok', why: '報表查詢很重，落後幾秒不影響' },
+  recommendations: { need: 'replica-ok', why: '推薦本來就不精確，舊一點也沒差' },
+}
+// 錯：read-your-writes 沒有看 LSN，直接讀第一台 replica
+function routeFor(name: ReadName, session: Session, replicas: ReadonlyArray<Replica>, primary: Primary): { target: string; session: Session } {
+  const need = READ_POLICY[name].need
+  if (need === 'primary') return { target: primary.name, session }
+  return { target: replicas[0]?.name ?? primary.name, session }
+}
+</script>
+  <script type="wrong">
+type Session = { lastWriteLsn: string | null; lastReadLsn: string | null }
+type Replica = { name: string; replayLsn: string }
+type Primary = { name: string; currentLsn: string }
+function parseLsn(text: string): bigint {
+  const m = /^([0-9A-Fa-f]{1,8})\/([0-9A-Fa-f]{1,8})$/.exec(text)
+  if (!m) throw new Error(`LSN 格式不對：${text}`)
+  return (BigInt('0x' + m[1]) << 32n) + BigInt('0x' + m[2])
+}
+function routeRead(session: Session, replicas: ReadonlyArray<Replica>, primary: Primary): { target: string; session: Session } {
+  let need = 0n
+  for (const lsn of [session.lastWriteLsn, session.lastReadLsn]) {
+    if (lsn !== null && parseLsn(lsn) > need) need = parseLsn(lsn)
+  }
+  const replica = replicas.find(r => parseLsn(r.replayLsn) >= need)
+  if (replica) return { target: replica.name, session: { ...session, lastReadLsn: replica.replayLsn } }
+  return { target: primary.name, session: { ...session, lastReadLsn: primary.currentLsn } }
+}
+type ReadName = 'checkoutPrice' | 'stockCheck' | 'paymentStatusForRefund' | 'menu' | 'myOrdersAfterCheckout' | 'stampBalanceAfterRedeem' | 'dailyReport' | 'recommendations'
+type Need = 'primary' | 'read-your-writes' | 'replica-ok'
+// 錯：why 只寫了幾個字，沒有說出理由
+const READ_POLICY: Record<ReadName, { need: Need; why: string }> = {
+  checkoutPrice: { need: 'primary', why: '要準' },
+  stockCheck: { need: 'primary', why: '會超賣' },
+  paymentStatusForRefund: { need: 'primary', why: '錢' },
+  menu: { need: 'replica-ok', why: '沒差' },
+  myOrdersAfterCheckout: { need: 'read-your-writes', why: '自己的單' },
+  stampBalanceAfterRedeem: { need: 'read-your-writes', why: '點數' },
+  dailyReport: { need: 'replica-ok', why: '很重' },
+  recommendations: { need: 'replica-ok', why: '不精確' },
+}
+function routeFor(name: ReadName, session: Session, replicas: ReadonlyArray<Replica>, primary: Primary): { target: string; session: Session } {
+  const need = READ_POLICY[name].need
+  if (need === 'primary') return { target: primary.name, session }
+  if (need === 'read-your-writes') return routeRead(session, replicas, primary)
+  return { target: replicas[0]?.name ?? primary.name, session }
+}
+</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：顧客結帳後立刻跳到「我的訂單」，卻看不到剛下的單；重新整理後又出現了。最可能的原因是什麼？</p>
+  <label data-key="a">INSERT 有 bug，第一次沒寫進去，重新整理時才補寫</label>
+  <label data-key="b">交易還沒 COMMIT 就回傳成功了</label>
+  <label data-key="c">「我的訂單」讀到還沒重播到這筆的 replica，違反讀己之寫</label>
+  <label data-key="d">隔離等級太低，第一次讀到了別人還沒提交的資料</label>
+  <p class="why">✓ 重新整理就出現，代表資料早就寫進去了，只是第一次讀的那台還沒追上。INSERT 沒有「補寫」這回事；沒 COMMIT 的資料重新整理也看不到。PostgreSQL 在任何隔離等級都不會讀到還沒提交的資料，而且這裡是「讀不到」不是「多讀到」。寫完馬上讀卻時有時無，第一個要查的是讀取導向。修法：LSN 導向（練習 1）、或寫入後讀 primary。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：「CAP 說三選二，單機的 PostgreSQL 選的是 CA。」這句話哪裡有問題？</p>
+  <label data-key="a">沒問題，單機版確實放棄了分割容忍</label>
+  <label data-key="b">分割不是可以選擇不要的功能；CAP 講的是分割發生時要選一致還是可用，單機根本不是分散式系統</label>
+  <label data-key="c">單機 PostgreSQL 選的是 CP，因為它有交易</label>
+  <p class="why">✓ 只要資料分散在兩台以上的機器，網路就可能斷，P 不是可以放棄的選項。CAP 真正的問題是「分割發生時，選一致還是可用」；沒有分割時兩者可以兼得。單機沒有「機器之間連不上」這回事，CAP 根本不適用；有交易也跟 CAP 的 C（線性一致）是兩回事。一旦加了 replica，就要開始回答這個問題。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 7（選讀，對應「多個寫入點」一節）：台北和高雄兩個區域都能改同一張訂單，衝突時用各自主機的時間做 LWW。台北主機的時鐘快了 2 秒，會發生什麼事？</p>
+  <label data-key="a">台北先寫、高雄 1 秒後才改的內容，可能因為時間戳比較小而被丟掉，而且沒有任何錯誤</label>
+  <label data-key="b">不會有問題，時間戳一定能排出正確的先後</label>
+  <label data-key="c">資料庫會偵測到時鐘不準，回傳衝突錯誤</label>
+  <p class="why">✓ LWW 只比時間戳。台北的時間戳多了 2 秒，2 秒內在高雄做的修改都會輸給台北比較早的寫入，被默默丟掉。主機的時鐘靠 NTP（網路校時協定）定期校正，誤差是常態；要判斷真正的先後或並行，要用版本向量（練習 3）。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 8（選讀，對應「Quorum」一節）：N = 3、R = 1、W = 1。寫入回成功之後馬上讀，一定讀得到剛寫的值嗎？</p>
+  <label data-key="a">一定，寫入已經成功了</label>
+  <label data-key="b">一定，三台最後都會收到</label>
+  <label data-key="c">不一定，R + W = 2 沒有大於 3，讀的那一台可能還沒收到這次寫入</label>
+  <p class="why">✓ 寫入只等 1 台確認，讀取只問 1 台，兩台可能不是同一台。「最後都會收到」是最終一致，但「最後」不是「現在」。要保證讀到，R + W 要大於 N，例如 (3, 2, 2)。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>寫完馬上從 replica 讀</strong>：自己剛寫的資料可能還沒到。用 LSN 導向、黏著，或寫入後讀 primary。</li>
+  <li><strong>讀取在多台 replica 之間隨機分配</strong>：兩次讀到落後程度不同的 replica，資料看起來在倒退。記住讀過的 LSN，或讓 session 黏在同一台。</li>
+  <li><strong>LSN 用字串比較或用 number 存</strong>：<code>'0/9' &gt; '0/10'</code> 是 true；64 位元超過 2^53 會失去精度。解析成 bigint 再比。</li>
+  <li><strong>以為開了同步複寫就絕對不會掉資料</strong>：<code>synchronous_commit</code> 的等級、failover 時升格哪一台、同步 replica 掛掉時寫入會卡住，都要確認（<a href="../../postgresql/lessons/37-backup-replication.html">PostgreSQL 課第 37 課</a>）。</li>
+  <li><strong>用牆上時間做 LWW</strong>：時鐘偏移會默默丟掉比較新的寫入。要判斷先後用版本向量，能用單一 primary 就用單一 primary。</li>
+  <li><strong>說「最終一致」卻沒有上限和監控</strong>：量 <code>replay_lag</code> 並告警，落後太多的 replica 從讀取名單拿掉。</li>
+  <li><strong>該讀 primary 的讀 replica、可以讀 replica 的打 primary</strong>：付款狀態、庫存走 replica 會出錯；報表這種重查詢打 primary 會拖慢結帳。每一種讀取都要選過。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>複寫是把同一份資料存在多台機器上，分擔讀取、高可用、異地備援。PostgreSQL 的寫入只到 primary，replica 重播 primary 傳來的 WAL；每一步都要時間，所以 replica 一定會落後，這叫複寫延遲。</li>
+  <li>同步複寫用延遲換不掉資料，同步 replica 壞掉時寫入會卡住；非同步快，但可能掉最後幾筆。先問 RPO 再決定。同步複寫修不好「讀不到剛寫的」：只有 <code>remote_apply</code> 保證同步 replica 查得到，非同步 replica 不受任何等級保證。</li>
+  <li>複寫延遲造成三種異常：讀不到自己剛寫的（讀己之寫）、資料倒退（單調讀）、因果顛倒。資料庫沒壞，錯在讀到哪一台。</li>
+  <li>修法由粗到細：寫入後讀 primary、session 黏同一台、記住 LSN。LSN 導向只讀已重播到需要位置的 replica，沒有就讀 primary；LSN 要解析成 bigint 再比。replica 的落後要用 <code>replay_lag</code> 監控並設上限。</li>
+  <li>一致性模型由強到弱：線性一致、因果、讀己之寫／單調讀、最終一致。每種讀取選夠用的最弱模型，並寫下可以舊多久。</li>
+  <li>CAP 只在網路分割時才要選一致或可用，而且可以依操作選；PACELC 補上平常的取捨：延遲與一致。</li>
+  <li>（選讀）Quorum：R + W &gt; N 讀寫一定重疊；讀到多個版本取最新、順便 read repair。</li>
+  <li>（選讀）多個寫入點會衝突。LWW 在時鐘偏移時會丟掉較新的寫入；版本向量分得出先後或並行，並行時要合併（購物車取聯集）。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 7 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 9：下單流程新加了「推薦加購」：同步呼叫推薦服務（99.5%），失敗就整張單回 500。上線後下單成功率明顯下降，怎麼改最有效？</p>
+  <label data-key="a">推薦服務再多開一台做冗餘，兩台同時壞的機率很小，下單就不受影響</label>
+  <label data-key="b">讓負載平衡器對推薦服務做健康檢查，壞的機器踢掉，就不會再回 500</label>
+  <label data-key="c">推薦失敗或逾時就把區塊藏起來、照常下單，讓它從硬相依變成軟相依</label>
+  <p class="why">✓ 硬相依串聯要相乘，下單最多只剩 99.5% 再乘上其他依賴；改成軟相依後，推薦壞了下單照常，不再拉低可用性，通常比加機器便宜。降級時畫面怎麼呈現要先跟 PM 講好。a 錯在冗餘公式假設獨立，同一次壞部署、同一份設定會讓兩台一起壞，而且它仍然是硬相依。（第 4 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 10：6 台 API 平均放在 2 個可用區，平常每台使用率 60%。老闆問：「一整個可用區掛掉撐得住嗎？」</p>
+  <label data-key="a">撐不住：掉一區就少 3 台，剩下 3 台各要扛 120%，要以掉一區之後的使用率加機器</label>
+  <label data-key="b">撐得住：掉一區相當於少一台的量，剩下 5 台平均 72%，還在安全範圍內</label>
+  <label data-key="c">撐得住：兩區互為冗餘，可用性是 1 − 不可用率的平方，已經遠超過目標</label>
+  <p class="why">✓ 總負載是 6 × 60% = 3.6 台的量，掉一區剩 3 台，每台 120%，排隊暴增、逾時又引發重試。容量要以「掉一個可用區之後」的使用率規劃。c 錯在可用性公式只說「至少有一區活著」，不保證活下來的那一區扛得住全部流量。（第 4 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 11：3 台負載平衡器共用一份每秒更新一次的後端負載資料，每個請求都送給「目前最閒」的後端。監控上卻看到後端輪流爆量：這一秒是 2 號，下一秒換 5 號。為什麼？</p>
+  <label data-key="a">後端的請求長短差很多，挑最閒的反而不準，改回 round robin 才會平均</label>
+  <label data-key="b">負載資料是過時的，3 台同時看到同一台最閒、一起把請求送過去；改用 P2C</label>
+  <label data-key="c">負載平衡器只有 3 台太少，加到跟後端一樣多台，請求才分得開</label>
+  <p class="why">✓ 大家在同一瞬間看到「2 號最閒」，就一起湧向 2 號，下一刻又一起湧向另一台，這是羊群效應。P2C 隨機挑兩台選比較閒的，不同請求挑到的兩台不同，不會全部湧向同一台；Envoy 的 least request 預設就是它。a 錯在 round robin 不看負載，請求長短差很多時本來就分不平均。（第 4 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 12：菜單用 cache-aside 加 TTL，後台改價的程式這樣寫。哪裡會出事？</p>
+<pre>async function updatePrice(id, price) {
+  await db.query('UPDATE products SET price = $1 WHERE id = $2', [price, id])
+  await cache.set(`price:${id}`, price)
+}</pre>
+  <label data-key="a">順序反了：應該先更新快取再寫資料庫，中間才不會有人讀到舊價</label>
+  <label data-key="b">UPDATE 和 set 沒有包在同一個交易裡，其中一個失敗時兩邊就不同步</label>
+  <label data-key="c">兩個改價同時進行時，比較慢的 set 可能最後才到，快取留下舊價到 TTL 到期</label>
+  <p class="why">✓ A 改 120、B 改 130，B 先更新快取、A 的 set 慢一步，資料庫是 130、快取卻是 120。改成寫完資料庫後刪除快取：刪除是冪等的，誰先誰後結果都是空的；再用 lease 擋住讀取把舊值寫回，TTL 當最後的保險。a 錯在資料庫寫失敗時快取會留下沒存進去的價格，兩個寫入交錯時一樣會留下舊值。（第 5 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 13：每次部署會把 2,000 個商品一次寫進快取，TTL 都是 60 秒。部署後資料庫 CPU 每 60 秒就跳一次，最該先改什麼？</p>
+  <label data-key="a">在 API 程式裡加 single-flight，同一個 key 同時只載入一次</label>
+  <label data-key="b">TTL 改成永不過期，靠寫入時刪除快取來維持正確</label>
+  <label data-key="c">Redis 換成更大的機器，扛得住大量 key 同時過期的流量</label>
+  <label data-key="d">每個 key 的 TTL 加隨機，例如 48～60 秒，讓過期時間分散</label>
+  <p class="why">✓ 同一時間寫入、同一個 TTL，2,000 個 key 就同一時間過期、一起打資料庫，這是雪崩。TTL 加隨機（jitter）讓過期分散開，改動很小。a 錯在 single-flight 只合併同一個 key 的載入，2,000 個不同的 key 還是各查一次資料庫。（第 5 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 14：「我的訂單」改走 replica 之後，顧客偶爾看不到剛下的單。哪個做法能保證讀得到自己剛寫的？</p>
+  <label data-key="a">讓同一個 session 一直黏在同一台 replica，資料就不會時有時無</label>
+  <label data-key="b">寫入後 3 秒內改讀 primary，過了 3 秒再回到 replica</label>
+  <label data-key="c">把 <code>synchronous_commit</code> 設成 <code>on</code>，COMMIT 時等 replica 確認</label>
+  <label data-key="d">寫入後記下 LSN，只讀已重播到那裡的 replica，沒有就讀 primary</label>
+  <p class="why">✓ LSN 是這次寫入在 WAL 裡的位置，replica 重播到那裡就一定查得到這筆，不必猜要等幾秒；比較時要解析成 bigint。a 錯在黏著同一台只保證單調讀（不會倒退），那台可能還沒收到你剛寫的。（第 6 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 15：台北和高雄機房之間斷線，高雄的 replica 同時收到「查這筆退款完成了沒」和「看菜單」兩個請求。怎麼回應最恰當？</p>
+  <label data-key="a">兩個都回手上的資料，斷線修好之後副本最終會一致</label>
+  <label data-key="b">退款狀態回「請稍後再試」，菜單照常回手上的資料</label>
+  <label data-key="c">兩個都回錯誤，網路分割期間一律以一致為優先</label>
+  <p class="why">✓ CAP 只在網路分割時要選一致或可用，而且可以依操作選：退款狀態讀到舊的可能重複退款，選 C；菜單舊幾分鐘沒關係，回錯誤頁反而損失訂單，選 A。a 錯在「最終」不是「現在」，顧客看到舊的「未退款」就可能再申請一次。（第 6 課）</p>
+</div>
+
+<p>這個階段的重點整理成<a href="../sheets/stage-2.html">一頁圖解</a>。</p>
+<p>下一課（選修）：分片與一致性雜湊。複寫解決了讀取量，但所有寫入還是擠在同一台 primary；資料和寫入多到一台放不下時，要把資料切開放到多台機器上。大部分系統用不到分片，跳過的話直接進<a href="08-timeouts-retries-backoff.html">第 8 課</a>，階段 3：可靠性。</p>
+
+</main>
+<script>
+// 時間軸：逐步顯示每一列，並在下方顯示目前步驟的說明
+document.querySelectorAll('.tl').forEach(tl => {
+  const rows = [...tl.querySelectorAll('tr[data-note]')]
+  const note = tl.querySelector('.note')
+  const count = tl.querySelector('[data-count]')
+  const prev = tl.querySelector('[data-prev]')
+  const next = tl.querySelector('[data-next]')
+  let cur = 0
+  const show = () => {
+    rows.forEach((r, i) => {
+      r.classList.toggle('now', i === cur)
+      r.classList.toggle('later', i > cur)
+    })
+    note.textContent = rows[cur].dataset.note
+    count.textContent = `步驟 ${cur + 1} / ${rows.length}`
+    prev.disabled = cur === 0
+    next.textContent = cur === rows.length - 1 ? '↺ 重新播放' : '下一步 ▶'
+  }
+  prev.onclick = () => { cur--; show() }
+  next.onclick = () => { cur = cur === rows.length - 1 ? 0 : cur + 1; show() }
+  show()
+})
+</script>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

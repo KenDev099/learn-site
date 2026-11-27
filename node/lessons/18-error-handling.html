@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>18. 錯誤處理策略</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="18" data-practice="node">
+<header>
+  <div class="eyebrow">階段 5：上線前的準備 · 第 18 課</div>
+  <h1>錯誤處理策略</h1>
+</header>
+<main>
+
+<p>咖啡店的 API 上線一週，客服轉來三件事。第一件：一位客人點餐時，畫面上出現 <code>duplicate key value violates unique constraint "orders_pkey"</code>，這是資料庫的原始錯誤訊息，連表名和約束名稱都露出來了。第二件：另一位客人的畫面顯示「點餐成功」，店裡卻沒有收到這筆訂單。第三件：凌晨三點程序整個掛掉，當時正在點餐的客人全部斷線。另外，重啟後翻 log 時發現，有一筆點餐遇到的同一個資料庫逾時被印了兩行，看不出是一次還是兩次、是哪個請求造成的，原本資料庫給的錯誤碼也不見了。</p>
+<p>三件事的原因都不是某一行打錯字，而是整個系統沒有一致的<strong>錯誤處理策略</strong>：錯誤該在哪一層接、接了要做什麼、客戶端看到什麼、log 記下什麼。這一課把三件事當成一次事後檢討，一件一件追到根源，最後替咖啡店的 <code>POST /orders</code> 定下這套策略。練習裡你會親手把它做出來。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>先分類：三件事裡的錯誤，哪些是正常運作會發生、要處理的，哪些是要修的 bug。</li>
+  <li>錯誤物件與邊界：錯誤要帶 <code>code</code> 和 <code>cause</code> 往上傳，在 HTTP 邊界一個地方轉成回應，用 errorId 對上 log。這兩節處理第一件事。</li>
+  <li>只記一次、不要吞掉：log 為什麼印了兩行，「點餐成功」為什麼是假的。</li>
+  <li>async 錯誤的陷阱：哪些錯誤根本到不了邊界，為什麼它們會讓整個程序結束。</li>
+  <li>程序層級的最後一道防線：沒人接的錯誤最後去哪，<code>uncaughtException</code> 之後為什麼不能繼續跑。這兩節處理第三件事的當機。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../typescript/lessons/04-errors.html">TypeScript 課第 4 課</a>的錯誤基礎：<code>throw</code> 丟出、<code>try</code>／<code>catch</code> 接住；自訂錯誤類別 <code>extends Error</code>，包裝時用 <code>{ cause }</code> 留住原始錯誤。</li>
+  <li><a href="../../typescript/lessons/09-async-await.html">TypeScript 課第 9 課</a>的 async 錯誤：async 函式丟錯會變成被 reject 的 Promise，沒有人 <code>await</code> 或 <code>catch</code> 就成了 unhandled rejection。</li>
+  <li><a href="14-rest-api-design.html">第 14 課</a>的 problem details：錯誤回應統一用 <code>application/problem+json</code>，帶 <code>type</code>、<code>title</code>、<code>status</code>、<code>detail</code>。</li>
+</ul></div>
+
+<h2>先分類：哪些錯誤要處理，哪些是要修的 bug？</h2>
+<p>面對三件事，最直覺的兩種反應都不對。一種是「所有東西都 <code>try/catch</code> 起來回 500」：客人送錯欄位也拿到 500，他不知道自己該改什麼，值班的人也分不出哪些 500 是真的壞了。另一種是「什麼都不接，讓程序倒掉」：一位客人填錯數量，所有人一起斷線。要決定一個錯誤該怎麼對待，得先知道它是哪一種。錯誤分成兩種，處理方式完全不同。</p>
+<p>第一種是<strong>可預期的錯誤</strong>（operational error）：程式寫得完全正確，正常運作時也一定會碰到的失敗。客人點了不存在的商品、欄位填錯、同一筆訂單送了兩次、資料庫因為負載高而查詢逾時、外部金流 API 回 503，都屬於這種。它們是需求的一部分，你在寫功能時就該想到，所以要<strong>處理</strong>：回對的狀態碼讓客戶端知道怎麼辦、重試、或改用備案。</p>
+<p>第二種是<strong>程式錯誤</strong>（programmer error），也就是 bug：讀 <code>undefined</code> 的屬性、把字串當數字加、呼叫函式時參數給錯。它們本來不該發生，發生了就代表程式對資料的假設是錯的。這時「處理」它沒有意義：你不知道程式現在的狀態對不對，接住之後硬往下跑，只會產生更多錯的結果。對 bug 要做的是<strong>修</strong>：記下完整資訊，回頭改程式碼。</p>
+<p>判斷方法只有一句：<strong>這個錯誤在程式完全正確的情況下會不會發生？</strong>會，就是可預期的；不會，就是 bug。注意同一個例外可能兩種都是，要看它從哪裡來：<code>JSON.parse</code> 讀客戶端送來的 body 失敗是可預期的（客人送了壞資料，回 400）；讀自己剛寫進去的設定檔失敗則是 bug（正確的程式不會寫出壞掉的設定檔）。用這個問題把咖啡店常見的錯誤分一次：</p>
+<div class="table-wrap"><table>
+  <tr><th>錯誤</th><th>種類</th><th>怎麼做</th></tr>
+  <tr><td>找不到 42 號訂單</td><td>可預期</td><td>404，告訴客戶端</td></tr>
+  <tr><td>qty 是 0</td><td>可預期</td><td>400，列出哪個欄位錯</td></tr>
+  <tr><td>同一個訂單編號已存在（資料庫 23505）</td><td>可預期</td><td>409</td></tr>
+  <tr><td>資料庫查詢逾時（57014）、上游 503</td><td>可預期</td><td>503、可能重試（<a href="17-calling-external-apis.html">第 17 課</a>），記 log 觀察頻率</td></tr>
+  <tr><td><code>TypeError: Cannot read properties of undefined (reading 'price')</code></td><td>bug</td><td>500＋errorId，記完整 log，修程式</td></tr>
+  <tr><td>處理函式之外的例外（計時器、事件 callback 裡 throw）</td><td>bug</td><td>記 log，讓程序結束、重新啟動</td></tr>
+</table></div>
+<p>回到第一件事：客人看到的 <code>duplicate key</code> 是表格第三列，資料庫錯誤碼 23505，代表同一個訂單編號已經存在，例如客人連按兩次送出。這是可預期的錯誤，正確的反應是回 409，告訴客戶端「這筆訂單已經存在」。實際上沒有任何一層分辨或轉換它，資料庫的原始訊息就這樣一路傳到回應裡。也就是說，程式從頭到尾沒有分辨過它是哪一種。</p>
+<div class="callout practice"><strong>💡 實務上：分類決定誰要半夜被叫起來</strong><br>團隊的告警通常這樣設：5xx 和 bug 會通知值班的人，404、409 這類只進統計圖表。所以把「找不到訂單」錯分成 bug，值班的人每晚被假警報吵醒；反過來把 bug 當成可預期的錯誤吞掉，問題就安靜地累積到客服爆量。Code review 看到新的 <code>catch</code>，資深工程師會先問兩句：「程式完全正確時這會發生嗎？」「客戶端或使用者能做什麼來修正？」答案決定它回 4xx、5xx，還是該直接修掉。也要小心對 bug 自動重試：重試十次也是同一個 <code>TypeError</code>，只是多打了十次資料庫。</div>
+<p>分類的判斷有了，但還有一個問題：23505 是在最底層的 repository（負責查資料庫的那一層）發生的，決定回 409 的卻是最上層的 HTTP 處理函式。分類的結果要怎麼一路帶上去？這要靠錯誤物件本身。</p>
+
+<h2>要讓分類一路帶上去，錯誤物件該帶什麼？</h2>
+<p>一個請求在伺服器裡會經過好幾層：handler（處理 HTTP，讀請求、寫回應）→ service（業務規則，例如「庫存不足不能下單」）→ repository（查資料庫）。錯誤從最底層丟出，一路往上傳到 handler。上層的人看不到底層發生了什麼，手上只有那個錯誤物件，所以錯誤物件要自己說清楚「我是哪一種錯、為什麼發生」。<a href="../../typescript/lessons/04-errors.html">TypeScript 課第 4 課</a>寫過自訂錯誤類別，放到伺服器裡，每個錯誤物件要帶三樣東西。</p>
+<p><strong>第一樣：類別與 name。</strong>用子類別區分種類，例如 <code>NotFoundError</code>、<code>ConflictError</code>，上層看類別就知道該回 404 還是 409。<code>name</code> 屬性要設成類別名稱，因為 log 和 stack 的第一行印的是 <code>name</code>；沒設的話，每個子類別印出來都只是 <code>Error</code>，看 log 的人分不出種類。不用每個子類別各寫一次：在父類別的建構子寫 <code>this.name = new.target.name</code>。<code>new.target</code> 指的是實際被 <code>new</code> 的那個類別，<code>new ConflictError()</code> 時它就是 <code>ConflictError</code>，即使這行程式寫在父類別裡。</p>
+<p><strong>第二樣：錯誤碼（code）。</strong>一個穩定的字串常數，例如 <code>'NOT_FOUND'</code>，給程式判斷用。為什麼不直接看錯誤訊息？因為訊息是寫給人看的，會被改寫、會被翻譯；今天比對 <code>'找不到訂單'</code> 能動，明天有人把文案改成「查無此訂單」就壞了，而且沒有任何測試會提醒你。code 是約定好不變的。Node 自己的錯誤也這樣做：<code>ENOENT</code>（檔案不存在）、<code>ECONNREFUSED</code>（連線被拒）、<code>ERR_MODULE_NOT_FOUND</code>。pg 套件丟出的資料庫錯誤帶 SQLSTATE，也就是 PostgreSQL 的五碼錯誤碼，第一件事的 <code>'23505'</code> 就是其中一個。</p>
+<p><strong>第三樣：cause。</strong>repository 接到 23505 時，會把它換成自己的 <code>ConflictError</code> 再往上丟，這叫<strong>包裝</strong>：上層不需要懂 PostgreSQL 的錯誤碼，只要懂領域錯誤。但包裝不能把原始錯誤丟掉。寫成 <code>new XxxError(訊息, { cause: 原始錯誤 })</code>，原始錯誤會掛在新錯誤的 <code>cause</code> 屬性上；如果原始錯誤自己也有 cause，就一層接一層，形成 <strong>cause 鏈</strong>。少了它，log 只看得到外層的「資料庫查詢逾時」，看不到是哪一句 SQL、哪個 code。第三件事裡「原本資料庫給的錯誤碼不見了」，就是包裝時沒有放 cause。</p>
+<p>三樣東西放進同一個父類別 <code>AppError</code>，每個子類別只決定自己的 code。<code>status</code> 是這個錯誤對應的 HTTP 狀態碼，<code>expose</code> 決定訊息能不能直接給客戶端看，下一節會用到：</p>
+<pre>export class AppError extends Error {
+  code: ErrorCode
+  status: number
+  expose: boolean          // 訊息能不能給客戶端看：4xx 可以，5xx 不行
+  constructor(code: ErrorCode, message: string, options: { cause?: unknown, expose?: boolean } = {}) {
+    super(message, { cause: options.cause })
+    this.name = new.target.name
+    // …
+  }
+}
+export class ConflictError extends AppError {
+  constructor(message: string, options: ErrorOptions = {}) {
+    super('CONFLICT', message, options)
+  }
+}
+
+throw new ConflictError('這筆訂單已經存在', { cause: dbError })</pre>
+<p>接著實際看一條 cause 鏈長什麼樣子。範例會用到 <code>Error.isError(value)</code>，它判斷一個值是不是真的 Error 物件，下一節會說明為什麼需要它。在 <code>learn/</code> 執行 <code>node check.mjs node 18</code> 建立 <code>work/18/</code>，再到 <code>work/18</code> 執行 <code>node examples/cause.ts</code>：</p>
+<pre>err.cause === dbError： true
+JSON.stringify(err)： {"code":"UPSTREAM_UNAVAILABLE","name":"UpstreamError"}
+Error.isError(err)： true ／Error.isError({ message })： false
+---- util.inspect（console.log 印 Error 時用的就是它）----
+UpstreamError: 資料庫查詢逾時 {
+  code: 'UPSTREAM_UNAVAILABLE',
+  [cause]: Error: canceling statement due to statement timeout {
+    code: '57014'
+  }
+}</pre>
+<p>由上往下看：</p>
+<ul>
+  <li><code>err.cause === dbError</code>：原始錯誤原封不動地掛在外層錯誤上，沒有被複製或轉成字串。</li>
+  <li><code>JSON.stringify</code> 只輸出物件自己的可列舉屬性，<code>message</code>、<code>stack</code>、<code>cause</code> 都不是，所以全部不見了。正式環境的 log 是一行一個 JSON，要把錯誤寫進去得自己序列化，<a href="19-structured-logging.html">第 19 課</a>會做。</li>
+  <li><code>Error.isError</code> 對真的錯誤回 <code>true</code>，對長得像錯誤的普通物件 <code>{ message }</code> 回 <code>false</code>。</li>
+  <li><code>console.log</code> 印 Error 時用的是 <code>util.inspect</code>，它會把整條 cause 鏈印出來（<code>[cause]</code> 那段），外層的 <code>UPSTREAM_UNAVAILABLE</code> 和底層的 <code>57014</code> 都看得到。</li>
+</ul>
+<p>錯誤物件現在帶齊了種類、code 和原因，能一路傳到最上層。下一個問題是：到了上層，由誰、在哪裡把它變成客人看到的回應？第一件事裡原始訊息漏給客人，就是這一步沒有人負責。</p>
+
+<h2>錯誤在哪裡變成回應？在邊界統一轉換</h2>
+<p>答案是只在一個地方，而且是最外層。這個地方叫<strong>錯誤邊界</strong>（error boundary）：所有往上傳的錯誤最後都會到這裡，由它統一轉成回應。HTTP 伺服器的邊界就是<a href="13-http-server.html">第 13 課</a>包住所有路由的那一層；之後學 NestJS 時，同樣的角色叫 exception filter。其他每一層只做自己懂的事：</p>
+<figure>
+  <svg viewBox="0 0 700 290" role="img" aria-label="錯誤從 repository 往上傳到 handler：repository 把資料庫錯誤包成領域錯誤並保留 cause，service 不處理直接往上，handler 是唯一的錯誤邊界，一份給客戶端的 problem details，一份給 log 的完整細節，兩邊用同一個 errorId">
+    <defs><marker id="a18" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="20" y="200" width="200" height="66" rx="8"/>
+    <text class="d-text" x="120" y="226" text-anchor="middle">repository</text>
+    <text class="d-small" x="120" y="248" text-anchor="middle">23505 → ConflictError</text>
+    <text class="d-small" x="120" y="262" text-anchor="middle">{ cause: 原始錯誤 }，不 log</text>
+    <rect class="d-soft" x="20" y="110" width="200" height="60" rx="8"/>
+    <text class="d-text" x="120" y="136" text-anchor="middle">service</text>
+    <text class="d-small" x="120" y="156" text-anchor="middle">不 catch、不 log，原樣往上</text>
+    <rect class="d-box" x="20" y="20" width="200" height="60" rx="8"/>
+    <text class="d-text" x="120" y="46" text-anchor="middle">handler（錯誤邊界）</text>
+    <text class="d-small" x="120" y="66" text-anchor="middle">產生 errorId，toProblem</text>
+    <line class="d-line" x1="120" y1="200" x2="120" y2="172" marker-end="url(#a18)"/>
+    <line class="d-line" x1="120" y1="110" x2="120" y2="82" marker-end="url(#a18)"/>
+    <rect class="d-box" x="330" y="20" width="350" height="96" rx="8"/>
+    <text class="d-accent" x="345" y="44">給客戶端：problem details</text>
+    <text class="d-small" x="345" y="66">status 500、detail「伺服器暫時無法處理…」</text>
+    <text class="d-small" x="345" y="86">errorId: "7f3c…"</text>
+    <text class="d-small" x="345" y="106">沒有 SQL、路徑、stack</text>
+    <rect class="d-box" x="330" y="150" width="350" height="116" rx="8"/>
+    <text class="d-accent" x="345" y="174">給 log：只記一次，只有 5xx</text>
+    <text class="d-small" x="345" y="196">errorId: "7f3c…"（和回應同一個）</text>
+    <text class="d-small" x="345" y="216">name、message、stack</text>
+    <text class="d-small" x="345" y="236">cause 鏈的 code：UPSTREAM_UNAVAILABLE → 57014</text>
+    <text class="d-small" x="345" y="256">請求的方法與路徑</text>
+    <line class="d-line" x1="222" y1="45" x2="328" y2="62" marker-end="url(#a18)"/>
+    <line class="d-line" x1="222" y1="60" x2="328" y2="200" marker-end="url(#a18)"/>
+  </svg>
+  <figcaption>錯誤往上傳到唯一的邊界，分成兩份：給客戶端的只有能公開的部分，給 log 的有完整細節，用同一個 errorId 對起來</figcaption>
+</figure>
+<p>repository 懂資料庫，所以由它把 23505 包成 <code>ConflictError</code>、把 57014 包成 <code>UpstreamError</code>；service 懂業務規則，但通常不知道怎麼處理「資料庫逾時」，所以它不接，讓錯誤原樣往上；handler 是邊界，用一張對照表把領域錯誤轉成狀態碼和<a href="14-rest-api-design.html">第 14 課</a>的 problem details。業務程式只丟領域錯誤（<code>NotFoundError</code>），完全不知道 HTTP 的存在。這樣做有兩個好處：「哪種錯誤回哪個狀態碼」的規則只寫在一個地方，要改只改一處；service 不依賴 HTTP，同一段下單邏輯也能被排程工作、CLI 重複使用。</p>
+<p>邊界拿到錯誤後，第一步是認出它是哪一種。有三種判斷方式，各有適合的對象：</p>
+<ul>
+  <li><code>err instanceof ConflictError</code>：判斷自己寫的錯誤類別最方便，TypeScript 還會幫你把型別縮小成 <code>ConflictError</code>，之後讀 <code>err.status</code> 不用轉型。邊界判斷「這是不是我的 <code>AppError</code>」就用它。</li>
+  <li><code>err.code === '23505'</code>：判斷別人的錯誤（pg、Node 的系統錯誤）只能用它，因為你拿不到他們內部的類別。repository 認 23505、57014 就用 code。</li>
+  <li><code>Error.isError(value)</code>：判斷「這到底是不是一個 Error」。下面會看到，邊界拿到的東西不一定是 Error。</li>
+</ul>
+<p>為什麼需要最後一種？<code>catch (err)</code> 裡的 <code>err</code>，TypeScript 給的型別是 <code>unknown</code>，因為 JavaScript 可以 <code>throw</code> 任何東西：字串、普通物件、甚至 <code>null</code>。邊界如果直接讀 <code>err.message</code>，遇到 <code>throw null</code> 時讀屬性本身就會再丟一個 <code>TypeError</code>，錯誤處理程式自己變成新的錯誤來源。所以處理錯誤的程式要先確認，再讀屬性。<code>instanceof</code> 在少數情況會判斷錯（同一個套件被裝了兩份、錯誤來自另一個執行環境），細節見課末。</p>
+<p>認出種類之後，就要決定客戶端看到什麼。第一件事的原始訊息為什麼不能給客人看？資料庫、檔案系統的錯誤訊息常常含有表名、SQL、檔案路徑、內部主機名稱。對攻擊者，這是了解你系統內部的現成情報；對客戶端，它毫無用處，因為他看了也什麼都改不了。規則分三條：</p>
+<ul>
+  <li><strong>4xx 的訊息是寫給客戶端看的</strong>，例如「找不到 42 號訂單」「這筆訂單已經存在」，可以原樣回傳。<code>AppError</code> 的 <code>expose</code> 就是這個意思：4xx 預設 <code>true</code>。</li>
+  <li><strong>5xx 一律回通用訊息，加一個 errorId</strong>。errorId 是每次出錯時產生的隨機編號（<code>crypto.randomUUID()</code>），同時寫進回應和 log。客人回報「錯誤代碼 7f3c…」，你在 log 裡搜尋這串字，就找到那一次的完整 stack 和 cause 鏈。回應裡沒有細節，細節都在 log 裡，兩邊靠 errorId 對起來，這就是上圖右邊的兩個方框。</li>
+  <li><strong>不認得的東西一律當成 500</strong>：<code>TypeError</code>、被 throw 的字串或物件都是。被 throw 的普通物件 <code>{ status: 404 }</code> 不是你的錯誤類別，不知道是誰丟的，不能相信它的欄位。</li>
+</ul>
+<p>套回第一件事：repository 把 23505 包成 <code>ConflictError</code>，邊界認出它是 <code>AppError</code>、<code>expose</code> 是 <code>true</code>，回 409「這筆訂單已經存在」。客人看到一句他看得懂的話，資料庫的表名和約束名稱不會再出現在畫面上。練習 1 的 <code>toProblem</code> 就是這段轉換。</p>
+<div class="callout practice"><strong>💡 實務上：errorId 要讓客人看得到、抄得下來</strong><br>errorId 只有送到客服手上才有用，所以前端的錯誤畫面不要只寫「發生錯誤」，要把它用小字顯示、可以一鍵複製。客人截圖給客服、客服轉給工程師，工程師貼進 log 搜尋就到了，不用再問「你大概幾點、點了什麼」。資安檢查常做的一項是故意送壞資料，看 500 的回應有沒有漏出 SQL、路徑或套件版本；錯誤都在邊界統一轉換的話，這一項只要檢查一個地方。errorId 只是隨機編號，不要拿使用者 id 或訂單編號拼成它。</div>
+<p>邊界設計好了，但它有一個前提：錯誤要能完整地、只有一份地傳到這裡。如果中間某一層自己 log 了一次、甚至把錯誤接住不再往上丟呢？第二件事的「點餐成功」和第三件事的那兩行 log，就是這樣來的。</p>
+
+<h2>log 為什麼印了兩行，「點餐成功」為什麼是假的？</h2>
+<p>這是事發時 <code>POST /orders</code> 的程式碼。repository、service 各自 <code>catch</code> 了一次，各自 log，service 還把錯誤吞掉回傳 <code>null</code>：</p>
+<pre>// repository
+catch (err) {
+  logger.error({ msg: 'insert failed', error: String(err) })
+  throw new UpstreamError('資料庫查詢逾時')            // 沒有 cause
+}
+// service
+catch (err) {
+  logger.error({ msg: 'placeOrder failed', error: String(err) })
+  return null                                          // 吞掉
+}</pre>
+<p>當資料庫查詢逾時，事情依序這樣發生：</p>
+<ul>
+  <li>repository 記一行 log，再丟出新的 <code>UpstreamError</code>，但沒有放 cause，原始的 <code>57014</code> 就在這裡丟了。</li>
+  <li>service 接住它，再記一行 log，然後回傳 <code>null</code>。錯誤到這裡就消失了，<strong>吞掉</strong>（swallow）指的就是這種接住之後既不處理、也不往上丟的寫法。</li>
+  <li>handler 拿到 <code>null</code>，不知道發生過錯誤，照常回客人「201 點餐成功」。訂單根本沒有寫進資料庫，這就是第二件事。</li>
+  <li>repository、service 各記一行，同一個錯誤就是兩行。告警數量翻倍，搜尋時分不出是一次還是兩次，每一行都沒有 errorId 能對上是哪個請求，這就是第三件事看到的 log。</li>
+</ul>
+<p>每一層都 log，看起來是「多記一點比較保險」，實際上資訊沒有變多，只是重複，而且最關鍵的原始 code 反而丟了。修正的規則有四條，每一條都對應上面一個問題：</p>
+<ul>
+  <li><strong>在處理錯誤的那一層記錄，而且只記一次</strong>。中間層不知道錯誤最後會不會被處理掉，例如上層可能重試一次就成功了，那這次失敗根本不算問題。中間層沒有資格判斷，所以不記；邊界是最後決定怎麼回應的地方，由它記。</li>
+  <li><strong>往上丟的時候用 cause 包起來</strong>，資訊只會變多，不會變少。</li>
+  <li><strong>catch 之後一定要做一件事</strong>：處理它（回應、重試、改用備案）、包裝後往上丟，或在邊界記錄。空的 <code>catch {}</code> 是最難除錯的 bug，因為它什麼痕跡都不留。真的要忽略時，寫註解說明為什麼可以忽略，並且只接你預期的那一種（檢查 <code>code</code>，其他的重新 throw）。</li>
+  <li><strong>可預期的錯誤不記成 error</strong>。404、409 是正常運作的一部分，記成 error 會淹沒真正的問題；需要統計時用 info 等級或指標（<a href="19-structured-logging.html">第 19 課</a>）。</li>
+</ul>
+<p>照這四條改，repository 只包裝、放 cause、不 log；service 不 catch；handler 產生一個 errorId，只有 5xx 才記一行，裡面有沿著 cause 鏈收集到的每一層 code。資料庫逾時時，客人收到 503 和 errorId，log 剛好一行、對得上同一個 errorId、看得到 <code>57014</code>。這正是練習 3 要你做的事。</p>
+<div class="callout practice"><strong>💡 實務上：review 時看到 catch，先問它做了哪一件事</strong><br>「只記一次、不要吞掉」很難靠記性維持，因為每一個多餘的 log 單獨看都很合理。團隊 review 時可以把新增的 <code>catch</code> 都過一遍：它處理了錯誤、包裝後往上丟，還是在邊界記錄？三者都不是，就是吞掉；它自己 log 之後又往上丟，就是重複記錄。<code>return null</code>、<code>return []</code> 這種「失敗時回傳空值」的寫法特別要注意，呼叫的人分不出「沒有資料」和「出錯了」，咖啡店的「點餐成功」就是這樣發生的。</div>
+<p>到這裡，同步的錯誤都能完整傳到邊界了。但第二件事還有另一種可能、第三件事的當機也還沒解釋：有些錯誤發生的時候，外面的 <code>try/catch</code> 早就執行完了，它們永遠到不了邊界。</p>
+
+<h2>哪些錯誤根本到不了邊界？async 錯誤的陷阱</h2>
+<p>邊界能接住錯誤，靠的是錯誤沿著呼叫鏈往上傳：handler <code>await</code> service、service <code>await</code> repository，任何一層 throw，錯誤就會一路回到 handler 的 <code>try/catch</code>。只要中間有一段沒被 <code>await</code>，這條鏈就斷了。<a href="../../typescript/lessons/09-async-await.html">TypeScript 課第 9 課</a>練過 async 的幾個經典 bug，放到伺服器上，後果是錯誤遺失：客戶端已經拿到成功的回應，錯誤才在之後發生，而且沒有任何 <code>catch</code> 接得到。下面這段想一次存三筆資料，在 <code>work/18</code> 執行 <code>node examples/floating.ts</code>，先看「回應 201」那行印出的陣列：</p>
+<pre>;[1, 2, 3].forEach(async id =&gt; await save(id))   // forEach 不理 callback 回傳的 Promise
+console.log('回應 201，這時已經存好的：', saved)</pre>
+<pre>回應 201，這時已經存好的： []
+file:///…/examples/floating.ts:7
+  if (id === 3) throw new Error(`第 ${id} 筆寫入失敗`)
+                      ^
+
+Error: 第 3 筆寫入失敗</pre>
+<p>callback 裡的 <code>await</code> 只暫停 callback 自己，<code>forEach</code> 呼叫完三次 callback 就回傳，不看它們回傳的 Promise。所以回應說成功時，其實一筆都還沒存，這是第二件事的另一種成因。第 3 筆失敗時，外面的 <code>try/catch</code> 早就執行完了，錯誤變成沒人處理的 rejection，整個程序以結束碼 1 結束，其他客人的請求也一起斷掉，這就是第三件事的當機。這種沒被 <code>await</code>、也沒接 <code>.catch</code> 的 Promise 叫<strong>浮動 Promise</strong>（floating promise）。</p>
+<p>改法看你要的是依序還是同時：依序存用 <code>for…of</code> 加 <code>await</code>；同時存用 <code>await Promise.all(ids.map(save))</code>。兩種寫法都讓外層真的等到每一筆完成，任何一筆失敗都會變成 handler 接得到的錯誤。typescript-eslint 的 <code>no-floating-promises</code> 規則能在編輯器裡就把漏掉的 <code>await</code> 標出來。</p>
+<p>改用 <code>Promise.all</code> 之後，還有一個常被誤會的地方：它在第一個失敗時就 reject，但<strong>其他的 Promise 不會停</strong>，會繼續在背景跑完。下單後同時寄簡訊、Email、推播，Email 失敗時另外兩個還在進行。執行 <code>node examples/all-settled.ts</code>，看 reject 的時間點和後面兩行「完成」：</p>
+<pre>Promise.all 在 22ms 就 reject：Email 失敗
+  62ms 推播 完成
+  101ms 簡訊 完成
+---- allSettled ----
+  …
+  成功 簡訊
+  失敗 Email 失敗
+  成功 推播</pre>
+<p>所以要先想清楚你要的是哪一種行為。要「一個失敗就全部停下」，得像<a href="17-calling-external-apis.html">第 17 課</a>那樣用 <code>AbortController</code> 主動取消其他的；要「每個都做完，再看誰失敗」，用 <code>Promise.allSettled</code>，它等全部結束，回傳每一個的 <code>{ status: 'fulfilled', value }</code> 或 <code>{ status: 'rejected', reason }</code>。下單後的三種通知，一個失敗不該影響其他，就用 allSettled，再把失敗的記下來。</p>
+<p>除了沒 await 的 Promise，還有兩個地方的錯誤會逃出 <code>try/catch</code>，原因都一樣：錯誤發生時，包住它的 <code>try</code> 已經不在呼叫堆疊上了。</p>
+<ul>
+  <li><strong>計時器和事件的 callback</strong>：<code>try { setTimeout(() =&gt; { throw … }) } catch {}</code> 接不到。<code>setTimeout</code> 只是登記一個 callback 就回傳，<code>try</code> 隨即結束；callback 是之後由 <a href="07-event-loop.html">第 7 課</a>的 event loop 呼叫的，那時已經沒有人包著它。錯誤變成 uncaught exception。</li>
+  <li><strong>EventEmitter 的 <code>'error'</code> 事件</strong>：沒有掛 <code>'error'</code> 監聽器時，emit <code>'error'</code> 會直接 throw（<a href="08-events-cancellation.html">第 8 課</a>）。stream、socket、伺服器都是 EventEmitter，所以這比想像中常見。</li>
+</ul>
+<div class="callout practice"><strong>💡 實務上：浮動 Promise 靠工具抓，不靠眼睛</strong><br>這類 bug 在本機幾乎測不出來：資料庫很快、不會失敗，回應和寫入的先後看起來都對，上線遇到慢查詢才出事。所以團隊專案通常直接開 typescript-eslint 的 <code>no-floating-promises</code>，讓 CI 擋下來，review 時就不用一行行找漏掉的 <code>await</code>。真的要「送出去不等結果」（例如下單後寄 Email），也要明確寫 <code>.catch</code> 記 log，讓讀程式的人知道這是刻意的。選 <code>Promise.all</code> 還是 <code>allSettled</code> 時先問：其中一個失敗，整件事算不算失敗？訂單寫入失敗算，通知失敗不算。</div>
+<p>工具能擋掉大部分浮動 Promise，但不可能擋掉全部，計時器裡的 bug 也總會有漏網的。這些錯誤逃出所有 <code>try/catch</code> 之後，並不是憑空消失，而是落到程序層級。第三件事的當機就停在那裡，下一節看它落地之後該怎麼處理。</p>
+
+<h2>逃走的錯誤最後去哪？程序層級的最後一道防線</h2>
+<p>一路沒人接的錯誤，最後會變成程序層級的兩種事件，Node 對它們有預設的處理方式：</p>
+<ul>
+  <li><strong>uncaughtException</strong>：同步丟出、沒有任何 <code>catch</code> 接住的例外，例如計時器 callback 裡的 throw。預設行為是把 stack 印到 stderr，以結束碼 1 結束程序。</li>
+  <li><strong>unhandledRejection</strong>：被 reject、沒有任何地方處理的 Promise，例如上一節的浮動 Promise。目前 Node 的預設模式（<code>--unhandled-rejections=throw</code>）是：有掛 <code>'unhandledRejection'</code> 監聽器就交給它，沒有就把它當成 uncaught exception，程序同樣以結束碼 1 結束。舊版的行為不同，見課末。</li>
+</ul>
+<p>也就是說，第三件事裡程序結束不是意外，而是 Node 的預設行為。第一個念頭通常是「那就掛個監聽器接住，別讓它結束」：<code>process.on('uncaughtException', …)</code> 確實可以取代預設行為。但 Node 文件寫得很明確：這個事件的正確用途是在結束前同步清理資源，<strong>在 uncaughtException 之後繼續正常運作是不安全的</strong>。</p>
+<p>為什麼不安全？例外是在某段程式執行到一半時中斷它的。被中斷的那段程式可能正在改記憶體裡的一筆訂單，改了一半；可能拿了一個連線的鎖，還沒放；可能該把某個計數器減一，還沒減。這些都是程式裡沒有預期的中斷點，所以也沒有任何程式會去把它們復原。你不知道哪些狀態壞了，之後的每個回應都可能是錯的，而且錯得很安靜：不會再有錯誤，只會有錯的結果。這正是第一節說的：bug 不能「處理」，因為處理之後的狀態不可信。</p>
+<p>所以業界的做法是<strong>讓它崩潰</strong>（let it crash）：記一行 log，停止接新請求，以非 0 的結束碼結束，再由<strong>監督者</strong>（supervisor）重新啟動一個狀態乾淨的程序。監督者是部署環境裡負責「程序掛了就重開」的系統，例如 systemd（<a href="../../devops/lessons/06-ssh-systemd.html">部署課第 6 課</a>）、Docker 的 restart policy、Kubernetes。結束碼要是 1，監督者和監控才知道這是壞掉、不是正常關機。新的程序從頭建立所有狀態，比在壞掉的狀態上繼續跑可靠得多。</p>
+<p>寫成程式碼，兩個事件都交給同一個 <code>fatal</code>：</p>
+<pre>function fatal(origin: string, err: unknown) {
+  const line = JSON.stringify({
+    level: 'fatal', msg: origin, errorId: randomUUID(),
+    name: Error.isError(err) ? err.name : typeof err,
+    message: Error.isError(err) ? err.message : String(err),
+  })
+  writeSync(2, line + '\n')   // 同步寫進 stderr
+  server.close()             // 不再接新的連線
+  process.exit(1)
+}
+process.on('uncaughtException', err =&gt; fatal('uncaughtException', err))
+process.on('unhandledRejection', reason =&gt; fatal('unhandledRejection', reason))</pre>
+<p>逐行看幾個刻意的選擇：</p>
+<ul>
+  <li><strong>為什麼用 <code>fs.writeSync(2, …)</code>，不用 <code>console.error</code></strong>：Node 文件說明 stdout／stderr 接到管線（pipe）時，在 POSIX 系統上是非同步寫入；<code>process.exit()</code> 會立刻結束，還沒寫出去的內容就掉了。正式環境的 log 幾乎都是經過管線收集的，用 <code>console.error</code> 等於最重要的那一行最可能遺失。<code>2</code> 是 stderr 的編號（file descriptor，<a href="02-process-config.html">第 2 課</a>）。</li>
+  <li><strong>為什麼先用 <code>Error.isError</code> 確認</strong>：<code>'unhandledRejection'</code> 的 reason 不一定是 Error，<code>Promise.reject('字串')</code> 也行。和上一節邊界的道理一樣，先確認再讀屬性。</li>
+  <li><strong>為什麼兩個都掛</strong>：只掛 <code>'uncaughtException'</code> 也接得到 rejection（會被轉成 uncaught exception），但分開掛，log 裡的 <code>msg</code> 直接告訴你是哪一種，比較清楚。</li>
+  <li><strong>進行中的請求會被切斷</strong>：這裡直接結束，正在處理的請求沒有機會回應。<a href="21-graceful-shutdown.html">第 21 課</a>會做優雅關機：先停止接新請求、等進行中的請求做完、設一個時限再結束。</li>
+</ul>
+<p>讀到這裡可能會疑惑：第 13 課的處理函式丟錯時，伺服器回 500 之後繼續服務其他人，為什麼這裡卻要讓程序結束？差別在錯誤是在哪裡被接住的。</p>
+<div class="callout warn">處理函式裡的錯誤和程序層級的錯誤界線不同。處理函式丟出的錯誤被邊界接住，回 500、程序繼續服務其他人，這是<a href="13-http-server.html">第 13 課</a>的做法：錯誤只影響這一個請求。會一路跑到 <code>uncaughtException</code> 的，代表它發生在你沒預料的地方，那才是要讓程序結束的時候。</div>
+<p>回到第三件事：凌晨三點的當機，根源就是上一節那種沒被 <code>await</code> 的 Promise，像 <code>forEach(async …)</code> 裡第 3 筆失敗的那個例子。修掉那個 bug 是一件事；加上這道防線後，下次再有漏網的錯誤，log 裡會留下一行帶 errorId 的 fatal，程序乾淨地結束並被重啟，而不是只有一段沒人看得懂的 stack。練習 2 要你在 <code>main.ts</code> 加上它。</p>
+<div class="callout practice"><strong>💡 實務上：let it crash 的前提是有人會重開</strong><br>敢讓程序結束，是因為部署時已經確認過三件事：監督者真的設了自動重啟（systemd 的 <code>Restart=</code>、Docker 的 restart policy）；正式環境通常跑不只一個實例，一個重開時其他的還在接請求；監控會看重啟次數。最後一點最容易漏：同一個 bug 每個請求都觸發時，程序會不停「啟動、崩潰、重啟」，服務看起來還活著，其實一直在斷線，所以重啟次數突然變多要告警。上線前問一句「這個程序掛了誰會重開、誰會知道？」，答不出來就還不能上線。</div>
+<p>三件事都追到了根源，也都有了對應的規則。接下來在 <code>work/18</code> 把它們依序做出來：先做錯誤類別和轉換（練習 1），再加程序層級的防線（練習 2），最後把 <code>POST /orders</code> 的三層改成只在邊界記一次（練習 3）。</p>
+
+<h2>練習</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs node 18</code> 建立 <code>work/18/</code>。<code>report.ts</code> 是練習 2 用的、有 bug 的排程工作，不用改。練習 3 會用到練習 1 的 <code>errors.ts</code>，請依序做。</p>
+
+<div class="local" data-test="ex1" data-files="errors.ts">
+  <p>練習 1：完成 <code>errors.ts</code>。<code>AppError</code> 的建構子：<code>status</code> 從 <code>PROBLEMS[code]</code> 查；<code>expose</code> 沒給時，4xx 是 <code>true</code>、5xx 是 <code>false</code>；<code>options.cause</code> 要保留成 <code>err.cause</code>；<code>name</code> 是實際的類別名稱。四個子類別（<code>NotFoundError</code>、<code>ValidationError</code>、<code>ConflictError</code>、<code>UpstreamError</code>）要把 <code>options</code> 傳下去。再完成 <code>toProblem(err, errorId)</code>：<code>AppError</code> 照表回 <code>{ type: PROBLEM_BASE + type, title, status, detail }</code>，<code>expose</code> 是 <code>true</code> 時 <code>detail</code> 是錯誤訊息，否則是 <code>GENERIC_DETAIL</code>；<code>ValidationError</code> 多一個 <code>errors</code>（它的 <code>details</code>）；5xx 才加 <code>errorId</code>。其他任何東西（<code>TypeError</code>、被 throw 的字串、物件、<code>null</code>）一律是 <code>INTERNAL</code> 的 500，不能讀它的欄位，也不能讓原始內容出現在回應裡。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="main.ts">
+  <p>練習 2：<code>main.ts</code> 啟動伺服器，<code>JOB_DELAY_MS</code> 毫秒後執行一次排程工作；<code>BUG=exception</code> 時它在計時器裡同步 throw <code>TypeError</code>，<code>BUG=rejection</code> 時它忘了 <code>await</code> 一個會失敗的 Promise。先執行 <code>BUG=exception node main.ts</code> 看看現在的樣子。加上程序層級的處理：發生 <code>uncaughtException</code> 或 <code>unhandledRejection</code> 時，在 stderr 印一行 JSON，至少有 <code>level: "fatal"</code>、<code>msg</code>、<code>errorId</code>（每次不同）、<code>name</code>、<code>message</code>（原始錯誤的名稱和訊息）；接著停止接受新請求，並以結束碼 1 結束。測試會在出錯後最多等 10 秒，程序沒自己結束就算錯。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="order-flow.ts">
+  <p>練習 3：<code>order-flow.ts</code> 的 <code>POST /orders</code> 經過 repository → service → handler 三層，現在每一層都 log、包裝時丟了 cause、service 把錯誤吞掉、errorId 產生了兩次。修好它：repository 把資料庫錯誤包成領域錯誤（<code>code</code> 是 <code>'23505'</code> → <code>ConflictError</code>、<code>'57014'</code> → <code>UpstreamError</code>，其他原樣往上丟；資料庫的訊息會隨語言設定改變，只能看 <code>code</code>），一律放 cause，不 log；service 不 log、不 catch；handler 是唯一的錯誤邊界：產生一個 errorId，用練習 1 的 <code>toProblem</code> 回應，<strong>只有 5xx</strong> 才呼叫一次 <code>logger.error({ msg, errorId, name, message, codes })</code>，<code>name</code> 是最外層錯誤的名稱，<code>codes</code> 是沿著 cause 一路往下收集到的每一層 <code>code</code>（例如 <code>['UPSTREAM_UNAVAILABLE', '57014']</code>）。測試會傳入會丟各種錯誤的假資料庫和收集 log 的 logger：23505 要 409、0 行 log；57014 要 503、剛好 1 行；不認得的錯誤和 <code>TypeError</code> 要 500、剛好 1 行；回應的 errorId 要和 log 相同。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 4：「資料庫查詢逾時」和「讀到 <code>undefined.price</code>」各是哪一種錯誤？</p>
+  <label data-key="a">兩個都是 bug，正確的程式不會出錯</label>
+  <label data-key="b">前者是可預期的錯誤，後者是 bug</label>
+  <label data-key="c">前者是 bug，後者是可預期的錯誤</label>
+  <label data-key="d">兩個都是可預期的錯誤，都回 500 就好</label>
+  <p class="why">✓ 程式完全正確，資料庫也可能因為負載高而逾時，這是正常運作中會發生的失敗，要處理：回 503、考慮重試、記 log 觀察頻率。讀 <code>undefined</code> 的屬性表示程式對資料的假設錯了，只有修程式能解決。兩者都可能回 5xx，但後續動作完全不同：前者調整逾時與重試，後者找出 bug 修掉。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：同事在 <code>main.ts</code> 加了 <code>process.on('uncaughtException', err =&gt; console.error(err))</code>，說「這樣伺服器再也不會掛了」。有什麼問題？</p>
+  <label data-key="a">沒問題，錯誤已經記下來，程序繼續服務最安全</label>
+  <label data-key="b">它只接得到同步的例外，async 的錯誤還是會讓程序結束</label>
+  <label data-key="c">例外可能讓程式的狀態只改了一半，繼續服務的結果不可信，而且不會有人發現</label>
+  <label data-key="d">Node 會忽略這個監聽器，程序一樣會結束</label>
+  <p class="why">✓ 例外中斷了某段程式的中間，記憶體裡的資料、鎖、計數器可能停在不一致的狀態。Node 文件明確說在 uncaughtException 之後繼續正常運作是不安全的。正確做法是記 log 後以結束碼 1 結束，讓監督者重啟一個乾淨的程序。b 錯：沒有 <code>'unhandledRejection'</code> 監聽器時，rejection 也會變成 uncaughtException 交給它。d 錯：掛了監聽器，預設的結束行為就被取代了，這正是危險的地方。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：<code>[1, 2, 3].forEach(async id =&gt; await save(id))</code> 的下一行開始執行時，三個 <code>save</code> 都完成了嗎？</p>
+  <label data-key="a">不一定，forEach 不會等 callback 回傳的 Promise</label>
+  <label data-key="b">完成了，callback 裡有 await</label>
+  <label data-key="c">完成了，但順序不固定</label>
+  <label data-key="d">要看外層函式是不是 async</label>
+  <p class="why">✓ <code>await</code> 只暫停 callback 自己，<code>forEach</code> 呼叫完三次 callback 就回傳，不看它們回傳的 Promise。下一行通常在任何一個 <code>save</code> 完成之前就執行了，<code>save</code> 失敗時也沒人接，變成 unhandled rejection。外層是不是 async 都一樣。依序做用 <code>for…of</code> 加 <code>await</code>，同時做用 <code>await Promise.all(ids.map(save))</code>。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>catch 之後什麼都不做</strong>：錯誤消失，留下的只有奇怪的結果。處理它、包裝後往上丟，或在邊界記錄；真的要忽略，只接預期的 <code>code</code>，其他的重新 throw。</li>
+  <li><strong>失敗時回傳 <code>null</code> 或空陣列</strong>：呼叫的人分不出「沒有資料」和「出錯了」，咖啡店的「點餐成功」就是這樣來的。讓錯誤往上丟到邊界。</li>
+  <li><strong>每一層都 log</strong>：一個錯誤變成好幾行，告警翻倍、搜尋時分不出次數。只在錯誤邊界記一次，中間層用 cause 往上傳。</li>
+  <li><strong>包裝錯誤時丟掉 cause</strong>：log 只看得到外層的「資料庫查詢逾時」，看不到原始的 code 和訊息。一律 <code>new XxxError(訊息, { cause: err })</code>。</li>
+  <li><strong>把內部訊息回給客戶端</strong>：SQL、表名、檔案路徑、stack 都是攻擊者的情報。5xx 回通用訊息加 errorId，細節只寫 log。</li>
+  <li><strong>throw 字串而不是 Error</strong>：沒有 stack、沒有 name，<code>instanceof</code> 和 <code>Error.isError</code> 都認不出來。一律 throw Error 或它的子類別；處理錯誤的程式也要能接受被 throw 的任何東西。</li>
+  <li><strong>子類別沒設 name</strong>：log 和 stack 都只寫 <code>Error</code>。在父類別寫 <code>this.name = new.target.name</code>。</li>
+  <li><strong>用錯誤訊息判斷種類</strong>：訊息會改、會翻譯。用 <code>code</code> 或 <code>instanceof</code>。</li>
+  <li><strong><code>forEach(async …)</code> 和忘了 <code>await</code></strong>：回應先送出、錯誤後到，沒人接得住。用 <code>for…of</code>＋<code>await</code> 或 <code>Promise.all</code>，並開啟 <code>no-floating-promises</code> 檢查。</li>
+  <li><strong>uncaughtException 之後繼續執行</strong>：程式的狀態不可信。記 log、以結束碼 1 結束，交給監督者重啟。</li>
+  <li><strong>可預期的 404、409 記成 error</strong>：真正的問題被淹沒。error 等級留給 5xx。</li>
+</ul>
+
+<h2>補充與查表</h2>
+<h3>instanceof 什麼時候會判斷錯</h3>
+<p><code>instanceof</code> 看的是原型鏈：物件的原型是不是那個類別的 <code>prototype</code>。兩種情況下，明明是同一種錯誤卻會得到 <code>false</code>。一是同一個套件被裝了兩份（例如兩個相依套件各自要求不同版本），兩份各有自己的錯誤類別。二是錯誤來自另一個 realm：realm 是一套獨立的全域環境，例如瀏覽器的 iframe、Node 的 <code>node:vm</code>，各有自己的一份 <code>Error</code>。這兩種情況改看 <code>code</code>，它跨套件、跨程序（錯誤被序列化傳過來）都還在。</p>
+<p><code>Error.isError(value)</code> 跨 realm 也判斷正確，<code>{ __proto__: Error.prototype }</code> 這種假的會回 <code>false</code>。Node 24 可以用（本機 24.22.1 驗證）；原本的 <code>util.types.isNativeError</code> 從 v24.2.0 起在文件中標為 deprecated，建議改用 <code>Error.isError</code>。</p>
+<h3>AggregateError：一次裝了多個錯誤</h3>
+<p><strong>AggregateError</strong> 是一次裝了多個錯誤的錯誤，<code>errors</code> 屬性是陣列。<code>Promise.any</code> 全部失敗時會丟它；<a href="17-calling-external-apis.html">第 17 課</a>連 <code>localhost</code> 失敗時，<code>fetch</code> 的 cause 也是它（IPv6 和 IPv4 各失敗一次）。log 時要把 <code>errors</code> 裡的每一個都印出來。</p>
+<h3>throw 還是回傳 Result？</h3>
+<p><a href="../../typescript/lessons/27-modeling-state-errors.html">TypeScript 課第 27 課</a>用 Result 把「可能失敗」寫進型別。兩者可以並用：領域內的邏輯（例如狀態轉換能不能做）回傳 Result，呼叫的人一定得處理；跨好幾層、呼叫的人通常也沒辦法處理的失敗（找不到、資料庫逾時）用 throw，一路傳到邊界統一轉換。bug 一律是 throw，不要包成 Result。</p>
+<h3>程序層級事件的細節</h3>
+<ul>
+  <li><code>unhandledRejection</code> 的預設行為從 v15.0.0 起才是上面說的「沒有監聽器就當成 uncaught exception、結束程序」；之前只印警告，程序繼續跑。</li>
+  <li>沒有掛 <code>'unhandledRejection'</code> 時，rejection 會變成 uncaughtException，<code>'uncaughtException'</code> 監聽器的第二個參數 <code>origin</code> 是 <code>'unhandledRejection'</code>。</li>
+  <li>只想觀察、不改變預設的結束行為，可以用 <code>'uncaughtExceptionMonitor'</code> 事件。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>可預期的錯誤（找不到、驗證失敗、衝突、上游逾時）要處理：回對的狀態碼、重試、改用備案；程式錯誤（bug）要修：記完整資訊，程序狀態不可信時讓它結束。判斷方法是問「程式完全正確時會不會發生」。</li>
+  <li>錯誤物件帶三樣東西：子類別與正確的 <code>name</code>、穩定的 <code>code</code>、保留原因的 <code>cause</code>。自己的類別用 <code>instanceof</code>，別人的錯誤看 <code>code</code>，判斷是不是 Error 用 <code>Error.isError</code>。</li>
+  <li>業務程式只丟領域錯誤，在 HTTP 邊界一個地方轉成 problem details；4xx 顯示訊息，5xx 回通用訊息和 errorId，同一個 errorId 寫進 log。</li>
+  <li>每個錯誤只在邊界記一次，往上丟用 cause 包起來，不要吞掉，可預期的錯誤不記成 error。</li>
+  <li>浮動 Promise、<code>forEach(async …)</code>、計時器與事件 callback 裡的 throw 都會逃出 <code>try/catch</code>；<code>Promise.all</code> 第一個失敗就 reject 但其他的還在跑，要收集全部結果用 <code>allSettled</code>。</li>
+  <li>uncaughtException 和 unhandledRejection 是最後一道防線：同步寫一行 fatal log，停止接新請求，以結束碼 1 結束，由監督者重新啟動。</li>
+</ul>
+<p>這課的 log 只寫了「在邊界記一行」，還沒處理那一行該長什麼樣子。下一課把 log 做好：一行一個 JSON、正確序列化 Error 和整條 cause 鏈，並用 AsyncLocalStorage 讓同一個請求的每一行 log 都自動帶上 request id。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

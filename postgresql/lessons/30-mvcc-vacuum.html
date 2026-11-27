@@ -1,0 +1,651 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>30. MVCC 內部：列的版本、VACUUM 與表膨脹</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="30" data-pg-extensions="pageinspect, pg_visibility, pg_freespacemap" data-pg-2pc>
+<header>
+  <div class="eyebrow">階段 9：資深必備｜並發與正確性 · 第 30 課</div>
+  <h1>MVCC 內部：列的版本、VACUUM 與表膨脹</h1>
+</header>
+<main>
+
+<p>咖啡店的集點卡表 <code>stamp_cards</code> 只有兩千位會員，每位會員一列，每買一杯咖啡就把那一列的 <code>stamps</code> 加 1。列數幾乎沒變，資料表的檔案卻一天比一天大，查詢也越來越慢；明明每晚都有排程跑 <code>VACUUM</code>，空間就是收不回來。這一課從頭到尾都在查這張表：它裡面實際存了什麼、空間為什麼收不回來、是什麼擋住了清理，最後動手修好它。</p>
+<p>要回答這些問題，得先知道 PostgreSQL 在表裡實際存了什麼。<a href="19-concurrency.html">第 19 課</a>說過 MVCC 讓「讀不擋寫」，代價是每次修改都留下舊版本。這一課打開資料頁，看版本怎麼產生、誰決定看得到哪一個、什麼時候能清掉、為什麼有時候清不掉。學完你能判斷一張表為什麼膨脹，找出擋住清理的交易，並調整表讓更新少產生垃圾。</p>
+
+<div class="callout"><strong>第一輪只要記住：</strong>
+<ul>
+  <li><code>UPDATE</code> 不會原地改，而是寫一個新版本，舊版本變成死版本。VACUUM 讓死版本的空間能重複使用，但不會讓檔案變小。</li>
+  <li>只要有一個交易開著不收尾（例如程式忘了 <code>COMMIT</code>），<strong>整個資料庫</strong>的死版本都清不掉，表會一直膨脹。</li>
+  <li>常被更新的欄位不要隨手建索引；autovacuum 不要關。</li>
+</ul>
+快照的格式、pageinspect、凍結的門檻這些細節，工作上遇到再回來查。</div>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li><code>UPDATE</code> 之後，舊的那一列去哪了？打開資料頁，看 <code>UPDATE</code>、<code>ROLLBACK</code> 留下了什麼。</li>
+  <li>舊版本誰來清？VACUUM 做了什麼、為什麼檔案不會變小（開場問題的最小答案）。</li>
+  <li>「沒有交易看得到」是誰說了算？快照與可見性規則。</li>
+  <li>VACUUM 為什麼清不掉？用可見性規則推出清理界線，找出擋住清理的交易。</li>
+  <li>能不能讓更新少產生垃圾？HOT 更新與 fillfactor，找出集點卡表垃圾特別多的原因和修法。</li>
+  <li>正式環境誰來跑 VACUUM？autovacuum 什麼時候觸發，以及交易編號用完之前會發生什麼事（凍結）。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="18-transactions.html">第 18 課</a>的交易：<code>BEGIN</code> 開始，<code>COMMIT</code> 或 <code>ROLLBACK</code> 結束，中間的修改一起生效或一起取消。</li>
+  <li><a href="19-concurrency.html">第 19 課</a>的 MVCC 與 <code>FOR UPDATE</code>：修改一列時寫一個新版本，正在讀的人繼續看舊版本，所以讀不擋寫；<code>FOR UPDATE</code> 讀的同時鎖住選到的列，直到交易結束。</li>
+</ul></div>
+
+<div class="callout"><strong>這頁的環境：</strong>資料庫是 PGlite 0.5.13（PostgreSQL 18.6），只有一條連線、看不到別人，「另一個人的交易」用暫停的同事模擬；有句子在等鎖時，約 5 秒後引擎會重置頁面資料庫。沒有 autovacuum 在背景跑，VACUUM 都手動執行；每次執行後統計立刻更新，正式環境會延遲。</div>
+
+<p><strong>這頁的資料：</strong><code>products</code>（6 項商品）、<code>big</code>（2 萬列，膨脹實驗用）、<code>stamp_cards</code>（開場的集點卡表，2,000 張），以及練習用的 <code>orders</code>、<code>sessions</code>、<code>order_items</code>、<code>coupons</code>。</p>
+
+<h2>UPDATE 之後，舊的那一列去哪了？</h2>
+<p>集點卡表列數沒變、檔案卻變大，表示表裡存的東西比 <code>SELECT</code> 看到的多。第一步先弄清楚一次 <code>UPDATE</code> 在表裡留下了什麼。這一節用 <code>products</code> 示範，不直接用 <code>stamp_cards</code>：商品只有 6 列，全部放在同一頁裡，每個變化都看得清楚；集點卡的每次集點也是一次 <code>UPDATE</code>，機制完全一樣，第 5 節會回到它。</p>
+<p>先認識表在磁碟上的樣子。PostgreSQL 把每張表存成一個檔案，檔案切成一個個 8 kB 的<strong>資料頁</strong>（page），讀寫都以頁為單位。每一頁裡有很多格，一格放一列資料的一個版本。為什麼說「一個版本」？<a href="19-concurrency.html">第 19 課</a>講過，有人修改一列時，正在讀的人要能繼續看到修改前的樣子，所以 PostgreSQL 不能直接把舊值蓋掉，同一列會同時存在新舊好幾份。表裡一列資料的某一個版本，叫<strong>列版本</strong>（tuple）。</p>
+<p>既然同一列有好幾個版本，PostgreSQL 就要記下每個版本是誰建立的、是誰刪掉的，才能判斷某個讀取的人該看哪一份。記錄的單位是<strong>交易編號</strong>（transaction ID，簡稱 XID）：會寫資料的交易，在第一次寫入時拿到一個流水號，越新的交易號碼越大。只讀不寫的交易不會拿號碼。每個列版本都帶著幾個隱藏欄位記錄這些資訊，平常 <code>SELECT *</code> 看不到，指名就看得到：</p>
+<div class="table-wrap"><table>
+  <tr><th>欄位</th><th>意思</th></tr>
+  <tr><td><code>ctid</code></td><td>這個版本的實際位置：（第幾頁, 第幾格）</td></tr>
+  <tr><td><code>xmin</code></td><td>建立這個版本的交易編號</td></tr>
+  <tr><td><code>xmax</code></td><td>刪除（或鎖住）這個版本的交易編號；0 代表沒有</td></tr>
+</table></div>
+<p>執行後看 <code>ctid</code> 和 <code>xmin</code> 兩欄：</p>
+<div class="lab" data-sql="SELECT ctid, xmin, xmax, * FROM products;"></div>
+<p>六個版本都在第 0 頁，<code>xmin</code> 都是 seed 那個交易的編號（你看到的數字可能不同）。這是「只寫過一次」的樣子。現在把拿鐵改成 115 元，再看一次，注意拿鐵那一列：</p>
+<div class="lab" data-sql="UPDATE products SET price = 115 WHERE name = '拿鐵';
+SELECT ctid, xmin, xmax, * FROM products;"></div>
+<ul>
+  <li><code>ctid</code> 從 <code>(0,2)</code> 變成 <code>(0,7)</code>：拿鐵搬到了另一格。</li>
+  <li><code>xmin</code> 變成這次 <code>UPDATE</code> 的交易編號。</li>
+</ul>
+<p>拿鐵為什麼搬家？因為 PostgreSQL 的 <code>UPDATE</code>（<a href="06-update-delete.html">第 6 課</a>）不會原地改。它做兩件事：把舊版本的 <code>xmax</code> 填上自己的交易編號，表示「這個版本被我刪掉了」；再寫一個新版本到空的格子，新版本的 <code>xmin</code> 是自己。<code>DELETE</code> 只做前一半：填上舊版本的 <code>xmax</code>，不寫新版本。<code>SELECT</code> 只回傳「你看得到的」版本，所以結果裡 <code>(0,2)</code> 消失了，但那個 110 元的拿鐵還在頁裡。</p>
+<p>如果做到一半反悔，交易最後 <code>ROLLBACK</code> 呢？舊版本的 <code>xmax</code> 已經填上了，新版本也寫出去了，PostgreSQL 要把它們改回去嗎？執行後看美式咖啡那一列：</p>
+<div class="lab" data-sql="BEGIN;
+UPDATE products SET price = 999 WHERE name = '美式咖啡';
+ROLLBACK;
+
+SELECT ctid, xmin, xmax, * FROM products;"></div>
+<ul>
+  <li>價格還是 80 元，位置還是 <code>(0,1)</code>。</li>
+  <li><code>xmax</code> 不是 0 了：那是被取消的交易留下的編號。PostgreSQL 另外記錄每個交易最後是提交還是取消，看到這個 <code>xmax</code> 時會去查，知道它沒有提交，所以這個舊版本仍然有效。</li>
+</ul>
+<p>被取消的交易寫出的新版本（999 元）則沒有人看得到。<strong>ROLLBACK 不會把頁面改回原樣，它只是讓那些版本永遠無效。</strong>這樣 <code>ROLLBACK</code> 才能很快完成，不管交易改了多少列，代價是頁裡又多了一個沒用的版本。</p>
+<p>到這裡，「舊版本還在頁裡」都還是推論，因為 <code>SELECT</code> 不會給你看看不到的版本。要親眼確認，用 <code>pageinspect</code>：它是 PostgreSQL 附帶的擴充套件，直接讀出某一頁的原始內容，不管誰看得到、看不到，每一格都列出來。它是學習和診斷用的工具，平常寫程式不會用到。讀第 0 頁：</p>
+<div class="lab" data-sql="SELECT lp, t_xmin, t_xmax, t_ctid,
+       'HEAP_HOT_UPDATED' = ANY (f.raw_flags) AS hot_updated,
+       'HEAP_ONLY_TUPLE' = ANY (f.raw_flags) AS heap_only
+FROM heap_page_items(get_raw_page('products', 0)) p,
+     heap_tuple_infomask_flags(p.t_infomask, p.t_infomask2) f;"></div>
+<ul>
+  <li><code>lp</code> 是格子編號，<code>t_xmin</code>、<code>t_xmax</code> 就是前面的 <code>xmin</code>、<code>xmax</code>。</li>
+  <li><code>t_ctid</code> 指向「下一個版本」在哪：第 2 格的拿鐵指向第 7 格，第 1 格的美式咖啡指向第 8 格（那個被取消的 999 元）。</li>
+  <li>最後兩欄是 HOT 標記，第 5 節會用到，先不管。</li>
+</ul>
+<figure>
+  <svg viewBox="0 0 700 230" role="img" aria-label="第 0 頁裡拿鐵有兩個版本：第 2 格是 110 元的舊版本，xmax 填了更新它的交易，t_ctid 指向第 7 格；第 7 格是 115 元的新版本">
+    <defs><marker id="arr30" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="20" y="20" width="660" height="190" rx="10"/>
+    <text class="d-small" x="36" y="42">products 的第 0 頁（8 kB）</text>
+    <rect class="d-box" x="40" y="60" width="270" height="120" rx="8"/>
+    <text class="d-text" x="56" y="86">第 2 格：拿鐵 110 元</text>
+    <text class="d-small" x="56" y="110">xmin = 建立它的 seed 交易</text>
+    <text class="d-small" x="56" y="130">xmax = 改價的交易</text>
+    <text class="d-small" x="56" y="150">t_ctid = (0,7)</text>
+    <text class="d-accent" x="56" y="170">舊版本：之後的交易看不到</text>
+    <rect class="d-box" x="390" y="60" width="270" height="120" rx="8"/>
+    <text class="d-text" x="406" y="86">第 7 格：拿鐵 115 元</text>
+    <text class="d-small" x="406" y="110">xmin = 改價的交易</text>
+    <text class="d-small" x="406" y="130">xmax = 0</text>
+    <text class="d-small" x="406" y="150">t_ctid = (0,7)（自己）</text>
+    <text class="d-accent" x="406" y="170">新版本</text>
+    <path class="d-line" d="M310,120 L386,120" marker-end="url(#arr30)"/>
+  </svg>
+  <figcaption>UPDATE 等於「標記舊版本已刪除＋寫一個新版本」，兩個版本都留在頁裡。</figcaption>
+</figure>
+<p>所以集點卡表變大的第一個原因找到了：每集一次點就是一次 <code>UPDATE</code>，每次都在表裡多留下一個舊版本。兩千位會員集了幾千次點，表裡就有幾千個沒人要看的舊版本。下一個問題是：這些舊版本會一直留著嗎？誰負責清掉它們？</p>
+
+<h2>舊版本誰來清？為什麼 VACUUM 之後檔案沒變小？</h2>
+<p>上一節第 2 格那個 110 元的拿鐵，已經沒有交易看得到，卻還佔著頁裡的位置。沒有任何交易還看得到的版本叫<strong>死版本</strong>（dead tuple）；反過來，還有交易看得到的叫活版本。「看得到」的精確規則第 3 節再講，這裡先用直覺理解：舊的價格已經被新的取代、而且沒有人還在讀舊價格，它就死了。</p>
+<p>PostgreSQL 不會在交易提交的當下就把舊版本清掉。提交的那一刻，可能還有別的交易正在讀舊版本，現在清掉它們就讀不到了；而且每次提交都去整理頁面，寫入會變慢。所以清理延後，交給一個獨立的工作：<strong>VACUUM</strong>。一次 VACUUM 大致做這幾件事：</p>
+<ol>
+  <li>掃過表，找出死版本。</li>
+  <li>把每個索引裡指向這些死版本的紀錄移除，再把死版本佔的格子空出來。</li>
+  <li>把每一頁還剩多少空位記進 <strong>free space map</strong>。它是每張表旁邊的一份小紀錄，之後要寫入新版本時，PostgreSQL 查它就知道哪一頁有空位，不用一頁頁去找。</li>
+  <li>更新 <strong>visibility map</strong>：記下哪些頁裡的版本全部對所有交易都可見。<a href="21-explain.html">第 21 課</a>的 Index Only Scan 靠它判斷能不能不回表；下次 VACUUM 也靠它跳過不需要處理的頁。</li>
+</ol>
+<p>接下來用 <code>big</code> 這張 20,000 列的表做實驗，觀察 VACUUM 前後的變化。<code>products</code> 太小，大小的變化看不出來。要觀察，需要兩種數字：表的檔案多大，以及表裡有幾個活版本、幾個死版本。後者在 <code>pg_stat_user_tables</code>：它是一個系統視圖（system view），也就是 PostgreSQL 內建、可以像表一樣查詢的資訊，每張使用者建立的表一列，記錄這張表被新增、更新、刪除了幾次、現在大約有幾個活版本和死版本。執行後看三欄：</p>
+<div class="lab" data-sql="SELECT pg_size_pretty(pg_relation_size('big')) AS size, n_live_tup, n_dead_tup
+FROM pg_stat_user_tables WHERE relname = 'big';"></div>
+<ul>
+  <li><code>size</code>：<code>pg_relation_size</code> 是表本身的大小，不含索引。</li>
+  <li><code>n_live_tup</code>、<code>n_dead_tup</code>：活版本數和死版本數。它們來自<strong>累計統計</strong>，是 PostgreSQL 一邊執行一邊累加的估計值，不是現場數出來的；正式環境要等一下才看得到最新的數字（見課首「這頁的環境」）。</li>
+</ul>
+<p>這句等一下還要查好幾次。seed 裡的 <code>big_stats()</code> 就是上面這句，另外多一欄 <code>reusable</code>：<code>(SELECT pg_size_pretty(sum(avail)) FROM pg_freespace('big'))</code>，也就是 free space map 記下的空位加總，VACUUM 之後再看它。先模擬集點卡表的情況，把每一列都更新一次：</p>
+<div class="lab" data-sql="UPDATE big SET qty = qty + 1;"></div>
+<p>再查一次，看 <code>size</code> 和 <code>n_dead_tup</code>：</p>
+<div class="lab" data-sql="SELECT * FROM big_stats();"></div>
+<p>2136 kB 變成大約 4272 kB，多了 20,000 個死版本：每一列都有新舊兩份，表就大了一倍。表裡大量被死版本或空位佔著、沒有存活資料的空間，叫<strong>表膨脹</strong>（bloat）。膨脹不只浪費磁碟：全表掃描要讀的頁變多，同樣大小的記憶體能快取的有效資料變少，查詢就跟著變慢。開場說集點卡表「查詢越來越慢」，就是這個原因。</p>
+<p>現在 <code>VACUUM</code>，加 <code>VERBOSE</code> 讓它把做了什麼印出來：</p>
+<div class="lab" data-sql="VACUUM (VERBOSE) big;"></div>
+<p>灰色的訊息很長，看這幾段就好：</p>
+<div class="table-wrap"><table>
+  <tr><th>片段</th><th>意思</th></tr>
+  <tr><td><code>tuples: 20000 removed, 20000 remain</code></td><td>清掉幾個死版本、還剩幾個版本</td></tr>
+  <tr><td><code>0 are dead but not yet removable</code></td><td>已經死了、但還有交易可能看得到，所以不能清的版本數。不是 0 就要找原因（第 4 節）</td></tr>
+  <tr><td><code>removable cutoff: …</code></td><td>這次的清理界線：比它新的交易刪掉的版本都不能清（第 4 節細講）</td></tr>
+  <tr><td><code>pages: 0 removed</code></td><td>還給作業系統的頁數。只有表尾整頁空掉時才會截掉</td></tr>
+</table></div>
+<p>20,000 個死版本都清掉了。那檔案變小了嗎？VACUUM 之後再查，看 <code>size</code> 和 <code>reusable</code>：</p>
+<div class="lab" data-sql="SELECT * FROM big_stats();"></div>
+<p>檔案還是 4272 kB，但 free space map 記下了約 2 MB 的空位。原因在空位的位置：死版本散在每一頁中間，清掉之後，每一頁都多出一些空格，而不是檔案尾巴空出一整段。作業系統的檔案只能從尾巴截短，要把中間的空位還回去，就得把活版本搬家、整個檔案重排，這需要擋住其他人的讀寫。一般 VACUUM 不做這件事，它只截掉表尾整頁空掉的部分。<strong>VACUUM 不縮小檔案，只讓空間能重複使用。</strong></p>
+<p>「能重複使用」是什麼意思？再更新一次全表，看表會不會再長大：</p>
+<div class="lab" data-sql="UPDATE big SET qty = qty + 1;"></div>
+<div class="lab" data-sql="SELECT * FROM big_stats();"></div>
+<p>表沒有再長大：新版本填進了 free space map 記下的空位。這就是開場問題的最小答案：每晚的 VACUUM 本來就不會讓檔案變小，它的工作是讓空間能被重複使用。只要 VACUUM 跟得上，新版本不斷填進舊版本空出的位置，表的大小會穩定下來，不會無限長大。集點卡表如果每天還在長，代表 VACUUM 被擋住或跟不上，這是接下來要查的。</p>
+<p>那真的想把檔案縮小呢？用 <code>VACUUM FULL</code>：它把活著的版本複製到一個新檔案，再刪掉舊檔。執行後再看 <code>size</code>：</p>
+<div class="lab" data-sql="VACUUM FULL big;"></div>
+<div class="lab" data-sql="SELECT * FROM big_stats();"></div>
+<p>檔案縮回原本的大小。代價在鎖和磁碟空間：</p>
+<div class="callout warn"><code>VACUUM FULL</code> 執行期間拿著 <strong>ACCESS EXCLUSIVE</strong> 鎖，整張表連 <code>SELECT</code> 都要等，還需要一份完整的額外磁碟空間。正式環境的大表不要直接跑；要縮小已經膨脹的表，用 pg_repack 這類線上重整的工具（只在建立新檔與切換的短暫時間拿重鎖）。更好的做法是讓一般 VACUUM 跟得上，不讓表膨脹到需要重整。</div>
+<p>兩者的差別整理成表：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th><code>VACUUM</code></th><th><code>VACUUM FULL</code></th></tr>
+  <tr><td>做什麼</td><td>標記死版本的空間可重用，更新 visibility map</td><td>把整張表重寫成新檔案</td></tr>
+  <tr><td>檔案大小</td><td>幾乎不變（只截掉表尾的空頁）</td><td>縮到剛好</td></tr>
+  <tr><td>鎖</td><td>SHARE UPDATE EXCLUSIVE：讀寫照常</td><td>ACCESS EXCLUSIVE：全部擋住</td></tr>
+  <tr><td>什麼時候用</td><td>日常，由 autovacuum 自動執行</td><td>幾乎不用；要縮表時改用線上工具</td></tr>
+</table></div>
+<div class="callout practice"><strong>💡 實務上：刪了舊資料，磁碟卻沒變小是正常的</strong><br>常見情境：維運說磁碟快滿，你把半年前的 <code>sessions</code> 刪掉，結果雲端主控台上的用量一點都沒降。這是預期行為：autovacuum 跑過後，空間被標成可重用，新寫入的資料會先填進這些空位，填滿之前表不會再長大。資深會先問「它還在長，還是只是沒縮？」；還在長才是問題，通常代表 VACUUM 跟不上或被擋住，集點卡表就是這種情況。確定那些空間不會再被填回（例如一次性清掉大量歷史資料）才考慮在離峰用 pg_repack 重整；固定要清舊資料的表，可以改用分區直接丟掉整個分區（第 35 課）。</div>
+<p>所以要查集點卡表，第一個問題是：VACUUM 有沒有被擋住？VERBOSE 裡有一行 <code>dead but not yet removable</code>，代表「死了但還不能清」。一個版本明明沒用了，為什麼會不能清？要回答這個，得先把「沒有交易看得到」講精確：誰看得到哪個版本，是由什麼決定的？</p>
+
+<h2>「沒有交易看得到」是誰說了算？</h2>
+<p>前兩節的「看得到」「沒有交易看得到」都還只是直覺。要看清楚規則，需要另一個正在進行、還沒提交的交易，讓「你」和「別人」看到的不一樣。這頁只有一條連線（見課首），沒辦法真的開兩個人，所以借用 <strong>PREPARE TRANSACTION</strong> 來模擬。</p>
+<p><code>PREPARE TRANSACTION</code> 是<strong>兩階段提交</strong>（two-phase commit）的第一步。兩階段提交用在一筆工作要同時寫進好幾個資料庫的時候：先讓每個資料庫都「準備好」，確認大家都能提交，再一起提交。準備好的交易會停在「已準備、還沒提交」的狀態，跟原本的連線脫鉤，連線本身可以繼續做別的事，之後再由任何一條連線 <code>COMMIT PREPARED</code> 或 <code>ROLLBACK PREPARED</code> 收尾。對我們來說，它就像一位做到一半、被按了暫停的同事：他改的東西你看不到，他鎖住的列你拿不到。</p>
+<p>讓同事把拿鐵漲到 120 元，然後按下暫停：</p>
+<div class="lab" data-sql="BEGIN;
+UPDATE products SET price = 120 WHERE name = '拿鐵';   -- 同事要把拿鐵漲到 120
+PREPARE TRANSACTION 'colleague';"></div>
+<p>所有還沒收尾的 prepared transaction 都列在 <code>pg_prepared_xacts</code>：<code>gid</code> 是名字，<code>transaction</code> 是它的交易編號。執行後記下這個編號，等一下會用到：</p>
+<div class="lab" data-sql="SELECT gid, transaction, prepared, owner FROM pg_prepared_xacts;"></div>
+<p>在看可見性之前，先確認同事真的停在「改了一半、還沒提交」的狀態：他如果還拿著拿鐵這一列的鎖，就代表他的交易還沒結束，接下來的實驗才有意義。用 <code>FOR UPDATE</code> 試著鎖住它就知道。但一般的 <code>FOR UPDATE</code> 拿不到鎖會一直等，這頁等 5 秒就會重置資料庫。所以加上 <strong>NOWAIT</strong>：拿不到鎖就立刻報錯 <code>55P03</code>，不等待。執行後看錯誤代碼：</p>
+<div class="lab" data-sql="SELECT * FROM products WHERE name = '拿鐵' FOR UPDATE NOWAIT;"></div>
+<p>收到 <code>55P03</code>，表示同事確實還拿著這一列的鎖。</p>
+<div class="callout warn">PostgreSQL 文件明說 <code>PREPARE TRANSACTION</code> 不是給應用程式或互動操作用的，它是外部交易協調器（transaction manager）跨資料庫做原子提交的工具。prepared transaction 會一直佔著鎖和交易編號，連線斷了、伺服器重啟了都還在，直到有人收尾。忘了收尾，下一節會看到它擋住整個資料庫的清理。這頁的實驗一定要用 <code>COMMIT PREPARED</code>／<code>ROLLBACK PREPARED</code> 結束。</div>
+<p>同事還沒提交，這時你查拿鐵，看 <code>price</code> 和 <code>xmax</code>：</p>
+<div class="lab" data-sql="SELECT ctid, xmin, xmax, name, price FROM products WHERE name = '拿鐵';"></div>
+<p>你看到的仍是 115 元，但這個版本的 <code>xmax</code> 已經是同事的交易編號。<code>xmax</code> 有值，不代表這個版本對你失效。PostgreSQL 還要問一個問題：在你開始查詢的那一刻，同事的交易算完成了嗎？</p>
+<p>回答這個問題的，是<strong>快照</strong>（snapshot）。快照是一句查詢（或 <code>REPEATABLE READ</code> 交易）開始時，PostgreSQL 記下的一份「哪些交易算已完成」的名單。為什麼需要它？一句查詢可能要讀好幾秒，期間別人不斷提交；如果每讀一列都用「現在」的狀態判斷，前半段和後半段會看到不同時間點的資料，例如轉帳只看到扣款、沒看到入帳。有了快照，整句查詢都用同一份名單判斷，看到的是同一個時間點的資料。</p>
+<p><code>pg_current_snapshot()</code> 會把快照印成 <code>xmin:xmax:進行中清單</code>。注意這裡的 <code>xmin</code>、<code>xmax</code> 是快照的欄位，跟列版本上的同名欄位是兩回事：</p>
+<ul>
+  <li>編號小於 <code>xmin</code> 的交易都已結束；</li>
+  <li>編號大於或等於 <code>xmax</code> 的交易在快照之後才開始，一律當作還沒完成；</li>
+  <li>中間的，列在進行中清單的就是還沒完成。</li>
+</ul>
+<p>先自己提交一筆修改（單獨一格就是一個交易，執行完就提交了），讓快照裡同時有「已提交」和「進行中」的交易，再看快照：</p>
+<div class="lab" data-sql="UPDATE products SET price = 75 WHERE name = '可頌';"></div>
+<div class="lab" data-sql="SELECT pg_current_snapshot();"></div>
+<p>結果像 <code>755:757:755</code>（數字依你執行的次數而不同）：</p>
+<ul>
+  <li>同事的 755 是最舊的未完成交易，所以是 <code>xmin</code>，也出現在進行中清單。</li>
+  <li>你剛才那筆 756 已提交，不在清單裡。</li>
+</ul>
+<p>有了快照，就能寫出簡化的可見規則：<strong>建立版本的交易（xmin）在我的快照裡已提交，而且刪除它的交易（xmax）在我的快照裡沒提交（或根本沒有），我就看得到這個版本。</strong>套回拿鐵的兩個版本：</p>
+<ul>
+  <li>115 元：xmin 已提交、xmax 是還在進行的 755，所以看得到。</li>
+  <li>120 元：xmin 是 755、還沒提交，所以看不到。</li>
+</ul>
+<p>下面的時間軸把整個過程逐步播一次，每一步看最右欄頁裡的版本怎麼變：</p>
+<div class="tl">
+  <div class="table-wrap"><table>
+    <tr><th>步驟</th><th>同事（交易 755）</th><th>你</th><th>頁裡的拿鐵版本</th></tr>
+    <tr data-note="同事 UPDATE：舊版本的 xmax 填上 755，另外寫一個 xmin = 755 的新版本。"><td>1</td><td><code>UPDATE … price = 120</code></td><td></td><td>115（xmax 755）<br>120（xmin 755）</td></tr>
+    <tr data-note="同事 PREPARE，交易停在已準備、未提交。"><td>2</td><td><code>PREPARE TRANSACTION</code></td><td></td><td>同上</td></tr>
+    <tr data-note="你的快照裡 755 還在進行中：115 的 xmax 不算數 → 看得到；120 的 xmin 沒提交 → 看不到。"><td>3</td><td></td><td><code>SELECT</code> → 115</td><td>同上</td></tr>
+    <tr data-note="你想鎖住拿鐵，但 755 拿著這一列的鎖。用 NOWAIT 會立刻收到 55P03；不加的話會一直等。"><td>4</td><td></td><td><code>FOR UPDATE</code><br><span class="wait">等待中…</span></td><td>同上</td></tr>
+    <tr data-note="同事提交。之後開始的查詢，快照裡 755 已完成：115 失效、120 生效。"><td>5</td><td><code>COMMIT PREPARED</code></td><td></td><td>115（死版本）<br>120</td></tr>
+    <tr data-note="115 那個版本再也沒有任何交易看得到，它成了死版本，等 VACUUM 清掉。"><td>6</td><td></td><td><code>SELECT</code> → 120</td><td>同上</td></tr>
+  </table></div>
+  <div class="bar"><button data-prev>◀ 上一步</button><button class="primary" data-next>下一步 ▶</button><span class="kbd" data-count></span></div>
+  <p class="note"></p>
+</div>
+<p>讓同事收尾，再查一次，拿鐵變成 120 元：</p>
+<div class="lab" data-sql="COMMIT PREPARED 'colleague';"></div>
+<div class="lab" data-sql="SELECT name, price, xmin, xmax FROM products ORDER BY id;"></div>
+<p>現在可以把「死版本」講精確了：一個版本的 <code>xmax</code> 已提交，而且<strong>所有</strong>還在進行的交易的快照都認為它已提交，它才是死版本。115 元的拿鐵在同事提交、而且沒有任何更舊的快照之後，才真正死去。這條規則也解釋了為什麼 <code>count(*)</code> 在大表上很慢：每個快照看得到的列數不同，只能逐列檢查，細節見課末「補充與查表」。</p>
+<p>反過來說，只要還有一個快照比 <code>xmax</code> 更舊，那個快照的主人就可能還要看這個版本，VACUUM 就不能清。這就是 <code>dead but not yet removable</code> 的來源。下一個問題：什麼樣的交易會讓快照一直停在過去，怎麼把它找出來？</p>
+
+<h2>VACUUM 為什麼清不掉？找出擋住清理的交易</h2>
+<p>上一節的結論是：只要還有交易可能要看某個舊版本，VACUUM 就不能清它。把這個條件推到整個資料庫，就是<strong>清理界線</strong>（xmin horizon）：資料庫裡最舊的那個仍在進行的交易或快照，決定了界線在哪裡。在界線之前就被刪掉的版本，所有交易都看不到，可以清；在界線之後才被刪掉的版本，最舊的那個交易可能還要看，一律不能清。</p>
+<p>為什麼是「整個資料庫」，而不是只看那個交易碰過的表？因為 VACUUM 無從知道一個進行中的交易接下來會查哪張表。一個交易可以在任何時候 <code>SELECT</code> 任何表，它的快照又是開始時就定好的，所以 VACUUM 只能保守地假設：它可能要看任何表的任何舊版本。結果是一個卡住的交易，會讓所有表的死版本一起累積。</p>
+<figure>
+  <svg viewBox="0 0 700 215" role="img" aria-label="時間軸：最舊的進行中交易 night_report 開始的地方就是清理界線；界線之前被刪掉的死版本可以清，界線之後被刪掉的死版本不能清，直到 night_report 結束">
+    <defs><marker id="arr30b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="20" y="30" width="220" height="60" rx="8"/>
+    <text class="d-text" x="130" y="56" text-anchor="middle">界線之前刪掉的死版本</text>
+    <text class="d-accent" x="130" y="78" text-anchor="middle">VACUUM 可以清</text>
+    <rect class="d-box" x="280" y="30" width="400" height="60" rx="8"/>
+    <text class="d-text" x="480" y="56" text-anchor="middle">界線之後刪掉的死版本（下面更新的 1,000 列）</text>
+    <text class="d-accent" x="480" y="78" text-anchor="middle">night_report 可能還要看 → 不能清</text>
+    <path class="d-line" d="M20,115 L680,115" marker-end="url(#arr30b)"/>
+    <text class="d-small" x="680" y="135" text-anchor="end">時間（交易編號越來越大）</text>
+    <path class="d-line" d="M260,20 L260,185" stroke-dasharray="6 4"/>
+    <rect class="d-box" x="270" y="150" width="410" height="34" rx="6"/>
+    <text class="d-small" x="475" y="172" text-anchor="middle">night_report 沒收尾之前，界線一直停在這裡</text>
+    <text class="d-accent" x="260" y="205" text-anchor="middle">清理界線：最舊的進行中交易（night_report）</text>
+  </svg>
+  <figcaption>清理界線由最舊的進行中交易決定。它不結束，界線就不會往右移，之後產生的死版本全部累積在表裡。</figcaption>
+</figure>
+<p>實際做一次。讓「暫停的同事」拿著一個交易編號不放，就像一份跑到一半、卡住的夜間報表。<code>pg_current_xact_id()</code> 會讓交易立刻拿到編號（只讀的交易本來不會拿）：</p>
+<div class="lab" data-sql="BEGIN;
+SELECT pg_current_xact_id();   -- 讓這個交易拿到編號
+PREPARE TRANSACTION 'night_report';"></div>
+<p>接著更新 1,000 列，製造 1,000 個死版本，再 VACUUM，看 VERBOSE 訊息裡 <code>tuples:</code> 那一行：</p>
+<div class="lab" data-sql="UPDATE big SET qty = qty + 1 WHERE id &lt;= 1000;"></div>
+<div class="lab" data-sql="VACUUM (VERBOSE) big;"></div>
+<p>這次是 <code>0 removed</code>、<code>1000 are dead but not yet removable</code>：那 1,000 個舊版本是在 night_report 開始之後才被刪掉的，在 night_report 的眼中可能還活著。正式環境遇到這個訊息，下一步是找出元兇。先查 prepared transaction，再查所有連線：</p>
+<div class="lab" data-sql="SELECT gid, transaction, age(transaction) AS xid_age, prepared FROM pg_prepared_xacts;"></div>
+<div class="lab" data-sql="SELECT pid, state, xact_start, backend_xid, backend_xmin, age(backend_xmin) AS xmin_age, query
+FROM pg_stat_activity;"></div>
+<ul>
+  <li><code>age()</code> 算出某個交易編號距離現在過了幾個交易，數字越大代表擋得越久。</li>
+  <li><code>pg_stat_activity</code> 每條連線一列（第 32 課深入）：<code>state</code> 是狀態，<code>backend_xid</code> 是它拿到的交易編號，<code>backend_xmin</code> 是它的快照的 <code>xmin</code>。這頁只有一條連線，所以只有你自己這一列。</li>
+  <li>正式環境依 <code>age(backend_xmin)</code> 由大到小排，排第一的通常就是元兇。</li>
+</ul>
+<p>找到之後處理掉它。這裡的 night_report 沒有要保留的修改，直接放棄，再 VACUUM 一次：</p>
+<div class="lab" data-sql="ROLLBACK PREPARED 'night_report';"></div>
+<div class="lab" data-sql="VACUUM (VERBOSE) big;"></div>
+<p>這次 <code>1000 removed</code>：界線往前移，那 1,000 個版本終於可以清了。真實世界擋住清理的常見元兇有四種，查法和處理方式不同：</p>
+<div class="table-wrap"><table>
+  <tr><th>元兇</th><th>怎麼查</th><th>怎麼處理、預防</th></tr>
+  <tr><td>跑很久的查詢（報表、匯出）</td><td><code>pg_stat_activity</code> 的 <code>state = 'active'</code>、<code>xact_start</code> 很早</td><td>把報表放到唯讀副本（第 37 課）；設定 <code>statement_timeout</code>（單一句子的執行時間上限，第 32 課）</td></tr>
+  <tr><td><strong>idle in transaction</strong>：開了交易卻閒著沒送下一句，常見於程式忘了 <code>COMMIT</code>，或在交易中途呼叫外部 API</td><td><code>state = 'idle in transaction'</code>，且有 <code>backend_xid</code>（做過寫入）或 <code>backend_xmin</code>（拿著快照）</td><td>修程式；設定 <code>idle_in_transaction_session_timeout</code>（閒置太久由伺服器結束連線）、<code>transaction_timeout</code>（PostgreSQL 17 起，整個交易的上限）；交易裡不要等外部 API（第 19 課）</td></tr>
+  <tr><td>遺忘的 prepared transaction</td><td><code>pg_prepared_xacts</code></td><td><code>COMMIT</code>／<code>ROLLBACK PREPARED</code>；上面兩個逾時設定管不到它，沒有用兩階段提交就讓 <code>max_prepared_transactions</code> 維持預設的 0</td></tr>
+  <tr><td>沒人使用的 replication slot（複寫槽，替複寫的接收端保留變更紀錄，第 37 課）</td><td><code>pg_replication_slots</code> 裡 <code>age(xmin)</code> 或 <code>age(catalog_xmin)</code> 很大的</td><td>確認接收端已不存在後刪除（它同時讓 WAL 檔案一直堆積）</td></tr>
+</table></div>
+<p>只要有一個這樣的交易或 slot，<strong>整個資料庫</strong>所有表的死版本都清不掉，不只是它碰過的那張。這是正式環境表膨脹最常見的原因。集點卡表每晚的 VACUUM 收不回空間，第一個要查的就是這四種元兇。</p>
+<div class="callout practice"><strong>💡 實務上：code review 時看交易裡有沒有 await 外部服務</strong><br>咖啡店結帳的常見寫法：開交易、寫訂單、呼叫金流 API、等回應、再 <code>COMMIT</code>。金流慢個幾秒，這條連線就一直 idle in transaction；遇到逾時或程式例外沒收尾，它可能卡上好幾個小時，整個資料庫的清理都停住。review 時看到交易範圍裡有 HTTP 呼叫、寄信、讀檔，就請作者移到交易外，或拆成「先寫待付款訂單 → 呼叫金流 → 再開一個短交易更新狀態」。另外替應用程式用的資料庫帳號設好 <code>idle_in_transaction_session_timeout</code>，監控面板放一張「最久的交易開了多久」，超過門檻就通知值班的人。</div>
+<p>擋住清理的交易處理掉之後，VACUUM 跟得上，表就不會無限長大。但集點卡表每集一次點，還是產生一個死版本，每個索引也各多一筆紀錄，VACUUM 每晚都要清一大堆。能不能從源頭下手，讓更新一開始就少產生垃圾？</p>
+
+<h2>能不能讓更新少產生垃圾？HOT 更新與 fillfactor</h2>
+<p>先看一次一般的 <code>UPDATE</code> 到底產生了多少垃圾。第 1 節看到新版本會換到另一格，<code>ctid</code> 改變了。而<a href="27-index-design.html">第 27 課</a>的索引，每一筆紀錄存的正是列版本的位置。位置變了，索引就得跟著更新：一般的 <code>UPDATE</code> 寫出新版本後，<strong>每個索引</strong>都要加一筆指向新位置的紀錄，即使索引的欄位根本沒變。一張表有三個索引，改一個跟索引無關的欄位，也要寫一個新版本加三筆索引紀錄，舊的那三筆之後也要 VACUUM 去清。</p>
+<p>PostgreSQL 為此有一個最佳化，叫 <strong>HOT 更新</strong>（Heap-Only Tuple，只寫在表裡的版本）：新版本放在同一頁，索引完全不用動。索引繼續指向舊版本那一格，舊版本的 <code>t_ctid</code> 指向新版本，同一列的版本在頁裡串成一條鏈，查詢經由索引找到舊格子後，沿著鏈走到看得到的那個版本。鏈中間的死版本，連一般查詢讀到這一頁時都能順手清掉，不必等 VACUUM。第 1 節 pageinspect 看到的 <code>hot_updated</code>、<code>heap_only</code> 就是這條鏈的標記：products 只有 <code>id</code> 上有索引，改價格就是 HOT。</p>
+<p>不是每次更新都能走 HOT。PostgreSQL 18 文件列的條件有兩個：</p>
+<ol>
+  <li>這次更新沒有改到任何索引用到的欄位（BRIN 這種摘要型索引除外）；</li>
+  <li>舊版本所在的那一頁還有空間放新版本。</li>
+</ol>
+<p>第一個條件很好理解：索引欄位的值變了，索引本來就得改，沒辦法省。第二個條件要靠 <strong>fillfactor</strong>：每一頁只填到幾成，剩下的留給之後的更新。預設 100，也就是新增資料時把頁填滿，之後的更新就找不到同一頁的空位。先驗證第二個條件。建兩張一樣的表，一張 fillfactor 100、一張 70：</p>
+<div class="lab" data-sql="-- CREATE TABLE … AS SELECT：用查詢結果建一張新表；rpad 把字串補到 64 字元，讓每列有固定的大小
+DROP TABLE IF EXISTS cups_ff100, cups_ff70;
+CREATE TABLE cups_ff100 AS
+  SELECT g AS id, 0 AS sold, rpad('cup-' || g, 64, '.') AS note FROM generate_series(1, 5000) g;
+CREATE TABLE cups_ff70 WITH (fillfactor = 70) AS
+  SELECT g AS id, 0 AS sold, rpad('cup-' || g, 64, '.') AS note FROM generate_series(1, 5000) g;"></div>
+<p>兩張表各更新 5,000 列：</p>
+<div class="lab" data-sql="UPDATE cups_ff100 SET sold = sold + 1;
+UPDATE cups_ff70 SET sold = sold + 1;"></div>
+<p>執行後看 <code>n_tup_hot_upd</code>，它是 <code>n_tup_upd</code>（更新次數）裡走 HOT 的次數：</p>
+<div class="lab" data-sql="SELECT relname, n_tup_upd, n_tup_hot_upd
+FROM pg_stat_user_tables WHERE relname LIKE 'cups%' ORDER BY relname;"></div>
+<p>fillfactor 100 的頁都滿了，幾乎沒有 HOT（只有最後一頁還有空位）；fillfactor 70 約有 2,200 次。所以更新密集的表可以把 fillfactor 降到 70～90。代價是表變大、全表掃描要讀更多頁；只新增不更新的表維持 100。</p>
+<p>再驗證第一個條件。在被更新的 <code>sold</code> 上建索引，再更新一次，然後看同一張統計：</p>
+<div class="lab" data-sql="CREATE INDEX cups_ff70_sold_idx ON cups_ff70 (sold);
+UPDATE cups_ff70 SET sold = sold + 1;"></div>
+<div class="lab" data-sql="SELECT relname, n_tup_upd, n_tup_hot_upd
+FROM pg_stat_user_tables WHERE relname LIKE 'cups%' ORDER BY relname;"></div>
+<p><code>n_tup_upd</code> 多了 5,000，<code>n_tup_hot_upd</code> 一次都沒增加：索引用到了被改的欄位，第一個條件就不成立，頁裡有空位也沒用。</p>
+<p>兩個條件都確認了，現在回到開場的集點卡表。先看更新次數和 HOT 次數：</p>
+<div class="lab" data-sql="SELECT relname, n_tup_upd, n_tup_hot_upd, n_dead_tup
+FROM pg_stat_user_tables WHERE relname = 'stamp_cards';"></div>
+<p>更新了 1,666 次，HOT 是 0。兩個條件是哪一個不成立？看它的索引，看 <code>idx_scan</code>（索引被查詢使用的次數，第 27 課用它找沒人用的索引）：</p>
+<div class="lab" data-sql="SELECT indexrelname, idx_scan, pg_get_indexdef(indexrelid) AS definition
+FROM pg_stat_user_indexes WHERE relname = 'stamp_cards';"></div>
+<p><code>stamps</code> 每次集點都在改，上面又有一個從沒被用過的索引 <code>stamp_cards_stamps_idx</code>，所以 1,666 次更新沒有一次是 HOT：每次集點都在表裡留下死版本，還在三個索引裡各多寫一筆。這就是集點卡表長得特別快的原因。修法有兩步：刪掉這個沒人用的索引，讓第一個條件成立；把 fillfactor 降下來，讓第二個條件成立。</p>
+<p>調 fillfactor 時要注意，<code>ALTER TABLE … SET (fillfactor = 70)</code> 只影響之後寫入的頁，已經填滿的頁要等表被重寫（<code>VACUUM FULL</code> 或 pg_repack）才會照新設定。練習 3 會動手修這張表。</p>
+<div class="callout practice"><strong>💡 實務上：建索引前先問「這個欄位多常被改」</strong><br>集點卡表的 <code>stamps</code> 索引，多半是有人想「之後可能會依點數查」就順手建了。索引讓讀變快，但每個索引都讓寫變慢，建在常被更新的欄位上，還會讓那張表的每次更新都無法走 HOT。資深會在建之前問：有沒有查詢真的用得到？這個欄位多常被改？上線後用 <code>idx_scan</code> 確認，一直是 0 的索引就該討論刪掉。</div>
+<p>到這裡，集點卡表的兩個病因都有了查法和修法：清理被擋住時，用上一節那張表的查法找出四種元兇；更新產生太多垃圾，是因為 <code>stamps</code> 上那個沒人用的索引讓 HOT 失效，加上頁裡沒有預留空間（練習 3 實際修它）。但前面每次 VACUUM 都是我們手動執行的。正式環境不可能靠人每晚盯著，誰來決定什麼時候清、清哪張表？</p>
+
+<h2>正式環境誰來跑 VACUUM？autovacuum 與凍結</h2>
+<p>答案是 <strong>autovacuum</strong>：PostgreSQL 內建的背景程序，定期檢查每張表，死版本夠多就自動 VACUUM，資料變動夠多就自動 ANALYZE（<a href="21-explain.html">第 21 課</a>）。開場的每晚排程是額外加的一層，平常讓表維持健康的是 autovacuum。這頁沒有 autovacuum（見課首），所以前面都手動執行，但它的設定看得到。先從 <code>pg_settings</code>（每個設定一列的系統視圖）看相關設定：</p>
+<div class="lab" data-sql="SELECT name, setting FROM pg_settings
+WHERE name IN ('autovacuum', 'autovacuum_vacuum_threshold', 'autovacuum_vacuum_scale_factor',
+               'autovacuum_vacuum_max_threshold', 'autovacuum_vacuum_insert_threshold',
+               'autovacuum_vacuum_insert_scale_factor', 'autovacuum_freeze_max_age')
+ORDER BY name;"></div>
+<p>「死版本夠多」怎麼算？PostgreSQL 18 文件定義的觸發門檻：死版本數超過</p>
+<pre>min(autovacuum_vacuum_max_threshold,
+    autovacuum_vacuum_threshold + autovacuum_vacuum_scale_factor × reltuples)</pre>
+<p>就會 VACUUM。<code>reltuples</code> 是 <code>pg_class</code> 裡的估計列數（上次 VACUUM／ANALYZE 時的值）。先看括號裡的後半：</p>
+<p>預設 50 + 0.2 × 列數，也就是死版本超過兩成才動手。一萬列的表等 2,050 個死版本還好；一億列的表要等 2,000 萬個，期間表一直膨脹。外層的 <code>autovacuum_vacuum_max_threshold</code> 是 PostgreSQL 18 新增的上限，只對非常大的表有作用，細節見課末。所以大表通常各自覆寫比例，讓它早一點清：</p>
+<pre>ALTER TABLE orders SET (autovacuum_vacuum_scale_factor = 0.01);</pre>
+<p>這頁的 seed 已經這樣設定 <code>orders</code>，另外把 <code>sessions</code> 的基本門檻 <code>autovacuum_vacuum_threshold</code> 覆寫成 1000。</p>
+<p>每表的覆寫存在哪？存在 <code>pg_class.reloptions</code>（文字陣列），用 <code>pg_options_to_table()</code> 拆成一列一個設定。練習 4 算門檻時會用到。第一張結果是原始的陣列，第二張是拆開的樣子：</p>
+<div class="lab" data-sql="SELECT relname, reloptions FROM pg_class WHERE relname = 'orders';
+SELECT * FROM pg_options_to_table((SELECT reloptions FROM pg_class WHERE relname = 'orders'));"></div>
+<p>只新增、從不更新的表（例如日誌）沒有死版本，靠另一組門檻觸發，見課末。它們也需要 VACUUM，原因是 VACUUM 還有一個工作：凍結。</p>
+<p>要理解凍結，先回到第 1 節的交易編號。交易編號只有 32 位元，大約 42 億個號碼，用完就繞回來從頭用。繞回來之後，「號碼越大越新」就不成立了，所以 PostgreSQL 比較新舊時用的是環狀的比法：以現在為中心，前約 21 億個算過去，後約 21 億個算未來。一個版本的 <code>xmin</code> 如果舊到超過這個範圍，它會突然從「過去」變成「未來」，依第 3 節的可見規則，建立它的交易「還沒發生」，整列資料就看不見了。這叫 <strong>wraparound</strong>。</p>
+<p>防止的方法是<strong>凍結</strong>（freeze）：VACUUM 把夠舊的版本標成「凍結」，意思是永遠可見，判斷時不再比較它的交易編號。每張表最舊的未凍結編號記在 <code>relfrozenxid</code>，<code>age(relfrozenxid)</code> 就是這張表離危險還有多遠的指標。凍結前後各查一次，看 <code>age</code> 欄：</p>
+<div class="lab" data-sql="SELECT relname, relfrozenxid, age(relfrozenxid) FROM pg_class WHERE relname IN ('products', 'orders');"></div>
+<div class="lab" data-sql="VACUUM (FREEZE) products;"></div>
+<div class="lab" data-sql="SELECT relname, relfrozenxid, age(relfrozenxid) FROM pg_class WHERE relname IN ('products', 'orders');"></div>
+<p><code>products</code> 的 age 變成 0。正式環境不用手動凍結，autovacuum 會處理，但要監控 <code>age(relfrozenxid)</code>，因為一旦凍結跟不上，後果是逐級加重的：</p>
+<ul>
+  <li>超過 <code>autovacuum_freeze_max_age</code>（預設 2 億）時，就算關掉 autovacuum，系統也會強制啟動防 wraparound 的 VACUUM。</li>
+  <li>文件寫明，離 wraparound 只剩 4,000 萬個交易時開始發出警告。</li>
+  <li>剩不到 300 萬時，資料庫拒絕任何新的寫入交易，只剩唯讀，直到 VACUUM 完成。</li>
+</ul>
+<p>凍結也是 VACUUM 的一部分，所以第 4 節那些擋住清理的元兇，同樣會讓凍結無法前進。一個忘了收尾的交易，短期讓表膨脹，放得夠久就會一路走到資料庫拒絕寫入。這也是為什麼 autovacuum 不能關：它同時負責清死版本、更新統計、凍結三件事。</p>
+
+<h2>補充與查表</h2>
+<p>主線用不到、但查問題或調設定時會用到的細節。</p>
+
+<h3>為什麼 count(*) 在大表上很慢</h3>
+<p>常見疑問：為什麼 <code>SELECT count(*) FROM orders</code> 在一億列的表上要跑好幾秒，PostgreSQL 不直接記一個總數？因為<strong>每個交易的快照不同，看得到的列數也不同</strong>，沒有一個數字對所有人都正確，只能逐列檢查可見性。只要大概的數字，看 <code>pg_class.reltuples</code>（統計估計值）；要精確又快，就自己維護一張計數表。</p>
+<div class="callout practice"><strong>💡 實務上：後台的「共幾筆」先問需不需要精確</strong><br>咖啡店後台的訂單列表常有「共 123,456 筆、第 1／6173 頁」，每次翻頁都跑一次 <code>count(*)</code>，資料一多列表就變慢。先問 PM：顯示「約 12 萬筆」或「1,000+ 筆」可以嗎？多數列表可以：沒有篩選條件的整表總數看 <code>reltuples</code>，有篩選就用 <code>LIMIT 1001</code> 數到上限就停。真的要精確（例如對帳），計數表要跟寫入放在同一個交易裡更新，而且所有訂單都搶同一列，會變成鎖競爭的熱點。能用「下一頁」取代總頁數，通常最省事。</div>
+
+<h3>autovacuum 觸發門檻的細節</h3>
+<p>PostgreSQL 18 新增的 <code>autovacuum_vacuum_max_threshold</code>（預設 1 億）是觸發門檻的上限，表超過約 5 億列時才會生效，對中大型表幫助有限，所以大表仍然要各自覆寫 <code>autovacuum_vacuum_scale_factor</code>。</p>
+<p>只新增、從不更新的表（例如日誌）沒有死版本，靠另一組門檻觸發：<code>autovacuum_vacuum_insert_threshold</code>（預設 1000）＋ <code>autovacuum_vacuum_insert_scale_factor</code>（預設 0.2）× 列數 × 還沒凍結的比例。這種 VACUUM 的目的是設定 visibility map 和凍結。</p>
+
+<h3>版本備註</h3>
+<p>PostgreSQL 18 新增 <code>autovacuum_vacuum_max_threshold</code>，VACUUM 也會順便積極凍結一部分全可見的頁（VERBOSE 裡的 <code>eagerly scanned</code>，由 <code>vacuum_max_eager_freeze_failure_rate</code> 控制）。<code>transaction_timeout</code> 是 PostgreSQL 17 新增的。這頁的 PGlite 0.5.13（PostgreSQL 18.6）是單人模式：沒有 autovacuum，<code>pg_stat_*</code> 要強制送出統計才會更新，有 pageinspect、pg_visibility、pg_freespacemap，沒有 pgstattuple。</p>
+
+<h2>練習</h2>
+
+<div class="exercise"
+  data-start="SELECT relname, n_live_tup, n_dead_tup
+FROM pg_stat_user_tables;"
+  data-answer="SELECT relname, n_live_tup, n_dead_tup,
+       round(n_dead_tup::numeric / nullif(n_live_tup + n_dead_tup, 0), 2) AS dead_ratio
+FROM pg_stat_user_tables
+WHERE n_dead_tup::numeric / nullif(n_live_tup + n_dead_tup, 0) &gt; 0.2
+ORDER BY dead_ratio DESC;"
+  data-ordered
+  data-isolated
+  data-require="\bpg_stat_(user|all)_tables\b"
+  data-require-msg="比例要從累計統計（pg_stat_user_tables）即時算出來，不能把數字寫死。">
+  <p>練習 1：seed 裡幾張表做過不同程度的更新和刪除。列出死版本比例超過 0.2 的表：表名、<code>n_live_tup</code>、<code>n_dead_tup</code>、比例（死版本 ÷ 全部版本，0～1 的小數，四捨五入到小數點 2 位），依比例由高到低。注意：<code>n_dead_tup</code> 是整數，PostgreSQL 裡整數除以整數的結果還是整數，小數會被捨去（<code>1 / 3</code> 得到 0）；有一張空表，除數是 0 會報錯，第 15 課的 <code>NULLIF</code> 可以避開。</p>
+  <script type="text/sql" data-role="wrong">SELECT relname, n_live_tup, n_dead_tup,
+       round(n_dead_tup / nullif(n_live_tup + n_dead_tup, 0), 2) AS dead_ratio
+FROM pg_stat_user_tables
+WHERE n_dead_tup / nullif(n_live_tup + n_dead_tup, 0) > 0.2
+ORDER BY dead_ratio DESC;</script>
+  <script type="text/sql" data-role="wrong">SELECT relname, n_live_tup, n_dead_tup,
+       round(n_dead_tup::numeric / (n_live_tup + n_dead_tup), 2) AS dead_ratio
+FROM pg_stat_user_tables
+WHERE n_dead_tup::numeric / (n_live_tup + n_dead_tup) > 0.2
+ORDER BY dead_ratio DESC;</script>
+  <script type="text/sql" data-role="wrong">SELECT relname, n_live_tup, n_dead_tup,
+       round(n_dead_tup::numeric / nullif(n_live_tup, 0), 2) AS dead_ratio
+FROM pg_stat_user_tables
+WHERE n_dead_tup::numeric / nullif(n_live_tup, 0) > 0.2
+ORDER BY dead_ratio DESC;</script>
+  <script type="text/sql" data-role="wrong">SELECT relname, n_live_tup, n_dead_tup,
+       round(n_dead_tup::numeric / nullif(n_live_tup + n_dead_tup, 0), 2) AS dead_ratio
+FROM pg_stat_user_tables
+ORDER BY dead_ratio DESC NULLS LAST;</script>
+  <script type="text/sql" data-role="wrong">SELECT relname, n_live_tup, n_dead_tup,
+       round(n_dead_tup::numeric / nullif(n_live_tup + n_dead_tup, 0), 2) AS dead_ratio
+FROM pg_stat_user_tables
+WHERE n_dead_tup::numeric / nullif(n_live_tup, 0) > 0.2
+ORDER BY dead_ratio DESC;</script>
+  <script type="text/sql" data-role="wrong">SELECT relname, n_live_tup, n_dead_tup,
+       round(n_dead_tup::numeric / nullif(n_live_tup + n_dead_tup, 0), 2) AS dead_ratio
+FROM pg_stat_user_tables
+WHERE n_dead_tup::numeric / nullif(n_live_tup + n_dead_tup, 0) > 0.2
+ORDER BY dead_ratio;</script>
+  <script type="text/sql" data-role="wrong">VALUES ('sessions', 400, 800, 0.67), ('stamp_cards', 2000, 1666, 0.45), ('orders', 700, 300, 0.30);</script>
+</div>
+
+<div class="exercise"
+  data-start="SELECT gid, transaction, prepared FROM pg_prepared_xacts;"
+  data-answer="ROLLBACK PREPARED 'export_2026_10_30';"
+  data-check="SELECT (SELECT count(*) FROM pg_prepared_xacts) AS prepared_left, (SELECT sum(price) FROM products) AS price_total;">
+  <p>練習 2：凌晨的匯出程式把一個交易 <code>PREPARE</code> 之後就當掉了，它改的商品價格是錯的，products 的死版本也因此一直清不掉。起始內容可以查到它的 <code>gid</code>。寫出處理它的指令：放棄這個交易，讓價格維持原樣。</p>
+  <script type="text/sql" data-role="setup">BEGIN;
+UPDATE products SET price = price * 2;
+PREPARE TRANSACTION 'export_2026_10_30';</script>
+  <script type="text/sql" data-role="wrong">COMMIT PREPARED 'export_2026_10_30';</script>
+  <script type="text/sql" data-role="wrong">ROLLBACK;</script>
+  <script type="text/sql" data-role="wrong">VACUUM FULL products;</script>
+</div>
+
+<div class="exercise"
+  data-start="SELECT indexrelname, idx_scan, pg_get_indexdef(indexrelid)
+FROM pg_stat_user_indexes WHERE relname = 'stamp_cards';"
+  data-answer="ALTER TABLE stamp_cards SET (fillfactor = 70);
+DROP INDEX stamp_cards_stamps_idx;"
+  data-check="SELECT (SELECT reloptions FROM pg_class WHERE relname = 'stamp_cards') AS options,
+       (SELECT array_agg(indexname::text ORDER BY indexname) FROM pg_indexes WHERE tablename = 'stamp_cards') AS indexes,
+       (SELECT count(*) || ' / ' || sum(stamps) FROM stamp_cards) AS data;"
+  data-isolated>
+  <p>練習 3：<code>stamp_cards</code> 每天被更新上萬次，統計卻顯示沒有 HOT 更新。調整這張表：fillfactor 設成 70，並刪掉那個從沒被查詢用過、又讓更新無法走 HOT 的索引。其他索引和資料都要留著。起始內容可以看每個索引的使用次數。</p>
+  <script type="text/sql" data-role="wrong">ALTER TABLE stamp_cards SET (fillfactor = 70);</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE stamp_cards SET (fillfactor = 70);
+DROP INDEX stamp_cards_customer_id_idx;</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE stamp_cards SET (fillfactor = 70);
+ALTER TABLE stamp_cards DROP CONSTRAINT stamp_cards_pkey;
+DROP INDEX stamp_cards_stamps_idx;</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE stamp_cards SET (fillfactor = 100);
+DROP INDEX stamp_cards_stamps_idx;</script>
+  <script type="text/sql" data-role="wrong">DROP INDEX stamp_cards_stamps_idx;</script>
+  <script type="text/sql" data-role="wrong">DROP TABLE stamp_cards;
+CREATE TABLE stamp_cards (id integer PRIMARY KEY, customer_id integer NOT NULL, stamps integer NOT NULL) WITH (fillfactor = 70);
+CREATE INDEX stamp_cards_customer_id_idx ON stamp_cards (customer_id);</script>
+  <script type="text/sql" data-role="wrong">DROP INDEX stamp_cards_stamps_idx, stamp_cards_customer_id_idx;
+ALTER TABLE stamp_cards SET (fillfactor = 70);</script>
+</div>
+
+<div class="exercise"
+  data-start="SELECT current_setting('autovacuum_vacuum_threshold'),
+       current_setting('autovacuum_vacuum_scale_factor');"
+  data-answer="SELECT s.relname,
+       round(coalesce((SELECT option_value::numeric FROM pg_options_to_table(c.reloptions)
+                       WHERE option_name = 'autovacuum_vacuum_threshold'),
+                      current_setting('autovacuum_vacuum_threshold')::numeric)
+           + coalesce((SELECT option_value::numeric FROM pg_options_to_table(c.reloptions)
+                       WHERE option_name = 'autovacuum_vacuum_scale_factor'),
+                      current_setting('autovacuum_vacuum_scale_factor')::numeric)
+             * c.reltuples::numeric) AS threshold
+FROM pg_stat_user_tables s
+JOIN pg_class c ON c.oid = s.relid
+ORDER BY s.relname;"
+  data-ordered
+  data-isolated
+  data-require="\bcurrent_setting\s*\("
+  data-require-msg="全域設定要用 current_setting() 讀，不能寫死：設定改了，查詢的結果要跟著變。">
+  <p>練習 4：寫一句查詢，算出每張使用者表的 autovacuum 觸發門檻：表名、門檻（四捨五入成整數），依表名排序。用 <code>current_setting()</code> 讀 <code>autovacuum_vacuum_threshold</code> 與 <code>autovacuum_vacuum_scale_factor</code>（回傳文字，要轉型）；使用者表從 <code>pg_stat_user_tables</code> 取（它的 <code>relid</code> 就是 <code>pg_class</code> 的 <code>oid</code>），<code>reltuples</code> 在 <code>pg_class</code>；有每表覆寫設定的（seed 裡不只一張表、不只一種設定），以覆寫值為準。這幾張表都很小，<code>autovacuum_vacuum_max_threshold</code> 的上限不會生效，可以不管。</p>
+  <script type="text/sql" data-role="wrong">SELECT s.relname,
+       round(coalesce((SELECT option_value::numeric FROM pg_options_to_table(c.reloptions)
+                       WHERE option_name = 'autovacuum_vacuum_scale_factor'),
+                      current_setting('autovacuum_vacuum_scale_factor')::numeric)
+             * c.reltuples::numeric) AS threshold
+FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid
+ORDER BY s.relname;</script>
+  <script type="text/sql" data-role="wrong">SELECT s.relname,
+       round(current_setting('autovacuum_vacuum_threshold')::numeric
+           + current_setting('autovacuum_vacuum_scale_factor')::numeric * c.reltuples::numeric) AS threshold
+FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid
+ORDER BY s.relname;</script>
+  <script type="text/sql" data-role="wrong">SELECT s.relname, round(50 + 0.2 * c.reltuples::numeric) AS threshold
+FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid
+ORDER BY s.relname;</script>
+  <script type="text/sql" data-role="wrong">SELECT s.relname,
+       round(coalesce((SELECT option_value::numeric FROM pg_options_to_table(c.reloptions)
+                       WHERE option_name = 'autovacuum_vacuum_threshold'),
+                      current_setting('autovacuum_vacuum_threshold')::numeric)
+           + coalesce((SELECT option_value::numeric FROM pg_options_to_table(c.reloptions)
+                       WHERE option_name = 'autovacuum_vacuum_scale_factor'),
+                      current_setting('autovacuum_vacuum_scale_factor')::numeric)
+             * s.n_dead_tup) AS threshold
+FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid
+ORDER BY s.relname;</script>
+  <script type="text/sql" data-role="wrong">SELECT s.relname,
+       round(coalesce((SELECT option_value::numeric FROM pg_options_to_table(c.reloptions)
+                       WHERE option_name = 'autovacuum_vacuum_threshold'),
+                      current_setting('autovacuum_vacuum_threshold')::numeric)
+           + coalesce((SELECT option_value::numeric FROM pg_options_to_table(c.reloptions)
+                       WHERE option_name = 'autovacuum_vacuum_scale_factor'),
+                      current_setting('autovacuum_vacuum_scale_factor')::numeric)
+             * s.n_live_tup) AS threshold
+FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid
+ORDER BY s.relname;</script>
+  <script type="text/sql" data-role="wrong">SELECT s.relname,
+       round(current_setting('autovacuum_vacuum_threshold')::numeric
+           + coalesce((SELECT option_value::numeric FROM pg_options_to_table(c.reloptions)
+                       WHERE option_name = 'autovacuum_vacuum_scale_factor'),
+                      current_setting('autovacuum_vacuum_scale_factor')::numeric)
+             * c.reltuples::numeric) AS threshold
+FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid
+ORDER BY s.relname;</script>
+  <script type="text/sql" data-role="wrong">SELECT s.relname,
+       round(coalesce((SELECT option_value::numeric FROM pg_options_to_table(c.reloptions)
+                       WHERE option_name = 'autovacuum_vacuum_threshold'), 50)
+           + coalesce((SELECT option_value::numeric FROM pg_options_to_table(c.reloptions)
+                       WHERE option_name = 'autovacuum_vacuum_scale_factor'), 0.2)
+             * c.reltuples::numeric) AS threshold
+FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid
+ORDER BY s.relname;</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：一次 <code>UPDATE</code> 了 100 萬列，<code>COMMIT</code> 之後也跑了 <code>VACUUM</code>，表的檔案卻幾乎沒有變小。為什麼？</p>
+  <label data-key="a">VACUUM 還沒跑完，要再等一下</label>
+  <label data-key="b">UPDATE 的交易還沒真正提交</label>
+  <label data-key="c">VACUUM 只把死版本的空間標成可重用，不還給作業系統；之後的寫入會填進這些空位</label>
+  <label data-key="d">要先 ANALYZE 才會縮小</label>
+  <p class="why">✓ 一般 VACUUM 只截掉表尾整頁空掉的部分，其餘空間留在檔案裡給之後的新版本用。要縮小檔案得重寫整張表（<code>VACUUM FULL</code> 要拿全表的重鎖，正式環境改用 pg_repack）。COMMIT 之後交易就已提交；ANALYZE 只更新統計，不碰空間。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：某個 worker 早上 9 點開了交易、更新了一列，之後就停在 idle in transaction，直到下午 5 點。它只改了一列，影響有多大？</p>
+  <label data-key="a">沒影響，它閒著沒做事</label>
+  <label data-key="b">它的交易編號讓清理界線停在 9 點：這 8 小時裡整個資料庫所有表的死版本都清不掉，表持續膨脹；它鎖住的那一列也一直沒人能改</label>
+  <label data-key="c">只有它更新的那張表無法 VACUUM</label>
+  <p class="why">✓ 清理界線看的是全資料庫最舊的進行中交易，跟它碰過哪張表無關，所以 c 錯。閒著不代表無害：它拿著交易編號和列鎖。用 <code>idle_in_transaction_session_timeout</code> 讓伺服器結束這種連線，程式也要確保每個交易都會 <code>COMMIT</code>／<code>ROLLBACK</code>。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 7：資料庫很忙，有人提議「把 autovacuum 關掉省資源」。可以嗎？</p>
+  <label data-key="a">不行：死版本沒人清，表和索引持續膨脹、統計不更新；交易編號越來越舊，最後系統仍會強制跑防 wraparound 的 VACUUM，甚至拒絕寫入</label>
+  <label data-key="b">可以，PostgreSQL 查詢時會順便把死版本清乾淨</label>
+  <label data-key="c">可以，每週跑一次 VACUUM FULL 就能取代</label>
+  <p class="why">✓ autovacuum 是必要的維護，不是可有可無。查詢時的頁面清理只處理一部分情況（例如 HOT 鏈），不更新 visibility map、也不凍結；VACUUM FULL 每次都鎖住整張表。負載太重時應該調整 autovacuum（每表的比例、成本限制），而不是關掉。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>正式環境直接 VACUUM FULL</strong>：整張表 ACCESS EXCLUSIVE，連 <code>SELECT</code> 都卡住。日常靠一般 VACUUM，要縮表用 pg_repack 這類線上工具。</li>
+  <li><strong>關掉 autovacuum，或大表沿用預設的 20%</strong>：大表等到死版本兩成才清，早就膨脹了。大表各自設定較小的 <code>autovacuum_vacuum_scale_factor</code>。</li>
+  <li><strong>放著長交易不管</strong>：跑很久的查詢、idle in transaction、忘了收尾的 prepared transaction 或 replication slot，會讓整個資料庫都清不掉。監控 <code>age(backend_xmin)</code> 和 <code>pg_prepared_xacts</code>，設定逾時。</li>
+  <li><strong>一句 UPDATE 整張大表</strong>：一次產生和表一樣多的死版本，交易期間也都清不掉。要分批更新（第 34 課）。</li>
+  <li><strong>在常更新的欄位上隨手建索引</strong>：每次更新都不能走 HOT，表和所有索引一起長大。</li>
+  <li><strong>把 n_dead_tup 當即時、精確的數字</strong>：它是累計統計，會延遲，也只是估計。</li>
+  <li><strong>把 PREPARE TRANSACTION 當成應用程式的功能</strong>：它是給外部交易協調器用的，這頁拿它模擬「另一位同事」而已。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>表裡存的是列版本：<code>UPDATE</code> 寫新版本、把舊版本的 <code>xmax</code> 填上自己的交易編號；<code>DELETE</code> 只填 <code>xmax</code>；<code>ROLLBACK</code> 讓寫出的版本永遠無效，不會改回頁面。集點卡每集一次點，就多一個舊版本。</li>
+  <li>VACUUM 清死版本、讓空間可重用，但不縮小檔案，所以每晚 VACUUM 後檔案沒變小是正常的；VACUUM FULL 重寫整張表、拿最重的鎖，正式環境改用線上重整工具。</li>
+  <li>快照記下哪些交易已完成；xmin 已提交、xmax 未提交（或沒有）的版本才看得到。所以 <code>count(*)</code> 要逐列檢查。</li>
+  <li>最舊的進行中交易決定整個資料庫的清理界線；VERBOSE 的 <code>dead but not yet removable</code> 不是 0，就去查 <code>pg_stat_activity</code>、<code>pg_prepared_xacts</code>、replication slot。</li>
+  <li>HOT 更新不碰索引：被改的欄位不在索引裡，加上 fillfactor 留下的空間。集點卡表的修法是刪掉 <code>stamps</code> 上沒人用的索引、把 fillfactor 降到 70。</li>
+  <li>autovacuum 門檻是 50 + 0.2 × reltuples（有上限、可每表覆寫）；它也負責凍結，防止交易編號繞回造成 wraparound，所以不能關。</li>
+</ul>
+<p>下一課回到隔離等級：<code>REPEATABLE READ</code> 的快照擋不住哪些問題（寫入偏差），以及怎麼寫重試和 UPSERT。</p>
+
+</main>
+
+<script type="text/sql" id="seed">
+CREATE EXTENSION pageinspect;
+CREATE EXTENSION pg_visibility;
+CREATE EXTENSION pg_freespacemap;
+
+CREATE TABLE products (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL,
+  price integer NOT NULL
+);
+INSERT INTO products (name, price) VALUES
+  ('美式咖啡', 80), ('拿鐵', 110), ('卡布奇諾', 110),
+  ('伯爵紅茶', 90), ('可頌', 70), ('起司蛋糕', 120);
+
+-- 膨脹實驗：20,000 列，每列約 100 bytes
+CREATE TABLE big (
+  id integer PRIMARY KEY,
+  qty integer NOT NULL,
+  note text NOT NULL
+);
+INSERT INTO big SELECT g, g % 10, rpad('order-note-' || g, 64, '.') FROM generate_series(1, 20000) g;
+
+-- big 的檔案大小、活版本與死版本數，加上 free space map 記下的可重用空間
+CREATE FUNCTION big_stats() RETURNS TABLE (size text, n_live_tup bigint, n_dead_tup bigint, reusable text) LANGUAGE sql AS $$
+  SELECT pg_size_pretty(pg_relation_size('big')), s.n_live_tup, s.n_dead_tup,
+         (SELECT pg_size_pretty(sum(avail)) FROM pg_freespace('big'))
+  FROM pg_stat_user_tables s WHERE s.relname = 'big'
+$$;
+
+-- 死版本比例不同的幾張表
+CREATE TABLE orders (
+  id integer PRIMARY KEY,
+  customer_id integer NOT NULL,
+  total integer NOT NULL
+);
+INSERT INTO orders SELECT g, 1 + g % 6, 70 + g % 50 FROM generate_series(1, 1000) g;
+DELETE FROM orders WHERE id % 10 < 3;
+ALTER TABLE orders SET (autovacuum_vacuum_scale_factor = 0.01);
+
+CREATE TABLE sessions (
+  id integer PRIMARY KEY,
+  last_seen integer NOT NULL
+);
+INSERT INTO sessions SELECT g, 0 FROM generate_series(1, 400) g;
+UPDATE sessions SET last_seen = last_seen + 1;
+UPDATE sessions SET last_seen = last_seen + 1;
+ALTER TABLE sessions SET (autovacuum_vacuum_threshold = 1000);
+
+CREATE TABLE order_items (
+  id integer PRIMARY KEY,
+  order_id integer NOT NULL,
+  quantity integer NOT NULL
+);
+INSERT INTO order_items SELECT g, 1 + g % 1000, 1 FROM generate_series(1, 2000) g;
+UPDATE order_items SET quantity = 2 WHERE id % 10 < 3;
+
+CREATE TABLE coupons (
+  code text PRIMARY KEY,
+  discount integer NOT NULL
+);
+
+-- 集點卡：stamps 常被更新，上面卻有一個沒人用的索引
+CREATE TABLE stamp_cards (
+  id integer PRIMARY KEY,
+  customer_id integer NOT NULL,
+  stamps integer NOT NULL
+);
+CREATE INDEX stamp_cards_customer_id_idx ON stamp_cards (customer_id);
+CREATE INDEX stamp_cards_stamps_idx ON stamp_cards (stamps);
+INSERT INTO stamp_cards SELECT g, g, 0 FROM generate_series(1, 2000) g;
+UPDATE stamp_cards SET stamps = stamps + 1 WHERE id % 2 = 0;
+UPDATE stamp_cards SET stamps = stamps + 1 WHERE id % 3 = 0;
+SET enable_seqscan = off;
+SELECT stamps FROM stamp_cards WHERE customer_id = 42;
+SELECT stamps FROM stamp_cards WHERE customer_id = 7;
+SELECT stamps FROM stamp_cards WHERE id = 42;
+RESET enable_seqscan;
+
+ANALYZE;
+
+-- ANALYZE 之後又進來 500 筆：n_live_tup 會變，reltuples 要等下次 VACUUM／ANALYZE
+INSERT INTO order_items SELECT g, 1 + g % 1000, 1 FROM generate_series(2001, 2500) g;
+</script>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

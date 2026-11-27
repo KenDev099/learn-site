@@ -1,0 +1,1753 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>5. 快取：命中率、失效與擊穿</title>
+<link rel="stylesheet" href="../../style.css">
+<style>
+.tl { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin: 1.2em 0; }
+.tl table { width: 100%; }
+.tl td { vertical-align: top; }
+.tl tr.now td { background: var(--accent-soft); }
+.tl tr.later { visibility: hidden; }
+.tl .note { margin: 10px 0 0; min-height: 3.5em; }
+.tl .wait { color: var(--fail); font-weight: 600; }
+</style>
+</head>
+<body data-lesson="5">
+<header>
+  <div class="eyebrow">階段 2：擴展：冗餘、快取與資料 · 第 5 課</div>
+  <h1>快取：命中率、失效與擊穿</h1>
+</header>
+<main>
+<p>上一課把下單 API 放到好幾台機器後面，API 不再是瓶頸，壓力全部落到 PostgreSQL 身上。下個月是週年慶，<a href="02-estimation.html">第 2 課</a>估過：尖峰時每秒約有 1,111 次在讀菜單，是平常的 20 倍。假設資料庫每秒只撐得住約 200 次菜單查詢，照現在的寫法，活動一開始資料庫就會被讀取淹沒，連下單一起失敗。可是菜單一天只改幾次，這 1,111 次查詢幾乎都在拿同一份資料，等於用資料庫最貴的容量重複做同一件事。</p>
+<p>這課的任務：替菜單加上一層<strong>快取</strong>（cache），讓週年慶當天資料庫撐得住。快取就是把查過、算過的結果先存在比較快、比較便宜的地方，下次同樣的請求直接從那裡拿，不再問資料庫。把資料存進去只要幾行程式；這課要處理的是存進去之後的三個問題：店長改價後，顧客會不會一直看到舊價？熱門的菜單資料過期的那一瞬間，會不會幾百個請求同時衝去資料庫？快取自己壞了，資料庫會不會跟著倒？</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>快取能省多少、資料怎麼放進去：命中率要多高資料庫才撐得住週年慶，菜單、購物車、訂單各該怎麼處理（開場問題的最小答案）。</li>
+  <li>改價之後：為什麼要刪除快取而不是更新它，刪除之後舊價為什麼還會被寫回去，lease 怎麼修。</li>
+  <li>過期的那一瞬間：熱門 key 過期時怎麼只打一次資料庫，大量 key 同時過期怎麼辦，能不能在過期前就先更新。</li>
+  <li>快取壞掉時與上線後：哪些資料不該快取、Redis 掛了怎麼不拖垮資料庫、週年慶當天要盯哪些指標。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../nestjs/lessons/19-caching-redis.html">NestJS 課第 19 課</a>的 Redis cache-aside：先查快取，沒有再查資料庫並放回快取；改價時刪除快取，Redis 壞掉時退回查資料庫。</li>
+  <li><a href="../../typescript/lessons/12-races-concurrency.html">TypeScript 課第 12 課</a>的「同一個 key 共用同一個 Promise」：好幾個人同時要同一份資料時只查一次，大家等同一個結果。</li>
+  <li><a href="../../postgresql/lessons/19-concurrency.html">PostgreSQL 課第 19 課</a>的 lost update：兩個人交錯讀寫，後寫的蓋掉先寫的。</li>
+</ul></div>
+
+<h2>快取放哪裡、要擋下多少？命中率要多高才撐得住週年慶</h2>
+<p>要算命中率，得先知道算的是哪一層的命中率，所以先決定快取放在哪裡。一個請求從顧客的手機一路到資料庫，沿路每一層都可以放快取。越靠近使用者，命中時省下的路越多，但能放的東西越受限：瀏覽器裡的快取只有這一位顧客用得到，資料庫自己的快取只省下讀磁碟，網路和 API 的工作一樣都沒省。</p>
+<figure>
+  <svg viewBox="0 0 700 200" role="img" aria-label="請求路徑上的六層快取：瀏覽器、CDN、nginx、程序記憶體、Redis、PostgreSQL 的 shared buffers，越左邊越靠近使用者">
+    <defs><marker id="arr5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="10" y="40" width="100" height="56" rx="8"/><text class="d-text" x="60" y="73" text-anchor="middle">瀏覽器</text>
+    <rect class="d-box" x="126" y="40" width="100" height="56" rx="8"/><text class="d-text" x="176" y="73" text-anchor="middle">CDN</text>
+    <rect class="d-box" x="242" y="40" width="100" height="56" rx="8"/><text class="d-text" x="292" y="73" text-anchor="middle">nginx</text>
+    <rect class="d-soft" x="358" y="40" width="100" height="56" rx="8"/><text class="d-text" x="408" y="73" text-anchor="middle">程序記憶體</text>
+    <rect class="d-soft" x="474" y="40" width="100" height="56" rx="8"/><text class="d-text" x="524" y="73" text-anchor="middle">Redis</text>
+    <rect class="d-box" x="590" y="40" width="100" height="56" rx="8"/><text class="d-text" x="640" y="73" text-anchor="middle">PostgreSQL</text>
+    <path class="d-line" d="M110,68 L122,68" marker-end="url(#arr5)"/>
+    <path class="d-line" d="M226,68 L238,68" marker-end="url(#arr5)"/>
+    <path class="d-line" d="M342,68 L354,68" marker-end="url(#arr5)"/>
+    <path class="d-line" d="M458,68 L470,68" marker-end="url(#arr5)"/>
+    <path class="d-line" d="M574,68 L586,68" marker-end="url(#arr5)"/>
+    <text class="d-small" x="60" y="118" text-anchor="middle">Cache-Control</text>
+    <text class="d-small" x="176" y="118" text-anchor="middle">圖片、公開菜單</text>
+    <text class="d-small" x="292" y="118" text-anchor="middle">反向代理快取</text>
+    <text class="d-small" x="408" y="118" text-anchor="middle">Map／LRU</text>
+    <text class="d-small" x="524" y="118" text-anchor="middle">多台共用</text>
+    <text class="d-small" x="640" y="118" text-anchor="middle">shared buffers</text>
+    <text class="d-accent" x="350" y="170" text-anchor="middle">← 越靠近使用者越省，能放的資料越受限　　越靠近資料越準，省得越少 →</text>
+  </svg>
+  <figcaption>前三層是 HTTP 快取（Node 課第 15 課），中間兩層是應用程式自己管的快取，最後一層是資料庫自己把常用的資料頁留在記憶體裡。這一課談中間兩層。</figcaption>
+</figure>
+<p>這課會遇到的三個選擇（瀏覽器／CDN、程序記憶體、Redis）各適合放什麼，差別在「所有人看到的是不是同一份」和「多台機器要不要一致」：</p>
+<div class="table-wrap"><table>
+  <tr><th>層</th><th>適合放</th><th>不適合放</th></tr>
+  <tr><td>瀏覽器、CDN</td><td>檔名帶雜湊的圖片、JS；所有人看到都一樣的公開菜單</td><td>依登入身分而不同的內容（「我的訂單」）</td></tr>
+  <tr><td>程序記憶體（Map、LRU）</td><td>極熱門、很小、晚幾秒沒關係的資料（門市清單）</td><td>要多台一致的資料：每台各有一份，改價後各台過期時間不同</td></tr>
+  <tr><td>Redis</td><td>多台共用的查詢結果、session、購物車</td><td>以它為準的金額、付款狀態</td></tr>
+</table></div>
+<p>咖啡店的 API 有好幾台，改價後希望每台看到的菜單一致，所以菜單放 Redis：所有 API 共用同一份，改價時只要處理一個地方。</p>
+<p>放好之後，要知道它替資料庫擋下了多少。每一次讀取，快取裡有這筆資料、直接拿到，叫<strong>命中</strong>（hit）；沒有，只好回資料庫查，叫<strong>未命中</strong>（miss）。所有讀取裡命中的比例叫<strong>命中率</strong>（hit ratio），記作 h。只有未命中的讀取會到資料庫，所以：</p>
+<pre>平均延遲     = h × 命中延遲 + (1 − h) × 未命中延遲
+資料庫讀取量 = (1 − h) × 總讀取量</pre>
+<p>第二個算式很反直覺。命中率從 90% 到 99%，看起來只多了 9 個百分點，但到資料庫的比例從 10% 變成 1%，資料庫的負載變成原本的<strong>十分之一</strong>。命中率越接近 100%，每多一個百分點，資料庫少扛的比例越大。用週年慶尖峰的每秒 1,111 次讀取跑跑看，假設命中花 1ms、未命中 25ms，執行後看每一列的「資料庫每秒幾次」：</p>
+<div class="lab"><script type="code">
+const reads = 1111   // 週年慶尖峰：每秒讀菜單的次數
+const hitMs = 1
+const missMs = 25
+
+for (const h of [0, 0.5, 0.9, 0.99, 0.999]) {
+  const db = (1 - h) * reads
+  const avg = h * hitMs + (1 - h) * missMs
+  console.log(`命中率 ${(h * 100).toFixed(1)}%：資料庫每秒 ${db.toFixed(1)} 次，平均延遲 ${avg.toFixed(2)} ms`)
+}
+</script></div>
+<p>回到開場的數字：資料庫每秒只撐 200 次，就要 (1 − h) × 1,111 ≤ 200，命中率至少約 82%。表裡 90% 時資料庫每秒約 111 次，還撐得住；命中率掉到 50%，資料庫每秒要扛 555 次，就倒了。練習 1 會把這個算法寫成函式。</p>
+<p>這個算式也透露了這個快取的身分。Google SRE 書〈Addressing Cascading Failures〉把快取分成兩種：拿掉它，系統只是變慢，叫<strong>延遲型快取</strong>（latency cache）；拿掉它，系統就撐不住負載，叫<strong>容量型快取</strong>（capacity cache）。週年慶的菜單快取是容量型的：命中率一掉到 0，每秒 1,111 次全部壓到只撐 200 次的資料庫上。所以快取空掉的時候，例如 Redis 重啟、擴容、一大批資料同時過期，服務會倒。這課最後一節會回來處理怎麼保護。</p>
+<p>快取不是免費的。它帶來三個代價，後面每一節都在處理其中一個：</p>
+<ul>
+  <li><strong>資料可能過時</strong>：店長改了價格，快取裡還是舊的。</li>
+  <li><strong>失效邏輯</strong>：每一個會改資料的地方，都要記得處理對應的快取。漏一個就是 bug，而且很難重現。</li>
+  <li><strong>多一個會壞的元件</strong>：Redis 也會當機、也會滿、也會慢。</li>
+</ul>
+<div class="callout practice"><strong>💡 實務上：先找出慢在哪，再決定要不要加快取</strong><br>工作中常聽到「API 很慢，加個 Redis 吧」。資深工程師會先問：慢的是哪一支查詢？用 <code>EXPLAIN</code> 看過了嗎？很多時候補一個索引、修掉 N+1 查詢（在迴圈裡一筆一筆查資料庫）就夠了，根本不需要多一個會壞、要維運的元件。真的要加時，再問 PM「價格晚幾秒、幾分鐘更新可以接受嗎？」，這個答案決定 TTL（下一節會講）；同時在設計文件寫清楚這個快取是延遲型還是容量型，維運才知道它掛掉時會發生什麼事。週年慶的菜單快取，兩個問題的答案都要先寫下來。</div>
+<p>知道命中率要 82% 以上之後，下一個問題是：資料一開始是怎麼進到快取的？誰負責放、什麼時候放？</p>
+
+<h2>資料怎麼進到快取？菜單、購物車、訂單各怎麼處理</h2>
+<p>最常用的做法是 NestJS 課第 19 課寫過的 <strong>cache-aside</strong>，又叫 lazy loading：快取擺在資料庫旁邊（aside），由應用程式自己決定什麼時候去查、什麼時候放進去。讀菜單時，API 先問 Redis；有就直接回傳；沒有就查資料庫，把結果放進 Redis，再回傳。只有真的被讀過的資料才會進快取，這就是「lazy」。寫入時，API 先改資料庫，再處理快取裡對應的那一筆。Redis 壞了，API 還能直接查資料庫，因為資料庫才是真正的資料來源，快取只是副本。</p>
+<p>副本放進快取之後要放多久？資料庫改了、快取卻沒人處理，舊資料會永遠留著。所以每一筆快取都要設 <strong>TTL</strong>（time to live，存活時間）：放進去之後經過這段時間，就當作不存在，下一次讀取會未命中、重新查資料庫。TTL 決定了「最壞情況下舊資料會留多久」，也就是上一節 💡 要問 PM 的那個數字。</p>
+<p>TTL 到期之前，快取的記憶體也可能不夠放。這時快取會<strong>淘汰</strong>（eviction）一部分資料騰出空間，例如 <a href="../../node/lessons/23-profiling-memory.html">Node 課第 23 課</a>寫過的 LRU（least recently used）：丟掉最久沒被讀過的那幾筆。被淘汰的資料下次讀取一樣會未命中，所以淘汰太多也會拉低命中率。</p>
+<p>cache-aside 不是唯一的做法。四種常見策略的差別在「讀的時候誰去資料庫拿」和「寫的時候快取怎麼跟著變」：</p>
+<div class="table-wrap"><table>
+  <tr><th>策略</th><th>讀</th><th>寫</th><th>優點</th><th>風險</th></tr>
+  <tr><td><strong>cache-aside</strong>（又叫 lazy loading）</td><td>應用程式先查快取，未命中再查資料庫並寫回快取</td><td>寫資料庫，刪除快取</td><td>只快取真的被讀的資料；快取壞了還能退回資料庫</td><td>未命中要多走兩趟；可能過時</td></tr>
+  <tr><td><strong>read-through</strong></td><td>應用程式只問快取，由快取層自己去資料來源載入</td><td>同 cache-aside</td><td>載入邏輯集中在一處</td><td>同 cache-aside；需要支援的快取函式庫或服務</td></tr>
+  <tr><td><strong>write-through</strong></td><td>同 cache-aside</td><td>寫資料庫時同步更新快取</td><td>讀的時候比較少過時</td><td>快取很多沒人讀的資料；新節點一開始是空的；兩個寫入交錯時仍可能留下舊值</td></tr>
+  <tr><td><strong>write-behind</strong>（又叫 write-back）</td><td>讀快取</td><td>先寫快取，之後批次寫回資料庫</td><td>寫入非常快</td><td>快取在寫回前壞掉，資料就遺失了</td></tr>
+</table></div>
+<p>AWS 的快取策略文件對 cache-aside 和 write-through 的比較也是這樣，並建議兩者都要加上 TTL。write-behind 的風險最值得記住：資料只存在快取裡的那段時間，快取一壞就沒了，所以它不適合任何不能掉的資料。</p>
+<p>咖啡店的三種資料，各自對應不同的選擇，判斷依據是「錯了或晚了會怎樣」：</p>
+<ul>
+  <li><strong>菜單</strong>：cache-aside 加 TTL。讀很多、改很少，顧客晚幾秒看到新價格可以接受。</li>
+  <li><strong>購物車</strong>：直接放 Redis 當主要儲存（<a href="../../devops/lessons/13-scaling.html">部署課第 13 課</a>）。這不是快取，購物車的資料本身就只存在 Redis，所以要設好 TTL，也要開持久化：讓 Redis 定期把資料寫到磁碟，重啟後不會全部消失。</li>
+  <li><strong>訂單、付款狀態、結帳時的價格與庫存</strong>：不快取，一律讀資料庫。錯一次就是錯帳。</li>
+</ul>
+<p>到這裡可以先給開場三個問題的最小答案：資料改了就刪掉快取，不要更新它；熱門 key 過期時，只讓一個請求去資料庫，其他人等它的結果；快取壞了，要限制打到資料庫的量，不能全部放過去。接下來每一節把其中一個答案講透，先從改價開始：cache-aside 的寫入說「刪除快取」，為什麼不是直接把快取改成新價？</p>
+
+<h2>店長改價之後，快取要更新還是刪除？</h2>
+<p>店長把拿鐵從 110 改成 120。資料庫改完之後，快取裡的 <code>price:2</code> 要怎麼處理？直覺是「把快取也改成 120」，這樣下一個讀取馬上看到新價。只有一個人改價時這樣沒問題，但店長和另一位同事幾乎同時改價時，兩個寫入會交錯：</p>
+<div class="table-wrap"><table>
+  <tr><th>步驟</th><th>寫入 A（改成 120）</th><th>寫入 B（改成 130）</th><th>資料庫</th><th>快取</th></tr>
+  <tr><td>1</td><td>寫資料庫 120</td><td></td><td>120</td><td>110</td></tr>
+  <tr><td>2</td><td></td><td>寫資料庫 130</td><td>130</td><td>110</td></tr>
+  <tr><td>3</td><td></td><td>更新快取 130</td><td>130</td><td>130</td></tr>
+  <tr><td>4</td><td>更新快取 120（比較慢）</td><td></td><td>130</td><td><strong>120</strong> ✗</td></tr>
+</table></div>
+<p>A 寫資料庫比較早，但更新快取比較晚，可能是網路慢了一下，或那台 API 剛好在忙。資料庫最後是 130，快取卻是 120，而且會一直錯到 TTL 到期。問題出在「更新快取」這個動作的結果取決於誰最後到：兩個寫入誰先誰後，快取就留下誰的值，而這個順序沒有人控制得了。結果取決於好幾個動作誰先誰後，叫<strong>競態</strong>（race condition）。</p>
+<p>改成<strong>刪除</strong>，這個動作叫<strong>失效</strong>（invalidation）：讓快取裡的這一筆失去效力，下次讀取自然會去資料庫拿最新的。刪除跟更新不同，它的結果不管做幾次、誰先誰後都一樣，最後快取都是空的。一個操作做一次和做好幾次結果相同，叫<strong>冪等</strong>（idempotent），第 9 課會詳談。上面的例子改成刪除，不管 A、B 的刪除哪個先到，快取都是空的，下一個讀取會去資料庫拿到 130。Facebook 在〈Scaling Memcache at Facebook〉（NSDI 2013）也是這樣選的，理由正是刪除是冪等的。</p>
+<p>所以 cache-aside 的寫入規則是：先寫資料庫，再刪除快取。但刪除也不是萬無一失：刪除只處理了「寫入和寫入」交錯的情況，還有「讀取和寫入」交錯的情況沒處理。</p>
+
+<h2>刪了快取，舊價為什麼還會被寫回去？</h2>
+<p>cache-aside 的讀取也會寫快取：未命中時，讀取請求查完資料庫，會把結果放回快取。這個「放回」如果晚了一步，就可能把舊價放回去。這個競態叫<strong>舊值寫回</strong>（stale set），按「下一步」看：</p>
+<div class="tl">
+  <div class="table-wrap"><table>
+    <tr><th>步驟</th><th>讀取請求 A</th><th>店長改價</th><th>資料庫</th><th>快取</th></tr>
+    <tr data-note="price:2 剛好過期。請求 A 查快取，未命中，準備去資料庫查。"><td>1</td><td>查快取：未命中</td><td></td><td>110</td><td>（空）</td></tr>
+    <tr data-note="A 從資料庫讀到 110。這時 A 手上拿著一個值，還沒寫回快取。"><td>2</td><td>查資料庫：讀到 110</td><td></td><td>110</td><td>（空）</td></tr>
+    <tr data-note="店長改價成 120。先寫資料庫，這個順序是對的（NestJS 課第 19 課）。"><td>3</td><td></td><td>寫資料庫 120</td><td>120</td><td>（空）</td></tr>
+    <tr data-note="店長刪除快取。快取本來就是空的，刪了等於沒做事。"><td>4</td><td></td><td>刪除 price:2</td><td>120</td><td>（空）</td></tr>
+    <tr data-note="A 慢了一步，把手上的 110 寫進快取。每一步都照規矩做，結果卻是錯的。"><td>5</td><td>寫回快取 110</td><td></td><td>120</td><td><strong>110</strong></td></tr>
+    <tr data-note="之後所有人都讀到 110，直到 TTL 到期。這就是 PostgreSQL 課第 19 課的 lost update 換了個地方發生：讀和寫之間有空檔，別人在空檔裡改了資料。"><td>6</td><td colspan="2">之後的讀取全部命中舊價</td><td>120</td><td><strong>110</strong> ✗</td></tr>
+  </table></div>
+  <div class="bar"><button data-prev>◀ 上一步</button><button class="primary" data-next>下一步 ▶</button><span class="kbd" data-count></span></div>
+  <p class="note"></p>
+</div>
+<p>每一步都照規矩做：店長先寫資料庫再刪快取，讀取請求未命中就查資料庫並放回。出錯的原因是請求 A 從「讀資料庫」到「寫回快取」之間有一段空檔，店長的改價和刪除剛好落在這段空檔裡。刪除發生在 A 寫回之前，等於刪了一個還不存在的東西，A 接著把手上過時的 110 放了進去。</p>
+<p>要修這個問題，快取必須有辦法分辨「這個寫回是在刪除之前讀的，還是之後讀的」。Facebook 的修法叫 <strong>lease</strong>（租約）：未命中時，快取發給呼叫者一張一次性的票（token），等於說「這個 key 由你負責去載入」；之後寫回時要附上這張票。<strong>刪除會讓這個 key 的票作廢</strong>，拿作廢的票寫回會被拒絕。同一個情境加上 lease：</p>
+<div class="tl">
+  <div class="table-wrap"><table>
+    <tr><th>步驟</th><th>讀取請求 A</th><th>店長改價</th><th>讀取請求 B</th><th>快取</th></tr>
+    <tr data-note="A 未命中，快取發給 A 一張票：lease 7。"><td>1</td><td>查快取：未命中，拿到 lease 7</td><td></td><td></td><td>（空），有效票：7</td></tr>
+    <tr data-note="A 去資料庫讀到 110。"><td>2</td><td>查資料庫：讀到 110</td><td></td><td></td><td>（空），有效票：7</td></tr>
+    <tr data-note="店長寫資料庫 120，再刪除 price:2。刪除讓 lease 7 作廢。"><td>3</td><td></td><td>寫資料庫 120、刪除 price:2</td><td></td><td>（空），沒有有效票</td></tr>
+    <tr data-note="A 拿 lease 7 寫回 110，快取發現這張票已經作廢，拒絕寫入。"><td>4</td><td>寫回 110（lease 7）<br><span class="wait">被拒絕</span></td><td></td><td></td><td>（空）</td></tr>
+    <tr data-note="下一個讀取 B 未命中，拿到新的票 lease 8，從資料庫讀到 120。"><td>5</td><td></td><td></td><td>未命中，拿到 lease 8；讀到 120</td><td>（空），有效票：8</td></tr>
+    <tr data-note="B 用有效的 lease 8 寫回 120。快取跟資料庫一致。"><td>6</td><td></td><td></td><td>寫回 120（lease 8）</td><td><strong>120</strong> ✓</td></tr>
+  </table></div>
+  <div class="bar"><button data-prev>◀ 上一步</button><button class="primary" data-next>下一步 ▶</button><span class="kbd" data-count></span></div>
+  <p class="note"></p>
+</div>
+<p>A 的票是在刪除之前發的，刪除讓它作廢，A 帶著 110 回來時就被擋下；B 的票是刪除之後發的，B 讀到的一定是改價後的資料。lease 把「讀的時間點」記在票上，讓快取能拒絕過時的寫回。練習 4 會實作這個機制。</p>
+<p>lease 還有另一個用途，下一節會看到。</p>
+<p>lease 需要快取這一端支援。沒有 lease 時，還有兩個比較簡單的保險。第一個是<strong>把版本號放進 key</strong>：菜單整份重新發布時，key 從 <code>menu:v41</code> 換成 <code>menu:v42</code>，讀取一律讀新版本的 key，就算有人把舊值寫回 <code>menu:v41</code>，也不會再有人讀它，等 TTL 自然清掉。這適合「整批換掉」的資料，代價是要有地方存目前的版本號。第二個是 <strong>TTL 本身</strong>：失效邏輯總有漏掉的時候，舊值寫回這類競態也不可能百分之百擋住，TTL 保證任何錯誤最多持續 TTL 那麼久。所以不要把 TTL 設成永不過期，它是最後一道保險。</p>
+<div class="callout practice"><strong>💡 實務上：失效最常漏在「不是走正常 API」的寫入</strong><br>後台改價的 API 通常記得刪快取，出事的多半是別條路：CSV 批次匯入、排程同步供應商價格、工程師直接下 SQL 修資料、另一個服務直接改同一張表。實務上會把「改這份資料」收斂到同一個函式或服務，刪快取寫在裡面；code review 時多問一句「這個寫入會影響哪些快取 key？」。週年慶前常會批次調價，客服回報「網頁上的價格不對」時，第一步就是比對資料庫和快取的值，不一致就是失效漏了，手動刪掉那個 key 能先止血，再回頭找是哪條寫入路徑。</div>
+<p>到這裡，改價後的正確性處理好了。但 TTL 和刪除都會讓快取「變空」，而菜單是全站最熱門的 key：它變空的那一瞬間，會發生什麼事？</p>
+
+<h2>菜單 key 過期的那一瞬間，資料庫會被打幾次？</h2>
+<p>週年慶尖峰每秒 1,111 次讀菜單。菜單的 key 因為 TTL 到期或被刪除而變空的那一瞬間，正在讀菜單的幾百個請求同時未命中。cache-aside 的寫法是「未命中就自己去查資料庫」，所以它們會同時去資料庫查同一份菜單，在第一個人把結果寫回之前，每一個都會打到資料庫。這叫<strong>快取擊穿</strong>（cache stampede），也叫驚群（thundering herd）：像一群動物同時受驚往同一個方向衝。執行下面的範例，先看簡單的 cache-aside 寫法讓 500 個同時的請求打了資料庫幾次，再看改成 single-flight 之後的次數：</p>
+<div class="lab"><script type="code">
+type Menu = { name: string; price: number }[]
+let dbQueries = 0
+const db = async (key: string): Promise<Menu> => {
+  dbQueries++
+  await new Promise(r => setTimeout(r, 20))   // 假裝查詢要 20ms
+  return [{ name: '拿鐵', price: 110 }]
+}
+
+// 簡單的 cache-aside：沒命中就自己去查
+const cache = new Map<string, Menu>()
+async function naive(key: string) {
+  const hit = cache.get(key)
+  if (hit) return hit
+  const value = await db(key)
+  cache.set(key, value)
+  return value
+}
+await Promise.all(Array.from({ length: 500 }, () => naive('menu')))
+console.log('簡單的 cache-aside：', dbQueries, '次查詢')
+
+// single-flight：同一個 key 正在載入時，其他人等同一個 Promise
+cache.clear()
+dbQueries = 0
+const inflight = new Map<string, Promise<Menu>>()
+function singleFlight(key: string) {
+  const hit = cache.get(key)
+  if (hit) return Promise.resolve(hit)
+  let p = inflight.get(key)
+  if (!p) {
+    p = db(key)
+      .then(value => { cache.set(key, value); return value })
+      .finally(() => inflight.delete(key))
+    inflight.set(key, p)
+  }
+  return p
+}
+await Promise.all(Array.from({ length: 500 }, () => singleFlight('menu')))
+console.log('single-flight：', dbQueries, '次查詢')
+</script></div>
+<p><strong>single-flight</strong> 就是 TypeScript 課第 12 課「同一個 key 共用同一個 Promise」的做法：第一個未命中的人去載入，並把這個載入中的 Promise 記在 <code>inflight</code> 裡；後來的人看到同一個 key 已經在載入，就等同一個 Promise，不再自己去查。500 個請求只打一次資料庫。</p>
+<p>這個寫法有三個細節，練習 2 都會考。第一，載入<strong>失敗</strong>時也要把 <code>inflight</code> 裡的紀錄清掉，上面用 <code>finally</code> 做到；不清的話，那個失敗的 Promise 會一直留著，之後每個人都拿到同一個錯誤，資料庫恢復了也沒用。第二，錯誤<strong>不要</strong>寫進快取：資料庫抖了一下是幾百毫秒的事，寫進快取就變成整個 TTL 的故障。第三，single-flight 只在<strong>同一個程序</strong>裡有效，因為 <code>inflight</code> 是那個程序記憶體裡的 Map。API 有 10 台時，每台各自擋成一次，資料庫還是收到 10 次。要跨機器擋成一次，有三個做法：上一節的 lease、分散式鎖（多台機器共用的一把鎖，同一時間只有一台能去載入，第 14 課），或下一節之後會講的提早更新。</p>
+<p>上一節的 lease 剛好能做到。Facebook 讓每個 key <strong>每 10 秒只發一張票</strong>：10 秒內其他未命中的請求拿不到票，被告知「稍等一下再查」，等第一個拿到票的人把值寫回。票是快取那一端發的，所有 API 共用同一個快取，所以不管請求落在哪台 API，熱門 key 未命中時都只有一個請求會去資料庫。論文的量測是：一組特別容易出擊穿的熱門 key，資料庫的尖峰查詢量從每秒 17K 次降到 1.3K 次。</p>
+<p>single-flight 解決的是「一個熱門 key 過期」。但週年慶菜單不只一個 key，每個商品也各有一筆快取，它們可能同時過期。</p>
+
+<h2>兩千個商品同時過期、有人一直查不存在的商品，怎麼辦？</h2>
+<p>擊穿是一個 key 過期，<strong>雪崩</strong>（avalanche）是大量 key 在<strong>同一時間</strong>過期，所有未命中一起壓到資料庫。最常見的原因是部署或活動前先<strong>預熱</strong>：主動一次把所有商品載入快取（不是 cache-aside 那種被讀到才載入），TTL 都是 60 秒，60 秒後它們一起過期，再一起被寫回、再過 60 秒又一起過期，資料庫的負載就每 60 秒跳一次。single-flight 擋不住這種情況：它合併的是同一個 key 的載入，兩千個不同的 key 還是各查一次。</p>
+<p>修法是讓過期時間錯開，叫 <strong>TTL 加隨機</strong>（jitter）：例如 TTL = 60 秒 × (1 − 0.2 × 隨機數)，隨機數在 0～1 之間，過期時間就分散在 48～60 秒之間。同一批寫入的 key 不再同一秒過期，資料庫的負載攤平成一條比較平的線。</p>
+<p>還有一種讓快取完全失效的情況：有人一直查不存在的商品，例如 <code>/products/99999</code>。資料庫查不到，沒有東西可以放進快取，所以這個請求永遠不會命中，每次都打資料庫。爬蟲或攻擊者大量送這種請求，就能繞過快取直接壓資料庫。修法是<strong>負快取</strong>（negative caching）：把「查無此資料」也當成一個結果快取起來，例如存一個 <code>null</code>，下次同樣的查詢直接命中這個 <code>null</code>。負快取的 TTL 要短，例如 30 秒，原因有兩個：商品可能剛好被新增，存太久會讓新商品一直顯示不存在；攻擊者也可以用大量不同的不存在 id 把快取塞滿，把真正的熱門資料擠出去。所以負快取要搭配限流，限制每個來源一段時間內能送幾個請求（第 10 課）。</p>
+<div class="callout practice"><strong>💡 實務上：看到「固定時間點」的資料庫尖峰，先懷疑 TTL</strong><br>雪崩在監控上的樣子是：資料庫 CPU 每隔固定時間跳一下，或每次部署後剛好過了一個 TTL 就突然變慢。排查時先看那批 key 是不是同一時間寫進去、TTL 是不是同一個整數，確認了就加 jitter，改動很小。另外，週年慶、推播發出去之前，先問行銷什麼時候發，提前把熱門資料載入快取，不要讓第一波流量撞上空的快取。</div>
+<p>到這裡，過期時資料庫只會被打一次，大批過期也錯開了。但 single-flight 留下一個代價：去載入的那一個請求，和所有等它的人，都要等完整的一次資料庫查詢。</p>
+
+<h2>能不能不等到過期，就先在背景更新？</h2>
+<p>過期才更新，就一定有一批人在等。更好的做法是<strong>在過期之前就更新</strong>，或過期後先回舊值、在背景更新，讓讀取的人永遠不用等資料庫。</p>
+<p>第一個做法來自 HTTP 快取（<a href="../../node/lessons/15-http-caching.html">Node 課第 15 課</a>）的 <strong>stale-while-revalidate</strong>，意思是「先用舊的，同時重新驗證」。例如 <code>Cache-Control: max-age=600, stale-while-revalidate=30</code>：前 600 秒資料是新鮮的；之後 30 秒內，快取可以先回舊值，同時在背景重新驗證。我們把同樣的語意搬到應用程式的快取裡，用 staleMs 表示「過期後還能容忍多舊」，對應 HTTP 的 <code>stale-while-revalidate=30</code>，跟 TTL 一樣要跟 PM 確認。讀取時依資料的狀態決定怎麼做：</p>
+<div class="table-wrap"><table>
+  <tr><th>讀取時的狀態</th><th>做法</th></tr>
+  <tr><td>沒有快取</td><td>等待載入（single-flight）</td></tr>
+  <tr><td>還沒過期</td><td>直接回傳</td></tr>
+  <tr><td>過期不到 staleMs</td><td>馬上回傳舊值，背景重新載入（同一個 key 只載入一次）</td></tr>
+  <tr><td>過期超過 staleMs</td><td>舊到不能用了，等待重新載入</td></tr>
+</table></div>
+<p>菜單過期幾秒內先回舊價，顧客幾乎感覺不到，但沒有人需要等資料庫。</p>
+<p>stale-while-revalidate 還是要等到過期之後的第一個讀取才開始更新。<strong>XFetch</strong>（Vattani 等人，PVLDB 8(8)，2015）再往前推一步：還沒過期時，就讓每個讀取以一定的機率「提早」重新載入，越接近到期機率越高。條件是：</p>
+<pre>now − Δ × β × ln(random()) ≥ expiresAt</pre>
+<p>一個一個看。Δ 是上次載入花的時間；β 預設 1，調大就更積極地提早。<code>random()</code> 在 0～1 之間，所以 <code>ln(random())</code> 是負數，<code>−Δ × β × ln(random())</code> 是一個正的「提早量」：random 很小時提早量很大，random 接近 1 時提早量趨近 0。整個條件是在問「現在加上這次抽到的提早量，有沒有超過到期時間」。離到期越近，需要的提早量越小，越容易成立；載入越慢（Δ 越大），提早量整體越大，就越早開始。下面的範例算出離到期還剩多少時，單一讀取觸發的機率，執行後看機率怎麼隨剩餘時間變化：</p>
+<div class="lab"><script type="code">
+const delta = 100   // 上次載入花了 100ms
+const beta = 1
+// 提早量 = −Δβ ln(U) 超過剩餘時間 left 的機率是 e^(−left / Δβ)
+for (const left of [1000, 500, 300, 200, 100, 50, 10]) {
+  const p = Math.exp(-left / (delta * beta))
+  console.log(`離到期 ${String(left).padStart(4)}ms：每次讀取觸發的機率 ${(p * 100).toFixed(2)}%`)
+}
+</script></div>
+<p>單一讀取的機率很低，但熱門的 key 每秒有很多讀取。週年慶的菜單每秒被讀上千次，接近到期時幾乎一定有某一個讀取先觸發、在背景更新完，其他人從頭到尾都命中，連擊穿都不會發生。冷門的 key 讀取少，多半等到真的過期，這也沒關係，因為冷門的 key 本來就不會造成擊穿。</p>
+<div class="callout warn">背景更新是「射後不理」：呼叫端已經拿到舊值走了，背景載入失敗時沒有人會 <code>await</code> 它。一定要自己 <code>.catch</code> 並記錄錯誤，否則就是未處理的 Promise rejection，Node 15 起預設會讓整個程序結束。練習 3 會檢查這一點。</div>
+<p>實際專案不用自己從頭寫，可以用現成的函式庫，見練習前的「補充與查表」。到這裡，菜單快取在 Redis 正常時已經很穩。剩下兩件事：有些資料根本不該放進快取，以及 Redis 自己壞掉的時候。</p>
+
+<h2>哪些資料不該快取？Redis 掛了怎麼不拖垮資料庫？</h2>
+<p>先看不該快取、或要特別小心的資料。最危險的是<strong>依身分而不同的資料用了共用的 key</strong>：如果用網址 <code>/me/orders</code> 當 key，第一個人查完，王小明的訂單就被快取起來，接著陳美華查同一個網址，拿到的是王小明的訂單。這是 NestJS 課第 19 課 <code>CacheInterceptor</code> 的陷阱。key 要包含使用者 id，或乾脆不快取；HTTP 快取也一樣，這類回應要設 <code>private</code> 或 <code>no-store</code>。</p>
+<p>第二種是<strong>結帳時的價格與庫存</strong>。菜單頁可以顯示快取的價格，晚幾秒沒關係；但下單時要從資料庫讀價格與庫存再計算金額，因為快取可能是舊的，用舊價收錢就是錯帳。快取不是資料來源。</p>
+<p>第三種不是資料不該快取，而是快取放的位置會出問題：<strong>熱門 key 讓單一 Redis 節點過熱</strong>。到目前為止我們把 Redis 當成一台，但資料量或流量大時，Redis 會拆成好幾台一起用（Redis Cluster，原理是第 7 課的分片），每個 key 只存在其中一台。所有人都讀 <code>menu</code>，這個 key 存在哪台 Redis 上，所有讀菜單的請求就都落在那台，那台最忙，其他節點閒著也幫不上忙。常見的做法是在每台 API 的程序記憶體再放一層 TTL 很短的快取，讓大部分讀取不必出門；或把同一份資料複製成幾個 key，分散到不同節點讀。</p>
+<p>程序記憶體這層跟第一節的表格有衝突：表格說程序記憶體不適合要多台一致的資料，菜單正是因此放 Redis。這裡是刻意取捨：這層的 TTL 只設幾秒，代表改價後各台 API 最多會有幾秒看到不同的價格。這是用一點一致性換掉單點過熱，要先跟 PM 確認可以接受；結帳不受影響，因為下單一律從資料庫讀價格。</p>
+<p>再來是快取壞掉時。NestJS 課第 19 課的做法是：Redis 的 get／set 失敗就記 log，直接查資料庫。對<strong>延遲型快取</strong>這是對的，系統只是變慢。但第一節算過，週年慶的菜單快取是<strong>容量型快取</strong>：Redis 一掛，每秒 1,111 次讀取全部壓到只撐 200 次的資料庫上，資料庫變慢，跟它共用資料庫的下單也一起失敗。這時「退回查資料庫」反而是讓資料庫倒下的原因。要做的是三件事。</p>
+<p>第一，<strong>限制同時打到資料庫的請求數</strong>，超過的直接回錯誤或回較舊的資料。這是第 11 課的兩個做法：<strong>隔艙</strong>是給每一類工作固定數量的位子，例如讀菜單最多同時佔 20 條資料庫連線，用完就不再接，下單永遠有自己的位子；<strong>負載卸除</strong>是超過容量時主動拒絕一部分請求，保住其他的。讀菜單失敗一部分，總比所有人連下單都失敗好。</p>
+<p>第二，<strong>暖機</strong>（warm-up）。Redis 重啟或擴容後，快取是空的，叫冷快取，命中率是 0，跟 Redis 掛掉對資料庫來說是一樣的。所以恢復時要先預先載入熱門 key，或把流量慢慢導進來，不要一次全部吃下。</p>
+<p>第三，在<a href="02-estimation.html">第 2 課</a>的容量估算裡寫清楚：哪些快取是容量型的、命中率最低要多少。週年慶菜單的答案是約 82%，練習 1 的 <code>requiredHitRatio</code> 算的就是這個數字，它就是上線後要監控的門檻。</p>
+<p>設計都到位了，但快取出問題時多半不會報錯，只會「變慢」或「資料怪怪的」。週年慶當天，要怎麼在顧客抱怨之前發現？</p>
+
+<h2>週年慶當天要盯哪些指標？</h2>
+<p>前面每一節處理的問題，都對應一個可以事先放上監控的指標。上線前把這些放好，出事時才知道是哪一種問題：</p>
+<div class="table-wrap"><table>
+  <tr><th>指標</th><th>看什麼</th></tr>
+  <tr><td>命中率，<strong>依 key 前綴分開</strong></td><td>整體 95% 可能掩蓋 <code>product:*</code> 只有 30%；掉下來時資料庫負載會跟著跳</td></tr>
+  <tr><td>淘汰數、記憶體用量</td><td>淘汰一直很高代表空間不夠，熱門資料被擠出去</td></tr>
+  <tr><td>未命中時的載入延遲</td><td>XFetch 的 Δ 就是它；變慢時擊穿的影響變大</td></tr>
+  <tr><td>同一個 key 同時載入的次數</td><td>大於 1 就是擊穿的訊號（跨機器、或 single-flight 沒生效）</td></tr>
+  <tr><td>lease 被拒絕的次數</td><td>突然升高代表某個 key 被頻繁修改，或有寫回競態</td></tr>
+</table></div>
+<p>命中率要依 key 前綴分開看，原因是第一節的算式：命中率最後幾個百分點對資料庫影響最大，整體平均會把某一類 key 的問題蓋掉。菜單的命中率一旦接近 82% 這條線，就是資料庫快撐不住的預警。</p>
+
+<h2>補充與查表</h2>
+<ul>
+  <li><strong>程序內快取的現成函式庫</strong>：正式環境的程序內快取可以用 <code>lru-cache</code>（npm 11.5.3）：設定 <code>fetchMethod</code> 後，<code>cache.fetch(key)</code> 會把同一個 key 同時的載入合併成一次，搭配 <code>allowStale</code> 會先回傳過期的值並在背景重新載入。Redis 端的寫法見 NestJS 課第 19 課。</li>
+  <li><strong>stale-while-revalidate 的出處</strong>：RFC 5861（2010-05，Informational），定義在 HTTP 的 <code>Cache-Control</code> 擴充裡。</li>
+</ul>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：寫 <code>cacheEffect</code>：依命中率算出平均延遲 <code>avgMs</code> 和資料庫每秒讀取量 <code>dbReadsPerSec</code>；<code>hitRatio</code> 不在 0～1 之間（0 和 1 本身可以；<code>NaN</code> 也算不在範圍內）時丟 <code>RangeError</code>。再寫 <code>requiredHitRatio</code>：資料庫每秒只撐得住 <code>dbCapacityPerSec</code> 次讀取時，命中率至少要多少（資料庫撐得住時回傳 0）。</p>
+  <script type="start">
+type CacheInput = { readsPerSec: number; hitRatio: number; hitMs: number; missMs: number }
+type CacheResult = { avgMs: number; dbReadsPerSec: number }
+
+function cacheEffect(input: CacheInput): CacheResult {
+  throw new Error('TODO')
+}
+
+function requiredHitRatio(readsPerSec: number, dbCapacityPerSec: number): number {
+  throw new Error('TODO')
+}
+</script>
+  <script type="answer">
+type CacheInput = { readsPerSec: number; hitRatio: number; hitMs: number; missMs: number }
+type CacheResult = { avgMs: number; dbReadsPerSec: number }
+
+function cacheEffect(input: CacheInput): CacheResult {
+  const { readsPerSec, hitRatio: h, hitMs, missMs } = input
+  if (!(h >= 0 && h <= 1)) throw new RangeError('hitRatio 要在 0～1 之間')
+  return {
+    avgMs: h * hitMs + (1 - h) * missMs,
+    dbReadsPerSec: (1 - h) * readsPerSec,
+  }
+}
+
+function requiredHitRatio(readsPerSec: number, dbCapacityPerSec: number): number {
+  return Math.max(0, 1 - dbCapacityPerSec / readsPerSec)
+}
+</script>
+  <script type="tests">
+const close = (actual: number, expected: number, msg: string) =>
+  assert(Math.abs(actual - expected) <= 1e-9 * Math.max(1, Math.abs(expected)), `${msg}：預期 ${expected}，實際是 ${actual}`)
+const r90 = cacheEffect({ readsPerSec: 55.6, hitRatio: 0.9, hitMs: 1, missMs: 25 })
+const r99 = cacheEffect({ readsPerSec: 55.6, hitRatio: 0.99, hitMs: 1, missMs: 25 })
+close(r90.avgMs, 3.4, '命中率 0.9 的平均延遲 = 0.9 × 1 + 0.1 × 25')
+close(r90.dbReadsPerSec, 5.56, '命中率 0.9 時，只有 10% 的讀取會打到資料庫')
+close(r99.avgMs, 1.24, '命中率 0.99 的平均延遲')
+close(r99.dbReadsPerSec, 0.556, '命中率 0.99 時，只有 1% 的讀取會打到資料庫')
+close(r90.dbReadsPerSec / r99.dbReadsPerSec, 10, '命中率從 0.9 到 0.99，資料庫讀取量要變成十分之一')
+close(cacheEffect({ readsPerSec: 100, hitRatio: 0, hitMs: 1, missMs: 25 }).dbReadsPerSec, 100, '命中率 0 時全部打資料庫')
+close(cacheEffect({ readsPerSec: 100, hitRatio: 1, hitMs: 1, missMs: 25 }).avgMs, 1, '命中率 1 時平均延遲就是命中延遲')
+for (const bad of [-0.1, 1.1, 90, NaN]) {
+  let err: unknown
+  try { cacheEffect({ readsPerSec: 100, hitRatio: bad, hitMs: 1, missMs: 25 }) } catch (e) { err = e }
+  assert(err instanceof RangeError, `hitRatio = ${bad} 不在 0～1 之間，要丟 RangeError（NaN 跟任何數比較都是 false，h < 0 || h > 1 擋不住它）`)
+}
+close(requiredHitRatio(1111, 200), 1 - 200 / 1111, '週年慶每秒 1,111 次讀取、資料庫只撐 200 次，命中率至少約 0.82')
+assert.equal(requiredHitRatio(55.6, 200), 0, '資料庫撐得住時回傳 0，不能是負數')
+const mulberry32 = (seed: number) => () => {
+  seed = (seed + 0x6d2b79f5) | 0
+  let t = Math.imul(seed ^ (seed >>> 15), 1 | seed)
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+}
+const rand = mulberry32(5)
+for (let i = 0; i < 200; i++) {
+  const input = { readsPerSec: 1 + rand() * 5000, hitRatio: rand(), hitMs: rand() * 5, missMs: 5 + rand() * 100 }
+  const got = cacheEffect(input)
+  close(got.avgMs, input.hitRatio * input.hitMs + (1 - input.hitRatio) * input.missMs, `隨機輸入 ${JSON.stringify(input)} 的平均延遲`)
+  close(got.dbReadsPerSec, (1 - input.hitRatio) * input.readsPerSec, `隨機輸入 ${JSON.stringify(input)} 的資料庫讀取量`)
+  const cap = rand() * 6000
+  close(requiredHitRatio(input.readsPerSec, cap), Math.max(0, 1 - cap / input.readsPerSec), `requiredHitRatio(${input.readsPerSec}, ${cap})`)
+}
+</script>
+  <script type="wrong">
+type CacheInput = { readsPerSec: number; hitRatio: number; hitMs: number; missMs: number }
+type CacheResult = { avgMs: number; dbReadsPerSec: number }
+
+function cacheEffect(input: CacheInput): CacheResult {
+  const { readsPerSec, hitRatio: h, hitMs, missMs } = input
+  if (!(h >= 0 && h <= 1)) throw new RangeError('hitRatio 要在 0～1 之間')
+  return { avgMs: h * hitMs + (1 - h) * missMs, dbReadsPerSec: h * readsPerSec }
+}
+
+function requiredHitRatio(readsPerSec: number, dbCapacityPerSec: number): number {
+  return Math.max(0, 1 - dbCapacityPerSec / readsPerSec)
+}
+</script>
+  <script type="wrong">
+type CacheInput = { readsPerSec: number; hitRatio: number; hitMs: number; missMs: number }
+type CacheResult = { avgMs: number; dbReadsPerSec: number }
+
+function cacheEffect(input: CacheInput): CacheResult {
+  const { readsPerSec, hitRatio: h, hitMs, missMs } = input
+  if (!(h >= 0 && h <= 1)) throw new RangeError('hitRatio 要在 0～1 之間')
+  return { avgMs: (hitMs + missMs) / 2, dbReadsPerSec: (1 - h) * readsPerSec }
+}
+
+function requiredHitRatio(readsPerSec: number, dbCapacityPerSec: number): number {
+  return Math.max(0, 1 - dbCapacityPerSec / readsPerSec)
+}
+</script>
+  <script type="wrong">
+type CacheInput = { readsPerSec: number; hitRatio: number; hitMs: number; missMs: number }
+type CacheResult = { avgMs: number; dbReadsPerSec: number }
+
+function cacheEffect(input: CacheInput): CacheResult {
+  const { readsPerSec, hitRatio: h, hitMs, missMs } = input
+  if (!(h >= 0 && h <= 1)) throw new RangeError('hitRatio 要在 0～1 之間')
+  return { avgMs: h * hitMs + (1 - h) * missMs, dbReadsPerSec: (1 - h) * readsPerSec }
+}
+
+function requiredHitRatio(readsPerSec: number, dbCapacityPerSec: number): number {
+  return 1 - dbCapacityPerSec / readsPerSec
+}
+</script>
+  <script type="wrong">
+type CacheInput = { readsPerSec: number; hitRatio: number; hitMs: number; missMs: number }
+type CacheResult = { avgMs: number; dbReadsPerSec: number }
+
+function cacheEffect(input: CacheInput): CacheResult {
+  const { readsPerSec, hitRatio: h, hitMs, missMs } = input
+  return { avgMs: h * hitMs + (1 - h) * missMs, dbReadsPerSec: (1 - h) * readsPerSec }
+}
+
+function requiredHitRatio(readsPerSec: number, dbCapacityPerSec: number): number {
+  return Math.max(0, 1 - dbCapacityPerSec / readsPerSec)
+}
+</script>
+  <script type="wrong">
+type CacheInput = { readsPerSec: number; hitRatio: number; hitMs: number; missMs: number }
+type CacheResult = { avgMs: number; dbReadsPerSec: number }
+
+function cacheEffect(input: CacheInput): CacheResult {
+  const { readsPerSec, hitRatio: h, hitMs, missMs } = input
+  if (h < 0 || h > 1) throw new RangeError('hitRatio 要在 0～1 之間')
+  return {
+    avgMs: h * hitMs + (1 - h) * missMs,
+    dbReadsPerSec: (1 - h) * readsPerSec,
+  }
+}
+
+function requiredHitRatio(readsPerSec: number, dbCapacityPerSec: number): number {
+  return Math.max(0, 1 - dbCapacityPerSec / readsPerSec)
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：寫 <code>createCachedLoader</code>，回傳一個 <code>(key) =&gt; Promise</code> 的讀取函式。規則：</p>
+  <ul>
+    <li><code>store.get(key)</code> 有東西就是命中，回傳裡面的 <code>value</code>（包括快取起來的 <code>null</code>）。</li>
+    <li>未命中時，同一個 key 同時只呼叫一次 <code>load</code>，其他呼叫等同一個結果（single-flight）。</li>
+    <li><code>load</code> 成功：值是 <code>null</code>（查無此資料）就用 <code>negativeTtlMs</code> 存；否則 TTL = <code>Math.round(ttlMs × (1 − jitter × random()))</code>。</li>
+    <li><code>load</code> 失敗：所有等待者收到同一個錯誤，不寫入快取。</li>
+    <li>不管成功或失敗，結束後都要清掉進行中的紀錄。亂數只能用傳進來的 <code>random</code>。</li>
+  </ul>
+  <script type="start">
+type Entry<V> = { value: V | null }
+type Store<V> = {
+  get(key: string): Entry<V> | undefined
+  set(key: string, entry: Entry<V>, ttlMs: number): void
+}
+type LoaderOptions<V> = {
+  store: Store<V>
+  load: (key: string) => Promise<V | null>
+  ttlMs: number
+  negativeTtlMs: number
+  jitter: number
+  random: () => number
+}
+
+function createCachedLoader<V>(opts: LoaderOptions<V>): (key: string) => Promise<V | null> {
+  throw new Error('TODO')
+}
+</script>
+  <script type="answer">
+type Entry<V> = { value: V | null }
+type Store<V> = {
+  get(key: string): Entry<V> | undefined
+  set(key: string, entry: Entry<V>, ttlMs: number): void
+}
+type LoaderOptions<V> = {
+  store: Store<V>
+  load: (key: string) => Promise<V | null>
+  ttlMs: number
+  negativeTtlMs: number
+  jitter: number
+  random: () => number
+}
+
+function createCachedLoader<V>(opts: LoaderOptions<V>): (key: string) => Promise<V | null> {
+  const inflight = new Map<string, Promise<V | null>>()
+  return key => {
+    const hit = opts.store.get(key)
+    if (hit) return Promise.resolve(hit.value)
+    const running = inflight.get(key)
+    if (running) return running
+    const p = opts.load(key)
+      .then(value => {
+        const ttl = value === null
+          ? opts.negativeTtlMs
+          : Math.round(opts.ttlMs * (1 - opts.jitter * opts.random()))
+        opts.store.set(key, { value }, ttl)
+        return value
+      })
+      .finally(() => inflight.delete(key))
+    inflight.set(key, p)
+    return p
+  }
+}
+</script>
+  <script type="tests">
+const flush = () => new Promise<void>(r => setTimeout(r, 0))
+const poison = () => {
+  const saved = { now: Date.now, random: Math.random }
+  const boom = (): never => { throw new Error('不能用 Date.now／Math.random：亂數要用傳進來的 random()') }
+  Date.now = boom
+  Math.random = boom
+  return () => { Date.now = saved.now; Math.random = saved.random }
+}
+const setup = (randoms: number[] = [0]) => {
+  const data = new Map<string, Entry<number>>()
+  const sets: Array<{ key: string; value: number | null; ttlMs: number }> = []
+  const pending: Array<{ key: string; d: PromiseWithResolvers<number | null> }> = []
+  let i = 0
+  const get = createCachedLoader<number>({
+    store: {
+      get: key => data.get(key),
+      set: (key, entry, ttlMs) => { data.set(key, entry); sets.push({ key, value: entry.value, ttlMs }) },
+    },
+    load: key => { const d = Promise.withResolvers<number | null>(); pending.push({ key, d }); return d.promise },
+    ttlMs: 60000,
+    negativeTtlMs: 30000,
+    jitter: 0.2,
+    random: () => randoms[i++ % randoms.length],
+  })
+  return { get, sets, pending, data }
+}
+const settle = async (p: Promise<unknown>) => { try { return { ok: true, value: await p } } catch (e) { return { ok: false, error: e } } }
+
+{
+  const { get, pending } = setup()
+  const restore = poison()
+  try {
+    const ps = Array.from({ length: 10 }, () => get('menu'))
+    await flush()
+    assert.equal(pending.length, 1, '同一個 key 同時 10 個呼叫，load 只能被呼叫 1 次（single-flight）')
+    pending[0].d.resolve(110)
+    assert.deepEqual(await Promise.all(ps), Array(10).fill(110), '10 個呼叫都要拿到同一個值')
+    assert.equal(await get('menu'), 110, '載入完成後再讀要命中快取')
+    assert.equal(pending.length, 1, '命中時不能再呼叫 load')
+  } finally { restore() }
+}
+{
+  const { get, pending } = setup()
+  const a = get('product:1')
+  const b = get('product:2')
+  await flush()
+  assert.deepEqual(pending.map(p => p.key), ['product:1', 'product:2'], '不同的 key 要各自載入')
+  pending[0].d.resolve(80)
+  pending[1].d.resolve(110)
+  assert.deepEqual([await a, await b], [80, 110], '不同的 key 拿到各自的值')
+}
+{
+  const { get, sets, pending } = setup([0.5, 0, 0.99])
+  const restore = poison()
+  try {
+    for (const [i, key] of ['a', 'b', 'c'].entries()) {
+      const p = get(key)
+      await flush()
+      pending[i].d.resolve(i + 1)
+      await p
+    }
+  } finally { restore() }
+  assert.deepEqual(sets.map(s => s.ttlMs), [54000, 60000, 48120], 'TTL = Math.round(ttlMs × (1 − jitter × random()))，random 要用傳進來的')
+}
+{
+  const { get, sets, pending } = setup()
+  const p = get('product:99999')
+  await flush()
+  pending[0].d.resolve(null)
+  assert.equal(await p, null, '查無此資料回傳 null')
+  assert.deepEqual(sets, [{ key: 'product:99999', value: null, ttlMs: 30000 }], 'null 要用 negativeTtlMs 寫進快取')
+  assert.equal(await get('product:99999'), null, '快取的 null 也算命中')
+  assert.equal(pending.length, 1, '快取的 null 命中時不能再呼叫 load')
+}
+{
+  const { get, pending, data } = setup()
+  const p = get('menu')
+  await flush()
+  pending[0].d.resolve(110)
+  await p
+  data.delete('menu')   // TTL 到了，store 把資料清掉
+  const again = get('menu')
+  await flush()
+  assert.equal(pending.length, 2, 'store.get 回傳 undefined（資料過期）時要重新 load：成功之後也要清掉進行中的紀錄，命中與否只能看 store')
+  pending[1]?.d.resolve(120)
+  assert.equal(await again, 120, '過期後重新 load 拿到新的值')
+}
+{
+  const { get, sets, pending } = setup()
+  const ps = [get('y'), get('y'), get('y')]
+  await flush()
+  const boom = new Error('資料庫逾時')
+  pending[0].d.reject(boom)
+  const results = await Promise.all(ps.map(settle))
+  assert(results.every(r => !r.ok && r.error === boom), 'load 失敗時，所有等待者都要收到同一個錯誤')
+  assert.equal(sets.length, 0, '錯誤不能寫進快取')
+  const again = get('y')
+  await flush()
+  assert.equal(pending.length, 2, '失敗之後要清掉進行中的紀錄，下一次呼叫要重新 load')
+  pending[1]?.d.resolve(90)
+  assert.equal(await again, 90, '重新 load 成功要拿到新的值')
+}
+</script>
+  <script type="wrong">
+type Entry<V> = { value: V | null }
+type Store<V> = {
+  get(key: string): Entry<V> | undefined
+  set(key: string, entry: Entry<V>, ttlMs: number): void
+}
+type LoaderOptions<V> = {
+  store: Store<V>
+  load: (key: string) => Promise<V | null>
+  ttlMs: number
+  negativeTtlMs: number
+  jitter: number
+  random: () => number
+}
+
+function createCachedLoader<V>(opts: LoaderOptions<V>): (key: string) => Promise<V | null> {
+  return async key => {
+    const hit = opts.store.get(key)
+    if (hit) return hit.value
+    const value = await opts.load(key)
+    const ttl = value === null ? opts.negativeTtlMs : Math.round(opts.ttlMs * (1 - opts.jitter * opts.random()))
+    opts.store.set(key, { value }, ttl)
+    return value
+  }
+}
+</script>
+  <script type="wrong">
+type Entry<V> = { value: V | null }
+type Store<V> = {
+  get(key: string): Entry<V> | undefined
+  set(key: string, entry: Entry<V>, ttlMs: number): void
+}
+type LoaderOptions<V> = {
+  store: Store<V>
+  load: (key: string) => Promise<V | null>
+  ttlMs: number
+  negativeTtlMs: number
+  jitter: number
+  random: () => number
+}
+
+function createCachedLoader<V>(opts: LoaderOptions<V>): (key: string) => Promise<V | null> {
+  const inflight = new Map<string, Promise<V | null>>()
+  return key => {
+    const hit = opts.store.get(key)
+    if (hit) return Promise.resolve(hit.value)
+    const running = inflight.get(key)
+    if (running) return running
+    const p = opts.load(key)
+      .catch(() => null)
+      .then(value => {
+        const ttl = value === null ? opts.negativeTtlMs : Math.round(opts.ttlMs * (1 - opts.jitter * opts.random()))
+        opts.store.set(key, { value }, ttl)
+        return value
+      })
+      .finally(() => inflight.delete(key))
+    inflight.set(key, p)
+    return p
+  }
+}
+</script>
+  <script type="wrong">
+type Entry<V> = { value: V | null }
+type Store<V> = {
+  get(key: string): Entry<V> | undefined
+  set(key: string, entry: Entry<V>, ttlMs: number): void
+}
+type LoaderOptions<V> = {
+  store: Store<V>
+  load: (key: string) => Promise<V | null>
+  ttlMs: number
+  negativeTtlMs: number
+  jitter: number
+  random: () => number
+}
+
+function createCachedLoader<V>(opts: LoaderOptions<V>): (key: string) => Promise<V | null> {
+  const inflight = new Map<string, Promise<V | null>>()
+  return key => {
+    const hit = opts.store.get(key)
+    if (hit) return Promise.resolve(hit.value)
+    const running = inflight.get(key)
+    if (running) return running
+    const p = opts.load(key).then(value => {
+      const ttl = value === null ? opts.negativeTtlMs : Math.round(opts.ttlMs * (1 - opts.jitter * opts.random()))
+      opts.store.set(key, { value }, ttl)
+      inflight.delete(key)
+      return value
+    })
+    inflight.set(key, p)
+    return p
+  }
+}
+</script>
+  <script type="wrong">
+type Entry<V> = { value: V | null }
+type Store<V> = {
+  get(key: string): Entry<V> | undefined
+  set(key: string, entry: Entry<V>, ttlMs: number): void
+}
+type LoaderOptions<V> = {
+  store: Store<V>
+  load: (key: string) => Promise<V | null>
+  ttlMs: number
+  negativeTtlMs: number
+  jitter: number
+  random: () => number
+}
+
+function createCachedLoader<V>(opts: LoaderOptions<V>): (key: string) => Promise<V | null> {
+  const inflight = new Map<string, Promise<V | null>>()
+  return key => {
+    const hit = opts.store.get(key)
+    if (hit) return Promise.resolve(hit.value)
+    const running = inflight.get(key)
+    if (running) return running
+    const p = opts.load(key)
+      .then(value => {
+        const ttl = value === null ? opts.negativeTtlMs : Math.round(opts.ttlMs * (1 - opts.jitter * Math.random()))
+        opts.store.set(key, { value }, ttl)
+        return value
+      })
+      .finally(() => inflight.delete(key))
+    inflight.set(key, p)
+    return p
+  }
+}
+</script>
+  <script type="wrong">
+type Entry<V> = { value: V | null }
+type Store<V> = {
+  get(key: string): Entry<V> | undefined
+  set(key: string, entry: Entry<V>, ttlMs: number): void
+}
+type LoaderOptions<V> = {
+  store: Store<V>
+  load: (key: string) => Promise<V | null>
+  ttlMs: number
+  negativeTtlMs: number
+  jitter: number
+  random: () => number
+}
+
+function createCachedLoader<V>(opts: LoaderOptions<V>): (key: string) => Promise<V | null> {
+  const inflight = new Map<string, Promise<V | null>>()
+  return key => {
+    const hit = opts.store.get(key)
+    if (hit) return Promise.resolve(hit.value)
+    const running = inflight.get(key)
+    if (running) return running
+    const p = opts.load(key)
+      .then(value => {
+        opts.store.set(key, { value }, Math.round(opts.ttlMs * (1 - opts.jitter * opts.random())))
+        return value
+      })
+      .finally(() => inflight.delete(key))
+    inflight.set(key, p)
+    return p
+  }
+}
+</script>
+  <script type="wrong">
+type Entry<V> = { value: V | null }
+type Store<V> = {
+  get(key: string): Entry<V> | undefined
+  set(key: string, entry: Entry<V>, ttlMs: number): void
+}
+type LoaderOptions<V> = {
+  store: Store<V>
+  load: (key: string) => Promise<V | null>
+  ttlMs: number
+  negativeTtlMs: number
+  jitter: number
+  random: () => number
+}
+
+function createCachedLoader<V>(opts: LoaderOptions<V>): (key: string) => Promise<V | null> {
+  const inflight = new Map<string, Promise<V | null>>()
+  return key => {
+    const hit = opts.store.get(key)
+    if (hit?.value) return Promise.resolve(hit.value)
+    const running = inflight.get(key)
+    if (running) return running
+    const p = opts.load(key)
+      .then(value => {
+        if (value !== null) opts.store.set(key, { value }, Math.round(opts.ttlMs * (1 - opts.jitter * opts.random())))
+        return value
+      })
+      .finally(() => inflight.delete(key))
+    inflight.set(key, p)
+    return p
+  }
+}
+</script>
+  <script type="wrong">
+type Entry<V> = { value: V | null }
+type Store<V> = {
+  get(key: string): Entry<V> | undefined
+  set(key: string, entry: Entry<V>, ttlMs: number): void
+}
+type LoaderOptions<V> = {
+  store: Store<V>
+  load: (key: string) => Promise<V | null>
+  ttlMs: number
+  negativeTtlMs: number
+  jitter: number
+  random: () => number
+}
+
+function createCachedLoader<V>(opts: LoaderOptions<V>): (key: string) => Promise<V | null> {
+  const inflight = new Map<string, Promise<V | null>>()
+  return key => {
+    const hit = opts.store.get(key)
+    if (hit) return Promise.resolve(hit.value)
+    const running = inflight.get(key)
+    if (running) return running
+    const p = opts.load(key)
+      .then(value => {
+        const ttl = value === null
+          ? opts.negativeTtlMs
+          : Math.round(opts.ttlMs * (1 - opts.jitter * opts.random()))
+        opts.store.set(key, { value }, ttl)
+        return value
+      })
+      .catch(e => { inflight.delete(key); throw e })
+    inflight.set(key, p)
+    return p
+  }
+}
+</script>
+  <script type="wrong">
+type Entry<V> = { value: V | null }
+type Store<V> = {
+  get(key: string): Entry<V> | undefined
+  set(key: string, entry: Entry<V>, ttlMs: number): void
+}
+type LoaderOptions<V> = {
+  store: Store<V>
+  load: (key: string) => Promise<V | null>
+  ttlMs: number
+  negativeTtlMs: number
+  jitter: number
+  random: () => number
+}
+
+function createCachedLoader<V>(opts: LoaderOptions<V>): (key: string) => Promise<V | null> {
+  const own = new Map<string, Entry<V>>()
+  const inflight = new Map<string, Promise<V | null>>()
+  return key => {
+    const hit = own.get(key) ?? opts.store.get(key)
+    if (hit) return Promise.resolve(hit.value)
+    const running = inflight.get(key)
+    if (running) return running
+    const p = opts.load(key)
+      .then(value => {
+        const ttl = value === null
+          ? opts.negativeTtlMs
+          : Math.round(opts.ttlMs * (1 - opts.jitter * opts.random()))
+        opts.store.set(key, { value }, ttl); own.set(key, { value })
+        return value
+      })
+      .finally(() => inflight.delete(key))
+    inflight.set(key, p)
+    return p
+  }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：寫 <code>createSwrCache</code>，加上 stale-while-revalidate 和 XFetch。每筆快取記住 <code>value</code>、<code>expiresAt</code>（載入完成時的 <code>now()</code> ＋ <code>ttlMs</code>）和 <code>delta</code>（這次載入前後 <code>now()</code> 的差）。讀取時依序判斷：</p>
+  <ol>
+    <li>沒有快取 → 等待載入（single-flight）。</li>
+    <li>過期超過 <code>staleMs</code>（<code>now ≥ expiresAt + staleMs</code>）→ 等待重新載入。</li>
+    <li>已經過期，或還沒過期但 XFetch 觸發（<code>now − delta × beta × Math.log(random()) ≥ expiresAt</code>）→ 馬上回傳目前的值，並在背景重新載入。</li>
+    <li>其他 → 直接回傳。</li>
+  </ol>
+  <p>同一個 key 同時只有一個載入（不管是前景還是背景）。前景載入失敗時，等待的呼叫端收到那個錯誤。背景載入每失敗一次就呼叫一次 <code>onError</code>、保留舊值，不能變成未處理的 rejection。</p>
+  <script type="start">
+type SwrOptions<V> = {
+  load: (key: string) => Promise<V>
+  ttlMs: number
+  staleMs: number
+  beta: number
+  now: () => number
+  random: () => number
+  onError: (err: unknown) => void
+}
+
+function createSwrCache<V>(opts: SwrOptions<V>): (key: string) => Promise<V> {
+  throw new Error('TODO')
+}
+</script>
+  <script type="answer">
+type SwrOptions<V> = {
+  load: (key: string) => Promise<V>
+  ttlMs: number
+  staleMs: number
+  beta: number
+  now: () => number
+  random: () => number
+  onError: (err: unknown) => void
+}
+
+function createSwrCache<V>(opts: SwrOptions<V>): (key: string) => Promise<V> {
+  const entries = new Map<string, { value: V; expiresAt: number; delta: number }>()
+  const loading = new Map<string, Promise<V>>()
+
+  const refresh = (key: string): Promise<V> => {
+    const running = loading.get(key)
+    if (running) return running
+    const start = opts.now()
+    const p = opts.load(key)
+      .then(value => {
+        const end = opts.now()
+        entries.set(key, { value, expiresAt: end + opts.ttlMs, delta: end - start })
+        return value
+      })
+      .finally(() => loading.delete(key))
+    loading.set(key, p)
+    return p
+  }
+
+  return async key => {
+    const e = entries.get(key)
+    const t = opts.now()
+    if (!e || t >= e.expiresAt + opts.staleMs) return refresh(key)
+    const early = t - e.delta * opts.beta * Math.log(opts.random()) >= e.expiresAt
+    if ((t >= e.expiresAt || early) && !loading.has(key)) refresh(key).catch(opts.onError)
+    return e.value
+  }
+}
+</script>
+  <script type="tests">
+const flush = () => new Promise<void>(r => setTimeout(r, 0))
+const WAIT = 'WAITING'
+// 等一輪事件迴圈：馬上回傳舊值的實作已經 resolve，還在等 load 的實作沒有
+const peek = <T,>(p: Promise<T>): Promise<T | typeof WAIT> => Promise.race([p, flush().then((): typeof WAIT => WAIT)])
+let t = 0
+let r = 0.99
+const pending: Array<PromiseWithResolvers<string>> = []
+const errors: unknown[] = []
+const get = createSwrCache<string>({
+  load: () => { const d = Promise.withResolvers<string>(); pending.push(d); return d.promise },
+  ttlMs: 1000,
+  staleMs: 500,
+  beta: 1,
+  now: () => t,
+  random: () => r,
+  onError: e => { errors.push(e) },
+})
+const call = (key: string) => {
+  const saved = { now: Date.now, random: Math.random }
+  const boom = (): never => { throw new Error('不能用 Date.now／Math.random：時間和亂數要用傳進來的 now()、random()') }
+  Date.now = boom
+  Math.random = boom
+  try { return get(key) } finally { Date.now = saved.now; Math.random = saved.random }
+}
+
+const a = call('menu')
+const b = call('menu')
+assert.equal(await peek(a), WAIT, '沒有快取時要等待載入')
+assert.equal(pending.length, 1, '沒有快取時，同一個 key 同時兩個讀取只能 load 一次')
+t = 100
+pending[0].resolve('v1')
+assert.deepEqual([await a, await b], ['v1', 'v1'], '兩個讀取都拿到載入的值')
+
+t = 500
+assert.equal(await peek(call('menu')), 'v1', '新鮮的值直接回傳')
+t = 1000
+assert.equal(await peek(call('menu')), 'v1', '新鮮的值直接回傳')
+assert.equal(pending.length, 1, 'random 接近 1 時提早量只有約 1ms，離到期還有 100ms 不該重新載入（檢查 XFetch 的條件有沒有寫反）')
+
+t = 1050
+r = 0.1
+assert.equal(await peek(call('menu')), 'v1', 'XFetch 觸發時要馬上回傳目前的值，不能讓呼叫端等')
+assert.equal(pending.length, 2, '離到期 50ms、random = 0.1（提早量約 230ms）時 XFetch 要觸發背景載入')
+t = 1100
+pending[1].resolve('v2')
+await flush()
+
+t = 2000
+r = 0.2
+assert.equal(await peek(call('menu')), 'v2', '新鮮的值直接回傳')
+assert.equal(pending.length, 2, 'delta 是「這一次」載入前後 now() 的差（1050 → 1100 是 50ms）：離到期 100ms、random = 0.2 時提早量約 80ms，不該觸發')
+
+t = 2150
+r = 0.99
+const reads = Array.from({ length: 5 }, () => call('menu'))
+for (const p of reads) assert.equal(await peek(p), 'v2', '過期不到 staleMs 時要馬上回傳舊值（stale-while-revalidate）')
+assert.equal(pending.length, 3, '過期後連續 5 次讀取只能觸發 1 次背景載入')
+
+pending[2].reject(new Error('資料庫逾時'))
+await flush()
+assert.equal(errors.length, 1, '背景載入失敗要呼叫 onError')
+assert.equal(await peek(call('menu')), 'v2', '背景載入失敗後要保留舊值')
+assert.equal(pending.length, 4, '上一次背景載入失敗後，還在 stale 期間的下一次讀取要再試一次')
+t = 2250
+pending[3].resolve('v3')
+await flush()
+
+t = 3800
+const late = call('menu')
+assert.equal(await peek(late), WAIT, '過期超過 staleMs 時不能再回舊值，要等重新載入')
+assert.equal(pending.length, 5, '過期超過 staleMs 時要重新載入')
+t = 3850
+pending[4].resolve('v4')
+assert.equal(await late, 'v4', '等到的是新載入的值')
+
+const other = call('latte')
+assert.equal(await peek(other), WAIT, '不同的 key 各自快取：latte 還沒載入過，要等待載入，不能拿到 menu 的值')
+assert.equal(pending.length, 6, '不同的 key 要各自載入')
+const fgErr = new Error('資料庫逾時')
+pending[5].reject(fgErr)
+const settled = await other.then(() => 'ok', e => e)
+assert.equal(settled, fgErr, '沒有快取時載入失敗，等待的呼叫端要收到那個錯誤（不能吞掉、回 undefined）')
+const retry = call('latte')
+await flush()
+assert.equal(pending.length, 7, '前景載入失敗後要清掉進行中的紀錄，下一次讀取重新載入')
+pending[6].resolve('latte-v1')
+assert.equal(await retry, 'latte-v1', '重新載入成功拿到值')
+</script>
+  <script type="wrong">
+type SwrOptions<V> = {
+  load: (key: string) => Promise<V>
+  ttlMs: number
+  staleMs: number
+  beta: number
+  now: () => number
+  random: () => number
+  onError: (err: unknown) => void
+}
+
+function createSwrCache<V>(opts: SwrOptions<V>): (key: string) => Promise<V> {
+  const entries = new Map<string, { value: V; expiresAt: number; delta: number }>()
+  const loading = new Map<string, Promise<V>>()
+  const refresh = (key: string): Promise<V> => {
+    const running = loading.get(key)
+    if (running) return running
+    const start = opts.now()
+    const p = opts.load(key)
+      .then(value => {
+        const end = opts.now()
+        entries.set(key, { value, expiresAt: end + opts.ttlMs, delta: end - start })
+        return value
+      })
+      .finally(() => loading.delete(key))
+    loading.set(key, p)
+    return p
+  }
+  return async key => {
+    const e = entries.get(key)
+    const t = opts.now()
+    if (!e || t >= e.expiresAt) return refresh(key)
+    if (t - e.delta * opts.beta * Math.log(opts.random()) >= e.expiresAt) refresh(key).catch(opts.onError)
+    return e.value
+  }
+}
+</script>
+  <script type="wrong">
+type SwrOptions<V> = {
+  load: (key: string) => Promise<V>
+  ttlMs: number
+  staleMs: number
+  beta: number
+  now: () => number
+  random: () => number
+  onError: (err: unknown) => void
+}
+
+function createSwrCache<V>(opts: SwrOptions<V>): (key: string) => Promise<V> {
+  const entries = new Map<string, { value: V; expiresAt: number; delta: number }>()
+  const load = (key: string): Promise<V> => {
+    const start = opts.now()
+    return opts.load(key).then(value => {
+      const end = opts.now()
+      entries.set(key, { value, expiresAt: end + opts.ttlMs, delta: end - start })
+      return value
+    })
+  }
+  return async key => {
+    const e = entries.get(key)
+    const t = opts.now()
+    if (!e || t >= e.expiresAt + opts.staleMs) return load(key)
+    const early = t - e.delta * opts.beta * Math.log(opts.random()) >= e.expiresAt
+    if (t >= e.expiresAt || early) load(key).catch(opts.onError)
+    return e.value
+  }
+}
+</script>
+  <script type="wrong">
+type SwrOptions<V> = {
+  load: (key: string) => Promise<V>
+  ttlMs: number
+  staleMs: number
+  beta: number
+  now: () => number
+  random: () => number
+  onError: (err: unknown) => void
+}
+
+function createSwrCache<V>(opts: SwrOptions<V>): (key: string) => Promise<V> {
+  const entries = new Map<string, { value: V; expiresAt: number; delta: number }>()
+  const loading = new Map<string, Promise<V>>()
+  const refresh = (key: string): Promise<V> => {
+    const running = loading.get(key)
+    if (running) return running
+    const start = opts.now()
+    const p = opts.load(key)
+      .then(value => {
+        const end = opts.now()
+        entries.set(key, { value, expiresAt: end + opts.ttlMs, delta: end - start })
+        return value
+      })
+      .finally(() => loading.delete(key))
+    loading.set(key, p)
+    return p
+  }
+  return async key => {
+    const e = entries.get(key)
+    const t = opts.now()
+    if (!e || t >= e.expiresAt + opts.staleMs) return refresh(key)
+    const early = t - e.delta * opts.beta * Math.log(opts.random()) >= e.expiresAt
+    if ((t >= e.expiresAt || early) && !loading.has(key)) refresh(key)
+    return e.value
+  }
+}
+</script>
+  <script type="wrong">
+type SwrOptions<V> = {
+  load: (key: string) => Promise<V>
+  ttlMs: number
+  staleMs: number
+  beta: number
+  now: () => number
+  random: () => number
+  onError: (err: unknown) => void
+}
+
+function createSwrCache<V>(opts: SwrOptions<V>): (key: string) => Promise<V> {
+  const entries = new Map<string, { value: V; expiresAt: number; delta: number }>()
+  const loading = new Map<string, Promise<V>>()
+  const refresh = (key: string): Promise<V> => {
+    const running = loading.get(key)
+    if (running) return running
+    const start = opts.now()
+    const p = opts.load(key)
+      .then(value => {
+        const end = opts.now()
+        entries.set(key, { value, expiresAt: end + opts.ttlMs, delta: end - start })
+        return value
+      })
+      .finally(() => loading.delete(key))
+    loading.set(key, p)
+    return p
+  }
+  return async key => {
+    const e = entries.get(key)
+    const t = opts.now()
+    if (!e || t >= e.expiresAt + opts.staleMs) return refresh(key)
+    const early = t - e.delta * opts.beta * Math.log(1 - opts.random()) >= e.expiresAt
+    if ((t >= e.expiresAt || early) && !loading.has(key)) refresh(key).catch(opts.onError)
+    return e.value
+  }
+}
+</script>
+  <script type="wrong">
+type SwrOptions<V> = {
+  load: (key: string) => Promise<V>
+  ttlMs: number
+  staleMs: number
+  beta: number
+  now: () => number
+  random: () => number
+  onError: (err: unknown) => void
+}
+
+function createSwrCache<V>(opts: SwrOptions<V>): (key: string) => Promise<V> {
+  const entries = new Map<string, { value: V; expiresAt: number; delta: number }>()
+  const loading = new Map<string, Promise<V>>()
+  const refresh = (key: string): Promise<V> => {
+    const running = loading.get(key)
+    if (running) return running
+    const start = opts.now()
+    const p = opts.load(key)
+      .then(value => {
+        const end = opts.now()
+        entries.set(key, { value, expiresAt: end + opts.ttlMs, delta: end - start })
+        return value
+      })
+      .finally(() => loading.delete(key))
+    loading.set(key, p)
+    return p
+  }
+  return async key => {
+    const e = entries.get(key)
+    const t = opts.now()
+    if (!e) return refresh(key)
+    const early = t - e.delta * opts.beta * Math.log(opts.random()) >= e.expiresAt
+    if ((t >= e.expiresAt || early) && !loading.has(key)) refresh(key).catch(opts.onError)
+    return e.value
+  }
+}
+</script>
+  <script type="wrong">
+type SwrOptions<V> = {
+  load: (key: string) => Promise<V>
+  ttlMs: number
+  staleMs: number
+  beta: number
+  now: () => number
+  random: () => number
+  onError: (err: unknown) => void
+}
+
+function createSwrCache<V>(opts: SwrOptions<V>): (key: string) => Promise<V> {
+  const entries = new Map<string, { value: V; expiresAt: number; delta: number }>()
+  const loading = new Map<string, Promise<V>>()
+
+  const refresh = (key: string): Promise<V> => {
+    const running = loading.get(key)
+    if (running) return running
+    const start = opts.now()
+    const p = opts.load(key)
+      .then(value => {
+        const end = opts.now()
+        entries.set(key, { value, expiresAt: end + opts.ttlMs, delta: end })
+        return value
+      })
+      .finally(() => loading.delete(key))
+    loading.set(key, p)
+    return p
+  }
+
+  return async key => {
+    const e = entries.get(key)
+    const t = opts.now()
+    if (!e || t >= e.expiresAt + opts.staleMs) return refresh(key)
+    const early = t - e.delta * opts.beta * Math.log(opts.random()) >= e.expiresAt
+    if ((t >= e.expiresAt || early) && !loading.has(key)) refresh(key).catch(opts.onError)
+    return e.value
+  }
+}
+</script>
+  <script type="wrong">
+type SwrOptions<V> = {
+  load: (key: string) => Promise<V>
+  ttlMs: number
+  staleMs: number
+  beta: number
+  now: () => number
+  random: () => number
+  onError: (err: unknown) => void
+}
+
+function createSwrCache<V>(opts: SwrOptions<V>): (key: string) => Promise<V> {
+  const entries = new Map<string, { value: V; expiresAt: number; delta: number }>()
+  const loading = new Map<string, Promise<V>>()
+
+  const refresh = (key: string): Promise<V> => {
+    const running = loading.get(key)
+    if (running) return running
+    const start = opts.now()
+    const p = opts.load(key)
+      .then(value => {
+        const end = opts.now()
+        entries.set(key, { value, expiresAt: end + opts.ttlMs, delta: entries.get(key)?.delta ?? end - start })
+        return value
+      })
+      .finally(() => loading.delete(key))
+    loading.set(key, p)
+    return p
+  }
+
+  return async key => {
+    const e = entries.get(key)
+    const t = opts.now()
+    if (!e || t >= e.expiresAt + opts.staleMs) return refresh(key)
+    const early = t - e.delta * opts.beta * Math.log(opts.random()) >= e.expiresAt
+    if ((t >= e.expiresAt || early) && !loading.has(key)) refresh(key).catch(opts.onError)
+    return e.value
+  }
+}
+</script>
+  <script type="wrong">
+type SwrOptions<V> = {
+  load: (key: string) => Promise<V>
+  ttlMs: number
+  staleMs: number
+  beta: number
+  now: () => number
+  random: () => number
+  onError: (err: unknown) => void
+}
+
+function createSwrCache<V>(opts: SwrOptions<V>): (key: string) => Promise<V> {
+  const entries = new Map<string, { value: V; expiresAt: number; delta: number }>()
+  const loading = new Map<string, Promise<V>>()
+
+  const refresh = (key: string): Promise<V> => {
+    const running = loading.get(key)
+    if (running) return running
+    const start = opts.now()
+    const p = opts.load(key)
+      .then(value => {
+        const end = opts.now()
+        entries.set(key, { value, expiresAt: end + opts.ttlMs, delta: end - start })
+        return value
+      })
+      .finally(() => loading.delete(key))
+    loading.set(key, p)
+    return p
+  }
+
+  return async key => {
+    const e = [...entries.values()][0]
+    const t = opts.now()
+    if (!e || t >= e.expiresAt + opts.staleMs) return refresh(key)
+    const early = t - e.delta * opts.beta * Math.log(opts.random()) >= e.expiresAt
+    if ((t >= e.expiresAt || early) && !loading.has(key)) refresh(key).catch(opts.onError)
+    return e.value
+  }
+}
+</script>
+  <script type="wrong">
+type SwrOptions<V> = {
+  load: (key: string) => Promise<V>
+  ttlMs: number
+  staleMs: number
+  beta: number
+  now: () => number
+  random: () => number
+  onError: (err: unknown) => void
+}
+
+function createSwrCache<V>(opts: SwrOptions<V>): (key: string) => Promise<V> {
+  const entries = new Map<string, { value: V; expiresAt: number; delta: number }>()
+  const loading = new Map<string, Promise<V>>()
+
+  const refresh = (key: string): Promise<V> => {
+    const running = loading.get(key)
+    if (running) return running
+    const start = opts.now()
+    const p = opts.load(key)
+      .then(value => {
+        const end = opts.now()
+        entries.set(key, { value, expiresAt: end + opts.ttlMs, delta: end - start })
+        return value
+      })
+      .finally(() => loading.delete(key))
+    loading.set(key, p)
+    return p
+  }
+
+  return async key => {
+    const e = entries.get(key)
+    const t = opts.now()
+    if (!e || t >= e.expiresAt + opts.staleMs) return refresh(key).catch(err => { opts.onError(err); return e?.value as V })
+    const early = t - e.delta * opts.beta * Math.log(opts.random()) >= e.expiresAt
+    if ((t >= e.expiresAt || early) && !loading.has(key)) refresh(key).catch(opts.onError)
+    return e.value
+  }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 4：完成 <code>LeaseCache</code>，修好課文時間軸裡的「舊值寫回」：</p>
+  <ul>
+    <li><code>get(key)</code>：有值回傳 <code>{ hit: true, value }</code>。沒有值時，如果這個 key 沒有有效的 lease，發一張新的：<code>{ hit: false, lease: token }</code>，token 從 1 開始、<strong>整個快取共用</strong>一個遞增的計數器；如果已經有人拿著有效的 lease，回傳 <code>{ hit: false, lease: null }</code>（請稍後重試）。</li>
+    <li><code>set(key, value, lease)</code>：只有 <code>lease</code> 等於這個 key 目前有效的 token 才寫入並回傳 <code>true</code>，寫入後這張 lease 就用掉了；其他情況回傳 <code>false</code>、不寫入。</li>
+    <li><code>delete(key)</code>：刪掉值，並讓這個 key 目前的 lease 作廢。</li>
+    <li>lease 發出後經過 <code>leaseMs</code>（<code>now() − 發出時間 ≥ leaseMs</code>）就失效：不能再拿來 set，下一個 get 會拿到新的。</li>
+  </ul>
+  <script type="start">
+type LeaseGet<V> = { hit: true; value: V } | { hit: false; lease: number | null }
+
+class LeaseCache<V> {
+  constructor(opts: { now: () => number; leaseMs: number }) {
+    throw new Error('TODO')
+  }
+
+  get(key: string): LeaseGet<V> {
+    throw new Error('TODO')
+  }
+
+  set(key: string, value: V, lease: number): boolean {
+    throw new Error('TODO')
+  }
+
+  delete(key: string): void {
+    throw new Error('TODO')
+  }
+}
+</script>
+  <script type="answer">
+type LeaseGet<V> = { hit: true; value: V } | { hit: false; lease: number | null }
+
+class LeaseCache<V> {
+  private now: () => number
+  private leaseMs: number
+  private values = new Map<string, { value: V }>()
+  private leases = new Map<string, { token: number; issuedAt: number }>()
+  private nextToken = 1
+
+  constructor(opts: { now: () => number; leaseMs: number }) {
+    this.now = opts.now
+    this.leaseMs = opts.leaseMs
+  }
+
+  private validLease(key: string) {
+    const l = this.leases.get(key)
+    return l && this.now() - l.issuedAt < this.leaseMs ? l : undefined
+  }
+
+  get(key: string): LeaseGet<V> {
+    const v = this.values.get(key)
+    if (v) return { hit: true, value: v.value }
+    if (this.validLease(key)) return { hit: false, lease: null }
+    const token = this.nextToken++
+    this.leases.set(key, { token, issuedAt: this.now() })
+    return { hit: false, lease: token }
+  }
+
+  set(key: string, value: V, lease: number): boolean {
+    if (this.validLease(key)?.token !== lease) return false
+    this.leases.delete(key)
+    this.values.set(key, { value })
+    return true
+  }
+
+  delete(key: string): void {
+    this.values.delete(key)
+    this.leases.delete(key)
+  }
+}
+</script>
+  <script type="tests">
+let t = 0
+const cache = new LeaseCache<number>({ now: () => t, leaseMs: 10000 })
+const first = cache.get('price:2')
+assert.deepEqual(first, { hit: false, lease: 1 }, '第一次未命中拿到 lease 1')
+cache.delete('price:2')
+assert.equal(cache.set('price:2', 110, 1), false, '店長改價刪除快取後，A 拿作廢的 lease 1 寫回舊價要被拒絕')
+assert.deepEqual(cache.get('price:2'), { hit: false, lease: 2 }, '刪除後下一個未命中的 B 拿到新的 lease 2')
+assert.equal(cache.set('price:2', 120, 2), true, 'B 用有效的 lease 寫回新價要成功')
+assert.deepEqual(cache.get('price:2'), { hit: true, value: 120 }, '之後讀到新價 120')
+assert.equal(cache.set('price:2', 999, 2), false, '用過的 lease 不能再寫一次')
+assert.deepEqual(cache.get('price:2'), { hit: true, value: 120 }, '用過的 lease 不能改到值')
+assert.equal(cache.set('price:2', 999, 1), false, '作廢的 lease 不能寫入')
+
+const herd = new LeaseCache<string>({ now: () => t, leaseMs: 10000 })
+const results = Array.from({ length: 100 }, () => herd.get('menu'))
+assert.deepEqual(results[0], { hit: false, lease: 1 }, '100 個同時未命中，第一個拿到 lease')
+assert(results.slice(1).every(r => !r.hit && r.lease === null), '其他 99 個要拿到 lease: null（稍後重試），不能每個都發新票')
+
+t = 9999
+assert.deepEqual(herd.get('menu'), { hit: false, lease: null }, 'leaseMs 還沒到，lease 仍然有效')
+t = 10000
+assert.deepEqual(herd.get('menu'), { hit: false, lease: 2 }, 'lease 發出經過 leaseMs 之後失效，下一個 get 拿到新的')
+assert.equal(herd.set('menu', '過期票寫入', 1), false, '過期的 lease 不能寫入')
+t = 20000
+assert.equal(herd.set('menu', '過期票寫入', 2), false, 'lease 2 也已經過了 leaseMs，不能寫入')
+
+const multi = new LeaseCache<number>({ now: () => 0, leaseMs: 10000 })
+assert.deepEqual(multi.get('product:1'), { hit: false, lease: 1 }, 'product:1 拿到 lease 1')
+assert.deepEqual(multi.get('product:2'), { hit: false, lease: 2 }, 'token 整個快取共用遞增：product:2 拿到 lease 2')
+assert.equal(multi.set('product:2', 80, 1), false, 'product:1 的 lease 不能拿去寫 product:2')
+assert.equal(multi.set('product:1', 80, 1), true, '用自己的 lease 寫入成功')
+assert.equal(multi.set('product:2', 110, 2), true, '用自己的 lease 寫入成功')
+multi.delete('product:1')
+assert.deepEqual(multi.get('product:1'), { hit: false, lease: 3 }, '刪除後再讀是未命中，拿到下一個 token')
+const stock = multi.get('stock:7')
+assert.equal(stock.hit === false && stock.lease !== null && multi.set('stock:7', 0, stock.lease), true, 'stock:7 用自己的 lease 寫入 0')
+assert.deepEqual(multi.get('stock:7'), { hit: true, value: 0 }, '快取的值是 0（賣完了）也是命中，判斷有沒有值不能用 if (value)')
+</script>
+  <script type="wrong">
+type LeaseGet<V> = { hit: true; value: V } | { hit: false; lease: number | null }
+
+class LeaseCache<V> {
+  private now: () => number
+  private leaseMs: number
+  private values = new Map<string, { value: V }>()
+  private leases = new Map<string, { token: number; issuedAt: number }>()
+  private nextToken = 1
+
+  constructor(opts: { now: () => number; leaseMs: number }) {
+    this.now = opts.now
+    this.leaseMs = opts.leaseMs
+  }
+
+  private validLease(key: string) {
+    const l = this.leases.get(key)
+    return l && this.now() - l.issuedAt < this.leaseMs ? l : undefined
+  }
+
+  get(key: string): LeaseGet<V> {
+    const v = this.values.get(key)
+    if (v) return { hit: true, value: v.value }
+    if (this.validLease(key)) return { hit: false, lease: null }
+    const token = this.nextToken++
+    this.leases.set(key, { token, issuedAt: this.now() })
+    return { hit: false, lease: token }
+  }
+
+  set(key: string, value: V, lease: number): boolean {
+    if (this.validLease(key)?.token !== lease) return false
+    this.leases.delete(key)
+    this.values.set(key, { value })
+    return true
+  }
+
+  delete(key: string): void {
+    this.values.delete(key)
+  }
+}
+</script>
+  <script type="wrong">
+type LeaseGet<V> = { hit: true; value: V } | { hit: false; lease: number | null }
+
+class LeaseCache<V> {
+  private now: () => number
+  private leaseMs: number
+  private values = new Map<string, { value: V }>()
+  private leases = new Map<string, { token: number; issuedAt: number }>()
+  private nextToken = 1
+
+  constructor(opts: { now: () => number; leaseMs: number }) {
+    this.now = opts.now
+    this.leaseMs = opts.leaseMs
+  }
+
+  get(key: string): LeaseGet<V> {
+    const v = this.values.get(key)
+    if (v) return { hit: true, value: v.value }
+    const token = this.nextToken++
+    this.leases.set(key, { token, issuedAt: this.now() })
+    return { hit: false, lease: token }
+  }
+
+  set(key: string, value: V, lease: number): boolean {
+    const l = this.leases.get(key)
+    if (!l || l.token !== lease || this.now() - l.issuedAt >= this.leaseMs) return false
+    this.leases.delete(key)
+    this.values.set(key, { value })
+    return true
+  }
+
+  delete(key: string): void {
+    this.values.delete(key)
+    this.leases.delete(key)
+  }
+}
+</script>
+  <script type="wrong">
+type LeaseGet<V> = { hit: true; value: V } | { hit: false; lease: number | null }
+
+class LeaseCache<V> {
+  private now: () => number
+  private leaseMs: number
+  private values = new Map<string, { value: V }>()
+  private leases = new Map<string, { token: number; issuedAt: number }>()
+  private nextToken = 1
+
+  constructor(opts: { now: () => number; leaseMs: number }) {
+    this.now = opts.now
+    this.leaseMs = opts.leaseMs
+  }
+
+  get(key: string): LeaseGet<V> {
+    const v = this.values.get(key)
+    if (v) return { hit: true, value: v.value }
+    const l = this.leases.get(key)
+    if (l && this.now() - l.issuedAt < this.leaseMs) return { hit: false, lease: null }
+    const token = this.nextToken++
+    this.leases.set(key, { token, issuedAt: this.now() })
+    return { hit: false, lease: token }
+  }
+
+  set(key: string, value: V, lease: number): boolean {
+    this.leases.delete(key)
+    this.values.set(key, { value })
+    return true
+  }
+
+  delete(key: string): void {
+    this.values.delete(key)
+    this.leases.delete(key)
+  }
+}
+</script>
+  <script type="wrong">
+type LeaseGet<V> = { hit: true; value: V } | { hit: false; lease: number | null }
+
+class LeaseCache<V> {
+  private now: () => number
+  private leaseMs: number
+  private values = new Map<string, { value: V }>()
+  private leases = new Map<string, { token: number; issuedAt: number }>()
+  private counters = new Map<string, number>()
+
+  constructor(opts: { now: () => number; leaseMs: number }) {
+    this.now = opts.now
+    this.leaseMs = opts.leaseMs
+  }
+
+  get(key: string): LeaseGet<V> {
+    const v = this.values.get(key)
+    if (v) return { hit: true, value: v.value }
+    const l = this.leases.get(key)
+    if (l && this.now() - l.issuedAt < this.leaseMs) return { hit: false, lease: null }
+    const token = (this.counters.get(key) ?? 0) + 1
+    this.counters.set(key, token)
+    this.leases.set(key, { token, issuedAt: this.now() })
+    return { hit: false, lease: token }
+  }
+
+  set(key: string, value: V, lease: number): boolean {
+    const l = this.leases.get(key)
+    if (!l || l.token !== lease || this.now() - l.issuedAt >= this.leaseMs) return false
+    this.leases.delete(key)
+    this.values.set(key, { value })
+    return true
+  }
+
+  delete(key: string): void {
+    this.values.delete(key)
+    this.leases.delete(key)
+  }
+}
+</script>
+  <script type="wrong">
+type LeaseGet<V> = { hit: true; value: V } | { hit: false; lease: number | null }
+
+class LeaseCache<V> {
+  private now: () => number
+  private leaseMs: number
+  private values = new Map<string, { value: V }>()
+  private leases = new Map<string, { token: number; issuedAt: number }>()
+  private nextToken = 1
+
+  constructor(opts: { now: () => number; leaseMs: number }) {
+    this.now = opts.now
+    this.leaseMs = opts.leaseMs
+  }
+
+  private validLease(key: string) {
+    const l = this.leases.get(key)
+    return l && this.now() - l.issuedAt < this.leaseMs ? l : undefined
+  }
+
+  get(key: string): LeaseGet<V> {
+    const v = this.values.get(key)
+    if (v?.value) return { hit: true, value: v!.value }
+    if (this.validLease(key)) return { hit: false, lease: null }
+    const token = this.nextToken++
+    this.leases.set(key, { token, issuedAt: this.now() })
+    return { hit: false, lease: token }
+  }
+
+  set(key: string, value: V, lease: number): boolean {
+    if (this.validLease(key)?.token !== lease) return false
+    this.leases.delete(key)
+    this.values.set(key, { value })
+    return true
+  }
+
+  delete(key: string): void {
+    this.values.delete(key)
+    this.leases.delete(key)
+  }
+}
+</script>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：店長把拿鐵從 110 改成 120，寫完資料庫之後，快取裡的 <code>price:2</code> 應該怎麼處理？</p>
+  <label data-key="a">直接把快取更新成 120，這樣下一個讀取馬上看到新價，最即時</label>
+  <label data-key="b">刪除快取；但刪除後仍可能有人把讀到的舊值寫回，要再搭配 lease 或版本號，並保留 TTL</label>
+  <label data-key="c">什麼都不做，等 TTL 到期就好，這樣最簡單也最安全</label>
+  <p class="why">✓ 刪除是冪等的，兩個寫入不管誰先誰後，快取最後都是空的；更新快取（a）在兩個寫入交錯時，會留下比較慢的那一個寫入的舊值。只靠 TTL（c）不會錯得更離譜，但到期前所有人都看到舊價。刪除之後還有「舊值寫回」的競態，所以要 lease 或版本號，TTL 當最後的保險。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 6：熱門的菜單 key 過期瞬間，500 個請求同時未命中。你在 API 程式裡加了 single-flight。API 共有 10 台，資料庫大約會收到幾次查詢？</p>
+  <label data-key="a">1 次，single-flight 讓同一個 key 只載入一次</label>
+  <label data-key="b">500 次，single-flight 只擋同一個請求的重複呼叫</label>
+  <label data-key="c">約 10 次，每台各一次</label>
+  <p class="why">✓ single-flight 靠的是程序記憶體裡的 Map，每台 API 各有一份，只擋得住同一台裡的重複載入，所以是每台各一次。a 忘了每台各有一份 Map；b 說反了，同一台裡 500 個請求本來就會被合併成一次載入。要跨機器擋到一次，要用快取端的 lease、分散式鎖，或用 stale-while-revalidate／XFetch 讓 key 在過期前就被更新。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 7：菜單快取的命中率從 90% 提高到 99%，資料庫要處理的菜單讀取量變成原本的多少？</p>
+  <label data-key="a">十分之一</label>
+  <label data-key="b">91%（少了 9%）</label>
+  <label data-key="c">一半</label>
+  <p class="why">✓ 資料庫讀取量 = (1 − 命中率) × 總讀取量。未命中的比例從 10% 變成 1%，是十分之一。b 把命中率多了 9 個百分點，誤當成資料庫讀取量少了 9%；c 沒有任何算式支持。命中率最後幾個百分點的影響最大，這也是為什麼要依 key 前綴監控命中率。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 8：Redis 突然掛了。同事說：「反正還有 PostgreSQL，讓所有請求直接打資料庫就好，只是慢一點。」什麼時候這樣做會出事？</p>
+  <label data-key="a">不會出事，快取只是用來加速的</label>
+  <label data-key="b">當它是容量型快取時：資料庫撐不住原本由快取擋下的讀取量，會被壓垮，連下單也一起失敗</label>
+  <label data-key="c">只有在 Redis 存的是 session 時才會出事</label>
+  <p class="why">✓ 延遲型快取掛了只是變慢；容量型快取掛了，所有讀取都壓到資料庫上，超過它的容量。要限制同時打到資料庫的請求數、卸除部分負載（第 11 課），Redis 恢復後也要暖機或逐步導流。c 說的是另一件事：session 放在 Redis 是資料本身，不是快取。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>依身分而不同的資料用共用的 key</strong>：王小明的訂單被快取給陳美華看。key 要包含使用者 id，或乾脆不快取。</li>
+  <li><strong>寫入時更新快取而不是刪除</strong>：兩個寫入交錯時，快取留下比較慢的那個寫入的舊值。改成刪除。</li>
+  <li><strong>刪除之後就以為沒事</strong>：讀到舊值的請求晚一步寫回，舊價一直留到 TTL 到期。用 lease 或版本號，並保留 TTL。</li>
+  <li><strong>所有 key 用一樣的 TTL</strong>：同一時間大量過期造成雪崩。TTL 加隨機。</li>
+  <li><strong>把錯誤或 null 長時間快取</strong>：資料庫抖一下就變成長時間的故障。錯誤不快取，null 只快取很短的時間。</li>
+  <li><strong>以為程序內的 single-flight 擋得住跨機器的擊穿</strong>：10 台 API 就是 10 次。跨機器要 lease、鎖或提早更新。</li>
+  <li><strong>背景更新沒有 catch</strong>：射後不理的 Promise 失敗時變成未處理的 rejection，可能讓整個程序結束。</li>
+  <li><strong>把快取當成資料來源</strong>：金額、庫存、付款狀態以資料庫為準，結帳時重新讀。</li>
+  <li><strong>重啟或擴容後冷快取直接吃全部流量</strong>：容量型快取要暖機或逐步導流，Redis 掛掉時要限制打到資料庫的並發。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>快取可以放在瀏覽器、CDN、反向代理、程序記憶體、Redis、資料庫自己的緩衝；越靠近使用者越省，能放的資料越受限。多台 API 共用的菜單放 Redis。</li>
+  <li>平均延遲 = h × 命中延遲 + (1 − h) × 未命中延遲；資料庫負載 = (1 − h) × 讀取量。命中率 90% → 99%，資料庫負載變成十分之一；週年慶每秒 1,111 次、資料庫撐 200 次，命中率至少約 82%。</li>
+  <li>分清延遲型和容量型快取：拿掉只是變慢的是延遲型，拿掉就撐不住的是容量型。</li>
+  <li>cache-aside 加 TTL 是最常用的組合；write-behind 快但可能遺失資料；訂單、付款、結帳時的價格與庫存不快取。</li>
+  <li>寫入時刪除快取，不要更新：刪除是冪等的。「舊值寫回」的競態用 lease 修正；lease 每個 key 一段時間只發一張，也順便擋住擊穿。版本號放進 key 與 TTL 是另外兩道保險。</li>
+  <li>擊穿用 single-flight（同一程序）、lease 或提早更新（跨程序）；雪崩用 TTL 加隨機；查無此資料用短 TTL 的負快取。</li>
+  <li>stale-while-revalidate 先回舊值、背景更新；XFetch 在到期前以遞增的機率提早更新；背景更新的錯誤要自己接住。</li>
+  <li>容量型快取壞掉或變冷時，不能直接退回查資料庫：要限制並發、卸除負載、暖機；命中率依 key 前綴監控，門檻就是算出來的最低命中率。</li>
+</ul>
+<p>下一課換一個方向分擔資料庫的讀取：把資料複製到讀副本，並面對「剛寫入卻讀不到」的複寫延遲與一致性取捨。</p>
+
+</main>
+<script>
+// 時間軸（.tl）：逐步顯示每一列 tr[data-note]，下方顯示目前步驟的說明（與 PostgreSQL 課相同）
+document.querySelectorAll('.tl').forEach(tl => {
+  const rows = [...tl.querySelectorAll('tr[data-note]')]
+  const note = tl.querySelector('.note')
+  const count = tl.querySelector('[data-count]')
+  const prev = tl.querySelector('[data-prev]')
+  const next = tl.querySelector('[data-next]')
+  let cur = 0
+  const show = () => {
+    rows.forEach((r, i) => {
+      r.classList.toggle('now', i === cur)
+      r.classList.toggle('later', i > cur)
+    })
+    note.textContent = rows[cur].dataset.note
+    count.textContent = `步驟 ${cur + 1} / ${rows.length}`
+    prev.disabled = cur === 0
+    next.textContent = cur === rows.length - 1 ? '↺ 重新播放' : '下一步 ▶'
+  }
+  prev.onclick = () => { cur--; show() }
+  next.onclick = () => { cur = cur === rows.length - 1 ? 0 : cur + 1; show() }
+  show()
+})
+</script>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

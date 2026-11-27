@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>14. 可靠性：逾時、重試、fallback、限流與拒答處理</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="14" data-practice="ai">
+<header>
+  <div class="eyebrow">階段 5：上線：評估、安全、成本、可靠性與可觀測性 · 第 14 課</div>
+  <h1>可靠性：逾時、重試、fallback、限流與拒答處理</h1>
+</header>
+<main>
+
+<p>週五晚上七點，咖啡店的線上客服最忙的時候。監控上開始出現 429 和 529，有些回答要 30 秒才回來，有些顧客的畫面一直轉圈，最後顯示「系統錯誤」。同一時間，信義店的店長在後台跑「把一千則評論重新分類」的工作，把整個帳號的配額吃光，連帶其他分店的即時客服也一起變慢。</p>
+<p><a href="02-first-api-call.html">第 2 課</a>的程式送一次請求、等一個回應，在測試時沒有問題。上線之後，外部 API 一定會慢、會忙、會拒絕。這一課把單次呼叫變成上線等級。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>上線後會遇到的失敗、SDK 已經在做的事：週五晚上的 429、529、轉圈各是哪一種失敗，SDK 預設已經替你重試了什麼（開場問題的最小答案）。</li>
+  <li>錯誤分類、deadline 與 fallback：哪些錯誤可以重試或換模型，顧客最多等多久，主要模型掛了換誰。</li>
+  <li>限流與隔離、斷路器：一家分店的批次工作怎麼不拖垮其他分店的即時客服，主要模型一直失敗時怎麼不再白等。</li>
+  <li>拒答、資深視角：HTTP 200 卻沒有答案時跟顧客說什麼，上線前怎麼替每一種失敗先決定顧客看到什麼。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="02-first-api-call.html">第 2 課</a>的 <code>readAnswer</code>：先看 <code>stop_reason</code>，截斷丟 <code>TruncatedError</code>、拒答丟 <code>RefusalError</code>，不把不完整的回答當成答案。</li>
+  <li><a href="../../system-design/lessons/08-timeouts-retries-backoff.html">系統設計課第 8 課</a>的逾時與重試：只重試暫時性錯誤，間隔逐次拉長（指數退避），每一層都重試會讓流量放大好幾倍。</li>
+  <li><a href="../../system-design/lessons/10-rate-limiting.html">系統設計課第 10 課</a>的 token bucket：桶子以固定速度補 token，每個請求拿一個，拿不到就拒絕。</li>
+  <li><a href="../../system-design/lessons/11-circuit-breaker-bulkhead.html">系統設計課第 11 課</a>的斷路器與降級：下游一直失敗就先停止呼叫、直接走備用方案，過一段時間再試探。</li>
+</ul></div>
+
+<h2>上線後會遇到的失敗</h2>
+<p>呼叫模型 API 會失敗的方式不只一種，處理方式也不同。先把它們分清楚：</p>
+<div class="table-wrap"><table>
+  <tr><th>狀況</th><th>你看到的</th><th>原因</th><th>重試有用嗎</th></tr>
+  <tr><td>限流</td><td>HTTP 429 <code>rate_limit_error</code>，通常帶 <code>retry-after</code> 標頭</td><td>你的帳號這一分鐘的請求數或 token 數用完了</td><td>有，等 <code>retry-after</code> 說的秒數</td></tr>
+  <tr><td>過載</td><td>HTTP 529 <code>overloaded_error</code></td><td>供應商那邊暫時忙不過來，跟你的用量無關</td><td>有，稍等再試，或換模型</td></tr>
+  <tr><td>伺服器錯誤、連線失敗</td><td>HTTP 500、503，或連不上、連線中斷</td><td>暫時性的故障</td><td>通常有</td></tr>
+  <tr><td>很慢</td><td>30 秒、60 秒沒有回應</td><td>尖峰、回答很長、網路問題</td><td>要先設逾時，才會變成一個錯誤</td></tr>
+  <tr><td>請求有問題</td><td>HTTP 400、401、403、404</td><td>你的程式送錯參數、key 錯了、沒權限、模型 id 打錯</td><td>沒有，重送一百次結果都一樣</td></tr>
+  <tr><td>拒答</td><td>HTTP <strong>200</strong>，但 <code>stop_reason: 'refusal'</code></td><td>模型基於安全政策拒絕回答</td><td>沒有，要給顧客合理的回應</td></tr>
+</table></div>
+<p><strong>限流（rate limit）</strong>是供應商限制每個帳號每分鐘能送多少請求、多少 token，超過就回 429。<strong>過載（overloaded）</strong>是 529，代表 API 本身暫時太忙。兩者都是「等一下就好」的錯誤，叫做<strong>暫時性錯誤</strong>；400 這類是「程式有 bug」的錯誤，重試只會浪費時間和配額，還會讓 bug 晚一點被發現。</p>
+
+<h2>SDK 已經在做的事：timeout 與 maxRetries</h2>
+<p>在自己寫重試之前，先看 <code>@anthropic-ai/sdk</code>（這門課用 1.3.0）預設做了什麼。這些行為是從 SDK 1.3.0 的原始碼與本機實測確認的：</p>
+<div class="table-wrap"><table>
+  <tr><th>設定</th><th>預設值</th><th>行為</th></tr>
+  <tr><td><code>maxRetries</code></td><td>2</td><td>一個請求最多送 3 次（第 1 次＋重試 2 次）。只重試 408、409、429、5xx（包括 529）與連線錯誤、逾時；400、401、403、404 不重試</td></tr>
+  <tr><td>重試間隔</td><td>0.5 秒起、每次加倍、最多 8 秒</td><td>每次再隨機少 0～25%（jitter，避免大家同時重試）。回應有 <code>retry-after-ms</code> 或 <code>retry-after</code> 標頭時，照它說的時間等：說 60 秒就真的等 60 秒，而且這段等待不算在 <code>timeout</code> 裡。回應帶 <code>x-should-retry</code> 標頭時，重不重試照它決定</td></tr>
+  <tr><td><code>timeout</code></td><td>600000（10 分鐘，單位毫秒）</td><td>等不到回應就中斷，丟出 <code>APIConnectionTimeoutError</code>，而且<strong>逾時也會重試</strong></td></tr>
+</table></div>
+<p>重試之間逐次拉長等待時間叫<strong>退避（backoff）</strong>；每次加倍就是指數退避。這些 SDK 都做好了，你不用自己寫 <code>sleep</code>。</p>
+<p>問題在預設值的組合：timeout 10 分鐘、逾時又重試 2 次，最壞情況是顧客等 30 分鐘才看到錯誤。客服的回答沒有人願意等超過十幾秒，所以上線前一定要改：</p>
+<pre>import Anthropic from '@anthropic-ai/sdk'
+
+// 整個 client 的預設：最多等 20 秒、重試 1 次
+const client = new Anthropic({ timeout: 20_000, maxRetries: 1 })
+
+// 單一請求覆寫：第二個參數是請求選項
+await client.messages.create(
+  { model: 'claude-opus-5-5', max_tokens: 16000, messages },
+  { timeout: 8_000, maxRetries: 0 },
+)</pre>
+<p>SDK 的 <code>timeout</code> 量的是「送出到回應開始」這段時間（原始碼裡計時器只包住 fetch）。對串流來說，回應標頭一到（串流開始），後面講多久都不算逾時；重試之間的等待也不算。要限制串流的總時間，用<a href="03-streaming.html">第 3 課</a>的 <code>AbortController</code> 或 <code>signal: AbortSignal.timeout(毫秒)</code>；這時丟出的是 <code>APIUserAbortError</code>，代表「是你要它停的」。</p>
+
+<h3>重試只能有一層</h3>
+<p>常見的錯誤是在 SDK 外面再包一層「失敗就重試 3 次」：</p>
+<pre>for (let i = 0; i &lt; 3; i++) {
+  try { return await client.messages.create(params) }   // SDK 裡面又會試 3 次
+  catch { await sleep(1000) }
+}</pre>
+<p>外層的每一次嘗試，SDK 裡面都會再送最多 3 次，一個請求最多變成 3 × 3 = 9 次。供應商已經在過載了，你送出 9 倍的流量，讓它更難恢復，這是<a href="../../system-design/lessons/08-timeouts-retries-backoff.html">系統設計課第 8 課</a>的<strong>重試放大</strong>。如果外面還有一層 API gateway 也會重試，再乘一次。</p>
+<p>規則：<strong>重試放在一層</strong>。大部分情況交給 SDK，只調 <code>maxRetries</code> 和 <code>timeout</code>；需要自己控制（例如失敗時換模型、要配合 deadline）時，把 SDK 設成 <code>maxRetries: 0</code>，重試完全由你的程式決定。這課的練習 2 就是後者。</p>
+<div class="callout practice"><strong>💡 實務上：接手專案時先搜一次 <code>new Anthropic(</code></strong><br>用在哪：code review 或接手別人的服務時，搜尋所有建立 client 的地方，以及包在外面的 retry 工具（例如 p-retry、自己寫的 <code>withRetry</code>、API gateway 的重試設定）。要考量什麼：同一條呼叫路徑上只能有一層重試，timeout 要比前端或 gateway 的逾時短，否則上游已經放棄了，你還在重試、還在付錢。資深會先問：「這個請求最壞會打幾次 API、顧客最久等多久？」答得出兩個數字才算設定完成。</div>
+
+<h2>錯誤分類：用類別判斷，不比對訊息</h2>
+<p>SDK 把每種錯誤做成不同的類別，掛在 <code>Anthropic</code> 底下。用 <code>instanceof</code> 判斷，不要用 <code>err.message.includes('rate')</code>：訊息的文字隨時會改，而且「rate limit settings are invalid」這種 400 錯誤也會被誤判成限流。</p>
+<div class="table-wrap"><table>
+  <tr><th>類別</th><th>什麼時候</th><th>重試？</th></tr>
+  <tr><td><code>RateLimitError</code></td><td>429</td><td>是</td></tr>
+  <tr><td><code>InternalServerError</code></td><td>500 以上，包括 529（<code>.type</code> 是 <code>'overloaded_error'</code>）</td><td>是</td></tr>
+  <tr><td><code>APIConnectionError</code></td><td>連不上、連線中斷</td><td>是</td></tr>
+  <tr><td><code>APIConnectionTimeoutError</code></td><td>逾時（是 <code>APIConnectionError</code> 的子類別）</td><td>是</td></tr>
+  <tr><td><code>BadRequestError</code>、<code>AuthenticationError</code>、<code>PermissionDeniedError</code>、<code>NotFoundError</code></td><td>400、401、403、404</td><td>否：修程式、告警</td></tr>
+  <tr><td><code>APIUserAbortError</code></td><td>你自己用 signal 中斷（例如顧客關掉頁面）</td><td>否：是你要它停的</td></tr>
+  <tr><td><code>APIError</code></td><td>上面全部的父類別；串流中途收到 <code>error</code> 事件也是它</td><td>看 <code>.status</code> 與 <code>.type</code></td></tr>
+</table></div>
+<p>兩個細節，練習 1 會遇到：</p>
+<ul>
+  <li><strong>子類別要先判斷</strong>。<code>APIUserAbortError</code>、<code>APIConnectionError</code> 都繼承 <code>APIError</code>，而且 <code>status</code> 都是 <code>undefined</code>。先寫 <code>if (err instanceof Anthropic.APIError)</code> 再看 status，使用者中斷就會被當成連線問題去重試：顧客已經離開了，你還在花錢。</li>
+  <li><strong>串流中途的錯誤沒有 HTTP status</strong>。串流開始時 HTTP 已經回了 200，之後 API 用 SSE 的 <code>error</code> 事件告訴你過載了。本機實測 SDK 1.3.0 丟出的是 <code>APIError</code>，<code>status</code> 是 <code>undefined</code>、<code>type</code> 是 <code>'overloaded_error'</code>。只看 status 的分類會漏掉它，要另外看 <code>.type</code>。</li>
+</ul>
+<pre>try {
+  return await client.messages.create(params)
+} catch (err) {
+  if (err instanceof Anthropic.APIUserAbortError) return               // 子類別先判斷
+  if (err instanceof Anthropic.BadRequestError) {
+    logger.error({ requestId: err.requestID, type: err.type }, '請求有問題')   // requestID 回報供應商時用
+  }
+  throw err
+}</pre>
+<p>不是 SDK 丟出的錯誤（你自己程式的 <code>TypeError</code>、<code>readAnswer</code> 丟的 <code>TruncatedError</code>）不屬於任何一類，不要重試也不要換模型，直接往外丟，讓它在 log 裡被看見。</p>
+
+<h2>deadline 與 fallback：一定要給顧客一句話</h2>
+<p>單一請求的 timeout 不夠，因為重試、換模型都會再花時間。<strong>deadline</strong> 是整個操作的總時間上限，包含所有重試：客服回答訂 15 秒，從收到顧客的問題開始算，不管中間試了幾次，15 秒一到就停。每次送請求前算「還剩多少時間」，把它當成這個請求的 timeout，請求就不可能超過 deadline。</p>
+<p><strong>fallback</strong> 是主要方案失敗時改用的備用方案。客服的 fallback 可以排成一條鏈：</p>
+<figure>
+  <svg viewBox="0 0 700 230" role="img" aria-label="fallback 鏈：先送主要模型 Opus 5.5，可重試的錯誤時改送備用模型 Sonnet 5.5，再失敗或 deadline 到了就回預先準備的回覆；400 這類錯誤直接丟出">
+    <defs><marker id="ar14" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="var(--muted)"/></marker></defs>
+    <rect x="20" y="40" width="170" height="56" rx="6" class="d-box"/><text x="105" y="64" text-anchor="middle" class="d-text">主要模型</text><text x="105" y="83" text-anchor="middle" class="d-small">claude-opus-5-5</text>
+    <line x1="190" y1="68" x2="260" y2="68" class="d-line" marker-end="url(#ar14)"/><text x="225" y="58" text-anchor="middle" class="d-small">retry 類</text>
+    <rect x="265" y="40" width="170" height="56" rx="6" class="d-box"/><text x="350" y="64" text-anchor="middle" class="d-text">備用模型</text><text x="350" y="83" text-anchor="middle" class="d-small">claude-sonnet-5-5</text>
+    <line x1="435" y1="68" x2="505" y2="68" class="d-line" marker-end="url(#ar14)"/><text x="470" y="58" text-anchor="middle" class="d-small">retry 類</text>
+    <rect x="510" y="40" width="170" height="56" rx="6" class="d-soft"/><text x="595" y="64" text-anchor="middle" class="d-text">預先準備的回覆</text><text x="595" y="83" text-anchor="middle" class="d-small">「已通知店員」</text>
+    <line x1="105" y1="96" x2="105" y2="150" class="d-line" marker-end="url(#ar14)"/><text x="115" y="128" class="d-small">400、401…</text>
+    <rect x="20" y="155" width="170" height="44" rx="6" class="d-box"/><text x="105" y="182" text-anchor="middle" class="d-text">丟錯：修程式</text>
+    <rect x="265" y="140" width="415" height="70" rx="6" class="d-box"/>
+    <text x="280" y="165" class="d-accent">deadline 15 秒</text>
+    <text x="280" y="186" class="d-small">每次送出前算剩下的時間，當成這個請求的 timeout</text>
+    <text x="280" y="203" class="d-small">剩下 ≤ 0 就不再送，直接回預先準備的回覆</text>
+  </svg>
+  <figcaption>只有暫時性錯誤才往右走；請求本身有問題時換模型也沒用，直接丟出去讓它被修好。</figcaption>
+</figure>
+<pre>const started = now()
+for (const { by, client, model } of attempts) {        // 主要 → 備用，兩個 client 都是 maxRetries: 0
+  const left = deadlineMs - (now() - started)
+  if (left &lt;= 0) break
+  try {
+    const response = await client.messages.create({ model, … }, { timeout: left })
+    return { by, text: readAnswer(response) }
+  } catch (err) {
+    if (classify(err) !== 'retry') throw err         // 400 這類不換模型
+  }
+}
+return { by: 'canned', text: CANNED }</pre>
+<p>預先準備的回覆（canned response）是寫死的一句話，例如「目前詢問的人比較多，已經通知店員」。它不需要模型，所以永遠不會失敗。走到這一步時同時記 log、通知值班的人。</p>
+<p>換模型的代價要先想清楚：</p>
+<ul>
+  <li><strong>快取不共用</strong>：<a href="13-cost-caching.html">第 13 課</a>的 prompt caching 是依模型分開的，換到備用模型後前綴要重新寫入，這幾次請求比較貴。</li>
+  <li><strong>回答不一樣</strong>：備用模型的語氣、遵守指示的程度、工具使用都可能不同。備用模型也要跑過<a href="11-evals.html">第 11 課</a>的 eval，確認可以接受，否則只是把一種錯誤換成另一種錯誤。</li>
+  <li><strong>備用也會失敗</strong>：同一家供應商過載時，兩個模型可能一起忙。這就是為什麼最後一層要是不依賴模型的回覆。</li>
+</ul>
+<p>測試時間用注入的 <code>now()</code>，不在函式裡直接呼叫 <code>Date.now()</code>，練習才能用假時鐘模擬「主要模型花了 16 秒才失敗」。</p>
+<div class="callout practice"><strong>💡 實務上：deadline 和預先準備的回覆要跟 PM 一起定</strong><br>用在哪：客服聊天、訂單查詢、商品推薦這類顧客在畫面前等的功能；後台批次不需要這麼緊的 deadline。要考量什麼：deadline 從「前端轉圈多久會讓人放棄」倒推，不是工程師隨便填 15；預先準備的回覆是產品文案，要讓 PM 或客服主管確認，而且「已通知店員」要真的有人收到通知。資深上線前會在測試環境故意讓主要模型失敗（例如把主要模型的 timeout 設成 1 毫秒；填錯模型 id 是 404，不會走 fallback），親眼看過顧客在每一層 fallback 看到的畫面。</div>
+
+<h2>限流與隔離：一個租戶不能拖垮所有人</h2>
+<p>供應商的 rate limit 是算在<strong>整個帳號</strong>上的。如果咖啡店的系統服務好幾家分店（每家是一個<strong>租戶</strong>，tenant），信義店的批次工作一口氣送出幾百個請求，帳號的配額用完，所有分店的即時客服一起收到 429。供應商看到的只有你，它不知道背後是誰在用。</p>
+<p>所以要在你這一側，<strong>每個租戶</strong>各自限制（限制同時進行的請求數，做法跟 <a href="../../node/lessons/17-calling-external-apis.html">Node 課第 17 課</a>呼叫外部 API 時一樣）：</p>
+<div class="table-wrap"><table>
+  <tr><th>限制</th><th>做法</th><th>超過時</th></tr>
+  <tr><td>同時請求數（並發）</td><td>每個租戶最多 N 個請求在進行中，多的排隊</td><td>等前面的完成。讓一個租戶的慢請求只卡住自己</td></tr>
+  <tr><td>每分鐘請求數</td><td>每個租戶一個 token bucket（<a href="../../system-design/lessons/10-rate-limiting.html">系統設計課第 10 課</a>）</td><td>立刻拒絕，回 429 給前端，帶 <code>retry-after</code></td></tr>
+</table></div>
+<p><strong>token bucket</strong> 是一個裝 token 的桶：容量是每分鐘上限（例如 10），一開始是滿的；每個請求拿走 1 個，桶空了就拒絕；token 依經過的時間<strong>持續</strong>補回來，每分鐘 10 個就是每 6 秒補 1 個。跟「每滿一分鐘歸零」的固定視窗相比，它不會在視窗交界允許兩倍的突發，而且被拒絕的人可以算出確切要等多久：</p>
+<pre>// 補 token：經過的毫秒 × 每毫秒補的量，最多補到容量
+s.tokens = Math.min(ratePerMin, s.tokens + (t - s.at) * ratePerMin / 60_000)
+s.at = t
+if (s.tokens &lt; 1) throw new TooManyRequests(tenant, Math.ceil((1 - s.tokens) * 60_000 / ratePerMin))
+s.tokens -= 1</pre>
+<p>兩種限制的處理不同，是刻意的：並發超過時排隊，因為前面的請求幾秒內就會完成；速率超過時立刻拒絕，因為排隊要等好幾秒甚至一分鐘，顧客寧可馬上看到「請稍後再試」。並發名額一定要在 <code>finally</code> 裡還回去，不然 fn 丟一次錯，名額就永久少一個，丟幾次之後這個租戶就永遠卡住了。</p>
+<p>再往上一層的隔離：<strong>即時與批次分開</strong>。重新分類一千則評論不需要馬上完成，送進<a href="13-cost-caching.html">第 13 課</a>的 Message Batches API，費用打 5 折，也不跟即時客服搶同一份即時配額。這課的 limiter 只存在一個程序的記憶體裡；伺服器有好幾台時，計數要放在共用的地方（例如 Redis），系統設計課第 10 課講過做法。</p>
+<div class="callout practice"><strong>💡 實務上：限流的數字從供應商的配額倒推</strong><br>用在哪：後台的「批次重新分類」、報表產生這類一次送很多請求的功能，以及多分店（多租戶）的 SaaS。要考量什麼：先到 Console 看帳號的 rate limit（每分鐘請求數、輸入／輸出 token 數），再分給各租戶，總和留一些餘裕給即時客服；前端收到 429 要顯示「請稍後再試」，不要無限轉圈或自動狂重送。誰會關心：PM 要決定大客戶能不能付費提高上限，維運要看哪個租戶最常被擋。</div>
+
+<h2>斷路器：已知會失敗就不要再等</h2>
+<p>主要模型這幾分鐘一直 529。照上面的 fallback，每個顧客都要先等主要模型失敗，才換到備用模型：每個請求都多浪費幾秒，還持續對過載的 API 送流量。</p>
+<p><strong>斷路器（circuit breaker）</strong>記錄最近的結果，錯誤率太高時「斷開」：接下來一段時間（例如 30 秒）直接走備用模型，不呼叫主要模型。時間到了進入<strong>半開</strong>，放一個請求試探，成功就恢復，失敗就再斷開一段時間。狀態與實作細節在<a href="../../system-design/lessons/11-circuit-breaker-bulkhead.html">系統設計課第 11 課</a>，這裡只說怎麼接上：</p>
+<pre>const usePrimary = breaker.allow()        // 斷開時回 false
+const attempts = usePrimary ? [primary, secondary] : [secondary]
+// 主要模型的結果要回報：成功 breaker.success()，retry 類錯誤 breaker.failure()
+// 400 這類是你的 bug，不算主要模型的失敗</pre>
+<p>規模小的服務不一定需要斷路器：有 deadline 和 fallback，最壞就是每個請求多等一次失敗。流量大、失敗會持續好幾分鐘時，斷路器省下的時間和配額才明顯。</p>
+
+<h2>拒答：HTTP 200 不代表有答案</h2>
+<p><strong>拒答（refusal）</strong>是模型基於安全政策拒絕回答。API 不把它當錯誤：HTTP 是 200，回應裡 <code>stop_reason</code> 是 <code>'refusal'</code>，<code>stop_details</code> 有 <code>category</code>（SDK 1.3.0 的型別是 <code>'cyber' | 'bio' | 'frontier_llm' | 'reasoning_extraction' | 'general_harms' | null</code>）與 <code>explanation</code>。<code>stop_details</code> 本身也可能是 <code>null</code>。<code>content</code> 可能是空的，也可能有停下前產生的片段，不能當成答案。</p>
+<p>咖啡店的客服很少遇到拒答，但顧客問「怎麼繞過你們 POS 的登入」這種問題時會出現。處理方式：</p>
+<ol>
+  <li><strong>先看 <code>stop_reason</code> 再讀內容</strong>，第 2 課的 <code>readAnswer</code> 就是這樣做的。</li>
+  <li><strong>給顧客中性、固定的訊息</strong>，例如「這個問題我沒辦法回答，點餐或訂單的問題可以換個方式問我」。不要轉述 <code>explanation</code>：它是給開發者看的，可能透露判斷的細節，對顧客也沒有幫助。</li>
+  <li><strong>記錄</strong> <code>category</code> 與訊息 id（<code>message.id</code>）。拒答率突然變高，可能是有人在試探你的系統，也可能是你改的 prompt 讓正常問題被誤判，<a href="15-observability-sse.html">第 15 課</a>會把它做成指標。</li>
+</ol>
+<p>拒答不要重試、也不要換到你自己的備用模型：同樣的問題通常會得到同樣的結果。Anthropic 另外有<strong>伺服器端 fallback</strong>（beta <code>server-side-fallback-2026-07-01</code>，請求加 <code>fallbacks: 'default'</code> 或指定模型清單）：模型拒答時由 API 自動改用其他模型回答。它只處理拒答，跟這課為了 429、529 寫的 fallback 是兩回事；這課只介紹，不練習，要用時查官方文件的 refusals and fallback 頁面。</p>
+<div class="callout practice"><strong>💡 實務上：拒答率是 prompt 改壞的早期訊號</strong><br>用在哪：每次改 system prompt、加新工具、換模型之後。要考量什麼：拒答會被顧客回報成「客服不理我」，很少有人說「它拒答了」；所以要靠 log 裡的 <code>category</code> 與訊息 id 回頭查是哪些問題被拒。資深會在發版後看一天的拒答率，跟改版前比；突然變高就拿那些問題跑第 11 課的 eval，確認是 prompt 的問題還是真的有人在試探。</div>
+
+<h2>資深視角：先決定「失敗時顧客看到什麼」</h2>
+<p>可靠性不是讓錯誤消失，而是讓每一種失敗都有設計好的結果。上線前把這張表填完，每一格都要有答案：</p>
+<div class="table-wrap"><table>
+  <tr><th>失敗</th><th>處理</th><th>顧客看到</th><th>你看到</th></tr>
+  <tr><td>429、529、5xx、逾時</td><td>一層重試 → 備用模型 → 預先準備的回覆</td><td>稍慢的回答，或「已通知店員」</td><td>fallback 次數、斷路器狀態</td></tr>
+  <tr><td>400、401、403、404</td><td>不重試，丟錯</td><td>「系統暫時無法回答」</td><td>告警，附 request id</td></tr>
+  <tr><td>租戶超過速率</td><td>立刻拒絕</td><td>「請稍後再試」</td><td>哪個租戶、多頻繁</td></tr>
+  <tr><td>拒答</td><td>固定訊息</td><td>中性的說明</td><td>category、拒答率</td></tr>
+  <tr><td>截斷（<code>max_tokens</code>）</td><td><code>readAnswer</code> 丟錯</td><td>不完整的回答不要直接顯示</td><td>是否該調高 <code>max_tokens</code></td></tr>
+</table></div>
+<p>最後一欄就是下一課的可觀測性。沒有記錄，你不會知道 fallback 每天發生幾百次，直到帳單或客訴告訴你。</p>
+
+<h2>練習</h2>
+<p>在 learn 資料夾執行 <code>node check.mjs ai 14</code>，會建立 <code>ai/practice/work/14/</code>。<code>read-answer.ts</code> 是第 2 課練習 2 的 <code>readAnswer</code>，已經寫好，不用改。練習 2 會 import 練習 1 的 <code>classify</code>，所以照順序做；練習 3、4 獨立。做完練習 2 後，有 API key 的話可以在 <code>ai/practice</code> 執行 <code>node --env-file-if-exists=.env work/14/live.ts</code>，看真實模型走哪一條路、花多久；加上 <code>LIVE_DEADLINE_MS=50</code> 可以看到 deadline 到了回預先準備的回覆。</p>
+
+<div class="local" data-test="ex1" data-files="ex1.ts">
+  <p>練習 1：完成 <code>classify(err)</code>，回傳 <code>'retry'</code>、<code>'fail'</code> 或 <code>'unknown'</code>。retry：<code>RateLimitError</code>、<code>InternalServerError</code>（含 529）、408、409、<code>APIConnectionError</code>（含逾時），以及串流中途 <code>.type</code> 是 <code>'overloaded_error'</code> 或 <code>'api_error'</code> 的 <code>APIError</code>（status 是 <code>undefined</code>）。fail：<code>APIUserAbortError</code>、400、401、403、404 等其他有 status 的 API 錯誤，以及其他 type 的串流中途錯誤。不是 SDK 的錯誤一律 unknown。用 <code>instanceof</code>、<code>.status</code>、<code>.type</code> 判斷，不比對訊息；測試用的是 SDK 實際丟出的錯誤物件。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="ex2.ts">
+  <p>練習 2：完成 <code>answerWithFallback({ primary, secondary }, question, { deadlineMs, now })</code>。先用 primary 送 <code>PRIMARY</code>（Opus 5.5，<code>max_tokens</code> 16000、<code>system: SYSTEM</code>、一則 user 訊息），成功就用 <code>readAnswer</code> 取文字，回傳 <code>{ by: 'primary', text }</code>；<code>classify</code> 是 retry 時改用 secondary 送 <code>SECONDARY</code>（Sonnet 5.5）；再失敗或已經沒有剩餘時間就回傳 <code>{ by: 'canned', text: CANNED }</code>。fail 與 unknown 的錯誤直接丟出、不換模型。每個模型只送一次（兩個 client 都是 <code>maxRetries: 0</code>）；每個請求帶 <code>{ timeout: 剩下的毫秒數 }</code>，時間一律用 <code>now()</code>。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="ex3.ts">
+  <p>練習 3：完成 <code>TenantLimiter</code>：<code>new TenantLimiter({ maxConcurrent, ratePerMin, now })</code>，<code>run(tenant, fn)</code> 回傳 fn 的結果。每個租戶一個 token bucket：一開始是滿的（<code>ratePerMin</code> 個），依 <code>now()</code> 經過的時間按比例補、最多補到 <code>ratePerMin</code>；呼叫時先補再扣，不到 1 個就立刻丟出 <code>TooManyRequests</code>（<code>retryAfterMs</code> 是補到 1 個還要等的毫秒數，用 <code>Math.ceil</code>），不呼叫 fn。同一個租戶最多 <code>maxConcurrent</code> 個 fn 同時執行，多的依序排隊；fn 成功或丟錯都要還名額。不同租戶完全分開。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="ex4.ts">
+  <p>練習 4：完成 <code>handleReply(message, log)</code>。<code>stop_reason</code> 是 <code>'refusal'</code> 時，呼叫一次 <code>log({ event: 'refusal', category, messageId })</code>（<code>stop_details</code> 是 <code>null</code> 時 category 記 <code>null</code>），回傳 <code>{ kind: 'refused', userMessage: REFUSAL_MESSAGE }</code>，不轉述 explanation、不用 content 的文字。其他 stop_reason 回傳 <code>{ kind: 'answer', text: readAnswer(message) }</code>，截斷等情況讓 <code>readAnswer</code> 丟錯，不呼叫 log。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：SDK 的 <code>maxRetries</code> 是預設的 2，你又在外面包了一層「失敗就重試 3 次」。一次 529 風暴中，一個請求最多會打幾次 API？</p>
+  <label data-key="a">3</label>
+  <label data-key="b">5</label>
+  <label data-key="c">9（3 × 3）</label>
+  <label data-key="d">2</label>
+  <p class="why">✓ 外層的每次嘗試，SDK 裡面都會送最多 3 次（第 1 次＋重試 2 次），3 × 3 = 9。a 和 d 只算了其中一層，b 是把兩層的次數相加。重試要放在一層：交給 SDK，或設 <code>maxRetries: 0</code> 自己做。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：收到 400 <code>invalid_request_error</code>，應該怎麼做？</p>
+  <label data-key="a">指數退避後重試</label>
+  <label data-key="b">不重試：請求本身有問題（例如送了 temperature、訊息角色順序錯），要修程式並告警</label>
+  <label data-key="c">換備用模型再送一次</label>
+  <label data-key="d">等 retry-after 標頭說的秒數再送</label>
+  <p class="why">✓ 4xx（408、409、429 以外）表示請求本身有問題，重送只會得到一樣的結果（a 錯）。換模型通常也一樣會 400，就算碰巧成功也掩蓋了 bug（c 錯）。retry-after 是 429 這類暫時性錯誤告訴你「多久後再來」用的；400 等多久重送都一樣（d 錯）。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：fallback 從 Opus 5.5 換到 Sonnet 5.5 時，下列哪個是要注意的代價？</p>
+  <label data-key="a">沒有代價，同一家的模型行為都一樣</label>
+  <label data-key="b">快取依模型分開，切換後前綴要重新寫入；回答的風格與品質也不同，備用模型要跑過 eval 確認可以接受</label>
+  <label data-key="c">Sonnet 5.5 不支援 tool use，工具都要拿掉</label>
+  <label data-key="d">切換模型需要重新部署伺服器</label>
+  <p class="why">✓ 不同模型的 prompt 快取不共用，回答也不會一樣（a 錯）。Sonnet 5.5 支援 tool use（c 錯）。模型 id 是請求的一個參數，切換不需要部署（d 錯）。備案也要被評估過，不然只是把錯誤換成另一種錯誤。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>重試包兩層</strong>：SDK 預設已經重試 2 次，外面再包一層，請求數相乘，過載時讓情況更糟。只留一層。</li>
+  <li><strong>所有錯誤都重試</strong>：400、401 重送一百次都一樣，還會延後發現 bug。用錯誤類別分出暫時性錯誤，只重試那些。</li>
+  <li><strong>比對錯誤訊息</strong>：<code>message.includes('rate')</code> 會把含 rate 字樣的 400 當成限流，訊息改了就全部失效。用 <code>instanceof</code>、<code>.status</code>、<code>.type</code>。</li>
+  <li><strong>先判斷父類別 <code>APIError</code></strong>：使用者中斷與連線錯誤都是它的子類別、status 都是 undefined，判斷順序錯了就把中斷當成連線問題去重試。</li>
+  <li><strong>沒有 deadline，或用 SDK 預設的 10 分鐘 timeout</strong>：逾時加上重試，顧客最壞要等半小時。設 deadline，每個請求的 timeout 用剩下的時間。</li>
+  <li><strong>fallback 的最後一層還是模型</strong>：同一家供應商過載時可能一起失敗。最後一層要是不需要模型的固定回覆。</li>
+  <li><strong>所有租戶共用一個並發池</strong>：一個大客戶的批次工作拖垮所有人的即時客服。每個租戶分開限制，批次改用 Batches API。</li>
+  <li><strong>並發名額沒有在 finally 釋放</strong>：fn 丟錯幾次後，這個租戶的請求永遠在排隊。</li>
+  <li><strong>把 refusal 的 content 當答案，或把 explanation 給顧客看</strong>：先看 <code>stop_reason</code>，給固定的中性訊息，explanation 只留在內部。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>失敗分兩種：暫時性的（429、529、5xx、連線、逾時）可以重試；請求本身有問題的（400、401、403、404）要修程式。拒答是 HTTP 200，要看 <code>stop_reason</code>。</li>
+  <li>SDK 1.3.0 預設 <code>maxRetries: 2</code>、<code>timeout: 600000</code> 毫秒，會用指數退避重試、遵守 <code>retry-after</code>，逾時也重試。上線前調小，重試只放一層。</li>
+  <li>用 <code>instanceof</code> 分類錯誤，子類別先判斷；串流中途的錯誤 status 是 undefined，看 <code>.type</code>。</li>
+  <li>deadline 管整個操作的總時間；fallback 鏈是主要模型 → 備用模型 → 固定回覆，只有暫時性錯誤才往下走。換模型會失去快取，備用模型也要跑 eval。</li>
+  <li>每個租戶各自限制並發（排隊）與速率（token bucket，立刻拒絕）；即時與批次分開。</li>
+  <li>斷路器在持續失敗時直接走備案，省下每個請求的等待。</li>
+  <li>拒答給固定的中性訊息、不轉述 explanation，記錄 category 與訊息 id。</li>
+</ul>
+<p>下一課做可觀測性：把這課的 fallback、拒答、限流記成 log 與指標，並把串流回答透過 SSE 送到 Vue 前端。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

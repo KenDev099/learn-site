@@ -1,0 +1,2062 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>19. AWS IAM 與帳號安全：最小權限、角色與 OIDC</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="19">
+<header>
+  <div class="eyebrow">階段 5：雲端與基礎設施即程式碼 · 第 19 課</div>
+  <h1>AWS IAM 與帳號安全：最小權限、角色與 OIDC</h1>
+</header>
+<main>
+
+<p>咖啡店剛開了 AWS 帳號。工程師為了趕上線，用 root 帳號建了一組 access key，放進 cafe-api 的 <code>.env</code> 和 GitHub 的 repository secrets，部署和程式都用這一組。三個月後有人把 <code>.env</code> 推上公開的 fork，幾小時內帳號被拿去開了幾十台挖礦機器，S3 裡顧客上傳的照片也被整包下載。這組金鑰能做任何事，而且不會過期。</p>
+<p>這一課處理「誰可以對什麼做什麼」，目標是帳號裡不再有長期金鑰。練習都在瀏覽器裡做，用虛構的帳號 <code>123456789012</code> 和 GitHub 組織 <code>cafe-org</code>，不需要 AWS 帳號。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>帳號的第一天：root 為什麼不能拿來日常用，開帳號當天要先鎖好哪些東西。</li>
+  <li>policy 與評估規則：讀寫 IAM policy，預測一個請求會被允許還是拒絕，替 cafe-api 只開它真正需要的權限。</li>
+  <li>用角色取代金鑰、GitHub Actions 用 OIDC：程式和部署流程改用會自動過期的臨時憑證，沒有長期金鑰可以外洩。</li>
+  <li>危險寫法與驗證政策：權限開太寬最常見的寫法，以及怎麼在 CI 裡自動檢查政策有沒有被改寬。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../auth/lessons/01-authn-authz.html">Auth 課第 1 課</a>的認證與授權：認證確認「你是誰」，授權決定「你能做什麼」。IAM 兩件事都管。</li>
+  <li><a href="../../auth/lessons/13-openid-connect.html">Auth 課第 13 課</a>的 OpenID Connect：身分提供者簽一張 ID token（一種 JWT，<a href="../../auth/lessons/08-jwt-signatures.html">Auth 課第 8 課</a>），收的一方驗簽章、檢查 claims 才相信它。</li>
+  <li><a href="18-aws-architecture.html">第 18 課</a>的 AWS 元件：EC2 是虛擬機，ECS 跑容器，S3 放檔案，它們都在你的帳號裡。</li>
+</ul></div>
+
+<h2>帳號的第一天：root、MFA 與 Identity Center</h2>
+<p>註冊 AWS 時用的那組 email 和密碼，登入後的身分叫 <strong>root 使用者</strong>（root user）。它對帳號裡所有服務、所有資源都有完整權限；在單獨的帳號裡，任何 IAM 政策都限制不了它（只有加入 AWS Organizations 之後，組織的 SCP 才能限制成員帳號的 root）。root 外洩等於整個帳號外洩，所以它只用在少數「非 root 不可」的操作，例如關閉帳號、變更 root 的 email 或密碼、某些帳單設定。</p>
+<p>開帳號當天要做的事：</p>
+<ol>
+  <li><strong>root 開 MFA</strong>（多因素認證，<a href="../../auth/lessons/14-mfa-totp.html">Auth 課第 14 課</a>）。AWS 現在對 root 預設強制 MFA，但要你自己完成註冊；用實體安全金鑰或 passkey 比簡訊可靠。密碼和 MFA 裝置分開保管，至少兩個人知道怎麼取得。</li>
+  <li><strong>root 不建 access key</strong>。access key 是一組 ID 加上一把私密金鑰（secret access key），讓程式或 CLI 不用登入畫面就能呼叫 AWS API；root 的 access key 等於一把不能被限制的萬能鑰匙。已經建了就刪掉。</li>
+  <li><strong>人員用 IAM Identity Center 登入</strong>。Identity Center 是 AWS 的單一登入（SSO）：每個人有自己的帳號，透過 <strong>permission set</strong>（一組要套用到帳號的權限）拿到權限，登入後拿到的是會過期的臨時憑證。CLI 用 <code>aws configure sso</code> 設定一次，之後 <code>aws sso login</code> 就好，電腦上不會留下長期金鑰。</li>
+  <li><strong>設 Budgets 警示</strong>（<a href="18-aws-architecture.html">第 18 課</a>）。帳號被盜最先出現的徵兆常常是帳單。</li>
+</ol>
+<p>IAM（Identity and Access Management）裡有三種身分，常被混在一起：</p>
+<div class="table-wrap"><table>
+  <tr><th>名稱</th><th>是什麼</th><th>憑證</th><th>什麼時候用</th></tr>
+  <tr><td><strong>IAM user</strong></td><td>帳號裡的一個長期身分</td><td>密碼、長期 access key（<code>AKIA</code> 開頭）</td><td>盡量不用。只剩無法用角色的舊系統</td></tr>
+  <tr><td><strong>IAM group</strong></td><td>一群 user，把政策掛在群組上</td><td>沒有，它不是身分，不能登入</td><td>管理多個 user 的權限</td></tr>
+  <tr><td><strong>IAM role</strong></td><td>一組權限，誰被允許就可以「扮演」（assume）它</td><td>臨時憑證（<code>ASIA</code> 開頭，加上 session token），會過期</td><td>程式、CI、跨帳號存取、人員透過 Identity Center 登入</td></tr>
+</table></div>
+<p>role 和 <a href="../../auth/lessons/18-rbac.html">Auth 課第 18 課</a>的 RBAC 角色是同一個想法：權限綁在角色上，不綁在個人上。差別是 AWS 的 role 本身也是一個身分，扮演它的人拿到的是一組新的、短期的憑證。</p>
+<div class="callout">資深一點的做法是<strong>一個環境一個帳號</strong>：production、staging、開發各自是 AWS Organizations 裡的獨立帳號。帳號是 AWS 最硬的隔離邊界，staging 的權限設錯了，也碰不到 production 的資料。</div>
+<div class="callout practice"><strong>💡 實務上：接手一個舊帳號，先盤點長期金鑰</strong><br>到新公司或接手外包留下的 AWS 帳號，第一件事是下載 <strong>credential report</strong>（IAM 主控台的 Credential report，或 <code>aws iam generate-credential-report</code> 再 <code>aws iam get-credential-report</code>）。它是一份 CSV，每個 user 和 root 一列：有沒有開 MFA、有沒有 access key、金鑰最後一次用在哪天、哪個服務。先找三種：root 有 access key、user 沒開 MFA、很久沒用的金鑰。處理時不要一口氣刪掉，先把金鑰設成 Inactive（停用可以馬上恢復，刪除不行），觀察一兩週沒有東西壞掉再刪。整理成一張表交給主管和資安，每一把金鑰寫上要換成什麼：role、OIDC 或 Identity Center。</div>
+
+<h2>policy 長什麼樣子</h2>
+<p><strong>policy</strong>（政策）是一份 JSON，描述允許或拒絕哪些動作。掛在 user、group、role 身上的叫<strong>身分型政策</strong>（identity-based policy）。下面是 cafe-api 的 role 要用的一段：</p>
+<pre>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "UploadsReadWrite",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject"],
+      "Resource": "arn:aws:s3:::cafe-uploads-prod/uploads/*"
+    }
+  ]
+}</pre>
+<div class="table-wrap"><table>
+  <tr><th>欄位</th><th>意思</th></tr>
+  <tr><td><code>Version</code></td><td>政策語言的版本，固定寫 <code>"2012-10-17"</code>（不是今天的日期）</td></tr>
+  <tr><td><code>Statement</code></td><td>一條條規則，彼此獨立評估</td></tr>
+  <tr><td><code>Sid</code></td><td>這條規則的名字，選填，方便閱讀和查 log</td></tr>
+  <tr><td><code>Effect</code></td><td><code>Allow</code>（允許）或 <code>Deny</code>（拒絕）</td></tr>
+  <tr><td><code>Action</code></td><td>哪些 API 動作，格式是「服務前綴:動作名稱」。可以用萬用字元：<code>*</code> 代表任意多個字元、<code>?</code> 代表一個字元，例如 <code>s3:Get*</code></td></tr>
+  <tr><td><code>Resource</code></td><td>作用在哪些資源，用 ARN 寫，也可以用萬用字元</td></tr>
+  <tr><td><code>Condition</code></td><td>選填，在什麼條件下這條規則才成立</td></tr>
+  <tr><td><code>Principal</code></td><td>對誰。只出現在掛在資源上的政策（例如 bucket policy）和信任政策；身分型政策不寫，因為它掛在誰身上就是對誰</td></tr>
+</table></div>
+<p><strong>ARN</strong>（Amazon Resource Name）是 AWS 資源的完整名稱：<code>arn:aws:服務:region:帳號:資源</code>。S3 的 bucket 名稱全球唯一，所以 region 和帳號兩段是空的：</p>
+<div class="table-wrap"><table>
+  <tr><th>資源</th><th>ARN</th></tr>
+  <tr><td>bucket 本身</td><td><code>arn:aws:s3:::cafe-uploads-prod</code></td></tr>
+  <tr><td>bucket 裡 <code>uploads/</code> 底下的物件</td><td><code>arn:aws:s3:::cafe-uploads-prod/uploads/*</code></td></tr>
+  <tr><td>SSM 參數 <code>/cafe/prod/db-url</code></td><td><code>arn:aws:ssm:ap-east-2:123456789012:parameter/cafe/prod/db-url</code></td></tr>
+  <tr><td>KMS 金鑰</td><td><code>arn:aws:kms:ap-east-2:123456789012:key/0f3a9c2e-…</code></td></tr>
+  <tr><td>IAM role</td><td><code>arn:aws:iam::123456789012:role/cafe-api</code>（IAM 不分 region，region 那段是空的）</td></tr>
+</table></div>
+<p>最常見的錯誤是搞混 <strong>bucket ARN</strong> 和<strong>物件 ARN</strong>。<code>s3:GetObject</code>、<code>s3:PutObject</code> 作用在物件上，Resource 要寫 <code>bucket/路徑</code>；<code>s3:ListBucket</code>（列出 bucket 裡有哪些物件）作用在 bucket 本身，Resource 要寫不含斜線的 bucket ARN。把 ListBucket 的 Resource 寫成 <code>bucket/*</code>，政策存得進去、也不會報錯，只是永遠不會生效：</p>
+<div class="lab"><script type="code">
+// IAM 的萬用字元 * 是任意多個字元（包含 /）；這裡只示範 *
+const like = (pattern: string, value: string) =>
+  new RegExp('^' + pattern.split('*').map(s => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$').test(value)
+
+const bucketArn = 'arn:aws:s3:::cafe-uploads-prod'
+const objectArn = 'arn:aws:s3:::cafe-uploads-prod/uploads/2026/latte.jpg'
+const rule = 'arn:aws:s3:::cafe-uploads-prod/*'
+
+console.log('GetObject 的資源是物件：', like(rule, objectArn))
+console.log('ListBucket 的資源是 bucket：', like(rule, bucketArn))   // 少了結尾的 /，對不上
+console.log('* 會跨過 /：', like('arn:aws:s3:::cafe-uploads-prod/*/latte.jpg', objectArn))
+</script></div>
+<p>ListBucket 要限制只能列某個資料夾，用 <strong>Condition</strong>。S3 在 ListBucket 的請求裡會帶 <code>s3:prefix</code> 這個<strong>條件鍵</strong>（condition key），值是使用者要列的前綴：</p>
+<pre>{
+  "Effect": "Allow",
+  "Action": "s3:ListBucket",
+  "Resource": "arn:aws:s3:::cafe-uploads-prod",
+  "Condition": { "StringLike": { "s3:prefix": "uploads/*" } }
+}</pre>
+<p>Condition 的結構是「運算子 → 條件鍵 → 值」。規則：</p>
+<ul>
+  <li><code>StringEquals</code> 完全相等、<code>StringLike</code> 可以用 <code>*</code> 和 <code>?</code>，兩者都<strong>分大小寫</strong>；<code>StringNotEquals</code>、<code>StringNotLike</code> 是反過來。</li>
+  <li>不同運算子、不同條件鍵之間是「<strong>且</strong>」；同一個條件鍵給多個值（陣列）是「<strong>或</strong>」。</li>
+  <li>請求裡<strong>沒有</strong>這個條件鍵時，<code>StringEquals</code>、<code>StringLike</code> 不成立；<code>StringNotEquals</code>、<code>StringNotLike</code> 反而成立。寫 Deny 時這點很重要。</li>
+</ul>
+<p>其他常見的條件鍵：<code>aws:SourceIp</code>（請求來源 IP，搭配 <code>IpAddress</code> 運算子）、<code>aws:PrincipalTag/team</code>（呼叫者身上的標籤，就是 <a href="../../auth/lessons/19-object-level-authz.html">Auth 課第 19 課</a>的 ABAC：依屬性決定權限）、<code>aws:SecureTransport</code>（是不是走 HTTPS）。</p>
+<div class="callout">Action 的服務前綴和動作名稱<strong>不分大小寫</strong>（<code>s3:GetObject</code> 和 <code>S3:getobject</code> 一樣）；Resource 的 ARN 和 StringEquals 的值<strong>分大小寫</strong>。<code>uploads/</code> 和 <code>Uploads/</code> 是兩個不同的前綴。</div>
+
+<h2>AWS 怎麼決定允許或拒絕</h2>
+<p>每一個 API 請求，AWS 都會把所有適用的政策拿出來評估，順序跟政策寫在哪裡、Statement 排第幾條都無關：</p>
+<figure>
+  <svg viewBox="0 0 700 300" role="img" aria-label="評估流程：先看所有適用政策裡有沒有符合的 Deny，有就是明確拒絕；沒有的話，看身分型或資源型政策裡有沒有任何一條符合的 Allow，有就允許；都沒有就是隱含拒絕。SCP 與 permission boundary 也必須允許，取交集">
+    <defs><marker id="arr19a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="20" y="20" width="200" height="50" rx="8"/>
+    <text class="d-text" x="120" y="42" text-anchor="middle">請求</text>
+    <text class="d-small" x="120" y="60" text-anchor="middle">誰、什麼動作、哪個資源、情境</text>
+    <rect class="d-soft" x="20" y="105" width="200" height="56" rx="8"/>
+    <text class="d-text" x="120" y="128" text-anchor="middle">有任何符合的 Deny？</text>
+    <text class="d-small" x="120" y="147" text-anchor="middle">所有政策、所有 Statement</text>
+    <rect class="d-soft" x="20" y="200" width="200" height="56" rx="8"/>
+    <text class="d-text" x="120" y="223" text-anchor="middle">有任何符合的 Allow？</text>
+    <text class="d-small" x="120" y="242" text-anchor="middle">身分型或資源型，任一即可</text>
+    <rect class="d-box" x="290" y="108" width="170" height="50" rx="8"/>
+    <text class="d-accent" x="375" y="130" text-anchor="middle">明確拒絕</text>
+    <text class="d-small" x="375" y="148" text-anchor="middle">explicitDeny，誰都蓋不過</text>
+    <rect class="d-box" x="290" y="203" width="170" height="50" rx="8"/>
+    <text class="d-accent" x="375" y="225" text-anchor="middle">允許</text>
+    <text class="d-small" x="375" y="243" text-anchor="middle">allowed</text>
+    <rect class="d-box" x="20" y="270" width="200" height="26" rx="6"/>
+    <text class="d-small" x="120" y="288" text-anchor="middle">都沒有 → 隱含拒絕 implicitDeny</text>
+    <line class="d-line" x1="120" y1="70" x2="120" y2="103" marker-end="url(#arr19a)"/>
+    <line class="d-line" x1="220" y1="133" x2="288" y2="133" marker-end="url(#arr19a)"/>
+    <text class="d-small" x="254" y="126" text-anchor="middle">有</text>
+    <line class="d-line" x1="120" y1="161" x2="120" y2="198" marker-end="url(#arr19a)"/>
+    <text class="d-small" x="132" y="184">沒有</text>
+    <line class="d-line" x1="220" y1="228" x2="288" y2="228" marker-end="url(#arr19a)"/>
+    <text class="d-small" x="254" y="221" text-anchor="middle">有</text>
+    <line class="d-line" x1="120" y1="256" x2="120" y2="268" marker-end="url(#arr19a)"/>
+    <rect class="d-soft" x="490" y="20" width="195" height="236" rx="8"/>
+    <text class="d-text" x="505" y="45">另外還要通過（取交集）</text>
+    <text class="d-small" x="505" y="72">SCP／RCP：組織對整個</text>
+    <text class="d-small" x="505" y="90">帳號設的上限</text>
+    <text class="d-small" x="505" y="118">permission boundary：</text>
+    <text class="d-small" x="505" y="136">某個 role 能拿到的上限</text>
+    <text class="d-small" x="505" y="164">它們只能「收窄」，</text>
+    <text class="d-small" x="505" y="182">本身不給任何權限</text>
+    <text class="d-small" x="505" y="210">跨帳號存取：兩邊的政策</text>
+    <text class="d-small" x="505" y="228">都要允許</text>
+  </svg>
+  <figcaption>同一個帳號內的評估：預設拒絕、明確拒絕優先、身分型與資源型政策取聯集。</figcaption>
+</figure>
+<p>三個名詞：</p>
+<ul>
+  <li><strong>隱含拒絕</strong>（implicit deny）：沒有任何 Allow 符合，就拒絕。AWS 預設什麼都不給，所以新建的 role 什麼都不能做。</li>
+  <li><strong>明確拒絕</strong>（explicit deny）：有一條 <code>"Effect": "Deny"</code> 符合，就拒絕，不管別處有多大的 Allow。Deny 用來畫一條誰都跨不過的線，例如「production 的 bucket 任何人都不能刪物件」。</li>
+  <li><strong>資源型政策</strong>（resource-based policy）：掛在資源上的政策，例如 S3 的 bucket policy、KMS 的 key policy。它有 <code>Principal</code>，說明對誰。同一個帳號內，身分型和資源型政策<strong>取聯集</strong>：任一邊允許、而且沒有 Deny，就允許。</li>
+</ul>
+<p>右邊那一欄是進階的上限機制：組織管理者用 <strong>SCP</strong>（Service Control Policy）規定某些帳號整個不能做什麼（例如不准關掉 CloudTrail），平台團隊用 <strong>permission boundary</strong> 讓開發者可以自己建 role，但建出來的 role 權限不能超過邊界。它們本身不給權限，只會把能拿到的權限再收窄。</p>
+<div class="callout warn">KMS 是例外：每把金鑰都有 key policy，金鑰的權限以它為主。預設的 key policy 把權限交給帳號，帳號裡的 IAM 政策才有作用；如果有人把 key policy 改成只列特定 role，其他人的 IAM 政策寫了 <code>kms:Decrypt</code> 也沒用。查 KMS 權限問題時，兩邊都要看。</div>
+<div class="callout practice"><strong>💡 實務上：看到 AccessDenied，先讀錯誤訊息的後半句</strong><br>cafe-api 上線後最常收到的 IAM 問題就是 AccessDenied。很多服務的錯誤訊息長這樣：<code>User: arn:…:role/cafe-api is not authorized to perform: s3:GetObject on resource: … because no identity-based policy allows the s3:GetObject action</code>。後半句是 <code>because no … policy allows</code> 就是隱含拒絕，去補 Allow；是 <code>with an explicit deny in a service control policy</code> 這類寫法就是明確拒絕，要找那條 Deny，它常常不在你正在看的那份政策裡（可能在 SCP、bucket policy）。不是每個服務都會寫出政策類型。查的順序：先 <code>aws sts get-caller-identity</code> 確認程式到底用了哪個身分（SDK 撿到別組憑證很常見），再看身分型、資源型、SCP、permission boundary。不要為了先讓它動起來就加 <code>s3:*</code>，臨時的寬權限很少有人回來收。</div>
+
+<h2>用角色取代金鑰</h2>
+<p><a href="11-config-secrets.html">第 11 課</a>處理過金鑰外洩：輪替、撤銷、清 git 歷史。最好的處理是根本沒有長期金鑰可以外洩。AWS 的做法是 <strong>STS</strong>（Security Token Service）發<strong>臨時憑證</strong>（temporary credentials）：一組 access key ID、secret、session token，加上到期時間（從十幾分鐘到幾小時），過期就失效。即使被偷，攻擊者能用的時間也很短。</p>
+<p>程式跑在 AWS 上時，不用自己拿憑證：</p>
+<ul>
+  <li><strong>EC2 instance profile</strong>：把一個 role 掛在機器上。機器上的程式向<strong>執行個體中繼資料服務</strong>（IMDS，位址 <code>169.254.169.254</code>）要憑證，AWS 會在到期前自動換新。AWS SDK 預設就會去找它，程式碼裡不用寫任何金鑰。</li>
+  <li><strong>IMDSv2</strong>：要先用 <code>PUT</code> 拿一個 session token，之後的 <code>GET</code> 都要帶著它。這擋掉了一種經典攻擊：程式有 SSRF 漏洞（<a href="../../auth/lessons/22-ssrf.html">Auth 課第 22 課</a>），攻擊者讓伺服器去 GET <code>169.254.169.254</code> 把 role 的憑證讀出來。新的機器一律設成只接受 IMDSv2。</li>
+  <li><strong>ECS task role</strong>：Fargate 上的容器用 task role 拿憑證。注意另一個長得很像的 <strong>task execution role</strong>：那是 ECS 自己用來拉 ECR 映像、寫 log、讀 secret 注入環境變數的，跟你的程式要用的權限分開。</li>
+</ul>
+<pre>同一段程式，不同地方跑：
+  筆電    → aws sso login 拿到的臨時憑證（Identity Center）
+  EC2     → instance profile 的 role
+  Fargate → task role
+  CI      → OIDC 換到的 role（下一節）
+程式碼裡：new S3Client({ region: 'ap-east-2' })，沒有任何金鑰</pre>
+<p>AWS SDK 會依序找環境變數、本機的設定檔、容器或機器的中繼資料，找到第一組就用。所以程式碼完全不必知道憑證從哪來；環境變數裡出現 <code>AWS_SECRET_ACCESS_KEY</code> 本身就是警訊。</p>
+<div class="callout">扮演 role 的權限是兩邊都要同意的：role 的<strong>信任政策</strong>（trust policy）說「誰可以扮演我」，扮演者那邊也要有 <code>sts:AssumeRole</code> 之類的權限（AWS 服務除外）。EC2 和 ECS 的 role，信任政策的 Principal 寫的是 <code>{"Service": "ec2.amazonaws.com"}</code> 或 <code>{"Service": "ecs-tasks.amazonaws.com"}</code>。</div>
+
+<h2>GitHub Actions 用 OIDC 部署</h2>
+<p>CI 跑在 GitHub 的機器上，不是 AWS 的，沒有 instance profile 可以用。以前的做法是把 IAM user 的 access key 放進 repository secrets，<a href="15-ci.html">第 15 課</a>說過這有多危險。現在的做法是 <strong>OIDC 聯合身分</strong>（web identity federation）：GitHub 當身分提供者，替每一次 job 簽一張 JWT，寫明「我是哪個 repo、哪個分支或 environment 的 job」；AWS 驗證簽章、檢查 role 的信任政策，通過就發臨時憑證。這跟 Auth 課第 13 課的 OpenID Connect 是同一套：ID token 就是 JWT，你在網站上驗 Google 的 token，這裡換 AWS 驗 GitHub 的。</p>
+<figure>
+  <svg viewBox="0 0 700 330" role="img" aria-label="時序圖：GitHub Actions 的 job 向 GitHub 的 OIDC 提供者要 token，需要 id-token write 權限；提供者回傳簽好的 JWT；job 把 JWT 和 role ARN 送給 AWS STS 的 AssumeRoleWithWebIdentity；STS 驗證簽章並用信任政策檢查 aud 與 sub；通過後回傳預設 1 小時的臨時憑證；job 用臨時憑證呼叫 ECR 與 ECS 部署">
+    <defs><marker id="arr19b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="10" y="10" width="150" height="40" rx="6"/>
+    <text class="d-text" x="85" y="35" text-anchor="middle">deploy job</text>
+    <rect class="d-box" x="190" y="10" width="150" height="40" rx="6"/>
+    <text class="d-text" x="265" y="35" text-anchor="middle">GitHub OIDC</text>
+    <rect class="d-box" x="370" y="10" width="150" height="40" rx="6"/>
+    <text class="d-text" x="445" y="35" text-anchor="middle">AWS STS</text>
+    <rect class="d-box" x="550" y="10" width="140" height="40" rx="6"/>
+    <text class="d-text" x="620" y="35" text-anchor="middle">ECR／ECS</text>
+    <line class="d-line" x1="85" y1="50" x2="85" y2="320"/>
+    <line class="d-line" x1="265" y1="50" x2="265" y2="320"/>
+    <line class="d-line" x1="445" y1="50" x2="445" y2="320"/>
+    <line class="d-line" x1="620" y1="50" x2="620" y2="320"/>
+    <line class="d-line" x1="85" y1="80" x2="262" y2="80" marker-end="url(#arr19b)"/>
+    <text class="d-small" x="175" y="72" text-anchor="middle">① 要 token（id-token: write）</text>
+    <line class="d-line" x1="265" y1="115" x2="88" y2="115" marker-end="url(#arr19b)"/>
+    <text class="d-small" x="175" y="107" text-anchor="middle">② 簽好的 JWT</text>
+    <text class="d-small" x="175" y="132" text-anchor="middle">iss、aud、sub、exp</text>
+    <line class="d-line" x1="85" y1="165" x2="442" y2="165" marker-end="url(#arr19b)"/>
+    <text class="d-small" x="265" y="157" text-anchor="middle">③ AssumeRoleWithWebIdentity（role ARN＋JWT）</text>
+    <rect class="d-soft" x="350" y="178" width="190" height="62" rx="6"/>
+    <text class="d-small" x="445" y="198" text-anchor="middle">④ 驗簽章、檢查信任政策</text>
+    <text class="d-small" x="445" y="214" text-anchor="middle">aud ＝ sts.amazonaws.com</text>
+    <text class="d-small" x="445" y="230" text-anchor="middle">sub ＝ 指定的 repo＋環境</text>
+    <line class="d-line" x1="445" y1="262" x2="88" y2="262" marker-end="url(#arr19b)"/>
+    <text class="d-small" x="265" y="254" text-anchor="middle">⑤ 臨時憑證（預設 1 小時）</text>
+    <line class="d-line" x1="85" y1="300" x2="617" y2="300" marker-end="url(#arr19b)"/>
+    <text class="d-small" x="350" y="292" text-anchor="middle">⑥ 用臨時憑證推映像、更新服務</text>
+  </svg>
+  <figcaption>整個流程裡沒有任何長期金鑰：GitHub 的 token 幾分鐘就過期，AWS 的憑證預設 1 小時。</figcaption>
+</figure>
+<p>token 裡跟授權有關的 claims：</p>
+<div class="table-wrap"><table>
+  <tr><th>claim</th><th>值</th><th>意思</th></tr>
+  <tr><td><code>iss</code></td><td><code>https://token.actions.githubusercontent.com</code></td><td>簽發者，AWS 用它找到對應的 OIDC provider 與公鑰</td></tr>
+  <tr><td><code>aud</code></td><td><code>sts.amazonaws.com</code></td><td>這張 token 是給誰的。官方的 <code>configure-aws-credentials</code> 預設要這個值</td></tr>
+  <tr><td><code>sub</code></td><td><code>repo:cafe-org/cafe-api:environment:production</code></td><td>哪個 repo 的哪種 job。job 有 <code>environment</code> 時是 <code>…:environment:名稱</code>；沒有時，PR 觸發的是 <code>…:pull_request</code>，其他是 <code>…:ref:refs/heads/分支</code> 或 <code>…:ref:refs/tags/標籤</code></td></tr>
+</table></div>
+<div class="lab"><script type="code">
+// JWT 的 payload 只是 base64url 編碼的 JSON（Auth 課第 8 課）；這是一張範例 token 的 payload
+const b64url = (s: string) => btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+const payload = b64url(JSON.stringify({
+  iss: 'https://token.actions.githubusercontent.com',
+  aud: 'sts.amazonaws.com',
+  sub: 'repo:cafe-org/cafe-api:environment:production',
+  repository: 'cafe-org/cafe-api',
+  environment: 'production',
+  ref: 'refs/heads/main',
+  exp: 1793520300,
+}))
+const token = 'eyJhbGciOiJSUzI1NiJ9.' + payload + '.簽章'
+
+const claims = JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')))
+console.log('aud:', claims.aud)
+console.log('sub:', claims.sub)
+console.log('注意 sub 裡沒有 main：有 environment 的 job，sub 用 environment 取代分支')
+</script></div>
+<p>在 AWS 這邊要做兩件事。第一，在 IAM 建一個 OIDC provider，URL 是 <code>https://token.actions.githubusercontent.com</code>、audience 是 <code>sts.amazonaws.com</code>，它的 ARN 是 <code>arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com</code>。第二，建 role <code>cafe-deploy-prod</code>，信任政策寫：</p>
+<pre>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com" },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+        "token.actions.githubusercontent.com:sub": "repo:…（練習 3 要你寫）"
+      }
+    }
+  }]
+}</pre>
+<p><code>sub</code> 是整個設定裡最重要的一行。GitHub 替<strong>每一個</strong> repo 的 workflow 簽 token，簽發者都是同一個。信任政策只檢查 aud 的話，任何人在自己的 repo 寫個 workflow，就能扮演你的部署 role。sub 寫成 <code>repo:cafe-org/*</code>，組織裡任何一個 repo（包括實習生的練習 repo）都能部署 production；寫成 <code>repo:cafe-org/cafe-api:*</code>，任何分支、任何 PR 都能。用 <code>environment:production</code> 綁定，再在 GitHub 把 production environment 設成需要核准、只允許 main 分支部署（<a href="16-cd.html">第 16 課</a>），「誰能拿到 production 權限」就由 GitHub 的核准流程把關。</p>
+<p>workflow 這邊（接第 16 課的 deploy job）：</p>
+<pre>  deploy:
+    runs-on: ubuntu-24.04
+    environment: production
+    permissions:
+      id-token: write    # 讓 job 能向 GitHub 要 OIDC token
+      contents: read
+    steps:
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/cafe-deploy-prod
+          aws-region: ap-east-2
+      - run: aws sts get-caller-identity   # 印出 assumed-role/cafe-deploy-prod/…，確認扮演成功</pre>
+<div class="callout warn">GitHub 從 2026-07-15 起，<strong>新建立</strong>的 repo 預設使用不會變的 sub 格式，把組織與 repo 的數字 ID 加進去，例如 <code>repo:octo-org@123456/octo-repo@456789:ref:refs/heads/main</code>；之前建立的 repo 維持舊格式，除非組織或 repo 選擇改用（改名、轉移也會切換）。數字 ID 的好處是：repo 被刪掉或改名後，別人註冊同名 repo 也拿不到同樣的 sub。寫信任政策前，先確認自己的 repo 是哪一種格式。本課練習的 <code>cafe-org/cafe-api</code> 是舊 repo，用舊格式。</div>
+<div class="callout practice"><strong>💡 實務上：把 CI 裡的 access key 換成 OIDC，不中斷部署的順序</strong><br>很多團隊的 repository secrets 裡還躺著 <code>AWS_ACCESS_KEY_ID</code>。換掉的順序：① 建 OIDC provider 和 <code>cafe-deploy-prod</code> role，權限先跟舊 user 一樣；② workflow 改用 <code>role-to-assume</code>，部署一次，確認 <code>aws sts get-caller-identity</code> 印出的是 role；③ 刪掉 repository secrets 裡的兩個金鑰；④ 舊 access key 設成 Inactive，用 credential report 或 <code>aws iam get-access-key-last-used</code> 確認沒有其他地方還在用，再刪掉 user；⑤ 最後才收窄 role 的權限（只留推 ECR、更新 ECS 服務需要的）。staging 和 production 各用一個 role、各綁自己的 environment，staging 的 workflow 出事也拿不到 production 的權限。</div>
+
+<h2>危險寫法</h2>
+<p>最小權限（least privilege）是只給完成工作所需的最少權限。真實帳號裡最常看到的違反方式：</p>
+<div class="table-wrap"><table>
+  <tr><th>寫法</th><th>問題</th><th>改成</th></tr>
+  <tr><td><code>"Action": "*", "Resource": "*"</code></td><td>就是管理員，外洩一次全帳號淪陷</td><td>列出實際用到的動作與資源</td></tr>
+  <tr><td><code>s3:*</code> 對整個 bucket</td><td>包含刪物件、改 ACL、改 bucket policy；也碰得到不該碰的前綴</td><td>只列 <code>s3:GetObject</code>、<code>s3:PutObject</code>，Resource 限定前綴</td></tr>
+  <tr><td><code>iam:PassRole</code> 給 <code>*</code></td><td><strong>PassRole</strong> 是「把某個 role 交給 AWS 服務去用」的權限（例如建 EC2 時指定 instance profile）。給 <code>*</code> 時，只能開機器的人可以把管理員 role 掛到新機器上，再從機器上拿到管理員憑證，變相提權</td><td>Resource 寫具體的 role ARN，加 <code>iam:PassedToService</code> 條件</td></tr>
+  <tr><td><code>Allow</code> 搭配 <code>NotAction</code></td><td>「除了這些以外全部允許」，連 AWS 以後新增的服務也自動允許</td><td>Allow 只用 Action 白名單；NotAction 只適合搭配 Deny</td></tr>
+  <tr><td>bucket policy 的 <code>"Principal": "*"</code> 搭 Allow</td><td>全世界都能存取（Block Public Access 開著時會擋下，被關掉就公開了）</td><td>Principal 寫具體的 role；要公開的檔案走 CloudFront</td></tr>
+  <tr><td>OIDC 信任政策沒有 <code>sub</code></td><td>任何 GitHub repo 都能扮演</td><td>sub 用 StringEquals 寫死 repo 與 environment</td></tr>
+</table></div>
+<p>AWS 的 <strong>IAM Access Analyzer</strong> 能幫忙抓：在主控台編輯政策時，它的<strong>政策驗證</strong>會即時列出語法錯誤與安全警告（例如 PassRole 搭 <code>*</code>），CLI 是 <code>aws accessanalyzer validate-policy</code>；<strong>未使用的存取</strong>分析會列出 90 天沒用過的權限和 role，讓你慢慢收窄（這個要另外付費）。實務上常見的節奏是：先給一個合理的範圍上線，看 CloudTrail 裡實際呼叫了哪些 API，再把沒用到的拿掉。</p>
+
+<h2>驗證政策：simulate-custom-policy</h2>
+<p>寫完政策，不必真的去刪檔案才知道擋不擋得住。<code>aws iam simulate-custom-policy</code> 把政策 JSON 和一組「動作＋資源＋條件鍵」交給 IAM 評估，<strong>不會執行任何動作，資源也不必存在</strong>，回傳的 <code>EvalDecision</code> 是 <code>allowed</code>、<code>explicitDeny</code> 或 <code>implicitDeny</code>，就是上面流程圖的三個結果。它需要一個 AWS 帳號和 <code>iam:SimulateCustomPolicy</code> 權限，本課的練習用不到，有帳號時可以這樣試：</p>
+<pre>aws sts get-caller-identity          # 先確認自己是誰、在哪個帳號
+
+aws iam simulate-custom-policy \
+  --policy-input-list file://cafe-api-policy.json \
+  --action-names s3:GetObject s3:DeleteObject \
+  --resource-arns arn:aws:s3:::cafe-uploads-prod/uploads/a.jpg arn:aws:s3:::cafe-uploads-prod/private/a.csv \
+  --query 'EvaluationResults[].[EvalActionName,EvalResourceName,EvalDecision]' --output table
+
+aws iam simulate-custom-policy \
+  --policy-input-list file://cafe-api-policy.json \
+  --action-names s3:ListBucket --resource-arns arn:aws:s3:::cafe-uploads-prod \
+  --context-entries ContextKeyName=s3:prefix,ContextKeyValues=private/,ContextKeyType=string</pre>
+<p>把「應該允許」和「應該拒絕」的請求各列一組，放進 CI 每次跑，政策被誰改寬了就會失敗。練習 1、3 的隱藏測試就是這樣做的，只是評估器在瀏覽器裡。</p>
+
+<h2>練習</h2>
+<p>三題都是 TypeScript。政策用物件寫，跟 JSON 的差別只在 key 不用加引號；型別已經宣告好，<code>Effect</code> 寫錯字會直接報錯。</p>
+
+<div class="exercise">
+  <p>練習 1：寫出最小權限的政策。替 cafe-api 的 role 完成 <code>policy</code>，只能：在 <code>cafe-uploads-prod</code> 的 <code>uploads/</code> 底下 <code>s3:PutObject</code> 與 <code>s3:GetObject</code>；<code>s3:ListBucket</code> 只能列 <code>uploads/</code> 開頭的前綴（用 <code>s3:prefix</code> 條件）；用 <code>ssm:GetParameter</code>、<code>ssm:GetParameters</code> 讀 <code>ap-east-2</code> 帳號 <code>123456789012</code> 裡 <code>/cafe/prod/</code> 底下的參數；用 <code>kms:Decrypt</code> 解密，但只限 <code>KEY_ARN</code> 這把金鑰。不能用 <code>*</code>、<code>s3:*</code>、<code>NotAction</code>，Resource 不能只寫 <code>*</code>。測試會用一個 IAM 評估器檢查一組該允許與該拒絕的請求。</p>
+  <script type="start">
+type Condition = Record<string, Record<string, string | string[]>>
+type Statement = {
+  Sid?: string
+  Effect: 'Allow' | 'Deny'
+  Action?: string | string[]
+  NotAction?: string | string[]
+  Resource: string | string[]
+  Condition?: Condition
+}
+type Policy = { Version: '2012-10-17', Statement: Statement[] }
+
+const BUCKET = 'cafe-uploads-prod'
+const KEY_ARN = 'arn:aws:kms:ap-east-2:123456789012:key/0f3a9c2e-7b41-4d8e-a5c6-2e9b8d1f4a70'
+
+// cafe-api 的 role 要用的權限政策
+const policy: Policy = {
+  Version: '2012-10-17',
+  Statement: [
+  ],
+}
+
+console.log(JSON.stringify(policy, null, 2))
+</script>
+  <script type="answer">
+type Condition = Record<string, Record<string, string | string[]>>
+type Statement = {
+  Sid?: string
+  Effect: 'Allow' | 'Deny'
+  Action?: string | string[]
+  NotAction?: string | string[]
+  Resource: string | string[]
+  Condition?: Condition
+}
+type Policy = { Version: '2012-10-17', Statement: Statement[] }
+
+const BUCKET = 'cafe-uploads-prod'
+const KEY_ARN = 'arn:aws:kms:ap-east-2:123456789012:key/0f3a9c2e-7b41-4d8e-a5c6-2e9b8d1f4a70'
+
+// cafe-api 的 role 要用的權限政策
+const policy: Policy = {
+  Version: '2012-10-17',
+  Statement: [
+    {
+      Sid: 'UploadsReadWrite',
+      Effect: 'Allow',
+      Action: ['s3:PutObject', 's3:GetObject'],
+      Resource: `arn:aws:s3:::${BUCKET}/uploads/*`,
+    },
+    {
+      Sid: 'ListUploadsOnly',
+      Effect: 'Allow',
+      Action: 's3:ListBucket',
+      Resource: `arn:aws:s3:::${BUCKET}`,
+      Condition: { StringLike: { 's3:prefix': 'uploads/*' } },
+    },
+    {
+      Sid: 'ReadProdParameters',
+      Effect: 'Allow',
+      Action: ['ssm:GetParameter', 'ssm:GetParameters'],
+      Resource: 'arn:aws:ssm:ap-east-2:123456789012:parameter/cafe/prod/*',
+    },
+    {
+      Sid: 'DecryptWithCafeKey',
+      Effect: 'Allow',
+      Action: 'kms:Decrypt',
+      Resource: KEY_ARN,
+    },
+  ],
+}
+
+console.log(JSON.stringify(policy, null, 2))
+</script>
+  <script type="tests">
+const _list = (v: string | string[] | undefined): string[] => v === undefined ? [] : Array.isArray(v) ? v : [v]
+const _like = (p: string, v: string) => new RegExp('^' + p.split('').map(c => c === '*' ? '.*' : c === '?' ? '.' : c.replace(/[.+^${}()|[\]\\]/g, '\\$&')).join('') + '$').test(v)
+const _cond = (c: Condition | undefined, ctx: Record<string, string>): boolean => {
+  for (const [op, keys] of Object.entries(c ?? {})) {
+    if (!['StringEquals', 'StringLike', 'StringNotEquals', 'StringNotLike'].includes(op)) throw new Error(`測試的評估器只支援 StringEquals、StringLike、StringNotEquals、StringNotLike，收到 ${op}`)
+    for (const [k, vals] of Object.entries(keys)) {
+      const hit = k in ctx && _list(vals).some(p => op.endsWith('Like') ? _like(p, ctx[k]) : p === ctx[k])
+      if (op.startsWith('StringNot') ? hit : !hit) return false
+    }
+  }
+  return true
+}
+const _eval = (action: string, resource: string, ctx: Record<string, string> = {}) => {
+  const hits = policy.Statement.filter(st =>
+    (st.NotAction !== undefined ? !_list(st.NotAction).some(p => _like(p.toLowerCase(), action.toLowerCase())) : _list(st.Action).some(p => _like(p.toLowerCase(), action.toLowerCase())))
+    && _list(st.Resource).some(p => _like(p, resource)) && _cond(st.Condition, ctx))
+  if (hits.some(st => st.Effect === 'Deny')) return 'explicitDeny'
+  return hits.some(st => st.Effect === 'Allow') ? 'allowed' : 'implicitDeny'
+}
+for (const st of policy.Statement) {
+  assert(st.NotAction === undefined, '不要用 NotAction：Allow 搭配 NotAction 等於「除了這些以外全部允許」')
+  assert(!_list(st.Action).includes('*'), 'Action 不能寫 *')
+  assert(!_list(st.Action).some(a => /^s3:\*$/i.test(a)), '不要用 s3:*：它包含刪除物件、改 bucket policy 等動作，只列真正需要的 Action')
+  assert(!_list(st.Action).some(a => /^(ssm|kms):\*$/i.test(a)), '不要用 ssm:* 或 kms:*，只列真正需要的 Action')
+  assert(!_list(st.Resource).includes('*'), 'Resource 不能只寫 *，要寫具體的 ARN')
+}
+const _B = 'arn:aws:s3:::cafe-uploads-prod'
+const _P = 'arn:aws:ssm:ap-east-2:123456789012:parameter/cafe'
+const _cases: [string, string, Record<string, string>, boolean, string][] = [
+  ['s3:PutObject', _B + '/uploads/2026/latte.jpg', {}, true, '要能把檔案上傳到 uploads/ 底下'],
+  ['s3:GetObject', _B + '/uploads/a.jpg', {}, true, '要能讀 uploads/ 底下的檔案'],
+  ['s3:ListBucket', _B, { 's3:prefix': 'uploads/' }, true, 'ListBucket 要能列 uploads/。ListBucket 作用在 bucket 本身，Resource 要寫 bucket ARN（沒有 /*）'],
+  ['s3:ListBucket', _B, { 's3:prefix': 'uploads/2026/' }, true, 'ListBucket 要能列 uploads/ 底下的子資料夾'],
+  ['ssm:GetParameter', _P + '/prod/db-url', {}, true, '要能讀 /cafe/prod/db-url'],
+  ['ssm:GetParameters', _P + '/prod/jwt-secret', {}, true, '要能用 GetParameters 讀 /cafe/prod/ 底下的參數'],
+  ['kms:Decrypt', KEY_ARN, {}, true, '要能用 KEY_ARN 這把金鑰解密'],
+  ['s3:GetObject', _B + '/private/salary.csv', {}, false, 'private/ 底下的檔案不能讀：S3 的 Resource 要限定 uploads/ 前綴'],
+  ['s3:PutObject', _B + '/index.html', {}, false, 'bucket 根目錄不能寫：S3 的 Resource 要限定 uploads/ 前綴'],
+  ['s3:GetObject', _B + '/uploads-backup/db.sql', {}, false, 'uploads-backup/ 不是 uploads/：Resource 的前綴要包含結尾的 /'],
+  ['s3:GetObjectAcl', _B + '/uploads/a.jpg', {}, false, '不能讀物件的 ACL：不要用 s3:Get* 這種萬用字元，只列 s3:GetObject'],
+  ['s3:DeleteObject', _B + '/uploads/a.jpg', {}, false, '不能刪物件'],
+  ['s3:PutObjectAcl', _B + '/uploads/a.jpg', {}, false, '不能改物件的 ACL'],
+  ['s3:GetObject', 'arn:aws:s3:::cafe-uploads-staging/uploads/a.jpg', {}, false, '別的 bucket 不能讀'],
+  ['s3:ListBucket', _B, { 's3:prefix': 'uploads-backup/' }, false, 'ListBucket 不能列 uploads-backup/：s3:prefix 的條件值要包含結尾的 /'],
+  ['s3:ListBucket', _B, { 's3:prefix': 'private/' }, false, 'ListBucket 不能列 private/：用 s3:prefix 條件限制前綴'],
+  ['s3:ListBucket', _B, {}, false, '沒帶前綴（列整個 bucket）要被拒絕：用 s3:prefix 條件限制前綴'],
+  ['s3:ListBucket', _B, { 's3:prefix': '' }, false, '空前綴等於列整個 bucket，要被拒絕'],
+  ['s3:PutBucketPolicy', _B, {}, false, '不能改 bucket policy'],
+  ['ssm:GetParameter', _P + '/staging/db-url', {}, false, 'staging 的參數不能讀'],
+  ['ssm:PutParameter', _P + '/prod/db-url', {}, false, '不能寫參數'],
+  ['ssm:DeleteParameter', _P + '/prod/db-url', {}, false, '不能刪參數'],
+  ['kms:Decrypt', 'arn:aws:kms:ap-east-2:123456789012:key/11111111-2222-3333-4444-555555555555', {}, false, '別的金鑰不能用：kms:Decrypt 的 Resource 要寫 KEY_ARN'],
+  ['kms:ScheduleKeyDeletion', KEY_ARN, {}, false, '不能排程刪除金鑰'],
+  ['iam:PassRole', 'arn:aws:iam::123456789012:role/admin', {}, false, '不能 PassRole'],
+]
+for (const [action, resource, ctx, want, msg] of _cases) {
+  const got = _eval(action, resource, ctx)
+  assert.equal(got === 'allowed', want, `${action} ${resource}${'s3:prefix' in ctx ? `（s3:prefix='${ctx['s3:prefix']}'）` : ''} 應該${want ? '允許' : '拒絕'}，結果是 ${got}：${msg}`)
+}
+</script>
+  <script type="wrong" data-name="前綴少了結尾的 /">
+type Condition = Record<string, Record<string, string | string[]>>
+type Statement = {
+  Sid?: string
+  Effect: 'Allow' | 'Deny'
+  Action?: string | string[]
+  NotAction?: string | string[]
+  Resource: string | string[]
+  Condition?: Condition
+}
+type Policy = { Version: '2012-10-17', Statement: Statement[] }
+
+const BUCKET = 'cafe-uploads-prod'
+const KEY_ARN = 'arn:aws:kms:ap-east-2:123456789012:key/0f3a9c2e-7b41-4d8e-a5c6-2e9b8d1f4a70'
+
+// cafe-api 的 role 要用的權限政策
+const policy: Policy = {
+  Version: '2012-10-17',
+  Statement: [
+    {
+      Sid: 'UploadsReadWrite',
+      Effect: 'Allow',
+      Action: ['s3:PutObject', 's3:GetObject'],
+      Resource: `arn:aws:s3:::${BUCKET}/uploads*`,
+    },
+    {
+      Sid: 'ListUploadsOnly',
+      Effect: 'Allow',
+      Action: 's3:ListBucket',
+      Resource: `arn:aws:s3:::${BUCKET}`,
+      Condition: { StringLike: { 's3:prefix': 'uploads*' } },
+    },
+    {
+      Sid: 'ReadProdParameters',
+      Effect: 'Allow',
+      Action: ['ssm:GetParameter', 'ssm:GetParameters'],
+      Resource: 'arn:aws:ssm:ap-east-2:123456789012:parameter/cafe/prod/*',
+    },
+    {
+      Sid: 'DecryptWithCafeKey',
+      Effect: 'Allow',
+      Action: 'kms:Decrypt',
+      Resource: KEY_ARN,
+    },
+  ],
+}
+
+console.log(JSON.stringify(policy, null, 2))
+</script>
+  <script type="wrong" data-name="s3:Get* 與 s3:PutObject">
+type Condition = Record<string, Record<string, string | string[]>>
+type Statement = {
+  Sid?: string
+  Effect: 'Allow' | 'Deny'
+  Action?: string | string[]
+  NotAction?: string | string[]
+  Resource: string | string[]
+  Condition?: Condition
+}
+type Policy = { Version: '2012-10-17', Statement: Statement[] }
+
+const BUCKET = 'cafe-uploads-prod'
+const KEY_ARN = 'arn:aws:kms:ap-east-2:123456789012:key/0f3a9c2e-7b41-4d8e-a5c6-2e9b8d1f4a70'
+
+// cafe-api 的 role 要用的權限政策
+const policy: Policy = {
+  Version: '2012-10-17',
+  Statement: [
+    {
+      Sid: 'UploadsReadWrite',
+      Effect: 'Allow',
+      Action: ['s3:PutObject', 's3:Get*'],
+      Resource: `arn:aws:s3:::${BUCKET}/uploads/*`,
+    },
+    {
+      Sid: 'ListUploadsOnly',
+      Effect: 'Allow',
+      Action: 's3:ListBucket',
+      Resource: `arn:aws:s3:::${BUCKET}`,
+      Condition: { StringLike: { 's3:prefix': 'uploads/*' } },
+    },
+    {
+      Sid: 'ReadProdParameters',
+      Effect: 'Allow',
+      Action: ['ssm:GetParameter', 'ssm:GetParameters'],
+      Resource: 'arn:aws:ssm:ap-east-2:123456789012:parameter/cafe/prod/*',
+    },
+    {
+      Sid: 'DecryptWithCafeKey',
+      Effect: 'Allow',
+      Action: 'kms:Decrypt',
+      Resource: KEY_ARN,
+    },
+  ],
+}
+
+console.log(JSON.stringify(policy, null, 2))
+</script>
+  <script type="wrong" data-name="Resource 寫整個 bucket">
+type Condition = Record<string, Record<string, string | string[]>>
+type Statement = {
+  Sid?: string
+  Effect: 'Allow' | 'Deny'
+  Action?: string | string[]
+  NotAction?: string | string[]
+  Resource: string | string[]
+  Condition?: Condition
+}
+type Policy = { Version: '2012-10-17', Statement: Statement[] }
+
+const BUCKET = 'cafe-uploads-prod'
+const KEY_ARN = 'arn:aws:kms:ap-east-2:123456789012:key/0f3a9c2e-7b41-4d8e-a5c6-2e9b8d1f4a70'
+
+// cafe-api 的 role 要用的權限政策
+const policy: Policy = {
+  Version: '2012-10-17',
+  Statement: [
+    {
+      Sid: 'UploadsReadWrite',
+      Effect: 'Allow',
+      Action: ['s3:PutObject', 's3:GetObject'],
+      Resource: `arn:aws:s3:::${BUCKET}/*`,
+    },
+    {
+      Sid: 'ListUploadsOnly',
+      Effect: 'Allow',
+      Action: 's3:ListBucket',
+      Resource: `arn:aws:s3:::${BUCKET}`,
+      Condition: { StringLike: { 's3:prefix': 'uploads/*' } },
+    },
+    {
+      Sid: 'ReadProdParameters',
+      Effect: 'Allow',
+      Action: ['ssm:GetParameter', 'ssm:GetParameters'],
+      Resource: 'arn:aws:ssm:ap-east-2:123456789012:parameter/cafe/prod/*',
+    },
+    {
+      Sid: 'DecryptWithCafeKey',
+      Effect: 'Allow',
+      Action: 'kms:Decrypt',
+      Resource: KEY_ARN,
+    },
+  ],
+}
+
+console.log(JSON.stringify(policy, null, 2))
+</script>
+  <script type="wrong" data-name="ListBucket 用物件 ARN">
+type Condition = Record<string, Record<string, string | string[]>>
+type Statement = {
+  Sid?: string
+  Effect: 'Allow' | 'Deny'
+  Action?: string | string[]
+  NotAction?: string | string[]
+  Resource: string | string[]
+  Condition?: Condition
+}
+type Policy = { Version: '2012-10-17', Statement: Statement[] }
+
+const BUCKET = 'cafe-uploads-prod'
+const KEY_ARN = 'arn:aws:kms:ap-east-2:123456789012:key/0f3a9c2e-7b41-4d8e-a5c6-2e9b8d1f4a70'
+
+// cafe-api 的 role 要用的權限政策
+const policy: Policy = {
+  Version: '2012-10-17',
+  Statement: [
+    {
+      Sid: 'UploadsReadWrite',
+      Effect: 'Allow',
+      Action: ['s3:PutObject', 's3:GetObject'],
+      Resource: `arn:aws:s3:::${BUCKET}/uploads/*`,
+    },
+    {
+      Sid: 'ListUploadsOnly',
+      Effect: 'Allow',
+      Action: 's3:ListBucket',
+      Resource: `arn:aws:s3:::${BUCKET}/*`,
+      Condition: { StringLike: { 's3:prefix': 'uploads/*' } },
+    },
+    {
+      Sid: 'ReadProdParameters',
+      Effect: 'Allow',
+      Action: ['ssm:GetParameter', 'ssm:GetParameters'],
+      Resource: 'arn:aws:ssm:ap-east-2:123456789012:parameter/cafe/prod/*',
+    },
+    {
+      Sid: 'DecryptWithCafeKey',
+      Effect: 'Allow',
+      Action: 'kms:Decrypt',
+      Resource: KEY_ARN,
+    },
+  ],
+}
+
+console.log(JSON.stringify(policy, null, 2))
+</script>
+  <script type="wrong" data-name="s3:*">
+type Condition = Record<string, Record<string, string | string[]>>
+type Statement = {
+  Sid?: string
+  Effect: 'Allow' | 'Deny'
+  Action?: string | string[]
+  NotAction?: string | string[]
+  Resource: string | string[]
+  Condition?: Condition
+}
+type Policy = { Version: '2012-10-17', Statement: Statement[] }
+
+const BUCKET = 'cafe-uploads-prod'
+const KEY_ARN = 'arn:aws:kms:ap-east-2:123456789012:key/0f3a9c2e-7b41-4d8e-a5c6-2e9b8d1f4a70'
+
+// cafe-api 的 role 要用的權限政策
+const policy: Policy = {
+  Version: '2012-10-17',
+  Statement: [
+    {
+      Sid: 'UploadsReadWrite',
+      Effect: 'Allow',
+      Action: 's3:*',
+      Resource: `arn:aws:s3:::${BUCKET}/uploads/*`,
+    },
+    {
+      Sid: 'ListUploadsOnly',
+      Effect: 'Allow',
+      Action: 's3:ListBucket',
+      Resource: `arn:aws:s3:::${BUCKET}`,
+      Condition: { StringLike: { 's3:prefix': 'uploads/*' } },
+    },
+    {
+      Sid: 'ReadProdParameters',
+      Effect: 'Allow',
+      Action: ['ssm:GetParameter', 'ssm:GetParameters'],
+      Resource: 'arn:aws:ssm:ap-east-2:123456789012:parameter/cafe/prod/*',
+    },
+    {
+      Sid: 'DecryptWithCafeKey',
+      Effect: 'Allow',
+      Action: 'kms:Decrypt',
+      Resource: KEY_ARN,
+    },
+  ],
+}
+
+console.log(JSON.stringify(policy, null, 2))
+</script>
+  <script type="wrong" data-name="沒有 s3:prefix 條件">
+type Condition = Record<string, Record<string, string | string[]>>
+type Statement = {
+  Sid?: string
+  Effect: 'Allow' | 'Deny'
+  Action?: string | string[]
+  NotAction?: string | string[]
+  Resource: string | string[]
+  Condition?: Condition
+}
+type Policy = { Version: '2012-10-17', Statement: Statement[] }
+
+const BUCKET = 'cafe-uploads-prod'
+const KEY_ARN = 'arn:aws:kms:ap-east-2:123456789012:key/0f3a9c2e-7b41-4d8e-a5c6-2e9b8d1f4a70'
+
+// cafe-api 的 role 要用的權限政策
+const policy: Policy = {
+  Version: '2012-10-17',
+  Statement: [
+    {
+      Sid: 'UploadsReadWrite',
+      Effect: 'Allow',
+      Action: ['s3:PutObject', 's3:GetObject'],
+      Resource: `arn:aws:s3:::${BUCKET}/uploads/*`,
+    },
+    {
+      Sid: 'ListUploadsOnly',
+      Effect: 'Allow',
+      Action: 's3:ListBucket',
+      Resource: `arn:aws:s3:::${BUCKET}`,
+    },
+    {
+      Sid: 'ReadProdParameters',
+      Effect: 'Allow',
+      Action: ['ssm:GetParameter', 'ssm:GetParameters'],
+      Resource: 'arn:aws:ssm:ap-east-2:123456789012:parameter/cafe/prod/*',
+    },
+    {
+      Sid: 'DecryptWithCafeKey',
+      Effect: 'Allow',
+      Action: 'kms:Decrypt',
+      Resource: KEY_ARN,
+    },
+  ],
+}
+
+console.log(JSON.stringify(policy, null, 2))
+</script>
+  <script type="wrong" data-name="任何 KMS 金鑰">
+type Condition = Record<string, Record<string, string | string[]>>
+type Statement = {
+  Sid?: string
+  Effect: 'Allow' | 'Deny'
+  Action?: string | string[]
+  NotAction?: string | string[]
+  Resource: string | string[]
+  Condition?: Condition
+}
+type Policy = { Version: '2012-10-17', Statement: Statement[] }
+
+const BUCKET = 'cafe-uploads-prod'
+const KEY_ARN = 'arn:aws:kms:ap-east-2:123456789012:key/0f3a9c2e-7b41-4d8e-a5c6-2e9b8d1f4a70'
+
+// cafe-api 的 role 要用的權限政策
+const policy: Policy = {
+  Version: '2012-10-17',
+  Statement: [
+    {
+      Sid: 'UploadsReadWrite',
+      Effect: 'Allow',
+      Action: ['s3:PutObject', 's3:GetObject'],
+      Resource: `arn:aws:s3:::${BUCKET}/uploads/*`,
+    },
+    {
+      Sid: 'ListUploadsOnly',
+      Effect: 'Allow',
+      Action: 's3:ListBucket',
+      Resource: `arn:aws:s3:::${BUCKET}`,
+      Condition: { StringLike: { 's3:prefix': 'uploads/*' } },
+    },
+    {
+      Sid: 'ReadProdParameters',
+      Effect: 'Allow',
+      Action: ['ssm:GetParameter', 'ssm:GetParameters'],
+      Resource: 'arn:aws:ssm:ap-east-2:123456789012:parameter/cafe/prod/*',
+    },
+    {
+      Sid: 'DecryptWithCafeKey',
+      Effect: 'Allow',
+      Action: 'kms:Decrypt',
+      Resource: 'arn:aws:kms:ap-east-2:123456789012:key/*',
+    },
+  ],
+}
+
+console.log(JSON.stringify(policy, null, 2))
+</script>
+  <script type="wrong" data-name="所有環境的參數">
+type Condition = Record<string, Record<string, string | string[]>>
+type Statement = {
+  Sid?: string
+  Effect: 'Allow' | 'Deny'
+  Action?: string | string[]
+  NotAction?: string | string[]
+  Resource: string | string[]
+  Condition?: Condition
+}
+type Policy = { Version: '2012-10-17', Statement: Statement[] }
+
+const BUCKET = 'cafe-uploads-prod'
+const KEY_ARN = 'arn:aws:kms:ap-east-2:123456789012:key/0f3a9c2e-7b41-4d8e-a5c6-2e9b8d1f4a70'
+
+// cafe-api 的 role 要用的權限政策
+const policy: Policy = {
+  Version: '2012-10-17',
+  Statement: [
+    {
+      Sid: 'UploadsReadWrite',
+      Effect: 'Allow',
+      Action: ['s3:PutObject', 's3:GetObject'],
+      Resource: `arn:aws:s3:::${BUCKET}/uploads/*`,
+    },
+    {
+      Sid: 'ListUploadsOnly',
+      Effect: 'Allow',
+      Action: 's3:ListBucket',
+      Resource: `arn:aws:s3:::${BUCKET}`,
+      Condition: { StringLike: { 's3:prefix': 'uploads/*' } },
+    },
+    {
+      Sid: 'ReadProdParameters',
+      Effect: 'Allow',
+      Action: ['ssm:GetParameter', 'ssm:GetParameters'],
+      Resource: 'arn:aws:ssm:ap-east-2:123456789012:parameter/cafe/*',
+    },
+    {
+      Sid: 'DecryptWithCafeKey',
+      Effect: 'Allow',
+      Action: 'kms:Decrypt',
+      Resource: KEY_ARN,
+    },
+  ],
+}
+
+console.log(JSON.stringify(policy, null, 2))
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：預測評估結果。實作 <code>conditionMatches</code>、<code>statementMatches</code> 與 <code>evaluate(identity, resource, req)</code>，回傳 <code>'allowed'</code>、<code>'explicitDeny'</code> 或 <code>'implicitDeny'</code>。規則照本課的流程圖：同一帳號內身分型（<code>identity</code>）與資源型（<code>resource</code>）政策取聯集，任何符合的 Deny 優先，Statement 的順序不影響結果。Action 不分大小寫、Resource 與條件值分大小寫；資源型政策的 <code>Principal</code> 是 <code>'*'</code> 或列出的 ARN 之一才適用，身分型政策沒有 <code>Principal</code>；有 <code>NotAction</code> 的 Statement 適用於「不在清單裡」的動作。條件運算子只要支援 <code>StringEquals</code>、<code>StringLike</code>、<code>StringNotEquals</code>、<code>StringNotLike</code>，請求裡沒有該條件鍵時照本課說的規則處理。<code>like</code> 已經寫好，它分大小寫。</p>
+  <script type="start">
+type Condition = Record<string, Record<string, string | string[]>>
+type Statement = {
+  Sid?: string
+  Effect: 'Allow' | 'Deny'
+  Principal?: '*' | { AWS: string | string[] }   // 只有資源型政策（例如 bucket policy）才有
+  Action?: string | string[]
+  NotAction?: string | string[]
+  Resource: string | string[]
+  Condition?: Condition
+}
+type Policy = { Version: '2012-10-17', Statement: Statement[] }
+type Request = { principal: string, action: string, resource: string, context: Record<string, string> }
+type Decision = 'allowed' | 'explicitDeny' | 'implicitDeny'
+
+const list = (v: string | string[] | undefined): string[] => v === undefined ? [] : Array.isArray(v) ? v : [v]
+
+// 萬用字元比對：* 是任意多個字元（可以是 0 個），? 是一個字元；分大小寫
+function like(pattern: string, value: string): boolean {
+  const re = pattern.split('').map(c => c === '*' ? '.*' : c === '?' ? '.' : c.replace(/[.+^${}()|[\]\\]/g, '\\$&')).join('')
+  return new RegExp('^' + re + '$').test(value)
+}
+
+// 不同運算子、不同條件鍵之間是「且」；同一個條件鍵的多個值是「或」
+function conditionMatches(condition: Condition | undefined, context: Record<string, string>): boolean {
+  return true
+}
+
+// Principal、Action（或 NotAction）、Resource、Condition 都符合，這條 Statement 才適用
+function statementMatches(st: Statement, req: Request): boolean {
+  return false
+}
+
+function evaluate(identity: Policy[], resource: Policy[], req: Request): Decision {
+  return 'implicitDeny'
+}
+
+const req: Request = {
+  principal: 'arn:aws:iam::123456789012:role/cafe-api',
+  action: 's3:DeleteObject',
+  resource: 'arn:aws:s3:::cafe-uploads-prod/uploads/a.jpg',
+  context: {},
+}
+const allowAll: Policy = { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: 's3:*', Resource: 'arn:aws:s3:::cafe-uploads-prod/*' }] }
+const denyDelete: Policy = { Version: '2012-10-17', Statement: [{ Effect: 'Deny', Action: 's3:DeleteObject', Resource: '*' }] }
+console.log(evaluate([allowAll], [], req), evaluate([allowAll, denyDelete], [], req))
+</script>
+  <script type="answer">
+type Condition = Record<string, Record<string, string | string[]>>
+type Statement = {
+  Sid?: string
+  Effect: 'Allow' | 'Deny'
+  Principal?: '*' | { AWS: string | string[] }   // 只有資源型政策（例如 bucket policy）才有
+  Action?: string | string[]
+  NotAction?: string | string[]
+  Resource: string | string[]
+  Condition?: Condition
+}
+type Policy = { Version: '2012-10-17', Statement: Statement[] }
+type Request = { principal: string, action: string, resource: string, context: Record<string, string> }
+type Decision = 'allowed' | 'explicitDeny' | 'implicitDeny'
+
+const list = (v: string | string[] | undefined): string[] => v === undefined ? [] : Array.isArray(v) ? v : [v]
+
+// 萬用字元比對：* 是任意多個字元（可以是 0 個），? 是一個字元；分大小寫
+function like(pattern: string, value: string): boolean {
+  const re = pattern.split('').map(c => c === '*' ? '.*' : c === '?' ? '.' : c.replace(/[.+^${}()|[\]\\]/g, '\\$&')).join('')
+  return new RegExp('^' + re + '$').test(value)
+}
+
+// 不同運算子、不同條件鍵之間是「且」；同一個條件鍵的多個值是「或」
+function conditionMatches(condition: Condition | undefined, context: Record<string, string>): boolean {
+  for (const [op, keys] of Object.entries(condition ?? {})) {
+    for (const [key, values] of Object.entries(keys)) {
+      const actual = context[key]
+      // 請求裡沒有這個鍵：一般運算子不成立，Not 開頭的反而成立
+      const hit = actual !== undefined && list(values).some(v => op.endsWith('Like') ? like(v, actual) : v === actual)
+      const negated = op.startsWith('StringNot')
+      if (negated ? hit : !hit) return false
+    }
+  }
+  return true
+}
+
+// Principal、Action（或 NotAction）、Resource、Condition 都符合，這條 Statement 才適用
+function statementMatches(st: Statement, req: Request): boolean {
+  if (st.Principal !== undefined && st.Principal !== '*' && !list(st.Principal.AWS).includes(req.principal)) return false
+  const action = req.action.toLowerCase()
+  const actionIn = (patterns: string[]) => patterns.some(p => like(p.toLowerCase(), action))
+  const actionOk = st.NotAction !== undefined ? !actionIn(list(st.NotAction)) : actionIn(list(st.Action))
+  if (!actionOk) return false
+  if (!list(st.Resource).some(p => like(p, req.resource))) return false
+  return conditionMatches(st.Condition, req.context)
+}
+
+function evaluate(identity: Policy[], resource: Policy[], req: Request): Decision {
+  const matched = identity.concat(resource).flatMap(p => p.Statement).filter(st => statementMatches(st, req))
+  if (matched.some(st => st.Effect === 'Deny')) return 'explicitDeny'
+  if (matched.some(st => st.Effect === 'Allow')) return 'allowed'
+  return 'implicitDeny'
+}
+
+const req: Request = {
+  principal: 'arn:aws:iam::123456789012:role/cafe-api',
+  action: 's3:DeleteObject',
+  resource: 'arn:aws:s3:::cafe-uploads-prod/uploads/a.jpg',
+  context: {},
+}
+const allowAll: Policy = { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: 's3:*', Resource: 'arn:aws:s3:::cafe-uploads-prod/*' }] }
+const denyDelete: Policy = { Version: '2012-10-17', Statement: [{ Effect: 'Deny', Action: 's3:DeleteObject', Resource: '*' }] }
+console.log(evaluate([allowAll], [], req), evaluate([allowAll, denyDelete], [], req))
+</script>
+  <script type="tests">
+const _V = '2012-10-17' as const
+const _pol = (...s: Statement[]): Policy => ({ Version: _V, Statement: s })
+const _me = 'arn:aws:iam::123456789012:role/cafe-api'
+const _other = 'arn:aws:iam::123456789012:role/cafe-report'
+const _B = 'arn:aws:s3:::cafe-uploads-prod'
+const _r = (action: string, resource: string, context: Record<string, string> = {}, principal = _me): Request => ({ principal, action, resource, context })
+const _check = (identity: Policy[], resource: Policy[], req: Request, want: Decision, msg: string) => {
+  const got = evaluate(identity, resource, req)
+  assert.equal(got, want, `${msg}（${req.action} ${req.resource}：應該是 ${want}，結果是 ${got}）`)
+}
+const _s3All = _pol({ Effect: 'Allow', Action: 's3:*', Resource: _B + '/*' })
+const _noDel = _pol({ Effect: 'Deny', Action: 's3:DeleteObject', Resource: '*' })
+_check([], [], _r('s3:GetObject', _B + '/a.jpg'), 'implicitDeny', '沒有任何政策時是隱含拒絕')
+_check([_pol({ Effect: 'Allow', Action: 's3:PutObject', Resource: _B + '/*' })], [], _r('s3:GetObject', _B + '/a.jpg'), 'implicitDeny', '沒有任何 Statement 符合時是 implicitDeny，不是 allowed')
+_check([_s3All], [], _r('s3:GetObject', _B + '/uploads/a.jpg'), 'allowed', 's3:* 包含 s3:GetObject')
+_check([_s3All, _noDel], [], _r('s3:DeleteObject', _B + '/uploads/a.jpg'), 'explicitDeny', '有符合的 Deny 就是明確拒絕，範圍再大的 Allow 也蓋不過')
+_check([_noDel, _s3All], [], _r('s3:DeleteObject', _B + '/uploads/a.jpg'), 'explicitDeny', '政策的順序調換，結果要一樣')
+_check([_pol({ Effect: 'Allow', Action: 's3:*', Resource: '*' }, { Effect: 'Deny', Action: 's3:DeleteObject', Resource: '*' })], [], _r('s3:DeleteObject', _B + '/a'), 'explicitDeny', '同一份政策裡 Allow 寫在前面，Deny 仍然優先')
+_check([_pol({ Effect: 'Deny', Action: 's3:DeleteObject', Resource: '*' }, { Effect: 'Allow', Action: 's3:*', Resource: '*' })], [], _r('s3:GetObject', _B + '/a'), 'allowed', 'Deny 不符合這個動作時，後面的 Allow 仍然有效：不能只看第一條符合的 Statement')
+_check([_s3All, _noDel], [], _r('s3:PutObject', _B + '/uploads/a.jpg'), 'allowed', 'Deny 只擋 DeleteObject，PutObject 仍然允許')
+_check([_pol({ Effect: 'Allow', Action: 's3:GetObject', Resource: _B + '/*' })], [], _r('S3:getobject', _B + '/a.jpg'), 'allowed', 'Action 不分大小寫：S3:getobject 等於 s3:GetObject')
+_check([_pol({ Effect: 'Allow', Action: 'S3:GETOBJECT', Resource: _B + '/*' })], [], _r('s3:GetObject', _B + '/a.jpg'), 'allowed', 'Action 不分大小寫：政策寫 S3:GETOBJECT 也符合 s3:GetObject')
+_check([_pol({ Effect: 'Allow', Action: 's3:*', Resource: '*' }), _pol({ Effect: 'Deny', Action: 'S3:DELETE*', Resource: '*' })], [], _r('s3:DeleteObject', _B + '/a'), 'explicitDeny', 'Deny 的 Action 也不分大小寫')
+_check([_pol({ Effect: 'Allow', Action: 's3:GetObject', Resource: _B + '/Uploads/*' })], [], _r('s3:GetObject', _B + '/uploads/a.jpg'), 'implicitDeny', 'Resource 分大小寫：Uploads/ 和 uploads/ 是不同的前綴')
+_check([_pol({ Effect: 'Allow', Action: 's3:Get*', Resource: _B + '/*' })], [], _r('s3:PutObject', _B + '/a.jpg'), 'implicitDeny', 's3:Get* 不包含 s3:PutObject')
+_check([_pol({ Effect: 'Allow', Action: 's3:GetObject', Resource: _B + '/*/thumbs/*' })], [], _r('s3:GetObject', _B + '/uploads/2026/thumbs/a.jpg'), 'allowed', 'Resource 中間的 * 可以跨過好幾層 /')
+_check([_pol({ Effect: 'Allow', Action: 's3:GetObject', Resource: _B + '/*/thumbs/*' })], [], _r('s3:GetObject', _B + '/uploads/a.jpg'), 'implicitDeny', '路徑裡沒有 /thumbs/ 就不符合')
+_check([_pol({ Effect: 'Allow', Action: 's3:GetObject', Resource: _B + '/v?/menu.json' })], [], _r('s3:GetObject', _B + '/v10/menu.json'), 'implicitDeny', '? 只代表一個字元')
+_check([_pol({ Effect: 'Allow', Action: 's3:GetObject', Resource: ['arn:aws:s3:::other', _B + '/menu/*'] })], [], _r('s3:GetObject', _B + '/menu/a.json'), 'allowed', 'Resource 是陣列時，符合其中一個就好')
+const _tagGate = _pol(
+  { Effect: 'Allow', Action: 'ssm:GetParameter', Resource: 'arn:aws:ssm:ap-east-2:123456789012:parameter/cafe/*' },
+  { Effect: 'Deny', Action: 'ssm:GetParameter', Resource: '*', Condition: { StringNotEquals: { 'aws:PrincipalTag/team': 'backend' } } },
+)
+const _param = 'arn:aws:ssm:ap-east-2:123456789012:parameter/cafe/prod/db-url'
+_check([_tagGate], [], _r('ssm:GetParameter', _param, { 'aws:PrincipalTag/team': 'backend' }), 'allowed', '標籤是 backend，帶條件的 Deny 不成立')
+_check([_tagGate], [], _r('ssm:GetParameter', _param, { 'aws:PrincipalTag/team': 'marketing' }), 'explicitDeny', '標籤不是 backend，StringNotEquals 成立，Deny 生效')
+_check([_tagGate], [], _r('ssm:GetParameter', _param, {}), 'explicitDeny', '請求裡沒有 aws:PrincipalTag/team 時，StringNotEquals 視為成立，Deny 生效')
+const _prefix = _pol({ Effect: 'Allow', Action: 's3:ListBucket', Resource: _B, Condition: { StringLike: { 's3:prefix': 'uploads/*' } } })
+_check([_prefix], [], _r('s3:ListBucket', _B, { 's3:prefix': 'uploads/2026/' }), 'allowed', 'StringLike 可以用 *')
+_check([_prefix], [], _r('s3:ListBucket', _B, { 's3:prefix': 'private/' }), 'implicitDeny', 'prefix 不符合時 Allow 不成立')
+_check([_prefix], [], _r('s3:ListBucket', _B, {}), 'implicitDeny', '請求裡沒有條件鍵時，StringLike 不成立')
+_check([_pol({ Effect: 'Allow', Action: 's3:ListBucket', Resource: _B, Condition: { StringNotLike: { 's3:prefix': 'private/*' } } })], [], _r('s3:ListBucket', _B, {}), 'allowed', '請求裡沒有條件鍵時，StringNotLike 成立')
+_check([_pol({ Effect: 'Allow', Action: 's3:GetObject', Resource: _B + '/*', Condition: { StringEquals: { 'aws:SourceVpce': ['vpce-1a', 'vpce-2b'] } } })], [], _r('s3:GetObject', _B + '/a', { 'aws:SourceVpce': 'vpce-2b' }), 'allowed', '同一個條件鍵有多個值時是「或」')
+const _and = _pol({ Effect: 'Allow', Action: 's3:GetObject', Resource: _B + '/*', Condition: { StringEquals: { 'aws:PrincipalTag/team': 'backend' }, StringLike: { 'aws:PrincipalTag/env': 'prod*' } } })
+_check([_and], [], _r('s3:GetObject', _B + '/a', { 'aws:PrincipalTag/team': 'backend' }), 'implicitDeny', '不同的條件之間是「且」：少了 env 標籤就不成立')
+_check([_and], [], _r('s3:GetObject', _B + '/a', { 'aws:PrincipalTag/team': 'backend', 'aws:PrincipalTag/env': 'prod-tw' }), 'allowed', '兩個條件都成立就允許')
+_check([_and], [], _r('s3:GetObject', _B + '/a', { 'aws:PrincipalTag/team': 'Backend', 'aws:PrincipalTag/env': 'prod' }), 'implicitDeny', 'StringEquals 分大小寫')
+const _bucketPolicy = _pol({ Effect: 'Allow', Principal: { AWS: [_me] }, Action: 's3:GetObject', Resource: _B + '/reports/*' })
+_check([], [_bucketPolicy], _r('s3:GetObject', _B + '/reports/2026-10.csv'), 'allowed', '身分型政策沒有給權限，但 bucket policy 允許這個 principal：同帳號內取聯集，允許')
+_check([], [_bucketPolicy], _r('s3:GetObject', _B + '/reports/2026-10.csv', {}, _other), 'implicitDeny', 'bucket policy 的 Principal 沒有列這個 role，對它不適用')
+_check([], [_pol({ Effect: 'Allow', Principal: '*', Action: 's3:GetObject', Resource: _B + '/public/*' })], _r('s3:GetObject', _B + '/public/menu.json', {}, _other), 'allowed', 'Principal 是 * 時對誰都適用')
+const _vpceOnly = _pol({ Effect: 'Deny', Principal: '*', Action: 's3:*', Resource: _B + '/*', Condition: { StringNotEquals: { 'aws:SourceVpce': 'vpce-1a' } } })
+_check([_s3All], [_vpceOnly], _r('s3:GetObject', _B + '/a', { 'aws:SourceVpce': 'vpce-1a' }), 'allowed', '從指定的 VPC endpoint 來，bucket policy 的 Deny 不成立')
+_check([_s3All], [_vpceOnly], _r('s3:GetObject', _B + '/a'), 'explicitDeny', '不是從 VPC endpoint 來，bucket policy 的 Deny 蓋過身分型的 Allow')
+const _notAction = _pol({ Effect: 'Allow', NotAction: 'iam:*', Resource: '*' })
+_check([_notAction], [], _r('s3:DeleteBucket', _B), 'allowed', 'Allow 搭配 NotAction iam:*：除了 IAM 以外全部允許（所以很危險）')
+_check([_notAction], [], _r('IAM:CreateUser', 'arn:aws:iam::123456789012:user/x'), 'implicitDeny', 'NotAction 的比對也不分大小寫：IAM:CreateUser 在 iam:* 裡，不適用這條 Allow')
+_check([_s3All, _pol({ Effect: 'Deny', NotAction: ['s3:GetObject'], Resource: '*' })], [], _r('s3:PutObject', _B + '/a'), 'explicitDeny', 'Deny 搭配 NotAction：除了 GetObject 以外全部拒絕')
+_check([_s3All, _pol({ Effect: 'Deny', NotAction: ['s3:GetObject'], Resource: '*' })], [], _r('s3:GetObject', _B + '/a'), 'allowed', 'GetObject 在 NotAction 清單裡，Deny 不適用')
+_check([_s3All, _pol({ Effect: 'Deny', Action: 's3:*', Resource: _B + '/private/*' })], [], _r('s3:GetObject', _B + '/uploads/a'), 'allowed', 'Deny 的 Resource 不符合時不適用')
+</script>
+  <script type="wrong" data-name="第一個符合的就決定">
+type Condition = Record<string, Record<string, string | string[]>>
+type Statement = {
+  Sid?: string
+  Effect: 'Allow' | 'Deny'
+  Principal?: '*' | { AWS: string | string[] }   // 只有資源型政策（例如 bucket policy）才有
+  Action?: string | string[]
+  NotAction?: string | string[]
+  Resource: string | string[]
+  Condition?: Condition
+}
+type Policy = { Version: '2012-10-17', Statement: Statement[] }
+type Request = { principal: string, action: string, resource: string, context: Record<string, string> }
+type Decision = 'allowed' | 'explicitDeny' | 'implicitDeny'
+
+const list = (v: string | string[] | undefined): string[] => v === undefined ? [] : Array.isArray(v) ? v : [v]
+
+// 萬用字元比對：* 是任意多個字元（可以是 0 個），? 是一個字元；分大小寫
+function like(pattern: string, value: string): boolean {
+  const re = pattern.split('').map(c => c === '*' ? '.*' : c === '?' ? '.' : c.replace(/[.+^${}()|[\]\\]/g, '\\$&')).join('')
+  return new RegExp('^' + re + '$').test(value)
+}
+
+// 不同運算子、不同條件鍵之間是「且」；同一個條件鍵的多個值是「或」
+function conditionMatches(condition: Condition | undefined, context: Record<string, string>): boolean {
+  for (const [op, keys] of Object.entries(condition ?? {})) {
+    for (const [key, values] of Object.entries(keys)) {
+      const actual = context[key]
+      // 請求裡沒有這個鍵：一般運算子不成立，Not 開頭的反而成立
+      const hit = actual !== undefined && list(values).some(v => op.endsWith('Like') ? like(v, actual) : v === actual)
+      const negated = op.startsWith('StringNot')
+      if (negated ? hit : !hit) return false
+    }
+  }
+  return true
+}
+
+// Principal、Action（或 NotAction）、Resource、Condition 都符合，這條 Statement 才適用
+function statementMatches(st: Statement, req: Request): boolean {
+  if (st.Principal !== undefined && st.Principal !== '*' && !list(st.Principal.AWS).includes(req.principal)) return false
+  const action = req.action.toLowerCase()
+  const actionIn = (patterns: string[]) => patterns.some(p => like(p.toLowerCase(), action))
+  const actionOk = st.NotAction !== undefined ? !actionIn(list(st.NotAction)) : actionIn(list(st.Action))
+  if (!actionOk) return false
+  if (!list(st.Resource).some(p => like(p, req.resource))) return false
+  return conditionMatches(st.Condition, req.context)
+}
+
+function evaluate(identity: Policy[], resource: Policy[], req: Request): Decision {
+  const matched = identity.concat(resource).flatMap(p => p.Statement).filter(st => statementMatches(st, req))
+  const first = matched[0]
+  if (first === undefined) return 'implicitDeny'
+  return first.Effect === 'Deny' ? 'explicitDeny' : 'allowed'
+}
+
+const req: Request = {
+  principal: 'arn:aws:iam::123456789012:role/cafe-api',
+  action: 's3:DeleteObject',
+  resource: 'arn:aws:s3:::cafe-uploads-prod/uploads/a.jpg',
+  context: {},
+}
+const allowAll: Policy = { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: 's3:*', Resource: 'arn:aws:s3:::cafe-uploads-prod/*' }] }
+const denyDelete: Policy = { Version: '2012-10-17', Statement: [{ Effect: 'Deny', Action: 's3:DeleteObject', Resource: '*' }] }
+console.log(evaluate([allowAll], [], req), evaluate([allowAll, denyDelete], [], req))
+</script>
+  <script type="wrong" data-name="Allow 蓋過 Deny">
+type Condition = Record<string, Record<string, string | string[]>>
+type Statement = {
+  Sid?: string
+  Effect: 'Allow' | 'Deny'
+  Principal?: '*' | { AWS: string | string[] }   // 只有資源型政策（例如 bucket policy）才有
+  Action?: string | string[]
+  NotAction?: string | string[]
+  Resource: string | string[]
+  Condition?: Condition
+}
+type Policy = { Version: '2012-10-17', Statement: Statement[] }
+type Request = { principal: string, action: string, resource: string, context: Record<string, string> }
+type Decision = 'allowed' | 'explicitDeny' | 'implicitDeny'
+
+const list = (v: string | string[] | undefined): string[] => v === undefined ? [] : Array.isArray(v) ? v : [v]
+
+// 萬用字元比對：* 是任意多個字元（可以是 0 個），? 是一個字元；分大小寫
+function like(pattern: string, value: string): boolean {
+  const re = pattern.split('').map(c => c === '*' ? '.*' : c === '?' ? '.' : c.replace(/[.+^${}()|[\]\\]/g, '\\$&')).join('')
+  return new RegExp('^' + re + '$').test(value)
+}
+
+// 不同運算子、不同條件鍵之間是「且」；同一個條件鍵的多個值是「或」
+function conditionMatches(condition: Condition | undefined, context: Record<string, string>): boolean {
+  for (const [op, keys] of Object.entries(condition ?? {})) {
+    for (const [key, values] of Object.entries(keys)) {
+      const actual = context[key]
+      // 請求裡沒有這個鍵：一般運算子不成立，Not 開頭的反而成立
+      const hit = actual !== undefined && list(values).some(v => op.endsWith('Like') ? like(v, actual) : v === actual)
+      const negated = op.startsWith('StringNot')
+      if (negated ? hit : !hit) return false
+    }
+  }
+  return true
+}
+
+// Principal、Action（或 NotAction）、Resource、Condition 都符合，這條 Statement 才適用
+function statementMatches(st: Statement, req: Request): boolean {
+  if (st.Principal !== undefined && st.Principal !== '*' && !list(st.Principal.AWS).includes(req.principal)) return false
+  const action = req.action.toLowerCase()
+  const actionIn = (patterns: string[]) => patterns.some(p => like(p.toLowerCase(), action))
+  const actionOk = st.NotAction !== undefined ? !actionIn(list(st.NotAction)) : actionIn(list(st.Action))
+  if (!actionOk) return false
+  if (!list(st.Resource).some(p => like(p, req.resource))) return false
+  return conditionMatches(st.Condition, req.context)
+}
+
+function evaluate(identity: Policy[], resource: Policy[], req: Request): Decision {
+  const matched = identity.concat(resource).flatMap(p => p.Statement).filter(st => statementMatches(st, req))
+  if (matched.some(st => st.Effect === 'Allow')) return 'allowed'
+  if (matched.some(st => st.Effect === 'Deny')) return 'explicitDeny'
+  return 'implicitDeny'
+}
+
+const req: Request = {
+  principal: 'arn:aws:iam::123456789012:role/cafe-api',
+  action: 's3:DeleteObject',
+  resource: 'arn:aws:s3:::cafe-uploads-prod/uploads/a.jpg',
+  context: {},
+}
+const allowAll: Policy = { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: 's3:*', Resource: 'arn:aws:s3:::cafe-uploads-prod/*' }] }
+const denyDelete: Policy = { Version: '2012-10-17', Statement: [{ Effect: 'Deny', Action: 's3:DeleteObject', Resource: '*' }] }
+console.log(evaluate([allowAll], [], req), evaluate([allowAll, denyDelete], [], req))
+</script>
+  <script type="wrong" data-name="預設允許">
+type Condition = Record<string, Record<string, string | string[]>>
+type Statement = {
+  Sid?: string
+  Effect: 'Allow' | 'Deny'
+  Principal?: '*' | { AWS: string | string[] }   // 只有資源型政策（例如 bucket policy）才有
+  Action?: string | string[]
+  NotAction?: string | string[]
+  Resource: string | string[]
+  Condition?: Condition
+}
+type Policy = { Version: '2012-10-17', Statement: Statement[] }
+type Request = { principal: string, action: string, resource: string, context: Record<string, string> }
+type Decision = 'allowed' | 'explicitDeny' | 'implicitDeny'
+
+const list = (v: string | string[] | undefined): string[] => v === undefined ? [] : Array.isArray(v) ? v : [v]
+
+// 萬用字元比對：* 是任意多個字元（可以是 0 個），? 是一個字元；分大小寫
+function like(pattern: string, value: string): boolean {
+  const re = pattern.split('').map(c => c === '*' ? '.*' : c === '?' ? '.' : c.replace(/[.+^${}()|[\]\\]/g, '\\$&')).join('')
+  return new RegExp('^' + re + '$').test(value)
+}
+
+// 不同運算子、不同條件鍵之間是「且」；同一個條件鍵的多個值是「或」
+function conditionMatches(condition: Condition | undefined, context: Record<string, string>): boolean {
+  for (const [op, keys] of Object.entries(condition ?? {})) {
+    for (const [key, values] of Object.entries(keys)) {
+      const actual = context[key]
+      // 請求裡沒有這個鍵：一般運算子不成立，Not 開頭的反而成立
+      const hit = actual !== undefined && list(values).some(v => op.endsWith('Like') ? like(v, actual) : v === actual)
+      const negated = op.startsWith('StringNot')
+      if (negated ? hit : !hit) return false
+    }
+  }
+  return true
+}
+
+// Principal、Action（或 NotAction）、Resource、Condition 都符合，這條 Statement 才適用
+function statementMatches(st: Statement, req: Request): boolean {
+  if (st.Principal !== undefined && st.Principal !== '*' && !list(st.Principal.AWS).includes(req.principal)) return false
+  const action = req.action.toLowerCase()
+  const actionIn = (patterns: string[]) => patterns.some(p => like(p.toLowerCase(), action))
+  const actionOk = st.NotAction !== undefined ? !actionIn(list(st.NotAction)) : actionIn(list(st.Action))
+  if (!actionOk) return false
+  if (!list(st.Resource).some(p => like(p, req.resource))) return false
+  return conditionMatches(st.Condition, req.context)
+}
+
+function evaluate(identity: Policy[], resource: Policy[], req: Request): Decision {
+  const matched = identity.concat(resource).flatMap(p => p.Statement).filter(st => statementMatches(st, req))
+  if (matched.some(st => st.Effect === 'Deny')) return 'explicitDeny'
+  return 'allowed'
+}
+
+const req: Request = {
+  principal: 'arn:aws:iam::123456789012:role/cafe-api',
+  action: 's3:DeleteObject',
+  resource: 'arn:aws:s3:::cafe-uploads-prod/uploads/a.jpg',
+  context: {},
+}
+const allowAll: Policy = { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: 's3:*', Resource: 'arn:aws:s3:::cafe-uploads-prod/*' }] }
+const denyDelete: Policy = { Version: '2012-10-17', Statement: [{ Effect: 'Deny', Action: 's3:DeleteObject', Resource: '*' }] }
+console.log(evaluate([allowAll], [], req), evaluate([allowAll, denyDelete], [], req))
+</script>
+  <script type="wrong" data-name="Action 分大小寫">
+type Condition = Record<string, Record<string, string | string[]>>
+type Statement = {
+  Sid?: string
+  Effect: 'Allow' | 'Deny'
+  Principal?: '*' | { AWS: string | string[] }   // 只有資源型政策（例如 bucket policy）才有
+  Action?: string | string[]
+  NotAction?: string | string[]
+  Resource: string | string[]
+  Condition?: Condition
+}
+type Policy = { Version: '2012-10-17', Statement: Statement[] }
+type Request = { principal: string, action: string, resource: string, context: Record<string, string> }
+type Decision = 'allowed' | 'explicitDeny' | 'implicitDeny'
+
+const list = (v: string | string[] | undefined): string[] => v === undefined ? [] : Array.isArray(v) ? v : [v]
+
+// 萬用字元比對：* 是任意多個字元（可以是 0 個），? 是一個字元；分大小寫
+function like(pattern: string, value: string): boolean {
+  const re = pattern.split('').map(c => c === '*' ? '.*' : c === '?' ? '.' : c.replace(/[.+^${}()|[\]\\]/g, '\\$&')).join('')
+  return new RegExp('^' + re + '$').test(value)
+}
+
+// 不同運算子、不同條件鍵之間是「且」；同一個條件鍵的多個值是「或」
+function conditionMatches(condition: Condition | undefined, context: Record<string, string>): boolean {
+  for (const [op, keys] of Object.entries(condition ?? {})) {
+    for (const [key, values] of Object.entries(keys)) {
+      const actual = context[key]
+      // 請求裡沒有這個鍵：一般運算子不成立，Not 開頭的反而成立
+      const hit = actual !== undefined && list(values).some(v => op.endsWith('Like') ? like(v, actual) : v === actual)
+      const negated = op.startsWith('StringNot')
+      if (negated ? hit : !hit) return false
+    }
+  }
+  return true
+}
+
+// Principal、Action（或 NotAction）、Resource、Condition 都符合，這條 Statement 才適用
+function statementMatches(st: Statement, req: Request): boolean {
+  if (st.Principal !== undefined && st.Principal !== '*' && !list(st.Principal.AWS).includes(req.principal)) return false
+  const action = req.action
+  const actionIn = (patterns: string[]) => patterns.some(p => like(p, action))
+  const actionOk = st.NotAction !== undefined ? !actionIn(list(st.NotAction)) : actionIn(list(st.Action))
+  if (!actionOk) return false
+  if (!list(st.Resource).some(p => like(p, req.resource))) return false
+  return conditionMatches(st.Condition, req.context)
+}
+
+function evaluate(identity: Policy[], resource: Policy[], req: Request): Decision {
+  const matched = identity.concat(resource).flatMap(p => p.Statement).filter(st => statementMatches(st, req))
+  if (matched.some(st => st.Effect === 'Deny')) return 'explicitDeny'
+  if (matched.some(st => st.Effect === 'Allow')) return 'allowed'
+  return 'implicitDeny'
+}
+
+const req: Request = {
+  principal: 'arn:aws:iam::123456789012:role/cafe-api',
+  action: 's3:DeleteObject',
+  resource: 'arn:aws:s3:::cafe-uploads-prod/uploads/a.jpg',
+  context: {},
+}
+const allowAll: Policy = { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: 's3:*', Resource: 'arn:aws:s3:::cafe-uploads-prod/*' }] }
+const denyDelete: Policy = { Version: '2012-10-17', Statement: [{ Effect: 'Deny', Action: 's3:DeleteObject', Resource: '*' }] }
+console.log(evaluate([allowAll], [], req), evaluate([allowAll, denyDelete], [], req))
+</script>
+  <script type="wrong" data-name="Resource 不分大小寫">
+type Condition = Record<string, Record<string, string | string[]>>
+type Statement = {
+  Sid?: string
+  Effect: 'Allow' | 'Deny'
+  Principal?: '*' | { AWS: string | string[] }   // 只有資源型政策（例如 bucket policy）才有
+  Action?: string | string[]
+  NotAction?: string | string[]
+  Resource: string | string[]
+  Condition?: Condition
+}
+type Policy = { Version: '2012-10-17', Statement: Statement[] }
+type Request = { principal: string, action: string, resource: string, context: Record<string, string> }
+type Decision = 'allowed' | 'explicitDeny' | 'implicitDeny'
+
+const list = (v: string | string[] | undefined): string[] => v === undefined ? [] : Array.isArray(v) ? v : [v]
+
+// 萬用字元比對：* 是任意多個字元（可以是 0 個），? 是一個字元；分大小寫
+function like(pattern: string, value: string): boolean {
+  const re = pattern.split('').map(c => c === '*' ? '.*' : c === '?' ? '.' : c.replace(/[.+^${}()|[\]\\]/g, '\\$&')).join('')
+  return new RegExp('^' + re + '$').test(value)
+}
+
+// 不同運算子、不同條件鍵之間是「且」；同一個條件鍵的多個值是「或」
+function conditionMatches(condition: Condition | undefined, context: Record<string, string>): boolean {
+  for (const [op, keys] of Object.entries(condition ?? {})) {
+    for (const [key, values] of Object.entries(keys)) {
+      const actual = context[key]
+      // 請求裡沒有這個鍵：一般運算子不成立，Not 開頭的反而成立
+      const hit = actual !== undefined && list(values).some(v => op.endsWith('Like') ? like(v, actual) : v === actual)
+      const negated = op.startsWith('StringNot')
+      if (negated ? hit : !hit) return false
+    }
+  }
+  return true
+}
+
+// Principal、Action（或 NotAction）、Resource、Condition 都符合，這條 Statement 才適用
+function statementMatches(st: Statement, req: Request): boolean {
+  if (st.Principal !== undefined && st.Principal !== '*' && !list(st.Principal.AWS).includes(req.principal)) return false
+  const action = req.action.toLowerCase()
+  const actionIn = (patterns: string[]) => patterns.some(p => like(p.toLowerCase(), action))
+  const actionOk = st.NotAction !== undefined ? !actionIn(list(st.NotAction)) : actionIn(list(st.Action))
+  if (!actionOk) return false
+  if (!list(st.Resource).some(p => like(p.toLowerCase(), req.resource.toLowerCase()))) return false
+  return conditionMatches(st.Condition, req.context)
+}
+
+function evaluate(identity: Policy[], resource: Policy[], req: Request): Decision {
+  const matched = identity.concat(resource).flatMap(p => p.Statement).filter(st => statementMatches(st, req))
+  if (matched.some(st => st.Effect === 'Deny')) return 'explicitDeny'
+  if (matched.some(st => st.Effect === 'Allow')) return 'allowed'
+  return 'implicitDeny'
+}
+
+const req: Request = {
+  principal: 'arn:aws:iam::123456789012:role/cafe-api',
+  action: 's3:DeleteObject',
+  resource: 'arn:aws:s3:::cafe-uploads-prod/uploads/a.jpg',
+  context: {},
+}
+const allowAll: Policy = { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: 's3:*', Resource: 'arn:aws:s3:::cafe-uploads-prod/*' }] }
+const denyDelete: Policy = { Version: '2012-10-17', Statement: [{ Effect: 'Deny', Action: 's3:DeleteObject', Resource: '*' }] }
+console.log(evaluate([allowAll], [], req), evaluate([allowAll, denyDelete], [], req))
+</script>
+  <script type="wrong" data-name="忽略 Principal">
+type Condition = Record<string, Record<string, string | string[]>>
+type Statement = {
+  Sid?: string
+  Effect: 'Allow' | 'Deny'
+  Principal?: '*' | { AWS: string | string[] }   // 只有資源型政策（例如 bucket policy）才有
+  Action?: string | string[]
+  NotAction?: string | string[]
+  Resource: string | string[]
+  Condition?: Condition
+}
+type Policy = { Version: '2012-10-17', Statement: Statement[] }
+type Request = { principal: string, action: string, resource: string, context: Record<string, string> }
+type Decision = 'allowed' | 'explicitDeny' | 'implicitDeny'
+
+const list = (v: string | string[] | undefined): string[] => v === undefined ? [] : Array.isArray(v) ? v : [v]
+
+// 萬用字元比對：* 是任意多個字元（可以是 0 個），? 是一個字元；分大小寫
+function like(pattern: string, value: string): boolean {
+  const re = pattern.split('').map(c => c === '*' ? '.*' : c === '?' ? '.' : c.replace(/[.+^${}()|[\]\\]/g, '\\$&')).join('')
+  return new RegExp('^' + re + '$').test(value)
+}
+
+// 不同運算子、不同條件鍵之間是「且」；同一個條件鍵的多個值是「或」
+function conditionMatches(condition: Condition | undefined, context: Record<string, string>): boolean {
+  for (const [op, keys] of Object.entries(condition ?? {})) {
+    for (const [key, values] of Object.entries(keys)) {
+      const actual = context[key]
+      // 請求裡沒有這個鍵：一般運算子不成立，Not 開頭的反而成立
+      const hit = actual !== undefined && list(values).some(v => op.endsWith('Like') ? like(v, actual) : v === actual)
+      const negated = op.startsWith('StringNot')
+      if (negated ? hit : !hit) return false
+    }
+  }
+  return true
+}
+
+// Principal、Action（或 NotAction）、Resource、Condition 都符合，這條 Statement 才適用
+function statementMatches(st: Statement, req: Request): boolean {
+  const action = req.action.toLowerCase()
+  const actionIn = (patterns: string[]) => patterns.some(p => like(p.toLowerCase(), action))
+  const actionOk = st.NotAction !== undefined ? !actionIn(list(st.NotAction)) : actionIn(list(st.Action))
+  if (!actionOk) return false
+  if (!list(st.Resource).some(p => like(p, req.resource))) return false
+  return conditionMatches(st.Condition, req.context)
+}
+
+function evaluate(identity: Policy[], resource: Policy[], req: Request): Decision {
+  const matched = identity.concat(resource).flatMap(p => p.Statement).filter(st => statementMatches(st, req))
+  if (matched.some(st => st.Effect === 'Deny')) return 'explicitDeny'
+  if (matched.some(st => st.Effect === 'Allow')) return 'allowed'
+  return 'implicitDeny'
+}
+
+const req: Request = {
+  principal: 'arn:aws:iam::123456789012:role/cafe-api',
+  action: 's3:DeleteObject',
+  resource: 'arn:aws:s3:::cafe-uploads-prod/uploads/a.jpg',
+  context: {},
+}
+const allowAll: Policy = { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: 's3:*', Resource: 'arn:aws:s3:::cafe-uploads-prod/*' }] }
+const denyDelete: Policy = { Version: '2012-10-17', Statement: [{ Effect: 'Deny', Action: 's3:DeleteObject', Resource: '*' }] }
+console.log(evaluate([allowAll], [], req), evaluate([allowAll, denyDelete], [], req))
+</script>
+  <script type="wrong" data-name="沒有條件鍵時 Not 運算子也不成立">
+type Condition = Record<string, Record<string, string | string[]>>
+type Statement = {
+  Sid?: string
+  Effect: 'Allow' | 'Deny'
+  Principal?: '*' | { AWS: string | string[] }   // 只有資源型政策（例如 bucket policy）才有
+  Action?: string | string[]
+  NotAction?: string | string[]
+  Resource: string | string[]
+  Condition?: Condition
+}
+type Policy = { Version: '2012-10-17', Statement: Statement[] }
+type Request = { principal: string, action: string, resource: string, context: Record<string, string> }
+type Decision = 'allowed' | 'explicitDeny' | 'implicitDeny'
+
+const list = (v: string | string[] | undefined): string[] => v === undefined ? [] : Array.isArray(v) ? v : [v]
+
+// 萬用字元比對：* 是任意多個字元（可以是 0 個），? 是一個字元；分大小寫
+function like(pattern: string, value: string): boolean {
+  const re = pattern.split('').map(c => c === '*' ? '.*' : c === '?' ? '.' : c.replace(/[.+^${}()|[\]\\]/g, '\\$&')).join('')
+  return new RegExp('^' + re + '$').test(value)
+}
+
+// 不同運算子、不同條件鍵之間是「且」；同一個條件鍵的多個值是「或」
+function conditionMatches(condition: Condition | undefined, context: Record<string, string>): boolean {
+  for (const [op, keys] of Object.entries(condition ?? {})) {
+    for (const [key, values] of Object.entries(keys)) {
+      const actual = context[key]
+      if (actual === undefined) return false
+      // 請求裡沒有這個鍵：一般運算子不成立，Not 開頭的反而成立
+      const hit = actual !== undefined && list(values).some(v => op.endsWith('Like') ? like(v, actual) : v === actual)
+      const negated = op.startsWith('StringNot')
+      if (negated ? hit : !hit) return false
+    }
+  }
+  return true
+}
+
+// Principal、Action（或 NotAction）、Resource、Condition 都符合，這條 Statement 才適用
+function statementMatches(st: Statement, req: Request): boolean {
+  if (st.Principal !== undefined && st.Principal !== '*' && !list(st.Principal.AWS).includes(req.principal)) return false
+  const action = req.action.toLowerCase()
+  const actionIn = (patterns: string[]) => patterns.some(p => like(p.toLowerCase(), action))
+  const actionOk = st.NotAction !== undefined ? !actionIn(list(st.NotAction)) : actionIn(list(st.Action))
+  if (!actionOk) return false
+  if (!list(st.Resource).some(p => like(p, req.resource))) return false
+  return conditionMatches(st.Condition, req.context)
+}
+
+function evaluate(identity: Policy[], resource: Policy[], req: Request): Decision {
+  const matched = identity.concat(resource).flatMap(p => p.Statement).filter(st => statementMatches(st, req))
+  if (matched.some(st => st.Effect === 'Deny')) return 'explicitDeny'
+  if (matched.some(st => st.Effect === 'Allow')) return 'allowed'
+  return 'implicitDeny'
+}
+
+const req: Request = {
+  principal: 'arn:aws:iam::123456789012:role/cafe-api',
+  action: 's3:DeleteObject',
+  resource: 'arn:aws:s3:::cafe-uploads-prod/uploads/a.jpg',
+  context: {},
+}
+const allowAll: Policy = { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: 's3:*', Resource: 'arn:aws:s3:::cafe-uploads-prod/*' }] }
+const denyDelete: Policy = { Version: '2012-10-17', Statement: [{ Effect: 'Deny', Action: 's3:DeleteObject', Resource: '*' }] }
+console.log(evaluate([allowAll], [], req), evaluate([allowAll, denyDelete], [], req))
+</script>
+  <script type="wrong" data-name="同一個條件鍵的多個值當成「且」">
+type Condition = Record<string, Record<string, string | string[]>>
+type Statement = {
+  Sid?: string
+  Effect: 'Allow' | 'Deny'
+  Principal?: '*' | { AWS: string | string[] }   // 只有資源型政策（例如 bucket policy）才有
+  Action?: string | string[]
+  NotAction?: string | string[]
+  Resource: string | string[]
+  Condition?: Condition
+}
+type Policy = { Version: '2012-10-17', Statement: Statement[] }
+type Request = { principal: string, action: string, resource: string, context: Record<string, string> }
+type Decision = 'allowed' | 'explicitDeny' | 'implicitDeny'
+
+const list = (v: string | string[] | undefined): string[] => v === undefined ? [] : Array.isArray(v) ? v : [v]
+
+// 萬用字元比對：* 是任意多個字元（可以是 0 個），? 是一個字元；分大小寫
+function like(pattern: string, value: string): boolean {
+  const re = pattern.split('').map(c => c === '*' ? '.*' : c === '?' ? '.' : c.replace(/[.+^${}()|[\]\\]/g, '\\$&')).join('')
+  return new RegExp('^' + re + '$').test(value)
+}
+
+// 不同運算子、不同條件鍵之間是「且」；同一個條件鍵的多個值是「或」
+function conditionMatches(condition: Condition | undefined, context: Record<string, string>): boolean {
+  for (const [op, keys] of Object.entries(condition ?? {})) {
+    for (const [key, values] of Object.entries(keys)) {
+      const actual = context[key]
+      // 請求裡沒有這個鍵：一般運算子不成立，Not 開頭的反而成立
+      const hit = actual !== undefined && list(values).every(v => op.endsWith('Like') ? like(v, actual) : v === actual)
+      const negated = op.startsWith('StringNot')
+      if (negated ? hit : !hit) return false
+    }
+  }
+  return true
+}
+
+// Principal、Action（或 NotAction）、Resource、Condition 都符合，這條 Statement 才適用
+function statementMatches(st: Statement, req: Request): boolean {
+  if (st.Principal !== undefined && st.Principal !== '*' && !list(st.Principal.AWS).includes(req.principal)) return false
+  const action = req.action.toLowerCase()
+  const actionIn = (patterns: string[]) => patterns.some(p => like(p.toLowerCase(), action))
+  const actionOk = st.NotAction !== undefined ? !actionIn(list(st.NotAction)) : actionIn(list(st.Action))
+  if (!actionOk) return false
+  if (!list(st.Resource).some(p => like(p, req.resource))) return false
+  return conditionMatches(st.Condition, req.context)
+}
+
+function evaluate(identity: Policy[], resource: Policy[], req: Request): Decision {
+  const matched = identity.concat(resource).flatMap(p => p.Statement).filter(st => statementMatches(st, req))
+  if (matched.some(st => st.Effect === 'Deny')) return 'explicitDeny'
+  if (matched.some(st => st.Effect === 'Allow')) return 'allowed'
+  return 'implicitDeny'
+}
+
+const req: Request = {
+  principal: 'arn:aws:iam::123456789012:role/cafe-api',
+  action: 's3:DeleteObject',
+  resource: 'arn:aws:s3:::cafe-uploads-prod/uploads/a.jpg',
+  context: {},
+}
+const allowAll: Policy = { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: 's3:*', Resource: 'arn:aws:s3:::cafe-uploads-prod/*' }] }
+const denyDelete: Policy = { Version: '2012-10-17', Statement: [{ Effect: 'Deny', Action: 's3:DeleteObject', Resource: '*' }] }
+console.log(evaluate([allowAll], [], req), evaluate([allowAll, denyDelete], [], req))
+</script>
+  <script type="wrong" data-name="只看身分型政策">
+type Condition = Record<string, Record<string, string | string[]>>
+type Statement = {
+  Sid?: string
+  Effect: 'Allow' | 'Deny'
+  Principal?: '*' | { AWS: string | string[] }   // 只有資源型政策（例如 bucket policy）才有
+  Action?: string | string[]
+  NotAction?: string | string[]
+  Resource: string | string[]
+  Condition?: Condition
+}
+type Policy = { Version: '2012-10-17', Statement: Statement[] }
+type Request = { principal: string, action: string, resource: string, context: Record<string, string> }
+type Decision = 'allowed' | 'explicitDeny' | 'implicitDeny'
+
+const list = (v: string | string[] | undefined): string[] => v === undefined ? [] : Array.isArray(v) ? v : [v]
+
+// 萬用字元比對：* 是任意多個字元（可以是 0 個），? 是一個字元；分大小寫
+function like(pattern: string, value: string): boolean {
+  const re = pattern.split('').map(c => c === '*' ? '.*' : c === '?' ? '.' : c.replace(/[.+^${}()|[\]\\]/g, '\\$&')).join('')
+  return new RegExp('^' + re + '$').test(value)
+}
+
+// 不同運算子、不同條件鍵之間是「且」；同一個條件鍵的多個值是「或」
+function conditionMatches(condition: Condition | undefined, context: Record<string, string>): boolean {
+  for (const [op, keys] of Object.entries(condition ?? {})) {
+    for (const [key, values] of Object.entries(keys)) {
+      const actual = context[key]
+      // 請求裡沒有這個鍵：一般運算子不成立，Not 開頭的反而成立
+      const hit = actual !== undefined && list(values).some(v => op.endsWith('Like') ? like(v, actual) : v === actual)
+      const negated = op.startsWith('StringNot')
+      if (negated ? hit : !hit) return false
+    }
+  }
+  return true
+}
+
+// Principal、Action（或 NotAction）、Resource、Condition 都符合，這條 Statement 才適用
+function statementMatches(st: Statement, req: Request): boolean {
+  if (st.Principal !== undefined && st.Principal !== '*' && !list(st.Principal.AWS).includes(req.principal)) return false
+  const action = req.action.toLowerCase()
+  const actionIn = (patterns: string[]) => patterns.some(p => like(p.toLowerCase(), action))
+  const actionOk = st.NotAction !== undefined ? !actionIn(list(st.NotAction)) : actionIn(list(st.Action))
+  if (!actionOk) return false
+  if (!list(st.Resource).some(p => like(p, req.resource))) return false
+  return conditionMatches(st.Condition, req.context)
+}
+
+function evaluate(identity: Policy[], resource: Policy[], req: Request): Decision {
+  const matched = identity.flatMap(p => p.Statement).filter(st => statementMatches(st, req))
+  if (matched.some(st => st.Effect === 'Deny')) return 'explicitDeny'
+  if (matched.some(st => st.Effect === 'Allow')) return 'allowed'
+  return 'implicitDeny'
+}
+
+const req: Request = {
+  principal: 'arn:aws:iam::123456789012:role/cafe-api',
+  action: 's3:DeleteObject',
+  resource: 'arn:aws:s3:::cafe-uploads-prod/uploads/a.jpg',
+  context: {},
+}
+const allowAll: Policy = { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: 's3:*', Resource: 'arn:aws:s3:::cafe-uploads-prod/*' }] }
+const denyDelete: Policy = { Version: '2012-10-17', Statement: [{ Effect: 'Deny', Action: 's3:DeleteObject', Resource: '*' }] }
+console.log(evaluate([allowAll], [], req), evaluate([allowAll, denyDelete], [], req))
+</script>
+  <script type="wrong" data-name="NotAction 當成 Action">
+type Condition = Record<string, Record<string, string | string[]>>
+type Statement = {
+  Sid?: string
+  Effect: 'Allow' | 'Deny'
+  Principal?: '*' | { AWS: string | string[] }   // 只有資源型政策（例如 bucket policy）才有
+  Action?: string | string[]
+  NotAction?: string | string[]
+  Resource: string | string[]
+  Condition?: Condition
+}
+type Policy = { Version: '2012-10-17', Statement: Statement[] }
+type Request = { principal: string, action: string, resource: string, context: Record<string, string> }
+type Decision = 'allowed' | 'explicitDeny' | 'implicitDeny'
+
+const list = (v: string | string[] | undefined): string[] => v === undefined ? [] : Array.isArray(v) ? v : [v]
+
+// 萬用字元比對：* 是任意多個字元（可以是 0 個），? 是一個字元；分大小寫
+function like(pattern: string, value: string): boolean {
+  const re = pattern.split('').map(c => c === '*' ? '.*' : c === '?' ? '.' : c.replace(/[.+^${}()|[\]\\]/g, '\\$&')).join('')
+  return new RegExp('^' + re + '$').test(value)
+}
+
+// 不同運算子、不同條件鍵之間是「且」；同一個條件鍵的多個值是「或」
+function conditionMatches(condition: Condition | undefined, context: Record<string, string>): boolean {
+  for (const [op, keys] of Object.entries(condition ?? {})) {
+    for (const [key, values] of Object.entries(keys)) {
+      const actual = context[key]
+      // 請求裡沒有這個鍵：一般運算子不成立，Not 開頭的反而成立
+      const hit = actual !== undefined && list(values).some(v => op.endsWith('Like') ? like(v, actual) : v === actual)
+      const negated = op.startsWith('StringNot')
+      if (negated ? hit : !hit) return false
+    }
+  }
+  return true
+}
+
+// Principal、Action（或 NotAction）、Resource、Condition 都符合，這條 Statement 才適用
+function statementMatches(st: Statement, req: Request): boolean {
+  if (st.Principal !== undefined && st.Principal !== '*' && !list(st.Principal.AWS).includes(req.principal)) return false
+  const action = req.action.toLowerCase()
+  const actionIn = (patterns: string[]) => patterns.some(p => like(p.toLowerCase(), action))
+  const actionOk = actionIn(list(st.Action ?? st.NotAction))
+  if (!actionOk) return false
+  if (!list(st.Resource).some(p => like(p, req.resource))) return false
+  return conditionMatches(st.Condition, req.context)
+}
+
+function evaluate(identity: Policy[], resource: Policy[], req: Request): Decision {
+  const matched = identity.concat(resource).flatMap(p => p.Statement).filter(st => statementMatches(st, req))
+  if (matched.some(st => st.Effect === 'Deny')) return 'explicitDeny'
+  if (matched.some(st => st.Effect === 'Allow')) return 'allowed'
+  return 'implicitDeny'
+}
+
+const req: Request = {
+  principal: 'arn:aws:iam::123456789012:role/cafe-api',
+  action: 's3:DeleteObject',
+  resource: 'arn:aws:s3:::cafe-uploads-prod/uploads/a.jpg',
+  context: {},
+}
+const allowAll: Policy = { Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: 's3:*', Resource: 'arn:aws:s3:::cafe-uploads-prod/*' }] }
+const denyDelete: Policy = { Version: '2012-10-17', Statement: [{ Effect: 'Deny', Action: 's3:DeleteObject', Resource: '*' }] }
+console.log(evaluate([allowAll], [], req), evaluate([allowAll, denyDelete], [], req))
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：鎖住 GitHub OIDC 的信任政策。替 role <code>cafe-deploy-prod</code> 完成 <code>trustPolicy</code>：Principal 是帳號 <code>123456789012</code> 裡 <code>token.actions.githubusercontent.com</code> 的 OIDC provider（<code>Federated</code>），Action 只有 <code>sts:AssumeRoleWithWebIdentity</code>，<code>aud</code> 必須是 <code>sts.amazonaws.com</code>，<code>sub</code> 只允許 <code>cafe-org/cafe-api</code> 這個 repo 的 <code>production</code> environment（舊格式，不含數字 ID）。測試會拿一組 token 的 claims 模擬扮演：只有該 repo 的 production 部署 job 能過，同 repo 的其他分支、PR、其他 environment、組織裡的其他 repo、aud 不符都要被拒絕。</p>
+  <script type="start">
+type Statement = {
+  Effect: 'Allow' | 'Deny'
+  Principal: '*' | { Federated: string } | { AWS: string } | { Service: string }
+  Action: string | string[]
+  Condition?: Record<string, Record<string, string | string[]>>
+}
+type TrustPolicy = { Version: '2012-10-17', Statement: Statement[] }
+
+const ACCOUNT = '123456789012'
+const PROVIDER = 'token.actions.githubusercontent.com'
+
+// role cafe-deploy-prod 的信任政策：誰可以扮演這個 role
+const trustPolicy: TrustPolicy = {
+  Version: '2012-10-17',
+  Statement: [
+  ],
+}
+
+console.log(JSON.stringify(trustPolicy, null, 2))
+</script>
+  <script type="answer">
+type Statement = {
+  Effect: 'Allow' | 'Deny'
+  Principal: '*' | { Federated: string } | { AWS: string } | { Service: string }
+  Action: string | string[]
+  Condition?: Record<string, Record<string, string | string[]>>
+}
+type TrustPolicy = { Version: '2012-10-17', Statement: Statement[] }
+
+const ACCOUNT = '123456789012'
+const PROVIDER = 'token.actions.githubusercontent.com'
+
+// role cafe-deploy-prod 的信任政策：誰可以扮演這個 role
+const trustPolicy: TrustPolicy = {
+  Version: '2012-10-17',
+  Statement: [
+    {
+      Effect: 'Allow',
+      Principal: { Federated: `arn:aws:iam::${ACCOUNT}:oidc-provider/${PROVIDER}` },
+      Action: 'sts:AssumeRoleWithWebIdentity',
+      Condition: {
+        StringEquals: {
+          'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
+          'token.actions.githubusercontent.com:sub': 'repo:cafe-org/cafe-api:environment:production',
+        },
+      },
+    },
+  ],
+}
+
+console.log(JSON.stringify(trustPolicy, null, 2))
+</script>
+  <script type="tests">
+const _list = (v: string | string[] | undefined): string[] => v === undefined ? [] : Array.isArray(v) ? v : [v]
+const _like = (p: string, v: string) => new RegExp('^' + p.split('').map(c => c === '*' ? '.*' : c === '?' ? '.' : c.replace(/[.+^${}()|[\]\\]/g, '\\$&')).join('') + '$').test(v)
+const _cond = (c: Record<string, Record<string, string | string[]>> | undefined, ctx: Record<string, string>): boolean => {
+  for (const [op, keys] of Object.entries(c ?? {})) {
+    if (!['StringEquals', 'StringLike', 'StringNotEquals', 'StringNotLike'].includes(op)) throw new Error(`測試的評估器只支援 StringEquals、StringLike、StringNotEquals、StringNotLike，收到 ${op}`)
+    for (const [k, vals] of Object.entries(keys)) {
+      const hit = k in ctx && _list(vals).some(p => op.endsWith('Like') ? _like(p, ctx[k]) : p === ctx[k])
+      if (op.startsWith('StringNot') ? hit : !hit) return false
+    }
+  }
+  return true
+}
+const _fed = 'arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com'
+const _assume = (claims: { aud?: string, sub?: string }) => {
+  const ctx: Record<string, string> = {}
+  if (claims.aud !== undefined) ctx['token.actions.githubusercontent.com:aud'] = claims.aud
+  if (claims.sub !== undefined) ctx['token.actions.githubusercontent.com:sub'] = claims.sub
+  const hits = trustPolicy.Statement.filter(st =>
+    (st.Principal === '*' || ('Federated' in st.Principal && st.Principal.Federated === _fed))
+    && _list(st.Action).some(a => _like(a.toLowerCase(), 'sts:assumerolewithwebidentity'))
+    && _cond(st.Condition, ctx))
+  return !hits.some(st => st.Effect === 'Deny') && hits.some(st => st.Effect === 'Allow')
+}
+assert(trustPolicy.Statement.length > 0, 'Statement 是空的：寫一條 Allow')
+for (const st of trustPolicy.Statement.filter(s => s.Effect === 'Allow')) {
+  const pr = st.Principal
+  assert(pr !== '*', 'Principal 不能是 *：要寫 { Federated: OIDC provider 的 ARN }')
+  assert('Federated' in pr, 'Principal 要用 Federated（外部身分提供者），不是 AWS 或 Service')
+  assert('Federated' in pr && pr.Federated === _fed, 'Federated 要是 OIDC provider 的 ARN：arn:aws:iam::帳號:oidc-provider/token.actions.githubusercontent.com')
+  assert.deepEqual(_list(st.Action).map(a => a.toLowerCase()), ['sts:assumerolewithwebidentity'], 'Action 只能是 sts:AssumeRoleWithWebIdentity（不要用 sts:* 或 *）')
+}
+const _aud = 'sts.amazonaws.com'
+assert(_assume({ aud: _aud, sub: 'repo:cafe-org/cafe-api:environment:production' }), 'cafe-org/cafe-api 的 production environment 部署 job 要能扮演')
+const _deny: [{ aud?: string, sub?: string }, string][] = [
+  [{ aud: _aud, sub: 'repo:cafe-org/cafe-api:ref:refs/heads/feature-latte' }, '同 repo 的 feature 分支（沒有 environment）不能扮演'],
+  [{ aud: _aud, sub: 'repo:cafe-org/cafe-api:ref:refs/heads/main' }, '沒有走 production environment 的 main 分支 job 不能扮演：題目要求綁 environment，不是分支'],
+  [{ aud: _aud, sub: 'repo:cafe-org/cafe-api:pull_request' }, 'PR（包括 fork 送來的 PR）不能扮演'],
+  [{ aud: _aud, sub: 'repo:cafe-org/cafe-api:environment:staging' }, 'staging environment 不能扮演 production 的 role'],
+  [{ aud: _aud, sub: 'repo:cafe-org/cafe-api:environment:production-preview' }, 'environment 名稱只是開頭相同也不行：用 StringEquals 寫完整的 sub'],
+  [{ aud: _aud, sub: 'repo:cafe-org/cafe-admin:environment:production' }, '組織裡的其他 repo 不能扮演：sub 不要寫 repo:cafe-org/*'],
+  [{ aud: _aud, sub: 'repo:cafe-org/cafe-api-fork:environment:production' }, '名字開頭相同的其他 repo 不能扮演'],
+  [{ aud: _aud, sub: 'repo:evil-org/cafe-api:environment:production' }, '別的組織的同名 repo 不能扮演'],
+  [{ aud: _aud }, 'token 沒有 sub 時不能扮演'],
+  [{ aud: 'https://github.com/cafe-org', sub: 'repo:cafe-org/cafe-api:environment:production' }, 'aud 不是 sts.amazonaws.com 要拒絕：條件要檢查 aud'],
+  [{ sub: 'repo:cafe-org/cafe-api:environment:production' }, 'token 沒有 aud 時要拒絕：條件要檢查 aud'],
+]
+for (const [claims, msg] of _deny) assert(!_assume(claims), `${msg}（aud=${claims.aud ?? '無'}，sub=${claims.sub ?? '無'}）`)
+</script>
+  <script type="wrong" data-name="sub 用 repo:cafe-org/*">
+type Statement = {
+  Effect: 'Allow' | 'Deny'
+  Principal: '*' | { Federated: string } | { AWS: string } | { Service: string }
+  Action: string | string[]
+  Condition?: Record<string, Record<string, string | string[]>>
+}
+type TrustPolicy = { Version: '2012-10-17', Statement: Statement[] }
+
+const ACCOUNT = '123456789012'
+const PROVIDER = 'token.actions.githubusercontent.com'
+
+// role cafe-deploy-prod 的信任政策：誰可以扮演這個 role
+const trustPolicy: TrustPolicy = {
+  Version: '2012-10-17',
+  Statement: [
+    {
+      Effect: 'Allow',
+      Principal: { Federated: `arn:aws:iam::${ACCOUNT}:oidc-provider/${PROVIDER}` },
+      Action: 'sts:AssumeRoleWithWebIdentity',
+      Condition: {
+        StringLike: {
+          'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
+          'token.actions.githubusercontent.com:sub': 'repo:cafe-org/*',
+        },
+      },
+    },
+  ],
+}
+
+console.log(JSON.stringify(trustPolicy, null, 2))
+</script>
+  <script type="wrong" data-name="repo 任何分支">
+type Statement = {
+  Effect: 'Allow' | 'Deny'
+  Principal: '*' | { Federated: string } | { AWS: string } | { Service: string }
+  Action: string | string[]
+  Condition?: Record<string, Record<string, string | string[]>>
+}
+type TrustPolicy = { Version: '2012-10-17', Statement: Statement[] }
+
+const ACCOUNT = '123456789012'
+const PROVIDER = 'token.actions.githubusercontent.com'
+
+// role cafe-deploy-prod 的信任政策：誰可以扮演這個 role
+const trustPolicy: TrustPolicy = {
+  Version: '2012-10-17',
+  Statement: [
+    {
+      Effect: 'Allow',
+      Principal: { Federated: `arn:aws:iam::${ACCOUNT}:oidc-provider/${PROVIDER}` },
+      Action: 'sts:AssumeRoleWithWebIdentity',
+      Condition: {
+        StringLike: {
+          'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
+          'token.actions.githubusercontent.com:sub': 'repo:cafe-org/cafe-api:*',
+        },
+      },
+    },
+  ],
+}
+
+console.log(JSON.stringify(trustPolicy, null, 2))
+</script>
+  <script type="wrong" data-name="environment 前綴">
+type Statement = {
+  Effect: 'Allow' | 'Deny'
+  Principal: '*' | { Federated: string } | { AWS: string } | { Service: string }
+  Action: string | string[]
+  Condition?: Record<string, Record<string, string | string[]>>
+}
+type TrustPolicy = { Version: '2012-10-17', Statement: Statement[] }
+
+const ACCOUNT = '123456789012'
+const PROVIDER = 'token.actions.githubusercontent.com'
+
+// role cafe-deploy-prod 的信任政策：誰可以扮演這個 role
+const trustPolicy: TrustPolicy = {
+  Version: '2012-10-17',
+  Statement: [
+    {
+      Effect: 'Allow',
+      Principal: { Federated: `arn:aws:iam::${ACCOUNT}:oidc-provider/${PROVIDER}` },
+      Action: 'sts:AssumeRoleWithWebIdentity',
+      Condition: {
+        StringLike: {
+          'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
+          'token.actions.githubusercontent.com:sub': 'repo:cafe-org/cafe-api:environment:production*',
+        },
+      },
+    },
+  ],
+}
+
+console.log(JSON.stringify(trustPolicy, null, 2))
+</script>
+  <script type="wrong" data-name="沒有檢查 aud">
+type Statement = {
+  Effect: 'Allow' | 'Deny'
+  Principal: '*' | { Federated: string } | { AWS: string } | { Service: string }
+  Action: string | string[]
+  Condition?: Record<string, Record<string, string | string[]>>
+}
+type TrustPolicy = { Version: '2012-10-17', Statement: Statement[] }
+
+const ACCOUNT = '123456789012'
+const PROVIDER = 'token.actions.githubusercontent.com'
+
+// role cafe-deploy-prod 的信任政策：誰可以扮演這個 role
+const trustPolicy: TrustPolicy = {
+  Version: '2012-10-17',
+  Statement: [
+    {
+      Effect: 'Allow',
+      Principal: { Federated: `arn:aws:iam::${ACCOUNT}:oidc-provider/${PROVIDER}` },
+      Action: 'sts:AssumeRoleWithWebIdentity',
+      Condition: {
+        StringEquals: {
+          'token.actions.githubusercontent.com:sub': 'repo:cafe-org/cafe-api:environment:production',
+        },
+      },
+    },
+  ],
+}
+
+console.log(JSON.stringify(trustPolicy, null, 2))
+</script>
+  <script type="wrong" data-name="用 main 分支取代 environment">
+type Statement = {
+  Effect: 'Allow' | 'Deny'
+  Principal: '*' | { Federated: string } | { AWS: string } | { Service: string }
+  Action: string | string[]
+  Condition?: Record<string, Record<string, string | string[]>>
+}
+type TrustPolicy = { Version: '2012-10-17', Statement: Statement[] }
+
+const ACCOUNT = '123456789012'
+const PROVIDER = 'token.actions.githubusercontent.com'
+
+// role cafe-deploy-prod 的信任政策：誰可以扮演這個 role
+const trustPolicy: TrustPolicy = {
+  Version: '2012-10-17',
+  Statement: [
+    {
+      Effect: 'Allow',
+      Principal: { Federated: `arn:aws:iam::${ACCOUNT}:oidc-provider/${PROVIDER}` },
+      Action: 'sts:AssumeRoleWithWebIdentity',
+      Condition: {
+        StringEquals: {
+          'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
+          'token.actions.githubusercontent.com:sub': 'repo:cafe-org/cafe-api:ref:refs/heads/main',
+        },
+      },
+    },
+  ],
+}
+
+console.log(JSON.stringify(trustPolicy, null, 2))
+</script>
+  <script type="wrong" data-name="Principal 是 *">
+type Statement = {
+  Effect: 'Allow' | 'Deny'
+  Principal: '*' | { Federated: string } | { AWS: string } | { Service: string }
+  Action: string | string[]
+  Condition?: Record<string, Record<string, string | string[]>>
+}
+type TrustPolicy = { Version: '2012-10-17', Statement: Statement[] }
+
+const ACCOUNT = '123456789012'
+const PROVIDER = 'token.actions.githubusercontent.com'
+
+// role cafe-deploy-prod 的信任政策：誰可以扮演這個 role
+const trustPolicy: TrustPolicy = {
+  Version: '2012-10-17',
+  Statement: [
+    {
+      Effect: 'Allow',
+      Principal: '*',
+      Action: 'sts:AssumeRoleWithWebIdentity',
+      Condition: {
+        StringEquals: {
+          'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
+          'token.actions.githubusercontent.com:sub': 'repo:cafe-org/cafe-api:environment:production',
+        },
+      },
+    },
+  ],
+}
+
+console.log(JSON.stringify(trustPolicy, null, 2))
+</script>
+  <script type="wrong" data-name="Action 是 sts:*">
+type Statement = {
+  Effect: 'Allow' | 'Deny'
+  Principal: '*' | { Federated: string } | { AWS: string } | { Service: string }
+  Action: string | string[]
+  Condition?: Record<string, Record<string, string | string[]>>
+}
+type TrustPolicy = { Version: '2012-10-17', Statement: Statement[] }
+
+const ACCOUNT = '123456789012'
+const PROVIDER = 'token.actions.githubusercontent.com'
+
+// role cafe-deploy-prod 的信任政策：誰可以扮演這個 role
+const trustPolicy: TrustPolicy = {
+  Version: '2012-10-17',
+  Statement: [
+    {
+      Effect: 'Allow',
+      Principal: { Federated: `arn:aws:iam::${ACCOUNT}:oidc-provider/${PROVIDER}` },
+      Action: 'sts:*',
+      Condition: {
+        StringEquals: {
+          'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
+          'token.actions.githubusercontent.com:sub': 'repo:cafe-org/cafe-api:environment:production',
+        },
+      },
+    },
+  ],
+}
+
+console.log(JSON.stringify(trustPolicy, null, 2))
+</script>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 4：cafe-api 的 role 掛了兩份政策：一份 <code>Allow s3:*</code>（Resource 是整個 bucket 的物件），另一份 <code>Deny s3:DeleteObject</code>。程式呼叫 DeleteObject 刪 <code>uploads/a.jpg</code>，結果是？</p>
+  <label data-key="a">可以刪：<code>s3:*</code> 範圍比較大，涵蓋了 DeleteObject</label>
+  <label data-key="b">不能刪：任何符合的明確 Deny 都優先於 Allow</label>
+  <label data-key="c">看兩份政策掛上去的先後，後掛的蓋過先掛的</label>
+  <label data-key="d">兩份政策衝突，AWS 會拒絕儲存第二份</label>
+  <p class="why">✓ b。評估時先找有沒有符合的 Deny，有就是 explicitDeny，跟 Allow 的範圍大小、政策的順序都無關（a、c 錯）。互相衝突的政策是合法的，而且是刻意的寫法：用大範圍的 Allow 加一條 Deny 畫出誰都跨不過的線（d 錯）。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：同事寫了 <code>{"Effect": "Allow", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::cafe-uploads-prod/*"}</code>，說「<code>*</code> 什麼都包含」。程式呼叫 ListObjectsV2 列 bucket，會怎樣？</p>
+  <label data-key="a">可以列，<code>/*</code> 包含 bucket 本身和所有物件</label>
+  <label data-key="b">儲存政策時就會報錯</label>
+  <label data-key="c">被拒絕：ListBucket 作用在 bucket ARN <code>arn:aws:s3:::cafe-uploads-prod</code>，<code>bucket/*</code> 只符合物件 ARN</label>
+  <label data-key="d">可以列，但只列得出 <code>*</code> 開頭的物件</label>
+  <p class="why">✓ c。<code>arn:aws:s3:::cafe-uploads-prod/*</code> 要求後面有一個 <code>/</code>，bucket ARN 沒有，所以這條 Allow 永遠不符合，結果是隱含拒絕（a 錯）。政策語法沒問題，存得進去，這正是它難發現的原因（b 錯）。<code>*</code> 是萬用字元，不是字面上的星號（d 錯）。要列 bucket 就把 Resource 寫成 bucket ARN，再用 <code>s3:prefix</code> 條件限制能列的前綴。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：<code>cafe-deploy-prod</code> 的信任政策只檢查 <code>token.actions.githubusercontent.com:aud</code> 等於 <code>sts.amazonaws.com</code>，沒有檢查 sub。會怎樣？</p>
+  <label data-key="a">任何 GitHub 使用者在自己的 repo 寫一個 workflow，都可能扮演這個 role 拿到 production 權限</label>
+  <label data-key="b">沒問題：aud 對了，代表 token 是給我們的 AWS 帳號用的</label>
+  <label data-key="c">只有 cafe-org 組織裡的 repo 能扮演，因為 OIDC provider 是我們建的</label>
+  <label data-key="d">AWS 會拒絕建立沒有 sub 條件的信任政策，所以不會發生</label>
+  <p class="why">✓ a。GitHub 替所有 repo 的 job 簽 token，簽發者都是 <code>token.actions.githubusercontent.com</code>，aud 也都是 <code>sts.amazonaws.com</code>；aud 只說明「這張 token 要給 AWS STS」，不說明是哪個帳號、哪個 repo（b 錯）。OIDC provider 只是讓 AWS 信任 GitHub 這個簽發者，不會限制組織（c 錯）。能區分 repo、分支、environment 的只有 sub；官方文件明確建議檢查 sub，但不能指望 AWS 每次都替你擋下（d 錯）。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 7：cafe-api 改成跑在 EC2 上，要讀 S3 的 <code>uploads/</code>。哪一種做法最好？</p>
+  <label data-key="a">建一個 IAM user，access key 寫進 <code>.env</code>，<code>.env</code> 加進 <code>.gitignore</code></label>
+  <label data-key="b">access key 放進 SSM Parameter Store，程式啟動時讀出來</label>
+  <label data-key="c">用 root 的 access key，因為只有一台機器、比較好管</label>
+  <label data-key="d">建一個只有 <code>uploads/</code> 權限的 role，用 instance profile 掛在機器上，程式不寫任何金鑰，並設成只接受 IMDSv2</label>
+  <p class="why">✓ d。instance profile 給的是會自動換新、會過期的臨時憑證，機器上沒有長期金鑰可以外洩；IMDSv2 擋掉透過 SSRF 讀中繼資料的攻擊。a 仍然是長期金鑰，備份、映像、日誌、別人的電腦都可能帶走它（第 11 課）。b 只是把長期金鑰換個地方放，而且要讀 Parameter Store 本來就需要權限，那份權限又從哪來？c 是最糟的：root 不能被任何政策限制。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>日常用 root 帳號，或替 root 建 access key</strong>：root 不能被 IAM 政策限制，外洩就是整個帳號。root 開 MFA、不建金鑰，人員用 Identity Center 登入。</li>
+  <li><strong>程式、CI、筆電用長期 access key</strong>：遲早出現在 git、映像、log 或 <code>.env</code> 裡（第 11 課）。程式用 instance profile 或 task role，CI 用 OIDC，人用 <code>aws sso login</code>。</li>
+  <li><strong>為了方便寫 <code>Resource: "*"</code> 或 <code>s3:*</code></strong>：一次程式漏洞就能刪掉整個 bucket。列出實際的動作，Resource 寫到前綴。</li>
+  <li><strong>搞混 bucket ARN 與物件 ARN</strong>：ListBucket 的 Resource 寫成 <code>bucket/*</code> 不會報錯，只是永遠不生效。ListBucket 用 bucket ARN 加 <code>s3:prefix</code>，物件動作用 <code>bucket/前綴/*</code>。</li>
+  <li><strong>OIDC 信任政策沒有限制 sub，或寫成 <code>repo:組織/*</code></strong>：別的 repo、別的分支、PR 都能拿到 production 權限。sub 用 StringEquals 寫死 repo 與 environment，並確認 repo 用的是舊格式還是含數字 ID 的新格式。</li>
+  <li><strong><code>iam:PassRole</code> 給 <code>*</code></strong>：能開機器的人就能把管理員 role 掛到機器上，變相提權。Resource 寫具體的 role，加 <code>iam:PassedToService</code>。</li>
+  <li><strong>Allow 搭配 NotAction</strong>：等於「其他全部允許」，AWS 新服務也自動被允許。NotAction 只搭配 Deny。</li>
+  <li><strong>以為 Statement 的順序或政策的先後會影響結果</strong>：評估是「有 Deny 就拒絕、有 Allow 就允許、都沒有就拒絕」，跟順序無關。</li>
+  <li><strong>查 KMS 權限只看 IAM 政策</strong>：key policy 也要允許。兩邊都看。</li>
+  <li><strong>把 task execution role 和 task role 混成一個</strong>：拉映像、寫 log 的權限和程式要用的權限混在一起，兩邊都變寬。分開兩個 role。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>開帳號第一天：root 開 MFA、不建 access key、只做非 root 不可的事；人員用 IAM Identity Center；設 Budgets 警示。可以的話，一個環境一個帳號。</li>
+  <li>policy 由 Effect、Action、Resource、Condition（資源型政策再加 Principal）組成。Action 不分大小寫，Resource 和 StringEquals 分大小寫；ListBucket 用 bucket ARN，物件動作用 <code>bucket/前綴/*</code>。</li>
+  <li>評估規則：預設隱含拒絕；任何符合的 Deny 優先；同一帳號內身分型與資源型政策取聯集；SCP、permission boundary 只能收窄。KMS 還要看 key policy。</li>
+  <li>用角色取代金鑰：EC2 用 instance profile（只接受 IMDSv2）、ECS 用 task role，STS 發的臨時憑證會自動換新、會過期。</li>
+  <li>GitHub Actions 用 OIDC：<code>id-token: write</code> 拿 JWT，STS 依信任政策檢查 <code>aud</code>＝<code>sts.amazonaws.com</code> 與 <code>sub</code>＝指定的 repo 和 environment，換到預設 1 小時的憑證。</li>
+  <li>危險寫法：<code>*</code>、<code>s3:*</code>、PassRole 給 <code>*</code>、Allow 搭配 NotAction、Principal <code>*</code>、沒有 sub 的信任政策。用 Access Analyzer 和 <code>simulate-custom-policy</code> 驗證，把該允許與該拒絕的請求寫成測試。</li>
+</ul>
+<p>到這裡，咖啡店的 VPC、資料庫、bucket、role 和政策都是在主控台一個個點出來的。下一課用 OpenTofu 把基礎設施寫成程式碼，讓每一個改動都能審查、能重現。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

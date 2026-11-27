@@ -1,0 +1,537 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>23. 分散式追蹤：OpenTelemetry</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="23" data-practice="devops">
+<header>
+  <div class="eyebrow">階段 6：可觀測性與可靠性 · 第 23 課</div>
+  <h1>分散式追蹤：OpenTelemetry</h1>
+</header>
+<main>
+
+<p>儀表板顯示 <code>POST /orders</code> 的 p99 從 300ms 跳到 2.4 秒（<a href="22-metrics-slo.html">第 22 課</a>的指標）。你知道「有問題」，可是一個下單請求會經過 cafe-api、資料庫、kitchen 服務、kitchen 的資料庫，最後送進出單佇列。到底是哪一段變慢？log 裡每個服務各自寫著自己的耗時，你得用 request_id 一個服務一個服務地對時間，還不一定對得上。</p>
+<p><strong>分散式追蹤</strong>（distributed tracing）就是為這個問題設計的。這一課用 <strong>OpenTelemetry</strong> 替 cafe-api 和 kitchen 加上追蹤，並把 trace_id 放進 log，讓 log、指標、trace 三者互相連得起來。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>trace 與 span：把一個請求在所有服務裡做的工作連成一棵樹、畫成瀑布圖，一眼看出慢在哪一段（開場問題的最小答案）。</li>
+  <li>traceparent：kitchen 怎麼知道收到的請求屬於哪一條 trace，自己動手解析這個標頭。</li>
+  <li>OpenTelemetry 的元件、手動與自動埋點：SDK、exporter、Collector 各做什麼，怎麼替 cafe-api 和 kitchen 加上追蹤。</li>
+  <li>取樣與成本：流量大時不能每個 span 都留，該留哪些。</li>
+  <li>把 log 和 trace 連起來：log 帶上 trace_id，值班時從一行錯誤 log 直接跳到整條 trace。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="21-logs.html">第 21 課</a>的集中式 log：所有服務的 log 收到同一個地方，用 request_id 找出同一個請求的每一行。</li>
+  <li><a href="22-metrics-slo.html">第 22 課</a>的百分位數：p99 是「99% 的請求比這個值快」，代表最慢那群人的感受。</li>
+  <li><a href="../../node/lessons/19-structured-logging.html">Node 課第 19 課</a>的 AsyncLocalStorage：在一連串 <code>await</code> 之間保留「目前是哪個請求」，不必一層層傳參數。</li>
+</ul></div>
+
+<h2>一個慢請求到底慢在哪：trace 與 span</h2>
+<p>一條 <strong>trace</strong>（追蹤）是一個請求在所有服務裡經過的完整路徑。它由很多個 <strong>span</strong>（區段）組成：每個 span 是一段有開始、有結束的工作，例如「處理 POST /orders」「查資料庫」「呼叫 kitchen」。span 記得自己的<strong>父 span</strong>（parent），所以整條 trace 是一棵樹；沒有父 span 的第一段叫 <strong>root span</strong>。</p>
+<figure>
+  <svg viewBox="0 0 700 280" role="img" aria-label="一個 POST /orders 的瀑布圖：api 的 SERVER span 從 0 到 2400 毫秒，底下的資料庫查詢 40 毫秒，呼叫 kitchen 的 CLIENT span 2300 毫秒，kitchen 的 SERVER span 幾乎一樣長，kitchen 的資料庫查詢佔了 2200 毫秒，最後送進佇列的 PRODUCER span 只有 10 毫秒。慢的是 kitchen 的資料庫查詢">
+    <text class="d-small" x="10" y="20">服務・span 名稱</text>
+    <text class="d-small" x="250" y="20">0</text><text class="d-small" x="455" y="20">1200ms</text><text class="d-small" x="650" y="20">2400ms</text>
+    <line class="d-line" x1="250" y1="28" x2="690" y2="28"/>
+    <text class="d-text" x="10" y="55">cafe-api　POST /orders</text>
+    <rect class="d-soft" x="250" y="42" width="440" height="20" rx="3"/>
+    <text class="d-text" x="25" y="90">cafe-api　SELECT products</text>
+    <rect class="d-box" x="252" y="77" width="8" height="20" rx="2"/>
+    <text class="d-text" x="25" y="125">cafe-api　POST（呼叫 kitchen）</text>
+    <rect class="d-soft" x="262" y="112" width="422" height="20" rx="3"/>
+    <text class="d-text" x="40" y="160">kitchen　POST /tickets</text>
+    <rect class="d-soft" x="264" y="147" width="418" height="20" rx="3"/>
+    <text class="d-accent" x="55" y="195">kitchen　UPDATE stock</text>
+    <rect class="d-box" x="268" y="182" width="402" height="20" rx="3"/>
+    <text class="d-accent" x="420" y="197" text-anchor="middle">2200ms：在等鎖</text>
+    <text class="d-text" x="55" y="230">kitchen　publish print-ticket</text>
+    <rect class="d-box" x="672" y="217" width="6" height="20" rx="2"/>
+    <text class="d-small" x="10" y="265">每一列是一個 span；縮排是父子關係；橫條的位置與長度是開始時間與耗時</text>
+  </svg>
+  <figcaption>只看 cafe-api 的 log 或指標，只知道 POST /orders 花了 2.4 秒；trace 直接指出是 kitchen 的 UPDATE 在等鎖。</figcaption>
+</figure>
+<p>一個 span 有這些欄位：</p>
+<div class="table-wrap"><table>
+  <tr><th>欄位</th><th>是什麼</th><th>例子</th></tr>
+  <tr><td><code>trace_id</code></td><td>整條 trace 的編號，16 bytes，寫成 32 個 hex 字元；同一個請求的所有 span 都一樣</td><td><code>4bf92f3577b34da6a3ce929d0e0e4736</code></td></tr>
+  <tr><td><code>span_id</code></td><td>這個 span 的編號，8 bytes，16 個 hex 字元</td><td><code>00f067aa0ba902b7</code></td></tr>
+  <tr><td><code>parent_span_id</code></td><td>父 span 的編號；root span 沒有</td><td></td></tr>
+  <tr><td>name</td><td>這段工作叫什麼。要是<strong>低基數</strong>的：路由樣板，不是原始網址</td><td><code>POST /orders</code>、<code>GET /orders/:id</code></td></tr>
+  <tr><td>kind</td><td><strong>span kind</strong>：這段工作的角色。SERVER 處理收到的請求；CLIENT 呼叫別的服務；PRODUCER 送出佇列訊息；CONSUMER 處理佇列訊息；INTERNAL 程序內部的工作</td><td><code>SERVER</code></td></tr>
+  <tr><td>開始、結束時間</td><td>相減就是耗時</td><td></td></tr>
+  <tr><td>屬性（attributes）</td><td>描述這段工作的鍵值</td><td><code>http.route=/orders</code></td></tr>
+  <tr><td>事件（events）</td><td>span 期間某個時間點發生的事，最常見的是例外</td><td><code>exception</code></td></tr>
+  <tr><td>狀態（status）</td><td>UNSET（預設）、OK、ERROR</td><td><code>ERROR</code></td></tr>
+</table></div>
+<p>span 跟 log 的差別在結構：log 是一個時間點上的一句話；span 是一段<strong>時間區間</strong>，而且知道自己的父親是誰，所以能組成樹、算出每一段佔了多少時間、知道誰在等誰。<a href="22-metrics-slo.html">第 22 課</a>說過三者的分工：指標告訴你「有問題」，trace 告訴你「在哪裡」，log 告訴你「為什麼」。</p>
+
+<h2>傳遞情境：traceparent</h2>
+<p>kitchen 怎麼知道自己收到的請求屬於哪一條 trace？呼叫的一方要把 trace 資訊放進請求裡帶過去，這叫<strong>情境傳遞</strong>（context propagation）。HTTP 用的格式是 W3C 的標準 <strong>Trace Context</strong>（Level 1，2021 年 11 月成為正式建議），定義了兩個標頭：<code>traceparent</code> 帶 trace 的身分，<code>tracestate</code> 讓各家廠商附加自己的資料。</p>
+<pre>traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+             │  │                                │                │
+             │  trace-id（32 個 hex）             parent-id（16）    flags（2）
+             version（2）</pre>
+<ul>
+  <li><strong>version</strong>：目前是 <code>00</code>。<code>ff</code> 明訂為無效。</li>
+  <li><strong>trace-id</strong>：整條 trace 的編號。<strong>parent-id</strong>：送出這個請求的那個 span 的編號，收到的一方拿它當自己的父 span。</li>
+  <li><strong>flags</strong>：最低的位元是 <strong>sampled</strong>：<code>01</code> 表示上游決定要記錄這條 trace，<code>00</code> 表示不記錄。其他位元保留，目前要設成 0。</li>
+  <li>所有 hex 都要<strong>小寫</strong>。trace-id 全是 0、parent-id 全是 0 都是無效值。</li>
+</ul>
+<p>收到無效的 traceparent 時，規格要求忽略它、開一條新的 trace，並丟掉 tracestate。這不只是格式潔癖：traceparent 來自外部，可能是壞掉的客戶端，也可能是有人故意塞的，照單全收會讓不相干的請求被串成同一條 trace。練習 1 你要自己寫這段解析。</p>
+<p>每經過一個服務，trace-id 不變，parent-id 換成新的 span 的編號，sampled 照上游的決定往下傳：</p>
+<pre>瀏覽器 → api      traceparent: 00-4bf9…4736-<strong>00f067aa0ba902b7</strong>-01    （api 的 SERVER span 的父親）
+api → kitchen     traceparent: 00-4bf9…4736-<strong>b7ad6b7169203331</strong>-01    （api 的 CLIENT span 的編號）</pre>
+<p>情境不只走 HTTP。訊息送進佇列（例如 <a href="../../nestjs/lessons/20-queues-bullmq.html">NestJS 課第 20 課</a>的 BullMQ），也要把 traceparent 一起放進訊息，否則 worker 處理訂單的那一段就跟原本的請求斷開了：</p>
+<pre>// 送出（PRODUCER）：把目前的情境寫進一個普通物件，跟著 job 一起存
+const otel: Record&lt;string, string&gt; = {}
+propagation.inject(context.active(), otel)          // otel = { traceparent: '00-…-01' }
+await queue.add('print-ticket', { orderId, otel })
+
+// 處理（CONSUMER）：從 job 取回情境，在它底下建立 span
+const parent = propagation.extract(ROOT_CONTEXT, job.data.otel)
+await tracer.startActiveSpan('process print-ticket', { kind: SpanKind.CONSUMER }, parent, async span =&gt; { … })</pre>
+<p>一次批次處理很多則訊息時，一個 span 沒辦法有好幾個父親，這時用 <strong>span link</strong>（連結）指向每一則訊息原本的 trace。</p>
+<div class="callout practice"><strong>💡 實務上：trace 的邊界要自己決定</strong><br>咖啡店的公開 API 會收到瀏覽器、合作夥伴、甚至攻擊者送來的 traceparent。常見的做法是：內部服務之間照單延續；從外部進來的請求，在入口（外部請求最先進到的那一層，例如反向代理後的第一個服務）開一條新的 trace，需要時用 span link 指回對方給的 trace。前端的 Vue 頁面若要送 traceparent，它是自訂標頭，跨網域時會觸發 CORS 預檢，後端要在 <code>Access-Control-Allow-Headers</code> 放行。設計時要問：哪些入口信任上游、哪些重開，寫進團隊的文件，不然每個服務各做各的。</div>
+
+<h2>OpenTelemetry 的元件</h2>
+<p><strong>OpenTelemetry</strong>（簡稱 OTel）是 CNCF 的開放標準與工具組，涵蓋 trace、指標、log：定義資料長什麼樣、怎麼傳、各語言的程式庫怎麼寫。它不負責儲存與畫圖，那是 Jaeger、Grafana Tempo 這類後端，或各家 SaaS 的事。好處是你只埋點一次，後端可以換。</p>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="OpenTelemetry 的管線：程式碼呼叫 API 建立 span，SDK 的 TracerProvider 交給 BatchSpanProcessor 分批，OTLP exporter 用 HTTP 送到 4318 port 的 Collector，Collector 處理後轉送到 Jaeger 或 Tempo">
+    <defs><marker id="arr23a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="10" y="20" width="390" height="210" rx="10"/>
+    <text class="d-small" x="205" y="40" text-anchor="middle">cafe-api 程序裡</text>
+    <rect class="d-box" x="25" y="55" width="160" height="55" rx="8"/>
+    <text class="d-text" x="105" y="78" text-anchor="middle">你的程式、函式庫</text>
+    <text class="d-small" x="105" y="98" text-anchor="middle">只依賴 @opentelemetry/api</text>
+    <rect class="d-box" x="225" y="55" width="160" height="55" rx="8"/>
+    <text class="d-text" x="305" y="78" text-anchor="middle">SDK：TracerProvider</text>
+    <text class="d-small" x="305" y="98" text-anchor="middle">取樣、resource</text>
+    <rect class="d-box" x="225" y="150" width="160" height="55" rx="8"/>
+    <text class="d-text" x="305" y="173" text-anchor="middle">BatchSpanProcessor</text>
+    <text class="d-small" x="305" y="193" text-anchor="middle">結束的 span 先排隊</text>
+    <rect class="d-box" x="25" y="150" width="160" height="55" rx="8"/>
+    <text class="d-text" x="105" y="173" text-anchor="middle">OTLP exporter</text>
+    <text class="d-small" x="105" y="193" text-anchor="middle">JSON over HTTP</text>
+    <rect class="d-box" x="440" y="110" width="110" height="65" rx="8"/>
+    <text class="d-accent" x="495" y="137" text-anchor="middle">Collector</text>
+    <text class="d-small" x="495" y="157" text-anchor="middle">:4317 / :4318</text>
+    <rect class="d-box" x="590" y="110" width="100" height="65" rx="8"/>
+    <text class="d-text" x="640" y="137" text-anchor="middle">後端</text>
+    <text class="d-small" x="640" y="157" text-anchor="middle">Jaeger、Tempo</text>
+    <line class="d-line" x1="185" y1="82" x2="223" y2="82" marker-end="url(#arr23a)"/>
+    <line class="d-line" x1="305" y1="110" x2="305" y2="148" marker-end="url(#arr23a)"/>
+    <line class="d-line" x1="225" y1="177" x2="187" y2="177" marker-end="url(#arr23a)"/>
+    <line class="d-line" x1="105" y1="205" x2="105" y2="222"/>
+    <line class="d-line" x1="105" y1="222" x2="420" y2="222"/>
+    <line class="d-line" x1="420" y1="222" x2="438" y2="160" marker-end="url(#arr23a)"/>
+    <line class="d-line" x1="550" y1="142" x2="588" y2="142" marker-end="url(#arr23a)"/>
+  </svg>
+  <figcaption>程式只碰 API；SDK、exporter、Collector 都可以換掉或重新設定，不用改業務程式碼。</figcaption>
+</figure>
+<ul>
+  <li><strong>API 與 SDK 分開</strong>：<code>@opentelemetry/api</code> 只有介面。沒有註冊 SDK 時，它的每個呼叫都是什麼都不做的 no-op，幾乎沒有成本。所以<strong>函式庫只依賴 API</strong>：裝了它的應用程式不想要追蹤，就不用付代價；要追蹤，由<strong>應用程式</strong>自己裝 SDK、決定送去哪裡。函式庫要是自帶 SDK，就會跟應用程式的 SDK 版本衝突、各送各的。</li>
+  <li><strong>SDK</strong>：<code>TracerProvider</code> 產生 span、做取樣、附上 <strong>resource</strong>（這個程序是誰：<code>service.name</code>、版本、環境）；<strong>span processor</strong> 在 span 結束時接手，<code>BatchSpanProcessor</code> 先放進佇列，攢一批（預設每 5 秒）再送，不會每個 span 一個網路請求。</li>
+  <li><strong>exporter</strong>：把 span 轉成某種格式送出。標準格式是 <strong>OTLP</strong>（OpenTelemetry Protocol），gRPC 用 4317 port，HTTP 用 4318 port。<code>OTLPTraceExporter</code>（<code>@opentelemetry/exporter-trace-otlp-http</code>）預設送 JSON 到 <code>http://localhost:4318/v1/traces</code>，設了環境變數 <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> 就改送到那個位址（自動接上 <code>/v1/traces</code>）。</li>
+  <li><strong>Collector</strong>：接收、處理、轉送遙測資料的獨立服務。程式只送到附近的 Collector，由它批次、重試、遮蔽敏感屬性、取樣，再轉送到一個或多個後端。換後端只改 Collector 的設定。</li>
+  <li><strong>語意慣例</strong>（semantic conventions）：大家同意的屬性名稱，例如 <code>http.request.method</code>、<code>http.route</code>、<code>http.response.status_code</code>、<code>url.full</code>、<code>service.name</code>。名稱一致，後端才能自動畫出服務地圖、算出錯誤率。<code>@opentelemetry/semantic-conventions</code> 提供常數，例如 <code>ATTR_HTTP_ROUTE</code>。慣例也規定 HTTP span 的名稱：SERVER 是「方法 路由樣板」，CLIENT 只用方法。</li>
+</ul>
+<div class="callout warn">版本注意：OpenTelemetry JS 3.0.0（2026-10-20）把 <code>sdk-trace-base</code>、<code>sdk-trace-node</code>、<code>sdk-trace-web</code> 合併成 <code>@opentelemetry/sdk-trace</code>，最低需要 Node 22.15.0，實驗性的套件（例如 exporter）要搭配 0.300.0；<code>AsyncHooksContextManager</code> 被移除，改用 <code>AsyncLocalStorageContextManager</code>；也不能再 import 套件內部的深層路徑。<code>BatchSpanProcessor</code> 的參數改成一個物件：<code>new BatchSpanProcessor({ exporter })</code>。npm 上的 <code>sdk-trace-node</code> 停在 2.x，網路上多數教學還是 2.x 的寫法，照抄會裝到舊套件。這門課用 sdk-trace 3.0.0、api 1.10.0、semantic-conventions 1.44.0。</div>
+
+<h2>手動埋點</h2>
+<p><strong>埋點</strong>（instrumentation）是在程式裡加上產生遙測資料的程式碼。先設定 SDK，這一段每個服務啟動時跑一次：</p>
+<pre>import { context, propagation, trace } from '@opentelemetry/api'
+import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks'
+import { W3CTraceContextPropagator } from '@opentelemetry/core'
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http'
+import { resourceFromAttributes } from '@opentelemetry/resources'
+import { BatchSpanProcessor, TracerProvider } from '@opentelemetry/sdk-trace'
+import { ATTR_SERVICE_NAME } from '@opentelemetry/semantic-conventions'
+
+context.setGlobalContextManager(new AsyncLocalStorageContextManager())   // ① 記住「現在的 span」
+propagation.setGlobalPropagator(new W3CTraceContextPropagator())          // ② 用 traceparent 跨服務
+const provider = new TracerProvider({
+  resource: resourceFromAttributes({ [ATTR_SERVICE_NAME]: 'cafe-api' }),  // ③ 我是誰
+  spanProcessors: [new BatchSpanProcessor({ exporter: new OTLPTraceExporter() })],   // ④ 分批送出
+})
+trace.setGlobalTracerProvider(provider)</pre>
+<p>① 是關鍵。<code>await</code> 之後，程式怎麼知道「現在」屬於哪個請求的哪個 span？跟 <a href="../../node/lessons/19-structured-logging.html">Node 課第 19 課</a>放 request id 的方法一樣：<strong>AsyncLocalStorage</strong>。<strong>context manager</strong> 把目前的情境（裡面有 active span）放在 AsyncLocalStorage 裡，每個非同步流程各自一份，同時處理 20 個請求也不會混在一起。</p>
+<p>接著在處理請求的地方建立 span。<code>tracer.startActiveSpan(名稱, 選項, 父情境, fn)</code> 建立 span、在 <code>fn</code> 執行期間把它設成 active span，<code>fn</code> 裡建立的 span 自動成為它的子 span：</p>
+<pre>const tracer = trace.getTracer('cafe-api')
+
+// 收到請求：從標頭取出上游的情境，在它底下建立 SERVER span
+const parent = propagation.extract(context.active(), req.headers)
+await tracer.startActiveSpan('POST /orders', {
+  kind: SpanKind.SERVER,
+  attributes: { [ATTR_HTTP_REQUEST_METHOD]: 'POST', [ATTR_HTTP_ROUTE]: '/orders' },
+}, parent, async span =&gt; {
+  try {
+    await createOrder(req, res)
+  } finally {
+    span.setAttribute(ATTR_HTTP_RESPONSE_STATUS_CODE, res.statusCode)
+    if (res.statusCode &gt;= 500) span.setStatus({ code: SpanStatusCode.ERROR })
+    span.end()                                   // 沒有 end 的 span 永遠不會送出
+  }
+})</pre>
+<p>呼叫 kitchen 時建立 CLIENT span，並且在它是 active span 的時候把情境 <strong>inject</strong>（寫入）到要送出的標頭：</p>
+<pre>await tracer.startActiveSpan('POST', { kind: SpanKind.CLIENT, attributes: { … } }, async span =&gt; {
+  try {
+    const headers: Record&lt;string, string&gt; = { 'content-type': 'application/json' }
+    propagation.inject(context.active(), headers)          // headers.traceparent = '00-…-&lt;這個 CLIENT span 的 id&gt;-01'
+    const res = await fetch(url, { method: 'POST', headers, body })
+    if (!res.ok) throw new Error(`kitchen responded ${res.status}`)
+  } catch (err) {
+    span.recordException(err as Error)                      // 記成 exception 事件，含 stack
+    span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message })
+    throw err
+  } finally {
+    span.end()
+  }
+})</pre>
+<p>還有一件常被忘記的事：BatchSpanProcessor 的 span 先放在記憶體裡。部署時容器收到 SIGTERM（<a href="03-processes-signals.html">第 3 課</a>）就 <code>process.exit</code>，最後幾秒的 span 全部消失，偏偏出事的往往就是那幾秒。結束前要 <code>await provider.shutdown()</code>，它會把佇列裡的 span 送完再關掉 exporter。</p>
+<p>屬性裡<strong>不要放個資與機密</strong>：email、電話、token、整個請求 body。trace 後端的保存與權限通常比資料庫寬鬆，<a href="21-logs.html">第 21 課</a>對 log 的規則一樣適用；Collector 也可以再遮蔽一次，當作第二道防線。</p>
+<div class="callout practice"><strong>💡 實務上：值班時 trace 怎麼用</strong><br>告警通知 <code>POST /orders</code> 的 p99 超標（第 22 課）。值班的人先在 trace 後端篩出這段時間、這個路由、耗時超過 1 秒或狀態 ERROR 的 trace，打開其中幾條看瀑布圖：哪個子 span 最長、是不是一直在同一段（同一個下游、同一句 SQL）。找到那一段，再用 trace_id 跳到那段時間的 log 看錯誤訊息。所以埋點時要先想好之後會用什麼篩選：路由、狀態碼、下游服務名稱都要是屬性，不然 trace 存了也撈不出來。</div>
+
+<h2>自動埋點與 ESM</h2>
+<p>每個 HTTP 請求、每次查詢都手寫 span 很累。<strong>自動埋點</strong>（auto-instrumentation）是不改業務程式碼，替常用函式庫（http、undici／fetch、pg、ioredis、Express、NestJS…）自動產生 span、自動 inject／extract。Node 的入口是 <code>@opentelemetry/auto-instrumentations-node</code>，它的做法是在模組載入時<strong>修改</strong>（patch）那些函式庫。</p>
+<p>問題在 <strong>ESM</strong>（ECMAScript modules，<code>import</code> 語法）。CommonJS 的 <code>require</code> 可以攔截，ESM 的載入流程不同，要多掛一個 loader hook，官方文件寫的啟動方式是：</p>
+<pre>node --experimental-loader=@opentelemetry/instrumentation/hook.mjs \
+     --import @opentelemetry/auto-instrumentations-node/register app.js</pre>
+<p>沒有 hook，程式照樣跑、一個錯誤都沒有，就是沒有 span。OpenTelemetry 的文件也說 ESM 的支援仍在進行中，結果可能不一致。NestJS 12 以 ESM 發布，一樣需要這個 hook。另一個細節是順序：SDK 必須在被埋點的函式庫載入<strong>之前</strong>啟動，所以用 <code>--import</code> 先載入設定，不是在 <code>main.ts</code> 裡面 import。</p>
+<p>實務上兩者並用：自動埋點涵蓋框架與資料庫，手動 span 補上業務上重要的步驟（「計算折扣」「保留庫存」），再把業務屬性（訂單的商品數、付款方式）加到 active span 上。這一課的練習全部手動，是為了讓你看清楚自動埋點替你做了哪些事。</p>
+
+<h2>取樣與成本</h2>
+<p>每個 span 都要花 CPU 產生、花網路送、花錢存。每秒 500 個請求、每個請求 8 個 span，一天就是 3.5 億個 span。所以流量大時不會全部留下，而是<strong>取樣</strong>（sampling）：</p>
+<div class="table-wrap"><table>
+  <tr><th>方式</th><th>在哪裡、什麼時候決定</th><th>優點</th><th>代價</th></tr>
+  <tr><td><strong>head-based</strong>：例如 <code>TraceIdRatioBasedSampler(0.1)</code> 留 10%</td><td>root span 開始時，在 SDK</td><td>便宜：沒被選中的 span 根本不產生、不送</td><td>決定時還不知道結果。罕見的錯誤、慢請求很可能剛好沒被選中</td></tr>
+  <tr><td><strong>parent-based</strong>：<code>ParentBasedSampler</code></td><td>有上游時跟著 traceparent 的 sampled 旗標</td><td>同一條 trace 在每個服務的決定一致，不會只剩半條</td><td>只是跟隨，root 的決定還是要另外設</td></tr>
+  <tr><td><strong>tail-based</strong></td><td>在 Collector，等整條 trace 的 span 到齊之後</td><td>可以「錯誤與超過 1 秒的全留、其他留 5%」</td><td>Collector 要把所有 span 暫存在記憶體裡等；同一條 trace 的 span 必須送到同一台 Collector</td></tr>
+</table></div>
+<p>sdk-trace 3.0 沒設 sampler 時用的是 <code>ParentBasedSampler({ root: new AlwaysOnSampler() })</code>：自己是 root 就全留，有上游就照上游的 sampled 旗標。所以上游送來 <code>-00</code> 時，你的服務不會記錄這個請求。常見的正式設定是 SDK 用 ParentBased + 比例取樣控制總量，Collector 再用 tail sampling 把錯誤與慢的 trace 撈回來。<code>TraceIdRatioBasedSampler</code> 用 trace id 算決定，同一條 trace 在不同服務算出來的結果一樣。</p>
+<p>取樣只影響 trace。指標（第 22 課）要從<strong>全部</strong>請求算，錯誤率、p99 才準；不要拿取樣後的 trace 去算錯誤率。</p>
+<div class="callout practice"><strong>💡 實務上：取樣率是成本決策，要跟人討論</strong><br>trace 的費用通常照 span 數或資料量計價，取樣率直接影響帳單，所以會跟維運、主管一起決定。常見的起點：流量小的服務先全留；流量大的用比例取樣，錯誤與慢請求靠 tail sampling 留下；上線新功能那幾天暫時調高。也要讓團隊知道 trace 不是完整紀錄：客服回報某一筆訂單很慢時，那筆不一定有 trace，要先查 log。</div>
+
+<h2>把 log 和 trace 連起來</h2>
+<p><a href="21-logs.html">第 21 課</a>的 log 欄位裡有 <code>trace_id</code>。有了它，在 Grafana 看 trace 時可以一鍵跳到這條 trace 的所有 log，反過來看到一行錯誤 log 也能跳到它的 trace。做法是讓 logger 每寫一行都去問「現在的 active span 是誰」。pino 的 <code>mixin</code> 選項是一個函式，每寫一行 log 都會呼叫，回傳的物件併進那一行：</p>
+<pre>pino({
+  mixin() {
+    const span = trace.getActiveSpan()          // 從 AsyncLocalStorage 拿「這個請求」的 span
+    if (!span) return {}                        // 請求以外（啟動、排程）不帶
+    const { traceId, spanId } = span.spanContext()
+    return { trace_id: traceId, span_id: spanId }
+  },
+})</pre>
+<p>兩個看起來也行、其實會錯的做法：只在 api 從 traceparent 標頭讀出 trace id 塞進 log，kitchen 那邊就沒有；用一個全域變數存「目前的 trace id」，第二個請求進來就把第一個的蓋掉，併發時 log 會掛到別人的 trace 上。練習 3 的測試會同時送 20 個請求抓這兩種錯。</p>
+<p>想在本機看看真的瀑布圖（選用，不判分），可以開一個 Jaeger 2.22 all-in-one（UI 在 16686，OTLP 在 4317／4318），只開在 127.0.0.1：</p>
+<pre>docker run -d --rm --name ld-23-jaeger -p 127.0.0.1:18236:16686 -p 127.0.0.1:18238:4318 \
+  cr.jaegertracing.io/jaegertracing/jaeger:2.22.0
+cd devops/practice/work/23
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:18238 PORT=3001 node kitchen.ts
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:18238 PORT=3000 KITCHEN_URL=http://localhost:3001 node api.ts
+# 送幾個請求後打開 http://localhost:18236，選 cafe-api；看完 docker stop ld-23-jaeger</pre>
+<p>想要 trace、log、指標放在同一個介面，<code>grafana/otel-lgtm</code> 這個映像把 Collector、Prometheus、Tempo、Loki、Grafana 包在一起，官方說明它只適合開發、展示與測試。</p>
+
+<h2>練習</h2>
+<p>練習 1 在頁面上做。練習 2、3 在 <code>devops/practice</code> 做，不需要 Docker：測試會在 127.0.0.1 的隨機 port 開一個假的 OTLP/HTTP 接收器，用 <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> 指向它，啟動 <code>kitchen.ts</code> 與 <code>api.ts</code>，送請求、送 SIGTERM，再檢查收到的 span 與兩個服務印出的 log。<code>testkit.ts</code> 是測試用的工具，不用改。</p>
+
+<div class="exercise">
+  <p>練習 1：實作 traceparent 的解析與產生。這題只處理版本 <code>00</code>，其他版本一律當成無效。<code>parseTraceparent(header)</code>：格式完全正確時回傳 <code>{ version, traceId, parentId, sampled }</code>，否則回 <code>null</code>。無效的情況包括：大寫 hex、任何一段長度不對、非 hex 字元、trace-id 或 parent-id 全是 0、版本不是 <code>00</code>（包括 <code>ff</code>）、多出來的 <code>-</code> 或內容、前後有空白。<code>sampled</code> 只看 flags 的最低位元。<code>childTraceparent(parent, newSpanId)</code>：產生要送給下游的 traceparent，trace-id 不變、parent-id 換成新的 span id、只保留 sampled 旗標（其他位元歸 0）。<code>newRootTraceparent(traceIdHex, spanIdHex, sampled)</code>：開一條新的 trace。這兩個產生的函式收到不合格的 id（長度不對、大寫、全是 0）時要丟出錯誤。</p>
+  <script type="start">
+type Traceparent = { version: string, traceId: string, parentId: string, sampled: boolean }
+
+function parseTraceparent(header: string): Traceparent | null {
+  return null
+}
+
+function childTraceparent(parent: Traceparent, newSpanId: string): string {
+  return ''
+}
+
+function newRootTraceparent(traceIdHex: string, spanIdHex: string, sampled: boolean): string {
+  return ''
+}
+
+const p = parseTraceparent('00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01')
+console.log(p)
+if (p) console.log(childTraceparent(p, 'b7ad6b7169203331'))
+console.log(parseTraceparent('00-00000000000000000000000000000000-00f067aa0ba902b7-01'))
+</script>
+  <script type="answer">
+type Traceparent = { version: string, traceId: string, parentId: string, sampled: boolean }
+
+// ^ 和 $ 錨定整個字串：前後多一個字元（空白、dash、多的欄位）都不行；不加 i 旗標，大寫不行
+const PATTERN = /^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/
+const allZero = (hex: string) => /^0+$/.test(hex)
+
+function parseTraceparent(header: string): Traceparent | null {
+  const m = PATTERN.exec(header)
+  if (!m) return null
+  const [, version, traceId, parentId, flags] = m
+  if (version !== '00') return null                     // ff 無效；其他版本這題不處理
+  if (allZero(traceId) || allZero(parentId)) return null
+  return { version, traceId, parentId, sampled: (parseInt(flags, 16) & 1) === 1 }
+}
+
+function checkId(hex: string, length: number, what: string) {
+  if (!new RegExp(`^[0-9a-f]{${length}}$`).test(hex) || allZero(hex))
+    throw new Error(`${what} 要是 ${length} 個小寫 hex，而且不能全是 0：${hex}`)
+}
+
+const format = (traceId: string, spanId: string, sampled: boolean) => `00-${traceId}-${spanId}-${sampled ? '01' : '00'}`
+
+function childTraceparent(parent: Traceparent, newSpanId: string): string {
+  checkId(newSpanId, 16, 'span id')
+  return format(parent.traceId, newSpanId, parent.sampled)   // trace-id 與取樣決定跟著上游
+}
+
+function newRootTraceparent(traceIdHex: string, spanIdHex: string, sampled: boolean): string {
+  checkId(traceIdHex, 32, 'trace id')
+  checkId(spanIdHex, 16, 'span id')
+  return format(traceIdHex, spanIdHex, sampled)
+}
+
+const p = parseTraceparent('00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01')
+console.log(p)
+if (p) console.log(childTraceparent(p, 'b7ad6b7169203331'))
+console.log(parseTraceparent('00-00000000000000000000000000000000-00f067aa0ba902b7-01'))
+</script>
+  <script type="tests">
+const T = '4bf92f3577b34da6a3ce929d0e0e4736', P = '00f067aa0ba902b7', S = 'b7ad6b7169203331'
+const OK = `00-${T}-${P}-01`
+const randHex = (bytes: number) => Array.from(crypto.getRandomValues(new Uint8Array(bytes)), b => b.toString(16).padStart(2, '0')).join('')
+const throws = (fn: () => unknown) => { try { fn() } catch { return true } return false }
+
+assert.deepEqual(parseTraceparent(OK), { version: '00', traceId: T, parentId: P, sampled: true }, '合法的 traceparent 要回傳 { version, traceId, parentId, sampled }')
+assert.equal(parseTraceparent(`00-${T}-${P}-00`)?.sampled, false, 'flags 00：sampled 是 false')
+assert.equal(parseTraceparent(`00-${T}-${P}-03`)?.sampled, true, 'flags 03 也合法，最低位元是 1，sampled 是 true：只看最低位元，不是比對字串 01')
+assert.equal(parseTraceparent(`00-${T}-${P}-02`)?.sampled, false, 'flags 02 合法，最低位元是 0，sampled 是 false')
+const t2 = randHex(16), p2 = randHex(8)
+assert.deepEqual(parseTraceparent(`00-${t2}-${p2}-01`), { version: '00', traceId: t2, parentId: p2, sampled: true }, '隨機產生的合法 traceparent 也要解析正確')
+
+const invalid: [string, string][] = [
+  [OK.toUpperCase(), '大寫 hex'],
+  [`00-${T.toUpperCase()}-${P}-01`, 'trace-id 是大寫'],
+  [`00-${T}-${P.toUpperCase()}-01`, 'parent-id 是大寫'],
+  [`00-${T.slice(1)}-${P}-01`, 'trace-id 少一個字'],
+  [`00-${T}a-${P}-01`, 'trace-id 多一個字'],
+  [`00-${T}-${P.slice(1)}-01`, 'parent-id 少一個字'],
+  [`00-${T}-${P}-1`, 'flags 只有一個字'],
+  [`0-${T}-${P}-01`, 'version 只有一個字'],
+  [`00-${'0'.repeat(32)}-${P}-01`, 'trace-id 全是 0'],
+  [`00-${T}-${'0'.repeat(16)}-01`, 'parent-id 全是 0'],
+  [`ff-${T}-${P}-01`, '版本 ff'],
+  [`01-${T}-${P}-01`, '版本不是 00'],
+  [`00-${T}-${P}-01-`, '後面多一個 dash'],
+  [`00-${T}-${P}-01-abcd`, '後面多一段'],
+  [`00--${T}-${P}-01`, '中間多一個 dash'],
+  [` ${OK}`, '前面有空白'],
+  [`${OK} `, '後面有空白'],
+  [`${OK}\n`, '後面有換行'],
+  [`x${OK}`, '前面多一個字'],
+  [`00-${T.slice(0, 31)}g-${P}-01`, 'trace-id 有非 hex 字元'],
+  [`00-${T}-${P.slice(0, 15)}z-01`, 'parent-id 有非 hex 字元'],
+  [`00_${T}_${P}_01`, '分隔符號不是 dash'],
+  ['', '空字串'],
+]
+for (const [header, why] of invalid) assert.equal(parseTraceparent(header), null, `${why}：${JSON.stringify(header)} 要回 null`)
+
+const parsed = parseTraceparent(OK)!
+assert.equal(childTraceparent(parsed, S), `00-${T}-${S}-01`, 'childTraceparent 要保留 trace-id、parent-id 換成新的 span id、sampled 照上游')
+assert.equal(childTraceparent(parseTraceparent(`00-${T}-${P}-00`)!, S), `00-${T}-${S}-00`, '上游 sampled 是 false 時，往下傳也要是 00：不能丟掉上游的取樣決定')
+assert.equal(childTraceparent(parseTraceparent(`00-${T}-${P}-03`)!, S), `00-${T}-${S}-01`, '只保留 sampled 旗標，其他保留位元要歸 0（03 → 01）')
+for (let i = 0; i < 5; i++) {
+  const t = randHex(16), q = randHex(8), s = randHex(8), sampled = i % 2 === 0
+  assert.equal(childTraceparent(parseTraceparent(`00-${t}-${q}-${sampled ? '01' : '00'}`)!, s), `00-${t}-${s}-${sampled ? '01' : '00'}`, '子 span 的 trace-id 要跟上游一樣，不能產生新的')
+}
+assert(throws(() => childTraceparent(parsed, 'B7AD6B7169203331')), 'childTraceparent 收到大寫的 span id 要丟出錯誤')
+assert(throws(() => childTraceparent(parsed, '0'.repeat(16))), 'childTraceparent 收到全是 0 的 span id 要丟出錯誤')
+
+assert.equal(newRootTraceparent(T, P, true), OK, 'newRootTraceparent(T, P, true) 應該是 00-T-P-01')
+assert.equal(newRootTraceparent(T, P, false), `00-${T}-${P}-00`, 'sampled 是 false 時 flags 是 00')
+const rt = randHex(16), rs = randHex(8)
+assert.deepEqual(parseTraceparent(newRootTraceparent(rt, rs, true)), { version: '00', traceId: rt, parentId: rs, sampled: true }, '產生的 traceparent 要能被 parseTraceparent 解析回來')
+assert(throws(() => newRootTraceparent('0'.repeat(32), P, true)), 'trace id 全是 0 要丟出錯誤')
+assert(throws(() => newRootTraceparent(T.toUpperCase(), P, true)), 'trace id 是大寫要丟出錯誤')
+assert(throws(() => newRootTraceparent(T, P.slice(1), true)), 'span id 長度不對要丟出錯誤')
+assert(throws(() => newRootTraceparent(T.slice(2), P, true)), 'trace id 長度不對要丟出錯誤')
+</script>
+  <script type="wrong">
+type Traceparent = { version: string, traceId: string, parentId: string, sampled: boolean }
+const PATTERN = /([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})/
+const allZero = (hex: string) => /^0+$/.test(hex)
+function parseTraceparent(header: string): Traceparent | null {
+  const m = PATTERN.exec(header)
+  if (!m) return null
+  const [, version, traceId, parentId, flags] = m
+  if (version !== '00' || allZero(traceId) || allZero(parentId)) return null
+  return { version, traceId, parentId, sampled: (parseInt(flags, 16) & 1) === 1 }
+}
+function checkId(hex: string, length: number) {
+  if (!new RegExp(`^[0-9a-f]{${length}}$`).test(hex) || allZero(hex)) throw new Error('bad id')
+}
+const format = (t: string, s: string, sampled: boolean) => `00-${t}-${s}-${sampled ? '01' : '00'}`
+function childTraceparent(parent: Traceparent, newSpanId: string): string { checkId(newSpanId, 16); return format(parent.traceId, newSpanId, parent.sampled) }
+function newRootTraceparent(t: string, s: string, sampled: boolean): string { checkId(t, 32); checkId(s, 16); return format(t, s, sampled) }
+</script>
+  <script type="wrong">
+type Traceparent = { version: string, traceId: string, parentId: string, sampled: boolean }
+const PATTERN = /^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/i
+const allZero = (hex: string) => /^0+$/.test(hex)
+function parseTraceparent(header: string): Traceparent | null {
+  const m = PATTERN.exec(header)
+  if (!m) return null
+  const [, version, traceId, parentId, flags] = m
+  if (version !== '00' || allZero(traceId) || allZero(parentId)) return null
+  return { version, traceId: traceId.toLowerCase(), parentId: parentId.toLowerCase(), sampled: (parseInt(flags, 16) & 1) === 1 }
+}
+function checkId(hex: string, length: number) {
+  if (!new RegExp(`^[0-9a-f]{${length}}$`, 'i').test(hex) || allZero(hex)) throw new Error('bad id')
+}
+const format = (t: string, s: string, sampled: boolean) => `00-${t.toLowerCase()}-${s.toLowerCase()}-${sampled ? '01' : '00'}`
+function childTraceparent(parent: Traceparent, newSpanId: string): string { checkId(newSpanId, 16); return format(parent.traceId, newSpanId, parent.sampled) }
+function newRootTraceparent(t: string, s: string, sampled: boolean): string { checkId(t, 32); checkId(s, 16); return format(t, s, sampled) }
+</script>
+  <script type="wrong">
+type Traceparent = { version: string, traceId: string, parentId: string, sampled: boolean }
+const PATTERN = /^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/
+const allZero = (hex: string) => /^0+$/.test(hex)
+function parseTraceparent(header: string): Traceparent | null {
+  const m = PATTERN.exec(header)
+  if (!m) return null
+  const [, version, traceId, parentId, flags] = m
+  if (version !== '00' || allZero(traceId) || allZero(parentId)) return null
+  return { version, traceId, parentId, sampled: (parseInt(flags, 16) & 1) === 1 }
+}
+function checkId(hex: string, length: number) {
+  if (!new RegExp(`^[0-9a-f]{${length}}$`).test(hex) || allZero(hex)) throw new Error('bad id')
+}
+const format = (t: string, s: string, sampled: boolean) => `00-${t}-${s}-${sampled ? '01' : '00'}`
+// 子 span 開了一條新的 trace
+function childTraceparent(parent: Traceparent, newSpanId: string): string { checkId(newSpanId, 16); return format(newSpanId + newSpanId, newSpanId, parent.sampled) }
+function newRootTraceparent(t: string, s: string, sampled: boolean): string { checkId(t, 32); checkId(s, 16); return format(t, s, sampled) }
+</script>
+  <script type="wrong">
+type Traceparent = { version: string, traceId: string, parentId: string, sampled: boolean }
+const PATTERN = /^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/
+const allZero = (hex: string) => /^0+$/.test(hex)
+function parseTraceparent(header: string): Traceparent | null {
+  const m = PATTERN.exec(header)
+  if (!m) return null
+  const [, version, traceId, parentId, flags] = m
+  if (version !== '00' || allZero(traceId) || allZero(parentId)) return null
+  return { version, traceId, parentId, sampled: (parseInt(flags, 16) & 1) === 1 }
+}
+function checkId(hex: string, length: number) {
+  if (!new RegExp(`^[0-9a-f]{${length}}$`).test(hex) || allZero(hex)) throw new Error('bad id')
+}
+// 丟掉 sampled 旗標，一律送 01
+function childTraceparent(parent: Traceparent, newSpanId: string): string { checkId(newSpanId, 16); return `00-${parent.traceId}-${newSpanId}-01` }
+function newRootTraceparent(t: string, s: string, sampled: boolean): string { checkId(t, 32); checkId(s, 16); return `00-${t}-${s}-${sampled ? '01' : '00'}` }
+</script>
+  <script type="wrong">
+type Traceparent = { version: string, traceId: string, parentId: string, sampled: boolean }
+const PATTERN = /^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/
+// 格式對就好，沒有檢查全是 0 與版本
+function parseTraceparent(header: string): Traceparent | null {
+  const m = PATTERN.exec(header)
+  if (!m) return null
+  const [, version, traceId, parentId, flags] = m
+  return { version, traceId, parentId, sampled: (parseInt(flags, 16) & 1) === 1 }
+}
+function checkId(hex: string, length: number) {
+  if (!new RegExp(`^[0-9a-f]{${length}}$`).test(hex)) throw new Error('bad id')
+}
+const format = (t: string, s: string, sampled: boolean) => `00-${t}-${s}-${sampled ? '01' : '00'}`
+function childTraceparent(parent: Traceparent, newSpanId: string): string { checkId(newSpanId, 16); return format(parent.traceId, newSpanId, parent.sampled) }
+function newRootTraceparent(t: string, s: string, sampled: boolean): string { checkId(t, 32); checkId(s, 16); return format(t, s, sampled) }
+</script>
+  <script type="wrong">
+type Traceparent = { version: string, traceId: string, parentId: string, sampled: boolean }
+const PATTERN = /^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/
+const allZero = (hex: string) => /^0+$/.test(hex)
+// sampled 用字串比對，03 會被當成沒取樣
+function parseTraceparent(header: string): Traceparent | null {
+  const m = PATTERN.exec(header)
+  if (!m) return null
+  const [, version, traceId, parentId, flags] = m
+  if (version !== '00' || allZero(traceId) || allZero(parentId)) return null
+  return { version, traceId, parentId, sampled: flags === '01' }
+}
+function checkId(hex: string, length: number) {
+  if (!new RegExp(`^[0-9a-f]{${length}}$`).test(hex) || allZero(hex)) throw new Error('bad id')
+}
+const format = (t: string, s: string, sampled: boolean) => `00-${t}-${s}-${sampled ? '01' : '00'}`
+function childTraceparent(parent: Traceparent, newSpanId: string): string { checkId(newSpanId, 16); return format(parent.traceId, newSpanId, parent.sampled) }
+function newRootTraceparent(t: string, s: string, sampled: boolean): string { checkId(t, 32); checkId(s, 16); return format(t, s, sampled) }
+</script>
+</div>
+
+<div class="local" data-test="ex2" data-files="tracing.ts api.ts kitchen.ts">
+  <p>練習 2：把 api 與 kitchen 串成一條 trace。在 <code>tracing.ts</code> 完成 <code>setupTracing(serviceName)</code>：AsyncLocalStorageContextManager、W3CTraceContextPropagator、TracerProvider（resource 的 <code>service.name</code>、BatchSpanProcessor 接 OTLPTraceExporter），註冊成全域。在 <code>api.ts</code>：每個請求從標頭 extract 上游情境、建立 SERVER span（名稱 <code>POST /orders</code>，不是 <code>req.url</code>；屬性 <code>http.request.method</code>、<code>http.route</code>，結束前寫上 <code>http.response.status_code</code>，5xx 時狀態 ERROR）；<code>callKitchen</code> 包一個 CLIENT span（名稱 <code>POST</code>；屬性 <code>http.request.method</code>、<code>url.full</code>、<code>http.response.status_code</code>），送出前 inject 標頭，失敗時 <code>recordException</code> 並設成 ERROR。在 <code>kitchen.ts</code>：extract 後在那個情境下建立 SERVER span（<code>POST /tickets</code>，同樣的屬性），出錯時 <code>recordException</code>、設成 ERROR。每個 span 都在 <code>finally</code> 裡 end；兩個服務收到 SIGTERM 時都要先 <code>await provider.shutdown()</code> 再結束。測試會檢查：三個 span 都在傳入的 trace 裡、父子關係正確、名稱與屬性、kitchen 回 500 時三個 span 都是 ERROR、送完 10 個請求立刻 SIGTERM 時 30 個 span 一個都不少，而且是分批送出（不是每個 span 送一次）。手動試的指令寫在 <code>api.ts</code> 開頭。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="logger.ts">
+  <p>練習 3：先完成練習 2。兩個服務都用 <code>logger.ts</code> 的 <code>createLogger</code>，請求期間會印出 order received、kitchen accepted、request（api）與 ticket received、ticket printed（kitchen）。在 <code>logger.ts</code> 讓請求期間的每一行 log 都帶上目前的 <code>trace_id</code> 與 <code>span_id</code>，請求以外的 log（例如 listening）不帶這兩個欄位。只能改 <code>logger.ts</code>。測試會同時送 20 個帶不同 traceparent 的請求，用 request_id 對出每一行屬於哪個請求，檢查 trace_id 是那個請求的、span_id 是這個服務在那個請求裡的某個 span。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 4：團隊在寫一個共用的資料庫存取套件 <code>@cafe/db</code>，想讓每個查詢都有 span。同事提議：「套件裡直接裝好 <code>@opentelemetry/sdk-trace</code> 和 OTLP exporter，誰用了就自動有追蹤。」比較好的做法是？</p>
+  <label data-key="a">照他說的做，函式庫自帶完整 SDK 才方便</label>
+  <label data-key="b">套件只依賴 <code>@opentelemetry/api</code> 建立 span；SDK、exporter 由應用程式決定與安裝</label>
+  <label data-key="c">套件不要碰 OpenTelemetry，追蹤是應用程式的事，函式庫裡的 span 沒有價值</label>
+  <label data-key="d">套件自己用 console.log 印出耗時，比 span 輕量</label>
+  <p class="why">✓ b。API 在沒有註冊 SDK 時是 no-op，不想追蹤的應用程式幾乎不付代價；要追蹤的應用程式裝自己的 SDK，函式庫的 span 自動接到它的 trace 裡。a 函式庫自帶 SDK 會跟應用程式的 SDK 版本衝突、各自決定送去哪裡、取樣不一致；c 查詢這一段正是 trace 最想看到的；d console.log 沒有父子關係，也接不上 trace。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：為了省錢，SDK 改成 <code>ParentBasedSampler({ root: new TraceIdRatioBasedSampler(0.1) })</code>，只留 10% 的 trace。這樣會漏掉什麼？</p>
+  <label data-key="a">什麼都不會漏，取樣只是少存一些重複的資料</label>
+  <label data-key="b">每條 trace 只會留下 10% 的 span，瀑布圖會缺一段一段</label>
+  <label data-key="c">決定在請求開始時就做了，罕見的錯誤和慢請求有 90% 的機率沒被留下；要保留它們，要在 Collector 做 tail sampling</label>
+  <label data-key="d">錯誤率和 p99 指標會變成只算 10% 的請求</label>
+  <p class="why">✓ c。head-based 取樣在 root span 開始時決定，那時還不知道這個請求會不會出錯、會不會慢。tail sampling 等整條 trace 到齊再決定，可以「錯誤與慢的全留、其他抽樣」，代價是 Collector 要暫存 span。b ParentBased 讓下游跟著 root 的決定，一條 trace 是整條留或整條丟；d 指標是另外算的，跟 trace 取樣無關，也不應該從取樣後的 trace 算。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：同事說：「span 就是有時間戳的 log，我們已經有結構化 log 加 request_id，不需要 trace。」哪個說法正確？</p>
+  <label data-key="a">span 是有開始與結束的時間區間，還記得父 span，能組成跨服務的樹，直接看出每一段花多久、誰在等誰；log 是時間點，要自己拼</label>
+  <label data-key="b">他說得對，span 和 log 存的資料一樣，只是格式不同</label>
+  <label data-key="c">trace 會取代 log，有了 trace 就可以把 log 關掉</label>
+  <label data-key="d">差別只在 trace 比較便宜</label>
+  <p class="why">✓ a。結構化 log 加 request_id 可以找出同一個請求的所有行，但看不出巢狀關係、哪幾段同時進行、哪一段在等哪一段。b 少了區間與父子關係；c 兩者互補：trace 告訴你在哪裡，log 告訴你為什麼，所以要用 trace_id 把兩者連起來；d trace 通常比 log 貴，所以才要取樣。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>沒有傳遞情境</strong>：呼叫下游時沒有 inject，或收到時沒有 extract，每個服務各自一條 trace，瀑布圖斷成好幾段。CLIENT span 要 inject，SERVER span 要在 extract 回來的情境下建立。</li>
+  <li><strong>佇列訊息裡忘了帶 traceparent</strong>：worker 那一段變成獨立的 trace。送出時 inject 到訊息資料，處理時 extract。</li>
+  <li><strong>用原始網址當 span 名稱</strong>：<code>POST /orders/1155?source=pos</code> 每張訂單一個名稱，後端無法彙總。名稱用「方法 路由樣板」，id 放屬性。</li>
+  <li><strong>忘了 end span、關機時沒有 flush</strong>：沒 end 的 span 永遠不會送出；BatchSpanProcessor 記憶體裡的 span 會在 <code>process.exit</code> 時消失。end 寫在 <code>finally</code>，SIGTERM 時先 <code>await provider.shutdown()</code>。</li>
+  <li><strong>把個資放進 span 屬性</strong>：email、token、整個 body 進到 trace 後端，保存期與權限都管不住。只放除錯需要的、低敏感的欄位，Collector 再遮蔽一次。</li>
+  <li><strong>高流量下 100% 取樣</strong>：網路、儲存費用跟著流量線性長。用 ParentBased + 比例取樣，錯誤與慢的 trace 交給 tail sampling。</li>
+  <li><strong>ESM 專案以為裝了自動埋點就會生效</strong>：沒有 <code>--experimental-loader=@opentelemetry/instrumentation/hook.mjs</code>，不會報錯，只是沒有 span；SDK 也要用 <code>--import</code> 在函式庫載入前啟動。</li>
+  <li><strong>照 2.x 教學寫 3.0</strong>：<code>sdk-trace-node</code>、<code>new BatchSpanProcessor(exporter)</code>、深層 import 在 3.0 都不能用。看套件的版本，查對應版本的 README。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>trace 是一個請求在所有服務的完整路徑，由 span 組成；span 有 trace_id、span_id、父 span、名稱、kind、時間區間、屬性、事件與狀態。</li>
+  <li>W3C traceparent：<code>00-trace-id-parent-id-flags</code>，小寫 hex、全 0 與版本 ff 無效、sampled 是最低位元；無效就開新的 trace。HTTP 標頭與佇列訊息都要傳。</li>
+  <li>函式庫只依賴 API，應用程式裝 SDK：TracerProvider（resource、sampler）→ BatchSpanProcessor → OTLP exporter（:4318/v1/traces）→ Collector → Jaeger／Tempo。OTel JS 3.0 合併成 <code>@opentelemetry/sdk-trace</code>。</li>
+  <li>手動埋點：<code>startActiveSpan</code>、extract／inject、<code>recordException</code>、ERROR 狀態、<code>finally</code> 裡 end、SIGTERM 時 shutdown；AsyncLocalStorage 讓併發的請求各自有自己的 active span。</li>
+  <li>自動埋點在 ESM 需要 loader hook；取樣要在成本與留下罕見錯誤之間取捨，head、parent-based、tail 各有位置。</li>
+  <li>log 的每一行帶 trace_id、span_id（pino 的 mixin），log、指標、trace 才能互相跳轉。</li>
+</ul>
+<p>能看見問題之後，下一課處理最壞的情況：資料不見了怎麼辦，備份與災難復原。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>19. 並發與鎖</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="19">
+<header>
+  <div class="eyebrow">階段 5：正確性 · 第 19 課</div>
+  <h1>並發與鎖</h1>
+</header>
+<main>
+
+<p>上一課的交易保證「一組操作全做或全不做」，但它沒有回答另一件事：如果<strong>兩個人在同一時間</strong>操作同一筆資料呢？咖啡店只有一台收銀機時不會遇到，可是店裡有兩位店員在收銀、線上點餐 API 一秒鐘湧進上百個請求時，就會有好幾段程式在同一刻讀寫同一列。好幾件事在同一段時間內一起進行，叫做<strong>並發</strong>（concurrency）。</p>
+<p>這一課從一個具體的事故開始，一路解到底：<strong>拿鐵還剩 10 杯，店員 A 和店員 B 同時各賣出一杯，庫存最後卻是 9</strong>。每一句 SQL 都成功、資料庫沒有報任何錯，帳就是對不起來。學完你會知道這個錯是怎麼發生的、收銀程式要怎麼寫才不會再發生，以及修好之後會冒出的下一個問題（兩筆訂單互相卡死）要怎麼處理。</p>
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>庫存為什麼少扣一杯：重播兩位店員的操作，找出「讀」和「寫」之間的空檔。</li>
+  <li>讓資料庫自己減：一句原子 <code>UPDATE</code> 怎麼消滅空檔，它順便拿的「列鎖」是什麼；庫存不夠時怎麼擋。</li>
+  <li>一定要先讀再判斷時：用 <code>SELECT … FOR UPDATE</code> 在讀的當下就鎖住那一列。</li>
+  <li>一張訂單扣好幾項商品：兩個交易互相等對方的鎖（死結）時會怎樣，程式怎麼預防、怎麼重試。</li>
+  <li>回頭解開第一節的疑問：為什麼包了交易還是擋不住？從 MVCC 講到隔離等級。</li>
+</ol></div>
+<div class="callout"><strong>這課會用到：</strong><a href="18-transactions.html">第 18 課</a>的交易（<code>BEGIN</code> 開始、<code>COMMIT</code> 確定、<code>ROLLBACK</code> 取消，中間的修改要 <code>COMMIT</code> 之後別人才看得到）；<a href="06-update-delete.html">第 6 課</a>的 <code>UPDATE … RETURNING</code>（改完直接回傳改後的值）。</div>
+
+<div class="callout">
+  這個頁面的 PGlite 只有<strong>一條連線</strong>，沒辦法真的同時開兩個交易。所以這一課用<strong>時間軸</strong>模擬兩位店員同時操作（按「下一步」逐步播放），能在單一連線裡做的部分，再用執行框實際跑。
+</div>
+
+<h2>拿鐵賣出兩杯，庫存為什麼只少一杯？</h2>
+<p>先看收銀程式原本怎麼寫。咖啡店的 <code>products</code> 表記錄每項商品的庫存 <code>stock</code>，拿鐵是 <code>id = 1</code>，現在剩 10 杯。賣出一杯時，程式的寫法跟你在前端改一個 reactive 物件的欄位很像：先把值讀出來，在程式裡減 1，再把結果寫回去：</p>
+<pre>// 收銀程式（虛擬碼）
+const stock = SELECT stock FROM products WHERE id = 1   // 讀
+UPDATE products SET stock = ${stock - 1} WHERE id = 1  // 寫</pre>
+<p>只有一個人在用的時候，這段程式完全正確。問題出在兩位店員的請求「幾乎同時」進來。資料庫不會等 A 整段程式跑完才處理 B，兩段程式的每一句會交錯執行。按「下一步」，一句一句看交錯的結果：</p>
+
+<div class="tl">
+  <div class="table-wrap"><table>
+    <tr><th>步驟</th><th>店員 A</th><th>店員 B</th><th>資料庫的 stock</th></tr>
+    <tr data-note="A 讀出庫存 10，程式算出 10 − 1 = 9，準備寫回。"><td>1</td><td><code>SELECT stock …</code><br>讀到 10</td><td></td><td>10</td></tr>
+    <tr data-note="A 還沒寫回，所以 B 讀到的也是 10，程式同樣算出 9。"><td>2</td><td></td><td><code>SELECT stock …</code><br>讀到 10</td><td>10</td></tr>
+    <tr data-note="A 寫回 9。到這裡都沒問題。"><td>3</td><td><code>UPDATE … SET stock = 9</code></td><td></td><td>9</td></tr>
+    <tr data-note="B 用它手上的舊值算出的 9 寫回去，把 A 的結果蓋掉了。"><td>4</td><td></td><td><code>UPDATE … SET stock = 9</code></td><td>9</td></tr>
+    <tr data-note="賣出兩杯，庫存卻只少一杯。A 的那次更新「遺失」了，這就是 lost update。每一句 SQL 都沒出錯，資料庫也沒有報錯，只是結果錯了。"><td>5</td><td colspan="2">結果：賣出 2 杯</td><td><strong>9</strong>（應該是 8）</td></tr>
+  </table></div>
+  <div class="bar"><button data-prev>◀ 上一步</button><button class="primary" data-next>下一步 ▶</button><span class="kbd" data-count></span></div>
+  <p class="note"></p>
+</div>
+
+<p>這種錯誤叫<strong>更新遺失</strong>（lost update）：兩個人都根據同一個舊值算出新值，後寫的人把先寫的人的結果整個蓋掉，先寫的那次更新就像沒發生過。它危險的地方在於沒有任何人出錯：每一句 SQL 都合法，資料庫沒有報錯，log 裡什麼都看不到，只有月底盤點時才發現庫存對不上。</p>
+<p>根源是程式的「讀」和「寫」之間有一段空檔。A 讀到 10 之後、寫回 9 之前，這段時間裡 10 這個值其實已經「過期」了，但 B 不知道，照樣拿它來算。只要讀和寫分成兩步、中間沒有任何東西攔住別人，這個空檔就一定存在，請求越多越容易撞上。</p>
+<p>直覺的修法是「把兩句包進 <code>BEGIN</code>／<code>COMMIT</code>，上一課不是說交易讓幾句變成一個整體嗎？」結果還是一樣會錯。交易保證的是「全做或全不做」，並不保證「做的時候別人不能讀」：在 PostgreSQL 預設的設定下，交易裡普通的 <code>SELECT</code> 不會攔住別人讀同一列，B 照樣讀得到 10。為什麼會這樣設計，要等後面「包了交易，為什麼 SELECT 還是攔不住別人？」那一節講到資料庫怎麼同時服務讀和寫的人，才說得清楚。現在先處理眼前的問題：既然空檔是問題，能不能讓讀和寫之間根本沒有空檔？</p>
+
+<h2>讓資料庫自己減：讀和寫怎麼變成一步？</h2>
+<p>空檔來自「在程式裡算」：值要先從資料庫傳到程式、算完再傳回去。如果把計算交給資料庫，寫成 <code>stock = stock - 1</code>，讀和寫就在資料庫內部的同一個動作裡完成，中間沒有程式插手的機會：</p>
+<pre>UPDATE products SET stock = stock - 1 WHERE id = 1;</pre>
+<p>這種「讀出舊值、算出新值、寫回去」在一句裡完成、別人沒辦法從中間插進來的更新，叫做<strong>原子更新</strong>（atomic update）。「原子」取的是不可分割的意思，跟上一課 ACID 的 A 用的是同一個字；這裡強調的是讀、算、寫在一句裡完成，中間沒有讓別的程式插進來的空檔。</p>
+<p>但「在資料庫內部一次完成」還不足以解釋兩個人同時送出這一句時為什麼不會撞在一起。真正擋住 B 的是<strong>列鎖</strong>（row lock）。鎖是資料庫用來排隊的機制：某個交易要修改一列之前，先在那一列上登記「這列現在歸我改」；別的交易也想修改同一列時，看到這個登記就只能停下來等。這個登記會一直保留到持有它的交易 <code>COMMIT</code> 或 <code>ROLLBACK</code> 為止，不是那一句執行完就放掉。<code>UPDATE</code> 會自動幫你拿這把鎖，不用另外寫任何東西。</p>
+<p>拿鐵的事故改用原子更新，再重播一次。注意第 4 步 B 拿到鎖之後用的是哪個值：</p>
+
+<div class="tl">
+  <div class="table-wrap"><table>
+    <tr><th>步驟</th><th>店員 A</th><th>店員 B</th><th>已確定的 stock</th></tr>
+    <tr data-note="A 的 UPDATE 鎖住拿鐵這一列。A 自己看到 9，但還沒 COMMIT，別人看到的仍是 10。"><td>1</td><td><code>BEGIN;</code><br><code>UPDATE … SET stock = stock - 1</code><br>鎖住這一列</td><td></td><td>10</td></tr>
+    <tr data-note="B 也想改同一列，但鎖在 A 手上，B 只能停在這裡等。"><td>2</td><td></td><td><code>BEGIN;</code><br><code>UPDATE … SET stock = stock - 1</code><br><span class="wait">等待中…</span></td><td>10</td></tr>
+    <tr data-note="A 確定生效，鎖釋放。"><td>3</td><td><code>COMMIT;</code></td><td><span class="wait">等待中…</span></td><td>9</td></tr>
+    <tr data-note="B 被放行。關鍵：PostgreSQL 會拿這一列「最新」的值 9 重新計算 stock - 1，而不是 B 一開始看到的 10。"><td>4</td><td></td><td>拿到鎖，用最新的 9 計算 → 8</td><td>9</td></tr>
+    <tr data-note="兩杯都正確扣到了。"><td>5</td><td></td><td><code>COMMIT;</code></td><td><strong>8</strong> ✓</td></tr>
+  </table></div>
+  <div class="bar"><button data-prev>◀ 上一步</button><button class="primary" data-next>下一步 ▶</button><span class="kbd" data-count></span></div>
+  <p class="note"></p>
+</div>
+
+<p>兩件事合在一起才讓結果正確：列鎖讓 B 必須等 A 結束，而 B 被放行後，PostgreSQL 會用那一列<strong>最新已確定</strong>的值 9 重新算 <code>stock - 1</code>，不是沿用 B 一開始看到的 10。第一節的版本少了這兩件事：B 的 <code>SELECT</code> 不拿鎖，不必等；B 寫回的是程式裡算好的固定數字 9，資料庫也沒有機會幫它重算。</p>
+<p>在這個頁面實際跑跑看。執行兩次，每次少 1；<code>RETURNING</code>（第 6 課）直接回傳更新後的值，不用再查一次：</p>
+<div class="lab" data-sql="UPDATE products SET stock = stock - 1 WHERE id = 1 RETURNING name, stock;"></div>
+<p>扣庫存還有一個問題沒處理：賣完了怎麼辦？原子更新只負責「正確地減」，不會管減完是不是負數。布朗尼（<code>id = 4</code>）已經賣完，庫存是 0，直接減會變成 -1，等於賣出一個不存在的布朗尼：</p>
+<div class="lab" data-sql="UPDATE products SET stock = stock - 1 WHERE id = 4 RETURNING name, stock;"></div>
+<p>如果用「先查庫存夠不夠，夠才扣」來擋，又回到第一節的讀寫空檔：兩個人同時查到剩 1 個，兩個人都扣，一樣變成 -1。正確做法是把「夠不夠」也寫進同一句的 <code>WHERE</code>，讓檢查和扣除一起在鎖的保護下完成。庫存不足時，<code>WHERE</code> 不成立，這句就一列都不更新。程式只要看「影響了幾列」：1 列代表賣出成功，0 列代表賣完了。先把剛剛的 -1 改回 0，再試試有條件的版本：</p>
+<div class="lab" data-sql="UPDATE products SET stock = 0 WHERE id = 4;
+
+UPDATE products SET stock = stock - 1
+WHERE id = 4 AND stock >= 1
+RETURNING name, stock;"></div>
+<p>第二句顯示「影響 0 列」（沒有 RETURNING 的結果），布朗尼的庫存維持 0。這個條件在並發下也成立：兩個人搶最後一個時，後到的人等到鎖之後，PostgreSQL 用最新的值（已經是 0）重新檢查 <code>WHERE</code>，條件不成立，就不會更新。另一層保險是在表上加 <code>CHECK (stock >= 0)</code>（<a href="12-constraints.html">第 12 課</a>），萬一哪段程式忘了寫這個條件，資料庫也會擋下來。</p>
+<div class="callout practice"><strong>💡 實務上：扣庫存、扣點數、搶限量優惠券都是這個寫法</strong><br>咖啡店的庫存、集點卡點數、限量 100 張的優惠券、活動報名名額，本質上都是「多人同時減同一個數字」。最常見的坑來自 ORM：<code>product.stock -= 1; product.save()</code> 看起來很自然，實際送出的就是「先讀再寫」。code review 時看到「讀出來、改欄位、存回去」的數量欄位，資深工程師會先問「兩個請求同時進來會怎樣？」，再確認改用 ORM 的遞增／遞減方法或原生 SQL。影響 0 列時，API 應回傳「已售完」這類明確的錯誤給前端，而不是假裝成功。</div>
+<p>原子更新解決了「減一個數字」，但收銀程式不一定都這麼單純。如果在決定怎麼寫之前，程式必須先看到目前的值呢？</p>
+
+<h2>一定要先讀再判斷時，怎麼不讓別人插隊？</h2>
+<p>有些邏輯沒辦法塞進一句 <code>UPDATE</code>。例如下單時，程式要先讀出庫存，再判斷「夠不夠、不夠的話要不要改用替代品、剩不到 3 個要不要通知補貨」，最後才決定寫什麼。這些判斷寫在後端程式裡，資料庫沒辦法幫你在一句裡算完。可是一旦「先讀、在程式裡判斷、再寫」，第一節的空檔就回來了。</p>
+<p>原子更新之所以安全，是因為 <code>UPDATE</code> 會拿列鎖。所以問題變成：能不能在「讀」的時候就先拿到同一把鎖？可以，在 <code>SELECT</code> 後面加 <code>FOR UPDATE</code>。它的意思是「我讀這一列，是為了接下來要改它」：讀出資料的同時就把這一列鎖起來，直到交易結束。其他也想 <code>FOR UPDATE</code> 或修改這一列的人，都要排在你後面。</p>
+<p>拿鐵的事故第三次重播，這次 A 和 B 都先 <code>FOR UPDATE</code> 讀庫存，在程式裡算好再寫回。注意第 2 步 B 卡在哪裡：</p>
+
+<div class="tl">
+  <div class="table-wrap"><table>
+    <tr><th>步驟</th><th>店員 A</th><th>店員 B</th><th>已確定的 stock</th></tr>
+    <tr data-note="A 讀到 10，同時鎖住這一列。"><td>1</td><td><code>BEGIN;</code><br><code>SELECT stock … FOR UPDATE</code><br>讀到 10，鎖住</td><td></td><td>10</td></tr>
+    <tr data-note="B 也要 FOR UPDATE 同一列，被擋住了。注意：B 連「讀」都在等，所以不可能讀到 A 即將改掉的舊值。"><td>2</td><td></td><td><code>BEGIN;</code><br><code>SELECT stock … FOR UPDATE</code><br><span class="wait">等待中…</span></td><td>10</td></tr>
+    <tr data-note="A 在程式裡判斷庫存足夠，寫回 9 並 COMMIT，鎖釋放。"><td>3</td><td><code>UPDATE … SET stock = 9;</code><br><code>COMMIT;</code></td><td><span class="wait">等待中…</span></td><td>9</td></tr>
+    <tr data-note="B 被放行，讀到的是 A 改過之後的 9。"><td>4</td><td></td><td>讀到 <strong>9</strong>，鎖住</td><td>9</td></tr>
+    <tr data-note="B 寫回 8。即使在程式裡計算，結果也正確。"><td>5</td><td></td><td><code>UPDATE … SET stock = 8;</code><br><code>COMMIT;</code></td><td><strong>8</strong> ✓</td></tr>
+  </table></div>
+  <div class="bar"><button data-prev>◀ 上一步</button><button class="primary" data-next>下一步 ▶</button><span class="kbd" data-count></span></div>
+  <p class="note"></p>
+</div>
+
+<p>跟第一節比，差別只在 B 的 <code>SELECT</code>：第一節它不拿鎖，馬上讀到 10；這次它要拿鎖，所以停在 A 後面，等 A <code>COMMIT</code> 之後才讀，讀到的已經是 9。空檔還在，但空檔期間沒有人能讀到即將過期的值。</p>
+<p>這把鎖要發揮作用，整段必須在<strong>交易</strong>裡。<code>FOR UPDATE</code> 的鎖在交易結束（<code>COMMIT</code>／<code>ROLLBACK</code>）時才釋放；沒有 <code>BEGIN</code> 的話，每一句自己就是一個交易（上一課的 autocommit），<code>SELECT</code> 一執行完交易就結束，鎖馬上放掉，等你送出 <code>UPDATE</code> 時早就沒有保護了。</p>
+<p>這個頁面只有一條連線，看不到另一個人被擋住，但寫法就是這樣。執行後看最後的查詢，起司蛋糕從 2 變成 1：</p>
+<div class="lab" data-sql="BEGIN;
+SELECT id, name, stock FROM products WHERE id = 2 FOR UPDATE;   -- 讀並鎖住起司蛋糕
+-- （程式判斷：庫存 2 ≥ 1，可以賣）
+UPDATE products SET stock = stock - 1 WHERE id = 2;
+COMMIT;
+
+SELECT id, name, stock FROM products ORDER BY id;"></div>
+<p>兩種解法怎麼選，看的是「寫什麼」能不能在一句裡決定。能用原子更新就用原子更新：一句完成、鎖住的時間最短。<code>FOR UPDATE</code> 要在讀和寫之間一直拿著鎖，程式判斷得越久，別人就等越久：</p>
+<div class="table-wrap">
+<table>
+  <tr><th>情況</th><th>建議</th></tr>
+  <tr><td>增減數量、累加點數這類能用一句算完的</td><td>原子 <code>UPDATE … SET x = x - 1</code>，加上 <code>WHERE</code> 條件</td></tr>
+  <tr><td>要先讀出來、在程式裡做判斷，再決定怎麼寫</td><td><code>BEGIN</code> → <code>SELECT … FOR UPDATE</code> → <code>UPDATE</code> → <code>COMMIT</code></td></tr>
+</table>
+</div>
+<div class="callout practice"><strong>💡 實務上：FOR UPDATE 必須和後面的 UPDATE 用同一條連線</strong><br>常見場景是會員儲值金扣款：先鎖住錢包讀出餘額，判斷夠不夠，再扣款並寫一筆交易紀錄。這裡要先認識<strong>連線池</strong>（connection pool）：後端程式啟動時會預先開好好幾條資料庫連線放在池子裡，每次呼叫 <code>pool.query</code>，就借一條空閒的連線送出這一句，用完馬上還回去。問題在於 <code>BEGIN</code> 開啟的交易、<code>FOR UPDATE</code> 拿到的鎖，都綁在送出它的那一條連線上。如果三句分別借到三條不同的連線，<code>UPDATE</code> 根本不在那個交易裡，也不受那把鎖保護，等於沒鎖。所以要先從 pool 取出一條連線，整段交易都用它，或使用 ORM 提供的 transaction 函式。另外 <code>WHERE</code> 要精準到需要的那幾列，沒有條件的 <code>FOR UPDATE</code> 會鎖住整批資料，讓其他人全部排隊。</div>
+<p>到這裡，一杯拿鐵的事故已經解決：不管用原子更新還是 <code>FOR UPDATE</code>，靠的都是「讓後到的人排隊」。但排隊本身會帶來新的風險，只要一筆訂單不只一項商品，就會遇到。</p>
+
+<h2>一張訂單扣好幾項商品，為什麼兩個交易會互相卡死？</h2>
+<p>真實的訂單常常不只一項。A 的客人點了「拿鐵＋可頌」，B 的客人點了「可頌＋拿鐵」，兩張訂單各自在一個交易裡逐項扣庫存，每扣一項就拿到那一列的鎖，而且要到交易結束才放。照收銀員點餐的順序扣，就可能出現下面這種情況：A 先鎖住拿鐵，B 先鎖住可頌；接著 A 要扣可頌，得等 B 放手，B 要扣拿鐵，得等 A 放手。兩個人都在等對方，而對方也在等自己，誰都不會先結束：</p>
+<figure>
+  <svg viewBox="0 0 700 220" role="img" aria-label="死結：A 持有拿鐵的鎖、等待可頌；B 持有可頌的鎖、等待拿鐵，形成循環">
+    <defs><marker id="arr19" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="60" y="20" width="170" height="54" rx="10"/><text class="d-text" x="145" y="45" text-anchor="middle">店員 A 的交易</text><text class="d-small" x="145" y="64" text-anchor="middle">一張訂單：拿鐵＋可頌</text>
+    <rect class="d-box" x="470" y="20" width="170" height="54" rx="10"/><text class="d-text" x="555" y="45" text-anchor="middle">店員 B 的交易</text><text class="d-small" x="555" y="64" text-anchor="middle">一張訂單：可頌＋拿鐵</text>
+    <rect class="d-soft" x="60" y="146" width="170" height="54" rx="10"/><text class="d-text" x="145" y="178" text-anchor="middle">拿鐵這一列</text>
+    <rect class="d-soft" x="470" y="146" width="170" height="54" rx="10"/><text class="d-text" x="555" y="178" text-anchor="middle">可頌這一列</text>
+    <path class="d-line" d="M145,74 L145,142" marker-end="url(#arr19)"/><text class="d-accent" x="153" y="112">① 已鎖住</text>
+    <path class="d-line" d="M555,74 L555,142" marker-end="url(#arr19)"/><text class="d-accent" x="563" y="112">② 已鎖住</text>
+    <path class="d-line" d="M230,60 L466,160" marker-end="url(#arr19)" stroke-dasharray="6 4"/>
+    <path class="d-line" d="M470,60 L234,160" marker-end="url(#arr19)" stroke-dasharray="6 4"/>
+    <text class="d-small" x="350" y="88" text-anchor="middle">③ A 想要可頌 → 等 B</text>
+    <text class="d-small" x="350" y="140" text-anchor="middle">④ B 想要拿鐵 → 等 A</text>
+  </svg>
+  <figcaption>實線：已經拿到的鎖；虛線：正在等的鎖。兩條虛線形成循環，誰都動不了。</figcaption>
+</figure>
+<p>這種「等待繞成一圈」的狀態叫<strong>死結</strong>（deadlock）。它跟一般的等鎖不一樣：一般的等鎖，前面的人總會做完、放手；死結裡每個人都在等圈子裡的下一個人，沒有外力介入就會永遠等下去。</p>
+<p>PostgreSQL 不會讓它永遠等。一個交易等鎖等了一段時間（預設 1 秒）之後，PostgreSQL 會檢查等待關係有沒有繞成一圈；發現死結，就挑其中一個交易讓它失敗，錯誤訊息是 deadlock detected。被挑中的交易整個回滾，它手上的鎖全部放開，另一個交易就能繼續做完。所以死結的結果不是當機，而是其中一張訂單收到錯誤。</p>
+<p>這帶出程式要做的兩件事。第一是<strong>收到錯誤時重試</strong>：被犧牲的交易已經整個取消，從 <code>BEGIN</code> 重新跑一次通常就成功了，因為另一個交易這時已經做完。第二是<strong>從源頭預防</strong>：死結的成因是兩個交易用不同順序拿同一批鎖，那就讓所有人都用<strong>相同的順序</strong>上鎖。例如規定一張訂單裡有多項商品時，一律依商品 <code>id</code> 由小到大扣。A 和 B 都會先去拿拿鐵（<code>id = 1</code>），後到的人在第一把鎖就開始排隊，手上什麼都沒拿，等待繞不成一圈。另外，交易越短，持有鎖的時間越短，兩個交易撞在一起的機會也越小。</p>
+<div class="callout practice"><strong>💡 實務上：重試要包住「整個交易」，而且要有上限</strong><br>購物車結帳一次扣好幾項商品，是很常遇到死結的地方；先把品項依商品 <code>id</code> 排序再逐一更新，就能避開大部分情況。重試時要從 <code>BEGIN</code> 重新跑整段，不是只重跑失敗的那一句；次數要有上限（例如幾次就放棄並回錯誤），之間稍等一下。寄信、呼叫金流這類無法撤回的動作不要放在會重試的交易裡，否則可能寄兩次、扣兩次。上線後如果 log 裡常出現 deadlock detected，就該回頭檢查哪兩段程式的上鎖順序不一致。</div>
+<p>鎖的部分到這裡告一段落。但第一節還留著一個問題沒回答：為什麼把「先讀再寫」包進交易，普通的 <code>SELECT</code> 還是攔不住別人？</p>
+
+<h2>包了交易，為什麼 SELECT 還是攔不住別人？</h2>
+<p>答案在 PostgreSQL 處理「同時有人讀、有人寫」的方式。先想一個情境：店員 A 在一個還沒 <code>COMMIT</code> 的交易裡改了拿鐵的庫存，這時店長查報表。如果資料庫只有「一列一份資料」，店長只有兩個選擇：等 A 結束再讀，或讀到 A 還沒確定的值。前者讓報表被收銀卡住，後者讀到的值可能下一秒就被 <code>ROLLBACK</code> 掉。</p>
+<p>PostgreSQL 用的是第三種做法，叫 <strong>MVCC</strong>（multi-version concurrency control，多版本並行控制）。它的核心是：修改一列時不直接覆蓋原本的資料，而是另外寫一個<strong>新版本</strong>，舊版本先保留著。每個查詢依照自己開始的時間點，只看「那一刻已經 commit」的版本。A 還沒 <code>COMMIT</code> 的新版本，別人看不到；店長讀到的是 A 修改前的那一版，不用等，也不會讀到沒確定的值。</p>
+<p>這帶來 PostgreSQL 最重要的一個性質：<strong>讀不擋寫，寫不擋讀</strong>。普通的 <code>SELECT</code> 不拿列鎖，永遠不會因為有人在 <code>UPDATE</code> 而停下來，<code>UPDATE</code> 也不會因為有人在讀而停下來。只有「兩個人要改同一列」，或有人用了 <code>FOR UPDATE</code>，才需要排隊。</p>
+<p>回到第一節的事故，現在就說得通了。B 的 <code>SELECT</code> 是普通讀取，不拿鎖，所以不管包不包在交易裡，它都會立刻讀到「目前已 commit 的版本」，也就是 10。交易保證的是 A 自己那幾句全做或全不做，它沒有讓 B 的讀取停下來。要讓讀取排隊，只能明確說「我讀是為了改」，也就是上一節的 <code>FOR UPDATE</code>。</p>
+<p>這個設計讓讀取很快，但也留下一個要選擇的地方：「每個查詢看自己開始那一刻的版本」，那同一個交易裡的第二句查詢，看的是第一句那一刻，還是第二句這一刻？這個選擇就是下一節的隔離等級。</p>
+
+<h2>交易要看到哪一刻的資料？隔離等級</h2>
+<p>上一課的 ACID 裡，I 是隔離（isolation）：同時執行的交易彼此不要互相干擾。但「不干擾」可以嚴格到不同程度，越嚴格越安全，代價是資料庫越常讓交易失敗、要你重來。這些程度叫<strong>隔離等級</strong>（isolation level）。用上一節的話來說，隔離等級決定的就是：交易裡的查詢看的是哪一刻的版本，以及跟別人衝突時資料庫要不要出面阻止。</p>
+<p>表裡會出現一個名詞：<strong>dirty read</strong>（讀到髒資料），指讀到別人還沒 commit 的修改。PostgreSQL 的 MVCC 本來就只給你看已 commit 的版本，所以任何等級都不會發生。PostgreSQL 有三種實際不同的等級：</p>
+<div class="table-wrap">
+<table>
+  <tr><th>等級</th><th>白話</th><th>防住了</th><th>沒防住</th></tr>
+  <tr><td><code>READ COMMITTED</code>（預設）</td><td>每一句 SQL 看到的是「這一句開始時」已經 commit 的資料</td><td>讀到別人還沒 commit 的資料（dirty read）</td><td>同一個交易裡查兩次，結果可能不同；先讀再寫的 lost update</td></tr>
+  <tr><td><code>REPEATABLE READ</code></td><td>整個交易看到同一份「快照」，像是拍照那一刻的資料</td><td>上面全部，加上：同交易內重讀結果一致；兩人改同一列時，後改的人會收到錯誤，不會悄悄蓋掉</td><td>某些跨多列的邏輯衝突（例如兩人各自檢查「還有人值班嗎？」後都下班）</td></tr>
+  <tr><td><code>SERIALIZABLE</code></td><td>保證結果跟「所有交易一個一個排隊執行」完全一樣</td><td>所有並發造成的異常</td><td>沒有。代價是比較常失敗，程式一定要寫重試</td></tr>
+</table>
+</div>
+<p>由上往下讀這張表：</p>
+<ul>
+  <li><code>READ COMMITTED</code> 是預設，也是第一節事故發生的等級。每一句都重新看「現在」已 commit 的資料，所以 B 的 <code>SELECT</code> 讀到 10，寫回時也不會有人檢查這個 10 是不是已經過期。它防不住 lost update，要靠前面兩種寫法自己防。</li>
+  <li><code>REPEATABLE READ</code> 讓整個交易用同一份快照。拿鐵的事故放在這個等級下跑，B 寫回時資料庫會發現「你要改的這一列，在你的快照之後已經被別人改過了」，直接讓 B 失敗，不讓它悄悄蓋掉 A 的結果。</li>
+  <li><code>SERIALIZABLE</code> 再多檢查「跨好幾列」的衝突，保證結果跟排隊執行一樣。下面用一個例子說明這種衝突長什麼樣子。</li>
+</ul>
+<p>咖啡店規定每家店至少要有一位咖啡師值班。信義店現在有兩位：阿明和小美，兩人同時按下「我要下班」。各自的流程都是：開交易，查「這家店還有幾人值班」，看到 2 人，心想「我走了還剩 1 人，可以」，把自己那一列的狀態改成下班，然後 <code>COMMIT</code>。兩個交易都成功，結果信義店沒有人值班。每個人的判斷在自己的快照裡都是對的，錯在兩人都根據「對方還在」做決定，卻沒看到對方也同時改了。</p>
+<p>為什麼 <code>REPEATABLE READ</code> 擋不住？它的檢查是「你要改的<strong>這一列</strong>，在你的快照之後被別人改過了嗎」。阿明改的是阿明那一列，小美改的是小美那一列，兩人改的是不同列，這個檢查不會觸發。衝突不在任何一列上，而在「我讀過的那幾列，被你改了」這層關係裡。</p>
+<p><code>SERIALIZABLE</code> 會額外追蹤這層關係：記下每個交易讀過哪些資料，如果發現「你讀過的資料被另一個交易改了，而對方讀過的也被你改了」，就知道這兩個交易不管怎麼排順序都排不出這個結果，於是讓其中一方收到 could not serialize access 的錯誤。被擋下的那位重試時，重新查詢會看到只剩 1 人值班，就不會再下班。「同一時段的預約不能超過 5 組」也是同一類問題：兩人各自數到 4 組、各自新增一筆，新增的是不同列，同樣只有 <code>SERIALIZABLE</code> 擋得住。這類衝突的完整實驗留到第 31 課。</p>
+<p>後兩種等級在偵測到衝突時，錯誤訊息是 could not serialize access…，意思是「這個交易如果繼續，結果就不正確了，請重來」。這不是 bug，而是資料庫在保護你，程式收到後應該整個交易重試，跟處理死結一樣從 <code>BEGIN</code> 重跑。</p>
+<p>先確認這個頁面目前的等級，再在一個交易裡指定等級。第一格看預設值：</p>
+<div class="lab" data-sql="SHOW transaction_isolation;"></div>
+<p>等級是跟著交易設定的，寫在 <code>BEGIN</code> 後面，只影響這一個交易：</p>
+<div class="lab" data-sql="BEGIN ISOLATION LEVEL REPEATABLE READ;
+SHOW transaction_isolation;
+COMMIT;"></div>
+<div class="callout practice"><strong>💡 實務上：大多數系統維持預設的 READ COMMITTED</strong><br>一般的 CRUD、訂單、庫存，用預設的 <code>READ COMMITTED</code> 配合原子更新和 <code>FOR UPDATE</code> 就夠了，不需要整個專案改隔離等級。會考慮 <code>SERIALIZABLE</code> 的，多半是「檢查好幾列再決定」的商業規則，例如「同一時段的預約不能超過 5 組」「每個時段至少一位店員值班」，這類規則很難靠鎖單一列想清楚。決定採用時，團隊要先準備好共用的重試函式，並只對需要的交易開啟，而不是改全域設定。</div>
+<p>回到拿鐵的事故：咖啡店的收銀維持 <code>READ COMMITTED</code>，扣庫存寫成帶 <code>WHERE stock >= 1</code> 的原子更新，需要先判斷的流程用 <code>FOR UPDATE</code>，多項商品依 <code>id</code> 順序扣，收到 deadlock detected 就整個交易重試。這就是一套可以上線的寫法。</p>
+
+<h2>補充與查表</h2>
+<ul>
+  <li><strong>死結檢查的等待時間</strong>：前面說的「預設 1 秒」是設定 <code>deadlock_timeout</code>，它是「等鎖多久之後才去檢查有沒有死結」，不是「多久算死結」。<a href="32-locks.html">第 32 課</a>會深入鎖的種類、等待佇列與死結診斷。</li>
+  <li><strong><code>READ UNCOMMITTED</code></strong>：PostgreSQL 也接受這個名稱，但實際行為跟 <code>READ COMMITTED</code> 一樣：PostgreSQL 永遠不會讓你讀到別人沒 commit 的資料。</li>
+  <li><strong>MVCC 的舊版本去哪了</strong>：舊版本不會馬上消失，等沒有交易需要它之後，才由 <code>VACUUM</code> 清掉。內部怎麼運作、表為什麼會膨脹，見<a href="30-mvcc-vacuum.html">第 30 課</a>。</li>
+  <li><strong>隔離等級深入</strong>：<code>REPEATABLE READ</code> 的快照在什麼時候拍、「兩人都下班」這類跨多列衝突（寫入偏差）的完整實驗與重試寫法，見<a href="31-isolation-upsert.html">第 31 課</a>。</li>
+</ul>
+
+<h2>練習</h2>
+
+<div class="exercise"
+  data-start="-- 店員 A 和 B 同時讀到拿鐵庫存 10，各自寫回 9
+SELECT stock FROM products WHERE id = 1;
+SELECT stock FROM products WHERE id = 1;
+UPDATE products SET stock = 9 WHERE id = 1;
+UPDATE products SET stock = 9 WHERE id = 1;"
+  data-answer="UPDATE products SET stock = stock - 1 WHERE id = 1;
+UPDATE products SET stock = stock - 1 WHERE id = 1;"
+  data-check="SELECT id, name, stock FROM products ORDER BY id;"
+  data-isolated>
+  <p>練習 1：起始內容是兩位店員「先讀再寫」各賣出一杯拿鐵（<code>id = 1</code>），結果庫存只少 1。改寫成兩句<strong>原子更新</strong>（每位店員一句），讓庫存正確地少 2。</p>
+</div>
+
+<div class="exercise"
+  data-answer="UPDATE products SET stock = stock - 3 WHERE stock >= 3;"
+  data-check="SELECT id, name, stock FROM products ORDER BY id;"
+  data-isolated>
+  <p>練習 2：來了一個團體，每樣商品都要 3 個。寫<strong>一句</strong> <code>UPDATE</code>：庫存至少 3 的商品各扣 3；庫存不足 3 的商品不賣，庫存維持原樣（不能變成負數）。</p>
+</div>
+
+<div class="exercise"
+  data-start="BEGIN;
+"
+  data-answer="BEGIN;
+SELECT stock FROM products WHERE id = 3 FOR UPDATE;
+UPDATE products SET stock = stock - 2 WHERE id = 3;
+COMMIT;"
+  data-check="SELECT id, name, stock FROM products ORDER BY id;"
+  data-isolated>
+  <p>練習 3：寫一個完整的交易賣出 2 個可頌（<code>id = 3</code>）：先用 <code>SELECT … FOR UPDATE</code> 讀出並鎖住可頌的庫存，再用 <code>UPDATE</code> 扣掉 2，最後確定生效。忘了 <code>COMMIT</code> 的話，判分會告訴你交易還沒結束。<span class="muted">（判分只看最後的資料，沒辦法檢查你有沒有真的寫 <code>FOR UPDATE</code>，請自己對照答案。）</span></p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 4：庫存 10。店員 A、B 同時用「先 <code>SELECT</code> 讀出庫存，程式減 1，再 <code>UPDATE … SET stock = 算好的值</code>」各賣出一杯，而且兩人都在 A 寫回之前讀取。最後庫存可能是多少？</p>
+  <label data-key="a">一定是 8</label>
+  <label data-key="b">9，其中一次更新被蓋掉了</label>
+  <label data-key="c">資料庫會報錯，兩筆都不成功</label>
+  <p class="why">✓ 兩人都讀到 10、都寫回 9，後寫的蓋掉先寫的。資料庫不會報錯，因為每一句都合法。這就是 lost update。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：為什麼 <code>UPDATE products SET stock = stock - 1 WHERE id = 1</code> 在兩人同時執行時不會出錯？</p>
+  <label data-key="a">因為 PostgreSQL 一次只執行一個交易</label>
+  <label data-key="b">因為 <code>UPDATE</code> 比 <code>SELECT</code> 快，不會撞在一起</label>
+  <label data-key="c">因為 <code>UPDATE</code> 會鎖住那一列，後到的人要等前面的交易結束，再用最新的值計算</label>
+  <p class="why">✓ PostgreSQL 可以同時執行很多交易。改同一列時，後到的 <code>UPDATE</code> 會等鎖，拿到鎖之後依「最新已確定的值」重新計算 <code>stock - 1</code>。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：兩個交易互相等待對方的鎖（死結），PostgreSQL 會怎麼處理？</p>
+  <label data-key="a">偵測到死結後，讓其中一個交易失敗（deadlock detected），另一個繼續</label>
+  <label data-key="b">兩個交易永遠等下去，直到管理員手動處理</label>
+  <label data-key="c">兩個交易都自動成功</label>
+  <p class="why">✓ PostgreSQL 會定期檢查有沒有循環等待，有的話就犧牲其中一個。程式收到 deadlock detected 時應該重試整個交易；平常則用「固定順序上鎖」來預防。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：店員 A 正在一個還沒 <code>COMMIT</code> 的交易裡 <code>UPDATE</code> 拿鐵的價格。這時店長執行 <code>SELECT * FROM products</code>，會發生什麼事？</p>
+  <label data-key="a">店長的查詢會等到 A 的交易結束才回傳</label>
+  <label data-key="b">馬上回傳，看到的是 A 修改之前的舊價格</label>
+  <label data-key="c">馬上回傳，看到 A 修改後的新價格</label>
+  <p class="why">✓ MVCC：讀不擋寫、寫不擋讀。店長讀到的是舊版本；A 沒有 <code>COMMIT</code> 之前，別人看不到他的修改（不會有 dirty read）。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 8：在 <code>SERIALIZABLE</code> 等級下，交易收到 could not serialize access 的錯誤。這代表什麼？程式該怎麼做？</p>
+  <label data-key="a">資料庫壞了，要聯絡管理員</label>
+  <label data-key="b">SQL 語法錯了，要修改 SQL</label>
+  <label data-key="c">跟其他交易有衝突，繼續下去結果會不正確；程式應該把整個交易重試一次</label>
+  <p class="why">✓ 這是嚴格隔離等級的正常行為：資料庫寧可讓交易失敗，也不讓錯誤的結果寫進去。使用 <code>REPEATABLE READ</code> 或 <code>SERIALIZABLE</code> 時，程式一定要有重試機制。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>在程式裡算好再寫回</strong>：<code>SET stock = 9</code> 這種寫法在並發時會遺失更新。能讓資料庫算的就寫成 <code>SET stock = stock - 1</code>。</li>
+  <li><strong>以為包了交易就不會 lost update</strong>：預設的 <code>READ COMMITTED</code> 下，交易裡的普通 <code>SELECT</code> 不會擋住別人。需要先讀再寫時，用 <code>FOR UPDATE</code>。</li>
+  <li><strong>在交易外使用 <code>FOR UPDATE</code></strong>：沒有 <code>BEGIN</code>，查詢一結束鎖就放掉了，什麼也沒保護到。</li>
+  <li><strong>扣庫存不檢查夠不夠</strong>：原子更新也要加 <code>WHERE stock >= 數量</code>，再看影響了幾列；最好再加 <code>CHECK (stock >= 0)</code>。</li>
+  <li><strong>拿著鎖做慢的事</strong>：在 <code>FOR UPDATE</code> 之後呼叫金流 API、等使用者確認，其他人全部卡住。</li>
+  <li><strong>不處理 deadlock 和 serialization 錯誤</strong>：這兩種錯誤是預期中會發生的，程式要重試，而不是直接回 500 給使用者。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>兩個人同時「先讀再寫」會造成 lost update：後寫的人用舊值算出的結果蓋掉先寫的人，每一句都合法，結果卻是錯的。</li>
+  <li>能在一句裡算完的，寫成原子更新 <code>SET stock = stock - 1</code>：<code>UPDATE</code> 會拿列鎖，後到的人排隊，拿到鎖後用最新的值重算；加 <code>WHERE stock >= 1</code> 並看影響幾列，防止扣成負數。</li>
+  <li>必須先讀再判斷的，在交易裡用 <code>SELECT … FOR UPDATE</code>，讀的當下就鎖住那一列；沒有 <code>BEGIN</code> 鎖會馬上放掉。</li>
+  <li>多個交易用不同順序上鎖會形成死結，PostgreSQL 自動偵測並讓一方失敗；固定上鎖順序、縮短交易可以預防，程式要從 <code>BEGIN</code> 重試整個交易。</li>
+  <li>MVCC 讓讀和寫互不阻擋：普通 <code>SELECT</code> 不拿鎖，所以包了交易也攔不住別人讀；只有改同一列或 <code>FOR UPDATE</code> 才需要等。</li>
+  <li>隔離等級：預設 <code>READ COMMITTED</code> 每一句看最新已 commit 的資料；<code>REPEATABLE READ</code> 給整個交易一份快照；<code>SERIALIZABLE</code> 等同排隊執行，衝突時要重試。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 7 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 9：結帳 API 這樣寫，第三步扣儲值金時餘額不足，違反 <code>CHECK</code>。程式跑完後，資料庫裡是什麼狀態？</p>
+<pre>BEGIN
+try {
+  扣庫存
+  建立訂單
+  扣儲值金        -- 違反 CHECK，出錯
+} catch (e) { 記錄錯誤 }
+COMMIT</pre>
+  <label data-key="a">庫存和訂單已經寫入，只有儲值金沒有扣</label>
+  <label data-key="b">COMMIT 被拒絕，交易一直開著，擋住別人修改</label>
+  <label data-key="c">整個交易被取消，庫存和訂單都沒有寫入</label>
+  <p class="why">✓ 交易裡有一句出錯就進入 aborted 狀態，之後的 <code>COMMIT</code> 等於 <code>ROLLBACK</code>，前兩步一起取消。catch 裡要明確 <code>ROLLBACK</code> 並回錯誤給前端；只想取消一部分，要事先設 SAVEPOINT。a 錯在出錯前的修改不會因為 COMMIT 而保留，交易是全做或全不做。（第 18 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 10：下單流程如下，扣儲值金時餘額不足而出錯，程式執行了 <code>ROLLBACK</code>。哪裡會出事？</p>
+<pre>BEGIN
+建立訂單、扣庫存
+寄出「訂單成立」確認信
+扣儲值金        -- 餘額不足，出錯
+ROLLBACK</pre>
+  <label data-key="a">信已經寄出，訂單卻被取消了，顧客收到一封假的通知</label>
+  <label data-key="b">ROLLBACK 只取消出錯的那一句，訂單和庫存都還留著</label>
+  <label data-key="c">ROLLBACK 救不回來，要另外寫一個交易把訂單改回來</label>
+  <p class="why">✓ 交易只管得到資料庫，寄信、推播這類外部動作沒辦法 <code>ROLLBACK</code>。把它們移到 <code>COMMIT</code> 成功之後再做。c 錯在交易還沒 COMMIT，ROLLBACK 會把訂單和庫存一起取消；要另寫交易改回來的是已經 COMMIT 的資料。（第 18 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 11：同事說「收銀已經包進交易了，不會有 lost update」。兩個請求同時賣拿鐵，而且都在對方 <code>UPDATE</code> 之前讀取，預設隔離等級下結果是？</p>
+<pre>BEGIN;
+SELECT stock FROM products WHERE id = 1;    -- 讀到 10
+-- 程式算出 9
+UPDATE products SET stock = 9 WHERE id = 1;
+COMMIT;</pre>
+  <label data-key="a">後到的 <code>SELECT</code> 會等前一個交易 COMMIT，最後是 8</label>
+  <label data-key="b">兩人都讀到 10、都寫回 9，賣出兩杯只扣了一杯</label>
+  <label data-key="c">後寫的 <code>UPDATE</code> 收到 could not serialize access，交易失敗</label>
+  <p class="why">✓ <code>READ COMMITTED</code> 下普通 <code>SELECT</code> 不會擋住別人讀，讀和寫之間的空檔還在，包交易解決不了。改成 <code>SET stock = stock - 1</code>，或用 <code>SELECT … FOR UPDATE</code> 先鎖再讀。a 錯在只有 <code>FOR UPDATE</code> 才會讓讀取排隊；c 是 <code>REPEATABLE READ</code> 以上才有的錯誤。（第 19 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 12：咖啡店發限量 100 張的買一送一券，開搶時上千個請求同時進來。<code>coupons.remaining</code> 記錄剩餘張數，怎麼寫最恰當？</p>
+  <label data-key="a">交易裡先 <code>SELECT remaining</code>，程式判斷大於 0，再寫回減 1 的值</label>
+  <label data-key="b">把整個專案的隔離等級改成 <code>SERIALIZABLE</code>，就不會多發</label>
+  <label data-key="c">先 <code>SELECT</code> 確認 <code>remaining</code> 大於 0，再 <code>UPDATE … SET remaining = remaining - 1</code></label>
+  <label data-key="d"><code>UPDATE … SET remaining = remaining - 1 WHERE … AND remaining &gt;= 1</code>，看影響了幾列</label>
+  <p class="why">✓ 原子更新讓讀和寫在資料庫裡一次完成，<code>UPDATE</code> 鎖住那一列，後到的人用最新的值計算；<code>WHERE</code> 擋住扣成負數，影響 1 列是領到、0 列回「已領完」。a 錯在普通 <code>SELECT</code> 不會擋住別人，兩人都讀到 1，就發出兩張。（第 19 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 13：儲值金扣款要先讀餘額、在程式裡判斷夠不夠，同事這樣寫，每一句都直接交給連線池執行。哪裡會出事？</p>
+<pre>await pool.query('BEGIN')
+await pool.query('SELECT balance FROM wallets WHERE id = 1 FOR UPDATE')
+// 程式判斷餘額夠不夠
+await pool.query('UPDATE wallets SET balance = balance - 110 WHERE id = 1')
+await pool.query('COMMIT')</pre>
+  <label data-key="a">每一句可能落在不同連線，鎖和交易都沒有包住後面的 UPDATE</label>
+  <label data-key="b">鎖住的期間，其他人連查詢這個錢包的餘額都要等</label>
+  <label data-key="c"><code>FOR UPDATE</code> 只在 SELECT 那一句有效，UPDATE 前要再鎖一次</label>
+  <p class="why">✓ 交易和鎖屬於一條連線；<code>BEGIN</code>、<code>FOR UPDATE</code>、<code>UPDATE</code> 分散到不同連線，就等於沒包交易。先從 pool 取出一條連線整段都用它，或用 ORM 的 transaction 函式。b 錯在 MVCC 讓普通 <code>SELECT</code> 不被擋住，只有也要修改或 <code>FOR UPDATE</code> 同一列的人才排隊。（第 19 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 14：結帳一次扣好幾項商品的庫存，尖峰時段 log 常出現 deadlock detected。怎麼修最恰當？</p>
+  <label data-key="a">收到這個錯誤時，只重跑失敗的那一句 <code>UPDATE</code></label>
+  <label data-key="b">把偵測死結前的等待時間調長，讓交易多等對方一下</label>
+  <label data-key="c">依商品 id 由小到大更新，收到錯誤時從 <code>BEGIN</code> 重試整段</label>
+  <p class="why">✓ 兩張訂單用不同順序鎖同樣的商品，才會互相等。統一上鎖順序就避開大部分死結，剩下的整個交易重試，次數要有上限。a 錯在資料庫已經讓這個交易失敗，前面的修改都取消了，只重跑一句會被拒絕。（第 19 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 15：店裡開放預約座位，同一時段最多 5 組。預約的交易先 <code>COUNT</code> 該時段已有幾組，小於 5 才 <code>INSERT</code>。兩組客人同時搶最後一個名額，怎麼處理最恰當？</p>
+  <label data-key="a">維持 <code>READ COMMITTED</code>，COUNT 和 INSERT 已經在同一個交易裡</label>
+  <label data-key="b">只對這個交易用 <code>SERIALIZABLE</code>，並寫好整個交易的重試</label>
+  <label data-key="c">改用 <code>REPEATABLE READ</code>，整個交易看同一份快照就不會超額</label>
+  <p class="why">✓ 這是「檢查好幾列再決定」的規則，兩人各自 COUNT 都看到 4，鎖單一列防不住；<code>SERIALIZABLE</code> 保證結果跟排隊執行一樣，衝突時讓一方收到 could not serialize access 再重試。c 錯在快照只保證自己重讀一致，兩人插入的是不同列，這種跨多列的衝突 <code>REPEATABLE READ</code> 防不住。（第 19 課）</p>
+</div>
+
+<p>這個階段的重點整理成<a href="../sheets/stage-5.html">一頁圖解</a>。</p>
+<p>下一課進入效能：orders 累積到 10 萬筆，App 的「我的訂單」開始轉圈圈，怎麼讓查詢重新快起來？——索引。</p>
+
+</main>
+
+<script type="text/sql" id="seed">
+CREATE TABLE products (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL,
+  stock integer NOT NULL
+);
+INSERT INTO products (name, stock) VALUES
+  ('拿鐵', 10),
+  ('起司蛋糕', 2),
+  ('可頌', 5),
+  ('布朗尼', 0),
+  ('提拉米蘇', 3);
+</script>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

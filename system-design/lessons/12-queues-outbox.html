@@ -1,0 +1,1745 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>12. 佇列、送達語意與 outbox</title>
+<link rel="stylesheet" href="../../style.css">
+<style>
+.tl { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin: 1.2em 0; }
+.tl table { width: 100%; }
+.tl td { vertical-align: top; }
+.tl tr.now td { background: var(--accent-soft); }
+.tl tr.later { visibility: hidden; }
+.tl .note { margin: 10px 0 0; min-height: 3.5em; }
+.tl .wait { color: var(--fail); font-weight: 600; }
+</style>
+</head>
+<body data-lesson="12">
+<header>
+  <div class="eyebrow">階段 3：可靠性：失敗是常態 · 第 12 課</div>
+  <h1>佇列、送達語意與 outbox</h1>
+</header>
+<main>
+
+<p><a href="11-circuit-breaker-bulkhead.html">第 11 課</a>那個早上 8 點，金流恢復之後，客服又收到新的抱怨：結帳按下去要轉 5 秒才有反應。追下去發現，結帳 API 在回應顧客之前，要依序做完五件事：扣款、寫入訂單、寄收據 email、通知廚房出單、幫會員集點。寄 email 的服務這個早上很慢，一封要 5 秒，於是每一張訂單都跟著慢 5 秒；它如果直接回錯，整個結帳請求就失敗，顧客不知道自己到底買成功沒有。收據晚幾秒寄出根本沒人在意，卻拖住了顧客最在意的「付款成功」。</p>
+<p>這一課的任務是把一張訂單走完：王小明點了一杯拿鐵（110 元），這是今天的訂單 41。我們要讓結帳只做必須馬上完成的事就回應，寄收據、廚房出單、集點交給背景處理，而且這些背景工作要做到三件事：<strong>不漏</strong>（收據一定會寄出、點數一定會加上）、<strong>不重</strong>（點數不會加兩次）、<strong>不亂</strong>（App 上的訂單狀態不會倒退）。每一節補上其中一個洞。學完你能分清楚三種送達語意，親手寫出 visibility timeout 佇列、冪等消費者（inbox）、outbox relay 和「同一張訂單依序、不同訂單平行」的消費者，也知道上線後要看哪些指標、什麼情況選哪一種佇列。</p>
+
+<div class="callout"><strong>第一輪只要記住：</strong>
+<ul>
+  <li>佇列只能延後工作，不能減少工作。它換來回應快、解耦、可重試，代價是最終一致。</li>
+  <li>幾乎所有佇列都是「至少一次」：同一則訊息一定會來兩次。消費者用 inbox（訊息 id 和副作用寫在同一個交易）讓重複無害。</li>
+  <li>「寫資料庫」和「送訊息」沒有一個交易包得住，用 outbox：訊息和訂單寫在同一個交易，relay 先送出、再標記。</li>
+</ul></div>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>結帳裡哪些事可以晚一點做：把工作搬進佇列，看它換來什麼、付出什麼。</li>
+  <li>消費者做到一半當機會怎樣、佇列怎麼知道它當機了：三種送達語意與 visibility timeout，結論是重複一定會發生（不漏）。</li>
+  <li>點數被加兩次怎麼辦：用 inbox 讓重複無害（不重）。</li>
+  <li>訂單成立了訊息卻沒送出怎麼辦：雙寫問題與 outbox（生產者這端的不漏）。</li>
+  <li>狀態會不會倒退、上線後怎麼顧：依訂單排序（不亂），再看監控與選型。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../nestjs/lessons/20-queues-bullmq.html">NestJS 課第 20 課</a>的 BullMQ：工作失敗用 <code>attempts</code>、<code>backoff</code> 重試，用 <code>jobId</code> 去重，worker 要冪等。</li>
+  <li><a href="../../postgresql/lessons/33-job-queue.html">PostgreSQL 課第 33 課</a>的工作佇列與 outbox：用 <code>SKIP LOCKED</code> 讓多個 worker 各取各的，事件和訂單寫在同一個交易。</li>
+  <li><a href="09-idempotency.html">第 9 課</a>的冪等：同一個請求做一次和做很多次，結果相同。</li>
+  <li><a href="08-timeouts-retries-backoff.html">第 8 課</a>的退避：重試時每次等久一點，並加一點隨機量。</li>
+</ul></div>
+
+<h2>結帳裡哪些事可以晚一點做？</h2>
+<p>先把結帳的五件事分成兩堆。分的標準只有一個問題：<strong>顧客要不要在按下結帳的這個畫面上，就知道這件事的結果？</strong>付款成功沒有、訂單有沒有建立，顧客必須馬上知道，失敗了也要馬上告訴他，讓他換一張卡或改點別的。收據、廚房出單、集點則不同：晚幾秒完成，顧客感覺不到；就算失敗，也可以等一下再試，不應該因此讓整張訂單失敗。</p>
+<div class="table-wrap"><table>
+  <tr><th>在請求裡做（同步）</th><th>晚一點做（非同步）</th></tr>
+  <tr><td>檢查商品與金額、扣款、寫入訂單</td><td>寄收據 email、通知廚房出單、集點、推播「訂單成立」</td></tr>
+  <tr><td>顧客要馬上知道結果，失敗要馬上告訴他</td><td>晚幾秒沒關係；失敗可以重試，不影響訂單成立</td></tr>
+</table></div>
+<p>右邊那一堆「晚一點做」的工作，要先記在某個地方，之後才有人來做。這個地方就是<strong>訊息佇列</strong>（message queue）：一個暫時保管「待辦事項」的系統。咖啡店櫃台的出單夾就是佇列：店員把單子夾上去，就轉身招呼下一位客人，不用站在旁邊等咖啡做好；吧台師傅照自己的速度，一張一張從夾子上取單。</p>
+<p>這個比喻裡有三個角色，後面會一直用到：</p>
+<ul>
+  <li><strong>生產者</strong>（producer）：把訊息放進佇列的一方。這課是結帳 API，它放進去的訊息像「訂單 41 已付款」。</li>
+  <li><strong>消費者</strong>（consumer）：從佇列取出訊息、實際做事的一方。寄收據的程式、通知廚房的程式、集點的程式各是一個消費者，通常跑在跟 API 不同的程序裡，也常被叫做 worker。</li>
+  <li><strong>broker</strong>：中間負責保管訊息的系統，例如 Redis、Amazon SQS、RabbitMQ、Kafka。它要確保訊息放進去之後不會因為某個程序重啟就不見。</li>
+</ul>
+<p>生產者把訊息交給 broker 就算完成，不用等消費者在線，也不用等它處理完。回到早上的事故，這帶來四個好處，每一個都直接對應剛才的問題：</p>
+<ul>
+  <li><strong>回應變快</strong>：結帳 API 只做左邊那一堆就回應，寄 email 的 5 秒不再算在顧客的等待時間裡。</li>
+  <li><strong>解耦</strong>：email 服務掛了，訊息就留在佇列裡等，結帳照常成功。兩個服務不用同時活著。</li>
+  <li><strong>可重試</strong>：寄信失敗的訊息還在佇列裡，消費者等一下再試，不需要顧客重按結帳。</li>
+  <li><strong>削峰</strong>：尖峰時湧進來的工作先排著，消費者照自己的速度消化，不會因為一瞬間的量被壓垮。</li>
+</ul>
+<p>第四個好處最容易被誤會。削峰有一個常被忽略的前提：<strong>佇列只能延後工作，不能減少工作</strong>。工作只是換了地方排隊，總量一件都沒少。用<a href="01-what-is-system-design.html">第 1 課</a>的情境卡算一次：每天 6 萬筆訂單，早上 7:30～9:30 佔 40%。假設廚房出單服務每秒只能處理 2 張。執行後看兩件事：尖峰結束時佇列裡積了多少張，以及最後下單的人要等多久。</p>
+<div class="lab"><script type="code">
+const perDay = 60000
+const peakRate = (perDay * 0.4) / (2 * 3600)    // 尖峰 2 小時，每秒到達幾張
+const offRate = (perDay * 0.6) / (22 * 3600)    // 其餘 22 小時，每秒到達幾張
+const kitchen = 2                               // 出單服務每秒處理 2 張
+
+const growth = peakRate - kitchen
+const backlog = growth * 2 * 3600
+console.log(`尖峰每秒到 ${peakRate.toFixed(2)} 張、處理 ${kitchen} 張 → 積壓每秒增加 ${growth.toFixed(2)} 張`)
+console.log(`9:30 時佇列裡有 ${Math.round(backlog)} 張`)
+// Little's Law：L = λ × W，所以排在最後的那張要等 W = L ÷ λ（λ 是處理速度）
+console.log(`9:30 下的單，要等 ${(backlog / kitchen / 60).toFixed(0)} 分鐘才出單`)
+const drainSec = backlog / (kitchen - offRate)
+console.log(`尖峰後每秒只到 ${offRate.toFixed(2)} 張，消化完積壓要 ${(drainSec / 3600).toFixed(2)} 小時`)
+
+for (const k of [3, 3.4, 4]) {
+  const g = Math.max(0, peakRate - k) * 2 * 3600
+  console.log(`處理速度 ${k} 張/秒：尖峰結束時積壓 ${Math.round(g)} 張`)
+}
+</script></div>
+<p>尖峰時每秒到 3.33 張、只處理得了 2 張，每秒多出來的 1.33 張就留在佇列裡，兩小時累積近萬張。到達率比處理速度高時，積壓會一直長（<a href="03-latency-percentiles.html">第 3 課</a>的 Little's Law）。佇列讓結帳 API 不會倒，但顧客的咖啡晚了 80 分鐘。最後一段迴圈顯示，處理速度一旦達到每秒 3.4 張（高於到達率），積壓就是 0。所以真正的解法還是讓處理速度跟上尖峰（加消費者、加快處理），佇列吸收的是<strong>短暫</strong>的高峰，不是長期的不足。</p>
+<p>除了積壓，把工作搬出請求還有幾個代價，設計時要寫下來，讓團隊知道換到了什麼、付出了什麼：</p>
+<ul>
+  <li><strong>最終一致</strong>：訂單成立了，收據幾秒後才寄出。這段時間內，系統各處的狀態不一致，最後才會一致，這就叫最終一致（eventual consistency）。畫面上要能顯示「處理中」。</li>
+  <li><strong>多一個會壞的元件</strong>：broker 本身要監控、要備援、要升級。</li>
+  <li><strong>除錯變難</strong>：一次結帳被拆到好幾個程序、好幾個時間點執行，要靠 trace id 串起來（<a href="21-debugging-incidents.html">第 21 課</a>）。</li>
+  <li><strong>可靠性變成你的責任</strong>：以前寄 email 失敗，整個請求回錯，顧客至少知道。現在結帳已經回了「成功」，背景工作再出事，沒有人會在畫面上看到錯誤。訊息會不會掉、會不會被處理兩次、順序會不會亂，都要自己設計。這就是本課接下來要處理的事。</li>
+</ul>
+<div class="callout practice"><strong>💡 實務上：先問「使用者需不需要馬上看到結果」</strong><br>PM 說「結帳後要寄收據、通知廚房」時，資深工程師會一項一項問：顧客要在這個畫面上看到它的結果嗎？失敗了要不要擋下整張訂單？要的就留在請求裡，不要的才丟佇列。丟進佇列的工作，前端要跟著改：API 回「已受理」，畫面顯示「處理中」，再用輪詢或推播更新狀態。只有一兩件小事、量也不大時，不要為了它多架一套 broker，先用現有 PostgreSQL 裡的佇列，或專案已經有 Redis 時用 BullMQ（本課最後一節的選型）。</div>
+<p>現在結帳 API 把「寄收據給王小明」放進佇列就回應了顧客。從這一刻起，這封收據寄不寄得出去，只剩消費者在負責。那麼，消費者寄到一半，程序被部署重啟了，會怎樣？</p>
+
+<h2>消費者做到一半當機，訊息會掉還是會重複？</h2>
+<p>要回答這個問題，先看消費者處理一則訊息時到底做了哪些動作。它有兩個動作：</p>
+<ul>
+  <li><strong>處理</strong>：真正做事，例如呼叫 email 服務寄出收據。</li>
+  <li><strong>ack</strong>（acknowledge，確認）：告訴佇列「這則我處理完了，可以刪掉」。</li>
+</ul>
+<p>為什麼需要 ack？因為佇列不知道消費者做完了沒。如果佇列在把訊息交出去的那一刻就刪掉，消費者拿到之後當機，這則訊息就沒有任何人保管了。所以佇列會先保留訊息，等消費者明確說「完成」才刪。問題在於，「處理」和「ack」是兩個分開的動作，兩者之間程序隨時可能當機，而且兩個動作誰先誰後，當機的結果完全不同。</p>
+<p>下面的程式模擬這件事：佇列裡只有一則「寄收據給王小明」，在兩個動作之間讓程序當機一次，重啟後繼續消費。執行後看最後一行和倒數第三行：兩種順序在當機時各寄出幾封。</p>
+<div class="lab"><script type="code">
+function consume(order: 'ack-first' | 'process-first', crashBetween: boolean): string[] {
+  const queue = ['寄收據給王小明']
+  const sent: string[] = []
+  let crashed = false
+  while (queue.length > 0) {
+    const msg = queue[0]                          // 取出來看，還沒刪
+    const ack = () => { queue.shift() }
+    const process = () => { sent.push(msg) }
+    if (order === 'ack-first') ack(); else process()
+    if (crashBetween && !crashed) {               // 兩個動作之間當機，重啟後繼續消費
+      crashed = true
+      continue
+    }
+    if (order === 'ack-first') process(); else ack()
+  }
+  return sent
+}
+
+console.log('先 ack 再處理，沒當機：', consume('ack-first', false).length, '封')
+console.log('先 ack 再處理，當機一次：', consume('ack-first', true).length, '封 ← 遺失')
+console.log('先處理再 ack，沒當機：', consume('process-first', false).length, '封')
+console.log('先處理再 ack，當機一次：', consume('process-first', true).length, '封 ← 重複')
+</script></div>
+<p>先 ack 再處理：訊息已經刪了，還沒寄就當機，重啟後佇列是空的，王小明永遠收不到收據。先處理再 ack：信已經寄出，還沒 ack 就當機，訊息還在佇列裡，重啟後又寄一次，王小明收到兩封。沒有第三種順序可以選，所以只能在「可能遺失」和「可能重複」之間挑一個。這兩種結果，加上理想中的第三種，業界合稱<strong>送達語意</strong>（delivery semantics），用來描述一個佇列系統對訊息保證到什麼程度：</p>
+<div class="table-wrap"><table>
+  <tr><th>語意</th><th>定義</th><th>怎麼來的</th></tr>
+  <tr><td><strong>至多一次</strong>（at-most-once）</td><td>訊息可能遺失，但不會重送</td><td>先 ack 再處理：處理到一半當機，訊息已經刪了</td></tr>
+  <tr><td><strong>至少一次</strong>（at-least-once）</td><td>訊息不會遺失，但可能重送</td><td>先處理再 ack：處理完、ack 前當機，訊息會再被送一次</td></tr>
+  <tr><td><strong>恰好一次</strong>（exactly-once）</td><td>每則訊息只被處理一次</td><td>需要「處理結果」和「已處理的紀錄」一起成功或一起失敗</td></tr>
+</table></div>
+<p>咖啡店該選哪個？收據寄兩封，顧客頂多覺得奇怪；訂單通知掉了，廚房不做咖啡、顧客白付錢。重複可以事後處理，遺失沒辦法補救，所以幾乎所有系統都選<strong>至少一次</strong>：Kafka 預設就是至少一次；Amazon SQS 的標準佇列也是至少一次，文件寫明即使在 visibility timeout（下一節）內也不保證只送一次；BullMQ 也一樣（NestJS 課第 20 課）。這也是本課「不漏」的基礎：先處理、成功後才 ack。</p>
+<p>那為什麼不直接選恰好一次？看表格最後一欄：它要求「信寄出去了」和「這則已處理」這兩件事一起成功或一起失敗。這兩件事分別在 email 服務和佇列裡，是兩個不同的系統，沒有一個交易能同時包住它們。無論哪一個先做，中間當機都會讓兩邊不一致，這正是上面那段程式示範的事。有些 broker 提供名為 exactly-once 的功能（例如 Kafka），但它只在 broker 自己內部成立，碰到寄 email、呼叫金流這種外部副作用就管不到了（細節見課末「補充與查表」）。</p>
+<div class="callout">跨系統能做到的是：<strong>至少一次送達＋冪等處理＝效果上一次</strong>（effectively-once）。訊息可能來兩次，但第二次什麼都不做。這就是<a href="09-idempotency.html">第 9 課</a>的冪等，從 API 那一端換到消費者這一端。</div>
+<p>選了至少一次，就等於接受「同一則訊息會被處理兩次」。不過上面的模擬是程序真的當機、重啟。現實中，佇列看不到消費者的程序，它怎麼判斷消費者當機了、什麼時候該把訊息交給別人？這個判斷方式，會讓重複比你想的更常發生。</p>
+
+<h2>佇列怎麼知道消費者當機了？visibility timeout 與死信佇列</h2>
+<p>佇列和消費者之間只有網路，佇列看不到消費者的程序還在不在。它唯一能觀察到的訊號是：消費者有沒有在合理的時間內回來 ack。所以佇列用的是<strong>租約</strong>（lease）：一段有期限的持有權。消費者取走訊息，等於借走它一段時間；時間內還回來（ack）就結束，時間到了沒消息，佇列就當作消費者已經死了，把訊息借給別人。就像圖書館借書：館員不會打電話確認你還在不在讀，只看到期日。</p>
+<p>以 Amazon SQS 為例，這個租約的運作方式是：</p>
+<ul>
+  <li>消費者取走訊息時，訊息<strong>還留在佇列裡</strong>，只是對其他消費者隱藏一段時間。這段時間叫 <strong>visibility timeout</strong>（可見性逾時），SQS 預設 30 秒。</li>
+  <li>處理完要在時間內刪除，也就是 ack。時間到了還沒刪，訊息重新出現，讓別的消費者處理。當機的消費者手上的訊息不會遺失，靠的就是這一條。</li>
+  <li>每次取走都會拿到一張新的 <strong>receipt</strong>（SQS 叫 receipt handle），代表「這一次的租約」。刪除要用 receipt，不是用訊息 id。同一則訊息被取走第二次，會拿到不同的 receipt；SQS 的文件要求刪除時用<strong>最近一次</strong>的 receipt。為什麼要分得這麼細，下面的時間軸會看到。</li>
+  <li>處理比較久時，可以呼叫 <code>ChangeMessageVisibility</code> 延長隱藏時間。文件建議用<strong>心跳</strong>（heartbeat）定期延長：處理中每隔一段時間就告訴佇列「我還活著，再借我一陣子」。延長的上限見課末。</li>
+</ul>
+<p>租約的弱點在於：佇列只能看時間，分不出「消費者當機了」和「消費者還活著，只是很慢」。早上 email 服務一封要 5 秒，慢的時候更久。如果處理時間超過 visibility timeout、又沒有延長，會發生什麼事？按「下一步」看：</p>
+<div class="tl">
+  <div class="table-wrap"><table>
+    <tr><th>時間</th><th>消費者 A</th><th>消費者 B</th><th>佇列裡的訊息「寄收據 #41」</th></tr>
+    <tr data-note="A 取走訊息，拿到 receipt r1。訊息隱藏 30 秒。"><td>0 秒</td><td>取走，receipt r1</td><td></td><td>隱藏到 30 秒</td></tr>
+    <tr data-note="A 呼叫 email 服務，對方很慢（或 A 的程序卡在垃圾回收）。A 不知道自己已經超時。"><td>5 秒</td><td>寄信中……（很慢）</td><td></td><td>隱藏中</td></tr>
+    <tr data-note="30 秒到了，A 還沒 ack，佇列以為 A 當機了，讓訊息重新出現。"><td>30 秒</td><td>還在寄</td><td></td><td>重新可見</td></tr>
+    <tr data-note="B 取走同一則訊息，拿到新的 receipt r2。現在有兩個消費者同時在處理同一則訊息。"><td>31 秒</td><td>還在寄</td><td>取走，receipt r2</td><td>隱藏到 61 秒</td></tr>
+    <tr data-note="A 終於寄出收據，然後用 r1 ack。r1 已經不是最新的 receipt：如果這時刪掉訊息，等於刪掉 B 正在處理的訊息，B 失敗時就沒有人會重試。所以舊的 receipt 不能刪除成功。A 這種「以為自己還持有、其實租約已經過期」的消費者叫殭屍消費者。"><td>40 秒</td><td>寄出 ✉；用 r1 ack<br><span class="wait">receipt 已過期</span></td><td>寄信中</td><td>隱藏中（B 持有）</td></tr>
+    <tr data-note="B 也寄出收據，用 r2 ack 成功。王小明收到兩封收據。visibility timeout 只能減少重複，不能消除重複，所以消費者一定要冪等（下一節）。"><td>45 秒</td><td></td><td>寄出 ✉；用 r2 ack ✓</td><td>刪除</td></tr>
+  </table></div>
+  <div class="bar"><button data-prev>◀ 上一步</button><button class="primary" data-next>下一步 ▶</button><span class="kbd" data-count></span></div>
+  <p class="note"></p>
+</div>
+<p>這段時間軸說明了兩件事。第一，receipt 為什麼要每次不同：A 的 ack 如果能刪掉訊息，B 萬一寄信失敗，就沒有人會再試，收據就漏了。用 receipt 區分「哪一次的租約」，過期的租約就碰不到訊息。第二，就算程序完全沒當機，只要處理得夠慢，同一則訊息也會被兩個消費者處理。像 A 這樣租約已經過期、自己卻不知道，還繼續做事的消費者，叫<strong>殭屍消費者</strong>（zombie consumer）。</p>
+<p>所以 visibility timeout 要比正常的處理時間長，但也不能太長：消費者真的當機時，訊息要等整個 timeout 過去才會重試，收據就晚了這麼久。處理時間不固定時，設一個中等的值，處理中每隔一段時間延長一次（心跳）；延長也失敗了，代表租約已經被別人拿走，這時就停止處理，不要繼續做副作用。</p>
+<div class="callout warn">SQS 用舊的 receipt 刪除時，文件說「請求會成功，但訊息不一定被刪掉」，所以不能拿刪除的回應判斷自己是不是還持有訊息。這一課練習 1 的佇列更嚴格，直接回傳 <code>false</code>。<a href="14-distributed-locks-leases.html">第 14 課</a>的 fencing token 會再處理「殭屍拿著過期租約繼續寫」的問題。</div>
+<p>租約會帶來另一個問題。假設有一則訊息怎麼處理都會失敗，例如 JSON 格式壞掉，或引用的訂單已經被刪除。它每次失敗就不 ack，時間到又重新出現，再失敗、再出現，永遠佔著消費者。這種訊息叫<strong>毒訊息</strong>（poison message）。重試對它沒有用，因為失敗的原因不會自己消失。</p>
+<p>解法是限制一則訊息<strong>最多被取走幾次</strong>。SQS 在 redrive policy 裡設定 <code>maxReceiveCount</code>：一則訊息被取走超過這個次數仍沒被刪除，就移到另一個佇列，叫<strong>死信佇列</strong>（DLQ，dead-letter queue）。DLQ 不會自動被處理，它的用途是把毒訊息隔離出來，讓正常的訊息繼續流動，等人來看原因。</p>
+<p><code>maxReceiveCount</code> 不要設太小。設成 1 的話，email 服務一次暫時性的 503 就讓收據直接進 DLQ。失敗有兩種：暫時性的（對方忙、網路抖動）靠重試加退避（<a href="08-timeouts-retries-backoff.html">第 8 課</a>）就會好；永久性的（資料壞了）再試幾次都一樣。<code>maxReceiveCount</code> 要大到足以撐過暫時性失敗，DLQ 留給永久性失敗。</p>
+<div class="callout practice"><strong>💡 實務上：DLQ 要有人看，也要能搬回去重跑</strong><br>沒有人看的 DLQ 等於把訊息默默丟掉：王小明的收據躺在 DLQ 裡，沒有任何錯誤畫面。所以 DLQ <strong>有任何訊息就告警</strong>。告警之後要有<strong>重新處理</strong>的流程：查出原因、修好 bug，再把訊息搬回原佇列（SQS 叫 redrive）。搬回去等於再送一次，所以消費者冪等，重跑才安全。SQS、BullMQ、PostgreSQL 佇列都有這套概念，只是名字不同，對照表與 DLQ 保存期限的細節見課末。</div>
+<p>到這裡結論很清楚：visibility timeout 能讓訊息「不漏」，但它只能減少重複，不能消除重複。王小明的集點訊息就算一切設定正確，還是可能被處理兩次。下一步是讓第二次處理什麼都不做。</p>
+
+<h2>點數被加了兩次：怎麼讓重複的訊息無害？</h2>
+<p>集點的消費者收到「訂單 41 已付款」，要幫王小明加 11 點（110 元，每 10 元 1 點）。收據寄兩封只是尷尬，點數加兩次就是錢的問題。既然重複一定會發生，消費者就要能認出「這則我處理過了」。</p>
+<p>做法叫 <strong>inbox</strong>，也叫冪等消費者（idempotent consumer）：在消費者自己的資料庫裡準備一張表，記錄處理過的訊息 id，並把 id 設為主鍵。主鍵保證同一個 id 只能有一列，所以「這則處理過沒有」由資料庫的唯一約束來判斷，不由程式判斷。處理一則訊息時，記錄 id 和加點數寫在同一個交易裡：</p>
+<pre>CREATE TABLE processed_messages (
+  message_id text PRIMARY KEY,
+  processed_at timestamptz NOT NULL DEFAULT now()
+);
+
+BEGIN;
+INSERT INTO processed_messages (message_id) VALUES ('evt-41')
+  ON CONFLICT DO NOTHING;          -- 影響 0 列 → 處理過了：ROLLBACK，直接 ack
+UPDATE members SET points = points + 11 WHERE id = 3;   -- 副作用：3 是王小明的會員 id
+COMMIT;                            -- 成功之後才 ack</pre>
+<p>第一次收到 evt-41，<code>INSERT</code> 影響 1 列，接著加點數、提交、ack。第二次收到，<code>INSERT</code> 撞到主鍵，因為 <code>ON CONFLICT DO NOTHING</code> 而影響 0 列，程式看到 0 就知道處理過了，回滾並直接 ack，點數不會再加。</p>
+<p>關鍵在<strong>同一個交易</strong>。把幾種看起來也行的寫法排在一起比較，看當機或失敗時各會怎樣：</p>
+<div class="table-wrap"><table>
+  <tr><th>寫法</th><th>當機或失敗時</th></tr>
+  <tr><td>inbox 和副作用在同一個交易 ✓</td><td>交易失敗兩個一起回滾，重送時重新處理；交易成功兩個一起留下，重送時被認出來</td></tr>
+  <tr><td>先做副作用，另一個交易再記 inbox</td><td>兩者之間當機 → 沒有紀錄 → 重送時再做一次</td></tr>
+  <tr><td>先記 inbox（自己提交），再做副作用</td><td>副作用失敗 → 紀錄已經在 → 重送時被當成處理過而略過＝<strong>遺失</strong></td></tr>
+  <tr><td>先 <code>SELECT</code> 查有沒有，再 <code>INSERT</code></td><td>兩個消費者同時處理同一則（上一節的殭屍）時，兩個都查到「沒有」，都做了</td></tr>
+</table></div>
+<p>第二、三列跟上一節「先 ack 還是先處理」是同一個問題換了位置：兩個動作分開提交，中間當機就會重複或遺失。放進同一個交易，兩件事就變成一件事，沒有「中間」可以當機。</p>
+<p>最後一列是 <a href="../../postgresql/lessons/19-concurrency.html">PostgreSQL 課第 19 課</a>的「先讀再寫」競態：先讀出來、在程式裡判斷，再寫回去，兩個交易中間會互相看不到。上一節的時間軸裡，A 和 B 確實會同時處理同一則訊息；換成集點的 evt-41，兩邊都 <code>SELECT</code> 到「沒有」，就都加了點數。用主鍵加 <code>INSERT … ON CONFLICT DO NOTHING</code> 是原子的：兩個交易同時插入同一個 id 時，第二個會<strong>等</strong>第一個結束；第一個提交了，第二個就是衝突；第一個回滾了，第二個就插入成功、接手處理。</p>
+<p>inbox 只保護得了<strong>同一個資料庫</strong>裡的副作用。加點數在消費者自己的資料庫裡，可以跟 inbox 同一個交易；寄 email、呼叫金流這種外部副作用沒辦法跟資料庫同一個交易，要靠對方的冪等鍵：把訊息 id（或由它衍生的值）當成 <code>Idempotency-Key</code> 傳給對方（<a href="09-idempotency.html">第 9 課</a>），對方看到同一個鍵就不重做。對方不支援冪等時，只能盡量縮小重複的機會，並在設計文件裡寫清楚「極少數情況會寄兩封」。</p>
+<p>重複的訊息還會帶來一個比較隱蔽的問題：訊息可能排了 10 分鐘才被處理，這段時間訂單可能已經取消了。如果訊息裡帶著完整的訂單資料，消費者會照著過時的內容做事。所以<strong>訊息裡放 id，不放完整資料</strong>：寫「訂單 41 已付款」，處理時再去查訂單的最新狀態（NestJS 課第 20 課）。最後，inbox 表每處理一則就多一列，<strong>也要定期清理</strong>：保留比「最長可能重送的時間」再長一些，例如 7 天，之後刪掉舊紀錄。</p>
+<div class="callout practice"><strong>💡 實務上：review 消費者時先問「同一則來兩次會怎樣」</strong><br>典型客訴是「我的點數被加了兩次」或「收到兩封收據」，原因幾乎都是消費者不冪等。review 一個新的 worker 時，資深工程師會看：訊息 id 是生產者產生、重送時不變的嗎？inbox 紀錄和副作用在同一個交易嗎？呼叫外部服務有沒有帶冪等鍵？測試也很直接：把同一則訊息送兩次，斷言資料只變一次。</div>
+<p>消費者這一端現在不漏也不重了。但這一切有個前提：訊息有被送進佇列。回頭看結帳 API，它寫完訂單、再送出訊息，這兩步之間也有一個洞。</p>
+
+<h2>訂單成立了，收據卻永遠沒寄：生產者怎麼保證訊息一定送出？</h2>
+<p>結帳 API 要做兩件事：在資料庫寫入訂單 41，並送出「訂單 41 已付款」的訊息到 broker。資料庫和 broker 是兩個系統，沒有一個交易能同時包住兩者。要同時寫進兩個系統、又沒有交易保護，這叫<strong>雙寫問題</strong>（dual write）。三種常見的寫法都會出事，只是出事的時機不同：</p>
+<div class="table-wrap"><table>
+  <tr><th>寫法</th><th>出事的時機</th><th>結果</th></tr>
+  <tr><td>交易裡先送訊息，再 <code>COMMIT</code></td><td>送出之後交易失敗回滾</td><td>訂單不存在，廚房卻收到出單通知</td></tr>
+  <tr><td><code>COMMIT</code> 之後再送訊息</td><td>提交之後、送出之前當機（部署重啟、broker 連不上）</td><td>訂單成立，收據永遠不會寄、廚房永遠不知道</td></tr>
+  <tr><td>程序內的事件（<a href="../../nestjs/lessons/21-scheduling-events.html">NestJS 課第 21 課</a>的 EventEmitter）</td><td>事件處理完之前程序結束</td><td>同上，而且連重試的機會都沒有</td></tr>
+</table></div>
+<p>這跟消費者端的「先 ack 還是先處理」是同一種結構：兩個系統、兩個動作，中間會當機。消費者那邊靠「重複無害」解決，但生產者這邊的第二列是<strong>遺失</strong>，沒有任何重試會發生。「當機剛好在那一瞬間」聽起來很少見，但每天 6 萬筆訂單、每週部署好幾次，一年下來一定會遇到，而且這種錯不會報錯，只會有顧客說「我沒收到收據」。</p>
+<p>解法是把兩個系統的問題變回一個系統的問題。<strong>transactional outbox</strong> 的做法是：結帳 API 不直接送訊息，而是把要送的訊息當成一筆資料，跟訂單寫在<strong>同一個交易</strong>裡的 <code>outbox</code> 表。這樣訂單和訊息一起提交或一起回滾，不會只有一邊存在。再另外跑一個 <strong>relay</strong>（轉送）程序，負責把 outbox 裡還沒送出的列送到 broker。microservices.io 的說法是：只有在資料庫交易提交時，訊息才保證送出。</p>
+<figure>
+  <svg viewBox="0 0 700 260" role="img" aria-label="outbox 架構：結帳 API 在同一個交易裡寫入 orders 表與 outbox 表；relay 讀取 outbox 送到 broker；消費者用 inbox 去重後處理">
+    <defs><marker id="arr12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="10" y="90" width="110" height="56" rx="8"/><text class="d-text" x="65" y="123" text-anchor="middle">結帳 API</text>
+    <rect class="d-soft" x="160" y="30" width="200" height="176" rx="10"/>
+    <text class="d-small" x="260" y="52" text-anchor="middle">PostgreSQL：同一個交易</text>
+    <rect class="d-box" x="180" y="66" width="160" height="50" rx="8"/><text class="d-text" x="260" y="96" text-anchor="middle">orders</text>
+    <rect class="d-box" x="180" y="134" width="160" height="50" rx="8"/><text class="d-text" x="260" y="164" text-anchor="middle">outbox</text>
+    <rect class="d-box" x="400" y="134" width="90" height="50" rx="8"/><text class="d-text" x="445" y="164" text-anchor="middle">relay</text>
+    <rect class="d-box" x="530" y="134" width="70" height="50" rx="8"/><text class="d-text" x="565" y="164" text-anchor="middle">broker</text>
+    <rect class="d-box" x="620" y="76" width="74" height="44" rx="8"/><text class="d-small" x="657" y="102" text-anchor="middle">收據</text>
+    <rect class="d-box" x="620" y="196" width="74" height="44" rx="8"/><text class="d-small" x="657" y="222" text-anchor="middle">廚房</text>
+    <path class="d-line" d="M120,110 L176,92" marker-end="url(#arr12)"/>
+    <path class="d-line" d="M120,126 L176,156" marker-end="url(#arr12)"/>
+    <path class="d-line" d="M340,159 L396,159" marker-end="url(#arr12)"/>
+    <path class="d-line" d="M490,159 L526,159" marker-end="url(#arr12)"/>
+    <path class="d-line" d="M600,150 L630,122" marker-end="url(#arr12)"/>
+    <path class="d-line" d="M600,170 L630,196" marker-end="url(#arr12)"/>
+    <text class="d-small" x="445" y="124" text-anchor="middle">取未送出的列</text>
+    <text class="d-small" x="445" y="208" text-anchor="middle">送出後標記</text>
+    <text class="d-accent" x="350" y="250" text-anchor="middle">relay 可能重送 → 消費者用 inbox 去重</text>
+  </svg>
+  <figcaption>訂單和 outbox 一起提交或一起回滾。relay 只負責「把已經提交的訊息送出去」，失敗就下次再送。</figcaption>
+</figure>
+<p>雙寫的問題沒有消失，只是移到了 relay：relay 也要做兩件事，「送到 broker」和「在 outbox 標記已送出」，兩者還是分屬兩個系統。差別在於，relay 失敗了可以一直重來，因為訊息安全地存在 outbox 裡；結帳 API 的請求卻只有一次機會。表和 SQL 在 PostgreSQL 課第 33 課寫過，這裡看 relay 的邏輯。每一輪：</p>
+<ol>
+  <li>依 <code>id</code> 取一批還沒送出的列。</li>
+  <li><strong>依序</strong>一筆一筆送出，前一筆成功才送下一筆。</li>
+  <li>遇到第一個失敗就停下來，只把已經成功送出的列標記為已送出；失敗那筆和後面的留到下一輪。</li>
+</ol>
+<p>為什麼是「先送出、再標記」？兩個順序都試想一次：</p>
+<ul>
+  <li><strong>先標記、再送出</strong>：送出失敗或當機，這列已經被標記，永遠不會再送 → 遺失。</li>
+  <li><strong>先送出、再標記</strong>：送出之後、標記之前當機 → 下一輪再送一次 → 重複。重複可以靠消費者的 inbox 解決，遺失沒辦法補救，所以選這個。</li>
+</ul>
+<p>這又是至少一次的選擇。下面把訂單 41 從結帳一路走到消費者，看 relay 當機時，上一節的 inbox 怎麼接住重送：</p>
+<div class="tl">
+  <div class="table-wrap"><table>
+    <tr><th>步驟</th><th>結帳 API</th><th>relay</th><th>outbox 第 41 列</th><th>消費者（inbox）</th></tr>
+    <tr data-note="結帳在同一個交易裡寫入訂單 41 和 outbox 第 41 列（order.paid）。COMMIT 成功之後兩者同時存在。"><td>1</td><td>INSERT orders、INSERT outbox、COMMIT</td><td></td><td>未送出</td><td></td></tr>
+    <tr data-note="relay 依 id 取出未送出的列，拿到第 41 列。"><td>2</td><td></td><td>取出第 41 列</td><td>未送出</td><td></td></tr>
+    <tr data-note="relay 送到 broker 成功。消費者收到 evt-41，inbox 沒有紀錄，處理並記錄。"><td>3</td><td></td><td>送出 evt-41 ✓</td><td>未送出</td><td>處理 evt-41，記入 inbox</td></tr>
+    <tr data-note="relay 還沒來得及標記就被部署重啟了。outbox 裡第 41 列仍然是未送出。"><td>4</td><td></td><td><span class="wait">當機</span>（還沒標記）</td><td>未送出</td><td></td></tr>
+    <tr data-note="relay 重啟，取出未送出的列，又拿到第 41 列，再送一次。這是預期中的重複。"><td>5</td><td></td><td>重啟，再送一次 evt-41</td><td>未送出</td><td></td></tr>
+    <tr data-note="這次標記成功。"><td>6</td><td></td><td>標記第 41 列 ✓</td><td>已送出</td><td></td></tr>
+    <tr data-note="消費者第二次收到 evt-41，inbox 已經有這個 id，直接 ack，不重複集點。訊息 id 必須在重送時保持不變，所以用 outbox 的 id 當訊息 id，不要在送出時才產生。"><td>7</td><td></td><td></td><td>已送出</td><td>evt-41 已在 inbox → 略過、ack</td></tr>
+  </table></div>
+  <div class="bar"><button data-prev>◀ 上一步</button><button class="primary" data-next>下一步 ▶</button><span class="kbd" data-count></span></div>
+  <p class="note"></p>
+</div>
+<p>最後一步點出 outbox 和 inbox 的接點：訊息 id 必須在重送時保持不變，inbox 才認得出來。用 outbox 那一列的 id 當訊息 id，就自然滿足這一點。</p>
+<p>relay 要怎麼知道 outbox 有新的列？有兩種做法：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>輪詢（polling publisher）</th><th>CDC（change data capture）</th></tr>
+  <tr><td>怎麼做</td><td>定期 <code>SELECT … WHERE published_at IS NULL ORDER BY id LIMIT 100</code></td><td>讀資料庫的變更紀錄（PostgreSQL 的 WAL），看到 outbox 有新列就發布，例如 Debezium</td></tr>
+  <tr><td>延遲</td><td>最多一個輪詢間隔</td><td>通常更低</td></tr>
+  <tr><td>對資料庫的負擔</td><td>一直在查詢；已送出的列要清理</td><td>不用查詢，但會佔用一個 replication slot，CDC 停太久 WAL 會堆積</td></tr>
+  <tr><td>維運</td><td>一個小程式，好懂好除錯</td><td>多一套系統（Debezium 常跑在 Kafka Connect 上）</td></tr>
+</table></div>
+<p><strong>replication slot</strong> 是 PostgreSQL 為了讓某個讀取者（這裡是 Debezium）不漏讀變更而保留的書籤。讀取者沒有往前讀，PostgreSQL 就不能刪掉書籤之後的舊 WAL，所以 CDC 停太久，磁碟會被 WAL 撐滿。</p>
+<p>咖啡店一開始用輪詢就夠了。用 Debezium 時，它的 outbox event router 對欄位名稱與送往的位置有預設慣例，見課末「補充與查表」。</p>
+<p>輪詢版上線前要想好三件事。第一，<strong>多個 relay 同時跑</strong>時要分工：用 <code>FOR UPDATE SKIP LOCKED</code> 讓每個 relay 拿不同的列，或用 advisory lock 保證只有一個 relay 在跑（PostgreSQL 課第 33 課）。但只要有兩個 relay 平行送同一張訂單的事件，順序就沒有保證，這是下一節的主題。第二，<strong>已送出的列要定期刪除</strong>：outbox 每天多 6 萬列以上，只更新不刪除，表和索引會一直長，VACUUM 跟不上（<a href="../../postgresql/lessons/30-mvcc-vacuum.html">PostgreSQL 課第 30 課</a>的表膨脹）。第三，<strong>佇列本身就在 PostgreSQL 裡時</strong>（PostgreSQL 課第 33 課、pg-boss），工作和訂單本來就能寫在同一個交易，沒有雙寫問題，也就不需要 outbox。outbox 解決的是「broker 在資料庫之外」的情況。</p>
+<div class="callout practice"><strong>💡 實務上：outbox 用在「漏了會有人來問」的事件</strong><br>訂單成立、付款完成、庫存扣減這類漏掉會變成客訴或對帳差異的事件，才值得走 outbox。使用者行為追蹤、分析用的事件掉幾筆沒關係，直接送就好，不用多一張表。outbox 表本身也是很好的除錯工具：客服說「沒收到收據」時，先查那張訂單的 outbox 列有沒有、送出了沒。上線後加一個告警：「超過幾分鐘還沒送出的列」大於 0，代表 relay 停了或 broker 連不上。</div>
+<p>現在訂單 41 的訊息從生產者到消費者都不漏、不重了。只有一個 relay 依 <code>id</code> 依序送出時，訂單 41 的 <code>order.paid</code> 會比 <code>order.preparing</code> 先進 broker。但就算依序進了 broker，有好幾個消費者平行在處理，它們處理完的順序還會跟送進來的一樣嗎？</p>
+
+<h2>訂單 41 的狀態會倒退嗎？順序與平行</h2>
+<p>同一張訂單會有好幾個事件：<code>order.paid</code> → <code>order.preparing</code> → <code>order.done</code>。王小明的 App 依收到的事件更新畫面，如果先處理到 done、再處理到 preparing，畫面就會從「可以取餐」倒退回「製作中」。要保證順序，最簡單的方法是只開一個消費者，所有訊息一則一則做；但尖峰每秒 3 張以上的訂單，一個消費者根本跟不上。順序和平行，看起來只能二選一。</p>
+<p>關鍵在於觀察：我們要的其實不是「全店所有事件依序」，而是「<strong>同一張訂單</strong>的事件依序」。訂單 41 和訂單 42 誰先處理，沒有人在意。broker 的順序保證也正是這樣設計的，都是<strong>局部</strong>的：</p>
+<ul>
+  <li><strong>Kafka</strong>：一個 topic（一類訊息的名稱，例如「訂單事件」）分成多個 <strong>partition</strong>（分區），每個 partition 是一條獨立的、完全有序的佇列，partition 之間沒有順序。每則訊息帶一個 key，key 決定它進哪個 partition，同一個 key 一定進同一個。同一個消費群組裡，一個 partition 同時只會交給一個消費者，所以 partition 內的順序保得住，不同 partition 則可以平行。</li>
+  <li><strong>SQS FIFO</strong>：同一個 <strong>message group ID</strong> 依序處理：群組裡有訊息還在處理（已取走、還沒刪除）時，同群組後面的訊息要等它被刪除或 visibility timeout 到期才會被取出。不同群組可以平行。SQS 文件提醒：在乎順序的 FIFO 佇列不要接 DLQ，訊息被移走會打亂順序。</li>
+  <li><strong>SQS 標準佇列、多個 worker 的 BullMQ</strong>：不保證順序。</li>
+</ul>
+<p>所以順序要靠設計決定：用 <strong>orderId 當 key</strong>，同一張訂單的事件依序處理，不同訂單平行處理。這樣訂單 41 的三個事件一定照順序，同時另一個消費者可以處理訂單 42。練習 4 會在單一程序裡實作這個規則。</p>
+<p>這個設計有兩個代價。第一是<strong>隊頭阻塞</strong>（head-of-line blocking）：排在隊伍最前面的那則卡住，後面的全部跟著卡住。如果訂單 41 的 <code>order.paid</code> 一直處理失敗，它的 <code>order.preparing</code>、<code>order.done</code> 全部要等。有人在等的流程要設重試上限，到上限就停在那裡並告警，不能跳過去先做後面的，因為跳過就是亂序。第二是<strong>熱門 key</strong>：同一個 key 只能一則一則處理，某個 key 的量特別大時，它就是瓶頸，加再多消費者也沒用。所以 key 要選「需要順序的最小範圍」：用訂單 id，不要用門市 id。用門市 id 的話，整間門市的訂單全部排成一列，平行度就沒了。</p>
+<div class="callout warn">重試也會打亂順序：第一則失敗、等退避的時候，第二則先處理成功了。真的在乎順序時，除了依 key 排隊，還要在事件裡帶<strong>版本號</strong>，消費者遇到比目前狀態舊的版本就略過（<a href="16-events-webhooks.html">第 16 課</a>）。很多事件其實只需要「最後狀態正確」，這時版本號比嚴格排隊便宜。</div>
+<div class="callout practice"><strong>💡 實務上：先問「這個事件真的需要順序嗎」</strong><br>需要順序的通常是同一個東西的狀態變化，例如訂單 41 從付款、製作到完成；寄收據、集點這類各自獨立的工作，就不必排隊，平行處理最快。設計時把每一種事件標上「需不需要順序、順序的範圍是什麼」，key 就跟著決定了。App 這種只在乎最後狀態的地方，用版本號擋掉舊事件，通常比嚴格排隊省事。</div>
+<p>不漏、不重、不亂都有了對應的機制。最後兩個問題是上線之後的事：這些機制什麼時候開始出問題、怎麼提早發現，以及咖啡店到底該用哪一種佇列來實作它們。</p>
+
+<h2>上線後怎麼知道佇列健康？又該選哪一種佇列？</h2>
+<p>佇列出問題時通常不會報錯。結帳照常成功，只是收據越寄越晚、廚房越來越慢出單，等到顧客來問才發現。所以監控要看的是「工作有沒有在時間內完成」，不是「有沒有錯誤」：</p>
+<div class="table-wrap"><table>
+  <tr><th>指標</th><th>看什麼</th></tr>
+  <tr><td><strong>最老訊息的年齡</strong>（age of oldest message，SQS 是 <code>ApproximateAgeOfOldestMessage</code>）</td><td>最重要的一個，直接回答「顧客要等多久」。告警門檻依業務定：收據 5 分鐘、廚房出單 1 分鐘</td></tr>
+  <tr><td>佇列長度</td><td>單看沒有意義：1 萬則如果 10 秒內消化完不是問題，100 則卡了一小時才是問題。要跟處理速度一起看</td></tr>
+  <tr><td>到達率與處理速度</td><td>到達持續大於處理，積壓只會一直長</td></tr>
+  <tr><td>DLQ 的訊息數</td><td>大於 0 就告警</td></tr>
+  <tr><td>重送次數、處理時間的 p99</td><td>處理時間接近 visibility timeout，就會開始出現殭屍與重複</td></tr>
+</table></div>
+<p>這張表的每一列都對應前面某一節：最老訊息的年齡和到達率是第一節積壓的計算，DLQ 是毒訊息，處理時間接近 visibility timeout 是殭屍消費者的前兆。</p>
+<p>告警響了、積壓已經很大時怎麼辦？AWS Builders' Library〈Avoiding insurmountable queue backlogs〉提了幾個做法。積壓很大時<strong>優先處理新的訊息</strong>：舊的反正已經晚了，新的還來得及準時。依租戶分開佇列或分開處理容量，讓一個門市或一個客戶的爆量不會拖垮全部（文中的 shuffle sharding）。會被之後的「完整同步」取代的舊訊息，可以直接丟掉。這些都是取捨，要依訊息的性質決定，例如「推播：訂單已完成」晚了 2 小時，不如不送；但收據就算晚了也還是要寄。</p>
+<p>最後是選型。前面所有的機制，在每一種佇列裡都要用到，差別在於哪些是內建的、哪些要自己做。比較的面向有五個：順序、能不能保留訊息並重播、一則訊息能不能給多個消費者（扇出）、維運成本，以及適合的情境。</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>順序</th><th>保存與重播</th><th>一則訊息給多個消費者（扇出）</th><th>維運成本</th><th>適合</th></tr>
+  <tr><td><strong>PostgreSQL 佇列</strong>（PostgreSQL 課第 33 課、pg-boss）</td><td>自己用 SQL 決定</td><td>看你保不保留列</td><td>要自己做</td><td>最低，沿用現有資料庫</td><td>量不大、想跟業務資料同一個交易</td></tr>
+  <tr><td><strong>Redis／BullMQ</strong></td><td>多個 worker 時不保證</td><td>處理完就移走</td><td>要自己做</td><td>低，Redis 持久化設定決定會不會掉工作</td><td>背景工作、延遲工作、重試退避</td></tr>
+  <tr><td><strong>Amazon SQS</strong></td><td>標準不保證；FIFO 依群組</td><td>刪除就沒了</td><td>搭配 SNS 之類的服務</td><td>全託管</td><td>在 AWS 上、不想維運 broker</td></tr>
+  <tr><td><strong>RabbitMQ</strong></td><td>單一佇列、單一消費者時有序</td><td>ack 就刪</td><td>exchange 路由，原生支援</td><td>中，要自己維運叢集</td><td>需要彈性的路由規則</td></tr>
+  <tr><td><strong>Kafka</strong></td><td>partition 內有序</td><td>依保存期限保留，可以從舊的 offset 重播</td><td>每個消費群組各讀一份</td><td>高</td><td>事件串流、多個系統讀同一份事件、要重播</td></tr>
+</table></div>
+<p>各家 Node 客戶端套件的版本見課末「補充與查表」。</p>
+<p>咖啡店的建議：一開始就用 PostgreSQL 佇列或沿用 NestJS 課的 BullMQ，加上 outbox。訂單 41 的收據、出單、集點，量都不大，也都只有咖啡店自己的系統在讀。等到有多個團隊、多個系統要讀同一份訂單事件、需要重播時，再評估 Kafka。這是<a href="01-what-is-system-design.html">第 1 課</a>的 YAGNI。</p>
+
+<h2>補充與查表</h2>
+<p>主線省略的出處、上限與版本，查表用，不用背。</p>
+<h3>送達語意與 Kafka 的 exactly-once</h3>
+<ul>
+  <li>本課三種送達語意的定義，依照 Kafka 4.4 的設計文件。</li>
+  <li>Kafka 的「exactly-once」功能，文件說得很清楚：它只在 <strong>Kafka 內部</strong>成立（Kafka Streams、交易式 producer 搭配 <code>read_committed</code> 的消費者），寫到外部系統要對方配合，例如把讀到哪裡（offset）和輸出存在同一個地方。寄 email、呼叫金流都是外部副作用，Kafka 管不到。</li>
+</ul>
+<h3>Amazon SQS 的上限與 DLQ 保存期限</h3>
+<ul>
+  <li><code>ChangeMessageVisibility</code> 延長隱藏時間：從第一次取走起算，最長 12 小時，延長不會重置這個上限。</li>
+  <li>SQS 建議 DLQ 的保存期限比原佇列長：標準佇列的訊息從原本送進來的時間算到期，移到 DLQ 不會重新計時。</li>
+</ul>
+<h3>同一套概念在其他工具裡的名字</h3>
+<div class="table-wrap"><table>
+  <tr><th>概念</th><th>Amazon SQS</th><th>BullMQ 6（NestJS 課第 20 課）</th><th>PostgreSQL 佇列（PostgreSQL 課第 33 課）</th></tr>
+  <tr><td>取走後隱藏</td><td>visibility timeout</td><td>worker 持有 job 的鎖（lock），處理中自動續約</td><td><code>FOR UPDATE SKIP LOCKED</code> 加上租約到期時間欄位</td></tr>
+  <tr><td>消費者當機</td><td>時間到重新可見</td><td>鎖過期的 job 視為 stalled，移回等待</td><td>租約過期的列被別人取走</td></tr>
+  <tr><td>處理失敗重試</td><td>不刪除，等它重新出現</td><td><code>attempts</code>＋<code>backoff</code></td><td>重試次數欄位＋下次執行時間</td></tr>
+  <tr><td>放棄</td><td><code>maxReceiveCount</code> → DLQ</td><td>次數用完進 failed；stalled 超過 <code>maxStalledCount</code>（預設 1）也直接 failed</td><td>標記為 dead，另外查</td></tr>
+</table></div>
+<h3>Debezium 的 outbox event router</h3>
+<p>Debezium 3.7 的 outbox event router 預設讀 <code>id</code>、<code>aggregatetype</code>、<code>aggregateid</code>、<code>type</code>、<code>payload</code> 這幾個欄位，送到 <code>outbox.event.&lt;aggregatetype&gt;</code> 這個 topic，並以 <code>aggregateid</code> 當訊息的 key，所以同一個聚合（例如同一張訂單）的事件會落在同一個 partition、保持順序。<strong>聚合</strong>（aggregate）在這裡指「事件屬於哪一個東西」，咖啡店通常就是訂單。</p>
+<h3>選型表的版本</h3>
+<ul>
+  <li>pg-boss 12.38.0、bullmq 6.5.3、@aws-sdk/client-sqs 3.1161.0、amqplib 2.2.0；Kafka 以文件最新的 4.4 為準。</li>
+  <li>Node 的 Kafka 客戶端套件：常見的 kafkajs 最新版是 2.2.4，最後更新在 2023-02-27；Confluent 的 <code>@confluentinc/kafka-javascript</code>（1.11.0）仍在更新。新專案選有在維護的那一個（版本以 2026-10-31 的 npm 為準）。</li>
+</ul>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：完成 <code>InMemoryQueue</code>，一個有 visibility timeout 和死信佇列的佇列：</p>
+  <ul>
+    <li><code>send(body)</code>：放到佇列尾端，馬上可見，回傳訊息 id（每則不同）。</li>
+    <li><code>receive(max)</code>：依送出順序取出<strong>目前可見</strong>的訊息，最多 <code>max</code> 則。每取一則：<code>receiveCount</code> 加 1、用 <code>makeReceipt(id, receiveCount)</code> 發新的 receipt、隱藏到 <code>now() + visibilityTimeoutMs</code>。</li>
+    <li>某則訊息已經被取走 <code>maxReceives</code> 次仍沒被 ack，下一次 <code>receive</code> 遇到它（它又可見了）時，把它移到 DLQ，不再送出。</li>
+    <li><code>ack(receipt)</code>：只有這則訊息<strong>目前的</strong> receipt 能刪除它，成功回傳 <code>true</code>；舊的或不存在的 receipt 回傳 <code>false</code>，什麼都不改。</li>
+    <li><code>extend(receipt, ms)</code>：只有目前的 receipt 能把隱藏時間改成 <code>now() + ms</code>，規則同 <code>ack</code>。</li>
+    <li><code>dlq()</code>：回傳已經移到 DLQ 的 <code>{ id, body }</code>，依移入順序。時間只能用傳進來的 <code>now</code>。</li>
+  </ul>
+  <script type="start">
+type Received<T> = { id: string; body: T; receipt: string; receiveCount: number }
+type QueueOptions = { visibilityTimeoutMs: number; maxReceives: number; now: () => number }
+
+// 已經寫好：每次取走都會得到不同的 receipt
+const makeReceipt = (id: string, receiveCount: number) => `${id}#${receiveCount}`
+
+class InMemoryQueue<T> {
+  constructor(opts: QueueOptions) {
+    throw new Error('TODO')
+  }
+
+  send(body: T): string {
+    throw new Error('TODO')
+  }
+
+  receive(max: number): Received<T>[] {
+    throw new Error('TODO')
+  }
+
+  ack(receipt: string): boolean {
+    throw new Error('TODO')
+  }
+
+  extend(receipt: string, ms: number): boolean {
+    throw new Error('TODO')
+  }
+
+  dlq(): Array<{ id: string; body: T }> {
+    throw new Error('TODO')
+  }
+}
+</script>
+  <script type="answer">
+type Received<T> = { id: string; body: T; receipt: string; receiveCount: number }
+type QueueOptions = { visibilityTimeoutMs: number; maxReceives: number; now: () => number }
+
+// 已經寫好：每次取走都會得到不同的 receipt
+const makeReceipt = (id: string, receiveCount: number) => `${id}#${receiveCount}`
+
+type Stored<T> = { id: string; body: T; visibleAt: number; receiveCount: number; receipt: string | null }
+
+class InMemoryQueue<T> {
+  private opts: QueueOptions
+  private messages: Stored<T>[] = []
+  private dead: Array<{ id: string; body: T }> = []
+  private seq = 0
+
+  constructor(opts: QueueOptions) {
+    this.opts = opts
+  }
+
+  send(body: T): string {
+    const id = `m${++this.seq}`
+    this.messages.push({ id, body, visibleAt: this.opts.now(), receiveCount: 0, receipt: null })
+    return id
+  }
+
+  receive(max: number): Received<T>[] {
+    const now = this.opts.now()
+    const out: Received<T>[] = []
+    for (const m of [...this.messages]) {
+      if (out.length >= max) break
+      if (m.visibleAt > now) continue
+      if (m.receiveCount >= this.opts.maxReceives) {
+        this.messages.splice(this.messages.indexOf(m), 1)
+        this.dead.push({ id: m.id, body: m.body })
+        continue
+      }
+      m.receiveCount++
+      m.receipt = makeReceipt(m.id, m.receiveCount)
+      m.visibleAt = now + this.opts.visibilityTimeoutMs
+      out.push({ id: m.id, body: m.body, receipt: m.receipt, receiveCount: m.receiveCount })
+    }
+    return out
+  }
+
+  ack(receipt: string): boolean {
+    const i = this.messages.findIndex(m => m.receipt === receipt)
+    if (i < 0) return false
+    this.messages.splice(i, 1)
+    return true
+  }
+
+  extend(receipt: string, ms: number): boolean {
+    const m = this.messages.find(m => m.receipt === receipt)
+    if (!m) return false
+    m.visibleAt = this.opts.now() + ms
+    return true
+  }
+
+  dlq(): Array<{ id: string; body: T }> {
+    return this.dead.map(d => ({ ...d }))
+  }
+}
+</script>
+  <script type="tests">
+const saved = { now: Date.now, random: Math.random }
+const boom = (): never => { throw new Error('不能用 Date.now／Math.random：時間要用傳進來的 now()') }
+Date.now = boom
+Math.random = boom
+try {
+  let t = 0
+  const make = (vt: number, maxReceives: number) => new InMemoryQueue<string>({ visibilityTimeoutMs: vt, maxReceives, now: () => t })
+  const bodies = (rs: Received<string>[]) => rs.map(r => r.body)
+
+  {
+    t = 0
+    const q = make(1000, 5)
+    const ids = ['寄收據 #1', '寄收據 #2', '寄收據 #3'].map(b => q.send(b))
+    assert.equal(new Set(ids).size, 3, 'send 回傳的訊息 id 每則都要不同')
+    const r1 = q.receive(2)
+    assert.deepEqual(bodies(r1), ['寄收據 #1', '寄收據 #2'], 'receive(2) 要依送出順序取出前 2 則')
+    assert.deepEqual(r1.map(r => r.receiveCount), [1, 1], '第一次被取走時 receiveCount 是 1')
+    assert.deepEqual(r1.map(r => r.id), ids.slice(0, 2), 'receive 回傳的 id 要跟 send 回傳的一樣')
+    assert.deepEqual(bodies(q.receive(10)), ['寄收據 #3'], '已經取走的訊息要隱藏，只剩第 3 則可見')
+    assert.equal(q.receive(10).length, 0, '全部都被取走、還在 visibility timeout 內時，receive 拿不到東西')
+    t = 999
+    assert.equal(q.receive(10).length, 0, 'visibility timeout 還沒到（999ms），訊息不能重新出現')
+    t = 1000
+    const r2 = q.receive(10)
+    assert.deepEqual(bodies(r2), ['寄收據 #1', '寄收據 #2', '寄收據 #3'], '超過 visibility timeout 沒 ack，訊息要依原本順序重新出現')
+    assert.deepEqual(r2.map(r => r.receiveCount), [2, 2, 2], '第二次被取走時 receiveCount 是 2')
+    assert(r2[0].receipt !== r1[0].receipt, '同一則訊息再被取走時，receipt 要不同')
+  }
+  {
+    t = 0
+    const q = make(1000, 5)
+    q.send('A')
+    q.send('B')
+    assert.deepEqual(bodies(q.receive(1)), ['A'], '先送的 A 先被取出')
+    t = 1000
+    assert.deepEqual(bodies(q.receive(10)), ['A', 'B'], 'A 逾時重新出現後，仍要排在 B 前面（依送出順序，不能把取過的訊息移到尾端）')
+  }
+  {
+    t = 0
+    const q = make(1000, 5)
+    for (let i = 1; i <= 5; i++) q.send(`#${i}`)
+    assert.equal(q.receive(2).length, 2, 'receive(max) 最多只能取 max 則')
+  }
+  {
+    t = 0
+    const q = make(1000, 5)
+    q.send('集點：訂單 41')
+    const a = q.receive(1)[0]
+    t = 1000
+    const b = q.receive(1)[0]
+    assert(b !== undefined && b.receipt !== a.receipt, '逾時後別的消費者要能取走，並拿到新的 receipt')
+    assert.equal(q.extend(a.receipt, 5000), false, '殭屍消費者用舊的 receipt 延長要回傳 false')
+    assert.equal(q.ack(a.receipt), false, '殭屍消費者用舊的 receipt ack 要回傳 false（不能刪掉別人正在處理的訊息）')
+    t = 2000
+    assert.deepEqual(bodies(q.receive(1)), ['集點：訂單 41'], '舊的 receipt 不能改到訊息：B 的租約到期後訊息要重新出現')
+  }
+  {
+    t = 0
+    const q = make(1000, 5)
+    q.send('集點：訂單 42')
+    const a = q.receive(1)[0]
+    t = 500
+    assert.equal(q.ack(a.receipt), true, '目前的 receipt ack 要回傳 true')
+    assert.equal(q.ack(a.receipt), false, '已經刪除的訊息再 ack 要回傳 false')
+    t = 5000
+    assert.equal(q.receive(10).length, 0, 'ack 之後訊息不能再出現')
+  }
+  {
+    t = 0
+    const q = make(1000, 5)
+    q.send('廚房出單：訂單 43')
+    const a = q.receive(1)[0]
+    t = 900
+    assert.equal(q.extend(a.receipt, 1000), true, '目前的 receipt 延長要回傳 true')
+    t = 1000
+    assert.equal(q.receive(1).length, 0, 'extend 之後，原本的到期時間到了也不能重新出現')
+    t = 1899
+    assert.equal(q.receive(1).length, 0, 'extend(receipt, 1000) 要從 now() 起再隱藏 1000ms')
+    t = 1900
+    const b = q.receive(1)
+    assert.equal(b.length, 1, '延長的時間到了要重新出現')
+    assert.equal(b[0].receiveCount, 2, '延長不算一次接收')
+    assert.equal(q.extend('m999#1', 1000), false, '不存在的 receipt 延長要回傳 false')
+  }
+  {
+    t = 0
+    const q = make(1000, 3)
+    const pid = q.send('壞掉的訊息')
+    q.send('正常的訊息')
+    const first = q.receive(10)
+    assert.equal(q.ack(first[1].receipt), true, '正常的訊息 ack 成功')
+    t = 1000
+    assert.deepEqual(q.receive(10).map(r => r.receiveCount), [2], '第 2 次被取走')
+    t = 2000
+    assert.deepEqual(q.receive(10).map(r => r.receiveCount), [3], 'maxReceives = 3：第 3 次還是要送出')
+    assert.equal(q.dlq().length, 0, '被取走 3 次之前不能進 DLQ')
+    t = 3000
+    assert.equal(q.receive(10).length, 0, '已經被取走 maxReceives 次，再次可見時不能再送出')
+    assert.deepEqual(q.dlq(), [{ id: pid, body: '壞掉的訊息' }], '被取走 maxReceives 次仍沒 ack，要移到 DLQ')
+    t = 9000
+    assert.equal(q.receive(10).length, 0, '進了 DLQ 的訊息不能再從原佇列出現')
+    assert.equal(q.dlq().length, 1, 'DLQ 裡只能有一筆')
+  }
+} finally {
+  Date.now = saved.now
+  Math.random = saved.random
+}
+</script>
+  <script type="wrong">
+type Received<T> = { id: string; body: T; receipt: string; receiveCount: number }
+type QueueOptions = { visibilityTimeoutMs: number; maxReceives: number; now: () => number }
+const makeReceipt = (id: string, receiveCount: number) => `${id}#${receiveCount}`
+type Stored<T> = { id: string; body: T; visibleAt: number; receiveCount: number; receipt: string | null }
+
+// 錯誤：ack 用 receipt 裡的訊息 id 找訊息，殭屍消費者會刪掉別人正在處理的訊息
+class InMemoryQueue<T> {
+  private opts: QueueOptions
+  private messages: Stored<T>[] = []
+  private dead: Array<{ id: string; body: T }> = []
+  private seq = 0
+  constructor(opts: QueueOptions) { this.opts = opts }
+  send(body: T): string {
+    const id = `m${++this.seq}`
+    this.messages.push({ id, body, visibleAt: this.opts.now(), receiveCount: 0, receipt: null })
+    return id
+  }
+  receive(max: number): Received<T>[] {
+    const now = this.opts.now()
+    const out: Received<T>[] = []
+    for (const m of [...this.messages]) {
+      if (out.length >= max) break
+      if (m.visibleAt > now) continue
+      if (m.receiveCount >= this.opts.maxReceives) {
+        this.messages.splice(this.messages.indexOf(m), 1)
+        this.dead.push({ id: m.id, body: m.body })
+        continue
+      }
+      m.receiveCount++
+      m.receipt = makeReceipt(m.id, m.receiveCount)
+      m.visibleAt = now + this.opts.visibilityTimeoutMs
+      out.push({ id: m.id, body: m.body, receipt: m.receipt, receiveCount: m.receiveCount })
+    }
+    return out
+  }
+  ack(receipt: string): boolean {
+    const id = receipt.split('#')[0]
+    const i = this.messages.findIndex(m => m.id === id)
+    if (i < 0) return false
+    this.messages.splice(i, 1)
+    return true
+  }
+  extend(receipt: string, ms: number): boolean {
+    const m = this.messages.find(m => m.receipt === receipt)
+    if (!m) return false
+    m.visibleAt = this.opts.now() + ms
+    return true
+  }
+  dlq(): Array<{ id: string; body: T }> { return this.dead.map(d => ({ ...d })) }
+}
+</script>
+  <script type="wrong">
+type Received<T> = { id: string; body: T; receipt: string; receiveCount: number }
+type QueueOptions = { visibilityTimeoutMs: number; maxReceives: number; now: () => number }
+const makeReceipt = (id: string, receiveCount: number) => `${id}#${receiveCount}`
+type Stored<T> = { id: string; body: T; visibleAt: number; receiveCount: number; receipt: string | null }
+
+// 錯誤：取走後沒有隱藏
+class InMemoryQueue<T> {
+  private opts: QueueOptions
+  private messages: Stored<T>[] = []
+  private dead: Array<{ id: string; body: T }> = []
+  private seq = 0
+  constructor(opts: QueueOptions) { this.opts = opts }
+  send(body: T): string {
+    const id = `m${++this.seq}`
+    this.messages.push({ id, body, visibleAt: this.opts.now(), receiveCount: 0, receipt: null })
+    return id
+  }
+  receive(max: number): Received<T>[] {
+    const out: Received<T>[] = []
+    for (const m of [...this.messages]) {
+      if (out.length >= max) break
+      if (m.receiveCount >= this.opts.maxReceives) {
+        this.messages.splice(this.messages.indexOf(m), 1)
+        this.dead.push({ id: m.id, body: m.body })
+        continue
+      }
+      m.receiveCount++
+      m.receipt = makeReceipt(m.id, m.receiveCount)
+      out.push({ id: m.id, body: m.body, receipt: m.receipt, receiveCount: m.receiveCount })
+    }
+    return out
+  }
+  ack(receipt: string): boolean {
+    const i = this.messages.findIndex(m => m.receipt === receipt)
+    if (i < 0) return false
+    this.messages.splice(i, 1)
+    return true
+  }
+  extend(receipt: string, ms: number): boolean {
+    const m = this.messages.find(m => m.receipt === receipt)
+    if (!m) return false
+    m.visibleAt = this.opts.now() + ms
+    return true
+  }
+  dlq(): Array<{ id: string; body: T }> { return this.dead.map(d => ({ ...d })) }
+}
+</script>
+  <script type="wrong">
+type Received<T> = { id: string; body: T; receipt: string; receiveCount: number }
+type QueueOptions = { visibilityTimeoutMs: number; maxReceives: number; now: () => number }
+const makeReceipt = (id: string, receiveCount: number) => `${id}#${receiveCount}`
+type Stored<T> = { id: string; body: T; visibleAt: number; receiveCount: number; receipt: string | null }
+
+// 錯誤：進 DLQ 的次數差一（第 4 次還送出）
+class InMemoryQueue<T> {
+  private opts: QueueOptions
+  private messages: Stored<T>[] = []
+  private dead: Array<{ id: string; body: T }> = []
+  private seq = 0
+  constructor(opts: QueueOptions) { this.opts = opts }
+  send(body: T): string {
+    const id = `m${++this.seq}`
+    this.messages.push({ id, body, visibleAt: this.opts.now(), receiveCount: 0, receipt: null })
+    return id
+  }
+  receive(max: number): Received<T>[] {
+    const now = this.opts.now()
+    const out: Received<T>[] = []
+    for (const m of [...this.messages]) {
+      if (out.length >= max) break
+      if (m.visibleAt > now) continue
+      if (m.receiveCount > this.opts.maxReceives) {
+        this.messages.splice(this.messages.indexOf(m), 1)
+        this.dead.push({ id: m.id, body: m.body })
+        continue
+      }
+      m.receiveCount++
+      m.receipt = makeReceipt(m.id, m.receiveCount)
+      m.visibleAt = now + this.opts.visibilityTimeoutMs
+      out.push({ id: m.id, body: m.body, receipt: m.receipt, receiveCount: m.receiveCount })
+    }
+    return out
+  }
+  ack(receipt: string): boolean {
+    const i = this.messages.findIndex(m => m.receipt === receipt)
+    if (i < 0) return false
+    this.messages.splice(i, 1)
+    return true
+  }
+  extend(receipt: string, ms: number): boolean {
+    const m = this.messages.find(m => m.receipt === receipt)
+    if (!m) return false
+    m.visibleAt = this.opts.now() + ms
+    return true
+  }
+  dlq(): Array<{ id: string; body: T }> { return this.dead.map(d => ({ ...d })) }
+}
+</script>
+  <script type="wrong">
+type Received<T> = { id: string; body: T; receipt: string; receiveCount: number }
+type QueueOptions = { visibilityTimeoutMs: number; maxReceives: number; now: () => number }
+const makeReceipt = (id: string, receiveCount: number) => `${id}#${receiveCount}`
+type Stored<T> = { id: string; body: T; visibleAt: number; receiveCount: number; receipt: string | null }
+
+// 錯誤：進 DLQ 的次數少一（第 3 次就不送了）
+class InMemoryQueue<T> {
+  private opts: QueueOptions
+  private messages: Stored<T>[] = []
+  private dead: Array<{ id: string; body: T }> = []
+  private seq = 0
+  constructor(opts: QueueOptions) { this.opts = opts }
+  send(body: T): string {
+    const id = `m${++this.seq}`
+    this.messages.push({ id, body, visibleAt: this.opts.now(), receiveCount: 0, receipt: null })
+    return id
+  }
+  receive(max: number): Received<T>[] {
+    const now = this.opts.now()
+    const out: Received<T>[] = []
+    for (const m of [...this.messages]) {
+      if (out.length >= max) break
+      if (m.visibleAt > now) continue
+      if (m.receiveCount + 1 >= this.opts.maxReceives) {
+        this.messages.splice(this.messages.indexOf(m), 1)
+        this.dead.push({ id: m.id, body: m.body })
+        continue
+      }
+      m.receiveCount++
+      m.receipt = makeReceipt(m.id, m.receiveCount)
+      m.visibleAt = now + this.opts.visibilityTimeoutMs
+      out.push({ id: m.id, body: m.body, receipt: m.receipt, receiveCount: m.receiveCount })
+    }
+    return out
+  }
+  ack(receipt: string): boolean {
+    const i = this.messages.findIndex(m => m.receipt === receipt)
+    if (i < 0) return false
+    this.messages.splice(i, 1)
+    return true
+  }
+  extend(receipt: string, ms: number): boolean {
+    const m = this.messages.find(m => m.receipt === receipt)
+    if (!m) return false
+    m.visibleAt = this.opts.now() + ms
+    return true
+  }
+  dlq(): Array<{ id: string; body: T }> { return this.dead.map(d => ({ ...d })) }
+}
+</script>
+  <script type="wrong">
+type Received<T> = { id: string; body: T; receipt: string; receiveCount: number }
+type QueueOptions = { visibilityTimeoutMs: number; maxReceives: number; now: () => number }
+const makeReceipt = (id: string, receiveCount: number) => `${id}#${receiveCount}`
+type Stored<T> = { id: string; body: T; visibleAt: number; receiveCount: number; receipt: string | null }
+
+// 錯誤：extend 不檢查 receipt，只看訊息 id
+class InMemoryQueue<T> {
+  private opts: QueueOptions
+  private messages: Stored<T>[] = []
+  private dead: Array<{ id: string; body: T }> = []
+  private seq = 0
+  constructor(opts: QueueOptions) { this.opts = opts }
+  send(body: T): string {
+    const id = `m${++this.seq}`
+    this.messages.push({ id, body, visibleAt: this.opts.now(), receiveCount: 0, receipt: null })
+    return id
+  }
+  receive(max: number): Received<T>[] {
+    const now = this.opts.now()
+    const out: Received<T>[] = []
+    for (const m of [...this.messages]) {
+      if (out.length >= max) break
+      if (m.visibleAt > now) continue
+      if (m.receiveCount >= this.opts.maxReceives) {
+        this.messages.splice(this.messages.indexOf(m), 1)
+        this.dead.push({ id: m.id, body: m.body })
+        continue
+      }
+      m.receiveCount++
+      m.receipt = makeReceipt(m.id, m.receiveCount)
+      m.visibleAt = now + this.opts.visibilityTimeoutMs
+      out.push({ id: m.id, body: m.body, receipt: m.receipt, receiveCount: m.receiveCount })
+    }
+    return out
+  }
+  ack(receipt: string): boolean {
+    const i = this.messages.findIndex(m => m.receipt === receipt)
+    if (i < 0) return false
+    this.messages.splice(i, 1)
+    return true
+  }
+  extend(receipt: string, ms: number): boolean {
+    const id = receipt.split('#')[0]
+    const m = this.messages.find(m => m.id === id)
+    if (!m) return false
+    m.visibleAt = this.opts.now() + ms
+    return true
+  }
+  dlq(): Array<{ id: string; body: T }> { return this.dead.map(d => ({ ...d })) }
+}
+</script>
+  <script type="wrong">
+type Received<T> = { id: string; body: T; receipt: string; receiveCount: number }
+type QueueOptions = { visibilityTimeoutMs: number; maxReceives: number; now: () => number }
+const makeReceipt = (id: string, receiveCount: number) => `${id}#${receiveCount}`
+type Stored<T> = { id: string; body: T; visibleAt: number; receiveCount: number; receipt: string | null }
+
+// 錯誤：extend 從原本的到期時間往後加，而不是從現在起算
+class InMemoryQueue<T> {
+  private opts: QueueOptions
+  private messages: Stored<T>[] = []
+  private dead: Array<{ id: string; body: T }> = []
+  private seq = 0
+  constructor(opts: QueueOptions) { this.opts = opts }
+  send(body: T): string {
+    const id = `m${++this.seq}`
+    this.messages.push({ id, body, visibleAt: this.opts.now(), receiveCount: 0, receipt: null })
+    return id
+  }
+  receive(max: number): Received<T>[] {
+    const now = this.opts.now()
+    const out: Received<T>[] = []
+    for (const m of [...this.messages]) {
+      if (out.length >= max) break
+      if (m.visibleAt > now) continue
+      if (m.receiveCount >= this.opts.maxReceives) {
+        this.messages.splice(this.messages.indexOf(m), 1)
+        this.dead.push({ id: m.id, body: m.body })
+        continue
+      }
+      m.receiveCount++
+      m.receipt = makeReceipt(m.id, m.receiveCount)
+      m.visibleAt = now + this.opts.visibilityTimeoutMs
+      out.push({ id: m.id, body: m.body, receipt: m.receipt, receiveCount: m.receiveCount })
+    }
+    return out
+  }
+  ack(receipt: string): boolean {
+    const i = this.messages.findIndex(m => m.receipt === receipt)
+    if (i < 0) return false
+    this.messages.splice(i, 1)
+    return true
+  }
+  extend(receipt: string, ms: number): boolean {
+    const m = this.messages.find(m => m.receipt === receipt)
+    if (!m) return false
+    m.visibleAt += ms
+    return true
+  }
+  dlq(): Array<{ id: string; body: T }> { return this.dead.map(d => ({ ...d })) }
+}
+</script>
+  <script type="wrong">
+type Received<T> = { id: string; body: T; receipt: string; receiveCount: number }
+type QueueOptions = { visibilityTimeoutMs: number; maxReceives: number; now: () => number }
+const makeReceipt = (id: string, receiveCount: number) => `${id}#${receiveCount}`
+type Stored<T> = { id: string; body: T; visibleAt: number; receiveCount: number; receipt: string | null }
+
+// 錯誤：取走的訊息移到尾端，重新出現時排到後面的訊息之後
+class InMemoryQueue<T> {
+  private opts: QueueOptions
+  private messages: Stored<T>[] = []
+  private dead: Array<{ id: string; body: T }> = []
+  private seq = 0
+  constructor(opts: QueueOptions) { this.opts = opts }
+  send(body: T): string {
+    const id = `m${++this.seq}`
+    this.messages.push({ id, body, visibleAt: this.opts.now(), receiveCount: 0, receipt: null })
+    return id
+  }
+  receive(max: number): Received<T>[] {
+    const now = this.opts.now()
+    const out: Received<T>[] = []
+    for (const m of [...this.messages]) {
+      if (out.length >= max) break
+      if (m.visibleAt > now) continue
+      this.messages.splice(this.messages.indexOf(m), 1)
+      if (m.receiveCount >= this.opts.maxReceives) {
+        this.dead.push({ id: m.id, body: m.body })
+        continue
+      }
+      this.messages.push(m)
+      m.receiveCount++
+      m.receipt = makeReceipt(m.id, m.receiveCount)
+      m.visibleAt = now + this.opts.visibilityTimeoutMs
+      out.push({ id: m.id, body: m.body, receipt: m.receipt, receiveCount: m.receiveCount })
+    }
+    return out
+  }
+  ack(receipt: string): boolean {
+    const i = this.messages.findIndex(m => m.receipt === receipt)
+    if (i < 0) return false
+    this.messages.splice(i, 1)
+    return true
+  }
+  extend(receipt: string, ms: number): boolean {
+    const m = this.messages.find(m => m.receipt === receipt)
+    if (!m) return false
+    m.visibleAt = this.opts.now() + ms
+    return true
+  }
+  dlq(): Array<{ id: string; body: T }> { return this.dead.map(d => ({ ...d })) }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：寫 <code>createInboxHandler</code>，把一個會重複收到訊息的處理函式變成冪等的。回傳的函式收到 <code>msg</code> 時：</p>
+  <ul>
+    <li>在 <code>db.transaction(async tx =&gt; …)</code> 裡，先用 <code>tx.insertIfAbsent('inbox', msg.id)</code> 記錄訊息 id（原子操作，id 已經存在就回傳 <code>false</code>）。</li>
+    <li>回傳 <code>false</code> 就是處理過了，回傳 <code>'duplicate'</code>；否則呼叫 <code>handle(msg, tx)</code>，回傳 <code>'processed'</code>。</li>
+    <li><code>handle</code> 丟錯時讓錯誤往外傳（訊息不 ack，之後會重送）。交易的 callback 丟錯時，callback 裡的所有寫入都會回滾，包括 inbox 紀錄。</li>
+  </ul>
+  <p>測試用的假資料庫跟 PostgreSQL 一樣：兩個交易同時插入同一個 key，第二個會等第一個提交或回滾。</p>
+  <script type="start">
+type Msg = { id: string; type: 'order.paid'; orderId: number; amount: number }
+type Tx = {
+  insertIfAbsent(table: string, key: string): Promise<boolean>
+  get(table: string, key: string): Promise<unknown>
+  put(table: string, key: string, value: unknown): Promise<void>
+}
+// 不在交易裡的操作會馬上生效；transaction 的 callback 丟錯時，裡面的寫入全部回滾
+type TxDb = Tx & { transaction<R>(fn: (tx: Tx) => Promise<R>): Promise<R> }
+
+function createInboxHandler(
+  db: TxDb,
+  handle: (msg: Msg, tx: Tx) => Promise<void>,
+): (msg: Msg) => Promise<'processed' | 'duplicate'> {
+  throw new Error('TODO')
+}
+</script>
+  <script type="answer">
+type Msg = { id: string; type: 'order.paid'; orderId: number; amount: number }
+type Tx = {
+  insertIfAbsent(table: string, key: string): Promise<boolean>
+  get(table: string, key: string): Promise<unknown>
+  put(table: string, key: string, value: unknown): Promise<void>
+}
+// 不在交易裡的操作會馬上生效；transaction 的 callback 丟錯時，裡面的寫入全部回滾
+type TxDb = Tx & { transaction<R>(fn: (tx: Tx) => Promise<R>): Promise<R> }
+
+function createInboxHandler(
+  db: TxDb,
+  handle: (msg: Msg, tx: Tx) => Promise<void>,
+): (msg: Msg) => Promise<'processed' | 'duplicate'> {
+  return msg => db.transaction(async tx => {
+    if (!(await tx.insertIfAbsent('inbox', msg.id))) return 'duplicate' as const
+    await handle(msg, tx)
+    return 'processed' as const
+  })
+}
+</script>
+  <script type="tests">
+const tick = () => new Promise<void>(r => setTimeout(r, 0))
+const createDb = () => {
+  const tables = new Map<string, Map<string, unknown>>()
+  const locks = new Map<string, Promise<void>>()
+  const table = (name: string) => {
+    let m = tables.get(name)
+    if (!m) { m = new Map(); tables.set(name, m) }
+    return m
+  }
+  const ops = (undo: Array<() => void> | null, release: Array<() => void>): Tx => ({
+    async insertIfAbsent(name, key) {
+      await tick()
+      const lk = `${name}/${key}`
+      while (locks.has(lk)) await locks.get(lk)
+      const m = table(name)
+      if (m.has(key)) return false
+      m.set(key, true)
+      if (undo) {
+        undo.push(() => { m.delete(key) })
+        const d = Promise.withResolvers<void>()
+        locks.set(lk, d.promise)
+        release.push(() => { locks.delete(lk); d.resolve() })
+      }
+      return true
+    },
+    async get(name, key) {
+      await tick()
+      return table(name).get(key)
+    },
+    async put(name, key, value) {
+      await tick()
+      const m = table(name)
+      const had = m.has(key)
+      const old = m.get(key)
+      m.set(key, value)
+      undo?.push(() => { if (had) m.set(key, old); else m.delete(key) })
+    },
+  })
+  const db: TxDb = {
+    ...ops(null, []),
+    async transaction<R>(fn: (tx: Tx) => Promise<R>): Promise<R> {
+      const undo: Array<() => void> = []
+      const release: Array<() => void> = []
+      try {
+        return await fn(ops(undo, release))
+      } catch (e) {
+        for (const u of undo.reverse()) u()
+        throw e
+      } finally {
+        for (const r of release) r()
+      }
+    },
+  }
+  return { db, tables: table }
+}
+const setup = () => {
+  const { db, tables } = createDb()
+  const effects: string[] = []
+  const sawInbox: boolean[] = []
+  const failures = new Set<string>()
+  const handle = async (msg: Msg, tx: Tx) => {
+    sawInbox.push((await tx.get('inbox', msg.id)) !== undefined)
+    const key = String(msg.orderId)
+    const cur = ((await tx.get('points', key)) as number | undefined) ?? 0
+    await tx.put('points', key, cur + msg.amount)
+    if (failures.has(msg.id)) { failures.delete(msg.id); throw new Error('集點服務暫時失敗') }
+    effects.push(msg.id)
+  }
+  return { db, tables, effects, sawInbox, failures, handler: createInboxHandler(db, handle) }
+}
+const settle = async (p: Promise<unknown>) => { try { return { ok: true, value: await p } } catch (e) { return { ok: false, value: e } } }
+const m41: Msg = Object.freeze({ id: 'evt-41', type: 'order.paid', orderId: 41, amount: 11 })
+const m42: Msg = Object.freeze({ id: 'evt-42', type: 'order.paid', orderId: 42, amount: 8 })
+
+{
+  const s = setup()
+  assert.equal(await s.handler(m41), 'processed', '第一次收到要回傳 processed')
+  assert.deepEqual(s.sawInbox, [true], 'handle 執行時，inbox 紀錄要已經在同一個交易裡寫入（先記 inbox，再 handle）')
+  assert.equal(await s.handler(m41), 'duplicate', '同一則訊息第二次收到要回傳 duplicate')
+  assert.deepEqual(s.effects, ['evt-41'], '同一則訊息送兩次，副作用只能發生一次')
+  assert.equal(s.tables('points').get('41'), 11, '點數只能加一次')
+  assert.equal(await s.handler(m42), 'processed', '不同的訊息要各自處理')
+  assert.equal(s.tables('points').get('42'), 8, '不同的訊息各自加點')
+}
+{
+  const s = setup()
+  s.failures.add('evt-41')
+  const first = await settle(s.handler(m41))
+  assert(!first.ok && first.value instanceof Error && first.value.message === '集點服務暫時失敗', 'handle 丟錯時，錯誤要往外傳（不能吞掉，否則訊息會被 ack）')
+  assert.equal(s.tables('inbox').has('evt-41'), false, 'handle 失敗時 inbox 紀錄也要回滾（inbox 要寫在同一個交易裡）')
+  assert.equal(s.tables('points').has('41'), false, 'handle 失敗時副作用要回滾')
+  assert.equal(await s.handler(m41), 'processed', 'handle 失敗後重送，要能成功處理（不能被當成 duplicate 而遺失）')
+  assert.equal(s.tables('points').get('41'), 11, '重送成功後點數加一次')
+}
+{
+  const s = setup()
+  const results = await Promise.all([s.handler(m41), s.handler(m41)])
+  assert.deepEqual(results.toSorted(), ['duplicate', 'processed'], '同一則訊息同時送兩次（殭屍消費者），只能有一個 processed')
+  assert.deepEqual(s.effects, ['evt-41'], '同時送兩次，副作用只能發生一次（不能先查再寫）')
+  assert.equal(s.tables('points').get('41'), 11, '同時送兩次，點數只能加一次')
+}
+{
+  const s = setup()
+  s.failures.add('evt-42')
+  const results = await Promise.all([settle(s.handler(m42)), settle(s.handler(m42))])
+  assert.equal(results.filter(r => r.ok && r.value === 'processed').length, 1, '同時送兩次、先拿到的那個失敗回滾時，等待中的另一個要接手處理成功')
+  assert.equal(s.tables('points').get('42'), 8, '失敗的那次回滾、成功的那次加點，總共只加一次')
+}
+</script>
+  <script type="wrong">
+type Msg = { id: string; type: 'order.paid'; orderId: number; amount: number }
+type Tx = {
+  insertIfAbsent(table: string, key: string): Promise<boolean>
+  get(table: string, key: string): Promise<unknown>
+  put(table: string, key: string, value: unknown): Promise<void>
+}
+type TxDb = Tx & { transaction<R>(fn: (tx: Tx) => Promise<R>): Promise<R> }
+
+// 錯誤：先 handle 再記 inbox，而且不在同一個交易
+function createInboxHandler(
+  db: TxDb,
+  handle: (msg: Msg, tx: Tx) => Promise<void>,
+): (msg: Msg) => Promise<'processed' | 'duplicate'> {
+  return async msg => {
+    if (await db.get('inbox', msg.id)) return 'duplicate'
+    await db.transaction(tx => handle(msg, tx))
+    await db.insertIfAbsent('inbox', msg.id)
+    return 'processed'
+  }
+}
+</script>
+  <script type="wrong">
+type Msg = { id: string; type: 'order.paid'; orderId: number; amount: number }
+type Tx = {
+  insertIfAbsent(table: string, key: string): Promise<boolean>
+  get(table: string, key: string): Promise<unknown>
+  put(table: string, key: string, value: unknown): Promise<void>
+}
+type TxDb = Tx & { transaction<R>(fn: (tx: Tx) => Promise<R>): Promise<R> }
+
+// 錯誤：inbox 寫在交易外，handle 失敗時紀錄不會回滾
+function createInboxHandler(
+  db: TxDb,
+  handle: (msg: Msg, tx: Tx) => Promise<void>,
+): (msg: Msg) => Promise<'processed' | 'duplicate'> {
+  return async msg => {
+    if (!(await db.insertIfAbsent('inbox', msg.id))) return 'duplicate'
+    await db.transaction(tx => handle(msg, tx))
+    return 'processed'
+  }
+}
+</script>
+  <script type="wrong">
+type Msg = { id: string; type: 'order.paid'; orderId: number; amount: number }
+type Tx = {
+  insertIfAbsent(table: string, key: string): Promise<boolean>
+  get(table: string, key: string): Promise<unknown>
+  put(table: string, key: string, value: unknown): Promise<void>
+}
+type TxDb = Tx & { transaction<R>(fn: (tx: Tx) => Promise<R>): Promise<R> }
+
+// 錯誤：先查再寫，兩個同時進來都查到「沒有」
+function createInboxHandler(
+  db: TxDb,
+  handle: (msg: Msg, tx: Tx) => Promise<void>,
+): (msg: Msg) => Promise<'processed' | 'duplicate'> {
+  return msg => db.transaction(async tx => {
+    if (await tx.get('inbox', msg.id)) return 'duplicate' as const
+    await tx.put('inbox', msg.id, true)
+    await handle(msg, tx)
+    return 'processed' as const
+  })
+}
+</script>
+  <script type="wrong">
+type Msg = { id: string; type: 'order.paid'; orderId: number; amount: number }
+type Tx = {
+  insertIfAbsent(table: string, key: string): Promise<boolean>
+  get(table: string, key: string): Promise<unknown>
+  put(table: string, key: string, value: unknown): Promise<void>
+}
+type TxDb = Tx & { transaction<R>(fn: (tx: Tx) => Promise<R>): Promise<R> }
+
+// 錯誤：吞掉 handle 的錯誤，訊息會被 ack，失敗的處理再也不會重試
+function createInboxHandler(
+  db: TxDb,
+  handle: (msg: Msg, tx: Tx) => Promise<void>,
+): (msg: Msg) => Promise<'processed' | 'duplicate'> {
+  return msg => db.transaction(async tx => {
+    if (!(await tx.insertIfAbsent('inbox', msg.id))) return 'duplicate' as const
+    try { await handle(msg, tx) } catch { /* 記 log 就好 */ }
+    return 'processed' as const
+  })
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：寫 outbox relay 的一輪 <code>relayOnce</code>：</p>
+  <ul>
+    <li>用 <code>store.fetchUnpublished(batchSize)</code> 取一批未送出的列（已依 <code>id</code> 排序）。</li>
+    <li>依序逐筆 <code>publish</code>，前一筆完成才送下一筆。</li>
+    <li>遇到第一個失敗就停下來（後面的不送）。這一輪送完或停下之後，呼叫<strong>一次</strong> <code>store.markPublished</code>，只傳失敗之前已成功送出的列的 id（一筆都沒送成功就不用呼叫）；回傳標記的筆數。</li>
+    <li><code>markPublished</code> 丟錯時（例如資料庫斷線）讓錯誤往外傳，下一輪會重送這些列：允許重複，不允許遺失。</li>
+  </ul>
+  <script type="start">
+type OutboxRow = { id: number; aggregateId: string; type: string; payload: string }
+type OutboxStore = {
+  fetchUnpublished(limit: number): Promise<OutboxRow[]>
+  markPublished(ids: readonly number[]): Promise<void>
+}
+
+async function relayOnce(
+  store: OutboxStore,
+  publish: (row: OutboxRow) => Promise<void>,
+  batchSize: number,
+): Promise<number> {
+  throw new Error('TODO')
+}
+</script>
+  <script type="answer">
+type OutboxRow = { id: number; aggregateId: string; type: string; payload: string }
+type OutboxStore = {
+  fetchUnpublished(limit: number): Promise<OutboxRow[]>
+  markPublished(ids: readonly number[]): Promise<void>
+}
+
+async function relayOnce(
+  store: OutboxStore,
+  publish: (row: OutboxRow) => Promise<void>,
+  batchSize: number,
+): Promise<number> {
+  const rows = await store.fetchUnpublished(batchSize)
+  const sent: number[] = []
+  for (const row of rows) {
+    try {
+      await publish(row)
+    } catch {
+      break   // 正式環境要記 log；這筆和後面的留到下一輪
+    }
+    sent.push(row.id)
+  }
+  if (sent.length > 0) await store.markPublished(sent)
+  return sent.length
+}
+</script>
+  <script type="tests">
+const flush = () => new Promise<void>(r => setTimeout(r, 0))
+const makeRows = (n: number): OutboxRow[] => Array.from({ length: n }, (_, i) => ({
+  id: i + 1, aggregateId: `order-${41 + (i % 2)}`, type: 'order.status', payload: `{"step":${Math.floor(i / 2)}}`,
+}))
+const createStore = (n: number) => {
+  const rows = makeRows(n).map(r => ({ ...r, published: false }))
+  const limits: number[] = []
+  let failMark = 0
+  const store: OutboxStore = {
+    async fetchUnpublished(limit) {
+      await flush()
+      limits.push(limit)
+      return rows.filter(r => !r.published).slice(0, limit)
+        .map(({ published, ...r }) => Object.freeze(r))
+    },
+    async markPublished(ids) {
+      await flush()
+      if (failMark > 0) { failMark--; throw new Error('資料庫連線中斷') }
+      for (const id of ids) rows.find(r => r.id === id)!.published = true
+    },
+  }
+  return {
+    store, limits,
+    published: () => rows.filter(r => r.published).map(r => r.id),
+    failMarkOnce: () => { failMark = 1 },
+  }
+}
+const recorder = (failIds: number[] = []) => {
+  const attempts: number[] = []
+  const sent: OutboxRow[] = []
+  const fails = new Set(failIds)
+  const publish = async (row: OutboxRow) => {
+    attempts.push(row.id)
+    await flush()
+    if (fails.has(row.id)) { fails.delete(row.id); throw new Error('broker 暫時無法連線') }
+    sent.push(row)
+  }
+  return { attempts, sent, publish }
+}
+
+{
+  const s = createStore(5)
+  const r = recorder()
+  assert.equal(await relayOnce(s.store, r.publish, 3), 3, '一批 3 筆全部送出，要回傳 3')
+  assert.deepEqual(s.limits, [3], 'fetchUnpublished 要用 batchSize 當上限')
+  assert.deepEqual(r.attempts, [1, 2, 3], '要依 id 順序送出')
+  assert.deepEqual(s.published(), [1, 2, 3], '送出成功的列要標記為已送出')
+  assert.equal(await relayOnce(s.store, r.publish, 3), 2, '下一輪送出剩下的 2 筆')
+  assert.deepEqual(r.attempts, [1, 2, 3, 4, 5], '第二輪接著送 4、5')
+  assert.equal(await relayOnce(s.store, r.publish, 3), 0, '沒有未送出的列時回傳 0')
+}
+{
+  const s = createStore(5)
+  const r = recorder([3])
+  assert.equal(await relayOnce(s.store, r.publish, 10), 2, '第 3 筆失敗：只有前 2 筆算送出')
+  assert.deepEqual(r.attempts, [1, 2, 3], '遇到第一個失敗就要停下來，第 4 筆之後不能送（同一張訂單的事件會亂序）')
+  assert.deepEqual(s.published(), [1, 2], '只能標記失敗之前已經成功送出的列（失敗那筆標記了就永遠遺失）')
+  assert.equal(await relayOnce(s.store, r.publish, 10), 3, '下一輪從失敗那筆重新開始')
+  assert.deepEqual(r.attempts, [1, 2, 3, 3, 4, 5], '下一輪要重送第 3 筆，再送 4、5')
+  assert.deepEqual(s.published(), [1, 2, 3, 4, 5], '最後全部標記')
+}
+{
+  const s = createStore(1)
+  const r = recorder([1])
+  assert.equal(await relayOnce(s.store, r.publish, 10), 0, '第 1 筆就失敗時回傳 0')
+  assert.deepEqual(s.published(), [], '第 1 筆就失敗時什麼都不能標記')
+}
+{
+  const s = createStore(3)
+  const r = recorder()
+  s.failMarkOnce()
+  let err: unknown
+  try { await relayOnce(s.store, r.publish, 10) } catch (e) { err = e }
+  assert(err instanceof Error && err.message === '資料庫連線中斷', 'markPublished 丟錯時要讓錯誤往外傳')
+  assert.deepEqual(r.attempts, [1, 2, 3], 'markPublished 只能在 publish 之後呼叫（先標記再送出，送出失敗就遺失）')
+  assert.deepEqual(s.published(), [], '標記失敗時沒有列被標記')
+  assert.equal(await relayOnce(s.store, r.publish, 10), 3, '下一輪要重送同樣的 3 筆（允許重複，不允許遺失）')
+  assert.deepEqual(r.sent.map(x => x.id), [1, 2, 3, 1, 2, 3], '同樣的列被送了兩次，消費者用 inbox 去重')
+}
+{
+  const s = createStore(4)
+  const pending: Array<{ row: OutboxRow; d: PromiseWithResolvers<void> }> = []
+  let inflight = 0
+  let maxInflight = 0
+  const publish = (row: OutboxRow) => {
+    inflight++
+    maxInflight = Math.max(maxInflight, inflight)
+    const d = Promise.withResolvers<void>()
+    pending.push({ row, d })
+    return d.promise.finally(() => { inflight-- })
+  }
+  const run = relayOnce(s.store, publish, 10)
+  for (let i = 0; i < 4; i++) {
+    for (let k = 0; k < 3; k++) await flush()
+    assert.equal(pending.length, i + 1, `前一筆完成之前不能送下一筆（第 ${i + 1} 筆）`)
+    assert.deepEqual(s.published(), [], '全部送完之前不能先標記')
+    pending[i].d.resolve()
+  }
+  assert.equal(await run, 4, '依序送完 4 筆')
+  assert.equal(maxInflight, 1, '同時只能有一筆在送（平行送出會打亂順序）')
+  const byAgg = (id: string) => pending.filter(p => p.row.aggregateId === id).map(p => p.row.id)
+  assert.deepEqual(byAgg('order-41'), [1, 3], '同一張訂單的事件要依 id 順序送出')
+}
+</script>
+  <script type="wrong">
+type OutboxRow = { id: number; aggregateId: string; type: string; payload: string }
+type OutboxStore = {
+  fetchUnpublished(limit: number): Promise<OutboxRow[]>
+  markPublished(ids: readonly number[]): Promise<void>
+}
+
+// 錯誤：先標記再送出
+async function relayOnce(
+  store: OutboxStore,
+  publish: (row: OutboxRow) => Promise<void>,
+  batchSize: number,
+): Promise<number> {
+  const rows = await store.fetchUnpublished(batchSize)
+  await store.markPublished(rows.map(r => r.id))
+  let n = 0
+  for (const row of rows) {
+    try { await publish(row) } catch { break }
+    n++
+  }
+  return n
+}
+</script>
+  <script type="wrong">
+type OutboxRow = { id: number; aggregateId: string; type: string; payload: string }
+type OutboxStore = {
+  fetchUnpublished(limit: number): Promise<OutboxRow[]>
+  markPublished(ids: readonly number[]): Promise<void>
+}
+
+// 錯誤：Promise.all 平行送出
+async function relayOnce(
+  store: OutboxStore,
+  publish: (row: OutboxRow) => Promise<void>,
+  batchSize: number,
+): Promise<number> {
+  const rows = await store.fetchUnpublished(batchSize)
+  const results = await Promise.allSettled(rows.map(r => publish(r)))
+  const sent: number[] = []
+  for (const [i, r] of results.entries()) {
+    if (r.status === 'rejected') break
+    sent.push(rows[i].id)
+  }
+  if (sent.length > 0) await store.markPublished(sent)
+  return sent.length
+}
+</script>
+  <script type="wrong">
+type OutboxRow = { id: number; aggregateId: string; type: string; payload: string }
+type OutboxStore = {
+  fetchUnpublished(limit: number): Promise<OutboxRow[]>
+  markPublished(ids: readonly number[]): Promise<void>
+}
+
+// 錯誤：有一筆失敗仍把整批標記
+async function relayOnce(
+  store: OutboxStore,
+  publish: (row: OutboxRow) => Promise<void>,
+  batchSize: number,
+): Promise<number> {
+  const rows = await store.fetchUnpublished(batchSize)
+  let n = 0
+  for (const row of rows) {
+    try { await publish(row) } catch { break }
+    n++
+  }
+  if (rows.length > 0) await store.markPublished(rows.map(r => r.id))
+  return n
+}
+</script>
+  <script type="wrong">
+type OutboxRow = { id: number; aggregateId: string; type: string; payload: string }
+type OutboxStore = {
+  fetchUnpublished(limit: number): Promise<OutboxRow[]>
+  markPublished(ids: readonly number[]): Promise<void>
+}
+
+// 錯誤：跳過失敗的那筆，繼續送後面的
+async function relayOnce(
+  store: OutboxStore,
+  publish: (row: OutboxRow) => Promise<void>,
+  batchSize: number,
+): Promise<number> {
+  const rows = await store.fetchUnpublished(batchSize)
+  const sent: number[] = []
+  for (const row of rows) {
+    try {
+      await publish(row)
+      sent.push(row.id)
+    } catch {
+      continue
+    }
+  }
+  if (sent.length > 0) await store.markPublished(sent)
+  return sent.length
+}
+</script>
+  <script type="wrong">
+type OutboxRow = { id: number; aggregateId: string; type: string; payload: string }
+type OutboxStore = {
+  fetchUnpublished(limit: number): Promise<OutboxRow[]>
+  markPublished(ids: readonly number[]): Promise<void>
+}
+
+// 錯誤：吞掉 markPublished 的錯誤，還回報送出成功
+async function relayOnce(
+  store: OutboxStore,
+  publish: (row: OutboxRow) => Promise<void>,
+  batchSize: number,
+): Promise<number> {
+  const rows = await store.fetchUnpublished(batchSize)
+  const sent: number[] = []
+  for (const row of rows) {
+    try { await publish(row) } catch { break }
+    sent.push(row.id)
+  }
+  if (sent.length > 0) await store.markPublished(sent).catch(() => {})
+  return sent.length
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 4：寫 <code>processByKey</code>，消費一批訊息：</p>
+  <ul>
+    <li>同一個 <code>key</code>（例如訂單 id）的訊息，依陣列順序一則做完才做下一則。</li>
+    <li>不同 key 可以同時進行，但同時進行的 <code>handler</code> 總數不超過 <code>concurrency</code>；有空位、也有可做的 key 時，就要開始做。</li>
+    <li>全部完成才 resolve；任何一個 <code>handler</code> 失敗就 reject 那個錯誤（不必取消其他進行中的）。不能修改傳進來的陣列。</li>
+  </ul>
+  <p>提示：<a href="../../typescript/lessons/09-async-await.html">TypeScript 課第 9 課</a>「限制同時 N 個」的 worker 寫法（依 key 排隊的想法見 <a href="../../typescript/lessons/12-races-concurrency.html">TypeScript 課第 12 課</a>），讓每個 worker 一次負責一整個 key。</p>
+  <script type="start">
+async function processByKey<M extends { key: string }>(
+  messages: readonly M[],
+  handler: (m: M) => Promise<void>,
+  concurrency: number,
+): Promise<void> {
+  throw new Error('TODO')
+}
+</script>
+  <script type="answer">
+async function processByKey<M extends { key: string }>(
+  messages: readonly M[],
+  handler: (m: M) => Promise<void>,
+  concurrency: number,
+): Promise<void> {
+  const groups = new Map<string, M[]>()
+  for (const m of messages) {
+    const list = groups.get(m.key)
+    if (list) list.push(m)
+    else groups.set(m.key, [m])
+  }
+  const lists = [...groups.values()]
+  let next = 0
+  const worker = async () => {
+    while (next < lists.length) {
+      const list = lists[next++]
+      for (const m of list) await handler(m)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, lists.length) }, worker))
+}
+</script>
+  <script type="tests">
+const flush = () => new Promise<void>(r => setTimeout(r, 0))
+type Ev = { key: string; id: string }
+const ev = (ids: string[]): readonly Ev[] => Object.freeze(ids.map(id => Object.freeze({ key: id.replace(/\d+$/, ''), id })))
+const drive = async (msgs: readonly Ev[], concurrency: number, failId?: string) => {
+  const pending: Array<{ m: Ev; d: PromiseWithResolvers<void> }> = []
+  const started: Ev[] = []
+  const busy = new Set<string>()
+  let inflight = 0
+  let maxInflight = 0
+  let overlap = ''
+  const inflightAtStart: Record<string, number> = {}
+  const handler = (m: Ev) => {
+    if (busy.has(m.key)) overlap = m.id
+    busy.add(m.key)
+    inflight++
+    inflightAtStart[m.id] = inflight
+    maxInflight = Math.max(maxInflight, inflight)
+    started.push(m)
+    const d = Promise.withResolvers<void>()
+    pending.push({ m, d })
+    return d.promise.finally(() => { busy.delete(m.key); inflight-- })
+  }
+  let done = false
+  let error: unknown
+  processByKey(msgs, handler, concurrency).then(() => { done = true }, e => { done = true; error = e })
+  let earlyDone = false
+  for (let step = 0; step < 200; step++) {
+    await flush(); await flush()
+    if (done) break
+    const next = pending.shift()
+    if (!next) break
+    if (next.m.id === failId) next.d.reject(new Error(`處理 ${next.m.id} 失敗`))
+    else next.d.resolve()
+  }
+  if (pending.length > 0 && done && failId === undefined) earlyDone = true
+  return { done, error, started, maxInflight, overlap, earlyDone, leftover: pending.length, inflightAtStart }
+}
+const orderOf = (list: Ev[], key: string) => list.filter(m => m.key === key).map(m => m.id)
+
+{
+  const msgs = ev(['a1', 'b1', 'a2', 'c1', 'b2', 'a3', 'd1'])
+  const r = await drive(msgs, 2)
+  assert(r.done && r.error === undefined, 'processByKey 要在全部完成後 resolve')
+  assert(!r.earlyDone, '還有 handler 沒完成就 resolve 了')
+  assert.equal(r.overlap, '', `同一個 key 的訊息不能同時進行（${r.overlap} 在同一個 key 的前一則還沒完成時就開始了）`)
+  assert(r.maxInflight <= 2, `同時進行的數量不能超過 concurrency（2），實際最多 ${r.maxInflight}`)
+  assert.equal(r.maxInflight, 2, '不同 key 要同時進行，用滿 concurrency（不能全部依序）')
+  assert.equal(r.started.length, 7, '每則訊息都要處理一次')
+  for (const k of ['a', 'b', 'c', 'd']) assert.deepEqual(orderOf(r.started, k), orderOf([...msgs], k), `key ${k} 的訊息要依陣列順序處理`)
+  assert.equal(r.inflightAtStart.c1, 2, 'b 做完、a3 還在處理時，空出來的位置要馬上開始 c1（不能等這一批 key 全部做完才開始下一批）')
+}
+{
+  const msgs = ev(['a1', 'a2', 'a3', 'a4'])
+  const r = await drive(msgs, 3)
+  assert(r.done && r.error === undefined, '只有一個 key 時也要全部完成')
+  assert.equal(r.maxInflight, 1, '只有一個 key 時，就算 concurrency 是 3 也只能一則一則做')
+  assert.deepEqual(r.started.map(m => m.id), ['a1', 'a2', 'a3', 'a4'], '同一個 key 依陣列順序')
+}
+{
+  const msgs = ev(['a1', 'b1', 'c1', 'a2', 'b2', 'c2'])
+  const r = await drive(msgs, 10)
+  assert.equal(r.maxInflight, 3, '3 個 key、concurrency 10 時，3 個 key 要同時進行')
+  assert.equal(r.overlap, '', '同一個 key 的訊息不能同時進行')
+  assert.equal(r.started.length, 6, '每則訊息都要處理一次')
+}
+{
+  const msgs = ev(['a1', 'b1', 'a2', 'b2'])
+  const r = await drive(msgs, 2, 'b1')
+  assert(r.done, '有 handler 失敗時 processByKey 要結束（reject）')
+  assert(r.error instanceof Error && r.error.message === '處理 b1 失敗', 'handler 失敗時要 reject 那個錯誤')
+}
+{
+  const r = await drive(ev([]), 2)
+  assert(r.done && r.error === undefined, '沒有訊息時要直接 resolve')
+}
+</script>
+  <script type="wrong">
+// 錯誤：Promise.all 全部同時跑
+async function processByKey<M extends { key: string }>(
+  messages: readonly M[],
+  handler: (m: M) => Promise<void>,
+  concurrency: number,
+): Promise<void> {
+  await Promise.all(messages.map(m => handler(m)))
+}
+</script>
+  <script type="wrong">
+// 錯誤：全部依序執行，沒有平行
+async function processByKey<M extends { key: string }>(
+  messages: readonly M[],
+  handler: (m: M) => Promise<void>,
+  concurrency: number,
+): Promise<void> {
+  for (const m of messages) await handler(m)
+}
+</script>
+  <script type="wrong">
+// 錯誤：依 key 分組平行，但沒有總數上限
+async function processByKey<M extends { key: string }>(
+  messages: readonly M[],
+  handler: (m: M) => Promise<void>,
+  concurrency: number,
+): Promise<void> {
+  const groups = new Map<string, M[]>()
+  for (const m of messages) groups.set(m.key, [...(groups.get(m.key) ?? []), m])
+  await Promise.all([...groups.values()].map(async list => {
+    for (const m of list) await handler(m)
+  }))
+}
+</script>
+  <script type="wrong">
+// 錯誤：限制同時 N 個，但不管 key（同一個 key 會重疊）
+async function processByKey<M extends { key: string }>(
+  messages: readonly M[],
+  handler: (m: M) => Promise<void>,
+  concurrency: number,
+): Promise<void> {
+  let next = 0
+  const worker = async () => {
+    while (next < messages.length) await handler(messages[next++])
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, messages.length) }, worker))
+}
+</script>
+  <script type="wrong">
+// 錯誤：用 pop 從尾巴取，同一個 key 的順序被打亂
+async function processByKey<M extends { key: string }>(
+  messages: readonly M[],
+  handler: (m: M) => Promise<void>,
+  concurrency: number,
+): Promise<void> {
+  const groups = new Map<string, M[]>()
+  for (const m of messages) {
+    const list = groups.get(m.key)
+    if (list) list.push(m)
+    else groups.set(m.key, [m])
+  }
+  const lists = [...groups.values()]
+  let next = 0
+  const worker = async () => {
+    while (next < lists.length) {
+      const list = lists[next++]
+      while (list.length > 0) await handler(list.pop()!)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, lists.length) }, worker))
+}
+</script>
+  <script type="wrong">
+// 錯誤：一次拿 concurrency 個 key 一起做，整批做完才開始下一批（有空位也在等）
+async function processByKey<M extends { key: string }>(
+  messages: readonly M[],
+  handler: (m: M) => Promise<void>,
+  concurrency: number,
+): Promise<void> {
+  const groups = new Map<string, M[]>()
+  for (const m of messages) groups.set(m.key, [...(groups.get(m.key) ?? []), m])
+  const lists = [...groups.values()]
+  for (let i = 0; i < lists.length; i += concurrency) {
+    await Promise.all(lists.slice(i, i + concurrency).map(async list => {
+      for (const m of list) await handler(m)
+    }))
+  }
+}
+</script>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：集點的消費者先 ack 訊息，再去資料庫加點數。加到一半程序被部署重啟了，這則訊息會怎樣？</p>
+  <label data-key="a">佇列會在 visibility timeout 之後自動重送，點數最後還是會加上</label>
+  <label data-key="b">訊息已經被刪除，不會再送，點數永遠不會加上（至多一次）</label>
+  <label data-key="c">佇列會偵測到程序重啟，把訊息放回去</label>
+  <p class="why">✓ ack 就是告訴佇列「可以刪了」，刪除之後佇列手上沒有這則訊息，重送無從發生（a、c 都不成立）。visibility timeout 只保護「還沒 ack」的訊息。所以要先處理、成功之後才 ack，代價是可能重複，再用 inbox 讓重複無害。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 6：結帳程式在交易 <code>COMMIT</code> 成功之後，才把「寄收據」放進佇列。同事說：「提交之後到送出之間只有幾毫秒，當機剛好落在中間的機率很低，不用管。」你怎麼回？</p>
+  <label data-key="a">同意，真的發生時顧客會自己來問，再手動補寄就好</label>
+  <label data-key="b">把送出佇列移到 <code>COMMIT</code> 之前就安全了</label>
+  <label data-key="c">這是雙寫問題：每天 6 萬筆、每週好幾次部署，一定會遇到，而且不會報錯。把訊息寫進同一個交易的 outbox 表，由 relay 送出</label>
+  <p class="why">✓ 機率低乘上量大、部署頻繁，就是「一定會發生」，而且發生時沒有錯誤可以查，只有顧客抱怨（a 的代價是找不到哪些人漏了）。移到 <code>COMMIT</code> 之前（b）換成另一個錯：交易回滾了，訊息卻已經送出，廚房收到不存在的訂單。outbox 讓訂單和訊息一起提交，relay 負責送出，消費者用 inbox 處理重送。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 7：監控顯示廚房出單的佇列裡有 1 萬則訊息。這一定代表出問題了嗎？</p>
+  <label data-key="a">不一定。要看處理速度和最老訊息的年齡：如果 10 秒內就消化完，顧客感覺不到；最老的訊息已經等了 20 分鐘才是問題</label>
+  <label data-key="b">一定是，佇列長度就是延遲，1 萬則代表顧客要等 1 萬倍的處理時間</label>
+  <label data-key="c">不是問題，佇列本來就是用來放積壓的，多長都沒關係</label>
+  <p class="why">✓ 等待時間 = 積壓 ÷ 處理速度（Little's Law）。同樣 1 萬則，消費者每秒處理 1,000 則就是 10 秒，每秒 2 則就是 80 多分鐘，所以長度要跟處理速度一起看（b 少了處理速度）。最直接的指標是最老訊息的年齡，它就是「最慘的顧客等了多久」。c 忽略了到達率持續大於處理速度時，積壓會一直長下去。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 8：團隊改用 Kafka，並開啟了 exactly-once 的設定。寄收據 email 的消費者還需要用訊息 id 去重嗎？</p>
+  <label data-key="a">不需要，exactly-once 保證每則訊息只處理一次</label>
+  <label data-key="b">需要。Kafka 的 exactly-once 只在 Kafka 內部成立；寄 email 是外部副作用，消費者寄完、提交 offset 前當機，重啟後還是會再寄一次</label>
+  <label data-key="c">需要，因為 Kafka 不保證同一個 partition 內的順序</label>
+  <p class="why">✓ Kafka 4.4 的文件寫明：exactly-once 適用於 Kafka Streams 和交易式 producer 搭配 <code>read_committed</code> 的消費者，也就是「從 Kafka 讀、寫回 Kafka」；寫到外部系統需要對方配合（a 誤會了範圍）。email 服務不會跟 Kafka 一起回滾，所以仍要冪等：用訊息 id 當 inbox 的 key，或傳給 email 服務當冪等鍵。c 也錯：Kafka 在 partition 內完全有序。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>以為佇列能解決長期的處理不足</strong>：佇列只能延後工作，到達率長期大於處理速度時積壓會一直長。加消費者或加快處理，佇列只吸收短暫的高峰。</li>
+  <li><strong>先 ack 再處理</strong>：處理到一半當機，訊息就遺失了。先處理，成功後才 ack。</li>
+  <li><strong>處理時間超過 visibility timeout 又不延長</strong>：同一則訊息被兩個消費者同時處理。依處理時間設定 timeout，處理中用心跳延長，延長失敗就停下來。</li>
+  <li><strong>用訊息 id 或過期的 receipt 刪除</strong>：殭屍消費者刪掉別人正在處理的訊息，那次處理失敗時就沒有人會重試。只用最近一次取得的 receipt。</li>
+  <li><strong>DLQ 沒有告警、也沒有重新處理的流程</strong>：訊息默默躺在那裡。有任何訊息就告警，修好後 redrive。</li>
+  <li><strong>消費者不冪等</strong>：至少一次的佇列一定會重複。用 inbox 或對方的冪等鍵。</li>
+  <li><strong>inbox 紀錄不在副作用的同一個交易裡</strong>：紀錄在前會遺失，紀錄在後會重複。兩者放同一個交易，並用唯一約束的原子插入，不要先查再寫。</li>
+  <li><strong>訊息裡放完整資料</strong>：處理時資料可能已經改了。訊息放 id，處理時查最新的。</li>
+  <li><strong>在交易提交前送訊息，或提交後直接送</strong>：前者會送出不存在的訂單，後者當機時訊息遺失。用 transactional outbox。</li>
+  <li><strong>relay 先標記再送出</strong>：送出失敗就永遠遺失。先送出再標記，重複交給消費者處理。</li>
+  <li><strong>outbox 表從不清理</strong>：表越來越大、VACUUM 跟不上。定期刪除已送出的列。</li>
+  <li><strong>以為整個佇列全域有序</strong>：只有同一個 partition 或 message group 內有序。用訂單 id 當 key，需要時再加版本號。</li>
+  <li><strong>只監控佇列長度</strong>：長度不等於延遲。監控最老訊息的年齡，並跟處理速度一起看。</li>
+</ul>
+
+<h2>小結</h2>
+<p>王小明的訂單 41 從結帳到收據、出單、集點，每一個洞對應一個機制：</p>
+<ul>
+  <li>結帳只做顧客要馬上知道結果的事（扣款、寫入訂單），其他交給佇列。佇列讓請求快速回應、削峰、解耦、可重試；代價是最終一致、多一個元件、除錯變難。佇列只能延後工作，到達率長期大於處理速度時積壓會一直長。</li>
+  <li>先 ack 再處理是至多一次，先處理再 ack 是至少一次。跨系統的恰好一次做不到，能做到的是「至少一次＋冪等＝效果上一次」。</li>
+  <li>visibility timeout 是租約：時間到沒 ack 就重新出現；每次取走拿新的 receipt，只有最新的 receipt 能 ack 或延長；超過最多接收次數移到 DLQ，DLQ 要告警。它讓訊息不漏，但只能減少重複，不能消除。</li>
+  <li>不重靠 inbox：訊息 id 用唯一約束原子插入，跟副作用在同一個交易；外部副作用用對方的冪等鍵。</li>
+  <li>生產者端的不漏靠 outbox：訊息跟業務資料同一個交易寫入，relay 依序送出、成功後才標記；送出後、標記前當機會重送，所以消費者要冪等。relay 可以輪詢或用 CDC（Debezium）。</li>
+  <li>不亂靠 key：順序只在同一個分區或群組內成立，用訂單 id 當 key，同一張訂單依序、不同訂單平行；小心隊頭阻塞和熱門 key。</li>
+  <li>監控最老訊息的年齡、DLQ、到達率與處理速度；佇列選型依順序、重播、扇出與維運成本決定，量小時從 PostgreSQL 佇列或 BullMQ 開始。</li>
+</ul>
+<p>下一課處理一個佇列解決不了的問題：一張訂單要經過門市庫存、金流、會員集點好幾個服務，中途某一步失敗時，前面已經完成的步驟要怎麼撤銷——saga 與補償。</p>
+
+</main>
+<script>
+// 時間軸（.tl）：逐步顯示每一列 tr[data-note]，下方顯示目前步驟的說明（與 PostgreSQL 課相同）
+document.querySelectorAll('.tl').forEach(tl => {
+  const rows = [...tl.querySelectorAll('tr[data-note]')]
+  const note = tl.querySelector('.note')
+  const count = tl.querySelector('[data-count]')
+  const prev = tl.querySelector('[data-prev]')
+  const next = tl.querySelector('[data-next]')
+  let cur = 0
+  const show = () => {
+    rows.forEach((r, i) => {
+      r.classList.toggle('now', i === cur)
+      r.classList.toggle('later', i > cur)
+    })
+    note.textContent = rows[cur].dataset.note
+    count.textContent = `步驟 ${cur + 1} / ${rows.length}`
+    prev.disabled = cur === 0
+    next.textContent = cur === rows.length - 1 ? '↺ 重新播放' : '下一步 ▶'
+  }
+  prev.onclick = () => { cur--; show() }
+  next.onclick = () => { cur = cur === rows.length - 1 ? 0 : cur + 1; show() }
+  show()
+})
+</script>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>9. MongoDB 交易與一致性（資深）：write concern、read concern 與何時不用 MongoDB</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="9" data-practice="data-stores">
+<header>
+  <div class="eyebrow">階段 3：MongoDB 與文件模型 · 第 9 課</div>
+  <h1>MongoDB 交易與一致性（資深）：write concern、read concern 與何時不用 MongoDB</h1>
+</header>
+<main>
+
+<p>咖啡店的門市活動頁開放「拉花體驗，限量 50 名」。上線第一週出了兩件事：第一，報名人數變成 53 人；第二，有位客人拿著「報名成功」的截圖來店裡，名單上卻找不到他。查了紀錄，那天晚上 MongoDB 的主機剛好故障切換過一次。</p>
+<p>這一課就是這場事故的檢討：從這兩件事出發，一路把報名系統修到「名額守得住、回了成功就不會消失、客人看到的是對的」，再處理檢討時冒出來的換場次、多人編輯活動頁，最後回答會議上一定會有人問的那一題：這些資料到底該不該放在 MongoDB。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>名額為什麼變成 53 人：先讀再寫為什麼會超賣，一次帶條件的更新怎麼守住名額。</li>
+  <li>「報名成功」卻不見：正式環境的 MongoDB 是好幾台機器，「成功」是幾台說的，write concern 怎麼讓回了成功的寫入不再消失（開場第二個問題的答案）。</li>
+  <li>剛報名完卻顯示「尚未報名」：讀取送到哪台機器、讀到的資料有多可靠（讀取偏好與 read concern）。</li>
+  <li>換場次要改兩份文件：一次更新做不到時，多文件交易怎麼寫、為什麼會重試、代價是什麼。</li>
+  <li>多人編輯活動文案、該不該用 MongoDB：版本欄位防止修改被蓋掉；用第 1 課的四個問題判斷哪些資料該留在 PostgreSQL。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="07-mongodb-modeling.html">第 7 課</a>的內嵌與部分更新：一起讀的放同一份文件；<code>$inc</code>、<code>$push</code> 只改文件的一部分。</li>
+  <li><a href="../../postgresql/lessons/18-transactions.html">PostgreSQL 課第 18 課</a>的交易：多個修改要嘛一起提交、要嘛一起回滾。</li>
+</ul></div>
+
+<h2>名額為什麼變成 53 人？</h2>
+<p>先處理第一件。報名的第一版寫法，把活動的名額和名單存在 <code>events</code> 集合的同一份文件裡：<code>seatsLeft</code> 是剩下幾位，<code>attendees</code> 是已報名客人的陣列。程式先讀、再判斷、再寫：</p>
+<pre>const ev = await events.findOne({ _id: 'latte-art-11' })              // 1. 讀
+if (ev.seatsLeft &lt;= 0 || ev.attendees.includes(customerId)) return false   // 2. 判斷
+await events.updateOne({ _id: 'latte-art-11' },                         // 3. 寫
+  { $inc: { seatsLeft: -1 }, $push: { attendees: customerId } })</pre>
+<p>只有一個人報名時，這段程式完全正確。問題出在同時有很多人報名。API 伺服器同一時間會處理好幾個請求，每個請求在 <code>await</code> 等資料庫回應時，Node 就去處理別的請求，所以兩個請求的步驟會交錯執行，這種情況叫並發（concurrency）。</p>
+<p>假設只剩最後 1 位，客人甲和客人乙同時按下報名：</p>
+<ol>
+  <li>甲的請求執行第 1 步，讀到 <code>seatsLeft: 1</code>。</li>
+  <li>甲還沒執行第 3 步，乙的請求就執行了第 1 步，讀到的同樣是 <code>seatsLeft: 1</code>，因為甲還沒寫。</li>
+  <li>兩個請求的第 2 步都判斷「還有名額」，都往下走。</li>
+  <li>甲寫入，<code>seatsLeft</code> 變 0；乙寫入，<code>seatsLeft</code> 變 -1，名單多了一個人。</li>
+</ol>
+<p>判斷用的是「讀的那一刻」的資料，寫入發生在「之後」，中間這段空檔誰都可以插進來。開放報名的瞬間有幾十個人同時按，空檔被插了 3 次，就是 53 人。這跟<a href="04-redis-atomicity.html">第 4 課</a>的限量優惠券是同一類問題，修法的想法也一樣：讓「判斷」和「寫入」變成一個不能被插隊的動作。</p>
+<p>「不能被插隊」在資料庫裡叫<strong>原子</strong>（atomic）。一個原子操作要嘛整個做完、要嘛完全沒做；別人看不到它做到一半的樣子，也插不進它的中間。MongoDB 保證<strong>單一文件的寫入是原子的</strong>：一次 <code>updateOne</code> 裡的篩選條件和所有修改，在那份文件上一次完成，別的寫入要等它做完才能動這份文件。</p>
+<p>所以把「判斷」搬進篩選條件，讀、判斷、寫三步就變成一次更新：</p>
+<pre>const r = await events.updateOne(
+  { _id: 'latte-art-11', seatsLeft: { $gt: 0 }, attendees: { $ne: customerId } },  // 有名額、還沒報名
+  { $inc: { seatsLeft: -1 }, $push: { attendees: customerId } },
+)
+return r.modifiedCount === 1    // 1：報名成功；0：條件不成立（額滿、已報名或活動不存在）</pre>
+<p>再跑一次甲和乙搶最後一位：兩個更新到了 MongoDB，在這份文件上一個接一個執行。先到的甲檢查條件成立，把 <code>seatsLeft</code> 改成 0、名單加入甲；後到的乙再檢查條件時，<code>seatsLeft: { $gt: 0 }</code> 已經不成立，這次更新什麼都不改，<code>modifiedCount</code> 是 0，API 就回「已額滿」。程式不再自己讀名額，判斷交給資料庫在寫入的同一刻做。</p>
+<p>篩選裡的 <code>attendees: { $ne: customerId }</code> 意思是「陣列裡沒有這個值」，擋掉同一個人連按兩次。這個條件一定要放在篩選裡，不能只靠更新運算子：</p>
+<div class="callout">只用 <code>$addToSet</code>（陣列裡沒有才加）取代 <code>$push</code> 不夠：同一個人第二次報名時，<code>$addToSet</code> 不會重複加入，但同一個更新裡的 <code>$inc</code> 照樣扣了名額。「還沒報名」一定要寫在篩選條件裡，條件不成立時整個更新都不做。</div>
+<p>這招之所以可行，是因為名額和名單放在同一份文件。這就是<a href="07-mongodb-modeling.html">第 7 課</a>說「一起讀寫的資料放在同一份文件」的另一個好處：需要一起成立的規則（名額和名單要一致），放在同一份文件就能用一次更新守住，不需要交易。MongoDB 官方文件也這樣建議：交易比單一文件寫入慢，不能拿來取代好的資料模型。</p>
+<p>反過來說，規則一旦跨了好幾份文件，一次更新就做不到：把客人從 A 活動移到 B 活動（兩份活動文件）、報名同時要寫一筆紀錄到另一個集合、扣門市庫存同時建立訂單。名單太大也不能內嵌（一份文件最大 16 MB，幾萬人的名單要改成每人一份文件）。這些情況要用多文件交易，後面「換場次」那一節會遇到。</p>
+<div class="callout practice"><strong>💡 實務上：看到「先 find 再 update」就停下來問一句</strong><br>限量報名、優惠券、庫存扣減、點數折抵，都是「先檢查還夠不夠、再扣」的需求，程式碼審查時最常看到的就是先 <code>findOne</code> 再 <code>updateOne</code>。資深的人會先問：這個檢查能不能寫進更新的篩選條件？能，就一次條件更新，用 <code>modifiedCount</code>（或 <code>findOneAndUpdate</code> 回傳的文件）判斷成功沒，API 依結果回「報名成功」或 409「已額滿」。單機測試幾乎測不出這種錯，要像練習 1 那樣讓幾百個請求同時打才會出現。</div>
+<p>名額守住了。但第二件事還沒解釋：那位客人的報名明明拿到了「成功」，資料卻不在。要回答這個問題，得先知道正式環境的 MongoDB 不是一台機器。</p>
+
+<h2>「報名成功」卻不見：成功是幾台機器說的？</h2>
+<p>只放一台資料庫伺服器，它當機時整個報名系統就停了，硬碟壞掉資料也跟著沒了。所以正式環境的 MongoDB 幾乎都是 <strong>replica set</strong>（複本集）：同一份資料存在三台（或更多台）機器上，每台叫一個節點。</p>
+<p>這幾個節點的分工不一樣。其中一台是 <strong>primary</strong>（主節點），所有寫入都只送到它；其他的是 <strong>secondary</strong>（次節點），不直接接受寫入，而是跟著 primary 複製資料。primary 每做一筆修改，就記一行到自己的操作紀錄裡，這份紀錄叫 <strong>oplog</strong>；secondary 在背景不斷讀 primary 的 oplog，照著同樣的順序在自己身上重做一次。這個複製是非同步的：primary 寫好就繼續做下一件事，不等 secondary，所以 secondary 總是落後 primary 一點點。</p>
+<p>primary 當機時，剩下的節點會投票，選出一台資料最新的 secondary 當新的 primary，這叫故障切換（failover），通常十幾秒內就能恢復寫入。開場那天晚上發生的就是這件事。這套架構就是<a href="../../system-design/lessons/06-replication-consistency.html">系統設計課第 6 課</a>的主從複寫。</p>
+<p>問題就藏在「非同步」裡。primary 寫好一筆、還沒被任何 secondary 複製走之前，這筆資料只存在 primary 上。如果這時 primary 當機，新選出來的 primary 根本沒有這筆。</p>
+<p>那應用程式什麼時候會收到「成功」？由 <strong>write concern</strong>（寫入確認等級）決定：它設定一次寫入要被多少個節點確認，資料庫才回你成功。開場那位客人的報名用的是 <code>w: 1</code>，意思是「primary 自己寫好就回成功」：</p>
+<figure>
+  <svg viewBox="0 0 700 300" role="img" aria-label="時間軸：應用程式用 w:1 寫入報名，舊 primary 回覆成功後當機，secondary 被選為新 primary，舊 primary 回來時把那筆沒被複製的報名 rollback">
+    <defs><marker id="arr9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <text class="d-accent" x="80" y="24" text-anchor="middle">應用程式</text>
+    <text class="d-accent" x="290" y="24" text-anchor="middle">節點 1（primary）</text>
+    <text class="d-accent" x="500" y="24" text-anchor="middle">節點 2</text>
+    <text class="d-accent" x="640" y="24" text-anchor="middle">節點 3</text>
+    <line class="d-line" x1="80" y1="34" x2="80" y2="290"/>
+    <line class="d-line" x1="290" y1="34" x2="290" y2="290"/>
+    <line class="d-line" x1="500" y1="34" x2="500" y2="290"/>
+    <line class="d-line" x1="640" y1="34" x2="640" y2="290"/>
+    <line class="d-line" x1="80" y1="60" x2="280" y2="60" marker-end="url(#arr9)"/>
+    <text class="d-small" x="180" y="54" text-anchor="middle">報名（w: 1）</text>
+    <line class="d-line" x1="290" y1="84" x2="90" y2="84" marker-end="url(#arr9)"/>
+    <text class="d-small" x="180" y="78" text-anchor="middle">成功 ✓</text>
+    <rect class="d-soft" x="215" y="100" width="150" height="34" rx="4"/>
+    <text class="d-text" x="290" y="122" text-anchor="middle">當機，還沒複製</text>
+    <rect class="d-box" x="425" y="150" width="150" height="34" rx="4"/>
+    <text class="d-text" x="500" y="172" text-anchor="middle">當選新 primary</text>
+    <text class="d-small" x="500" y="204" text-anchor="middle">沒有那筆報名</text>
+    <text class="d-small" x="640" y="204" text-anchor="middle">沒有那筆報名</text>
+    <rect class="d-soft" x="200" y="226" width="180" height="50" rx="4"/>
+    <text class="d-text" x="290" y="248" text-anchor="middle">回來變成 secondary</text>
+    <text class="d-small" x="290" y="266" text-anchor="middle">撤銷那筆 → rollback 檔</text>
+  </svg>
+  <figcaption>w: 1 的「成功」只代表節點 1 寫好了。它沒來得及複製就當機，新的 primary 上沒有這筆；節點 1 回來後要跟上新 primary，只能撤銷自己多出來的寫入。</figcaption>
+</figure>
+<p>由上往下讀這張圖：節點 1 寫好報名、回了成功，客人截圖；接著節點 1 還沒把這筆複製出去就當機；節點 2 當選新的 primary，它和節點 3 上都沒有這筆報名，之後的報名都寫在節點 2 上。</p>
+<p>節點 1 修好回來時，它身上多了一筆新 primary 沒有的寫入，兩邊的歷史對不起來。它只能變成 secondary、跟著新 primary 走，所以必須先撤銷自己多出來的那筆。這個撤銷叫 MongoDB 的 <strong>rollback</strong>：被撤銷的寫入會存成 <code>&lt;dbpath&gt;/rollback/</code> 底下的 BSON 檔，不會自動放回去，要管理員用 <code>bsondump</code> 讀出來再決定怎麼處理。實務上幾乎沒人去撈，所以等於遺失。這就是那位客人的報名不見的原因。注意這和 PostgreSQL 交易的 <code>ROLLBACK</code>（回滾）不同：交易的回滾是程式主動放棄一筆還沒提交的交易；這裡的 rollback 是舊 primary 重新加入時，被迫撤銷已經回過成功的寫入。</p>
+<p>修法是讓「成功」等到資料已經安全再回。把 write concern 設成 <code>w: 'majority'</code>，資料庫要等多數有投票權的節點（3 台裡的 2 台）都寫好才回成功。故障切換時，新 primary 必須拿到多數票才能當選，而節點不會投票給資料比自己舊的候選人；多數節點已經有這筆，能拿到多數票的新 primary 一定也有這筆，所以回了成功的寫入不會被 rollback。</p>
+<p>write concern 的幾個設定放在一起比較：</p>
+<div class="table-wrap"><table>
+  <tr><th>設定</th><th>等到什麼才回成功</th><th>故障時</th></tr>
+  <tr><td><code>w: 0</code></td><td>不等任何回應，送出就算</td><td>寫入失敗你也不知道</td></tr>
+  <tr><td><code>w: 1</code></td><td>primary 寫好</td><td>primary 在複製出去之前當機，這筆會被 rollback</td></tr>
+  <tr><td><code>w: 'majority'</code></td><td>多數有投票權的節點（3 台裡的 2 台）都寫好</td><td>回成功之後，故障切換也不會消失</td></tr>
+  <tr><td><code>journal: true</code>（舊寫法 <code>j: true</code>）</td><td>另外要求寫進磁碟上的日誌（journal）</td><td>防的是程序當機、斷電；單獨使用不防故障切換</td></tr>
+  <tr><td><code>wtimeoutMS</code></td><td>等確認最多等多久</td><td>逾時只回錯誤，<strong>已經寫入的不會撤銷</strong></td></tr>
+</table></div>
+<p>表裡的 journal 是每個節點磁碟上的日誌：寫入先記進 journal，程序當機重啟時可以從這裡補回來。它保護的是「這一台」的資料，跟要不要複製到別台是兩回事，所以只開 journal 擋不住開場那種故障切換。<code>wtimeoutMS</code> 則是給 <code>majority</code> 配的上限：多數節點連不上時，<code>majority</code> 會一直等，加上逾時才能讓 API 不卡住。</p>
+<p>從 MongoDB 5.0 起，大多數部署的預設 write concern 就是 <code>w: 'majority'</code>，但有例外（例如 primary＋secondary＋arbiter 這種架構，arbiter 是只投票、不存資料的節點，這時預設會降成 <code>w: 1</code>），細節見課末。既然預設多半是安全的，為什麼還要寫出來？因為預設會被改：有人為了壓測數字在連線字串加 <code>w=1</code>、雲端服務的設定被調過、或架構有例外。開場的事故就是這樣：報名用的是 <code>w: 1</code>。重要的寫入在程式碼裡明寫 <code>w: 'majority'</code>，看程式的人一眼知道這筆不能丟，部署設定被改也不受影響。driver 的寫法（課程用的是 Node.js driver <code>mongodb</code> 7.8.0）：</p>
+<pre>// 單一操作
+await db.collection('registrations').insertOne(reg, { writeConcern: { w: 'majority' } })
+// 整個 client 的預設，也可以寫在連線字串：mongodb://…/?w=majority
+const client = new MongoClient(url, { writeConcern: { w: 'majority' } })</pre>
+<p>majority 不是免費的：它要多等一個網路來回，加上 secondary 寫入的時間，延遲比 <code>w: 1</code> 高一些。所以要依「這筆丟了會怎樣」來選。報名、付款、稽核紀錄這類「回了成功就不能消失」的寫入用 majority；活動頁瀏覽次數這種少幾筆沒關係的計數，可以用 <code>w: 1</code> 換一點延遲。<code>w: 0</code> 連錯誤都收不到，幾乎沒有適合的場合。練習 3 就是要你替這三種寫入做選擇。課程的容器只有一個節點，在本機看不出 <code>w: 1</code> 和 majority 的差別，原因見課末。</p>
+<div class="callout practice"><strong>💡 實務上：接手專案時，先查清楚「預設」到底是什麼</strong><br>在 mongosh 執行 <code>db.adminCommand({ getDefaultRWConcern: 1 })</code>：<code>defaultWriteConcern</code> 是整個部署的預設，<code>defaultWriteConcernSource</code> 是 <code>implicit</code> 代表沒人設定過、用的是隱含預設，是 <code>global</code> 代表有人用 <code>setDefaultRWConcern</code> 改過。接著看環境變數裡的連線字串有沒有 <code>w=1</code>，再搜尋程式碼裡的 <code>writeConcern</code>。架構裡有 arbiter 時，跟維運確認預設是不是被降成了 <code>w: 1</code>。<code>w: 'majority'</code> 在多數節點連不上時會一直等，所以 API 的寫入通常再加 <code>wtimeoutMS</code>（例如 5000）；逾時只代表「不確定」，這筆可能已經寫進去，重試要靠冪等，也就是同一個請求送兩次，結果和送一次一樣（<a href="../../system-design/lessons/09-idempotency.html">系統設計課第 9 課</a>），例如報名用唯一索引擋重複。</div>
+<p>寫入不會再消失了。但這個架構還有另一面：資料存在好幾台機器上，讀取的時候也有「讀哪一台」的問題。</p>
+
+<h2>剛報名完重新整理，為什麼顯示「尚未報名」？</h2>
+<p>修好 write concern 之後，團隊為了減輕 primary 的負載，把整個服務的讀取改去 secondary。隔週客服轉來新的回報：客人剛報名完、重新整理頁面，畫面卻顯示「尚未報名」，有人因此又報名一次。報名確實寫進去了，問題出在讀。</p>
+<p>讀取送到哪個節點，由<strong>讀取偏好</strong>（read preference）決定。預設是 <code>primary</code>：所有讀取都送到 primary，讀到的一定是最新寫入的資料。團隊改成的 <code>secondaryPreferred</code> 則是「有 secondary 可用就讀 secondary」。讀 secondary 的好處是分擔 primary 的負載，代價來自上一節講的非同步複製：secondary 落後 primary 一點點，<strong>可能讀到舊資料</strong>。另外還有幾種模式，列在課末。</p>
+<p>客人遇到的就是這個落後：報名寫進了 primary，重新整理的讀取被送到還沒複製到這筆的 secondary，讀到的是報名之前的狀態。「自己剛寫的東西，自己馬上讀得到」這個保證叫 read-your-writes，讀 secondary 時它就不成立了。</p>
+<p>解法依情況選：</p>
+<ul>
+  <li><strong>使用者剛改過的東西，讀 primary</strong>。最簡單，大部分服務這樣就夠了；讀 secondary 只用在報表、推薦這類晚幾秒沒關係的地方。報名狀態就屬於前者。</li>
+  <li><strong>因果一致 session</strong>（causally consistent session）：真的需要讀 secondary，又要看得到自己剛寫的，就讓讀寫在同一個 session 裡。做法在下面說明。</li>
+</ul>
+<p><strong>session</strong> 是 driver 裡代表「同一串相關操作」的物件，用 <code>client.startSession()</code> 開，用完要 <code>endSession()</code> 歸還，每個操作傳 <code>{ session }</code> 表示它屬於這一串。因果一致的意思是：同一個 session 裡，後面的讀取保證看得到前面的寫入。driver 會在讀取時帶上前一次操作的時間點，secondary 還沒跟上這個時間點就先等，跟上了才回結果。Node.js driver 用 <code>client.startSession()</code> 明確開的 session 預設就是因果一致。</p>
+<p>讀 primary 就一定安全嗎？還差一層。從上一節知道，primary 上的資料不一定被多數節點確認過，之後可能被 rollback。讀取也有對應的設定，叫 <strong>read concern</strong>（讀取一致性等級），決定讀到的資料要多「確定」：</p>
+<div class="table-wrap"><table>
+  <tr><th>等級</th><th>讀到什麼</th><th>什麼時候用</th></tr>
+  <tr><td><code>local</code>（預設）</td><td>這個節點上最新的資料，不管有沒有被多數確認，<strong>可能是之後會被 rollback 的</strong></td><td>一般讀取</td></tr>
+  <tr><td><code>majority</code></td><td>已經被多數節點確認的資料，故障切換後也不會變</td><td>依讀到的值做重要決定（例如讀到「已付款」就出貨）</td></tr>
+  <tr><td><code>snapshot</code></td><td>同一個時間點的一致快照</td><td>交易裡、需要多次讀取彼此一致時</td></tr>
+</table></div>
+<p>write concern 管「回成功之前要確認到什麼程度」，read concern 管「讀到的要確認到什麼程度」，兩者配成一對。因果一致 session 要在故障切換時也成立，官方建議寫入用 <code>w: 'majority'</code>、讀取用 read concern <code>majority</code>。合在一起的寫法：</p>
+<pre>const session = client.startSession()        // 明確開的 session 預設 causalConsistency: true
+try {
+  await regs.insertOne(reg, { session, writeConcern: { w: 'majority' } })
+  const mine = await regs.find({ customerId: reg.customerId }, {
+    session, readPreference: 'secondaryPreferred', readConcern: { level: 'majority' },
+  }).toArray()                                  // 讀 secondary 也看得到剛剛那筆
+} finally {
+  await session.endSession()
+}</pre>
+<p>這段程式看兩件事：寫入和讀取傳的是同一個 <code>session</code>；讀取雖然送到 secondary，但因為在同一個因果一致 session 裡，看得到剛剛那筆報名。表中的 <code>snapshot</code> 是給交易用的：同一個交易裡讀好幾次，看到的都是同一個時間點的資料。下一節的換場次交易裡每一步都是條件更新，不需要先讀出資料再比對，所以用不到它。</p>
+<div class="callout practice"><strong>💡 實務上：讀 secondary 之前，先量複寫延遲，也減少「寫完馬上讀」</strong><br>適合讀 secondary 的是後台報表、推薦清單、熱門活動排行這類晚幾秒沒關係的查詢；報名、付款狀態、會員資料一律讀 primary。決定之前，在 primary 上用 <code>rs.printSecondaryReplicationInfo()</code> 看每台 secondary 落後幾秒（Atlas 的監控頁有 Replication Lag 圖表），平常就落後好幾秒的，讀它的頁面會常常「看起來沒更新」。前端也能幫忙：報名 API 直接回傳更新後的報名狀態，Vue 頁面用這個回應更新畫面，不要報名成功後立刻再打一次 GET。客服回報「剛改完又變回舊的」時，先查那支 API 的讀取偏好。</div>
+<p>到這裡，報名這一份活動文件的寫和讀都處理好了。檢討會上接著提出新需求：讓客人把報名從這一場換到另一場。這要同時改兩份活動文件，第一節的一次條件更新做不到。</p>
+
+<h2>換場次要同時改兩份活動文件，怎麼用交易守住？</h2>
+<p>換場次是三個動作：從 A 場的名單移除客人並把 A 的名額加 1、把客人加進 B 場並把 B 的名額減 1、在 <code>moves</code> 集合記一筆換場紀錄。它們分散在兩份活動文件和另一個集合，單一文件的原子性管不到。如果 A 已經移除、B 卻剛好額滿加不進去，客人就兩場都沒有。我們要的是三個動作一起成功或一起失敗。</p>
+<p>這就是<strong>多文件交易</strong>（multi-document transaction）：讓多份文件、甚至多個集合的修改一起提交、或一起回滾，對應 <a href="../../postgresql/lessons/18-transactions.html">PostgreSQL 課第 18 課</a>的 BEGIN／COMMIT／ROLLBACK。MongoDB 的伺服器程式叫 mongod，交易只能在 replica set（上一節的架構）上用，單獨跑一台 mongod 不能用交易；課程的容器怎麼滿足這個條件，見課末。</p>
+<p>Node.js driver 的寫法。交易綁在上一節介紹的 session 上：</p>
+<pre>const session = client.startSession()          // 1. 開一個 session：交易綁在 session 上
+try {
+  await session.withTransaction(async () => {   // 2. 開始交易、執行函式、提交
+    const out = await events.updateOne(
+      { _id: fromId, attendees: customerId },
+      { $pull: { attendees: customerId }, $inc: { seatsLeft: 1 } },
+      { session },                               // 3. 每個操作都要傳 session
+    )
+    if (out.modifiedCount === 0) throw new NotRegisteredError()   // 丟錯 → 中止交易
+    const into = await events.updateOne(
+      { _id: toId, seatsLeft: { $gt: 0 }, attendees: { $ne: customerId } },
+      { $push: { attendees: customerId }, $inc: { seatsLeft: -1 } },
+      { session },
+    )
+    if (into.modifiedCount === 0) throw new SeatsFullError()      // 前面的 $pull 也會一起回滾
+    await moves.insertOne({ customerId, from: fromId, to: toId }, { session })
+  })
+} finally {
+  await session.endSession()                     // 4. 用完歸還 session
+}</pre>
+<p>注意每一步本身仍是第一節的條件更新：A 場的篩選確認客人在名單裡，B 場的篩選確認有名額、客人還沒報名。交易沒有取代條件更新，它做的是把這幾次更新綁在一起。</p>
+<p><code>withTransaction(fn)</code> 依序做這些事：開始交易 → 執行 <code>fn</code> → <code>fn</code> 正常結束就提交，<code>fn</code> 丟錯就中止（abort）並把錯誤往外丟。成功時它回傳 <code>fn</code> 的回傳值。所以上面 B 場額滿時丟出 <code>SeatsFullError</code>，交易中止，A 場的 <code>$pull</code> 也一起撤銷，客人留在 A 場。寫的時候有四條規則：</p>
+<ul>
+  <li><strong>每個操作都要傳 <code>{ session }</code></strong>。漏傳的那個操作不在交易裡，它會立刻生效，交易中止時也不會跟著回滾。這是最常見、也最難發現的錯：平常都成功，只有失敗的時候資料才不一致。</li>
+  <li><strong>錯誤要往外丟，不能自己 catch 吞掉</strong>。<code>fn</code> 正常結束，<code>withTransaction</code> 就會提交。上面的 <code>SeatsFullError</code> 如果被你 catch 後 <code>return</code>，交易照樣提交，客人從 A 移除了、卻沒加進 B。</li>
+  <li><strong>交易裡的操作要一個一個 await</strong>。driver 的文件寫明：同一個交易裡用 <code>Promise.all</code> 平行執行是未定義行為。</li>
+  <li><strong><code>fn</code> 可能被執行好幾次</strong>，所以裡面只放資料庫操作。寄信、呼叫金流、推播放在交易成功之後，不然重試時會寄兩封。為什麼會執行好幾次，下面說明。</li>
+</ul>
+<p>第四條要從交易怎麼處理衝突講起。開放換場那晚，好幾個人同時換進熱門的 B 場，他們的交易都要改 B 場這份文件。PostgreSQL 遇到這種情況，會讓後來的交易等前面的提交；MongoDB 不等，而是讓後來的那個交易立刻失敗，錯誤是 <code>WriteConflict</code>。失敗的交易什麼都沒寫進去，只要從頭再跑一次，通常就成功了。</p>
+<p>程式怎麼知道一個錯誤「重跑就好」？MongoDB 在這類錯誤上附了<strong>錯誤標籤</strong>（error label），告訴程式該怎麼處理。跟交易有關的有兩個：</p>
+<div class="table-wrap"><table>
+  <tr><th>標籤</th><th>代表什麼</th><th>該怎麼做</th></tr>
+  <tr><td><code>TransientTransactionError</code></td><td>暫時性的錯：寫入衝突、故障切換中找不到 primary、網路斷線。交易已經中止，什麼都沒寫進去</td><td>從頭重跑整個交易</td></tr>
+  <tr><td><code>UnknownTransactionCommitResult</code></td><td>送出 commit 後沒收到回覆，不知道到底提交了沒</td><td>只重送 commit（commit 是冪等的，重送不會做兩次）</td></tr>
+</table></div>
+<p>第二種要多解釋一句。前面提過的冪等（idempotent），意思是同一個動作做一次和做好幾次，結果一樣。commit 送出後連線斷了，程式不知道交易到底提交了沒；因為重送 commit 是冪等的，已經提交過的不會再提交一次，所以只要重送 commit，不需要、也不應該重跑整個交易。</p>
+<p><code>withTransaction</code> 已經照這張表處理：遇到 <code>TransientTransactionError</code> 就稍等一下、重跑整個 <code>fn</code>，遇到 <code>UnknownTransactionCommitResult</code> 就重送 commit，有總時間上限（driver 的實際數字見課末）。這就是 <code>fn</code> 會被執行好幾次的原因，也是第四條規則的由來。自己用 <code>session.startTransaction()</code>、<code>commitTransaction()</code> 手寫，就要自己做這些重試；沒做的話，並發一高就會有請求因為 WriteConflict 直接失敗。除非有特別理由，一律用 <code>withTransaction</code>。</p>
+<p>這跟 <a href="../../postgresql/lessons/31-isolation-upsert.html">PostgreSQL 課第 31 課</a>的「SERIALIZABLE 遇到序列化失敗（40001）就重跑整個交易」是同一個想法：資料庫負責偵測衝突，程式負責重試。</p>
+<p>交易能解決跨文件的問題，但不是免費的，這也是第一節說「能用一次條件更新就不要用交易」的原因。它的代價與限制：</p>
+<ul>
+  <li><strong>時間</strong>：交易預設要在 60 秒內完成（伺服器參數 <code>transactionLifetimeLimitSeconds</code>），超過會被背景程序中止。交易裡不要等使用者輸入、不要呼叫外部 API。</li>
+  <li><strong>同時開啟的數量</strong>：MongoDB 9.0 起，伺服器限制同時開啟的多文件交易數（<code>maxConcurrentMultiDocumentTransactions</code>，預設 10000），超過時新的交易會收到 <code>TooManyOpenTransactions</code> 錯誤。交易拖太久或忘了結束，就會慢慢佔滿這個額度。</li>
+  <li><strong>記憶體</strong>：交易中的修改都留在 WiredTiger 快取（<a href="08-mongodb-indexes-aggregation.html">第 8 課</a>提過的儲存引擎記憶體）裡，太大放不下會收到 <code>TransactionTooLargeForCache</code>。一次改上萬份文件的批次作業不要包成一個交易。</li>
+  <li><strong>讀取偏好</strong>：交易裡有讀取時，讀取偏好必須是 <code>primary</code>，所有操作都送到同一個節點。上一節改成 <code>secondaryPreferred</code> 的設定，不能用在交易裡。</li>
+  <li><strong>write concern 設在交易上</strong>：交易裡的單一操作不要各自設 write concern，要設在 <code>withTransaction(fn, { writeConcern: { w: 'majority' } })</code> 或 client 上。換場次和報名一樣不能丟，交易提交也要等多數節點確認。單一操作寫了會怎樣，見課末。</li>
+</ul>
+<div class="callout practice"><strong>💡 實務上：交易函式只做資料庫的事，其他動作排在後面</strong><br>常見的場景是後台的「把客人換到另一場」「取消報名並退回名額」。程式碼審查時看三件事：交易函式裡每個呼叫都有 <code>{ session }</code>；業務錯誤（<code>SeatsFullError</code>）往外丟，到 API 層才轉成 409 和「這場已額滿」的訊息，不要變成 500；寄確認信、推播、呼叫金流都在 <code>withTransaction</code> 回傳之後。如果信「一定要寄出」，就在同一個交易裡多寫一筆待寄送紀錄，由背景程式讀出來寄，這就是<a href="../../system-design/lessons/12-queues-outbox.html">系統設計課第 12 課</a>的 outbox。交易函式會被重跑，所以也不要在裡面累加記憶體裡的計數器或陣列。</div>
+<p>換場次在一次請求內就做完，交易撐得住。但後台還有一種並發，時間長到交易撐不住：兩個人同時編輯同一份活動文案。</p>
+
+<h2>店長和行銷同時改活動文案，誰的修改會被蓋掉？</h2>
+<p>事故之後，活動頁要補上說明。店長和行銷同時打開「拉花體驗」的後台編輯頁，畫面上是同一份文件的第 3 版。店長改了標題先存；幾分鐘後行銷改完內文也存了。行銷的編輯頁送出的是她打開時看到的整份內容，裡面的標題還是舊的，店長的修改就被蓋了回去。這叫<strong>遺失更新</strong>（lost update），<a href="../../postgresql/lessons/19-concurrency.html">PostgreSQL 課第 19 課</a>看過。</p>
+<p>前面兩個工具在這裡都不適用。第一節的條件更新，前提是規則能寫成篩選條件，但「我打開之後沒有別人改過」不是文件裡現成的欄位。交易也不行：編輯頁會開好幾分鐘，交易有 60 秒上限，不可能從打開頁面一路撐到按下儲存；就算能撐，也會一直佔著資源。</p>
+<p>解法是讓「有沒有被別人改過」變成文件裡的一個欄位。<strong>樂觀並發控制</strong>（optimistic concurrency control）的做法是：文件帶一個 <code>version</code> 欄位，編輯頁打開時把它一起讀出來；儲存時要求「版本還是我讀到的那個，才更新，並把版本加 1」。它叫「樂觀」，是因為它不事先鎖住文件，假設衝突很少發生，真的發生時才在儲存那一刻擋下來。版本檢查放進篩選條件，又回到第一節那一招：</p>
+<pre>const { _id, version, ...fields } = patch    // 不讓前端送來的 _id、version 混進 $set
+const doc = await promos.findOneAndUpdate(
+  { _id: id, version: expectedVersion },     // 版本還是我讀到的那個
+  { $set: fields, $inc: { version: 1 } },    // 套用修改，版本加 1
+  { returnDocument: 'after' },               // 回傳更新後的文件（預設是更新前的）
+)
+if (!doc) throw new VersionConflictError()   // 被別人改過了（或文件不存在）</pre>
+<p>套回店長和行銷：兩人都拿 <code>version: 3</code> 送出。店長先到，篩選 <code>version: 3</code> 找到文件，套用修改，版本變成 4。行銷後到，篩選 <code>version: 3</code> 已經找不到文件，<code>findOneAndUpdate</code> 回傳 <code>null</code>。API 回 409 Conflict，前端提示「這份內容剛被別人修改，請重新載入」，讓行銷看過最新版本再決定怎麼改，店長的標題就保住了。</p>
+<p>第一行先把 <code>_id</code> 和 <code>version</code> 從 <code>patch</code> 拿掉，有兩個原因。第一，如果讓呼叫端能改 <code>version</code>，版本檢查就形同虛設。第二，同一個更新裡同時 <code>$set</code> 和 <code>$inc</code> 同一個欄位，MongoDB 會直接回錯誤（路徑衝突），改 <code>_id</code> 也會被拒絕（<code>_id</code> 不能修改）。</p>
+<p>到這裡，這課的三種工具可以放在一起選：同一份文件、條件能寫進篩選的，一次條件更新就好；一次請求內做完、跨多份文件的修改，用交易；衝突少、操作時間長（人在編輯），用版本欄位。</p>
+<div class="callout practice"><strong>💡 實務上：版本號要從資料庫一路走到前端</strong><br>後台編輯頁的 API 常見做法：GET 回傳文件時帶上 <code>version</code>，前端把它存在表單狀態裡，儲存時原樣送回（放在 body，或用 HTTP 的 <code>ETag</code>／<code>If-Match</code> 標頭；用 <code>If-Match</code> 時慣例回 412 Precondition Failed，放 body 時回 409）。Vue 編輯頁收到衝突時，提示「內容已被其他人修改」並提供重新載入，不要自動用新版本重送，那樣等於把別人的修改蓋掉。不是每份資料都需要版本欄位：計數器用 <code>$inc</code>、只有本人會改的偏好設定，直接更新就好；多人會長時間編輯的內容（活動文案、菜單、價格）才值得加。</div>
+<p>報名系統修完了。檢討會的最後，有人提出更根本的問題：既然 MongoDB 要額外處理這麼多一致性的事，咖啡店的訂單要不要也放進來統一管理？或者反過來，報名要不要乾脆搬回 PostgreSQL？</p>
+
+<h2>事故檢討的最後一題：這些資料該不該放在 MongoDB？</h2>
+<p>先說清楚這題不是在問「做不做得到」。這課已經看到，MongoDB 有交易、有 majority write concern，技術上能存訂單。選型真正的問題是「用它做，程式和團隊要多付出多少」。把<a href="01-choosing-a-store.html">第 1 課</a>的四個問題套在 MongoDB 上，以下情況要付出的特別多：</p>
+<div class="table-wrap"><table>
+  <tr><th>情況</th><th>為什麼不適合 MongoDB</th></tr>
+  <tr><td>資料高度關聯：訂單、品項、付款、庫存彼此引用</td><td>沒有外鍵，資料之間的一致性全靠程式；幾乎每個寫入都要跨文件交易，交易又比單一文件慢</td></tr>
+  <tr><td>需要大量約束：金額不能為負、庫存不能超賣、帳要平</td><td>schema 驗證只檢查單一文件，跨文件的規則（總和、唯一組合以外的關係）資料庫幫不上忙</td></tr>
+  <tr><td>臨時的複雜報表：老闆要「上個月每家門市、每種商品、每個時段」</td><td><code>$lookup</code> 可以做，但寫起來長、效能難預測；SQL 的 JOIN 與 GROUP BY 是這種需求的強項</td></tr>
+  <tr><td>團隊只有 PostgreSQL 的維運經驗</td><td>replica set、備份、升級、監控都要重新學，事故時沒人知道 rollback 檔是什麼</td></tr>
+</table></div>
+<p>拿訂單對照這張表：一張訂單牽涉品項、付款、庫存，每次下單都是跨文件的寫入，等於每個寫入都要走換場次那一節的交易；「庫存不能超賣」「帳要平」這類規則，MongoDB 只能靠程式守。表上四項它幾乎全中。</p>
+<p>報名則相反。它以「一份活動文件」為單位讀寫，名額和名單放在一起，靠第一節的一次條件更新就守住了，只有換場次需要交易。這正是 MongoDB 適合的樣子。適合的情況還有：每筆的結構差很多（不同類別商品有不同屬性），或寫入量大到需要水平擴展。水平擴展在 MongoDB 叫 sharding：依某個欄位把資料切開，分散到好幾組 replica set，每組只負責一部分資料。</p>
+<p>所以咖啡店的分工是：訂單、付款、庫存留在 PostgreSQL，活動頁內容、報名與評論放 MongoDB。如果只是需要「幾個彈性欄位」，PostgreSQL 的 JSONB 就夠了，還保留交易和外鍵。</p>
+<div class="callout practice"><strong>💡 實務上：選型討論講需求，不講工具的好惡</strong><br>在團隊討論時，不要說「MongoDB 不適合做交易」，這句話不精確，這課就用交易做了換場次。要說「這份資料的存取模式是 X，一致性需求是 Y，用 MongoDB 要額外處理 Z」，例如「訂單每次寫入都跨品項、付款、庫存三種資料，用 MongoDB 每個寫入都要包交易，約束也要自己寫」。這樣大家討論的是需求，不是誰喜歡哪個工具。</div>
+
+<h2>補充與查表</h2>
+<p>主線略過的版本細節與冷門選項，需要時再查。</p>
+<ul>
+  <li><strong>課程環境的 replica set</strong>：課程的容器以 <code>--replSet rs0</code> 啟動成只有一個節點的 replica set，所以交易可以用，連線字串要加 <code>directConnection=true</code>。只有一個節點時，多數就是 1，<code>w: 1</code> 和 majority 在本機看不出差別，差別只在真正有多台機器時出現。</li>
+  <li><strong>sharded cluster 與交易</strong>：除了 replica set，多文件交易也能用在 sharded cluster（分片叢集：資料依某個欄位切開，分散到好幾組 replica set）上。</li>
+  <li><strong>預設 write concern 的細節</strong>：從 MongoDB 5.0 起，大多數部署的隱含預設 write concern 是 <code>w: 'majority'</code>。例外是有仲裁節點（arbiter，只投票、不存資料的節點）的 replica set：存資料的有投票權節點數不超過「多數」時，預設會降成 <code>w: 1</code>，例如 primary＋secondary＋arbiter 的三節點架構。另外，伺服器參數 <code>writeConcernMajorityJournalDefault</code> 預設 true，所以 <code>w: 'majority'</code> 也會等 journal 寫進磁碟。（來源：MongoDB 官方文件 Write Concern 與 Rollbacks During Replica Set Failover 頁面。）</li>
+  <li><strong>write concern 的選項名稱</strong>：mongodb 7.8.0 的型別裡，<code>j</code> 和 <code>wtimeout</code> 已標為 deprecated，改用 <code>journal</code> 和 <code>wtimeoutMS</code>；送到伺服器的命令裡還是 <code>j</code>、<code>wtimeout</code>。</li>
+  <li><strong>withTransaction 的重試參數</strong>：看 driver 7.8.0 的原始碼，遇到 <code>TransientTransactionError</code> 會退避一小段時間（5 ms 起，最多 500 ms，帶隨機抖動）後重跑 <code>fn</code>，遇到 <code>UnknownTransactionCommitResult</code> 就重送 commit，總共最多重試 120 秒。</li>
+  <li><strong>交易裡的單一操作設了 write concern</strong>：官方文件寫明伺服器收到會回錯誤；mongodb 7.8.0 的 driver 則是在交易中直接不送出這個選項（實測），寫了也沒作用。</li>
+  <li><strong>其他讀取偏好</strong>：除了 <code>primary</code>、<code>secondaryPreferred</code>，還有 <code>primaryPreferred</code>（primary 不在時才讀 secondary）、<code>secondary</code>（只讀 secondary）、<code>nearest</code>（讀延遲最低的節點）。後三種同樣可能讀到舊資料。</li>
+  <li><strong>其他 read concern</strong>：另外還有 <code>available</code>（sharded cluster 上最快但最不保證）和 <code>linearizable</code>（只用在單一文件、讀 primary，成本高），一般業務很少用到。</li>
+  <li><strong>findOneAndUpdate 的回傳值</strong>：mongodb 7.x 的 <code>findOneAndUpdate</code> 預設直接回傳文件（找不到時是 <code>null</code>），不是包一層結果物件。</li>
+</ul>
+
+<h2>練習</h2>
+<p>先啟動 MongoDB（在 <code>learn/data-stores/practice</code> 執行 <code>docker compose --profile mongo up -d --wait</code>），每一題都在 <code>learn/</code> 執行 <code>node check.mjs data-stores 09</code> 判分。測試用資料庫 <code>ds_t09</code>，每個測試檔開始前會清空。集合由測試傳入，每個檔案最上面的註解寫了文件格式與規則。</p>
+
+<div class="local" data-test="ex1" data-files="register.ts">
+  <p>練習 1：在 <code>register.ts</code> 實作 <code>register(col, eventId, customerId)</code>，<strong>不用交易</strong>，只對 <code>col</code> 呼叫一次 <code>updateOne</code>：名額大於 0 而且這位客人還沒報名，才把他加進 <code>attendees</code>、<code>seatsLeft</code> 減 1，回傳 <code>true</code>；其他情況（額滿、已報名、活動不存在）什麼都不改，回傳 <code>false</code>。測試會讓 200 個請求（150 位客人，其中 50 位按兩次）同時搶 50 個名額，而且每個操作都故意慢 30 ms，先讀再寫的寫法一定會超賣。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="transfer.ts">
+  <p>練習 2：在 <code>transfer.ts</code> 實作 <code>transfer(client, db, customerId, fromId, toId)</code>，用 <code>session.withTransaction</code> 把客人從活動 A 移到活動 B：從 A 移除並把 A 的名額加 1、加進 B 並把 B 的名額減 1、在 <code>registrations</code> 新增一筆 <code>{ customerId, from, to }</code>。不在 A 裡丟 <code>NotRegisteredError</code>，B 沒名額丟 <code>SeatsFullError</code>，這兩種情況三個集合都要保持原樣。B 沒名額或客人已經在 B 裡都算 <code>SeatsFullError</code>；不論成功或丟錯都要 <code>endSession()</code>。測試會用 command monitoring（driver 每送出一個命令就發出一個 <code>commandStarted</code> 事件，測試收集起來看命令內容）檢查每個命令都在同一個交易裡，並讓 30 個移轉同時搶 B 的 20 個名額（會發生 WriteConflict），名額與人數都要守恆。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="concern.ts">
+  <p>練習 3：在 <code>concern.ts</code> 替三種寫入填好 <code>WRITE_CONCERNS</code>：<code>activityPageView</code>（活動頁瀏覽計數）、<code>registration</code>（報名）、<code>auditLog</code>（稽核紀錄），規則寫在檔案的註解裡，要自己判斷每一種該用哪個等級。再實作 <code>saveRegistration(db, reg)</code>，把報名寫進 <code>registrations</code> 集合並使用對應的設定。測試會檢查 driver 實際送出的 insert 命令帶了什麼 write concern，也會暫時改動 <code>WRITE_CONCERNS.registration</code>，確認 <code>saveRegistration</code> 讀的是這份設定而不是另外寫死。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="optimistic.ts">
+  <p>練習 4：在 <code>optimistic.ts</code> 實作 <code>updatePromo(col, id, expectedVersion, patch)</code>：文件的 <code>version</code> 還是 <code>expectedVersion</code> 才套用 <code>patch</code> 並把版本加 1，回傳更新後的文件；版本不符或文件不存在丟 <code>VersionConflictError</code>。<code>patch</code> 裡就算有 <code>_id</code> 或 <code>version</code> 也要忽略，而且不能改動傳進來的 <code>patch</code> 物件。測試會讓兩位編輯者同時拿第 3 版儲存，只能有一位成功。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：寫入用 <code>w: 1</code> 回應成功，接著 primary 當機、一台 secondary 被選為新的 primary。這筆寫入會怎樣？</p>
+  <label data-key="a">一定還在，資料庫已經回成功了</label>
+  <label data-key="b">可能消失：它可能只寫在舊 primary 上，舊 primary 回來時會把它 rollback</label>
+  <label data-key="c">舊 primary 回來後會自動把它補寫到新 primary</label>
+  <label data-key="d">新舊 primary 各有一份，會變成重複資料</label>
+  <p class="why">✓ <code>w: 1</code> 只代表 primary 寫好了。還沒複製出去就當機，新 primary 上沒有這筆；舊 primary 重新加入時撤銷它，寫成 rollback 目錄裡的檔案，不會自動補回去（c 錯），也不會留兩份（d 錯）。要「回了成功就不會消失」，用 <code>w: 'majority'</code>。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：把名額和報名名單放在同一份活動文件裡，用一次 <code>updateOne</code> 帶條件 <code>{ seatsLeft: { $gt: 0 }, attendees: { $ne: id } }</code> 扣名額並加入名單。還需要交易嗎？</p>
+  <label data-key="a">需要，MongoDB 同時改兩個欄位就要交易</label>
+  <label data-key="b">不需要：單一文件的更新本身就是原子的，條件和修改一次完成</label>
+  <label data-key="c">需要，不然並發時會死結</label>
+  <label data-key="d">要看文件大小，超過 1 MB 才需要</label>
+  <p class="why">✓ MongoDB 保證單一文件寫入的原子性，同一個更新裡改幾個欄位都一樣（a 錯）。並發的更新在這份文件上一個接一個執行，後到的看到條件不成立就不改，不會死結（c 錯）；文件大小跟原子性無關（d 錯）。交易留給真的跨文件的情況，因為它比單一文件寫入慢。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 7：下列哪一種資料，最不適合把 MongoDB 當主要資料庫？</p>
+  <label data-key="a">每家門市的活動頁內容：欄位常變、整頁一起讀</label>
+  <label data-key="b">商品目錄：每類商品的屬性都不同</label>
+  <label data-key="c">咖啡店的訂單、付款、庫存：彼此引用，有大量約束與跨實體交易</label>
+  <label data-key="d">App 的使用者偏好設定：每人一份</label>
+  <p class="why">✓ 高度關聯、需要外鍵與約束、幾乎每次寫入都跨好幾種資料，是關聯式資料庫的強項；放在 MongoDB 要靠程式和交易補，成本高。a、b、d 都以「一份文件」為單位讀寫，結構也因每筆而異，正是文件模型適合的地方。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 8：服務把讀取偏好設成 <code>secondaryPreferred</code> 後，客人剛報名完重新整理，卻看到「尚未報名」。最可能的原因是？</p>
+  <label data-key="a">報名的交易失敗了</label>
+  <label data-key="b">讀取送到了 secondary，複製還沒跟上，讀到舊資料</label>
+  <label data-key="c">報名集合的索引壞了</label>
+  <label data-key="d">write concern 設得太高，寫入被延後</label>
+  <p class="why">✓ secondary 是非同步複製，會落後 primary 一點點。使用者剛改過的資料要讀 primary，或在同一個因果一致 session 裡讀寫（搭配 majority）。a 的話報名當下就會看到錯誤；d 剛好相反，majority 是等多數節點寫好才回成功，不會讓寫入延後生效。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>先 findOne 判斷，再 updateOne</strong>：中間會被插隊，並發時超賣。把判斷寫進 updateOne 的篩選條件，用 <code>modifiedCount</code> 看成功沒。</li>
+  <li><strong>什麼都包交易</strong>：先看能不能調整建模，讓需要一起成立的資料在同一份文件，用一次條件更新完成；交易留給真的跨文件的情況。</li>
+  <li><strong>為了快把 write concern 降到 w: 1 或 w: 0</strong>：故障切換時，已經回成功的寫入會被 rollback。不能丟的寫入明寫 <code>w: 'majority'</code>。</li>
+  <li><strong>從 secondary 讀取，卻期待讀到剛寫的資料</strong>：複製有延遲。剛改過的資料讀 primary，或用因果一致 session。</li>
+  <li><strong>交易裡的操作忘了傳 session</strong>：那個操作不在交易裡，失敗時不會回滾。每個 <code>find</code>、<code>updateOne</code>、<code>insertOne</code> 都要帶 <code>{ session }</code>。</li>
+  <li><strong>在 withTransaction 的函式裡 catch 錯誤不往外丟</strong>：函式正常結束，交易就提交，前半段的修改留了下來。要中止就把錯誤丟出去。</li>
+  <li><strong>手寫 startTransaction／commitTransaction 卻沒有重試</strong>：並發寫入同一份文件會得到 WriteConflict。用 <code>withTransaction</code>，它會依錯誤標籤重試。</li>
+  <li><strong>交易函式裡寄信、呼叫外部 API</strong>：函式可能被重跑好幾次，副作用也會做好幾次；交易太久還會超過 60 秒被中止。外部動作放在交易成功之後。</li>
+  <li><strong>樂觀鎖的版本沒遞增，或讓 patch 改到 version</strong>：兩個人都能拿同一個版本存成功，等於沒檢查。只在更新函式裡 <code>$inc</code> 版本，patch 裡的 <code>_id</code>、<code>version</code> 拿掉。</li>
+  <li><strong>因為「比較彈性」就把訂單與金流搬到 MongoDB</strong>：彈性欄位用 PostgreSQL 的 JSONB 就有；關聯、約束、跨實體交易才是訂單真正需要的。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>名額變成 53 人，是因為先讀再寫中間會被插隊。單一文件的寫入是原子的：把判斷寫進 <code>updateOne</code> 的篩選條件，用 <code>modifiedCount</code> 看成功沒，很多需求不需要交易。</li>
+  <li>報名成功卻不見，是 <code>w: 1</code> 遇上故障切換：只有 primary 寫好就回成功，還沒複製出去就當機，舊 primary 回來時把它 rollback。<code>w: 'majority'</code> 等多數節點寫好才回成功，就不會消失；5.0 起大多數部署預設 majority，重要寫入仍要明寫。</li>
+  <li>讀 secondary 可能讀到舊資料，剛寫的東西讀 primary 或用因果一致 session；read concern <code>local</code> 可能讀到之後被 rollback 的資料，<code>majority</code> 不會。</li>
+  <li>跨文件時用 <code>session.withTransaction</code>：每個操作傳 <code>session</code>、錯誤往外丟、操作依序 await、函式裡沒有副作用；它會依 <code>TransientTransactionError</code> 重跑交易、依 <code>UnknownTransactionCommitResult</code> 重送 commit。</li>
+  <li>交易有代價：預設 60 秒上限、MongoDB 9.0 起同時開啟數上限 10000、修改要放得進快取。</li>
+  <li>長時間的編輯用版本欄位做樂觀並發控制：篩選帶 version、成功就 <code>$inc</code>，對不上就回衝突。</li>
+  <li>高度關聯、約束多、需要臨時報表的資料（訂單、金流、庫存）留在 PostgreSQL；以文件為單位讀寫、結構多變的資料才是 MongoDB 的位置。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 8 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="b">
+  <p>練習 9：門市活動頁要顯示營業時間、推薦商品（含品名與價格）、顧客評論。哪一種建模最合理？</p>
+  <label data-key="a">營業時間內嵌；推薦商品內嵌整份商品資料；評論也內嵌，讀一次就全有</label>
+  <label data-key="b">營業時間內嵌；推薦商品存 id 加上架當下的品名價格；評論放獨立集合用 storeId 參照</label>
+  <label data-key="c">營業時間內嵌；推薦商品只存 id、每次查最新；評論內嵌，用 <code>$slice</code> 留最新 20 則</label>
+  <label data-key="d">三樣各放一個集合，活動頁用 <code>$lookup</code> 組回來，跟 PostgreSQL 一樣正規化</label>
+  <p class="why">✓ 建模看存取模式：一起讀、只屬於這份的內嵌；獨立變動的參照，需要時存當下的快照；會無限增加的放獨立集合。c 錯在 <code>$slice</code> 會把舊評論永久刪掉，評論是要保留的資料，不是只留最新幾筆的清單；價格也會在活動期間悄悄改變。（第 7 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 10：後台的「上傳照片」API 這樣寫。兩位店長同時上傳，同一時間還有人改營業時間，哪裡會出事？</p>
+<pre>const store = await stores.findOne({ _id: id })
+store.photos.push(photo)
+await stores.replaceOne({ _id: id }, store)</pre>
+  <label data-key="a">後寫回的那份整份蓋掉先寫的，先上傳的照片和剛改的營業時間都可能消失</label>
+  <label data-key="b">不會出事：單一文件的寫入是原子的，<code>replaceOne</code> 也一樣安全</label>
+  <label data-key="c">兩個請求同時寫同一份文件，後到的會收到 WriteConflict，要包交易</label>
+  <label data-key="d"><code>replaceOne</code> 會產生新的 <code>_id</code>，參照這家門市的評論全部失效</label>
+  <p class="why">✓ 讀出、改、整份寫回，中間別人的修改都會被蓋掉（遺失更新）。改成 <code>updateOne({ _id: id }, { $push: { photos: { $each: [photo], $slice: -20 } } })</code>，由伺服器只改那個陣列。b 錯在原子性只保證一次寫入不會寫一半，擋不住「拿舊的整份去覆蓋」。（第 7 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 11：打卡計數用 <code>updateOne({ storeId, date }, { $inc: { count: 1 } }, { upsert: true })</code>，<code>date</code> 已經固定用台北時區。上線後偶爾出現同一家門市同一天有兩份文件、各記一半，原因是？</p>
+  <label data-key="a">upsert 不是原子的，要改成先 <code>findOne</code>，再決定 insert 或 update</label>
+  <label data-key="b"><code>$inc</code> 在並發時會遺失次數，要改成讀出來加 1 再 <code>$set</code></label>
+  <label data-key="c"><code>{ storeId, date }</code> 沒有唯一索引，兩個 upsert 同時找不到，各自新增一份</label>
+  <label data-key="d">沒有包進交易，兩個 upsert 才會同時執行，包了就會排隊</label>
+  <p class="why">✓ upsert 的「找不到就新增」在並發時要靠篩選欄位上的唯一索引：第二個新增撞到重複鍵，伺服器會自動重試成更新，結果只有一份。a 更糟：沒有唯一索引照樣重複，有的話後到的直接收到 E11000。（第 7 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 12：查詢 <code>find({ city: '台北', rating: { $gte: 4 } }).sort({ createdAt: -1 }).limit(20)</code>。哪個索引能讓它只掃台北的索引項，而且不用在記憶體排序？</p>
+  <label data-key="a"><code>{ city: 1, rating: 1, createdAt: -1 }</code></label>
+  <label data-key="b"><code>{ rating: 1, city: 1, createdAt: -1 }</code></label>
+  <label data-key="c"><code>{ createdAt: -1, city: 1, rating: 1 }</code></label>
+  <label data-key="d"><code>{ city: 1, createdAt: -1, rating: 1 }</code></label>
+  <p class="why">✓ ESR：等值 city 在前，排序 createdAt 接著，範圍 rating 最後；台北的索引項已經依時間排好，rating 在索引裡直接篩。a 照「條件寫的順序」排，範圍放在排序前面，符合的索引項依 rating 排而不是依時間，explain 會出現 SORT。c 沒有 SORT，但要走過每個城市的索引項。（第 8 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 13：限量 50 名的報名 API 這樣寫，壓力測試報名人數變成 53。哪裡出錯？</p>
+<pre>const ev = await events.findOne({ _id: eventId })
+if (ev.seatsLeft &gt; 0 &amp;&amp; !ev.attendees.includes(customerId)) {
+  await events.updateOne({ _id: eventId },
+    { $inc: { seatsLeft: -1 }, $push: { attendees: customerId } })
+  return true
+}
+return false</pre>
+  <label data-key="a"><code>updateOne</code> 同時改兩個欄位不是原子的，要包進 <code>withTransaction</code></label>
+  <label data-key="b"><code>$inc</code> 在並發時會少扣，要改成讀出 <code>seatsLeft</code> 減 1 再 <code>$set</code></label>
+  <label data-key="c">判斷和寫入分兩次往返，並發的請求都讀到還有名額，一起扣下去</label>
+  <label data-key="d"><code>findOne</code> 預設讀 secondary，讀到的是還沒複製過來的舊名額</label>
+  <p class="why">✓ 先讀再判斷，中間會被插隊。把條件搬進篩選：<code>{ _id: eventId, seatsLeft: { $gt: 0 }, attendees: { $ne: customerId } }</code>，用 <code>modifiedCount</code> 看成功沒，一次更新就做完，不需要交易。a 錯在單一文件的一次更新本來就是原子的，問題出在更新之前的那次讀取。（第 9 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 14：「換場次」用 <code>withTransaction</code> 包起來，並在函式最後寄確認信。活動開放換場那晚，有客人收到三封同樣的信，為什麼？</p>
+<pre>await session.withTransaction(async () =&gt; {
+  await events.updateOne({ _id: from, … }, { … }, { session })
+  await events.updateOne({ _id: to, … }, { … }, { session })
+  await mailer.send(customer, '已換到新場次')
+})</pre>
+  <label data-key="a">並發搶同一場遇到 WriteConflict，<code>withTransaction</code> 從頭重跑整個函式，信也跟著寄</label>
+  <label data-key="b"><code>mailer.send</code> 沒有傳 <code>{ session }</code>，交易提交時 driver 又把它補送了一次</label>
+  <label data-key="c">commit 的結果不確定，driver 重送 commit 時把整個函式的動作也重做了一遍</label>
+  <p class="why">✓ 交易函式可能被重跑好幾次，副作用也會做好幾次。函式裡只放帶 <code>{ session }</code> 的資料庫操作，寄信放在 <code>withTransaction</code> 回傳之後；一定要寄就在交易裡寫一筆待寄送紀錄（outbox）。c 錯在 <code>UnknownTransactionCommitResult</code> 只重送 commit，不重跑函式。（第 9 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 15：報名寫入用 <code>{ w: 'majority', wtimeoutMS: 5000 }</code>，某次 API 收到 write concern 逾時的錯誤。這筆報名該怎麼看？</p>
+  <label data-key="a">寫入失敗了，資料庫已經撤銷這筆，請客人重新報名就好</label>
+  <label data-key="b">不確定：可能已經寫進 primary，只是沒等到多數確認，重試要靠冪等</label>
+  <label data-key="c">改用 <code>w: 1</code> 重送一次，primary 寫好就會回成功，不會再逾時</label>
+  <label data-key="d">已經寫進多數節點了，只是回應慢，直接回客人「報名成功」</label>
+  <p class="why">✓ 逾時只代表「等不到確認」，這筆可能已經寫進去。重試要冪等，例如用唯一索引擋重複報名。a 錯在逾時不會撤銷已寫入的資料，讓客人重報可能變成兩筆；c 回了成功，故障切換時卻可能被 rollback。（第 9 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 16：店長和行銷同時打開同一份活動文案，各自編輯幾分鐘後儲存，店長改的標題被行銷存的舊標題蓋回去。該怎麼防？</p>
+  <label data-key="a">把「讀出文案」到「儲存」整段包進 <code>withTransaction</code>，讓兩人排隊</label>
+  <label data-key="b">儲存改用 <code>$set</code> 只送整份表單的欄位，不用 <code>replaceOne</code></label>
+  <label data-key="c">儲存時用 <code>w: 'majority'</code>，確定每次修改都被多數節點確認</label>
+  <label data-key="d">文件帶 <code>version</code>，儲存時篩選帶上讀到的版本並 <code>$inc</code>，對不上回 409</label>
+  <p class="why">✓ 樂觀並發控制：版本還是我讀到的那個才更新，後到的找不到文件，前端提示「內容已被其他人修改」並重新載入。a 錯在編輯會開好幾分鐘，交易有 60 秒上限，不能撐那麼久；b 送的仍是她打開時看到的整份表單，標題照樣被蓋回去。（第 9 課）</p>
+</div>
+<p>這個階段的重點整理成<a href="../sheets/stage-3.html">一頁圖解</a>。</p>
+<p>下一課進入搜尋：為什麼 PostgreSQL 的 <code>LIKE</code> 搜不好中文菜單，倒排索引和中文分詞怎麼解決這件事。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

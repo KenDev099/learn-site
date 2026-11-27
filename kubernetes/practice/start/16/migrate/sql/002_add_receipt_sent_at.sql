@@ -1,0 +1,1 @@
+-- 練習 3：v2 的 migration（expand）。沒有任何 SQL 敘述時，migration 執行器會略過這個檔案

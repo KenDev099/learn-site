@@ -1,0 +1,7 @@
+-- 練習 1：chunks 表的 migration（寫完執行 node check.mjs ai 09）
+-- 這個檔案要能重複執行（第二次執行不能出錯）
+-- 1. 啟用 vector 擴充
+-- 2. 建 chunks 表：id、doc_id、seq、heading_path、content、content_hash、embedding（64 維）、embed_model、updated_at
+--    每個欄位都不能是 NULL；updated_at 預設 now()；同一份文件的 seq 不能重複
+-- 3. 建 HNSW 索引，用 cosine 距離
+-- TODO

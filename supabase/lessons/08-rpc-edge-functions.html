@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>8. 伺服器端邏輯放哪裡：資料庫函式（RPC）與 Edge Functions</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="8" data-practice="supabase">
+<header>
+  <div class="eyebrow">階段 4：伺服器端邏輯與上線 · 第 8 課</div>
+  <h1>伺服器端邏輯放哪裡：資料庫函式（RPC）與 Edge Functions</h1>
+</header>
+<main>
+
+<p>咖啡店的結帳流程是前端寫的：先 insert 一張訂單、再 insert 每個品項、最後呼叫金流。上線後出了三件事。顧客在第二步斷網，資料庫留下一張沒有品項的半張訂單；有人改了前端送出的價格，用 1 元買到拿鐵；金流的 API 金鑰為了讓前端能呼叫，被寫進了 Vite 的環境變數，打包後任何人都看得到。</p>
+<p>這三件事都在說：有些邏輯不能放在前端。用 Supabase 不代表沒有伺服器端，而是伺服器端邏輯有好幾個地方可以放。這一課先給一張判斷表，再實作其中兩個：資料庫函式（透過 RPC 呼叫）與 Edge Function，最後談什麼時候該改用自己的 NestJS 服務。</p>
+
+<div class="callout"><strong>這課的路線</strong>
+<ul>
+  <li>四個可以放邏輯的地方：先給判斷表，回答「結帳該放哪」。</li>
+  <li>RPC：把多步驟寫入包成一個資料庫函式，一個交易做完；它的權限怎麼設。</li>
+  <li>Edge Functions：要呼叫外部 API、要藏金鑰時；用呼叫者的身分還是 secret key。</li>
+  <li>其他伺服器端工具一段帶過：trigger、排程、佇列、webhook。</li>
+  <li>什麼時候改用自己的後端：混合架構。</li>
+</ul></div>
+
+<div class="callout"><strong>這課會用到：</strong>函式與 plpgsql（資料庫裡的程式，<code>begin … end</code> 之間可以有變數、判斷，<a href="../../postgresql/lessons/23-views-functions-triggers.html">PostgreSQL 課第 23 課</a>）；交易（一組操作全部成功或全部取消，<a href="../../postgresql/lessons/18-transactions.html">PostgreSQL 課第 18 課</a>）；<code>security definer</code> 的規則（以擁有者的權限執行，要鎖 search_path、不放在公開的 schema，<a href="05-rls-patterns.html">第 5 課</a>）；publishable 與 secret key 對應的角色（<a href="03-keys-roles-grants.html">第 3 課</a>）。</div>
+
+<div class="callout warn"><strong>環境</strong>：這課用到資料庫、gateway、Data API、Auth（db、kong、rest、auth）。練習 2 的測試用 Docker 跑 Edge Runtime 的映像（<code>edge-runtime:v1.78.1</code>，跟本機 Supabase 同一個，已經下載過）：每次判分開一個自己的容器，跑完刪掉。</div>
+
+<h2>四個可以放邏輯的地方</h2>
+<p>先回答開場的問題。用 Supabase 時，一段邏輯可以放在四個地方，由近到遠：</p>
+<div class="table-wrap"><table>
+  <tr><th>放哪裡</th><th>適合</th><th>咖啡店的例子</th></tr>
+  <tr><td><strong>直接打 Data API</strong>（前端＋RLS）</td><td>單張表的讀寫，權限能用「這列屬於誰」表達</td><td>菜單、我的訂單列表、改自己的暱稱</td></tr>
+  <tr><td><strong>資料庫函式（RPC）</strong></td><td>好幾個寫入要一起成功或一起失敗；價格、庫存這類要由資料庫決定的計算；RLS 很難表達的規則</td><td>結帳建立訂單＋品項；店員把訂單改成「已出餐」</td></tr>
+  <tr><td><strong>Edge Function</strong></td><td>要呼叫外部 API、要用不能給前端的金鑰、要接別人打進來的 webhook；短時間就能做完</td><td>向金流扣款、接金流的付款通知、寄收據信</td></tr>
+  <tr><td><strong>自己的後端</strong>（例如 NestJS）</td><td>流程長、跨好幾個系統、要排程與失敗重試，或團隊本來就熟 Node 的生態系</td><td>每晚跟 POS 對帳、月底產生發票</td></tr>
+</table></div>
+<p>判斷的順序：先問「需不需要離開資料庫（外部 API、金鑰、webhook）」，不需要的話，再問「是不是多個寫入、或要資料庫算」。結帳拆成兩段：「建訂單、算總價」放 RPC，「向金流扣款」放 Edge Function，由 Edge Function 呼叫 RPC。這一課的兩個練習就是這兩段。</p>
+
+<h2>RPC：一個交易做完多步驟寫入</h2>
+<p>從判斷表的第二格開始。RPC（Remote Procedure Call，遠端程序呼叫）在 Supabase 指的是：PostgREST 把資料庫函式也變成 API，<code>POST /rest/v1/rpc/&lt;函式名&gt;</code>，body 是參數。supabase-js 的寫法：</p>
+<pre>const { data: orderId, error } = await supabase.rpc('place_order', {
+  items: [{ product_id: 2, quantity: 2 }, { product_id: 5, quantity: 1 }],
+})</pre>
+<p>函式本體（plpgsql 的語法在 <a href="../../postgresql/lessons/23-views-functions-triggers.html">PostgreSQL 課第 23 課</a>）：</p>
+<pre>create function public.place_order(items jsonb) returns integer
+language plpgsql
+set search_path = ''
+as $$
+declare
+  uid uuid := (select auth.uid());
+  order_total integer;
+  found_count integer;
+  new_id integer;
+begin
+  if uid is null then
+    raise exception '請先登入' using errcode = '42501';
+  end if;
+
+  -- 價格從資料庫讀，不看前端傳了什麼
+  select sum(p.price * (i -&gt;&gt; 'quantity')::integer), count(*)
+    into order_total, found_count
+    from jsonb_array_elements(items) as i
+    join public.products p on p.id = (i -&gt;&gt; 'product_id')::integer;
+  if found_count is distinct from jsonb_array_length(items) or found_count = 0 then
+    raise exception '有商品不存在';
+  end if;
+
+  insert into public.orders (customer_id, total) values (uid, order_total) returning id into new_id;
+  insert into public.order_items (order_id, product_id, quantity, unit_price)
+    select new_id, p.id, (i -&gt;&gt; 'quantity')::integer, p.price
+      from jsonb_array_elements(items) as i
+      join public.products p on p.id = (i -&gt;&gt; 'product_id')::integer;
+  return new_id;
+end;
+$$;</pre>
+<p>它解決開場的兩件事：</p>
+<ul>
+  <li><strong>半張訂單</strong>：PostgREST 把每個請求包在一個交易裡，函式裡任何一步 <code>raise exception</code> 或違反約束，前面的 insert 全部回滾。前端從「三個請求」變成「一個請求」，不會停在中間。</li>
+  <li><strong>前端改價格</strong>：參數只收商品 id 與數量，單價與總價由函式從 <code>products</code> 讀。前端就算多送 <code>unit_price</code>，函式也不看。</li>
+</ul>
+<p><code>raise exception</code> 會變成 API 的錯誤回應：supabase-js 的 <code>error.message</code> 就是那段文字、<code>error.code</code> 是 SQLSTATE（沒指定時是 <code>P0001</code>）。用 <code>errcode = '42501'</code>（權限不足）時，PostgREST 會回 401 或 403，跟沒有 GRANT 的錯誤一樣。</p>
+
+<h3>函式以誰的身分執行</h3>
+<p>函式預設是 <strong>security invoker</strong>：以呼叫者的角色執行，裡面的 insert 照樣受 <code>orders</code>、<code>order_items</code> 的 GRANT 與 RLS 管。所以上面的函式能插入訂單，是因為第 4 課那條「顧客只能替自己下單」的 INSERT policy 允許；<code>auth.uid()</code> 也照常讀到呼叫者。這是首選：函式只是把幾個本來就允許的動作包成一個交易。</p>
+<p>需要做到呼叫者自己沒權限的事（例如扣全店共用的庫存表），才改成 <code>security definer</code>，並照第 5 課的規則：放在不公開的 schema 或至少 <code>set search_path = ''</code>，<strong>函式裡自己檢查 <code>auth.uid()</code></strong>，因為 RLS 已經不會替你擋了。</p>
+
+<h3>誰能呼叫：EXECUTE 權限</h3>
+<p>函式也有自己的 GRANT。這裡有個容易誤會的地方：第 3 課講過 2026 年起新表預設不開放給 API（本機 <code>auto_expose_new_tables = false</code>），但<strong>函式不在這個規則裡</strong>。在本機實測，postgres 在 public 新建的函式，<code>has_function_privilege('anon', …, 'execute')</code> 是 <code>true</code>：Postgres 對新函式的內建預設是 PUBLIC（所有角色）都能執行，所以沒登入的人也能 <code>POST /rest/v1/rpc/place_order</code>。每個要公開的函式都明確設定：</p>
+<pre>revoke execute on function public.place_order(jsonb) from public, anon;
+grant execute on function public.place_order(jsonb) to authenticated;</pre>
+<p>上面的函式就算沒 revoke，anon 呼叫也會被 <code>uid is null</code> 擋下；但 security definer 的函式、或忘了檢查身分的函式，就會變成任何人都能呼叫的後門。把「只給該給的人執行」當成每個函式的固定兩行。</p>
+<div class="callout practice"><strong>💡 實務上：金額一律在伺服器端算</strong><br>任何跟錢有關的數字（單價、折扣、運費、總價）都不能信任前端送來的值，前端只送「要買什麼、買幾個、用哪張優惠券」，由 RPC 或後端從資料庫讀價格算出來。code review 看到 <code>insert</code> 的資料裡有前端傳來的 <code>price</code>、<code>total</code>，就是要修的 bug。同樣的道理也適用庫存、點數、會員等級。</div>
+
+<h2>Edge Functions：要離開資料庫的時候</h2>
+<p>RPC 解決了資料庫裡的事，但向金流扣款要呼叫外部 API、要用金流給的金鑰。資料庫函式不適合做 HTTP 呼叫（會把交易拖住，金鑰也得存在資料庫裡），前端又不能拿金鑰，這就是判斷表第三格：<strong>Edge Function</strong>。</p>
+<p>Edge Function 是你寫的一段 TypeScript，跑在 Supabase 的 Edge Runtime 上。Edge Runtime 以 Deno 為基礎（另一個 JavaScript／TypeScript 執行環境，直接跑 .ts、內建 <code>fetch</code>、用 <code>Deno.env.get</code> 讀環境變數）。每個函式一個資料夾，網址是 <code>/functions/v1/&lt;名稱&gt;</code>：</p>
+<pre>npx supabase functions new checkout      # 建立 supabase/functions/checkout/index.ts
+npx supabase functions serve             # 本機執行所有函式，改檔案會自動重新載入
+npx supabase functions deploy checkout   # 部署到雲端（CLI 3.x：預設部署到 link 的專案）</pre>
+<p>一個函式就是一個處理 HTTP 請求的 handler：</p>
+<pre>import { createClient } from 'npm:@supabase/supabase-js@2'
+
+Deno.serve(async (req) =&gt; {
+  // 用「呼叫者自己的 token」建 client：之後的查詢都以這位顧客的身分執行，RLS 照常
+  const supabase = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    JSON.parse(Deno.env.get('SUPABASE_PUBLISHABLE_KEYS')!).default,
+    { global: { headers: { Authorization: req.headers.get('Authorization')! } } },
+  )
+  const { items } = await req.json()
+  const { data: orderId, error } = await supabase.rpc('place_order', { items })
+  if (error) return Response.json({ error: error.message }, { status: 400 })
+
+  const { data: order } = await supabase.from('orders').select('total').eq('id', orderId).single()
+  const charge = await fetch('https://api.payments.example/charges', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${Deno.env.get('PAYMENT_API_KEY')}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ order_id: orderId, amount: order!.total }),
+  })
+  if (!charge.ok) return Response.json({ error: '扣款失敗' }, { status: 502 })
+  return Response.json({ order_id: orderId, total: order!.total, charge_id: (await charge.json()).id })
+})</pre>
+<p>逐一看這段程式用到的設定：</p>
+<ul>
+  <li><strong>預設環境變數</strong>：Supabase 自動提供 <code>SUPABASE_URL</code>、<code>SUPABASE_PUBLISHABLE_KEYS</code>、<code>SUPABASE_SECRET_KEYS</code>（JSON，例如 <code>{"default":"sb_publishable_…"}</code>）、<code>SUPABASE_DB_URL</code>，以及舊的 <code>SUPABASE_ANON_KEY</code>、<code>SUPABASE_SERVICE_ROLE_KEY</code>（官方文件 guides/functions/secrets，2026-11-20 查詢）。</li>
+  <li><strong>secrets</strong>：自己的金鑰（金流、寄信服務）本機寫在 <code>supabase/functions/.env</code>（加進 <code>.gitignore</code>），雲端用 <code>npx supabase secrets set --env-file supabase/functions/.env</code> 設定。程式裡一律 <code>Deno.env.get</code>，不寫死。</li>
+  <li><strong>JWT 驗證</strong>：雲端與 <code>functions serve</code> 預設會先驗 <code>Authorization</code> 裡的 JWT，沒帶或無效直接回 401，不會執行你的程式。要給「別人打進來」的請求用（例如金流的 webhook，對方不會有你使用者的 JWT），在 <code>config.toml</code> 對那個函式關掉：<code>[functions.payment-webhook]</code> 下寫 <code>verify_jwt = false</code>，再自己驗簽章。</li>
+  <li><strong>import</strong>：Deno 用 <code>npm:</code> 前綴直接載入 npm 套件，第一次執行時下載。</li>
+</ul>
+<p>JWT 驗證只確認「token 是真的」。真正的權限還是靠程式裡用哪個身分查資料庫：</p>
+<div class="table-wrap"><table>
+  <tr><th>用哪個身分建 client</th><th>結果</th><th>什麼時候用</th></tr>
+  <tr><td>publishable key＋呼叫者的 <code>Authorization</code></td><td>以那位顧客的身分執行，RLS、<code>auth.uid()</code> 都照常</td><td>預設。代替使用者做事的函式都用這個</td></tr>
+  <tr><td>secret key（<code>service_role</code>）</td><td>繞過所有 RLS，<code>auth.uid()</code> 是 null</td><td>真的需要跨使用者的管理工作：webhook 更新訂單狀態、後台批次作業。用的時候自己檢查權限</td></tr>
+</table></div>
+<p>常見的錯是圖方便全部用 secret key：函式收到「替訂單 42 付款」的請求，用 secret key 查得到每一張訂單，於是顧客 A 傳別人的訂單編號也能操作。用呼叫者的 token，同樣的請求會因為 RLS 查不到而失敗。</p>
+<div class="callout practice"><strong>💡 實務上：Edge Function 有時間與資源上限，長流程不要放這裡</strong><br>官方文件（guides/functions/limits，2026-11-20 查詢）列的上限：記憶體 256 MB；每個請求的 CPU 時間 2 秒（等待網路的時間不算）；整體執行時間（wall clock）免費方案 150 秒、付費方案 400 秒；請求閒置 150 秒逾時。適合「收到請求、呼叫一兩個 API、回應」這種短流程。要跑幾分鐘的報表、要等外部系統回呼、要失敗後隔一段時間重試的流程，放進佇列交給背景工作（自己的後端），不要在 Edge Function 裡硬撐。</div>
+
+<h2>其他伺服器端工具，一段帶過</h2>
+<p>這幾樣別門課教過，在 Supabase 裡一樣能用，記得它們存在就好：</p>
+<ul>
+  <li><strong>trigger</strong>：資料變動時自動執行的函式，例如自動更新 <code>updated_at</code>、第 6 課的 profiles（<a href="../../postgresql/lessons/23-views-functions-triggers.html">PostgreSQL 課第 23 課</a>）。</li>
+  <li><strong>pg_cron</strong>：資料庫裡的排程，例如每天凌晨清掉沒有訂單的收據檔案紀錄。<strong>pgmq</strong>：資料庫裡的訊息佇列。原理在 <a href="../../postgresql/lessons/33-job-queue.html">PostgreSQL 課第 33 課</a>、<a href="../../nestjs/lessons/21-scheduling-events.html">NestJS 課第 21 課</a>。</li>
+  <li><strong>webhook</strong>：金流的付款通知打到一個 <code>verify_jwt = false</code> 的 Edge Function，函式驗簽章、用唯一約束做到同一個通知重送也只處理一次，再用 secret key 更新訂單狀態。簽章與冪等在 <a href="../../nestjs/lessons/22-uploads-webhooks.html">NestJS 課第 22 課</a>、<a href="../../delivery/lessons/08-payments.html">delivery 課第 8 課</a>講過。</li>
+</ul>
+
+<h2>什麼時候改用自己的後端</h2>
+<p>最後一格。判斷表上的「自己的後端」不是失敗的選項，而是很常見的組合：Supabase 繼續管資料、登入、檔案，另外跑一個 NestJS 服務處理複雜流程，兩邊連同一個 Postgres（NestJS 用 <code>SUPABASE_DB_URL</code> 這類直連網址，或用 secret key 呼叫 API）。這叫<strong>混合架構</strong>。出現下面的訊號時考慮它：</p>
+<ul>
+  <li>流程要跨好幾個系統（POS、發票、物流），每一步失敗都要重試、要能查進度。</li>
+  <li>工作要跑很久，或要排程、要佇列。</li>
+  <li>業務規則多到 SQL 函式難以閱讀與測試，而團隊熟悉 TypeScript 的測試工具。</li>
+  <li>需要 Supabase 沒有的東西：特定的函式庫、長連線、自訂的快取層。</li>
+</ul>
+<p>代價是多一個要部署、監控、維護的服務，權限也變成兩套：API 走 RLS，NestJS 直連資料庫時通常是高權限的角色，要在程式裡自己檢查（作品專案課的 <a href="../../portfolio/lessons/09-rls-defense-in-depth.html">第 9 課</a>示範了在自己的後端裡也用 RLS 當第二道防線）。架構上的取捨在 <a href="../../system-design/lessons/15-monolith-microservices.html">system-design 課第 15 課</a>。</p>
+<div class="callout practice"><strong>💡 實務上：用一張表記下「這段邏輯為什麼放這裡」</strong><br>專案長大後，同一類邏輯散在前端、RPC、Edge Function、後端四個地方，新同事很難找。團隊會在 README 或 ADR 寫一張表：哪些功能在哪裡、為什麼。審新功能時先對照判斷表決定放哪，並寫進那張表。出問題時也知道該去哪裡看 log：RPC 看 Postgres 的 log，Edge Function 看函式的 log。</div>
+
+<h2>練習</h2>
+<p>練習 1、2 在本機，題目資料夾是 <code>supabase/practice/work/08/</code>。這一題的 <code>products</code>、<code>orders</code>、<code>order_items</code> 在你專屬的 schema（policy 跟第 4 課一樣：顧客只能讀寫自己的訂單），SQL 照正式專案的寫法寫 <code>public.</code>，判分時測試會換成那個 schema。</p>
+
+<div class="local" data-test="ex1" data-files="place_order.sql">
+  <p>練習 1：在 <code>place_order.sql</code> 寫 <code>public.place_order(items jsonb) returns integer</code>：沒登入就 <code>raise exception</code>；單價一律從 <code>public.products</code> 讀（前端多傳的 <code>unit_price</code> 不能用），有商品不存在就 <code>raise exception</code>；建一張屬於呼叫者的 <code>orders</code>（<code>total</code> 是總價）與每個 <code>order_items</code>，回傳訂單 id；最後設定只有 <code>authenticated</code> 能執行。測試會用顧客的身分透過 <code>rpc()</code> 呼叫，也會送不存在的商品、數量 0，確認失敗時一筆都沒留下。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="functions/checkout/index.ts">
+  <p>練習 2：完成 Edge Function <code>functions/checkout/index.ts</code>：收到 <code>POST { items }</code>，用<strong>呼叫者的 <code>Authorization</code></strong> 呼叫練習 1 的 <code>place_order</code>（失敗就把狀態碼原樣回傳、不扣款），再讀這張訂單的 <code>total</code>，用環境變數裡的金流金鑰向金流扣款（失敗回 502），回傳 <code>{ order_id, total, charge_id }</code>。這一題沒有 supabase-js（容器不連外網下載套件），用 <code>fetch</code> 直接呼叫 <code>/rest/v1/rpc/place_order</code> 與 <code>/rest/v1/orders</code>，檔案開頭的註解列了可以用的環境變數與金流 API 的格式。測試會在你的函式與 Supabase 之間放一個記錄請求的 proxy，並開一個假的金流 API。</p>
+</div>
+
+<div class="exercise">
+  <p>練習 3：寫 <code>whereToPut(req)</code>，依需求的特徵回傳邏輯該放哪裡。規則照「四個可以放邏輯的地方」那一節，由上往下，第一條符合的就是答案：</p>
+  <ol>
+    <li>要跑 60 秒以上（<code>seconds &gt;= 60</code>），或要排程與失敗重試（<code>scheduledRetry</code>）→ <code>'own-backend'</code></li>
+    <li>要呼叫外部 API、要用不能給前端的金鑰、或要接 webhook → <code>'edge-function'</code></li>
+    <li>要寫兩張以上的表而且要一起成功（<code>tablesWritten &gt;= 2 &amp;&amp; atomic</code>），或權限沒辦法直接寫成 RLS（<code>!fitsRls</code>）→ <code>'rpc'</code></li>
+    <li>其他 → <code>'data-api'</code></li>
+  </ol>
+  <script type="start">
+type Place = 'data-api' | 'rpc' | 'edge-function' | 'own-backend'
+type Requirement = {
+  tablesWritten: number      // 要寫幾張表（只讀是 0）
+  atomic: boolean            // 這些寫入要一起成功或一起失敗
+  fitsRls: boolean           // 權限能直接用「這列屬於誰」寫成 RLS
+  callsExternalApi: boolean  // 要呼叫外部服務（金流、物流、寄信）
+  needsSecret: boolean       // 要用不能給前端看到的金鑰
+  receivesWebhook: boolean   // 由別的系統主動打進來
+  seconds: number            // 預估要跑幾秒
+  scheduledRetry: boolean    // 要排程或失敗後重試
+}
+
+function whereToPut(req: Requirement): Place {
+  return 'data-api'
+}
+
+const base: Requirement = { tablesWritten: 0, atomic: false, fitsRls: true, callsExternalApi: false, needsSecret: false, receivesWebhook: false, seconds: 1, scheduledRetry: false }
+console.log('菜單列表：', whereToPut(base))
+console.log('結帳建訂單：', whereToPut({ ...base, tablesWritten: 2, atomic: true }))
+console.log('向金流扣款：', whereToPut({ ...base, callsExternalApi: true, needsSecret: true }))
+</script>
+  <script type="answer">
+type Place = 'data-api' | 'rpc' | 'edge-function' | 'own-backend'
+type Requirement = {
+  tablesWritten: number      // 要寫幾張表（只讀是 0）
+  atomic: boolean            // 這些寫入要一起成功或一起失敗
+  fitsRls: boolean           // 權限能直接用「這列屬於誰」寫成 RLS
+  callsExternalApi: boolean  // 要呼叫外部服務（金流、物流、寄信）
+  needsSecret: boolean       // 要用不能給前端看到的金鑰
+  receivesWebhook: boolean   // 由別的系統主動打進來
+  seconds: number            // 預估要跑幾秒
+  scheduledRetry: boolean    // 要排程或失敗後重試
+}
+
+function whereToPut(req: Requirement): Place {
+  if (req.seconds >= 60 || req.scheduledRetry) return 'own-backend'
+  if (req.callsExternalApi || req.needsSecret || req.receivesWebhook) return 'edge-function'
+  if ((req.tablesWritten >= 2 && req.atomic) || !req.fitsRls) return 'rpc'
+  return 'data-api'
+}
+
+const base: Requirement = { tablesWritten: 0, atomic: false, fitsRls: true, callsExternalApi: false, needsSecret: false, receivesWebhook: false, seconds: 1, scheduledRetry: false }
+console.log('菜單列表：', whereToPut(base))
+console.log('結帳建訂單：', whereToPut({ ...base, tablesWritten: 2, atomic: true }))
+console.log('向金流扣款：', whereToPut({ ...base, callsExternalApi: true, needsSecret: true }))
+</script>
+  <script type="tests">
+const b: Requirement = { tablesWritten: 0, atomic: false, fitsRls: true, callsExternalApi: false, needsSecret: false, receivesWebhook: false, seconds: 1, scheduledRetry: false }
+assert.equal(whereToPut(b), 'data-api', '只讀、權限能寫成 RLS：直接打 Data API')
+assert.equal(whereToPut({ ...b, tablesWritten: 1 }), 'data-api', '只寫一張表、權限能寫成 RLS（例如改自己的暱稱）：Data API 就夠，不需要伺服器端程式')
+assert.equal(whereToPut({ ...b, tablesWritten: 2, atomic: true }), 'rpc', '兩張表要一起成功（訂單＋品項）：包成資料庫函式，一個交易')
+assert.equal(whereToPut({ ...b, tablesWritten: 2, atomic: false }), 'data-api', '寫兩張表但彼此獨立、權限也能寫成 RLS：分開打 Data API 就好')
+assert.equal(whereToPut({ ...b, tablesWritten: 1, fitsRls: false }), 'rpc', '權限沒辦法寫成 RLS（例如店員只能改 status 欄位）：用函式把規則包起來')
+assert.equal(whereToPut({ ...b, callsExternalApi: true }), 'edge-function', '要呼叫外部 API：Edge Function')
+assert.equal(whereToPut({ ...b, needsSecret: true }), 'edge-function', '要用不能給前端的金鑰：Edge Function')
+assert.equal(whereToPut({ ...b, receivesWebhook: true }), 'edge-function', '接 webhook：Edge Function（verify_jwt = false，自己驗簽章）')
+assert.equal(whereToPut({ ...b, tablesWritten: 3, atomic: true, callsExternalApi: true }), 'edge-function', '要呼叫外部 API 的流程放 Edge Function（多表寫入的部分它再呼叫 RPC）')
+assert.equal(whereToPut({ ...b, callsExternalApi: true, seconds: 300 }), 'own-backend', '要跑 5 分鐘：超過 Edge Function 適合的範圍（免費方案整體上限 150 秒），放自己的後端')
+assert.equal(whereToPut({ ...b, seconds: 60 }), 'own-backend', '60 秒以上就算長流程')
+assert.equal(whereToPut({ ...b, seconds: 59, needsSecret: true }), 'edge-function', '59 秒還不算長流程')
+assert.equal(whereToPut({ ...b, scheduledRetry: true, tablesWritten: 2, atomic: true }), 'own-backend', '要排程與失敗重試（例如每晚對帳）：自己的後端')
+</script>
+  <script type="wrong">
+type Place = 'data-api' | 'rpc' | 'edge-function' | 'own-backend'
+type Requirement = { tablesWritten: number, atomic: boolean, fitsRls: boolean, callsExternalApi: boolean, needsSecret: boolean, receivesWebhook: boolean, seconds: number, scheduledRetry: boolean }
+// 只要有寫入就放 Edge Function
+function whereToPut(req: Requirement): Place {
+  if (req.seconds >= 60 || req.scheduledRetry) return 'own-backend'
+  if (req.tablesWritten > 0 || req.callsExternalApi || req.needsSecret || req.receivesWebhook) return 'edge-function'
+  if (!req.fitsRls) return 'rpc'
+  return 'data-api'
+}
+</script>
+  <script type="wrong">
+type Place = 'data-api' | 'rpc' | 'edge-function' | 'own-backend'
+type Requirement = { tablesWritten: number, atomic: boolean, fitsRls: boolean, callsExternalApi: boolean, needsSecret: boolean, receivesWebhook: boolean, seconds: number, scheduledRetry: boolean }
+// 先看外部 API：長流程也被放進 Edge Function
+function whereToPut(req: Requirement): Place {
+  if (req.callsExternalApi || req.needsSecret || req.receivesWebhook) return 'edge-function'
+  if (req.seconds >= 60 || req.scheduledRetry) return 'own-backend'
+  if ((req.tablesWritten >= 2 && req.atomic) || !req.fitsRls) return 'rpc'
+  return 'data-api'
+}
+</script>
+  <script type="wrong">
+type Place = 'data-api' | 'rpc' | 'edge-function' | 'own-backend'
+type Requirement = { tablesWritten: number, atomic: boolean, fitsRls: boolean, callsExternalApi: boolean, needsSecret: boolean, receivesWebhook: boolean, seconds: number, scheduledRetry: boolean }
+// 寫兩張表就用 RPC，沒看要不要一起成功
+function whereToPut(req: Requirement): Place {
+  if (req.seconds >= 60 || req.scheduledRetry) return 'own-backend'
+  if (req.callsExternalApi || req.needsSecret || req.receivesWebhook) return 'edge-function'
+  if (req.tablesWritten >= 2 || !req.fitsRls) return 'rpc'
+  return 'data-api'
+}
+</script>
+  <script type="wrong">
+type Place = 'data-api' | 'rpc' | 'edge-function' | 'own-backend'
+type Requirement = { tablesWritten: number, atomic: boolean, fitsRls: boolean, callsExternalApi: boolean, needsSecret: boolean, receivesWebhook: boolean, seconds: number, scheduledRetry: boolean }
+// 邊界寫錯：剛好 60 秒沒算長流程
+function whereToPut(req: Requirement): Place {
+  if (req.seconds > 60 || req.scheduledRetry) return 'own-backend'
+  if (req.callsExternalApi || req.needsSecret || req.receivesWebhook) return 'edge-function'
+  if ((req.tablesWritten >= 2 && req.atomic) || !req.fitsRls) return 'rpc'
+  return 'data-api'
+}
+</script>
+</div>
+<p>真實的需求不會剛好是幾個布林值，這張判斷表的價值在於逼你先問對問題：要不要離開資料庫、要不要一起成功、要跑多久。答案常常是組合：結帳的入口是 Edge Function，它呼叫 RPC 做交易，再把「寄收據信」丟進佇列給背景工作。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：前端的結帳寫成先 <code>insert</code> 訂單、拿到 id 後再 <code>insert</code> 品項，兩個請求都有 RLS 保護，而且都檢查了 <code>error</code>。為什麼還是不安全？</p>
+  <label data-key="a">第二個請求會被 safeupdate 擋下</label>
+  <label data-key="b">RLS 只保護讀取，不保護新增</label>
+  <label data-key="c">兩個請求是兩個交易：第二個失敗（斷網、某個商品不存在）時第一個已經提交，留下半張訂單；而且 total、unit_price 由前端決定</label>
+  <label data-key="d">supabase-js 一次只能送一個請求，第二個會排隊太久</label>
+  <p class="why">✓ PostgREST 每個請求一個交易，跨請求的「一起成功」只能靠把它們包進同一個函式。另一個問題是金額來自前端。修法是 <code>place_order</code> 這類 RPC。b 錯：INSERT 的 WITH CHECK 確實會擋，只是擋不住「半張訂單」和「自己改價格」這兩件事。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 5：Edge Function <code>cancel-order</code> 收到 <code>{ order_id }</code> 後，用 secret key 建的 client 執行 <code>update orders set status = 'cancelled' where id = order_id</code>，函式有開 <code>verify_jwt</code>。哪裡會出事？</p>
+  <label data-key="a">任何登入的顧客傳別人的 order_id 都能取消那張訂單：secret key 繞過 RLS，函式也沒檢查訂單是不是呼叫者的</label>
+  <label data-key="b">沒有問題，<code>verify_jwt</code> 已經確認了呼叫者的身分</label>
+  <label data-key="c">secret key 在 Edge Function 裡讀不到</label>
+  <label data-key="d">update 沒有 where 會被 safeupdate 擋下</label>
+  <p class="why">✓ <code>verify_jwt</code> 只確認「有一個真的使用者在呼叫」，沒確認「他能不能動這張訂單」。用呼叫者的 Authorization 建 client，RLS 就會擋；真的要用 secret key，就自己比對訂單的 customer_id 與 token 的 sub。b 是最常見的誤會：認證不等於授權。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 6：咖啡店要做「每晚 2 點跟 POS 系統對帳：拉一整天的交易、逐筆比對、有差異就建工單並通知店長，POS 偶爾會逾時要重試」。放哪裡比較合適？</p>
+  <label data-key="a">前端：店長每天早上打開後台時觸發</label>
+  <label data-key="b">一個資料庫函式，用 pg_cron 每晚呼叫</label>
+  <label data-key="c">一個 Edge Function，用排程每晚呼叫一次</label>
+  <label data-key="d">自己的後端（例如 NestJS）的背景工作：排程、重試、可以跑比較久，Supabase 繼續管資料</label>
+  <p class="why">✓ 長時間、跨系統、要重試，是判斷表上「自己的後端」的典型訊號。c 是最多人會選的：Edge Function 有整體執行時間與 CPU 時間上限，失敗重試也要自己另外做。b 讓資料庫去呼叫外部 API，一筆逾時就拖住交易。a 依賴有人打開頁面，而且金鑰會到前端。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>前端連續發好幾個寫入當成一個流程</strong>：中間失敗會留下半套資料。要一起成功的寫入包成 RPC。</li>
+  <li><strong>RPC 收前端傳的價格</strong>：參數只收 id 與數量，價格在函式裡從資料庫讀。</li>
+  <li><strong>以為新函式跟新表一樣預設不公開</strong>：函式預設 PUBLIC 可以執行。每個函式都 <code>revoke execute … from public, anon</code> 再 grant 給需要的角色。</li>
+  <li><strong>security definer 函式沒自己檢查 <code>auth.uid()</code></strong>：RLS 不會替它擋，等於給了呼叫者擁有者的權限。</li>
+  <li><strong>Edge Function 一律用 secret key</strong>：繞過 RLS，任何人都能操作別人的資料。代替使用者做事時轉交呼叫者的 Authorization。</li>
+  <li><strong>金鑰寫死在程式碼或放進 <code>VITE_</code> 變數</strong>：放 secrets（本機 <code>supabase/functions/.env</code>，雲端 <code>supabase secrets set</code>），用 <code>Deno.env.get</code> 讀。</li>
+  <li><strong>webhook 的函式開著 <code>verify_jwt</code></strong>：對方沒有你的使用者 JWT，每次都 401。關掉之後一定要自己驗簽章。</li>
+  <li><strong>把長流程塞進 Edge Function</strong>：有執行時間與 CPU 上限，失敗也沒有重試。改放背景工作。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>邏輯可以放四個地方：Data API（單表、權限能寫成 RLS）→ RPC（多步驟寫入要一起成功、由資料庫算）→ Edge Function（外部 API、金鑰、webhook，短流程）→ 自己的後端（長流程、跨系統、排程與重試）。</li>
+  <li>RPC 是 <code>POST /rest/v1/rpc/&lt;函式&gt;</code>，一個請求一個交易；預設 security invoker，RLS 照套；definer 要照第 5 課的規則並自己檢查身分。</li>
+  <li>新函式預設 PUBLIC 可執行（不受 <code>auto_expose_new_tables</code> 影響）：每個函式都 revoke 再 grant。</li>
+  <li>Edge Function 跑在 Deno 上，<code>Deno.serve</code> 處理請求；預設驗 JWT；金鑰放 secrets；代替使用者做事時用呼叫者的 Authorization 建 client，secret key 只給真正的管理工作。有記憶體、CPU、執行時間上限。</li>
+  <li>trigger、pg_cron、pgmq、webhook 在 Supabase 都能用；複雜流程用混合架構，多一個服務的代價要算進去。</li>
+</ul>
+<p>下一課是期末專題：把前面的點餐功能整理成 migration、找出並修好權限漏洞，最後替咖啡店寫一份「要不要繼續用 Supabase」的決策紀錄。</p>
+
+<div class="callout">版本：Supabase CLI 3.1.0、PostgREST 16.5、Edge Runtime 1.78.1（Deno 2）。新函式的預設 EXECUTE 權限是 2026-11-20 在本機（PostgreSQL 17.11.0.018）實測；Edge Function 的預設環境變數、secrets 與上限照官方文件 guides/functions/secrets、guides/functions/limits（2026-11-20 查詢）。</div>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

@@ -1,0 +1,1451 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>13. Saga：跨服務的流程與補償</title>
+<link rel="stylesheet" href="../../style.css">
+<style>
+  .tl { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin: 1.2em 0; }
+  .tl table { width: 100%; }
+  .tl td { vertical-align: top; }
+  .tl tr.now td { background: var(--accent-soft); }
+  .tl tr.later { visibility: hidden; }
+  .tl .note { margin: 10px 0 0; min-height: 3.5em; }
+</style>
+</head>
+<body data-lesson="13">
+<header>
+  <div class="eyebrow">階段 3：可靠性：失敗是常態 · 第 13 課</div>
+  <h1>Saga：跨服務的流程與補償</h1>
+</header>
+<main>
+
+<p>咖啡店的下單流程原本在一個 NestJS 服務、一個 PostgreSQL 裡：建立訂單、扣庫存、記帳，一個交易全部包住，失敗就整個 ROLLBACK。現在庫存交給門市系統、扣款交給金流閘道、集點交給會員服務。王小明下單買一杯 110 元的拿鐵，錢包裡只有 100 元：訂單 #501 建好了、拿鐵也預留了，扣款卻因為餘額不足失敗。這時沒有 ROLLBACK 可以按，預留的拿鐵會一直卡著，別人買不到。</p>
+<p>這一課從頭到尾處理同一件事：讓訂單 #501 這種跨服務的下單，不管在哪一步失敗、協調的程式在哪一刻當機，最後都只會落在「全部完成」或「全部抵銷」其中一個結果，而且不會重複扣款、不會讓拿鐵一直卡著。學完之後，你能說出為什麼跨服務的流程不能用一個交易包住；能把下單拆成一連串步驟、替每一步設計<strong>補償</strong>，並排出正確的順序；能自己寫出依序執行、失敗時反向補償、當機後從紀錄續跑的協調者；也知道 saga 沒有隔離會出什麼事、逾時為什麼不能直接補償，以及什麼時候根本不需要 saga。</p>
+
+<div class="callout"><strong>第一輪只要記住：</strong>
+<ul>
+  <li>跨服務沒有 ROLLBACK 可以按。Saga 把流程拆成各自提交的步驟，失敗時對已完成的步驟做補償；補償是一筆新的交易，不是回滾。</li>
+  <li>不可逆的步驟（扣款）放在所有驗證之後；過了它，後面的步驟只能重試到成功。</li>
+  <li>協調者每一步都寫紀錄、帶冪等鍵。逾時代表結果未知，要先查清楚再決定補償；補不回來就標成 stuck，交給人處理。</li>
+  <li>全部在同一個資料庫時直接用交易，不需要 saga。</li>
+</ul></div>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>為什麼一個交易包不住，以及王小明的拿鐵怎麼還回去：把下單拆成步驟與補償、排出順序（開場問題的最小答案）。</li>
+  <li>誰照著步驟表執行：協調者怎麼依序執行、失敗時補償；它自己當機後，怎麼從紀錄續跑而不重複扣款。</li>
+  <li>能不能不要協調者：choreography 的做法與取捨。</li>
+  <li>付款處理中顧客按了取消：saga 沒有隔離時會出什麼事、怎麼擋。</li>
+  <li>扣款逾時、不知道成功還是失敗時怎麼辦；要自己寫還是用工具，什麼時候根本不需要 saga。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../postgresql/lessons/18-transactions.html">PostgreSQL 課第 18 課</a>的交易：同一個資料庫裡的修改全做或全不做，失敗就 ROLLBACK。</li>
+  <li><a href="08-timeouts-retries-backoff.html">第 8 課</a>的逾時與重試：逾時代表結果未知，重試要有上限和退避。</li>
+  <li><a href="09-idempotency.html">第 9 課</a>的冪等鍵：同一把鍵送很多次，對方只做一次。</li>
+  <li><a href="12-queues-outbox.html">第 12 課</a>的 outbox：要送出的命令和本地資料寫在同一個交易，不會只成功一半。</li>
+</ul></div>
+
+<h2>為什麼不能用一個交易包住整個下單？</h2>
+<p>先回想交易在單一資料庫裡是怎麼救你的。<a href="../../postgresql/lessons/18-transactions.html">PostgreSQL 課第 18 課</a>的 <code>BEGIN</code> 之後，建立訂單、扣庫存、記帳都還沒有真正生效；中途任何一句出錯，<code>ROLLBACK</code> 就把這些修改全部丟掉，就像什麼都沒發生。這件事做得到，是因為所有資料都在同一個資料庫裡：它自己保管著「還沒提交的修改」和「改之前的樣子」，要丟掉時不用問任何人。</p>
+<p>拆成多個服務之後，下單流程橫跨四個地方：</p>
+<ul>
+  <li>訂單服務的 PostgreSQL</li>
+  <li>門市庫存服務的資料庫（另一個團隊、另一台機器）</li>
+  <li>金流閘道（別家公司的 HTTP API）</li>
+  <li>會員服務（集點）</li>
+</ul>
+<p>訂單服務的 <code>BEGIN</code> 只管得到自己那條資料庫連線。門市系統預留拿鐵時，是在它自己的資料庫裡提交的；訂單服務就算 ROLLBACK，也碰不到那一筆。金流閘道更不用說，它是別家公司的系統，你只能呼叫它的 API。開場那杯卡住的拿鐵就是這樣來的：訂單服務知道扣款失敗了，但門市那邊的預留早就提交，沒有人去還。</p>
+<p>「讓分散在多個資料庫或服務上的修改，要嘛全部成功、要嘛全部失敗」這件事，叫做<strong>分散式交易（distributed transaction）</strong>。傳統的做法是<strong>兩階段提交（2PC，two-phase commit）</strong>：找一個協調者，第一階段先問每個參與者「你能提交嗎？」（prepare），每個參與者把要改的資料準備好、鎖住，回答「可以」；第二階段，協調者確認大家都說可以，才叫所有人一起提交，只要有一個說不行就叫所有人放棄。這樣確實能做到「全部或全無」，但放到咖啡店的下單流程裡，有三個問題：</p>
+<ul>
+  <li><strong>協調者卡住，大家一起卡住</strong>：參與者回了「可以」之後，就不能自己決定提交或放棄，只能鎖著資料等協調者下令。協調者當機十分鐘，拿鐵的庫存就鎖十分鐘，其他顧客也買不了。</li>
+  <li><strong>外部系統不支援</strong>：金流閘道只給你「扣款」和「退款」兩個 HTTP API，不會陪你做 prepare。</li>
+  <li><strong>延遲與耦合</strong>：每次下單都要等最慢的參與者兩輪往返，任何一個服務不在線，整個流程都不能做。</li>
+</ul>
+<p>既然做不到「像什麼都沒發生」，就換一個目標：接受每一步都各自提交，失敗時再用新的動作把已經生效的效果抵銷掉。這就是 <strong>saga</strong>：把一個大流程拆成一連串<strong>各自提交的本地交易</strong>，每一步在自己的服務裡用普通的交易完成（名稱的出處見課末「補充與查表」）。某一步失敗時，不是回滾（前面的早就提交了），而是對已完成的步驟執行<strong>補償交易（compensating transaction）</strong>，在語意上抵銷它們的效果。</p>
+<p>代價是一致性變成<a href="06-replication-consistency.html">第 6 課</a>的<strong>最終一致</strong>：中間會有一段時間，系統處在「訂單已建立、還沒付款」這種半完成的狀態，別人也看得到；但最後會走到「全部完成」或「全部抵銷」其中一個。真的走不下去時，停下來交給人處理，後面會講。</p>
+<p>回到王小明：他的拿鐵要靠「補償」還回去。但補償具體是什麼、每一步的補償長什麼樣子、哪一步該先做，要先把整個下單流程攤開來看。</p>
+
+<h2>王小明的拿鐵怎麼還回去？把下單拆成步驟與補償</h2>
+<p>設計 saga 的第一步，是把流程列成一張表：每一步做什麼、做完之後要怎麼抵銷。先看前兩步。建立訂單的補償是「把訂單改成 <code>cancelled</code>」；預留拿鐵的補償是「釋放預留」。訂單 #501 在扣款失敗時，只要把這兩個補償執行一次，拿鐵就回到架上，訂單也標成取消，這就是開場問題的最小答案。</p>
+<div class="callout warn"><strong>補償不是回滾。</strong>ROLLBACK 讓資料庫像什麼都沒發生；補償是一筆<em>新的</em>本地交易，在語意上抵銷前面的效果。退款不會讓扣款消失，帳上會有兩筆；釋放庫存時，中間可能已經有別人改過庫存。所以補償通常寫成「加回 1 杯」，而不是「把庫存改回原來的 3 杯」。</div>
+<p>接著往下列，會發現不是每一步都能這樣乾淨地抵銷。扣款的「補償」是退款：會產生一筆新的金流紀錄、可能有手續費，顧客的帳單上還會出現「扣了又退」。廚房出單更麻煩：咖啡做出來就收不回來，根本沒有補償。所以每一步除了寫補償，還要標出它屬於哪一種。Azure Architecture Center 的 Saga 模式文件把步驟分成三種：</p>
+<ul>
+  <li><strong>可補償的交易（compensable）</strong>：之後還能被補償抵銷，例如預留庫存（補償是釋放）。</li>
+  <li><strong>pivot 交易</strong>：不可回頭的點。它成功之後，前面的補償都用不到了，只能往前把流程做完。</li>
+  <li><strong>可重試的交易（retryable）</strong>：pivot 之後的步驟。必須<a href="09-idempotency.html">冪等</a>，暫時失敗就重試，最後一定要成功。</li>
+</ul>
+<p>把咖啡店的下單照這三種排好：</p>
+<div class="table-wrap"><table>
+  <tr><th>順序</th><th>步驟</th><th>動作</th><th>補償</th><th>類型</th></tr>
+  <tr><td>1</td><td><code>createOrder</code></td><td>訂單服務建立訂單，狀態 <code>pending_payment</code></td><td>把訂單改成 <code>cancelled</code></td><td>可補償</td></tr>
+  <tr><td>2</td><td><code>reserveStock</code></td><td>門市預留拿鐵 1 杯</td><td>釋放預留</td><td>可補償</td></tr>
+  <tr><td>3</td><td><code>capturePayment</code></td><td>金流扣款 110 元</td><td>（不補償，見下面說明）</td><td><strong>pivot</strong></td></tr>
+  <tr><td>4</td><td><code>confirmOrder</code></td><td>訂單改成 <code>paid</code></td><td>—</td><td>可重試</td></tr>
+  <tr><td>5</td><td><code>sendKitchenTicket</code></td><td>廚房出單、開始做咖啡</td><td>—</td><td>可重試</td></tr>
+  <tr><td>6</td><td><code>awardStamps</code></td><td>會員集點 +1</td><td>—</td><td>可重試</td></tr>
+</table></div>
+<p>這個順序有三個理由，每一個都是「如果不這樣排會出什麼事」。</p>
+<p>第一，<strong>扣款放在所有驗證之後</strong>。如果先扣款再預留庫存，拿鐵賣完時就得退款，退款的成本和顧客觀感前面說過了。先把能失敗、又便宜抵銷的步驟（建訂單、預留庫存）做完，確定拿鐵真的有，最後才動錢。原則是：不可逆或代價高的步驟，要等所有關鍵驗證都成功之後才做。</p>
+<p>第二，<strong>扣款是 pivot</strong>。嚴格說退款也算一種補償，但成本高、顧客看得到，所以這裡的設計選擇是「扣款成功就不回頭」。pivot 選在哪裡是業務決定，不是技術限制：另一家店也可以決定扣款後仍可退款取消，那 pivot 就往後移。</p>
+<p>第三，<strong>出廚房單一定要在 pivot 之後</strong>。它沒有補償，放在 pivot 之前的話，萬一後面扣款失敗，咖啡已經做了、錢卻沒收到。放在之後，它就變成可重試的步驟：廚房系統暫時當機，就重試到成功並告警，而不是退款。</p>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="下單 saga 分成三區：pivot 之前是可補償的建立訂單與預留庫存，中間是扣款 pivot，之後是可重試的確認訂單、出廚房單、集點；失敗時 pivot 之前的步驟反向補償，pivot 之後只能重試">
+    <defs><marker id="s13a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="10" y="20" width="230" height="160" rx="8"/>
+    <rect class="d-soft" x="260" y="20" width="140" height="160" rx="8"/>
+    <rect class="d-soft" x="420" y="20" width="270" height="160" rx="8"/>
+    <text class="d-accent" x="125" y="42" text-anchor="middle">可補償</text>
+    <text class="d-accent" x="330" y="42" text-anchor="middle">pivot</text>
+    <text class="d-accent" x="555" y="42" text-anchor="middle">可重試</text>
+    <rect class="d-box" x="20" y="60" width="95" height="44" rx="6"/>
+    <text class="d-small" x="67" y="87" text-anchor="middle">建立訂單</text>
+    <rect class="d-box" x="135" y="60" width="95" height="44" rx="6"/>
+    <text class="d-small" x="182" y="87" text-anchor="middle">預留庫存</text>
+    <rect class="d-box" x="275" y="60" width="110" height="44" rx="6"/>
+    <text class="d-small" x="330" y="87" text-anchor="middle">扣款</text>
+    <rect class="d-box" x="430" y="60" width="80" height="44" rx="6"/>
+    <text class="d-small" x="470" y="87" text-anchor="middle">確認訂單</text>
+    <rect class="d-box" x="518" y="60" width="80" height="44" rx="6"/>
+    <text class="d-small" x="558" y="87" text-anchor="middle">廚房出單</text>
+    <rect class="d-box" x="606" y="60" width="78" height="44" rx="6"/>
+    <text class="d-small" x="645" y="87" text-anchor="middle">集點</text>
+    <path class="d-line" d="M115,82 L131,82" marker-end="url(#s13a)"/>
+    <path class="d-line" d="M230,82 L271,82" marker-end="url(#s13a)"/>
+    <path class="d-line" d="M385,82 L426,82" marker-end="url(#s13a)"/>
+    <path class="d-line" d="M510,82 L514,82" marker-end="url(#s13a)"/>
+    <path class="d-line" d="M598,82 L602,82" marker-end="url(#s13a)"/>
+    <path class="d-line" d="M300,110 C280,150 220,150 182,110" marker-end="url(#s13a)"/>
+    <path class="d-line" d="M175,110 C150,150 95,150 67,110" marker-end="url(#s13a)"/>
+    <text class="d-small" x="125" y="168" text-anchor="middle">扣款失敗 → 反向補償</text>
+    <text class="d-small" x="555" y="130" text-anchor="middle">失敗 → 重試到成功、告警</text>
+    <text class="d-small" x="555" y="150" text-anchor="middle">（不退款）</text>
+    <text class="d-text" x="350" y="220" text-anchor="middle">pivot 成功之前可以全部抵銷；成功之後只能往前走完</text>
+  </svg>
+  <figcaption>三種步驟的位置：可補償的在前、pivot 一個、可重試的在後。</figcaption>
+</figure>
+<p>圖上的箭頭也說明了失敗時的方向：pivot 之前的步驟失敗，就從最後完成的一步<strong>往回</strong>補償，先釋放庫存、再取消訂單。反向的好處是，每個補償執行時，它之後做的事都已經抵銷了，狀態跟它當初剛做完時一樣，比較不會出乎意料。這不是唯一的做法（彼此無關的補償也可以平行做，見課末），但這一課的練習都用最常見、最安全的反向依序補償。</p>
+<div class="callout practice"><strong>💡 實務上：步驟表要先跟 PM、財務對過，再開始寫程式</strong><br>像上面這張步驟與補償表，在團隊裡通常出現在設計文件裡，而不是寫完程式才補。pivot 放在哪、退款誰負責、手續費誰吸收、出了餐的單能不能取消，這些都是業務問題，工程師要拿著表去問 PM 和財務，而不是自己決定。常見的坑是只想「成功的路徑」：每一列都要問「這步失敗怎麼辦？補償失敗又怎麼辦？顧客這時看到什麼？」。外送平台、訂票、電商結帳都是同樣的結構：先保留名額或庫存，最後才扣款。</div>
+<p>表排好了，但表不會自己動。接下來要有一段程式照著它執行：依序呼叫每一步、記住哪些做完了、失敗時倒著補償。</p>
+
+<h2>誰照著步驟表執行？協調者依序執行與補償</h2>
+<p>最直接的做法是 <strong>orchestration</strong>：由一個<strong>協調者（orchestrator）</strong>拿著步驟表，依序告訴各服務該做什麼，並且記住做到哪裡。協調者不是新的服務類型，它通常就是訂單服務裡的一段程式，或一個獨立的小服務。</p>
+<p>先寫出最小的協調者，重現開場的訂單 #501：王小明的錢包只有 100 元，拿鐵 110 元，扣款會失敗。執行後看補償的順序：</p>
+<div class="lab"><script type="code">
+type Step = { name: string; action: () => Promise<void>; compensate: () => Promise<void> }
+
+let latteStock = 3
+const walletOfXiaoming = 100
+
+const steps: Step[] = [
+  {
+    name: 'createOrder',
+    action: async () => console.log('建立訂單 #501（pending_payment）'),
+    compensate: async () => console.log('補償：訂單 #501 改成 cancelled'),
+  },
+  {
+    name: 'reserveStock',
+    action: async () => { latteStock -= 1; console.log('預留拿鐵 1 杯，剩', latteStock) },
+    compensate: async () => { latteStock += 1; console.log('補償：釋放拿鐵 1 杯，剩', latteStock) },
+  },
+  {
+    name: 'capturePayment',
+    action: async () => { if (walletOfXiaoming < 110) throw new Error('餘額不足') },
+    compensate: async () => console.log('（不會被呼叫：失敗的這一步沒有完成，沒東西可抵銷）'),
+  },
+]
+
+const done: Step[] = []
+for (const step of steps) {
+  try {
+    await step.action()
+    done.push(step)
+  } catch (e) {
+    console.log(`${step.name} 失敗：${(e as Error).message}，開始補償`)
+    for (const d of [...done].reverse()) await d.compensate()
+    break
+  }
+}
+</script></div>
+<p>輸出裡有兩件事對應前一節的規則：失敗的 <code>capturePayment</code> 本身不補償，因為它的本地交易沒有成功（或已經被它自己的資料庫回滾），沒有東西可以抵銷；補償從最後完成的一步往回做，先釋放拿鐵、再取消訂單。</p>
+<p>這個迴圈只要一失敗就補償，放到正式環境還差兩件事。</p>
+<p>第一件，<strong>先重試，再補償</strong>。失敗有兩種：一種是<strong>暫時性錯誤</strong>，例如網路抖一下、對方回 503，等一下再試很可能就成功；另一種是<strong>業務失敗</strong>，例如餘額不足、庫存不夠，再試幾次結果都一樣。如果門市系統只是回了一次 503，協調者就把整張訂單取消，等於把一個小晃動放大成顧客下單失敗。所以暫時性錯誤先照<a href="08-timeouts-retries-backoff.html">第 8 課</a>的退避重試；重試用盡，或確定是業務失敗，才開始補償。補償是最後手段，不是第一反應。</p>
+<p>第二件，<strong>補償本身也會失敗</strong>。釋放庫存時，門市系統可能剛好當機。這時先重試幾次；仍失敗就把 saga 標成 <code>stuck</code>、告警、停下來。不要繼續補償更早的步驟：這一步到底釋放了沒有已經不確定，再往前做只會讓狀態更難收拾。也不要無限重試，對方本來就有問題，一直打只會把它打得更爛。</p>
+<p>把這兩件事加進去，協調者就是一個有固定幾種狀態的狀態機（<a href="../../typescript/lessons/27-modeling-state-errors.html">TypeScript 課第 27 課</a>用型別描述狀態機；<a href="../../nestjs/lessons/18-layering-domain.html">NestJS 課第 18 課</a>寫過訂單的狀態機）：</p>
+<figure>
+  <svg viewBox="0 0 700 220" role="img" aria-label="saga 的狀態機：running 一路成功到 completed；某步失敗進入 compensating，補償全部成功到 compensated，補償用盡重試仍失敗到 stuck 交給人">
+    <defs><marker id="s13b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="20" y="80" width="120" height="50" rx="25"/>
+    <text class="d-text" x="80" y="110" text-anchor="middle">running</text>
+    <rect class="d-soft" x="280" y="20" width="140" height="50" rx="25"/>
+    <text class="d-text" x="350" y="50" text-anchor="middle">completed</text>
+    <rect class="d-box" x="280" y="140" width="140" height="50" rx="25"/>
+    <text class="d-text" x="350" y="170" text-anchor="middle">compensating</text>
+    <rect class="d-soft" x="540" y="100" width="140" height="50" rx="25"/>
+    <text class="d-text" x="610" y="130" text-anchor="middle">compensated</text>
+    <rect class="d-soft" x="540" y="165" width="140" height="50" rx="25"/>
+    <text class="d-text" x="610" y="195" text-anchor="middle">stuck</text>
+    <path class="d-line" d="M140,95 L276,50" marker-end="url(#s13b)"/>
+    <text class="d-small" x="195" y="60" text-anchor="middle">每一步都成功</text>
+    <path class="d-line" d="M140,115 L276,160" marker-end="url(#s13b)"/>
+    <text class="d-small" x="190" y="160" text-anchor="middle">某一步失敗</text>
+    <path class="d-line" d="M420,160 L536,128" marker-end="url(#s13b)"/>
+    <text class="d-small" x="478" y="130" text-anchor="middle">補償都成功</text>
+    <path class="d-line" d="M420,172 L536,188" marker-end="url(#s13b)"/>
+    <text class="d-small" x="478" y="205" text-anchor="middle">重試用盡</text>
+    <path class="d-line" d="M80,80 C80,30 60,30 50,78" marker-end="url(#s13b)"/>
+    <text class="d-small" x="40" y="30">下一步</text>
+  </svg>
+  <figcaption>stuck 不是失敗的終點，而是「交給人處理」的訊號：要告警。</figcaption>
+</figure>
+<p><code>running</code> 時一步一步往前；每一步都成功就到 <code>completed</code>。某一步確定失敗就進入 <code>compensating</code>，補償全部成功到 <code>compensated</code>，訂單 #501 就是走這條路；某個補償重試用盡則停在 <code>stuck</code>，等人來處理。練習 1 會把上面的迴圈補成這個狀態機：寫紀錄、補償的重試上限、stuck。</p>
+<p>但這個協調者還有一個致命的假設：它把「做完了哪些步驟」放在記憶體裡的 <code>done</code> 陣列。協調者本身也是一個會當機的程序，它一停，陣列就沒了。</p>
+
+<h2>協調者當機了，怎麼不重做也不漏做？</h2>
+<p>部署新版本、記憶體不足、機器被雲端回收，都可能讓協調者停在流程中間。重啟後如果從頭再跑一次，已經扣款的顧客就會被扣兩次；如果什麼都不做，預留的庫存就一直卡著。協調者需要一份當機也不會消失的進度：<strong>saga 紀錄</strong>。</p>
+<p>saga 紀錄就是資料庫裡的一張表，例如 <code>saga_steps</code>，每完成一步、每補償一步，就寫一筆，例如「saga #502 的 reserveStock 已 done」。協調者啟動時先讀這張表，就知道每個 saga 做到哪裡，從中斷的地方繼續。王小明的 #501 補償一路順利，協調者沒有在中途停下；要看當機時怎麼辦，換一張補償做到一半、協調者剛好被重新部署的訂單：陳美華買卡布奇諾的訂單 #502。</p>
+<div class="tl">
+  <div class="table-wrap"><table>
+    <tr><th>步驟</th><th>協調者</th><th>saga 紀錄（#502）</th><th>外部效果</th></tr>
+    <tr data-note="陳美華下單買卡布奇諾。協調者執行 createOrder 成功，寫下 done。"><td>1</td><td>createOrder</td><td>createOrder: done</td><td>訂單 #502 pending_payment</td></tr>
+    <tr data-note="reserveStock 成功，寫下 done。"><td>2</td><td>reserveStock</td><td>reserveStock: done</td><td>卡布奇諾預留 1 杯</td></tr>
+    <tr data-note="capturePayment 失敗：信用卡被拒，這是業務失敗，不重試。寫下 failed，開始補償。"><td>3</td><td>capturePayment ✗</td><td>capturePayment: failed</td><td>沒有扣款</td></tr>
+    <tr data-note="反向補償：先釋放庫存，成功後寫下 compensated。"><td>4</td><td>補償 reserveStock</td><td>reserveStock: compensated</td><td>卡布奇諾釋放</td></tr>
+    <tr data-note="就在要補償 createOrder 之前，協調者的容器被重新部署，程序結束。訂單還停在 pending_payment。"><td>5</td><td><strong>當機</strong></td><td></td><td>訂單 #502 還是 pending_payment</td></tr>
+    <tr data-note="新的協調者啟動，讀到 #502 的紀錄：有 failed，所以這個 saga 在補償中。reserveStock 已經 compensated，不能再釋放一次（否則庫存憑空多 1 杯）；createOrder 是 done 但還沒 compensated，要補償它。"><td>6</td><td>讀紀錄、續跑</td><td>（同上，共 4 筆）</td><td></td></tr>
+    <tr data-note="只補償剩下的 createOrder，寫下 compensated，saga 結束在 compensated。整個過程中，每個動作和每個補償都只生效一次。"><td>7</td><td>補償 createOrder</td><td>createOrder: compensated</td><td>訂單 #502 cancelled</td></tr>
+  </table></div>
+  <div class="bar"><button data-prev>◀ 上一步</button><button class="primary" data-next>下一步 ▶</button><span class="kbd" data-count></span></div>
+  <p class="note"></p>
+</div>
+<p>紀錄解決了「做到哪裡」，但還有一個它救不了的縫隙：<strong>動作成功了、還沒寫紀錄就當機</strong>。重啟後紀錄說這一步沒做，協調者只能再呼叫一次。這時要靠<a href="09-idempotency.html">第 9 課</a>的冪等鍵：每一步都用 <code>saga:&lt;sagaId&gt;:&lt;步驟&gt;</code> 當鍵傳給對方，例如 <code>saga:502:reserveStock</code>。門市系統看到同一把鍵的重複請求，就回傳上次的結果，不會預留兩杯；金流收到重複的 <code>saga:501:capturePayment</code>，也只會扣一次款。補償也一樣要帶自己的冪等鍵，否則重做一次補償就會退兩次款。</p>
+<p>紀錄負責「做到哪裡」，冪等負責「重做也沒關係」，兩者缺一不可。把協調者可能當機的時間點整理成一張表：</p>
+<div class="table-wrap"><table>
+  <tr><th>協調者在哪裡當機</th><th>重啟後讀到的紀錄</th><th>怎麼續跑</th></tr>
+  <tr><td>呼叫某一步之前</td><td>這一步沒有紀錄</td><td>照常執行這一步</td></tr>
+  <tr><td>動作成功、還沒寫紀錄</td><td>這一步沒有紀錄</td><td>再呼叫一次；對方靠冪等鍵認出重複，回傳上次的結果</td></tr>
+  <tr><td>寫完 done、還沒呼叫下一步</td><td>這一步 done</td><td>從下一步繼續</td></tr>
+  <tr><td>補償到一半（上面的時間軸）</td><td>有一步 failed，部分步驟已 compensated</td><td>只補償 done 但還沒 compensated 的步驟</td></tr>
+</table></div>
+<p>還剩最後一個縫隙。實際的系統裡，協調者常常不是直接呼叫門市系統，而是寫一筆紀錄、再送出一則「請預留庫存」的命令到佇列。這就是<a href="12-queues-outbox.html">第 12 課</a>的雙寫問題：紀錄寫好了、命令還沒送出就當機，命令就永遠不會送出。解法也一樣：把命令和 saga 紀錄寫在同一個本地交易的 outbox 裡，由 relay 送出。</p>
+<p>練習 2 會寫出續跑的邏輯。</p>
+<p>到這裡，整個流程都寫在協調者這一個地方，協調者自己也要部署、監控、保管紀錄。很自然會有人問：能不能不要這個中央元件，讓各服務自己接力完成？</p>
+
+<h2>能不能不要協調者？Choreography 的取捨</h2>
+<p>不要中央協調者的做法叫 <strong>choreography</strong>（編舞）：每個服務訂閱別人發出的事件，做完自己的事再發出新的事件，像舞者聽音樂各自起舞，沒有人在台上指揮：</p>
+<figure>
+  <svg viewBox="0 0 700 230" role="img" aria-label="上方是 orchestration：協調者分別對訂單、庫存、金流下命令；下方是 choreography：訂單服務發 OrderCreated，庫存服務聽到後發 StockReserved，金流服務聽到後發 PaymentCaptured">
+    <defs><marker id="s13c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <text class="d-accent" x="20" y="24">orchestration</text>
+    <rect class="d-soft" x="20" y="36" width="130" height="44" rx="6"/>
+    <text class="d-text" x="85" y="63" text-anchor="middle">協調者</text>
+    <rect class="d-box" x="260" y="36" width="110" height="44" rx="6"/>
+    <text class="d-small" x="315" y="63" text-anchor="middle">訂單服務</text>
+    <rect class="d-box" x="400" y="36" width="110" height="44" rx="6"/>
+    <text class="d-small" x="455" y="63" text-anchor="middle">庫存服務</text>
+    <rect class="d-box" x="540" y="36" width="110" height="44" rx="6"/>
+    <text class="d-small" x="595" y="63" text-anchor="middle">金流服務</text>
+    <path class="d-line" d="M150,52 L256,52" marker-end="url(#s13c)"/>
+    <path class="d-line" d="M150,66 C250,100 380,100 450,84" marker-end="url(#s13c)"/>
+    <path class="d-line" d="M150,74 C260,120 500,120 590,84" marker-end="url(#s13c)"/>
+    <text class="d-small" x="200" y="46" text-anchor="middle">命令</text>
+    <text class="d-accent" x="20" y="150">choreography</text>
+    <rect class="d-box" x="20" y="162" width="110" height="44" rx="6"/>
+    <text class="d-small" x="75" y="189" text-anchor="middle">訂單服務</text>
+    <rect class="d-box" x="275" y="162" width="110" height="44" rx="6"/>
+    <text class="d-small" x="330" y="189" text-anchor="middle">庫存服務</text>
+    <rect class="d-box" x="530" y="162" width="110" height="44" rx="6"/>
+    <text class="d-small" x="585" y="189" text-anchor="middle">金流服務</text>
+    <path class="d-line" d="M130,184 L271,184" marker-end="url(#s13c)"/>
+    <text class="d-small" x="200" y="176" text-anchor="middle">OrderCreated</text>
+    <path class="d-line" d="M385,184 L526,184" marker-end="url(#s13c)"/>
+    <text class="d-small" x="455" y="176" text-anchor="middle">StockReserved</text>
+    <text class="d-small" x="585" y="224" text-anchor="middle">→ PaymentCaptured …</text>
+  </svg>
+  <figcaption>orchestration 把流程寫在一個地方；choreography 把流程分散在每個服務的訂閱裡。</figcaption>
+</figure>
+<p>下單成功時，訂單服務發出 <code>OrderCreated</code>，庫存服務聽到後預留拿鐵並發出 <code>StockReserved</code>，金流服務聽到後扣款並發出 <code>PaymentCaptured</code>。失敗時也一樣靠事件：金流發出 <code>PaymentFailed</code>，庫存服務聽到就釋放、訂單服務聽到就取消。補償還是那幾個補償，只是「誰決定該補償」從協調者分散到了每個服務。</p>
+<p>Azure 的 Saga 文件整理了兩者的取捨：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Orchestration</th><th>Choreography</th></tr>
+  <tr><td>流程寫在哪裡</td><td>協調者的一份程式</td><td>分散在每個服務訂閱了哪些事件</td></tr>
+  <tr><td>新增步驟</td><td>改協調者</td><td>要追出誰聽誰，容易漏</td></tr>
+  <tr><td>互相依賴成環</td><td>由協調者控制，不容易出現</td><td>服務彼此訂閱，可能繞成一個環</td></tr>
+  <tr><td>測試</td><td>可以只測協調者（假的參與者）</td><td>整合測試要把所有服務都跑起來</td></tr>
+  <tr><td>單點</td><td>協調者是一個要顧好的元件</td><td>沒有額外元件</td></tr>
+  <tr><td>適合</td><td>步驟多、有補償、流程會改</td><td>步驟少、參與者少的簡單流程</td></tr>
+</table></div>
+<p>「少一個元件」不等於簡單。步驟一多，choreography 的流程只存在於各服務的程式碼裡，沒有人說得出「訂單 #503 現在卡在哪一步」，也沒有一份 saga 紀錄可以讀。實務上常混用：下單這種有補償的核心流程用 orchestration；「訂單完成後寄收據、更新推薦」這種互不相干的後續反應用事件（<a href="16-events-webhooks.html">第 16 課</a>）。</p>
+<p>不管選哪一種，saga 都少了一個交易原本免費提供的保護。前面一直說「中間狀態別人也看得到」，下一節就看看別人真的看到時會發生什麼事。</p>
+
+<h2>付款處理中，顧客按了取消：saga 沒有隔離會出什麼事？</h2>
+<p>#502 已經取消了。陳美華隔天又下了一張訂單 #504，這次正在扣款，狀態還是 <code>pending_payment</code>，她在 App 上按了「取消訂單」。如果取消的 API 直接把訂單改成 <code>cancelled</code>，接下來 saga 的扣款成功、<code>confirmOrder</code> 又把訂單改回 <code>paid</code>：陳美華以為取消了，卻被扣了款。或者反過來，訂單停在 <code>cancelled</code>，錢卻已經扣走。</p>
+<p>在單一資料庫的交易裡，這種事不會發生，因為 ACID 裡的 I 是<strong>隔離（isolation）</strong>：別的交易看不到你還沒提交的中間狀態，也不能跟你同時改同一筆資料而互相蓋掉。Saga 的每一步都是各自提交的，所以<strong>中間狀態對所有人都看得到</strong>，別的請求、別的 saga、報表都可能在流程走完前讀到或改到它。Azure 的文件列出三種因此出現的異常：</p>
+<ul>
+  <li><strong>lost update</strong>：一個 saga 沒考慮另一個 saga 的修改就覆蓋了它。上面的取消就是一例：取消請求寫的 <code>cancelled</code> 被 saga 的 <code>paid</code> 蓋掉。</li>
+  <li><strong>dirty read</strong>：讀到另一個 saga 還沒走完的修改。例如報表把「已預留、但最後因付款失敗被釋放」的拿鐵算成賣出。</li>
+  <li><strong>fuzzy read（不可重複讀）</strong>：同一個 saga 的兩步讀到不同的值，因為中間有人改了。例如 <code>reserveStock</code> 時讀到訂單金額 110 元，扣款前店家改了價格或顧客套用了折扣，<code>capturePayment</code> 讀到的是另一個金額，就會扣錯錢。下面對策表裡的「重新讀取」就是擋這種情況。</li>
+</ul>
+<p>lost update 最容易在庫存這種數字上出現，因為預留和補償都會改它。兩個 saga 同時處理拿鐵，比較兩種寫法：第一種是「讀出來、算好、整個寫回去」，第二種是只送「增減多少」。執行後看兩個最後的庫存數字：</p>
+<div class="lab"><script type="code">
+// 寫法一：讀出值、算好、整個設回去
+let stock = 3
+const readByA = stock          // saga A（王小明）讀到 3
+const readByB = stock          // saga B（陳美華）也讀到 3
+stock = readByA - 1            // A 預留 → 2
+stock = readByB - 1            // B 預留 → 2，覆蓋了 A 的修改
+console.log('設成某個值：', stock, '（兩杯被預留，應該是 1）')
+
+// 寫法二：交換律更新，只送「增減多少」
+let stock2 = 3
+stock2 += -1                   // A 預留
+stock2 += -1                   // B 預留
+stock2 += 1                    // A 付款失敗，補償：釋放
+console.log('只送增減：', stock2, '（B 的 1 杯還在預留中，正確）')
+</script></div>
+<p>第一種寫法裡，B 寫回的 2 是根據它讀到的舊值算的，A 的那一筆就這樣消失了。第二種寫法不管 A、B 和補償以什麼順序套用，結果都一樣。補償也是同一個道理：如果 A 失敗後的補償寫成「把庫存改回 3 杯」，一樣會蓋掉 B 的預留；寫成「加回 1 杯」才不會。這就是前面要求補償寫成「加回」的原因。</p>
+<p>沒有隔離不代表只能放著不管。Azure 整理了幾種對策，各自擋住不同的情況：</p>
+<div class="table-wrap"><table>
+  <tr><th>對策</th><th>做法</th><th>咖啡店的例子</th></tr>
+  <tr><td><strong>semantic lock</strong></td><td>用應用層的狀態標示「這筆正在進行中」，其他操作看到就擋下或排隊</td><td>訂單在 <code>pending_payment</code> 時不接受修改；App 顯示「付款處理中」</td></tr>
+  <tr><td><strong>交換律更新</strong>（commutative update）</td><td>更新設計成任何順序套用結果都一樣</td><td><code>UPDATE stock SET qty = qty - 1</code>，不是 <code>SET qty = 2</code></td></tr>
+  <tr><td><strong>pessimistic view</strong></td><td>調整順序，把會被別人讀的更新放到 pivot 之後的可重試步驟</td><td>集點在扣款之後才加，就不會有人看到「加了又扣回」的點數</td></tr>
+  <tr><td><strong>重新讀取</strong>（reread values）</td><td>更新前再確認資料沒變，變了就停下或重來</td><td>扣款前再讀一次訂單金額，跟預留時的一致才扣</td></tr>
+  <tr><td><strong>version file</strong></td><td>記錄對某筆資料的所有操作，依正確順序套用</td><td>庫存異動記成一筆筆紀錄，而不是只存一個數字</td></tr>
+</table></div>
+<p>回到陳美華 #504 的取消。正確的做法是 semantic lock：<code>pending_payment</code> 本身就是一把用狀態做的鎖，告訴其他操作「這筆正在進行中」。這段期間取消按鈕回「付款處理中，請稍候」，或把取消請求記下來，等 saga 走到終點再處理：已經扣款成功，就走退款流程；扣款失敗，saga 自己就會取消訂單。</p>
+<div class="callout practice"><strong>💡 實務上：中間狀態要讓畫面和報表都知道</strong><br>身為前端，你最先碰到的就是 <code>pending_payment</code> 這類中間狀態：App 要顯示「付款處理中」並停用取消、修改按鈕，而不是顯示成功或失敗，也不要讓使用者狂按重送。後台和報表也一樣，營收、熱銷排行只該算 <code>paid</code> 之後的訂單，不然會把最後被釋放的預留算成賣出。資深工程師在設計 saga 時，會把每個中間狀態列成表，逐一問「顧客看到什麼？客服看到什麼？報表算不算？」。庫存、點數、餘額這類數字，在 code review 時看到「讀出來再整個寫回去」就該提出來。</div>
+<p>到目前為止，我們都假設每一步會清楚回答「成功」或「失敗」，協調者再決定往前走或補償。最麻煩的情況是，對方什麼都沒說。</p>
+
+<h2>扣款逾時：不知道成功還是失敗時怎麼辦？</h2>
+<p>最危險的情況不是「失敗」，而是<strong>不知道成功還是失敗</strong>。<a href="08-timeouts-retries-backoff.html">第 8 課</a>說過，逾時代表<strong>結果未知</strong>：扣款請求逾時，可能是請求沒送到，也可能是對方已經扣款、只是回應在路上掉了。這時如果直接當成失敗、開始補償（取消訂單、釋放庫存），王小明的錢被扣了、訂單卻取消了。</p>
+<p>下面用一個假的金流閘道重現：第一次請求對方真的扣了，但回應掉了。接著比較兩種重試：用同一把冪等鍵，和換一把新鍵。執行後看每次印出的扣款筆數：</p>
+<div class="lab"><script type="code">
+// 假的金流閘道：同一把冪等鍵只扣一次
+const charges = new Map<string, number>()
+
+async function charge(idempotencyKey: string, amount: number, loseResponse: boolean) {
+  if (!charges.has(idempotencyKey)) charges.set(idempotencyKey, amount)   // 對方真的扣了
+  if (loseResponse) throw new Error('逾時')                                // 但回應掉了
+  return { chargeId: 'ch_' + idempotencyKey, amount: charges.get(idempotencyKey) }
+}
+
+// 第一次：逾時
+try { await charge('saga:501:capturePayment', 110, true) } catch (e) { console.log('第一次：', (e as Error).message) }
+console.log('對方其實已經扣了幾筆：', charges.size)
+
+// 正確：用同一把鍵重試，拿到第一次的結果
+console.log('同一把鍵重試：', await charge('saga:501:capturePayment', 110, false))
+console.log('總共扣款筆數：', charges.size)
+
+// 錯誤：換一把新鍵重試
+await charge('saga:501:capturePayment:retry', 110, false)
+console.log('換新鍵重試後的扣款筆數：', charges.size, '← 重複扣款')
+</script></div>
+<p>同一把鍵重試，金流認出這是同一筆，回傳第一次的結果，扣款仍是一筆；換新鍵，金流把它當成新的扣款，王小明被扣了兩次。所以逾時的處理順序是：<strong>用同一把冪等鍵重試或查詢</strong>，確定結果之後才決定往前走還是補償。重試用盡仍不知道結果，就標成 stuck 交給人，不要猜。</p>
+<p>即使每一步都照這課寫對了，協調者的 bug、有人手動改資料、金流那邊的異常，還是可能讓「金流的扣款紀錄」和「訂單狀態」對不起來，而且 saga 本身不會發現，因為它以為自己做完了。所以資深工程師會在 saga 外面再加一層保險：<strong>對帳（reconciliation）</strong>，也就是定期拿兩邊各自的紀錄逐筆比對。例如每天把金流閘道的交易明細下載下來，跟訂單比對：</p>
+<ul>
+  <li>金流有扣款、訂單是 <code>cancelled</code> → 漏了退款或確認</li>
+  <li>訂單是 <code>paid</code>、金流沒有這筆 → 不該出餐</li>
+  <li>saga 停在 <code>stuck</code> 超過一小時 → 告警沒人處理</li>
+</ul>
+<p>最後一項提醒了一件事：stuck 不是終點，而是交給人的開始。Azure 的補償交易文件也把「交給人工處理」列為正式的一環：stuck 的 saga 要進到一個有人看的地方（死信佇列、後台的待處理清單），附上 saga 紀錄，讓客服或工程師能決定手動退款還是手動補完。</p>
+<div class="callout practice"><strong>💡 實務上：stuck 清單是給客服用的，不是只給工程師看</strong><br>顧客打電話說「被扣款卻沒拿到咖啡」，客服第一個要查的就是這張清單。所以後台要讓非工程師看得懂：訂單編號、顧客、卡在哪一步、金流那邊的狀態，以及「手動退款」「標記已處理」這類按鈕，而且每次手動操作都要留下誰、什麼時候、做了什麼。對帳差異也要有負責人：通常是工程師和財務一起看，先約定誰每天看報表、多久內要處理。上線前，資深工程師會先問：「金流逾時、協調者當機、補償失敗時，各會出現在哪裡？誰會被通知？」答不出來，就還沒準備好上線。</div>
+<p>回頭數一數，協調者要處理的事已經很多：紀錄、續跑、冪等鍵、重試、逾時、stuck、告警、對帳。這引出最後兩個問題：這些要自己寫嗎？以及，這張訂單真的需要 saga 嗎？</p>
+
+<h2>要自己寫協調者嗎？什麼時候根本不需要 saga？</h2>
+<p>自己寫協調者，要處理的就是上一段列的那些重複工作。這些工作有現成的工具：</p>
+<ul>
+  <li><strong>Temporal</strong>：一種 <strong>durable execution</strong> 引擎，意思是「程式執行到哪裡會被持久保存，當機後能接著執行」。你用普通的 TypeScript 寫流程（workflow），每個外部呼叫是一個 activity；Temporal 伺服器把每一步的結果記在事件歷史（event history）裡，等於替你做了 saga 紀錄。執行流程程式的程序叫 worker，worker 當機後由另一個 worker 重播歷史、從中斷處繼續。activity 依重試政策自動重試。要注意的是，activity 還是可能被執行不只一次，所以依然要冪等。版本與官方範例見課末。</li>
+  <li><strong>BullMQ 的 flow</strong>（<a href="../../nestjs/lessons/20-queues-bullmq.html">NestJS 課第 20 課</a>）：用父子工作表示「子工作都完成後才執行父工作」，適合「扇出再收斂」（一次分出好幾個平行的子工作，全部做完再彙整），但補償要自己寫。</li>
+  <li><strong>自己做</strong>：一張 <code>sagas</code> 表（目前狀態）＋一張 <code>saga_steps</code> 表（每步的紀錄）＋<a href="12-queues-outbox.html">第 12 課</a>的 outbox 送命令＋定期掃描卡住的 saga。步驟少、團隊不想多維運一套系統時夠用。</li>
+</ul>
+<p>比選工具更重要的，是先確認<strong>這裡需不需要 saga</strong>。Saga 換來的是跨服務也能「全部完成或全部抵銷」，付出的是補償、中間狀態、紀錄與對帳。下面三種情況付了代價卻換不到東西：</p>
+<ul>
+  <li><strong>全部在同一個資料庫</strong>：直接用交易。有人把模組化單體（一個程式、一個資料庫，內部分成幾個模組，<a href="15-monolith-microservices.html">第 15 課</a>會教）裡的「訂單模組」和「庫存模組」也做成 saga，平白多了補償和中間狀態。</li>
+  <li><strong>只有一個外部呼叫</strong>：先在本地寫好訂單（<code>pending_payment</code>），呼叫金流，再依結果更新，搭配冪等鍵和對帳就夠了。</li>
+  <li><strong>失敗了也沒關係的步驟</strong>：寄收據失敗不用取消訂單，丟到佇列重試即可。</li>
+</ul>
+<p>咖啡店的下單需要 saga，是因為庫存、金流、會員分屬不同的系統。Saga 是拆分服務之後付出的代價之一（<a href="15-monolith-microservices.html">第 15 課</a>會再談）：拆之前，先問這兩邊的資料是否真的需要分開。</p>
+
+<h2>補充與查表</h2>
+<ul>
+  <li><strong>名稱出處</strong>：saga 出自 Hector Garcia-Molina 與 Kenneth Salem 1987 年的論文〈Sagas〉。</li>
+  <li><strong>這課引用的 Azure 文件</strong>：步驟的三種分類（compensable、pivot、retryable）、三種隔離異常與五種對策、orchestration 與 choreography 的比較，出自 Azure Architecture Center 的 Saga 模式文件（2025-02-25）。「不可逆的步驟要等所有關鍵驗證都成功之後才做」與「交給人工處理」出自補償交易（Compensating Transaction）模式文件（2026-04-16）。</li>
+  <li><strong>補償的順序</strong>：Azure 的補償交易文件提醒，補償<strong>不一定</strong>要照完全相反的順序，彼此無關的補償可以平行做。這一課的練習用反向依序補償。</li>
+  <li><strong>Temporal</strong>：Node 客戶端套件 <code>@temporalio/client</code> 1.25.0（2026-10-27）。activity 的重試政策裡，<code>maximumAttempts</code> 設 0 代表不限次數。官方範例 <code>samples-typescript/saga</code> 示範失敗時反向呼叫補償 activity。</li>
+</ul>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：完成 <code>runSaga(steps, log)</code>。依序執行每一步的 <code>action</code>：</p>
+  <ul>
+    <li>成功就 <code>log.append({ step, status: 'done' })</code>，繼續下一步；全部成功回傳 <code>{ status: 'completed' }</code>。</li>
+    <li>某一步的 <code>action</code> 丟錯（假設它自己的重試已經用盡）：記 <code>failed</code>，後面的步驟<strong>不再執行</strong>，然後把已經 <code>done</code> 的步驟<strong>依相反順序</strong>補償。失敗的那一步本身不補償。</li>
+    <li>每個補償最多呼叫 3 次，成功就記 <code>compensated</code>；3 次都失敗就記 <code>stuck</code>，立刻回傳 <code>{ status: 'stuck', step }</code>，<strong>不再補償更早的步驟</strong>。</li>
+    <li>補償全部成功回傳 <code>{ status: 'compensated', failedStep }</code>。<code>runSaga</code> 本身不丟錯。</li>
+  </ul>
+  <script type="start">
+type Step = { name: string; action: () => Promise<void>; compensate: () => Promise<void> }
+type Entry = { step: string; status: 'done' | 'failed' | 'compensated' | 'stuck' }
+type Log = { append(entry: Entry): void }
+type SagaResult =
+  | { status: 'completed' }
+  | { status: 'compensated'; failedStep: string }
+  | { status: 'stuck'; step: string }
+
+async function runSaga(steps: ReadonlyArray<Step>, log: Log): Promise<SagaResult> {
+  throw new Error('TODO')
+}
+
+// 試跑：第 3 步失敗
+const entries: Entry[] = []
+const make = (name: string, fail = false): Step => ({
+  name,
+  action: async () => { if (fail) throw new Error(name + ' 失敗') },
+  compensate: async () => console.log('補償', name),
+})
+console.log(await runSaga([make('createOrder'), make('reserveStock'), make('capturePayment', true), make('confirmOrder')], { append: e => entries.push(e) }))
+console.log(entries)
+</script>
+  <script type="answer">
+type Step = { name: string; action: () => Promise<void>; compensate: () => Promise<void> }
+type Entry = { step: string; status: 'done' | 'failed' | 'compensated' | 'stuck' }
+type Log = { append(entry: Entry): void }
+type SagaResult =
+  | { status: 'completed' }
+  | { status: 'compensated'; failedStep: string }
+  | { status: 'stuck'; step: string }
+
+async function compensateAll(done: ReadonlyArray<Step>, failedStep: string, log: Log): Promise<SagaResult> {
+  for (const step of [...done].reverse()) {
+    let ok = false
+    for (let attempt = 1; attempt <= 3 && !ok; attempt++) {
+      try {
+        await step.compensate()
+        ok = true
+      } catch {
+        // 再試一次
+      }
+    }
+    if (!ok) {
+      log.append({ step: step.name, status: 'stuck' })
+      return { status: 'stuck', step: step.name }
+    }
+    log.append({ step: step.name, status: 'compensated' })
+  }
+  return { status: 'compensated', failedStep }
+}
+
+async function runSaga(steps: ReadonlyArray<Step>, log: Log): Promise<SagaResult> {
+  const done: Step[] = []
+  for (const step of steps) {
+    try {
+      await step.action()
+    } catch {
+      log.append({ step: step.name, status: 'failed' })
+      return compensateAll(done, step.name, log)
+    }
+    log.append({ step: step.name, status: 'done' })
+    done.push(step)
+  }
+  return { status: 'completed' }
+}
+
+const entries: Entry[] = []
+const make = (name: string, fail = false): Step => ({
+  name,
+  action: async () => { if (fail) throw new Error(name + ' 失敗') },
+  compensate: async () => console.log('補償', name),
+})
+console.log(await runSaga([make('createOrder'), make('reserveStock'), make('capturePayment', true), make('confirmOrder')], { append: e => entries.push(e) }))
+console.log(entries)
+</script>
+  <script type="tests">
+function setup(names: string[], failAction?: string, compFails: Record<string, number> = {}) {
+  const calls: string[] = []
+  const counts: Record<string, number> = {}
+  const steps = Object.freeze(names.map(name => Object.freeze({
+    name,
+    action: async () => {
+      calls.push(name)
+      if (name === failAction) throw new Error(name + ' 失敗')
+    },
+    compensate: async () => {
+      calls.push('undo ' + name)
+      counts[name] = (counts[name] ?? 0) + 1
+      if (counts[name] <= (compFails[name] ?? 0)) throw new Error('補償 ' + name + ' 失敗')
+    },
+  })))
+  const logged: { step: string; status: string }[] = []
+  const log = { append: (e: { step: string; status: string }) => { logged.push({ step: e.step, status: e.status }) } }
+  return { steps, calls, logged, log }
+}
+
+{
+  const s = setup(['a', 'b', 'c'])
+  const r = await runSaga(s.steps, s.log)
+  assert.deepEqual(r, { status: 'completed' }, '全部成功要回傳 { status: "completed" }')
+  assert.deepEqual(s.calls, ['a', 'b', 'c'], '全部成功時依序執行每個 action，不呼叫任何補償')
+  assert.deepEqual(s.logged, [{ step: 'a', status: 'done' }, { step: 'b', status: 'done' }, { step: 'c', status: 'done' }], '每完成一步就記一筆 done')
+}
+{
+  const s = setup(['a', 'b', 'c', 'd'], 'c')
+  let r: unknown
+  try { r = await runSaga(s.steps, s.log) } catch (e) { assert(false, 'runSaga 不能丟錯，失敗要用回傳值表示：' + (e as Error).message) }
+  assert(!s.calls.includes('d'), '第 3 步失敗後，後面的步驟不能再執行')
+  assert(!s.calls.includes('undo c'), '失敗的那一步沒有完成，不能補償它')
+  assert.deepEqual(s.calls, ['a', 'b', 'c', 'undo b', 'undo a'], '失敗後要依相反順序補償已完成的步驟：先 b 再 a')
+  assert.deepEqual(r, { status: 'compensated', failedStep: 'c' }, '補償完成要回傳 { status: "compensated", failedStep: "c" }')
+  assert.deepEqual(s.logged, [
+    { step: 'a', status: 'done' }, { step: 'b', status: 'done' }, { step: 'c', status: 'failed' },
+    { step: 'b', status: 'compensated' }, { step: 'a', status: 'compensated' },
+  ], '紀錄的內容與順序：done a、done b、failed c、compensated b、compensated a')
+}
+{
+  const s = setup(['a', 'b'], 'a')
+  const r = await runSaga(s.steps, s.log)
+  assert.deepEqual(s.calls, ['a'], '第一步就失敗時沒有要補償的步驟')
+  assert.deepEqual(r, { status: 'compensated', failedStep: 'a' }, '第一步失敗：回傳 compensated，failedStep 是 a')
+  assert.deepEqual(s.logged, [{ step: 'a', status: 'failed' }], '第一步失敗只記一筆 failed')
+}
+{
+  const s = setup(['a', 'b', 'c'], 'c', { b: 2 })
+  const r = await runSaga(s.steps, s.log)
+  assert.deepEqual(s.calls, ['a', 'b', 'c', 'undo b', 'undo b', 'undo b', 'undo a'], '補償 b 前兩次失敗、第三次成功：要重試，成功後再補償 a')
+  assert.deepEqual(r, { status: 'compensated', failedStep: 'c' }, '補償重試成功後，結果是 compensated')
+  assert.equal(s.logged.filter(e => e.status === 'compensated' && e.step === 'b').length, 1, '補償 b 成功只記一筆 compensated')
+}
+{
+  const s = setup(['a', 'b', 'c'], 'c', { b: 3 })
+  const r = await runSaga(s.steps, s.log)
+  assert.equal(s.calls.filter(c => c === 'undo b').length, 3, '每個補償最多呼叫 3 次，不能無限重試')
+  assert(!s.calls.includes('undo a'), '補償 b 卡住時，不能繼續補償更早的 a（狀態已經不確定，要交給人）')
+  assert.deepEqual(r, { status: 'stuck', step: 'b' }, '補償 3 次都失敗要回傳 { status: "stuck", step: "b" }')
+  assert.deepEqual(s.logged[s.logged.length - 1], { step: 'b', status: 'stuck' }, '最後一筆紀錄要是 stuck b')
+  assert(!s.logged.some(e => e.status === 'compensated'), '沒有補償成功的步驟，不能記 compensated')
+}
+{
+  const s = setup(['p', 'q', 'r', 's', 't'], 's')
+  const r = await runSaga(s.steps, s.log)
+  assert.deepEqual(s.calls, ['p', 'q', 'r', 's', 'undo r', 'undo q', 'undo p'], '換一組步驟也要正確：依相反順序補償')
+  assert.deepEqual(r, { status: 'compensated', failedStep: 's' }, 'failedStep 要是實際失敗的那一步')
+}
+</script>
+  <script type="wrong">
+// 依原本的順序補償
+type Step = { name: string; action: () => Promise<void>; compensate: () => Promise<void> }
+type Entry = { step: string; status: 'done' | 'failed' | 'compensated' | 'stuck' }
+type Log = { append(entry: Entry): void }
+type SagaResult = { status: 'completed' } | { status: 'compensated'; failedStep: string } | { status: 'stuck'; step: string }
+async function runSaga(steps: ReadonlyArray<Step>, log: Log): Promise<SagaResult> {
+  const done: Step[] = []
+  for (const step of steps) {
+    try { await step.action() } catch {
+      log.append({ step: step.name, status: 'failed' })
+      for (const d of done) {
+        let ok = false
+        for (let i = 0; i < 3 && !ok; i++) { try { await d.compensate(); ok = true } catch {} }
+        if (!ok) { log.append({ step: d.name, status: 'stuck' }); return { status: 'stuck', step: d.name } }
+        log.append({ step: d.name, status: 'compensated' })
+      }
+      return { status: 'compensated', failedStep: step.name }
+    }
+    log.append({ step: step.name, status: 'done' })
+    done.push(step)
+  }
+  return { status: 'completed' }
+}
+</script>
+  <script type="wrong">
+// 也補償失敗的那一步
+type Step = { name: string; action: () => Promise<void>; compensate: () => Promise<void> }
+type Entry = { step: string; status: 'done' | 'failed' | 'compensated' | 'stuck' }
+type Log = { append(entry: Entry): void }
+type SagaResult = { status: 'completed' } | { status: 'compensated'; failedStep: string } | { status: 'stuck'; step: string }
+async function runSaga(steps: ReadonlyArray<Step>, log: Log): Promise<SagaResult> {
+  const done: Step[] = []
+  for (const step of steps) {
+    done.push(step)
+    try { await step.action() } catch {
+      log.append({ step: step.name, status: 'failed' })
+      for (const d of [...done].reverse()) {
+        let ok = false
+        for (let i = 0; i < 3 && !ok; i++) { try { await d.compensate(); ok = true } catch {} }
+        if (!ok) { log.append({ step: d.name, status: 'stuck' }); return { status: 'stuck', step: d.name } }
+        log.append({ step: d.name, status: 'compensated' })
+      }
+      return { status: 'compensated', failedStep: step.name }
+    }
+    log.append({ step: step.name, status: 'done' })
+  }
+  return { status: 'completed' }
+}
+</script>
+  <script type="wrong">
+// 失敗後繼續執行後面的步驟
+type Step = { name: string; action: () => Promise<void>; compensate: () => Promise<void> }
+type Entry = { step: string; status: 'done' | 'failed' | 'compensated' | 'stuck' }
+type Log = { append(entry: Entry): void }
+type SagaResult = { status: 'completed' } | { status: 'compensated'; failedStep: string } | { status: 'stuck'; step: string }
+async function runSaga(steps: ReadonlyArray<Step>, log: Log): Promise<SagaResult> {
+  const done: Step[] = []
+  let failed: string | undefined
+  for (const step of steps) {
+    try { await step.action(); log.append({ step: step.name, status: 'done' }); if (!failed) done.push(step) }
+    catch { log.append({ step: step.name, status: 'failed' }); failed ??= step.name }
+  }
+  if (!failed) return { status: 'completed' }
+  for (const d of [...done].reverse()) {
+    let ok = false
+    for (let i = 0; i < 3 && !ok; i++) { try { await d.compensate(); ok = true } catch {} }
+    if (!ok) { log.append({ step: d.name, status: 'stuck' }); return { status: 'stuck', step: d.name } }
+    log.append({ step: d.name, status: 'compensated' })
+  }
+  return { status: 'compensated', failedStep: failed }
+}
+</script>
+  <script type="wrong">
+// 補償失敗時一直重試到成功
+type Step = { name: string; action: () => Promise<void>; compensate: () => Promise<void> }
+type Entry = { step: string; status: 'done' | 'failed' | 'compensated' | 'stuck' }
+type Log = { append(entry: Entry): void }
+type SagaResult = { status: 'completed' } | { status: 'compensated'; failedStep: string } | { status: 'stuck'; step: string }
+async function runSaga(steps: ReadonlyArray<Step>, log: Log): Promise<SagaResult> {
+  const done: Step[] = []
+  for (const step of steps) {
+    try { await step.action() } catch {
+      log.append({ step: step.name, status: 'failed' })
+      for (const d of [...done].reverse()) {
+        for (;;) { try { await d.compensate(); break } catch {} }
+        log.append({ step: d.name, status: 'compensated' })
+      }
+      return { status: 'compensated', failedStep: step.name }
+    }
+    log.append({ step: step.name, status: 'done' })
+    done.push(step)
+  }
+  return { status: 'completed' }
+}
+</script>
+  <script type="wrong">
+// 完全不補償就回傳
+type Step = { name: string; action: () => Promise<void>; compensate: () => Promise<void> }
+type Entry = { step: string; status: 'done' | 'failed' | 'compensated' | 'stuck' }
+type Log = { append(entry: Entry): void }
+type SagaResult = { status: 'completed' } | { status: 'compensated'; failedStep: string } | { status: 'stuck'; step: string }
+async function runSaga(steps: ReadonlyArray<Step>, log: Log): Promise<SagaResult> {
+  for (const step of steps) {
+    try { await step.action() } catch {
+      log.append({ step: step.name, status: 'failed' })
+      return { status: 'compensated', failedStep: step.name }
+    }
+    log.append({ step: step.name, status: 'done' })
+  }
+  return { status: 'completed' }
+}
+</script>
+  <script type="wrong">
+// 補償卡住後還繼續補償更早的步驟
+type Step = { name: string; action: () => Promise<void>; compensate: () => Promise<void> }
+type Entry = { step: string; status: 'done' | 'failed' | 'compensated' | 'stuck' }
+type Log = { append(entry: Entry): void }
+type SagaResult = { status: 'completed' } | { status: 'compensated'; failedStep: string } | { status: 'stuck'; step: string }
+async function runSaga(steps: ReadonlyArray<Step>, log: Log): Promise<SagaResult> {
+  const done: Step[] = []
+  for (const step of steps) {
+    try { await step.action() } catch {
+      log.append({ step: step.name, status: 'failed' })
+      let stuck: string | undefined
+      for (const d of [...done].reverse()) {
+        let ok = false
+        for (let i = 0; i < 3 && !ok; i++) { try { await d.compensate(); ok = true } catch {} }
+        if (!ok) { log.append({ step: d.name, status: 'stuck' }); stuck ??= d.name; continue }
+        log.append({ step: d.name, status: 'compensated' })
+      }
+      return stuck ? { status: 'stuck', step: stuck } : { status: 'compensated', failedStep: step.name }
+    }
+    log.append({ step: step.name, status: 'done' })
+    done.push(step)
+  }
+  return { status: 'completed' }
+}
+</script>
+  <script type="wrong">
+// 補償只試一次，不重試
+type Step = { name: string; action: () => Promise<void>; compensate: () => Promise<void> }
+type Entry = { step: string; status: 'done' | 'failed' | 'compensated' | 'stuck' }
+type Log = { append(entry: Entry): void }
+type SagaResult = { status: 'completed' } | { status: 'compensated'; failedStep: string } | { status: 'stuck'; step: string }
+async function runSaga(steps: ReadonlyArray<Step>, log: Log): Promise<SagaResult> {
+  const done: Step[] = []
+  for (const step of steps) {
+    try { await step.action() } catch {
+      log.append({ step: step.name, status: 'failed' })
+      for (const d of [...done].reverse()) {
+        try { await d.compensate() } catch { log.append({ step: d.name, status: 'stuck' }); return { status: 'stuck', step: d.name } }
+        log.append({ step: d.name, status: 'compensated' })
+      }
+      return { status: 'compensated', failedStep: step.name }
+    }
+    log.append({ step: step.name, status: 'done' })
+    done.push(step)
+  }
+  return { status: 'completed' }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：協調者當機重啟後，寫 <code>resumeSaga(steps, entries, log)</code> 依照已經寫下的紀錄 <code>entries</code> 續跑。新的紀錄一樣寫進 <code>log</code>（不要重寫舊的），補償規則同練習 1（反向、最多 3 次、stuck 就停）：</p>
+  <ul>
+    <li><strong>沒有 <code>failed</code> 紀錄</strong>：saga 還在往前走。從第一個還沒 <code>done</code> 的步驟繼續；之後失敗時，要補償的是<strong>所有</strong> <code>done</code> 的步驟（包含當機前完成的）。</li>
+    <li><strong>有 <code>failed</code> 紀錄</strong>：saga 在補償中。不再執行任何 <code>action</code>，只補償「<code>done</code> 但還沒 <code>compensated</code>」的步驟，依步驟的相反順序；結果的 <code>failedStep</code> 是紀錄裡 <code>failed</code> 的那一步。</li>
+    <li>已經 <code>done</code> 的步驟不能再呼叫 <code>action</code>，已經 <code>compensated</code> 的不能再補償。<code>entries</code> 是空的時候，等於從頭執行。</li>
+  </ul>
+  <script type="start">
+type Step = { name: string; action: () => Promise<void>; compensate: () => Promise<void> }
+type Entry = { step: string; status: 'done' | 'failed' | 'compensated' | 'stuck' }
+type SavedEntry = { step: string; status: 'done' | 'failed' | 'compensated' }
+type Log = { append(entry: Entry): void }
+type SagaResult =
+  | { status: 'completed' }
+  | { status: 'compensated'; failedStep: string }
+  | { status: 'stuck'; step: string }
+
+async function resumeSaga(steps: ReadonlyArray<Step>, entries: ReadonlyArray<SavedEntry>, log: Log): Promise<SagaResult> {
+  throw new Error('TODO')
+}
+
+// 試跑：#502 補償到一半當機
+const make = (name: string): Step => ({
+  name,
+  action: async () => console.log('執行', name),
+  compensate: async () => console.log('補償', name),
+})
+const saved: SavedEntry[] = [
+  { step: 'createOrder', status: 'done' },
+  { step: 'reserveStock', status: 'done' },
+  { step: 'capturePayment', status: 'failed' },
+  { step: 'reserveStock', status: 'compensated' },
+]
+console.log(await resumeSaga([make('createOrder'), make('reserveStock'), make('capturePayment')], saved, { append: e => console.log('新紀錄', e) }))
+</script>
+  <script type="answer">
+type Step = { name: string; action: () => Promise<void>; compensate: () => Promise<void> }
+type Entry = { step: string; status: 'done' | 'failed' | 'compensated' | 'stuck' }
+type SavedEntry = { step: string; status: 'done' | 'failed' | 'compensated' }
+type Log = { append(entry: Entry): void }
+type SagaResult =
+  | { status: 'completed' }
+  | { status: 'compensated'; failedStep: string }
+  | { status: 'stuck'; step: string }
+
+async function compensateAll(toUndo: ReadonlyArray<Step>, failedStep: string, log: Log): Promise<SagaResult> {
+  for (const step of [...toUndo].reverse()) {
+    let ok = false
+    for (let attempt = 1; attempt <= 3 && !ok; attempt++) {
+      try {
+        await step.compensate()
+        ok = true
+      } catch {
+        // 再試一次
+      }
+    }
+    if (!ok) {
+      log.append({ step: step.name, status: 'stuck' })
+      return { status: 'stuck', step: step.name }
+    }
+    log.append({ step: step.name, status: 'compensated' })
+  }
+  return { status: 'compensated', failedStep }
+}
+
+async function resumeSaga(steps: ReadonlyArray<Step>, entries: ReadonlyArray<SavedEntry>, log: Log): Promise<SagaResult> {
+  const done = new Set(entries.filter(e => e.status === 'done').map(e => e.step))
+  const compensated = new Set(entries.filter(e => e.status === 'compensated').map(e => e.step))
+  const failed = entries.find(e => e.status === 'failed')
+
+  if (failed) {
+    const toUndo = steps.filter(s => done.has(s.name) && !compensated.has(s.name))
+    return compensateAll(toUndo, failed.step, log)
+  }
+
+  const finished: Step[] = []
+  for (const step of steps) {
+    if (done.has(step.name)) {
+      finished.push(step)
+      continue
+    }
+    try {
+      await step.action()
+    } catch {
+      log.append({ step: step.name, status: 'failed' })
+      return compensateAll(finished, step.name, log)
+    }
+    log.append({ step: step.name, status: 'done' })
+    finished.push(step)
+  }
+  return { status: 'completed' }
+}
+
+const make = (name: string): Step => ({
+  name,
+  action: async () => console.log('執行', name),
+  compensate: async () => console.log('補償', name),
+})
+const saved: SavedEntry[] = [
+  { step: 'createOrder', status: 'done' },
+  { step: 'reserveStock', status: 'done' },
+  { step: 'capturePayment', status: 'failed' },
+  { step: 'reserveStock', status: 'compensated' },
+]
+console.log(await resumeSaga([make('createOrder'), make('reserveStock'), make('capturePayment')], saved, { append: e => console.log('新紀錄', e) }))
+</script>
+  <script type="tests">
+type Saved = { step: string; status: 'done' | 'failed' | 'compensated' }
+function setup(names: string[], failAction?: string, compFails: Record<string, number> = {}) {
+  const calls: string[] = []
+  const counts: Record<string, number> = {}
+  const steps = Object.freeze(names.map(name => Object.freeze({
+    name,
+    action: async () => {
+      calls.push(name)
+      if (name === failAction) throw new Error(name + ' 失敗')
+    },
+    compensate: async () => {
+      calls.push('undo ' + name)
+      counts[name] = (counts[name] ?? 0) + 1
+      if (counts[name] <= (compFails[name] ?? 0)) throw new Error('補償 ' + name + ' 失敗')
+    },
+  })))
+  const logged: { step: string; status: string }[] = []
+  const log = { append: (e: { step: string; status: string }) => { logged.push({ step: e.step, status: e.status }) } }
+  return { steps, calls, logged, log }
+}
+const freeze = (list: Saved[]) => Object.freeze(list.map(e => Object.freeze({ ...e })))
+function d(step: string): Saved { return { step, status: 'done' } }
+function f(step: string): Saved { return { step, status: 'failed' } }
+function c(step: string): Saved { return { step, status: 'compensated' } }
+
+{
+  const s = setup(['a', 'b', 'c', 'd'])
+  const r = await resumeSaga(s.steps, freeze([d('a'), d('b')]), s.log)
+  assert.deepEqual(s.calls, ['c', 'd'], 'a、b 已經 done：續跑只能執行 c、d，不能從頭重跑（已完成的扣款會再扣一次）')
+  assert.deepEqual(s.logged, [{ step: 'c', status: 'done' }, { step: 'd', status: 'done' }], '只寫新的紀錄：done c、done d')
+  assert.deepEqual(r, { status: 'completed' }, '續跑完成要回傳 completed')
+}
+{
+  const s = setup(['a', 'b', 'c', 'd'], 'c')
+  const r = await resumeSaga(s.steps, freeze([d('a'), d('b')]), s.log)
+  assert.deepEqual(s.calls, ['c', 'undo b', 'undo a'], '續跑後 c 失敗：當機前完成的 a、b 也要反向補償')
+  assert.deepEqual(r, { status: 'compensated', failedStep: 'c' }, '回傳 compensated，failedStep 是 c')
+}
+{
+  const s = setup(['a', 'b', 'c', 'd'])
+  const r = await resumeSaga(s.steps, freeze([d('a'), d('b'), d('c'), f('d'), c('c')]), s.log)
+  assert(!s.calls.some(x => !x.startsWith('undo ')), '有 failed 紀錄時 saga 在補償中，不能再執行任何 action')
+  assert(!s.calls.includes('undo c'), 'c 已經 compensated，不能再補償（會重複退款）')
+  assert.deepEqual(s.calls, ['undo b', 'undo a'], '只補償剩下的 b、a，依相反順序')
+  assert.deepEqual(s.logged, [{ step: 'b', status: 'compensated' }, { step: 'a', status: 'compensated' }], '新紀錄：compensated b、compensated a')
+  assert.deepEqual(r, { status: 'compensated', failedStep: 'd' }, 'failedStep 要取自紀錄裡 failed 的那一步')
+}
+{
+  const s = setup(['a', 'b', 'c', 'd'])
+  const r = await resumeSaga(s.steps, freeze([d('a'), f('b')]), s.log)
+  assert(!s.calls.includes('c') && !s.calls.includes('b'), 'b 是 failed，不能當成 done 繼續往下執行')
+  assert.deepEqual(s.calls, ['undo a'], 'b 失敗後只要補償 a')
+  assert.deepEqual(r, { status: 'compensated', failedStep: 'b' }, '回傳 compensated，failedStep 是 b')
+}
+{
+  const s = setup(['a', 'b', 'c', 'd'])
+  await resumeSaga(s.steps, freeze([d('a'), d('b'), d('c'), f('d')]), s.log)
+  assert.deepEqual(s.calls, ['undo c', 'undo b', 'undo a'], '續跑時也要依相反順序補償：c、b、a')
+}
+{
+  const s = setup(['a', 'b', 'c'])
+  const r = await resumeSaga(s.steps, freeze([d('a'), d('b'), f('c'), c('b'), c('a')]), s.log)
+  assert.deepEqual(s.calls, [], '全部補償完的 saga 再續跑，不能呼叫任何東西')
+  assert.deepEqual(r, { status: 'compensated', failedStep: 'c' }, '全部補償完：回傳 compensated')
+}
+{
+  const s = setup(['a', 'b', 'c', 'd'], undefined, { b: 3 })
+  const r = await resumeSaga(s.steps, freeze([d('a'), d('b'), d('c'), f('d'), c('c')]), s.log)
+  assert.equal(s.calls.filter(x => x === 'undo b').length, 3, '補償最多呼叫 3 次')
+  assert(!s.calls.includes('undo a'), '補償 b 卡住時不能繼續補償 a')
+  assert.deepEqual(r, { status: 'stuck', step: 'b' }, '補償 3 次都失敗：回傳 stuck')
+}
+{
+  const s = setup(['a', 'b'], 'b')
+  const r = await resumeSaga(s.steps, freeze([]), s.log)
+  assert.deepEqual(s.calls, ['a', 'b', 'undo a'], '紀錄是空的時候等於從頭執行')
+  assert.deepEqual(r, { status: 'compensated', failedStep: 'b' }, '從頭執行、b 失敗：回傳 compensated')
+}
+{
+  // 在每一個可能的位置當機：續跑之後，紀錄要跟沒當機時一樣，每個動作與補償合計只做一次
+  const full: Saved[] = [d('a'), d('b'), d('c'), f('d'), c('c'), c('b'), c('a')]
+  for (let k = 0; k <= full.length; k++) {
+    const s = setup(['a', 'b', 'c', 'd', 'e'], 'd')
+    await resumeSaga(s.steps, freeze(full.slice(0, k)), s.log)
+    assert.deepEqual([...full.slice(0, k), ...s.logged], full, `在第 ${k} 筆紀錄之後當機：續跑寫下的紀錄接上舊紀錄，要跟沒當機時完全一樣`)
+    const expectedCalls = full.slice(k).map(e => e.status === 'compensated' ? 'undo ' + e.step : e.step)
+    assert.deepEqual(s.calls, expectedCalls, `在第 ${k} 筆紀錄之後當機：只能做還沒記下來的事`)
+  }
+}
+</script>
+  <script type="wrong">
+// 不看紀錄，從頭重跑
+type Step = { name: string; action: () => Promise<void>; compensate: () => Promise<void> }
+type Entry = { step: string; status: 'done' | 'failed' | 'compensated' | 'stuck' }
+type SavedEntry = { step: string; status: 'done' | 'failed' | 'compensated' }
+type Log = { append(entry: Entry): void }
+type SagaResult = { status: 'completed' } | { status: 'compensated'; failedStep: string } | { status: 'stuck'; step: string }
+async function undo(list: ReadonlyArray<Step>, failedStep: string, log: Log): Promise<SagaResult> {
+  for (const s of [...list].reverse()) {
+    let ok = false
+    for (let i = 0; i < 3 && !ok; i++) { try { await s.compensate(); ok = true } catch {} }
+    if (!ok) { log.append({ step: s.name, status: 'stuck' }); return { status: 'stuck', step: s.name } }
+    log.append({ step: s.name, status: 'compensated' })
+  }
+  return { status: 'compensated', failedStep }
+}
+async function resumeSaga(steps: ReadonlyArray<Step>, entries: ReadonlyArray<SavedEntry>, log: Log): Promise<SagaResult> {
+  const finished: Step[] = []
+  for (const s of steps) {
+    try { await s.action() } catch { log.append({ step: s.name, status: 'failed' }); return undo(finished, s.name, log) }
+    log.append({ step: s.name, status: 'done' })
+    finished.push(s)
+  }
+  return { status: 'completed' }
+}
+</script>
+  <script type="wrong">
+// 忽略 compensated 紀錄
+type Step = { name: string; action: () => Promise<void>; compensate: () => Promise<void> }
+type Entry = { step: string; status: 'done' | 'failed' | 'compensated' | 'stuck' }
+type SavedEntry = { step: string; status: 'done' | 'failed' | 'compensated' }
+type Log = { append(entry: Entry): void }
+type SagaResult = { status: 'completed' } | { status: 'compensated'; failedStep: string } | { status: 'stuck'; step: string }
+async function undo(list: ReadonlyArray<Step>, failedStep: string, log: Log): Promise<SagaResult> {
+  for (const s of [...list].reverse()) {
+    let ok = false
+    for (let i = 0; i < 3 && !ok; i++) { try { await s.compensate(); ok = true } catch {} }
+    if (!ok) { log.append({ step: s.name, status: 'stuck' }); return { status: 'stuck', step: s.name } }
+    log.append({ step: s.name, status: 'compensated' })
+  }
+  return { status: 'compensated', failedStep }
+}
+async function resumeSaga(steps: ReadonlyArray<Step>, entries: ReadonlyArray<SavedEntry>, log: Log): Promise<SagaResult> {
+  const done = new Set(entries.filter(e => e.status === 'done').map(e => e.step))
+  const failed = entries.find(e => e.status === 'failed')
+  if (failed) return undo(steps.filter(s => done.has(s.name)), failed.step, log)
+  const finished: Step[] = []
+  for (const s of steps) {
+    if (done.has(s.name)) { finished.push(s); continue }
+    try { await s.action() } catch { log.append({ step: s.name, status: 'failed' }); return undo(finished, s.name, log) }
+    log.append({ step: s.name, status: 'done' })
+    finished.push(s)
+  }
+  return { status: 'completed' }
+}
+</script>
+  <script type="wrong">
+// 把 failed 的步驟當成 done 繼續往下
+type Step = { name: string; action: () => Promise<void>; compensate: () => Promise<void> }
+type Entry = { step: string; status: 'done' | 'failed' | 'compensated' | 'stuck' }
+type SavedEntry = { step: string; status: 'done' | 'failed' | 'compensated' }
+type Log = { append(entry: Entry): void }
+type SagaResult = { status: 'completed' } | { status: 'compensated'; failedStep: string } | { status: 'stuck'; step: string }
+async function undo(list: ReadonlyArray<Step>, failedStep: string, log: Log): Promise<SagaResult> {
+  for (const s of [...list].reverse()) {
+    let ok = false
+    for (let i = 0; i < 3 && !ok; i++) { try { await s.compensate(); ok = true } catch {} }
+    if (!ok) { log.append({ step: s.name, status: 'stuck' }); return { status: 'stuck', step: s.name } }
+    log.append({ step: s.name, status: 'compensated' })
+  }
+  return { status: 'compensated', failedStep }
+}
+async function resumeSaga(steps: ReadonlyArray<Step>, entries: ReadonlyArray<SavedEntry>, log: Log): Promise<SagaResult> {
+  const seen = new Set(entries.map(e => e.step))
+  const finished: Step[] = []
+  for (const s of steps) {
+    if (seen.has(s.name)) { finished.push(s); continue }
+    try { await s.action() } catch { log.append({ step: s.name, status: 'failed' }); return undo(finished, s.name, log) }
+    log.append({ step: s.name, status: 'done' })
+    finished.push(s)
+  }
+  return { status: 'completed' }
+}
+</script>
+  <script type="wrong">
+// 續跑時依原本的順序補償
+type Step = { name: string; action: () => Promise<void>; compensate: () => Promise<void> }
+type Entry = { step: string; status: 'done' | 'failed' | 'compensated' | 'stuck' }
+type SavedEntry = { step: string; status: 'done' | 'failed' | 'compensated' }
+type Log = { append(entry: Entry): void }
+type SagaResult = { status: 'completed' } | { status: 'compensated'; failedStep: string } | { status: 'stuck'; step: string }
+async function undo(list: ReadonlyArray<Step>, failedStep: string, log: Log): Promise<SagaResult> {
+  for (const s of list) {
+    let ok = false
+    for (let i = 0; i < 3 && !ok; i++) { try { await s.compensate(); ok = true } catch {} }
+    if (!ok) { log.append({ step: s.name, status: 'stuck' }); return { status: 'stuck', step: s.name } }
+    log.append({ step: s.name, status: 'compensated' })
+  }
+  return { status: 'compensated', failedStep }
+}
+async function resumeSaga(steps: ReadonlyArray<Step>, entries: ReadonlyArray<SavedEntry>, log: Log): Promise<SagaResult> {
+  const done = new Set(entries.filter(e => e.status === 'done').map(e => e.step))
+  const compensated = new Set(entries.filter(e => e.status === 'compensated').map(e => e.step))
+  const failed = entries.find(e => e.status === 'failed')
+  if (failed) return undo(steps.filter(s => done.has(s.name) && !compensated.has(s.name)), failed.step, log)
+  const finished: Step[] = []
+  for (const s of steps) {
+    if (done.has(s.name)) { finished.push(s); continue }
+    try { await s.action() } catch { log.append({ step: s.name, status: 'failed' }); return undo([...finished].reverse(), s.name, log) }
+    log.append({ step: s.name, status: 'done' })
+    finished.push(s)
+  }
+  return { status: 'completed' }
+}
+</script>
+  <script type="wrong">
+// 續跑失敗時只補償這次執行過的步驟，忘了當機前完成的
+type Step = { name: string; action: () => Promise<void>; compensate: () => Promise<void> }
+type Entry = { step: string; status: 'done' | 'failed' | 'compensated' | 'stuck' }
+type SavedEntry = { step: string; status: 'done' | 'failed' | 'compensated' }
+type Log = { append(entry: Entry): void }
+type SagaResult = { status: 'completed' } | { status: 'compensated'; failedStep: string } | { status: 'stuck'; step: string }
+async function undo(list: ReadonlyArray<Step>, failedStep: string, log: Log): Promise<SagaResult> {
+  for (const s of [...list].reverse()) {
+    let ok = false
+    for (let i = 0; i < 3 && !ok; i++) { try { await s.compensate(); ok = true } catch {} }
+    if (!ok) { log.append({ step: s.name, status: 'stuck' }); return { status: 'stuck', step: s.name } }
+    log.append({ step: s.name, status: 'compensated' })
+  }
+  return { status: 'compensated', failedStep }
+}
+async function resumeSaga(steps: ReadonlyArray<Step>, entries: ReadonlyArray<SavedEntry>, log: Log): Promise<SagaResult> {
+  const done = new Set(entries.filter(e => e.status === 'done').map(e => e.step))
+  const compensated = new Set(entries.filter(e => e.status === 'compensated').map(e => e.step))
+  const failed = entries.find(e => e.status === 'failed')
+  if (failed) return undo(steps.filter(s => done.has(s.name) && !compensated.has(s.name)), failed.step, log)
+  const ranNow: Step[] = []
+  for (const s of steps) {
+    if (done.has(s.name)) continue
+    try { await s.action() } catch { log.append({ step: s.name, status: 'failed' }); return undo(ranNow, s.name, log) }
+    log.append({ step: s.name, status: 'done' })
+    ranNow.push(s)
+  }
+  return { status: 'completed' }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：先寫 <code>validateSaga(def)</code> 檢查 saga 定義，回傳問題代碼的陣列，沒有問題回傳 <code>[]</code>：</p>
+  <ul>
+    <li><code>'no-pivot'</code>：沒有任何 pivot。這時只回傳 <code>['no-pivot']</code>。</li>
+    <li>以<strong>第一個</strong> pivot 為界：它之前出現 retryable → <code>'retryable-before-pivot'</code>；它之後出現 compensable → <code>'compensable-after-pivot'</code>；之後又出現 pivot → <code>'multiple-pivots'</code>。</li>
+    <li>每種代碼最多出現一次，依「第一個觸發它的步驟」的位置排序。</li>
+  </ul>
+  <p>再填寫 <code>ORDER_SAGA</code>：用上面的 6 個步驟名稱各一次，排出咖啡店下單的順序並標上種類，讓 <code>validateSaga(ORDER_SAGA)</code> 回傳 <code>[]</code>。想想哪些步驟做了就收不回來、哪些驗證要先做。</p>
+  <script type="start">
+type Kind = 'compensable' | 'pivot' | 'retryable'
+type StepDef = { name: string; kind: Kind }
+type Problem = 'no-pivot' | 'multiple-pivots' | 'compensable-after-pivot' | 'retryable-before-pivot'
+
+function validateSaga(def: ReadonlyArray<StepDef>): Problem[] {
+  throw new Error('TODO')
+}
+
+// 步驟名稱：createOrder、reserveStock、capturePayment、confirmOrder、sendKitchenTicket、awardStamps
+const ORDER_SAGA: ReadonlyArray<StepDef> = [
+  // TODO：依正確順序填入 { name, kind }
+]
+
+console.log(validateSaga(ORDER_SAGA))
+</script>
+  <script type="answer">
+type Kind = 'compensable' | 'pivot' | 'retryable'
+type StepDef = { name: string; kind: Kind }
+type Problem = 'no-pivot' | 'multiple-pivots' | 'compensable-after-pivot' | 'retryable-before-pivot'
+
+function validateSaga(def: ReadonlyArray<StepDef>): Problem[] {
+  const pivotAt = def.findIndex(s => s.kind === 'pivot')
+  if (pivotAt === -1) return ['no-pivot']
+  const problems: Problem[] = []
+  const add = (p: Problem) => { if (!problems.includes(p)) problems.push(p) }
+  def.forEach((s, i) => {
+    if (i < pivotAt && s.kind === 'retryable') add('retryable-before-pivot')
+    if (i > pivotAt && s.kind === 'compensable') add('compensable-after-pivot')
+    if (i > pivotAt && s.kind === 'pivot') add('multiple-pivots')
+  })
+  return problems
+}
+
+const ORDER_SAGA: ReadonlyArray<StepDef> = [
+  { name: 'createOrder', kind: 'compensable' },
+  { name: 'reserveStock', kind: 'compensable' },
+  { name: 'capturePayment', kind: 'pivot' },
+  { name: 'confirmOrder', kind: 'retryable' },
+  { name: 'sendKitchenTicket', kind: 'retryable' },
+  { name: 'awardStamps', kind: 'retryable' },
+]
+
+console.log(validateSaga(ORDER_SAGA))
+</script>
+  <script type="tests">
+const S = (name: string, kind: 'compensable' | 'pivot' | 'retryable') => Object.freeze({ name, kind })
+const v = (list: ReturnType<typeof S>[]) => validateSaga(Object.freeze(list))
+
+assert.deepEqual(v([S('a', 'compensable'), S('b', 'pivot'), S('c', 'retryable')]), [], '正確的定義要回傳 []')
+assert.deepEqual(v([S('a', 'pivot')]), [], '只有一個 pivot 也是合法的')
+assert.deepEqual(v([]), ['no-pivot'], '空的定義沒有 pivot')
+assert.deepEqual(v([S('a', 'compensable'), S('b', 'retryable')]), ['no-pivot'], '沒有 pivot 時只回傳 ["no-pivot"]')
+assert.deepEqual(v([S('a', 'compensable'), S('b', 'pivot'), S('c', 'pivot')]), ['multiple-pivots'], '有兩個 pivot 要回報 multiple-pivots')
+assert.deepEqual(v([S('a', 'pivot'), S('b', 'pivot'), S('c', 'pivot')]), ['multiple-pivots'], '每種代碼最多出現一次')
+assert.deepEqual(v([S('a', 'pivot'), S('b', 'compensable'), S('c', 'compensable')]), ['compensable-after-pivot'], 'pivot 之後出現 compensable 要回報，且只回報一次')
+assert.deepEqual(v([S('a', 'retryable'), S('b', 'pivot')]), ['retryable-before-pivot'], 'pivot 之前出現 retryable 要回報')
+assert.deepEqual(
+  v([S('a', 'retryable'), S('b', 'pivot'), S('c', 'pivot'), S('d', 'compensable'), S('e', 'retryable')]),
+  ['retryable-before-pivot', 'multiple-pivots', 'compensable-after-pivot'],
+  '多種問題要依觸發位置排序：a 觸發 retryable-before-pivot、c 觸發 multiple-pivots、d 觸發 compensable-after-pivot',
+)
+assert.deepEqual(
+  v([S('a', 'compensable'), S('b', 'pivot'), S('c', 'compensable'), S('d', 'pivot')]),
+  ['compensable-after-pivot', 'multiple-pivots'],
+  '順序看觸發的位置：c 在 d 前面',
+)
+
+const names = ORDER_SAGA.map(s => s.name)
+assert.deepEqual([...names].sort(), ['awardStamps', 'capturePayment', 'confirmOrder', 'createOrder', 'reserveStock', 'sendKitchenTicket'], 'ORDER_SAGA 要剛好包含 6 個步驟名稱，各一次')
+assert.deepEqual(validateSaga(ORDER_SAGA), [], 'ORDER_SAGA 要通過 validateSaga')
+const kindOf = (n: string) => ORDER_SAGA.find(s => s.name === n)?.kind
+assert.equal(kindOf('capturePayment'), 'pivot', '扣款是不可回頭的點')
+assert.equal(names[0], 'createOrder', '第一步要先建立訂單（pending_payment），後面的步驟才有訂單可以掛')
+assert(names.indexOf('reserveStock') < names.indexOf('capturePayment'), '預留庫存要在扣款之前：庫存不足時才不用退款')
+assert.equal(kindOf('sendKitchenTicket'), 'retryable', '咖啡做出來就收不回來：出廚房單不能補償，要在 pivot 之後重試到成功')
+assert.equal(kindOf('confirmOrder'), 'retryable', '訂單要扣款成功之後才能改成 paid：confirmOrder 要在 pivot 之後、可重試')
+assert.equal(kindOf('awardStamps'), 'retryable', '集點放在 pivot 之後（pessimistic view），失敗就重試')
+assert(names.indexOf('sendKitchenTicket') > names.indexOf('capturePayment'), '出廚房單要在扣款之後')
+</script>
+  <script type="wrong">
+// 把扣款放在第一步
+type Kind = 'compensable' | 'pivot' | 'retryable'
+type StepDef = { name: string; kind: Kind }
+type Problem = 'no-pivot' | 'multiple-pivots' | 'compensable-after-pivot' | 'retryable-before-pivot'
+function validateSaga(def: ReadonlyArray<StepDef>): Problem[] {
+  const pivotAt = def.findIndex(s => s.kind === 'pivot')
+  if (pivotAt === -1) return ['no-pivot']
+  const problems: Problem[] = []
+  const add = (p: Problem) => { if (!problems.includes(p)) problems.push(p) }
+  def.forEach((s, i) => {
+    if (i < pivotAt && s.kind === 'retryable') add('retryable-before-pivot')
+    if (i > pivotAt && s.kind === 'compensable') add('compensable-after-pivot')
+    if (i > pivotAt && s.kind === 'pivot') add('multiple-pivots')
+  })
+  return problems
+}
+const ORDER_SAGA: ReadonlyArray<StepDef> = [
+  { name: 'capturePayment', kind: 'pivot' },
+  { name: 'createOrder', kind: 'retryable' },
+  { name: 'reserveStock', kind: 'retryable' },
+  { name: 'confirmOrder', kind: 'retryable' },
+  { name: 'sendKitchenTicket', kind: 'retryable' },
+  { name: 'awardStamps', kind: 'retryable' },
+]
+</script>
+  <script type="wrong">
+// 出廚房單標成 compensable，放在扣款之前
+type Kind = 'compensable' | 'pivot' | 'retryable'
+type StepDef = { name: string; kind: Kind }
+type Problem = 'no-pivot' | 'multiple-pivots' | 'compensable-after-pivot' | 'retryable-before-pivot'
+function validateSaga(def: ReadonlyArray<StepDef>): Problem[] {
+  const pivotAt = def.findIndex(s => s.kind === 'pivot')
+  if (pivotAt === -1) return ['no-pivot']
+  const problems: Problem[] = []
+  const add = (p: Problem) => { if (!problems.includes(p)) problems.push(p) }
+  def.forEach((s, i) => {
+    if (i < pivotAt && s.kind === 'retryable') add('retryable-before-pivot')
+    if (i > pivotAt && s.kind === 'compensable') add('compensable-after-pivot')
+    if (i > pivotAt && s.kind === 'pivot') add('multiple-pivots')
+  })
+  return problems
+}
+const ORDER_SAGA: ReadonlyArray<StepDef> = [
+  { name: 'createOrder', kind: 'compensable' },
+  { name: 'reserveStock', kind: 'compensable' },
+  { name: 'sendKitchenTicket', kind: 'compensable' },
+  { name: 'capturePayment', kind: 'pivot' },
+  { name: 'confirmOrder', kind: 'retryable' },
+  { name: 'awardStamps', kind: 'retryable' },
+]
+</script>
+  <script type="wrong">
+// validateSaga 沒檢查 pivot 數量
+type Kind = 'compensable' | 'pivot' | 'retryable'
+type StepDef = { name: string; kind: Kind }
+type Problem = 'no-pivot' | 'multiple-pivots' | 'compensable-after-pivot' | 'retryable-before-pivot'
+function validateSaga(def: ReadonlyArray<StepDef>): Problem[] {
+  const pivotAt = def.findIndex(s => s.kind === 'pivot')
+  if (pivotAt === -1) return ['no-pivot']
+  const problems: Problem[] = []
+  const add = (p: Problem) => { if (!problems.includes(p)) problems.push(p) }
+  def.forEach((s, i) => {
+    if (i < pivotAt && s.kind === 'retryable') add('retryable-before-pivot')
+    if (i > pivotAt && s.kind === 'compensable') add('compensable-after-pivot')
+  })
+  return problems
+}
+const ORDER_SAGA: ReadonlyArray<StepDef> = [
+  { name: 'createOrder', kind: 'compensable' },
+  { name: 'reserveStock', kind: 'compensable' },
+  { name: 'capturePayment', kind: 'pivot' },
+  { name: 'confirmOrder', kind: 'retryable' },
+  { name: 'sendKitchenTicket', kind: 'retryable' },
+  { name: 'awardStamps', kind: 'retryable' },
+]
+</script>
+  <script type="wrong">
+// validateSaga 永遠回傳 []
+type Kind = 'compensable' | 'pivot' | 'retryable'
+type StepDef = { name: string; kind: Kind }
+type Problem = 'no-pivot' | 'multiple-pivots' | 'compensable-after-pivot' | 'retryable-before-pivot'
+function validateSaga(def: ReadonlyArray<StepDef>): Problem[] {
+  return []
+}
+const ORDER_SAGA: ReadonlyArray<StepDef> = [
+  { name: 'createOrder', kind: 'compensable' },
+  { name: 'reserveStock', kind: 'compensable' },
+  { name: 'capturePayment', kind: 'pivot' },
+  { name: 'confirmOrder', kind: 'retryable' },
+  { name: 'sendKitchenTicket', kind: 'retryable' },
+  { name: 'awardStamps', kind: 'retryable' },
+]
+</script>
+  <script type="wrong">
+// 問題代碼依固定順序排，而不是依觸發位置
+type Kind = 'compensable' | 'pivot' | 'retryable'
+type StepDef = { name: string; kind: Kind }
+type Problem = 'no-pivot' | 'multiple-pivots' | 'compensable-after-pivot' | 'retryable-before-pivot'
+function validateSaga(def: ReadonlyArray<StepDef>): Problem[] {
+  const pivotAt = def.findIndex(s => s.kind === 'pivot')
+  if (pivotAt === -1) return ['no-pivot']
+  const problems: Problem[] = []
+  if (def.some((s, i) => i < pivotAt && s.kind === 'retryable')) problems.push('retryable-before-pivot')
+  if (def.some((s, i) => i > pivotAt && s.kind === 'compensable')) problems.push('compensable-after-pivot')
+  if (def.some((s, i) => i > pivotAt && s.kind === 'pivot')) problems.push('multiple-pivots')
+  return problems
+}
+const ORDER_SAGA: ReadonlyArray<StepDef> = [
+  { name: 'createOrder', kind: 'compensable' },
+  { name: 'reserveStock', kind: 'compensable' },
+  { name: 'capturePayment', kind: 'pivot' },
+  { name: 'confirmOrder', kind: 'retryable' },
+  { name: 'sendKitchenTicket', kind: 'retryable' },
+  { name: 'awardStamps', kind: 'retryable' },
+]
+</script>
+  <script type="wrong">
+// 確認訂單（改成 paid）放在扣款之前
+type Kind = 'compensable' | 'pivot' | 'retryable'
+type StepDef = { name: string; kind: Kind }
+type Problem = 'no-pivot' | 'multiple-pivots' | 'compensable-after-pivot' | 'retryable-before-pivot'
+function validateSaga(def: ReadonlyArray<StepDef>): Problem[] {
+  const pivotAt = def.findIndex(s => s.kind === 'pivot')
+  if (pivotAt === -1) return ['no-pivot']
+  const problems: Problem[] = []
+  const add = (p: Problem) => { if (!problems.includes(p)) problems.push(p) }
+  def.forEach((s, i) => {
+    if (i < pivotAt && s.kind === 'retryable') add('retryable-before-pivot')
+    if (i > pivotAt && s.kind === 'compensable') add('compensable-after-pivot')
+    if (i > pivotAt && s.kind === 'pivot') add('multiple-pivots')
+  })
+  return problems
+}
+const ORDER_SAGA: ReadonlyArray<StepDef> = [
+  { name: 'createOrder', kind: 'compensable' },
+  { name: 'reserveStock', kind: 'compensable' },
+  { name: 'confirmOrder', kind: 'compensable' },
+  { name: 'capturePayment', kind: 'pivot' },
+  { name: 'sendKitchenTicket', kind: 'retryable' },
+  { name: 'awardStamps', kind: 'retryable' },
+]
+</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：王小明的扣款成功了，接著建立廚房工單時，廚房系統回 503。協調者應該怎麼做？</p>
+  <label data-key="a">立刻退款、取消訂單，任何一步失敗都要補償</label>
+  <label data-key="b">把 saga 標成失敗，請王小明重新下單</label>
+  <label data-key="c">依退避重試，帶同一把冪等鍵，重試很久仍失敗就告警交給人；不退款</label>
+  <p class="why">✓ 扣款是 pivot，它成功之後流程只能往前走。出廚房單是可重試的步驟：503 是暫時性錯誤，照第 8 課退避重試，冪等鍵讓重送不會出兩張單；長時間失敗要告警，讓人處理（例如請店員手動出單）。(a) 把「失敗就補償」套在 pivot 之後，顧客付了錢卻被退款取消，原本只是廚房系統晃一下。(b) 讓顧客重新下單會扣第二次款。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：關於補償交易，哪一個說法正確？</p>
+  <label data-key="a">補償就是回滾，執行後資料會回到 saga 開始前的樣子</label>
+  <label data-key="b">補償是一筆新的交易，在語意上抵銷前面的效果；退款會留下紀錄、可能有手續費，中間別人也可能改過資料</label>
+  <label data-key="c">只要每一步都有補償，saga 就跟資料庫交易一樣有隔離</label>
+  <p class="why">✓ 前面的步驟早就提交了，沒有東西可以「回滾」。補償是往前寫一筆新的交易：退款在帳上是第二筆紀錄，釋放庫存時其他 saga 可能已經動過庫存，所以要寫成「加回 1 杯」。(a) 混淆了 ROLLBACK 與補償。(c) 補償處理的是原子性，不提供隔離：中間狀態一直都看得到，要靠 semantic lock、交換律更新等對策。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：團隊想把下單流程改成 choreography，理由是「不用多一個協調者，比較簡單」。流程有 6 步、其中 2 步要補償。你的看法？</p>
+  <label data-key="a">少一個元件不等於簡單：流程會散在各服務的訂閱裡，難追蹤、可能互相觸發成環、整合測試要所有服務一起跑；這種有補償的流程比較適合 orchestration</label>
+  <label data-key="b">同意，choreography 永遠比 orchestration 好，因為沒有單點故障</label>
+  <label data-key="c">兩者沒有差別，只是名稱不同</label>
+  <p class="why">✓ Azure 的比較：choreography 適合步驟少、參與者少的簡單流程；步驟多、有補償時，沒有人能從一個地方看出「訂單現在卡在哪」，新增步驟也要追出誰聽誰。(b) 協調者確實是要顧好的元件，但它的狀態存在資料庫、可以多台跑、當機後從紀錄續跑，這個代價通常比流程失控小。(c) 兩者的流程寫在不同地方，維運與測試方式差很多。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 7：陳美華的訂單正在扣款（狀態 <code>pending_payment</code>），她在 App 上按了「取消訂單」。系統應該怎麼處理？</p>
+  <label data-key="a">直接把訂單改成 <code>cancelled</code>，顧客最大</label>
+  <label data-key="b">先取消訂單，等扣款成功的事件來了再忽略它</label>
+  <label data-key="c">訂單在 <code>pending_payment</code> 時不接受直接取消：回「付款處理中」，或把取消請求記下來，等 saga 結束再處理（已付款就走退款流程）</label>
+  <p class="why">✓ Saga 沒有隔離，<code>pending_payment</code> 就是 semantic lock：它告訴其他操作「這筆正在進行中」。(a) 直接改狀態，saga 下一步扣款成功、確認訂單會把它改回 <code>paid</code>，或者訂單取消了錢卻被扣走。(b) 忽略扣款成功的事件，錢已經扣了卻沒有訂單、也沒有退款，只能等對帳發現。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>同一個資料庫內也用 saga</strong>：多了補償和中間狀態，什麼都沒換到。同一個資料庫直接用交易。</li>
+  <li><strong>不可逆的步驟放在前面</strong>：先扣款再檢查庫存，庫存不足時只能退款。把不可逆或代價高的步驟放在所有驗證之後。</li>
+  <li><strong>一失敗就補償</strong>：網路抖一下就退款取消。暫時性錯誤先重試，重試用盡或確定是業務失敗才補償；pivot 之後根本不補償。</li>
+  <li><strong>補償失敗後無限重試或默默放棄</strong>：前者打爆對方，後者留下沒人知道的不一致。設上限，用盡就標成 stuck、告警、交給人。</li>
+  <li><strong>沒有記錄進度</strong>：協調者當機後不知道做到哪裡，只能從頭跑或放著不管。每完成一步就寫進 saga 紀錄，重啟時依紀錄續跑。</li>
+  <li><strong>步驟或補償不冪等</strong>：協調者在「呼叫成功、還沒寫紀錄」時當機，重啟後再呼叫一次，就重複扣款或重複退款。每一步都帶 <code>saga:&lt;id&gt;:&lt;步驟&gt;</code> 冪等鍵。</li>
+  <li><strong>以為 saga 有隔離</strong>：其他流程會看到中間狀態，用「讀出來再寫回去」會蓋掉別人的修改。用 semantic lock 擋住衝突操作，用交換律更新（<code>qty = qty - 1</code>）。</li>
+  <li><strong>把逾時當成失敗</strong>：扣款逾時就補償，但對方可能已經扣款。用同一把冪等鍵重試或查詢，確定結果再決定。</li>
+  <li><strong>沒有對帳</strong>：saga 的 bug 會留下金流與訂單對不起來的資料，沒人發現。每天把金流明細跟訂單比對。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>跨服務、跨外部系統沒有一個交易包得住；2PC 會讓參與者在協調者卡住時一起鎖著，外部金流也不支援。Saga 用一連串各自提交的本地交易加上補償，達成最終一致。</li>
+  <li>補償是語意上的抵銷，不是回滾：退款是新的一筆，釋放庫存寫成「加回」。訂單 #501 扣款失敗時，反向補償：先釋放拿鐵、再取消訂單。</li>
+  <li>步驟分三種：可補償的在前、pivot 一個、可重試的在後。不可逆的步驟放在所有驗證之後；咖啡店下單的 pivot 是扣款。</li>
+  <li>Orchestration 協調者：先重試再補償、反向補償、補償有重試上限、用盡就 stuck 交給人。每步寫 saga 紀錄，當機後依紀錄續跑；加上冪等鍵讓重做也安全，命令與紀錄用 outbox 一起寫。</li>
+  <li>Choreography 沒有協調者，但流程分散、難追蹤，適合簡單流程。</li>
+  <li>Saga 沒有隔離：用 semantic lock（例如 <code>pending_payment</code> 時不接受直接取消）、交換律更新、pessimistic view、重新讀取處理。</li>
+  <li>逾時是「結果未知」，用同一把冪等鍵確認再決定；每天對帳是最後一道保險，stuck 清單要讓客服看得懂。</li>
+  <li>Temporal 這類 durable execution 工具替你保存進度與重試，步驟依然要冪等；同一個資料庫內不需要 saga。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 7 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="b">
+  <p>練習 8：金流當機的那 10 分鐘，下單請求數跟平常一樣，金流收到的請求卻是平常的 9 倍。最先該查什麼？</p>
+  <label data-key="a">退避有沒有加 jitter：大家同時重試，流量才會集中暴增</label>
+  <label data-key="b">呼叫鏈上有幾層各自在重試：兩層各試 3 次就是 3 × 3</label>
+  <label data-key="c">金流的逾時是不是太短：逾時太短，請求就會被一直重送</label>
+  <p class="why">✓ 9 倍正好是 3 × 3：上層的每一次嘗試，都讓下層再跑完自己的 3 次，所以是相乘。只留一層重試，其他層把錯誤往上傳，再用重試預算在大面積失敗時自動停止。a 錯在 jitter 改變的是重試的時間點，不改變總次數。（第 8 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 9：App 的結帳這樣寫，伺服器已經實作了冪等鍵。哪裡會出事？</p>
+<pre>async function checkout(cart) {
+  for (let attempt = 1; attempt &lt;= 3; attempt++) {
+    const key = crypto.randomUUID()
+    try {
+      return await api.post('/orders', cart, { headers: { 'Idempotency-Key': key } })
+    } catch (err) {
+      if (!isRetryable(err) || attempt === 3) throw err
+      await sleep(backoffWithJitter(attempt))
+    }
+  }
+}</pre>
+  <label data-key="a">每次嘗試都換一把新 key，逾時後的重試被當成新訂單，可能扣兩次款</label>
+  <label data-key="b">key 應該由伺服器產生再回傳，App 自己產生的 UUID 可能跟別人重複</label>
+  <label data-key="c">POST 不是冪等的方法，就算帶了冪等鍵，也不應該自動重試</label>
+  <label data-key="d">jitter 讓每次重試的時間不同，伺服器會認不出這是同一個請求</label>
+  <p class="why">✓ 伺服器認重複只靠 key，key 換了就是新的意圖。把產生 key 移到迴圈外，使用者按下結帳時產生一次，所有重試沿用；下一張訂單再換新的。c 錯在帶冪等鍵、伺服器做了去重，POST 就「實際上冪等」，可以重試。（第 9 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 10：合作夥伴平常每秒送 5 次，整點會一口氣送 50 筆。你要讓最多 50 個的突發通過，長期平均不超過每秒 10 次。怎麼設？</p>
+  <label data-key="a">固定視窗，每分鐘最多 600 次</label>
+  <label data-key="b">滑動視窗計數，每秒最多 10 次</label>
+  <label data-key="c">token bucket，容量 50、每秒補充 10 個</label>
+  <label data-key="d">token bucket，容量 10、每秒補充 50 個</label>
+  <p class="why">✓ token bucket 的容量決定一次能通過多少（突發），補充速率決定長期平均。b 錯在每秒只放 10 個，整點的 50 筆有 40 筆會收到 429。a 擋不住同一秒湧入幾百個，視窗交界還可能到 1,200；d 把兩個數字放反了。（第 10 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 11：金流沒有掛，只是回應從 200 毫秒變成 8 秒。幾分鐘後，根本不呼叫金流的菜單 API 也開始逾時，健康檢查跟著失敗。為什麼？</p>
+  <label data-key="a">等金流的請求一直佔著 CPU，其他請求分不到 CPU 時間</label>
+  <label data-key="b">卡住的付款請求佔滿共用的連線池和並行名額，菜單排不到</label>
+  <label data-key="c">金流慢不會影響菜單，一定是菜單自己剛好也出了問題</label>
+  <p class="why">✓ L = λW：每個付款請求卡的時間 W 從 0.2 秒變 8 秒，同時卡著的請求多了 40 倍，共用的資源被佔滿，健康的功能和健康檢查一起被拖垮。修法是每個呼叫都有逾時，用隔艙讓金流只能用自己那一格，滿了快速失敗。c 錯在「變慢」比「掛掉」更危險：掛掉會快速回錯、釋放資源，變慢才會一點一點吃光共用資源。（第 11 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 12：結帳成功後要送「訂單成立」事件給廚房。哪一種寫法既不會漏送，也不會送出其實沒成立的訂單？</p>
+  <label data-key="a">在結帳的交易裡先送出事件，送出成功了再 COMMIT</label>
+  <label data-key="b">COMMIT 之後再送出事件，送失敗就退避重試 3 次</label>
+  <label data-key="c">事件和訂單同一個交易寫進 outbox，relay 先送出再標記</label>
+  <label data-key="d">事件和訂單同一個交易寫進 outbox，relay 先標記再送出</label>
+  <p class="why">✓ 訂單和事件一起提交、一起回滾，relay 只送已提交的列；送出後、標記前當機會再送一次，所以消費者要冪等。b 錯在 COMMIT 之後、送出之前程序當機或被部署重啟，訊息就沒了，重試幾次都救不回來，而且不會報錯。a 會在 COMMIT 失敗時送出不存在的訂單，d 送出失敗就永遠遺失。（第 12 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 13：集點的消費者這樣寫，佇列是至少一次送達。哪裡會出事？</p>
+<pre>async function onOrderPaid(msg) {
+  const seen = await db.query('SELECT 1 FROM inbox WHERE msg_id = $1', [msg.id])
+  if (seen.rowCount &gt; 0) return ack(msg)
+  await db.query('UPDATE customers SET points = points + 10 WHERE id = $1', [msg.customerId])
+  await db.query('INSERT INTO inbox (msg_id) VALUES ($1)', [msg.id])
+  await ack(msg)
+}</pre>
+  <label data-key="a">加點數和寫 inbox 不在同一個交易，中間當機的話，重送時會再加一次</label>
+  <label data-key="b">應該先 ack 再處理，才不會因為處理太久，同一則訊息又被送來一次</label>
+  <label data-key="c">INSERT inbox 要放在加點數之前，順序對調之後重送就不會重複加點</label>
+  <label data-key="d">msg.id 是生產者給的，應該改用消費者收到時自己產生的 UUID 來去重</label>
+  <p class="why">✓ inbox 紀錄要跟副作用在同一個交易，用 <code>ON CONFLICT DO NOTHING</code> 原子插入，看影響列數決定要不要加點，不要先查再寫。c 錯在紀錄在前會遺失：寫完 inbox、加點前當機，重送時被當成做過了，點數永遠沒加上。b 是至多一次，處理到一半當機訊息就沒了。（第 12 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 14：saga 已經預留了庫存，呼叫金流扣款時逾時了。協調者接下來該怎麼做？</p>
+  <label data-key="a">當作扣款成功、繼續出單，金額有出入再靠每天的對帳修正</label>
+  <label data-key="b">立刻補償：釋放預留的庫存，並把訂單改成 cancelled</label>
+  <label data-key="c">換一把新的冪等鍵重新扣款，確保這一次請求真的有送到</label>
+  <label data-key="d">用同一把冪等鍵重試或向金流查詢，確定結果再往前或補償</label>
+  <p class="why">✓ 逾時是結果未知：請求可能沒到，也可能已經扣款、只是回應掉了。同一把 key 重試不會重複扣款，拿到確定的結果才決定下一步；一直確認不了就標成 stuck 交給人。b 錯在對方可能已經扣款，顧客付了錢、訂單卻被取消。（第 13 課）</p>
+</div>
+
+<p>這個階段的重點整理成<a href="../sheets/stage-3.html">一頁圖解</a>。</p>
+<p>下一課（選修）：saga 用狀態擋住同一筆訂單的衝突操作；如果是多台機器要搶著做同一件事（例如每天 03:00 的營業報表只能由一台產生、寄出），就需要分散式鎖、租約與 fencing token。跳過的話直接進<a href="15-monolith-microservices.html">第 15 課</a>，階段 4：架構。</p>
+
+</main>
+<script>
+// 時間軸：逐步顯示每一列，並在下方顯示目前步驟的說明
+document.querySelectorAll('.tl').forEach(tl => {
+  const rows = [...tl.querySelectorAll('tr[data-note]')]
+  const note = tl.querySelector('.note')
+  const count = tl.querySelector('[data-count]')
+  const prev = tl.querySelector('[data-prev]')
+  const next = tl.querySelector('[data-next]')
+  let cur = 0
+  const show = () => {
+    rows.forEach((r, i) => {
+      r.classList.toggle('now', i === cur)
+      r.classList.toggle('later', i > cur)
+    })
+    note.textContent = rows[cur].dataset.note
+    count.textContent = `步驟 ${cur + 1} / ${rows.length}`
+    prev.disabled = cur === 0
+    next.textContent = cur === rows.length - 1 ? '↺ 重新播放' : '下一步 ▶'
+  }
+  prev.onclick = () => { cur--; show() }
+  next.onclick = () => { cur = cur === rows.length - 1 ? 0 : cur + 1; show() }
+  show()
+})
+</script>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

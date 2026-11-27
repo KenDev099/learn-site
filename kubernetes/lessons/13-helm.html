@@ -1,0 +1,481 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>13. Helm 打包與多環境設定（對照 Kustomize）</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="13" data-practice="kubernetes">
+<header>
+  <div class="eyebrow">階段 4：資料、安全與打包 · 第 13 課</div>
+  <h1>Helm 打包與多環境設定（對照 Kustomize）</h1>
+</header>
+<main>
+
+<p>到目前為止，咖啡店的 API 是一疊 YAML：Deployment、Service、HTTPRoute、ConfigMap、HPA、PDB。只有一個環境時沒問題。可是公司會有 dev、staging、prod 三個環境，三份 YAML 有九成一樣，只差副本數、資源、網域和映像版本。複製三份的結果是：調整一個 probe 要改三個地方，總有一個忘記，而且忘記的那個通常是 prod。</p>
+<p>這一課學兩種解法。<strong>Helm</strong> 把 manifest 寫成範本，每個環境餵不同的值；<strong>Kustomize</strong> 保留原本的 YAML，每個環境只寫要改的地方。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>複製貼上的問題：三個環境的 YAML 九成一樣，為什麼最後總是 prod 忘了改。</li>
+  <li>第一個 chart、範本語法：從零寫一個最小的 chart，範本最常出的縮排 bug，部署前怎麼檢查。</li>
+  <li>多環境的 values 疊加、release 的生命週期：每個環境只寫差異；一個指令完成部署、等待、失敗自動回滾，新版壞了 CI 不會還亮綠燈。</li>
+  <li>chart 裡的三個陷阱：改了設定 Pod 卻沒換、HPA 擴出的副本被下一次部署蓋回去、migration 要排在哪個時機。</li>
+  <li>Kustomize 對照、chart 在團隊裡怎麼用：另一種做法長什麼樣，你的服務該選哪一個。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="06-config-secrets.html">第 6 課</a>的設定更新：以環境變數注入的 ConfigMap 改了，已經在跑的 Pod 看不到新值，要讓 Pod 範本變動、觸發滾動更新才會生效。</li>
+  <li><a href="08-resources-autoscaling.html">第 8 課</a>的 HPA：依 CPU 自動調整副本數；manifest 裡還寫著 <code>replicas</code> 的話，每次部署都會把副本數改回去。</li>
+  <li><a href="09-rollouts-pdb.html">第 9 課</a>的 <code>deploy.sh</code>：用 <code>rollout status</code> 等新版就緒，失敗就 <code>rollout undo</code> 回到上一版。</li>
+  <li><a href="10-jobs-cronjobs.html">第 10 課</a>的 migration Job：每個版本跑一次 migration，成功了才更新應用。</li>
+</ul></div>
+
+<h2>複製貼上的問題</h2>
+<p>把三個環境的 Deployment 並排，真正不同的只有幾行：</p>
+<div class="table-wrap"><table>
+  <tr><th>欄位</th><th>dev</th><th>staging</th><th>prod</th></tr>
+  <tr><td>副本數</td><td>1</td><td>1</td><td>交給 HPA（3～6）</td></tr>
+  <tr><td>resources</td><td>50m／64Mi</td><td>50m／64Mi</td><td>250m／256Mi</td></tr>
+  <tr><td>網域（HTTPRoute）</td><td>cafe.test</td><td>staging-api.cafe.test</td><td>api.cafe.test</td></tr>
+  <tr><td>映像 tag</td><td colspan="3">每次部署不同：CI 建置出來的那一版（<a href="../../devops/lessons/16-cd.html">devops 課第 16 課</a>）</td></tr>
+  <tr><td>PDB</td><td>無</td><td>無</td><td>有</td></tr>
+  <tr><td>probe、preStop、labels、port……</td><td colspan="3">完全一樣</td></tr>
+</table></div>
+<p>需要的是「一份共用的東西＋每個環境一小份差異」。有兩種做法：</p>
+<ul>
+  <li><strong>範本</strong>：把會變的地方挖成空格（<code>replicas: {{ .Values.replicas }}</code>），部署時填值。Helm 是這一派，表達力強，可以有條件與迴圈，代價是 YAML 裡混了範本語法，不能直接 <code>kubectl apply</code>。</li>
+  <li><strong>疊加</strong>：base 是普通、可以直接 apply 的 YAML，每個環境寫一個 overlay，描述「把哪個欄位改成什麼」。Kustomize 是這一派，內建在 kubectl 裡（<code>kubectl apply -k</code>），沒有範本語法，代價是表達力有限。</li>
+</ul>
+
+<h2>第一個 chart</h2>
+<p><strong>Helm</strong> 是 Kubernetes 的套件管理工具。一個 Helm 套件叫 <strong>chart</strong>，是一個資料夾。<code>helm create</code> 會產生一個功能齊全但檔案很多的範例，初學時反而看不出重點，我們從零寫一個最小的：</p>
+<pre>chart/
+  Chart.yaml            # chart 的名稱與版本
+  values.yaml           # 預設值
+  templates/
+    _helpers.tpl        # 共用的小範本（名稱、labels）；底線開頭的檔案不會輸出成物件
+    deployment.yaml
+    service.yaml
+    httproute.yaml</pre>
+<p><code>Chart.yaml</code> 有兩個容易搞混的版本：</p>
+<pre>apiVersion: v2          # chart 格式的版本，Helm 3、4 都用 v2
+name: cafe-api
+version: 0.1.0          # chart 本身的版本：改了範本就要加，發佈 chart 時用它區分
+appVersion: "1.0.0"     # 這個 chart 部署的應用程式版本，只是標籤，不會影響映像</pre>
+<p>你的服務每天部署好幾次，但 chart 的範本可能幾個月才改一次，所以兩者分開。Helm 4 還有實驗中的 chart v3 格式，正式使用仍是 <code>apiVersion: v2</code>。</p>
+<p>Helm 怎麼把這些檔案變成叢集裡的物件：</p>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="values.yaml 加上 -f 的環境值檔與 --set 的值合併成一份 values，餵給 templates 產生最終的 YAML；helm template 只印出 YAML，helm upgrade --install 把它送進 API server，並在 namespace 裡存一筆 release 紀錄">
+    <defs><marker id="h13a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="10" y="20" width="170" height="40" rx="6"/><text class="d-text" x="95" y="45" text-anchor="middle">values.yaml（預設）</text>
+    <rect class="d-soft" x="10" y="70" width="170" height="40" rx="6"/><text class="d-text" x="95" y="95" text-anchor="middle">-f values-prod.yaml</text>
+    <rect class="d-soft" x="10" y="120" width="170" height="40" rx="6"/><text class="d-text" x="95" y="145" text-anchor="middle">--set image.tag=…</text>
+    <text class="d-small" x="95" y="185" text-anchor="middle">後面的蓋過前面的</text>
+    <rect class="d-box" x="230" y="60" width="130" height="60" rx="6"/><text class="d-text" x="295" y="86" text-anchor="middle">templates/</text><text class="d-small" x="295" y="106" text-anchor="middle">填入 values</text>
+    <line class="d-line" x1="180" y1="40" x2="228" y2="80" marker-end="url(#h13a)"/>
+    <line class="d-line" x1="180" y1="90" x2="228" y2="90" marker-end="url(#h13a)"/>
+    <line class="d-line" x1="180" y1="140" x2="228" y2="100" marker-end="url(#h13a)"/>
+    <rect class="d-box" x="410" y="60" width="120" height="60" rx="6"/><text class="d-text" x="470" y="86" text-anchor="middle">最終的 YAML</text><text class="d-small" x="470" y="106" text-anchor="middle">helm template 到此</text>
+    <line class="d-line" x1="360" y1="90" x2="408" y2="90" marker-end="url(#h13a)"/>
+    <rect class="d-soft" x="575" y="30" width="115" height="50" rx="6"/><text class="d-text" x="632" y="60" text-anchor="middle">API server</text>
+    <rect class="d-soft" x="575" y="110" width="115" height="70" rx="6"/><text class="d-text" x="632" y="135" text-anchor="middle">release 紀錄</text><text class="d-small" x="632" y="155" text-anchor="middle">Secret</text><text class="d-small" x="632" y="171" text-anchor="middle">sh.helm.release.v1.*</text>
+    <line class="d-line" x1="530" y1="80" x2="573" y2="60" marker-end="url(#h13a)"/>
+    <line class="d-line" x1="530" y1="100" x2="573" y2="135" marker-end="url(#h13a)"/>
+    <text class="d-accent" x="470" y="220" text-anchor="middle">helm upgrade --install 才會送進叢集</text>
+  </svg>
+  <figcaption>values 合併 → 範本產生 YAML → 送進叢集，並記下這次部署</figcaption>
+</figure>
+<p>chart 安裝到叢集的一個實例叫 <strong>release</strong>，有自己的名稱（例如 <code>cafe</code>）和版本紀錄。同一個 chart 可以在同一個叢集裝成好幾個 release（<code>cafe-staging</code>、<code>cafe-prod</code>），所以範本裡的物件名稱與 labels 要用 release 名稱來產生，否則兩個 release 會搶同一個物件。</p>
+<p>部署前的三道檢查，每一道都不需要叢集。先在 <code>learn</code> 資料夾執行一次 <code>node check.mjs kubernetes 13</code>，起始檔會複製到 <code>kubernetes/practice/work/13/</code>；做完練習 1 之後：</p>
+<pre>cd learn
+C=kubernetes/practice/work/13/ex1/chart
+S=kubernetes/practice/schemas
+helm template cafe $C --set image.tag=v1           # 印出最終的 YAML，用眼睛看
+helm lint $C --set image.tag=v1                    # chart 的結構與範本語法
+helm template cafe $C --set image.tag=v1 --kube-version 1.37.0 \
+  | kubeconform -strict -summary -kubernetes-version 1.37.0 \
+    -schema-location "$S/{{.NormalizedKubernetesVersion}}-standalone{{.StrictSuffix}}/{{.ResourceKind}}{{.KindSuffix}}.json" \
+    -schema-location "$S/crds/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json" -     # 欄位與型別</pre>
+<p>兩個 <code>-schema-location</code> 指向課程下載好的離線 schema：第一個是 Kubernetes 內建的資源，第二個是 HTTPRoute 這類 CRD（不加的話 kubeconform 找不到 HTTPRoute 的 schema）。最後的 <code>-</code> 表示從 stdin 讀。<code>helm lint</code> 也要給 <code>image.tag</code>，因為它會實際產生一次範本。</p>
+<p><code>helm lint</code> 只檢查 chart 本身（範本能不能產生、YAML 合不合法），<strong>不檢查</strong>欄位名稱寫錯或放錯層級。這種錯要靠 kubeconform（<a href="02-pods-yaml.html">第 2 課</a>）照 Kubernetes 的 schema 檢查。</p>
+
+<h2>範本語法：夠用就好</h2>
+<p>範本是 Go 的 <code>text/template</code>，加上 Helm 附的一組函式。<code>{{ }}</code> 之間是程式，其他照原樣輸出。常用的只有這些：</p>
+<div class="table-wrap"><table>
+  <tr><th>寫法</th><th>作用</th></tr>
+  <tr><td><code>{{ .Values.replicas }}</code></td><td>讀 values；<code>.Release.Name</code> 是 release 名稱，<code>.Chart.Name</code>、<code>.Chart.AppVersion</code> 來自 Chart.yaml</td></tr>
+  <tr><td><code>{{ .Values.host | quote }}</code></td><td><code>|</code> 把左邊的結果交給右邊的函式；<code>quote</code> 加上雙引號。數字或 <code>"0"</code>、<code>"true"</code> 這類值要當字串時（環境變數、ConfigMap 的值）一定要加</td></tr>
+  <tr><td><code>{{- … }}</code>／<code>{{ … -}}</code></td><td>減號吃掉左邊／右邊的空白與換行，避免產生多餘的空行</td></tr>
+  <tr><td><code>{{ required "訊息" .Values.image.tag }}</code></td><td>值是空的就讓整個 template 失敗並印出訊息</td></tr>
+  <tr><td><code>{{ .Values.x | default "info" }}</code></td><td>沒給就用預設值</td></tr>
+  <tr><td><code>{{- if … }} … {{- end }}</code></td><td>條件：值是 false、0、空字串、空清單時不輸出</td></tr>
+  <tr><td><code>{{- with .Values.db.existingSecret }} … {{ . }} … {{- end }}</code></td><td>有值才輸出，區塊裡的 <code>.</code> 變成那個值</td></tr>
+  <tr><td><code>{{- range $k, $v := .Values.env }} … {{- end }}</code></td><td>對 map 或清單的每一項輸出一次</td></tr>
+  <tr><td><code>{{- include "cafe.labels" . | nindent 4 }}</code></td><td>呼叫 _helpers.tpl 裡 <code>define</code> 的小範本，換行後每一行縮排 4 格</td></tr>
+  <tr><td><code>{{- toYaml .Values.resources | nindent 12 }}</code></td><td>把 values 裡的一整塊原樣轉成 YAML，再縮排</td></tr>
+</table></div>
+<p>最常見的 bug 是<strong>縮排</strong>。YAML 用縮排表示層級，範本卻只是在做文字替換，它不知道自己在第幾層。看這段：</p>
+<pre>          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}</pre>
+<p><code>resources:</code> 在第 10 格，它底下的 <code>requests</code>、<code>limits</code> 要在第 12 格，所以是 <code>nindent 12</code>。寫成 <code>nindent 10</code>，<code>requests</code> 會跟 <code>resources</code> 同一層，變成容器的欄位；<code>resources</code> 本身變成空的。這份 YAML 語法完全合法，<code>helm lint</code> 也會通過，kubeconform 才會說 <code>additional properties 'limits', 'requests' not allowed</code>。沒有這道檢查，就要等到部署時才出事。這就是為什麼每次都要跑 kubeconform。</p>
+<p><code>_helpers.tpl</code> 放共用的小範本：</p>
+<pre>{{- define "cafe.fullname" -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+
+{{- define "cafe.selectorLabels" -}}
+app.kubernetes.io/name: {{ .Chart.Name }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{- define "cafe.labels" -}}
+{{ include "cafe.selectorLabels" . }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
+{{- end }}</pre>
+<ul>
+  <li><strong>名稱</strong>：Kubernetes 物件名稱最長 63 字元（DNS label 的上限），<code>trunc 63</code> 截斷。這裡直接用 release 名稱，比 <code>helm create</code> 的寫法簡單，同一個 namespace 一個服務一個 release 時就夠了。</li>
+  <li><strong>兩組 labels</strong>：<code>app.kubernetes.io/*</code> 是 Kubernetes 建議的標準 label。selector 只放 name 與 instance，因為 <strong>Deployment 的 selector 建立後不能改</strong>（<a href="03-deployments.html">第 3 課</a>）。把每次升級都會變的 version 或 chart 版本放進 selector，下一次 <code>helm upgrade</code> 就會被 API server 以 <code>field is immutable</code> 拒絕。</li>
+  <li>每個範本都用 <code>include</code> 引用，不要各自寫一份：要加一個 label（例如成本歸屬的 <code>team</code>）時只改一個地方。</li>
+</ul>
+<p>映像這一行用 <code>required</code>：</p>
+<pre>image: "{{ .Values.image.repository }}:{{ required "image.tag 是必填：部署時用 --set image.tag=&lt;版本&gt; 傳入" .Values.image.tag }}"</pre>
+<p>不給 <code>image.tag</code> 預設值，尤其不能是 <code>latest</code>。<code>latest</code> 只是一個會移動的名字：今天和下週部署的「同一個 chart」跑的是不同程式，出事時你不知道線上是哪一版，也沒有確定的版本可以回滾。用 <code>required</code> 讓「忘了傳版本」在 template 階段就失敗。開源的 chart 通常讓 tag 預設成 <code>.Chart.AppVersion</code>，因為它們發佈時兩者一起決定；自己的服務每次由 CI 傳入 git commit 的 SHA，所以用 required。</p>
+<div class="callout practice"><strong>💡 實務上：values 欄位是一份介面，要有人負責</strong><br>範本可以有 if、range、自訂函式，很容易長成一套沒人看得懂的程式。資深的判斷是：一個 values 欄位對應一個真實存在的環境差異；只有一個環境用到的設定、永遠不會變的設定，直接寫在範本裡。每多一個欄位，就多一種組合要測、一個設定要寫文件，也多一個別人會依賴、以後很難拿掉的開關。團隊裡要講清楚誰負責：通常應用團隊維護 chart 和 <code>values.yaml</code>，prod 值檔的變更再經過一位熟悉正式環境的人 review。有人提議「加個參數讓它可以設定」時，先問「現在哪個環境需要不同的值？」，答不出來就先不要加。</div>
+
+<h2>多環境：values 疊加</h2>
+<p>每個環境一個值檔，只寫跟 <code>values.yaml</code> 不同的地方。合併時後面的蓋過前面的，map 會深層合併：</p>
+<pre># values-prod.yaml
+host: api.cafe.test
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    memory: 512Mi
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 6
+pdb:
+  enabled: true
+db:
+  existingSecret: cafe-db</pre>
+<pre>helm template cafe ./chart -f values-prod.yaml --set image.tag=3f9c2ab        # 預覽 prod 會部署什麼
+helm upgrade --install cafe ./chart -n cafe-prod -f values-prod.yaml --set image.tag=3f9c2ab</pre>
+<p>順序是 chart 的 <code>values.yaml</code> → 每個 <code>-f</code>（照命令列的順序）→ <code>--set</code>。映像 tag 不寫在任何值檔裡，部署時用 <code>--set</code> 傳入，同一份值檔才能部署任何版本，也才能回滾。</p>
+<h3>機密不放 values</h3>
+<p>把資料庫密碼寫進 <code>values-prod.yaml</code> 有兩個問題：值檔通常 commit 進 git，所有能讀 repo 的人、每一份 clone 都有它；而且 Helm 會把這次部署用的 values 原樣存進 release 紀錄（下一節），能讀那個 namespace Secret 的人用 <code>helm get values</code> 就看得到。正確做法是第 6 課的分工：Secret 由外部 secret 管理或平台建立，chart 只寫它的名稱：</p>
+<pre>            {{- with .Values.db.existingSecret }}
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: DATABASE_URL
+            {{- end }}</pre>
+<p><code>existingSecret</code> 是很多公開 chart 共用的慣例名稱，看到它就知道「這裡填一個已經存在的 Secret」。</p>
+
+<h2>release 的生命週期</h2>
+<p>部署只用一個指令：</p>
+<pre>helm upgrade --install cafe ./chart -n cafe-prod -f values-prod.yaml \
+  --set image.tag=3f9c2ab --wait --timeout 3m --rollback-on-failure</pre>
+<div class="table-wrap"><table>
+  <tr><th>旗標</th><th>意思</th></tr>
+  <tr><td><code>upgrade --install</code></td><td>release 不存在就安裝，存在就升級。CI 不必分辨是第一次還是第 N 次</td></tr>
+  <tr><td><code>--wait</code></td><td>等資源真的就緒。Helm 4.3.1 的 <code>--wait</code> 是一個「等待策略」：不加時預設 <code>hookOnly</code>，只等 hook，Deployment 送進 API server 就回報成功；單寫 <code>--wait</code> 等於 <code>--wait=watcher</code>，照每種資源的狀態判斷（Deployment 要更新完成且可用）；另有 <code>legacy</code> 是 Helm 3 的做法</td></tr>
+  <tr><td><code>--timeout 3m</code></td><td>最多等多久，預設 5 分鐘。超過就算失敗</td></tr>
+  <tr><td><code>--rollback-on-failure</code></td><td>失敗就自動回到上一個成功的 revision；第一次安裝就失敗時改成整個解除安裝。有這個旗標時 <code>--wait</code> 預設會變成 watcher，但腳本還是明寫 <code>--wait</code>，讓讀的人不用記這條規則</td></tr>
+</table></div>
+<p>沒有 <code>--wait</code> 是最常見的事故：新版本 CrashLoopBackOff，Helm 卻回報成功，CI 一片綠燈。第 9 課的 deploy.sh 用 <code>rollout status</code>＋<code>rollout undo</code> 自己做了這件事；用 Helm 時交給這三個旗標。</p>
+<p>每次 install、upgrade、rollback 都產生一個新的 <strong>revision</strong>，存在 release 所在 namespace 的 Secret 裡（名稱 <code>sh.helm.release.v1.cafe.v3</code> 這種格式，內容是壓縮過的 chart、values 與最終 YAML）：</p>
+<pre>helm history cafe -n cafe-prod
+REVISION  STATUS      DESCRIPTION
+1         superseded  Install complete
+2         superseded  Upgrade complete
+3         failed      Upgrade "cafe" failed: resource Deployment/cafe-prod/cafe not ready …
+4         deployed    Rollback to 2
+
+helm get values cafe -n cafe-prod          # 這個 release 用了哪些值（-f 與 --set 給的）
+helm get manifest cafe -n cafe-prod        # 叢集裡應該要是什麼樣子
+helm rollback cafe 2 -n cafe-prod --wait   # 手動回到 revision 2
+kubectl get secret -n cafe-prod -l owner=helm</pre>
+<p>Helm 4 跟 Helm 3 的差異裡，這幾個會出現在你的腳本：</p>
+<ul>
+  <li><strong>server-side apply</strong>：Helm 4 新安裝的 release 預設用 server-side apply，由 API server 合併欄位並記錄每個欄位歸誰管，跟其他工具（例如 HPA、Argo CD）一起改同一個物件時衝突比較少。升級與回滾沿用 release 原本的方式，所以 Helm 3 建立的 release 在 Helm 4 還是 client-side apply；要改用 <code>--server-side true</code>。</li>
+  <li><code>--atomic</code> 改名 <code>--rollback-on-failure</code>，<code>--force</code> 改名 <code>--force-replace</code>。舊名稱還能用，但會印出棄用警告；網路上的文章大多還是舊名稱。</li>
+  <li>post-renderer 改成 plugin，要用 plugin 名稱指定。</li>
+</ul>
+
+<div class="callout practice"><strong>💡 實務上：CI 被取消，release 卡在 pending-upgrade</strong><br>常見的情境：<code>helm upgrade --wait</code> 跑到一半，有人推了新的 commit，CI 把舊的工作取消。Helm 來不及把結果寫回 release 紀錄，<code>helm history</code> 最後一筆停在 <code>pending-upgrade</code>，之後每一次部署都被拒絕：<code>another operation (install/upgrade/rollback) is in progress</code>。先確認真的沒有別的 helm 在跑，再用 <code>helm rollback</code> 回到最後一個 <code>deployed</code> 的 revision，release 就恢復正常。預防的方法第 9 課提過：部署這一步在 CI 裡設成不能被取消，同一個環境同時只跑一個部署。</div>
+
+<h2>chart 裡的三個陷阱</h2>
+<h3>1. 設定改了，Pod 沒換</h3>
+<p>第 6 課講過：ConfigMap 以環境變數注入時，改了 ConfigMap，已經在跑的 Pod 看不到新值；Pod 範本沒變，Deployment 也不會換 Pod。<code>helm upgrade</code> 只改了 ConfigMap，結果就是「設定改了但沒生效」。Helm 官方的做法是把設定內容的雜湊值放進 <strong>Pod 範本</strong>的 annotation：</p>
+<pre>  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}</pre>
+<p><code>include (print $.Template.BasePath "/configmap.yaml") .</code> 把 configmap.yaml 範本產生的內容當成字串，<code>sha256sum</code> 算雜湊。設定變了，雜湊就變，Pod 範本就變，Deployment 照滾動更新換 Pod；設定沒變時重複部署，雜湊相同，不會多重啟一次。兩個常見的錯：放在 Deployment 自己的 <code>metadata.annotations</code>（那裡變了不會換 Pod），以及用 <code>now</code> 時間戳（每次部署都重啟所有 Pod）。</p>
+<h3>2. 開了 HPA 還輸出 replicas</h3>
+<p>第 8 課講過：HPA 把副本數擴到 8，下一次部署又把 <code>replicas: 3</code> 寫回去，尖峰時突然少了 5 個 Pod。在 chart 裡用條件包住：</p>
+<pre>spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicas }}
+  {{- end }}</pre>
+<p>HPA 與 PDB 也各自用 <code>{{- if .Values.autoscaling.enabled }}</code>、<code>{{- if .Values.pdb.enabled }}</code> 包住整個檔案。PDB 只在多副本的環境開：只有 1 個副本時，<code>maxUnavailable: 1</code> 等於允許服務整個中斷，<code>minAvailable: 1</code> 則讓節點 drain 永遠卡住（第 9 課）。</p>
+<h3>3. migration 在哪裡跑</h3>
+<p>Helm 的 <strong>hook</strong> 是帶著 <code>helm.sh/hook</code> annotation 的資源，在安裝或升級的特定時機執行。把第 10 課的 migration Job 標成 <code>pre-upgrade</code>，Helm 會在換 Deployment 之前執行它、等它完成，失敗就讓這次升級失敗：</p>
+<pre>metadata:
+  name: {{ include "cafe.fullname" . }}-migrate
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded</pre>
+<p>取捨：hook 建立的資源<strong>不算</strong> release 的一部分，<code>helm uninstall</code> 不會刪，要靠 <code>hook-delete-policy</code>（預設 <code>before-hook-creation</code>：下次執行前刪掉上一個）或 Job 的 TTL 清理；hook 失敗時，失敗的 Job 留在叢集可以查 log，但這次 release 標成 failed。另一個選擇是第 10 課的做法：deploy.sh 先跑 migration Job、等它完成，再 <code>helm upgrade</code>。兩者都對，差別在你想在哪裡看到 migration 的狀態；期末專題（第 16 課）用第二種，讓 migration 與部署的 log 分開。不管哪一種，migration 都要照第 9 課的 expand／contract，讓舊版程式在 migration 之後還能跑。</p>
+
+<h2>Kustomize 對照</h2>
+<p>同一件事用 <strong>Kustomize</strong> 做。它內建在 kubectl（這台 Mac 的 kubectl 1.36.1 內含 Kustomize v5.8.1），資料夾長這樣：</p>
+<pre>base/
+  kustomization.yaml     # 列出共用的資源、共用的 labels、ConfigMap 的產生方式
+  deployment.yaml        # 普通的 YAML，可以直接讀、直接 apply
+  service.yaml
+overlays/
+  prod/
+    kustomization.yaml   # 引用 base，再描述 prod 要改什麼
+    deployment-patch.yaml
+    hpa.yaml             # 只有 prod 才有的資源
+    pdb.yaml</pre>
+<p>prod 的 <code>kustomization.yaml</code>：</p>
+<pre>apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+  - hpa.yaml
+  - pdb.yaml
+images:                          # 換映像 tag，不用寫 patch
+  - name: learn-k8s/cafe-api
+    newTag: v2
+configMapGenerator:              # 在 base 的 cafe-config 上加／改鍵
+  - name: cafe-config
+    behavior: merge
+    literals:
+      - APP_ENV=prod
+patches:
+  - path: deployment-patch.yaml  # strategic merge：寫一份「只有要改的欄位」的 Deployment
+  - target:                      # JSON patch：精準地刪掉一個欄位
+      kind: Deployment
+      name: cafe
+    patch: |-
+      - op: remove
+        path: /spec/replicas</pre>
+<ul>
+  <li><strong>overlay</strong>（疊加層）是一個環境專屬的資料夾；<strong>patch</strong> 是對 base 的局部修改。strategic merge patch 長得像原本的物件，只寫要改的欄位（容器用 <code>name</code> 對上）；JSON patch 用 <code>op</code>／<code>path</code> 描述，適合「刪掉某個欄位」這種 strategic merge 不好表達的事。舊的 <code>patchesStrategicMerge</code>、<code>commonLabels</code> 欄位在 Kustomize v5 已棄用，改用 <code>patches</code>、<code>labels</code>。</li>
+  <li><strong>configMapGenerator</strong> 產生的 ConfigMap 名稱會加上內容的雜湊，例如 <code>cafe-config-f247tk59d9</code>，並自動把 Deployment 裡參照它的地方改成新名稱。設定一變，名稱變，Pod 範本變，就滾動更新；舊的 ConfigMap 還在，所以 <code>rollout undo</code> 時設定跟著回去。這正是第 6 課「不可變設定＋改名」的自動版。<code>disableNameSuffixHash: true</code> 會關掉這個行為，除非有外部程式要用固定名稱找它，否則不要關。</li>
+</ul>
+<pre>kubectl kustomize overlays/prod                 # 印出最終 YAML（等於 helm template）
+kubectl apply -k overlays/prod -n cafe-prod     # 套用
+kubectl diff -k overlays/prod -n cafe-prod      # 跟叢集現況比較</pre>
+<p>Kustomize 沒有 release 與 history，回滾靠 git（revert 再 apply）或 <code>kubectl rollout undo</code>，等待與失敗處理要自己寫（第 9 課的 deploy.sh）。</p>
+<div class="table-wrap"><table>
+  <tr><th>情況</th><th>選擇</th><th>原因</th></tr>
+  <tr><td>安裝第三方軟體（metrics-server、Argo CD、ingress controller）</td><td>Helm</td><td>官方多半提供 chart，參數都整理好了，升級時換 chart 版本即可</td></tr>
+  <tr><td>要把服務發佈給別的團隊或客戶安裝，需要很多參數</td><td>Helm</td><td>範本與 values 就是設計來給別人設定的；有版本、可以放 registry</td></tr>
+  <tr><td>需要安裝前後執行步驟、需要 release 紀錄與一鍵回滾</td><td>Helm</td><td>hook、history、rollback 內建</td></tr>
+  <tr><td>團隊自己的服務，環境之間只差 tag、副本數、資源、網域</td><td>Kustomize 也很好</td><td>YAML 保持原樣可讀、沒有範本語法要學、kubectl 內建</td></tr>
+  <tr><td>用別人的 chart，但需要改一個 chart 沒開放的欄位</td><td>兩者混用</td><td><code>helm template</code> 產生 YAML，再交給 Kustomize patch</td></tr>
+</table></div>
+<p>沒有標準答案，重要的是一個團隊只選一種主要做法，不要每個服務各自發明。</p>
+
+<h2>實務：chart 在團隊裡怎麼用</h2>
+<p>工具選好之後，剩下的是 chart 在團隊裡怎麼放、怎麼檢查、由誰部署：</p>
+<ul>
+  <li><strong>chart 放在服務的 repo</strong>：<code>deploy/chart/</code> 跟程式一起改、一起 review。改了 API 需要新的環境變數時，同一個 PR 就把 values 與範本改好。</li>
+  <li><strong>PR 就檢查</strong>：CI 對每個環境跑 <code>helm lint</code>、<code>helm template -f values-&lt;env&gt;.yaml</code>＋kubeconform。縮排錯誤、prod 漏了值，在合併前就擋下，而不是部署時才發現。</li>
+  <li><strong>部署時看差異</strong>：<code>helm template … | kubectl diff -n &lt;ns&gt; -f -</code> 印出這次部署會改到叢集的哪些欄位（kubectl 內建，不需外掛）。上 prod 前看一眼，比部署後再查快得多。</li>
+  <li><strong>發佈 chart</strong>：要給別的 repo 或團隊用時，<code>helm package</code> 打包成 <code>cafe-api-0.1.0.tgz</code>，用 <code>helm push</code> 推到 <strong>OCI registry</strong>（存映像的倉庫也能存 chart，例如 AWS 的 ECR），安裝時用 <code>oci://…</code> 網址並指定 <code>--version</code>。</li>
+  <li><strong>第三方 chart 一律鎖版本</strong>：<code>helm upgrade --install … --version 3.12.2</code>，自訂的值放在 git 的值檔，升級 chart 版本當成一次變更，先讀 release note。</li>
+  <li><strong>正式環境多半不是人下指令</strong>：第 15 課的 GitOps 讓 Argo CD 讀 git 裡的 chart 與值檔、自己算出 YAML 並同步；你這課寫的 chart 與值檔原封不動地用上。</li>
+</ul>
+
+<h2>練習</h2>
+<p>在 <code>learn</code> 資料夾執行頁面上的指令，起始檔會複製到 <code>kubernetes/practice/work/13/</code>。練習 1、2、5 只用 <code>helm template</code>、<code>kubectl kustomize</code> 和 kubeconform 檢查，幾秒就跑完，不需要叢集；練習 3、4 會部署到叢集的專屬 namespace（<code>k8s-13-ex3</code>、<code>k8s-13-ex4</code>），每題要幾分鐘。想自己先試時用 <code>try-13</code> namespace，用完 <code>kubectl delete namespace try-13</code>（release 紀錄也在裡面，一起刪掉）。</p>
+
+<div class="local" data-test="ex1" data-files="ex1/chart/templates/_helpers.tpl ex1/chart/templates/deployment.yaml ex1/chart/templates/service.yaml ex1/chart/templates/httproute.yaml">
+  <p>練習 1：完成 <code>ex1/chart/</code>（<code>Chart.yaml</code>、<code>values.yaml</code> 已經寫好，不用改）。在 <code>_helpers.tpl</code> 定義 <code>cafe.selectorLabels</code>（name、instance）與 <code>cafe.labels</code>（selectorLabels 加上 version、managed-by、helm.sh/chart）；三個範本的 labels 都用 <code>include "cafe.labels"</code>，Deployment 與 Service 的 selector 用 <code>include "cafe.selectorLabels"</code>；Deployment 的 replicas 讀 values、映像是 <code>repository:tag</code> 且 tag 用 <code>required</code>（訊息要提到 image.tag）、resources 用 <code>toYaml</code>＋正確的 <code>nindent</code>；HTTPRoute 的 hostnames 用 <code>.Values.host</code>、backendRefs 指到這個 chart 的 Service。probe 與 preStop 已經寫好。測試跑 <code>helm lint</code>、確認沒給 tag 時失敗、用 kubeconform 檢查輸出，再換 release 名稱與 values 檢查每個物件的 labels。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="ex2/values-staging.yaml ex2/values-prod.yaml ex2/chart/templates/deployment.yaml">
+  <p>練習 2：<code>ex2/chart/</code> 是練習 1 的答案，加上了 HPA、PDB 範本與 <code>db.existingSecret</code>。寫 <code>ex2/values-staging.yaml</code>：1 個副本、host <code>staging-api.cafe.test</code>，不開 HPA 與 PDB。寫 <code>ex2/values-prod.yaml</code>：host <code>api.cafe.test</code>、resources 為 requests cpu 250m／memory 256Mi、limits memory 512Mi、HPA 3～6、開 PDB、資料庫連線參照既有的 Secret <code>cafe-db</code>。再改 <code>chart/templates/deployment.yaml</code>，讓啟用 HPA 時不輸出 replicas。值檔只寫跟 <code>chart/values.yaml</code> 不同的地方，不寫 image.tag，也不能有任何密碼欄位。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="ex3/chart/templates/configmap.yaml ex3/chart/templates/deployment.yaml">
+  <p>練習 3：<code>ex3/chart/values.yaml</code> 多了 <code>config</code>（兩個 <code>CAFE_</code> 開頭的設定）。寫 <code>templates/configmap.yaml</code>：名為 <code>&lt;fullname&gt;-config</code> 的 ConfigMap，data 是 <code>.Values.config</code> 的每個鍵值（值加 quote）；Deployment 的容器用 <code>envFrom</code> 讀它，並在 Pod 範本加上 <code>checksum/config</code> annotation。測試先用 helm template 比對：只改 config 時 annotation 要變，只改 replicas 或什麼都不改時不變；再到叢集 <code>helm upgrade --install</code>，接著只改 <code>config.CAFE_MESSAGE</code> 升級，所有 Pod 都要被換掉，<code>GET /config</code> 要看到新值。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="ex4/deploy.sh">
+  <p>練習 4：完成 <code>ex4/deploy.sh &lt;tag&gt;</code>：用一個 <code>helm upgrade --install</code> 把 <code>./chart</code> 部署成 namespace <code>k8s-13-ex4</code> 的 release <code>cafe</code>，tag 用 <code>--set image.tag</code> 傳入，明寫 <code>--wait</code>、<code>--timeout 3m</code>、<code>--rollback-on-failure</code>，失敗時印一行說明並 <code>exit 1</code>。不能用已棄用的 <code>--atomic</code>，也不能改用 kubectl apply。測試在 loadgen 每秒 10 個請求下依序執行 <code>deploy.sh v1</code>、<code>v2</code>（都要成功，helm history 有 2 個 revision）和 <code>deploy.sh bad</code>（啟動就崩潰的映像：要在 280 秒內以非 0 結束，最新的 revision 是自動回滾產生的 deployed，2 個 Ready 的 Pod 都是 v2），全程 0 錯誤。</p>
+</div>
+
+<div class="local" data-test="ex5" data-files="ex5/overlays/prod/kustomization.yaml ex5/overlays/prod/deployment-patch.yaml">
+  <p>練習 5：用 Kustomize 做出跟練習 2 prod 等價的設定。<code>ex5/base/</code> 已經寫好（1 個副本、v1、dev 的 ConfigMap），不要改。完成 <code>ex5/overlays/prod/kustomization.yaml</code>：引用 base 與這個資料夾的 <code>hpa.yaml</code>、<code>pdb.yaml</code>，映像 tag 換成 <code>v2</code>，用 configMapGenerator 的 <code>behavior: merge</code> 把 <code>APP_ENV</code> 改成 <code>prod</code>、<code>LOG_LEVEL</code> 改成 <code>info</code>，用 JSON patch 拿掉 <code>/spec/replicas</code>；在 <code>deployment-patch.yaml</code> 用 strategic merge 只寫容器 api 的 prod resources（同練習 2）。測試檢查 <code>kubectl kustomize overlays/prod</code> 的輸出：通過 kubeconform、ConfigMap 名稱帶雜湊且 Deployment 參照它、probe 與 labels 跟 base 一樣、overlay 沒有複製整份 Deployment。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：把資料庫密碼寫在 <code>values-prod.yaml</code>，用 <code>helm upgrade -f values-prod.yaml</code> 部署。問題在哪？</p>
+  <label data-key="a">沒問題，Helm 會自動加密 values</label>
+  <label data-key="b">值檔常被 commit 進 git，而且 Helm 把這次用的 values 存在 namespace 的 release 紀錄裡，能讀那些 Secret 的人用 helm get values 就看得到；chart 應該只參照既有的 Secret（existingSecret）</label>
+  <label data-key="c">Helm 不支援含有特殊字元的值</label>
+  <label data-key="d">只是格式問題，改用 --set 傳密碼就安全了</label>
+  <p class="why">✓ 機密由外部 secret 管理或平台建立成 Secret，chart 只寫名稱。a 錯在 release 紀錄只是 base64 加壓縮，不是加密；c 不相干；d 的 <code>--set</code> 一樣會被存進 release 紀錄，還會留在 CI 的 log 與 shell 歷史裡。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：CI 執行 <code>helm upgrade --install cafe ./chart --set image.tag=bad</code>，新 Pod 一直 CrashLoopBackOff，CI 卻顯示成功。原因？</p>
+  <label data-key="a">Helm 4 的 bug</label>
+  <label data-key="b">沒加 --wait 時 Helm 4 的等待策略是 hookOnly，只等 hook，資源送進 API server 就算成功；要加 --wait（搭配 --timeout 與 --rollback-on-failure）</label>
+  <label data-key="c">CrashLoopBackOff 在 Kubernetes 不算錯誤</label>
+  <label data-key="d">要加 --force-replace 才會檢查 Pod</label>
+  <p class="why">✓ 加上 <code>--wait</code>（watcher 策略）Helm 才會等 Deployment 更新完成並可用，超過 <code>--timeout</code> 就失敗、由 <code>--rollback-on-failure</code> 回到上一版。a 是預期行為；c 錯在它正是 Pod 起不來的狀態；d 的 <code>--force-replace</code> 是用刪掉重建的方式更新資源，跟等待無關，還會造成中斷。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 8：下列哪個情況比較適合 Kustomize 而不是 Helm？</p>
+  <label data-key="a">要把服務發佈給其他公司安裝，需要幾十個可設定的參數</label>
+  <label data-key="b">團隊自己的服務，環境之間只差映像 tag、副本數與資源，希望 YAML 保持原樣、能直接閱讀</label>
+  <label data-key="c">需要在每次升級前自動執行 migration Job，失敗就中止</label>
+  <label data-key="d">要從 OCI registry 安裝 Argo CD 並鎖定版本</label>
+  <p class="why">✓ 差異小時，Kustomize 用 images、patches、configMapGenerator 就能表達，沒有範本語法。a 需要大量參數與發佈機制，是 Helm 的強項；c 是 Helm hook 的用途；d 是 Helm chart 的發佈與安裝方式。兩者也常一起用：用 Helm 裝第三方軟體，自己的服務用 Kustomize。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>縮排錯誤</strong>：<code>toYaml</code>、<code>include</code> 搭配的 <code>nindent</code> 格數不對，欄位跑到錯的層級，<code>helm lint</code> 照樣通過。每次都跑 <code>helm template</code>＋kubeconform，最好放進 PR 的 CI。</li>
+  <li><strong>image.tag 預設 latest</strong>：不知道線上是哪一版，也沒有確定的版本可以回滾。用 <code>required</code> 強制部署時傳入。</li>
+  <li><strong>selector 放了會變的 label</strong>：version 或 chart 版本進了 selector，下一次升級就被拒絕（selector 不能改）。selector 只放 name 與 instance。</li>
+  <li><strong>機密放 values</strong>：git 與 release 紀錄都留著它。參照既有的 Secret。</li>
+  <li><strong>設定變更沒觸發 rollout</strong>：checksum annotation 要放在 Pod 範本，值用 configmap 內容的 sha256sum，不要用時間戳。</li>
+  <li><strong>開了 HPA 還輸出 replicas</strong>：每次部署都把副本數改回去。用 <code>if not .Values.autoscaling.enabled</code> 包住。</li>
+  <li><strong>沒有 --wait</strong>：部署「成功」但服務是壞的。部署腳本一律 <code>--wait --timeout … --rollback-on-failure</code>。</li>
+  <li><strong>照舊文章寫 --atomic、--force</strong>：Helm 4 改名為 <code>--rollback-on-failure</code>、<code>--force-replace</code>，舊名稱會印出棄用警告。</li>
+  <li><strong>範本寫成程式</strong>：大量 if／range 讓 chart 沒人敢改。一個 values 欄位對應一個真實的環境差異；差異小時考慮 Kustomize。</li>
+  <li><strong>Kustomize overlay 複製整份 Deployment</strong>：base 改了 probe，prod 不會跟著變。overlay 只寫差異。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>多環境的差異只有幾行，不要複製整份 YAML。Helm 用範本＋values，Kustomize 用 base＋overlay。</li>
+  <li>chart＝Chart.yaml（version 是 chart 的版本、appVersion 是應用程式的版本）＋values.yaml＋templates；共用的名稱與 labels 放在 _helpers.tpl，selector 只放不會變的 label。</li>
+  <li>範本語法只要 .Values／.Release／.Chart、quote、required、default、if／with／range、include、toYaml＋nindent；部署前跑 helm template、helm lint、kubeconform。</li>
+  <li>環境值檔只寫差異，image.tag 部署時用 --set 傳入；機密參照既有的 Secret。</li>
+  <li><code>helm upgrade --install --wait --timeout 3m --rollback-on-failure</code> 一個指令完成部署、等待與失敗回滾；revision 存在 namespace 的 Secret，用 history、get values、rollback 查與退。Helm 4 新安裝預設 server-side apply。</li>
+  <li>chart 的三個陷阱：Pod 範本的 checksum annotation、開 HPA 不輸出 replicas、migration 用 pre-upgrade hook 或由部署腳本先跑。</li>
+  <li>Kustomize 的 images、patches、configMapGenerator（名稱帶雜湊）處理小差異；安裝第三方軟體與發佈給別人用 Helm，兩者可以混用。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 8 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 9：內部的菜單圖片工具是 1 個副本的 Deployment，掛一顆 ReadWriteOnce 的 PVC，strategy 沒改。換版時新 Pod 一直停在 ContainerCreating，舊 Pod 也沒被關掉，為什麼？</p>
+  <label data-key="a">WaitForFirstConsumer 要等舊 Pod 刪除，才會替新 Pod 建立新的磁碟</label>
+  <label data-key="b">新映像的 readinessProbe 一直失敗，Deployment 才不肯關掉舊 Pod</label>
+  <label data-key="c">滾動更新先建新 Pod、等它 Ready 才關舊的，新 Pod 卻要等舊 Pod 放開磁碟</label>
+  <label data-key="d">PVC 綁定後只給建立它的那個 Pod 用，新 Pod 要另外申請一個 PVC</label>
+  <p class="why">✓ 預設的 RollingUpdate 和 RWO 磁碟互等：磁碟還掛在舊 Pod 的節點上，新 Pod 掛不上，永遠不會 Ready。改成 <code>strategy.type: Recreate</code>，先關舊的再建新的，代價是換版時幾秒沒有服務。d 錯在 PVC 不屬於某個 Pod，舊 Pod 放開後新 Pod 就掛得上。（第 11 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 10：開發環境的 postgres 是 1 個副本的 StatefulSet，同事把 replicas 改成 3，說「pg-0 掛了還有兩台頂著」。實際上會怎樣？</p>
+  <label data-key="a">多出 pg-1、pg-2，各掛一顆新的空磁碟，跟 pg-0 之間沒有任何複寫</label>
+  <label data-key="b">pg-1、pg-2 依序啟動後，從 pg-0 串流複寫資料，成為唯讀的複本</label>
+  <label data-key="c">三個 Pod 掛同一個 PVC，同時寫同一個資料目錄，資料會被寫壞</label>
+  <label data-key="d">pg-0 掛掉時，StatefulSet 會把 pg-1 升成主節點，接手所有寫入</label>
+  <p class="why">✓ volumeClaimTemplates 替每個 Pod 建自己的 PVC，結果是三個各自獨立的資料庫。StatefulSet 只給固定名稱和自己的磁碟；誰是主節點、怎麼複寫、怎麼切換，是資料庫自己的事（RDS 或 operator 才會做）。b 錯在 Kubernetes 不懂 PostgreSQL 的複寫，不會替你設定。（第 11 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 11：假設正式環境的 postgres 用 StatefulSet 跑在 EKS（EBS、1 個副本），a 區整個故障後 pg-0 一直 Pending。原因是什麼，正式環境該怎麼避免？</p>
+  <label data-key="a">reclaim policy 是 Delete，節點消失時磁碟跟著刪了；改成 Retain 就能在 b 區重建</label>
+  <label data-key="b">排程器還在等 Kubernetes 把磁碟複製到 b 區；正式環境把 timeout 調長就好</label>
+  <label data-key="c">WaitForFirstConsumer 正在 b 區建新磁碟，只是還沒好；正式環境多開幾個副本</label>
+  <label data-key="d">EBS 綁在 a 區，PVC 綁定後 pg-0 只能去 a 區；跨區要靠資料庫自己的複寫，用 RDS Multi-AZ</label>
+  <p class="why">✓ 綁定後，PV 的位置決定 Pod 能排到哪裡；EBS 不會跨可用區搬家，Kubernetes 也不會複製資料。高可用要在資料庫層做：RDS Multi-AZ 會切換到另一區的備援。c 錯在 PVC 已經綁定 a 區的 PV，不會再建新的；多開副本也只是多幾個空資料庫。（第 11 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 12：cafe-api 被入侵，攻擊者用 Pod 裡的 token 呼叫 API，列出了 namespace 裡所有的 ConfigMap。cafe-api 的程式從來不呼叫 Kubernetes API，最可能的原因是？</p>
+  <label data-key="a">token 是永久有效的，之前外洩過的 token 到現在都還能拿來呼叫 API</label>
+  <label data-key="b">它用 default 又自動掛 token，有人為了別的工具把讀 ConfigMap 的權限綁給了 default</label>
+  <label data-key="c">每個 ServiceAccount 預設就能讀自己 namespace 裡的 ConfigMap，只是不能讀 Secret</label>
+  <p class="why">✓ token 能做什麼完全看這個 ServiceAccount 綁了哪些 RBAC；綁給 default，同 namespace 每個用 default 的 Pod 都拿到了。修法：每個應用用自己的 ServiceAccount，不呼叫 API 的設 <code>automountServiceAccountToken: false</code>。c 錯在 default 預設沒有任何權限，問題出在後來綁上去的規則。（第 12 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 13：postgres 的 ingress 想要「只收 <code>team: cafe</code> 的 namespace 裡的 cafe-api」，寫成下面這樣。哪裡會出事？</p>
+<pre>spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: postgres }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: { matchLabels: { team: cafe } }
+        - podSelector: { matchLabels: { app.kubernetes.io/name: cafe-api } }
+      ports:
+        - { protocol: TCP, port: 5432 }</pre>
+  <label data-key="a">兩個 selector 各是一個元素，變成「或」：那些 namespace 的每個 Pod 都連得到</label>
+  <label data-key="b">沒有放行 CoreDNS 的 53 port，cafe-api 會查不到 postgres 的名字</label>
+  <label data-key="c">policyTypes 沒寫 Egress，postgres 回給 cafe-api 的回應會被擋掉</label>
+  <label data-key="d">podSelector 只看本 namespace，別的 namespace 的 cafe-api 永遠連不進來</label>
+  <p class="why">✓ <code>from</code> 是陣列，各加一個 <code>-</code> 就是兩條規則取聯集：那些 namespace 的所有 Pod，或本 namespace 的 cafe-api。拿掉第二個 <code>-</code>，兩個 selector 在同一個元素裡才是「而且」；寫完從不該連的 Pod 實際試一次。b 錯在這是 postgres 的 ingress，DNS 被擋看的是 cafe-api 那一端的 egress。（第 12 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 14：收據的 S3 bucket 出現不明寫入，查到是跟 cafe-api 跑在同一個節點、第三方報表工具的 Pod 寫的。cafe-api 的 S3 權限最可能是怎麼給的？</p>
+  <label data-key="a">用 Pod Identity 把 cafe-api 的 ServiceAccount 對應到能寫這個 bucket 的 IAM 角色</label>
+  <label data-key="b">IAM 使用者的 access key 放進 Secret，只有 cafe-api 的 Pod 範本引用它</label>
+  <label data-key="c">把這個 bucket 的寫入權限加在 cafe-api 所在節點的 IAM 角色上</label>
+  <p class="why">✓ 節點上的每個 Pod 都能透過 IMDS 拿到節點角色，cafe-api 能寫，同節點的每個 Pod 就都能寫。改用 Pod Identity（或 IRSA），只有用那個 ServiceAccount 的 Pod 拿得到短期憑證，再限制 Pod 連到 IMDS。b 的長期金鑰有外洩風險，但報表工具要先讀得到那個 Secret，不是最可能的路。（第 12 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 15：容器用 envFrom 讀 ConfigMap，chart 想讓設定改了就換 Pod，寫成下面這樣。只改 <code>config.CAFE_MESSAGE</code> 升級後會怎樣？</p>
+<pre>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "cafe.fullname" . }}
+  annotations:
+    checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+spec:
+  template:
+    metadata:
+      labels: {{- include "cafe.selectorLabels" . | nindent 8 }}</pre>
+  <label data-key="a">annotation 變了，Helm 會刪掉 Deployment 重建，服務中斷一下</label>
+  <label data-key="b">ConfigMap 更新了，但 Pod 範本沒變，跑著的 Pod 還是舊值</label>
+  <label data-key="c">Deployment 照常滾動更新，新 Pod 啟動時讀到新的設定值</label>
+  <label data-key="d">之後每次升級都會重啟所有 Pod，就算設定沒改也一樣</label>
+  <p class="why">✓ 只有 Pod 範本（<code>spec.template</code>）變了，Deployment 才會換 Pod；放在 Deployment 自己的 metadata，變了也沒用。移到 <code>spec.template.metadata.annotations</code>。c 錯在以環境變數注入時，ConfigMap 改了，已經在跑的 Pod 看不到新值，Pod 範本沒變就不會被換掉。（第 13 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 16：線上是 revision 2（v2），deploy.sh 執行 <code>helm upgrade --install cafe ./chart --set image.tag=bad --wait --timeout 3m --rollback-on-failure</code>，新映像一啟動就崩潰。指令結束後是什麼狀態？</p>
+  <label data-key="a">revision 3 標成 failed，Deployment 停在 bad，要再手動 helm rollback</label>
+  <label data-key="b">Helm 刪掉失敗的 revision 3，history 只剩 1、2，像沒部署過一樣</label>
+  <label data-key="c">整個 release 被解除安裝，下次要重新 install，history 也一起清空</label>
+  <label data-key="d">revision 3 是 failed，另外產生內容同 2 的 revision 4，Pod 回到 v2</label>
+  <p class="why">✓ 超過 timeout 就算失敗，<code>--rollback-on-failure</code> 回到上一個成功的 revision；回滾本身也是新的 revision，失敗紀錄留在 history 可以查。a 是少了 <code>--rollback-on-failure</code> 的結果；c 只發生在第一次安裝就失敗時。（第 13 課）</p>
+</div>
+<p>這個階段的重點整理成<a href="../sheets/stage-4.html">一頁圖解</a>。</p>
+<p>下一課換到出事的時候：Pod 起不來、起來了卻不接流量，從 Pod 的狀態一路查到根因的固定流程。</p>
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>22. 改 schema 與 migration</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="22">
+<header>
+  <div class="eyebrow">階段 7：實務 · 第 22 課</div>
+  <h1>改 schema 與 migration</h1>
+</header>
+<main>
+
+<p>咖啡店後台已經上線半年。當初趕著開店，<code>products</code> 表建得很隨便：<code>price</code> 存成文字，後台想算「漲價 10 元」直接報錯；有些商品的 <code>category</code> 是空的，分類篩選漏掉它們；還有一個早就沒人用的 <code>legacy_code</code> 欄位。現在老闆又要一個新功能：商品可以暫時下架。你接到的任務是把這張表整理好，並讓這次整理安全地送到同事的電腦、測試環境和正式環境。</p>
+<p>難處在於表裡已經有真實資料，網站也一直有人在用，不能 <code>DROP TABLE</code> 重建。這一課整課都在完成這個任務：先在自己電腦上用 <code>ALTER TABLE</code> 一步步把表改好，再把這些修改寫成 <strong>migration 檔</strong>，讓每個環境做一模一樣的修改，最後處理上線那一刻的風險。</p>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="12-constraints.html">第 12 課</a>的約束：<code>NOT NULL</code>、<code>CHECK</code> 讓資料庫擋掉不合規則的資料。</li>
+  <li><a href="18-transactions.html">第 18 課</a>的交易與 DDL：<code>BEGIN … COMMIT</code> 包起來的語句全做或全不做，<code>CREATE TABLE</code>、<code>ALTER TABLE</code> 這類改結構的語句也一樣。</li>
+  <li><a href="19-concurrency.html">第 19 課</a>的鎖：一個交易拿著鎖時，想碰同一份資料的其他交易要排隊等。</li>
+</ul></div>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>表已經有資料，怎麼改結構：<code>ALTER TABLE</code> 原地修改，以及整個任務的最小答案。</li>
+  <li>在自己電腦上把 <code>products</code> 改好：加「是否供應中」、把 <code>price</code> 改成整數、補上規則、改名和刪欄位，每一步都在問「既有的資料怎麼辦」。</li>
+  <li>同事和正式環境怎麼做一樣的修改：migration 檔、up／down，以及一支 migration 跑到一半失敗時為什麼不會留下半套結構。</li>
+  <li>工作中誰幫你管 migration：Supabase、Prisma、Strapi 的做法差在哪。</li>
+  <li>上線那一刻：一句 <code>ALTER</code> 為什麼可能讓網站停擺，欄位非改名不可時怎麼拆成幾次部署。</li>
+</ol></div>
+
+<h2>表裡已經有資料，要怎麼改它的結構？</h2>
+<p>先把「結構」和「資料」分開。資料庫的 <strong>schema</strong> 指的是結構：有哪些表、每張表有哪些欄位、每個欄位是什麼型別、有哪些約束和索引。資料是放進這個結構裡的內容。schema 決定資料能長什麼樣子，例如 <code>price</code> 是 <code>text</code>，資料庫就只把它當文字看待，不會讓你拿來加減。</p>
+<p>用咖啡店的菜單板來想：板子上畫好了「品名、價格」兩欄，每一行寫著一個商品。現在要多一欄「是否供應中」。你不會把整塊板子連同上面寫好的商品一起丟掉，而是在旁邊畫一欄，替已經寫好的每一行補上一個值。改結構的時候，最需要想清楚的永遠是這件事：<strong>已經在裡面的資料要怎麼辦</strong>。</p>
+<p>如果把表刪掉重建，結構是乾淨了，但半年來的商品資料也沒了；就算先匯出再匯回，這段時間網站也沒辦法用。所以 SQL 提供了 <code>ALTER TABLE</code>：在原本的表上修改結構，資料留在原地。加欄位、改型別、加約束、改名、刪欄位，都是 <code>ALTER TABLE</code> 後面接不同的動作。</p>
+<p>這也是開場任務的最小答案，分成三件事：</p>
+<ol>
+  <li>用 <code>ALTER TABLE</code> 原地修改，每一步先想好既有的資料怎麼處理。</li>
+  <li>把這些 <code>ALTER</code> 寫成 migration 檔放進 git，讓每個環境照順序執行一樣的修改。</li>
+  <li>上線時注意 <code>ALTER</code> 會鎖住整張表；改名、刪欄位這類會讓舊程式壞掉的修改，拆成幾次部署。</li>
+</ol>
+<p>接下來照這個順序做。第一件事，先看看要整理的這張表現在長什麼樣子。</p>
+
+<h2>加「是否供應中」：既有的商品要填什麼？</h2>
+<p>這頁的 <code>products</code> 就是那張早期亂建的表。執行這一格，注意三個地方：<code>price</code> 的值是文字、有兩個商品的 <code>category</code> 是空的、<code>legacy_code</code> 有的有值有的沒有：</p>
+<div class="lab" data-sql="SELECT * FROM products ORDER BY id;"></div>
+<p>先做新功能：加一個 <code>is_available</code> 欄位，記錄商品是否供應中。新增欄位用 <code>ADD COLUMN</code>，後面接欄位名稱和型別，跟 <code>CREATE TABLE</code> 裡寫欄位的方式一樣：</p>
+<div class="lab" data-sql="ALTER TABLE products ADD COLUMN is_available boolean NOT NULL DEFAULT true;
+
+SELECT id, name, is_available FROM products ORDER BY id;"></div>
+<p>表裡原本的 7 個商品，<code>is_available</code> 全部是 <code>true</code>。這就是開頭那個問題的答案：新欄位加進來的那一刻，既有的每一列都需要一個值，PostgreSQL 會拿 <code>DEFAULT</code> 的值填進去。之後新增的商品沒指定這一欄時，也會用同一個預設值。</p>
+<p>這也說明了為什麼 <code>NOT NULL</code> 能跟著一起加。<code>NOT NULL</code> 規定這一欄不能是空的，而既有的列都已經被填上 <code>true</code>，沒有一列違反。如果只寫 <code>ADD COLUMN is_available boolean NOT NULL</code>、沒寫 <code>DEFAULT</code>，既有的列在新欄位上會是 NULL，跟 <code>NOT NULL</code> 互相矛盾，整句就會失敗（表是空的除外）。所以要加一個必填欄位時，要先決定舊資料該填什麼：「所有商品預設都在供應中」是合理的值，就把它寫成 <code>DEFAULT</code>。</p>
+<p>在大表上加欄位會不會很慢，要看 PostgreSQL 的版本，細節見課末。</p>
+<p>加欄位很順利，因為新欄位本來就沒有資料。下一個問題比較麻煩：<code>price</code> 已經裝滿了文字，要怎麼把它換成數字？</p>
+
+<h2><code>price</code> 存成文字：怎麼把型別改對又不丟資料？</h2>
+<p>型別錯了的代價很具體：<code>text</code> 欄位不能直接拿來加減，排序也是照文字排，<code>'110'</code> 會排在 <code>'80'</code> 前面，因為比的是第一個字元 <code>1</code> 和 <code>8</code>。改型別的語法是 <code>ALTER COLUMN 欄位 TYPE 新型別</code>。先直接試試看：</p>
+<div class="lab" data-sql="ALTER TABLE products ALTER COLUMN price TYPE integer;"></div>
+<p>失敗了，錯誤訊息裡的 cannot be cast automatically 意思是「不能自動轉換」。改型別時，PostgreSQL 要把每一列的舊值換成新型別的值。有些轉換是理所當然的，例如 <code>integer</code> 改成 <code>bigint</code>，它就直接做；但從文字變成數字並不保證可行：<code>'80'</code> 可以變成 80，<code>'八十'</code> 或 <code>'1,200'</code> 就不行。PostgreSQL 不替你猜，要你明確說出每一列的新值怎麼算。</p>
+<p>說明的方法是加上 <code>USING</code>，後面寫一個運算式，PostgreSQL 會對每一列算一次，結果就是新值。<code>price::integer</code> 是把 <code>price</code> 轉成整數的寫法：</p>
+<div class="lab" data-sql="ALTER TABLE products ALTER COLUMN price TYPE integer USING price::integer;
+
+SELECT name, price, price + 10 AS 漲價後 FROM products ORDER BY id;"></div>
+<p>這次成功了，<code>price + 10</code> 也能算了。<code>USING</code> 後面可以是任何運算式，所以資料比較髒的時候可以先整理再轉，例如價格裡混了千分位逗號，就寫 <code>USING replace(price, ',', '')::integer</code>，先去掉逗號再轉成整數。</p>
+<p>還有一個保證要知道：只要有一列轉不過去，整個 <code>ALTER</code> 就會失敗，表維持原樣，不會出現「前一半是數字、後一半還是文字」。所以在正式資料上改型別之前，先用 <code>SELECT</code> 找出轉不過去的值，比在部署時才看到錯誤好得多。</p>
+<p>型別改對了，但資料庫還不知道「價格必須大於 0」、「每個商品都要有分類」這些規則。接下來把規則補上。</p>
+
+<h2>補上規則：既有資料不合格時怎麼辦？</h2>
+<p>規則在資料庫裡叫約束，<a href="12-constraints.html">第 12 課</a>是在建表時就寫好；表已經存在時，用 <code>ADD CONSTRAINT</code> 補上。先加「價格必須大於 0」，同一格順便試著違反它：</p>
+<div class="lab" data-sql="ALTER TABLE products ADD CONSTRAINT products_price_positive CHECK (price &gt; 0);
+
+-- 試試違反規則
+UPDATE products SET price = -10 WHERE id = 1;"></div>
+<p>第二句 <code>UPDATE</code> 被約束擋下來，這一格的兩句一起取消，所以約束也還沒建立。把 <code>UPDATE</code> 那一行刪掉再執行一次，約束就會建立，之後任何把價格改成 0 以下的操作都會被擋。</p>
+<p>這一格順利，是因為現有的價格都大於 0。加約束時，PostgreSQL 不只管之後寫進來的資料，它會先檢查<strong>既有的每一列</strong>：規則一旦加上，表裡就不應該有違反規則的資料。只要有一列不符合，約束就加不上去。<code>category</code> 正好是這種情況，試著讓它變成必填：</p>
+<div class="lab" data-sql="ALTER TABLE products ALTER COLUMN category SET NOT NULL;"></div>
+<p>失敗了，因為抹茶拿鐵和起司蛋糕的 <code>category</code> 是 NULL。資料庫不會替你決定這兩筆該填什麼，所以順序一定是：先把不合格的資料修好，再加規則。這裡把空的分類補成「其他」，再加 <code>NOT NULL</code>：</p>
+<div class="lab" data-sql="UPDATE products SET category = '其他' WHERE category IS NULL;
+ALTER TABLE products ALTER COLUMN category SET NOT NULL;
+
+SELECT name, category FROM products ORDER BY id;"></div>
+<p>這個「先查、再修、最後加規則」的順序，適用於所有約束。實際做的時候，第一步是用 <code>SELECT</code> 找出會違反規則的列，例如 <code>WHERE category IS NULL</code> 或 <code>WHERE price &lt;= 0</code>，知道有幾筆、長什麼樣子，再決定怎麼修。</p>
+<div class="callout practice"><strong>💡 實務上：補資料的值要先跟 PM 確認</strong><br>剛才把空的分類填成「其他」，是工程師自己決定的。換成咖啡店後台要讓會員的「城市」變必填，舊會員的空值該填「未知」、留空讓前端提示補填，還是乾脆不改成必填？這是產品決定，不是工程師自己選。動手前先在正式資料的副本跑 <code>SELECT count(*) FROM customers WHERE city IS NULL</code>，知道影響幾筆再討論。另外記得前端表單和 API 驗證也要同步改成必填，不然新資料一進來就被資料庫擋下、使用者只看到 500 錯誤。</div>
+<p>到這裡，<code>products</code> 的值都整理好了。剩下兩個動作看起來最簡單，影響卻超出資料庫：改名和刪欄位。</p>
+
+<h2>改名和刪欄位：資料庫一瞬間完成，為什麼程式會壞？</h2>
+<p>有人覺得 <code>name</code> 太籠統、想改成 <code>product_name</code>，表名也想改成 <code>menu_items</code>。改名用 <code>RENAME</code>，欄位和表都可以改：</p>
+<div class="lab" data-sql="ALTER TABLE products RENAME COLUMN name TO product_name;
+ALTER TABLE products RENAME TO menu_items;
+
+SELECT id, product_name FROM menu_items ORDER BY id;"></div>
+<p>資料庫這邊一瞬間就改好了，資料完全沒動。問題在資料庫外面：後端程式裡寫的是 <code>SELECT name FROM products</code>，報表和排程也是，這些查詢在改名之後<strong>立刻全部報錯</strong>。資料庫不知道誰在用這個名字，改名時也不會提醒你。</p>
+<p>為了讓後面的範例照常使用原本的名稱，把名稱改回來：</p>
+<div class="lab" data-sql="ALTER TABLE menu_items RENAME TO products;
+ALTER TABLE products RENAME COLUMN product_name TO name;"></div>
+<p>刪欄位更進一步。<code>legacy_code</code> 已經沒人用了，用 <code>DROP COLUMN</code> 刪掉：</p>
+<div class="lab" data-sql="ALTER TABLE products DROP COLUMN legacy_code;
+
+SELECT * FROM products ORDER BY id;"></div>
+<p>欄位不見了，裡面的資料也<strong>一起消失、無法復原</strong>。改名至少還能改回來，刪掉的資料只能從備份找。所以正式環境刪欄位之前，要先確定已經沒有任何程式在讀它，最好也先備份。</p>
+<p>改名和刪欄位共同的教訓是：schema 不只屬於資料庫，所有讀寫它的程式都依賴它。這一點到這課最後一節會變成關鍵。不過在那之前有一個更直接的問題：剛才這一連串 <code>ALTER</code> 都只在你的電腦上跑過，同事的資料庫、正式環境的資料庫都還是舊的。</p>
+
+<h2>同事和正式環境，怎麼做一模一樣的修改？</h2>
+<p>最直覺的做法是把剛才的 SQL 存起來，到每台機器手動貼一次。只有你一個人、只改一次的時候還行，但團隊裡每個人都在改 schema，幾個月下來會累積幾十次修改。誰記得正式環境跑到哪一次了？同事休假兩週回來，他的資料庫缺了哪幾次？漏跑一次，程式就會在某個環境找不到欄位。</p>
+<p>解法是把每一次 schema 的修改寫成一個檔案，這個檔案叫 <strong>migration</strong>。migration 的原意是遷移，指把資料庫從一個版本的結構搬到下一個版本。這課的整理工作，寫成 migration 會像這樣：</p>
+<pre>migrations/
+  001_create_customers.sql
+  002_create_orders.sql
+  003_add_is_available_to_products.sql
+  004_change_price_to_integer.sql</pre>
+<p>這幾個檔案要能取代「到每台機器手動貼 SQL」，靠的是四個規則：</p>
+<ul>
+  <li><strong>有編號、照順序執行</strong>：004 一定在 003 之後跑，因為後面的修改可能依賴前面的。例如 003 建了 <code>is_available</code>，之後若有一支要替它加索引，就必須排在 003 後面。</li>
+  <li><strong>進版本控制（git）</strong>：schema 的修改跟程式碼一起 review、一起部署。看 git 記錄就知道「這個欄位是誰、為什麼加的」。</li>
+  <li><strong>只往後加、不改舊的</strong>：已經在別的環境跑過的 migration 不能再修改。那個環境不會再跑一次，改了舊檔只會讓各環境變得不一致。要修正就寫一支新的。</li>
+  <li><strong>資料庫自己記得跑到哪</strong>：migration 工具會在資料庫裡建一張表（例如 <code>schema_migrations</code>），記錄已經執行過哪些編號，部署時只跑還沒跑過的。</li>
+</ul>
+<p>第四點回答了「誰記得跑到哪」：不靠人記，靠每個資料庫裡的那張記錄表。下圖是同一組 migration 檔遇到兩個進度不同的資料庫：</p>
+<figure>
+  <svg viewBox="0 0 720 220" role="img" aria-label="migration 檔依序套用到不同環境，每個資料庫用 schema_migrations 表記錄已經執行到哪一個">
+    <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <text class="d-accent" x="20" y="24">git 裡的 migration 檔</text>
+    <rect class="d-soft" x="20" y="36" width="190" height="30" rx="5"/><text class="d-text" x="32" y="56">001_create_customers</text>
+    <rect class="d-soft" x="20" y="72" width="190" height="30" rx="5"/><text class="d-text" x="32" y="92">002_create_orders</text>
+    <rect class="d-soft" x="20" y="108" width="190" height="30" rx="5"/><text class="d-text" x="32" y="128">003_add_is_available</text>
+    <rect class="d-soft" x="20" y="144" width="190" height="30" rx="5"/><text class="d-text" x="32" y="164">004_price_to_integer</text>
+    <path class="d-line" d="M215,80 L300,60" marker-end="url(#arr)"/>
+    <path class="d-line" d="M215,120 L300,180" marker-end="url(#arr)"/>
+    <rect class="d-box" x="305" y="30" width="390" height="60" rx="8"/>
+    <text class="d-text" x="320" y="54">你的電腦</text>
+    <text class="d-small" x="320" y="76">schema_migrations：001 002 003 004　→ 已是最新</text>
+    <rect class="d-box" x="305" y="150" width="390" height="60" rx="8"/>
+    <text class="d-text" x="320" y="174">正式環境</text>
+    <text class="d-small" x="320" y="196">schema_migrations：001 002　→ 部署時補跑 003、004</text>
+  </svg>
+  <figcaption>每個環境的資料庫都記得自己跑到哪一支，部署時只補跑缺的。</figcaption>
+</figure>
+<p>你的電腦已經跑完 004；正式環境只記錄到 002，所以下次部署時，工具會比對檔案和記錄表，只補跑 003 和 004。同事休假回來也一樣，執行一次 migration 指令就追上了。</p>
+<p>有了往前的路，自然會問：如果某一支 migration 寫錯了，能不能退回去？</p>
+
+<h2>migration 寫錯了，能退回去嗎？up 和 down</h2>
+<p>有些工具要求每支 migration 寫兩個方向：<strong>up</strong> 是套用這次的修改，<strong>down</strong> 是把它撤銷。以 003 為例：</p>
+<pre>-- 003_add_is_available_to_products
+-- up
+ALTER TABLE products ADD COLUMN is_available boolean NOT NULL DEFAULT true;
+
+-- down
+ALTER TABLE products DROP COLUMN is_available;</pre>
+<p>開發時 down 很好用：在自己電腦上試一個新欄位，發現設計不對，跑 down 退回去、改好再跑 up。但正式環境很少真的跑 down。看看上面的 down 做了什麼：<code>DROP COLUMN</code>。如果 003 上線後已經有店員把幾個商品設成下架，跑 down 就會把這些資料一起刪掉，而且刪掉之後無法復原。很多修改的 down 只能還原結構，還原不了資料。</p>
+<p>所以實務上，正式環境的 migration 出問題時，通常是<strong>再寫一支新的 migration 往前修</strong>：例如預設值寫錯了，就新增一支把預設值改對，而不是退回去。這也跟上一節「只往後加、不改舊的」一致：正式環境的歷史只往前長。</p>
+<div class="callout practice"><strong>💡 實務上：migration 檔要和程式碼一起被 review</strong><br>團隊裡加一個「會員點數」功能，PR 通常同時包含 migration 檔和用到新欄位的程式碼。review 時資深工程師會特別看 migration：有沒有 <code>DROP</code> 或 <code>RENAME</code>、在大表上會不會鎖很久、加 <code>NOT NULL</code> 前有沒有先補資料，也就是這課前半每一步問過的問題。很多團隊也會設定 CI，也就是每次推 PR 時自動執行的檢查，讓它從空資料庫把所有 migration 跑一遍，確認一個新同事 clone 下來就能建出完整的 schema。</div>
+<p>還有一種出錯更麻煩：不是寫錯，而是一支 migration 裡有好幾句，執行到一半失敗了。</p>
+
+<h2>一支 migration 跑到一半失敗，資料庫會停在半套結構嗎？</h2>
+<p>假設一支 migration 有三句：建記錄表、加欄位、寫入記錄。前兩句成功、第三句失敗，資料庫就停在「欄位加了，但記錄表說沒跑過」的狀態。下次部署時工具會再跑一次這支，第二句因為欄位已經存在而失敗，從此卡住，只能有人手動進資料庫收拾。</p>
+<p>PostgreSQL 避開了這個問題。<a href="18-transactions.html">第 18 課</a>看過，<code>CREATE TABLE</code>、<code>ALTER TABLE</code> 這些改結構的語句也能包在交易裡：任何一句失敗，前面的也一起取消，資料庫不會停在改到一半的狀態。<code>products</code> 的修改前面已經在這頁跑過了，再加一次會因為欄位已存在而失敗，所以這裡用下一支還沒跑過的 migration：替會員加 <code>email</code> 欄位。這一格把它連同「寫入記錄表」包在同一個交易裡，模擬 migration 工具會做的事：</p>
+<div class="lab" data-sql="BEGIN;
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version text PRIMARY KEY,
+  applied_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE customers ADD COLUMN email text;
+INSERT INTO schema_migrations (version) VALUES ('005_add_email_to_customers');
+COMMIT;
+
+SELECT version FROM schema_migrations;"></div>
+<p>第一次執行，記錄表裡多了 <code>005_add_email_to_customers</code>。再執行一次會失敗，因為 <code>email</code> 欄位已經存在；而且因為三句在同一個交易裡，<code>schema_migrations</code> 也不會多出重複的記錄。「修改結構」和「記錄跑到哪」要嘛一起成功、要嘛一起不算，這就是 migration 工具在 PostgreSQL 上做的事，本質上就是這一格。不是每種資料庫都有這個保證，比較見課末。</p>
+<p>到這裡為止，migration 檔、記錄表、交易都是手寫的。工作中通常不會自己寫這套機制，而是交給工具。</p>
+
+<h2>工作中，誰幫你建 migration 檔、記錄跑到哪？</h2>
+<p>工具做的事跟上一節的手寫版本一樣：產生有順序的 migration 檔、在資料庫裡記錄跑到哪一支、部署時只跑缺的。差別在 migration 檔從哪裡來。你可能會遇到這三種：</p>
+<div class="table-wrap">
+<table>
+  <tr><th>工具</th><th>migration 長什麼樣</th><th>特點</th></tr>
+  <tr><td>Supabase</td><td><code>supabase/migrations/20261029083000_add_points.sql</code></td><td>檔名用時間戳當編號，內容就是純 SQL。<code>supabase migration new 名稱</code> 建檔、<code>supabase db push</code> 套用到遠端</td></tr>
+  <tr><td>Prisma</td><td><code>prisma/migrations/20261029083000_add_points/migration.sql</code></td><td>你改 <code>schema.prisma</code>，<code>prisma migrate dev</code> 比對差異、<strong>自動產生</strong> SQL 檔；部署用 <code>prisma migrate deploy</code></td></tr>
+  <tr><td>Strapi</td><td>沒有 migration 檔（schema 部分）</td><td>你在 Content-Type Builder 改欄位，Strapi 啟動時<strong>自動同步</strong> schema 到資料庫</td></tr>
+</table>
+</div>
+<p>Supabase 和 Prisma 的編號都是時間戳，不是 001、002。原因是團隊裡好幾個人同時在不同分支建 migration，用流水號很容易兩個人都建了 005；時間戳幾乎不會撞，排序也照建立的先後。兩者的差別在誰寫 SQL：Supabase 由你手寫，Prisma 由工具比對 <code>schema.prisma</code> 的差異幫你產生。Prisma 產生的檔案仍然是看得到的 SQL，提交前應該打開讀一遍，確認它做的是你想要的事。</p>
+<p>Strapi 走的是另一條路：沒有 schema 的 migration 檔，它在啟動時把 Content-Type Builder 裡的設定同步到資料庫。很方便，代價是你看不到、也控制不了它下了什麼 SQL。回想前面「改名和刪欄位」那節的教訓：你想的是「把欄位改名」，它做的可能是「刪掉舊欄、建新欄」，舊資料就不見了。所以對資料需要更多控制時，很多團隊會選擇 Supabase、Prisma 這種「每一步都是看得到的 SQL」的做法。Strapi 其實也有放自訂腳本的地方，見課末。</p>
+<p>不管用哪個工具，最後送進資料庫的都是 <code>ALTER TABLE</code>。工具解決了「每個環境跑一樣的修改」，但沒有解決另一件事：這些 <code>ALTER</code> 在正式環境執行的那一刻會發生什麼。</p>
+
+<h2>上線那一刻：為什麼一句 ALTER 可能讓網站停擺？</h2>
+<p>在自己電腦上，前面每一格都是一按就完成。正式環境的差別有兩個：表大得多，而且隨時有人在讀寫它。這兩件事加在一起，問題出在<strong>鎖</strong>。<a href="19-concurrency.html">第 19 課</a>看過，修改一列時會鎖住那一列，其他想改同一列的交易要排隊。<code>ALTER TABLE</code> 鎖的範圍大得多：大部分的 <code>ALTER TABLE</code> 會對<strong>整張表</strong>加最強的鎖，執行期間其他人<strong>連 SELECT 都要排隊</strong>。道理很直接：表的結構正在改，資料庫不能讓別人在這時候用舊的結構讀資料。</p>
+<p>鎖住整張表多久，取決於這句 <code>ALTER</code> 要做多少事。回頭看這課做過的動作：</p>
+<ul>
+  <li><code>ALTER COLUMN … TYPE</code>：通常要改寫整張表，因為每一列的值都要換成新型別。一千萬列可能要好幾分鐘，這段時間整張表都不能用。</li>
+  <li><code>SET NOT NULL</code>、<code>ADD CONSTRAINT … CHECK</code>：「補上規則」那節說過，加規則前要檢查既有的每一列，所以要掃過整張表。</li>
+</ul>
+<p>這課沒做、但很常跟 migration 一起出現的 <code>CREATE INDEX</code> 也一樣：建索引期間不能寫入這張表。正式環境用 <code>CREATE INDEX CONCURRENTLY</code>，比較慢但不會擋住寫入。</p>
+<p>就算 <code>ALTER</code> 本身很快，例如只改個預設值，還有一個陷阱：排隊。如果表上有一個跑很久的查詢，<code>ALTER</code> 拿不到鎖，只能排隊等它；而 <code>ALTER</code> 後面進來的所有查詢，又排在 <code>ALTER</code> 後面。結果是一句本來一瞬間就做完的 <code>ALTER</code>，讓整張表在那個慢查詢結束之前都沒辦法用。實務上會在 migration 開頭設 <code>SET lock_timeout = '3s'</code>，意思是等鎖最多等 3 秒，等不到就放棄這次、晚點再試，寧可 migration 失敗重跑，也不要讓網站跟著排隊。</p>
+<p>鎖的問題可以靠挑時間、設 <code>lock_timeout</code> 處理。但改名和刪欄位還有另一個問題，跟鎖無關：就算 <code>ALTER</code> 一瞬間完成，程式還是會壞。</p>
+
+<h2>欄位非改名不可時，怎麼拆成幾次部署？</h2>
+<p>前面的 <code>name</code> 只是示範，改完又改回來了。換一個真的要改的：客服希望 <code>customers.phone</code> 改叫 <code>mobile</code>，因為現在只收手機號碼。直接 <code>RENAME</code> 會出什麼事，要先看部署是怎麼進行的。</p>
+<p>部署不是瞬間完成的。24 小時都有人用的服務，通常跑在好幾台伺服器上，部署時一台一台換成新版程式。換到一半時，有幾台還是舊版、有幾台已經是新版，<strong>兩個版本的程式同時連著同一個資料庫</strong>。如果在這時候把 <code>phone</code> 改名成 <code>mobile</code>，舊版程式找不到 <code>phone</code>，全部報錯；如果先不改名，新版程式又找不到 <code>mobile</code>。不管 RENAME 放在部署前還是部署後，總有一個版本會壞。</p>
+<p>解法是讓 schema 在每一刻都同時滿足兩個版本，把一次改名拆成好幾次部署：</p>
+<figure>
+  <svg viewBox="0 0 720 170" role="img" aria-label="漸進式 schema 變更的四個步驟：加新欄位、程式同時寫兩欄並搬資料、程式改讀新欄位、刪除舊欄位">
+    <defs><marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="10" y="30" width="155" height="90" rx="8"/>
+    <text class="d-accent" x="87" y="56" text-anchor="middle">① 加新欄位</text>
+    <text class="d-small" x="87" y="80" text-anchor="middle">ADD COLUMN mobile</text>
+    <text class="d-small" x="87" y="100" text-anchor="middle">舊程式完全不受影響</text>
+    <rect class="d-box" x="190" y="30" width="155" height="90" rx="8"/>
+    <text class="d-accent" x="267" y="56" text-anchor="middle">② 雙寫＋搬資料</text>
+    <text class="d-small" x="267" y="80" text-anchor="middle">程式兩欄都寫</text>
+    <text class="d-small" x="267" y="100" text-anchor="middle">UPDATE 把舊資料複製過去</text>
+    <rect class="d-box" x="370" y="30" width="155" height="90" rx="8"/>
+    <text class="d-accent" x="447" y="56" text-anchor="middle">③ 改讀新欄位</text>
+    <text class="d-small" x="447" y="80" text-anchor="middle">程式只讀寫 mobile</text>
+    <text class="d-small" x="447" y="100" text-anchor="middle">觀察一段時間</text>
+    <rect class="d-soft" x="550" y="30" width="155" height="90" rx="8"/>
+    <text class="d-accent" x="627" y="56" text-anchor="middle">④ 刪舊欄位</text>
+    <text class="d-small" x="627" y="80" text-anchor="middle">DROP COLUMN phone</text>
+    <text class="d-small" x="627" y="100" text-anchor="middle">確定沒人在用了</text>
+    <path class="d-line" d="M165,75 L186,75" marker-end="url(#arr2)"/>
+    <path class="d-line" d="M345,75 L366,75" marker-end="url(#arr2)"/>
+    <path class="d-line" d="M525,75 L546,75" marker-end="url(#arr2)"/>
+    <text class="d-small" x="360" y="155" text-anchor="middle">每一步都是一次獨立的部署；任何一步出問題，都還能退回上一步</text>
+  </svg>
+  <figcaption>這種做法常被叫做 expand / contract：先擴充、再收斂。</figcaption>
+</figure>
+<p>逐步看為什麼每一步都安全：</p>
+<ol>
+  <li><strong>加新欄位</strong>：只多了 <code>mobile</code>，舊程式根本不知道它存在，照常讀寫 <code>phone</code>。</li>
+  <li><strong>雙寫並搬資料</strong>：部署一版同時寫 <code>phone</code> 和 <code>mobile</code> 的程式，再用 <code>UPDATE</code> 把舊會員的 <code>phone</code> 複製到 <code>mobile</code>。這時兩欄的資料一致，不管哪一版程式在讀都拿得到正確的號碼。</li>
+  <li><strong>改讀新欄位</strong>：部署只用 <code>mobile</code> 的程式。如果新版有問題，退回上一版也沒關係，因為 <code>phone</code> 還在、而且資料是同步的。</li>
+  <li><strong>刪舊欄位</strong>：確定已經沒有任何程式、報表、排程在讀 <code>phone</code>，才 <code>DROP COLUMN</code>。這是唯一無法退回的一步，所以放在最後、等觀察夠久再做。</li>
+</ol>
+<p>改型別、拆表也是同樣的思路：<strong>永遠讓「舊版程式」和「新版程式」在同一個 schema 上都能跑</strong>，因為部署的那段時間，兩個版本會同時存在。這也回答了開場任務的最後一塊：這課對 <code>products</code> 做的修改裡，加有 <code>DEFAULT</code> 的欄位可以直接上；補規則在小表上可以直接上，大表要先設 <code>lock_timeout</code>、挑離峰時段（不擋寫入的做法見<a href="34-zero-downtime-migrations.html">第 34 課</a>）；改名、刪欄位、改型別這類會讓舊程式壞掉的修改，要先想好新舊版程式怎麼共存。</p>
+<div class="callout practice"><strong>💡 實務上：先問「能不能停機」再決定要不要拆步驟</strong><br>expand / contract 要多部署好幾次，成本不低。內部用的後台、資料量小、可以公告半夜停機維護幾分鐘的系統，停機、跑 migration、換上新版程式，通常就夠了。真正需要拆步驟的是 24 小時都有人在用的服務：這類服務部署時常是多台伺服器輪流換成新版，有一段時間新舊程式會同時連著同一個資料庫。資深工程師會先問「能不能停機」「部署時新舊版會不會同時在跑」，再決定做法，並在 PR 裡寫明每一步的部署順序。</div>
+<p>各種 <code>ALTER</code> 拿什麼鎖、怎麼在不擋住寫入的情況下加約束和回填大量資料，<a href="32-locks.html">第 32 課</a>和<a href="34-zero-downtime-migrations.html">第 34 課</a>會深入。</p>
+
+<h2>補充與查表</h2>
+<ul>
+  <li><strong>加有預設值的欄位會不會很慢</strong>：PostgreSQL 11 之後，加一個有固定 DEFAULT 的欄位不需要改寫整張表，就算有上億列也幾乎是瞬間完成。</li>
+  <li><strong>其他 <code>ALTER COLUMN</code> 動作</strong>：<code>ALTER COLUMN … DROP NOT NULL</code> 可以拿掉必填的規則；<code>ALTER COLUMN … SET DEFAULT …</code> 可以改預設值。</li>
+  <li><strong>DDL 放進交易</strong>：PostgreSQL 可以把 <code>CREATE TABLE</code>、<code>ALTER TABLE</code> 包在交易裡整批撤銷，MySQL 就做不到，這是 PostgreSQL 很受歡迎的原因之一。</li>
+  <li><strong>Strapi 的自訂腳本</strong>：Strapi 有 <code>database/migrations</code> 資料夾可以放自訂的資料搬移腳本，但 schema 本身仍由它自動管理。</li>
+</ul>
+
+<h2>練習</h2>
+
+<div class="exercise"
+  data-answer="ALTER TABLE customers ADD COLUMN points integer NOT NULL DEFAULT 0;"
+  data-check="SELECT column_name, data_type, is_nullable, column_default
+FROM information_schema.columns
+WHERE table_name = 'customers' AND column_name = 'points'
+UNION ALL
+SELECT 'sum', NULL, NULL, sum(points)::text FROM customers;">
+  <p>練習 1：咖啡店要推出會員集點。幫 <code>customers</code> 加一個欄位 <code>points</code>（整數、不能是 NULL），既有的會員都從 0 點開始。</p>
+</div>
+
+<div class="exercise"
+  data-start="SELECT id, ordered_at, pg_typeof(ordered_at) FROM orders ORDER BY id;"
+  data-answer="ALTER TABLE orders ALTER COLUMN ordered_at TYPE timestamptz USING ordered_at::timestamptz;"
+  data-check="SELECT data_type FROM information_schema.columns
+WHERE table_name = 'orders' AND column_name = 'ordered_at'
+UNION ALL
+SELECT ordered_at::text FROM (SELECT ordered_at FROM orders ORDER BY id) t;"
+  data-ordered>
+  <p>練習 2：<code>orders.ordered_at</code> 當初被建成 <code>text</code>，裡面存著像 <code>'2026-10-01 09:30'</code> 的字串（都是台灣時間）。把它改成 <code>timestamptz</code>，既有的資料要保留。</p>
+</div>
+
+<div class="exercise"
+  data-start="SELECT * FROM customers WHERE city IS NULL;"
+  data-answer="UPDATE customers SET city = '未知' WHERE city IS NULL;
+ALTER TABLE customers ALTER COLUMN city SET NOT NULL;"
+  data-check="SELECT is_nullable FROM information_schema.columns
+WHERE table_name = 'customers' AND column_name = 'city'
+UNION ALL
+SELECT city FROM customers ORDER BY 1;">
+  <p>練習 3：要讓 <code>customers.city</code> 變成必填（NOT NULL），但有幾位舊會員的 city 是 NULL。先把這些 NULL 改成 <code>'未知'</code>，再加上 NOT NULL。</p>
+</div>
+
+<div class="exercise"
+  data-start="SELECT * FROM orders WHERE total &lt; 0;"
+  data-answer="UPDATE orders SET total = -total WHERE total &lt; 0;
+ALTER TABLE orders ADD CONSTRAINT orders_total_check CHECK (total &gt;= 0);"
+  data-check="SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint
+WHERE conrelid = 'orders'::regclass AND contype = 'c'
+UNION ALL
+SELECT id::text, total::text FROM orders ORDER BY 1, 2;">
+  <p>練習 4：要幫 <code>orders</code> 加一個名為 <code>orders_total_check</code> 的約束，規定 <code>total &gt;= 0</code>。但有一筆訂單的金額被打成負數（多打了負號）。先把它改成正確的正數，再加上約束。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：正式環境的 <code>customers</code> 有 500 萬列，網站 24 小時都有人用。要把 <code>phone</code> 改名為 <code>mobile</code>，哪個做法最安全？</p>
+  <label data-key="a">半夜直接 <code>ALTER TABLE customers RENAME COLUMN phone TO mobile</code>，同時部署新程式</label>
+  <label data-key="b">先部署只讀 <code>mobile</code> 的新程式，再執行 RENAME</label>
+  <label data-key="c">先加 <code>mobile</code> 欄位、程式雙寫並搬資料、程式改讀 <code>mobile</code>，最後才刪 <code>phone</code></label>
+  <p class="why">✓ 部署期間新舊兩版程式會同時存在，任何一刻 schema 都要讓兩版都能跑。a 在部署空窗期舊程式會壞；b 新程式一上線就找不到欄位。分步驟的 expand / contract 每一步都可以退回。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：同事發現上週已經部署到正式環境的 <code>20261020_add_points.sql</code> 裡，<code>DEFAULT</code> 寫成了 10（應該是 0）。正確的處理方式是？</p>
+  <label data-key="a">直接修改那支檔案的內容，再部署一次</label>
+  <label data-key="b">新增一支 migration，例如 <code>20261029_fix_points_default.sql</code>，在裡面 <code>ALTER COLUMN points SET DEFAULT 0</code></label>
+  <label data-key="c">到正式資料庫手動執行 ALTER，不用寫 migration</label>
+  <p class="why">✓ 已經跑過的 migration 不會再被執行，改了也沒用，還會讓各環境不一致。手動改則沒有留下記錄，其他環境不會跟著改。往前寫一支新的 migration 才能讓每個環境都正確。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>加 NOT NULL 或 CHECK 時沒先清資料</strong>：加約束時會檢查既有的每一列，只要有一列不符合就會失敗。先用 <code>SELECT</code> 找出不合格的列，修好再加。</li>
+  <li><strong>改型別忘了 USING</strong>：<code>text</code> 轉數字或日期，PostgreSQL 不會替你猜，要寫 <code>USING 欄位::新型別</code>；資料比較髒時，在 <code>USING</code> 裡先整理再轉。</li>
+  <li><strong>修改已經部署的 migration</strong>：跑過的環境不會再跑一次，改了只會讓各環境不一致。永遠往後加新的。</li>
+  <li><strong>直接在正式資料庫手動改 schema</strong>：其他環境和 migration 檔都跟著對不上，下次部署可能出錯。</li>
+  <li><strong>以為 RENAME、DROP 只影響資料庫</strong>：所有讀那個欄位的程式、報表、排程都會壞掉；部署期間新舊版程式並存時，要用先加、再搬、最後刪的做法。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>表裡有資料時用 <code>ALTER TABLE</code> 原地改結構，每一步先想「既有的資料怎麼辦」：<code>ADD COLUMN</code> 用 <code>DEFAULT</code> 替舊列填值、<code>ALTER COLUMN … TYPE … USING</code> 說明舊值怎麼轉、<code>ADD CONSTRAINT</code> 和 <code>SET NOT NULL</code> 前先修好不合格的資料。</li>
+  <li><code>RENAME</code> 和 <code>DROP COLUMN</code> 在資料庫裡一瞬間完成，但用到舊名稱的程式會立刻壞掉，刪掉的資料無法復原。</li>
+  <li>migration 檔讓每個環境做一樣的修改：有編號、照順序、進 git、只往後加，資料庫用記錄表記得跑到哪一支。</li>
+  <li>down 在開發時好用，正式環境出問題通常寫一支新的 migration 往前修。</li>
+  <li>PostgreSQL 的 DDL 可以放在交易裡，一支 migration 失敗會整支撤銷，不會留下半套結構。</li>
+  <li>正式環境的 <code>ALTER TABLE</code> 會鎖整張表，用 <code>lock_timeout</code> 避免整張表跟著排隊；新舊版程式會同時存在時，用「先加、再搬、最後刪」讓兩版都能跑。</li>
+</ul>
+<p>下一課：把常用的查詢存成 View、把邏輯寫成 Function，以及讓資料庫自動反應的 Trigger。</p>
+
+</main>
+
+<script type="text/sql" id="seed">
+-- 早期隨便建的商品表：price 是 text、category 有 NULL、還有一個沒在用的欄位
+CREATE TABLE products (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL,
+  category text,
+  price text,
+  legacy_code text
+);
+INSERT INTO products (name, category, price, legacy_code) VALUES
+  ('美式咖啡', '咖啡', '80', 'A01'),
+  ('拿鐵', '咖啡', '110', 'A02'),
+  ('卡布奇諾', '咖啡', '110', NULL),
+  ('伯爵紅茶', '茶', '90', 'B01'),
+  ('抹茶拿鐵', NULL, '120', NULL),
+  ('可頌', '甜點', '70', 'C01'),
+  ('起司蛋糕', NULL, '120', 'C02');
+
+CREATE TABLE customers (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL,
+  phone text,
+  city text
+);
+INSERT INTO customers (name, phone, city) VALUES
+  ('王小明', '0912-345-678', '台北'),
+  ('陳美華', '0922-111-222', '台中'),
+  ('林志豪', NULL, NULL),
+  ('張雅婷', '0955-666-777', '高雄'),
+  ('李建國', '0966-777-888', NULL),
+  ('黃淑芬', '0977-888-999', '台北');
+
+-- ordered_at 也被建成了 text
+CREATE TABLE orders (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  customer_id integer NOT NULL REFERENCES customers(id),
+  ordered_at text NOT NULL,
+  total integer NOT NULL
+);
+INSERT INTO orders (customer_id, ordered_at, total) VALUES
+  (1, '2026-10-01 09:30', 190),
+  (2, '2026-10-01 14:05', 110),
+  (1, '2026-10-02 08:15', 80),
+  (4, '2026-10-03 16:40', -230),
+  (5, '2026-10-04 11:20', 120),
+  (3, '2026-10-05 10:00', 200);
+</script>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

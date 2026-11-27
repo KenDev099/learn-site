@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>3. Redis 實戰模式：限流、session、計數器與冪等</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="3" data-practice="data-stores">
+<header>
+  <div class="eyebrow">階段 2：Redis 不只是快取 · 第 3 課</div>
+  <h1>Redis 實戰模式：限流、session、計數器與冪等</h1>
+</header>
+<main>
+
+<p>咖啡店的 API 原本只跑在一台伺服器上。生意變好之後擴成三台，前面加了一台負載平衡器（load balancer）：它站在三台伺服器前面，把進來的請求輪流分給其中一台（<a href="../../system-design/lessons/04-redundancy-load-balancing.html">系統設計課第 4 課</a>）。擴充後的第一週，四件事接連出狀況：</p>
+<ul>
+  <li>有人用腳本每秒打 50 次登入 API 猜密碼。程式裡用一個 <code>Map</code> 記每個 IP 打了幾次、每分鐘限 5 次，結果完全擋不住。</li>
+  <li>商品頁每被看一次就 <code>UPDATE products SET views = views + 1</code>，熱門商品那一列一直被鎖住，結帳也跟著變慢。</li>
+  <li>客人剛登入，下一個請求卻被當成沒登入，要求重新登入。</li>
+  <li>客人在弱網路下按了兩次「送出訂單」，被扣了兩次款。</li>
+</ul>
+<p>這四件事的原因是同一個：程式把一份<strong>很小、很常被改、而且每台伺服器都要看到同一份</strong>的狀態，放在了單台伺服器的記憶體裡。一台的時候沒問題；變成三台，每台各記各的，部署重啟還會歸零。這一課的任務是把這四份狀態搬進三台共用的 Redis，一份一份處理，用的都是第 2 課學過的資料結構。每搬一份，都要回答資深工程師一定會問的兩個問題：這份資料可以只放在 Redis 嗎？Redis 掛掉時這個功能該怎麼辦？</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>登入計數：三台伺服器怎麼共用同一個計數，擋住猜密碼的腳本（四件事的最小答案也在這一節）；固定視窗在邊界會漏掉多少，想更準要多付什麼。</li>
+  <li>瀏覽數：先在 Redis 累加、定時寫回資料庫，熱門商品那一列為什麼不再拖慢結帳；寫回的途中怎麼不掉資料。</li>
+  <li>登入狀態：session 放進 Redis，三台都認得同一個人；「登出所有裝置」怎麼做。</li>
+  <li>重送的訂單：冪等鍵怎麼讓同一筆訂單只建立一次，為什麼資料庫還要再擋一層。</li>
+  <li>Redis 掛掉時：搬完四份狀態，每個功能該放行還是拒絕，連線要怎麼設才不會整個 API 一起卡住。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="02-redis-data-structures.html">第 2 課</a>的 INCR、hash、set、sorted set 與 TTL：INCR 是在 Redis 上一步完成的加一；每個 key 可以設到期時間，用 SET 覆寫時 TTL 會被清掉。</li>
+</ul></div>
+
+<h2>三台伺服器怎麼共用同一個登入計數？固定視窗限流</h2>
+<p>先看 <code>Map</code> 為什麼擋不住。負載平衡器把攻擊者每秒 50 個請求平均分給三台，每台只看到大約三分之一；每台的 <code>Map</code> 各自數，每台都覺得「這個 IP 還沒超過 5 次」。部署時程序重啟，<code>Map</code> 清空，計數從 0 開始。問題不在計數的寫法，在計數放的位置：它必須放在三台都連得到、而且不會跟著某一台重啟消失的地方。Redis 就是這樣的地方：三台伺服器連到同一個 Redis，對同一個 key 加一，看到的是同一個數字。</p>
+<p>開場另外三件事的最小答案也是同一個方向：瀏覽數先在 Redis 累加、定時批次寫回資料庫，熱門商品那一列就不會一直被鎖；session 放進 Redis，三台都查得到同一份登入狀態；訂單請求帶一個冪等鍵記在 Redis，第二次送出直接回上次的結果。後面各有一節講細節，這一節先把限流做出來。</p>
+<p>限流要回答的是「這個 IP 在一段時間內打了幾次」。最簡單的做法叫<strong>固定視窗</strong>（fixed window）：把時間切成一格一格，例如每分鐘一格，每一格各自計數，超過上限就拒絕；下一格開始時重新從 0 數。用 Redis 做，每一格的計數就是一個 string，key 裡帶上「哪個 IP」和「第幾格」。「第幾格」用現在時間除以視窗長度、無條件捨去算出來：</p>
+<pre>視窗編號 = Math.floor(now / windowMs)
+now = 60,005,000 毫秒、windowMs = 60,000 → 視窗編號 1000
+key = ds:rl:login:10.0.0.12:1000</pre>
+<p>同一分鐘裡的每個請求算出同一個編號、打到同一個 key；過了這一分鐘，編號變成 1001，key 也跟著變成新的，計數自然從 0 開始。舊的 key 不用寫程式去清，給它一個過期時間，讓 Redis 到期自己刪掉就好。所以每個請求做兩件事：加一，以及確保這個 key 有過期時間。</p>
+<pre>127.0.0.1:6379&gt; INCR ds:rl:login:10.0.0.12:1000
+(integer) 1                     # 這一格的第 1 次
+127.0.0.1:6379&gt; PEXPIRE ds:rl:login:10.0.0.12:1000 60000 NX
+(integer) 1                     # 還沒有過期時間，設成 60 秒
+127.0.0.1:6379&gt; INCR ds:rl:login:10.0.0.12:1000
+(integer) 2
+127.0.0.1:6379&gt; PEXPIRE ds:rl:login:10.0.0.12:1000 60000 NX
+(integer) 0                     # 已經有過期時間，NX 讓它什麼都不做</pre>
+<p><code>INCR</code> 回傳加完之後的值，所以「這是第幾次」不需要再讀一次。<code>PEXPIRE</code> 用毫秒設過期時間；後面的 <strong>NX</strong> 選項意思是「只在 key 還沒有過期時間時才設定」，已經有的就不動（這個選項從哪個 Redis 版本開始有，見課末）。ioredis 的寫法：</p>
+<pre>const count = await redis.incr(key)
+await redis.pexpire(key, windowMs, 'NX')
+const allowed = count &lt;= limit</pre>
+<p>你可能會問：<strong>為什麼每次都送 PEXPIRE，而不是只在 INCR 回傳 1 的時候送？</strong>網路上很多範例寫 <code>if (count === 1) await redis.expire(key, 60)</code>，看起來省了一個指令。問題是 INCR 和 EXPIRE 是兩個獨立的指令，中間可能發生任何事：程式當掉、部署把程序砍掉、連線剛好斷了。只要有一次 INCR 成功、EXPIRE 沒送到，這個 key 就存在但沒有 TTL。之後的 INCR 回傳 2、3、4……永遠不會再是 1，所以也永遠不會再設過期。結果是這個 IP 從此被永久封鎖，key 也一直佔著記憶體。改成每次都送 <code>PEXPIRE … NX</code>：前一次沒設成功的，下一次會補上；已經設好的，NX 讓它保持原樣，不會因為一直有請求就把過期時間一直往後延。練習 1 會模擬這種當機。</p>
+<p>TTL 為什麼是「從現在起算 60 秒」，而不是精準地設在這一格結束的那一刻？因為 key 上已經帶著視窗編號，就算 key 多活幾十秒，下一分鐘的請求也打不到它；TTL 只負責「最後會被清掉」。精準設定反而有風險，原因見課末。</p>
+<p>判斷完之後，回應裡通常附上兩個值，讓客戶端知道該怎麼做：<code>remaining</code> 是這一格還能打幾次，超過之後是 0，不要回負數；<code>resetAt</code> 是這一格結束的時間，也就是 <code>(視窗編號 + 1) × windowMs</code>。被拒絕時，HTTP 回 429，並用 <code>Retry-After</code> 標頭告訴客戶端多久之後再試，這些在<a href="../../system-design/lessons/10-rate-limiting.html">系統設計課第 10 課</a>講過。</p>
+<p>到這裡，三台伺服器已經共用同一個登入計數，猜密碼的腳本被擋住了。但固定視窗有一個缺口，在兩格的交界。為了好看出差距，假設上限是每分鐘 100 次（登入的 5 次也是同樣的道理：10 秒內可以猜 10 次）。攻擊者在 10:00:59.9 打 100 次、10:01:00.0 再打 100 次，這兩批分屬兩格，兩格各自都沒超過上限，於是前後不到一秒就通過了 200 次。</p>
+<figure>
+  <svg viewBox="0 0 700 200" role="img" aria-label="固定視窗的邊界：10:00:59.9 打 100 次，10:01:00.0 再打 100 次，前後不到一秒就通過 200 次">
+    <defs><marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="40" y="40" width="300" height="60" rx="6"/>
+    <rect class="d-soft" x="350" y="40" width="300" height="60" rx="6"/>
+    <text class="d-text" x="190" y="30" text-anchor="middle">視窗 1000（10:00）上限 100</text>
+    <text class="d-text" x="500" y="30" text-anchor="middle">視窗 1001（10:01）上限 100</text>
+    <rect class="d-box" x="300" y="50" width="40" height="40" rx="4"/>
+    <text class="d-accent" x="320" y="75" text-anchor="middle">100</text>
+    <rect class="d-box" x="350" y="50" width="40" height="40" rx="4"/>
+    <text class="d-accent" x="370" y="75" text-anchor="middle">100</text>
+    <line class="d-line" x1="300" y1="125" x2="390" y2="125" marker-start="url(#a3)" marker-end="url(#a3)"/>
+    <text class="d-text" x="345" y="150" text-anchor="middle">不到一秒通過 200 次</text>
+    <text class="d-small" x="345" y="175" text-anchor="middle">兩格各自計數，各自都沒超過上限</text>
+  </svg>
+  <figcaption>固定視窗在邊界最多放行約 2 倍的上限。登入這種「平均一下就夠」的場合可以接受；要更平均就用滑動視窗或 token bucket。</figcaption>
+</figure>
+<p>登入防護可以接受這個 2 倍，但有些 API 不行，例如呼叫要錢的外部服務。下一節看怎麼補這個缺口，以及要付出什麼。</p>
+
+<h2>邊界的 2 倍擋不住怎麼辦？滑動視窗要多付什麼</h2>
+<p>固定視窗會在邊界漏，是因為它看的是「這一格」，而不是「剛剛這 60 秒」。<strong>滑動視窗</strong>（sliding window log）直接看後者：不切格子，而是記下每一次請求的時間，每次進來一個請求，就數「從現在往前 60 秒內」有幾筆紀錄。10:01:00.0 那一刻往前看 60 秒，10:00:59.9 的 100 次都還在裡面，所以第 101 次會被擋下。</p>
+<p>「記下每次的時間、刪掉太舊的、數剩下幾筆」正好是第 2 課 sorted set 擅長的事：每個成員帶一個分數，可以依分數範圍刪除和計數。成員是這次請求的唯一 id，分數是請求的時間。每個請求依序做四步：</p>
+<pre># 現在 now = 60005000，視窗 60 秒，所以 59945000 以前的都不算
+ZREMRANGEBYSCORE ds:rl2:login:10.0.0.12 -inf 59945000   # 1. 刪掉 60 秒以前的紀錄
+ZCARD ds:rl2:login:10.0.0.12                            # 2. 剩下幾筆
+ZADD ds:rl2:login:10.0.0.12 60005000 req-7f3a           # 3. 沒超過上限才記下這一次（成員是 request id）
+PEXPIRE ds:rl2:login:10.0.0.12 60000                    # 4. 整個 key 閒置 60 秒後清掉</pre>
+<p>成員為什麼不直接用時間？sorted set 的成員不能重複。同一毫秒進來兩個請求，如果都用時間當成員，第二次 ZADD 只會更新同一個成員，最後只留下一筆，等於少算一次。所以成員用每個請求自己的唯一 id，例如 <code>crypto.randomUUID()</code>，時間只放在分數裡。</p>
+<p>準確換來的第一個代價是記憶體。固定視窗每個 IP 每分鐘只存一個整數；滑動視窗每個請求存一個成員，上限 100 次的話，一個 IP 最多存 100 個成員。上限越大、來的 IP 越多，差距越明顯。</p>
+<p>第二個代價更麻煩：這四步是四個獨立的指令，中間會被別的請求插進來。這裡先給一個名詞：一組操作要嘛全部做完、要嘛完全沒做，中間不會被別的指令插進來，這叫<strong>原子</strong>（atomic）。Redis 的單一指令都是原子的，像 INCR、RENAME、SET NX；但好幾個指令連著送，整段就不是。兩個請求幾乎同時到，都做完第 2 步，都看到 99 筆，都判斷「還能放行」，都做了第 3 步，結果放行了 101 次。固定視窗沒有這個問題，因為 INCR 一個指令就同時完成了「加一」和「回傳新值」，判斷用的是自己加完的數字。滑動視窗的「讀 → 判斷 → 寫」分成好幾步，要讓中間不被插隊，就得讓 Redis 把整段一次執行完，這是<a href="04-redis-atomicity.html">第 4 課</a>的 Lua 腳本，那一課會把整段寫成一個原子操作。</p>
+<p>還有第三種常見做法叫 <strong>token bucket</strong>。每個 key 有一個桶子，裡面裝著 token，可以想成預先發好的入場券；桶子以固定速度補充 token，裝滿就不再增加，每個請求拿走一個，沒有 token 就拒絕。桶子裡存著的 token 讓客戶端可以短暫爆量，補充速度則限制了長期的平均值。在 Redis 裡只要一個 hash 存兩個欄位：還剩幾個 token、上次補充的時間。它同樣是「讀 → 算 → 寫」，所以也留到第 4 課用 Lua 做。三種做法的取捨：</p>
+<div class="table-wrap"><table>
+  <tr><th>做法</th><th>Redis 結構</th><th>準確度</th><th>每個 key 的記憶體</th><th>這門課</th></tr>
+  <tr><td>固定視窗</td><td>string＋INCR</td><td>邊界可到 2 倍</td><td>一個整數</td><td>這課實作</td></tr>
+  <tr><td>滑動視窗</td><td>sorted set</td><td>準確</td><td>每個請求一個成員</td><td>這課講做法，第 4 課用 Lua</td></tr>
+  <tr><td>token bucket</td><td>hash（剩幾個 token、上次補充時間）</td><td>允許短暫爆量，長期平均固定</td><td>兩個欄位</td><td>第 4 課用 Lua</td></tr>
+</table></div>
+<p>咖啡店的登入防護用固定視窗就夠了：攻擊者在邊界多猜幾次密碼，影響有限，換來的是最簡單、不會被插隊的實作。</p>
+<div class="callout practice"><strong>💡 實務上：限流通常用現成套件，但你要看得懂它的 key</strong><br>不一定要手寫：NestJS 的 <code>@nestjs/throttler</code>（<a href="../../nestjs/lessons/06-middleware-guards.html">NestJS 課第 6 課</a>）預設把計數放在記憶體，跟開場的 <code>Map</code> 一樣有三台各算各的問題；換成 Redis 的 storage 套件之後，做的就是這兩節的事：用 key 計數、設過期時間。自己寫一次，你才看得懂它的 key、知道它在邊界會怎樣、Redis 掛掉時它會怎麼反應。上線前資深工程師會先問三件事：限流用什麼當 key（IP、帳號還是 API token；公司或校園網路常讓幾百人經由同一個對外 IP 上網（NAT），用 IP 當 key 會把他們當成同一個人一起擋掉）、超過時回什麼（429 加 <code>Retry-After</code>）、Redis 掛掉時放行還是拒絕（最後一節）。</div>
+<p>第一份狀態搬完了。登入計數是「很常加一、但只有 Redis 需要知道」的數字；開場的第二件事是另一種計數：瀏覽數最後要寫進資料庫，給報表和排序用。</p>
+
+<h2>熱門商品那一列為什麼拖慢結帳？瀏覽數先在 Redis 累加</h2>
+<p>先看原本的寫法為什麼會拖慢結帳。PostgreSQL 執行 <code>UPDATE products SET views = views + 1 WHERE id = 12</code> 時，會鎖住商品 12 那一列，直到這個交易結束；別的請求要改同一列，只能排隊等（<a href="../../postgresql/lessons/19-concurrency.html">PostgreSQL 課第 19 課</a>）。而且每次 UPDATE 都不是原地改，是寫出一個新版本的列，舊版本留著等清理（<a href="../../postgresql/lessons/30-mvcc-vacuum.html">PostgreSQL 課第 30 課</a>）。熱門商品每秒被看幾十次，就是每秒幾十個 UPDATE 搶同一列、留下幾十個舊版本。結帳要扣這個商品的庫存時，也要更新同一列，只能排在一長串瀏覽數更新的後面。</p>
+<p>瀏覽數有兩個特性：寫得非常頻繁，但少算幾次沒有人會發現。這種數字不需要每次都寫進資料庫。做法是先在 Redis 累加，每分鐘一次把累積的數字批次寫回 PostgreSQL：一分鐘裡商品 12 被看了 250 次，資料庫只收到一次「加 250」。累加用 hash，一個 key 放整間店的瀏覽數，欄位是商品 id：</p>
+<pre>HINCRBY ds:views 12 1        # 商品 12 被看了一次；整間店的瀏覽數放在同一個 hash</pre>
+<p>累加很簡單，難的是寫回。最直覺的寫法是三步：<code>HGETALL</code> 讀出全部、寫進資料庫、<code>DEL</code> 清空。問題在第一步和第三步之間：讀完之後、刪除之前，還是不斷有新的 HINCRBY 進來，這些瀏覽沒有被讀到，卻被 DEL 一起刪掉了。它們不在資料庫，也不在 Redis，就這樣消失。寫進資料庫要花幾十毫秒，流量越大，這段時間裡掉得越多。</p>
+<p>要讓「讀」和「之後的寫入」互不干擾，就先把舊的 key <strong>整個搬走</strong>，再慢慢讀。<code>RENAME</code> 把一個 key 改名，是一個指令、一步完成，中間不會有別的指令插進來：</p>
+<pre>RENAME ds:views ds:views:flushing   # 1. 舊的計數搬到暫存 key；之後的 HINCRBY 會建立一個全新的 ds:views
+HGETALL ds:views:flushing           # 2. 慢慢讀，這個 key 不會再有人寫
+（寫進 PostgreSQL）                   # 3.
+DEL ds:views:flushing               # 4. 資料庫寫成功才刪</pre>
+<p>改名之前的瀏覽都在 <code>ds:views:flushing</code> 裡；改名之後才進來的 HINCRBY 打到一個新建的 <code>ds:views</code>，等下一次寫回才會被搬走。每一次瀏覽都剛好落在其中一邊，一次都不會漏。寫進資料庫用累加的 upsert：這個商品還沒有紀錄就新增，已經有就加上這一批的數字：</p>
+<pre>INSERT INTO product_views (product_id, views) VALUES (12, 250), (13, 31)
+ON CONFLICT (product_id) DO UPDATE SET views = product_views.views + EXCLUDED.views;</pre>
+<p>正常流程就是這樣，但寫回會遇到三種不正常的狀況，練習 2 都會測。第一種是這一分鐘根本沒有人看商品：<code>ds:views</code> 不存在，RENAME 一個不存在的 key，Redis 會回 <code>ERR no such key</code>，ioredis 會把它變成被 reject 的 Promise。這是正常狀況，不是故障，要接住這個錯誤並直接結束，不要呼叫資料庫。</p>
+<p>第二種是資料庫寫入失敗。這時不能刪暫存 key，要留著，下一次寫回時先把它送掉，再處理新的 <code>ds:views</code>。順序很重要，因為 <code>RENAME</code> 會直接蓋掉已經存在的目的 key：暫存 key 還在的時候再 RENAME 一次，上一批沒寫成功的計數就被新的一批蓋掉了。</p>
+<p>第三種是好幾個程序同時寫回。三台伺服器如果都跑同一個每分鐘的排程，就會搶同一個暫存 key：一台剛 RENAME 完正在讀，另一台也來 RENAME，又回到第二種狀況的覆蓋問題。所以同一時間只能有一個程序在寫回：讓排程只在一台跑，或用<a href="../../system-design/lessons/14-distributed-locks-leases.html">分散式鎖</a>確保只有一個。</p>
+<p>還有一個情況處理不掉：資料庫已經寫成功，DEL 之前程式當掉。下一次寫回時，暫存 key 還在，同一批會再送一次，那幾個商品的瀏覽數就多算了一次。這種「保證每一筆至少送到一次，但可能重複」的流程叫<strong>至少一次</strong>（at-least-once）。要做到剛好一次，資料庫得記下「哪一批已經寫過」，例如每批給一個 id，存進有唯一約束的欄位，重送時就會被擋下，代價是更多的程式碼和一張多出來的表。瀏覽數多算幾次可以接受，所以這裡停在至少一次。</p>
+<p>那麼，哪些計數不能這樣做？庫存、餘額、點數、優惠券剩幾張。<code>DECR</code> 本身是原子的，問題不在指令，在 Redis 不是記錄系統（<a href="01-choosing-a-store.html">第 1 課</a>：一份資料唯一的權威來源，兩邊對不起來時以它為準）：依持久化的設定，Redis 重啟時可能丟掉最近一秒的寫入（<a href="06-redis-operations.html">第 6 課</a>）。正式環境的 Redis 通常是一個主節點加副本，主節點壞掉時改由副本接手，這叫主從切換；副本可能還沒收到最近的寫入，切換後那些寫入也就不見了。庫存丟了就是超賣，而且對帳時你不知道該信 Redis 還是資料庫。這些數字留在 PostgreSQL，用<a href="../../postgresql/lessons/19-concurrency.html">條件更新</a>（<code>UPDATE … SET stock = stock - 1 WHERE id = $1 AND stock &gt; 0</code>）扣。判斷的問題是：<strong>這個數字算錯，要不要賠錢或道歉？</strong>要，就不要讓 Redis 當它的權威。</p>
+<div class="callout practice"><strong>💡 實務上：先問這個數字錯一點有沒有關係</strong><br>瀏覽數、按讚數、文章閱讀數、API 用量統計，都是這種「Redis 累加、排程批次寫回」的做法，它讓咖啡店的熱門商品那一列一分鐘只被更新一次，結帳不再排隊。設計審查時資深工程師會先問：這個數字少算或多算幾次，有沒有人會在意？瀏覽數不在意，停在至少一次就好；API 用量如果拿來向客戶收費，就要做到每批有 id、資料庫擋重複。至於庫存和餘額，根本不該走這條路。</div>
+<p>兩份計數搬完了。回到開場的第三件事：限流擋住了猜密碼的腳本，但正常客人登入成功之後，「他已經登入」這件事也得讓三台伺服器都知道。</p>
+
+<h2>登入之後，三台伺服器怎麼認得同一個人？session 放進 Redis</h2>
+<p><a href="../../auth/lessons/04-cookies-sessions.html">認證課第 4 課</a>教過 session 的流程：登入成功後，伺服器產生一個 <strong>session id</strong>，用 HttpOnly cookie 交給瀏覽器；之後每個請求都帶著這個 id，伺服器用它找回「這是誰、什麼角色」。開場客人被要求重新登入，是因為 session 資料存在登入那一台的記憶體：下一個請求被負載平衡器分到另一台，那一台用同一個 id 查自己的記憶體，什麼都找不到，只好當作沒登入。跟限流計數同一個解法，session 資料放到三台都查得到的 Redis。設計如下：</p>
+<pre>ds:session:&lt;id&gt;             hash：userId、role；TTL 30 分鐘，每次使用都延長
+ds:user-sessions:&lt;userId&gt;   set：這位使用者所有的 session id（登出所有裝置用）</pre>
+<p>第一個 key 存 session 本身，第二個 key 是為了「登出所有裝置」多存的，本節最後會講它為什麼需要。先看 id 怎麼產生。</p>
+<p><strong>id 要猜不到。</strong>session id 就是登入憑證：誰拿著這個 id 發請求，伺服器就把他當成那位使用者。所以猜中別人的 id，就等於登入成他。遞增的數字一猜就中；<code>Math.random()</code> 不是密碼學安全的亂數，輸出可以被推算。要用 <code>crypto.randomBytes(32)</code> 產生 32 bytes（256 bits）的安全亂數（<a href="../../auth/lessons/02-crypto-toolbox.html">認證課第 2 課</a>），再編成 base64url，得到 43 個只含英數字、<code>-</code>、<code>_</code> 的字元，可以直接放進 cookie 和 key：</p>
+<pre>import { randomBytes } from 'node:crypto'
+
+const id = randomBytes(32).toString('base64url')       // 例如 'q3J0x…'，43 個字元
+await redis.hset(`ds:session:${id}`, { userId: String(userId), role })
+await redis.pexpire(`ds:session:${id}`, SESSION_TTL_MS)
+await redis.sadd(`ds:user-sessions:${userId}`, id)</pre>
+<p>注意 <code>HSET</code> 和 <code>PEXPIRE</code> 也是分開的兩個指令，跟限流那一節的 INCR 加 EXPIRE 是同一個問題：兩步之間程序當掉，會留下一個永不過期的 session。要讓這兩步一起成立，用<a href="04-redis-atomicity.html">第 4 課</a>的 MULTI 或 Lua（這次的練習不測這一點）。</p>
+<p><strong>為什麼用 hash，而不是把整個 session 存成一個 JSON string？</strong>跟第 2 課的購物車同一個理由：之後要改角色、記錄最後活動時間，只要改一個欄位，不必讀出整包、改完再寫回整包，也就不會有兩個請求同時寫回、互相蓋掉的問題。另外，<code>HGETALL</code> 對不存在的 key 回 <code>{}</code> 而不是 null，所以判斷 session 存不存在，看的是「有沒有 userId 欄位」。</p>
+<p>session 裡只放找回使用者需要的最少資料：userId 和角色。會員名字、地址這類資料，需要時查資料庫（或快取）。放進 session 就變成兩份資料，客人改了名字，session 裡的還是舊的。</p>
+<p>接著是過期時間。如果只在建立 session 時設 30 分鐘的 TTL，客人正在結帳，第 30 分鐘一到也會被踢出去。比較合理的是<strong>滑動過期</strong>（sliding expiration）：每次使用都把過期時間往後延，客人一直在用就一直保持登入，閒置滿 30 分鐘才登出。做法就是每次讀到 session 之後，再 <code>PEXPIRE</code> 一次。但只用滑動過期，一個一直被使用的 session 可以永遠活著，被偷走的 id 也一樣；所以很多系統另外設一個<strong>絕對上限</strong>，例如建立 12 小時後一定要重新登入，做法是在 hash 裡記下建立時間，每次讀的時候檢查。</p>
+<p>最後是<strong>登出所有裝置</strong>。客人改了密碼、或發現帳號被盜時，要讓他所有的 session 立刻失效。麻煩在於 session 的 key 是用亂數 id 命名的，從 userId 算不出來。用 <code>KEYS ds:session:*</code> 一個一個看裡面的 userId，會走過整個 key 空間並卡住 Redis（<a href="02-redis-data-structures.html">第 2 課</a>說過正式環境不能用）；換成 SCAN 不會卡住別人，但一樣要看過幾百萬個 key 才找得完。所以要在建立 session 的時候，另外在 <code>ds:user-sessions:&lt;userId&gt;</code> 這個 set 記下 id，登出全部時直接從這裡拿：</p>
+<pre>const ids = await redis.smembers(`ds:user-sessions:${userId}`)
+await redis.del(...ids.map(id =&gt; `ds:session:${id}`), `ds:user-sessions:${userId}`)</pre>
+<p>這個 set 就是<strong>索引</strong>：為了支援一種查詢方式（從 userId 找 session），自己多維護一份資料。PostgreSQL 的索引由資料庫自動更新，Redis 不會，你要在每個寫入的地方記得更新它：單一登出時要 <code>SREM</code> 掉那個 id；這個 set 也要有 TTL，不然使用者的 session 都過期了，它還一直留著；而且 session 被延長時它也要一起延長，不然它會比 session 先過期，「登出所有裝置」就找不到還活著的 session。</p>
+<p>「session 還是 JWT」的取捨在於能不能立刻撤銷，<a href="../../auth/lessons/11-revocation-tradeoffs.html">認證課第 11 課</a>談過；這一節就是「立刻撤銷」在 Redis 的做法：刪掉 key，下一個請求就查不到。</p>
+<p>三份狀態搬完了。開場的最後一件事不一樣：前面三份都是「讀寫一個數字或一份資料」，重送的訂單要的是「同一個操作只能做一次」。</p>
+
+<h2>客人按兩次送出，訂單怎麼只建立一次？冪等鍵</h2>
+<p>客人按了兩次送出，或手機在弱網路下自動重試，伺服器都會收到兩個一模一樣的「建立訂單」請求。伺服器沒辦法從內容分辨「這是重送」還是「客人真的又點了一杯一樣的」，所以需要客戶端告訴它。<strong>冪等鍵</strong>（idempotency key）就是客戶端為「這一次操作」產生的唯一值，放在 <code>Idempotency-Key</code> 標頭送出；重送時帶同一個值，伺服器看到就知道「這個我處理過了」，直接回傳上次的結果，不再建立一筆（完整流程在<a href="../../system-design/lessons/09-idempotency.html">系統設計課第 9 課</a>）。</p>
+<p>三台伺服器都可能收到重送的請求，所以「這把 key 處理過了沒」也要記在共用的 Redis。Redis 的部分只要一個指令：</p>
+<pre>127.0.0.1:6379&gt; SET ds:idem:order-abc processing PX 86400000 NX
+OK          # 搶到了：這是第一次，去建立訂單
+127.0.0.1:6379&gt; SET ds:idem:order-abc processing PX 86400000 NX
+(nil)       # 已經有人在處理或處理完了</pre>
+<p><code>SET … NX</code> 是「key 不存在才寫入」，<code>PX</code> 是同時設定毫秒的 TTL。ioredis 寫成 <code>redis.set(key, 'processing', 'PX', ttlMs, 'NX')</code>，搶到回 <code>'OK'</code>，沒搶到回 <code>null</code>。關鍵在「檢查有沒有」和「寫入」是同一個指令。如果先 <code>GET</code> 看是空的、再 <code>SET</code>，兩個同時到的請求會都看到空的、都去建立訂單，這跟<a href="02-redis-data-structures.html">第 2 課</a>的遺失更新是同一種問題，也是上一節滑動視窗被插隊的同一種問題。</p>
+<p>搶到之後，這把 key 會經過三種狀態，每一種都要處理：</p>
+<div class="table-wrap"><table>
+  <tr><th>SET NX 的結果</th><th>key 的值</th><th>怎麼做</th></tr>
+  <tr><td>OK（搶到）</td><td>—</td><td>執行建立訂單。成功：把結果 <code>JSON.stringify</code> 後蓋回這個 key（記得再給 PX，SET 會清掉舊的 TTL）並回傳。失敗：<code>DEL</code> 這個 key，讓客戶端可以重試，再把錯誤丟出去</td></tr>
+  <tr><td>null</td><td><code>processing</code></td><td>第一個請求還在跑：回 409 Conflict，客戶端等一下用同一把 key 重試</td></tr>
+  <tr><td>null</td><td>結果的 JSON</td><td>已經完成：<code>JSON.parse</code> 後回傳同一個結果，不再執行</td></tr>
+</table></div>
+<p>表裡有兩個地方最容易漏。第一個是 <code>processing</code> 也要有 TTL：伺服器在建立訂單途中當掉，沒有機會 DEL，如果這把 key 沒有過期時間，它會永遠停在「處理中」，客人用同一把 key 重試永遠拿到 409，這筆訂單再也送不出去。有 TTL，最壞的情況是等它過期。</p>
+<p>第二個是失敗要釋放。付款閘道逾時這類錯誤，訂單其實沒建立，客戶端應該可以用同一把 key 再試一次。不 DEL，重試會被當成「還在處理中」擋下，只能等 TTL 到期。</p>
+<p>還有一種情況這課先不處理：客戶端的 bug 拿同一把 key 送出了內容不同的訂單。照上面的做法，第二筆會直接拿到第一筆的結果，客人以為點了卡布奇諾，拿到的是拿鐵的訂單。正式做法是把請求內容的雜湊一起存起來，重送時比對，不同就回 422，系統設計課第 9 課有完整流程；練習 4 先不做這一步。</p>
+<div class="callout practice"><strong>💡 實務上：Redis 管快，資料庫管對</strong><br><strong>Redis 擋住了，資料庫還要唯一約束嗎？</strong>要。Redis 的冪等鍵是第一道、很快的門：重送的請求在這裡就返回，不必碰資料庫。但跟上一節的庫存一樣，Redis 裡的 key 可能遺失：記憶體滿時 Redis 會依設定淘汰一些 key（<a href="06-redis-operations.html">第 6 課</a>），重啟、主從切換也可能丟掉最近的寫入，TTL 到期後也沒了。最後的防線是 PostgreSQL 的 <code>orders.idempotency_key UNIQUE</code>：就算 Redis 什麼都忘了，第二筆 INSERT 也會被拒絕。付款、建立訂單、寄出優惠券這類「做兩次會出事」的 API，code review 時都要找得到這兩層。</div>
+<p>四份狀態都搬進 Redis 了，開場那一週的四件事都有了解法。但這也代表限流、瀏覽數、登入、下單，現在全都依賴 Redis。它掛掉的那一刻，這四個功能各該怎麼辦？</p>
+
+<h2>Redis 掛掉時，每個功能該放行還是拒絕？</h2>
+<p>Redis 連不上時，每個用到它的地方都得選一個方向：<strong>fail open</strong> 是依賴壞掉時放行請求，當作檢查通過；<strong>fail closed</strong> 是拒絕請求，當作檢查失敗。沒有統一的答案，要逐個功能比較「放行的風險」和「拒絕的傷害」哪個大。把這課的四份狀態排在一起看：</p>
+<div class="table-wrap"><table>
+  <tr><th>功能</th><th>Redis 壞掉時</th><th>理由與補救</th></tr>
+  <tr><td>一般 API 限流</td><td>fail open</td><td>擋掉所有請求，等於 Redis 的故障變成整個 API 的故障。記 log、發告警</td></tr>
+  <tr><td>登入的暴力破解防護</td><td>fail open，但退回較保守的防線</td><td>例如每台伺服器記憶體裡的嚴格限制，加上資料庫裡的帳號鎖定</td></tr>
+  <tr><td>session 驗證</td><td>fail closed</td><td>找不到 session 就當作沒登入，要求重新登入；絕對不能「找不到就放行」</td></tr>
+  <tr><td>冪等鍵</td><td>略過 Redis，繼續處理</td><td>由資料庫的唯一約束擋重複，只是重送的請求變慢</td></tr>
+  <tr><td>瀏覽數累加</td><td>直接忽略錯誤</td><td>少算幾次可以接受，不要因為計數失敗讓商品頁打不開</td></tr>
+</table></div>
+<p>表裡的選擇都來自前面每一節的分析。限流是保護措施，壞掉時擋掉所有人，傷害比放行大。登入是例外：它就是這課要擋的猜密碼腳本，單純放行的話，Redis 一掛，腳本就能無限次猜密碼。所以退回各台記憶體裡的 <code>Map</code>：它有開場說的缺點，三台各算一份，實際放行的次數大約是上限的 3 倍，重啟還會歸零；但在 Redis 故障的這段時間，有一道粗略的防線總比沒有好。資料庫的帳號鎖定（例如連錯 N 次就鎖帳號）不依賴 Redis，是第二道防線。session 是身分驗證，放行等於讓沒登入的人進來；冪等鍵敢略過 Redis，是因為上一節在資料庫留了唯一約束；瀏覽數敢忽略錯誤，是因為我們已經決定它少算幾次沒關係。反過來說，如果冪等鍵沒有資料庫那一層，Redis 一掛就只剩兩個壞選擇：拒絕所有下單，或冒重複扣款的風險。</p>
+<p>決定方向還不夠，程式得先「知道」Redis 壞了，才會走進 catch。「怎麼才算壞掉」要自己設定，而 ioredis 的預設值對 API 伺服器並不友善：連線斷掉時，它不會馬上回報錯誤，而是把指令先放進離線佇列，等重新連上再送，每個指令要等到重連很多次都失敗才丟錯；連線還在、但 Redis 卡住不回應時，沒設指令逾時就一直等下去（各選項的預設值見課末）。結果是 Redis 一出事，每個請求都卡在 await 那一行十幾秒，API 的連線和記憶體越堆越多，跟著一起掛。給 API 用的連線，應該讓錯誤快一點出現：</p>
+<pre>const redis = new Redis(process.env.REDIS_URL!, {
+  connectTimeout: 2_000,       // 建立連線最多等 2 秒（預設 10 秒）
+  commandTimeout: 500,         // 單一指令 500 毫秒沒回應就丟錯（預設不限）
+  maxRetriesPerRequest: 1,     // 斷線時這個指令最多等一次重連就失敗（預設 20）
+})
+
+try {
+  decision = await allow(redis, `login:${ip}`, 5, 60_000, Date.now())
+} catch (e) {
+  logger.warn({ err: e }, 'rate limiter unavailable, failing open')
+  decision = { allowed: true, remaining: 0, resetAt: 0 }
+}</pre>
+<p>逾時要設多短，看你的 API 的延遲目標：Redis 正常時一個指令不到 1 毫秒，500 毫秒已經是出事了。catch 裡記 log 再放行，就是表格第一列的 fail open。注意 <code>Date.now()</code> 只出現在呼叫的地方，<code>allow</code> 本身收 <code>now</code> 參數：這樣測試可以傳固定的時間，練習 1 就是靠這個測視窗的邊界。</p>
+<div class="callout practice"><strong>💡 實務上：上線前先在 staging 把 Redis 停掉一次</strong><br>這張表最常出問題的地方，是從來沒人真的測過：程式寫了 try/catch，連線卻還是預設值，Redis 一出事，請求要卡十幾秒才輪到 catch。上線前在 staging 把 Redis 停掉幾分鐘；staging 是上線前、設定盡量跟正式環境一樣的測試環境。看三件事：API 是不是很快回應而不是卡住、登入中的使用者會怎樣、告警有沒有響。每個功能選 fail open 還是 fail closed，最好寫進設計文件或 PR 說明，讓 PM 和維運事先知道「Redis 掛掉時使用者會看到什麼」，而不是半夜出事才發現。</div>
+
+<h2 id="appendix">補充與查表</h2>
+<p>這裡收主線提過、但做到這一步不需要記住的細節，查表用，不用背。</p>
+<p><strong>指令選項是從哪個版本開始有的。</strong>課程用的 Redis 是 8.10.3，下面這些都可以用：</p>
+<div class="table-wrap"><table>
+  <tr><th>寫法</th><th>從哪個版本開始</th><th>用在這課的哪裡</th></tr>
+  <tr><td><code>PEXPIRE key ms NX</code>（同時加入的還有 XX、GT、LT）</td><td>Redis 7.0</td><td>固定視窗限流</td></tr>
+  <tr><td><code>SET key value PX ms NX</code></td><td>Redis 2.6.12</td><td>冪等鍵</td></tr>
+</table></div>
+<p><strong>為什麼限流的 TTL 用 <code>PEXPIRE windowMs</code>，而不是 <code>PEXPIREAT</code> 精準設在視窗結束的時間？</strong><code>PEXPIREAT</code> 收的是絕對時間。但 <code>now</code> 是你的伺服器算的，三台伺服器的時鐘可能差幾百毫秒，測試裡傳入的 <code>now</code> 甚至是假的時間；拿它當 Redis 的絕對時間，key 可能一建立就過期。key 上已經帶著視窗編號，TTL 只負責「最後會被清掉」，多留幾十秒沒關係。</p>
+<p><strong>ioredis 6.0.0 跟逾時有關的預設值</strong>（課程練習用的版本）：</p>
+<div class="table-wrap"><table>
+  <tr><th>選項</th><th>預設</th><th>影響</th></tr>
+  <tr><td><code>enableOfflineQueue</code></td><td>true</td><td>連線斷掉時，指令先放進離線佇列等重新連線</td></tr>
+  <tr><td><code>maxRetriesPerRequest</code></td><td>20</td><td>每個指令最多等到重連 20 次才失敗</td></tr>
+  <tr><td><code>commandTimeout</code></td><td>不限</td><td>連上了但 Redis 不回應時，一直等</td></tr>
+  <tr><td><code>connectTimeout</code></td><td>10 秒</td><td>建立連線最多等多久</td></tr>
+</table></div>
+
+<h2>練習</h2>
+<p>先確認 Redis 有在跑（在 <code>learn/data-stores/practice</code> 執行 <code>docker compose --profile redis up -d --wait</code>），每一題都在 <code>learn/</code> 執行 <code>node check.mjs data-stores 03</code> 判分。所有函式的第一個參數 <code>redis</code> 由測試傳入，連到 <strong>DB 3</strong>，每個測試檔開始前會清空。每個起始檔最上面的註解寫了 key 的名稱和規則。</p>
+
+<div class="local" data-test="ex1" data-files="fixed-window.ts">
+  <p>練習 1：在 <code>fixed-window.ts</code> 實作 <code>allow(redis, key, limit, windowMs, now)</code>，回傳 <code>{ allowed, remaining, resetAt }</code>。計數放在 <code>ds:rl:&lt;key&gt;:&lt;視窗編號&gt;</code>，視窗編號是 <code>Math.floor(now / windowMs)</code>，時間一律用參數 <code>now</code>。同一個視窗的第 limit＋1 次起拒絕，20 個請求同時進來也一樣；<code>remaining</code> 最小是 0；<code>resetAt</code> 是這個視窗結束的時間。每次呼叫後 key 都要有過期時間：測試會讓第一次設定過期的指令失敗，模擬程式在 INCR 之後當掉，下一次呼叫必須把 TTL 補上。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="views.ts">
+  <p>練習 2：在 <code>views.ts</code> 實作 <code>incrView(redis, productId)</code>：把瀏覽數累加在 hash <code>ds:views</code>；以及 <code>flushViews(redis, sink)</code>：用 RENAME 把目前的計數搬到 <code>ds:views:flushing</code>，讀出來轉成 <code>{ productId, views }[]</code>（兩個都是 number）交給 <code>sink</code>（測試給的假資料庫寫入），sink 成功才刪掉暫存 key。要求：沒有計數時不呼叫 sink 也不出錯；讀取之後進來的瀏覽不能消失；sink 丟錯時錯誤要往外丟、計數要留著，下一次 flushViews 要把上一次的和新的都送出。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="session.ts">
+  <p>練習 3：在 <code>session.ts</code> 實作伺服器端 session。<code>createSession(redis, userId, { role })</code> 回傳 32 bytes 安全亂數的 base64url id，把 <code>userId</code>、<code>role</code> 存進 hash <code>ds:session:&lt;id&gt;</code>（30 分鐘過期），並把 id 加進 <code>ds:user-sessions:&lt;userId&gt;</code>（這個索引 set 也要有 30 分鐘 TTL）；<code>getSession</code> 回傳 <code>{ userId, role }</code>（userId 是 number），找不到回傳 <code>null</code>，找到時把 session 和索引的 TTL 都延長回 30 分鐘；<code>destroySession</code> 登出一個 session（索引也要移除）；<code>destroyAllForUser</code> 登出這位使用者的所有 session 並刪掉索引，不能用 KEYS 或 SCAN。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="idempotency.ts">
+  <p>練習 4：在 <code>idempotency.ts</code> 實作 <code>withIdempotency(redis, key, ttlMs, fn)</code>：用 <code>ds:idem:&lt;key&gt;</code> 確保同一個 key 的 <code>fn</code> 只成功執行一次。第一次執行 <code>fn</code>，把結果存起來再回傳；完成後同一個 key 再呼叫，回傳存好的結果（物件要跟原本深度相等）而不執行 <code>fn</code>；還在執行中時丟出 <code>ConflictError</code>；<code>fn</code> 丟錯時刪掉 key 並把錯誤丟出去。執行中和完成後的 key 都要有 TTL。測試會同時送出 10 次，也會用兩份模組模擬兩台伺服器同時收到同一把 key，所以鎖不能放在程式記憶體裡。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：登入 API 用固定視窗限流，每分鐘 100 次。攻擊者最多可以在大約 1 秒內通過幾次？</p>
+  <label data-key="a">100 次，上限就是 100</label>
+  <label data-key="b">約 200 次：前一分鐘的最後一刻 100 次，加上下一分鐘的第一刻 100 次</label>
+  <label data-key="c">沒有上限，固定視窗擋不住</label>
+  <label data-key="d">50 次，Redis 會平均分配</label>
+  <p class="why">✓ 兩格各自計數，跨過邊界時計數重新開始，所以短時間內最多約 2 倍。a 忽略了邊界；c 錯在每一格仍有上限；d 的「平均分配」是滑動視窗或 token bucket 才有的效果，代價是更多記憶體或計算。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 6：Redis 暫時連不上。以下哪一種處理方式正確？</p>
+  <label data-key="a">session 驗證讀不到 Redis 時先放行，等 Redis 恢復再檢查</label>
+  <label data-key="b">一般 API 的限流讀不到 Redis 時回 500，安全第一</label>
+  <label data-key="c">一般 API 的限流放行並告警；session 驗證當作沒登入，要求重新登入</label>
+  <label data-key="d">所有功能都重試到 Redis 恢復為止</label>
+  <p class="why">✓ 限流是保護措施，壞掉時擋掉所有人的傷害比放行大，所以 fail open 並告警；session 是身分驗證，放行等於讓沒登入的人進來，要 fail closed。a 剛好反過來；b 讓 Redis 的故障變成整個 API 的故障；d 讓請求越堆越多，連線和記憶體一起耗盡，這也是要設 <code>commandTimeout</code>、<code>maxRetriesPerRequest</code> 的原因。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：訂單的冪等鍵已經用 <code>SET NX PX</code> 放在 Redis、保留 24 小時。<code>orders</code> 表還需要 <code>idempotency_key</code> 的唯一約束嗎？</p>
+  <label data-key="a">不需要，SET NX 已經保證只有一個請求搶得到</label>
+  <label data-key="b">需要：Redis 的 key 可能因為淘汰、重啟或主從切換而遺失，資料庫的唯一約束才是最後防線</label>
+  <label data-key="c">只有用 Redis Cluster 時才需要</label>
+  <label data-key="d">不需要，但要把 TTL 改成永久</label>
+  <p class="why">✓ SET NX 只在 key 還在的前提下有效；Redis 不是記錄系統，遺失時第二個請求會搶到新的 key、再建立一筆訂單，只有 PostgreSQL 的 UNIQUE 擋得住。c 錯在單機 Redis 一樣會遺失資料；d 讓 key 只增不減吃光記憶體，而且仍然擋不住遺失。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>限流計數放在程式的 Map 裡</strong>：多台伺服器各算各的，部署重啟就歸零。計數要放在所有伺服器共用的 Redis。</li>
+  <li><strong>INCR 回傳 1 才設過期</strong>：INCR 和 EXPIRE 中間當掉，key 就永遠沒有 TTL，這個 IP 被永久封鎖。每次都送 <code>PEXPIRE key ms NX</code>。</li>
+  <li><strong>限流函式裡呼叫 Date.now()</strong>：沒辦法測邊界、沒辦法重現問題。讓函式接收 <code>now</code>，只在最外層取現在時間。</li>
+  <li><strong>計數落地用 HGETALL 再 DEL</strong>：兩步之間的累加被一起刪掉。先 RENAME 把舊計數原子地搬走，寫進資料庫成功才 DEL 暫存 key。</li>
+  <li><strong>寫入失敗就丟掉計數，或暫存 key 還在時又 RENAME</strong>：前者計數遺失；後者 RENAME 會蓋掉目的 key，上一批一樣遺失。先處理留下來的暫存 key。</li>
+  <li><strong>session id 用遞增數字、Math.random 或 userId 組出來</strong>：猜得到就能冒充別人。用 <code>crypto.randomBytes(32)</code>。</li>
+  <li><strong>「登出所有裝置」用 KEYS 掃描</strong>：會卡住整台 Redis。建立 session 時就維護 <code>user-sessions</code> 索引。</li>
+  <li><strong>冪等鍵先 GET 再 SET</strong>：同時到的兩個請求都會通過。用 <code>SET … NX PX</code> 一步搶下；fn 失敗要 DEL，每種狀態都要有 TTL。</li>
+  <li><strong>把冪等鍵或庫存只放 Redis</strong>：Redis 遺失資料時會重複建立訂單或超賣。Redis 是加速，記錄系統和最後防線在 PostgreSQL。</li>
+  <li><strong>ioredis 用預設值連線</strong>：Redis 卡住時每個請求跟著卡十幾秒。設 <code>connectTimeout</code>、<code>commandTimeout</code>、<code>maxRetriesPerRequest</code>，並為每個功能決定 fail open 或 fail closed。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>從一台擴成多台時，放在單台記憶體裡的小狀態會壞掉：每台各記各的、重啟就歸零。很小、很常改、多台都要看到同一份的狀態，是 Redis 的主場：限流計數、累加中的計數、session、冪等鍵。</li>
+  <li>登入計數用固定視窗：<code>INCR</code>＋每次都送 <code>PEXPIRE … NX</code>，key 帶視窗編號；邊界可到 2 倍。滑動視窗更準，但每個請求佔一個成員，而且要第 4 課的 Lua 才能不被插隊。</li>
+  <li>瀏覽數先在 Redis 累加、批次寫回：<code>RENAME</code> 原子地取走 → 讀 → 寫進資料庫 → 成功才 DEL；失敗留著下次先送；這是至少一次。</li>
+  <li>session：<code>randomBytes(32)</code> 的 id、hash 存最少資料、每次使用延長 TTL、用 set 當索引做「登出所有裝置」。</li>
+  <li>冪等鍵：<code>SET … NX PX</code> 一步搶下，處理中、完成、失敗三種狀態都要處理；資料庫唯一約束是最後防線。</li>
+  <li>每搬一份狀態都問兩個問題：這個數字錯了要不要賠錢（要就不能只放 Redis）；Redis 掛了這個功能要放行還是拒絕，連線逾時要設得讓錯誤快點出現。</li>
+</ul>
+<p>這課留下一個沒解決的問題：滑動視窗那種「讀 → 判斷 → 寫」分成好幾個指令時會被插隊。下一課用 pipeline、MULTI/WATCH 和 Lua 腳本，讓好幾個指令一起成立。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

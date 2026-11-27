@@ -1,0 +1,1755 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>16. 事件驅動與 webhook</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="16">
+<header>
+  <div class="eyebrow">階段 4：架構：服務、事件與即時推送 · 第 16 課</div>
+  <h1>事件驅動與 webhook</h1>
+</header>
+<main>
+
+<p>咖啡店的訂單服務在顧客付款成功後，要通知五個地方：集點、廚房出單、寄收據、營收報表，還有外送平台。最早的寫法很直覺：付款成功之後，依序呼叫這五個服務，全部成功才回應顧客「付款完成」。後來報表服務部署失敗、掛了 10 分鐘，這 10 分鐘內所有付款都回 500。錢其實已經扣了，失敗的只是「通知報表」這一步，顧客卻看到付款失敗，有人還再付了一次。再後來行銷部門想加「首購送優惠券」，又得去改訂單服務的程式、重新部署，跟一個與優惠券無關的團隊排上線時間。</p>
+<p>這一課就做一件事：把「付款後通知其他人」從同步呼叫改成事件。訂單服務只宣布「這張訂單付款了」，誰需要就自己來聽。改完之後要做到四件事：報表掛了不影響付款；加新功能不用改訂單服務；集點不會因為同一則通知來兩次而加兩次、廚房畫面不會因為通知晚到而倒退；公司外面的外送平台也收得到，而且收得到的方式不會被某一個客戶拖垮。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>「通知報表」為什麼能讓付款失敗：同步呼叫的問題，命令和事件差在哪（開場問題的最小答案）。</li>
+  <li><code>OrderPaid</code> 裡要放多少資料：只放 ID、放完整資料，還是折衷。</li>
+  <li>消費者怎麼認出同一個事件、排出先後：每個事件該帶的 ID、來源和序號。</li>
+  <li>集點為什麼會加兩次、廚房畫面為什麼會倒退：消費者怎麼處理重複與亂序，以及廚房畫面怎麼從事件組出來。</li>
+  <li>怎麼把事件送到公司外面的外送平台：webhook 的重送、簽章與隔離；最後是什麼時候不該用事件。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../nestjs/lessons/21-scheduling-events.html">NestJS 課第 21 課</a>的程序內事件（EventEmitter2）：發出事件、多個 listener 各自處理；限制是程序一重啟，還沒處理的事件就沒了。</li>
+  <li><a href="12-queues-outbox.html">第 12 課</a>的至少一次送達與 outbox／inbox：同一則訊息一定會來兩次，消費者用 inbox 去重；訊息和訂單寫在同一個交易，不會漏送。</li>
+  <li><a href="09-idempotency.html">第 9 課</a>的冪等鍵：同一把鍵送很多次，對方只做一次。</li>
+</ul></div>
+
+<h2>「通知報表」為什麼能讓付款失敗？命令與事件</h2>
+<p>先看開場的事故是怎麼發生的。付款 API 的程式長這樣：扣款成功，然後 <code>await</code> 集點、<code>await</code> 廚房、<code>await</code> 收據、<code>await</code> 報表、<code>await</code> 外送平台，最後回應顧客。任何一個 <code>await</code> 丟錯，整個請求就失敗。這五個呼叫都是<strong>硬相依</strong>：每一個都必須活著，付款 API 才會成功。<a href="15-monolith-microservices.html">第 15 課</a>算過，硬相依的可用性要相乘，五個 99.9% 的服務串在一起，付款 API 最多只剩約 99.5%，而且延遲是五個服務的延遲加起來。</p>
+<p>但仔細想，顧客其實只在乎一件事：卡有沒有過。集點晚 3 秒加上去、報表晚 10 分鐘更新，顧客根本不會發現。問題出在付款 API 把「付款」和「付款之後別人要做的事」綁在同一個請求裡。要拆開它們，得先分清楚服務之間傳的訊息有哪幾種意圖。</p>
+<p>服務之間傳的訊息有三種意圖，把它們混在一起，是很多設計問題的起點：</p>
+<div class="table-wrap"><table>
+  <tr><th>種類</th><th>意思</th><th>咖啡店的例子</th><th>可以被拒絕嗎</th><th>格式誰決定</th></tr>
+  <tr><td><strong>命令</strong>（command）</td><td>要求某個服務去做一件事</td><td><code>PlaceOrder</code>、<code>ChargeCard</code></td><td>可以（庫存不足、卡被拒）</td><td>接收者</td></tr>
+  <tr><td><strong>事件</strong>（event）</td><td>宣布一件已經發生的事實</td><td><code>OrderPlaced</code>、<code>OrderPaid</code></td><td>不行，已經發生了</td><td>發布者</td></tr>
+  <tr><td><strong>查詢</strong>（query）</td><td>問現在的狀態，不改變任何東西</td><td><code>GetOrder</code></td><td>只會查不到</td><td>接收者</td></tr>
+</table></div>
+<p>原本的付款 API 發的是五個命令：「集點服務，去加點」「報表服務，去記一筆」。命令通常只有一個接收者，發送者在等它的結果，所以接收者失敗，發送者也跟著失敗。事件不一樣：它說的是「訂單 A-1001 付款了」這個已經發生的事實。事實不能被拒絕，所以事件用<strong>過去式</strong>命名，<code>OrderPaid</code> 是「付款了」，不是「去付款」。</p>
+<p>事件的送法叫<strong>發布／訂閱</strong>（pub/sub）。發布者把事件交給一個中間的系統，想知道這件事的服務事先向這個系統登記（訂閱），之後每個訂閱者各收到一份。發布者不知道、也不需要知道有誰在聽。這個中間的系統叫<strong>事件匯流排</strong>（event bus），常見的有 Kafka，或 SNS 搭配 SQS（SNS 負責把一則訊息複製給多個訂閱者，每個訂閱者用自己的 SQS 佇列接）。匯流排會把事件存起來，訂閱者暫時掛掉，事件就留在那裡等它回來。</p>
+<figure>
+  <svg viewBox="0 0 700 260" role="img" aria-label="訂單服務發布 OrderPaid 事件到事件匯流排，集點、廚房、收據、報表四個訂閱者各收到一份，訂單服務不知道有哪些訂閱者">
+    <defs><marker id="a16" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="20" y="105" width="140" height="50" rx="6"/>
+    <text class="d-text" x="90" y="135" text-anchor="middle">訂單服務</text>
+    <line class="d-line" x1="160" y1="130" x2="240" y2="130" marker-end="url(#a16)"/>
+    <text class="d-small" x="200" y="120" text-anchor="middle">OrderPaid</text>
+    <rect class="d-soft" x="245" y="90" width="170" height="80" rx="6"/>
+    <text class="d-text" x="330" y="125" text-anchor="middle">事件匯流排</text>
+    <text class="d-small" x="330" y="145" text-anchor="middle">（Kafka、SQS+SNS…）</text>
+    <line class="d-line" x1="415" y1="115" x2="500" y2="40" marker-end="url(#a16)"/>
+    <line class="d-line" x1="415" y1="125" x2="500" y2="100" marker-end="url(#a16)"/>
+    <line class="d-line" x1="415" y1="135" x2="500" y2="160" marker-end="url(#a16)"/>
+    <line class="d-line" x1="415" y1="145" x2="500" y2="220" marker-end="url(#a16)"/>
+    <rect class="d-box" x="505" y="20" width="170" height="40" rx="6"/><text class="d-text" x="590" y="45" text-anchor="middle">集點</text>
+    <rect class="d-box" x="505" y="80" width="170" height="40" rx="6"/><text class="d-text" x="590" y="105" text-anchor="middle">廚房出單</text>
+    <rect class="d-box" x="505" y="140" width="170" height="40" rx="6"/><text class="d-text" x="590" y="165" text-anchor="middle">寄收據</text>
+    <rect class="d-box" x="505" y="200" width="170" height="40" rx="6"/><text class="d-text" x="590" y="225" text-anchor="middle">報表（掛了也不影響付款）</text>
+    <text class="d-accent" x="90" y="190" text-anchor="middle">不知道誰在聽</text>
+  </svg>
+  <figcaption>改成事件之後，付款 API 只要把 <code>OrderPaid</code> 交給匯流排就能回應顧客。報表服務掛了，事件留在匯流排上等它回來；要加「首購送優惠券」，只要多一個訂閱者，訂單服務不用改。</figcaption>
+</figure>
+<p>這就是開場兩個問題的最小答案。報表掛了不影響付款，因為付款 API 不再等報表；加優惠券不用改訂單服務，因為發布者本來就不知道有誰在聽。</p>
+<p>表格最後一欄「格式誰決定」，說的是耦合的方向。命令的格式由接收者決定：金流服務說要哪些欄位，呼叫它的人就得照給，金流改格式，所有呼叫者都要跟著改。事件的格式由發布者決定：訂單服務定義 <code>OrderPaid</code> 長什麼樣，訂閱者照著讀，訂單服務不用為了任何一個訂閱者改程式。</p>
+<p>分辨命令和事件，不能只看它有沒有走匯流排。最常見的假事件是 <code>SendReceiptEmail</code>：它走匯流排送出，看起來是非同步的事件，但名字是命令，只有一個接收者，發布者其實在指揮別人做事。它換了傳送方式，耦合卻沒有減少：哪天收據改成簡訊，訂單服務還是要改。正確的是發 <code>OrderPaid</code>，由通知服務自己決定要寄信、發簡訊還是推播。</p>
+
+<div class="callout practice"><strong>💡 實務上：先用程序內事件，真的跨服務再上訊息系統</strong><br>多數團隊一開始是單體（<a href="15-monolith-microservices.html">第 15 課</a>），同一個程式裡用 NestJS 的 EventEmitter 就能把「付款後要做的事」拆成各自的監聽器，先把事件的命名與邊界練好。等報表、外送整合變成獨立服務，或「程序重啟事件就沒了」已經不能接受（例如集點），才值得引進 outbox 加 Kafka、SQS+SNS 這類匯流排，它們要有人維運、要監控積壓。審設計時資深工程師常問一句：「明天多一個要知道這件事的功能，發布者要改程式嗎？」要改，就表示你發的其實是命令。</div>
+<p>決定發 <code>OrderPaid</code> 之後，馬上碰到下一個問題：這個事件裡要放什麼？集點要知道金額，廚房要知道品項，外送平台要知道地址。全部塞進去，還是只放一個訂單 ID？</p>
+
+<h2><code>OrderPaid</code> 裡要放多少資料？</h2>
+<p>這個問題沒有單一答案，因為「事件驅動」這個詞底下其實有好幾種不同的做法。Martin Fowler 在 2017 年的文章〈What do you mean by "Event-Driven"?〉把它們分開來看。跟這課有關的有三種，前兩種回答的正是「事件裡放多少」。</p>
+<p>第一種是<strong>事件通知</strong>（event notification）：事件只告訴你「發生了什麼」，例如 <code>{ type: 'OrderPaid', orderId: 'A-1001' }</code>，內容就這樣。集點服務收到後，要知道金額，就自己呼叫訂單服務的 API 回頭查。這種只帶 ID 的事件，這課叫<strong>薄事件</strong>。它的好處是契約小：訂單服務以後改了內部欄位，只要查詢 API 不變，訂閱者不受影響。代價是每個訂閱者都要多打一次 API，而且訂單服務掛了，大家都查不到，等於又把訂閱者綁回訂單服務身上。</p>
+<p>第二種是<strong>事件攜帶狀態轉移</strong>（event-carried state transfer）：事件直接帶上訂閱者需要的資料，例如金額、品項。訂閱者不用回查，甚至可以在自己的資料庫存一份副本，訂單服務掛了也照樣能工作。這種事件這課叫<strong>胖事件</strong>。代價是事件裡的每個欄位都成了對所有訂閱者的承諾：哪天訂單服務把 <code>total</code> 改名成 <code>amount</code>，所有讀 <code>total</code> 的訂閱者一起壞掉，而發布者往往不知道有誰在讀。資料也是事件產生當下的快照，訂閱者拿到時可能已經過時。</p>
+<p>第三種是<strong>事件溯源</strong>（event sourcing），它回答的是另一個問題：資料怎麼存。資料庫不存「目前狀態」，而是存所有發生過的事件；目前狀態等於從頭依序套用每一個事件的結果。銀行帳戶就是這樣：餘額是所有存款、提款紀錄加總出來的。它不是傳遞事件的方式，後面講到廚房畫面時會再回來看它。</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>薄事件</th><th>胖事件</th><th>事件溯源</th></tr>
+  <tr><td>訂閱者要回查嗎</td><td>要，多一次呼叫；訂單服務掛了就查不到</td><td>不用，發布者掛了也能工作</td><td>（這是儲存方式，不是傳遞方式）</td></tr>
+  <tr><td>契約大小</td><td>小：只有 ID 和類型</td><td>大：每個欄位都是承諾，改名就打壞訂閱者</td><td>事件是永久紀錄，格式要能一直讀</td></tr>
+  <tr><td>資料新鮮度</td><td>回查時拿到最新的</td><td>事件當下的快照，可能已經過時</td><td>隨時能重算任何時間點的狀態</td></tr>
+  <tr><td>個資</td><td>只在回查的地方</td><td>每個訂閱者都拿到一份</td><td>永久保存的個資很難刪除</td></tr>
+</table></div>
+<p>表格最後一列常被忽略。如果 <code>OrderPaid</code> 帶了王小明的手機與地址，集點、報表、外送平台的每個訂閱者都拿到了一份個資：每一個都要保護好，顧客要求刪除個資時，每一個都要能跟著刪。發布者送出事件的那一刻，就失去了對這些資料的控制。</p>
+<p>所以實務上多半取中間：帶上大多數訂閱者真正需要、不敏感的欄位（訂單 ID、門市、金額、狀態），個資和少數人才要的細節讓需要的人回查。咖啡店的 <code>OrderPaid</code> 就照這個原則帶訂單 ID、門市與金額，外送平台要地址，就用訂單 ID 回查。</p>
+<p>內容決定了，但事件還缺一樣東西。下一節會看到，事件在路上會重複、會亂序，訂閱者需要一個辦法認出「這則我看過了」「這則比我手上的還舊」，而光靠 <code>{ type, orderId, total }</code> 做不到。</p>
+
+<h2>消費者怎麼認出同一個事件、排出先後？</h2>
+<p>訂閱者要做兩個判斷：這個事件是不是已經處理過，以及它跟同一張訂單的其他事件誰先誰後。第一個判斷需要每個事件有一個唯一的身分；第二個判斷需要一個可靠的先後依據。這些描述「事件本身」而不是「訂單內容」的欄位，叫事件的<strong>中繼資料</strong>（metadata）。</p>
+<p>事件一旦送出就不能改，它是已經發生的事實，所以中繼資料的格式要一開始就想好。不必自己發明：<strong>CloudEvents</strong> 是一份公開規格，定義事件的中繼資料該有哪些欄位，各家的 SDK 與雲端服務都看得懂。事件裡的 <code>specversion</code> 填 <code>"1.0"</code>（規格的維護單位與版本見課末）。它的欄位如下，前四個必填：</p>
+<div class="table-wrap"><table>
+  <tr><th>屬性</th><th>必填</th><th>意思</th></tr>
+  <tr><td><code>id</code></td><td>是</td><td>這個事件的 ID；發布者必須保證 <code>source</code> + <code>id</code> 對每個不同的事件都唯一</td></tr>
+  <tr><td><code>source</code></td><td>是</td><td>事件在哪裡發生的（URI），例如 <code>/cafe/orders</code></td></tr>
+  <tr><td><code>specversion</code></td><td>是</td><td>規格版本，<code>"1.0"</code></td></tr>
+  <tr><td><code>type</code></td><td>是</td><td>事件類型，常用反向網域：<code>tw.cafe.order.paid</code></td></tr>
+  <tr><td><code>time</code></td><td>否</td><td>事情發生的時間，RFC 3339 格式</td></tr>
+  <tr><td><code>subject</code></td><td>否</td><td>事件關於 source 裡的哪個東西，例如訂單編號</td></tr>
+  <tr><td><code>datacontenttype</code></td><td>否</td><td><code>data</code> 的格式，例如 <code>application/json</code></td></tr>
+</table></div>
+<p>第一個判斷靠 <code>source</code> 加 <code>id</code>。規格寫明：重送的事件可以帶相同的 <code>id</code>，消費者可以把 <code>source</code> 與 <code>id</code> 都相同的事件視為重複。這有一個前提：ID 要在事件產生時就決定好，例如寫進 <a href="12-queues-outbox.html">第 12 課</a>的 outbox 那一刻，之後每次重送都沿用。如果每次送出時才產生新的 ID，同一個 <code>OrderPaid</code> 送兩次就是兩個不同的 ID，消費者分不出它們是重複的。</p>
+<p>第二個判斷，CloudEvents 沒有管，要自己加兩個欄位。先講第一個名詞：<strong>聚合</strong>（aggregate）是一組一起變化、需要維持一致的資料，例如一張訂單和它的明細。每張訂單就是一個聚合，用訂單 ID 識別。第二個是<strong>序號</strong>（seq）：這個聚合的第幾個事件，從 1 開始、每次加 1。訂單 A-1001 的 <code>OrderPlaced</code> 是 1、<code>OrderPaid</code> 是 2、<code>OrderCompleted</code> 是 3。同一張訂單的事件靠序號排先後；不同訂單之間不需要順序，A-1001 和 A-1002 誰先處理沒有人在意。<a href="12-queues-outbox.html">第 12 課</a>講順序時提到的「版本號」，就是這個序號。CloudEvents 允許加自訂欄位，叫<strong>擴充屬性</strong>（extension attribute），這兩個欄位就用它加上去。</p>
+<p>下面是咖啡店的 <code>OrderPaid</code> 完整長相。執行後看兩處：<code>data</code> 裡只有訂單 ID、門市、金額，沒有個資；最後一行印出消費者去重用的鍵。</p>
+<div class="lab"><script type="code">
+type CafeEvent = {
+  specversion: '1.0'
+  id: string
+  source: string
+  type: string
+  time: string
+  subject: string
+  datacontenttype: 'application/json'
+  aggregateid: string     // 擴充屬性：哪一張訂單（CloudEvents 的屬性名只能是小寫英數字）
+  seq: number             // 擴充屬性：這張訂單的第幾個事件
+  data: { orderId: string; storeId: number; total: number }
+}
+
+const paid: CafeEvent = {
+  specversion: '1.0',
+  id: '01JB9Z6Q3V5K8M2N4P7R9T1W3Y',
+  source: '/cafe/orders',
+  type: 'tw.cafe.order.paid',
+  time: '2026-10-31T08:01:12+08:00',
+  subject: 'A-1001',
+  datacontenttype: 'application/json',
+  aggregateid: 'A-1001',
+  seq: 2,
+  data: { orderId: 'A-1001', storeId: 1, total: 190 },   // 沒有姓名、手機：要的人回查
+}
+console.log(JSON.stringify(paid, null, 2))
+console.log('去重用的鍵：', `${paid.source} ${paid.id}`)
+</script></div>
+<p>這個格式一旦有人在讀，就是公開的 API：加欄位沒問題，改名、刪欄位、改意思都會打壞你不知道的訂閱者。演進的規則跟 HTTP API 一樣，<a href="19-evolution-compatibility.html">第 19 課</a>詳談。</p>
+<p>每個事件都有了 ID 和序號。下一節就站到消費者那一邊，看這兩個欄位怎麼擋住「集點加兩次」和「畫面倒退」。</p>
+
+<h2>集點為什麼會加兩次、畫面為什麼會倒退？</h2>
+<p>上一節說事件會重複、會亂序，這一節先講清楚為什麼。<a href="12-queues-outbox.html">第 12 課</a>學過，可靠的傳遞只能做到<strong>至少一次</strong>（at-least-once）：消費者處理完、還沒回報 ack（告訴匯流排「這則我做完了」）就當機，匯流排沒收到 ack，會把同一個事件再送一次。所以重複不是 bug，是可靠傳遞的代價。集點服務如果收到就加點，同一個 <code>OrderPaid</code> 來兩次，王小明就拿到兩倍點數。</p>
+<p>順序也不保證，原因有三個：</p>
+<ul>
+  <li><strong>重試</strong>：<code>OrderPaid</code> 第一次處理失敗，在等退避的時候，後面的 <code>OrderCompleted</code> 先處理成功了。</li>
+  <li><strong>partition</strong>：Kafka 把一類事件分成好幾條各自有序的佇列，叫 partition，partition 之間沒有順序（<a href="12-queues-outbox.html">第 12 課</a>）。同一張訂單的事件如果沒用訂單 ID 當 key，就可能分到不同 partition，各走各的。</li>
+  <li><strong>outbox relay 重送</strong>：relay 送到一半當機，重啟後把還沒確認的事件再送一次，這時它可能排在更新的事件後面。</li>
+</ul>
+<p>所以消費者要假設事件<strong>會重複、會亂序</strong>。先看一個沒有這個假設的消費者：收到什麼就套用什麼。範例模擬 <code>OrderPaid</code> 第一次送出時逾時、重試排到 <code>OrderCompleted</code> 之後才到，執行後看每一行「畫面顯示」的變化。</p>
+<div class="lab"><script type="code">
+type Ev = { id: string; orderId: string; seq: number; type: string }
+const statusOf: Record<string, string> = { OrderPlaced: 'pending', OrderPaid: 'paid', OrderCompleted: 'done' }
+
+const view = new Map<string, string>()
+const naive = (e: Ev) => view.set(e.orderId, statusOf[e.type])
+
+// OrderPaid 第一次送出時逾時，重試排在 OrderCompleted 之後才到
+const arrivals: Ev[] = [
+  { id: 'e1', orderId: 'A-1001', seq: 1, type: 'OrderPlaced' },
+  { id: 'e3', orderId: 'A-1001', seq: 3, type: 'OrderCompleted' },
+  { id: 'e2', orderId: 'A-1001', seq: 2, type: 'OrderPaid' },
+]
+for (const e of arrivals) {
+  naive(e)
+  console.log(`收到 seq ${e.seq} ${e.type} → 畫面顯示 ${view.get('A-1001')}`)
+}
+console.log('咖啡早就做好了，畫面卻停在「已付款」')
+</script></div>
+<p>畫面先顯示「做好了」，接著被晚到的 <code>OrderPaid</code> 蓋回「已付款」。這張訂單會一直卡在已付款，因為不會再有新事件來修正它。要擋住重複與亂序，消費者需要三樣東西，正好用上上一節的 ID 和序號：</p>
+<ol>
+  <li><strong>依事件 ID 去重</strong>：看過的 ID 直接跳過，回報「重複」，照樣 ack，不然匯流排會一直重送。正式環境用 <a href="12-queues-outbox.html">第 12 課</a>的 inbox 表記住看過的 ID，而且跟這次的點數更新寫在同一個交易裡，才不會出現「點數加了，ID 卻沒記到」的半套狀態。</li>
+  <li><strong>依聚合的序號丟掉過時事件</strong>：記住每張訂單已經套用到第幾號。收到的序號 ≤ 它，表示這件事已經反映在狀態裡了，丟掉。上面的範例裡，<code>OrderPaid</code>（seq 2）晚到時，這張訂單已經套用到 3，所以它會被丟掉，畫面停在「做好了」。注意：ID 不同、序號舊的也要丟，例如上游重新產生了一次同樣的事件，去重擋不住它，序號擋得住。</li>
+  <li><strong>還沒輪到的先暫存</strong>：收到 seq 5，但最後套用的是 3，表示 4 還在路上。先把 5 存起來；等 4 到了，套用 4，再接著套用暫存的 5。另一種做法是收到跳號時直接回查訂單服務拿最新狀態，代價是多一次呼叫。</li>
+</ol>
+<p>你可能會想：每個事件都有 <code>time</code>，為什麼不直接照時間排？因為時間是不同機器的時鐘產生的，時鐘會有誤差。付款服務的時鐘快了 2 秒，<code>OrderPaid</code> 的時間就可能比 <code>OrderCompleted</code> 還晚，照時間排反而排錯。序號由擁有這張訂單的訂單服務在同一個交易裡遞增，只有一個來源、只往上加，不會有這個問題。練習 1 你會寫出包含這三樣東西的完整消費者。</p>
+<div class="callout warn">暫存區要有上限與逾時：缺的那一號如果永遠不來（上游的 bug、被手動刪掉），暫存會一直長大，那張訂單也永遠卡住。等太久就告警、回查來源服務的最新狀態補上。</div>
+
+<div class="callout practice"><strong>💡 實務上：寫消費者時，測試先把同一個事件送兩次</strong><br>「集點加了兩次」「訂單卡在已付款」這類客訴幾乎都出在這裡，而且只在正式環境重試、重新部署時才出現，本機很難重現。code review 消費者時，資深會先問三件事：同一個事件送兩次結果一樣嗎？舊事件晚到會不會蓋掉新狀態？處理到一半當機，重來會不會多做一次副作用（寄兩封收據）？把「送兩次」「倒過來送」直接寫成測試案例，比上線後翻 log 便宜得多。</div>
+<p>集點只要記一個數字，廚房要的卻是一整個畫面：每家門市還沒做完的訂單、各自的品項。消費者收到事件之後，要把它們組成什麼樣的資料，才撐得起這個畫面？</p>
+
+<h2>廚房出單畫面怎麼從事件組出來？投影與 CQRS</h2>
+<p>廚房出單畫面要的是「每家門市還沒做完的訂單、各自的品項」。最直接的做法是去查訂單服務的資料庫，但有兩個問題：這個查詢要 JOIN 訂單和明細、過濾狀態，在訂單資料庫上很貴，尖峰時會拖慢下單；而且廚房服務不該直接讀訂單服務的表（<a href="15-monolith-microservices.html">第 15 課</a>：每張表只有一個擁有者），不然訂單服務一改欄位，廚房就壞掉。</p>
+<p>做法是廚房服務訂閱訂單事件，在自己的資料庫維護一份專門給出單畫面用的資料：收到 <code>OrderPlaced</code> 就新增一列「待製作」，收到 <code>OrderCompleted</code> 就把它改成「已完成」。實際上廚房會在 <code>OrderPlaced</code> 先記下品項（<code>OrderPaid</code> 依上一節的原則不帶品項），等 <code>OrderPaid</code> 到了才列為待製作；如果 <code>OrderPlaced</code> 也不帶品項，就用訂單 ID 回查一次。這種從事件算出來、專門為某個查詢設計的資料，叫<strong>投影</strong>（projection），也叫<strong>讀取模型</strong>（read model）。上一節的三樣東西就是投影的更新規則。</p>
+<p>讀與寫用不同的模型，就是 <strong>CQRS</strong>（Command Query Responsibility Segregation，命令查詢職責分離）。寫入端是訂單服務，顧規則：不能付兩次款、已取消的不能完成。讀取端是廚房的投影，只顧查詢快，表的形狀完全照畫面需要來設計。兩邊各自最佳化，不用互相妥協。</p>
+<p>投影有兩個好性質。第一，它<strong>可以重建</strong>：投影的程式有 bug，或要新增一個查詢，把所有事件從頭重播一次，就得到新的投影。前提是事件有保存下來，例如 Kafka 設定了保存期限。第二，重建和重送都會讓同一個事件再來一次，所以投影的<strong>更新要冪等</strong>，結果必須一樣，上一節的去重和序號就是為此。</p>
+<p>「重建投影」其實就是把事件依序套進一個函式，跟陣列的 <code>reduce</code> 一樣。範例把一串事件依序套進去，算出廚房的畫面資料（函數式程式把這個動作叫 fold，程式註解裡會看到這個字）。範例為了簡短只記狀態和金額、不記品項，執行後看印出來的是哪幾張訂單：</p>
+<div class="lab"><script type="code">
+type Ev = { orderId: string; seq: number; type: 'OrderPlaced' | 'OrderPaid' | 'OrderCompleted'; total?: number }
+type Row = { status: string; total: number }
+
+// 重建投影 = 依序把每個事件套進去（fold）
+const reducer = (view: Map<string, Row>, e: Ev) => {
+  const cur = view.get(e.orderId)
+  if (e.type === 'OrderPlaced') view.set(e.orderId, { status: 'pending', total: e.total ?? 0 })
+  else if (cur) view.set(e.orderId, { ...cur, status: e.type === 'OrderPaid' ? 'paid' : 'done' })
+  return view
+}
+
+const log: Ev[] = [
+  { orderId: 'A-1001', seq: 1, type: 'OrderPlaced', total: 190 },
+  { orderId: 'A-1002', seq: 1, type: 'OrderPlaced', total: 80 },
+  { orderId: 'A-1001', seq: 2, type: 'OrderPaid' },
+  { orderId: 'A-1001', seq: 3, type: 'OrderCompleted' },
+  { orderId: 'A-1002', seq: 2, type: 'OrderPaid' },
+]
+const kitchen = log.reduce(reducer, new Map<string, Row>())
+console.log('廚房還沒做完的：', [...kitchen].filter(([, r]) => r.status !== 'done'))
+</script></div>
+<p>A-1001 已經 <code>OrderCompleted</code>，所以只剩 A-1002 在廚房的待辦裡。</p>
+<p>投影的代價是<strong>最終一致</strong>（<a href="06-replication-consistency.html">第 6 課</a>）：資料最後會一致，但中間有一段落差。顧客剛付款，廚房和訂單列表的投影可能還沒收到事件。UI 要誠實地呈現這段落差：付款完成頁直接用付款 API 的回應顯示「已付款」，訂單列表若還沒更新就顯示「處理中」，不要讓顧客以為付款失敗而再付一次，那正是開場事故的翻版。</p>
+<p>上一節提過的事件溯源，可以看成把這個做法推到底：連寫入端都不存目前狀態，只存事件，每次都從事件算出狀態。它換來完整的歷史，代價也大得多（快照、格式永遠不能壞、個資難刪，細節見課末）。只有真的需要完整歷史的領域，例如金流、點數帳本，才值得；一般的訂單用普通的表加 outbox 發事件就夠了，咖啡店的訂單服務就是這樣。</p>
+
+<div class="callout practice"><strong>💡 實務上：先問「一條 SQL 加索引夠不夠」，再考慮投影</strong><br>同一個資料庫裡的後台報表、訂單列表，通常加索引、建一個 view 或改讀讀副本（<a href="06-replication-consistency.html">第 6 課</a>）就解決了，不需要 CQRS。投影適合跨服務的查詢：廚房、外送整合讀不到訂單服務的表，只能靠事件在自己這邊組出需要的資料。導入前要跟 PM 和設計師講清楚「處理中」會出現在哪些畫面，讓設計稿先準備好這個狀態；也要先想好重建流程：重播全部事件要多久、重建期間畫面顯示什麼。</div>
+<p>集點、廚房、收據、報表都在公司裡，可以訂閱我們的匯流排。開場要通知的五個地方只剩外送平台：它是別家公司的系統，碰不到我們的 Kafka。事件要怎麼送出公司？</p>
+
+<h2>怎麼把事件可靠地送到外送平台？webhook</h2>
+<p>外送平台想知道訂單什麼時候做好，好派外送員來拿。一種做法是讓它每 5 秒呼叫我們的 API 問一次，這叫輪詢，成本在<a href="17-realtime-push.html">第 17 課</a>會算。更好的做法是反過來：外送平台事先在我們的後台登記一個網址，事件發生時由我們主動 POST 到那個網址。這就是 <strong>webhook</strong>，可以看成事件跨出公司邊界的形式。</p>
+<p>webhook 有兩端。接收端的責任（驗簽、去重、快速回 2xx）在 <a href="../../nestjs/lessons/22-uploads-webhooks.html">NestJS 課第 22 課</a>，簽章的原理在<a href="../../auth/lessons/17-api-keys-m2m.html">認證課第 17 課</a>。這一課站在送出端：外送平台的伺服器會慢、會掛、會部署失敗、會改網址，我們的責任是在這些狀況下還送得到，而且不被任何一個客戶拖垮。這裡依照 <strong>Standard Webhooks</strong> 這份公開規格來做，它統一了 webhook 的標頭名稱、簽章方式與重送建議，讓接收端可以用同一套程式驗證不同廠商送來的 webhook。下面分兩個問題看：重送時要注意什麼，以及一個客戶出事時怎麼不拖累其他人。</p>
+
+<h3>重送時，ID、時間戳和簽章怎麼處理？</h3>
+<p>外送平台週末部署壞了，週一才修好。這段時間的事件要一直重送，直到對方收到為止。重送牽涉到三個標頭，各自的規則不同：</p>
+<ul>
+  <li><strong><code>webhook-id</code> 永遠不變</strong>：接收端靠它去重，它就是<a href="09-idempotency.html">第 9 課</a>的冪等鍵。每次重送換一個新 ID，接收端會把它當成新事件，外送平台就派了兩次外送員。用的就是事件產生時決定好的那個 ID。</li>
+  <li><strong>body 不變</strong>：內容只序列化一次，每次都送一模一樣的字串。</li>
+  <li><strong><code>webhook-timestamp</code> 和簽章每次重算</strong>：原因要從簽章怎麼防攻擊講起。</li>
+</ul>
+<p>簽章證明這則 webhook 真的是我們送的，而且內容沒被改過。但光有簽章還不夠：攻擊者可以把一則合法的 webhook 原封不動錄下來，過幾天再送一次，簽章照樣正確，這叫<strong>重放攻擊</strong>（replay attack）。所以時間戳也包在簽章裡，接收端只接受時間戳在一段容忍範圍內的請求，官方 <code>standardwebhooks</code> 套件預設是前後 5 分鐘，太舊的一律拒絕，不管簽章對不對。</p>
+<p>這就是為什麼重送要重新簽章。如果第一次送出時算好時間戳和簽章，之後重送都沿用，那 5 分鐘之後的每一次重送，時間戳都太舊，全部被拒絕。規格也寫明每次重試都要更新 <code>webhook-timestamp</code>。規格給的範例重送排程是：立即、5 秒、5 分、30 分、2 小時、5 小時、10 小時、14 小時、20 小時、24 小時，共 10 次。下面的範例算出每一次距離第一次送出多久，以及「只簽一次」的話會不會被接收端拒絕：</p>
+<div class="lab"><script type="code">
+const schedule = [0, 5_000, 300_000, 1_800_000, 7_200_000, 18_000_000, 36_000_000, 50_400_000, 72_000_000, 86_400_000]
+const toleranceSec = 300   // 接收端的時間容忍：前後 5 分鐘
+
+let elapsedMs = 0
+schedule.forEach((delay, k) => {
+  elapsedMs += delay
+  const age = elapsedMs / 1000              // 沿用第一次時間戳的話，它已經多舊
+  const h = Math.floor(age / 3600), m = Math.floor(age % 3600 / 60), s = age % 60
+  console.log(`第 ${k + 1} 次：第一次之後 ${h} 小時 ${m} 分 ${s} 秒，只簽一次 → ${age <= toleranceSec ? '通過' : '被拒絕'}`)
+})
+</script></div>
+<p>只簽一次的話，第 3 次（第一次之後 5 分 5 秒）以後全部失敗。而真正需要重送的，往往就是這些「客戶修了好幾個小時」的情況。規則很單純：<strong>ID 不變、body 不變、時間戳與簽章每次重算</strong>。</p>
+<p>知道怎麼重送之後，還要決定「該不該重送、等多久」，這取決於對方回了什麼。下表是送出端依回應決定下一步的規則，查表用，不用背，練習 2 會把它寫成程式：</p>
+<div class="table-wrap"><table>
+  <tr><th>規則</th><th>原因</th></tr>
+  <tr><td>只有 2xx 算成功</td><td>3xx 也算失敗：不跟隨轉址，請客戶更新網址（跟隨轉址也是 SSRF 的入口，下一小節細講）</td></tr>
+  <tr><td>410 Gone → 停用端點</td><td>對方明確說不要了，不再送</td></tr>
+  <tr><td>429、502、504 → 放慢；有 <code>Retry-After</code> 就納入排程</td><td>對方過載，繼續猛送只會更糟（<a href="08-timeouts-retries-backoff.html">第 8 課</a>）</td></tr>
+  <tr><td>其他失敗（404、500、逾時、連線失敗）都重試</td><td>可能只是部署中、網址暫時設錯</td></tr>
+  <tr><td>跨多天的指數退避加 jitter</td><td>客戶週末掛掉，週一修好還收得到</td></tr>
+  <tr><td>逾時 15～30 秒</td><td>不讓一個慢客戶占住送出用的連線</td></tr>
+  <tr><td>長期失敗 → 用 email 等其他管道通知，停用端點</td><td>不要默默地一直失敗</td></tr>
+</table></div>
+<p>表裡的「逾時 15～30 秒」帶出了下一個問題：一個慢客戶每次都占住連線 30 秒，其他客戶的 webhook 會不會跟著卡住？</p>
+
+<h3>一個客戶掛了，怎麼不拖垮其他客戶？</h3>
+<p>咖啡店不會只接一家外送平台，還可能有會員系統、加盟主的 POS。所有客戶的 webhook 如果排在同一條佇列，一個每次都逾時 30 秒的客戶，就會讓排在它後面的所有客戶一起等。解法是<strong>每個端點各自的佇列與並行上限</strong>，這就是<a href="11-circuit-breaker-bulkhead.html">第 11 課</a>的隔艙：一個艙進水，其他艙不受影響。</p>
+<p>整個送出流程的其他部分，也各有一個「不做會出什麼事」：</p>
+<ul>
+  <li><strong>從 outbox 開始</strong>：在訂單的交易裡寫一筆 outbox（<a href="12-queues-outbox.html">第 12 課</a>），交易提交後才送。交易提交前就送，萬一交易回滾，外送平台已經收到一張其實不存在的訂單。</li>
+  <li><strong>防 SSRF</strong>：SSRF（server-side request forgery）是讓我們的伺服器替攻擊者去連它自己連不到的位址。webhook 的網址是客戶填的，可能填 <code>http://169.254.169.254/</code>（雲端主機的中繼資料服務，查得到這台主機的憑證）或內網位址。送出前檢查網址解析後的 IP、不跟隨轉址，送出用的 worker 放在只能連外網的子網路（<a href="../../auth/lessons/22-ssrf.html">認證課第 22 課</a>）。</li>
+  <li><strong>重播</strong>（replay）：客戶的系統壞了三天，修好後要補收這三天的事件，而這時重送次數早就用完了。提供「重送某段時間的事件」的 API 或後台按鈕，用原本的 <code>webhook-id</code>，讓客戶的去重照樣有效。</li>
+  <li><strong>payload 要小</strong>：規格建議通常小於 20 KB；大的資料讓客戶用 ID 回查，順便避開胖事件的個資問題。</li>
+</ul>
+<p>Node 端可以用 Standard Webhooks 官方的 <code>standardwebhooks</code> 套件簽章與驗證（版本見課末）；退避排程與佇列仍然要自己設計，練習 2、3 就是這一段。</p>
+
+<div class="callout practice"><strong>💡 實務上：先當過接收端，自己做送出端前評估現成服務</strong><br>工作中更常接的是別人的 webhook，例如 Stripe 的付款通知、GitHub 的 push 通知。看看它們的後台會發現同一套設計：每次送達的紀錄、對方回的狀態碼、手動重送按鈕。開放 webhook 給客戶時，這個「送達紀錄」頁幾乎是必備，客戶說「沒收到通知」時，客服和客戶自己就查得到，不用找工程師翻 log。送出端要做對的事很多（簽章、退避、隔艙、SSRF、重播），人手少時可以評估 Svix 這類託管的 webhook 送出服務；自己做的話，上線前找一個測試網址實際接收，故意回 500、410，確認重試與停用照規格走。</div>
+<p>到這裡，付款後的五個通知都改成了事件。但這不代表所有服務之間的溝通都該改成事件，最後一節看界線在哪。</p>
+
+<h2>什麼時候不要用事件？上線後看什麼？</h2>
+<p>事件換來的是發布者不用等、不用知道誰在聽；付出的是最終一致，以及流程散在各個訂閱者裡、沒有一個地方看得到全貌。下面三種情況，這個代價不值得：</p>
+<ul>
+  <li><strong>呼叫端需要立刻知道結果</strong>：付款授權。顧客站在櫃台前，要馬上知道卡有沒有過，這是同步的命令。開場的付款 API 裡，扣款本身一直都是同步的，改成事件的只有付款成功之後的集點、收據、報表。</li>
+  <li><strong>流程太長、看不見</strong>：Fowler 指出事件通知的缺點是「整個流程不在任何一段程式碼裡」，要看執行中的系統才知道誰接著做什麼。事件串了五、六層，出錯時沒人說得清發生了什麼。需要明確流程、補償與狀態的，改用 orchestration（<a href="13-saga.html">第 13 課</a>）。</li>
+  <li><strong>只有一個接收者、而且在等結果</strong>：那就是命令，直接呼叫或放進工作佇列。包成事件就是第一節的假事件。</li>
+</ul>
+<p>決定用事件後，系統的問題會從「請求失敗」變成「事件卡在某處」，錯誤不會再直接回到使用者的畫面上，所以要主動看這些指標：</p>
+<ul>
+  <li>每個消費者的<strong>延遲</strong>（事件產生到投影更新的時間）與積壓：報表掛了 10 分鐘，這裡會看到積壓上升，而不是付款失敗。</li>
+  <li><strong>去重次數</strong>、<strong>因序號被丟棄的事件數</strong>、暫存中等待缺號的事件數與最久的等待時間。</li>
+  <li>每個 webhook 端點的<strong>成功率</strong>、重試次數、被停用的端點數。</li>
+  <li>事件也要帶 trace context（<a href="../../devops/lessons/23-tracing.html">部署課第 23 課</a>），不然非同步的那一段在追蹤裡會斷掉。</li>
+</ul>
+
+<h2>補充與查表</h2>
+<p>主線省略的出處、版本與延伸細節，查表用，不用背。</p>
+<h3>CloudEvents 的維護單位與版本</h3>
+<ul>
+  <li>CloudEvents 由 CNCF（雲原生運算基金會，也維護 Kubernetes）維護。最新的發布版本是 v1.0.2，事件裡的 <code>specversion</code> 填 <code>"1.0"</code>。</li>
+  <li>擴充屬性的名稱只能用小寫英數字，所以範例寫成 <code>aggregateid</code>，不是 <code>aggregateId</code>。</li>
+</ul>
+<h3>事件溯源的代價</h3>
+<ul>
+  <li>每次讀狀態都要重播事件，事件一多就慢，所以要定期存一份「到第 N 個事件為止的狀態」當<strong>快照</strong>（snapshot），之後只重播 N 之後的。</li>
+  <li>事件是永久紀錄，格式永遠不能壞，舊格式的事件也要一直讀得懂。</li>
+  <li>永久保存的事件裡有個資時，刪除很麻煩。</li>
+  <li>換來的是完整的歷史與稽核：每一點集點都查得到來源。</li>
+</ul>
+<h3>Standard Webhooks 的套件版本</h3>
+<ul>
+  <li>Node 端的官方套件是 <code>standardwebhooks</code> 1.1.1，簽章與驗證都用它；時間容忍預設前後 5 分鐘。</li>
+</ul>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：完成 <code>OrderProjection</code>。<code>apply(e)</code> 依序檢查：</p>
+  <ul>
+    <li>看過的 <code>id</code> → <code>'duplicate'</code>。</li>
+    <li><code>seq</code> ≤ 這張訂單已套用的最後序號 → <code>'stale'</code>（還沒套用過任何事件時，最後序號是 0）。</li>
+    <li><code>seq</code> 等於最後序號 + 1 → 套用，接著把暫存中接得上的事件依序套用，回傳 <code>'applied'</code>。</li>
+    <li><code>seq</code> 更大 → 暫存，回傳 <code>'buffered'</code>。</li>
+  </ul>
+  <p>套用的規則：<code>OrderPlaced</code> 建立 <code>{ status: 'pending', total, updatedAt: at }</code>；<code>OrderPaid</code>、<code>OrderCompleted</code>、<code>OrderCancelled</code> 把狀態改成 <code>'paid'</code>、<code>'done'</code>、<code>'cancelled'</code> 並更新 <code>updatedAt</code>。<code>get(orderId)</code> 回傳投影，沒有就是 <code>undefined</code>。不同訂單的序號各自獨立；順序只能看 <code>seq</code>，不能看 <code>at</code>。</p>
+  <script type="start">
+type OrderEvent = {
+  id: string
+  orderId: string
+  seq: number
+  type: 'OrderPlaced' | 'OrderPaid' | 'OrderCompleted' | 'OrderCancelled'
+  at: string
+  total?: number
+}
+type OrderView = { status: 'pending' | 'paid' | 'done' | 'cancelled'; total: number; updatedAt: string }
+type ApplyResult = 'applied' | 'duplicate' | 'stale' | 'buffered'
+
+class OrderProjection {
+  apply(e: OrderEvent): ApplyResult {
+    throw new Error('TODO')
+  }
+
+  get(orderId: string): OrderView | undefined {
+    throw new Error('TODO')
+  }
+}
+
+const p = new OrderProjection()
+console.log(p.apply({ id: 'e1', orderId: 'A-1001', seq: 1, type: 'OrderPlaced', at: '08:00:00', total: 190 }))   // applied
+console.log(p.apply({ id: 'e3', orderId: 'A-1001', seq: 3, type: 'OrderCompleted', at: '08:04:00' }))           // buffered
+console.log(p.apply({ id: 'e2', orderId: 'A-1001', seq: 2, type: 'OrderPaid', at: '08:00:30' }))                // applied（連 e3 一起）
+console.log(p.apply({ id: 'e2', orderId: 'A-1001', seq: 2, type: 'OrderPaid', at: '08:00:30' }))                // duplicate
+console.log(p.get('A-1001'))                                                                                     // done
+</script>
+  <script type="answer">
+type OrderEvent = {
+  id: string
+  orderId: string
+  seq: number
+  type: 'OrderPlaced' | 'OrderPaid' | 'OrderCompleted' | 'OrderCancelled'
+  at: string
+  total?: number
+}
+type OrderView = { status: 'pending' | 'paid' | 'done' | 'cancelled'; total: number; updatedAt: string }
+type ApplyResult = 'applied' | 'duplicate' | 'stale' | 'buffered'
+
+const NEXT_STATUS = { OrderPaid: 'paid', OrderCompleted: 'done', OrderCancelled: 'cancelled' } as const
+
+class OrderProjection {
+  private seen = new Set<string>()
+  private lastSeq = new Map<string, number>()
+  private pending = new Map<string, Map<number, OrderEvent>>()
+  private views = new Map<string, OrderView>()
+
+  apply(e: OrderEvent): ApplyResult {
+    if (this.seen.has(e.id)) return 'duplicate'
+    const last = this.lastSeq.get(e.orderId) ?? 0
+    if (e.seq <= last) return 'stale'
+    this.seen.add(e.id)
+    if (e.seq > last + 1) {
+      const buf = this.pending.get(e.orderId) ?? new Map<number, OrderEvent>()
+      buf.set(e.seq, e)
+      this.pending.set(e.orderId, buf)
+      return 'buffered'
+    }
+    this.step(e)
+    const buf = this.pending.get(e.orderId)
+    let next = buf?.get(e.seq + 1)
+    while (buf && next) {
+      buf.delete(next.seq)
+      this.step(next)
+      next = buf.get(next.seq + 1)
+    }
+    return 'applied'
+  }
+
+  private step(e: OrderEvent) {
+    if (e.type === 'OrderPlaced') {
+      this.views.set(e.orderId, { status: 'pending', total: e.total ?? 0, updatedAt: e.at })
+    } else {
+      const cur = this.views.get(e.orderId)
+      if (cur) this.views.set(e.orderId, { ...cur, status: NEXT_STATUS[e.type], updatedAt: e.at })
+    }
+    this.lastSeq.set(e.orderId, e.seq)
+  }
+
+  get(orderId: string): OrderView | undefined {
+    return this.views.get(orderId)
+  }
+}
+
+const p = new OrderProjection()
+console.log(p.apply({ id: 'e1', orderId: 'A-1001', seq: 1, type: 'OrderPlaced', at: '08:00:00', total: 190 }))
+console.log(p.apply({ id: 'e3', orderId: 'A-1001', seq: 3, type: 'OrderCompleted', at: '08:04:00' }))
+console.log(p.apply({ id: 'e2', orderId: 'A-1001', seq: 2, type: 'OrderPaid', at: '08:00:30' }))
+console.log(p.apply({ id: 'e2', orderId: 'A-1001', seq: 2, type: 'OrderPaid', at: '08:00:30' }))
+console.log(p.get('A-1001'))
+</script>
+  <script type="tests">
+type T = OrderEvent['type']
+const mk = (orderId: string, seq: number, type: T, at: string, total?: number): OrderEvent =>
+  total === undefined ? { id: `${orderId}#${seq}`, orderId, seq, type, at } : { id: `${orderId}#${seq}`, orderId, seq, type, at, total }
+const plain = (v: OrderView | undefined) => v && { status: v.status, total: v.total, updatedAt: v.updatedAt }
+
+const p1 = new OrderProjection()
+assert.equal(p1.get('X'), undefined, '沒有事件的訂單，get 要回傳 undefined')
+assert.equal(p1.apply(mk('A', 1, 'OrderPlaced', '08:00:00', 190)), 'applied', 'seq 1 要直接套用')
+assert.deepEqual(plain(p1.get('A')), { status: 'pending', total: 190, updatedAt: '08:00:00' }, 'OrderPlaced 要建立 pending、帶 total 與 updatedAt')
+assert.equal(p1.apply(mk('A', 2, 'OrderPaid', '08:00:30')), 'applied', 'seq 2 接在 1 後面，要套用')
+assert.equal(p1.apply(mk('A', 2, 'OrderPaid', '08:00:30')), 'duplicate', '同一個 id 第二次來要回傳 duplicate')
+assert.equal(p1.apply({ ...mk('A', 2, 'OrderPaid', '08:00:31'), id: 'A#2-regenerated' }), 'stale', 'id 不同但 seq ≤ 已套用的最後序號，要回傳 stale')
+assert.equal(p1.apply({ ...mk('A', 1, 'OrderPlaced', '08:00:00', 999), id: 'A#1-again' }), 'stale', '舊的 OrderPlaced 不能把狀態蓋回 pending')
+assert.deepEqual(plain(p1.get('A')), { status: 'paid', total: 190, updatedAt: '08:00:30' }, 'stale 與 duplicate 都不能改變投影')
+
+const p2 = new OrderProjection()
+p2.apply(mk('E', 1, 'OrderPlaced', '08:00:00', 80))
+p2.apply(mk('E', 3, 'OrderCompleted', '08:04:00'))
+p2.apply(mk('E', 2, 'OrderPaid', '08:00:30'))
+assert.equal(plain(p2.get('E'))?.status, 'done', 'OrderPaid 晚到時不能把 done 改回 paid')
+
+const p3 = new OrderProjection()
+assert.equal(p3.apply(mk('B', 3, 'OrderCompleted', '08:05:00')), 'buffered', '還沒輪到的 seq 3 要暫存，回傳 buffered')
+assert.equal(p3.get('B'), undefined, '暫存的事件還不能出現在投影裡')
+assert.equal(p3.apply(mk('B', 3, 'OrderCompleted', '08:05:00')), 'duplicate', '暫存中的事件再來一次，也是 duplicate')
+assert.equal(p3.apply(mk('B', 1, 'OrderPlaced', '08:00:00', 110)), 'applied', 'seq 1 要套用')
+assert.equal(plain(p3.get('B'))?.status, 'pending', '缺 seq 2 時，暫存的 seq 3 還不能套用')
+assert.equal(p3.apply(mk('B', 2, 'OrderPaid', '08:01:00')), 'applied', 'seq 2 補上要套用')
+assert.deepEqual(plain(p3.get('B')), { status: 'done', total: 110, updatedAt: '08:05:00' }, '補上缺號後，要接著把暫存的 seq 3 也套用')
+assert.equal(p3.apply(mk('B', 3, 'OrderCompleted', '08:05:00')), 'duplicate', '已套用的事件再來一次是 duplicate')
+
+const p6 = new OrderProjection()
+assert.equal(p6.apply(mk('F', 3, 'OrderCompleted', '08:05:00')), 'buffered', 'seq 3 先到要暫存')
+assert.equal(p6.apply(mk('F', 2, 'OrderPaid', '08:01:00')), 'buffered', 'seq 2 也還沒輪到（缺 seq 1），要暫存')
+assert.equal(p6.apply(mk('F', 1, 'OrderPlaced', '08:00:00', 90)), 'applied', 'seq 1 到了要套用')
+assert.deepEqual(plain(p6.get('F')), { status: 'done', total: 90, updatedAt: '08:05:00' }, '補上 seq 1 後，要把暫存中接得上的 seq 2、3 依序全部套用（一直往下接，不是只套一個）')
+
+const p4 = new OrderProjection()
+p4.apply(mk('A', 1, 'OrderPlaced', '08:00:00', 190))
+assert.equal(p4.apply(mk('C', 1, 'OrderPlaced', '08:00:01', 70)), 'applied', '不同訂單的 seq 各自獨立：C 的 seq 1 不是重複')
+assert.equal(p4.apply(mk('C', 2, 'OrderCancelled', '08:02:00')), 'applied', 'C 的 seq 2 要套用')
+assert.equal(plain(p4.get('A'))?.status, 'pending', 'C 的事件不能影響 A')
+assert.equal(plain(p4.get('C'))?.status, 'cancelled', 'OrderCancelled 要改成 cancelled')
+
+const p5 = new OrderProjection()
+p5.apply(mk('D', 1, 'OrderPlaced', '08:00:10', 120))
+p5.apply(mk('D', 2, 'OrderPaid', '08:00:09'))
+p5.apply(mk('D', 3, 'OrderCompleted', '08:00:08'))
+assert.equal(plain(p5.get('D'))?.status, 'done', '不同機器的時鐘有誤差：at 比較早的事件 seq 比較大時照樣要套用，順序只看 seq')
+
+function mulberry32(seed: number) {
+  return () => {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed)
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t
+    return ((t ^ t >>> 14) >>> 0) / 4294967296
+  }
+}
+const rnd = mulberry32(16)
+const orders = ['O1', 'O2', 'O3', 'O4', 'O5']
+const all: OrderEvent[] = []
+const expected = new Map<string, OrderView>()
+orders.forEach((o, k) => {
+  const total = 70 + k * 20
+  const evs = [mk(o, 1, 'OrderPlaced', `08:0${k}:00`, total), mk(o, 2, 'OrderPaid', `08:0${k}:30`)]
+  if (k % 2 === 0) evs.push(mk(o, 3, 'OrderCompleted', `08:0${k}:50`))
+  else if (k === 1) evs.push(mk(o, 3, 'OrderCancelled', `08:0${k}:40`))
+  all.push(...evs)
+  const last = evs[evs.length - 1]
+  const status = ({ OrderPlaced: 'pending', OrderPaid: 'paid', OrderCompleted: 'done', OrderCancelled: 'cancelled' } as const)[last.type]
+  expected.set(o, { status, total, updatedAt: last.at })
+})
+for (let round = 0; round < 200; round++) {
+  const list = [...all, ...all.filter(() => rnd() < 0.3)]
+  for (let i = list.length - 1; i > 0; i--) {
+    const j = Math.floor(rnd() * (i + 1))
+    ;[list[i], list[j]] = [list[j], list[i]]
+  }
+  const p = new OrderProjection()
+  for (const e of list) p.apply(e)
+  for (const o of orders) {
+    assert.deepEqual(plain(p.get(o)), expected.get(o), `第 ${round + 1} 輪：事件打亂順序、加上重複後，${o} 的投影要跟依序送入一樣（順序：${list.filter(e => e.orderId === o).map(e => e.seq).join(',')}）`)
+  }
+}
+</script>
+  <script type="wrong">
+// 收到就直接套用（只用 id 去重）
+type OrderEvent = { id: string; orderId: string; seq: number; type: 'OrderPlaced' | 'OrderPaid' | 'OrderCompleted' | 'OrderCancelled'; at: string; total?: number }
+type OrderView = { status: 'pending' | 'paid' | 'done' | 'cancelled'; total: number; updatedAt: string }
+type ApplyResult = 'applied' | 'duplicate' | 'stale' | 'buffered'
+const NEXT_STATUS = { OrderPaid: 'paid', OrderCompleted: 'done', OrderCancelled: 'cancelled' } as const
+class OrderProjection {
+  private seen = new Set<string>()
+  private views = new Map<string, OrderView>()
+  apply(e: OrderEvent): ApplyResult {
+    if (this.seen.has(e.id)) return 'duplicate'
+    this.seen.add(e.id)
+    if (e.type === 'OrderPlaced') this.views.set(e.orderId, { status: 'pending', total: e.total ?? 0, updatedAt: e.at })
+    else {
+      const cur = this.views.get(e.orderId)
+      if (cur) this.views.set(e.orderId, { ...cur, status: NEXT_STATUS[e.type], updatedAt: e.at })
+    }
+    return 'applied'
+  }
+  get(orderId: string) { return this.views.get(orderId) }
+}
+</script>
+  <script type="wrong">
+// 缺號時直接丟掉後面的事件
+type OrderEvent = { id: string; orderId: string; seq: number; type: 'OrderPlaced' | 'OrderPaid' | 'OrderCompleted' | 'OrderCancelled'; at: string; total?: number }
+type OrderView = { status: 'pending' | 'paid' | 'done' | 'cancelled'; total: number; updatedAt: string }
+type ApplyResult = 'applied' | 'duplicate' | 'stale' | 'buffered'
+const NEXT_STATUS = { OrderPaid: 'paid', OrderCompleted: 'done', OrderCancelled: 'cancelled' } as const
+class OrderProjection {
+  private seen = new Set<string>()
+  private lastSeq = new Map<string, number>()
+  private views = new Map<string, OrderView>()
+  apply(e: OrderEvent): ApplyResult {
+    if (this.seen.has(e.id)) return 'duplicate'
+    const last = this.lastSeq.get(e.orderId) ?? 0
+    if (e.seq <= last) return 'stale'
+    this.seen.add(e.id)
+    if (e.seq > last + 1) return 'buffered'
+    if (e.type === 'OrderPlaced') this.views.set(e.orderId, { status: 'pending', total: e.total ?? 0, updatedAt: e.at })
+    else {
+      const cur = this.views.get(e.orderId)
+      if (cur) this.views.set(e.orderId, { ...cur, status: NEXT_STATUS[e.type], updatedAt: e.at })
+    }
+    this.lastSeq.set(e.orderId, e.seq)
+    return 'applied'
+  }
+  get(orderId: string) { return this.views.get(orderId) }
+}
+</script>
+  <script type="wrong">
+// 有暫存，但補上缺號後沒有把暫存的事件套用
+type OrderEvent = { id: string; orderId: string; seq: number; type: 'OrderPlaced' | 'OrderPaid' | 'OrderCompleted' | 'OrderCancelled'; at: string; total?: number }
+type OrderView = { status: 'pending' | 'paid' | 'done' | 'cancelled'; total: number; updatedAt: string }
+type ApplyResult = 'applied' | 'duplicate' | 'stale' | 'buffered'
+const NEXT_STATUS = { OrderPaid: 'paid', OrderCompleted: 'done', OrderCancelled: 'cancelled' } as const
+class OrderProjection {
+  private seen = new Set<string>()
+  private lastSeq = new Map<string, number>()
+  private pending = new Map<string, OrderEvent[]>()
+  private views = new Map<string, OrderView>()
+  apply(e: OrderEvent): ApplyResult {
+    if (this.seen.has(e.id)) return 'duplicate'
+    const last = this.lastSeq.get(e.orderId) ?? 0
+    if (e.seq <= last) return 'stale'
+    this.seen.add(e.id)
+    if (e.seq > last + 1) {
+      this.pending.set(e.orderId, [...(this.pending.get(e.orderId) ?? []), e])
+      return 'buffered'
+    }
+    if (e.type === 'OrderPlaced') this.views.set(e.orderId, { status: 'pending', total: e.total ?? 0, updatedAt: e.at })
+    else {
+      const cur = this.views.get(e.orderId)
+      if (cur) this.views.set(e.orderId, { ...cur, status: NEXT_STATUS[e.type], updatedAt: e.at })
+    }
+    this.lastSeq.set(e.orderId, e.seq)
+    return 'applied'
+  }
+  get(orderId: string) { return this.views.get(orderId) }
+}
+</script>
+  <script type="wrong">
+// 依 at 時間決定順序
+type OrderEvent = { id: string; orderId: string; seq: number; type: 'OrderPlaced' | 'OrderPaid' | 'OrderCompleted' | 'OrderCancelled'; at: string; total?: number }
+type OrderView = { status: 'pending' | 'paid' | 'done' | 'cancelled'; total: number; updatedAt: string }
+type ApplyResult = 'applied' | 'duplicate' | 'stale' | 'buffered'
+const NEXT_STATUS = { OrderPaid: 'paid', OrderCompleted: 'done', OrderCancelled: 'cancelled' } as const
+class OrderProjection {
+  private seen = new Set<string>()
+  private views = new Map<string, OrderView>()
+  private early = new Map<string, OrderEvent[]>()
+  apply(e: OrderEvent): ApplyResult {
+    if (this.seen.has(e.id)) return 'duplicate'
+    this.seen.add(e.id)
+    const cur = this.views.get(e.orderId)
+    if (e.type === 'OrderPlaced') {
+      if (cur) return 'stale'
+      this.views.set(e.orderId, { status: 'pending', total: e.total ?? 0, updatedAt: e.at })
+      for (const x of (this.early.get(e.orderId) ?? []).sort((a, b) => a.at.localeCompare(b.at))) this.apply({ ...x, id: x.id + '~' })
+      return 'applied'
+    }
+    if (!cur) {
+      this.early.set(e.orderId, [...(this.early.get(e.orderId) ?? []), e])
+      return 'buffered'
+    }
+    if (e.at < cur.updatedAt) return 'stale'
+    this.views.set(e.orderId, { ...cur, status: NEXT_STATUS[e.type], updatedAt: e.at })
+    return 'applied'
+  }
+  get(orderId: string) { return this.views.get(orderId) }
+}
+</script>
+  <script type="wrong">
+// 只用 seq 去重（不同訂單的同一個 seq 被當成重複）
+type OrderEvent = { id: string; orderId: string; seq: number; type: 'OrderPlaced' | 'OrderPaid' | 'OrderCompleted' | 'OrderCancelled'; at: string; total?: number }
+type OrderView = { status: 'pending' | 'paid' | 'done' | 'cancelled'; total: number; updatedAt: string }
+type ApplyResult = 'applied' | 'duplicate' | 'stale' | 'buffered'
+const NEXT_STATUS = { OrderPaid: 'paid', OrderCompleted: 'done', OrderCancelled: 'cancelled' } as const
+class OrderProjection {
+  private seen = new Set<number>()
+  private lastSeq = new Map<string, number>()
+  private pending = new Map<string, Map<number, OrderEvent>>()
+  private views = new Map<string, OrderView>()
+  apply(e: OrderEvent): ApplyResult {
+    if (this.seen.has(e.seq)) return 'duplicate'
+    const last = this.lastSeq.get(e.orderId) ?? 0
+    if (e.seq <= last) return 'stale'
+    this.seen.add(e.seq)
+    if (e.seq > last + 1) {
+      const buf = this.pending.get(e.orderId) ?? new Map<number, OrderEvent>()
+      buf.set(e.seq, e)
+      this.pending.set(e.orderId, buf)
+      return 'buffered'
+    }
+    this.step(e)
+    const buf = this.pending.get(e.orderId)
+    let next = buf?.get(e.seq + 1)
+    while (buf && next) { buf.delete(next.seq); this.step(next); next = buf.get(next.seq + 1) }
+    return 'applied'
+  }
+  private step(e: OrderEvent) {
+    if (e.type === 'OrderPlaced') this.views.set(e.orderId, { status: 'pending', total: e.total ?? 0, updatedAt: e.at })
+    else {
+      const cur = this.views.get(e.orderId)
+      if (cur) this.views.set(e.orderId, { ...cur, status: NEXT_STATUS[e.type], updatedAt: e.at })
+    }
+    this.lastSeq.set(e.orderId, e.seq)
+  }
+  get(orderId: string) { return this.views.get(orderId) }
+}
+</script>
+  <script type="wrong">
+// 補上缺號後只接著套用一個暫存事件（if 而不是迴圈）
+type OrderEvent = {
+  id: string
+  orderId: string
+  seq: number
+  type: 'OrderPlaced' | 'OrderPaid' | 'OrderCompleted' | 'OrderCancelled'
+  at: string
+  total?: number
+}
+type OrderView = { status: 'pending' | 'paid' | 'done' | 'cancelled'; total: number; updatedAt: string }
+type ApplyResult = 'applied' | 'duplicate' | 'stale' | 'buffered'
+
+const NEXT_STATUS = { OrderPaid: 'paid', OrderCompleted: 'done', OrderCancelled: 'cancelled' } as const
+
+class OrderProjection {
+  private seen = new Set<string>()
+  private lastSeq = new Map<string, number>()
+  private pending = new Map<string, Map<number, OrderEvent>>()
+  private views = new Map<string, OrderView>()
+
+  apply(e: OrderEvent): ApplyResult {
+    if (this.seen.has(e.id)) return 'duplicate'
+    const last = this.lastSeq.get(e.orderId) ?? 0
+    if (e.seq <= last) return 'stale'
+    this.seen.add(e.id)
+    if (e.seq > last + 1) {
+      const buf = this.pending.get(e.orderId) ?? new Map<number, OrderEvent>()
+      buf.set(e.seq, e)
+      this.pending.set(e.orderId, buf)
+      return 'buffered'
+    }
+    this.step(e)
+    const buf = this.pending.get(e.orderId)
+    let next = buf?.get(e.seq + 1)
+    if (buf && next) {
+      buf.delete(next.seq)
+      this.step(next)
+      next = buf.get(next.seq + 1)
+    }
+    return 'applied'
+  }
+
+  private step(e: OrderEvent) {
+    if (e.type === 'OrderPlaced') {
+      this.views.set(e.orderId, { status: 'pending', total: e.total ?? 0, updatedAt: e.at })
+    } else {
+      const cur = this.views.get(e.orderId)
+      if (cur) this.views.set(e.orderId, { ...cur, status: NEXT_STATUS[e.type], updatedAt: e.at })
+    }
+    this.lastSeq.set(e.orderId, e.seq)
+  }
+
+  get(orderId: string): OrderView | undefined {
+    return this.views.get(orderId)
+  }
+}
+
+</script>
+  <script type="wrong">
+// 先檢查序號再檢查 id：已套用的事件重送時回傳 stale 而不是 duplicate
+type OrderEvent = {
+  id: string
+  orderId: string
+  seq: number
+  type: 'OrderPlaced' | 'OrderPaid' | 'OrderCompleted' | 'OrderCancelled'
+  at: string
+  total?: number
+}
+type OrderView = { status: 'pending' | 'paid' | 'done' | 'cancelled'; total: number; updatedAt: string }
+type ApplyResult = 'applied' | 'duplicate' | 'stale' | 'buffered'
+
+const NEXT_STATUS = { OrderPaid: 'paid', OrderCompleted: 'done', OrderCancelled: 'cancelled' } as const
+
+class OrderProjection {
+  private seen = new Set<string>()
+  private lastSeq = new Map<string, number>()
+  private pending = new Map<string, Map<number, OrderEvent>>()
+  private views = new Map<string, OrderView>()
+
+  apply(e: OrderEvent): ApplyResult {
+    const last = this.lastSeq.get(e.orderId) ?? 0
+    if (e.seq <= last) return 'stale'
+    if (this.seen.has(e.id)) return 'duplicate'
+    this.seen.add(e.id)
+    if (e.seq > last + 1) {
+      const buf = this.pending.get(e.orderId) ?? new Map<number, OrderEvent>()
+      buf.set(e.seq, e)
+      this.pending.set(e.orderId, buf)
+      return 'buffered'
+    }
+    this.step(e)
+    const buf = this.pending.get(e.orderId)
+    let next = buf?.get(e.seq + 1)
+    while (buf && next) {
+      buf.delete(next.seq)
+      this.step(next)
+      next = buf.get(next.seq + 1)
+    }
+    return 'applied'
+  }
+
+  private step(e: OrderEvent) {
+    if (e.type === 'OrderPlaced') {
+      this.views.set(e.orderId, { status: 'pending', total: e.total ?? 0, updatedAt: e.at })
+    } else {
+      const cur = this.views.get(e.orderId)
+      if (cur) this.views.set(e.orderId, { ...cur, status: NEXT_STATUS[e.type], updatedAt: e.at })
+    }
+    this.lastSeq.set(e.orderId, e.seq)
+  }
+
+  get(orderId: string): OrderView | undefined {
+    return this.views.get(orderId)
+  }
+}
+
+</script>
+  <script type="wrong">
+// 用「訂單 + 序號」去重：id 不同、序號舊的事件被當成 duplicate
+type OrderEvent = {
+  id: string
+  orderId: string
+  seq: number
+  type: 'OrderPlaced' | 'OrderPaid' | 'OrderCompleted' | 'OrderCancelled'
+  at: string
+  total?: number
+}
+type OrderView = { status: 'pending' | 'paid' | 'done' | 'cancelled'; total: number; updatedAt: string }
+type ApplyResult = 'applied' | 'duplicate' | 'stale' | 'buffered'
+
+const NEXT_STATUS = { OrderPaid: 'paid', OrderCompleted: 'done', OrderCancelled: 'cancelled' } as const
+
+class OrderProjection {
+  private seen = new Set<string>()
+  private lastSeq = new Map<string, number>()
+  private pending = new Map<string, Map<number, OrderEvent>>()
+  private views = new Map<string, OrderView>()
+
+  apply(e: OrderEvent): ApplyResult {
+    if (this.seen.has(`${e.orderId}#${e.seq}`)) return 'duplicate'
+    const last = this.lastSeq.get(e.orderId) ?? 0
+    if (e.seq <= last) return 'stale'
+    this.seen.add(`${e.orderId}#${e.seq}`)
+    if (e.seq > last + 1) {
+      const buf = this.pending.get(e.orderId) ?? new Map<number, OrderEvent>()
+      buf.set(e.seq, e)
+      this.pending.set(e.orderId, buf)
+      return 'buffered'
+    }
+    this.step(e)
+    const buf = this.pending.get(e.orderId)
+    let next = buf?.get(e.seq + 1)
+    while (buf && next) {
+      buf.delete(next.seq)
+      this.step(next)
+      next = buf.get(next.seq + 1)
+    }
+    return 'applied'
+  }
+
+  private step(e: OrderEvent) {
+    if (e.type === 'OrderPlaced') {
+      this.views.set(e.orderId, { status: 'pending', total: e.total ?? 0, updatedAt: e.at })
+    } else {
+      const cur = this.views.get(e.orderId)
+      if (cur) this.views.set(e.orderId, { ...cur, status: NEXT_STATUS[e.type], updatedAt: e.at })
+    }
+    this.lastSeq.set(e.orderId, e.seq)
+  }
+
+  get(orderId: string): OrderView | undefined {
+    return this.views.get(orderId)
+  }
+}
+
+</script>
+  <script type="wrong">
+// 暫存區不分訂單：不同訂單的同一個序號互相覆蓋
+type OrderEvent = {
+  id: string
+  orderId: string
+  seq: number
+  type: 'OrderPlaced' | 'OrderPaid' | 'OrderCompleted' | 'OrderCancelled'
+  at: string
+  total?: number
+}
+type OrderView = { status: 'pending' | 'paid' | 'done' | 'cancelled'; total: number; updatedAt: string }
+type ApplyResult = 'applied' | 'duplicate' | 'stale' | 'buffered'
+
+const NEXT_STATUS = { OrderPaid: 'paid', OrderCompleted: 'done', OrderCancelled: 'cancelled' } as const
+
+class OrderProjection {
+  private seen = new Set<string>()
+  private lastSeq = new Map<string, number>()
+  private pending = new Map<string, Map<number, OrderEvent>>()
+  private views = new Map<string, OrderView>()
+
+  apply(e: OrderEvent): ApplyResult {
+    if (this.seen.has(e.id)) return 'duplicate'
+    const last = this.lastSeq.get(e.orderId) ?? 0
+    if (e.seq <= last) return 'stale'
+    this.seen.add(e.id)
+    if (e.seq > last + 1) {
+      const buf = this.pending.get('all') ?? new Map<number, OrderEvent>()
+      buf.set(e.seq, e)
+      this.pending.set('all', buf)
+      return 'buffered'
+    }
+    this.step(e)
+    const buf = this.pending.get('all')
+    let next = buf?.get(e.seq + 1)
+    while (buf && next) {
+      buf.delete(next.seq)
+      this.step(next)
+      next = buf.get(next.seq + 1)
+    }
+    return 'applied'
+  }
+
+  private step(e: OrderEvent) {
+    if (e.type === 'OrderPlaced') {
+      this.views.set(e.orderId, { status: 'pending', total: e.total ?? 0, updatedAt: e.at })
+    } else {
+      const cur = this.views.get(e.orderId)
+      if (cur) this.views.set(e.orderId, { ...cur, status: NEXT_STATUS[e.type], updatedAt: e.at })
+    }
+    this.lastSeq.set(e.orderId, e.seq)
+  }
+
+  get(orderId: string): OrderView | undefined {
+    return this.views.get(orderId)
+  }
+}
+
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：寫 webhook 的重送決策 <code>nextAttempt(state, retrySchedule, random)</code>。<code>state.attempt</code> 是已經失敗的次數（從 1 開始），<code>retrySchedule[k]</code> 是第 k 次失敗後要等的毫秒數（<code>retrySchedule[0]</code> 是第一次送出前的 0）。規則依序：</p>
+  <ul>
+    <li><code>lastStatus</code> 是 410 → <code>{ action: 'disable-endpoint' }</code>。</li>
+    <li><code>attempt ≥ retrySchedule.length</code> → <code>{ action: 'give-up' }</code>。</li>
+    <li>否則 <code>{ action: 'retry', delayMs }</code>，<code>delayMs = max(Math.round(retrySchedule[attempt] × (0.9 + random() × 0.2)), retryAfterMs ?? 0)</code>：±10% 的 jitter，<code>Retry-After</code> 比較長就聽它的。</li>
+  </ul>
+  <p><code>lastStatus</code> 為 <code>null</code> 代表逾時或連線失敗。除了 410，其他狀態碼（包括 404、429、500）都重試。不能用 <code>Math.random</code>。</p>
+  <script type="start">
+type RetryState = { attempt: number; lastStatus: number | null; retryAfterMs: number | null }
+type Decision = { action: 'retry'; delayMs: number } | { action: 'give-up' } | { action: 'disable-endpoint' }
+
+function nextAttempt(state: RetryState, retrySchedule: readonly number[], random: () => number): Decision {
+  throw new Error('TODO')
+}
+
+// Standard Webhooks 規格的範例排程：立即、5 秒、5 分、30 分、2 小時、5 小時、10 小時、14 小時、20 小時、24 小時
+const SCHEDULE = [0, 5_000, 300_000, 1_800_000, 7_200_000, 18_000_000, 36_000_000, 50_400_000, 72_000_000, 86_400_000]
+console.log(nextAttempt({ attempt: 1, lastStatus: 503, retryAfterMs: null }, SCHEDULE, () => 0.5))     // retry 5000
+console.log(nextAttempt({ attempt: 2, lastStatus: 429, retryAfterMs: 900_000 }, SCHEDULE, () => 0.5))  // retry 900000
+console.log(nextAttempt({ attempt: 1, lastStatus: 410, retryAfterMs: null }, SCHEDULE, () => 0.5))     // disable-endpoint
+console.log(nextAttempt({ attempt: 10, lastStatus: 500, retryAfterMs: null }, SCHEDULE, () => 0.5))    // give-up
+</script>
+  <script type="answer">
+type RetryState = { attempt: number; lastStatus: number | null; retryAfterMs: number | null }
+type Decision = { action: 'retry'; delayMs: number } | { action: 'give-up' } | { action: 'disable-endpoint' }
+
+function nextAttempt(state: RetryState, retrySchedule: readonly number[], random: () => number): Decision {
+  if (state.lastStatus === 410) return { action: 'disable-endpoint' }
+  if (state.attempt >= retrySchedule.length) return { action: 'give-up' }
+  const jittered = Math.round(retrySchedule[state.attempt] * (0.9 + random() * 0.2))
+  return { action: 'retry', delayMs: Math.max(jittered, state.retryAfterMs ?? 0) }
+}
+
+const SCHEDULE = [0, 5_000, 300_000, 1_800_000, 7_200_000, 18_000_000, 36_000_000, 50_400_000, 72_000_000, 86_400_000]
+console.log(nextAttempt({ attempt: 1, lastStatus: 503, retryAfterMs: null }, SCHEDULE, () => 0.5))
+console.log(nextAttempt({ attempt: 2, lastStatus: 429, retryAfterMs: 900_000 }, SCHEDULE, () => 0.5))
+console.log(nextAttempt({ attempt: 1, lastStatus: 410, retryAfterMs: null }, SCHEDULE, () => 0.5))
+console.log(nextAttempt({ attempt: 10, lastStatus: 500, retryAfterMs: null }, SCHEDULE, () => 0.5))
+</script>
+  <script type="tests">
+const S = [0, 5_000, 300_000, 1_800_000, 7_200_000, 18_000_000, 36_000_000, 50_400_000, 72_000_000, 86_400_000] as const
+const realRandom = Math.random
+const realNow = Date.now
+function guard<R>(fn: () => R): R {
+  Math.random = () => { throw new Error('不能用 Math.random：jitter 要用參數傳進來的 random()') }
+  Date.now = () => { throw new Error('不需要 Date.now') }
+  try { return fn() } finally { Math.random = realRandom; Date.now = realNow }
+}
+const st = (attempt: number, lastStatus: number | null, retryAfterMs: number | null = null) => ({ attempt, lastStatus, retryAfterMs })
+
+assert.deepEqual(guard(() => nextAttempt(st(1, 503), S, () => 0.5)), { action: 'retry', delayMs: 5_000 }, '第 1 次失敗後用 retrySchedule[1]（5 秒），random 0.5 時 jitter 剛好是 ×1.0')
+assert.deepEqual(guard(() => nextAttempt(st(1, 503), S, () => 0)), { action: 'retry', delayMs: 4_500 }, 'random() = 0 時是 ×0.9：要用 random() 加上 ±10% 的 jitter')
+assert.deepEqual(guard(() => nextAttempt(st(1, 503), S, () => 0.75)), { action: 'retry', delayMs: 5_250 }, 'random() = 0.75 時是 ×1.05')
+assert.deepEqual(guard(() => nextAttempt(st(3, 500), S, () => 0.5)), { action: 'retry', delayMs: 1_800_000 }, '第 3 次失敗後用 retrySchedule[3]（30 分）')
+for (let k = 1; k < S.length; k++) {
+  for (const r of [0, 0.0002, 0.0007, 0.1, 0.33, 0.5, 0.9, 0.999]) {
+    const d = guard(() => nextAttempt(st(k, 502), S, () => r))
+    assert(d.action === 'retry' && d.delayMs === Math.round(S[k] * (0.9 + r * 0.2)), `第 ${k} 次失敗、random ${r}：delayMs 要是 Math.round(retrySchedule[${k}] × (0.9 + random() × 0.2))`)
+  }
+}
+assert.deepEqual(guard(() => nextAttempt(st(1, 429, 600_000), S, () => 0.5)), { action: 'retry', delayMs: 600_000 }, 'Retry-After（60 萬毫秒）比排程的 5 秒長時，要等 Retry-After')
+assert.deepEqual(guard(() => nextAttempt(st(3, 503, 1_000), S, () => 0.5)), { action: 'retry', delayMs: 1_800_000 }, 'Retry-After 比排程短時，照排程')
+assert.deepEqual(guard(() => nextAttempt(st(1, 410), S, () => 0.5)), { action: 'disable-endpoint' }, '410 Gone 表示對方不要了：要停用端點，不能重試')
+assert.deepEqual(guard(() => nextAttempt(st(10, 410), S, () => 0.5)), { action: 'disable-endpoint' }, '最後一次失敗是 410 時也要停用端點')
+assert.deepEqual(guard(() => nextAttempt(st(10, 500), S, () => 0.5)), { action: 'give-up' }, '排程有 10 項，失敗 10 次後要放棄')
+assert.deepEqual(guard(() => nextAttempt(st(15, null), S, () => 0.5)), { action: 'give-up' }, '超過排程長度時要放棄，不能讀到陣列外面變成 NaN')
+assert.deepEqual(guard(() => nextAttempt(st(3, 500), [0, 1_000, 2_000], () => 0.5)), { action: 'give-up' }, '要用傳進來的 retrySchedule 的長度判斷')
+for (const status of [400, 401, 404, 429, 500, 502, 504, null]) {
+  assert.equal(guard(() => nextAttempt(st(2, status), S, () => 0.5)).action, 'retry', `狀態 ${status}：除了 410 都要重試（null 是逾時或連線失敗）`)
+}
+</script>
+  <script type="wrong">
+// 不加 jitter
+type RetryState = { attempt: number; lastStatus: number | null; retryAfterMs: number | null }
+type Decision = { action: 'retry'; delayMs: number } | { action: 'give-up' } | { action: 'disable-endpoint' }
+function nextAttempt(state: RetryState, retrySchedule: readonly number[], random: () => number): Decision {
+  if (state.lastStatus === 410) return { action: 'disable-endpoint' }
+  if (state.attempt >= retrySchedule.length) return { action: 'give-up' }
+  return { action: 'retry', delayMs: Math.max(retrySchedule[state.attempt], state.retryAfterMs ?? 0) }
+}
+</script>
+  <script type="wrong">
+// 忽略 Retry-After
+type RetryState = { attempt: number; lastStatus: number | null; retryAfterMs: number | null }
+type Decision = { action: 'retry'; delayMs: number } | { action: 'give-up' } | { action: 'disable-endpoint' }
+function nextAttempt(state: RetryState, retrySchedule: readonly number[], random: () => number): Decision {
+  if (state.lastStatus === 410) return { action: 'disable-endpoint' }
+  if (state.attempt >= retrySchedule.length) return { action: 'give-up' }
+  return { action: 'retry', delayMs: Math.round(retrySchedule[state.attempt] * (0.9 + random() * 0.2)) }
+}
+</script>
+  <script type="wrong">
+// 410 也重試
+type RetryState = { attempt: number; lastStatus: number | null; retryAfterMs: number | null }
+type Decision = { action: 'retry'; delayMs: number } | { action: 'give-up' } | { action: 'disable-endpoint' }
+function nextAttempt(state: RetryState, retrySchedule: readonly number[], random: () => number): Decision {
+  if (state.attempt >= retrySchedule.length) return { action: 'give-up' }
+  const jittered = Math.round(retrySchedule[state.attempt] * (0.9 + random() * 0.2))
+  return { action: 'retry', delayMs: Math.max(jittered, state.retryAfterMs ?? 0) }
+}
+</script>
+  <script type="wrong">
+// 排程用完後仍重試
+type RetryState = { attempt: number; lastStatus: number | null; retryAfterMs: number | null }
+type Decision = { action: 'retry'; delayMs: number } | { action: 'give-up' } | { action: 'disable-endpoint' }
+function nextAttempt(state: RetryState, retrySchedule: readonly number[], random: () => number): Decision {
+  if (state.lastStatus === 410) return { action: 'disable-endpoint' }
+  const jittered = Math.round(retrySchedule[state.attempt] * (0.9 + random() * 0.2))
+  return { action: 'retry', delayMs: Math.max(jittered, state.retryAfterMs ?? 0) }
+}
+</script>
+  <script type="wrong">
+// 4xx 一律放棄
+type RetryState = { attempt: number; lastStatus: number | null; retryAfterMs: number | null }
+type Decision = { action: 'retry'; delayMs: number } | { action: 'give-up' } | { action: 'disable-endpoint' }
+function nextAttempt(state: RetryState, retrySchedule: readonly number[], random: () => number): Decision {
+  if (state.lastStatus === 410) return { action: 'disable-endpoint' }
+  if (state.lastStatus !== null && state.lastStatus >= 400 && state.lastStatus < 500) return { action: 'give-up' }
+  if (state.attempt >= retrySchedule.length) return { action: 'give-up' }
+  const jittered = Math.round(retrySchedule[state.attempt] * (0.9 + random() * 0.2))
+  return { action: 'retry', delayMs: Math.max(jittered, state.retryAfterMs ?? 0) }
+}
+</script>
+  <script type="wrong">
+// 用 Math.floor 取整，不是題目要求的 Math.round
+type RetryState = { attempt: number; lastStatus: number | null; retryAfterMs: number | null }
+type Decision = { action: 'retry'; delayMs: number } | { action: 'give-up' } | { action: 'disable-endpoint' }
+
+function nextAttempt(state: RetryState, retrySchedule: readonly number[], random: () => number): Decision {
+  if (state.lastStatus === 410) return { action: 'disable-endpoint' }
+  if (state.attempt >= retrySchedule.length) return { action: 'give-up' }
+  const jittered = Math.floor(retrySchedule[state.attempt] * (0.9 + random() * 0.2))
+  return { action: 'retry', delayMs: Math.max(jittered, state.retryAfterMs ?? 0) }
+}
+
+</script>
+  <script type="wrong">
+// 第 k 次失敗後用 retrySchedule[k - 1]（索引差一）
+type RetryState = { attempt: number; lastStatus: number | null; retryAfterMs: number | null }
+type Decision = { action: 'retry'; delayMs: number } | { action: 'give-up' } | { action: 'disable-endpoint' }
+
+function nextAttempt(state: RetryState, retrySchedule: readonly number[], random: () => number): Decision {
+  if (state.lastStatus === 410) return { action: 'disable-endpoint' }
+  if (state.attempt > retrySchedule.length) return { action: 'give-up' }
+  const jittered = Math.round(retrySchedule[state.attempt - 1] * (0.9 + random() * 0.2))
+  return { action: 'retry', delayMs: Math.max(jittered, state.retryAfterMs ?? 0) }
+}
+
+</script>
+  <script type="wrong">
+// 有 Retry-After 就直接用它，沒有跟排程取較大值
+type RetryState = { attempt: number; lastStatus: number | null; retryAfterMs: number | null }
+type Decision = { action: 'retry'; delayMs: number } | { action: 'give-up' } | { action: 'disable-endpoint' }
+
+function nextAttempt(state: RetryState, retrySchedule: readonly number[], random: () => number): Decision {
+  if (state.lastStatus === 410) return { action: 'disable-endpoint' }
+  if (state.attempt >= retrySchedule.length) return { action: 'give-up' }
+  const jittered = Math.round(retrySchedule[state.attempt] * (0.9 + random() * 0.2))
+  return { action: 'retry', delayMs: state.retryAfterMs ?? jittered }
+}
+
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：寫 <code>deliverWebhook(endpoint, event, deps)</code>，把一個事件送到客戶的端點，失敗就依練習 2 的 <code>nextAttempt</code> 重送（起始程式已貼好參考解，也貼好<a href="../../auth/lessons/17-api-keys-m2m.html">認證課第 17 課</a>的 <code>signWebhook</code>）。要求：</p>
+  <ul>
+    <li>body 只序列化一次：<code>JSON.stringify(event.payload)</code>，每次都送一模一樣的字串。</li>
+    <li>每次嘗試都取當下的 <code>deps.nowSeconds()</code> 當時間戳，重新呼叫 <code>deps.sign(endpoint.secret, { id, timestamp, payload: body })</code>。</li>
+    <li>標頭：<code>webhook-id</code>（永遠是 <code>event.id</code>）、<code>webhook-timestamp</code>（字串）、<code>webhook-signature</code>、<code>content-type: application/json</code>。</li>
+    <li>回應 2xx 才算成功，回傳 <code>{ result: 'delivered', attempts }</code>。<code>deps.post</code> 丟錯（逾時、連線失敗）時當作 <code>lastStatus: null</code>、<code>retryAfterMs: null</code>。</li>
+    <li>失敗時呼叫 <code>nextAttempt</code>：<code>retry</code> → <code>await deps.sleep(delayMs)</code> 再送；<code>disable-endpoint</code> → <code>'disabled'</code>；<code>give-up</code> → <code>'gave-up'</code>。<code>attempts</code> 是實際送出的次數。</li>
+  </ul>
+  <script type="start">
+type Endpoint = { url: string; secret: string }
+type WebhookEvent = { id: string; payload: unknown }
+type PostResult = { status: number; retryAfterMs: number | null }
+type Deps = {
+  sign: (secret: string, msg: { id: string; timestamp: number; payload: string }) => Promise<string>
+  post: (url: string, headers: Record<string, string>, body: string) => Promise<PostResult>
+  nowSeconds: () => number
+  sleep: (ms: number) => Promise<void>
+  random: () => number
+  retrySchedule: readonly number[]
+}
+type DeliveryResult = { result: 'delivered' | 'gave-up' | 'disabled'; attempts: number }
+
+// ── 已經寫好：練習 2 的參考解 ──
+type RetryState = { attempt: number; lastStatus: number | null; retryAfterMs: number | null }
+type Decision = { action: 'retry'; delayMs: number } | { action: 'give-up' } | { action: 'disable-endpoint' }
+function nextAttempt(state: RetryState, retrySchedule: readonly number[], random: () => number): Decision {
+  if (state.lastStatus === 410) return { action: 'disable-endpoint' }
+  if (state.attempt >= retrySchedule.length) return { action: 'give-up' }
+  const jittered = Math.round(retrySchedule[state.attempt] * (0.9 + random() * 0.2))
+  return { action: 'retry', delayMs: Math.max(jittered, state.retryAfterMs ?? 0) }
+}
+
+// ── 已經寫好：認證課第 17 課的 Standard Webhooks 簽章 ──
+async function signWebhook(secret: string, msg: { id: string; timestamp: number; payload: string }): Promise<string> {
+  const raw = Uint8Array.from(atob(secret.replace(/^whsec_/, '')), c => c.charCodeAt(0))
+  const key = await crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${msg.id}.${msg.timestamp}.${msg.payload}`)))
+  return 'v1,' + btoa(String.fromCharCode(...sig))
+}
+
+// ── 要完成的 ──
+async function deliverWebhook(endpoint: Endpoint, event: WebhookEvent, deps: Deps): Promise<DeliveryResult> {
+  throw new Error('TODO')
+}
+
+// 試跑：前兩次 503、第三次 200；假時鐘，sleep 只推進時間不真的等
+let clock = 1_761_868_800
+const replies = [503, 503, 200]
+const result = await deliverWebhook(
+  { url: 'https://delivery.example.com/hooks/cafe', secret: 'whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw' },
+  { id: 'msg_2KWPBgLlAfxdpx2AI54pPJ85f4W', payload: { type: 'order.completed', orderId: 'A-1001' } },
+  {
+    sign: signWebhook,
+    post: async (url, headers, body) => {
+      console.log('POST', headers['webhook-id'], headers['webhook-timestamp'], headers['webhook-signature'].slice(0, 16) + '…')
+      return { status: replies.shift() ?? 200, retryAfterMs: null }
+    },
+    nowSeconds: () => clock,
+    sleep: async ms => { console.log(`等 ${ms} 毫秒`); clock += Math.round(ms / 1000) },
+    random: () => 0.5,
+    retrySchedule: [0, 5_000, 300_000, 1_800_000, 7_200_000, 18_000_000, 36_000_000, 50_400_000, 72_000_000, 86_400_000],
+  },
+)
+console.log(result)
+</script>
+  <script type="answer">
+type Endpoint = { url: string; secret: string }
+type WebhookEvent = { id: string; payload: unknown }
+type PostResult = { status: number; retryAfterMs: number | null }
+type Deps = {
+  sign: (secret: string, msg: { id: string; timestamp: number; payload: string }) => Promise<string>
+  post: (url: string, headers: Record<string, string>, body: string) => Promise<PostResult>
+  nowSeconds: () => number
+  sleep: (ms: number) => Promise<void>
+  random: () => number
+  retrySchedule: readonly number[]
+}
+type DeliveryResult = { result: 'delivered' | 'gave-up' | 'disabled'; attempts: number }
+
+type RetryState = { attempt: number; lastStatus: number | null; retryAfterMs: number | null }
+type Decision = { action: 'retry'; delayMs: number } | { action: 'give-up' } | { action: 'disable-endpoint' }
+function nextAttempt(state: RetryState, retrySchedule: readonly number[], random: () => number): Decision {
+  if (state.lastStatus === 410) return { action: 'disable-endpoint' }
+  if (state.attempt >= retrySchedule.length) return { action: 'give-up' }
+  const jittered = Math.round(retrySchedule[state.attempt] * (0.9 + random() * 0.2))
+  return { action: 'retry', delayMs: Math.max(jittered, state.retryAfterMs ?? 0) }
+}
+
+async function signWebhook(secret: string, msg: { id: string; timestamp: number; payload: string }): Promise<string> {
+  const raw = Uint8Array.from(atob(secret.replace(/^whsec_/, '')), c => c.charCodeAt(0))
+  const key = await crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${msg.id}.${msg.timestamp}.${msg.payload}`)))
+  return 'v1,' + btoa(String.fromCharCode(...sig))
+}
+
+async function deliverWebhook(endpoint: Endpoint, event: WebhookEvent, deps: Deps): Promise<DeliveryResult> {
+  const body = JSON.stringify(event.payload)
+  let attempts = 0
+  while (true) {
+    const timestamp = deps.nowSeconds()                      // 每次嘗試都用當下的時間
+    const signature = await deps.sign(endpoint.secret, { id: event.id, timestamp, payload: body })
+    const headers = {
+      'webhook-id': event.id,                                // 重送時不變
+      'webhook-timestamp': String(timestamp),
+      'webhook-signature': signature,
+      'content-type': 'application/json',
+    }
+    let lastStatus: number | null = null
+    let retryAfterMs: number | null = null
+    try {
+      const res = await deps.post(endpoint.url, headers, body)
+      lastStatus = res.status
+      retryAfterMs = res.retryAfterMs
+    } catch {
+      // 逾時或連線失敗：跟其他失敗一樣交給 nextAttempt
+    }
+    attempts++
+    if (lastStatus !== null && lastStatus >= 200 && lastStatus < 300) return { result: 'delivered', attempts }
+    const d = nextAttempt({ attempt: attempts, lastStatus, retryAfterMs }, deps.retrySchedule, deps.random)
+    if (d.action === 'disable-endpoint') return { result: 'disabled', attempts }
+    if (d.action === 'give-up') return { result: 'gave-up', attempts }
+    await deps.sleep(d.delayMs)
+  }
+}
+
+let clock = 1_761_868_800
+const replies = [503, 503, 200]
+const result = await deliverWebhook(
+  { url: 'https://delivery.example.com/hooks/cafe', secret: 'whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw' },
+  { id: 'msg_2KWPBgLlAfxdpx2AI54pPJ85f4W', payload: { type: 'order.completed', orderId: 'A-1001' } },
+  {
+    sign: signWebhook,
+    post: async (url, headers, body) => {
+      console.log('POST', headers['webhook-id'], headers['webhook-timestamp'], headers['webhook-signature'].slice(0, 16) + '…')
+      return { status: replies.shift() ?? 200, retryAfterMs: null }
+    },
+    nowSeconds: () => clock,
+    sleep: async ms => { console.log(`等 ${ms} 毫秒`); clock += Math.round(ms / 1000) },
+    random: () => 0.5,
+    retrySchedule: [0, 5_000, 300_000, 1_800_000, 7_200_000, 18_000_000, 36_000_000, 50_400_000, 72_000_000, 86_400_000],
+  },
+)
+console.log(result)
+</script>
+  <script type="tests">
+const SECRET = 'whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw'
+const FULL = [0, 5_000, 300_000, 1_800_000, 7_200_000, 18_000_000, 36_000_000, 50_400_000, 72_000_000, 86_400_000]
+async function hmacKey(usage: 'sign' | 'verify') {
+  const raw = Uint8Array.from(atob(SECRET.slice(6)), c => c.charCodeAt(0))
+  return crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, [usage])
+}
+async function testSign(_secret: string, msg: { id: string; timestamp: number; payload: string }) {
+  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', await hmacKey('sign'), new TextEncoder().encode(`${msg.id}.${msg.timestamp}.${msg.payload}`)))
+  return 'v1,' + btoa(String.fromCharCode(...sig))
+}
+async function testVerify(h: Record<string, string>, body: string) {
+  const sig = Uint8Array.from(atob((h['webhook-signature'] ?? '').replace(/^v1,/, '')), c => c.charCodeAt(0))
+  return crypto.subtle.verify('HMAC', await hmacKey('verify'), sig, new TextEncoder().encode(`${h['webhook-id']}.${h['webhook-timestamp']}.${body}`))
+}
+type Reply = PostResult | 'throw'
+function harness(replies: Reply[], schedule: readonly number[] = FULL) {
+  let clock = 1_761_868_800
+  const calls: { headers: Record<string, string>; body: string; sentAt: number; url: string }[] = []
+  const sleeps: number[] = []
+  let signCalls = 0
+  const secrets: string[] = []
+  let sleeping = false
+  let overlapped = false
+  const deps: Deps = {
+    sign: async (s, m) => { signCalls++; secrets.push(s); return testSign(s, m) },
+    post: async (url, headers, body) => {
+      if (sleeping) overlapped = true
+      calls.push({ url, headers: { ...headers }, body, sentAt: clock })
+      const r = replies[calls.length - 1] ?? { status: 200, retryAfterMs: null }
+      if (r === 'throw') throw new Error('連線逾時')
+      return r
+    },
+    nowSeconds: () => clock,
+    sleep: async ms => { sleeps.push(ms); sleeping = true; await Promise.resolve(); clock += Math.round(ms / 1000); sleeping = false },
+    random: () => 0.5,
+    retrySchedule: schedule,
+  }
+  return { deps, calls, sleeps, secrets, signs: () => signCalls, overlapped: () => overlapped }
+}
+const realRandom = Math.random
+const realNow = Date.now
+async function run(h: ReturnType<typeof harness>, payload: unknown = { type: 'order.completed', orderId: 'A-1001', total: 190 }) {
+  Math.random = () => { throw new Error('不能用 Math.random：用 deps.random') }
+  Date.now = () => { throw new Error('不能用 Date.now：時間戳用 deps.nowSeconds()') }
+  try {
+    return await deliverWebhook({ url: 'https://delivery.example.com/hooks/cafe', secret: SECRET }, { id: 'msg_A1001_completed', payload }, h.deps)
+  } finally { Math.random = realRandom; Date.now = realNow }
+}
+const ok: PostResult = { status: 200, retryAfterMs: null }
+const s503: PostResult = { status: 503, retryAfterMs: null }
+
+const h1 = harness([s503, s503, ok])
+assert.deepEqual(await run(h1), { result: 'delivered', attempts: 3 }, '503、503、200：要重送到成功，回傳 delivered 與 3 次')
+assert.equal(h1.calls.length, 3, '要送出 3 次')
+for (const [k, c] of h1.calls.entries()) {
+  assert.equal(c.url, 'https://delivery.example.com/hooks/cafe', '要送到 endpoint.url')
+  assert.equal(c.headers['webhook-id'], 'msg_A1001_completed', `第 ${k + 1} 次：webhook-id 要永遠是 event.id，接收端才能去重`)
+  assert.equal(c.headers['content-type'], 'application/json', '要帶 content-type: application/json')
+  assert.equal(c.body, JSON.stringify({ type: 'order.completed', orderId: 'A-1001', total: 190 }), `第 ${k + 1} 次：body 要是 JSON.stringify(event.payload)，每次都一樣`)
+  assert.equal(c.headers['webhook-timestamp'], String(c.sentAt), `第 ${k + 1} 次：webhook-timestamp 要是這次送出當下的 nowSeconds()（字串）；沿用第一次的時間戳，5 分鐘後的重送會被接收端拒絕`)
+  assert(await testVerify(c.headers, c.body), `第 ${k + 1} 次：簽章要對 webhook-id.webhook-timestamp.body 驗證通過`)
+}
+assert.equal(new Set(h1.calls.map(c => c.headers['webhook-signature'])).size, 3, '時間戳不同，三次的簽章要各不相同：每次嘗試都要重新呼叫 sign')
+assert.equal(h1.signs(), 3, '每次嘗試都要呼叫一次 deps.sign')
+assert(h1.secrets.every(x => x === SECRET), '簽章要用 endpoint.secret（每個端點有自己的密鑰）')
+assert(!h1.overlapped(), '要 await deps.sleep(delayMs)，等完才送下一次')
+assert.deepEqual(h1.sleeps, [5_000, 300_000], '第 1 次失敗後等 5 秒、第 2 次失敗後等 5 分（交給 nextAttempt 算），第一次送出前不用等')
+
+const h2 = harness([{ status: 410, retryAfterMs: null }, ok])
+assert.deepEqual(await run(h2), { result: 'disabled', attempts: 1 }, '410 要回傳 disabled')
+assert.equal(h2.calls.length, 1, '410 之後不能再送')
+
+const h3 = harness([{ status: 429, retryAfterMs: 3_600_000 }, ok])
+assert.deepEqual(await run(h3), { result: 'delivered', attempts: 2 }, '429 之後要重送')
+assert.deepEqual(h3.sleeps, [3_600_000], '429 附了 Retry-After 1 小時：要把 retryAfterMs 交給 nextAttempt，等 1 小時')
+
+const h4 = harness([s503, s503, s503, s503], [0, 1_000, 2_000])
+assert.deepEqual(await run(h4), { result: 'gave-up', attempts: 3 }, '排程只有 3 項、一直失敗：送 3 次後回傳 gave-up')
+assert.deepEqual(h4.sleeps, [1_000, 2_000], '要用 deps.retrySchedule 的排程')
+
+const h5 = harness(['throw', 'throw', ok])
+assert.deepEqual(await run(h5), { result: 'delivered', attempts: 3 }, 'post 丟錯（逾時、連線失敗）時要當成失敗並重試，不能讓錯誤往外丟')
+
+const h6 = harness([{ status: 302, retryAfterMs: null }, { status: 399, retryAfterMs: null }, { status: 204, retryAfterMs: null }])
+assert.deepEqual(await run(h6), { result: 'delivered', attempts: 3 }, '只有 2xx 算成功：302 轉址、399 都是失敗，204 是成功')
+
+const h7 = harness([ok])
+await run(h7, 'plain text')
+assert.equal(h7.calls[0].body, JSON.stringify('plain text'), 'payload 是字串時也要 JSON.stringify')
+</script>
+  <script type="wrong">
+// 只簽一次，沿用第一次的時間戳與簽章
+type Endpoint = { url: string; secret: string }
+type WebhookEvent = { id: string; payload: unknown }
+type PostResult = { status: number; retryAfterMs: number | null }
+type Deps = { sign: (secret: string, msg: { id: string; timestamp: number; payload: string }) => Promise<string>; post: (url: string, headers: Record<string, string>, body: string) => Promise<PostResult>; nowSeconds: () => number; sleep: (ms: number) => Promise<void>; random: () => number; retrySchedule: readonly number[] }
+type DeliveryResult = { result: 'delivered' | 'gave-up' | 'disabled'; attempts: number }
+type RetryState = { attempt: number; lastStatus: number | null; retryAfterMs: number | null }
+type Decision = { action: 'retry'; delayMs: number } | { action: 'give-up' } | { action: 'disable-endpoint' }
+function nextAttempt(state: RetryState, retrySchedule: readonly number[], random: () => number): Decision {
+  if (state.lastStatus === 410) return { action: 'disable-endpoint' }
+  if (state.attempt >= retrySchedule.length) return { action: 'give-up' }
+  return { action: 'retry', delayMs: Math.max(Math.round(retrySchedule[state.attempt] * (0.9 + random() * 0.2)), state.retryAfterMs ?? 0) }
+}
+async function deliverWebhook(endpoint: Endpoint, event: WebhookEvent, deps: Deps): Promise<DeliveryResult> {
+  const body = JSON.stringify(event.payload)
+  const timestamp = deps.nowSeconds()
+  const signature = await deps.sign(endpoint.secret, { id: event.id, timestamp, payload: body })
+  const headers = { 'webhook-id': event.id, 'webhook-timestamp': String(timestamp), 'webhook-signature': signature, 'content-type': 'application/json' }
+  let attempts = 0
+  while (true) {
+    let lastStatus: number | null = null
+    let retryAfterMs: number | null = null
+    try { const r = await deps.post(endpoint.url, headers, body); lastStatus = r.status; retryAfterMs = r.retryAfterMs } catch {}
+    attempts++
+    if (lastStatus !== null && lastStatus >= 200 && lastStatus < 300) return { result: 'delivered', attempts }
+    const d = nextAttempt({ attempt: attempts, lastStatus, retryAfterMs }, deps.retrySchedule, deps.random)
+    if (d.action === 'disable-endpoint') return { result: 'disabled', attempts }
+    if (d.action === 'give-up') return { result: 'gave-up', attempts }
+    await deps.sleep(d.delayMs)
+  }
+}
+</script>
+  <script type="wrong">
+// 每次嘗試產生新的 webhook-id
+type Endpoint = { url: string; secret: string }
+type WebhookEvent = { id: string; payload: unknown }
+type PostResult = { status: number; retryAfterMs: number | null }
+type Deps = { sign: (secret: string, msg: { id: string; timestamp: number; payload: string }) => Promise<string>; post: (url: string, headers: Record<string, string>, body: string) => Promise<PostResult>; nowSeconds: () => number; sleep: (ms: number) => Promise<void>; random: () => number; retrySchedule: readonly number[] }
+type DeliveryResult = { result: 'delivered' | 'gave-up' | 'disabled'; attempts: number }
+type RetryState = { attempt: number; lastStatus: number | null; retryAfterMs: number | null }
+type Decision = { action: 'retry'; delayMs: number } | { action: 'give-up' } | { action: 'disable-endpoint' }
+function nextAttempt(state: RetryState, retrySchedule: readonly number[], random: () => number): Decision {
+  if (state.lastStatus === 410) return { action: 'disable-endpoint' }
+  if (state.attempt >= retrySchedule.length) return { action: 'give-up' }
+  return { action: 'retry', delayMs: Math.max(Math.round(retrySchedule[state.attempt] * (0.9 + random() * 0.2)), state.retryAfterMs ?? 0) }
+}
+async function deliverWebhook(endpoint: Endpoint, event: WebhookEvent, deps: Deps): Promise<DeliveryResult> {
+  const body = JSON.stringify(event.payload)
+  let attempts = 0
+  while (true) {
+    const id = `${event.id}_${attempts + 1}`
+    const timestamp = deps.nowSeconds()
+    const signature = await deps.sign(endpoint.secret, { id, timestamp, payload: body })
+    const headers = { 'webhook-id': id, 'webhook-timestamp': String(timestamp), 'webhook-signature': signature, 'content-type': 'application/json' }
+    let lastStatus: number | null = null
+    let retryAfterMs: number | null = null
+    try { const r = await deps.post(endpoint.url, headers, body); lastStatus = r.status; retryAfterMs = r.retryAfterMs } catch {}
+    attempts++
+    if (lastStatus !== null && lastStatus >= 200 && lastStatus < 300) return { result: 'delivered', attempts }
+    const d = nextAttempt({ attempt: attempts, lastStatus, retryAfterMs }, deps.retrySchedule, deps.random)
+    if (d.action === 'disable-endpoint') return { result: 'disabled', attempts }
+    if (d.action === 'give-up') return { result: 'gave-up', attempts }
+    await deps.sleep(d.delayMs)
+  }
+}
+</script>
+  <script type="wrong">
+// post 丟錯時直接中止
+type Endpoint = { url: string; secret: string }
+type WebhookEvent = { id: string; payload: unknown }
+type PostResult = { status: number; retryAfterMs: number | null }
+type Deps = { sign: (secret: string, msg: { id: string; timestamp: number; payload: string }) => Promise<string>; post: (url: string, headers: Record<string, string>, body: string) => Promise<PostResult>; nowSeconds: () => number; sleep: (ms: number) => Promise<void>; random: () => number; retrySchedule: readonly number[] }
+type DeliveryResult = { result: 'delivered' | 'gave-up' | 'disabled'; attempts: number }
+type RetryState = { attempt: number; lastStatus: number | null; retryAfterMs: number | null }
+type Decision = { action: 'retry'; delayMs: number } | { action: 'give-up' } | { action: 'disable-endpoint' }
+function nextAttempt(state: RetryState, retrySchedule: readonly number[], random: () => number): Decision {
+  if (state.lastStatus === 410) return { action: 'disable-endpoint' }
+  if (state.attempt >= retrySchedule.length) return { action: 'give-up' }
+  return { action: 'retry', delayMs: Math.max(Math.round(retrySchedule[state.attempt] * (0.9 + random() * 0.2)), state.retryAfterMs ?? 0) }
+}
+async function deliverWebhook(endpoint: Endpoint, event: WebhookEvent, deps: Deps): Promise<DeliveryResult> {
+  const body = JSON.stringify(event.payload)
+  let attempts = 0
+  while (true) {
+    const timestamp = deps.nowSeconds()
+    const signature = await deps.sign(endpoint.secret, { id: event.id, timestamp, payload: body })
+    const headers = { 'webhook-id': event.id, 'webhook-timestamp': String(timestamp), 'webhook-signature': signature, 'content-type': 'application/json' }
+    const r = await deps.post(endpoint.url, headers, body)
+    attempts++
+    if (r.status >= 200 && r.status < 300) return { result: 'delivered', attempts }
+    const d = nextAttempt({ attempt: attempts, lastStatus: r.status, retryAfterMs: r.retryAfterMs }, deps.retrySchedule, deps.random)
+    if (d.action === 'disable-endpoint') return { result: 'disabled', attempts }
+    if (d.action === 'give-up') return { result: 'gave-up', attempts }
+    await deps.sleep(d.delayMs)
+  }
+}
+</script>
+  <script type="wrong">
+// 忽略 Retry-After
+type Endpoint = { url: string; secret: string }
+type WebhookEvent = { id: string; payload: unknown }
+type PostResult = { status: number; retryAfterMs: number | null }
+type Deps = { sign: (secret: string, msg: { id: string; timestamp: number; payload: string }) => Promise<string>; post: (url: string, headers: Record<string, string>, body: string) => Promise<PostResult>; nowSeconds: () => number; sleep: (ms: number) => Promise<void>; random: () => number; retrySchedule: readonly number[] }
+type DeliveryResult = { result: 'delivered' | 'gave-up' | 'disabled'; attempts: number }
+type RetryState = { attempt: number; lastStatus: number | null; retryAfterMs: number | null }
+type Decision = { action: 'retry'; delayMs: number } | { action: 'give-up' } | { action: 'disable-endpoint' }
+function nextAttempt(state: RetryState, retrySchedule: readonly number[], random: () => number): Decision {
+  if (state.lastStatus === 410) return { action: 'disable-endpoint' }
+  if (state.attempt >= retrySchedule.length) return { action: 'give-up' }
+  return { action: 'retry', delayMs: Math.max(Math.round(retrySchedule[state.attempt] * (0.9 + random() * 0.2)), state.retryAfterMs ?? 0) }
+}
+async function deliverWebhook(endpoint: Endpoint, event: WebhookEvent, deps: Deps): Promise<DeliveryResult> {
+  const body = JSON.stringify(event.payload)
+  let attempts = 0
+  while (true) {
+    const timestamp = deps.nowSeconds()
+    const signature = await deps.sign(endpoint.secret, { id: event.id, timestamp, payload: body })
+    const headers = { 'webhook-id': event.id, 'webhook-timestamp': String(timestamp), 'webhook-signature': signature, 'content-type': 'application/json' }
+    let lastStatus: number | null = null
+    try { lastStatus = (await deps.post(endpoint.url, headers, body)).status } catch {}
+    attempts++
+    if (lastStatus !== null && lastStatus >= 200 && lastStatus < 300) return { result: 'delivered', attempts }
+    const d = nextAttempt({ attempt: attempts, lastStatus, retryAfterMs: null }, deps.retrySchedule, deps.random)
+    if (d.action === 'disable-endpoint') return { result: 'disabled', attempts }
+    if (d.action === 'give-up') return { result: 'gave-up', attempts }
+    await deps.sleep(d.delayMs)
+  }
+}
+</script>
+  <script type="wrong">
+// 成功判斷寫成 status < 400（3xx 也當成功）
+type Endpoint = { url: string; secret: string }
+type WebhookEvent = { id: string; payload: unknown }
+type PostResult = { status: number; retryAfterMs: number | null }
+type Deps = { sign: (secret: string, msg: { id: string; timestamp: number; payload: string }) => Promise<string>; post: (url: string, headers: Record<string, string>, body: string) => Promise<PostResult>; nowSeconds: () => number; sleep: (ms: number) => Promise<void>; random: () => number; retrySchedule: readonly number[] }
+type DeliveryResult = { result: 'delivered' | 'gave-up' | 'disabled'; attempts: number }
+type RetryState = { attempt: number; lastStatus: number | null; retryAfterMs: number | null }
+type Decision = { action: 'retry'; delayMs: number } | { action: 'give-up' } | { action: 'disable-endpoint' }
+function nextAttempt(state: RetryState, retrySchedule: readonly number[], random: () => number): Decision {
+  if (state.lastStatus === 410) return { action: 'disable-endpoint' }
+  if (state.attempt >= retrySchedule.length) return { action: 'give-up' }
+  return { action: 'retry', delayMs: Math.max(Math.round(retrySchedule[state.attempt] * (0.9 + random() * 0.2)), state.retryAfterMs ?? 0) }
+}
+async function deliverWebhook(endpoint: Endpoint, event: WebhookEvent, deps: Deps): Promise<DeliveryResult> {
+  const body = JSON.stringify(event.payload)
+  let attempts = 0
+  while (true) {
+    const timestamp = deps.nowSeconds()
+    const signature = await deps.sign(endpoint.secret, { id: event.id, timestamp, payload: body })
+    const headers = { 'webhook-id': event.id, 'webhook-timestamp': String(timestamp), 'webhook-signature': signature, 'content-type': 'application/json' }
+    let lastStatus: number | null = null
+    let retryAfterMs: number | null = null
+    try { const r = await deps.post(endpoint.url, headers, body); lastStatus = r.status; retryAfterMs = r.retryAfterMs } catch {}
+    attempts++
+    if (lastStatus !== null && lastStatus < 400) return { result: 'delivered', attempts }
+    const d = nextAttempt({ attempt: attempts, lastStatus, retryAfterMs }, deps.retrySchedule, deps.random)
+    if (d.action === 'disable-endpoint') return { result: 'disabled', attempts }
+    if (d.action === 'give-up') return { result: 'gave-up', attempts }
+    await deps.sleep(d.delayMs)
+  }
+}
+</script>
+  <script type="wrong">
+// sleep 沒有 await：還沒等完就送出下一次
+type Endpoint = { url: string; secret: string }
+type WebhookEvent = { id: string; payload: unknown }
+type PostResult = { status: number; retryAfterMs: number | null }
+type Deps = {
+  sign: (secret: string, msg: { id: string; timestamp: number; payload: string }) => Promise<string>
+  post: (url: string, headers: Record<string, string>, body: string) => Promise<PostResult>
+  nowSeconds: () => number
+  sleep: (ms: number) => Promise<void>
+  random: () => number
+  retrySchedule: readonly number[]
+}
+type DeliveryResult = { result: 'delivered' | 'gave-up' | 'disabled'; attempts: number }
+
+type RetryState = { attempt: number; lastStatus: number | null; retryAfterMs: number | null }
+type Decision = { action: 'retry'; delayMs: number } | { action: 'give-up' } | { action: 'disable-endpoint' }
+function nextAttempt(state: RetryState, retrySchedule: readonly number[], random: () => number): Decision {
+  if (state.lastStatus === 410) return { action: 'disable-endpoint' }
+  if (state.attempt >= retrySchedule.length) return { action: 'give-up' }
+  const jittered = Math.round(retrySchedule[state.attempt] * (0.9 + random() * 0.2))
+  return { action: 'retry', delayMs: Math.max(jittered, state.retryAfterMs ?? 0) }
+}
+
+async function signWebhook(secret: string, msg: { id: string; timestamp: number; payload: string }): Promise<string> {
+  const raw = Uint8Array.from(atob(secret.replace(/^whsec_/, '')), c => c.charCodeAt(0))
+  const key = await crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${msg.id}.${msg.timestamp}.${msg.payload}`)))
+  return 'v1,' + btoa(String.fromCharCode(...sig))
+}
+
+async function deliverWebhook(endpoint: Endpoint, event: WebhookEvent, deps: Deps): Promise<DeliveryResult> {
+  const body = JSON.stringify(event.payload)
+  let attempts = 0
+  while (true) {
+    const timestamp = deps.nowSeconds()                      // 每次嘗試都用當下的時間
+    const signature = await deps.sign(endpoint.secret, { id: event.id, timestamp, payload: body })
+    const headers = {
+      'webhook-id': event.id,                                // 重送時不變
+      'webhook-timestamp': String(timestamp),
+      'webhook-signature': signature,
+      'content-type': 'application/json',
+    }
+    let lastStatus: number | null = null
+    let retryAfterMs: number | null = null
+    try {
+      const res = await deps.post(endpoint.url, headers, body)
+      lastStatus = res.status
+      retryAfterMs = res.retryAfterMs
+    } catch {
+      // 逾時或連線失敗：跟其他失敗一樣交給 nextAttempt
+    }
+    attempts++
+    if (lastStatus !== null && lastStatus >= 200 && lastStatus < 300) return { result: 'delivered', attempts }
+    const d = nextAttempt({ attempt: attempts, lastStatus, retryAfterMs }, deps.retrySchedule, deps.random)
+    if (d.action === 'disable-endpoint') return { result: 'disabled', attempts }
+    if (d.action === 'give-up') return { result: 'gave-up', attempts }
+    deps.sleep(d.delayMs)
+  }
+}
+
+</script>
+  <script type="wrong">
+// 簽章用錯密鑰（用了 event.id）
+type Endpoint = { url: string; secret: string }
+type WebhookEvent = { id: string; payload: unknown }
+type PostResult = { status: number; retryAfterMs: number | null }
+type Deps = {
+  sign: (secret: string, msg: { id: string; timestamp: number; payload: string }) => Promise<string>
+  post: (url: string, headers: Record<string, string>, body: string) => Promise<PostResult>
+  nowSeconds: () => number
+  sleep: (ms: number) => Promise<void>
+  random: () => number
+  retrySchedule: readonly number[]
+}
+type DeliveryResult = { result: 'delivered' | 'gave-up' | 'disabled'; attempts: number }
+
+type RetryState = { attempt: number; lastStatus: number | null; retryAfterMs: number | null }
+type Decision = { action: 'retry'; delayMs: number } | { action: 'give-up' } | { action: 'disable-endpoint' }
+function nextAttempt(state: RetryState, retrySchedule: readonly number[], random: () => number): Decision {
+  if (state.lastStatus === 410) return { action: 'disable-endpoint' }
+  if (state.attempt >= retrySchedule.length) return { action: 'give-up' }
+  const jittered = Math.round(retrySchedule[state.attempt] * (0.9 + random() * 0.2))
+  return { action: 'retry', delayMs: Math.max(jittered, state.retryAfterMs ?? 0) }
+}
+
+async function signWebhook(secret: string, msg: { id: string; timestamp: number; payload: string }): Promise<string> {
+  const raw = Uint8Array.from(atob(secret.replace(/^whsec_/, '')), c => c.charCodeAt(0))
+  const key = await crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${msg.id}.${msg.timestamp}.${msg.payload}`)))
+  return 'v1,' + btoa(String.fromCharCode(...sig))
+}
+
+async function deliverWebhook(endpoint: Endpoint, event: WebhookEvent, deps: Deps): Promise<DeliveryResult> {
+  const body = JSON.stringify(event.payload)
+  let attempts = 0
+  while (true) {
+    const timestamp = deps.nowSeconds()                      // 每次嘗試都用當下的時間
+    const signature = await deps.sign(event.id, { id: event.id, timestamp, payload: body })
+    const headers = {
+      'webhook-id': event.id,                                // 重送時不變
+      'webhook-timestamp': String(timestamp),
+      'webhook-signature': signature,
+      'content-type': 'application/json',
+    }
+    let lastStatus: number | null = null
+    let retryAfterMs: number | null = null
+    try {
+      const res = await deps.post(endpoint.url, headers, body)
+      lastStatus = res.status
+      retryAfterMs = res.retryAfterMs
+    } catch {
+      // 逾時或連線失敗：跟其他失敗一樣交給 nextAttempt
+    }
+    attempts++
+    if (lastStatus !== null && lastStatus >= 200 && lastStatus < 300) return { result: 'delivered', attempts }
+    const d = nextAttempt({ attempt: attempts, lastStatus, retryAfterMs }, deps.retrySchedule, deps.random)
+    if (d.action === 'disable-endpoint') return { result: 'disabled', attempts }
+    if (d.action === 'give-up') return { result: 'gave-up', attempts }
+    await deps.sleep(d.delayMs)
+  }
+}
+
+</script>
+  <script type="wrong">
+// 第一次送出前也照 retrySchedule[0] 呼叫 sleep，之後索引差一
+type Endpoint = { url: string; secret: string }
+type WebhookEvent = { id: string; payload: unknown }
+type PostResult = { status: number; retryAfterMs: number | null }
+type Deps = {
+  sign: (secret: string, msg: { id: string; timestamp: number; payload: string }) => Promise<string>
+  post: (url: string, headers: Record<string, string>, body: string) => Promise<PostResult>
+  nowSeconds: () => number
+  sleep: (ms: number) => Promise<void>
+  random: () => number
+  retrySchedule: readonly number[]
+}
+type DeliveryResult = { result: 'delivered' | 'gave-up' | 'disabled'; attempts: number }
+
+type RetryState = { attempt: number; lastStatus: number | null; retryAfterMs: number | null }
+type Decision = { action: 'retry'; delayMs: number } | { action: 'give-up' } | { action: 'disable-endpoint' }
+function nextAttempt(state: RetryState, retrySchedule: readonly number[], random: () => number): Decision {
+  if (state.lastStatus === 410) return { action: 'disable-endpoint' }
+  if (state.attempt >= retrySchedule.length) return { action: 'give-up' }
+  const jittered = Math.round(retrySchedule[state.attempt] * (0.9 + random() * 0.2))
+  return { action: 'retry', delayMs: Math.max(jittered, state.retryAfterMs ?? 0) }
+}
+
+async function signWebhook(secret: string, msg: { id: string; timestamp: number; payload: string }): Promise<string> {
+  const raw = Uint8Array.from(atob(secret.replace(/^whsec_/, '')), c => c.charCodeAt(0))
+  const key = await crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${msg.id}.${msg.timestamp}.${msg.payload}`)))
+  return 'v1,' + btoa(String.fromCharCode(...sig))
+}
+
+async function deliverWebhook(endpoint: Endpoint, event: WebhookEvent, deps: Deps): Promise<DeliveryResult> {
+  const body = JSON.stringify(event.payload)
+  let attempts = 0
+  while (true) {
+    await deps.sleep(deps.retrySchedule[attempts] ?? 0)
+    const timestamp = deps.nowSeconds()                      // 每次嘗試都用當下的時間
+    const signature = await deps.sign(endpoint.secret, { id: event.id, timestamp, payload: body })
+    const headers = {
+      'webhook-id': event.id,                                // 重送時不變
+      'webhook-timestamp': String(timestamp),
+      'webhook-signature': signature,
+      'content-type': 'application/json',
+    }
+    let lastStatus: number | null = null
+    let retryAfterMs: number | null = null
+    try {
+      const res = await deps.post(endpoint.url, headers, body)
+      lastStatus = res.status
+      retryAfterMs = res.retryAfterMs
+    } catch {
+      // 逾時或連線失敗：跟其他失敗一樣交給 nextAttempt
+    }
+    attempts++
+    if (lastStatus !== null && lastStatus >= 200 && lastStatus < 300) return { result: 'delivered', attempts }
+    const d = nextAttempt({ attempt: attempts, lastStatus, retryAfterMs }, deps.retrySchedule, deps.random)
+    if (d.action === 'disable-endpoint') return { result: 'disabled', attempts }
+    if (d.action === 'give-up') return { result: 'gave-up', attempts }
+  }
+}
+
+</script>
+  <script type="wrong">
+// 只認 200：204 等其他 2xx 被當成失敗
+type Endpoint = { url: string; secret: string }
+type WebhookEvent = { id: string; payload: unknown }
+type PostResult = { status: number; retryAfterMs: number | null }
+type Deps = {
+  sign: (secret: string, msg: { id: string; timestamp: number; payload: string }) => Promise<string>
+  post: (url: string, headers: Record<string, string>, body: string) => Promise<PostResult>
+  nowSeconds: () => number
+  sleep: (ms: number) => Promise<void>
+  random: () => number
+  retrySchedule: readonly number[]
+}
+type DeliveryResult = { result: 'delivered' | 'gave-up' | 'disabled'; attempts: number }
+
+type RetryState = { attempt: number; lastStatus: number | null; retryAfterMs: number | null }
+type Decision = { action: 'retry'; delayMs: number } | { action: 'give-up' } | { action: 'disable-endpoint' }
+function nextAttempt(state: RetryState, retrySchedule: readonly number[], random: () => number): Decision {
+  if (state.lastStatus === 410) return { action: 'disable-endpoint' }
+  if (state.attempt >= retrySchedule.length) return { action: 'give-up' }
+  const jittered = Math.round(retrySchedule[state.attempt] * (0.9 + random() * 0.2))
+  return { action: 'retry', delayMs: Math.max(jittered, state.retryAfterMs ?? 0) }
+}
+
+async function signWebhook(secret: string, msg: { id: string; timestamp: number; payload: string }): Promise<string> {
+  const raw = Uint8Array.from(atob(secret.replace(/^whsec_/, '')), c => c.charCodeAt(0))
+  const key = await crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${msg.id}.${msg.timestamp}.${msg.payload}`)))
+  return 'v1,' + btoa(String.fromCharCode(...sig))
+}
+
+async function deliverWebhook(endpoint: Endpoint, event: WebhookEvent, deps: Deps): Promise<DeliveryResult> {
+  const body = JSON.stringify(event.payload)
+  let attempts = 0
+  while (true) {
+    const timestamp = deps.nowSeconds()                      // 每次嘗試都用當下的時間
+    const signature = await deps.sign(endpoint.secret, { id: event.id, timestamp, payload: body })
+    const headers = {
+      'webhook-id': event.id,                                // 重送時不變
+      'webhook-timestamp': String(timestamp),
+      'webhook-signature': signature,
+      'content-type': 'application/json',
+    }
+    let lastStatus: number | null = null
+    let retryAfterMs: number | null = null
+    try {
+      const res = await deps.post(endpoint.url, headers, body)
+      lastStatus = res.status
+      retryAfterMs = res.retryAfterMs
+    } catch {
+      // 逾時或連線失敗：跟其他失敗一樣交給 nextAttempt
+    }
+    attempts++
+    if (lastStatus === 200) return { result: 'delivered', attempts }
+    const d = nextAttempt({ attempt: attempts, lastStatus, retryAfterMs }, deps.retrySchedule, deps.random)
+    if (d.action === 'disable-endpoint') return { result: 'disabled', attempts }
+    if (d.action === 'give-up') return { result: 'gave-up', attempts }
+    await deps.sleep(d.delayMs)
+  }
+}
+
+</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：<code>OrderPaid</code> 事件要不要帶顧客的姓名、手機與完整明細，讓每個訂閱者都不用回查？</p>
+  <label data-key="a">要，資料帶越多，訂閱者越方便、系統越解耦</label>
+  <label data-key="b">不要，事件只能帶 ID，任何資料都要回查</label>
+  <label data-key="c">帶大多數訂閱者真正需要、不敏感的欄位（訂單 ID、門市、金額），個資與其他細節讓需要的人回查</label>
+  <p class="why">✓ 胖事件的每個欄位都是對所有訂閱者的承諾，改名就打壞別人；帶了手機和姓名，每個訂閱者（集點、報表、外送平台）都持有個資，都要保護、都要能刪除。(a) 只看到不用回查的好處。(b) 太極端：純薄事件讓每個訂閱者都回查，訂單服務掛了大家都不能工作，事件也失去「發布者掛了照樣能處理」的好處。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：廚房的消費者收到訂單 A-1001 的 seq 5，但這張訂單最後套用的是 seq 3。直接套用 seq 5 會怎樣？</p>
+  <label data-key="a">沒關係，事件會照產生的順序到達，seq 4 一定已經處理過了</label>
+  <label data-key="b">可能跳過 seq 4 代表的狀態；等 seq 4 晚到又被套用，會把狀態蓋回舊的。要先暫存 seq 5，或回查訂單服務的最新狀態</label>
+  <label data-key="c">比對兩個事件的 <code>time</code>，時間比較晚的那個才套用</label>
+  <p class="why">✓ 重試、不同 partition、relay 重送都會讓事件亂序，seq 4 晚到時直接套用會覆蓋掉 seq 5 的結果。(a) 是最常見的錯誤假設：送達順序不等於產生順序。(c) 時間來自不同機器的時鐘，有誤差，不能決定順序；序號由擁有訂單的服務在同一個交易裡遞增，才可靠。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：送 webhook 時，重送沿用第一次算好的 <code>webhook-timestamp</code> 與簽章，2 小時後的重送會怎樣？</p>
+  <label data-key="a">被接收端拒絕：它只接受前後 5 分鐘內的時間戳。每次重送都要用當下的時間重新簽章，<code>webhook-id</code> 保持不變</label>
+  <label data-key="b">會成功，簽章的內容沒變，驗證一定通過</label>
+  <label data-key="c">會成功，但接收端會把它當成新事件、重複處理</label>
+  <p class="why">✓ 時間戳在簽章範圍內，防的就是重放攻擊：太舊的時間戳一律拒絕，不管簽章對不對（<a href="../../auth/lessons/17-api-keys-m2m.html">認證課第 17 課</a>）。規格要求每次重試都更新時間戳。(b) 只檢查了簽章，忽略了時間容忍。(c) 重複處理是「每次換新 webhook-id」造成的問題，不是這一題。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 7：有人提議把付款授權改成「訂單服務發一個 <code>PaymentRequested</code> 事件，金流服務處理完再發 <code>PaymentAuthorized</code>」，讓兩個服務解耦。適合嗎？</p>
+  <label data-key="a">適合，事件驅動比同步呼叫好</label>
+  <label data-key="b">適合，只要訂閱者夠多就值得</label>
+  <label data-key="c">不適合：顧客站在櫃台等，要立刻知道付款成功沒，這是要等結果的命令；付款成功之後的集點、收據、報表才適合交給事件</label>
+  <p class="why">✓ <code>PaymentRequested</code> 名字就說明它是命令，只有一個接收者、發送者在等結果。改成事件只是把同步呼叫藏起來，還多了「結果要多久才來、沒來怎麼辦」的問題。(a) 事件不是一律比較好，它的代價是最終一致與看不見的流程。(b) 訂閱者多寡不改變「顧客要立刻知道結果」這個需求。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>把命令包裝成事件</strong>（<code>SendEmail</code>）：只有一個接收者、發布者在指揮別人，耦合沒有減少。發布已經發生的事實（<code>OrderPaid</code>），讓訂閱者自己決定做什麼。</li>
+  <li><strong>胖事件帶個資</strong>：每個訂閱者都拿到一份，都要保護、都要能刪除。只帶大多數人需要、不敏感的欄位，其他回查。</li>
+  <li><strong>事件沒有唯一 ID，或送出時才產生 ID</strong>：消費者無法去重。ID 在事件產生時就決定，重送沿用。</li>
+  <li><strong>假設事件依序到達，或用時間排序</strong>：重試、分區都會亂序，時鐘有誤差。用每個聚合的序號，舊的丟掉、還沒輪到的暫存或回查。</li>
+  <li><strong>交易提交前就發事件</strong>：交易回滾了事件卻已經送出。用 outbox（<a href="12-queues-outbox.html">第 12 課</a>），提交後才送。</li>
+  <li><strong>webhook 重送不重新簽章，或每次換新的 <code>webhook-id</code></strong>：前者 5 分鐘後的重送全被拒絕，後者讓接收端無法去重。ID 不變、時間戳與簽章每次重算。</li>
+  <li><strong>所有客戶的 webhook 共用一條佇列</strong>：一個每次都逾時的客戶拖住所有人。每個端點自己的佇列與並行上限。</li>
+  <li><strong>跟隨轉址、送到內網位址</strong>：SSRF。不跟隨轉址，檢查解析後的 IP，送出的 worker 只能連外網（<a href="../../auth/lessons/22-ssrf.html">認證課第 22 課</a>）。</li>
+  <li><strong>沒有重播工具</strong>：客戶的系統壞了三天，修好後只能請工程師手動補資料。提供依時間範圍重送的 API，沿用原本的 <code>webhook-id</code>。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>付款後的通知用同步命令串起來，任何一個下游掛了付款就失敗；改成發布 <code>OrderPaid</code>，下游自己訂閱，報表掛了不影響付款、加功能不改訂單服務。</li>
+  <li>命令要求別人做事、可以被拒絕、格式由接收者決定；事件宣布已經發生的事實、用過去式命名、格式由發布者決定。偽裝成事件的命令不會減少耦合。</li>
+  <li>薄事件契約小但要回查；胖事件不用回查但契約大、會散播個資；事件溯源用事件當儲存，只在需要完整歷史時才值得。</li>
+  <li>事件要有唯一 ID 與來源（CloudEvents 1.0：<code>id</code>、<code>source</code>、<code>specversion</code>、<code>type</code>），再加上聚合 ID 與序號。</li>
+  <li>消費者要假設重複與亂序：依 ID 去重、依序號丟掉舊的、暫存還沒輪到的；投影可以重播重建，UI 要呈現最終一致的落差。</li>
+  <li>送 webhook：ID 不變、每次重新簽章、只有 2xx 算成功、410 停用、尊重 <code>Retry-After</code>、跨多天退避加 jitter、每個端點各自的佇列、防 SSRF、提供重播。</li>
+  <li>需要立刻知道結果的（付款授權）用同步命令；流程長到看不見時改用 orchestration。上線後看消費延遲、去重與丟棄次數、每個端點的成功率。</li>
+</ul>
+<p>下一課：事件送到了後端，還要送到顧客的手機上，顯示「你的拿鐵做好了」：比較輪詢、SSE 與 WebSocket，以及上萬條連線時怎麼擴展。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

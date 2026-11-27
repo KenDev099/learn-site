@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>4. N+1 與 DataLoader：一次請求不能發出一百句 SQL（資深）</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="4" data-practice="api-styles">
+<header>
+  <div class="eyebrow">階段 2：GraphQL 基礎 · 第 4 課</div>
+  <h1>N+1 與 DataLoader：一次請求不能發出一百句 SQL（資深）</h1>
+</header>
+<main>
+
+<p>上一課把每個欄位寫成一個 resolver，程式很乾淨：<code>Order.customer</code> 用 <code>customer_id</code> 查顧客、<code>OrderItem.product</code> 用 <code>product_id</code> 查商品。可是前端查「最近 20 張訂單，每張的顧客與品項」時，這些 resolver 會被呼叫幾十次，每次各發一句 SQL。本機資料少看不出來，上線後訂單一多，一個畫面就讓資料庫收到上百句查詢。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>示範問題與成因：查 5 張訂單為什麼發出 18 句 SQL，GraphQL 為什麼比 REST 更容易踩到。</li>
+  <li>自己做迷你版：怎麼把 20 次「查一個顧客」收成一句 <code>WHERE id = ANY($1)</code>。</li>
+  <li>dataloader 套件：batch 函式的三條規則，為什麼每個請求要建一份 loader、改了資料要清快取。</li>
+  <li>什麼時候不用 DataLoader：每組只取前 3 筆、後台匯出報表這類形狀固定的查詢，改寫一句 JOIN。</li>
+  <li>上線後怎麼發現 N+1：開發機看不出來，正式環境靠測試、log 和追蹤把它抓出來。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="03-resolvers-mutations.html">第 3 課</a>的 resolver：每個欄位一個函式，<code>parent</code> 是上一層的回傳值；context 每個請求建立一份。</li>
+  <li><a href="../../typescript/lessons/07-event-loop.html">TypeScript 課第 7 課</a>的微任務：Promise 的後續工作排在目前的同步程式跑完之後、下一個計時器之前執行。</li>
+  <li><a href="../../postgresql/lessons/09-joins.html">PostgreSQL 課第 9 課</a>的 JOIN：依關聯欄位把兩張表的列配在一起，一句 SQL 查出訂單和它的顧客。</li>
+</ul></div>
+
+<h2>示範問題：查 5 張訂單，發出 18 句 SQL</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs api-styles 04</code>，會建立 <code>api-styles/practice/work/04/</code>（還沒安裝套件的話，先照<a href="02-graphql-schema-queries.html">第 2 課</a>開頭的步驟 <code>npm install</code>）。這一課的資料庫是真的 PostgreSQL 18.6：用 PGlite 0.5.13 在 Node 程序裡執行，不需要 Docker。<code>helpers/db.ts</code> 的 <code>createDb()</code> 建一個記憶體資料庫，裡面是咖啡店的資料；它回傳的 <code>db.query(sql, params)</code> 每執行一句，就把 SQL 文字推進 <code>db.log</code> 陣列。數 <code>db.log</code> 的長度，就知道發了幾句。</p>
+<p><code>naive.ts</code> 是沒有優化的 resolver，寫法跟上一課一樣，每個欄位各查各的：</p>
+<pre>// naive.ts（節錄）
+Order: {
+  customer: (order, _, ctx) =&gt;
+    first(ctx.db.query('SELECT id, name FROM customers WHERE id = $1', [order.customer_id])),
+  items: (order, _, ctx) =&gt;
+    ctx.db.query('SELECT … FROM order_items WHERE order_id = $1 ORDER BY product_id', [order.id]),
+},
+OrderItem: {
+  product: (item, _, ctx) =&gt;
+    first(ctx.db.query('SELECT id, name, price, category FROM products WHERE id = $1', [item.product_id])),
+},</pre>
+<p>在 <code>work/04</code> 執行 <code>node examples/measure.ts 5</code>，它用 naive.ts 執行 <code>{ orders(last: 5) { id total customer { name } items { quantity product { name price } } } }</code>，再把 <code>db.log</code> 依 SQL 文字分組：</p>
+<pre>naive.ts：這次請求一共 18 句 SQL
+   1 次  SELECT id, customer_id, ordered_at, total FROM orders ORDER BY ordered_at DESC, id DESC LIMIT $1
+   5 次  SELECT id, name FROM customers WHERE id = $1
+   5 次  SELECT order_id, product_id, quantity, unit_price FROM order_items WHERE order_id = $1 ORDER BY product_id
+   7 次  SELECT id, name, price, category FROM products WHERE id = $1</pre>
+<p>這就是 <strong>N+1 問題</strong>：先用 1 句查出 N 筆，再對每一筆各查 1 句，總共 N+1 句。這裡還疊了兩層：訂單 1 句，顧客 N 句，品項 N 句，商品每個品項 1 句。所以句數是 <code>1 + N + N + 品項數</code>。查 20 張訂單、平均每張 3 個品項，就是 1 + 20 + 20 + 60 = 101 句。咖啡店只有 6 種商品，商品卻被查了 7 次：同一個商品被不同訂單重複查。</p>
+
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="resolver 樹：Query.orders 一句 SQL，底下每張訂單的 customer 與 items 各一句，每個品項的 product 再一句">
+    <defs><marker id="a4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="250" y="12" width="200" height="40" rx="6"/>
+    <text class="d-text" x="350" y="37" text-anchor="middle">Query.orders：1 句</text>
+    <line class="d-line" x1="300" y1="52" x2="150" y2="100" marker-end="url(#a4)"/>
+    <line class="d-line" x1="400" y1="52" x2="530" y2="100" marker-end="url(#a4)"/>
+    <rect class="d-box" x="40" y="102" width="230" height="40" rx="6"/>
+    <text class="d-text" x="155" y="127" text-anchor="middle">Order.customer：N 句</text>
+    <rect class="d-box" x="420" y="102" width="230" height="40" rx="6"/>
+    <text class="d-text" x="535" y="127" text-anchor="middle">Order.items：N 句</text>
+    <line class="d-line" x1="535" y1="142" x2="535" y2="186" marker-end="url(#a4)"/>
+    <rect class="d-box" x="400" y="188" width="270" height="40" rx="6"/>
+    <text class="d-text" x="535" y="213" text-anchor="middle">OrderItem.product：品項數 句</text>
+    <text class="d-small" x="40" y="180">每個方框是一個欄位的 resolver；</text>
+    <text class="d-small" x="40" y="198">它被呼叫幾次，就發出幾句 SQL</text>
+    <text class="d-accent" x="40" y="228">總數 = 1 + N + N + 品項數</text>
+  </svg>
+  <figcaption>GraphQL 由上往下一層一層執行 resolver：清單有幾筆，下一層的 resolver 就被呼叫幾次。</figcaption>
+</figure>
+
+<div class="callout practice"><strong>💡 實務上：「列表頁很慢」常常不是 SQL 慢，而是 SQL 太多</strong><br>常見的回報是：咖啡店後台的訂單列表本機很快、上線後要好幾秒，可是慢查詢 log（資料庫記錄執行太久的 SQL 的地方）裡找不到任何一句慢的 SQL。每一句都很快，只是有一百句，每句還要走一次到資料庫的網路來回。查這類問題時，先看「這個請求發了幾句 SQL」，再看「哪一句最慢」。資料量越大越慢、而且跟清單長度成正比，是 N+1 的典型特徵；換成分頁只能減輕，不會根治。</div>
+
+<h2>為什麼 GraphQL 特別容易 N+1</h2>
+<p>REST 的一支端點由後端決定回傳什麼，寫 handler 的人看得到整個形狀，自然會寫一句 JOIN 一次查完。GraphQL 把形狀交給客戶端，伺服器把每個欄位拆成獨立的 resolver：<code>Order.customer</code> 只拿到自己那張訂單（parent），不知道旁邊還有 19 張訂單也在查顧客。每個 resolver 單獨看都對，合起來就是 N+1。</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>REST handler</th><th>GraphQL resolver</th></tr>
+  <tr><td>誰決定回傳哪些欄位</td><td>後端</td><td>客戶端的查詢</td></tr>
+  <tr><td>寫程式時看得到什麼</td><td>整個回應</td><td>只有自己的 parent 和參數</td></tr>
+  <tr><td>常見寫法</td><td>一句 JOIN</td><td>每個關聯欄位各查一次</td></tr>
+  <tr><td>N+1 何時出現</td><td>ORM 延遲載入時（<a href="../../nestjs/lessons/16-query-performance.html">NestJS 課第 16 課</a>）</td><td>只要清單底下有關聯欄位</td></tr>
+</table></div>
+<p>不能叫前端別查巢狀欄位，那等於放棄 GraphQL。要做的是讓同一層的兄弟 resolver 把各自要的 id 交給同一個地方，由它合成一句 SQL。這個動作叫<strong>批次（batching）</strong>：把很多個小請求合成一個。</p>
+
+<h2>原理：自己做一個 30 行的迷你版</h2>
+<p>關鍵在時機。GraphQL 執行到 <code>Order.customer</code> 這一層時，會在同一段同步程式裡把 20 張訂單的 resolver 依序呼叫完，才輪到下一個工作。所以只要讓 resolver 先「登記」要哪個 id、拿回一個 Promise，等這段同步程式跑完再一次查，就能把 20 個 id 收成一批。<code>examples/mini-loader.ts</code>：</p>
+<pre>// examples/mini-loader.ts（節錄）
+function createMiniLoader&lt;K, V&gt;(batch: (keys: K[]) =&gt; Promise&lt;V[]&gt;) {
+  let queue: Job&lt;K, V&gt;[] = []
+  async function dispatch() {
+    const jobs = queue
+    queue = []                                   // 之後的 load 進下一批
+    try {
+      const values = await batch(jobs.map(j =&gt; j.key))
+      jobs.forEach((job, i) =&gt; job.resolve(values[i]))   // 第 i 個 key 拿第 i 個值
+    } catch (error) {
+      jobs.forEach(job =&gt; job.reject(error))
+    }
+  }
+  return {
+    load(key: K): Promise&lt;V&gt; {
+      return new Promise&lt;V&gt;((resolve, reject) =&gt; {
+        queue.push({ key, resolve, reject })
+        if (queue.length === 1) queueMicrotask(dispatch)   // 這一批的第一個 key：排定「目前的同步程式跑完後」送出
+      })
+    },
+  }
+}</pre>
+<p>執行 <code>node examples/mini-loader.ts</code>：</p>
+<pre>batch 收到 keys： [ 2, 1, 2 ]
+第一批結果： [ '陳美華', '王小明', '陳美華' ]
+batch 收到 keys： [ 3 ]
+第二批結果： 林志豪</pre>
+<ul>
+  <li><code>load(key)</code> 不馬上查，只把 key 放進佇列、回傳 Promise。</li>
+  <li>第一個 key 進佇列時，用 <code>queueMicrotask</code> 排定 <code>dispatch</code>。微任務在目前的同步程式跑完後才執行（<a href="../../typescript/lessons/07-event-loop.html">TypeScript 課第 7 課</a>），所以同一段程式裡的三次 <code>load</code> 都進了同一批。</li>
+  <li><code>batch</code> 收到一組 key，回傳一組值，<strong>第 i 個值對應第 i 個 key</strong>。這個約定是整個機制的核心，下一節的三條規則都從它來。</li>
+  <li>等過一次之後才 <code>load(3)</code>，那時第一批已經送出，所以它自成一批。批次只合併「同一個時機」的 load。</li>
+</ul>
+<p>正式的 <strong>DataLoader</strong>（Facebook 開源、現在放在 GitHub 的 graphql 組織下維護的 <code>dataloader</code> 套件，本課用 2.2.3）做的是同一件事，送出的時機再晚一點：dataloader 2.2.3 的原始碼裡，在 Node 上是先等目前排入的 Promise 工作跑完，再用 <code>process.nextTick</code>（<a href="../../node/lessons/07-event-loop.html">Node 課第 7 課</a>）送出。這樣 resolver 裡多一層 <code>await</code> 才呼叫的 load 也能趕上同一批。另外它多了快取（同一個 key 只查一次）、<code>maxBatchSize</code>（一批最多幾個 key）和錯誤處理。</p>
+
+<h2>用 dataloader 套件：batch 函式的三條規則</h2>
+<p>建立一個 loader 只要給它一個 <strong>batch 函式</strong>（batch function）：收到一組 key，一次回傳對應的一組值。</p>
+<pre>import DataLoader from 'dataloader'
+
+const customerById = new DataLoader&lt;number, CustomerRow | null&gt;(async ids =&gt; {
+  const rows = await db.query&lt;CustomerRow&gt;('SELECT id, name FROM customers WHERE id = ANY($1)', [ids])
+  const byId = new Map(rows.map(r =&gt; [r.id, r]))
+  return ids.map(id =&gt; byId.get(id) ?? null)
+})
+
+// resolver 裡
+customer: (order, _, ctx) =&gt; ctx.loaders.customerById.load(order.customer_id)</pre>
+<p><code>WHERE id = ANY($1)</code> 是 PostgreSQL 用一個陣列參數（<a href="../../postgresql/lessons/14-jsonb-arrays.html">PostgreSQL 課第 14 課</a>）一次比對多個值的寫法：<code>$1</code> 傳 JS 陣列 <code>[3, 1, 5]</code>，等於 <code>id IN (3, 1, 5)</code>，但不管幾個 id 都是同一句 SQL。PGlite 會把 JS 的數字陣列當成整數陣列，不用另外轉型。<code>id</code> 是主鍵，本來就有索引；用別的欄位批次查時（例如 <code>order_items.order_id</code>），那個欄位要有索引（<a href="../../postgresql/lessons/20-indexes.html">PostgreSQL 課第 20 課</a>），否則一句查詢會掃整張表（PostgreSQL 課第 20 課）。</p>
+<p>batch 函式的回傳有三條規則，違反任何一條，結果就會錯或整批失敗：</p>
+<ol>
+  <li><strong>長度相同</strong>：回傳陣列的長度要等於 keys。長度不同時，DataLoader 會讓這一批的每個 load 都失敗（錯誤訊息是 <code>…not return a Promise of an Array of the same length as the Array of keys</code>）。</li>
+  <li><strong>順序相同</strong>：第 i 個值對應第 i 個 key。SQL 沒寫 <code>ORDER BY</code> 時，資料庫不保證回傳順序；就算寫了 <code>ORDER BY id</code>，順序也是 id 由小到大，不是 keys 的順序。所以一律先放進 <code>Map</code>，再用 <code>ids.map(…)</code> 依 keys 的順序取出。</li>
+  <li><strong>找不到放 null</strong>：不能把找不到的過濾掉，那會讓長度不同。也可以放一個 <code>Error</code> 物件，只讓那一個 load 失敗。</li>
+</ol>
+<p>直接回傳 <code>rows</code> 是最常見的錯：本機測試資料剛好每個 id 都有、順序也剛好一樣，就會一直通過。keys 是 <code>[3, 1, 9]</code>、資料庫只有 1 和 3 時，正確回傳是 <code>[row3, row1, null]</code>。</p>
+<p><strong>一對多</strong>的關聯（一張訂單有多個品項）也一樣，只是每個 key 對應一個陣列，回傳陣列的陣列：</p>
+<pre>const itemsByOrderId = new DataLoader&lt;number, ItemRow[]&gt;(async orderIds =&gt; {
+  const rows = await db.query&lt;ItemRow&gt;(
+    'SELECT order_id, product_id, quantity, unit_price FROM order_items WHERE order_id = ANY($1) ORDER BY order_id, product_id',
+    [orderIds])
+  const byOrder = Map.groupBy(rows, r =&gt; r.order_id)     // Map&lt;order_id, ItemRow[]&gt;
+  return orderIds.map(id =&gt; byOrder.get(id) ?? [])          // 沒有品項：空陣列
+})
+// orderIds [7, 2, 99] → [[品項…], [品項…], []]</pre>
+<p><code>Map.groupBy(陣列, 取 key 的函式)</code> 是 ES2024 加入的內建函式（Node 21 起可用），把陣列依 key 分組成 <code>Map</code>。改用 loader 之後再跑一次 <code>node examples/measure.ts mine</code>（練習 2 做完才會成功），不管查幾張訂單都是 4 句：</p>
+<pre>resolvers.ts：這次請求一共 4 句 SQL
+   1 次  SELECT id, customer_id, ordered_at, total FROM orders ORDER BY ordered_at DESC, id DESC LIMIT $1
+   1 次  SELECT id, name FROM customers WHERE id = ANY($1)
+   1 次  SELECT order_id, product_id, quantity, unit_price FROM order_items WHERE order_id = ANY($1) ORDER BY order_id, product_id
+   1 次  SELECT id, name, price, category FROM products WHERE id = ANY($1)</pre>
+<div class="callout warn">key 的型別要一致。DataLoader 的快取用 <code>Map</code> 比對 key，<code>'1'</code> 和 <code>1</code> 是兩個不同的 key。GraphQL 的 <code>ID</code> 參數進來是字串，資料庫的 <code>customer_id</code> 是數字：在 resolver 裡統一轉成數字（<code>Number(args.id)</code>）再 load。</div>
+
+<h2>每個請求一份 loader；改了資料要清快取</h2>
+<p>DataLoader 的快取是<strong>每個請求的快取（per-request cache）</strong>：同一個請求裡 load 過的 key，第二次直接拿同一個 Promise，不再查資料庫。它沒有過期時間，也不知道誰有權限看什麼。所以 loader 一定要在 context 裡每個請求建立一份：</p>
+<pre>// context.ts
+export function createContext(db: Db): Context {
+  return { db, loaders: createLoaders(db) }   // 每個請求一份新的；請求結束就跟著回收
+}</pre>
+<p>把 loader 存在模組變數裡「省下建立的成本」，會出這些事：</p>
+<ul>
+  <li><strong>權限外洩</strong>：王小明的請求載入了他的訂單；接著陳美華的請求用同一個 loader 查同一個 id，直接從快取拿到，權限檢查如果寫在批次查詢裡就被跳過了。</li>
+  <li><strong>讀到過期資料</strong>：店長改了拿鐵的價格，之後每個請求都還拿到快取裡的舊價格，直到程序重啟。</li>
+  <li><strong>記憶體只增不減</strong>：快取永遠不清，載入過的每一列都留在記憶體裡。</li>
+</ul>
+<p>建立 loader 的成本只是幾個物件，可以忽略。跨請求的快取要用真的快取層，並且設計失效機制（<a href="../../nestjs/lessons/19-caching-redis.html">NestJS 課第 19 課</a>的 Redis）。</p>
+<p>同一個請求裡也會過期：mutation 先 load 了商品確認它存在，接著 UPDATE 改價，再 load 一次回傳結果。第二次 load 會拿到快取裡的舊價格。改完資料要處理快取：</p>
+<pre>const [row] = await ctx.db.query('UPDATE products SET price = $2 WHERE id = $1 RETURNING id, name, price, category', [id, args.price])
+ctx.loaders.productById.clear(id).prime(id, row)   // 清掉舊值，放入新的那一列
+return ctx.loaders.productById.load(id)</pre>
+<p><code>clear(key)</code> 清掉一個 key 的快取，下次 load 會重新查；<code>prime(key, value)</code> 把已知的值直接放進快取（key 已經有值時 prime 不會覆蓋，所以先 clear）；<code>clearAll()</code> 清掉全部。只 clear 不 prime 也對，代價是多一句 SELECT。不要用 <code>new DataLoader(fn, { cache: false })</code> 來「修」：那樣同一個請求裡重複的 id 又會被查很多次。</p>
+
+<div class="callout practice"><strong>💡 實務上：review 時檢查 loader 在哪裡建立、結果會不會因人而異</strong><br>新增 DataLoader 的 PR，資深工程師會先問三件事：loader 是不是在 context 裡每個請求建立；batch 函式的結果會不會因為「誰在看」而不同（例如顧客只能看自己的訂單），會的話權限條件要跟著這個請求的使用者一起放進 batch 的 SQL；這個欄位會被 mutation 改到嗎，改到之後有沒有 <code>clear</code>。跨請求共用的錯誤在單一請求的測試裡看不出來，要送兩個請求來驗證：像練習 3 在兩個請求之間改資料，或用兩個不同使用者各查一次，確認第二個請求拿到的是自己的結果。</div>
+
+<h2>什麼時候不用 DataLoader</h2>
+<p>DataLoader 解決的是「同一層的兄弟各自要一筆關聯資料」。它不是萬用的：</p>
+<ul>
+  <li><strong>每一層仍至少一句</strong>：它把同一層合併，不會把不同層合併。查詢有 3 層關聯，就至少 3 句（加上最上層）。這通常可以接受，因為句數跟資料量無關了。</li>
+  <li><strong>每個父項各自要 LIMIT</strong>：「每張訂單只顯示金額最高的 3 個品項」。批次之後在同一句 SQL 加 <code>LIMIT 3</code>，LIMIT 作用在整句查詢上：</li>
+</ul>
+<pre>SELECT order_id, product_id FROM order_items WHERE order_id = ANY($1) LIMIT 3
+-- 傳 [1, 2, 3, 4]，只回 3 列：(1,1) (1,2) (2,2)，訂單 3、4 一個品項都沒有</pre>
+<p>要每組各取 3 筆，用 <strong>LATERAL JOIN</strong>（<a href="../../postgresql/lessons/29-query-tuning.html">PostgreSQL 課第 29 課</a>）或視窗函式 <code>ROW_NUMBER() OVER (PARTITION BY order_id …)</code>（<a href="../../postgresql/lessons/17-window-functions.html">PostgreSQL 課第 17 課</a>）。這句 SQL 也可以放在 batch 函式裡，重點是每組各自排序、各自 LIMIT：</p>
+<pre>SELECT o.id AS order_id, i.product_id, i.quantity, i.unit_price
+FROM unnest($1::int[]) AS o(id)
+CROSS JOIN LATERAL (
+  SELECT product_id, quantity, unit_price FROM order_items
+  WHERE order_id = o.id
+  ORDER BY quantity * unit_price DESC, product_id
+  LIMIT 3
+) AS i</pre>
+<ul>
+  <li><strong>形狀固定、每次都要全部資料</strong>：後台的訂單詳情、匯出報表，每次都要訂單＋顧客＋全部品項＋商品名稱。這種不是由客戶端決定形狀的地方，在一個地方寫一句 JOIN 最直接。</li>
+  <li><strong>看 info 決定要不要 JOIN</strong>：resolver 的第四個參數 <code>info</code> 帶著這次查詢選了哪些欄位，可以在父 resolver 先看「有沒有選 customer」再決定要不要 JOIN（叫 lookahead）。這是進階手段，程式會跟查詢形狀綁在一起，多數時候 DataLoader 就夠了。</li>
+</ul>
+<p>練習 4 會用到下面這張表。每一題選一種做法，再選一個理由代碼：</p>
+<div class="table-wrap"><table>
+  <tr><th>理由代碼</th><th>意思</th></tr>
+  <tr><td><code>optional-field</code></td><td>要不要查這個關聯由客戶端決定，同一層很多兄弟各要一筆；只在真的被查時才批次載入</td></tr>
+  <tr><td><code>per-parent-limit</code></td><td>每個父項要各自排序、各自取前幾筆，一句 LIMIT 做不到</td></tr>
+  <tr><td><code>fixed-shape</code></td><td>形狀固定、每次都要全部資料，一句 JOIN 一次查完</td></tr>
+  <tr><td><code>always-faster</code></td><td>JOIN 一定比較快</td></tr>
+  <tr><td><code>less-code</code></td><td>程式比較短</td></tr>
+  <tr><td><code>shared-cache</code></td><td>快取可以讓所有請求共用</td></tr>
+</table></div>
+<p>後三個是常見但不成立的理由：JOIN 在一對多時會讓父列重複很多次，不一定比較快；程式長短不是選擇的依據；DataLoader 的快取不能跨請求。</p>
+
+<h2>上線後怎麼發現 N+1</h2>
+<p>N+1 在開發機上幾乎看不出來：資料少、資料庫在本機，100 句也只要幾毫秒。上線後資料變多、資料庫在另一台機器，每句多一次網路來回，才變慢。所以要主動量：</p>
+<ul>
+  <li><strong>在測試裡斷言 SQL 句數</strong>：本課練習的做法。重要的查詢寫一個測試：「不管幾張訂單，都是 4 句」。有人把 resolver 改回直接查詢，測試會擋下來。</li>
+  <li><strong>每個請求記錄 SQL 數量</strong>：用 request context（<a href="../../node/lessons/19-structured-logging.html">Node 課第 19 課</a>）在每個請求結束時把句數寫進 log，查「句數最多的操作名稱」。</li>
+  <li><strong>tracing 的 span 數</strong>：分散式追蹤（<a href="../../devops/lessons/23-tracing.html">DevOps 課第 23 課</a>）會把每句 SQL 畫成一個 span，一個請求底下排了幾十條一樣的 span 就是 N+1。</li>
+</ul>
+
+<div class="callout practice"><strong>💡 實務上：句數多的操作，先修流量大的</strong><br>log 排出「句數最多的操作」之後，不用一次全部修完：先修顧客天天在點的畫面（例如咖啡店 App 的訂單紀錄），後台一天只跑幾次的報表可以排後面。修完補一個句數測試，放進每次 push 都會自動跑的測試（CI）。要注意測試只擋得住你寫進去的查詢：前端在查詢裡多加一個巢狀欄位，就是新的查詢形狀，要把它也加進測試，或在 code review 時問一句「這個欄位底下有沒有用 loader」。</div>
+
+<h2>練習</h2>
+<p>四題都在 <code>work/04/</code>。<code>schema.graphql</code>、<code>naive.ts</code>、<code>rows.ts</code>、<code>server.ts</code> 不用改。測試每次用不同的隨機訂單，寫死的數字不會過。</p>
+
+<div class="local" data-test="ex1" data-files="count.ts notes.md">
+  <p>練習 1：先量測再修。在 <code>count.ts</code> 寫 <code>countQueries(yoga, db, query, variables?)</code>：用 <code>yoga.fetch('http://localhost/graphql', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ query, variables }) })</code> 執行查詢，回傳這一次請求寫進 <code>db.log</code> 的句數（每次都從 0 開始算；UPDATE 也算）。回應有 <code>errors</code> 時丟錯，因為查詢根本沒執行，數字不可信。然後執行 <code>node examples/measure.ts</code>，把 naive.ts 在 N=20 時的句數填進 <code>notes.md</code> 最後一行。測試會用 N = 5、20、37 比對你的數字和從資料庫算出的 <code>1 + N + N + 品項數</code>。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="loaders.ts resolvers.ts">
+  <p>練習 2：在 <code>loaders.ts</code> 完成 <code>createLoaders(db)</code>，回傳 <code>customerById</code>、<code>productById</code>、<code>itemsByOrderId</code> 三個 DataLoader。每個 batch 函式只發一句 SQL（<code>WHERE … = ANY($1)</code>），依 keys 的順序回傳，找不到的放 <code>null</code>（<code>itemsByOrderId</code> 放 <code>[]</code>，品項依 <code>product_id</code> 由小到大）。每次呼叫 <code>createLoaders</code> 都建立新的 loader。再把 <code>resolvers.ts</code> 的 <code>Query.product</code>、<code>Order.customer</code>、<code>Order.items</code>、<code>OrderItem.product</code> 改用 <code>ctx.loaders</code>。測試會打亂資料庫回傳的順序、放進重複與不存在的 id，並確認 37 張訂單的查詢只發出 4 句 SQL、結果跟 naive.ts 一模一樣。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="context.ts resolvers.ts">
+  <p>練習 3：<code>context.ts</code> 的起始程式把 loader 存在模組變數裡，所有請求共用。改成每個請求一份。再修 <code>resolvers.ts</code> 的 <code>Mutation.updatePrice</code>：它先 load 商品確認存在、UPDATE 改價、再 load 一次回傳，現在回傳的是舊價格；改成讓同一個請求後面的讀取看到新價格，而且不要關掉快取。測試會在兩個請求之間直接改資料庫，確認第二個請求自己查、看到新值；在同一份 mutation 連改兩次價格，請求結束後再用那個請求的 loader 讀一次，要拿到新價格；並檢查同一個請求裡同一個商品 id 只查一次。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="explain.md">
+  <p>練習 4：在 <code>explain.md</code> 為三個情境各選一種做法（<code>dataloader</code>、<code>join</code>、<code>lateral</code>）和一個理由代碼（上面「什麼時候不用 DataLoader」那張表），格式是一題一行 <code>1: 做法 | 理由代碼</code>。一、GraphQL 的 <code>orders</code> 列表，有的畫面要顯示顧客名稱，有的不要（<code>Order.customer</code>）。二、每張訂單只顯示金額最高的 3 個品項。三、後台的單一訂單詳情端點，每次都要訂單、顧客、全部品項和商品名稱，形狀固定。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：DataLoader 怎麼知道「該送出這一批了」？</p>
+  <label data-key="a">固定每 10 毫秒送一次</label>
+  <label data-key="b">等目前這段同步程式和已排入的 Promise 工作跑完才呼叫 batch 函式，這段時間內所有 load 的 key 合成一批</label>
+  <label data-key="c">收到 100 個 key 才送</label>
+  <label data-key="d">每次 load 都立刻送</label>
+  <p class="why">✓ dataloader 2.2.3 在 Node 上先等排入的 Promise 工作跑完，再用 process.nextTick 送出。GraphQL 在同一段程式裡呼叫完同一層的兄弟 resolver，所以它們的 load 會合在一起。用計時器（a）會讓每個請求白白多等；數量門檻（c）在 key 不夠多時會一直等；立刻送（d）就回到 N+1。要改時機可以用 batchScheduleFn 選項，很少需要。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：batch 函式收到 keys <code>[3, 1, 9]</code>，資料庫只有 id 1 和 3。正確的回傳是？</p>
+  <label data-key="a"><code>[row1, row3]</code></label>
+  <label data-key="b"><code>[row3, row1, null]</code></label>
+  <label data-key="c"><code>[row1, row3, null]</code></label>
+  <label data-key="d">丟錯，因為 9 不存在</label>
+  <p class="why">✓ 回傳要跟 keys 一樣長、一樣順序，找不到的放 null（或放 Error 物件，只讓那一個 load 失敗）。a 長度不同，整批都會失敗；c 長度對但順序是資料庫的順序，3 號會拿到 1 號的資料；d 讓同一批的其他 load 也一起失敗。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 7：把 DataLoader 建在模組層級、讓所有請求共用，會怎樣？</p>
+  <label data-key="a">效能更好，沒有缺點</label>
+  <label data-key="b">DataLoader 會報錯，不能這樣用</label>
+  <label data-key="c">快取跨請求：可能拿到別人權限下載入的資料、改價後一直讀到舊值，記憶體也只增不減</label>
+  <label data-key="d">批次會失效，變回 N+1</label>
+  <p class="why">✓ DataLoader 的快取只是記憶化（memoization）：同一個 key 給同一個 Promise，沒有過期、沒有權限的概念，設計上就是每個請求一份。它不會報錯（b），批次也照常運作（d），所以這個錯誤在測試裡常常看不出來。跨請求的快取要用專門的快取層並設計失效。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 8：「每張訂單只顯示金額最高的 3 個品項」，用 DataLoader 批次 orderId，batch 函式的 SQL 加上 <code>LIMIT 3</code>，結果是？</p>
+  <label data-key="a">每張訂單各 3 個品項</label>
+  <label data-key="b">整批總共只有 3 個品項，大部分訂單是空的</label>
+  <label data-key="c">SQL 語法錯誤</label>
+  <label data-key="d">DataLoader 會自動依 key 拆開 LIMIT</label>
+  <p class="why">✓ LIMIT 作用在整句查詢上，不知道 order_id 的分組。要每組各取 3 筆，用 LATERAL JOIN 或 ROW_NUMBER() OVER (PARTITION BY order_id …)，batch 函式再依 order_id 分組。DataLoader 只負責收集 key，不會改你的 SQL（d）。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>batch 函式直接回傳 rows</strong>：順序是資料庫的順序，找不到的 id 也不見了。先放進 Map，再用 <code>keys.map(…)</code> 對回去，找不到放 null。</li>
+  <li><strong>在 batch 函式裡逐筆查詢</strong>：<code>Promise.all(ids.map(id =&gt; db.query(… = $1)))</code> 還是 N+1，只是包在 DataLoader 裡。要一句 <code>WHERE id = ANY($1)</code>。</li>
+  <li><strong>一對多回傳扁平陣列</strong>：<code>itemsByOrderId</code> 的每個 key 要對應一個陣列，回傳陣列的陣列；沒有品項的放 <code>[]</code>。</li>
+  <li><strong>loader 建在模組層級</strong>：快取跨請求，會洩漏權限、讀到舊資料。在 context 裡每個請求建立。</li>
+  <li><strong>mutation 之後沒清快取</strong>：同一個請求後面的讀取拿到舊值。改完用 <code>clear(id)</code>，需要時再 <code>prime(id, 新值)</code>（只 prime 不 clear 不會覆蓋舊值）；只回傳 UPDATE 的結果、不動快取也不對，後面的讀取還是舊值；不要用 <code>cache: false</code> 繞過。</li>
+  <li><strong>key 的型別不一致</strong>：字串 <code>'1'</code> 和數字 <code>1</code> 是不同的 key，同一個商品會被查兩次。進 loader 前統一型別。</li>
+  <li><strong>以為 DataLoader 讓查詢只剩 1 句</strong>：它合併同一層，每一層仍至少一句；每組各取前幾筆要用 LATERAL 或視窗函式。</li>
+  <li><strong>沒有量測</strong>：本機資料少看不出 N+1。重要查詢在測試裡斷言 SQL 句數，上線後記錄每個請求的句數。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>N+1：先 1 句查出 N 筆，再對每筆各查 1 句。GraphQL 的 resolver 各自獨立，只要清單底下有關聯欄位就會發生。句數可以從 SQL 記錄算出來：<code>1 + N + N + 品項數</code>。</li>
+  <li>DataLoader 在同一個時機收集所有 <code>load(key)</code>，一次呼叫 batch 函式，再依順序把結果分回去；同一個請求裡相同的 key 只查一次。</li>
+  <li>batch 函式三條規則：長度相同、順序相同、找不到放 null；一對多回傳陣列的陣列；SQL 用 <code>WHERE … = ANY($1)</code> 一句查完，欄位要有索引。</li>
+  <li>loader 每個請求一份，在 context 建立；改了資料用 <code>clear</code>／<code>prime</code> 更新快取。</li>
+  <li>每組各取前幾筆用 LATERAL 或視窗函式；形狀固定的地方直接 JOIN；用測試斷言句數，上線後記錄每個請求的句數。</li>
+</ul>
+<p>下一課處理清單的另一個問題：訂單歷史越來越長，要怎麼分頁才不會重複或漏掉，以及錯誤怎麼回給客戶端。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+import { Injectable } from '@nestjs/common'
+import { OutOfStockError, ProductNotFoundError } from '../errors/domain-errors.js'
+import { ProductsService } from '../products/products.service.js'
+import type { CreateOrderDto } from './create-order.dto.js'
+import type { OrderResponse } from './order-response.dto.js'
+
+@Injectable()
+export class OrdersService {
+  private nextId = 1
+
+  constructor(private readonly products: ProductsService) {}
+
+  create(dto: CreateOrderDto): OrderResponse {
+    const lines = dto.items.map(item => {
+      const product = this.products.find(item.productId)
+      if (!product) throw new ProductNotFoundError(item.productId)
+      if (product.stock < item.qty) throw new OutOfStockError(product.id, item.qty, product.stock)
+      return { product, qty: item.qty }
+    })
+    for (const { product, qty } of lines) product.stock -= qty
+    const total = lines.reduce((sum, { product, qty }) => sum + product.price * qty, 0)
+    return { id: this.nextId++, customerId: dto.customerId, total, status: 'pending' }
+  }
+}

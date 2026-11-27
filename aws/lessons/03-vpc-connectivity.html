@@ -1,0 +1,866 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>3. VPC 與「為什麼連不到」：route table、NAT、安全群組、NACL、VPC endpoint 與排查順序</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="3" data-practice="aws">
+<header>
+  <div class="eyebrow">階段 2：網路與入口 · 第 3 課</div>
+  <h1>VPC 與「為什麼連不到」：route table、NAT、安全群組、NACL、VPC endpoint 與排查順序</h1>
+</header>
+<main>
+
+<p>cafe-api 搬到 AWS 的私有子網路後，一週內來了三張單：結帳時呼叫金流商的 API 一直<strong>逾時</strong>；staging 環境的 cafe-api 連 RDS 也逾時，可是同一個 VPC 裡另一台機器連得上；月底帳單上 NAT gateway 的「資料處理費」比 RDS 還貴，查下去發現上傳到 S3 的收據圖片全部繞過 NAT。</p>
+<p>三件事的共同點是：<strong>網路設定在 AWS 裡是好幾層各自獨立的規則</strong>，任何一層沒對上，結果都是「連不到」，錯誤訊息卻幾乎一樣。這一課把封包從私有子網路出去要經過的每一關講清楚，給你一個固定的排查順序，最後用 VPC endpoint 讓 S3 的流量不再經過 NAT。</p>
+<p>這課的路線：</p>
+<ul>
+  <li>一個封包要過哪幾關：先拿到排查清單的最小版本。</li>
+  <li>route table：最長前綴、<code>local</code> 路由、沒關聯的子網路用哪一張（練習 1）。</li>
+  <li>NAT gateway：放在哪裡、為什麼要每個 AZ 一個、2025 年起的 regional NAT。</li>
+  <li>安全群組與 NACL：有狀態與無狀態，回程的臨時 port（練習 2）。</li>
+  <li>VPC endpoint：gateway 與 interface 兩種，怎麼讓 S3 流量不走 NAT（練習 4）。</li>
+  <li>排查順序、Reachability Analyzer 與 Flow Logs（練習 3）。</li>
+</ul>
+
+<div class="callout"><strong>這課會用到：</strong>devops 課<a href="../../devops/lessons/18-aws-architecture.html">第 18 課</a>的 VPC 架構（公有子網路的 route table 有 <code>0.0.0.0/0 → internet gateway</code>，私有子網路改指 NAT gateway；安全群組有狀態、只寫允許、來源可以寫另一個安全群組）；devops 課<a href="../../devops/lessons/04-networking.html">第 4 課</a>的 CIDR、port、TCP 連線與逐層排查（客戶端從一個臨時的 port 連到伺服器的固定 port）。</div>
+
+<div class="callout warn"><strong>練習環境：</strong>模擬器裡的 VPC、route table、安全群組只是資料，沒有真的封包在跑。所以「連不連得到」都在頁面練習裡依規則推論；本機練習只檢查你建的設定對不對。</div>
+
+<h2>一個封包要過哪幾關</h2>
+<p>先看 cafe-api（私有子網路裡的 Fargate task）呼叫金流商 API 時，封包依序經過的地方。每一關都可能是「逾時」的原因：</p>
+<figure>
+  <svg viewBox="0 0 700 300" role="img" aria-label="私有子網路的程式連到網際網路：安全群組出站、NACL 出站、route table 指向 NAT、NAT 所在公有子網路的 route table 指向 internet gateway">
+    <defs><marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="10" y="20" width="440" height="260" rx="10"/>
+    <text class="d-small" x="24" y="40">VPC 10.20.0.0/16</text>
+    <rect class="d-box" x="30" y="55" width="190" height="205" rx="8"/>
+    <text class="d-text" x="44" y="78">私有子網路 10.20.10.0/24</text>
+    <rect class="d-soft" x="46" y="92" width="158" height="36" rx="6"/>
+    <text class="d-text" x="60" y="115">cafe-api（task）</text>
+    <text class="d-small" x="46" y="150">① 安全群組：出站</text>
+    <text class="d-small" x="46" y="172">② NACL：出站（與回程進站）</text>
+    <text class="d-small" x="46" y="194">③ route table：</text>
+    <text class="d-accent" x="46" y="214">0.0.0.0/0 → nat-a</text>
+    <rect class="d-box" x="245" y="55" width="190" height="205" rx="8"/>
+    <text class="d-text" x="259" y="78">公有子網路 10.20.0.0/24</text>
+    <rect class="d-soft" x="261" y="92" width="158" height="36" rx="6"/>
+    <text class="d-text" x="290" y="115">NAT gateway</text>
+    <text class="d-small" x="261" y="150">④ NAT 自己的 route table：</text>
+    <text class="d-accent" x="261" y="170">0.0.0.0/0 → igw</text>
+    <text class="d-small" x="261" y="194">NAT 用自己的公開 IP</text>
+    <text class="d-small" x="261" y="212">替私有 IP 連外</text>
+    <line class="d-line" x1="204" y1="110" x2="259" y2="110" marker-end="url(#a3)"/>
+    <rect class="d-box" x="480" y="92" width="90" height="36" rx="6"/>
+    <text class="d-text" x="495" y="115">IGW</text>
+    <line class="d-line" x1="419" y1="110" x2="478" y2="110" marker-end="url(#a3)"/>
+    <rect class="d-box" x="590" y="92" width="100" height="36" rx="6"/>
+    <text class="d-text" x="602" y="115">金流商 API</text>
+    <line class="d-line" x1="570" y1="110" x2="588" y2="110" marker-end="url(#a3)"/>
+    <text class="d-small" x="480" y="160">⑤ 對方的防火牆、</text>
+    <text class="d-small" x="480" y="178">程式有沒有在聽</text>
+  </svg>
+  <figcaption>封包從私有子網路出去的路。回應沿原路回來：NACL 要另外放行回程，安全群組會自動放行。</figcaption>
+</figure>
+<p>開場第一張單的最小答案：私有子網路連外逾時，最常見的是 ③ 這個子網路的 route table 沒有 <code>0.0.0.0/0 → NAT</code>，或 ④ NAT 被放進了私有子網路，它自己也出不去。剩下的 ①②⑤ 是安全群組、NACL 與對方。後面每一節講一關，最後再把它們排成固定的排查順序。</p>
+<div class="table-wrap"><table>
+  <tr><th>關卡</th><th>掛在哪裡</th><th>決定什麼</th></tr>
+  <tr><td>route table</td><td>子網路</td><td>封包往哪裡送（有沒有路）</td></tr>
+  <tr><td>NACL（network ACL）</td><td>子網路</td><td>進出子網路的封包放不放行，進、出各自判斷</td></tr>
+  <tr><td>安全群組（security group，SG）</td><td>網路介面（ENI）</td><td>連線准不准建立，回應自動放行</td></tr>
+  <tr><td>NAT gateway、internet gateway、endpoint</td><td>route table 的目標</td><td>出了子網路之後往哪裡去</td></tr>
+</table></div>
+
+<h2>route table：封包往哪裡送</h2>
+<p>上面的第 ③ 關。每個子網路都關聯一張 route table（路由表）。表裡每一條路由是「目的地 CIDR → 目標」，目標可以是 <code>local</code>（VPC 內部）、internet gateway（<code>igw-…</code>）、NAT gateway（<code>nat-…</code>）、VPC endpoint、peering（<code>pcx-…</code>）等。三條規則決定封包走哪一條：</p>
+<ul>
+  <li><strong>最長前綴優先</strong>：一個目的地 IP 可能同時符合好幾條，挑前綴最長（網段最小、最具體）的那一條，跟路由在表裡的順序無關。<code>/32</code> 比 <code>/24</code> 優先，<code>0.0.0.0/0</code> 永遠最後。</li>
+  <li><strong><code>local</code> 路由</strong>：每張表都有一條 VPC 自己的 CIDR → <code>local</code>，刪不掉。VPC 裡的機器互相連線走它。</li>
+  <li><strong>沒有明確關聯的子網路用 main route table</strong>：建 VPC 時會自動建一張 main table。新建的子網路如果忘了關聯，就默默用它；很多「這個子網路明明設好了」的問題，都是它其實還在用 main table。</li>
+</ul>
+<p>按執行，看同一張表裡不同目的地挑到哪一條：</p>
+<div class="lab"><script type="code">
+// IP 轉成數字；CIDR 前綴 n 代表前 n 個位元相同（devops 課第 4 課）
+const toInt = (ip: string) => ip.split('.').reduce((n, part) => n * 256 + Number(part), 0)
+const inCidr = (ip: string, cidr: string) => {
+  const [base, bits] = cidr.split('/')
+  const size = 2 ** (32 - Number(bits))
+  return Math.floor(toInt(ip) / size) === Math.floor(toInt(base) / size)
+}
+
+const routes = [
+  { dest: '0.0.0.0/0', target: 'nat-a' },
+  { dest: '10.20.0.0/16', target: 'local' },
+  { dest: '198.51.100.0/24', target: 'pcx-payment' },   // 跟金流商的 VPC peering
+]
+for (const ip of ['10.20.20.5', '198.51.100.7', '8.8.8.8']) {
+  const matches = routes.filter(r => inCidr(ip, r.dest))
+  const best = matches.reduce((a, b) => Number(b.dest.split('/')[1]) > Number(a.dest.split('/')[1]) ? b : a)
+  console.log(`${ip}：符合 ${matches.map(r => r.dest).join('、')} → 走 ${best.target}`)
+}
+</script></div>
+<p>從結果看：<code>198.51.100.7</code> 同時符合 <code>0.0.0.0/0</code> 與 <code>198.51.100.0/24</code>，走的是比較具體的 peering，不是排在第一的 NAT。用「第一個符合的」去判斷，會得到錯的結論，練習 1 會擋這種寫法。</p>
+<p>另一個常見的盲點是只看第一層：私有子網路的路由指向 NAT 沒錯，但 NAT 自己所在的子網路也有一張 route table，那張表要有 <code>0.0.0.0/0 → igw</code>，NAT 才出得去。NAT 被誤放進私有子網路時，第一層看起來一切正常，封包卻到 NAT 就停了。</p>
+
+<h2>NAT gateway：放在哪裡、放幾個</h2>
+<p>route table 把封包交給 NAT 之後，NAT 用自己的公開 IP 替私有子網路的機器連外，回應再轉回來；外面無法主動連進來（devops 課第 4 課的 NAT）。傳統的 NAT gateway（官方現在稱為 <strong>zonal NAT gateway</strong>）有三個要點：</p>
+<ul>
+  <li>放在<strong>公有子網路</strong>，那個子網路的 route table 要指向 internet gateway。</li>
+  <li>它只存在於<strong>一個 AZ</strong>。兩個 AZ 共用一個 NAT 時，NAT 所在的 AZ 出事，另一個 AZ 的程式也連不出去，而且跨 AZ 的流量另外收費。所以常見的做法是每個 AZ 一個 NAT，每個 AZ 的私有 route table 指向自己 AZ 的 NAT。</li>
+  <li>計費是<strong>每小時</strong>（存在就收）加上<strong>每 GB 處理量</strong>，再加一般的資料傳輸費（<a href="https://aws.amazon.com/vpc/pricing/">VPC 定價頁</a>）。經過 NAT 的每一個位元組都算，包括送到同一個 region 的 S3。</li>
+</ul>
+<p>2025 年 11 月 AWS 推出 <strong>regional NAT gateway</strong>：建立時選 regional 模式並指定 VPC，不需要公有子網路，它會依你的工作負載出現在哪些 AZ 自動擴展，私有子網路的 route table 都指向同一個 NAT ID。限制是擴展到新的 AZ 可能要花上 60 分鐘（這段期間流量跨 AZ 處理），也不支援 private NAT；計費改成每個有它的 AZ 每小時，加上處理量（官方「Regional NAT gateways」文件與定價頁，2026-11-20 查證）。新架構可以優先考慮它；這課的練習與 devops 課第 18 課的架構圖都是 zonal 的做法，因為現有的系統大多還是這樣建。</p>
+<div class="callout practice"><strong>💡 實務上：NAT 只放一個 AZ，是成本與可用性的取捨</strong><br>staging、內部工具這類可以停一下的環境，團隊常只放一個 NAT 省每小時的費用，這是合理的取捨，但要寫進文件：那個 AZ 出問題時，所有私有子網路都連不出去。正式環境至少每個 AZ 一個 zonal NAT，或改用 regional NAT。資深工程師看帳單時會把 NAT 拆成「每小時」與「處理量」兩項：處理量高，先查是誰在大量經過 NAT，S3、ECR 拉映像是最常見的兩個，下面的 VPC endpoint 就是解法。</div>
+
+<h2>安全群組與 NACL：有狀態與無狀態</h2>
+<p>路由說的是「有沒有路」，接下來兩關說的是「准不准過」，也就是開場第二張單：連 RDS 逾時，同 VPC 的另一台卻連得上，路由一定沒問題（都是 <code>local</code>），問題在這兩關。</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>安全群組</th><th>NACL</th></tr>
+  <tr><td>掛在哪</td><td>網路介面（每個 task、每台機器、RDS）</td><td>子網路（子網路裡所有東西共用）</td></tr>
+  <tr><td>狀態</td><td><strong>有狀態</strong>：允許了連線，回應自動放行</td><td><strong>無狀態</strong>：去程、回程是兩個不相干的封包，各自判斷</td></tr>
+  <tr><td>規則</td><td>只能寫允許；所有規則一起看，有一條允許就過</td><td>可以寫允許與拒絕；依規則編號由小到大，<strong>第一條符合的決定結果</strong>；都不符合就被最後的 <code>*</code> 規則拒絕</td></tr>
+  <tr><td>來源</td><td>CIDR 或另一個安全群組</td><td>只能 CIDR</td></tr>
+  <tr><td>預設</td><td>新建的群組沒有進站規則（全擋）、出站全開</td><td>VPC 預設的 NACL 進出全開；自己新建的 NACL 全擋</td></tr>
+</table></div>
+<p>NACL 無狀態的後果是<strong>回程要另外開</strong>。cafe-api 從自己的臨時 port（例如 49152）連到 RDS 的 5432，RDS 回應的封包目的 port 是 49152。RDS 所在子網路的 NACL 出站規則若只寫了 5432，回應就被擋掉；cafe-api 那邊看到的是逾時。臨時 port 的範圍依作業系統與服務不同，常見的做法是 NACL 的回程規則開 <code>1024–65535</code>。按執行，看只開 5432 的 NACL 怎麼擋住回應：</p>
+<div class="lab"><script type="code">
+type Rule = { n: number, from: number, to: number, allow: boolean }
+// NACL：依編號由小到大，第一條符合的決定；都不符合就拒絕（CIDR 這裡省略，全部當成符合）
+const decide = (rules: Rule[], port: number) =>
+  [...rules].sort((a, b) => a.n - b.n).find(r => port >= r.from && port <= r.to)?.allow ?? false
+
+const dbInbound: Rule[] = [{ n: 100, from: 5432, to: 5432, allow: true }]
+const dbOutbound: Rule[] = [{ n: 100, from: 5432, to: 5432, allow: true }]   // 照抄進站規則：常見的錯
+console.log('去程 cafe-api:49152 → db:5432，db 進站：', decide(dbInbound, 5432))
+console.log('回程 db:5432 → cafe-api:49152，db 出站：', decide(dbOutbound, 49152))
+
+const fixed: Rule[] = [{ n: 100, from: 1024, to: 65535, allow: true }]
+console.log('改成開臨時 port 之後的回程：', decide(fixed, 49152))
+</script></div>
+<p>安全群組就沒有這個問題：db 的安全群組允許了來自 app 安全群組的 5432，回應自動放行，出站規則是空的也一樣。所以大多數團隊保留預設全開的 NACL，只用安全群組控制；NACL 用在「封鎖某一段 IP」這種需要拒絕規則的場合。真的要自訂 NACL 時，練習 2 的雙向檢查就是你要在腦中跑的流程。</p>
+<p>開場那台連不上 RDS 的 staging cafe-api，最後查到的原因是 db 的安全群組來源寫了 production app 的安全群組，staging 的 task 掛的是另一個群組。來源寫安全群組的好處（task 換 IP 不用改規則，devops 課第 18 課）同時也是排查時要對的東西：<strong>對的是群組 ID，不是名稱</strong>。</p>
+<div class="callout practice"><strong>💡 實務上：VPC 的 CIDR 撞到，之後就接不起來</strong><br>NACL、安全群組之外，跨 VPC 的連線還有一關在規劃階段就決定了：兩個 VPC 的 CIDR 重疊就不能 peering，透過 Transit Gateway 也會有路由衝突。公司收購另一家、或要把 staging 接到公司 VPN 時，最常卡在這裡。資深工程師開新 VPC 前會先查公司的位址規劃表（devops 課第 18 課），這比事後重建網路便宜得多。</div>
+
+<h2>VPC endpoint：S3 的流量不走 NAT</h2>
+<p>前面三關處理的是「連不到」；開場第三張單是「連得到，但很貴」。私有子網路連 S3，預設的路是 <code>0.0.0.0/0 → NAT</code>，每 GB 都要付 NAT 處理費。<strong>VPC endpoint</strong> 讓 VPC 內的流量直接到 AWS 的服務，不經過 NAT 與 internet gateway。有兩種：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>gateway endpoint</th><th>interface endpoint（PrivateLink）</th></tr>
+  <tr><td>支援的服務</td><td>只有 S3 與 DynamoDB</td><td>大多數 AWS 服務（SQS、ECR、Secrets Manager……），S3 也有</td></tr>
+  <tr><td>怎麼運作</td><td>在你指定的 route table 加一條路由：目的地是該服務的 prefix list（<code>pl-…</code>，AWS 維護的一組 IP 範圍），目標是 endpoint</td><td>在子網路裡建一張網路介面（ENI），有私有 IP；開了私有 DNS 時，服務原本的網域名稱在 VPC 裡會解析到這個私有 IP</td></tr>
+  <tr><td>費用</td><td><strong>不收費</strong></td><td>每個 AZ 每小時＋每 GB 處理量</td></tr>
+  <tr><td>從哪裡用得到</td><td>只有掛了它的 route table 所屬的子網路</td><td>VPC 內、以及透過 VPN 或 Direct Connect 連進 VPC 的地方</td></tr>
+</table></div>
+<p>所以 S3 從 VPC 內存取時用 gateway endpoint：免費，而且 S3 流量從此不經過 NAT。要注意它是掛在 <strong>route table</strong> 上的：兩個 AZ 有兩張私有 route table，就兩張都要掛，漏掉的那個 AZ 照樣走 NAT。interface endpoint 用在 gateway endpoint 沒有的服務，或要從公司內網透過 VPN 存取 S3 的時候。</p>
+<p>每個 endpoint 還可以掛一份 <strong>endpoint policy</strong>，控制「透過這個 endpoint 能存取哪些資源」。不設的話預設允許全部。把 Resource 限定在自己的 bucket，就算 VPC 裡的程式被入侵，攻擊者也不能透過這條路把資料寫到他自己的 bucket：</p>
+<pre>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": "*",
+    "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
+    "Resource": ["arn:aws:s3:::cafe-uploads-prod", "arn:aws:s3:::cafe-uploads-prod/*"]
+  }]
+}</pre>
+<p>endpoint policy 是另一道上限，不會給權限：程式的 role 還是要有自己的 S3 權限（第 2 課的「只能收窄」）。<code>Principal</code> 在 endpoint policy 裡常寫 <code>*</code>，因為要限制的是「經過這裡能碰什麼」，誰能做什麼交給 IAM。</p>
+<div class="callout practice"><strong>💡 實務上：S3 走 gateway endpoint，是 VPC 開好後的第一件事</strong><br>上傳收據、存菜單圖片、拉部署檔，這些流量走 NAT 時每 GB 都在付處理費，改走 gateway endpoint 不用改任何程式碼，只是在 route table 多一條路由，也不收費。資深工程師會在建 VPC 的 IaC 模組裡直接帶上 S3 與 DynamoDB 的 gateway endpoint，並在 endpoint policy 列出允許的 bucket。ECR 拉映像需要的是 interface endpoint（另外計費），要不要建，看拉映像的流量經過 NAT 的費用有多少。</div>
+
+<h2>排查順序：逾時先查網路，被拒絕先查程式</h2>
+<p>每一關都看過之後，把它們排成一個固定的順序。連線失敗時，先看<strong>錯誤長什麼樣子</strong>：</p>
+<ul>
+  <li><strong>逾時</strong>（timeout）：封包送出去沒有任何回應。安全群組、NACL 擋下封包時是直接丟掉、不回應，路由不通也一樣，所以逾時多半是網路層的問題。</li>
+  <li><strong>連線被拒絕</strong>（connection refused）：對方主機收到了，回了 TCP RST，代表網路是通的，但那個 port 上沒有程式在聽。查目的地的程式有沒有啟動、聽在哪個位址（devops 課第 4 課的 <code>127.0.0.1</code> 與 <code>0.0.0.0</code>）。</li>
+</ul>
+<p>逾時就照這個順序，從離自己近的查起：</p>
+<ol>
+  <li><strong>DNS</strong>：名稱解析成什麼 IP？RDS 的端點名稱在 VPC 裡應該解析成私有 IP；解析成公開 IP 或解析不出來，後面都不用查。</li>
+  <li><strong>路由</strong>：來源子網路的 route table（記得檢查是不是在用 main table）對這個 IP 走哪一條？目標是 NAT 的話，NAT 所在子網路的路由也要看。</li>
+  <li><strong>NACL，雙向</strong>：來源子網路的出站與回程進站、目的子網路的進站與回程出站。</li>
+  <li><strong>安全群組</strong>：來源的出站、目的地的進站（來源寫的是 CIDR 還是安全群組 ID，對得上嗎）。</li>
+  <li><strong>目的地的程式</strong>：有沒有在聽、聽在哪個位址與 port。</li>
+  <li><strong>作業系統的防火牆</strong>：EC2 上自己開的 iptables 之類的規則（Fargate、RDS 沒有這一層）。</li>
+</ol>
+<p>AWS 有兩個工具幫你做前四步：</p>
+<ul>
+  <li><strong>VPC Reachability Analyzer</strong>：給一個來源（例如某個 task 的網路介面）與目的地，它分析設定（不送真的封包），告訴你路徑通不通，不通的話卡在哪一個元件。每做一次分析計費一次。</li>
+  <li><strong>VPC Flow Logs</strong>：記錄網路介面上實際流過的連線，寫到 CloudWatch Logs 或 S3。預設格式（版本 2）每一行依序是：<code>version account-id interface-id srcaddr dstaddr srcport dstport protocol packets bytes start end action log-status</code>。<code>action</code> 是 <code>ACCEPT</code> 或 <code>REJECT</code>；<code>log-status</code> 是 <code>NODATA</code>（這段時間沒有流量）或 <code>SKIPDATA</code>（有紀錄被跳過）時，其他欄位是 <code>-</code>。也可以自訂欄位與順序，讀之前先確認格式。</li>
+</ul>
+<p>讀 Flow Logs 判斷是哪一關擋的，靠的是「有狀態與無狀態」的差別。看 db 那張網路介面上同一條連線的兩個方向：</p>
+<div class="table-wrap"><table>
+  <tr><th>去程（app → db:5432）</th><th>回程（db:5432 → app 的臨時 port）</th><th>代表什麼</th></tr>
+  <tr><td>REJECT</td><td>（沒有）</td><td>進站被擋：db 的安全群組或 NACL 進站規則</td></tr>
+  <tr><td>ACCEPT</td><td>REJECT</td><td>回程被擋：只可能是 NACL（安全群組會自動放行回應）</td></tr>
+  <tr><td>ACCEPT</td><td>ACCEPT</td><td>網路通了；連不上要查程式本身</td></tr>
+</table></div>
+<p>官方文件提醒，連線關閉後才抵達的封包也可能被記成 REJECT，所以看的是重複出現的模式，不是單一一行。練習 3 會把這張表寫成程式。</p>
+<div class="callout practice"><strong>💡 實務上：先問「是逾時還是被拒絕」，再開 Flow Logs</strong><br>同事說「連不到資料庫」時，資深工程師第一個問題是錯誤訊息原文：timeout 與 connection refused 的查法完全不同。接著用 Reachability Analyzer 跑一次 app 到 db 的路徑，通常幾分鐘內就能指出是哪一條規則。Flow Logs 適合事後與長期觀察（例如誰在掃你的 port），但要先開才有，寫到 CloudWatch Logs 也會產生 log 的費用，記得設保存天數。</div>
+
+<h2>這課的練習怎麼對應真的 AWS</h2>
+<p>前面的每一關在真的 AWS 都是實際的封包處理；模擬器只存設定，不會依規則擋任何東西。所以：</p>
+<ul>
+  <li><strong>頁面上的練習</strong>（1～3）：把路由、NACL＋安全群組、Flow Logs 的判斷寫成程式，餵給它設定或 log，推論連不連得到、卡在哪。</li>
+  <li><strong>本機練習</strong>（4）：用 SDK 在模擬器建安全群組與 gateway endpoint，測試把設定讀回來檢查。模擬器建 gateway endpoint 時，也會在 route table 加上指向 S3 prefix list 的路由，跟真的 AWS 一樣，可以在 <code>DescribeRouteTables</code> 看到。</li>
+</ul>
+
+<h2>在真的 AWS 帳號上做一次（選做）</h2>
+<p>這一節不判分，也不影響進度。用第 1 課開的獨立練習帳號與第 2 課建立的 <code>learn-sandbox</code> profile。做完看 route table 裡多出來的 prefix list 路由，再把東西清掉。</p>
+<div class="callout warn"><strong>費用：</strong>VPC、route table、安全群組與 gateway endpoint 都不收費（<a href="https://aws.amazon.com/vpc/pricing/">VPC 定價頁</a>，2026-11-20 查證）。這一節刻意不建 NAT gateway（每小時＋每 GB 處理量）、interface endpoint（每個 AZ 每小時＋每 GB）、Reachability Analyzer（每次分析計費）。</div>
+<pre># 1. 建 VPC，記下 VpcId
+aws ec2 create-vpc --cidr-block 10.30.0.0/16 --profile learn-sandbox \
+  --tag-specifications 'ResourceType=vpc,Tags=[{Key=Name,Value=cafe-learn-03}]' --query Vpc.VpcId --output text
+
+# 2. 建一張私有 route table，記下 RouteTableId
+aws ec2 create-route-table --vpc-id &lt;VpcId&gt; --profile learn-sandbox --query RouteTable.RouteTableId --output text
+
+# 3. 建 S3 gateway endpoint 掛到這張 route table，記下 VpcEndpointId
+aws ec2 create-vpc-endpoint --vpc-id &lt;VpcId&gt; --vpc-endpoint-type Gateway \
+  --service-name com.amazonaws.ap-northeast-1.s3 --route-table-ids &lt;RouteTableId&gt; \
+  --profile learn-sandbox --query VpcEndpoint.VpcEndpointId --output text
+
+# 4. 看路由：除了 local，多了一條 DestinationPrefixListId 是 pl-… 、GatewayId 是 vpce-… 的路由
+aws ec2 describe-route-tables --route-table-ids &lt;RouteTableId&gt; --profile learn-sandbox --query 'RouteTables[].Routes'
+
+# 5. 建 app 與 db 兩個安全群組，db 只允許來自 app 群組的 5432
+aws ec2 create-security-group --group-name cafe-learn-03-app --description 'cafe-api' --vpc-id &lt;VpcId&gt; --profile learn-sandbox --query GroupId --output text
+aws ec2 create-security-group --group-name cafe-learn-03-db --description 'postgres' --vpc-id &lt;VpcId&gt; --profile learn-sandbox --query GroupId --output text
+aws ec2 authorize-security-group-ingress --group-id &lt;db 的 GroupId&gt; --profile learn-sandbox \
+  --ip-permissions 'IpProtocol=tcp,FromPort=5432,ToPort=5432,UserIdGroupPairs=[{GroupId=&lt;app 的 GroupId&gt;}]'
+
+# 6. 確認 db 的規則來源是安全群組，不是 CIDR
+aws ec2 describe-security-groups --group-ids &lt;db 的 GroupId&gt; --profile learn-sandbox --query 'SecurityGroups[].IpPermissions'</pre>
+<h3>清除</h3>
+<pre>aws ec2 delete-vpc-endpoints --vpc-endpoint-ids &lt;VpcEndpointId&gt; --profile learn-sandbox
+aws ec2 delete-security-group --group-id &lt;db 的 GroupId&gt; --profile learn-sandbox
+aws ec2 delete-security-group --group-id &lt;app 的 GroupId&gt; --profile learn-sandbox
+aws ec2 delete-route-table --route-table-id &lt;RouteTableId&gt; --profile learn-sandbox
+aws ec2 delete-vpc --vpc-id &lt;VpcId&gt; --profile learn-sandbox
+aws ec2 describe-vpcs --filters Name=tag:Name,Values=cafe-learn-03 --profile learn-sandbox --query 'Vpcs[].VpcId'   # 確認：回傳 []</pre>
+<p>endpoint 刪除需要一點時間，刪 route table 或 VPC 時出現仍有相依資源的錯誤，等一下再執行一次。</p>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：完成 <code>routeFor(vpc, subnet, ip)</code> 與 <code>diagnoseEgress(vpc, subnet, ip)</code>。<code>inCidr</code> 與 <code>prefix</code> 已經寫好。<code>routeFor</code>：找出子網路用的 route table（<code>subnets</code> 裡有它的那一張，沒有就用 <code>main: true</code> 的那張），在符合 <code>ip</code> 的路由裡挑前綴最長的，回傳它的 <code>target</code>；沒有符合的回傳 <code>null</code>。<code>diagnoseEgress</code>：私有子網路裡沒有公開 IP 的程式要連到網際網路上的 <code>ip</code>，回傳：</p>
+  <ul>
+    <li><code>'no-route'</code>：沒有符合的路由，或目標不是 internet gateway（<code>igw-</code> 開頭）也不是 NAT（<code>nat-</code> 開頭）。</li>
+    <li><code>'igw-without-public-ip'</code>：直接指向 internet gateway，但這個程式沒有公開 IP，出不去。</li>
+    <li>指向 NAT 時，到 <code>vpc.nats</code> 找出 NAT 所在的子網路，再用那個子網路的 route table 查同一個 <code>ip</code>：目標是 <code>igw-</code> 開頭就是 <code>'ok'</code>，否則是 <code>'nat-without-igw'</code>。</li>
+  </ul>
+  <script type="start">
+type Route = { dest: string, target: string }
+type RouteTable = { id: string, main?: boolean, subnets: string[], routes: Route[] }
+type Vpc = { routeTables: RouteTable[], nats: { id: string, subnet: string }[] }
+type Egress = 'ok' | 'no-route' | 'igw-without-public-ip' | 'nat-without-igw'
+
+const toInt = (ip: string) => ip.split('.').reduce((n, part) => n * 256 + Number(part), 0)
+const inCidr = (ip: string, cidr: string) => {
+  const [base, bits] = cidr.split('/')
+  const size = 2 ** (32 - Number(bits))
+  return Math.floor(toInt(ip) / size) === Math.floor(toInt(base) / size)
+}
+const prefix = (cidr: string) => Number(cidr.split('/')[1])
+
+function routeFor(vpc: Vpc, subnet: string, ip: string): string | null {
+  // 1. 找出子網路的 route table（沒有明確關聯就用 main）
+  // 2. 符合的路由裡挑前綴最長的
+  return null
+}
+
+function diagnoseEgress(vpc: Vpc, subnet: string, ip: string): Egress {
+  return 'no-route'
+}
+
+const vpc: Vpc = {
+  routeTables: [
+    { id: 'rtb-main', main: true, subnets: [], routes: [{ dest: '10.20.0.0/16', target: 'local' }] },
+    { id: 'rtb-public', subnets: ['subnet-pub-a'], routes: [{ dest: '10.20.0.0/16', target: 'local' }, { dest: '0.0.0.0/0', target: 'igw-cafe' }] },
+    { id: 'rtb-app-a', subnets: ['subnet-app-a'], routes: [{ dest: '0.0.0.0/0', target: 'nat-a' }, { dest: '10.20.0.0/16', target: 'local' }] },
+  ],
+  nats: [{ id: 'nat-a', subnet: 'subnet-pub-a' }],
+}
+console.log(routeFor(vpc, 'subnet-app-a', '10.20.20.5'), diagnoseEgress(vpc, 'subnet-app-a', '198.51.100.7'))
+</script>
+  <script type="answer">
+type Route = { dest: string, target: string }
+type RouteTable = { id: string, main?: boolean, subnets: string[], routes: Route[] }
+type Vpc = { routeTables: RouteTable[], nats: { id: string, subnet: string }[] }
+type Egress = 'ok' | 'no-route' | 'igw-without-public-ip' | 'nat-without-igw'
+
+const toInt = (ip: string) => ip.split('.').reduce((n, part) => n * 256 + Number(part), 0)
+const inCidr = (ip: string, cidr: string) => {
+  const [base, bits] = cidr.split('/')
+  const size = 2 ** (32 - Number(bits))
+  return Math.floor(toInt(ip) / size) === Math.floor(toInt(base) / size)
+}
+const prefix = (cidr: string) => Number(cidr.split('/')[1])
+
+function routeFor(vpc: Vpc, subnet: string, ip: string): string | null {
+  const table = vpc.routeTables.find(t => t.subnets.includes(subnet)) ?? vpc.routeTables.find(t => t.main)
+  const matches = (table?.routes ?? []).filter(r => inCidr(ip, r.dest))
+  if (!matches.length) return null
+  return matches.reduce((best, r) => prefix(r.dest) > prefix(best.dest) ? r : best).target
+}
+
+function diagnoseEgress(vpc: Vpc, subnet: string, ip: string): Egress {
+  const target = routeFor(vpc, subnet, ip)
+  if (target?.startsWith('igw-')) return 'igw-without-public-ip'
+  if (!target?.startsWith('nat-')) return 'no-route'
+  const nat = vpc.nats.find(n => n.id === target)
+  if (!nat) return 'no-route'
+  return routeFor(vpc, nat.subnet, ip)?.startsWith('igw-') ? 'ok' : 'nat-without-igw'
+}
+
+const vpc: Vpc = {
+  routeTables: [
+    { id: 'rtb-main', main: true, subnets: [], routes: [{ dest: '10.20.0.0/16', target: 'local' }] },
+    { id: 'rtb-public', subnets: ['subnet-pub-a'], routes: [{ dest: '10.20.0.0/16', target: 'local' }, { dest: '0.0.0.0/0', target: 'igw-cafe' }] },
+    { id: 'rtb-app-a', subnets: ['subnet-app-a'], routes: [{ dest: '0.0.0.0/0', target: 'nat-a' }, { dest: '10.20.0.0/16', target: 'local' }] },
+  ],
+  nats: [{ id: 'nat-a', subnet: 'subnet-pub-a' }],
+}
+console.log(routeFor(vpc, 'subnet-app-a', '10.20.20.5'), diagnoseEgress(vpc, 'subnet-app-a', '198.51.100.7'))
+</script>
+  <script type="tests">
+const local = { dest: '10.20.0.0/16', target: 'local' }
+const net: Vpc = {
+  routeTables: [
+    { id: 'rtb-main', main: true, subnets: [], routes: [local] },
+    { id: 'rtb-public', subnets: ['subnet-pub-a', 'subnet-pub-c'], routes: [local, { dest: '0.0.0.0/0', target: 'igw-cafe' }] },
+    { id: 'rtb-app-a', subnets: ['subnet-app-a'], routes: [{ dest: '0.0.0.0/0', target: 'nat-a' }, local, { dest: '198.51.100.0/24', target: 'pcx-payment' }] },
+    { id: 'rtb-app-c', subnets: ['subnet-app-c'], routes: [local, { dest: '0.0.0.0/0', target: 'nat-c' }] },
+    { id: 'rtb-batch', subnets: ['subnet-batch'], routes: [local, { dest: '0.0.0.0/0', target: 'vgw-office' }] },
+  ],
+  nats: [{ id: 'nat-a', subnet: 'subnet-pub-a' }, { id: 'nat-c', subnet: 'subnet-app-a' }],
+}
+assert.equal(routeFor(net, 'subnet-app-a', '10.20.20.5'), 'local', 'VPC 內的位址符合 /16 與 /0，挑前綴最長的 local')
+assert.equal(routeFor(net, 'subnet-app-a', '8.8.8.8'), 'nat-a', '外面的位址只符合 0.0.0.0/0')
+assert.equal(routeFor(net, 'subnet-app-a', '198.51.100.7'), 'pcx-payment', '198.51.100.0/24 比 0.0.0.0/0 具體，就算排在後面也是它：最長前綴，不是第一個符合')
+assert.equal(routeFor(net, 'subnet-new', '10.20.1.9'), 'local', '沒有明確關聯的子網路用 main route table')
+assert.equal(routeFor(net, 'subnet-new', '8.8.8.8'), null, 'main table 沒有 0.0.0.0/0：沒有符合的路由要回傳 null')
+assert.equal(diagnoseEgress(net, 'subnet-app-a', '203.0.113.50'), 'ok', 'app-a → nat-a，nat-a 在公有子網路，那裡有 igw：通')
+assert.equal(diagnoseEgress(net, 'subnet-new', '203.0.113.50'), 'no-route', '忘了關聯 route table 的子網路用 main table，沒有預設路由')
+assert.equal(diagnoseEgress(net, 'subnet-app-c', '203.0.113.50'), 'nat-without-igw', 'nat-c 被放在私有子網路 subnet-app-a：要再查 NAT 所在子網路的路由，它沒有 igw')
+assert.equal(diagnoseEgress(net, 'subnet-pub-c', '203.0.113.50'), 'igw-without-public-ip', '直接指向 igw，但程式沒有公開 IP 出不去')
+assert.equal(diagnoseEgress(net, 'subnet-batch', '203.0.113.50'), 'no-route', '指向 VPN 的 vgw，不是 igw 也不是 NAT')
+assert.equal(diagnoseEgress(net, 'subnet-app-a', '198.51.100.7'), 'no-route', '金流商的網段走 peering，不經過 NAT')
+</script>
+  <script type="wrong">
+type Route = { dest: string, target: string }
+type RouteTable = { id: string, main?: boolean, subnets: string[], routes: Route[] }
+type Vpc = { routeTables: RouteTable[], nats: { id: string, subnet: string }[] }
+type Egress = 'ok' | 'no-route' | 'igw-without-public-ip' | 'nat-without-igw'
+const toInt = (ip: string) => ip.split('.').reduce((n, part) => n * 256 + Number(part), 0)
+const inCidr = (ip: string, cidr: string) => {
+  const [base, bits] = cidr.split('/')
+  const size = 2 ** (32 - Number(bits))
+  return Math.floor(toInt(ip) / size) === Math.floor(toInt(base) / size)
+}
+const prefix = (cidr: string) => Number(cidr.split('/')[1])
+// 第一個符合的就回傳
+function routeFor(vpc: Vpc, subnet: string, ip: string): string | null {
+  const table = vpc.routeTables.find(t => t.subnets.includes(subnet)) ?? vpc.routeTables.find(t => t.main)
+  return table?.routes.find(r => inCidr(ip, r.dest))?.target ?? null
+}
+function diagnoseEgress(vpc: Vpc, subnet: string, ip: string): Egress {
+  const target = routeFor(vpc, subnet, ip)
+  if (target?.startsWith('igw-')) return 'igw-without-public-ip'
+  if (!target?.startsWith('nat-')) return 'no-route'
+  const nat = vpc.nats.find(n => n.id === target)
+  if (!nat) return 'no-route'
+  return routeFor(vpc, nat.subnet, ip)?.startsWith('igw-') ? 'ok' : 'nat-without-igw'
+}
+</script>
+  <script type="wrong">
+type Route = { dest: string, target: string }
+type RouteTable = { id: string, main?: boolean, subnets: string[], routes: Route[] }
+type Vpc = { routeTables: RouteTable[], nats: { id: string, subnet: string }[] }
+type Egress = 'ok' | 'no-route' | 'igw-without-public-ip' | 'nat-without-igw'
+const toInt = (ip: string) => ip.split('.').reduce((n, part) => n * 256 + Number(part), 0)
+const inCidr = (ip: string, cidr: string) => {
+  const [base, bits] = cidr.split('/')
+  const size = 2 ** (32 - Number(bits))
+  return Math.floor(toInt(ip) / size) === Math.floor(toInt(base) / size)
+}
+const prefix = (cidr: string) => Number(cidr.split('/')[1])
+// 忽略 main table：沒有明確關聯就當成沒有路由
+function routeFor(vpc: Vpc, subnet: string, ip: string): string | null {
+  const table = vpc.routeTables.find(t => t.subnets.includes(subnet))
+  const matches = (table?.routes ?? []).filter(r => inCidr(ip, r.dest))
+  if (!matches.length) return null
+  return matches.reduce((best, r) => prefix(r.dest) > prefix(best.dest) ? r : best).target
+}
+function diagnoseEgress(vpc: Vpc, subnet: string, ip: string): Egress {
+  const target = routeFor(vpc, subnet, ip)
+  if (target?.startsWith('igw-')) return 'igw-without-public-ip'
+  if (!target?.startsWith('nat-')) return 'no-route'
+  const nat = vpc.nats.find(n => n.id === target)
+  if (!nat) return 'no-route'
+  return routeFor(vpc, nat.subnet, ip)?.startsWith('igw-') ? 'ok' : 'nat-without-igw'
+}
+</script>
+  <script type="wrong">
+type Route = { dest: string, target: string }
+type RouteTable = { id: string, main?: boolean, subnets: string[], routes: Route[] }
+type Vpc = { routeTables: RouteTable[], nats: { id: string, subnet: string }[] }
+type Egress = 'ok' | 'no-route' | 'igw-without-public-ip' | 'nat-without-igw'
+const toInt = (ip: string) => ip.split('.').reduce((n, part) => n * 256 + Number(part), 0)
+const inCidr = (ip: string, cidr: string) => {
+  const [base, bits] = cidr.split('/')
+  const size = 2 ** (32 - Number(bits))
+  return Math.floor(toInt(ip) / size) === Math.floor(toInt(base) / size)
+}
+const prefix = (cidr: string) => Number(cidr.split('/')[1])
+function routeFor(vpc: Vpc, subnet: string, ip: string): string | null {
+  const table = vpc.routeTables.find(t => t.subnets.includes(subnet)) ?? vpc.routeTables.find(t => t.main)
+  const matches = (table?.routes ?? []).filter(r => inCidr(ip, r.dest))
+  if (!matches.length) return null
+  return matches.reduce((best, r) => prefix(r.dest) > prefix(best.dest) ? r : best).target
+}
+// 只看第一層：指向 NAT 就當成通了
+function diagnoseEgress(vpc: Vpc, subnet: string, ip: string): Egress {
+  const target = routeFor(vpc, subnet, ip)
+  if (target?.startsWith('igw-')) return 'igw-without-public-ip'
+  return target?.startsWith('nat-') ? 'ok' : 'no-route'
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：cafe-api（<code>client</code>）從臨時 port <code>clientPort</code> 連到 db（<code>server</code>）的 <code>port</code>，兩者在不同的子網路。完成 <code>naclAllows</code> 與 <code>roundTrip</code>。<code>naclAllows(rules, ip, port)</code>：規則依編號 <code>n</code> 由小到大，第一條 <code>cidr</code> 包含 <code>ip</code>、<code>port</code> 在 <code>from</code>～<code>to</code> 之間的規則決定結果，都不符合就是 <code>false</code>。<code>sgAllows</code> 已經寫好。<code>roundTrip</code> 依序檢查，回傳第一個擋下的關卡，全部通過回傳 <code>'ok'</code>：</p>
+  <ol>
+    <li><code>'client-sg-out'</code>：client 的安全群組出站，允許連到 server 的 <code>port</code>。</li>
+    <li><code>'client-nacl-out'</code>：client 子網路的 NACL 出站，目的地 server 的 IP、<code>port</code>。</li>
+    <li><code>'server-nacl-in'</code>：server 子網路的 NACL 進站，來源 client 的 IP、目的 <code>port</code>。</li>
+    <li><code>'server-sg-in'</code>：server 的安全群組進站，來源 client、<code>port</code>。</li>
+    <li><code>'server-nacl-out'</code>：回程，server 子網路的 NACL 出站，目的地 client 的 IP、<code>clientPort</code>。</li>
+    <li><code>'client-nacl-in'</code>：回程，client 子網路的 NACL 進站，來源 server 的 IP、目的 <code>clientPort</code>。</li>
+  </ol>
+  <p>安全群組有狀態，回程不檢查。</p>
+  <script type="start">
+type NaclRule = { n: number, cidr: string, from: number, to: number, allow: boolean }
+type Nacl = { inbound: NaclRule[], outbound: NaclRule[] }
+type SgRule = { from: number, to: number, cidr?: string, sg?: string }
+type Sg = { id: string, inbound: SgRule[], outbound: SgRule[] }
+type Host = { ip: string, nacl: Nacl, sgs: string[] }
+type Conn = { client: Host, server: Host, port: number, clientPort: number }
+type Hop = 'ok' | 'client-sg-out' | 'client-nacl-out' | 'server-nacl-in' | 'server-sg-in' | 'server-nacl-out' | 'client-nacl-in'
+
+const toInt = (ip: string) => ip.split('.').reduce((n, part) => n * 256 + Number(part), 0)
+const inCidr = (ip: string, cidr: string) => {
+  const [base, bits] = cidr.split('/')
+  const size = 2 ** (32 - Number(bits))
+  return Math.floor(toInt(ip) / size) === Math.floor(toInt(base) / size)
+}
+// host 掛的安全群組裡，有沒有一條規則允許對方（CIDR 包含對方 IP，或對方掛著那個安全群組）的這個 port
+const sgAllows = (groups: Sg[], host: Host, dir: 'inbound' | 'outbound', peer: Host, port: number) =>
+  groups.filter(g => host.sgs.includes(g.id)).some(g => g[dir].some(r =>
+    port >= r.from && port <= r.to && (r.cidr ? inCidr(peer.ip, r.cidr) : peer.sgs.includes(r.sg ?? ''))))
+
+function naclAllows(rules: NaclRule[], ip: string, port: number): boolean {
+  return false
+}
+
+function roundTrip(groups: Sg[], { client, server, port, clientPort }: Conn): Hop {
+  return 'ok'
+}
+
+const open: Nacl = { inbound: [{ n: 100, cidr: '0.0.0.0/0', from: 0, to: 65535, allow: true }], outbound: [{ n: 100, cidr: '0.0.0.0/0', from: 0, to: 65535, allow: true }] }
+const groups: Sg[] = [
+  { id: 'sg-app', inbound: [], outbound: [{ from: 0, to: 65535, cidr: '0.0.0.0/0' }] },
+  { id: 'sg-db', inbound: [{ from: 5432, to: 5432, sg: 'sg-app' }], outbound: [] },
+]
+console.log(roundTrip(groups, {
+  client: { ip: '10.20.10.5', nacl: open, sgs: ['sg-app'] },
+  server: { ip: '10.20.20.5', nacl: open, sgs: ['sg-db'] },
+  port: 5432, clientPort: 49152,
+}))
+</script>
+  <script type="answer">
+type NaclRule = { n: number, cidr: string, from: number, to: number, allow: boolean }
+type Nacl = { inbound: NaclRule[], outbound: NaclRule[] }
+type SgRule = { from: number, to: number, cidr?: string, sg?: string }
+type Sg = { id: string, inbound: SgRule[], outbound: SgRule[] }
+type Host = { ip: string, nacl: Nacl, sgs: string[] }
+type Conn = { client: Host, server: Host, port: number, clientPort: number }
+type Hop = 'ok' | 'client-sg-out' | 'client-nacl-out' | 'server-nacl-in' | 'server-sg-in' | 'server-nacl-out' | 'client-nacl-in'
+
+const toInt = (ip: string) => ip.split('.').reduce((n, part) => n * 256 + Number(part), 0)
+const inCidr = (ip: string, cidr: string) => {
+  const [base, bits] = cidr.split('/')
+  const size = 2 ** (32 - Number(bits))
+  return Math.floor(toInt(ip) / size) === Math.floor(toInt(base) / size)
+}
+// host 掛的安全群組裡，有沒有一條規則允許對方（CIDR 包含對方 IP，或對方掛著那個安全群組）的這個 port
+const sgAllows = (groups: Sg[], host: Host, dir: 'inbound' | 'outbound', peer: Host, port: number) =>
+  groups.filter(g => host.sgs.includes(g.id)).some(g => g[dir].some(r =>
+    port >= r.from && port <= r.to && (r.cidr ? inCidr(peer.ip, r.cidr) : peer.sgs.includes(r.sg ?? ''))))
+
+function naclAllows(rules: NaclRule[], ip: string, port: number): boolean {
+  const first = [...rules].sort((a, b) => a.n - b.n).find(r => inCidr(ip, r.cidr) && port >= r.from && port <= r.to)
+  return first?.allow ?? false
+}
+
+function roundTrip(groups: Sg[], { client, server, port, clientPort }: Conn): Hop {
+  if (!sgAllows(groups, client, 'outbound', server, port)) return 'client-sg-out'
+  if (!naclAllows(client.nacl.outbound, server.ip, port)) return 'client-nacl-out'
+  if (!naclAllows(server.nacl.inbound, client.ip, port)) return 'server-nacl-in'
+  if (!sgAllows(groups, server, 'inbound', client, port)) return 'server-sg-in'
+  // 回程：NACL 無狀態，要再判斷一次；安全群組有狀態，不用
+  if (!naclAllows(server.nacl.outbound, client.ip, clientPort)) return 'server-nacl-out'
+  if (!naclAllows(client.nacl.inbound, server.ip, clientPort)) return 'client-nacl-in'
+  return 'ok'
+}
+
+const open: Nacl = { inbound: [{ n: 100, cidr: '0.0.0.0/0', from: 0, to: 65535, allow: true }], outbound: [{ n: 100, cidr: '0.0.0.0/0', from: 0, to: 65535, allow: true }] }
+const groups: Sg[] = [
+  { id: 'sg-app', inbound: [], outbound: [{ from: 0, to: 65535, cidr: '0.0.0.0/0' }] },
+  { id: 'sg-db', inbound: [{ from: 5432, to: 5432, sg: 'sg-app' }], outbound: [] },
+]
+console.log(roundTrip(groups, {
+  client: { ip: '10.20.10.5', nacl: open, sgs: ['sg-app'] },
+  server: { ip: '10.20.20.5', nacl: open, sgs: ['sg-db'] },
+  port: 5432, clientPort: 49152,
+}))
+</script>
+  <script type="tests">
+const all = (allow = true): NaclRule => ({ n: 100, cidr: '0.0.0.0/0', from: 0, to: 65535, allow })
+const openNacl: Nacl = { inbound: [all()], outbound: [all()] }
+const sgs: Sg[] = [
+  { id: 'sg-app', inbound: [{ from: 3000, to: 3000, sg: 'sg-alb' }], outbound: [{ from: 0, to: 65535, cidr: '0.0.0.0/0' }] },
+  { id: 'sg-db', inbound: [{ from: 5432, to: 5432, sg: 'sg-app' }], outbound: [] },
+  { id: 'sg-app-https-only', inbound: [], outbound: [{ from: 443, to: 443, cidr: '0.0.0.0/0' }] },
+  { id: 'sg-db-batch', inbound: [{ from: 5432, to: 5432, sg: 'sg-batch' }], outbound: [] },
+]
+const app = (nacl: Nacl = openNacl, groups = ['sg-app']): Host => ({ ip: '10.20.10.5', nacl, sgs: groups })
+const db = (nacl: Nacl = openNacl, groups = ['sg-db']): Host => ({ ip: '10.20.20.5', nacl, sgs: groups })
+const conn = (client: Host, server: Host, clientPort = 49152): Conn => ({ client, server, port: 5432, clientPort })
+
+assert.equal(roundTrip(sgs, conn(app(), db())), 'ok', '全部開著：通。db 的安全群組沒有出站規則也沒關係，安全群組會自動放行回應')
+assert.equal(roundTrip(sgs, conn(app(openNacl, ['sg-app-https-only']), db())), 'client-sg-out', 'app 的安全群組出站只開 443')
+assert.equal(roundTrip(sgs, conn(app(), db(openNacl, ['sg-db-batch']))), 'server-sg-in', 'db 的安全群組只接受 sg-batch，cafe-api 掛的是 sg-app')
+const mirrored: Nacl = {
+  inbound: [{ n: 100, cidr: '10.20.10.0/24', from: 5432, to: 5432, allow: true }],
+  outbound: [{ n: 100, cidr: '10.20.10.0/24', from: 5432, to: 5432, allow: true }],
+}
+assert.equal(roundTrip(sgs, conn(app(), db(mirrored))), 'server-nacl-out',
+  'db 子網路的 NACL 出站照抄進站只開 5432：回應的目的 port 是 49152，被擋。NACL 無狀態，回程要另外判斷')
+const blockOne: Nacl = { inbound: [{ n: 200, cidr: '10.20.0.0/16', from: 5432, to: 5432, allow: true }, { n: 100, cidr: '10.20.10.5/32', from: 0, to: 65535, allow: false }], outbound: [all()] }
+assert.equal(roundTrip(sgs, conn(app(), db(blockOne))), 'server-nacl-in',
+  '編號 100 的拒絕先比對到 10.20.10.5，就算後面 200 允許也沒用：依編號由小到大，第一條符合的決定（陣列順序不算）')
+const allowFirst: Nacl = { inbound: [{ n: 200, cidr: '0.0.0.0/0', from: 0, to: 65535, allow: false }, { n: 100, cidr: '10.20.10.0/24', from: 5432, to: 5432, allow: true }], outbound: [all()] }
+assert.equal(roundTrip(sgs, conn(app(), db(allowFirst))), 'ok', '編號 100 的允許先符合，200 的拒絕不會用到')
+assert.equal(roundTrip(sgs, conn(app(), db({ inbound: [], outbound: [all()] }))), 'server-nacl-in', '沒有任何規則符合：最後的 * 規則拒絕')
+const linuxRange: Nacl = { inbound: [{ n: 100, cidr: '0.0.0.0/0', from: 32768, to: 60999, allow: true }], outbound: [all()] }
+assert.equal(roundTrip(sgs, conn(app(linuxRange), db(), 1500)), 'client-nacl-in', 'app 子網路的回程只開 32768–60999，這條連線用的臨時 port 是 1500')
+assert.equal(roundTrip(sgs, conn(app(linuxRange), db(), 40000)), 'ok', '臨時 port 40000 在範圍內')
+assert.equal(roundTrip(sgs, conn(app({ inbound: [all()], outbound: [{ n: 100, cidr: '10.20.0.0/16', from: 443, to: 443, allow: true }] }), db())), 'client-nacl-out', 'app 子網路的 NACL 出站只開 443')
+</script>
+  <script type="wrong">
+type NaclRule = { n: number, cidr: string, from: number, to: number, allow: boolean }
+type Nacl = { inbound: NaclRule[], outbound: NaclRule[] }
+type SgRule = { from: number, to: number, cidr?: string, sg?: string }
+type Sg = { id: string, inbound: SgRule[], outbound: SgRule[] }
+type Host = { ip: string, nacl: Nacl, sgs: string[] }
+type Conn = { client: Host, server: Host, port: number, clientPort: number }
+type Hop = 'ok' | 'client-sg-out' | 'client-nacl-out' | 'server-nacl-in' | 'server-sg-in' | 'server-nacl-out' | 'client-nacl-in'
+const toInt = (ip: string) => ip.split('.').reduce((n, part) => n * 256 + Number(part), 0)
+const inCidr = (ip: string, cidr: string) => {
+  const [base, bits] = cidr.split('/')
+  const size = 2 ** (32 - Number(bits))
+  return Math.floor(toInt(ip) / size) === Math.floor(toInt(base) / size)
+}
+const sgAllows = (groups: Sg[], host: Host, dir: 'inbound' | 'outbound', peer: Host, port: number) =>
+  groups.filter(g => host.sgs.includes(g.id)).some(g => g[dir].some(r =>
+    port >= r.from && port <= r.to && (r.cidr ? inCidr(peer.ip, r.cidr) : peer.sgs.includes(r.sg ?? ''))))
+// 像安全群組一樣：只要有一條允許就過，不管編號與拒絕
+function naclAllows(rules: NaclRule[], ip: string, port: number): boolean {
+  return rules.some(r => r.allow && inCidr(ip, r.cidr) && port >= r.from && port <= r.to)
+}
+function roundTrip(groups: Sg[], { client, server, port, clientPort }: Conn): Hop {
+  if (!sgAllows(groups, client, 'outbound', server, port)) return 'client-sg-out'
+  if (!naclAllows(client.nacl.outbound, server.ip, port)) return 'client-nacl-out'
+  if (!naclAllows(server.nacl.inbound, client.ip, port)) return 'server-nacl-in'
+  if (!sgAllows(groups, server, 'inbound', client, port)) return 'server-sg-in'
+  if (!naclAllows(server.nacl.outbound, client.ip, clientPort)) return 'server-nacl-out'
+  if (!naclAllows(client.nacl.inbound, server.ip, clientPort)) return 'client-nacl-in'
+  return 'ok'
+}
+</script>
+  <script type="wrong">
+type NaclRule = { n: number, cidr: string, from: number, to: number, allow: boolean }
+type Nacl = { inbound: NaclRule[], outbound: NaclRule[] }
+type SgRule = { from: number, to: number, cidr?: string, sg?: string }
+type Sg = { id: string, inbound: SgRule[], outbound: SgRule[] }
+type Host = { ip: string, nacl: Nacl, sgs: string[] }
+type Conn = { client: Host, server: Host, port: number, clientPort: number }
+type Hop = 'ok' | 'client-sg-out' | 'client-nacl-out' | 'server-nacl-in' | 'server-sg-in' | 'server-nacl-out' | 'client-nacl-in'
+const toInt = (ip: string) => ip.split('.').reduce((n, part) => n * 256 + Number(part), 0)
+const inCidr = (ip: string, cidr: string) => {
+  const [base, bits] = cidr.split('/')
+  const size = 2 ** (32 - Number(bits))
+  return Math.floor(toInt(ip) / size) === Math.floor(toInt(base) / size)
+}
+const sgAllows = (groups: Sg[], host: Host, dir: 'inbound' | 'outbound', peer: Host, port: number) =>
+  groups.filter(g => host.sgs.includes(g.id)).some(g => g[dir].some(r =>
+    port >= r.from && port <= r.to && (r.cidr ? inCidr(peer.ip, r.cidr) : peer.sgs.includes(r.sg ?? ''))))
+function naclAllows(rules: NaclRule[], ip: string, port: number): boolean {
+  const first = [...rules].sort((a, b) => a.n - b.n).find(r => inCidr(ip, r.cidr) && port >= r.from && port <= r.to)
+  return first?.allow ?? false
+}
+// 去程過了就當作回程也會過
+function roundTrip(groups: Sg[], { client, server, port }: Conn): Hop {
+  if (!sgAllows(groups, client, 'outbound', server, port)) return 'client-sg-out'
+  if (!naclAllows(client.nacl.outbound, server.ip, port)) return 'client-nacl-out'
+  if (!naclAllows(server.nacl.inbound, client.ip, port)) return 'server-nacl-in'
+  if (!sgAllows(groups, server, 'inbound', client, port)) return 'server-sg-in'
+  return 'ok'
+}
+</script>
+  <script type="wrong">
+type NaclRule = { n: number, cidr: string, from: number, to: number, allow: boolean }
+type Nacl = { inbound: NaclRule[], outbound: NaclRule[] }
+type SgRule = { from: number, to: number, cidr?: string, sg?: string }
+type Sg = { id: string, inbound: SgRule[], outbound: SgRule[] }
+type Host = { ip: string, nacl: Nacl, sgs: string[] }
+type Conn = { client: Host, server: Host, port: number, clientPort: number }
+type Hop = 'ok' | 'client-sg-out' | 'client-nacl-out' | 'server-nacl-in' | 'server-sg-in' | 'server-nacl-out' | 'client-nacl-in'
+const toInt = (ip: string) => ip.split('.').reduce((n, part) => n * 256 + Number(part), 0)
+const inCidr = (ip: string, cidr: string) => {
+  const [base, bits] = cidr.split('/')
+  const size = 2 ** (32 - Number(bits))
+  return Math.floor(toInt(ip) / size) === Math.floor(toInt(base) / size)
+}
+const sgAllows = (groups: Sg[], host: Host, dir: 'inbound' | 'outbound', peer: Host, port: number) =>
+  groups.filter(g => host.sgs.includes(g.id)).some(g => g[dir].some(r =>
+    port >= r.from && port <= r.to && (r.cidr ? inCidr(peer.ip, r.cidr) : peer.sgs.includes(r.sg ?? ''))))
+function naclAllows(rules: NaclRule[], ip: string, port: number): boolean {
+  const first = [...rules].sort((a, b) => a.n - b.n).find(r => inCidr(ip, r.cidr) && port >= r.from && port <= r.to)
+  return first?.allow ?? false
+}
+// 安全群組也當成無狀態：回程要 server 的安全群組出站允許
+function roundTrip(groups: Sg[], { client, server, port, clientPort }: Conn): Hop {
+  if (!sgAllows(groups, client, 'outbound', server, port)) return 'client-sg-out'
+  if (!naclAllows(client.nacl.outbound, server.ip, port)) return 'client-nacl-out'
+  if (!naclAllows(server.nacl.inbound, client.ip, port)) return 'server-nacl-in'
+  if (!sgAllows(groups, server, 'inbound', client, port)) return 'server-sg-in'
+  if (!naclAllows(server.nacl.outbound, client.ip, clientPort)) return 'server-nacl-out'
+  if (!sgAllows(groups, server, 'outbound', client, clientPort)) return 'server-nacl-out'
+  if (!naclAllows(client.nacl.inbound, server.ip, clientPort)) return 'client-nacl-in'
+  return 'ok'
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：寫 <code>parseFlowLogs(text)</code>，從 Flow Logs 找出被擋的連線。<code>text</code> 的第一行是欄位名稱（空白分隔，順序可能是自訂的），之後每行一筆紀錄。<code>log-status</code> 不是 <code>OK</code> 的行整行跳過。對每一筆 <code>action</code> 是 <code>REJECT</code> 的紀錄：</p>
+  <ul>
+    <li>如果有一筆 <code>ACCEPT</code> 的紀錄剛好是它的反方向（對方的 srcaddr、dstaddr、srcport、dstport 跟它的 dstaddr、srcaddr、dstport、srcport 一樣），它是那條連線的回程被擋：<code>{ src, dst, port }</code> 用那筆 ACCEPT 的 srcaddr、dstaddr、dstport，<code>verdict</code> 是 <code>'return-rejected'</code>。</li>
+    <li>否則是進站被擋：用它自己的 srcaddr、dstaddr、dstport，<code>verdict</code> 是 <code>'inbound-rejected'</code>。</li>
+  </ul>
+  <p>相同 <code>src</code>、<code>dst</code>、<code>port</code>、<code>verdict</code> 的合成一項，<code>count</code> 是 REJECT 的筆數；結果依 src、dst、port 排序（字串用 <code>localeCompare</code>，port 用數字）。</p>
+  <script type="start">
+type Finding = { src: string, dst: string, port: number, verdict: 'inbound-rejected' | 'return-rejected', count: number }
+
+function parseFlowLogs(text: string): Finding[] {
+  const [header, ...lines] = text.trim().split('\n')
+  // 1. 用第一行的欄位名稱，把每一行轉成 { 欄位名稱: 值 }
+  // 2. 跳過 log-status 不是 OK 的行
+  // 3. 每一筆 REJECT：找反方向的 ACCEPT 判斷是回程還是進站被擋
+  return []
+}
+
+const logs = `version account-id interface-id srcaddr dstaddr srcport dstport protocol packets bytes start end action log-status
+2 111122223333 eni-db 10.20.10.5 10.20.20.5 49152 5432 6 3 180 1763600000 1763600060 ACCEPT OK
+2 111122223333 eni-db 10.20.20.5 10.20.10.5 5432 49152 6 3 180 1763600000 1763600060 REJECT OK`
+console.log(parseFlowLogs(logs))
+</script>
+  <script type="answer">
+type Finding = { src: string, dst: string, port: number, verdict: 'inbound-rejected' | 'return-rejected', count: number }
+
+function parseFlowLogs(text: string): Finding[] {
+  const [header, ...lines] = text.trim().split('\n')
+  const fields = header.trim().split(/\s+/)
+  const records = lines
+    .map(line => { const values = line.trim().split(/\s+/); return Object.fromEntries(fields.map((f, i) => [f, values[i]])) })
+    .filter(r => r['log-status'] === 'OK')
+  const accepted = records.filter(r => r.action === 'ACCEPT')
+  const found = new Map<string, Finding>()
+  for (const r of records.filter(r => r.action === 'REJECT')) {
+    const forward = accepted.find(a => a.srcaddr === r.dstaddr && a.dstaddr === r.srcaddr && a.srcport === r.dstport && a.dstport === r.srcport)
+    const f = forward
+      ? { src: forward.srcaddr, dst: forward.dstaddr, port: Number(forward.dstport), verdict: 'return-rejected' as const }
+      : { src: r.srcaddr, dst: r.dstaddr, port: Number(r.dstport), verdict: 'inbound-rejected' as const }
+    const key = `${f.src} ${f.dst} ${f.port} ${f.verdict}`
+    const seen = found.get(key)
+    if (seen) seen.count++
+    else found.set(key, { ...f, count: 1 })
+  }
+  return [...found.values()].sort((a, b) => a.src.localeCompare(b.src) || a.dst.localeCompare(b.dst) || a.port - b.port)
+}
+
+const logs = `version account-id interface-id srcaddr dstaddr srcport dstport protocol packets bytes start end action log-status
+2 111122223333 eni-db 10.20.10.5 10.20.20.5 49152 5432 6 3 180 1763600000 1763600060 ACCEPT OK
+2 111122223333 eni-db 10.20.20.5 10.20.10.5 5432 49152 6 3 180 1763600000 1763600060 REJECT OK`
+console.log(parseFlowLogs(logs))
+</script>
+  <script type="tests">
+const H = 'version account-id interface-id srcaddr dstaddr srcport dstport protocol packets bytes start end action log-status'
+const rec = (src: string, dst: string, sport: number, dport: number, action: string) =>
+  `2 111122223333 eni-db ${src} ${dst} ${sport} ${dport} 6 3 180 1763600000 1763600060 ${action} OK`
+const text = [H,
+  rec('10.20.10.5', '10.20.20.5', 49152, 5432, 'ACCEPT'),
+  rec('10.20.20.5', '10.20.10.5', 5432, 49152, 'REJECT'),
+  rec('10.20.20.5', '10.20.10.5', 5432, 49152, 'REJECT'),
+  rec('203.0.113.9', '10.20.20.5', 51515, 5432, 'REJECT'),
+  '2 111122223333 eni-db - - - - - - - 1763600000 1763600060 - NODATA',
+  rec('10.20.10.6', '10.20.20.5', 50000, 5432, 'ACCEPT'),
+  rec('10.20.20.5', '10.20.10.6', 5432, 50000, 'ACCEPT'),
+  '2 111122223333 eni-db - - - - - - - 1763600060 1763600120 - SKIPDATA',
+].join('\n')
+assert.deepEqual(parseFlowLogs(text), [
+  { src: '10.20.10.5', dst: '10.20.20.5', port: 5432, verdict: 'return-rejected', count: 2 },
+  { src: '203.0.113.9', dst: '10.20.20.5', port: 5432, verdict: 'inbound-rejected', count: 1 },
+], '10.20.10.5 → db:5432 去程 ACCEPT、回程 REJECT 兩次（NACL 擋回程）；203.0.113.9 的進站被擋；NODATA、SKIPDATA 的行要跳過，雙向都 ACCEPT 的連線不列')
+assert.deepEqual(parseFlowLogs([H, rec('10.20.10.7', '10.20.20.5', 41000, 5432, 'REJECT'), rec('10.20.10.7', '10.20.20.5', 41001, 5432, 'REJECT')].join('\n')),
+  [{ src: '10.20.10.7', dst: '10.20.20.5', port: 5432, verdict: 'inbound-rejected', count: 2 }], '沒有反方向的 ACCEPT：進站被擋，不同的來源 port 算同一項')
+const custom = [
+  'action srcaddr srcport dstaddr dstport log-status interface-id',
+  'ACCEPT 10.20.10.5 49152 10.20.20.5 5432 OK eni-db',
+  'REJECT 10.20.20.5 5432 10.20.10.5 49152 OK eni-db',
+  'REJECT 198.51.100.4 3333 10.20.20.5 22 OK eni-db',
+].join('\n')
+assert.deepEqual(parseFlowLogs(custom), [
+  { src: '10.20.10.5', dst: '10.20.20.5', port: 5432, verdict: 'return-rejected', count: 1 },
+  { src: '198.51.100.4', dst: '10.20.20.5', port: 22, verdict: 'inbound-rejected', count: 1 },
+], '自訂格式的欄位順序不同：依第一行的欄位名稱找位置，不能寫死預設格式的位置')
+assert.deepEqual(parseFlowLogs([H, rec('10.20.10.5', '10.20.20.5', 49152, 5432, 'ACCEPT')].join('\n')), [], '沒有 REJECT 時回傳空陣列')
+</script>
+  <script type="wrong">
+type Finding = { src: string, dst: string, port: number, verdict: 'inbound-rejected' | 'return-rejected', count: number }
+// 不是 ACCEPT 就當成 REJECT，也沒有跳過 NODATA、SKIPDATA
+function parseFlowLogs(text: string): Finding[] {
+  const [header, ...lines] = text.trim().split('\n')
+  const fields = header.trim().split(/\s+/)
+  const records = lines.map(line => { const values = line.trim().split(/\s+/); return Object.fromEntries(fields.map((f, i) => [f, values[i]])) })
+  const accepted = records.filter(r => r.action === 'ACCEPT')
+  const found = new Map<string, Finding>()
+  for (const r of records.filter(r => r.action !== 'ACCEPT')) {
+    const forward = accepted.find(a => a.srcaddr === r.dstaddr && a.dstaddr === r.srcaddr && a.srcport === r.dstport && a.dstport === r.srcport)
+    const f = forward
+      ? { src: forward.srcaddr, dst: forward.dstaddr, port: Number(forward.dstport), verdict: 'return-rejected' as const }
+      : { src: r.srcaddr, dst: r.dstaddr, port: Number(r.dstport), verdict: 'inbound-rejected' as const }
+    const key = `${f.src} ${f.dst} ${f.port} ${f.verdict}`
+    const seen = found.get(key)
+    if (seen) seen.count++
+    else found.set(key, { ...f, count: 1 })
+  }
+  return [...found.values()].sort((a, b) => a.src.localeCompare(b.src) || a.dst.localeCompare(b.dst) || a.port - b.port)
+}
+</script>
+  <script type="wrong">
+type Finding = { src: string, dst: string, port: number, verdict: 'inbound-rejected' | 'return-rejected', count: number }
+// 寫死預設格式的欄位位置，不看第一行
+function parseFlowLogs(text: string): Finding[] {
+  const [, ...lines] = text.trim().split('\n')
+  const records = lines.map(line => {
+    const v = line.trim().split(/\s+/)
+    return { srcaddr: v[3], dstaddr: v[4], srcport: v[5], dstport: v[6], action: v[12], status: v[13] }
+  }).filter(r => r.status === 'OK')
+  const accepted = records.filter(r => r.action === 'ACCEPT')
+  const found = new Map<string, Finding>()
+  for (const r of records.filter(r => r.action === 'REJECT')) {
+    const forward = accepted.find(a => a.srcaddr === r.dstaddr && a.dstaddr === r.srcaddr && a.srcport === r.dstport && a.dstport === r.srcport)
+    const f = forward
+      ? { src: forward.srcaddr, dst: forward.dstaddr, port: Number(forward.dstport), verdict: 'return-rejected' as const }
+      : { src: r.srcaddr, dst: r.dstaddr, port: Number(r.dstport), verdict: 'inbound-rejected' as const }
+    const key = `${f.src} ${f.dst} ${f.port} ${f.verdict}`
+    const seen = found.get(key)
+    if (seen) seen.count++
+    else found.set(key, { ...f, count: 1 })
+  }
+  return [...found.values()].sort((a, b) => a.src.localeCompare(b.src) || a.dst.localeCompare(b.dst) || a.port - b.port)
+}
+</script>
+  <script type="wrong">
+type Finding = { src: string, dst: string, port: number, verdict: 'inbound-rejected' | 'return-rejected', count: number }
+// 每一筆 REJECT 都當成進站被擋：分不出回程被 NACL 擋
+function parseFlowLogs(text: string): Finding[] {
+  const [header, ...lines] = text.trim().split('\n')
+  const fields = header.trim().split(/\s+/)
+  const records = lines
+    .map(line => { const values = line.trim().split(/\s+/); return Object.fromEntries(fields.map((f, i) => [f, values[i]])) })
+    .filter(r => r['log-status'] === 'OK')
+  const found = new Map<string, Finding>()
+  for (const r of records.filter(r => r.action === 'REJECT')) {
+    const f = { src: r.srcaddr, dst: r.dstaddr, port: Number(r.dstport), verdict: 'inbound-rejected' as const }
+    const key = `${f.src} ${f.dst} ${f.port}`
+    const seen = found.get(key)
+    if (seen) seen.count++
+    else found.set(key, { ...f, count: 1 })
+  }
+  return [...found.values()].sort((a, b) => a.src.localeCompare(b.src) || a.dst.localeCompare(b.dst) || a.port - b.port)
+}
+</script>
+</div>
+
+<div class="local" data-test="ex4" data-files="lockdown.ts">
+  <p>練習 4：完成 <code>lockdown.ts</code> 的 <code>lockdown(ec2, { vpcId, privateRouteTableIds, bucket })</code>，把開場的三件事在設定上做對。用 <code>CreateSecurityGroupCommand</code> 在 <code>vpcId</code> 建三個安全群組 <code>cafe-03-alb</code>、<code>cafe-03-app</code>、<code>cafe-03-db</code>（<code>Description</code> 必填，用英文），再用 <code>AuthorizeSecurityGroupIngressCommand</code> 各加一條進站規則：alb 允許 tcp 443 來自 <code>0.0.0.0/0</code>；app 允許 tcp 3000，來源用 <code>UserIdGroupPairs: [{ GroupId: alb 的 ID }]</code>；db 允許 tcp 5432，來源是 app 的安全群組。然後用 <code>CreateVpcEndpointCommand</code> 建 S3 的 gateway endpoint：<code>VpcEndpointType: 'Gateway'</code>、<code>ServiceName</code> 是 <code>com.amazonaws.&lt;region&gt;.s3</code>（region 用 <code>await ec2.config.region()</code>）、掛到 <code>privateRouteTableIds</code> 的每一張、<code>PolicyDocument</code> 只允許 <code>s3:GetObject</code>、<code>s3:PutObject</code>、<code>s3:ListBucket</code> 這個 bucket（Resource 同時列 bucket 本身與 <code>bucket/*</code>）。回傳四個 ID。測試每次會建一個新的 VPC 與兩張私有 route table 傳給你，再把設定讀回來檢查。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：cafe-api 呼叫金流商 API，log 裡是 <code>ETIMEDOUT</code>。同事馬上去看 cafe-api 有沒有在聽 3000 port。你會先查什麼？</p>
+  <label data-key="a">cafe-api 的程式有沒有啟動、有沒有聽在 0.0.0.0</label>
+  <label data-key="b">cafe-api 所在子網路的 route table 對那個 IP 走哪裡，目標是 NAT 的話，再看 NAT 所在子網路的路由</label>
+  <label data-key="c">金流商的 API 是不是掛了，換一個 API 金鑰再試</label>
+  <label data-key="d">cafe-api 的安全群組進站規則有沒有開 443</label>
+  <p class="why">✓ 逾時代表封包沒有得到任何回應，多半是網路層：從離自己近的路由查起，連外要經過 NAT 兩層路由。a 是查「connection refused」的方法，而且查的是自己的 port，跟連出去無關；d 錯在主動連出去看的是出站規則，回應會自動放行。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 6：cafe-api 在私有子網路，每天上傳大量收據到同一個 region 的 S3，NAT 的處理費很高。要讓這些流量不經過 NAT，選哪個？</p>
+  <label data-key="a">S3 的 interface endpoint：它是 PrivateLink，比較安全</label>
+  <label data-key="b">把 cafe-api 移到公有子網路，給它公開 IP 直接連 S3</label>
+  <label data-key="c">S3 的 gateway endpoint，掛到所有私有子網路的 route table</label>
+  <label data-key="d">在 bucket policy 加上 <code>aws:SourceVpc</code> 條件</label>
+  <p class="why">✓ gateway endpoint 不收費，在 route table 加一條到 S3 prefix list 的路由，S3 流量就不走 NAT。要記得每一張私有 route table 都掛。a 也能讓流量不走 NAT，但 interface endpoint 每個 AZ 每小時加每 GB 計費，從 VPC 內存取時沒有必要；它適合從公司內網透過 VPN 存取。d 只限制來源，不會改變流量走的路。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 7：db 的安全群組允許來自 app 安全群組的 5432 進站，出站規則被同事全部刪光了。cafe-api 連得上資料庫嗎？</p>
+  <label data-key="a">連得上：安全群組有狀態，允許了進來的連線，回應自動放行</label>
+  <label data-key="b">連不上：沒有出站規則，回應送不出去</label>
+  <label data-key="c">連不上：要開 1024–65535 的出站規則給回應用</label>
+  <label data-key="d">只有第一次連得上，連線池重用的連線會被擋</label>
+  <p class="why">✓ 安全群組追蹤連線狀態，回應屬於已允許的連線，不看出站規則。出站規則只管 db 主動發起的連線。c 是把 NACL 的規則套到安全群組上，這是最常見的混淆：無狀態、要開臨時 port 的是 NACL。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>用路由在表裡的順序判斷</strong>：route table 依最長前綴挑路由，跟順序無關。</li>
+  <li><strong>新子網路忘了關聯 route table</strong>：它會用 main table，看起來設好了其實沒有。建子網路時一起明確關聯。</li>
+  <li><strong>NAT 放進私有子網路</strong>：私有子網路的路由指向它沒問題，它自己卻沒有到 internet gateway 的路由。zonal NAT 一定放公有子網路，或改用不需要公有子網路的 regional NAT。</li>
+  <li><strong>兩個 AZ 共用一個 NAT 卻沒寫進文件</strong>：那個 AZ 出事時全部連不出去，還多了跨 AZ 流量費。</li>
+  <li><strong>NACL 的出站照抄進站規則</strong>：回應的目的 port 是對方的臨時 port，要另外開（常見 1024–65535）。</li>
+  <li><strong>以為 NACL 跟安全群組一樣，有一條允許就過</strong>：NACL 依編號第一條符合的決定，排在前面的拒絕會擋掉後面的允許。</li>
+  <li><strong>db 的安全群組來源寫 VPC 的 CIDR</strong>：VPC 裡任何一台被入侵的機器都能連資料庫。來源寫 app 的安全群組。</li>
+  <li><strong>S3 流量走 NAT</strong>：每 GB 付處理費。建 gateway endpoint，每張私有 route table 都掛，endpoint policy 只列自己的 bucket。</li>
+  <li><strong>逾時時去查程式有沒有在聽</strong>：逾時先查網路層；connection refused 才是程式沒在聽。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>封包出私有子網路要過：安全群組 → NACL → route table → NAT（以及 NAT 自己的路由）→ internet gateway。任何一關不通都是逾時。</li>
+  <li>route table 依最長前綴挑路由；每張表都有 VPC CIDR → <code>local</code>；沒有明確關聯的子網路用 main table。</li>
+  <li>zonal NAT gateway 放公有子網路、只在一個 AZ，正式環境每個 AZ 一個；2025-11 起的 regional NAT 不需要公有子網路、自動跨 AZ。NAT 依小時與處理量計費。</li>
+  <li>安全群組掛在網路介面、有狀態、只寫允許；NACL 掛在子網路、無狀態、依編號第一條符合的決定，回程要開臨時 port。</li>
+  <li>gateway endpoint（S3、DynamoDB）免費、掛在 route table；interface endpoint 是子網路裡的 ENI、計費。endpoint policy 只能收窄。</li>
+  <li>排查：先分逾時與被拒絕；逾時照 DNS → 路由 → NACL 雙向 → 安全群組 → 程式 → OS 防火牆。Reachability Analyzer 分析設定，Flow Logs 記錄實際流量：去程 ACCEPT、回程 REJECT 是 NACL 擋了回程。</li>
+</ul>
+<p>下一課從 VPC 往外走：顧客怎麼用 <code>cafe.example.com</code> 找到你的服務，Route 53、ACM 憑證、ALB 的轉送規則與 CloudFront。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

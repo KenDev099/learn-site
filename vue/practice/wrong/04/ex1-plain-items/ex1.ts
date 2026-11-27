@@ -1,0 +1,18 @@
+// 練習 1：購物車 composable
+// 問題：呼叫端寫 const { items, count, add } = useCart() 之後，add() 了好幾次，count 還是 0
+// 要求：呼叫端解構之後仍然有響應性。count 要是 ref（呼叫端用 count.value 讀），items 可以是 ref 或 reactive 陣列
+import { ref } from 'vue'
+
+export type CartItem = { id: number; name: string; price: number }
+
+export function useCart() {
+  const items: CartItem[] = []
+  const count = ref(0)
+
+  function add(item: CartItem) {
+    items.push(item)
+    count.value++
+  }
+
+  return { items, count, add }
+}

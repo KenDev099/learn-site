@@ -1,0 +1,684 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>29. 查詢調校：統計資訊、執行計畫與慢查詢</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="29" data-pg-extensions="pg_stat_statements, auto_explain">
+<header>
+  <div class="eyebrow">階段 8：資深必備｜查詢效能 · 第 29 課</div>
+  <h1>查詢調校：統計資訊、執行計畫與慢查詢</h1>
+</header>
+<main>
+
+<p>咖啡店的後台上線半年，老闆說「最近有點慢」。你打開程式碼，看到一句很長的報表查詢，直覺就想優化它。但它一天只跑兩次；真正拖垮資料庫的，可能是一句每秒被呼叫幾百次、每次只花 3 毫秒的查詢。憑感覺挑，很可能花一個下午改好一句對整體沒有影響的查詢。</p>
+<p>這一課從頭到尾都在處理老闆這句「有點慢」：先量測，找出真正佔掉資料庫時間的查詢；再看它的計畫，判斷慢在哪裡；修完再量一次；最後讓資料庫自己把慢查詢記下來，下次有人說「剛剛很慢」時有證據可查。學完你會有一套固定的排查順序，而不是每次從猜開始。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>該先修哪一句？用 <code>pg_stat_statements</code> 找出總成本最高的查詢，並列出慢的四種原因（開場問題的最小答案）。</li>
+  <li>計畫為什麼會選錯？規劃器怎麼用 <code>pg_stats</code> 估列數；兩個相關的欄位為什麼會估錯 4 倍、怎麼修。</li>
+  <li>統計資訊沒問題，為什麼 App 呼叫還是慢？預備陳述式重用了不適合的計畫。</li>
+  <li>計畫選對了，為什麼還慢？排序放不進記憶體，寫到磁碟上。</li>
+  <li>資料庫這一側都沒問題時，改寫 SQL 本身；最後讓資料庫在慢的當下留下計畫。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="21-explain.html">第 21 課</a>的 <code>EXPLAIN</code>：規劃器依統計資訊估算成本、挑出計畫；<code>EXPLAIN ANALYZE</code> 真的執行，附上每一步的實際列數；<code>ANALYZE 表名</code> 重新抽樣、更新統計資訊。</li>
+  <li><a href="18-transactions.html">第 18 課</a>的交易：<code>BEGIN</code> 開始，<code>COMMIT</code> 或 <code>ROLLBACK</code> 結束，中間的修改一起生效或一起取消。</li>
+  <li><a href="27-index-design.html">第 27 課</a>的複合索引與 Top-N：<code>(city, id)</code> 這種索引先依第一欄、再依第二欄排好；<code>ORDER BY … LIMIT N</code> 只取排在最前面的 N 筆。</li>
+</ul></div>
+
+<div class="callout"><strong>這頁的環境：</strong>資料庫跑在瀏覽器裡，執行時間會隨瀏覽器忙不忙而跳動，讀取頁數不會。<code>pg_stat_statements</code> 已經裝好，<code>work_mem</code> 設成 1MB；沒有伺服器 log 檔，log 訊息直接顯示在結果上方。</div>
+
+<p><strong>這頁的資料：</strong><code>customers</code> 2 萬位（<code>city</code> 4 個城市、<code>district</code> 每個城市 5 區）、<code>orders</code> 3 萬筆、<code>coupons</code> 優惠券。頁面啟動時已經模擬了一段「App 送來的查詢」，第一節要從裡面找出最該修的那一句。</p>
+
+<h2>該先修哪一句？先量測，不要憑感覺</h2>
+<p>開場的問題是「該先修哪一句」。要回答它，得先想清楚「慢」指的是什麼。使用者覺得後台慢，是因為資料庫忙：它的時間被所有查詢分掉了，輪到你的請求時要等。所以一句查詢對整體的影響，不是它跑一次要多久，而是它<strong>總共</strong>佔掉多少時間，也就是「執行次數 × 平均時間」。一句每次 2 秒、一天跑 2 次的報表，一天佔 4 秒；一句每次 0.3 毫秒、一天跑 100 萬次的查詢，一天佔 300 秒。後者才是該先修的那一句，但光看程式碼看不出來，因為程式碼不會告訴你每一句被呼叫了幾次。</p>
+<p>要知道每一句的次數和時間，需要資料庫替你記帳。<code>pg_stat_statements</code> 就是做這件事的工具：它是 PostgreSQL 附帶的擴充功能（extension），會記錄每一句執行過的查詢花了多少時間、讀了多少資料。這頁已經替你裝好；正式環境的安裝要改設定檔、重新啟動資料庫，步驟見課末「補充與查表」。</p>
+<p>如果它把每一句都分開記，<code>WHERE id = 1</code>、<code>WHERE id = 2</code>…… 一直到 <code>WHERE id = 60</code> 會變成 60 列，每列都只跑一次、看起來都很便宜，你就看不出「這種查詢一共被叫了 60 次」。所以它把<strong>只差常數</strong>的查詢合併成一列：常數換成參數符號，寫成 <code>WHERE id = $1</code>。這種常數被換掉之後的查詢文字，叫<strong>正規化查詢</strong>（normalized query）。每一列累計這個形狀的查詢被執行的次數與成本，常用的欄位是：</p>
+<div class="table-wrap">
+<table>
+  <tr><th>欄位</th><th>意思</th></tr>
+  <tr><td><code>calls</code></td><td>執行了幾次</td></tr>
+  <tr><td><code>total_exec_time</code></td><td>所有執行加起來花了幾毫秒（＝次數 × 平均）</td></tr>
+  <tr><td><code>mean_exec_time</code></td><td>平均一次幾毫秒</td></tr>
+  <tr><td><code>shared_blks_hit</code>／<code>shared_blks_read</code></td><td>讀了幾個資料頁（<code>blks</code> 是 blocks，就是<a href="21-explain.html">第 21 課</a>的資料頁）：在記憶體快取裡找到的／要從磁碟（或作業系統快取）讀的，兩個相加就是這課說的<strong>讀取頁數</strong></td></tr>
+</table>
+</div>
+<p>下面依 <code>total_exec_time</code> 由大到小列出前五名，<code>blocks</code> 欄是讀取頁數。執行後比較 <code>calls</code> 和 <code>mean_ms</code> 兩欄：</p>
+<div class="lab" data-sql="SELECT query, calls,
+       round(total_exec_time::numeric, 2) AS total_ms,
+       round(mean_exec_time::numeric, 2)  AS mean_ms,
+       shared_blks_hit + shared_blks_read AS blocks
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 5;"></div>
+<p>找一找 <code>WHERE id = $1</code> 那一列：頁面啟動時跑的 60 句主鍵查詢被合成了一列。再比較各列：平均最慢的那句，不一定是總時間最多的那句。正式環境就是依 <code>total_exec_time</code> 由大到小排，從最上面開始看，這正是開場問題的答案。</p>
+<p>這頁的時間會跳動（見課首），每次重新整理排名都可能不同。讀取頁數不會：同樣的資料、同樣的計畫，每次讀的頁數都一樣，所以練習 1 用讀取頁數排序。正式環境兩個都看：時間反映使用者的感受，頁數反映資料庫做了多少工作。</p>
+<p>找出要修的查詢只是開始。修完之後要用同一個指標再量一次，才知道有沒有變好；變好了，原本排第二的就變成第一，再繼續修。整個調校是一個循環：</p>
+<figure>
+  <svg viewBox="0 0 700 170" role="img" aria-label="調校流程：量測、找出總成本最高的查詢、看計畫、修、再量測，反覆進行">
+    <defs><marker id="a29" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="10" y="40" width="120" height="50" rx="8"/>
+    <text class="d-text" x="70" y="62" text-anchor="middle">① 量測</text>
+    <text class="d-small" x="70" y="80" text-anchor="middle">pg_stat_statements</text>
+    <rect class="d-box" x="150" y="40" width="120" height="50" rx="8"/>
+    <text class="d-text" x="210" y="62" text-anchor="middle">② 挑最貴的</text>
+    <text class="d-small" x="210" y="80" text-anchor="middle">次數 × 平均</text>
+    <rect class="d-box" x="290" y="40" width="120" height="50" rx="8"/>
+    <text class="d-text" x="350" y="62" text-anchor="middle">③ 看計畫</text>
+    <text class="d-small" x="350" y="80" text-anchor="middle">EXPLAIN ANALYZE</text>
+    <rect class="d-box" x="430" y="40" width="120" height="50" rx="8"/>
+    <text class="d-text" x="490" y="62" text-anchor="middle">④ 修</text>
+    <text class="d-small" x="490" y="80" text-anchor="middle">索引／統計／改寫</text>
+    <rect class="d-soft" x="570" y="40" width="120" height="50" rx="8"/>
+    <text class="d-text" x="630" y="62" text-anchor="middle">⑤ 再量測</text>
+    <text class="d-small" x="630" y="80" text-anchor="middle">跟基準比較</text>
+    <path class="d-line" d="M130,65 L148,65" marker-end="url(#a29)"/>
+    <path class="d-line" d="M270,65 L288,65" marker-end="url(#a29)"/>
+    <path class="d-line" d="M410,65 L428,65" marker-end="url(#a29)"/>
+    <path class="d-line" d="M550,65 L568,65" marker-end="url(#a29)"/>
+    <path class="d-line" d="M630,90 L630,140 L70,140 L70,94" fill="none" marker-end="url(#a29)"/>
+    <text class="d-small" x="350" y="158" text-anchor="middle">修完一個，回到第一步找下一個</text>
+  </svg>
+  <figcaption>每一輪都從量測開始，修完要用同一個指標再量一次，才知道有沒有變好。</figcaption>
+</figure>
+<p>「再量一次」需要一個基準。<code>pg_stat_statements</code> 的數字是從上次清空之後一路累計的，清空用 <code>SELECT pg_stat_statements_reset();</code>。清空之前先把目前的數字存下來（例如匯出成表），不然修完之後沒有基準可以比較。</p>
+<p>第 ③ 步「看計畫」之後，你要判斷這句查詢慢在哪裡。常見的原因可以分成四類，這課接下來每一節處理一類，每一類都有它在計畫上的特徵：</p>
+<div class="table-wrap">
+<table>
+  <tr><th>在計畫或現場看到的</th><th>原因</th><th>在哪一節</th></tr>
+  <tr><td><code>EXPLAIN ANALYZE</code> 的估計列數和實際列數差很多</td><td>規劃器用的統計資訊不準，選錯計畫</td><td>下兩節</td></tr>
+  <tr><td>手動跑很快，從 App 呼叫時只有某些參數值慢</td><td>預備陳述式重用了不適合的計畫</td><td>第 4 節</td></tr>
+  <tr><td>計畫裡出現 <code>Sort Method: external merge</code></td><td>記憶體不夠，排序寫到磁碟</td><td>第 5 節</td></tr>
+  <tr><td>計畫合理，但寫法讓資料庫做了多餘的事，甚至結果是錯的</td><td>SQL 本身的寫法</td><td>第 6 節</td></tr>
+</table>
+</div>
+<p>你在自己系統的前五名裡找到的查詢，也是照這張表判斷屬於哪一類。接下來每一節拿咖啡店後台一句常見的慢查詢當例子（待處理訂單、行銷撈某一區的顧客、依狀態列訂單的 API、月報、沒領過優惠券的顧客名單），照表上的順序一類一類修。</p>
+<div class="callout practice"><strong>💡 實務上：「系統變慢」先拿出前五名清單再討論</strong><br>老闆或客服說「後台很慢」時，先打開 <code>pg_stat_statements</code> 依 <code>total_exec_time</code> 列出前五名，討論就從「感覺」變成「這三句查詢佔了大部分時間」。多數雲端託管的 PostgreSQL 都支援這個擴充功能，通常在參數設定裡開啟。合併後的 SQL（常數換成 <code>$1</code>）常是 ORM 產生的，不容易對回程式碼；先用表名和 <code>WHERE</code> 條件在專案裡搜尋。修完把前後的數字貼在 PR 說明裡，審查的人和之後接手的人都看得到效果。</div>
+
+<h2>計畫為什麼會選錯？規劃器怎麼估列數</h2>
+<p>找出最貴的查詢之後，下一步是看它的計畫。<a href="21-explain.html">第 21 課</a>說過，規劃器會先估計每一步會出幾列，再依估計挑計畫。估計決定了計畫：以為只會找到幾百列，用索引一筆一筆去讀很划算；以為會找到幾萬列，整張表掃一遍反而比較快。估計錯了，挑出來的計畫就可能是錯的。所以看計畫時，第一件事是比較估計和實際；要看懂為什麼估錯，就得知道估計是怎麼算出來的。</p>
+<p>規劃器不會為了估計而真的去數資料，那樣估計本身就跟執行一樣貴。它靠的是 <code>ANALYZE</code> 事先抽樣算好的摘要：每一欄有多少 NULL、有幾種不同的值、哪些值最常出現、其他的值怎麼分布。這些摘要存起來，可以從 <code>pg_stats</code> 這個視圖查到。估計時主要用兩樣：</p>
+<ul>
+  <li><strong>最常見值</strong>（MCV，most common values）：這一欄出現最多次的那些值，和各自佔全表的比例。等號條件查這張清單。</li>
+  <li><strong>直方圖</strong>（histogram）：把 MCV 以外的值排序後，切成筆數相同的幾個區間，記下每個區間的邊界。範圍條件查這些區間。</li>
+</ul>
+<p>估計時還會用到一個詞：條件會留下全表多少比例的列，叫<strong>選擇率</strong>（selectivity）。選擇率乘上表的總列數，就是估計的列數。</p>
+<p>先看等號條件。後台有一頁「待處理訂單」，條件是 <code>status = 'pending'</code>。下面查 <code>orders.status</code> 這一欄的摘要，執行後看 <code>most_common_vals</code> 和 <code>most_common_freqs</code>：</p>
+<div class="lab" data-sql="SELECT null_frac, n_distinct, most_common_vals, most_common_freqs
+FROM pg_stats
+WHERE tablename = 'orders' AND attname = 'status';"></div>
+<p><code>status</code> 只有三種值，全部都在 MCV 裡：paid 0.9、cancelled 0.09、pending 0.01。所以 <code>status = 'pending'</code> 的選擇率直接查表得到 0.01，乘上表的總列數 30000，估計就是 300 列。執行後看計畫裡的 <code>rows=</code>：</p>
+<div class="lab" data-sql="EXPLAIN SELECT * FROM orders WHERE status = 'pending';"></div>
+<p>再看範圍條件。<code>total &gt; 450</code> 這種條件不會剛好命中某個值，所以改用直方圖：每個區間的筆數相同，數一數有幾個區間落在範圍裡，就知道大約佔幾成。執行後看估計（<code>rows=</code>）和實際（<code>actual … rows=</code>）有多接近：</p>
+<div class="lab" data-sql="EXPLAIN ANALYZE SELECT count(*) FROM orders WHERE total &gt; 450;"></div>
+<p>直方圖的估計不會完全準，但通常只要量級對了，規劃器就足以選出合理的計畫；真正要擔心的是差好幾倍以上的估計，下一節就是一個例子。</p>
+<p>摘要有多精細，由 <code>default_statistics_target</code> 決定：預設 100，代表 MCV 最多記 100 個值、直方圖最多切 100 個區間。它是一個<strong>設定參數</strong>（GUC）。設定參數是控制資料庫行為的一個個具名設定，可以在設定檔裡改全域的值，也可以只改一條連線或一個交易，這課後面的 <code>work_mem</code>、<code>plan_cache_mode</code> 也是。用 <code>SHOW 名稱</code> 查看目前的值：</p>
+<div class="lab" data-sql="SHOW default_statistics_target;"></div>
+<p>某一欄的值種類很多、分布特別不平均，100 個值和 100 個區間不夠描述它時，估計就會常常不準。這時不用改全域設定，只提高那一欄：<code>ALTER TABLE orders ALTER COLUMN total SET STATISTICS 500;</code>，之後要再 <code>ANALYZE</code> 才會生效。<code>pg_stats</code> 的其他欄位（例如 <code>n_distinct</code>、<code>correlation</code>）整理在課末的查表。</p>
+<p>到這裡的條件都只有一欄，估計都準。但後台的查詢常常不只一個條件，兩個條件的選擇率要怎麼合起來，就是下一節估錯 4 倍的原因。</p>
+
+<h2>統計資訊是新的，為什麼還估錯 4 倍？相關的欄位</h2>
+<p>上一節的摘要是一欄一欄存的，規劃器不知道兩欄之間有什麼關係。條件有兩個時，它預設兩個條件<strong>互不相關</strong>，把兩個選擇率直接相乘。這叫<strong>獨立性假設</strong>（independence assumption）。兩欄真的無關時，這樣算是對的；兩欄相關時，就會算錯。</p>
+<p>咖啡店的顧客資料就有一對相關的欄位：<code>district</code> 決定了 <code>city</code>，「台北市第1區」一定在台北市。行銷要撈這一區的顧客發活動簡訊，查詢同時寫了城市和行政區。執行後比較估計的 <code>rows=</code> 和實際的 <code>actual … rows=</code>：</p>
+<div class="lab" data-sql="EXPLAIN ANALYZE
+SELECT * FROM customers
+WHERE city = '台北市' AND district = '台北市第1區';"></div>
+<p>估計 250 列，實際 1000 列。規劃器的算式是：city 有 4 種，選擇率 1/4；district 有 20 種，選擇率 1/20；兩個相乘，20000 × 1/4 × 1/20 = 250。但知道了 district，city 的條件其實一列都沒有再刷掉，正確的算法只有 20000 × 1/20 = 1000。算式裡的種類數，來自 <code>pg_stats</code> 的 <code>n_distinct</code>：</p>
+<div class="lab" data-sql="SELECT attname, n_distinct
+FROM pg_stats
+WHERE tablename = 'customers' AND attname IN ('city', 'district');"></div>
+<p>差 4 倍在這裡看起來無害，但估計會一路往上傳：如果這個結果還要 JOIN 別的表，規劃器以為只有 250 列，可能選 Nested Loop 去逐列查另一張表，實際卻要跑 1000 次；在更大的表上，這就是「明明有索引卻突然慢 100 倍」的常見原因。</p>
+<p>問題出在規劃器缺少「兩欄之間的關係」這項資訊，所以修法是把這項資訊補給它。<strong>延伸統計</strong>（extended statistics）就是做這件事的：你指定幾個欄位，<code>ANALYZE</code> 時 PostgreSQL 會額外收集它們之間的關係，估計時拿來修正相乘的結果。</p>
+<pre>CREATE STATISTICS 統計名稱 (dependencies) ON 欄位1, 欄位2 FROM 表名;
+ANALYZE 表名;   -- 建立之後要 ANALYZE，統計才會真的算出來</pre>
+<p>括號裡的 <code>dependencies</code> 是要收集的種類：<strong>功能相依</strong>（functional dependency），也就是「知道 A 就幾乎知道 B」，正好對應城市和行政區的關係，改善的是多個欄位的 <code>=</code> 條件同時出現時的估計。延伸統計還有另外兩種，整理在課末的查表。</p>
+<p>直覺的修法在這裡沒有用。建一個 <code>(city, district)</code> 複合索引，改變的是讀資料的方式，不是估計；提高兩欄各自的統計目標，規劃器還是一欄一欄估，再相乘。練習 2 會讓你親手修好這個估計。</p>
+<div class="callout practice"><strong>💡 實務上：計畫怪怪的，先比「估計」和「實際」</strong><br>查詢突然變慢時，新手的第一反應常是再加一個索引；資深工程師會先看 <code>EXPLAIN ANALYZE</code> 每一步的估計列數和實際列數差多少。差距大，問題通常在統計資訊（剛匯入大量資料還沒 ANALYZE、欄位彼此相關），加索引救不了。容易相關的欄位在真實系統裡很常見：城市和行政區、商品大類和子類、多租戶系統的租戶 id 和其他欄位。延伸統計只在你看到估計明顯錯、而且錯在這幾個欄位時才建，不需要預先到處加。</div>
+<p>到這裡，統計資訊已經修好了。但有一種慢，統計資訊完全正確也會發生，而且只在 App 呼叫時出現，你手動跑同一句卻很快。</p>
+
+<h2>手動跑很快，App 呼叫卻慢？預備陳述式重用了計畫</h2>
+<p>正式環境常見的劇本是這樣：後台「依狀態列訂單」的 API，前幾次都很快，之後查某些值（例如很少見的狀態、或訂單特別多的大客戶）突然變慢。你把同一句 SQL 貼進 psql 手動跑，又很快，查不出問題。統計資訊是新的，SQL 也一樣，差別在於查詢<strong>送進資料庫的方式</strong>。</p>
+<p><a href="25-backend.html">第 25 課</a>說過，後端程式送 SQL 時用參數（<code>$1</code>）而不是把值拼進字串。很多驅動程式與 ORM 會更進一步，在背後使用<strong>預備陳述式</strong>（prepared statement）：先把帶參數的 SQL 送給資料庫，讓它解析、準備好；之後每次只送參數值。同一句查詢一秒被呼叫幾百次時，這省下了每次重新解析、重新規劃的時間。用 SQL 也能手動做：</p>
+<pre>PREPARE 名稱(參數型別) AS 查詢;   -- 準備
+EXECUTE 名稱(值);                 -- 執行
+DEALLOCATE 名稱;                  -- 丟掉</pre>
+<p>問題在「準備好」之後的計畫。預備陳述式執行時，資料庫可以用兩種計畫：</p>
+<ul>
+  <li><strong>custom plan</strong>：每次依這次的參數值重新規劃，例如看到 <code>'pending'</code> 就查 MCV，知道只有 1%。</li>
+  <li><strong>generic plan</strong>：不看參數值、規劃一次就一直重用，連規劃的時間都省下來；但因為不知道參數是什麼，它只能用「平均」的估計。</li>
+</ul>
+<p>資料庫會自己決定用哪一種。PostgreSQL 18 文件寫的規則（<code>plan_cache_mode = auto</code>，預設）：前五次用 custom plan，並記下它們的平均估計成本；之後規劃一次 generic plan，如果它的成本沒有比平均高太多，就改用 generic plan。</p>
+<p>下面重現開場的劇本。準備一句 <code>by_status</code>，先用 <code>'paid'</code> 執行五次，第六次換成 <code>'pending'</code>。執行後先看 <code>pg_prepared_statements</code> 的兩個計數，再看 <code>EXPLAIN</code> 的條件和 <code>rows=</code>：</p>
+<div class="lab" data-sql="DEALLOCATE ALL;   -- 清掉這條連線上之前準備的，可以重複執行
+PREPARE by_status(text) AS
+  SELECT count(*) FROM orders WHERE status = $1;
+
+EXECUTE by_status('paid');
+EXECUTE by_status('paid');
+EXECUTE by_status('paid');
+EXECUTE by_status('paid');
+EXECUTE by_status('paid');
+EXECUTE by_status('pending');
+
+SELECT name, generic_plans, custom_plans FROM pg_prepared_statements;
+EXPLAIN EXECUTE by_status('pending');"></div>
+<ul>
+  <li><code>pg_prepared_statements</code>：五次 <code>'paid'</code> 都是 custom plan，第六次已經換成 generic plan（<code>generic_plans</code> 變成 1）。</li>
+  <li><code>EXPLAIN EXECUTE</code> 的條件寫著 <code>status = $1</code> 而不是 <code>'pending'</code>，這就是 generic plan 的記號。</li>
+  <li>它估的是 10000 列（三種值平均一下，30000 × 1/3），而 pending 實際只有 300 列、paid 有 27000 列，兩邊都估錯。</li>
+</ul>
+<p>這解釋了開場的劇本：App 用預備陳述式，前五次是 custom plan 所以快，之後換成用平均估計的 generic plan，碰到特別常見或特別少見的值就選錯計畫；你在 psql 手動跑，每次都是一句新的查詢，用的是 custom plan，所以重現不出來。這份資料小，錯的代價不大；在大表上，就是 API 突然慢好幾倍。</p>
+<p>確定是這個原因時，用設定參數 <code>plan_cache_mode</code> 強迫每次重新規劃。但不要全域改，只在需要的地方設定，例如那一個交易，或那一個資料庫角色。這就要先知道改設定參數的兩種範圍：</p>
+<ul>
+  <li><code>SET 名稱 = 值</code>：改的是「這條連線」，之後所有的交易都受影響，直到連線關閉。</li>
+  <li><code>SET LOCAL 名稱 = 值</code>：只改「這個交易」，<code>COMMIT</code> 或 <code>ROLLBACK</code> 之後自動還原。<a href="24-rls.html">第 24 課</a>的 <code>set_config('名稱', '值', true)</code> 效果相同。</li>
+</ul>
+<p>後端程式裡幾乎都用 <code>SET LOCAL</code>，原因在連線池（connection pool）：後端不會為每個請求開新連線，而是從池子借一條、用完還回去。用 <code>SET</code> 改的設定會跟著連線留下來，下一個借到這條連線的請求，在不知情的情況下也套用了這個設定。</p>
+<div class="callout warn">規則很簡單：一般的請求裡不要寫沒有 <code>LOCAL</code> 的 <code>SET</code>。下一節調整記憶體設定時，會再碰到這個問題。</div>
+<p>下一格重做一次上面的實驗，只多了 <code>SET LOCAL</code>。五次 <code>EXECUTE by_status('paid')</code> 改用 seed 裡的輔助函式 <code>execute_times(句子, 次數)</code>：它把 <code>EXECUTE 句子</code> 執行指定的次數；句子放在字串裡，所以 <code>'paid'</code> 的引號要寫成兩個。執行後看 <code>EXPLAIN</code> 的 <code>rows=</code> 和最後的 <code>generic_plans</code>：</p>
+<div class="lab" data-sql="DEALLOCATE ALL;
+PREPARE by_status(text) AS
+  SELECT count(*) FROM orders WHERE status = $1;
+
+BEGIN;
+SET LOCAL plan_cache_mode = force_custom_plan;   -- 只影響這個交易
+SELECT execute_times('by_status(''paid'')', 5);
+EXPLAIN EXECUTE by_status('pending');
+COMMIT;
+
+SELECT name, generic_plans, custom_plans FROM pg_prepared_statements;"></div>
+<p>這次估計是 300 列，<code>generic_plans</code> 一直是 0。代價是每次執行都要重新規劃，對簡單又頻繁的查詢，規劃時間可能比執行時間還長，這也是不全域設定的原因。</p>
+<p>前面三節的慢都出在計畫選錯。計畫選對了，執行時還是可能慢：計畫要排序，但排序的資料放不進記憶體。</p>
+
+<h2>計畫選對了，為什麼還慢？排序放不進記憶體</h2>
+<p>咖啡店的月報要把所有顧客依姓名排序後匯出。排序（<code>ORDER BY</code>）要把資料放在記憶體裡比較、搬動；雜湊（Hash Join、<code>GROUP BY</code> 的 HashAggregate）也要在記憶體裡建一張雜湊表。每個排序或雜湊步驟最多能用多少記憶體，由設定參數 <code>work_mem</code> 決定（PostgreSQL 預設 4MB）。資料放得下，整個排序在記憶體裡完成；放不下時，資料庫把資料分批寫到暫存檔，在磁碟上排序再合併，讀寫磁碟比讀寫記憶體慢很多。雜湊步驟的上限算法略有不同，見課末。</p>
+<p>這頁啟動時把 <code>work_mem</code> 設成了 1MB（見課首），模擬一台設定保守的伺服器。執行後看 <code>Sort Method</code> 那一行和下面的 <code>Buffers</code>：</p>
+<div class="lab" data-sql="SHOW work_mem;
+EXPLAIN (ANALYZE, COSTS OFF) SELECT * FROM customers ORDER BY name;"></div>
+<ul>
+  <li><code>Sort Method: external merge</code>：在磁碟上排序。</li>
+  <li><code>Disk: …kB</code>：寫了多少暫存檔。</li>
+  <li><code>temp read／written</code>：讀寫暫存檔的頁數。</li>
+</ul>
+<p>單一句查詢用 <code>EXPLAIN ANALYZE</code> 看得到；要知道整個資料庫平常有多常發生這種事，可以從 <code>pg_stat_database</code> 看累計寫過多少暫存檔：</p>
+<div class="lab" data-sql="SELECT temp_files, temp_bytes
+FROM pg_stat_database
+WHERE datname = current_database();"></div>
+<p>直覺的修法是把 <code>work_mem</code> 調大，但要先想清楚它的計算方式：它不是整個資料庫共用的總量，而是<strong>每個排序或雜湊步驟各自</strong>可以用這麼多。一句複雜的查詢可能同時有好幾個這樣的步驟，而且每條連線都各自在用。</p>
+<p>設成 1GB、100 條連線同時跑報表，最多可能要 100 GB 以上；記憶體用光時，作業系統會強制終止資料庫的程序，所有連線一起斷掉。所以正確的做法是用上一節的 <code>SET LOCAL</code>，只在需要的報表交易裡調大。執行後看 <code>Sort Method</code>，以及最後 <code>SHOW</code> 的值：</p>
+<div class="lab" data-sql="BEGIN;
+SET LOCAL work_mem = '4MB';
+EXPLAIN (ANALYZE, COSTS OFF) SELECT * FROM customers ORDER BY name;
+COMMIT;
+
+SHOW work_mem;   -- 交易結束，回到 1MB"></div>
+<ul>
+  <li><code>Sort Method: quicksort  Memory: …kB</code>：全部在記憶體裡完成。<code>Memory</code> 的數字就是這次排序實際需要的量，調整時設得比它大一點就夠了。</li>
+  <li><code>Memory</code> 比剛才的 <code>Disk</code> 大：同樣的資料放在記憶體裡要多存一些管理資訊，所以不能拿 <code>Disk</code> 的數字直接當 <code>work_mem</code>。</li>
+  <li>最後的 <code>SHOW work_mem</code> 回到 1MB：交易結束，<code>SET LOCAL</code> 的設定自動還原。</li>
+</ul>
+<div class="callout practice"><strong>💡 實務上：報表和一般 API 分開對待</strong><br>咖啡店的月報、匯出 Excel 這類查詢要排序大量資料，和每秒很多次的點餐 API 需求完全不同。常見做法是讓報表用專門的資料庫角色連線（例如 <code>ALTER ROLE report_user SET work_mem = …</code>），或把報表放到唯讀副本上跑，不影響線上交易。調整前先看 <code>EXPLAIN ANALYZE</code> 的 <code>Memory</code> 數字決定要多大，調整後觀察 <code>pg_stat_database</code> 的 <code>temp_bytes</code> 有沒有下降。要調全域設定時，先和負責維運的人一起算過最多連線數乘上去的記憶體用量。</div>
+<p>到這裡修的都是資料庫這一側：統計資訊和設定參數。但有些查詢，統計資訊和設定都沒問題，慢（或錯）的原因出在 SQL 本身的寫法。</p>
+
+<h2>資料庫這一側都沒問題時：改寫 SQL 本身</h2>
+<p>這一節看後台三段常見的寫法，每一段都是規劃器救不了、只能改 SQL 的情況：一段結果是錯的，一段做了多餘的排序，一段被舊習慣擋住了最佳化。</p>
+
+<h3>「沒領過優惠券的顧客」名單是空的：NOT IN 遇到 NULL</h3>
+<p>第一種不是慢，是<strong>錯</strong>，而且不會報錯。行銷要發券給從來沒領過優惠券的顧客，程式寫成 <code>WHERE id NOT IN (SELECT customer_id FROM coupons)</code>，結果一筆都沒有。<a href="16-subquery-cte.html">第 16 課</a>提醒過這個陷阱，這裡把原因講完整。</p>
+<p><a href="04-select.html">第 4 課</a>說過，跟 NULL 比較的結果不是 true 也不是 false，而是「不知道」（NULL）。<code>x NOT IN (a, b, NULL)</code> 展開來等於 <code>x &lt;&gt; a AND x &lt;&gt; b AND x &lt;&gt; NULL</code>，最後一項永遠是 NULL；<code>AND</code> 串起來的條件只要有一項是「不知道」，整體就不可能是 true，<code>WHERE</code> 只留下 true 的列，於是一列都不留。執行後比較兩欄：</p>
+<div class="lab" data-sql="SELECT 1 NOT IN (2, NULL) AS not_in_with_null,
+       1 NOT IN (2, 3)    AS not_in_without_null;"></div>
+<p>咖啡店的 <code>coupons</code> 裡有一張發給臨時客人的券，<code>customer_id</code> 是 NULL，就足以讓整個 <code>NOT IN</code> 失效。改用 <code>NOT EXISTS</code>：它問的是「對這位顧客，找不找得到對應的券」，答案只有找得到或找不到，NULL 不會讓它失靈。修好的名單是：</p>
+<pre>SELECT c.id FROM customers c
+WHERE NOT EXISTS (SELECT 1 FROM coupons k WHERE k.customer_id = c.id);</pre>
+<p><code>NOT EXISTS</code> 不只結果對，規劃器也處理得好。它會把這種寫法變成 <strong>anti join</strong>（反連接）：一種專門找「在另一張表沒有對應資料」的列的連接方式，兩張表配對時，配不到的才留下。同樣的寫法套在資料量比較大的 <code>orders</code> 上，計畫比較容易看出 Anti Join：下面找從來沒下過單的顧客，執行後找計畫裡的 <code>Anti Join</code>：</p>
+<div class="lab" data-sql="EXPLAIN
+SELECT c.id FROM customers c
+WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id);"></div>
+<p>另一種等價寫法是 <code>LEFT JOIN … WHERE 右表.id IS NULL</code>。</p>
+
+<h3>每一組只要最新幾筆：LATERAL</h3>
+<p>後台常有「每位顧客最近 3 筆訂單」、「每個城市最新的 2 位顧客」這類需求。<a href="17-window-functions.html">第 17 課</a>的 <code>row_number() OVER (PARTITION BY …)</code> 可以做，但它要先把每一組的<strong>所有</strong>列都讀出來、排好、編號，最後才丟掉大部分。一個城市有 5000 位顧客，只要 2 位，卻要排 5000 位。</p>
+<p>更省的做法是：對每一組各跑一次第 27 課的 Top-N 查詢，每次讀到 N 筆就停。問題是一般的子查詢放在 <code>FROM</code> 裡時，看不到同一個 <code>FROM</code> 裡前面那張表的欄位，沒辦法寫「這一組的城市」。<strong>LATERAL</strong> 就是解除這個限制的關鍵字：加了它，<code>FROM</code> 裡的子查詢可以引用前面那張表的欄位，資料庫會對前面的每一列各跑一次子查詢。執行後看每個城市各列出 2 位顧客：</p>
+<div class="lab" data-sql="SELECT v.city, c.id, c.name
+FROM (VALUES ('台北市'), ('台中市')) AS v(city)
+CROSS JOIN LATERAL (
+  SELECT id, name FROM customers
+  WHERE customers.city = v.city      -- 引用了外面的 v.city
+  ORDER BY id DESC
+  LIMIT 2
+) AS c;"></div>
+<p>拿掉 <code>LATERAL</code>，子查詢看不到 <code>v.city</code>，這句會報錯。同一句加上 <code>EXPLAIN</code>，執行後由上往下看計畫：</p>
+<div class="lab" data-sql="EXPLAIN
+SELECT v.city, c.id, c.name
+FROM (VALUES ('台北市'), ('台中市')) AS v(city)
+CROSS JOIN LATERAL (
+  SELECT id, name FROM customers
+  WHERE customers.city = v.city
+  ORDER BY id DESC
+  LIMIT 2
+) AS c;"></div>
+<ul>
+  <li><code>Nested Loop</code>：外層每一列，內層跑一次。</li>
+  <li>內層是 <code>Limit</code>＋索引掃描：這頁的 <code>customers</code> 有 <code>(city, id)</code> 複合索引，同一個城市的顧客在索引裡依 id 排好，所以從尾端往回讀，讀到 2 筆就停。</li>
+</ul>
+<p>每組資料很多、只要前幾筆、又有符合「分組欄位＋排序欄位」的索引（第 27 課的複合索引）時，LATERAL 讀得最少。每組只有幾筆，或要的是整組的排名時，視窗函式一樣好，也比較好讀。</p>
+
+<h3>舊程式碼裡的 CTE：有沒有被內嵌</h3>
+<p>第三種常出現在比較舊的專案。<a href="16-subquery-cte.html">第 16 課</a>的 <code>WITH</code>（CTE）讓長查詢可以分段寫，但它在執行時有兩種處理方式：</p>
+<ul>
+  <li><strong>內嵌</strong>：把 CTE 的內容直接展開進主查詢，和直接寫子查詢一樣，規劃器可以把主查詢的條件推進去，用得上索引。PostgreSQL 12 起，沒有副作用、只被引用一次的 CTE 預設就是這樣處理。</li>
+  <li><strong>物化</strong>：先把整個 CTE 算完、存起來，主查詢再從存起來的結果裡篩。寫 <code>AS MATERIALIZED</code> 會強迫這樣做，主查詢的條件就推不進去了。</li>
+</ul>
+<p>執行後比較兩個計畫的掃描方式：</p>
+<div class="lab" data-sql="EXPLAIN WITH o AS (SELECT * FROM orders)
+SELECT * FROM o WHERE id = 5;
+
+EXPLAIN WITH o AS MATERIALIZED (SELECT * FROM orders)
+SELECT * FROM o WHERE id = 5;"></div>
+<p>第一個是主鍵的 <code>Index Scan</code>；第二個先 <code>Seq Scan</code> 整張 orders 存成 <code>CTE Scan</code>，再一列一列過濾。</p>
+<p>PostgreSQL 11 以前，CTE 一律先算完，有些人刻意拿它當「擋住最佳化」的工具。從那時候升上來的舊程式碼，現在要那個效果得明寫 <code>MATERIALIZED</code>；而沒有充分理由時不要寫，否則就是上面第二個計畫。</p>
+<p>還有一種寫法：條件用 <code>OR</code> 連接兩個不同的欄位，有時也會讓索引用不上，整理在課末。</p>
+<p>到這裡，四種慢的原因都有了修法。但這些修法有一個共同的前提：你要能在現場重跑那句查詢。</p>
+
+<h2>使用者說「剛剛很慢」，怎麼看到當時的計畫？auto_explain</h2>
+<p>前面的工具都要你在現場重跑查詢。可是使用者回報「剛剛很慢」時，你再跑 <code>EXPLAIN ANALYZE</code>，資料和快取可能都變了，參數值也不一定知道，看到的不一定是當時的計畫。所以正式環境會讓資料庫在查詢慢的當下自己記錄，有兩個工具：</p>
+<ul>
+  <li><code>log_min_duration_statement = '500ms'</code>：執行超過 500 毫秒的 SQL，連同時間寫進<strong>伺服器 log</strong>。伺服器 log 是 PostgreSQL 寫錯誤與事件的文字紀錄檔。這樣你知道哪一句、什麼時候慢。</li>
+  <li><strong>auto_explain</strong> 模組：超過 <code>auto_explain.log_min_duration</code> 的查詢，把<strong>計畫</strong>也寫進 log，你就知道它當時為什麼慢。<code>auto_explain.log_analyze = on</code> 時附上實際列數與時間；但開啟後每一句查詢都要量測，不只超過門檻的那些，所以負擔和門檻無關。正式環境常搭配 <code>auto_explain.log_timing = off</code>（只記列數、不記每一步的時間），或用 <code>auto_explain.sample_rate</code> 只抽樣一部分查詢。</li>
+</ul>
+<p>正式環境通常在設定檔用 <code>session_preload_libraries</code> 或 <code>shared_preload_libraries</code> 載入 auto_explain。這頁沒有 log 檔可以看（見課首），所以用 <code>LOAD</code> 載入，再把 <code>client_min_messages</code> 設成 <code>log</code>，log 訊息就會直接顯示在結果上方：</p>
+<div class="lab" data-sql="LOAD 'auto_explain';
+BEGIN;
+SET LOCAL auto_explain.log_min_duration = 0;   -- 0：每一句都記
+SET LOCAL client_min_messages = log;
+SELECT count(*) FROM orders WHERE total &gt; 450;
+COMMIT;"></div>
+<p>灰色的 <code>LOG: duration: … plan:</code> 就是 auto_explain 記下來的計畫。正式環境的 log 怎麼集中收集、查詢，<a href="../../devops/lessons/21-logs.html">DevOps 課第 21 課</a>會講。</p>
+<div class="callout practice"><strong>💡 實務上：上線前就把慢查詢紀錄開好</strong><br>慢查詢 log 是事後追查最有用的證據，等出事才開就晚了，所以新專案上線前就該設定好。門檻依使用者能接受的回應時間來定，設太低 log 會大量增加，重要的訊息反而被淹沒。要注意 log 裡可能出現查詢的參數值，例如顧客的 email 或電話，存放和保存期限要符合公司的資安與個資規定。追查時把 log 的時間點和 App 的錯誤回報、部署紀錄對在一起看，常常能直接找到是哪一次改版造成的。</div>
+<p>回到開場老闆那句「有點慢」，現在的排查順序是：用 <code>pg_stat_statements</code> 依總成本找出該修的查詢；用 <code>EXPLAIN ANALYZE</code> 看計畫，依第一節的表判斷是估計錯、計畫重用錯、記憶體不夠，還是寫法的問題；修完用同一個指標再量一次；平常開著慢查詢 log 與 auto_explain，下次有人說「剛剛很慢」時直接查紀錄。</p>
+
+<h2>補充與查表</h2>
+<p>主線用不到、但查問題或調設定時會用到的細節。查表用，不用背。</p>
+
+<h3>在正式環境安裝 pg_stat_statements</h3>
+<p><code>pg_stat_statements</code> 需要額外的共享記憶體，所以要先在設定檔的 <code>shared_preload_libraries</code> 加上它、重新啟動資料庫，再對資料庫執行 <code>CREATE EXTENSION pg_stat_statements;</code>。雲端託管的資料庫通常在參數設定裡開啟。</p>
+
+<h3>pg_stats 的欄位</h3>
+<div class="table-wrap">
+<table>
+  <tr><th>欄位</th><th>意思</th></tr>
+  <tr><td><code>null_frac</code></td><td>NULL 佔的比例</td></tr>
+  <tr><td><code>n_distinct</code></td><td>有幾種不同的值；負數表示「和列數成正比」，<code>-1</code> 代表每一列都不一樣（例如主鍵）</td></tr>
+  <tr><td><code>most_common_vals</code>／<code>most_common_freqs</code></td><td>最常見值（MCV）和各自的比例</td></tr>
+  <tr><td><code>histogram_bounds</code></td><td>直方圖：把 MCV 以外的值排序後切成筆數相同的區間，這是各區間的邊界</td></tr>
+  <tr><td><code>correlation</code></td><td>這一欄的大小順序和資料在磁碟上的順序有多一致，1 是完全一致，−1 是完全相反，接近 0 是亂的</td></tr>
+</table>
+</div>
+
+<h3>延伸統計的三種</h3>
+<div class="table-wrap">
+<table>
+  <tr><th>種類</th><th>收集什麼</th><th>改善哪種估計</th></tr>
+  <tr><td><code>dependencies</code></td><td>功能相依（functional dependency）：知道 A 就幾乎知道 B</td><td>多個欄位的 <code>=</code> 條件同時出現</td></tr>
+  <tr><td><code>ndistinct</code></td><td>欄位組合有幾種不同的值</td><td><code>GROUP BY a, b</code> 會分成幾組</td></tr>
+  <tr><td><code>mcv</code></td><td>欄位組合的最常見值清單</td><td>組合的分布不平均時</td></tr>
+</table>
+</div>
+<p><code>CREATE STATISTICS</code> 不寫種類就三種都收集。</p>
+
+<h3>雜湊步驟能用的記憶體</h3>
+<p>排序步驟最多用到 <code>work_mem</code>；雜湊步驟可以用到 <code>work_mem × hash_mem_multiplier</code>，後者預設 2.0。</p>
+
+<h3>EXPLAIN ANALYZE 的 BUFFERS</h3>
+<p>PostgreSQL 18 起，<code>EXPLAIN ANALYZE</code> 預設就包含 <code>BUFFERS</code>（讀取頁數），不用再另外寫。</p>
+
+<h3>跨欄位的 OR</h3>
+<p><code>WHERE customer_id = 5 OR status = 'pending'</code> 要兩個欄位<strong>各自</strong>有可用的索引，規劃器才能用 <code>BitmapOr</code> 把兩邊的結果合起來；只要其中一邊沒有索引，就只能整表掃描。另一種寫法是拆成兩句再 <code>UNION</code>。執行後找計畫裡有沒有 <code>BitmapOr</code>：</p>
+<div class="lab" data-sql="EXPLAIN SELECT * FROM orders WHERE customer_id = 5 OR status = 'pending';"></div>
+
+<h2>練習</h2>
+<p>練習 2、5 的判分用到 seed 裡的輔助函式 <code>plan_json('查詢', 要不要真的執行)</code>：它對那句查詢跑 <code>EXPLAIN (FORMAT JSON)</code>（第二個參數是 true 時加上 <code>ANALYZE</code>），回傳 JSON。例如取出最上層節點的估計列數：</p>
+<div class="lab" data-sql="SELECT plan_json('SELECT * FROM orders WHERE status = ''pending''') -&gt; 0 -&gt; 'Plan' -&gt;&gt; 'Plan Rows' AS estimated_rows;"></div>
+
+<div class="exercise" data-isolated data-ordered
+  data-require="shared_blks_hit[\s\S]*shared_blks_read|shared_blks_read[\s\S]*shared_blks_hit"
+  data-require-msg="排序要用題目指定的讀取頁數：記憶體裡找到的和要另外讀的，兩種都要算。"
+  data-start="SELECT query, calls
+FROM pg_stat_statements;"
+  data-answer="SELECT query, calls
+FROM pg_stat_statements
+ORDER BY shared_blks_hit + shared_blks_read DESC
+LIMIT 3;">
+  <p>練習 1：頁面啟動時已經跑過一段工作量。查 <code>pg_stat_statements</code>，依讀取頁數（<code>shared_blks_hit + shared_blks_read</code>）由多到少，列出前 3 名的 <code>query</code> 與 <code>calls</code>（順序也要對）。（這題每次都在全新的資料庫裡跑，看到的是同一段工作量。）</p>
+  <script type="text/sql" data-role="wrong">SELECT query, calls FROM pg_stat_statements ORDER BY calls DESC LIMIT 3;</script>
+  <script type="text/sql" data-role="wrong">SELECT query, calls FROM pg_stat_statements ORDER BY mean_exec_time DESC LIMIT 3;</script>
+  <script type="text/sql" data-role="wrong">SELECT query, calls FROM pg_stat_statements ORDER BY shared_blks_hit + shared_blks_read DESC;</script>
+  <script type="text/sql" data-role="wrong">SELECT query, calls FROM pg_stat_statements ORDER BY shared_blks_hit DESC LIMIT 3;</script>
+  <script type="text/sql" data-role="wrong">SELECT query, calls FROM pg_stat_statements ORDER BY shared_blks_hit + shared_blks_read LIMIT 3;</script>
+  <script type="text/sql" data-role="wrong">SELECT query, calls FROM pg_stat_statements ORDER BY calls DESC, shared_blks_hit + shared_blks_read DESC LIMIT 3;</script>
+</div>
+
+<div class="exercise" data-isolated
+  data-start="EXPLAIN SELECT * FROM customers
+WHERE city = '台北市' AND district = '台北市第1區';"
+  data-answer="CREATE STATISTICS customers_city_district (dependencies) ON city, district FROM customers;
+ANALYZE customers;"
+  data-check="SELECT (plan_json('SELECT * FROM customers WHERE city = ''台北市'' AND district = ''台北市第1區''') -&gt; 0 -&gt; 'Plan' -&gt;&gt; 'Plan Rows')::numeric BETWEEN 900 AND 1100
+  AND (SELECT count(*) FROM customers WHERE city = '台北市') = 5000
+  AND (SELECT count(*) FROM customers WHERE city = '台北市' AND district = '台北市第1區') = 1000 AS estimate_ok;">
+  <p>練習 2：<code>SELECT * FROM customers WHERE city = '台北市' AND district = '台北市第1區'</code> 估計 250 列、實際 1000 列。讓規劃器的估計接近實際。判分會檢查這句查詢的估計列數是否在 900～1100 之間，而且資料不能被改掉。</p>
+  <script type="text/sql" data-role="wrong">CREATE STATISTICS customers_city_district (dependencies) ON city, district FROM customers;</script>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON customers (city, district);
+ANALYZE customers;</script>
+  <script type="text/sql" data-role="wrong">CREATE STATISTICS customers_city_district (ndistinct) ON city, district FROM customers;
+ANALYZE customers;</script>
+  <script type="text/sql" data-role="wrong">UPDATE customers SET city = '台北市';
+ANALYZE customers;</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE customers ALTER COLUMN city SET STATISTICS 1000;
+ALTER TABLE customers ALTER COLUMN district SET STATISTICS 1000;
+ANALYZE customers;</script>
+</div>
+
+<div class="exercise"
+  data-start="SELECT id FROM customers
+WHERE id NOT IN (SELECT customer_id FROM coupons);"
+  data-answer="SELECT c.id FROM customers c
+WHERE NOT EXISTS (SELECT 1 FROM coupons k WHERE k.customer_id = c.id);">
+  <p>練習 3：列出「從來沒領過優惠券」的顧客 <code>id</code>。注意 <code>coupons</code> 裡有一張發給臨時客人的券，<code>customer_id</code> 是 NULL。起始的寫法一筆都不回，改寫它。</p>
+  <script type="text/sql" data-role="wrong">SELECT id FROM customers WHERE id NOT IN (SELECT DISTINCT customer_id FROM coupons);</script>
+  <script type="text/sql" data-role="wrong">SELECT id FROM customers WHERE id % 50 = 0;</script>
+  <script type="text/sql" data-role="wrong">SELECT c.id FROM customers c WHERE NOT EXISTS (SELECT 1 FROM coupons);</script>
+  <script type="text/sql" data-role="wrong">SELECT c.id FROM customers c JOIN coupons k ON k.customer_id = c.id WHERE k.customer_id IS NULL;</script>
+</div>
+
+<div class="exercise" data-ordered
+  data-start="SELECT customer_id, id, ordered_at
+FROM orders
+WHERE customer_id IN (1, 2, 3)
+ORDER BY customer_id, ordered_at DESC
+LIMIT 3;"
+  data-answer="SELECT c.id, o.id, o.ordered_at
+FROM customers c
+CROSS JOIN LATERAL (
+  SELECT id, ordered_at FROM orders
+  WHERE orders.customer_id = c.id
+  ORDER BY ordered_at DESC
+  LIMIT 3
+) AS o
+WHERE c.id IN (1, 2, 3)
+ORDER BY c.id, o.ordered_at DESC;">
+  <p>練習 4：顧客 1、2、3 <strong>各</strong>列出最近 3 筆訂單：顧客 id、訂單 id、<code>ordered_at</code>，依顧客 id、<code>ordered_at</code> 由新到舊排序。<code>orders</code> 已經有 <code>(customer_id, ordered_at DESC)</code> 索引。起始的寫法全部只有 3 筆。用 LATERAL 或視窗函式都可以；寫完可以加上 <code>EXPLAIN</code> 比較兩種的計畫。</p>
+  <script type="text/sql" data-role="wrong">SELECT DISTINCT ON (customer_id) customer_id, id, ordered_at FROM orders WHERE customer_id IN (1, 2, 3) ORDER BY customer_id, ordered_at DESC;</script>
+  <script type="text/sql" data-role="wrong">SELECT customer_id, id, ordered_at FROM (
+  SELECT customer_id, id, ordered_at, row_number() OVER (ORDER BY ordered_at DESC) AS rn
+  FROM orders WHERE customer_id IN (1, 2, 3)
+) t WHERE rn &lt;= 3 ORDER BY customer_id, ordered_at DESC;</script>
+  <script type="text/sql" data-role="wrong">SELECT customer_id, id, ordered_at FROM (
+  SELECT customer_id, id, ordered_at, row_number() OVER (PARTITION BY customer_id ORDER BY ordered_at) AS rn
+  FROM orders WHERE customer_id IN (1, 2, 3)
+) t WHERE rn &lt;= 3 ORDER BY customer_id, ordered_at DESC;</script>
+</div>
+
+<div class="exercise"
+  data-start="-- 在這句前面加一行設定
+EXPLAIN (ANALYZE, COSTS OFF) SELECT * FROM orders ORDER BY total, id;"
+  data-answer="SET LOCAL work_mem = '4MB';
+EXPLAIN (ANALYZE, COSTS OFF) SELECT * FROM orders ORDER BY total, id;"
+  data-check="SELECT plan_json('SELECT * FROM orders ORDER BY total, id', true) -&gt; 0 -&gt; 'Plan' -&gt;&gt; 'Sort Method' AS sort_method;"
+  data-require="\bSET\s+LOCAL\b|\bset_config\s*\([^)]*,\s*true\s*\)"
+  data-require-msg="這題要只影響本交易的寫法。"
+  data-forbid="\b(BEGIN|COMMIT|ROLLBACK|START\s+TRANSACTION)\b"
+  data-forbid-msg="練習框已經替你把 SQL 包在一個交易裡了，不用自己寫 BEGIN／COMMIT。">
+  <p>練習 5：這條連線的 <code>work_mem</code> 是 1MB，月報的排序 <code>SELECT * FROM orders ORDER BY total, id</code> 會寫暫存檔。在 <code>EXPLAIN</code> 前面加一行設定，讓「本交易裡」的這個排序不再寫暫存檔，交易結束後自動還原。先執行起始內容看計畫；記得 <code>Disk</code> 的數字比記憶體裡實際需要的小，設定後再執行一次，確認排序方式變了。（練習框會把你的 SQL 包在一個交易裡執行，判分會在同一個交易裡檢查 <code>Sort Method</code>。）</p>
+  <script type="text/sql" data-role="wrong">SET work_mem = '16MB';
+EXPLAIN (ANALYZE, COSTS OFF) SELECT * FROM orders ORDER BY total, id;</script>
+  <script type="text/sql" data-role="wrong">SET LOCAL work_mem = '1500kB';
+EXPLAIN (ANALYZE, COSTS OFF) SELECT * FROM orders ORDER BY total, id;</script>
+  <script type="text/sql" data-role="wrong">SET LOCAL enable_sort = off;
+EXPLAIN (ANALYZE, COSTS OFF) SELECT * FROM orders ORDER BY total, id;</script>
+  <script type="text/sql" data-role="wrong">SELECT set_config('work_mem', '16MB', false);
+EXPLAIN (ANALYZE, COSTS OFF) SELECT * FROM orders ORDER BY total, id;</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 6：<code>EXPLAIN ANALYZE</code> 顯示某一步估計 250 列、實際 1000 列，條件是兩個高度相關的欄位（例如城市和行政區）。統計資訊是剛 ANALYZE 過的。最該做什麼？</p>
+  <label data-key="a">替兩個欄位建一個複合索引</label>
+  <label data-key="b">把 <code>work_mem</code> 調大</label>
+  <label data-key="c">對這兩個欄位建延伸統計（<code>CREATE STATISTICS</code>），然後 <code>ANALYZE</code></label>
+  <label data-key="d">再跑一次 <code>ANALYZE</code></label>
+  <p class="why">✓ 估錯的原因是獨立性假設：規劃器把兩個條件的選擇率直接相乘。延伸統計讓它知道欄位之間的相依關係，建完要 ANALYZE 才會算出來。索引改變的是讀取方式，不改變估計；work_mem 跟估計無關；統計資訊已經是新的，再 ANALYZE 一次結果一樣。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：同一句查詢在 psql 手動跑很快，從 App 呼叫時前幾次也快，之後某些參數值突然變慢。最可能的原因是？</p>
+  <label data-key="a">網路變慢，或 ORM 本身太慢</label>
+  <label data-key="b">驅動程式用了預備陳述式，前五次之後換成不看參數值的 generic plan，對某些值不適合</label>
+  <label data-key="c">資料庫的快取滿了，要重開資料庫</label>
+  <p class="why">✓ 預備陳述式前五次用 custom plan，之後可能改用 generic plan；generic plan 用平均估計，對特別常見或特別少見的值可能選錯計畫。psql 手動執行每次都是 custom plan，所以重現不出來。用 <code>EXPLAIN EXECUTE</code> 看是否出現 <code>$1</code>，再考慮在需要的地方設 <code>plan_cache_mode = force_custom_plan</code>。網路與 ORM 的問題不會只影響某些參數值。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 8：報表的排序一直出現 <code>external merge Disk</code>，同事提議把 <code>work_mem</code> 全域調成 1GB。這樣好嗎？</p>
+  <label data-key="a">不好：work_mem 是每個排序／雜湊步驟、每條連線各自可用的量，同時跑的查詢多了，總用量可能是它的很多倍；應該只在報表交易裡用 <code>SET LOCAL</code> 調大</label>
+  <label data-key="b">好：work_mem 是整台伺服器共用的總量，1GB 不會超過機器的記憶體</label>
+  <label data-key="c">好：只要 1GB 小於 shared_buffers 就安全</label>
+  <p class="why">✓ 文件明寫一句查詢可能同時有好幾個排序與雜湊步驟，每個都能用到 work_mem，而且每條連線都各自在用，總量可能是 work_mem 的很多倍。全域調到 1GB，尖峰時可能用光記憶體。它不是總量，也跟 shared_buffers 無關。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>憑感覺調校</strong>：先用 <code>pg_stat_statements</code> 找出總成本（次數 × 平均）最高的查詢，再動手。</li>
+  <li><strong>清空 pg_stat_statements 前沒記下基準</strong>：修完之後無從比較。先把數字存下來，再 reset。</li>
+  <li><strong>大量匯入或 CREATE STATISTICS 之後忘了 ANALYZE</strong>：統計資訊不會自己出現，估計維持原樣。</li>
+  <li><strong>只比 EXPLAIN ANALYZE 的時間</strong>：時間受快取、機器忙碌程度影響，會跳動。比較讀取頁數（Buffers）和估計／實際列數更可靠。</li>
+  <li><strong>對 UPDATE／DELETE 直接跑 EXPLAIN ANALYZE</strong>：它會真的執行，包在 <code>BEGIN … ROLLBACK</code> 裡。</li>
+  <li><strong>NOT IN 用在可能有 NULL 的子查詢</strong>：一筆都不回、不會報錯。改用 <code>NOT EXISTS</code>。</li>
+  <li><strong>全域加大 work_mem</strong>：每個步驟、每條連線各自使用，總量會放大很多倍。在需要的交易裡 <code>SET LOCAL</code>。</li>
+  <li><strong>在一般請求裡用沒有 LOCAL 的 SET</strong>：設定跟著連線留在連線池裡，下一個請求也會套用。用 <code>SET LOCAL</code>。</li>
+  <li><strong>到處加 AS MATERIALIZED</strong>：會擋住條件下推，主查詢用不到索引。只在確定需要「先算完一次」時才用。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>調校的流程：量測 → 找總成本最高的 → 看計畫 → 修 → 再量測。<code>pg_stat_statements</code> 把只差常數的查詢合併累計，依 <code>total_exec_time</code>（次數 × 平均）或讀取頁數排序。</li>
+  <li>看計畫先比估計和實際。規劃器用 <code>pg_stats</code> 估計列數：等號條件查 MCV，範圍條件查直方圖；多個條件預設互不相關、選擇率相乘。</li>
+  <li>相關欄位會被低估，用 <code>CREATE STATISTICS</code> 加 <code>ANALYZE</code> 修正；加索引、提高單欄統計目標都沒用。</li>
+  <li>預備陳述式前五次 custom plan，之後可能換成用平均估計的 generic plan；<code>EXPLAIN EXECUTE</code> 出現 <code>$1</code> 就是 generic；必要時局部設定 <code>plan_cache_mode</code>。</li>
+  <li><code>external merge Disk</code> 代表 <code>work_mem</code> 不夠；它是每個步驟、每條連線各自的量，只在需要的交易裡 <code>SET LOCAL</code> 調大。</li>
+  <li>NOT IN 遇到 NULL 改 NOT EXISTS；每組前 N 筆用 LATERAL；CTE 預設內嵌，MATERIALIZED 會擋住最佳化。</li>
+  <li><code>log_min_duration_statement</code> 與 auto_explain 讓慢查詢在發生的當下留下紀錄。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 8 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 9：「我的訂單」查顧客最近 5 筆已付款訂單（<code>WHERE customer_id = $1 AND status = 'paid' ORDER BY ordered_at DESC LIMIT 5</code>），同事建了 <code>(ordered_at, customer_id)</code> 索引。常客很快，只有 7 筆訂單的顧客卻慢了十幾倍，為什麼？</p>
+  <label data-key="a">這位顧客的統計資訊太舊，規劃器估錯了列數，選了比較慢的計畫</label>
+  <label data-key="b">索引是遞增排序，<code>ORDER BY … DESC</code> 用不上它，還要另外 Sort</label>
+  <label data-key="c">第一欄是時間，等號條件縮小不了範圍，要從最新往回讀到湊滿 5 筆</label>
+  <p class="why">✓ B-tree 要前面的欄位固定，後面那一欄才是排好的；第一欄沒有條件，<code>customer_id</code> 只能邊讀邊比對，訂單越少的顧客讀得越多。改成等號欄位在前、排序欄位在後：<code>(customer_id, status, ordered_at DESC)</code>，Sort 消失、讀 5 筆就停。b 錯在索引可以倒著讀（<code>Index Scan Backward</code>），方向不是問題，欄位順序才是。（第 27 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 10：「載入更多」API 這樣寫，<code>$1</code> 是上一頁最後一筆的 <code>ordered_at</code>，表上有 <code>(ordered_at DESC)</code> 索引。哪裡會出事？</p>
+<pre>SELECT id, ordered_at FROM orders
+WHERE ordered_at &lt; $1
+ORDER BY ordered_at DESC
+LIMIT 20;</pre>
+  <label data-key="a">翻到越後面的頁，要先讀過前面所有的訂單，越來越慢</label>
+  <label data-key="b">同一時間的兩筆訂單剛好跨頁時，還沒顯示的那筆會被跳過</label>
+  <label data-key="c">翻頁期間有新訂單寫入，下一頁會重複出現上一頁的幾筆</label>
+  <label data-key="d">參數化查詢改用 generic plan 之後，這個索引就用不上了</label>
+  <p class="why">✓ 只拿時間當 cursor，和上一頁最後一筆同一時間、還沒顯示的訂單也不符合 <code>&lt; $1</code>，就被跳過了。要加同分決勝欄位：<code>(ordered_at, id) &lt; ($1, $2)</code>，ORDER BY 和索引都加上 <code>id</code>。c 是 OFFSET 的問題，keyset 從上一頁最後一筆之後開始，新資料不會讓它錯位。（第 27 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 11：同事要清理 <code>payments</code> 的索引，<code>idx_scan</code> 分別是：<code>(order_id)</code> 1200、<code>(order_id, paid_at DESC)</code> 800、<code>UNIQUE (transaction_no)</code> 0。統計沒有剛重設過，哪一個最適合刪？</p>
+  <label data-key="a"><code>(order_id)</code>：它的欄位正好是另一個索引的開頭</label>
+  <label data-key="b"><code>UNIQUE (transaction_no)</code>：從來沒有被掃描過</label>
+  <label data-key="c"><code>(order_id, paid_at DESC)</code>：用的次數比較少</label>
+  <p class="why">✓ 每個索引都讓寫入變慢、佔空間。<code>(order_id)</code> 被 <code>(order_id, paid_at DESC)</code> 涵蓋，能用它的查詢都能用後者，<code>idx_scan</code> 不是 0 也可以刪。b 錯在唯一索引每次 INSERT 都在檢查重複，只是不算「掃描」，刪了重複的交易編號就寫得進來。（第 27 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 12：<code>products.options</code>（JSONB）有 GIN 索引，後台篩「燕麥奶」寫成 <code>WHERE options -&gt;&gt; 'milk' = 'oat'</code>。結果正確，<code>EXPLAIN</code> 卻是 <code>Seq Scan</code>，為什麼？</p>
+  <label data-key="a">JSONB 的 GIN 只收錄 key，要查值得另外建一個 B-tree</label>
+  <label data-key="b">資料剛匯入還沒 ANALYZE，規劃器以為表很小，直接掃表</label>
+  <label data-key="c"><code>'oat'</code> 太短，抽不出足夠的 trigram，索引只好整個掃一遍</label>
+  <label data-key="d">GIN 看的是運算子，<code>-&gt;&gt;</code> 取出文字再用 <code>=</code> 比對，它不支援</label>
+  <p class="why">✓ 索引能不能用看運算子，不是語意；陣列的 <code>= ANY (…)</code> 也是同樣的道理。改寫成 <code>options @&gt; '{"milk":"oat"}'</code>，或這個 key 非常常查時另建運算式 B-tree <code>((options -&gt;&gt; 'milk'))</code>。a 錯在 GIN 也收錄值，<code>@&gt; '{"milk":"oat"}'</code> 就用得上，問題出在寫法。（第 28 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 13：老闆說後台很慢，<code>pg_stat_statements</code> 裡有三句：A 每次 2 秒、一天 2 次；B 每次 0.3 毫秒、一天 100 萬次；C 每次 80 毫秒、一天 500 次。先修哪一句？</p>
+  <label data-key="a">A：平均時間最長，使用者每次要等最久</label>
+  <label data-key="b">先 reset 統計重新累計，避免舊數字誤導</label>
+  <label data-key="c">B：次數乘上平均，佔掉的總時間最多</label>
+  <label data-key="d">C：次數和時間都不低，最像是少了索引</label>
+  <p class="why">✓ 依 <code>total_exec_time</code>（次數 × 平均）排序：B 一天約 300 秒，C 約 40 秒，A 只有 4 秒。修完再量測，跟修之前的數字比。a 錯在平均最慢的不一定最該修，一天兩次的查詢修好了，整體負載幾乎不變。（第 29 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 14：同事把報表裡的 CTE 都加上 <code>AS MATERIALIZED</code>，說「先算好比較快」。<code>orders</code> 有 <code>customer_id</code> 的索引，下面這句改完後從幾毫秒變成好幾百毫秒，為什麼？</p>
+<pre>WITH o AS MATERIALIZED (SELECT * FROM orders)
+SELECT * FROM o WHERE customer_id = 42;</pre>
+  <label data-key="a">加了 MATERIALIZED 之後，CTE 每被引用一次就要重新算一次</label>
+  <label data-key="b">物化的 CTE 沒有統計資訊，要先對它執行 ANALYZE 才估得準</label>
+  <label data-key="c">物化的結果要 REFRESH 才會更新，資料庫每次查詢前都先重算</label>
+  <label data-key="d">條件推不進 CTE，先把整張 <code>orders</code> 讀完存起來，再篩出顧客 42</label>
+  <p class="why">✓ PostgreSQL 12 起，CTE 預設內嵌到主查詢，和子查詢一樣能把條件推進去、用上索引。<code>AS MATERIALIZED</code> 強迫先把整個 CTE 算完，主查詢的條件推不進去，計畫變成 Seq Scan 加上 CTE Scan。沒有充分理由不要寫它。c 錯在 REFRESH 是 Materialized View 的事，CTE 每次執行本來就是重新查詢。（第 29 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 15：已經用 <code>EXPLAIN EXECUTE</code> 確認，某個 API 對少見的狀態變慢，是因為改用了 generic plan（條件裡出現 <code>$1</code>）。怎麼修最恰當？</p>
+  <label data-key="a">在那個 API 的交易裡 <code>SET LOCAL plan_cache_mode = force_custom_plan</code></label>
+  <label data-key="b">在全域設定 <code>plan_cache_mode = force_custom_plan</code>，所有查詢都不會再踩到</label>
+  <label data-key="c">改成把狀態值直接拼進 SQL 字串，資料庫就不會用預備陳述式</label>
+  <label data-key="d">對那張表重新 ANALYZE，讓 generic plan 用上新的平均估計</label>
+  <p class="why">✓ generic plan 不看參數值，只能用平均估計，對特別少見的值會選錯計畫；強迫 custom plan 就會依實際值規劃。只在需要的地方設定。b 錯在每次執行都要重新規劃，簡單又頻繁的查詢，規劃時間可能比執行時間還長。（第 29 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 16：後台用 <code>WHERE name ILIKE '%' || $1 || '%'</code> 搜尋顧客，一年後每次搜尋都要好幾秒。客服通常打三到五個字，<code>name</code> 上已經有一般的 B-tree 索引，怎麼改最恰當？</p>
+  <label data-key="a">改建 <code>lower(name)</code> 的運算式索引，查詢也改寫成 <code>lower(name) LIKE</code></label>
+  <label data-key="b">啟用 pg_trgm，建 <code>GIN (name gin_trgm_ops)</code> 索引，查詢寫法不用改</label>
+  <label data-key="c">改用全文檢索：存 <code>to_tsvector('simple', name)</code> 並建 GIN 索引</label>
+  <p class="why">✓ 兩邊都是 <code>%</code> 的樣式，一般 B-tree 幫不上，只能掃整張表。pg_trgm 從樣式抽出三連字，用 GIN 找出候選列，三個字以上的關鍵字就走得了索引；兩個字的抽不出 trigram，幫不上。c 錯在內建全文檢索不會中文斷詞，一段中文被當成一個詞，打名字的一部分會找不到。（第 28 課）</p>
+</div>
+
+<p>這個階段的重點整理成<a href="../sheets/stage-8.html">一頁圖解</a>。</p>
+<p>下一課進入資料庫的內部：一列資料為什麼會有好幾個版本、VACUUM 在清什麼，以及表為什麼會越用越肥。</p>
+
+</main>
+
+<script type="text/sql" id="seed">
+CREATE EXTENSION pg_stat_statements;
+
+-- 2 萬位顧客：依城市分段存放（每城 5000 位），district 由 city 決定
+CREATE TABLE customers (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL,
+  city text NOT NULL,
+  district text NOT NULL
+);
+INSERT INTO customers (name, city, district)
+SELECT '顧客' || g,
+       (ARRAY['台北市','台中市','高雄市','台南市'])[1 + (g - 1) / 5000],
+       (ARRAY['台北市','台中市','高雄市','台南市'])[1 + (g - 1) / 5000] || '第' || (1 + g % 5) || '區'
+FROM generate_series(1, 20000) g;
+CREATE INDEX customers_city_id_idx ON customers (city, id);
+
+-- 3 萬筆訂單：前 2000 位顧客每人 15 筆；paid 90%、cancelled 9%、pending 1%
+CREATE TABLE orders (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  customer_id integer NOT NULL REFERENCES customers,
+  ordered_at timestamptz NOT NULL,
+  status text NOT NULL,
+  total integer NOT NULL
+);
+INSERT INTO orders (customer_id, ordered_at, status, total)
+SELECT 1 + (g * 7919) % 2000,
+       timestamptz '2026-01-01 08:00+08' + g * interval '13 minutes',
+       CASE WHEN g % 100 = 7 THEN 'pending' WHEN g % 100 < 10 THEN 'cancelled' ELSE 'paid' END,
+       70 + (g * 37) % 431
+FROM generate_series(1, 30000) g;
+CREATE INDEX orders_customer_time_idx ON orders (customer_id, ordered_at DESC);
+CREATE INDEX orders_status_idx ON orders (status);
+
+-- 優惠券：id 是 50 的倍數的顧客，加上 7、19999 號沒領過；另有一張臨時客人券（customer_id 是 NULL）
+CREATE TABLE coupons (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  customer_id integer REFERENCES customers,
+  code text NOT NULL
+);
+INSERT INTO coupons (customer_id, code)
+SELECT id, 'WELCOME-' || id FROM customers WHERE id % 50 <> 0 AND id <> 7 AND id <> 19999;
+INSERT INTO coupons (customer_id, code) VALUES (NULL, 'WALKIN-0001');
+ANALYZE;
+
+-- 模擬設定保守的伺服器（練習 5）
+SET work_mem = '1MB';
+
+-- 範例用的輔助函式：把 EXECUTE stmt 執行 n 次（「參數化查詢的陷阱」第二格）
+CREATE FUNCTION execute_times(stmt text, n integer) RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+  FOR i IN 1..n LOOP
+    EXECUTE 'EXECUTE ' || stmt;
+  END LOOP;
+  RETURN format('EXECUTE %s：%s 次', stmt, n);
+END
+$$;
+
+-- 判分用的輔助函式：回傳 EXPLAIN (FORMAT JSON) 的結果，run = true 時加上 ANALYZE
+CREATE FUNCTION plan_json(query text, run boolean DEFAULT false) RETURNS json
+LANGUAGE plpgsql AS $$
+DECLARE result json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON' || CASE WHEN run THEN ', ANALYZE' ELSE '' END || ') ' || query INTO result;
+  RETURN result;
+END
+$$;
+</script>
+<script type="text/sql" id="seed-after">
+-- 清空統計，再跑一段固定的工作量（讀取頁數每次重建都一樣）
+SELECT pg_stat_statements_reset();
+--;;
+SELECT count(*) FROM orders WHERE total > 400;
+SELECT count(*) FROM orders WHERE total > 401;
+SELECT count(*) FROM orders WHERE total > 402;
+SELECT count(*) FROM orders WHERE total > 403;
+SELECT count(*) FROM orders WHERE total > 404;
+SELECT customer_id, sum(total) FROM orders GROUP BY customer_id ORDER BY sum(total) DESC LIMIT 10;
+SELECT customer_id, sum(total) FROM orders GROUP BY customer_id ORDER BY sum(total) DESC LIMIT 20;
+SELECT * FROM orders WHERE id = 1; SELECT * FROM orders WHERE id = 2; SELECT * FROM orders WHERE id = 3; SELECT * FROM orders WHERE id = 4;
+SELECT * FROM orders WHERE id = 5; SELECT * FROM orders WHERE id = 6; SELECT * FROM orders WHERE id = 7; SELECT * FROM orders WHERE id = 8;
+SELECT * FROM orders WHERE id = 9; SELECT * FROM orders WHERE id = 10; SELECT * FROM orders WHERE id = 11; SELECT * FROM orders WHERE id = 12;
+SELECT * FROM orders WHERE id = 13; SELECT * FROM orders WHERE id = 14; SELECT * FROM orders WHERE id = 15; SELECT * FROM orders WHERE id = 16;
+SELECT * FROM orders WHERE id = 17; SELECT * FROM orders WHERE id = 18; SELECT * FROM orders WHERE id = 19; SELECT * FROM orders WHERE id = 20;
+SELECT * FROM orders WHERE id = 21; SELECT * FROM orders WHERE id = 22; SELECT * FROM orders WHERE id = 23; SELECT * FROM orders WHERE id = 24;
+SELECT * FROM orders WHERE id = 25; SELECT * FROM orders WHERE id = 26; SELECT * FROM orders WHERE id = 27; SELECT * FROM orders WHERE id = 28;
+SELECT * FROM orders WHERE id = 29; SELECT * FROM orders WHERE id = 30; SELECT * FROM orders WHERE id = 31; SELECT * FROM orders WHERE id = 32;
+SELECT * FROM orders WHERE id = 33; SELECT * FROM orders WHERE id = 34; SELECT * FROM orders WHERE id = 35; SELECT * FROM orders WHERE id = 36;
+SELECT * FROM orders WHERE id = 37; SELECT * FROM orders WHERE id = 38; SELECT * FROM orders WHERE id = 39; SELECT * FROM orders WHERE id = 40;
+SELECT * FROM orders WHERE id = 41; SELECT * FROM orders WHERE id = 42; SELECT * FROM orders WHERE id = 43; SELECT * FROM orders WHERE id = 44;
+SELECT * FROM orders WHERE id = 45; SELECT * FROM orders WHERE id = 46; SELECT * FROM orders WHERE id = 47; SELECT * FROM orders WHERE id = 48;
+SELECT * FROM orders WHERE id = 49; SELECT * FROM orders WHERE id = 50; SELECT * FROM orders WHERE id = 51; SELECT * FROM orders WHERE id = 52;
+SELECT * FROM orders WHERE id = 53; SELECT * FROM orders WHERE id = 54; SELECT * FROM orders WHERE id = 55; SELECT * FROM orders WHERE id = 56;
+SELECT * FROM orders WHERE id = 57; SELECT * FROM orders WHERE id = 58; SELECT * FROM orders WHERE id = 59; SELECT * FROM orders WHERE id = 60;
+SELECT * FROM customers WHERE city = '台中市';
+SELECT * FROM customers WHERE city = '台中市';
+SELECT * FROM customers WHERE city = '台中市';
+</script>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

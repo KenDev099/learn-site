@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>5. 結構化輸出與驗證：從顧客訊息擷取訂單</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="5" data-practice="ai">
+<header>
+  <div class="eyebrow">階段 2：讓輸出可靠 · 第 5 課</div>
+  <h1>結構化輸出與驗證：從顧客訊息擷取訂單</h1>
+</header>
+<main>
+
+<p>咖啡店開放用 LINE 點餐。顧客打的是自然語言：「兩杯拿鐵少冰，再一個可頌，外帶」「老樣子」「拿鐵算我 100 就好」。後端要的卻是一筆訂單：哪些商品、各幾個、多少錢。把自然語言整理成固定格式的資料，正是 LLM 擅長的事；但模型的輸出是要寫進資料庫、要收錢的，它不能「大部分時候對」。</p>
+<p>這一課寫出一條從顧客訊息到訂單的可靠管線：模型負責「理解」，金額、庫存、要不要建立訂單由你的程式決定。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>為什麼不能直接 JSON.parse、structured outputs：自由文字的 JSON 會怎麼壞，怎麼讓 API 保證回傳符合 schema 的 JSON（開場問題的最小答案）。</li>
+  <li>schema 保證什麼、給模型「不知道」的出口：通過 schema 的資料還可能錯在哪，顧客說「老樣子」時怎麼不讓模型硬編一筆訂單。</li>
+  <li>業務驗證：價格、庫存、能不能下單，為什麼一律由你的程式和資料庫決定。</li>
+  <li>有上限的回饋重試：驗證失敗時怎麼請模型修正，試幾次就該放棄。</li>
+  <li>圖片與 PDF、資深視角：同一套做法怎麼用在收據照片和報價單，為什麼結構化輸出讓 AI 功能測得了。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../typescript/lessons/26-runtime-validation.html">TypeScript 課第 26 課</a>的 zod：用 schema 驗證外部資料，<code>safeParse</code> 不丟錯，回傳成功的資料或錯誤清單。</li>
+  <li><a href="../../typescript/lessons/27-modeling-state-errors.html">TypeScript 課第 27 課</a>的 Result：用 <code>{ ok: true, … } | { ok: false, … }</code> 回傳預期中的失敗，不丟例外。</li>
+  <li><a href="02-first-api-call.html">第 2 課</a>的回應與測試：<code>stop_reason</code> 說明回答能不能用，多輪對話要把 assistant 的完整 <code>content</code> 放回歷史，練習用假的 API 判分。</li>
+</ul></div>
+
+<h2>為什麼不能直接 JSON.parse</h2>
+<p>最直覺的寫法：在 prompt 裡寫「請用 JSON 回答，格式是 {…}」，拿到文字後 <code>JSON.parse</code>。測試幾次都正常，上線後每天幾千則訊息，下面三種情況一定會出現：</p>
+<pre>// 1. 多了說明文字：JSON.parse 直接丟 SyntaxError
+好的，以下是整理後的訂單：
+{"intent":"order","items":[{"product":"拿鐵","quantity":2}]}
+
+// 2. 形狀不對：少了 items、數量變成字串、商品名稱多了「熱」
+{"intent":"order","product":"熱拿鐵","quantity":"兩杯"}
+
+// 3. 被 max_tokens 截斷（第 2 課）：後半段不見了
+{"intent":"order","items":[{"product":"拿鐵","quan</pre>
+<p>第 1、3 種會丟錯，至少你知道出事了。第 2 種最危險：<code>JSON.parse</code> 成功，程式拿著 <code>undefined</code> 的 items 和字串的數量繼續往下跑，可能建出一張金額是 <code>NaN</code> 的訂單。這些不是模型「不聰明」，而是自由文字本來就沒有任何保證。第 1 課說過模型的輸出每次不一樣，你沒辦法靠多寫幾句「一定要用 JSON」把機率降到零。</p>
+<p>新模型也不能用以前「在 messages 最後放一則 assistant 訊息，先寫好 <code>{</code> 讓模型接著寫」的預填（prefill）技巧：Opus 5.5 會回 400。要固定格式，用的是下一節的結構化輸出。</p>
+
+<h2>structured outputs：output_config.format 與 messages.parse</h2>
+<p><strong>結構化輸出（structured outputs）</strong>是在請求裡附上一份 JSON Schema，API 在模型產生文字的時候就限制它，只能產生符合這份 schema 的 JSON：不會有前後的說明文字、不會少欄位、型別一定對。<strong>JSON Schema</strong> 是描述「一份 JSON 長什麼樣子」的標準格式，例如「這是物件，有 <code>intent</code> 欄位，型別是字串」。</p>
+<p>你不需要手寫 JSON Schema。用 zod 定義形狀，SDK 的 <code>zodOutputFormat</code> 會轉成 JSON Schema 放進請求；再用 <code>client.messages.parse()</code> 取代 <code>create()</code>，SDK 收到回應後會用同一份 zod schema 驗證，結果放在 <code>parsed_output</code>，而且有完整的 TypeScript 型別：</p>
+<pre>import * as z from 'zod'
+import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod'
+
+const OrderIntentSchema = z.object({
+  intent: z.enum(['order', 'question', 'unclear']),
+  items: z.array(z.object({
+    product: z.enum(['美式咖啡', '拿鐵', '卡布奇諾', '伯爵紅茶', '可頌', '起司蛋糕']),
+    quantity: z.int().min(1).max(20),
+  })),
+  note: z.string().nullable(),
+})
+
+const response = await client.messages.parse({
+  model: 'claude-opus-5-5',
+  max_tokens: 16000,
+  system: SYSTEM,
+  messages: [{ role: 'user', content: wrapMessage(text) }],   // 跳脫後包進 &lt;message&gt;（第 4 課）
+  output_config: { format: zodOutputFormat(OrderIntentSchema) },
+})
+
+response.parsed_output   // 型別：{ intent: 'order' | 'question' | 'unclear'; items: …[]; note: string | null } | null</pre>
+<ul>
+  <li><code>zodOutputFormat</code> 從 <code>@anthropic-ai/sdk/helpers/zod</code> 匯入。這門課用 SDK 1.3.0 與 zod 4.6.7，寫法和 <a href="../../typescript/lessons/26-runtime-validation.html">TypeScript 課第 26 課</a>的 zod 一樣；<code>z.int()</code> 是 zod 4 的整數型別。</li>
+  <li>參數寫在 <code>output_config: { format }</code>。網路上的舊範例會寫頂層的 <code>output_format</code>，那個參數已經淘汰，不要用。</li>
+  <li><code>note</code> 用 <code>.nullable()</code> 而不是 <code>.optional()</code>：欄位一定要出現，沒有內容就是 <code>null</code>。結構化輸出要求每個物件 <code>additionalProperties: false</code>，zod 的 <code>z.object</code> 交給 <code>zodOutputFormat</code> 時會自動加上。</li>
+  <li>不支援的組合：結構化輸出不能和 citations（第 10 課的引用來源）同時用，會回 400。</li>
+</ul>
+<p>其他供應商也有一樣的功能，名稱不同：OpenAI 叫 structured outputs（<code>response_format</code> 或 Responses API 的 <code>text.format</code>），也有「JSON mode」這種只保證是 JSON、不保證形狀的較弱版本。架構相同：定義 schema、讓 API 限制輸出、程式再驗證一次。</p>
+
+<h2>schema 保證什麼、不保證什麼</h2>
+<p>把 SDK 1.3.0 實際送出的 schema 印出來（測試的 <code>requests[0].body.output_config</code> 就看得到），會發現跟你寫的 zod 不完全一樣：</p>
+<pre>"quantity": { "type": "integer", "description": "{minimum: 1, maximum: 20}" },
+"product":  { "type": "string",  "description": "{enum: [\"美式咖啡\",\"拿鐵\",…]}" },
+"note":     { "type": ["string", "null"] }</pre>
+<p>API 端的限制只支援 JSON Schema 的一部分：<code>minimum</code>、<code>maximum</code>、字串長度、複雜的陣列條件都不支援。SDK 的處理方式是把這些條件從 schema 拿掉、寫進 <code>description</code> 給模型參考，收到回應後再<strong>在本機用 zod 驗證</strong>。實測 SDK 1.3.0 的 <code>zodOutputFormat</code> 連 <code>enum</code> 也搬進了 description（官方文件說 API 支援 enum，這是這個 SDK 版本的轉換行為），所以商品名稱同樣是在本機才擋下來。三層的分工：</p>
+<div class="table-wrap"><table>
+  <tr><th>誰檢查</th><th>擋得住什麼</th><th>失敗時</th></tr>
+  <tr><td>API（產生時限制）</td><td>是合法的 JSON、物件形狀、必填欄位、型別（字串、整數、陣列、null）、沒有多餘的欄位</td><td>不會發生，除非被截斷或拒答</td></tr>
+  <tr><td>SDK 在本機用 zod</td><td>數值範圍、字串長度、<code>enum</code>（SDK 1.3.0）、<code>refine</code> 這類自訂規則</td><td><code>parse()</code> 丟出 <code>AnthropicError</code>，訊息以 <code>Failed to parse structured output</code> 開頭，附上哪個路徑錯了</td></tr>
+  <tr><td>你的程式（業務驗證）</td><td>商品今天有沒有賣、庫存夠不夠、價格多少、這位顧客能不能下單</td><td>由你決定怎麼回顧客</td></tr>
+</table></div>
+<p>還有兩種情況 schema 管不到，第 2 課的 <code>stop_reason</code> 在這裡一樣重要：</p>
+<ul>
+  <li><strong>被截斷</strong>（<code>max_tokens</code>）：JSON 只寫了一半，<code>parse()</code> 解析失敗，丟出同一種 <code>AnthropicError</code>。</li>
+  <li><strong>拒答</strong>（<code>refusal</code>）：回應可能沒有任何 text block，<code>parse()</code> <strong>不會丟錯</strong>，<code>parsed_output</code> 是 <code>null</code>。型別上它本來就是 <code>… | null</code>，TypeScript 會逼你處理；直接回傳就會把 <code>null</code> 當成訂單往下傳。</li>
+</ul>
+<pre>if (response.parsed_output === null) {
+  throw new Error(`沒有拿到結構化輸出（stop_reason: ${response.stop_reason}）`)
+}
+return response.parsed_output</pre>
+<div class="callout"><strong>不管哪一層擋下來，你的程式都要處理失敗。</strong>「用了 structured outputs 就不會錯」是最常見的誤解：它保證的是<em>形狀</em>，不是<em>內容</em>。模型照樣可能把「老樣子」猜成一杯美式咖啡，形狀完全合法。</div>
+
+<div class="callout practice"><strong>💡 實務上：升級 SDK 或 zod 時，先看送出去的 schema</strong><br>哪些條件由 API 保證、哪些只在本機檢查，是 SDK 轉換時決定的，換版本就可能不同。團隊常見的做法是在測試裡把 <code>requests[0].body.output_config</code> 存成快照（snapshot：第一次把內容存成檔案，之後每次測試都拿來比對），升級套件時看到差異，就知道哪個條件從 API 搬到本機了。code review 看到 <code>parsed_output</code> 被直接寫進資料庫、中間沒有任何檢查，就該停下來問：範圍、商品、價格是誰在擋？</div>
+
+<h2>給模型「不知道」的出口</h2>
+<p>如果 schema 只允許 <code>intent: 'order'</code>，而顧客說「老樣子」，模型只有一個選擇：編一筆訂單。限制越嚴格，它越會在合法的範圍裡猜。所以 schema 要設計一個合法的出口：</p>
+<ul>
+  <li><code>intent</code> 有 <code>'unclear'</code>：看不出要什麼、商品不在菜單上、數量不清楚，都走這裡。</li>
+  <li><code>note</code> 讓模型用一句話說明哪裡不清楚，客服或程式可以拿來追問顧客。</li>
+  <li><code>'question'</code> 分開處理：「拿鐵可以換燕麥奶嗎？」不是訂單，交給第 8～10 課的 RAG 回答。</li>
+</ul>
+<p>system prompt 也要寫清楚什麼時候用 <code>unclear</code>（「不要猜」），模型才知道這是被鼓勵的答案，不是失敗。練習 1 的 <code>SYSTEM</code> 已經寫好，可以對照<a href="04-prompt-design.html">第 4 課</a>的寫法：規則放 system，顧客的訊息包在 <code>&lt;message&gt;</code> 裡，並說明那是資料不是指令。</p>
+<p>同樣的道理用在每一個欄位：真的可能不知道的值，就讓它可以是 <code>null</code>，不要強迫模型填一個看起來合理的值。</p>
+
+<h2>業務驗證：金額與庫存從資料庫來</h2>
+<p>拿到通過 zod 的 <code>parsed_output</code>，還不能直接建立訂單。<strong>業務驗證</strong>是 schema 之外的規則，只有你的系統知道答案：</p>
+<ul>
+  <li><strong>商品現在有沒有賣</strong>：schema 的 enum 是寫程式時的菜單，起司蛋糕今天賣完下架了，schema 不會知道。</li>
+  <li><strong>庫存夠不夠</strong>：同一個商品出現兩行（「一杯拿鐵……再兩杯拿鐵」）要先合併，用總數檢查。</li>
+  <li><strong>價格</strong>：一律用資料庫的價格算。模型的輸出是不可信的外部資料，跟前端送來的表單一樣（<a href="../../nestjs/lessons/07-pipes-validation.html">NestJS 課第 7 課</a>在邊界驗證的觀念）。顧客說「拿鐵算我 100 就好」，模型可能真的寫出 <code>price: 100</code>。最好的做法是 schema 裡根本沒有價格欄位；就算資料裡多了，計價時也只看菜單。</li>
+</ul>
+<p>回傳值用 <a href="../../typescript/lessons/27-modeling-state-errors.html">TypeScript 課第 27 課</a>的 Result 形狀，而不是丟例外：庫存不足、商品下架是預期中會發生的情況，呼叫的人要根據錯誤決定怎麼回顧客（「可頌只剩 2 個，要改嗎？」）。而且要<strong>列出全部錯誤</strong>，不是遇到第一個就停，否則顧客改完一個問題又冒出下一個：</p>
+<pre>type OrderResult =
+  | { ok: true; lines: Line[]; total: number }
+  | { ok: false; errors: string[] }
+
+const errors: string[] = []
+for (const [product, quantity] of merged) {
+  const item = menu.find(m =&gt; m.name === product)
+  if (!item || !item.available) { errors.push(`${product} 目前沒有供應`); continue }
+  if ((stock[product] ?? 0) &lt; quantity) errors.push(`${product} 庫存不足`)
+  …
+}
+if (errors.length) return { ok: false, errors }</pre>
+<p>金額是整數（元），小計和總額都用整數乘加，不會有 <a href="../../typescript/lessons/05-numbers-money.html">TypeScript 課第 5 課</a>的浮點數誤差。<code>stock[product] ?? 0</code> 這個細節也要注意：查不到庫存當成 0，不是當成無限；寫成 <code>stock[product] &lt; quantity</code> 時，<code>undefined &lt; 2</code> 是 <code>false</code>，等於沒檢查。</p>
+<p>正式系統裡，這一步是在資料庫交易裡查菜單、檢查並扣庫存（PostgreSQL 課的交易與鎖），練習用傳進來的 <code>menu</code> 和 <code>stock</code> 代替。重點是分工：<strong>模型只負責把文字變成「顧客想要什麼」，事實與決定都在你的程式和資料庫。</strong></p>
+
+<div class="callout practice"><strong>💡 實務上：LLM 擷取的結果，先給人確認再成立</strong><br>LINE 點餐、客服單分類、從 email 建立預約，這類功能上線時通常不會讓模型的輸出直接變成訂單，而是回一張「確認卡」：「兩杯拿鐵、一個可頌，共 290 元，確認送出？」顧客按下確認，才進入建立訂單的 API；那支 API 跟 App 點餐用的是同一支，驗證也是同一套。這樣模型猜錯的代價只是多問一次。PM 會關心「多一步確認會不會掉單」，資安會關心「一句話能不能改到價格」，有了這條分工，兩個問題都答得出來。</div>
+
+<h2>有上限的回饋重試</h2>
+<p>zod 驗證失敗時（例如 <code>quantity: 0</code>），同樣的請求再送一次，結果多半差不多。比較有效的是<strong>回饋重試</strong>：把上一次的回答和「錯在哪裡」告訴模型，請它修正。做法跟第 2 課的多輪對話一樣，把 assistant 的完整 content 放回歷史，再加一則 user 訊息：</p>
+<figure>
+  <svg viewBox="0 0 700 270" role="img" aria-label="回饋重試流程：送出請求，驗證通過就回傳；驗證失敗且還有次數，就把 assistant 回應和錯誤說明加進對話再送；拒答或 API 錯誤不重試">
+    <defs><marker id="ar5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="var(--muted)"/></marker></defs>
+    <rect x="20" y="30" width="140" height="44" rx="6" class="d-box"/><text x="90" y="57" text-anchor="middle" class="d-text">送出請求</text>
+    <line x1="160" y1="52" x2="228" y2="52" class="d-line" marker-end="url(#ar5)"/>
+    <rect x="230" y="30" width="170" height="44" rx="6" class="d-soft"/><text x="315" y="57" text-anchor="middle" class="d-text">format.parse 驗證</text>
+    <line x1="400" y1="52" x2="508" y2="52" class="d-line" marker-end="url(#ar5)"/><text x="454" y="44" text-anchor="middle" class="d-small">通過</text>
+    <rect x="510" y="30" width="170" height="44" rx="6" class="d-box"/><text x="595" y="57" text-anchor="middle" class="d-text">ok: true</text>
+    <line x1="315" y1="74" x2="315" y2="138" class="d-line" marker-end="url(#ar5)"/><text x="325" y="110" class="d-small">失敗，還有次數</text>
+    <rect x="200" y="140" width="230" height="56" rx="6" class="d-box"/>
+    <text x="315" y="163" text-anchor="middle" class="d-small">messages 加上 assistant（完整 content）</text>
+    <text x="315" y="183" text-anchor="middle" class="d-small">＋ user：「沒通過驗證：…請修正」</text>
+    <path d="M200,168 L90,168 L90,76" fill="none" class="d-line" marker-end="url(#ar5)"/>
+    <line x1="400" y1="66" x2="508" y2="140" class="d-line" marker-end="url(#ar5)"/>
+    <text x="470" y="118" class="d-small">次數用完</text>
+    <rect x="510" y="140" width="170" height="44" rx="6" class="d-box"/><text x="595" y="167" text-anchor="middle" class="d-text">ok: false</text>
+    <text x="20" y="240" class="d-accent">refusal → 直接 ok: false；400、401、529 這類 API 錯誤 → 往外丟，都不回饋重試</text>
+  </svg>
+  <figcaption>只有「模型改得了的內容錯誤」才回饋重試，而且有次數上限。</figcaption>
+</figure>
+<p>要做回饋，就需要失敗那次的原始回應，但 <code>parse()</code> 失敗時只丟出錯誤，拿不到回應本身。所以拆成兩步：<code>parse()</code> 其實就是 <code>create()</code> 加上對文字跑 <code>format.parse()</code>，自己分開做就能保留回應：</p>
+<pre>const format = zodOutputFormat(OrderIntentSchema)
+const response = await client.messages.create({ …, messages, output_config: { format } })   // API 錯誤在 try 外面，直接往外丟
+const raw = response.content.filter(b =&gt; b.type === 'text').map(b =&gt; b.text).join('')
+try {
+  return format.parse(raw)          // 跟 messages.parse 一樣：JSON 解析＋zod 驗證，失敗丟 AnthropicError
+} catch (e) {
+  if (!(e instanceof Anthropic.AnthropicError)) throw e
+  messages.push(
+    { role: 'assistant', content: response.content },
+    { role: 'user', content: `你上一次的回答沒有通過驗證：\n${e.message}\n請修正後重新回答。` },
+  )
+}</pre>
+<p>錯誤訊息裡有 <code>items.0.quantity: Too small: expected number to be &gt;=1</code> 這類路徑，模型讀得懂，比「格式不對，再試一次」有用得多。哪些錯誤適合回饋重試：</p>
+<div class="table-wrap"><table>
+  <tr><th>情況</th><th>怎麼處理</th><th>原因</th></tr>
+  <tr><td>zod 驗證失敗、JSON 被截斷</td><td>回饋重試，有上限</td><td>模型改得了</td></tr>
+  <tr><td><code>stop_reason: 'refusal'</code></td><td>不重試，回傳失敗</td><td>同樣的內容再問一次，通常還是拒答（第 14 課再談備援）</td></tr>
+  <tr><td>400、401、403、帳號額度用完</td><td>不重試，往外丟</td><td>是請求或帳號的問題，送幾次都一樣，只會浪費錢</td></tr>
+  <tr><td>429、529、連線錯誤</td><td>往外丟</td><td>SDK 的 <code>maxRetries</code> 已經自動重試過（第 2 課），第 14 課再設計完整策略</td></tr>
+</table></div>
+<p>上限一定要有。每次重試都是一次完整的 API 呼叫，輸入還越來越長（多了上一次的回答和錯誤說明），延遲和費用一起變大。一般 2～3 次就夠；用完還是失敗，就回 <code>ok: false</code>，讓顧客看到「我沒看懂，可以再說一次嗎？」。把重試次數記進 log，第 13 課算成本、第 15 課做監控時，重試率突然升高通常代表 prompt 或 schema 改壞了。</p>
+
+<div class="callout practice"><strong>💡 實務上：重試失敗的原始回應要留下來</strong><br>回饋重試用完還是失敗的那幾筆，是改 prompt 和 schema 最好的素材：把顧客原文、模型最後的回答、zod 的錯誤訊息一起記進 log（顧客個資要遮罩），每週挑幾筆看。常見的發現是「商品名稱多了『熱』『大杯』」這類規律，修法通常是在 system prompt 補一句對照規則，或在 schema 加一個欄位，而不是調高重試次數。這些案例之後也能直接變成第 11 課 eval 的測資。</div>
+
+<h2>圖片與 PDF 也能擷取</h2>
+<p>同樣的做法可以用在文字以外的輸入：顧客上傳的收據照片、廠商寄來的 PDF 報價單。把檔案放進 user 訊息的 content block，搭配同一套 structured outputs：</p>
+<pre>const pdf = readFileSync('quote.pdf').toString('base64')   // base64 字串，不能有換行
+await client.messages.parse({
+  model: 'claude-opus-5-5',
+  max_tokens: 16000,
+  messages: [{
+    role: 'user',
+    content: [
+      { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdf } },
+      { type: 'text', text: '擷取這份報價單的品項、單價與有效期限。' },
+    ],
+  }],
+  output_config: { format: zodOutputFormat(QuoteSchema) },
+})</pre>
+<ul>
+  <li>圖片用 <code>{ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data } }</code>，放在文字前面。</li>
+  <li>同一個檔案要用很多次時，先用 Files API（<code>client.files.upload()</code>，已經正式推出，不需要 beta 標頭）上傳，之後把 block 的 <code>source</code> 寫成 <code>{ type: 'file', file_id }</code> 引用，不必每次重傳。</li>
+  <li>上限：一個請求最多 32 MB、600 頁（PDF 頁數與圖片合計）。大檔案的每一頁都算 token，記得估成本。</li>
+</ul>
+<p>這一節只示範，不練習。業務驗證的原則完全一樣：報價單上的金額要跟採購系統核對，不能因為「是從 PDF 讀出來的」就直接相信。</p>
+
+<h2>資深視角：結構化輸出是可測試性的基礎</h2>
+<ul>
+  <li><strong>可以比對欄位，不必比對句子。</strong>自由文字每次措辭不同，測試只能用「包含某個詞」這種脆弱的判斷；結構化輸出可以斷言 <code>intent === 'unclear'</code>、<code>items</code> 正好是兩杯拿鐵。第 11 課的 eval 就是建立在這上面。</li>
+  <li><strong>schema 是介面，要有版本。</strong>改 schema 就像改 API 的回應格式：下游的程式、eval、存在資料庫的舊結果都要跟著檢查。加欄位比改欄位安全。</li>
+  <li><strong>schema 越大越容易出錯。</strong>欄位少、每個欄位意思明確、加上 <code>.describe()</code> 說明，比一個塞滿可選欄位的大物件可靠。一次請求做一件事。</li>
+  <li><strong>什麼時候不用 LLM。</strong>顧客是在 App 裡點選商品和數量，就直接是結構化資料，不需要模型；LLM 只用在真的要理解自然語言的入口。</li>
+</ul>
+
+<h2>練習</h2>
+<p>在 learn 資料夾執行 <code>node check.mjs ai 05</code>，會建立 <code>ai/practice/work/05/</code>。練習 2 用到練習 1 的型別，練習 3 用到練習 1 的 schema，照順序做。三題都用假的 API 判分，不需要 API key；做完後想看真實模型怎麼擷取，可以在 <code>ai/practice</code> 執行 <code>node --env-file-if-exists=.env work/05/live.ts</code>。</p>
+
+<div class="local" data-test="ex1" data-files="ex1.ts">
+  <p>練習 1：把 <code>OrderIntentSchema</code> 改成真正的 zod schema：<code>intent</code> 是 <code>'order'</code>、<code>'question'</code>、<code>'unclear'</code> 之一；<code>items</code> 每一項的 <code>product</code> 是 <code>PRODUCT_NAMES</code> 其中之一、<code>quantity</code> 是 1～20 的整數；<code>note</code> 是字串或 <code>null</code>。再完成 <code>extractIntent(client, text)</code>：用 <code>client.messages.parse</code> 搭配 <code>output_config: { format: zodOutputFormat(OrderIntentSchema) }</code>，model 用 <code>MODEL</code>、<code>max_tokens</code> 16000、system 用寫好的 <code>SYSTEM</code>，user 訊息用寫好的 <code>wrapMessage(text)</code>（第 4 課的跳脫加上 <code>&lt;message&gt;</code> 標籤）。回傳 <code>parsed_output</code>；它是 <code>null</code> 時丟出 <code>Error</code>，訊息帶 <code>stop_reason</code>。測試會送 quantity 0、21、1.5、菜單上沒有的商品，全部都要丟錯。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="ex2.ts">
+  <p>練習 2：完成 <code>toOrder(intent, menu, stock)</code>。<code>intent</code> 不是 <code>'order'</code> 或沒有品項時回傳 <code>ok: false</code>；同一個商品出現好幾次要合併成一行（順序依第一次出現）；不在 <code>menu</code> 或 <code>available</code> 是 <code>false</code>、<code>stock</code> 不夠（沒有這個 key 當成 0）都是錯誤，訊息要包含商品名稱，而且要全部列出。沒有錯誤時回傳每一行（<code>unitPrice</code> 用 menu 的價格）與整數的 <code>total</code>。模型的輸出就算夾帶 <code>price</code> 欄位也不能用；不要改到傳進來的資料。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="ex3.ts">
+  <p>練習 3：完成 <code>extractWithRetry(client, text, { maxAttempts = 3 })</code>。每次用 <code>client.messages.create</code> 送出（設定跟練習 1 一樣，包括 <code>output_config.format</code>），再用 <code>format.parse</code> 驗證文字。驗證失敗（<code>AnthropicError</code>，包括被截斷）時，把這次回應的完整 content 當成 assistant 訊息、再加一則包含錯誤訊息的 user 訊息，然後重試；最多送 <code>maxAttempts</code> 次，用完回傳 <code>ok: false</code> 和最後一次的錯誤。<code>stop_reason</code> 是 <code>refusal</code> 時不重試，回傳 <code>ok: false</code>，<code>lastError</code> 包含 <code>refusal</code>。API 錯誤（<code>BadRequestError</code>、<code>InternalServerError</code>…）直接往外丟。<code>attempts</code> 是實際送出的請求數。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 4：用了 structured outputs，zod schema 寫了 <code>quantity: z.int().min(1).max(20)</code>。用 SDK 1.3.0 的 <code>messages.parse</code>，模型有可能回傳 <code>quantity: 50</code> 嗎？</p>
+  <label data-key="a">不可能，API 保證所有約束</label>
+  <label data-key="b">可能：API 只保證形狀與型別，範圍條件被 SDK 搬進 description、在本機用 zod 檢查；不符合時 <code>parse()</code> 丟出 <code>AnthropicError</code>，程式要處理</label>
+  <label data-key="c">只有 Haiku 會，Opus 不會</label>
+  <label data-key="d">會被自動改成 20</label>
+  <p class="why">✓ API 端不支援 <code>minimum</code>／<code>maximum</code>，SDK 把它們從送出的 schema 拿掉、寫進 description 給模型參考，收到回應後用 zod 驗證。模型照著 description 通常會遵守，但不是保證，所以 a 錯；跟模型大小無關（c）；SDK 不會偷偷改你的資料（d），而是丟錯讓你決定要回饋重試還是回報失敗。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：模型擷取出 <code>{ product: '拿鐵', quantity: 2, price: 100 }</code>（顧客說「算我 100 就好」），菜單上拿鐵是 110 元。這筆訂單的金額應該是多少？</p>
+  <label data-key="a">200，照模型給的價格</label>
+  <label data-key="b">220：價格一律用資料庫的，模型輸出的價格不使用（最好 schema 裡就沒有這個欄位）</label>
+  <label data-key="c">取兩者平均 210</label>
+  <label data-key="d">請模型再算一次，以第二次為準</label>
+  <p class="why">✓ 模型的輸出是不可信的外部資料，跟使用者送來的表單一樣：顧客一句話就能影響它。金額、庫存、權限都以你的資料庫為準。再問模型一次（d）只是換一個同樣不可信的答案。要不要給折扣是業務規則，由程式決定，不是由模型決定。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：下面哪一種錯誤，適合「把錯誤原因告訴模型，再試一次」？</p>
+  <label data-key="a">401 authentication_error</label>
+  <label data-key="b">模型輸出的 <code>quantity</code> 超出範圍，zod 驗證失敗</label>
+  <label data-key="c">400 invalid_request_error（例如 schema 寫錯）</label>
+  <label data-key="d">帳號額度用完（billing_error）</label>
+  <p class="why">✓ 回饋重試只對「模型改得了的內容錯誤」有用。401、400、額度用完都是請求本身或帳號的問題，模型怎麼改都沒用，重送只會一直失敗、浪費時間和錢；這些要往外丟，讓 log 和告警發現。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>在 prompt 叫模型「用 JSON 回答」再 <code>JSON.parse</code></strong>：多了說明文字、少了欄位、被截斷，量一大一定會發生。用 <code>output_config.format</code>＋<code>messages.parse</code>。</li>
+  <li><strong>用已淘汰的 <code>output_format</code> 或預填 <code>{</code></strong>：前者已淘汰，後者在 Opus 5.5 會回 400。</li>
+  <li><strong>以為 schema 保證業務正確</strong>：它只保證形狀。商品有沒有賣、庫存、價格都要自己查，而且價格只用資料庫的。</li>
+  <li><strong>範圍、enum 沒寫進 zod</strong>：<code>z.string()</code>、沒有 <code>min</code>／<code>max</code> 的數字，等於告訴 SDK 什麼都接受。</li>
+  <li><strong>沒有 <code>unclear</code> 選項</strong>：模型被迫在合法範圍裡猜，編出一張看起來正常的訂單。</li>
+  <li><strong>忘了 <code>parsed_output</code> 可能是 <code>null</code></strong>：拒答時 <code>parse()</code> 不丟錯，直接回傳會把 <code>null</code> 當成結果。</li>
+  <li><strong>業務驗證遇到第一個錯誤就停</strong>：顧客改完一個又冒出下一個。全部列出。</li>
+  <li><strong>無上限、不分種類的重試</strong>：400、401 也重試，或寫成 <code>while (true)</code>，帳單和延遲一起爆炸。只回饋重試內容錯誤，次數有上限。</li>
+  <li><strong>重試時送一模一樣的請求</strong>：模型不知道哪裡錯，結果多半一樣。把 assistant 的回應和錯誤訊息加進對話。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>自由文字沒有任何格式保證；要固定格式用 structured outputs：<code>output_config: { format: zodOutputFormat(Schema) }</code> 搭配 <code>client.messages.parse()</code>，結果在有型別的 <code>parsed_output</code>。</li>
+  <li>API 保證 JSON 形狀、必填欄位與型別；SDK 1.3.0 把範圍、長度、enum 搬進 description，在本機用 zod 驗證，失敗或截斷時丟出 <code>AnthropicError</code>；拒答時 <code>parsed_output</code> 是 <code>null</code>。</li>
+  <li>schema 要有「不知道」的出口（<code>unclear</code>、可以是 <code>null</code> 的欄位），模型才不會被迫亂猜。</li>
+  <li>業務驗證在 schema 之後：商品是否供應、合併後的庫存、價格一律從資料庫來；回傳 Result、列出全部錯誤。</li>
+  <li>回饋重試：把 assistant 的完整 content 和錯誤說明加進對話再試，有次數上限；拒答與 API 錯誤不回饋重試。</li>
+  <li>圖片、PDF 用 image／document block（或 Files API 的 file_id），一樣搭配 structured outputs。</li>
+  <li>結構化輸出讓測試和 eval 可以比對欄位，是後面每一課的基礎。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 6 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 7：code review 看到這段組 prompt 的程式，<code>menu</code> 已經依 id 排序。哪裡會出事？</p>
+<pre>const system = `價格只根據 &lt;menu&gt; 回答。
+&lt;menu&gt;
+${menu.map(m =&gt; `${m.id}｜${m.name}｜${m.price}`).join('\n')}
+&lt;/menu&gt;`
+const user = `&lt;question&gt;${escapeForTag(question)}&lt;/question&gt;`</pre>
+  <label data-key="a">顧客的問題放在 user 訊息，應該跟規則一起放進 system 才會被遵守</label>
+  <label data-key="b"><code>escapeForTag</code> 會把顧客打的中文標點也換掉，模型讀不懂問題</label>
+  <label data-key="c">品名是店員在後台打的，沒有跳脫，含 <code>&lt;/menu&gt;</code> 的品名能偽造結構</label>
+  <label data-key="d">菜單放在 system 會讓每個請求的開頭都不同，快取命中不了</label>
+  <p class="why">✓ 不是親手寫在程式裡的文字，放進標籤前都要跳脫，後台的品名、公告、資料庫查回來的資料都算。最好整個專案只有一個組 prompt 的函式負責跳脫。a 錯在顧客輸入混進 system，正是讓模型分不清規則和資料的寫法。（第 4 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 8：客服助理開了 prompt caching，system 裡沒有時間戳記或亂數，log 卻顯示快取幾乎沒命中。先查什麼？</p>
+  <label data-key="a">菜單的 <code>SELECT</code> 有沒有 <code>ORDER BY</code>，兩次組出的 system 是否逐位元相同</label>
+  <label data-key="b">few-shot 放在 messages 而不是 system，範例那一段沒有被快取到</label>
+  <label data-key="c">user 訊息帶了今天的日期，每天的前綴都不同，快取跟著失效</label>
+  <label data-key="d">顧客的問題有沒有跳脫，沒跳脫的請求 API 不會替它快取</label>
+  <p class="why">✓ 快取是前綴比對，沒寫 <code>ORDER BY</code> 時資料庫不保證順序，菜單順序一變，system 和後面全部重算，API 也不會報錯。資料排序、物件的鍵順序固定。c 錯在 user 訊息在 system 後面，日期只影響它之後的部分，前面的 system 照樣命中。（第 4 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 9：為了統一語氣，同事加了三組 few-shot，都是顧客問價格、助理報出價格。之後「燕麥奶拿鐵多少？」又開始被報出菜單上沒有的價格，為什麼？</p>
+  <label data-key="a">範例中間的 assistant 訊息被當成預填，system 裡的規則跟著失效</label>
+  <label data-key="b">模型會模仿範例，三組都有答案，學到的是每題都要報價；要補一組「菜單沒有」</label>
+  <label data-key="c">範例放在 messages，模型分不出它是範例；要改寫進 system 的 <code>&lt;examples&gt;</code></label>
+  <label data-key="d">範例太少，蓋不過模型原本的習慣；加到十組以上規則才會穩定</label>
+  <p class="why">✓ 範例是 prompt 裡最強的訊號，有時強過規則。2～3 組、彼此不同，而且一定要有「不知道」或「沒有」的情況。a 錯在只有最後一則 assistant 才算預填，中間的是正常的對話歷史。（第 4 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 10：擷取訂單的 schema 寫 <code>intent: z.enum(['order', 'question'])</code>，顧客傳「老樣子」，結果是一杯美式咖啡，形狀完全合法。怎麼修？</p>
+  <label data-key="a">不用改，業務驗證會查菜單和庫存，猜錯的訂單會被擋下來</label>
+  <label data-key="b">在 system 加一句「絕對不要猜測顧客的訂單」，schema 維持不變</label>
+  <label data-key="c">intent 加上 <code>'unclear'</code>，system 寫清楚看不出來時用它、不要猜</label>
+  <label data-key="d">改回在 prompt 要求 JSON 再自己解析，讓模型能回一句「不確定」</label>
+  <p class="why">✓ schema 只允許 order 和 question 時，模型只能在合法範圍裡猜。給它合法的「不知道」出口，system 也說明這是被鼓勵的答案。a 錯在美式咖啡有賣、庫存也夠，業務驗證只檢查事實，看不出這不是顧客要的。（第 5 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 11：業務驗證這樣寫，<code>merged</code> 是合併過的品項，<code>stock</code> 只有部分商品有 key。哪裡會出事？</p>
+<pre>for (const [product, quantity] of merged) {
+  const item = menu.find(m =&gt; m.name === product)
+  if (!item || !item.available) { errors.push(`${product} 目前沒有供應`); continue }
+  if (stock[product] &lt; quantity) errors.push(`${product} 庫存不足`)
+  lines.push({ product, quantity, unitPrice: item.price })
+}</pre>
+  <label data-key="a">先合併再檢查庫存，單一行就超過庫存的情況會被漏掉</label>
+  <label data-key="b">遇到下架商品只是 continue，應該立刻 return 讓顧客先處理這一項</label>
+  <label data-key="c">單價用了菜單的價格，顧客跟助理談好的優惠價不會反映在金額上</label>
+  <label data-key="d">沒有庫存資料的商品比較結果是 false，等於不限量，永遠不會擋</label>
+  <p class="why">✓ <code>undefined &lt; 2</code> 是 <code>false</code>，查不到庫存就通過了。要寫成 <code>(stock[product] ?? 0) &lt; quantity</code>，查不到當成 0。c 錯在價格一律用資料庫的，顧客一句話就能影響模型的輸出，折扣是業務規則，由程式決定。（第 5 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 12：同事的重試是 zod 驗證失敗時，把同一份 messages 原封不動再送，最多 3 次。log 顯示常常三次都錯在同一個欄位，怎麼改？</p>
+  <label data-key="a">把上限調到 10 次，多試幾次總會有一次剛好通過驗證</label>
+  <label data-key="b">把上次 assistant 的完整 content 和帶欄位路徑的錯誤訊息加進對話再送</label>
+  <label data-key="c">交給 SDK 內建的自動重試，它遇到 zod 驗證失敗會自己再送一次</label>
+  <p class="why">✓ 一模一樣的請求，結果多半差不多；把錯在哪（例如 <code>items.0.quantity</code>）告訴模型才改得了，次數仍然有上限。a 錯在每次重試都是一次完整的呼叫，加次數只是讓延遲和費用一起變大，該做的是看失敗的原文去改 prompt 或 schema。（第 5 課）</p>
+</div>
+<p>這個階段的重點整理成<a href="../sheets/stage-2.html">一頁圖解</a>。</p>
+<p>下一課讓模型反過來呼叫你的函式：模型提出要查哪張訂單，你的程式執行查詢、把結果交回給它。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

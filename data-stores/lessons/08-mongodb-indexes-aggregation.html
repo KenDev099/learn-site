@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>8. MongoDB 查詢、索引、explain 與 aggregation pipeline</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="8" data-practice="data-stores">
+<header>
+  <div class="eyebrow">階段 3：MongoDB 與文件模型 · 第 8 課</div>
+  <h1>MongoDB 查詢、索引、explain 與 aggregation pipeline</h1>
+</header>
+<main>
+
+<p><a href="07-mongodb-modeling.html">第 7 課</a>做好的門市活動頁上線半年，加盟品牌一起放進來，門市從幾百筆長到 5 萬筆。首頁那一塊「台北營業中的門市，評分高的在前，取 20 家」從 5 ms 變成 600 ms，尖峰時把資料庫的 CPU 吃滿。同一週行銷又要一張「各城市的平均評分」報表，有同事寫成把全部門市 <code>find()</code> 回 Node 再 <code>reduce</code>；客服也轉來一則抱怨：評論翻到後面幾百頁要等很久。</p>
+<p>這課就從這三件事出發，從頭處理到底：先查出首頁的查詢到底做了什麼，替它設計一個讓它只讀 20 份文件的索引，接著把評論分頁改成第幾頁都一樣快，最後把報表搬進資料庫裡算。學完你會用 explain 證明一個查詢快或慢、說得出複合索引的欄位為什麼要這樣排，也知道哪些統計不該在線上資料庫算。如果你上過 PostgreSQL 課的索引與 EXPLAIN，會發現思路完全一樣，只是換一套語法。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>首頁的查詢怎麼寫：先放進 5 萬家門市，用 find 篩選、排序、取前 20 家，並先給慢的原因一句答案。</li>
+  <li>這個查詢讀了多少份文件：用 explain 證明它為了 20 份讀了 5 萬份；索引欄位怎麼排才能只讀 20 份（ESR 規則）。</li>
+  <li>活動頁的其他需求要什麼索引：標籤篩選、網址代稱、只查營業中、打卡紀錄自動過期。</li>
+  <li>評論翻到第 500 頁為什麼慢：skip 的代價，以及怎麼改成 keyset 分頁。</li>
+  <li>行銷的報表怎麼在資料庫裡算：aggregation pipeline，以及它什麼時候太重、該換地方算。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="07-mongodb-modeling.html">第 7 課</a>的門市與評論文件模型：門市內嵌營業時間，評論另放一個集合，用門市 id 參照；以及 mongosh、Node driver 的基本操作。</li>
+  <li><a href="../../postgresql/lessons/20-indexes.html">PostgreSQL 課第 20 課</a>的索引：另外存一份排好序的 key 指回資料，查詢不必掃全表。</li>
+</ul></div>
+
+<h2>首頁的「台北營業中前 20 家」怎麼查？先放進 5 萬家門市</h2>
+<p>先給開場問題最小的答案，後面每一節再把它拆開來證明：查詢慢，是因為沒有合適的索引，MongoDB 只好把 5 萬份文件全部讀一遍，挑出台北營業中的，再在記憶體裡排序取前 20；替這個查詢建一個複合索引 <code>{ city: 1, status: 1, rating: -1 }</code>，它就只讀 20 份。城市平均評分則交給 aggregation pipeline 在資料庫裡算，不要把 5 萬份文件搬回 Node。</p>
+<p>要親眼看到這個差別，得先有一份夠大的資料。開 MongoDB，進 mongosh，在 <code>ds_play</code> 這個資料庫做實驗。練習的測試用另一個資料庫 <code>ds_t08</code>，每次判分前會整個刪掉，所以不要在那裡放自己的東西。</p>
+<pre>$ cd learn/data-stores/practice
+$ docker compose --profile mongo up -d --wait
+$ docker compose exec mongo mongosh ds_play
+ds_play&gt; db.stores.drop()
+ds_play&gt; const cities = ['台北', '新北', '台中', '台南', '高雄']
+ds_play&gt; const docs = []
+ds_play&gt; for (let i = 0; i &lt; 50000; i++) docs.push({
+  name: `門市 ${i + 10}`, city: cities[i % 5],
+  status: i % 3 === 0 ? 'closed' : 'open',
+  rating: Math.round(Math.random() * 400 + 100) / 100,      // 1.00～5.00
+  reviewCount: i % 500,
+  tags: i % 2 ? ['wifi', '插座'] : ['寵物友善'],
+})
+ds_play&gt; db.stores.insertMany(docs)</pre>
+<p>mongosh 的語法就是 JavaScript，所以可以直接寫迴圈產生資料。結果是 5 個城市各 1 萬家，其中三分之一關閉；評分是 1.00 到 5.00 的亂數；<code>tags</code> 是陣列，等一下標籤篩選會用到。</p>
+<p>有了資料，來寫首頁那個查詢。mongosh 的查詢是 <code>find(篩選, 投影)</code>，<code>sort</code>、<code>limit</code> 接在後面。第一個參數是篩選條件，寫成一個物件：<code>{ city: '台北', status: 'open' }</code> 的意思是「city 等於台北，而且 status 等於 open」，同一個物件裡的多個條件都要成立。排序與取前幾筆接在後面，<code>sort</code>、<code>limit</code>、<code>skip</code> 分別對應 SQL 的 ORDER BY、LIMIT、OFFSET：</p>
+<pre>db.stores.find({ city: '台北', status: 'open' }, { name: 1, rating: 1, _id: 0 })
+  .sort({ rating: -1 })      // 1 由小到大，-1 由大到小
+  .limit(20)</pre>
+<p>中間那個 <code>{ name: 1, rating: 1, _id: 0 }</code> 是<strong>投影</strong>。投影決定回傳哪些欄位，相當於 SQL 的 SELECT 欄位清單：1 是要、0 是不要。<code>_id</code> 預設一定會回傳，不要的話得明確寫 0。首頁只顯示名稱和評分，就只拿這兩個欄位，少傳一點資料過網路。</p>
+<p>後端實際上是在 Node 裡送這個查詢。driver 的寫法一樣，最後加 <code>.toArray()</code> 拿到陣列：</p>
+<pre>const top = await db.collection('stores')
+  .find({ city: '台北', status: 'open' }, { projection: { name: 1, rating: 1, _id: 0 } })
+  .sort({ rating: -1 }).limit(20).toArray()</pre>
+<p>注意這裡跟 mongosh 不一樣：Node driver 的第二個參數是選項物件 <code>find(篩選, { projection, … })</code>，所以投影要包在 <code>projection</code> 裡。直接傳 <code>{ name: 1 }</code> 會被當成選項而忽略，回傳整份文件。</p>
+<p>首頁之外，活動頁還有篩選器：「評分 4 分以上」「台北或新北」「排除關閉的」。「等於」以外的比較要用<strong>查詢運算子</strong>（query operator）。它是放在欄位值位置的一個物件，名稱都以 <code>$</code> 開頭，例如 <code>{ rating: { $gte: 4 } }</code> 讀作「rating 大於等於 4」。常用的這幾個，對照 SQL 就很好記：</p>
+<div class="table-wrap"><table>
+  <tr><th>寫法</th><th>意思</th><th>SQL 對照</th></tr>
+  <tr><td><code>{ city: '台北' }</code></td><td>等於</td><td><code>city = '台北'</code></td></tr>
+  <tr><td><code>{ rating: { $gte: 4, $lt: 4.5 } }</code></td><td>大於等於、小於（還有 <code>$gt</code>、<code>$lte</code>）</td><td><code>rating &gt;= 4 AND rating &lt; 4.5</code></td></tr>
+  <tr><td><code>{ city: { $in: ['台北', '新北'] } }</code></td><td>其中之一（相反是 <code>$nin</code>）</td><td><code>city IN (…)</code></td></tr>
+  <tr><td><code>{ status: { $ne: 'closed' } }</code></td><td>不等於</td><td><code>status &lt;&gt; 'closed'</code></td></tr>
+  <tr><td><code>{ photos: { $exists: true } }</code></td><td>有這個欄位</td><td>—</td></tr>
+  <tr><td><code>{ $or: [{ city: '台北' }, { rating: 5 }] }</code></td><td>或；同一個物件裡的多個條件預設是「且」</td><td><code>OR</code></td></tr>
+</table></div>
+<p>活動頁還有「有 wifi 的門市」這個篩選，而 <code>tags</code> 是陣列。PostgreSQL 的一個欄位通常只放一個值，MongoDB 的欄位卻可以是陣列，所以查詢規則多了一條：對陣列欄位下條件時，只要陣列裡<em>任何一個</em>元素成立就算符合。</p>
+<pre>db.stores.find({ tags: 'wifi' })                         // tags 裡有 'wifi' 的門市
+db.stores.find({ tags: { $all: ['wifi', '插座'] } })      // 兩個都要有
+// promos 是物件陣列：[{ title, startsAt, active }]
+db.stores.find({ promos: { $elemMatch: { active: true, startsAt: { $lte: new Date() } } } })</pre>
+<p>第三個查詢是「正在進行中的限時活動」。第 7 課把活動內嵌在門市文件裡，成了一個物件陣列 <code>promos</code>，每個元素有 <code>active</code>（是否啟用）和 <code>startsAt</code>（開始時間）。直覺的寫法是 <code>{ 'promos.active': true, 'promos.startsAt': { $lte: … } }</code>，但套用剛才那條「任何一個元素成立就算」的規則，兩個條件會<em>分別</em>去找元素：只要有某個活動是啟用的，又有另一個活動已經開始，就算符合。結果一家門市只有「啟用但下個月才開始」和「已經開始但停用」兩個活動，也會被當成有進行中的活動。<code>$elemMatch</code> 改成要求<em>同一個</em>元素同時滿足所有條件，才是「有一個活動既啟用又已開始」。</p>
+<p>查詢寫得出來了，在 5 萬家的資料上也確實拿得到正確的 20 家。問題是它花了幾百毫秒。要知道時間花在哪裡，得看 MongoDB 實際怎麼執行它。</p>
+
+<h2>這個查詢讀了多少份文件？用 explain 看</h2>
+<p>PostgreSQL 用 EXPLAIN 看查詢計畫（<a href="../../postgresql/lessons/21-explain.html">PostgreSQL 課第 21 課</a>），MongoDB 對應的是在查詢後面加 <code>.explain('executionStats')</code>。加上 <code>'executionStats'</code> 時，MongoDB 會真的執行一次查詢，然後回報兩件事：它選了什麼方法找資料（查詢計畫），以及實際看了多少東西（執行統計）。輸出是一大份 JSON，下面只留重點欄位。先看還沒有任何索引時的首頁查詢：</p>
+<pre>ds_play&gt; db.stores.find({ city: '台北', status: 'open' }).sort({ rating: -1 }).limit(20).explain('executionStats')
+queryPlanner.winningPlan:  SORT ← COLLSCAN
+executionStats: { nReturned: 20, totalKeysExamined: 0, totalDocsExamined: 50000, executionTimeMillis: 225 }</pre>
+<p>先看 <code>executionStats</code> 的三個數字，判斷一個查詢好不好，主要就看它們：</p>
+<ul>
+  <li><strong>nReturned</strong>：回傳了幾份文件。這裡是 20，就是首頁要的那 20 家。</li>
+  <li><strong>totalKeysExamined</strong>：看了幾個索引項。0 代表完全沒用到索引，因為還沒建。</li>
+  <li><strong>totalDocsExamined</strong>：讀了幾份文件。50000，整個集合都讀了一遍。</li>
+</ul>
+<p>理想的查詢三個數字差不多：要 20 份，就只看 20 個索引項、讀 20 份文件。這裡是為了 20 份讀了 5 萬份，浪費 2500 倍。讀文件是查詢最貴的部分，資料越大越慢，尖峰時多個請求同時這樣讀，CPU 就被吃滿，這正是首頁的症狀。</p>
+<p>再看 <code>winningPlan</code>，它說明「怎麼讀」。MongoDB 收到查詢時可能想得出好幾種執行方法，<code>winningPlan</code> 是它最後選中的那一個。計畫是一棵由 <strong>stage</strong>（階段）組成的樹，每個 stage 做一件事，從最裡面讀起，做完把結果交給外層。<code>SORT ← COLLSCAN</code> 讀作：最裡面的 COLLSCAN 從頭到尾讀整個集合，邊讀邊篩出台北營業中的，交給外層的 SORT 在記憶體裡排序，排好取前 20。COLLSCAN 就是三個數字裡那 5 萬份的來源，SORT 則代表排序沒辦法省掉。</p>
+<p>之後會陸續看到其他 stage，這張表查表用，不用背：</p>
+<div class="table-wrap"><table>
+  <tr><th>stage</th><th>做什麼</th></tr>
+  <tr><td><code>COLLSCAN</code></td><td>collection scan：從頭到尾讀整個集合，相當於 PostgreSQL 的 Seq Scan</td></tr>
+  <tr><td><code>IXSCAN</code></td><td>index scan：在索引裡找；<code>indexName</code> 是用哪個索引</td></tr>
+  <tr><td><code>FETCH</code></td><td>拿著索引找到的位置去讀整份文件</td></tr>
+  <tr><td><code>SORT</code></td><td>在記憶體裡排序：索引沒辦法直接給出要的順序</td></tr>
+  <tr><td><code>LIMIT</code></td><td>拿到 n 份就停</td></tr>
+  <tr><td><code>PROJECTION_COVERED</code></td><td>需要的欄位全在索引裡，不讀文件（覆蓋查詢）</td></tr>
+  <tr><td><code>OR</code>、<code>SORT_MERGE</code></td><td><code>$or</code> 的每個條件各用一個索引，再合併（多個子計畫）</td></tr>
+</table></div>
+<p>在程式裡讀 explain 時，這棵樹在 JSON 裡的形狀，以及 aggregate 可能換成另一種格式，練習 2 會用到，細節集中在課末〈補充與查表〉。</p>
+<p>現在知道病因了：沒有索引，只能 COLLSCAN 讀完 5 萬份，再 SORT。下一步是建索引，但建在哪個欄位、建幾個欄位，結果差很多。</p>
+
+<h2>加哪個索引才只讀 20 份？複合索引與 ESR</h2>
+<p>最直覺的做法，是替篩選條件裡最有鑑別度的 <code>city</code> 建一個索引。索引跟 <a href="../../postgresql/lessons/20-indexes.html">PostgreSQL</a> 的一樣，是另外存的一份依 key 排好序的清單，每一項指回一份文件，所以要找台北的門市，不必翻過整個集合，直接跳到清單裡「台北」那一段。建好後名字自動叫 <code>city_1</code>，再跑一次同樣的 explain：</p>
+<pre>ds_play&gt; db.stores.createIndex({ city: 1 })
+ds_play&gt; (同一個查詢).explain('executionStats')
+winningPlan:  SORT ← FETCH ← IXSCAN(city_1)
+executionStats: { nReturned: 20, totalKeysExamined: 10000, totalDocsExamined: 10000, executionTimeMillis: 608 }</pre>
+<p>從最裡面讀：IXSCAN 在 <code>city_1</code> 裡找出台北那一段，共 1 萬個索引項；FETCH 拿著這 1 萬個位置把文件一份份讀出來，才看得到 status 是不是 open；最後 SORT 把剩下的營業中門市全部排序，取前 20。讀的文件從 5 萬降到 1 萬，但還是為了 20 份讀了 1 萬份，而且記憶體排序還在。<code>executionTimeMillis</code> 甚至沒有比較低，因為透過索引一份份跳去讀文件，不見得比連續讀整個集合快；這也是為什麼判斷要看三個數字，不能只看一次執行的毫秒數。</p>
+<p>問題出在這個索引只知道 city：status 要讀文件才知道，評分順序也要另外排。如果索引本身就把 status 和 rating 也照順序排好，就不必讀文件來篩、也不必再排序。這就是<strong>複合索引</strong>（compound index）：一個索引包含多個欄位，先依第一個欄位排，第一個相同時依第二個排，依此類推，跟電話簿先依姓、再依名排序一樣。替首頁的查詢建一個三個欄位的複合索引：</p>
+<pre>ds_play&gt; db.stores.createIndex({ city: 1, status: 1, rating: -1 })
+winningPlan:  LIMIT ← FETCH ← IXSCAN(city_1_status_1_rating_-1)
+  indexBounds: { city: ['台北', '台北'], status: ['open', 'open'], rating: [MaxKey, MinKey] }
+executionStats: { nReturned: 20, totalKeysExamined: 20, totalDocsExamined: 20 }</pre>
+<p>三個數字都是 20，計畫裡也沒有 SORT 了。原因在索引項的排列方式：先依 city，city 相同依 status，再依 rating 由大到小。所以「台北、open」的所有索引項擠在連續的一段，而且這一段已經按評分由高到低排好。<code>indexBounds</code> 說的就是這件事：city 只掃「台北」、status 只掃「open」、rating 從最大掃到最小。從這一段的開頭讀 20 個索引項就是答案，LIMIT 拿到 20 份就停，FETCH 也只讀這 20 份文件。</p>
+<p>欄位都對，順序卻很重要。下圖比較兩個欄位相同、順序不同的索引：</p>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="兩個索引的索引項排列：city、status、rating 的索引裡台北營業中的門市連續排列且依評分排序；city、rating、status 的索引裡關閉的門市穿插在中間">
+    <text class="d-accent" x="170" y="22" text-anchor="middle">{ city, status, rating: -1 }</text>
+    <text class="d-accent" x="530" y="22" text-anchor="middle">{ city, rating: -1, status }</text>
+    <rect class="d-box" x="40" y="36" width="260" height="30" rx="4"/><text class="d-small" x="170" y="56" text-anchor="middle">台北 · closed · 4.98</text>
+    <rect class="d-box" x="40" y="70" width="260" height="30" rx="4"/><text class="d-small" x="170" y="90" text-anchor="middle">台北 · closed · 4.95 …</text>
+    <rect class="d-soft" x="40" y="104" width="260" height="30" rx="4"/><text class="d-text" x="170" y="124" text-anchor="middle">台北 · open · 4.99 ← 從這裡開始</text>
+    <rect class="d-soft" x="40" y="138" width="260" height="30" rx="4"/><text class="d-text" x="170" y="158" text-anchor="middle">台北 · open · 4.97</text>
+    <rect class="d-soft" x="40" y="172" width="260" height="30" rx="4"/><text class="d-text" x="170" y="192" text-anchor="middle">台北 · open · 4.96</text>
+    <text class="d-small" x="170" y="226" text-anchor="middle">連續讀 20 個就停：看 20 個索引項</text>
+    <rect class="d-soft" x="400" y="36" width="260" height="30" rx="4"/><text class="d-text" x="530" y="56" text-anchor="middle">台北 · 4.99 · open ✓</text>
+    <rect class="d-box" x="400" y="70" width="260" height="30" rx="4"/><text class="d-small" x="530" y="90" text-anchor="middle">台北 · 4.98 · closed ✗ 看過再丟</text>
+    <rect class="d-soft" x="400" y="104" width="260" height="30" rx="4"/><text class="d-text" x="530" y="124" text-anchor="middle">台北 · 4.97 · open ✓</text>
+    <rect class="d-soft" x="400" y="138" width="260" height="30" rx="4"/><text class="d-text" x="530" y="158" text-anchor="middle">台北 · 4.96 · open ✓</text>
+    <rect class="d-box" x="400" y="172" width="260" height="30" rx="4"/><text class="d-small" x="530" y="192" text-anchor="middle">台北 · 4.95 · closed ✗ 看過再丟</text>
+    <text class="d-small" x="530" y="226" text-anchor="middle">沒有 SORT，但關閉的也要看：30 幾個索引項</text>
+  </svg>
+  <figcaption>兩個索引都不用記憶體排序，但 status 放在 rating 後面時，關閉的門市穿插在中間，每一個都要看過再丟掉。</figcaption>
+</figure>
+<p>右邊把 rating 放在 status 前面：台北的索引項依評分排好，所以一樣不用 SORT；但營業中和關閉的門市依評分交錯在一起，要湊滿 20 家營業中的，得沿路把關閉的也看過再丟掉。三分之一關閉時要多看十幾個；如果條件很少人符合（例如只要「整修中」的門市），多看的數量會大很多。</p>
+<p>把這個觀察整理成規則，就是 MongoDB 官方說的 <strong>ESR 規則</strong>（Equality、Sort、Range），複合索引的欄位依序放：</p>
+<ol>
+  <li><strong>等值</strong>（Equality）：<code>city: '台北'</code>、<code>status: 'open'</code> 這種「等於」的條件放最前面。每多一個等值欄位，符合的索引項就被壓縮到更窄的連續一段。等值欄位之間的順序不影響這個查詢。</li>
+  <li><strong>排序</strong>（Sort）：<code>sort()</code> 的欄位接在等值欄位後面。等值條件把範圍鎖在一段之後，這一段裡的索引項剛好依排序欄位排好，所以不必 SORT。方向要跟 sort 一致或全部相反（<code>{ rating: -1 }</code> 的索引也能倒著讀出 <code>sort({ rating: 1 })</code>）。</li>
+  <li><strong>範圍</strong>（Range）：<code>$gt</code>、<code>$lt</code>，以及 <code>$ne</code>、<code>$nin</code>、<code>$regex</code>，這些在官方文件裡都算範圍，不算等值，放最後。</li>
+</ol>
+<p>為什麼範圍要放在排序後面？假設活動頁加上「評論數 100 則以上」的篩選，條件變成 <code>reviewCount: { $gte: 100 }</code>，還是依評分排序。如果索引是 <code>{ city, status, reviewCount, rating }</code>，符合條件的索引項是「評論數 100 的一小段依評分排好、101 的一小段依評分排好……」好幾段接在一起，整體不是依評分排序的，MongoDB 只能把它們全部讀出來再 SORT。改成 <code>{ city, status, rating, reviewCount }</code>，這一段整體依評分排好，邊讀邊跳過評論數不夠的，讀滿 20 家就停。例外是範圍條件篩完只剩很少資料時，先篩（E、R、S）再在記憶體排那幾筆反而更快；這要用 explain 比較兩種索引才知道。這是 <a href="../../postgresql/lessons/27-index-design.html">PostgreSQL 課第 27 課</a>「等值在前、範圍在後」的同一件事。</p>
+<p>知道怎麼設計之後，容易犯另一個錯：每個查詢都加一個索引。</p>
+<div class="callout warn">索引不是越多越好。每個索引都佔記憶體（WiredTiger 快取，課程容器只給 0.25 GB），而且每次新增、修改、刪除文件都要一起更新所有相關的索引。替真正的熱門查詢設計一兩個好的複合索引，比每個欄位各建一個單欄索引有用。複合索引的<strong>前綴</strong>，指的是從最左邊開始連續的幾個欄位：<code>{ city }</code>、<code>{ city, status }</code> 都是 <code>{ city, status, rating }</code> 的前綴，只查這些欄位的查詢可以直接用複合索引。所以一個 <code>{ city, status, rating }</code> 也服務只查 <code>city</code> 的查詢，剛才實驗建的 <code>city_1</code> 是多餘的。</div>
+<div class="callout practice"><strong>💡 實務上：慢查詢多半是從 log 找到的，不是猜到的</strong><br>mongod 預設把超過 100 ms 的操作寫進 log，裡面有查詢條件、<code>planSummary</code>（例如 <code>COLLSCAN</code>）和讀了幾份文件；用 Atlas 時，Query Profiler 和 Performance Advisor 會把這些慢查詢整理好，還會建議索引。客服回報「活動頁好慢」時，資深工程師先找出那支 API 對應的查詢，拿到 mongosh 跑 explain 看那三個數字，再決定加或改哪個索引。新的列表 API 在 PR 裡附上 explain 結果，比上線後救火便宜。反過來要刪掉看起來沒用的索引時，先用 <code>$indexStats</code> 看它被用過幾次（mongod 重啟會歸零），再用 <code>hideIndex</code> 讓查詢暫時不用它、觀察幾天，沒問題才刪；藏起來的索引用 <code>unhideIndex</code> 就恢復，不必重建。</div>
+
+<h2>活動頁其他需求要什麼樣的索引？多鍵、唯一、部分、TTL</h2>
+<p>首頁的查詢解決了，但活動頁不只這一個查詢。上一節的複合索引是一般索引：欄位是單一值，目的是加快查詢。活動頁還有四個需求，各自需要索引多一點不同的能力。</p>
+<p><strong>標籤篩選：多鍵索引</strong>（multikey）。第一節的 <code>find({ tags: 'wifi' })</code> 沒有索引時也是 COLLSCAN。替陣列欄位建索引的寫法跟一般欄位一樣，<code>createIndex({ tags: 1 })</code>，不用另外宣告；MongoDB 發現欄位是陣列，就替陣列裡的每個元素各建一個索引項，一家有 <code>['wifi', '插座']</code> 的門市會在索引裡出現兩次，分別在「wifi」和「插座」的位置。explain 裡看到 <code>isMultiKey: true</code> 就是這種索引。限制是：複合多鍵索引裡，同一份文件最多只能有一個欄位是陣列。<code>{ tags: 1, photos: 1 }</code> 遇到兩個欄位都是陣列的文件，建索引或寫入會失敗，因為兩個陣列的每個元素兩兩組合，索引項會爆增。</p>
+<p><strong>網址代稱不能重複：唯一索引</strong>（unique）。活動頁的網址用門市代稱，例如 <code>/stores/xinyi</code>，兩家門市用同一個 <code>slug</code> 就會開到錯的頁面。在程式裡先查再寫擋不住兩個同時送進來的請求，要交給資料庫：<code>createIndex({ slug: 1 }, { unique: true })</code> 之後，寫入重複的值會得到錯誤碼 11000（duplicate key）。第 7 課的並發 upsert 只產生一份，靠的就是它。</p>
+<p><strong>只查營業中的門市：部分索引</strong>（partial）。活動頁幾乎只查營業中的門市，關閉的三分之一放在索引裡只是佔空間。<code>partialFilterExpression</code> 讓索引只收符合條件的文件，索引比較小，寫入關閉門市時也不用更新它。代價是查詢條件要包含 <code>status: 'open'</code>，MongoDB 才能確定要的文件都在索引裡，才會用它；查關閉門市的查詢用不到。部分索引加上 unique 時，唯一性也只管符合條件的文件：只有營業中的門市 slug 不能重複，關閉的可以。</p>
+<p><strong>打卡紀錄 30 天後自動刪除：TTL 索引</strong>。活動頁的打卡功能每天產生大量紀錄，只需要保留 30 天。TTL（time to live）索引建在日期欄位上，加上 <code>expireAfterSeconds</code>，MongoDB 會在「欄位的時間加上這麼多<strong>秒</strong>」之後自動刪除那份文件，常用在打卡紀錄、驗證碼、暫存資料。它不是即時的：背景工作每 60 秒跑一次，負載高時會更晚；replica set 裡只有 primary 會刪。TTL 只能用在單一欄位的索引（複合索引會忽略 <code>expireAfterSeconds</code>），欄位要是 Date 或 Date 的陣列，存成字串的文件永遠不會被刪。所以程式要「過期就不能用」時，查詢自己加上時間條件，TTL 只負責清垃圾。</p>
+<p>四種索引整理成一張表：</p>
+<div class="table-wrap"><table>
+  <tr><th>種類</th><th>寫法</th><th>用在</th></tr>
+  <tr><td>多鍵（multikey）</td><td><code>createIndex({ tags: 1 })</code></td><td>陣列欄位：每個元素各一個索引項，<code>find({ tags: 'wifi' })</code> 才快。不用另外宣告，欄位是陣列就自動變多鍵（explain 的 <code>isMultiKey: true</code>）</td></tr>
+  <tr><td>唯一（unique）</td><td><code>createIndex({ slug: 1 }, { unique: true })</code></td><td>網址代稱、email 不能重複；重複寫入得到錯誤碼 11000（duplicate key）。第 7 課的並發 upsert 就靠它</td></tr>
+  <tr><td>部分（partial）</td><td><code>createIndex({ city: 1, rating: -1 }, { partialFilterExpression: { status: 'open' } })</code></td><td>只替符合條件的文件建索引，比較小。查詢條件要包含 <code>status: 'open'</code> 才會用它</td></tr>
+  <tr><td>TTL</td><td><code>createIndex({ checkedInAt: 1 }, { expireAfterSeconds: 2592000 })</code></td><td>文件的日期欄位加上這麼多<strong>秒</strong>之後自動刪除：打卡紀錄、驗證碼、暫存資料</td></tr>
+</table></div>
+<p>在 mongosh 裡建索引適合實驗，正式的專案要讓索引跟著程式碼走，否則新環境、新同事的資料庫都會少索引。常見做法是在程式啟動或部署腳本裡呼叫 <code>createIndex</code>：</p>
+<pre>// Node driver：在程式啟動或部署腳本裡建立索引；同樣定義的索引已經存在時 createIndex 什麼都不做
+await db.collection('checkins').createIndex({ checkedInAt: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 })</pre>
+<div class="callout warn">正式環境在大集合上建索引會讀過整個集合，期間吃 CPU 與 I/O。資料量大時排在離峰時間，或在 Atlas 用滾動式建立；建之前先在接近正式資料量的環境用 explain 確認它真的會被選上。</div>
+<p>到這裡，活動頁的篩選查詢都有索引了。還剩客服轉來的評論翻頁問題，它也是查詢與索引的問題，但光加索引救不了。</p>
+
+<h2>評論翻到第 500 頁為什麼慢？skip 換成 keyset 分頁</h2>
+<p>評論列表目前用 <code>skip((page - 1) * 20).limit(20)</code> 分頁。<code>skip</code> 沒辦法直接跳到第 9,981 則：即使有索引，MongoDB 也要從頭沿著索引數過前面 9,980 則再丟掉，才拿到第 500 頁的 20 則。頁數越後面，數過再丟的越多，這跟 PostgreSQL 的大 OFFSET 是同一個問題（<a href="../../nestjs/lessons/16-query-performance.html">NestJS 課第 16 課</a>）。</p>
+<p>換個思路：使用者翻到下一頁時，我們其實知道上一頁最後一則是哪一則。如果索引依「門市、建立時間新到舊」排好，「比上一頁最後一則更早的 20 則」就是從索引裡那個位置接著讀 20 個，不用數前面的。這叫 <strong>keyset 分頁</strong>（也叫 range 或 cursor 分頁）：記住上一頁最後一則的排序值，下一頁從它後面接著讀，靠索引直接跳到那個位置，第幾頁都一樣快。這個「上一頁最後一則的排序值」就叫<strong>游標</strong>（cursor）。</p>
+<p>關鍵是游標要<strong>唯一</strong>。評論依 <code>createdAt</code> 新到舊排，但同一秒可能有好幾則（批次匯入時更多）。只記時間、下一頁用 <code>createdAt &lt; 上一則的時間</code>，剛好跨頁的那幾則同時間評論會被跳過；改用 <code>&lt;=</code> 又會重複。解法是加上一個唯一的欄位當第二排序，讓每一則評論在排序裡都有確定的位置，<code>_id</code> 最方便：</p>
+<pre>// 排序：createdAt 新到舊，同時間 _id 大的在前；索引方向一致
+await reviews.createIndex({ storeId: 1, createdAt: -1, _id: -1 })
+
+const filter = { storeId: 12, $or: [
+  { createdAt: { $lt: last.createdAt } },                         // 時間更早
+  { createdAt: last.createdAt, _id: { $lt: last._id } },          // 同時間、_id 更小
+] }
+const page = await reviews.find(filter).sort({ createdAt: -1, _id: -1 }).limit(21).toArray()
+// 多拿 1 則：拿到 21 則代表還有下一頁，回傳前 20 則</pre>
+<p>索引的欄位順序照前面〈加哪個索引才只讀 20 份？〉那節的 ESR：<code>storeId</code> 是等值，<code>createdAt</code>、<code>_id</code> 是排序，方向跟 sort 一致。<code>$or</code> 的兩個條件合起來就是「排在上一則後面的評論」：時間更早的，或時間相同但 <code>_id</code> 更小的。</p>
+<p>用 explain 驗證時，翻到中間的頁面，這個 <code>$or</code> 會是兩個 IXSCAN 由 <code>SORT_MERGE</code> 合併：兩邊各用索引讀出已經排好的評論，合併時不需要記憶體排序，一頁只讀 21 份文件。最前面一兩頁可能看到另一種計畫：一個 IXSCAN 從這家門市最新的評論讀起，在 FETCH 用 <code>$or</code> 篩掉看過的，多讀二十幾份。會這樣是因為規劃器（query planner）會試跑候選計畫挑快的，前面幾頁要篩掉的很少，兩種計畫差不多；越往後翻它越會選 SORT_MERGE。所以驗證分頁效能時，要拿中間或後面的頁面跑 explain。對外的 API 通常把游標（createdAt 與 _id）編碼成一個字串給前端，前端不用懂內容。</p>
+<div class="callout">代價：keyset 不能「直接跳到第 37 頁」，只能上一頁、下一頁、或「載入更多」。大多數列表（評論、動態、訂單紀錄）本來就是這樣用；真的要頁碼時，限制最多翻到第幾頁。官方文件也提醒 ObjectId 只到秒、由各 client 產生，不保證嚴格遞增，所以時間排序要用 <code>createdAt</code>，<code>_id</code> 只當同時間的決勝。</div>
+<div class="callout practice"><strong>💡 實務上：游標是 API 的一部分，要當成使用者輸入驗證</strong><br>評論、動態、通知這類「載入更多」的列表，API 常見的形狀是 <code>GET /stores/12/reviews?cursor=…</code>，回傳 <code>{ items, nextCursor }</code>；前端（例如 Vue 的無限捲動）只要把 <code>nextCursor</code> 原封不動帶回來，是 <code>null</code> 就停止載入。後端把 <code>{ createdAt, _id }</code> 轉成 JSON 再 base64url 編碼，解回來時要檢查：格式壞掉、日期不合法、<code>_id</code> 不是 24 位十六進位，一律回 400，不要讓 <code>new ObjectId()</code> 丟出的錯誤變成 500。排序方式改了（例如加上「依評分排序」），舊的游標就不能用，游標裡可以帶排序種類，對不上時回 400，讓前端從第一頁重新載入。</div>
+<p>活動頁的查詢和分頁都解決了，剩下開場的最後一件事：行銷的報表。它不是「找出某幾份文件」，而是「把很多份文件算成一個數字」，find 做不到。</p>
+
+<h2>各城市平均評分怎麼算？在資料庫裡跑 aggregation pipeline</h2>
+<p>同事的做法是 <code>find()</code> 撈回全部營業中的門市，在 Node 裡 <code>reduce</code> 出每個城市的平均。結果是對的，代價在過程：3 萬多份文件從資料庫序列化、傳過網路、在 Node 裡解析成物件放進記憶體，最後只為了算出 5 個數字。資料再長大，API 的記憶體和回應時間都跟著長；同時開報表的人多了，Node 程序和網路都會被拖慢。統計應該在資料所在的地方做，只把 5 筆結果傳回來。</p>
+<p>MongoDB 做統計的工具是 <strong>aggregation pipeline</strong>（聚合管線）。它是一串 stage 組成的陣列，每個 stage 收到上一個 stage 輸出的文件，處理後交給下一個，像 JS 陣列的 <code>.filter().map().reduce()</code> 串起來，只是在資料庫裡跑。這裡的 stage 跟 explain 的 stage 是兩件事：explain 的 stage 是 MongoDB 內部的執行步驟，pipeline 的 stage 是你寫的處理步驟，名稱以 <code>$</code> 開頭。「各城市營業中門市的平均評分」寫成：</p>
+<pre>db.stores.aggregate([
+  { $match: { status: 'open' } },                         // WHERE status = 'open'
+  { $group: {                                             // GROUP BY city
+      _id: '$city',                                       // 分組的 key 一律叫 _id；'$city' 是「欄位 city 的值」
+      avgRating: { $avg: '$rating' },
+      stores: { $sum: 1 },                                // COUNT(*)
+  } },
+  { $sort: { avgRating: -1 } },                           // ORDER BY
+  { $project: { _id: 0, city: '$_id', avgRating: { $round: ['$avgRating', 2] }, stores: 1 } },
+])</pre>
+<p>一步一步看文件怎麼流過去：<code>$match</code> 篩出營業中的門市，條件寫法跟 find 一模一樣；<code>$group</code> 把它們依 city 分成 5 組，每組輸出一份新文件，<code>_id</code> 是分組的值，<code>avgRating</code> 用 <code>$avg</code> 算平均，<code>stores</code> 每份文件加 1 就是家數；<code>$sort</code> 依平均評分排序；<code>$project</code> 把 <code>_id</code> 改名成 <code>city</code>、平均值四捨五入到小數兩位。注意 <code>'$city'</code> 前面的 <code>$</code>：在 pipeline 裡，字串以 <code>$</code> 開頭代表「這份文件某個欄位的值」，沒有 <code>$</code> 就只是字串 <code>'city'</code>。</p>
+<p>常用的 stage 對照 SQL，查表用，不用背：</p>
+<div class="table-wrap"><table>
+  <tr><th>stage</th><th>做什麼</th><th>SQL 對照</th></tr>
+  <tr><td><code>$match</code></td><td>篩選，條件寫法跟 find 一樣</td><td>WHERE（放在 $group 後面就是 HAVING）</td></tr>
+  <tr><td><code>$group</code></td><td>分組並計算 <code>$sum</code>、<code>$avg</code>、<code>$max</code>、<code>$first</code>、<code>$push</code>…</td><td>GROUP BY（<a href="../../postgresql/lessons/07-aggregate.html">PostgreSQL 課第 7 課</a>）</td></tr>
+  <tr><td><code>$sort</code>、<code>$limit</code>、<code>$skip</code></td><td>排序與取前幾筆</td><td>ORDER BY、LIMIT</td></tr>
+  <tr><td><code>$project</code>、<code>$set</code></td><td>挑選、改名、計算欄位</td><td>SELECT 的欄位與運算式</td></tr>
+  <tr><td><code>$unwind</code></td><td>把陣列攤開：一份有 3 個 tags 的文件變成 3 份</td><td>—（像 unnest）</td></tr>
+  <tr><td><code>$lookup</code></td><td>到另一個集合找對應的文件，放成陣列欄位</td><td>LEFT JOIN</td></tr>
+  <tr><td><code>$facet</code></td><td>同一批輸入跑好幾條子管線，一次回傳多組結果</td><td>多個查詢合在一起</td></tr>
+</table></div>
+<p>報表交出去，行銷很快就追加需求：每個城市要附上評分最高的門市名稱、每個標籤有幾家門市、每家門市附最新評論。這些都還是 pipeline，但各有一個容易寫錯的地方。</p>
+
+<h2>報表越要越多：常見的 pipeline 寫法，以及它什麼時候太重</h2>
+<p><strong>每組評分最高的門市名稱。</strong>直覺是在 <code>$group</code> 裡加 <code>topStore: { $first: '$name' }</code>。但 <code>$first</code> 拿的是「進到這一組的第一份文件」，文件進來的順序沒排過就是任意一份，結果看起來正常，其實是隨便一家。要先 <code>{ $sort: { rating: -1 } }</code> 再 <code>$group</code>，這時每組第一份才是評分最高的；或用不依賴前面順序的 <code>$top</code>：<code>{ $top: { sortBy: { rating: -1 }, output: '$name' } }</code>，在分組時自己依評分挑出最高的那一份。</p>
+<p><strong>每個標籤有幾家門市。</strong><code>tags</code> 是陣列，直接依 <code>$tags</code> 分組會把整個陣列當成一個 key，<code>['wifi', '插座']</code> 和 <code>['寵物友善']</code> 各成一組。要先用 <code>$unwind</code> 把陣列攤開：一份有兩個標籤的門市變成兩份，各帶一個標籤，再分組計數：</p>
+<pre>db.stores.aggregate([{ $unwind: '$tags' }, { $group: { _id: '$tags', n: { $sum: 1 } } }])</pre>
+<p><strong>每家門市附最新 3 則評論。</strong>評論在另一個集合，要用 <code>$lookup</code> 去 <code>reviews</code> 找 <code>storeId</code> 對得上的，<code>pipeline</code> 選項讓找到的評論再跑一段子管線，排序取前 3：</p>
+<pre>db.stores.aggregate([
+  { $match: { city: '台北', status: 'open' } },
+  { $limit: 20 },                                          // 先縮小到 20 家，再去 join
+  { $lookup: {
+      from: 'reviews', localField: '_id', foreignField: 'storeId', as: 'latest',
+      pipeline: [{ $sort: { createdAt: -1 } }, { $limit: 3 }],
+  } },
+])</pre>
+<p><code>$lookup</code> 對每一份輸入文件都去另一個集合查一次，所以 <code>reviews</code> 要有 <code>{ storeId: 1, createdAt: -1 }</code> 的索引（前面 keyset 分頁那節建的 <code>{ storeId, createdAt, _id }</code> 以它為前綴，已經涵蓋），而且要放在 <code>$match</code>、<code>$limit</code> 之後：先縮到 20 家再 join 是查 20 次，反過來是查 3 萬多次。如果每個畫面都要 <code>$lookup</code> 好幾個集合，代表建模在模仿關聯式資料庫，回頭看第 7 課的內嵌與快照，或者這份資料本來就該在 PostgreSQL。</p>
+<p><strong>搜尋頁一次要兩組結果。</strong>搜尋頁的側欄要「各城市家數」，主區要「評分前 3 名」，兩個 aggregate 就是兩次往返。<code>$facet</code> 讓同一批輸入同時跑好幾條子管線，結果放在同一份文件裡回傳，只要一次往返：</p>
+<pre>db.stores.aggregate([
+  { $match: { status: 'open' } },
+  { $facet: {
+      byCity: [{ $group: { _id: '$city', n: { $sum: 1 } } }],
+      top3: [{ $sort: { rating: -1 } }, { $limit: 3 }, { $project: { _id: 0, name: 1, rating: 1 } }],
+  } },
+])
+// → [{ byCity: [{ _id: '台中', n: 6667 }, …], top3: [{ name: '門市 4646', rating: 5 }, …] }]</pre>
+<p>pipeline 越寫越長，效能問題也跟著來。前幾節學的索引，在 pipeline 裡只有一部分用得上，而且每個 stage 都有資源上限：</p>
+<ul>
+  <li><strong>索引只有開頭用得到。</strong>pipeline 第一個 <code>$match</code>（後面可以接 <code>$sort</code>）等於一個 find，可以用索引；過了 <code>$group</code>、<code>$unwind</code>、<code>$project</code>，資料已經是新算出來的文件，沒有索引可用。所以能先篩的條件一律放最前面。最佳化器會自動把一些 <code>$match</code> 往前搬，但不要依賴它，explain 看得到最後的形狀。</li>
+  <li><strong>每個 stage 有 100 MB 記憶體上限。</strong>超過時，<code>allowDiskUseByDefault</code>（6.0 起，課程的 9.0.4 預設是 true）讓它寫暫存檔到磁碟繼續做，速度會掉很多；設成 false 的環境會直接報錯，要在 aggregate 加 <code>{ allowDiskUse: true }</code>。真的需要動用磁碟，通常代表該先 <code>$match</code> 縮小範圍，或這份報表不該在這裡算。</li>
+  <li><strong>回傳的每份文件最多 16 MB</strong>，<code>$push</code> 把整組放進陣列、<code>$facet</code> 把所有結果放在一份文件裡時要注意。</li>
+</ul>
+<p>這些上限說明了 aggregation 的定位：它適合「活動頁上的即時小統計」，也就是範圍有 <code>$match</code> 縮小、結果小、而且用得到索引的統計。行銷的城市平均評分符合這個條件。下面這些情況就該換地方：</p>
+<ul>
+  <li>每天掃過全部歷史資料的營運報表、跨好幾個集合的分析：會跟線上請求搶 CPU 與快取，explain 會看到大量 docsExamined 與寫磁碟。這種工作移到分析型資料庫（<a href="13-olap-analytics.html">第 13 課</a>），或至少讀 secondary、排在離峰。</li>
+  <li>同一個統計每次請求都重算：把結果存起來（<code>$merge</code> 寫進另一個集合，或用第 2 課的 Redis），定時更新。</li>
+  <li>需要大量 <code>$lookup</code> 才組得出來：資料本質是關聯的，第 9 課會談什麼時候不該用 MongoDB。</li>
+</ul>
+<div class="callout practice"><strong>💡 實務上：後台的統計 API 要有時間上限</strong><br>常見的場景是後台儀表板、行銷要的「本週各門市評分」：一開始資料少，pipeline 跑幾毫秒；半年後有人把日期範圍選成「全部」，一個請求就把資料庫的 CPU 吃滿，連帶拖慢前台。做法：pipeline 先在 mongosh 寫好、用 explain 看第一個 <code>$match</code> 有沒有走索引，再搬進程式；API 限制可查的日期範圍，aggregate 加上 <code>maxTimeMS</code>（例如 <code>{ maxTimeMS: 5000 }</code>，超過時得到錯誤碼 50 <code>MaxTimeMSExpired</code>，API 回「範圍太大，請縮小」）。同一份統計很多人看時，改成定時算好存起來，不要每次開頁面都重算。</div>
+
+<h2 id="appendix">補充與查表</h2>
+<p>這裡收主線提過、但做到這一步不需要記住的細節，查表用，不用背。</p>
+<p><strong>在程式裡讀 explain 的計畫樹（練習 2 會用到）。</strong>stage 樹的形狀：有一個子節點時放在 <code>inputStage</code>，有多個（例如 <code>OR</code>）時放在 <code>inputStages</code> 陣列。另外要知道 MongoDB 有兩個執行引擎：一般的 <code>find</code> 用 classic 引擎，樹直接在 <code>winningPlan</code>；有 <code>$group</code>、<code>$lookup</code> 的 aggregate 可能交給 slot-based 引擎（SBE），這時 <code>explainVersion</code> 是 <code>"2"</code>，樹搬到 <code>winningPlan.queryPlan</code>。練習 2 要寫一個讀這兩種格式的函式。</p>
+<p><strong>MongoDB 9.0 的 explain 與記憶體限制。</strong></p>
+<div class="callout">MongoDB 9.0 的 explain 多了幾個欄位：用 classic 引擎的 aggregation stage（<code>$match</code>、<code>$project</code>、<code>$lookup</code> 等）在 executionStats 以上會回報 <code>expressionEvaluationPeakMemoryBytes</code>（運算式用掉的記憶體高峰），還有 <code>queryKnobs</code> 列出有人用 setQuerySettings 或 setParameter 改過的查詢參數、實際值與來源（沒改過的不會出現）。9.0 也開始限制單一查詢的總記憶體：預設 1 GB 或伺服器可用記憶體的 20%，取大的；超過會得到 <code>ExceededMemoryLimit</code> 或 <code>QueryExceededMemoryLimitNoDiskUseAllowed</code> 錯誤。主線講過的「每個 stage 100 MB」上限和寫暫存檔的行為不變。</div>
+
+<h2>練習</h2>
+<p>先確認 MongoDB 有在跑（<code>docker compose --profile mongo up -d --wait</code>），每一題都在 <code>learn/</code> 執行 <code>node check.mjs data-stores 08</code> 判分。測試連到資料庫 <code>ds_t08</code>，每個測試檔開始前會清空。</p>
+
+<div class="local" data-test="ex1" data-files="indexes.ts">
+  <p>練習 1：在 <code>indexes.ts</code> 的 <code>ensureIndexes(db)</code> 建立兩個索引。第一個讓 <code>stores.find({ status: 'open', city }).sort({ rating: -1 }).limit(20)</code> 用索引、沒有 SORT stage，而且 totalKeysExamined、totalDocsExamined 都不超過 21。測試會先放進 5 萬家固定的門市（台北 600 家，營業中、關閉、整修中的評分交錯）再看 explain。第二個是 <code>checkins</code> 的 TTL 索引：<code>checkedInAt</code> 之後 30 天自動刪除。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="explain.ts">
+  <p>練習 2：在 <code>explain.ts</code> 寫 <code>analyze(explain)</code>，讀一份 <code>explain('executionStats')</code> 的輸出，回傳 <code>{ indexes, examinedRatio, inMemorySort }</code>：計畫裡所有 IXSCAN 的 <code>indexName</code>（不重複、依名稱排序）、<code>totalDocsExamined ÷ nReturned</code>（nReturned 是 0 時當成 1）、有沒有 SORT stage。測試會當場產生六種真實的 explain：COLLSCAN、FETCH 底下的 IXSCAN、記憶體排序、覆蓋查詢、<code>$or</code> 的兩個索引、slot-based 引擎執行的 <code>$group</code>。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="stats.ts">
+  <p>練習 3：在 <code>stats.ts</code> 的 <code>cityStats(stores)</code> 用<strong>一個</strong> aggregate 算出每個城市營業中（<code>status</code> 是 <code>'open'</code>，整修中也不算）門市的 <code>avgRating</code>（平均評分）、<code>reviews</code>（reviewCount 加總）、<code>topStore</code>（評分最高的門市名稱），每筆只有 <code>city</code> 與這三個欄位，依 avgRating 由高到低。測試會記錄送出的命令：只能有一個 aggregate、不能 find，pipeline 的第一個 stage 要是篩出營業中門市的 <code>$match</code>。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="paginate.ts">
+  <p>練習 4：在 <code>paginate.ts</code> 做評論的 keyset 分頁。<code>ensureReviewIndex</code> 建立需要的索引；<code>listReviews(reviews, storeId, after?)</code> 回傳一頁（最多 <code>PAGE_SIZE</code> 則，createdAt 新到舊、同時間 _id 大的在前）和 <code>next</code>（下一頁的游標 <code>{ createdAt, _id }</code>，沒有下一頁時是 <code>null</code>）。測試會一路翻完 1,000 則評論，其中每 7 則同一個時間：每則都要剛好出現一次。不能用 skip，中間頁的查詢要走索引、沒有 SORT stage，而且只讀要回傳的那 21 份文件（別家門市的評論穿插在同樣的時間裡）。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：查詢 <code>find({ city: '台北', status: 'open' }).sort({ rating: -1 })</code>，哪個索引最好？</p>
+  <label data-key="a"><code>{ rating: -1, city: 1, status: 1 }</code></label>
+  <label data-key="b"><code>{ city: 1, status: 1, rating: -1 }</code></label>
+  <label data-key="c"><code>{ status: 1 }</code></label>
+  <label data-key="d"><code>{ city: 1, rating: -1, createdAt: 1, status: 1 }</code></label>
+  <p class="why">✓ ESR：等值欄位 city、status 在前，排序欄位 rating 接著，符合條件的索引項連續而且已經排好，讀 20 個就停。a 依評分走過整個索引，邊走邊挑台北營業中的（練習 1 的 5 萬家門市要看 3 千多個索引項）；c 只篩掉關閉的，剩下的還要讀文件、記憶體排序；d 中間夾了 createdAt，rating 相同時才依 createdAt 排，status 又在最後，營業中的不連續，關閉的門市也要逐一看過。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：explain 顯示 <code>nReturned: 20</code>、<code>totalDocsExamined: 48000</code>，代表什麼？</p>
+  <label data-key="a">查詢很有效率，回傳的都是需要的</label>
+  <label data-key="b">為了回傳 20 份讀了 4.8 萬份：沒有合適的索引，或索引只涵蓋部分條件</label>
+  <label data-key="c">集合裡有重複資料</label>
+  <label data-key="d">WiredTiger 快取沒命中</label>
+  <p class="why">✓ 讀的文件數應該接近回傳數，比例越大浪費越多。接著看計畫：COLLSCAN 代表沒用索引；IXSCAN 但 docsExamined 很大，代表索引只篩掉一部分，剩下的條件要讀文件才知道。快取命中與否影響的是每份文件讀得快不快（c、d），不會改變要讀幾份。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：打卡紀錄的 TTL 索引設 <code>expireAfterSeconds: 3600</code>，文件會在剛好 1 小時後消失嗎？</p>
+  <label data-key="a">會，精確到秒</label>
+  <label data-key="b">不一定：背景工作每 60 秒跑一次，負載高時更晚，程式不能依賴刪除的時間</label>
+  <label data-key="c">要另外執行 compact 才會刪</label>
+  <label data-key="d">只在 mongod 重新啟動時刪</label>
+  <p class="why">✓ TTL 是背景的批次刪除，過期到真的被刪之間可能有一段時間。「一小時內有效的驗證碼」要在查詢條件加上時間（例如 <code>expiresAt: { $gt: now }</code>），TTL 只負責把過期的清掉，不讓集合一直變大。compact 是整理磁碟空間，跟 TTL 無關。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>複合索引的欄位順序不符 ESR</strong>：排序欄位放在等值欄位前面，或範圍欄位放在排序欄位前面，explain 會出現 SORT 或很大的 totalKeysExamined。等值在前、排序接著、範圍最後。</li>
+  <li><strong>建了索引沒驗證</strong>：查詢條件跟索引對不上（例如部分索引的條件沒包含在查詢裡），MongoDB 就不會用。建完一定用 explain 看 IXSCAN、SORT 和三個數字。</li>
+  <li><strong>每個欄位各建一個索引</strong>：MongoDB 一個查詢通常只用一個索引，單欄索引堆再多也比不上一個對的複合索引，還拖慢每一次寫入。</li>
+  <li><strong>物件陣列的多個條件沒用 $elemMatch</strong>：<code>'promos.active'</code> 和 <code>'promos.startsAt'</code> 分開寫時，兩個條件可以由不同的元素各自滿足。要同一個元素同時成立，用 <code>$elemMatch</code>。</li>
+  <li><strong>用大 skip 分頁</strong>：越後面越慢。改成 keyset 分頁，游標要包含唯一的欄位（<code>_id</code>），只用時間會漏掉或重複同時間的資料。</li>
+  <li><strong>$match 放在 $group 後面、在 Node 端做統計</strong>：每一份文件都進了分組或被傳過網路，而且用不到索引。能先篩就先篩，計算交給 pipeline。</li>
+  <li><strong>$first 前面沒有 $sort</strong>：拿到的是任意一份。要「最高分的那一個」先排序，或用 <code>$top</code>。</li>
+  <li><strong>以為 TTL 是即時的、或 TTL 秒數寫成毫秒</strong>：刪除可能晚好幾十秒以上；<code>expireAfterSeconds</code> 的單位是秒，欄位要是 Date。</li>
+  <li><strong>$lookup 濫用</strong>：每個畫面都 join 好幾個集合，代表把 MongoDB 當成關聯式資料庫在用，回頭調整建模或換資料庫。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>首頁變慢的原因是沒有合適的索引：find 只好 COLLSCAN 讀完整個集合，再在記憶體 SORT。find 的條件用 <code>$gte</code>、<code>$in</code>、<code>$ne</code> 等運算子；陣列欄位對任一元素成立就符合，物件陣列要同一個元素滿足多個條件用 <code>$elemMatch</code>；driver 的投影要包在 <code>projection</code> 選項裡。</li>
+  <li>explain('executionStats') 看計畫（COLLSCAN、IXSCAN、FETCH、SORT）與 nReturned、totalKeysExamined、totalDocsExamined，三個數字越接近越好；有 $group 的 aggregate 可能由 slot-based 引擎執行，計畫在 <code>winningPlan.queryPlan</code>。</li>
+  <li>複合索引依 ESR 排欄位：等值、排序、範圍，符合條件的索引項才會連續且已排好；它的前綴也服務較短的查詢，不必另建單欄索引。</li>
+  <li>其他需求用其他索引：陣列欄位自動變多鍵、不能重複用唯一、只查一部分文件用部分、自動過期用 TTL；TTL 每 60 秒左右跑一次，不即時。</li>
+  <li>分頁用 keyset：排序欄位加上 <code>_id</code> 當唯一的決勝，配上同順序的複合索引，第幾頁都只讀一頁的量。</li>
+  <li>aggregation pipeline 把統計留在資料庫：<code>$match</code> 放最前面才用得到索引，<code>$first</code> 前要排序，<code>$lookup</code> 前先縮小範圍，每個 stage 有 100 MB 記憶體上限；大型、全量的報表離開線上資料庫，移到分析型資料庫。</li>
+</ul>
+<p>下一課處理多份文件要一起改的情況：MongoDB 的交易、write concern 與 read concern，以及什麼時候不該用 MongoDB。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

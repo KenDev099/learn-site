@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>19. 快取與 Redis</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="19" data-practice="nestjs">
+<header>
+  <div class="eyebrow">階段 4：快取、背景工作與外部整合 · 第 19 課</div>
+  <h1>快取與 Redis</h1>
+</header>
+<main>
+
+<p>咖啡店的 App 每次打開都先拉菜單。菜單一天改不到一次，卻每秒被查幾百次，每次都問資料庫同一個問題。同事為了讓 API 變快，在 <code>app.module.ts</code> 加了兩段設定：所有 GET 的回應自動存起來 60 秒，60 秒內再來同樣的請求，就直接回存好的結果。隔天客服接到電話：陳美華打開「我的訂單」，看到的是王小明的訂單。</p>
+<p>這一課的任務是收拾這個局面：拿掉全域 interceptor、把快取改接 Redis，換成一個只快取菜單、老闆改價後立刻更新、Redis 壞了也不會拖垮 API 的快取。練習 1 到 4 是這個任務的四個步驟，但順序跟正文略有不同：練習 1 先把快取搬到 Redis、寫好菜單的 cache-aside，練習 2 才拆掉全域 interceptor。做完之後，你會知道什麼資料可以快取、快取為什麼放在 Redis、怎麼寫和怎麼清，以及快取出事時 API 怎麼活下來。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>同事那兩段做了什麼：自動快取怎麼運作，為什麼把王小明的訂單給了陳美華（開場問題的答案）。</li>
+  <li>拿掉之後，什麼還值得快取：菜單可以，庫存和「我的訂單」為什麼不行。</li>
+  <li>菜單的快取放哪裡、怎麼寫：為什麼放 Redis 而不是程序的記憶體；「先查快取、沒有再查資料庫」的 cache-aside。</li>
+  <li>老闆改價：寫入後怎麼讓快取失效，為什麼要先寫資料庫再刪快取。</li>
+  <li>Redis 壞掉時：菜單怎麼照樣查得到，只是慢一點。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="09-interceptors-rxjs.html">第 9 課</a>的 interceptor：包在 handler 外面，呼叫 <code>next.handle()</code> 才會執行 handler，不呼叫就能直接回別的值。</li>
+  <li><a href="12-docker-services.html">第 12 課</a>的 Redis：compose 裡已經跑著一台 Redis（<code>127.0.0.1:6380</code>），可以用 <code>redis-cli</code> 進去看裡面存了什麼。</li>
+</ul></div>
+
+<h2>同事那兩段做了什麼：為什麼陳美華看到王小明的訂單？</h2>
+<p>先看同事加的設定，這是練習起始程式 <code>app.module.ts</code> 裡的兩段：</p>
+<pre>imports: [
+  CacheModule.register({ isGlobal: true, ttl: 60_000 }),          // 開一個快取，每筆存 60 秒
+],
+providers: [
+  { provide: APP_INTERCEPTOR, useClass: CacheInterceptor },      // 全域：所有 GET 都快取
+],</pre>
+<p>要看懂它為什麼出事，先講清楚<strong>快取（cache）</strong>是什麼：把查過、算過的結果先存起來，下次遇到同樣的問題，直接拿存好的答案，不再問資料庫一次。存的時候要給每個答案一個名字，叫做 <strong>key</strong>；讀的時候用同一個 key 去找。所以 key 決定了「哪些請求算同一個問題」：key 相同，就拿到同一個答案。快取正不正確，幾乎都取決於 key 怎麼組。用 key 找到存好的答案叫<strong>命中（hit）</strong>，找不到叫<strong>沒命中（miss）</strong>；所有查詢裡命中的比例叫<strong>命中率</strong>。</p>
+<p><code>CacheModule</code> 和 <code>CacheInterceptor</code> 都來自 <code>@nestjs/cache-manager</code>，NestJS 官方的快取套件。<code>CacheModule.register</code> 準備好一個快取；<code>CacheInterceptor</code> 是一個 interceptor，做法就是第 9 課學的那一套：請求進來，先用 key 查快取，有的話就不呼叫 <code>next.handle()</code>，handler 根本不會執行，直接回快取的值；沒有的話才執行 handler，把回傳值存進快取再回應。用 <code>APP_INTERCEPTOR</code> 註冊，它就套在每一個路由上。看 12.0.2 的原始碼，它的行為是：</p>
+<ul>
+  <li>只快取 <code>GET</code>，key 是<strong>請求的網址</strong>（含查詢字串），例如 <code>/customers/me/orders</code>。</li>
+  <li>回應會加上 <code>X-Cache: HIT</code> 或 <code>MISS</code> 標頭。</li>
+  <li>用了 <code>@Res()</code> 自己送回應的路由不能用（handler 沒有回傳值可以存）。</li>
+</ul>
+<p>問題出在 key 只有網址。<code>/customers/me/orders</code> 對王小明和陳美華是同一個網址，差別在標頭（這課用 <code>X-Customer-Id</code>，之後是登入的 token）。王小明先查，結果被存在 <code>/customers/me/orders</code> 這個 key 底下；60 秒內陳美華再查，interceptor 用同一個 key 找到了答案，連 handler 都沒執行，她拿到的就是王小明的訂單。這是個資外洩事故，不是單純的「資料舊了一點」。</p>
+<p>對菜單來說，同樣的機制沒有問題：<code>/menu</code> 每個人看到的本來就一樣，用網址當 key 剛好對。所以開場問題的答案是：<strong>回應依「誰在問」而不同的路由，不能用只看網址的 key 快取</strong>。處理方式：</p>
+<ul>
+  <li><strong>不要全域掛 <code>CacheInterceptor</code></strong>。要快取的地方，在 service 裡明確地寫快取的程式（後面「怎麼寫菜單快取」一節的 cache-aside），讀程式的人看得到哪些資料被快取、key 是什麼。</li>
+  <li>真的要用 interceptor，只掛在公開、人人相同的路由上（<code>@UseInterceptors(CacheInterceptor)</code> 放在單一 handler）。</li>
+  <li><code>trackBy()</code> 是 <code>CacheInterceptor</code> 用來算 key 的方法，預設回傳網址。覆寫它把使用者 id 放進 key 也可以，但個人資料本來就很少重複讀，快取命中率低，換來的是「key 寫錯就外洩」的風險。通常直接不快取。</li>
+</ul>
+<div class="callout warn">對照 <a href="../../node/lessons/15-http-caching.html">Node 課第 15 課</a>：HTTP 的 <code>Cache-Control: public</code> 也有同樣的問題，CDN 會把一個人的回應給所有人。個人資料要 <code>private</code> 或 <code>no-store</code>。</div>
+<p>拿掉全域 interceptor，個資外洩就止住了，但菜單也跟著失去快取，每秒幾百次的查詢又全部回到資料庫。接下來要自己決定：哪些資料值得動手快取？</p>
+
+<h2>拿掉之後，哪些資料還值得快取？</h2>
+<p>快取換來速度，付出的代價有兩個。第一是資料可能過時：資料庫已經改了，快取裡還是舊的答案。第二是多了一段要維護的邏輯：什麼時候該把舊答案丟掉。上一節的事故還示範了第三種：key 設計錯了，答案給錯人。所以判斷要不要快取，先問的不是「讀得多不多」，而是「這份資料過時一下、或給錯人，會不會出事」：</p>
+<div class="table-wrap"><table>
+  <tr><th>資料</th><th>快取？</th><th>原因</th></tr>
+  <tr><td>菜單、商品分類</td><td>適合</td><td>讀很多、很少改，過時幾秒沒人受害；改的時候主動清掉</td></tr>
+  <tr><td>當日營收報表</td><td>看情況</td><td>查詢很重，但老闆可以接受晚 5 分鐘</td></tr>
+  <tr><td>庫存</td><td>不適合</td><td>一直在變，而且必須正確：快取說還有 3 個，實際已經賣完，就會超賣。正確性交給第 15 課的條件更新</td></tr>
+  <tr><td>「我的訂單」、會員資料</td><td>不要</td><td>每個人不一樣，key 稍微設計錯就把 A 的資料給 B；而且讀的次數本來就不多</td></tr>
+</table></div>
+<p>還有一條：<strong>先量測再加快取</strong>。如果慢是因為<a href="16-query-performance.html">第 16 課</a>的 N+1 或少了索引，加快取只是把問題蓋住；快取一沒命中，慢查詢又出現，還多了資料過時的問題。查詢本身已經修好、仍然撐不住流量時，才輪到快取。咖啡店的菜單查詢本身不慢，慢在每秒幾百次問同一件事，正是快取該出場的情況。</p>
+<p>結論是：咖啡店只快取菜單。下一個問題是這份快取要放在哪裡，同事用的那種放法能不能繼續用。</p>
+<div class="callout practice"><strong>💡 實務上：加快取之前，先回答三個問題</strong><br>工作上常聽到「首頁好慢，加個 Redis 吧」。資深工程師會先問：慢在哪一句查詢？這份資料多久改一次、一分鐘被讀幾次？過時多久可以接受？最後一題要去問 PM 或老闆，不是工程師自己決定，例如「拿鐵改價後，App 晚 1 分鐘才更新可以嗎？」不行的話，寫入時就要主動清快取（下面「老闆改價」一節）；連幾秒都不能錯的資料，例如庫存，就不要快取。決定要快取時，在 PR 說明寫清楚快取了什麼、TTL 多久，之後改這份資料的人才知道還有一份副本要清。</div>
+
+<h2>菜單的快取放哪裡：為什麼是 Redis？</h2>
+<p>同事寫的 <code>CacheModule.register({ isGlobal: true, ttl: 60_000 })</code> 沒有指定資料存在哪裡，這時快取放在 API 這個 Node 程序自己的記憶體裡，效果跟一個 <code>Map</code> 差不多。拿來快取菜單看起來也行，但正式環境會遇到三個問題：</p>
+<ul>
+  <li><strong>多台伺服器</strong>：正式環境通常跑好幾個程序。每個程序各自的 <code>Map</code> 內容不一樣，改價時只清得到處理那個請求的程序，其他程序還留著舊價格。</li>
+  <li><strong>重新部署就清空</strong>：每次部署，所有快取一起消失，所有請求同時打到資料庫（課末「擊穿與雪崩」）。</li>
+  <li><strong>記憶體</strong>：快取越長越大，吃的是 API 程序自己的記憶體。</li>
+</ul>
+<p>三個問題的根源相同：快取跟著 API 程序一起生、一起死。解法是把它搬到程序外面、所有程序共用的地方。後端最常用的是 <strong>Redis</strong>：一個把資料放在記憶體裡的 key-value 資料庫，用一個字串 key 存取一個值，讀寫通常在 1 毫秒內完成。它是獨立的服務，API 跑幾台、部署幾次，看到的都是同一份資料；改價時刪一次，所有程序都看得到。後端也常拿它做佇列（第 20 課）。第 12 課已經用 compose 把它跑起來了（<code>127.0.0.1:6380</code>）。</p>
+<p>在把菜單放進去之前，先認識三個會一直用到的東西。</p>
+<p>第一個是 <strong>TTL（time to live）</strong>，存活時間：每個 key 可以設一個期限，時間到了 Redis 自己把它刪掉。快取一定要設 TTL。下一節之後會在寫入時主動清快取，但總會有某條路徑忘了清，TTL 保證舊資料最多活這麼久，是失效邏輯漏掉時的最後防線。</p>
+<p>第二個是<strong>命名空間（namespace）</strong>：在每個 key 前面加上固定的前綴，例如 <code>nest-19::menu:v1:all</code> 開頭的 <code>nest-19</code>。一台 Redis 常被好幾個程式共用，有了前綴，各自的 key 才不會撞在一起，也能一眼看出某個 key 是誰存的。</p>
+<p>第三個是 <strong>DB 編號</strong>：一台 Redis 裡分成好幾個用數字編號的資料庫，連線網址最後的 <code>/0</code>、<code>/1</code> 就是在選它（第 12 課）。這門課開發用 DB 0，判分用 DB 1，兩邊的資料互不干擾。</p>
+<p>用 <code>redis-cli</code> 存一筆有 TTL 的資料，看它怎麼倒數：</p>
+<pre>cd learn/nestjs/practice
+docker compose exec redis redis-cli -n 0 SET hello world PX 60000   # PX：TTL 的單位是毫秒
+docker compose exec redis redis-cli -n 0 PTTL hello                 # 還剩幾毫秒；-1 = 沒設 TTL，-2 = 不存在
+docker compose exec redis redis-cli -n 0 GET hello</pre>
+<p>多執行幾次 <code>PTTL</code>，數字會越來越小；60 秒後它變成 <code>-2</code>，<code>GET</code> 也拿不到 <code>world</code> 了。Redis 準備好了，接下來要在 NestJS 裡寫出「先查 Redis，沒有再查資料庫」。</p>
+
+<h2>怎麼寫菜單快取：先查快取，沒有再查資料庫</h2>
+<p>這種寫法叫 <strong>cache-aside</strong>：快取放在資料庫「旁邊」，由程式自己決定什麼時候讀快取、什麼時候寫快取，資料庫完全不知道快取存在。命中與沒命中就是第一節定義的那兩種結果。以 <code>GET /menu</code> 為例，流程是：</p>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="cache-aside 流程：MenuService 先向 Redis get key。命中就直接回傳。沒命中（undefined）就向 PostgreSQL 查詢，把結果 set 回 Redis 並設定 TTL，再回傳。">
+    <defs><marker id="a19" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="20" y="95" width="150" height="56" rx="8"/>
+    <text class="d-text" x="95" y="120" text-anchor="middle">MenuService</text>
+    <text class="d-small" x="95" y="139" text-anchor="middle">getMenu()</text>
+    <rect class="d-soft" x="300" y="20" width="160" height="56" rx="8"/>
+    <text class="d-text" x="380" y="45" text-anchor="middle">Redis</text>
+    <text class="d-small" x="380" y="64" text-anchor="middle">menu:v1:all</text>
+    <rect class="d-soft" x="300" y="172" width="160" height="56" rx="8"/>
+    <text class="d-text" x="380" y="197" text-anchor="middle">PostgreSQL</text>
+    <text class="d-small" x="380" y="216" text-anchor="middle">products</text>
+    <line class="d-line" x1="170" y1="105" x2="298" y2="50" marker-end="url(#a19)"/>
+    <text class="d-small" x="190" y="62">① get(key)</text>
+    <line class="d-line" x1="300" y1="70" x2="172" y2="120" marker-end="url(#a19)"/>
+    <text class="d-accent" x="225" y="112">命中：直接回傳</text>
+    <line class="d-line" x1="170" y1="140" x2="298" y2="195" marker-end="url(#a19)"/>
+    <text class="d-small" x="170" y="185">② 沒命中：查資料庫</text>
+    <path class="d-line" d="M460,200 C560,200 560,48 462,48" fill="none" marker-end="url(#a19)"/>
+    <text class="d-small" x="565" y="120">③ set(key, 結果, TTL)</text>
+    <text class="d-small" x="565" y="140">④ 回傳結果</text>
+  </svg>
+  <figcaption>命中時不碰資料庫；沒命中時多做一次寫入，下一個人就能命中。</figcaption>
+</figure>
+<p>程式跟 Redis 之間隔著三層套件，先認清每一層做什麼，後面的設定才看得懂：</p>
+<ul>
+  <li><code>cache-manager</code>：快取的通用介面，提供 <code>get</code>、<code>set</code>、<code>del</code> 這些方法。它本身不管資料存在哪。</li>
+  <li><strong>Keyv</strong> 和 <code>@keyv/redis</code>：Keyv 是一個把各種儲存統一成同一套 key-value 介面的套件，cache-manager 透過它存取資料；<code>@keyv/redis</code> 是 Keyv 接上 Redis 的那一塊。要換成別的儲存，只要換這一塊。</li>
+  <li><code>@nestjs/cache-manager</code>：把 cache-manager 包成 NestJS 的模組和可以注入的 provider，上一節的 <code>CacheInterceptor</code> 也是它附的。</li>
+</ul>
+<p>這門課用 @nestjs/cache-manager 12.0.2、cache-manager 7.2.9、keyv 5.6.0、@keyv/redis 5.1.6，都已經裝在 <code>practice/</code> 裡。自己開專案時不要直接 <code>npm i</code> 裝最新版，keyv 和 @keyv/redis 的版本要配對，原因見課末「補充與查表」。</p>
+<p>第一步是把同事的 <code>CacheModule.register</code> 換成接 Redis 的版本。Redis 的網址和前綴從 <code>ConfigService</code> 讀（<a href="11-configuration.html">第 11 課</a>），因為判分時測試會用環境變數換成另一個 DB 和前綴：</p>
+<pre>import { createKeyv } from '@keyv/redis'
+import { CacheModule } from '@nestjs/cache-manager'
+
+CacheModule.registerAsync({
+  isGlobal: true,                      // 每個模組都能注入，不用各自 import
+  inject: [ConfigService],
+  useFactory: (config: ConfigService&lt;Env, true&gt;) =&gt; ({
+    stores: [
+      createKeyv(config.get('REDIS_URL', { infer: true }), {
+        namespace: config.get('REDIS_PREFIX', { infer: true }),   // key 會變成 nest-19::menu:v1:all
+        connectionTimeout: 1_000,
+      }),
+    ],
+  }),
+}),</pre>
+<p><code>stores</code> 告訴 cache-manager 資料存在哪；沒給 <code>stores</code>，就退回上一節說的程序記憶體，也就是同事那個版本。<code>connectionTimeout</code> 是連 Redis 最多等多久，它為什麼不能省，最後一節會看到。接著在 service 裡注入快取並使用：</p>
+<pre>import { CACHE_MANAGER, Cache } from '@nestjs/cache-manager'
+
+constructor(@Inject(CACHE_MANAGER) private readonly cache: Cache) {}
+
+const cached = await this.cache.get&lt;MenuItem[]&gt;('menu:v1:all')   // 沒有：undefined
+await this.cache.set('menu:v1:all', items, 60_000)                // 第三個參數是 TTL，單位毫秒
+await this.cache.del('menu:v1:all')
+await this.cache.mdel(['menu:v1:all', 'menu:v1:category:coffee'])</pre>
+<p>把這幾個方法照上面那張圖的順序接起來，就是 <code>getMenu</code> 的 cache-aside：<code>get</code>；拿到的不是 <code>undefined</code> 就直接回傳；否則查資料庫，<code>set</code> 回快取，再回傳。這幾步看起來直白，但有四個地方寫錯也不會報錯，只會讓快取悄悄失效或回錯型別。以下都在上面的版本和 Redis 8.10.3 實測過。</p>
+<p><strong>TTL 單位是毫秒。</strong>寫成 <code>60</code> 是 60 毫秒，資料一存進去就幾乎過期了，快取永遠不命中，而且不會報任何錯。<code>0</code> 代表不過期。寫 <code>60_000</code>，存完用 <code>redis-cli PTTL</code> 確認。</p>
+<p><strong>沒命中回傳 <code>undefined</code>。</strong>判斷用 <code>!== undefined</code>。<code>if (cached)</code> 會把 <code>0</code>、空字串、<code>false</code> 當成沒命中；<code>if (cached?.length)</code> 會把空陣列當成沒命中。某個分類全部停售時，菜單就是空陣列，這是合法的快取值，判斷錯了，這個分類每次都會去查資料庫。</p>
+<p><strong>值會變成 JSON。</strong>Redis 的值是字串，所以 Keyv 存之前會先用 <code>JSON.stringify</code> 把物件轉成字串，這叫<strong>序列化</strong>；讀回來再用 <code>JSON.parse</code> 轉回來。JSON 沒有 <code>Date</code> 和 class，所以<code>Date</code> 讀回來是 ISO 字串，class 的實例讀回來是普通物件、方法不見了。快取裡只放純資料，讀回來的型別要當成「JSON 長的樣子」。</p>
+<p><strong>key 的實際樣子。</strong><code>createKeyv(url, { namespace: 'nest-19' })</code> 存的 key 是 <code>nest-19::menu:v1:all</code>，前綴和你的 key 中間是兩個冒號。用 <code>docker compose exec redis redis-cli -n 0 KEYS 'nest-19*'</code> 可以看到（<code>KEYS</code> 會掃整個 DB，正式環境用 <code>SCAN</code>）。</p>
+<p>寫到這裡，第二次查同一份菜單就不碰資料庫了。但快取裡的菜單停在存進去的那一刻：這時老闆改了價格，會發生什麼事？</p>
+
+<h2>老闆改了拿鐵的價格，App 怎麼立刻顯示新價格？</h2>
+<p>只靠 TTL 的話，老闆把拿鐵從 110 改成 120，App 最多會繼續顯示 110 長達 60 秒。客人照 110 點單、結帳變 120，就是一通客訴。所以寫入資料的地方要主動讓相關快取<strong>失效（invalidation）</strong>：把那幾個 key 刪掉，下一個讀取沒命中，自然會去資料庫拿新的。要做到這件事，得先回答兩個問題：要刪哪些 key，以及刪快取和寫資料庫誰先。</p>
+<h3>要刪哪些 key：先把 key 設計好</h3>
+<p>菜單有「全部」和「依分類」兩種查法，各自一個 key：<code>menu:v1:all</code>、<code>menu:v1:category:coffee</code>。<code>v1</code> 是格式版本：之後回傳的形狀改了，換成 <code>v2</code>，舊格式的資料就不會被新程式讀到，等 TTL 到了自己消失。key 的組法寫成一個函式，讀、寫、刪都用它，才不會有一處拼錯：</p>
+<pre>const menuKey = (category?: string) =&gt; (category ? `menu:v1:category:${category}` : 'menu:v1:all')</pre>
+<p>拿鐵改價時，要刪的是 <code>menuKey()</code> 和 <code>menuKey('coffee')</code>。只刪全部菜單那一個，咖啡分類頁還是舊價格。落到程式上，<code>MenuService</code> 提供一個 <code>invalidate(category)</code> 刪掉這兩個 key，由 <code>ProductsService.update</code> 在改完商品後呼叫。</p>
+<p>key 裡有一段來自使用者輸入時，還要注意一件事：<code>category</code> 來自網址，如果什麼值都接受，任何人都能用 <code>?category=亂打</code> 在 Redis 裡塞出無數個 key。起始程式用 <code>ParseEnumPipe</code> 只接受三個分類，其他值回 400。</p>
+
+<h3>誰先：先寫資料庫，再刪快取</h3>
+<p>知道要刪哪些 key 之後，剩下順序。直覺上「先把舊的刪掉再改」好像比較保險，但寫資料庫要花時間，看看這段時間裡有讀取進來會怎樣：</p>
+<figure>
+  <svg viewBox="0 0 700 230" role="img" aria-label="時間軸比較。上排是錯的順序：改價請求先刪快取，寫資料庫要一段時間；這期間一個讀取請求沒命中，從資料庫讀到舊價格 110 並寫回快取；之後資料庫才改成 120，快取留著 110 直到 TTL 過期。下排是對的順序：先寫資料庫成 120，再刪快取；期間的讀取拿到的是快取裡的舊值，但寫入完成後快取被刪掉，下一個讀取拿到 120。">
+    <text class="d-text" x="20" y="28">先刪快取（錯）</text>
+    <rect class="d-soft" x="20" y="40" width="110" height="34" rx="6"/><text class="d-small" x="75" y="62" text-anchor="middle">刪快取</text>
+    <rect class="d-soft" x="135" y="40" width="300" height="34" rx="6"/><text class="d-small" x="285" y="62" text-anchor="middle">UPDATE price = 120（進行中）</text>
+    <rect class="d-box" x="180" y="82" width="230" height="30" rx="6"/><text class="d-small" x="295" y="102" text-anchor="middle">讀取：沒命中 → 讀到 110 → 寫回快取</text>
+    <text class="d-accent" x="445" y="62">快取留著 110</text>
+    <text class="d-small" x="445" y="82">直到 TTL 過期</text>
+    <text class="d-text" x="20" y="148">先寫資料庫，再刪快取（對）</text>
+    <rect class="d-soft" x="20" y="160" width="300" height="34" rx="6"/><text class="d-small" x="170" y="182" text-anchor="middle">UPDATE price = 120（進行中）</text>
+    <rect class="d-soft" x="325" y="160" width="110" height="34" rx="6"/><text class="d-small" x="380" y="182" text-anchor="middle">刪快取</text>
+    <rect class="d-box" x="70" y="202" width="230" height="24" rx="6"/><text class="d-small" x="185" y="219" text-anchor="middle">讀取：命中舊的 110（還沒改完，合理）</text>
+    <text class="d-accent" x="445" y="182">下一個讀取拿到 120</text>
+  </svg>
+  <figcaption>先刪快取時，寫入還沒完成的空檔裡，任何一個讀取都會把舊資料重新放回快取。</figcaption>
+</figure>
+<p>上排先刪快取：UPDATE 還在進行時進來一個讀取，快取已經空了，它沒命中、去資料庫讀到還沒改的 110，再把 110 寫回快取。等 UPDATE 完成，快取裡留著 110，而且不會再有人刪它，直到 TTL 過期。下排先寫資料庫：寫入期間的讀取拿到舊的 110，這時價格本來就還沒改完，不算錯；寫完後刪快取，下一個讀取沒命中，從資料庫拿到 120。練習 3 的測試會在改價寫入資料庫的中途插進一個讀取，檢查的就是這件事。</p>
+<p>先寫資料庫也不是萬無一失：一個讀取在 UPDATE 之前讀到 110，卻拖到刪快取之後才寫回，快取裡還是 110。這個空檔很窄，但會發生，所以 TTL 仍然要設，讓錯誤最多活 60 秒。需要更強的保證時，有延遲雙刪、用版本號當 key 等做法，代價都是更多複雜度（<a href="../../system-design/lessons/05-caching.html">系統設計課第 5 課</a>）。</p>
+<p>同樣的道理延伸到交易。如果在交易裡寫資料庫（第 15、18 課），刪快取要放在交易 commit 之後：交易還沒 commit 時，別人從資料庫讀到的仍是舊價格，這時刪快取，別人就可能讀到舊值、又寫回快取，跟上排是同一個問題。</p>
+<p>到這裡，菜單快取又快又正確。但它多依賴了一個東西：Redis。Redis 本身也會壞，那時 API 會怎樣？</p>
+<div class="callout practice"><strong>💡 實務上：最常見的快取 bug 是某條寫入路徑忘了刪快取</strong><br>菜單價格可能從後台 API 改、從批次匯入的腳本改，也可能是維運直接下 SQL 修資料。只有經過 service 的那條會刪快取，其他路徑改完，客人仍看到舊價格，直到 TTL 過期。所以失效邏輯集中在 service 的寫入方法裡，所有寫入都走它；需要手動改資料庫時，操作步驟要附上「改完要刪哪些 key」。Code review 看到新的寫入時，資深會多問一句：「這份資料有被快取嗎？要清哪幾個 key？」</div>
+
+<h2>Redis 壞了，菜單怎麼照樣查得到？</h2>
+<p>快取是加速用的，資料庫才是正確答案。Redis 重啟、網路斷線、記憶體滿了，菜單應該照樣能看，只是慢一點。要做到這件事，先要知道 Redis 壞掉時，<code>cache.get</code> 實際上會怎樣。以下是在 @keyv/redis 5.1.6 實測的結果：</p>
+<div class="table-wrap"><table>
+  <tr><th>情況</th><th><code>cache.get</code> 的結果</th></tr>
+  <tr><td>啟動時連不上 Redis，沒設 <code>connectionTimeout</code></td><td>一直等（它不斷重試連線），請求跟著卡住</td></tr>
+  <tr><td>啟動時連不上，設了 <code>connectionTimeout: 500</code></td><td>約 500 毫秒後回傳 <code>undefined</code>；<code>set</code> 也不會丟錯</td></tr>
+  <tr><td>已經連上，之後 Redis 不回應（實測用 <code>docker pause</code> 讓容器暫停）</td><td>一直等</td></tr>
+</table></div>
+<p>這就是前面設定 <code>connectionTimeout</code> 的原因，但它只管「啟動時連不上」；第三列「已經連上、之後不回應」它管不到。預設設定下，「Redis 壞掉」常常不是丟錯，而是讓請求永遠等下去。請求一直卡著，連線池和記憶體被占滿，最後整個 API 都不回應：本來只是加速用的快取，反過來拖垮了服務。另一種情況是快取的方法直接丟錯（練習 4 的測試就會換上一個會丟錯的假快取），沒接住的話，請求就回 500。</p>
+<p>所以 cache-aside 的每一步，讀、寫、刪，都要包起來：出錯或太久沒回應，就當作沒命中、改用資料庫。寫成一個輔助方法，三個地方共用：</p>
+<pre>private async safely&lt;T&gt;(action: string, key: string, run: () =&gt; Promise&lt;T&gt;): Promise&lt;T | undefined&gt; {
+  let timer: NodeJS.Timeout | undefined
+  const timeout = new Promise&lt;never&gt;((_, reject) =&gt; {
+    timer = setTimeout(() =&gt; reject(new Error('超過 200ms 沒有回應')), 200)
+  })
+  try {
+    return await Promise.race([run(), timeout])   // 誰先結束就用誰
+  } catch (e) {
+    this.logger.warn(`快取${action}失敗（${key}），改用資料庫：${e instanceof Error ? e.message : e}`)
+    return undefined                               // 當作沒命中
+  } finally {
+    clearTimeout(timer)                            // 不清掉，每個請求都留一個計時器
+  }
+}</pre>
+<p>逾時靠的是 <code>Promise.race([a, b])</code>：它回傳一個 Promise，跟著 a、b 裡先結束的那個走，先成功就成功、先失敗就失敗。<code>timeout</code> 在 200 毫秒後一定失敗，所以「Redis 沒回應」也會在 200 毫秒後變成一個錯誤，落進 <code>catch</code>。要知道它不會取消還在等的 Redis 指令，只是不再等它；<a href="../../node/lessons/17-calling-external-apis.html">Node 課第 17 課</a>的 fetch 能用 signal 真的取消，cache-manager 的方法沒有這個參數。200 毫秒對 Redis 已經很寬（正常 1 毫秒內），對使用者又不會等太久。</p>
+<p>讀、寫、刪都用同一個方式呼叫它，把原本的快取呼叫包成一個函式傳進去：</p>
+<pre>const cached = await this.safely('讀取', key, () =&gt; this.cache.get&lt;MenuItem[]&gt;(key))
+await this.safely('寫入', key, () =&gt; this.cache.set(key, items, 60_000))
+await this.safely('刪除', key, () =&gt; this.cache.del(key))</pre>
+<p>讀取出錯時 <code>safely</code> 回傳 <code>undefined</code>，跟沒命中的回傳值一樣，所以 <code>getMenu</code> 原本「<code>!== undefined</code> 就回傳、否則查資料庫」的流程完全不用改。寫入和刪除失敗也只是回傳 <code>undefined</code>，請求照常往下走。</p>
+<p><code>catch</code> 裡一定要記 log。不記的話，Redis 壞了一個禮拜也沒人發現，只覺得「最近資料庫好忙」。用 <code>warn</code> 這個等級：服務還能用，但需要有人看。</p>
+<p>刪快取失敗也照這個方式處理。改價時資料庫已經改好了，不該因為刪快取失敗讓 PATCH 回 500：使用者會以為沒改成功、再按一次。記一筆 warn，舊價格最多活到 TTL 過期，這正是上一節說的最後防線。</p>
+<p>做完這一步，菜單快取的任務就完成了：只快取菜單、改價立刻更新、Redis 壞了只是變慢。快取還有一種跟 Redis 無關的出事方式，很多請求同時沒命中、一起壓到資料庫，延伸閱讀見課末「擊穿與雪崩」。</p>
+<div class="callout practice"><strong>💡 實務上：「退回資料庫」只能撐一陣子</strong><br>快取還在的時候，資料庫只承受一小部分流量。快取全掛時，所有請求都會直接打到資料庫，資料庫可能撐不住。所以同時要有監控（<a href="24-observability-shutdown.html">第 24 課</a>）：快取失敗的 warn 數量和命中率放上儀表板，命中率突然掉下來就發告警，真正的解法是把 Redis 修好。上線前也值得和維運確認一件事：快取整個清空時，資料庫撐得住正常流量嗎？撐不住的話，Redis 就不只是加速用，而是服務能不能活著的一部分，要用對待資料庫的標準來顧它。</div>
+
+<h2>練習</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs nestjs 19</code> 建立 <code>work/19/</code>。這一題要用 PostgreSQL 和 Redis，先在 <code>learn/nestjs/practice</code> 執行 <code>docker compose up -d --wait</code>。專案有三個功能：<code>GET /menu</code>（可加 <code>?category=coffee|tea|food</code>）、<code>PATCH /products/:id</code>（改 <code>price</code> 或 <code>active</code>）、<code>GET /customers/me/orders</code>（用 <code>X-Customer-Id</code> 標頭表示身分）。<code>app.module.ts</code> 裡有同事加的全域 <code>CacheInterceptor</code>。想用開發伺服器試，先在 <code>work/19</code> 執行 <code>npx prisma migrate deploy</code>、<code>npx prisma db seed</code>，再 <code>npm run start:dev</code>。判分用的是另一個每次重建的資料庫和 Redis 的 DB 1，測試會用 <code>REDIS_URL</code>、<code>REDIS_PREFIX</code> 環境變數指定，所以這兩個值一定要從 <code>ConfigService</code>（<a href="11-configuration.html">第 11 課</a>）讀，不要寫死。</p>
+
+<div class="local" data-test="ex1" data-files="src/app.module.ts src/menu/menu.service.ts">
+  <p>練習 1：把快取搬到 Redis，並讓 <code>GET /menu</code> 用 cache-aside。在 <code>app.module.ts</code> 把 <code>CacheModule.register(...)</code> 換成 <code>registerAsync</code>，<code>stores</code> 放 <code>createKeyv(REDIS_URL, { namespace: REDIS_PREFIX, connectionTimeout: 1_000 })</code>（這一題先保留 <code>APP_INTERCEPTOR</code>，練習 2 再處理）。在 <code>MenuService</code> 注入 <code>CACHE_MANAGER</code>，<code>getMenu(category)</code> 先用 <code>menu:v1:all</code> 或 <code>menu:v1:category:&lt;分類&gt;</code> 查快取，沒命中才查資料庫，寫回快取時 TTL 60 秒。測試會數 SQL：第二次查同一份菜單要 0 句（分類全部停售、結果是空陣列時也一樣），並到 Redis 裡確認 <code>&lt;REDIS_PREFIX&gt;::menu:v1:all</code> 和 <code>&lt;REDIS_PREFIX&gt;::menu:v1:category:coffee</code> 存在、TTL 在 30 到 60 秒之間。全域 <code>CacheInterceptor</code> 存的 key 是網址，不算。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="src/app.module.ts">
+  <p>練習 2：先打兩次 <code>curl -H 'X-Customer-Id: 1' localhost:3100/customers/me/orders</code>、<code>curl -H 'X-Customer-Id: 2' …</code>，看第二個人拿到什麼（加 <code>-i</code> 看 <code>X-Cache</code> 標頭）。修好它：<code>/customers/me/orders</code> 不能被快取，王小明之後下的新訂單也要立刻看得到；<code>GET /menu</code> 仍然要有快取（第二次 0 句 SQL）。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="src/menu/menu.service.ts src/products/products.service.ts">
+  <p>練習 3：<code>PATCH /products/:id</code> 改價或停售之後，下一次 <code>GET /menu</code> 和該商品分類的 <code>GET /menu?category=…</code> 都要立刻看到新資料。在 <code>MenuService.invalidate(category)</code> 刪掉相關的 key，由 <code>ProductsService.update</code> 呼叫。測試會在改價寫入資料庫的中途插進一個讀取，檢查結束後快取沒有留著舊價格，所以順序要對。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="src/menu/menu.service.ts">
+  <p>練習 4：讓快取壞掉時 API 照常運作。<code>MenuService</code> 讀、寫、刪快取時：出錯或超過 200 毫秒沒回應，就用 <code>Logger</code> 記一筆 <code>warn</code>，讀取當作沒命中、直接用資料庫的結果；刪除失敗不影響 PATCH 的回應。測試會把 <code>CACHE_MANAGER</code> 換成一個會丟錯、或永遠不回應的假快取，要求 <code>GET /menu</code> 和 <code>PATCH</code> 都在 1 秒內回 200，並且有 warn 紀錄。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：商品的「剩餘庫存」每秒被查很多次，適合放進快取嗎？</p>
+  <label data-key="a">適合，讀得越多，快取的效益越大</label>
+  <label data-key="b">適合，只要 TTL 設短一點，例如 5 秒</label>
+  <label data-key="c">不適合，庫存一直在變而且必須正確，扣庫存的判斷要在資料庫裡做</label>
+  <label data-key="d">不適合，因為 Redis 不能存數字</label>
+  <p class="why">✓ c。判斷要不要快取，看的是「過時一下會不會出事」，不只是讀的次數。快取說還有 3 個、實際已經賣完，就會超賣；TTL 再短也有這個空檔。正確性靠第 15 課的條件更新。d 錯：Redis 可以存數字，問題不在這裡。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：<code>await cache.set('order:1', { orderedAt: new Date() }, 60_000)</code>，之後 <code>cache.get('order:1')</code> 拿回來的 <code>orderedAt</code> 是什麼？</p>
+  <label data-key="a">一個 <code>Date</code> 物件，跟存進去的一樣</label>
+  <label data-key="b">一個 ISO 格式的字串，例如 <code>"2026-11-01T02:00:00.000Z"</code></label>
+  <label data-key="c"><code>undefined</code>，Date 不能存進 Redis</label>
+  <label data-key="d">一個數字（毫秒時間戳）</label>
+  <p class="why">✓ b。值存進 Redis 前會序列化成 JSON，<code>Date</code> 經過 JSON 就變成 ISO 字串（實測 keyv 5.6.0 ＋ @keyv/redis 5.1.6）。拿回來直接呼叫 <code>.getTime()</code> 會丟 TypeError。快取只放純資料，需要時自己轉回 <code>new Date(...)</code>。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 7：全域掛 <code>CacheInterceptor</code>（<code>APP_INTERCEPTOR</code>），<code>GET /customers/me/orders</code> 依登入的人回傳他的訂單。會發生什麼事？</p>
+  <label data-key="a">第一個人查完後 TTL 內，其他人拿到的都是第一個人的訂單</label>
+  <label data-key="b">每個人的資料分開快取，只是變快</label>
+  <label data-key="c">沒有影響，CacheInterceptor 不會快取有標頭的請求</label>
+  <p class="why">✓ a。<code>CacheInterceptor</code> 預設用請求的網址當 key，不看標頭也不看登入的人。<code>/customers/me/orders</code> 對每個人都是同一個網址，所以第一個人的回應會給所有人，這是個資外洩。依身分而不同的資料不要快取，或至少不要用網址當 key。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>快取個人化或權限相關的資料</strong>：用網址當 key 會把 A 的資料給 B。不要全域掛 <code>CacheInterceptor</code>，個人資料不快取。</li>
+  <li><strong>沒量測就加快取</strong>：慢查詢被蓋住，沒命中時又出現。先修查詢（第 16 課），還不夠才加快取。</li>
+  <li><strong>TTL 寫成秒</strong>：cache-manager 的 TTL 是毫秒，寫 <code>60</code> 等於 60 毫秒，快取永遠不命中，也不會報錯。寫 <code>60_000</code>，並用 <code>redis-cli PTTL</code> 確認。</li>
+  <li><strong>只靠 TTL、寫入時不失效</strong>：使用者看到舊價格最多 TTL 那麼久。改資料的地方要刪相關的 key，TTL 只當最後防線。</li>
+  <li><strong>只刪一個 key</strong>：同一份資料出現在好幾個 key（全部菜單、分類菜單）。key 的組法集中在一個函式，失效時列出所有相關的 key。</li>
+  <li><strong>先刪快取再寫資料庫</strong>：中間的讀取會把舊值寫回快取。先寫資料庫、成功後再刪；在交易裡就等 commit 之後。</li>
+  <li><strong>快取壞掉整個 API 跟著壞</strong>：沒處理錯誤會回 500，沒設逾時會讓請求卡住。每一步都要 try/catch 加逾時，失敗記 warn、退回資料庫。</li>
+  <li><strong>用 <code>npm i</code> 裝最新的 @keyv/redis</strong>：6.x 要 keyv 6，跟 cache-manager 7 的 keyv 5 不合。鎖 keyv 5.6.0 ＋ @keyv/redis 5.1.6。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>快取用 key 決定「哪些請求算同一個問題」。<code>CacheInterceptor</code> 用網址當 key，不能用在依身分而不同的路由；不要全域掛，要快取的地方在 service 裡明確寫。</li>
+  <li>快取用「資料可能過時」和「失效邏輯」換速度：適合讀多寫少、能接受短暫過時的資料（菜單）；庫存和個人資料不放。先量測、先修查詢。</li>
+  <li>程序記憶體裡的快取在多台伺服器間不一致、部署就清空；Redis 讓所有程序共用同一份快取。key 加命名空間和格式版本（<code>nest-19::menu:v1:all</code>），一定設 TTL。</li>
+  <li>cache-aside：<code>get</code> → 沒命中（<code>undefined</code>）→ 查資料庫 → <code>set(key, value, 毫秒)</code>。值會變成 JSON，<code>Date</code> 回來是字串。</li>
+  <li>資料變更時先寫資料庫、再刪所有相關的 key；在交易裡就等 commit 之後。剩下那一點時間差造成的舊值，交給 TTL 收拾。</li>
+  <li>快取的每一步都要 try/catch 加逾時，失敗記 warn、退回資料庫；同時要監控 Redis 和命中率。</li>
+</ul>
+<p>下一課用同一台 Redis 做另一件事：佇列。付款成功後要寄收據、通知廚房，這些慢的工作改成丟到背景，由 BullMQ 的 worker 處理。</p>
+
+<h2>補充與查表</h2>
+<p>主線用不到、但工作上會查的細節集中在這裡。</p>
+
+<h3>版本陷阱：keyv 和 @keyv/redis 要配對</h3>
+<p><code>npm i @keyv/redis</code> 會裝到 6.x，它需要 keyv 6；但 cache-manager 7.2.9 依賴的是 keyv 5。兩個 keyv 版本混在一起，型別和行為都會出問題。自己開專案時要鎖 <code>keyv@5.6.0</code> ＋ <code>@keyv/redis@5.1.6</code>，這也是 @nestjs/cache-manager 12.0.2 自己測試用的組合。</p>
+
+<h3><code>cache.wrap</code>：一行做完 cache-aside</h3>
+<p>cache-manager 也有 <code>cache.wrap(key, () =&gt; 查資料庫, ttl)</code>，一行做完「查快取、沒命中就執行函式、存回去」。這課選擇手寫，因為最後一節要在每一步加上錯誤處理和逾時，手寫才看得到每一步。</p>
+
+<h3>擊穿與雪崩</h3>
+<p>快取還有一種失敗：很多請求同時沒命中。熱門的 key 剛好過期，那一瞬間進來的 300 個請求全部沒命中，全部去查資料庫，再全部寫回同一個 key。單一熱門 key 過期引起的叫<strong>快取擊穿</strong>；大量 key 在同一時間過期（例如部署後一起建立、TTL 又都是 60 秒）叫<strong>快取雪崩</strong>。英文常統稱 <strong>cache stampede</strong>。兩個基本對策：</p>
+<ul>
+  <li><strong>TTL 加隨機</strong>：<code>60_000 + Math.floor(Math.random() * 10_000)</code>，讓 key 不要在同一刻過期。</li>
+  <li><strong>同時只讓一個請求回填</strong>：cache-manager 7.2.9 的 <code>wrap()</code> 會把同一個程序裡、同一個 key 的同時呼叫合併成一次（看原始碼裡的 <code>coalesceAsync</code>）；跨多台伺服器要用 Redis 的鎖，在<a href="../../system-design/lessons/05-caching.html">系統設計課第 5 課</a>討論。</li>
+</ul>
+
+<h3>版本備註：沒命中的回傳值</h3>
+<p>cache-manager 7 沒命中時回傳 <code>undefined</code>；cache-manager 6 回傳的是 <code>null</code>。看舊文章或舊專案的 <code>=== null</code> 判斷時，要先確認版本。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

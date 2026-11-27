@@ -1,0 +1,852 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>1. 為什麼不只用 PostgreSQL：從存取模式選資料儲存</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="1">
+<header>
+  <div class="eyebrow">階段 1：選型的思路 · 第 1 課</div>
+  <h1>為什麼不只用 PostgreSQL：從存取模式選資料儲存</h1>
+</header>
+<main>
+
+<p>咖啡店的後端到目前為止只有一個 PostgreSQL。週會上同事提了兩個建議：「訂單改放 MongoDB 比較彈性，以後加欄位不用 migration；購物車反正量不大，放 PostgreSQL 就好。」主管請你在下週的技術評審前回覆：咖啡店的每一種資料該放在哪裡，理由是什麼。</p>
+<p>兩個建議聽起來都有道理，但其實都放錯了地方。要說服大家，你需要的不是「哪個資料庫比較紅」，而是一套能套在任何資料上、別人也能檢查的判斷步驟。這一課從頭到尾都在做這份回覆：先看出兩個建議錯在哪裡，再把判斷整理成四個問題，一步一步替咖啡店的六種資料做決定，最後寫成一年後的人也看得懂的紀錄。這套步驟也是後面 14 課的地圖：每一課都在回答「某一種資料該放哪裡、放過去要付什麼代價」。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>同事的兩個建議錯在哪：列出六種資料，寫下程式怎麼用它們，得到開場問題的最小答案。</li>
+  <li>四個問題：把剛才的直覺整理成存取模式、一致性、規模、維運成本，對每一份資料都問得出答案。</li>
+  <li>PostgreSQL 能撐到哪、資料放兩個地方信哪一份：確認現有的資料庫做不到才加；加了之後分清記錄系統與衍生資料。</li>
+  <li>每種儲存用什麼換什麼、報表現在要不要換：看各種儲存的代價，再用估算決定還沒定的那幾格。</li>
+  <li>團隊扛得起嗎、怎麼寫下來：多一種資料庫的永久工作，以及把決定寫成 ADR。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../postgresql/lessons/14-jsonb-arrays.html">PostgreSQL 課第 14 課</a>的 JSONB：把 JSON 存成一個欄位，可以查裡面的鍵、加 GIN 索引。</li>
+  <li><a href="../../postgresql/lessons/28-gin-search.html">PostgreSQL 課第 28 課</a>的全文檢索與 pg_trgm：用 GIN 倒排索引做關鍵字與模糊搜尋。</li>
+  <li><a href="../../postgresql/lessons/33-job-queue.html">PostgreSQL 課第 33 課</a>的 <code>FOR UPDATE SKIP LOCKED</code> 與 outbox：多個 worker 各自拿走沒被鎖的列，用一張表當工作佇列；要通知別的系統的事件，跟業務資料寫在同一個交易裡，之後再送出。</li>
+  <li><a href="../../nestjs/lessons/19-caching-redis.html">NestJS 課第 19 課</a>的 Redis：資料放在記憶體的 key-value 資料庫，key 可以設 TTL，到期自動刪除。</li>
+</ul>
+這一課只有瀏覽器練習，不需要 Docker。</div>
+
+<h2>同事的兩個建議，錯在哪裡？</h2>
+<p>要判斷資料放哪裡，第一步不是挑資料庫，而是把要存的東西列出來，並寫清楚程式會怎麼用它。咖啡店的網站和 App 會產生這六種資料：</p>
+<div class="table-wrap"><table>
+  <tr><th>資料</th><th>長什麼樣子</th><th>程式怎麼用它</th></tr>
+  <tr><td>訂單（<code>orders</code>、<code>order_items</code>）</td><td>一筆訂單幾個品項，每列幾百 bytes</td><td>下單時寫入、依顧客或日期查、對帳</td></tr>
+  <tr><td>購物車</td><td>每位顧客一份，幾個商品 id 和數量</td><td>每次加減商品都改一次，結帳後就沒用</td></tr>
+  <tr><td>菜單搜尋</td><td>商品名稱、描述、標籤</td><td>顧客打「拿鐵 燕麥」找商品，結果依相關程度排序</td></tr>
+  <tr><td>電子收據檔</td><td>每筆訂單一個 PDF，約 100～200 KB</td><td>產生一次、之後整個檔案下載</td></tr>
+  <tr><td>營運報表</td><td>每日營收、品項排行、尖峰時段</td><td>店長每天看，查詢要掃過幾個月的訂單</td></tr>
+  <tr><td>門市活動內容</td><td>每間門市的活動頁：標題、圖片、各種長短不一的區塊</td><td>行銷人員編輯，前台整頁讀出</td></tr>
+</table></div>
+<p>先只看「程式怎麼用它」這一欄，再回頭看同事的兩個建議。</p>
+<p><strong>訂單</strong>是錢。每一筆都要正確，不能因為伺服器當機就消失；也要跟顧客、商品對得起來：訂單上的 <code>customer_id</code> 必須是真的存在的顧客，一筆訂單和它的品項要一起寫進去，不能只寫進一半。這些保證，PostgreSQL 課教過的交易與外鍵直接就提供了，這正是關聯式資料庫最擅長的事。同事說 MongoDB「加欄位不用 migration」，解決的是訂單沒有的問題：訂單的欄位很固定，多年都不會大改；換過去反而要放棄或另外找方法取得訂單真正需要的保證（MongoDB 的關聯與交易怎麼做，第 9 課會講）。</p>
+<p><strong>購物車</strong>正好相反。顧客每加一次、減一次商品就要寫一次，結帳之後就沒用了；就算整份不見，顧客頂多重新加一次。它要的是每次讀寫都快，以及放著不結帳的購物車會自己消失。放進 PostgreSQL 也做得到，但它為訂單準備的那些保證，購物車用不到；而「到期自動刪除」PostgreSQL 沒有內建，要另外寫排程去清。Redis 的 key 可以直接設 TTL，剛好符合。</p>
+<p>所以開場問題的最小答案是：<strong>訂單留在 PostgreSQL，購物車放 Redis</strong>。兩個建議犯的是同一個錯：從資料庫的特色出發（「MongoDB 比較彈性」「量不大放哪都行」），而不是從這份資料怎麼被使用出發。</p>
+<p>「程式怎麼用它」這一欄有個正式的名字，叫存取模式。它是選型的第一個問題，但不是唯一一個：剛才判斷購物車時，其實還偷偷用了另外兩件事，「丟了可以接受」和「量不大」。這種直覺在訂單和購物車上很明顯，碰到剩下四種資料就沒那麼好判斷了。下一節把這些直覺整理成四個固定的問題，讓你對任何一份資料都能用同樣的方式問一遍。</p>
+
+<h2>怎麼對任何一份資料都問得出答案？四個問題</h2>
+<p>上一節對訂單和購物車的判斷，可以拆成四個問題。替任何一份資料挑儲存時，依序問這四個。</p>
+<p><strong>1. 存取模式（access pattern）：程式實際怎麼讀寫這份資料。</strong>重點不是「存什麼」，而是「怎麼拿」。同樣是商品資料，後台「依 id 改價格」和前台「打關鍵字找商品」是兩種完全不同的存取模式，適合的儲存也不同。常見的有五種：</p>
+<ul>
+  <li><strong>依 key 讀一筆</strong>：知道 id 就直接拿，例如「顧客 42 的購物車」。幾乎所有資料庫都做得好，Redis 這種記憶體 key-value 儲存最快。</li>
+  <li><strong>依範圍或條件查</strong>：「這位顧客最近 20 筆訂單」「昨天的訂單」，需要索引和排序，關聯式資料庫的強項。</li>
+  <li><strong>全文搜尋</strong>：依文字相關程度排序，要處理斷詞、同義詞、錯字，搜尋引擎的強項。</li>
+  <li><strong>掃描大量資料做統計</strong>：「過去一年每個月每個品項的營收」，一次讀幾千萬列但只用其中幾欄，分析型資料庫的強項。</li>
+  <li><strong>整個檔案讀寫</strong>：收據 PDF、商品照片，一次存、一次拿整份，不會只查其中一段，物件儲存的強項。</li>
+</ul>
+<p>前兩種和「掃描大量資料做統計」的差別特別大，大到業界有專門的名詞。第一種叫 <strong>OLTP</strong>（online transaction processing，線上交易處理）：大量、小而短的讀寫，每次只碰幾列，但每秒有很多次，例如下單、改購物車。第二種叫 <strong>OLAP</strong>（online analytical processing，線上分析處理）：次數少，但每次要掃過大量資料，例如算年度營收。同一個資料庫很難兩種都做到最好，第 13 課會說明原因。之後看到「報表該不該離開 OLTP 資料庫」，講的就是這件事。</p>
+<p>套回咖啡店：購物車是依 key 讀一筆；訂單是依範圍或條件查；菜單搜尋是全文搜尋；營運報表是掃描大量資料做統計；電子收據是整個檔案讀寫；門市活動內容是依門市整頁讀出，也算依 key 讀一筆，只是讀出來的是一大份結構不固定的內容。</p>
+<p><strong>2. 一致性：能不能丟、能不能舊。</strong>這裡問的是兩件事。第一件是「能不能丟」：資料寫進去之後，如果伺服器當機或重啟，可以接受它不見嗎？第二件是「能不能舊」：讀到的值比最新的晚幾秒、甚至晚一天，可以嗎？兩件事要分開問，因為同一份資料的答案常常不一樣。</p>
+<p>咖啡店的答案：訂單兩個都不行，少一筆帳就對不起來，顧客付了錢卻看不到訂單。購物車可以丟，顧客重加就好。菜單搜尋可以舊 1 秒左右，新上架的商品晚一點才搜得到沒關係；這個數字來自 Elasticsearch 的行為，它寫入後預設最快約 1 秒才搜得到，第 10 課會看到。報表可以舊一天，店長看的本來就是昨天以前的數字。</p>
+<p>這個問題決定了一份資料能不能放進「為了速度或功能放棄某些保證」的儲存。不能丟的資料，只能放在保證寫進去就不會消失、而且有人負責備份的地方；能丟或能舊的資料，選擇就多很多。</p>
+<p><strong>3. 規模：多大、多快。</strong>要三個數字：總筆數（或總容量）、每秒讀寫幾次、單筆多大。沒有數字，「量很大」「量不大」都只是感覺；同事那句「購物車反正量不大」就是一個沒有數字的判斷。咖啡店每天 2,000 筆訂單，三年下來 <code>order_items</code> 約 500 萬列，一台 PostgreSQL 輕鬆處理；同樣的表變成 50 億列，報表查詢才會開始痛。單筆大小也會改變答案：收據 PDF 每份 100～200 KB，比一列訂單大幾百倍，就算筆數不多，放進資料庫也會讓表和備份一起變大。這三個數字怎麼估，後面「用數字判斷」那一節會用程式算一次。</p>
+<p><strong>4. 維運成本（operational cost）：部署、備份、監控、升級、處理事故所花的人力與錢。</strong>資料庫不是裝好就沒事：要有人知道它怎麼備份、磁碟滿了怎麼辦、半夜出事誰會修。這一項常被忽略，卻往往是最後的決定因素：一個功能上最合適的儲存，如果團隊裡沒有人照顧得了，選了反而讓系統更脆弱。後面「團隊要多扛什麼」那一節會把這些工作一項一項列出來。</p>
+<div class="callout">四個問題的順序有意義：先用存取模式和一致性找出「哪些儲存做得到」，再用規模判斷「現在需不需要」，最後用維運成本判斷「值不值得」。跳過前兩個直接比功能清單，就會變成「MongoDB 比較彈性」這種討論。</div>
+<div class="callout practice"><strong>💡 實務上：選型討論先問數字，不先比功能</strong><br>這種討論常出現在週會、技術評審，或有人貼了一篇「我們改用 X 之後快了 10 倍」的文章。資深工程師會先問：這份資料怎麼讀寫、丟了誰會受影響、現在多少筆、尖峰每秒幾次、誰來維護。答不出來的，先回去量。PM 關心的是「丟了顧客會不會抱怨」，維運關心的是「半夜誰被叫起來」，把這兩種人的問題帶進討論，結論通常會比只比功能清單穩。你下週的回覆，也應該照這四個問題的順序寫。</div>
+<p>用這四個問題再看一次同事的建議：「訂單放 MongoDB 比較彈性」只回答了「加欄位方不方便」，沒有回答存取模式和一致性；「購物車量不大放 PostgreSQL」只回答了規模的一半，沒有問它要不要過期、能不能丟。不過問完前兩個問題，你會發現搜尋、報表、活動內容看起來都「需要另一種資料庫」。真的加之前，還有一件事要先確認。</p>
+
+<h2>這些需求，PostgreSQL 自己能撐到哪裡？</h2>
+<p>上一節留下的問題是：活動內容欄位不固定、菜單要搜尋、報表要掃大量資料，這些看起來都需要另一種資料庫。但很多這類需求，PostgreSQL 內建的功能就能處理，而且還保留了交易、外鍵和同一份備份。所以加新資料庫之前，先確認現有的做不到。</p>
+<p>下面的表會用到三個還沒解釋的名詞，先講清楚：</p>
+<ul>
+  <li><strong>分片（sharding）</strong>：把一張表的資料依某個 key 切開，分散存在多台機器上，每台只放一部分。單台機器的磁碟或寫入量不夠時才需要它。</li>
+  <li><strong>分面統計（facet）</strong>：搜尋結果旁邊列出「咖啡 12 項、茶 5 項」這種依分類計數的統計，使用者點一下就能縮小範圍。</li>
+  <li><strong>唯讀副本（replica）</strong>：另一台持續複製主資料庫內容的機器，只能讀不能寫。把報表這種重的查詢導過去，就不會拖慢主資料庫上的下單（<a href="../../postgresql/lessons/37-backup-replication.html">PostgreSQL 課第 37 課</a>）。</li>
+</ul>
+<p>下表是常見的需求、PostgreSQL 的做法，以及什麼時候才真的撐不住：</p>
+<div class="table-wrap"><table>
+  <tr><th>需求</th><th>PostgreSQL 的做法</th><th>什麼時候撐不住</th></tr>
+  <tr><td>欄位不固定的資料（活動頁區塊、商品規格）</td><td>JSONB 欄位＋GIN 索引（<a href="../../postgresql/lessons/14-jsonb-arrays.html">第 14 課</a>、<a href="../../postgresql/lessons/28-gin-search.html">第 28 課</a>）</td><td>整個應用都以巢狀文件為單位讀寫、幾乎不需要 JOIN，而且需要文件資料庫內建的分片</td></tr>
+  <tr><td>搜尋商品</td><td>全文檢索 <code>tsvector</code>、模糊比對 <code>pg_trgm</code>（<a href="../../postgresql/lessons/28-gin-search.html">第 28 課</a>）</td><td>要中文斷詞、同義詞、錯字容忍、可調的相關性排序、分面統計，或搜尋流量大到拖慢主資料庫</td></tr>
+  <tr><td>背景工作佇列</td><td><code>FOR UPDATE SKIP LOCKED</code>、outbox（<a href="../../postgresql/lessons/33-job-queue.html">第 33 課</a>）</td><td>每秒上千個工作、需要延遲重試與優先順序的大量訊息，或多個服務要訂閱同一串事件</td></tr>
+  <tr><td>資料越來越多的表</td><td>分割表（partitioning），依月份切開、舊分割整個刪（<a href="../../postgresql/lessons/35-partitioning.html">第 35 課</a>）</td><td>單一節點的磁碟或寫入量到頂，需要多台機器分擔寫入</td></tr>
+  <tr><td>報表</td><td>調校查詢與索引（<a href="../../postgresql/lessons/29-query-tuning.html">第 29 課</a>）、物化檢視（<a href="../../postgresql/lessons/23-views-functions-triggers.html">第 23 課</a>）、把報表查詢導到唯讀副本（<a href="../../postgresql/lessons/37-backup-replication.html">第 37 課</a>）</td><td>每次要掃幾千萬列以上，調校後仍要幾十秒，或報表拖慢下單</td></tr>
+</table></div>
+<p>讀這張表要看第三欄。它寫的幾乎都是可以量的條件（每秒幾個工作、掃幾千萬列、調校後仍要幾十秒），或是 PostgreSQL 內建功能做不好的事（中文斷詞、同義詞、錯字容忍）。還沒碰到第三欄之前，資料留在 PostgreSQL。另一種常見需求「向量相似度搜尋」也有 PostgreSQL 的做法，這門課不實作，細節見課末。</p>
+<p>套回咖啡店那三種看起來需要新資料庫的資料：</p>
+<ul>
+  <li><strong>門市活動內容</strong>：區塊結構不固定，正是 JSONB 的用途，所以它不一定需要 MongoDB。咖啡店的活動頁也沒有大到需要分片。</li>
+  <li><strong>營運報表</strong>：還沒有證據顯示調校查詢不夠用。PostgreSQL 課第 23 課的物化檢視是把一個查詢的結果實際存成一張表，之後讀它不用每次重算，很適合「每天看一次」的報表。</li>
+  <li><strong>菜單搜尋</strong>：要中文斷詞和同義詞（顧客打「鮮奶」也要找到寫「牛奶」的商品），落在第三欄，是六種資料裡最有理由離開 PostgreSQL 的一個。</li>
+</ul>
+<p>所以這門課的預設答案是 <strong>PostgreSQL</strong>，而加一個新儲存需要理由：存取模式 PostgreSQL 做不好，或量測證明它撐不住。這也是回覆同事第一個建議時最該講的一句：「沒有 schema 比較彈性」不是理由。資料總有結構，沒寫在資料庫裡，就是散在每一段讀它的程式裡，而且沒有東西幫你檢查。</p>
+<p>不過菜單搜尋確實要搬出去，購物車也確實適合放 Redis。資料一旦放在兩個地方，就多了一個問題：兩邊對不起來的時候，該信哪一份？</p>
+
+<h2>資料放在兩個地方，對不起來時該信哪一份？</h2>
+<p>菜單搜尋放進 Elasticsearch 之後，商品資料就同時存在兩個地方：PostgreSQL 的 <code>products</code> 表，和搜尋引擎裡的索引。兩邊遲早會對不起來：同步晚了、同步程式有 bug、索引壞了。那時候要能立刻回答「哪一份是對的」，而這個答案要在選型時就決定好，不是事故當下才討論。選型裡最重要的觀念，就是把資料分成這兩種：</p>
+<ul>
+  <li><strong>記錄系統</strong>（system of record）：一份資料唯一的權威來源。兩個地方的數字對不起來時，以它為準。咖啡店的訂單，記錄系統是 PostgreSQL 的 <code>orders</code> 表。</li>
+  <li><strong>衍生資料</strong>（derived data）：從記錄系統算出來或複製出來的資料，例如快取、搜尋索引、報表、排行榜。它們可以整份丟掉，再從記錄系統重建。</li>
+</ul>
+<figure>
+  <svg viewBox="0 0 700 260" role="img" aria-label="PostgreSQL 是記錄系統，搜尋索引、Redis 排行榜、報表都由它衍生，可以丟掉重建；購物車在 Redis，丟了沒有來源可重建">
+    <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="20" y="90" width="190" height="80" rx="8"/>
+    <text class="d-accent" x="115" y="122" text-anchor="middle">PostgreSQL</text>
+    <text class="d-text" x="115" y="146" text-anchor="middle">orders（記錄系統）</text>
+    <path class="d-line" d="M210,110 L330,50" marker-end="url(#arr)"/>
+    <path class="d-line" d="M210,130 L330,130" marker-end="url(#arr)"/>
+    <path class="d-line" d="M210,150 L330,210" marker-end="url(#arr)"/>
+    <rect class="d-box" x="335" y="25" width="200" height="50" rx="8"/>
+    <text class="d-text" x="435" y="55" text-anchor="middle">搜尋索引（Elasticsearch）</text>
+    <rect class="d-box" x="335" y="105" width="200" height="50" rx="8"/>
+    <text class="d-text" x="435" y="135" text-anchor="middle">人氣排行（Redis）</text>
+    <rect class="d-box" x="335" y="185" width="200" height="50" rx="8"/>
+    <text class="d-text" x="435" y="215" text-anchor="middle">營運報表（DuckDB）</text>
+    <text class="d-small" x="550" y="125">衍生資料：</text>
+    <text class="d-small" x="550" y="143">丟掉可以重建</text>
+    <text class="d-small" x="20" y="235">購物車只在 Redis：沒有來源，丟了就沒了，要事先說好可以接受</text>
+  </svg>
+  <figcaption>箭頭是資料流向：衍生資料都能從記錄系統再算一次。圖裡的報表畫成放在分析型資料庫 DuckDB，是量大之後的樣子；咖啡店現在的量要不要這樣做，後面用數字判斷。</figcaption>
+</figure>
+<p>這個區分決定了三件事：</p>
+<ul>
+  <li><strong>備份</strong>：記錄系統要完整備份、演練還原；衍生資料只要能重建，可以不備份或只做輕量備份。</li>
+  <li><strong>一致性</strong>：衍生資料晚幾秒、甚至錯了都能修，因為有權威來源可以對照。所以「搜尋結果跟資料庫不一致」是可以設計處理的問題（第 11 課），「訂單在兩個資料庫各有一半」不是。</li>
+  <li><strong>事故處理</strong>：Redis 被清空、搜尋索引壞掉時，有明確的重建步驟；如果沒人說得出哪一份是權威，事故當下就只能猜。</li>
+</ul>
+<p>購物車是第三種情況：它不是衍生資料，因為它只存在 Redis，沒有來源可以重建；但它也可以接受遺失。這不是錯，但要在選型時寫下來並跟產品確認：「Redis 重啟時購物車會清空，顧客要重新加」。沒寫下來，事後就會變成一場「資料遺失事故」的爭論。這也是你回覆同事第二個建議時要補上的一句：購物車放 Redis 的前提，是大家都同意它可以丟。</p>
+<div class="callout practice"><strong>💡 實務上：事故時第一個問題是「哪一份是對的」</strong><br>客服回報「App 顯示的訂單金額跟收據不一樣」，或「搜尋得到已下架的商品」，第一步是去記錄系統（PostgreSQL）查，以它為準修正衍生資料。為了讓值班的人做得到，每個衍生資料都要有一份重建 runbook。runbook 是寫給值班的人、照著做就能處理事故的步驟文件（<a href="../../system-design/lessons/21-debugging-incidents.html">系統設計課第 21 課</a>），重建 runbook 要寫清楚：從哪裡讀、要跑多久、重建期間使用者看到什麼。資深工程師在加 Redis 或搜尋引擎的同一個 PR，就會把「怎麼整份重建」一起寫好，而不是等出事才想。</div>
+<p>到這裡，每一份資料都能標上「它是不是記錄系統、壞了從哪裡重建」。接下來要看候選的那幾種儲存，各自擅長什麼、又放棄了什麼。</p>
+
+<h2>每種儲存用什麼換什麼？</h2>
+<p>上一節把資料分成記錄系統與衍生資料，這一節把候選的儲存擺上來。同一個系統裡用多種資料儲存、各放適合的資料，這種做法叫多語言持久化（polyglot persistence）。這門課會教的儲存，每一種都擅長某些存取模式，也都為此放棄了一些東西。</p>
+<p>表裡有三個名詞後面的課才會細講，這裡先知道意思就好。<strong>持久化</strong>是把記憶體裡的資料寫到磁碟，讓伺服器重啟後資料還在，Redis 可以設定（第 6 課）。<strong>限流計數</strong>是記錄每個人每分鐘呼叫了幾次 API、超過就擋下的計數器（第 3 課）。<strong>replica set</strong> 是 MongoDB 由多台互相複製的機器組成的部署方式（第 9 課）。</p>
+<div class="table-wrap"><table>
+  <tr><th>儲存</th><th>擅長的存取模式</th><th>代價與限制</th><th>咖啡店拿來放</th><th>課</th></tr>
+  <tr><td>PostgreSQL</td><td>依條件查、JOIN、交易、約束</td><td>單機寫入有上限；全文搜尋與大量統計不是最強</td><td>訂單、顧客、商品</td><td><a href="../../postgresql/lessons/01-what-is-db.html">PostgreSQL 課</a></td></tr>
+  <tr><td>Redis</td><td>依 key 存取，資料在記憶體，單次操作通常在 1 毫秒內</td><td>容量受記憶體限制；可以設定持久化，但選型時要把它當成可能遺失</td><td>購物車、排行榜、限流計數</td><td>第 2～6 課</td></tr>
+  <tr><td>MongoDB</td><td>以一整份文件（巢狀 JSON）為單位讀寫</td><td>跨文件的關聯要自己維護；一次改多份文件的交易，要部署成 replica set（或分片叢集）才能用</td><td>門市活動頁內容</td><td>第 7～9 課</td></tr>
+  <tr><td>Elasticsearch</td><td>全文搜尋、相關性排序、分面統計</td><td>寫入後約 1 秒才搜得到；不適合當記錄系統</td><td>菜單搜尋</td><td>第 10～11 課</td></tr>
+  <tr><td>物件儲存（S3）</td><td>用 HTTP 整個檔案存取，單一物件最大約 50 TB，按容量計費很便宜</td><td>不能查詢檔案內容、不能只改檔案的一部分</td><td>電子收據 PDF</td><td>第 12 課</td></tr>
+  <tr><td>DuckDB／ClickHouse</td><td>掃大量資料、只讀幾欄做統計</td><td>不適合大量的單筆更新與交易</td><td>營運報表</td><td>第 13 課</td></tr>
+  <tr><td>DynamoDB</td><td>已知 key 的讀寫，加機器（水平擴展）幾乎沒有上限，由 AWS 代管</td><td>只能照事先設計的 key 查；改需求很痛</td><td>這間咖啡店用不到，第 14 課看大規模時的設計</td><td>第 14 課</td></tr>
+</table></div>
+<p>電子收據也在這張表裡定下來：收據 PDF 是整個檔案讀寫、每份 100～200 KB，放物件儲存，資料庫只存它的 key。</p>
+<p>重點在「代價」那一欄：每個儲存都是用某些能力換來另一些。Redis 用容量和持久性換速度，Elasticsearch 用即時性和交易換搜尋能力，DynamoDB 用查詢彈性換擴展性。它們是 PostgreSQL 的補充，不是替代品。</p>
+<p>「咖啡店拿來放」這一欄，是每種儲存最典型的用途，可以當成選型草稿。但對照前面「PostgreSQL 自己能撐到哪裡」那一節，有兩格還不能直接照抄：門市活動頁寫的是 MongoDB，可是 JSONB 也許就夠；營運報表寫的是 DuckDB／ClickHouse，可是咖啡店三年 500 萬列真的需要嗎？要定下這兩格，得回到第三個問題，用數字說話。</p>
+
+<h2>報表很慢，現在就要換分析型資料庫嗎？用數字判斷</h2>
+<p>店長抱怨報表慢，有人提議「上 ClickHouse」。這是第三個問題「規模」要回答的事，而且要用數字回答。下面用咖啡店的數字估算三年後 <code>order_items</code> 有多大，以及尖峰每秒寫幾列。</p>
+<p>估算裡有一個係數要先說明：<strong>尖峰係數</strong>（peak factor）。一天的訂單不是平均分散在 24 小時，而是集中在早上上班前和午餐時間。尖峰係數就是「尖峰時每秒的量 ÷ 全天平均每秒的量」；平均值乘上它，才是系統最忙的時候要撐住的量。<a href="../../system-design/lessons/02-estimation.html">系統設計課第 2 課</a>算過它的由來。</p>
+<p>按「執行」，看印出的三行；再把 <code>ordersPerDay</code> 改成 20 萬（<code>200_000</code>）執行一次，比較兩次差多少：</p>
+<div class="lab"><script type="code">
+const ordersPerDay = 2_000
+const itemsPerOrder = 2.3      // 每筆訂單平均幾個品項
+const bytesPerRow = 200        // 一列 order_items 含索引約幾 bytes（假設）
+const retentionDays = 3 * 365  // 保留三年
+const peakFactor = 6           // 早上尖峰是平均的 6 倍（假設）
+
+const rowsPerDay = Math.ceil(ordersPerDay * itemsPerOrder)
+const rowsTotal = rowsPerDay * retentionDays
+const bytesTotal = rowsTotal * bytesPerRow
+const writesPerSecPeak = Math.ceil(rowsPerDay / 86_400 * peakFactor)
+
+console.log('每天新增', rowsPerDay.toLocaleString(), '列')
+console.log('三年共', rowsTotal.toLocaleString(), '列，約', (bytesTotal / 1e9).toFixed(2), 'GB')
+console.log('尖峰每秒寫入約', writesPerSecPeak, '列')
+</script></div>
+<p>結果是三年約 500 萬列、1 GB、尖峰每秒 1 列。這個量級整份放得進一台小主機的記憶體，報表慢一定是查詢寫法或索引的問題，該做的是先用 <code>EXPLAIN</code> 查（<a href="../../postgresql/lessons/21-explain.html">PostgreSQL 課第 21 課</a>），不是換資料庫。每日訂單變成 20 萬，三年是 5 億列、100 GB，這時候分析型資料庫才值得討論。所以報表這一格先填 PostgreSQL，它仍是從訂單算出來的衍生資料，量長大了再搬。</p>
+<p>這段估算有三個容易出錯的地方，每一個都會讓結論差一個數量級。第一，容量要無條件進位（<code>Math.ceil</code>）：估算是為了確認撐不撐得住，寧可多估不要少估。第二，單位一律寫清楚：bytes 還是 KB、天還是月，混用一次就差 1,024 倍或 30 倍。第三，尖峰係數一定要乘：系統出事都在尖峰，用全天平均挑主機規格，早上就會撐不住。</p>
+<div class="callout practice"><strong>💡 實務上：估算寫進提案，量測寫進結論</strong><br>估算用在提案階段：還沒寫程式前，判斷方向對不對、數量級差多少。真的要加新資料庫時，還要附上量測，常見的有三種：<code>EXPLAIN ANALYZE</code> 的結果，它會真的執行一次查詢，列出每一步花多久；正式環境的慢查詢紀錄，PostgreSQL 可以設定把執行超過指定時間的查詢寫進 log；尖峰時段的 CPU 與連線數。估算的假設也要寫出來（例如「尖峰係數 6 是看了上個月的流量圖」），別人才能挑戰你的數字，而不是挑戰你的結論。你給主管的回覆裡，報表那一格就該附上這段估算。</div>
+<p>報表這一格靠數字定下來了。活動內容那一格不一樣：放 MongoDB 或 PostgreSQL 的 JSONB 功能上都做得到，量也都不大。剩下的差別，要靠第四個問題：多一套資料庫，團隊要付出什麼。</p>
+
+<h2>多一種資料庫，團隊要多扛什麼？</h2>
+<p>功能和數字都分不出高下時，決定答案的是維運成本。每加一種資料儲存，團隊就多了這些工作，而且是永久的：</p>
+<ul>
+  <li><strong>備份與還原</strong>：它怎麼備份？多久演練一次還原？</li>
+  <li><strong>監控與告警</strong>：記憶體、磁碟、延遲、連線數的指標與告警門檻。</li>
+  <li><strong>升級與資安修補</strong>：主版本升級、安全性修正、client 套件的相容性。</li>
+  <li><strong>連線與設定</strong>：本機、測試、正式環境各一套；密碼與網路權限。</li>
+  <li><strong>資料同步</strong>：衍生資料怎麼跟記錄系統保持一致、不一致時怎麼修（第 11、15 課）。</li>
+  <li><strong>值班知識</strong>：半夜它出事，值班的人知道怎麼看、怎麼處理嗎？</li>
+</ul>
+<p>這份清單不會因為資料量小就變短。三位工程師的團隊同時維護 PostgreSQL、Redis、MongoDB、Elasticsearch，等於每個人都要懂四種東西的故障。所以小團隊的原則是：<strong>證明 PostgreSQL 不夠才加</strong>，而且加的時候先問「這份資料可以只當衍生資料嗎」。衍生資料壞了能重建，備份可以從簡，事故時也有固定的處理方式，維運壓力小很多。</p>
+<p>套回咖啡店最後兩個還在猶豫的決定：</p>
+<ul>
+  <li><strong>門市活動內容</strong>：為它多維運一套 MongoDB，換來的只是 JSONB 已經能做的事，所以放 PostgreSQL 的 JSONB 欄位。如果哪天整個應用都改成以文件為單位讀寫，再重新評估。</li>
+  <li><strong>菜單搜尋</strong>：確實需要 Elasticsearch，維運成本要付；但它是衍生資料，壞了能從 <code>products</code> 整份重建，這筆代價付得起。</li>
+</ul>
+<p>六種資料的決定都有了。最後一步是把決定和理由寫下來：一年後有人看到系統裡多了一套 Elasticsearch，要知道它為什麼在那裡、什麼情況下可以拿掉。</p>
+
+<h2>怎麼把決定寫下來，讓一年後的人看得懂？</h2>
+<p>程式碼只看得出系統現在長什麼樣子，看不出為什麼長這樣。一年後的人看到三種資料庫，要嘛不敢動，要嘛在不知道原因的情況下把其中一個拿掉，然後重新踩一次當初避開的坑。解決這個問題的文件叫架構決策紀錄（architecture decision record），通常簡稱 ADR：一個決定寫一份，記下當時的需求、考慮過的選項、選了哪個、付出什麼代價，以及什麼情況下該重新評估。完整寫法在<a href="../../system-design/lessons/18-design-docs-adr.html">系統設計課第 18 課</a>。</p>
+<p>六個決定裡，菜單搜尋是唯一真的多加一套儲存的，最需要寫 ADR。下面是它的 ADR：</p>
+<pre># ADR-007：菜單搜尋改用 Elasticsearch
+
+狀態：已採用（2026-11）
+需求數字：商品 300 項、尖峰搜尋 50 次/秒；需要中文斷詞與同義詞（「鮮奶」=「牛奶」）
+選項：
+  A. PostgreSQL 全文檢索＋pg_trgm：零新增維運；中文斷詞要自己處理
+  B. Elasticsearch：內建 cjk 分析器（中文兩字一組切詞）、同義詞、相關性調整；多一個要維運的叢集
+決定：B。記錄系統仍是 PostgreSQL 的 products，搜尋索引是衍生資料，可整份重建
+代價：寫入後約 1 秒才搜得到；需要同步機制（outbox）與重建 runbook
+何時重新評估：搜尋需求退回只要前綴比對，或維運人力不足時改回 A</pre>
+<p>這份 ADR 的每一行，都對應這課走過的一步：</p>
+<ul>
+  <li><strong>需求數字</strong>是存取模式和規模：要全文搜尋、多少商品、尖峰每秒幾次。</li>
+  <li><strong>選項 A</strong> 是「PostgreSQL 自己能撐到哪裡」那一步：先寫出不加新儲存的做法，以及它做不好的地方。</li>
+  <li><strong>決定</strong>寫明記錄系統與衍生資料：誰是權威、索引壞了從哪裡重建。</li>
+  <li><strong>代價</strong>是一致性與維運成本：接受舊 1 秒，並承擔同步與重建的工作。</li>
+  <li><strong>何時重新評估</strong>讓決定可以被推翻：條件改變時，後來的人知道可以改回 A，不必從頭爭論。</li>
+</ul>
+<p>回到週會。你給主管的回覆，就是把這課走過的步驟寫出來：六種資料各自的存取模式與能不能丟；訂單留在 PostgreSQL，因為它是要交易與外鍵的記錄系統；購物車放 Redis，並寫明重啟會清空、產品同意；收據 PDF 放物件儲存；活動內容用 JSONB、報表先調校查詢，附上估算；只有菜單搜尋加 Elasticsearch，附上這份 ADR。練習會讓你把這些判斷親手寫成程式。</p>
+
+<h2>補充與查表</h2>
+<p>主線用不到、但之後查資料或評估新需求時會用到的細節。</p>
+
+<h3>向量相似度搜尋：pgvector</h3>
+<p>向量相似度搜尋是把文字轉成一串數字（向量），再找意思最接近的商品，例如顧客打「不苦的咖啡」也能找到描述裡沒有這幾個字的商品。PostgreSQL 的做法是 pgvector 擴充，這門課只提到，不實作。它撐不住的時候，是向量數量與查詢量大到單機記憶體放不下索引。</p>
+
+<h3>這課提到、後面才細講的名詞</h3>
+<p>查表用，不用背。</p>
+<div class="table-wrap"><table>
+  <tr><th>名詞</th><th>這課的意思</th><th>哪一課細講</th></tr>
+  <tr><td>OLTP／OLAP</td><td>大量小而短的讀寫／少量但每次掃大量資料的統計</td><td>第 13 課</td></tr>
+  <tr><td>持久化</td><td>把 Redis 記憶體裡的資料寫到磁碟，重啟後還在</td><td>第 6 課</td></tr>
+  <tr><td>限流計數</td><td>限制每人每分鐘能呼叫幾次 API 的計數器</td><td>第 3 課</td></tr>
+  <tr><td>replica set</td><td>MongoDB 多台互相複製的部署方式，一次改多份文件的交易要靠它</td><td>第 9 課</td></tr>
+  <tr><td>寫入後約 1 秒才搜得到</td><td>Elasticsearch 的預設行為，菜單搜尋可以接受舊 1 秒的原因</td><td>第 10 課</td></tr>
+  <tr><td>outbox、重建索引</td><td>讓搜尋索引跟 PostgreSQL 保持一致、壞了能整份重建</td><td>第 11 課</td></tr>
+</table></div>
+
+<h2>練習</h2>
+<p>三題都在瀏覽器裡寫 TypeScript。第 1 題把這課的判斷寫成規則，第 2 題做估算，第 3 題替咖啡店做完整的選型。</p>
+
+<div class="exercise">
+  <p>練習 1：團隊把選型規則整理成下表。實作 <code>classifyAccess(need)</code>，<strong>由上往下</strong>檢查，第一條符合的規則決定答案：</p>
+  <div class="table-wrap"><table>
+    <tr><th>順序</th><th>條件</th><th>回傳</th></tr>
+    <tr><td>1</td><td>單筆大小 <code>sizeBytes</code> 超過 <code>FILE_BYTES</code>（102,400）</td><td><code>'object-storage'</code></td></tr>
+    <tr><td>2</td><td><code>durability</code> 是 <code>'must-not-lose'</code>（記錄系統）</td><td><code>'postgres'</code></td></tr>
+    <tr><td>3</td><td><code>lookup</code> 是 <code>'full-text'</code></td><td><code>'search'</code></td></tr>
+    <tr><td>4</td><td><code>lookup</code> 是 <code>'scan-aggregate'</code>，而且總筆數 <code>rows</code> 超過 <code>OLAP_ROWS</code>（5,000 萬）</td><td><code>'olap'</code></td></tr>
+    <tr><td>5</td><td><code>lookup</code> 是 <code>'by-key'</code>，而且每秒讀寫合計 <code>reads + writes</code> 超過 <code>HOT_OPS</code>（1,000）</td><td><code>'redis'</code></td></tr>
+    <tr><td>6</td><td>其他</td><td><code>'postgres'</code></td></tr>
+  </table></div>
+  <p>「超過」不含等於。<code>name</code> 只是說明用，不能拿來判斷；測試會用沒看過的名稱和數字。</p>
+  <script type="start">
+type Lookup = 'by-key' | 'by-range' | 'full-text' | 'scan-aggregate'
+type Durability = 'must-not-lose' | 'can-rebuild' | 'can-lose'
+type Store = 'postgres' | 'redis' | 'search' | 'object-storage' | 'olap'
+type Need = {
+  name: string
+  lookup: Lookup
+  durability: Durability
+  reads: number      // 每秒讀幾次
+  writes: number     // 每秒寫幾次
+  rows: number       // 總筆數
+  sizeBytes: number  // 單筆大小
+}
+
+const FILE_BYTES = 102_400
+const OLAP_ROWS = 50_000_000
+const HOT_OPS = 1_000
+
+function classifyAccess(need: Need): Store {
+  // 寫在這裡
+  return 'postgres'
+}
+
+console.log(classifyAccess({ name: '購物車', lookup: 'by-key', durability: 'can-lose', reads: 900, writes: 300, rows: 20_000, sizeBytes: 400 }))
+console.log(classifyAccess({ name: '收據 PDF', lookup: 'by-key', durability: 'must-not-lose', reads: 5, writes: 1, rows: 2_000_000, sizeBytes: 150_000 }))
+</script>
+  <script type="answer">
+type Lookup = 'by-key' | 'by-range' | 'full-text' | 'scan-aggregate'
+type Durability = 'must-not-lose' | 'can-rebuild' | 'can-lose'
+type Store = 'postgres' | 'redis' | 'search' | 'object-storage' | 'olap'
+type Need = {
+  name: string
+  lookup: Lookup
+  durability: Durability
+  reads: number      // 每秒讀幾次
+  writes: number     // 每秒寫幾次
+  rows: number       // 總筆數
+  sizeBytes: number  // 單筆大小
+}
+
+const FILE_BYTES = 102_400
+const OLAP_ROWS = 50_000_000
+const HOT_OPS = 1_000
+
+function classifyAccess(need: Need): Store {
+  if (need.sizeBytes > FILE_BYTES) return 'object-storage'
+  if (need.durability === 'must-not-lose') return 'postgres'
+  if (need.lookup === 'full-text') return 'search'
+  if (need.lookup === 'scan-aggregate' && need.rows > OLAP_ROWS) return 'olap'
+  if (need.lookup === 'by-key' && need.reads + need.writes > HOT_OPS) return 'redis'
+  return 'postgres'
+}
+
+console.log(classifyAccess({ name: '購物車', lookup: 'by-key', durability: 'can-lose', reads: 900, writes: 300, rows: 20_000, sizeBytes: 400 }))
+console.log(classifyAccess({ name: '收據 PDF', lookup: 'by-key', durability: 'must-not-lose', reads: 5, writes: 1, rows: 2_000_000, sizeBytes: 150_000 }))
+</script>
+  <script type="tests">
+const base: Need = { name: '', lookup: 'by-range', durability: 'can-rebuild', reads: 10, writes: 1, rows: 1_000, sizeBytes: 500 }
+const cases: [Partial<Need>, Store, string][] = [
+  [{ name: '會員訂單明細', lookup: 'by-range', durability: 'must-not-lose', reads: 50, writes: 5, rows: 5_000_000, sizeBytes: 300 }, 'postgres', '必須不丟、依範圍查的資料放 postgres'],
+  [{ name: '登入 session', lookup: 'by-key', durability: 'can-lose', reads: 3_000, writes: 500, sizeBytes: 500 }, 'redis', '可以丟、依 key 存取、每秒 3,500 次的資料放 redis'],
+  [{ name: '會員點數', lookup: 'by-key', durability: 'must-not-lose', reads: 5_000, writes: 2_000, sizeBytes: 200 }, 'postgres', '會員點數必須不丟：即使依 key 存取、流量很大，記錄系統仍是 postgres（規則 2 在規則 5 之前）'],
+  [{ name: '商品搜尋索引', lookup: 'full-text', durability: 'can-rebuild', reads: 80, sizeBytes: 2_000 }, 'search', '可以重建的全文搜尋放 search'],
+  [{ name: '客訴紀錄', lookup: 'full-text', durability: 'must-not-lose', reads: 2, sizeBytes: 3_000 }, 'postgres', '必須不丟的資料即使要全文搜尋，記錄系統也是 postgres'],
+  [{ name: '發票掃描檔', lookup: 'by-key', durability: 'must-not-lose', reads: 3, writes: 1, sizeBytes: 180_000 }, 'object-storage', '單筆 180,000 bytes 的檔案放 object-storage（規則 1 在規則 2 之前）'],
+  [{ name: '小圖示', lookup: 'by-key', durability: 'can-lose', reads: 10, sizeBytes: 102_400 }, 'postgres', 'sizeBytes 剛好 102,400 不算「超過」，不是 object-storage'],
+  [{ name: '小圖示 2', lookup: 'by-key', durability: 'can-lose', reads: 10, sizeBytes: 102_401 }, 'object-storage', 'sizeBytes 102,401 超過門檻，要回傳 object-storage'],
+  [{ name: '年度統計', lookup: 'scan-aggregate', durability: 'can-rebuild', rows: 50_000_000 }, 'postgres', 'rows 剛好 5,000 萬不算「超過」，留在 postgres'],
+  [{ name: '年度統計 2', lookup: 'scan-aggregate', durability: 'can-rebuild', rows: 50_000_001 }, 'olap', 'rows 超過 5,000 萬的統計查詢放 olap'],
+  [{ name: '帳務總表', lookup: 'scan-aggregate', durability: 'must-not-lose', rows: 200_000_000 }, 'postgres', '必須不丟的資料記錄系統是 postgres，即使要掃描統計'],
+  [{ name: '庫存快照', lookup: 'by-key', durability: 'can-rebuild', reads: 600, writes: 400 }, 'postgres', 'reads + writes 剛好 1,000 不算「超過」，留在 postgres'],
+  [{ name: '庫存快照 2', lookup: 'by-key', durability: 'can-rebuild', reads: 600, writes: 401 }, 'redis', 'reads + writes 是 1,001，超過 1,000 要回傳 redis'],
+  [{ name: '計數器', lookup: 'by-key', durability: 'can-rebuild', reads: 0, writes: 1_001 }, 'redis', '要用讀寫合計：reads 0、writes 1,001 也超過門檻'],
+  [{ name: '熱門讀取', lookup: 'by-key', durability: 'can-lose', reads: 1_001, writes: 0 }, 'redis', '要用讀寫合計：reads 1,001、writes 0 也超過門檻'],
+  [{ name: '最近活動', lookup: 'by-range', durability: 'can-lose', reads: 9_000, writes: 100 }, 'postgres', '規則 5 只看 by-key；依範圍查的資料即使流量大也留在 postgres'],
+  [{ name: '活動影片', lookup: 'full-text', durability: 'can-lose', sizeBytes: 2_000_000 }, 'object-storage', '規則 1 最先檢查：超過 FILE_BYTES 一律 object-storage'],
+  [{ name: '點擊紀錄', lookup: 'by-range', durability: 'can-rebuild', rows: 80_000_000 }, 'postgres', '規則 4 要同時是 scan-aggregate：依範圍查的大表即使超過 5,000 萬列也留在 postgres'],
+]
+for (const [patch, expected, msg] of cases) {
+  const need: Need = { ...base, ...patch }
+  assert.equal(classifyAccess(need), expected, `${msg}（${need.name}）`)
+}
+const renamed: Need = { ...base, name: '購物車', lookup: 'by-range', durability: 'must-not-lose' }
+assert.equal(classifyAccess(renamed), 'postgres', '不能依 name 判斷：名稱叫「購物車」但必須不丟、依範圍查，答案是 postgres')
+</script>
+  <script type="wrong">
+type Lookup = 'by-key' | 'by-range' | 'full-text' | 'scan-aggregate'
+type Durability = 'must-not-lose' | 'can-rebuild' | 'can-lose'
+type Store = 'postgres' | 'redis' | 'search' | 'object-storage' | 'olap'
+type Need = { name: string; lookup: Lookup; durability: Durability; reads: number; writes: number; rows: number; sizeBytes: number }
+function classifyAccess(need: Need): Store {
+  return 'postgres'
+}
+</script>
+  <script type="wrong">
+type Lookup = 'by-key' | 'by-range' | 'full-text' | 'scan-aggregate'
+type Durability = 'must-not-lose' | 'can-rebuild' | 'can-lose'
+type Store = 'postgres' | 'redis' | 'search' | 'object-storage' | 'olap'
+type Need = { name: string; lookup: Lookup; durability: Durability; reads: number; writes: number; rows: number; sizeBytes: number }
+function classifyAccess(need: Need): Store {
+  if (need.sizeBytes > 102_400) return 'object-storage'
+  if (need.lookup === 'full-text') return 'search'
+  if (need.lookup === 'scan-aggregate' && need.rows > 50_000_000) return 'olap'
+  if (need.lookup === 'by-key' && need.reads + need.writes > 1_000) return 'redis'
+  return 'postgres'
+}
+</script>
+  <script type="wrong">
+type Lookup = 'by-key' | 'by-range' | 'full-text' | 'scan-aggregate'
+type Durability = 'must-not-lose' | 'can-rebuild' | 'can-lose'
+type Store = 'postgres' | 'redis' | 'search' | 'object-storage' | 'olap'
+type Need = { name: string; lookup: Lookup; durability: Durability; reads: number; writes: number; rows: number; sizeBytes: number }
+function classifyAccess(need: Need): Store {
+  if (need.sizeBytes >= 102_400) return 'object-storage'
+  if (need.durability === 'must-not-lose') return 'postgres'
+  if (need.lookup === 'full-text') return 'search'
+  if (need.lookup === 'scan-aggregate' && need.rows >= 50_000_000) return 'olap'
+  if (need.lookup === 'by-key' && need.reads + need.writes >= 1_000) return 'redis'
+  return 'postgres'
+}
+</script>
+  <script type="wrong">
+type Lookup = 'by-key' | 'by-range' | 'full-text' | 'scan-aggregate'
+type Durability = 'must-not-lose' | 'can-rebuild' | 'can-lose'
+type Store = 'postgres' | 'redis' | 'search' | 'object-storage' | 'olap'
+type Need = { name: string; lookup: Lookup; durability: Durability; reads: number; writes: number; rows: number; sizeBytes: number }
+function classifyAccess(need: Need): Store {
+  if (need.durability === 'must-not-lose') return 'postgres'
+  if (need.sizeBytes > 102_400) return 'object-storage'
+  if (need.lookup === 'full-text') return 'search'
+  if (need.lookup === 'scan-aggregate' && need.rows > 50_000_000) return 'olap'
+  if (need.lookup === 'by-key' && need.reads + need.writes > 1_000) return 'redis'
+  return 'postgres'
+}
+</script>
+  <script type="wrong">
+type Lookup = 'by-key' | 'by-range' | 'full-text' | 'scan-aggregate'
+type Durability = 'must-not-lose' | 'can-rebuild' | 'can-lose'
+type Store = 'postgres' | 'redis' | 'search' | 'object-storage' | 'olap'
+type Need = { name: string; lookup: Lookup; durability: Durability; reads: number; writes: number; rows: number; sizeBytes: number }
+function classifyAccess(need: Need): Store {
+  if (need.sizeBytes > 102_400) return 'object-storage'
+  if (need.durability === 'must-not-lose') return 'postgres'
+  if (need.lookup === 'full-text') return 'search'
+  if (need.lookup === 'scan-aggregate' && need.rows > 50_000_000) return 'olap'
+  if (need.lookup === 'by-key' && need.reads > 1_000) return 'redis'
+  return 'postgres'
+}
+</script>
+  <script type="wrong">
+type Lookup = 'by-key' | 'by-range' | 'full-text' | 'scan-aggregate'
+type Durability = 'must-not-lose' | 'can-rebuild' | 'can-lose'
+type Store = 'postgres' | 'redis' | 'search' | 'object-storage' | 'olap'
+type Need = { name: string; lookup: Lookup; durability: Durability; reads: number; writes: number; rows: number; sizeBytes: number }
+function classifyAccess(need: Need): Store {
+  if (need.sizeBytes > 102_400) return 'object-storage'
+  if (need.durability === 'must-not-lose') return 'postgres'
+  if (need.lookup === 'full-text') return 'search'
+  if (need.rows > 50_000_000) return 'olap'
+  if (need.lookup === 'by-key' && need.reads + need.writes > 1_000) return 'redis'
+  return 'postgres'
+}
+</script>
+  <script type="wrong">
+type Lookup = 'by-key' | 'by-range' | 'full-text' | 'scan-aggregate'
+type Durability = 'must-not-lose' | 'can-rebuild' | 'can-lose'
+type Store = 'postgres' | 'redis' | 'search' | 'object-storage' | 'olap'
+type Need = { name: string; lookup: Lookup; durability: Durability; reads: number; writes: number; rows: number; sizeBytes: number }
+const known: Record<string, Store> = { '購物車': 'redis', '收據 PDF': 'object-storage', '菜單搜尋': 'search', '營運報表': 'olap', '訂單': 'postgres' }
+function classifyAccess(need: Need): Store {
+  return known[need.name] ?? 'postgres'
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：把上面「用數字判斷」的估算寫成函式。<code>estimate(load)</code> 回傳：</p>
+  <ul>
+    <li><code>rowsPerDay</code>：每天新增的 order_items 列數 = 每日訂單 × 平均品項數，<strong>無條件進位</strong>成整數</li>
+    <li><code>rowsTotal</code>：<code>rowsPerDay</code> × 保留天數</li>
+    <li><code>bytesTotal</code>：<code>rowsTotal</code> × 每列 bytes，單位是 <strong>bytes</strong></li>
+    <li><code>writesPerSecPeak</code>：<code>rowsPerDay</code> ÷ 86,400 × 尖峰係數，無條件進位</li>
+  </ul>
+  <p>再寫 <code>needsSeparateOlap(est)</code>：<code>rowsTotal</code> 超過 5,000 萬，<strong>或</strong> <code>bytesTotal</code> 超過 50,000,000,000（50 GB）時回傳 <code>true</code>，否則 <code>false</code>。「超過」不含等於。</p>
+  <script type="start">
+type Load = {
+  ordersPerDay: number
+  itemsPerOrder: number
+  bytesPerRow: number
+  retentionDays: number  // 單位是天
+  peakFactor: number
+}
+type Estimate = { rowsPerDay: number; rowsTotal: number; bytesTotal: number; writesPerSecPeak: number }
+
+function estimate(load: Load): Estimate {
+  // 寫在這裡
+  return { rowsPerDay: 0, rowsTotal: 0, bytesTotal: 0, writesPerSecPeak: 0 }
+}
+
+function needsSeparateOlap(est: Estimate): boolean {
+  // 寫在這裡
+  return false
+}
+
+const cafe = estimate({ ordersPerDay: 2_000, itemsPerOrder: 2.3, bytesPerRow: 200, retentionDays: 3 * 365, peakFactor: 6 })
+console.log(cafe, needsSeparateOlap(cafe))
+</script>
+  <script type="answer">
+type Load = {
+  ordersPerDay: number
+  itemsPerOrder: number
+  bytesPerRow: number
+  retentionDays: number  // 單位是天
+  peakFactor: number
+}
+type Estimate = { rowsPerDay: number; rowsTotal: number; bytesTotal: number; writesPerSecPeak: number }
+
+function estimate(load: Load): Estimate {
+  const rowsPerDay = Math.ceil(load.ordersPerDay * load.itemsPerOrder)
+  const rowsTotal = rowsPerDay * load.retentionDays
+  return {
+    rowsPerDay,
+    rowsTotal,
+    bytesTotal: rowsTotal * load.bytesPerRow,
+    writesPerSecPeak: Math.ceil(rowsPerDay / 86_400 * load.peakFactor),
+  }
+}
+
+function needsSeparateOlap(est: Estimate): boolean {
+  return est.rowsTotal > 50_000_000 || est.bytesTotal > 50_000_000_000
+}
+
+const cafe = estimate({ ordersPerDay: 2_000, itemsPerOrder: 2.3, bytesPerRow: 200, retentionDays: 3 * 365, peakFactor: 6 })
+console.log(cafe, needsSeparateOlap(cafe))
+</script>
+  <script type="tests">
+assert.deepEqual(estimate({ ordersPerDay: 2_000, itemsPerOrder: 2.3, bytesPerRow: 200, retentionDays: 1_095, peakFactor: 6 }),
+  { rowsPerDay: 4_600, rowsTotal: 5_037_000, bytesTotal: 1_007_400_000, writesPerSecPeak: 1 }, '咖啡店三年：每天 4,600 列、共 5,037,000 列、1,007,400,000 bytes、尖峰每秒 1 列')
+const a = estimate({ ordersPerDay: 1_234, itemsPerOrder: 2.3, bytesPerRow: 180, retentionDays: 730, peakFactor: 5 })
+assert.equal(a.rowsPerDay, 2_839, '1,234 × 2.3 = 2,838.2，要無條件進位成 2,839（不是四捨五入）')
+assert.equal(a.rowsTotal, 2_072_470, 'rowsTotal = rowsPerDay × retentionDays（天數，不是月數）')
+assert.equal(a.bytesTotal, 373_044_600, 'bytesTotal 的單位是 bytes：rowsTotal × bytesPerRow，不要換算成 KB')
+assert.equal(a.writesPerSecPeak, 1, '2,839 ÷ 86,400 × 5 ≈ 0.16，無條件進位是 1')
+const b = estimate({ ordersPerDay: 60_000, itemsPerOrder: 2.5, bytesPerRow: 200, retentionDays: 1_825, peakFactor: 4.8 })
+assert.equal(b.writesPerSecPeak, 9, '150,000 ÷ 86,400 × 4.8 ≈ 8.33，要乘尖峰係數並無條件進位成 9')
+assert.equal(b.bytesTotal, 54_750_000_000, '每天 6 萬筆訂單保留 5 年是 54,750,000,000 bytes')
+assert.equal(needsSeparateOlap(b), true, '2.7 億列、54.75 GB 要考慮分析型資料庫')
+assert.equal(needsSeparateOlap(a), false, '200 萬列、373 MB 留在 PostgreSQL')
+const rowsEdge = estimate({ ordersPerDay: 20_000, itemsPerOrder: 2.5, bytesPerRow: 100, retentionDays: 1_000, peakFactor: 3 })
+assert.equal(rowsEdge.rowsTotal, 50_000_000, '每天 50,000 列 × 1,000 天 = 5,000 萬列')
+assert.equal(needsSeparateOlap(rowsEdge), false, 'rowsTotal 剛好 5,000 萬不算「超過」')
+assert.equal(needsSeparateOlap(estimate({ ordersPerDay: 20_000, itemsPerOrder: 2.5, bytesPerRow: 100, retentionDays: 1_001, peakFactor: 3 })), true, 'rowsTotal 超過 5,000 萬要回傳 true')
+const bytesEdge = estimate({ ordersPerDay: 4_000, itemsPerOrder: 2.5, bytesPerRow: 5_000, retentionDays: 1_000, peakFactor: 3 })
+assert.equal(bytesEdge.bytesTotal, 50_000_000_000, '1,000 萬列 × 5,000 bytes = 50,000,000,000 bytes')
+assert.equal(needsSeparateOlap(bytesEdge), false, 'bytesTotal 剛好 50 GB 不算「超過」')
+assert.equal(needsSeparateOlap(estimate({ ordersPerDay: 4_000, itemsPerOrder: 2.5, bytesPerRow: 5_001, retentionDays: 1_000, peakFactor: 3 })), true, '列數不到 5,000 萬，但 bytesTotal 超過 50 GB 也要回傳 true')
+assert.equal(needsSeparateOlap({ rowsPerDay: 1, rowsTotal: 50_000_001, bytesTotal: 1, writesPerSecPeak: 1 }), true, '只有 rowsTotal 超過也要回傳 true')
+const c = estimate({ ordersPerDay: 3_333, itemsPerOrder: 1.7, bytesPerRow: 250, retentionDays: 400, peakFactor: 7 })
+assert.deepEqual(c, { rowsPerDay: 5_667, rowsTotal: 2_266_800, bytesTotal: 566_700_000, writesPerSecPeak: 1 }, '3,333 筆 × 1.7 = 5,666.1，進位成 5,667')
+</script>
+  <script type="wrong">
+type Load = { ordersPerDay: number; itemsPerOrder: number; bytesPerRow: number; retentionDays: number; peakFactor: number }
+type Estimate = { rowsPerDay: number; rowsTotal: number; bytesTotal: number; writesPerSecPeak: number }
+function estimate(load: Load): Estimate {
+  const rowsPerDay = Math.ceil(load.ordersPerDay * load.itemsPerOrder)
+  const rowsTotal = rowsPerDay * load.retentionDays * 30
+  return { rowsPerDay, rowsTotal, bytesTotal: rowsTotal * load.bytesPerRow, writesPerSecPeak: Math.ceil(rowsPerDay / 86_400 * load.peakFactor) }
+}
+function needsSeparateOlap(est: Estimate): boolean {
+  return est.rowsTotal > 50_000_000 || est.bytesTotal > 50_000_000_000
+}
+</script>
+  <script type="wrong">
+type Load = { ordersPerDay: number; itemsPerOrder: number; bytesPerRow: number; retentionDays: number; peakFactor: number }
+type Estimate = { rowsPerDay: number; rowsTotal: number; bytesTotal: number; writesPerSecPeak: number }
+function estimate(load: Load): Estimate {
+  const rowsPerDay = Math.ceil(load.ordersPerDay * load.itemsPerOrder)
+  const rowsTotal = rowsPerDay * load.retentionDays
+  return { rowsPerDay, rowsTotal, bytesTotal: rowsTotal * load.bytesPerRow, writesPerSecPeak: Math.ceil(rowsPerDay / 86_400) }
+}
+function needsSeparateOlap(est: Estimate): boolean {
+  return est.rowsTotal > 50_000_000 || est.bytesTotal > 50_000_000_000
+}
+</script>
+  <script type="wrong">
+type Load = { ordersPerDay: number; itemsPerOrder: number; bytesPerRow: number; retentionDays: number; peakFactor: number }
+type Estimate = { rowsPerDay: number; rowsTotal: number; bytesTotal: number; writesPerSecPeak: number }
+function estimate(load: Load): Estimate {
+  const rowsPerDay = Math.round(load.ordersPerDay * load.itemsPerOrder)
+  const rowsTotal = rowsPerDay * load.retentionDays
+  return { rowsPerDay, rowsTotal, bytesTotal: rowsTotal * load.bytesPerRow, writesPerSecPeak: Math.round(rowsPerDay / 86_400 * load.peakFactor) }
+}
+function needsSeparateOlap(est: Estimate): boolean {
+  return est.rowsTotal > 50_000_000 || est.bytesTotal > 50_000_000_000
+}
+</script>
+  <script type="wrong">
+type Load = { ordersPerDay: number; itemsPerOrder: number; bytesPerRow: number; retentionDays: number; peakFactor: number }
+type Estimate = { rowsPerDay: number; rowsTotal: number; bytesTotal: number; writesPerSecPeak: number }
+function estimate(load: Load): Estimate {
+  const rowsPerDay = Math.ceil(load.ordersPerDay * load.itemsPerOrder)
+  const rowsTotal = rowsPerDay * load.retentionDays
+  return { rowsPerDay, rowsTotal, bytesTotal: rowsTotal * load.bytesPerRow / 1024, writesPerSecPeak: Math.ceil(rowsPerDay / 86_400 * load.peakFactor) }
+}
+function needsSeparateOlap(est: Estimate): boolean {
+  return est.rowsTotal > 50_000_000 || est.bytesTotal > 50_000_000_000
+}
+</script>
+  <script type="wrong">
+type Load = { ordersPerDay: number; itemsPerOrder: number; bytesPerRow: number; retentionDays: number; peakFactor: number }
+type Estimate = { rowsPerDay: number; rowsTotal: number; bytesTotal: number; writesPerSecPeak: number }
+function estimate(load: Load): Estimate {
+  const rowsPerDay = Math.ceil(load.ordersPerDay * load.itemsPerOrder)
+  const rowsTotal = rowsPerDay * load.retentionDays
+  return { rowsPerDay, rowsTotal, bytesTotal: rowsTotal * load.bytesPerRow, writesPerSecPeak: Math.ceil(rowsPerDay / 86_400 * load.peakFactor) }
+}
+function needsSeparateOlap(est: Estimate): boolean {
+  return est.rowsTotal > 50_000_000
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：替咖啡店的六種資料各寫一筆決定，填進 <code>decisions</code>。每一筆寫出放在哪個儲存（<code>store</code>）、是不是記錄系統（<code>systemOfRecord</code>）、一句理由（<code>why</code>，至少 5 個字）。衍生資料或可接受遺失的資料（<code>systemOfRecord: false</code>）一定要寫 <code>rebuildFrom</code>：從哪裡重建（例如 <code>'postgres'</code>），沒有來源、丟了就沒了的寫 <code>'none'</code>；記錄系統不寫 <code>rebuildFrom</code>。照這課的原則判斷，有些資料不只一個合理答案，測試會接受。</p>
+  <script type="start">
+type DataKind = 'orders' | 'cart' | 'menu-search' | 'receipt-files' | 'sales-report' | 'store-pages'
+type Store = 'postgres' | 'redis' | 'mongo' | 'search' | 'object-storage' | 'olap'
+type Decision = {
+  data: DataKind
+  store: Store
+  systemOfRecord: boolean
+  rebuildFrom?: string
+  why: string
+}
+
+const decisions: Decision[] = [
+  // 寫在這裡：六種資料各一筆，例如
+  // { data: 'orders', store: '…', systemOfRecord: …, why: '…' },
+]
+
+console.log(decisions.map(d => `${d.data} → ${d.store}`).join('\n'))
+</script>
+  <script type="answer">
+type DataKind = 'orders' | 'cart' | 'menu-search' | 'receipt-files' | 'sales-report' | 'store-pages'
+type Store = 'postgres' | 'redis' | 'mongo' | 'search' | 'object-storage' | 'olap'
+type Decision = {
+  data: DataKind
+  store: Store
+  systemOfRecord: boolean
+  rebuildFrom?: string
+  why: string
+}
+
+const decisions: Decision[] = [
+  { data: 'orders', store: 'postgres', systemOfRecord: true, why: '金額要正確不能丟，需要交易與外鍵' },
+  { data: 'cart', store: 'redis', systemOfRecord: false, rebuildFrom: 'none', why: '依顧客 id 頻繁讀寫，可以接受遺失並自動過期' },
+  { data: 'menu-search', store: 'search', systemOfRecord: false, rebuildFrom: 'postgres', why: '需要中文斷詞與相關性排序，索引可從 products 重建' },
+  { data: 'receipt-files', store: 'object-storage', systemOfRecord: true, why: 'PDF 整個檔案讀寫，放資料庫會讓備份變大' },
+  { data: 'sales-report', store: 'postgres', systemOfRecord: false, rebuildFrom: 'postgres', why: '目前量小，用物化檢視即可，隨時能從訂單重算' },
+  { data: 'store-pages', store: 'postgres', systemOfRecord: true, why: '區塊結構不固定，用 JSONB 欄位就夠，不必多維運一套 MongoDB' },
+]
+
+console.log(decisions.map(d => `${d.data} → ${d.store}`).join('\n'))
+</script>
+  <script type="tests">
+const kinds: DataKind[] = ['orders', 'cart', 'menu-search', 'receipt-files', 'sales-report', 'store-pages']
+for (const k of kinds) {
+  const n = decisions.filter(d => d.data === k).length
+  assert(n === 1, `${k} 要恰好出現一次，目前 ${n} 次`)
+}
+assert.equal(decisions.length, 6, '只寫這六種資料，每種一筆')
+const get = (k: DataKind) => decisions.find(d => d.data === k)!
+for (const d of decisions) {
+  assert(typeof d.why === 'string' && d.why.trim().length >= 5, `${d.data} 要寫一句理由（why 至少 5 個字）`)
+  if (d.systemOfRecord) assert.equal(d.rebuildFrom, undefined, `${d.data} 是記錄系統，它就是來源，不寫 rebuildFrom`)
+  else assert(typeof d.rebuildFrom === 'string' && d.rebuildFrom.trim() !== '', `${d.data} 不是記錄系統，要寫 rebuildFrom（沒有來源時寫 'none'）`)
+}
+const orders = get('orders')
+assert.equal(orders.store, 'postgres', '訂單要正確、不能丟、要跟顧客與商品對得起來，放 postgres')
+assert.equal(orders.systemOfRecord, true, '訂單的記錄系統就是 postgres')
+const cart = get('cart')
+assert.equal(cart.store, 'redis', '購物車依顧客 id 頻繁讀寫、可以過期，放 redis')
+assert.equal(cart.systemOfRecord, false, '只在 redis 的購物車不是記錄系統：這間店接受它在 Redis 重啟時遺失')
+assert.equal(cart.rebuildFrom, 'none', '購物車只存在 redis，沒有別的來源可以重建，rebuildFrom 要明寫 \'none\'')
+const search = get('menu-search')
+assert.equal(search.store, 'search', '菜單搜尋放 search')
+assert.equal(search.systemOfRecord, false, '搜尋索引是衍生資料，不是記錄系統')
+assert.equal(search.rebuildFrom, 'postgres', '搜尋索引要能從 postgres 的商品資料重建')
+const receipts = get('receipt-files')
+assert.equal(receipts.store, 'object-storage', 'PDF 檔案整個讀寫，放 object-storage')
+const report = get('sales-report')
+assert(report.store === 'postgres' || report.store === 'olap', '營運報表留在 postgres（量小時）或放 olap（量大時）')
+assert.equal(report.systemOfRecord, false, '報表是從訂單算出來的衍生資料')
+assert.equal(report.rebuildFrom, 'postgres', '報表要能從 postgres 的訂單重算')
+const pages = get('store-pages')
+assert(pages.store === 'postgres' || pages.store === 'mongo', '門市活動內容放 postgres（JSONB）或 mongo 都合理')
+assert.equal(pages.systemOfRecord, true, '活動內容只有這一份，它就是記錄系統')
+</script>
+  <script type="wrong">
+type DataKind = 'orders' | 'cart' | 'menu-search' | 'receipt-files' | 'sales-report' | 'store-pages'
+type Store = 'postgres' | 'redis' | 'mongo' | 'search' | 'object-storage' | 'olap'
+type Decision = { data: DataKind; store: Store; systemOfRecord: boolean; rebuildFrom?: string; why: string }
+const decisions: Decision[] = [
+  { data: 'orders', store: 'postgres', systemOfRecord: true, why: '金額要正確不能丟' },
+  { data: 'cart', store: 'redis', systemOfRecord: false, rebuildFrom: 'none', why: '頻繁讀寫可過期的資料' },
+  { data: 'menu-search', store: 'search', systemOfRecord: true, why: '搜尋引擎就是商品的來源' },
+  { data: 'receipt-files', store: 'object-storage', systemOfRecord: true, why: '整個檔案讀寫的資料' },
+  { data: 'sales-report', store: 'olap', systemOfRecord: false, rebuildFrom: 'postgres', why: '掃描大量資料做統計' },
+  { data: 'store-pages', store: 'mongo', systemOfRecord: true, why: '文件結構不固定的內容' },
+]
+</script>
+  <script type="wrong">
+type DataKind = 'orders' | 'cart' | 'menu-search' | 'receipt-files' | 'sales-report' | 'store-pages'
+type Store = 'postgres' | 'redis' | 'mongo' | 'search' | 'object-storage' | 'olap'
+type Decision = { data: DataKind; store: Store; systemOfRecord: boolean; rebuildFrom?: string; why: string }
+const decisions: Decision[] = [
+  { data: 'orders', store: 'mongo', systemOfRecord: true, why: '沒有 schema 改需求比較快' },
+  { data: 'cart', store: 'redis', systemOfRecord: false, rebuildFrom: 'none', why: '頻繁讀寫可過期的資料' },
+  { data: 'menu-search', store: 'search', systemOfRecord: false, rebuildFrom: 'postgres', why: '需要相關性排序的搜尋' },
+  { data: 'receipt-files', store: 'object-storage', systemOfRecord: true, why: '整個檔案讀寫的資料' },
+  { data: 'sales-report', store: 'olap', systemOfRecord: false, rebuildFrom: 'postgres', why: '掃描大量資料做統計' },
+  { data: 'store-pages', store: 'mongo', systemOfRecord: true, why: '文件結構不固定的內容' },
+]
+</script>
+  <script type="wrong">
+type DataKind = 'orders' | 'cart' | 'menu-search' | 'receipt-files' | 'sales-report' | 'store-pages'
+type Store = 'postgres' | 'redis' | 'mongo' | 'search' | 'object-storage' | 'olap'
+type Decision = { data: DataKind; store: Store; systemOfRecord: boolean; rebuildFrom?: string; why: string }
+const decisions: Decision[] = [
+  { data: 'orders', store: 'redis', systemOfRecord: true, why: '記憶體讀寫速度最快' },
+  { data: 'cart', store: 'redis', systemOfRecord: false, rebuildFrom: 'none', why: '頻繁讀寫可過期的資料' },
+  { data: 'menu-search', store: 'search', systemOfRecord: false, rebuildFrom: 'postgres', why: '需要相關性排序的搜尋' },
+  { data: 'receipt-files', store: 'object-storage', systemOfRecord: true, why: '整個檔案讀寫的資料' },
+  { data: 'sales-report', store: 'olap', systemOfRecord: false, rebuildFrom: 'postgres', why: '掃描大量資料做統計' },
+  { data: 'store-pages', store: 'mongo', systemOfRecord: true, why: '文件結構不固定的內容' },
+]
+</script>
+  <script type="wrong">
+type DataKind = 'orders' | 'cart' | 'menu-search' | 'receipt-files' | 'sales-report' | 'store-pages'
+type Store = 'postgres' | 'redis' | 'mongo' | 'search' | 'object-storage' | 'olap'
+type Decision = { data: DataKind; store: Store; systemOfRecord: boolean; rebuildFrom?: string; why: string }
+const decisions: Decision[] = [
+  { data: 'orders', store: 'postgres', systemOfRecord: true, why: '金額要正確不能丟' },
+  { data: 'cart', store: 'redis', systemOfRecord: false, rebuildFrom: 'none', why: '頻繁讀寫可過期的資料' },
+  { data: 'menu-search', store: 'search', systemOfRecord: false, rebuildFrom: 'postgres', why: '需要相關性排序的搜尋' },
+  { data: 'receipt-files', store: 'object-storage', systemOfRecord: true, why: '整個檔案讀寫的資料' },
+  { data: 'store-pages', store: 'mongo', systemOfRecord: true, why: '文件結構不固定的內容' },
+]
+</script>
+  <script type="wrong">
+type DataKind = 'orders' | 'cart' | 'menu-search' | 'receipt-files' | 'sales-report' | 'store-pages'
+type Store = 'postgres' | 'redis' | 'mongo' | 'search' | 'object-storage' | 'olap'
+type Decision = { data: DataKind; store: Store; systemOfRecord: boolean; rebuildFrom?: string; why: string }
+const decisions: Decision[] = [
+  { data: 'orders', store: 'postgres', systemOfRecord: true, why: '金額要正確不能丟' },
+  { data: 'cart', store: 'redis', systemOfRecord: false, why: '頻繁讀寫可過期的資料' },
+  { data: 'menu-search', store: 'search', systemOfRecord: false, why: '需要相關性排序的搜尋' },
+  { data: 'receipt-files', store: 'object-storage', systemOfRecord: true, why: '整個檔案讀寫的資料' },
+  { data: 'sales-report', store: 'olap', systemOfRecord: false, why: '掃描大量資料做統計' },
+  { data: 'store-pages', store: 'mongo', systemOfRecord: true, why: '文件結構不固定的內容' },
+]
+</script>
+  <script type="wrong">
+type DataKind = 'orders' | 'cart' | 'menu-search' | 'receipt-files' | 'sales-report' | 'store-pages'
+type Store = 'postgres' | 'redis' | 'mongo' | 'search' | 'object-storage' | 'olap'
+type Decision = { data: DataKind; store: Store; systemOfRecord: boolean; rebuildFrom?: string; why: string }
+const decisions: Decision[] = [
+  { data: 'orders', store: 'postgres', systemOfRecord: true, why: '金額要正確不能丟' },
+  { data: 'cart', store: 'redis', systemOfRecord: false, rebuildFrom: 'none', why: '頻繁讀寫可過期的資料' },
+  { data: 'menu-search', store: 'search', systemOfRecord: false, rebuildFrom: 'postgres', why: '需要相關性排序的搜尋' },
+  { data: 'receipt-files', store: 'object-storage', systemOfRecord: true, why: '整個檔案讀寫的資料' },
+  { data: 'sales-report', store: 'olap', systemOfRecord: false, rebuildFrom: 'postgres', why: '掃描大量資料做統計' },
+  { data: 'store-pages', store: 'mongo', systemOfRecord: true, why: '文件結構不固定的內容' },
+  { data: 'orders', store: 'mongo', systemOfRecord: true, why: '再存一份訂單比較保險' },
+]
+</script>
+  <script type="wrong">
+type DataKind = 'orders' | 'cart' | 'menu-search' | 'receipt-files' | 'sales-report' | 'store-pages'
+type Store = 'postgres' | 'redis' | 'mongo' | 'search' | 'object-storage' | 'olap'
+type Decision = { data: DataKind; store: Store; systemOfRecord: boolean; rebuildFrom?: string; why: string }
+const decisions: Decision[] = [
+  { data: 'orders', store: 'postgres', systemOfRecord: true, why: '金額要正確不能丟' },
+  { data: 'cart', store: 'redis', systemOfRecord: false, rebuildFrom: 'postgres', why: '頻繁讀寫可過期的資料' },
+  { data: 'menu-search', store: 'search', systemOfRecord: false, rebuildFrom: 'postgres', why: '需要相關性排序的搜尋' },
+  { data: 'receipt-files', store: 'object-storage', systemOfRecord: true, why: '整個檔案讀寫的資料' },
+  { data: 'sales-report', store: 'olap', systemOfRecord: false, rebuildFrom: 'postgres', why: '掃描大量資料做統計' },
+  { data: 'store-pages', store: 'mongo', systemOfRecord: true, why: '文件結構不固定的內容' },
+]
+</script>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 4：同事說「MongoDB 沒有 schema，所以改需求比較快，訂單改放 MongoDB 吧」。最需要先問哪個問題？</p>
+  <label data-key="a">MongoDB 的寫入速度是不是比 PostgreSQL 快</label>
+  <label data-key="b">訂單的存取模式與一致性需求是什麼，PostgreSQL 的 JSONB 是否已經夠用</label>
+  <label data-key="c">團隊裡有沒有人會 MongoDB</label>
+  <label data-key="d">MongoDB 是不是比較新的技術</label>
+  <p class="why">✓ b。選型先看存取模式與一致性：訂單要交易、要跟顧客與商品對得起來、不能丟。「沒有 schema」只是把 schema 搬到程式碼裡；真的有不固定的欄位，JSONB 就能存，而且保留交易與外鍵。a 的速度和 c 的熟悉度是在確認「做得到」之後才比較的次要因素；d 跟需求無關。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：Redis 重啟後，所有顧客的購物車都清空了。這算不算資料遺失事故？</p>
+  <label data-key="a">一定算，Redis 不該用來存任何東西</label>
+  <label data-key="b">要看選型時有沒有把購物車定為「可以接受遺失」並跟產品說好；這是設計時就該決定、寫下來的事</label>
+  <label data-key="c">不算，Redis 本來就是快取</label>
+  <label data-key="d">算，所以購物車要改放物件儲存</label>
+  <p class="why">✓ b。Redis 可以設定持久化，也可以不設；重點是事先決定這份資料能不能丟、丟了誰受影響，並寫進 ADR。a 太絕對，Redis 很適合放可以遺失或可以重建的資料；c 把「Redis 就是快取」當定律，會漏掉 session、限流計數這些不是快取、丟了會有影響的用途；d 的物件儲存不適合每次加減商品都要改的小資料。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 6：團隊有 3 位工程師，每天 2,000 筆訂單，店長抱怨月報表要跑 20 秒。最先做什麼？</p>
+  <label data-key="a">導入 ClickHouse，把訂單同步過去跑報表</label>
+  <label data-key="b">把訂單搬到 MongoDB，改用 aggregation pipeline</label>
+  <label data-key="c">先用 EXPLAIN 找出慢在哪，加索引或物化檢視；量測後仍不夠，再考慮分析型資料庫</label>
+  <label data-key="d">把報表改成每晚匯出 Excel 給店長</label>
+  <p class="why">✓ c。每天 2,000 筆，三年約 500 萬列，這個量級跑 20 秒幾乎一定是查詢或索引的問題。a 會多一套要備份、監控、同步、值班的系統，3 個人的團隊負擔很重，而且分析型資料庫要到數千萬、數億列的掃描才明顯有優勢；b 搬資料庫解決不了查詢寫法的問題；d 繞過問題，也讓店長看不到當天的數字。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>從資料庫的特色出發，而不是從資料怎麼被使用出發</strong>：「MongoDB 比較彈性」「量不大放哪都行」都跳過了存取模式。先寫出程式怎麼讀寫這份資料，再挑儲存。</li>
+  <li><strong>因為「大公司在用」或履歷好看而加新資料庫</strong>：大公司的規模和人力跟你不同。先用四個問題和估算證明需要，再加。</li>
+  <li><strong>沒有分清楚記錄系統與衍生資料</strong>：事故時兩份數字對不起來，沒人知道該信哪一份。每份資料都寫下記錄系統是誰、衍生資料從哪裡重建。</li>
+  <li><strong>只比較功能，不算維運成本</strong>：功能清單上都打勾，但備份、升級、監控、值班的人力沒算進去。把這些工作列出來，確認誰負責。</li>
+  <li><strong>把 Redis、MongoDB 當成 PostgreSQL 的替代品</strong>：它們是補充，各自用某些能力換另一些。訂單這種要交易、要約束的資料留在 PostgreSQL。</li>
+  <li><strong>可以遺失的資料沒有事先說好</strong>：購物車放 Redis 沒問題，但要寫下「重啟會清空」並讓產品知道，否則每次重啟都是一場爭論。</li>
+  <li><strong>估算單位或進位錯</strong>：天當成月、bytes 當成 KB、四捨五入少估、忘了乘尖峰係數，結論就差一個數量級。</li>
+  <li><strong>沒有把選型理由寫下來</strong>：一年後沒人知道為什麼有三種資料庫，也不知道什麼時候可以拿掉。寫 ADR，包含需求數字和「何時重新評估」。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>選型從資料怎麼被使用出發，不從資料庫的特色出發：先列出每份資料，寫下程式怎麼讀寫它。</li>
+  <li>替資料挑儲存時依序問四個問題：存取模式、一致性（能不能丟、能不能舊）、規模（筆數、每秒讀寫、單筆大小）、維運成本。前兩個找出做得到的儲存，規模判斷現在需不需要，維運成本判斷值不值得。</li>
+  <li>PostgreSQL 是預設答案：JSONB、全文檢索、SKIP LOCKED、分割表、物化檢視與唯讀副本已經涵蓋很多需求（向量搜尋的 pgvector 見課末）；加新儲存要有存取模式或量測上的理由。</li>
+  <li>每份資料只有一個記錄系統；快取、搜尋索引、報表、排行榜是衍生資料，要能從記錄系統重建。只存在一處又可以遺失的資料（購物車）要事先說好。</li>
+  <li>Redis 換速度、Elasticsearch 換搜尋、物件儲存換便宜的大容量、分析型資料庫換掃描速度、DynamoDB 換擴展性，每一個都有代價。</li>
+  <li>用估算判斷「現在需不需要」：容量無條件進位、單位寫清楚、乘上尖峰係數。咖啡店三年約 500 萬列，報表慢先查查詢與索引。</li>
+  <li>每多一種資料庫，就多一份備份、監控、升級、同步與值班的工作；決定和理由寫成 ADR，包含需求數字、選項、代價與何時重新評估。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 5 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 7：Redis 的人氣排行顯示燕麥拿鐵本週賣了 520 杯，店長用 PostgreSQL 的訂單算出來是 488 杯。該怎麼處理？</p>
+  <label data-key="a">以 Redis 為準：排行是每筆即時累加的，比事後查詢更新</label>
+  <label data-key="b">把 PostgreSQL 的訂單補到跟 Redis 一致，再查計數為何多算</label>
+  <label data-key="c">以 PostgreSQL 的訂單為準，從訂單重算並整份重建 Redis 排行</label>
+  <label data-key="d">先停掉排行功能，等查出哪一份算錯再決定要信哪一個</label>
+  <p class="why">✓ 訂單的記錄系統是 PostgreSQL，排行是從它衍生的資料；對不起來時以記錄系統為準，照重建 runbook 從訂單重算。衍生資料錯了能修，正是因為有權威來源可以對照。b 最危險：拿衍生資料回頭改記錄系統，等於憑空多出 32 杯的營收。（第 1 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 8：為了省掉 PostgreSQL 到 Elasticsearch 的同步，同事提議商品資料只寫進 Elasticsearch，不再寫 <code>products</code> 表。哪裡會出事？</p>
+  <label data-key="a">搜尋索引成了唯一的權威來源，索引壞掉時沒有地方可以重建</label>
+  <label data-key="b">商品上架後要約 1 秒才搜得到，菜單搜尋不能接受這種延遲</label>
+  <label data-key="c">Elasticsearch 沒辦法處理中文斷詞，商品名稱會搜不到</label>
+  <p class="why">✓ Elasticsearch 不適合當記錄系統。搜尋索引當衍生資料，壞了能從 <code>products</code> 整份重建；拿掉 <code>products</code>，索引一壞商品資料就沒有來源。做法是記錄系統留在 PostgreSQL，用 outbox 同步、寫好重建 runbook。b 錯在約 1 秒的延遲是選型時就接受的代價，菜單搜尋舊 1 秒沒關係。（第 1 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 9：同事看到 DynamoDB「加機器幾乎沒有上限」，提議把訂單搬過去。店長每個月都會提新的報表條件（依門市、依品項、依時段），這個提議最大的問題是？</p>
+  <label data-key="a">DynamoDB 要自己處理備份與升級，3 個人的團隊維運不來</label>
+  <label data-key="b">DynamoDB 的資料放在記憶體，重啟時訂單可能遺失</label>
+  <label data-key="c">DynamoDB 單機寫入有上限，訂單量成長後會撐不住</label>
+  <label data-key="d">DynamoDB 只能照事先設計的 key 查，新條件要改資料設計</label>
+  <p class="why">✓ DynamoDB 用查詢彈性換擴展性：只能照事先設計的 key 查，店長每提一個新條件就要改設計，改需求很痛。每天 2,000 筆也遠用不到它的擴展性，訂單留在 PostgreSQL。a 把它說反了：DynamoDB 由 AWS 代管，問題不在維運，在查詢。（第 1 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 10：替每天 5 萬筆訂單的連鎖店估算寫入量，同事照下面的結果，用「每秒 2 列」去挑主機規格。哪裡會出事？</p>
+<pre>const ordersPerDay = 50_000
+const itemsPerOrder = 2.4
+const rowsPerDay = Math.ceil(ordersPerDay * itemsPerOrder)
+const writesPerSec = Math.ceil(rowsPerDay / 86_400)
+console.log('每秒寫入', writesPerSec, '列')  // 2</pre>
+  <label data-key="a"><code>Math.ceil</code> 會多估，改用 <code>Math.round</code> 數字才準</label>
+  <label data-key="b">算的是全天平均，沒乘尖峰係數，早上尖峰會是好幾倍</label>
+  <label data-key="c">應該用訂單數算，一筆訂單在資料庫裡只寫入一次</label>
+  <p class="why">✓ 每秒 2 列是把寫入平均攤在 24 小時，實際集中在尖峰；要乘尖峰係數（尖峰每秒 ÷ 平均每秒），系統出事都在尖峰。a 錯在估算本來就要無條件進位，寧可多估不要少估。（第 1 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 11：新功能要在下單後寄確認信，尖峰約每分鐘 60 封。3 位工程師的團隊，這個工作佇列該放哪裡？</p>
+  <label data-key="a">加一套專門的訊息佇列，趁現在流量小先上，以後就不用搬</label>
+  <label data-key="b">放 MongoDB：每種工作的欄位都不同，用文件存比較有彈性</label>
+  <label data-key="c">用 PostgreSQL 的 <code>FOR UPDATE SKIP LOCKED</code>，跟訂單共用交易與備份</label>
+  <p class="why">✓ 每分鐘 60 個工作遠在 PostgreSQL 撐得住的範圍，SKIP LOCKED 加 outbox 就夠，還保留交易和同一份備份。每多一種儲存，就永久多一份備份、監控、升級與值班的工作；要到每秒上千個工作、需要延遲重試與優先順序，或多個服務訂閱同一串事件才值得。a 錯在為了還沒發生的流量先付維運成本，加新儲存要有量測上的理由。（第 1 課）</p>
+</div>
+<p>這個階段的重點整理成<a href="../sheets/stage-1.html">一頁圖解</a>。</p>
+<p>下一課開始深入第一個補充的儲存：Redis 的五種資料結構，以及怎麼依存取模式替購物車、排行榜挑結構。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

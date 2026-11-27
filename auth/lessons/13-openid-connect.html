@@ -1,0 +1,2015 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>13. OpenID Connect：用 Google、LINE 登入</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="13">
+<header>
+  <div class="eyebrow">階段 4：更多登入方式：第三方、多因素與機器 · 第 13 課</div>
+  <h1>OpenID Connect：用 Google、LINE 登入</h1>
+</header>
+<main>
+
+
+<p>咖啡店的會員註冊頁，有一半的人填到密碼那一欄就走了。行銷部想加上「用 LINE 登入」：顧客按一下、在 LINE 的頁面同意，回到咖啡店時就已經登入。這一課要寫的是這個功能的後端：一支 <code>GET /login/line</code> 把顧客送去 LINE，一支 <code>GET /callback/line</code> 接住 LINE 送回來的結果，最後決定「這個人是誰、要不要發給他咖啡店的 session」。</p>
+<p>callback 的最後幾行寫錯，後果很直接。沒把 LINE 給的 token 驗好，攻擊者自己造一張 token，就能登入任何人的帳號。用 email 把 LINE 帳號接到既有會員，攻擊者在別的服務註冊會員陳美華的 email，一登入就拿走她在咖啡店累積的 800 點。這課從頭到尾跟著這支 callback 走：它拿到什麼、怎麼確認是真的、怎麼對應到會員、最後交出什麼。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>OAuth 只說「可以做什麼」，callback 怎麼知道「你是誰」：OpenID Connect（OIDC）在 OAuth 上多了什麼，整個登入流程的最小答案。</li>
+  <li>ID token 裡寫了什麼、憑什麼相信它：每個欄位的意思，公鑰和演算法從哪裡來，JWKS 為什麼要快取。</li>
+  <li>驗證 ID token 的六步，以及有了 <code>state</code> 為什麼還要 <code>nonce</code>：每一步擋住哪一張偽造的 token。</li>
+  <li>驗完之後這是哪位會員：用 <code>(iss, sub)</code> 認人，陳美華第一次按 LINE 登入時怎麼不被接管。</li>
+  <li>callback 最後交出什麼、什麼東西絕不能外流：換成咖啡店自己的 session，channel secret 只放後端；最後判斷要不要自己做這一切。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="12-oauth-pkce.html">第 12 課</a>的授權碼流程：把使用者導到授權伺服器登入同意，帶著 <code>code</code> 和 <code>state</code> 導回，後端再用 <code>code</code> 加 PKCE 的 verifier 換 token。這課的登入就是走這個流程。</li>
+  <li><a href="08-jwt-signatures.html">第 8 課</a>的 JWT 簽章：HS256 用同一把共用金鑰簽和驗；ES256 用私鑰簽、公鑰驗，公鑰放在 JWKS 裡，用 header 的 <code>kid</code> 挑出是哪一把。</li>
+  <li><a href="09-jwt-verification.html">第 9 課</a>的驗證步驟：演算法由伺服器設定決定，依序檢查演算法、金鑰、簽章、<code>exp</code>、<code>iss</code>、<code>aud</code>。</li>
+  <li><a href="04-cookies-sessions.html">第 4 課</a>的 session：伺服器端存「這個瀏覽器是誰」，登入成功時換一個新的 session ID、刪掉舊的。</li>
+</ul></div>
+
+<h2>OAuth 只說「可以做什麼」，callback 怎麼知道「你是誰」？</h2>
+<p>先看只用第 12 課的 OAuth 會卡在哪裡。授權碼流程走完，咖啡店後端拿到一張 access token。access token 回答的是「持有者可以做什麼」，它是給 LINE 的 API 看的：OAuth 沒有規定它的格式，可能只是一串咖啡店看不懂的不透明字串，裡面也不一定寫著「這是發給咖啡店的」。</p>
+<p>有人會想：那就拿 access token 去呼叫 LINE 的 API 查「這是誰」，查到的使用者 ID 就是登入者。問題是咖啡店沒辦法確定手上這張 access token 是 LINE 為了這次登入發給咖啡店的。如果它其實是發給另一個 App、被那個 App 的經營者拿來冒用，LINE 的 API 照樣會回答「這是陳美華」，因為 access token 本來就只證明「持有者可以讀她的資料」，不證明「她剛剛在你這裡登入」。用授權的憑證做登入，就缺了「給誰的、為了哪一次登入」這兩件事。</p>
+<p><strong>OpenID Connect（OIDC）</strong>就是補上這兩件事的登入協定。它建立在 OAuth 2.0 上，流程照舊，只是多發一張專門用來證明身分的 token，上面寫明「誰、什麼時候、為了哪個網站登入」，並由發出它的一方簽章。</p>
+<p>OIDC 的規格替兩個角色取了新名字，先對上：</p>
+<ul>
+  <li><strong>依賴方（relying party，RP）</strong>：用 OIDC 讓使用者登入的網站，這裡是咖啡店。它「依賴」別人告訴它使用者是誰。它就是第 12 課的 client，參數也還叫 <code>client_id</code>，所以這課沿用 <strong>client</strong> 這個叫法。</li>
+  <li><strong>OpenID 提供者（OpenID Provider，OP）</strong>：負責確認使用者身分、簽發身分證明的一方，例如 Google、LINE。在 OAuth 裡它是授權伺服器。它簽的 token 會在 <code>iss</code> 欄位寫上自己，所以講到 <code>iss</code> 時也叫它<strong>發行者</strong>（第 8 課）。</li>
+</ul>
+<p>OIDC 在 OAuth 上加的東西不多。下面這張表列出全部，後面各節會一樣一樣用到：</p>
+<div class="table-wrap">
+<table>
+  <tr><th>加了什麼</th><th>是什麼</th><th>用途</th></tr>
+  <tr><td><code>openid</code> scope</td><td>授權請求的 <code>scope</code> 加上 <code>openid</code></td><td>告訴 OP「這是一次登入」，token 回應就會多一個 <code>id_token</code></td></tr>
+  <tr><td><strong>ID token</strong></td><td>OP 簽的 JWT</td><td>證明「誰、什麼時候、為了哪個 client 登入」</td></tr>
+  <tr><td><code>nonce</code></td><td>client 產生的隨機值，OP 原樣寫進 ID token</td><td>把 ID token 綁回這一次登入請求</td></tr>
+  <tr><td><strong>UserInfo 端點</strong></td><td>用 access token 呼叫的 API</td><td>查使用者的名字、email、頭像這類資料</td></tr>
+  <tr><td><strong>Discovery</strong></td><td><code>/.well-known/openid-configuration</code> 這份 JSON</td><td>列出各端點網址、<code>jwks_uri</code>、支援的演算法，client 不用把網址寫死</td></tr>
+</table>
+</div>
+<p>放進咖啡店的「用 LINE 登入」，整個流程跟第 12 課的授權碼流程幾乎一樣，只多了 <code>openid</code> 和 <code>nonce</code>，最後多拿到一張 ID token：</p>
+<figure>
+  <svg viewBox="0 0 700 330" role="img" aria-label="OIDC 授權碼流程：咖啡店產生 state、nonce、code_verifier，導向 LINE；使用者登入同意後帶 code 回來；咖啡店後端用 code 換 token，驗證 ID token 後建立自己的 session">
+    <defs><marker id="arr-oidc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="20" y="10" width="150" height="40" rx="8"/>
+    <text class="d-text" x="95" y="35" text-anchor="middle">瀏覽器</text>
+    <rect class="d-soft" x="275" y="10" width="150" height="40" rx="8"/>
+    <text class="d-text" x="350" y="35" text-anchor="middle">咖啡店後端（client）</text>
+    <rect class="d-box" x="530" y="10" width="150" height="40" rx="8"/>
+    <text class="d-text" x="605" y="35" text-anchor="middle">LINE（OP）</text>
+    <path class="d-line" d="M95,50 L95,320"/>
+    <path class="d-line" d="M350,50 L350,320"/>
+    <path class="d-line" d="M605,50 L605,320"/>
+    <path class="d-line" d="M100,80 L345,80" marker-end="url(#arr-oidc)"/>
+    <text class="d-small" x="110" y="74">① 按「用 LINE 登入」</text>
+    <path class="d-line" d="M345,112 L100,112" marker-end="url(#arr-oidc)"/>
+    <text class="d-small" x="110" y="106">② 存 state、nonce、verifier，302 導向</text>
+    <path class="d-line" d="M100,144 L600,144" marker-end="url(#arr-oidc)"/>
+    <text class="d-accent" x="110" y="138">/authorize?scope=openid profile&amp;state&amp;nonce&amp;code_challenge</text>
+    <path class="d-line" d="M600,176 L100,176" marker-end="url(#arr-oidc)"/>
+    <text class="d-small" x="360" y="170">③ 登入、同意，帶 code、state 導回</text>
+    <path class="d-line" d="M100,208 L345,208" marker-end="url(#arr-oidc)"/>
+    <text class="d-small" x="110" y="202">④ /callback?code&amp;state</text>
+    <path class="d-line" d="M355,240 L600,240" marker-end="url(#arr-oidc)"/>
+    <text class="d-small" x="365" y="234">⑤ POST /token（code、verifier）</text>
+    <path class="d-line" d="M600,272 L355,272" marker-end="url(#arr-oidc)"/>
+    <text class="d-accent" x="365" y="266">⑥ access_token＋id_token</text>
+    <path class="d-line" d="M345,304 L100,304" marker-end="url(#arr-oidc)"/>
+    <text class="d-small" x="110" y="298">⑦ 驗 ID token → 建自己的 session</text>
+  </svg>
+  <figcaption>跟第 12 課相比，只多了 scope 裡的 openid、授權請求的 nonce，以及 token 回應裡的 id_token</figcaption>
+</figure>
+<p>這張圖就是開場問題的最小答案。callback 在第 ⑥ 步拿到 ID token，第 ⑦ 步做三件事：<strong>驗證 ID token</strong>，確認它真的是 LINE 為了這次登入、發給咖啡店的；<strong>用 token 裡的 <code>iss</code> 和 <code>sub</code> 找到會員</strong>；<strong>建立咖啡店自己的 session</strong>。這課剩下的部分，就是把第 ⑦ 步這三件事做對。</p>
+<p>要驗證一張 token，得先知道它裡面寫了什麼，下一節打開它。</p>
+
+<h2>callback 拿到的 ID token 裡寫了什麼？</h2>
+<p>ID token 是一張 JWT（第 8 課），payload 解開就是一個 JSON 物件。下面是陳美華用 LINE 網頁登入時拿到的 ID token payload（數值是範例）。執行後看三行輸出：有效期間多長、哪兩個欄位組成穩定的識別、哪些欄位只是資料：</p>
+<div class="lab"><script type="code">
+const payload = {
+  iss: 'https://access.line.me',       // 發行者：誰簽的
+  sub: 'U4af4980629e0c2b4c1f1d1a1a1a1a1a1', // 使用者在這個發行者內的 ID
+  aud: '1660000000',                   // 給誰的：咖啡店在 LINE 的 channel ID（client_id）
+  exp: 1793433600,                     // 到期時間（秒）
+  iat: 1793430000,                     // 簽發時間（秒）
+  auth_time: 1793429990,               // 使用者實際輸入帳密的時間（請求帶 max_age 才會有）
+  nonce: 'q7Yx3k0vT2mB',               // 咖啡店在授權請求放的隨機值
+  amr: ['pwd'],                        // 用了哪些認證方式
+  name: '陳美華',
+  email: 'meihua@example.com',         // 有申請 email 權限、使用者同意才會有
+}
+const fmt = (s: number) => new Date(s * 1000).toISOString()
+console.log('有效期間：', fmt(payload.iat), '→', fmt(payload.exp), '共', (payload.exp - payload.iat) / 60, '分鐘')
+console.log('使用者的穩定識別：', JSON.stringify([payload.iss, payload.sub]))
+console.log('name 和 email 只是資料，不是識別：', payload.name, payload.email)
+</script></div>
+<p><code>iss</code>、<code>exp</code>、<code>iat</code> 是第 9 課看過的欄位：誰簽的、什麼時候到期、什麼時候簽的。ID token 新出現、而且這課會一直用到的是下面四個。</p>
+<p><strong><code>sub</code>（subject）</strong>是使用者在<strong>這個發行者</strong>內的識別碼。<code>sub</code> 在這個發行者內唯一，而且不會重新分配給別人；對同一個 client 來說，同一個使用者的 <code>sub</code> 不會變，所以適合用來認人。（LINE 這類 pairwise 發行者，對不同 provider 底下的 client 會發不同的 <code>sub</code>，細節見課末。）但它只在發行者內部唯一：同一個陳美華，在 LINE 和 Google 的 <code>sub</code> 完全不同；兩個發行者也可能剛好發出同一個 <code>sub</code> 字串給兩個不同的人。這就是為什麼後面認人時要用 <code>iss</code> 和 <code>sub</code> 兩個一起。</p>
+<p><strong><code>aud</code>（audience）</strong>寫的是這張 ID token 給哪個 client，值就是 client_id，在 LINE 叫 channel ID。它可以是字串，也可以是陣列。上一節說 access token 缺「給誰的」，<code>aud</code> 補的就是這一塊：別的網站拿到的 ID token，<code>aud</code> 是那個網站的 client_id，咖啡店一比對就知道不是給自己的。</p>
+<p><strong><code>nonce</code></strong>是只用一次的隨機值（number used once）。咖啡店在把顧客送去 LINE 時帶上它，LINE 原樣寫進 ID token、一起簽章。上一節說 access token 缺「為了哪一次登入」，<code>nonce</code> 補的就是這一塊。它怎麼用、跟第 12 課的 <code>state</code> 有什麼不同，驗證那一節後面會講。</p>
+<p>範例裡沒列出、但 OP 給 email 時通常會一起給的 <strong><code>email_verified</code></strong>，是布林值，表示 OP 是否確認過這個 email 屬於這位使用者。payload 裡的 <code>auth_time</code>、<code>amr</code> 是登入方式的細節，這課用不到，所以不談。payload 裡的 <code>name</code>、<code>email</code> 是使用者的資料，不是識別：名字會改、email 會換，這件事到「這是哪位會員」那一節會變得很重要。</p>
+<p>到這裡有一個根本的問題：這些欄位只是一段 JSON，任何人都寫得出 <code>{"iss":"https://access.line.me","sub":"陳美華的 sub"}</code>。咖啡店要相信它，得確認它真的是 LINE 簽的，而這需要知道 LINE 用什麼演算法、什麼金鑰簽。</p>
+
+<h2>憑什麼相信是 LINE 簽的？Discovery、演算法與 JWKS</h2>
+<p>驗簽章需要兩樣東西：演算法和金鑰。咖啡店要去哪裡知道 LINE 的這兩樣東西，連同 token 端點的網址？OIDC 的答案是 <strong>Discovery</strong>：每個 OP 在 <code>發行者網址 + /.well-known/openid-configuration</code> 放一份 JSON，列出自己的端點網址、公鑰清單（JWKS）的網址 <code>jwks_uri</code>、支援的簽章演算法。client 啟動時讀這份文件，就不用把網址寫死。下面是 2026-10-31 實際查詢 Google 和 LINE 的結果（節錄）：</p>
+<pre>// https://accounts.google.com/.well-known/openid-configuration
+"issuer": "https://accounts.google.com",
+"jwks_uri": "https://www.googleapis.com/oauth2/v3/certs",
+"id_token_signing_alg_values_supported": ["RS256"],
+
+// https://access.line.me/.well-known/openid-configuration
+"issuer": "https://access.line.me",
+"jwks_uri": "https://api.line.me/oauth2/v2.1/certs",
+"id_token_signing_alg_values_supported": ["ES256"],
+"subject_types_supported": ["pairwise"],
+"code_challenge_methods_supported": ["S256"]</pre>
+<p>Google 的情況單純：ID token 只用 RS256，用 <code>jwks_uri</code> 裡的公鑰驗。要注意的是 <code>iss</code>：Google 的文件說它可能是 <code>https://accounts.google.com</code>，也可能是沒有 <code>https://</code> 的 <code>accounts.google.com</code>，兩個都要接受；存進資料庫前統一成一種寫法，不然同一個人會變成兩個身分。</p>
+<p>LINE 是這課的主角，也是最容易出事的地方。它的 discovery 只寫了 ES256，但 LINE Login v2.1 的文件寫得很清楚，簽法依整合方式而不同：</p>
+<ul>
+  <li><strong>網頁登入</strong>（咖啡店現在做的這種）拿到的 ID token 用 <strong>HS256</strong>，金鑰是你的 <strong>channel secret</strong>。channel secret 是 LINE Developers Console 發給你這個 LINE Login 頻道的秘密字串，它的 UTF-8 位元組直接當 HMAC 金鑰。HS256 是對稱的：LINE 用它簽，你用同一把驗。</li>
+  <li><strong>原生 App、LINE SDK、LIFF</strong>（在 LINE App 裡開的網頁）拿到的 ID token 才用 <strong>ES256</strong>，公鑰在 <code>jwks_uri</code> 的 JWKS 裡，依 header 的 <code>kid</code> 挑。</li>
+</ul>
+<p>同一個 <code>iss</code>，兩種簽法。這代表演算法不能看 discovery 決定（它只列了一種），更不能看 token 自己 header 裡的 <code>alg</code> 決定（第 8 課的演算法混淆：攻擊者會挑對他有利的那種）。正確做法是依咖啡店實際用的整合方式，在設定裡寫死「這個發行者用 HS256、金鑰是 channel secret」。</p>
+<p>用 ES256 時還有一個問題：JWKS 什麼時候去抓？兩個極端都不行。每個請求都抓，發行者會限流你，你的登入也跟著它的網路延遲一起變慢。抓一次就永遠不更新，發行者輪替金鑰（第 8 課）之後，新 token 的 <code>kid</code> 你都不認得，所有人都登入失敗。</p>
+<p>做法是 <strong>JWKS 快取</strong>：抓來的公鑰存在記憶體，過了一段時間才重抓；遇到不認得的 <code>kid</code>，代表發行者可能剛換了金鑰，可以提早重抓，但要限制頻率。原因是 <code>kid</code> 是 token 裡的字，攻擊者可以每個請求填一個亂碼。如果每次看到不認得的 <code>kid</code> 就去抓，你等於替他對發行者發動攻擊，自己也被限流，連正常使用者都登入不了。另外兩件事也要顧到。快取剛過期時，很多請求會同時發現要重抓，只讓第一個去抓，其他請求等同一次結果，這叫 <strong>single-flight</strong>（<a href="10-refresh-rotation.html">第 10 課</a>）；不這樣做，同一瞬間會對發行者發出幾十個請求。重抓失敗時，例如發行者暫時連不上，已知的 <code>kid</code> 繼續用快取裡的舊公鑰，不要讓所有登入一起失敗。成熟的函式庫都這樣做（jose 的預設值見課末「補充與查表」），練習 3 會自己寫一個。</p>
+<p>有了演算法和金鑰，簽章就驗得了。但簽章只回答「是 LINE 簽的、沒被改過」。LINE 每天簽出無數張 ID token，給別的網站的、過期的、別人登入時的，每一張的簽章都是對的。所以驗簽章只是其中一步。</p>
+
+<h2>驗證 ID token：六步各擋哪一張偽造的 token？</h2>
+<p>OIDC Core 1.0（errata set 2）§3.1.3.7 規定了 client 驗 ID token 的步驟。跟第 9 課驗 access token 比，順序和精神一樣，差別有兩個：<code>aud</code> 要等於自己的 client_id，以及多了 <code>nonce</code>。把每一步都想成「它擋住的是哪一張 token」，就比較不會漏：</p>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="ID token 驗證流程：iss 完全相等、依設定的演算法驗簽章、aud 包含自己且沒有不信任的受眾、exp、iat、nonce，任一步失敗就拒絕">
+    <defs><marker id="arr-val" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="10" y="20" width="200" height="60" rx="8"/>
+    <text class="d-text" x="110" y="45" text-anchor="middle">① iss 完全相等</text>
+    <text class="d-small" x="110" y="66" text-anchor="middle">查出這個發行者的設定</text>
+    <rect class="d-box" x="250" y="20" width="200" height="60" rx="8"/>
+    <text class="d-text" x="350" y="45" text-anchor="middle">② 簽章</text>
+    <text class="d-small" x="350" y="66" text-anchor="middle">演算法依設定，不依 header</text>
+    <rect class="d-box" x="490" y="20" width="200" height="60" rx="8"/>
+    <text class="d-text" x="590" y="45" text-anchor="middle">③ aud</text>
+    <text class="d-small" x="590" y="66" text-anchor="middle">有自己、沒有不信任的</text>
+    <rect class="d-box" x="490" y="130" width="200" height="60" rx="8"/>
+    <text class="d-text" x="590" y="155" text-anchor="middle">④ exp</text>
+    <text class="d-small" x="590" y="176" text-anchor="middle">現在要早於 exp</text>
+    <rect class="d-box" x="250" y="130" width="200" height="60" rx="8"/>
+    <text class="d-text" x="350" y="155" text-anchor="middle">⑤ iat</text>
+    <text class="d-small" x="350" y="176" text-anchor="middle">不能離現在太遠</text>
+    <rect class="d-soft" x="10" y="130" width="200" height="60" rx="8"/>
+    <text class="d-text" x="110" y="155" text-anchor="middle">⑥ nonce</text>
+    <text class="d-small" x="110" y="176" text-anchor="middle">等於登入前存的值</text>
+    <path class="d-line" d="M210,50 L245,50" marker-end="url(#arr-val)"/>
+    <path class="d-line" d="M450,50 L485,50" marker-end="url(#arr-val)"/>
+    <path class="d-line" d="M590,80 L590,125" marker-end="url(#arr-val)"/>
+    <path class="d-line" d="M490,160 L455,160" marker-end="url(#arr-val)"/>
+    <path class="d-line" d="M250,160 L215,160" marker-end="url(#arr-val)"/>
+    <text class="d-accent" x="350" y="230" text-anchor="middle">任何一步失敗就拒絕，全部通過才用 (iss, sub) 找使用者</text>
+  </svg>
+  <figcaption>OIDC Core §3.1.3.7 的主要步驟（加密的 ID token、acr、auth_time 這課不談）</figcaption>
+</figure>
+<ol>
+  <li><strong><code>iss</code> 必須完全等於</strong>你設定的發行者網址。它擋的是「別的發行者簽的 token」：咖啡店只信任 LINE 和自家身分服務，其他人簽的一律不認。用 <code>startsWith</code>、<code>includes</code> 比對，<code>https://access.line.me.evil.example</code> 這種攻擊者自己架的發行者就混得進來。用 <code>iss</code> 查設定表時，用 <code>Object.hasOwn</code> 或 <code>Map</code>：一般物件上 <code>issuers['constructor']</code> 會查到原型鏈上的函式，被當成一份設定。</li>
+  <li><strong>簽章</strong>：它擋的是「內容被改過或自己捏造的 token」。規格說 <code>alg</code> 應該是預設的 RS256 或註冊時約定的演算法。實作上就是上一節的結論：每個發行者在設定裡寫死一種演算法和金鑰，header 的 <code>alg</code> 必須跟設定相同，再用設定的金鑰驗。LINE 同時有 HS256 與 ES256，這一步比第 8 課的例子更容易寫錯。</li>
+  <li><strong><code>aud</code> 必須包含自己的 client_id</strong>，而且如果還有其他受眾，每一個都必須是你信任的；只要出現一個你不信任的，就整張拒絕。它擋的是「LINE 發給別的網站的 token」：攻擊者經營一個也接 LINE 登入的網站，收集來的 ID token 簽章、<code>iss</code> 都對，只有 <code>aud</code> 不是咖啡店。</li>
+  <li><strong>現在時間必須早於 <code>exp</code></strong>。它擋的是過期的 token，例如從舊的記錄檔裡翻出來的。</li>
+  <li><strong><code>iat</code> 不能離現在太遠</strong>：可接受的範圍由 client 自己決定。它擋的是很久以前簽的 token。另一個用處：如果你的系統要防同一張 ID token 被重送（例如 App 直接 POST ID token、沒有 session 可刪的情況），就得記住已經用過的 <code>nonce</code>；<code>iat</code> 有上限，這份紀錄只要保留到那個上限就能清掉。</li>
+  <li><strong>授權請求帶了 <code>nonce</code>，ID token 就必須有 <code>nonce</code>，而且相等</strong>。它擋的是「真的、沒過期、給咖啡店的，但不是這一次登入的 token」。ID token 沒有 <code>nonce</code> 時「略過不檢查」，等於沒驗。</li>
+</ol>
+<p>任何一步失敗就拒絕，全部通過才用 <code>(iss, sub)</code> 找會員。順序也有意義：先確認 <code>iss</code>、驗完簽章，後面讀到的 <code>aud</code>、<code>exp</code> 才是可信的資料；還沒驗簽章就看內容，看到的是攻擊者想讓你看的東西。練習 1 會把六步完整寫一遍。</p>
+<p>六步裡第 3 步最常寫錯，因為 <code>aud</code> 可能是字串也可能是陣列，兩種形狀各有一種偷懶的寫法。執行後看前兩行：兩種偷懶寫法都回 <code>true</code>，讓不該過的 token 通過了；後三行是正確寫法對三種 <code>aud</code> 的判斷：</p>
+<div class="lab"><script type="code">
+const clientId = 'coffee-web'
+
+// 錯誤 1：aud 是字串時用 includes
+const aud1: string = 'coffee-web-evil'
+console.log('字串 includes：', aud1.includes(clientId))   // 字串的 includes 是「子字串」
+
+// 錯誤 2：aud 是陣列時只看有沒有自己
+const aud2 = ['coffee-web', 'evil-app']
+console.log('陣列只看有沒有自己：', aud2.includes(clientId))
+
+// 正確：統一成陣列，必須有自己，其他每一個都在信任清單裡
+const trusted = ['coffee-pos']
+const audOk = (aud: string | string[]) => {
+  const list = typeof aud === 'string' ? [aud] : aud
+  return list.includes(clientId) && list.every(a => a === clientId || trusted.includes(a))
+}
+console.log('coffee-web-evil：', audOk(aud1))
+console.log('[coffee-web, evil-app]：', audOk(aud2))
+console.log('[coffee-web, coffee-pos]：', audOk(['coffee-web', 'coffee-pos']))
+</script></div>
+<p>字串的 <code>includes</code> 是「包含子字串」，<code>coffee-web-evil</code> 包含 <code>coffee-web</code>，所以通過。陣列的 <code>includes</code> 只確認有自己，沒管另一個受眾 <code>evil-app</code>：這張 token 同時發給了一個你不信任的 App，那個 App 的經營者手上也有這張 token，可以拿來你這裡用。正確寫法先統一成陣列，再要求「有自己」而且「每一個都是自己或信任的」。</p>
+<div class="callout practice"><strong>💡 實務上：直接從 token 端點拿到的 ID token，也一律驗簽章</strong><br>
+規格允許一個例外：ID token 是後端直接透過 TLS 向 token 端點拿到的，可以用 TLS 的伺服器驗證代替驗簽章。Google 的文件也這樣說，但同時強調：只要 ID token 被轉交給其他元件，那些元件就一定要驗。咖啡店的 callback 符合這個例外，實務上仍然<strong>一律驗</strong>。驗簽章的成本很低，而程式碼總有一天會被重構成「前端把 ID token 傳上來」。LINE 的 App 與 LIFF 就是這種情況：ID token 在使用者的手機上，送到你的後端時，跟任何人隨手寫的字串沒有差別。</div>
+<p>第 6 步的 <code>nonce</code> 還沒解釋清楚。它跟第 12 課的 <code>state</code> 一樣，都是登入前產生的隨機值；咖啡店的 callback 已經檢查 <code>state</code> 了，為什麼還要多一個？</p>
+
+<h2>已經有 state，為什麼還要 nonce？</h2>
+<p><code>state</code> 和 <code>nonce</code> 都在顧客按「用 LINE 登入」時產生、存在顧客自己的 session 裡，差別在它們出現的位置，位置決定了誰檢查、擋得住什麼：</p>
+<div class="table-wrap">
+<table>
+  <tr><th></th><th><code>state</code></th><th><code>nonce</code></th></tr>
+  <tr><td>出現在</td><td>導回 callback 的網址</td><td>ID token 裡（OP 簽過）</td></tr>
+  <tr><td>誰檢查</td><td>callback 一進來就檢查</td><td>驗 ID token 時檢查</td></tr>
+  <tr><td>擋什麼</td><td>CSRF：攻擊者把自己的 code 塞進受害者的瀏覽器</td><td>把 ID token 綁回這一次登入：擋重放、擋從別處拿來的 ID token</td></tr>
+  <tr><td>LINE</td><td>必填</td><td>選填，但你一定要帶</td></tr>
+</table>
+</div>
+<p><code>state</code> 只保護「callback 這個請求」：它在網址上，不在 ID token 裡。只要 ID token 不是由你這一次的 <code>code</code> 換來的，<code>state</code> 就完全幫不上忙。兩種常見的情況：App 或 LIFF 把 ID token 直接 POST 到你的 API，中間根本沒有 callback；攻擊者拿到一張別人登入時的舊 ID token，想重送一次。這兩種 token 的簽章、<code>iss</code>、<code>aud</code> 都對。</p>
+<p><code>nonce</code> 在 OP 的簽章裡，攻擊者改不了。咖啡店在 session 裡存著這一次登入產生的 <code>nonce</code>，ID token 裡的值跟它相等，就證明「這張 ID token 是為了這個 session 剛剛發起的那次登入簽的」；舊 token 的 <code>nonce</code> 是舊登入的值，對不上。RFC 9700 也提到：OIDC 流程裡 <code>nonce</code> 提供 CSRF 保護。兩個都帶，各擋一層。</p>
+<p>兩個值的處理方式一樣：用 CSPRNG 產生（<a href="02-crypto-toolbox.html">第 2 課</a>），存在使用者自己的 session，用過就刪。下面模擬咖啡店後端的兩支路由，這就是開場說要寫的 <code>/login/line</code> 和 <code>/callback/line</code> 的前半段。執行後看最後兩行：同一個 <code>state</code> 第一次通過，第二次被拒絕，因為取出時就刪掉了：</p>
+<div class="lab"><script type="code">
+const randomToken = () => {
+  const bytes = crypto.getRandomValues(new Uint8Array(32))
+  return btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+type PendingLogin = { state: string; nonce: string; codeVerifier: string }
+const session: { pending?: PendingLogin } = {}   // 第 4 課的 session，這裡用物件代替
+
+// GET /login/line
+function startLogin(): string {
+  const pending = { state: randomToken(), nonce: randomToken(), codeVerifier: randomToken() }
+  session.pending = pending
+  const url = new URL('https://access.line.me/oauth2/v2.1/authorize')
+  url.search = new URLSearchParams({
+    response_type: 'code', client_id: '1660000000', redirect_uri: 'https://coffee.example/callback/line',
+    scope: 'openid profile', state: pending.state, nonce: pending.nonce,
+    code_challenge: '（SHA-256(codeVerifier) 的 base64url，第 12 課）', code_challenge_method: 'S256',
+  }).toString()
+  return url.toString()
+}
+
+// GET /callback/line?code&state：取出就刪，只能用一次
+function takePending(stateFromUrl: string): PendingLogin | null {
+  const pending = session.pending
+  delete session.pending
+  if (!pending || pending.state !== stateFromUrl) return null
+  return pending   // 接著用 code 和 pending.codeVerifier 換 token，再用 pending.nonce 驗 ID token
+}
+
+const url = new URL(startLogin())
+console.log('導向：', url.origin + url.pathname)
+console.log('scope：', url.searchParams.get('scope'), '／帶了 nonce：', url.searchParams.has('nonce'), '／帶了 state：', url.searchParams.has('state'))
+const state = url.searchParams.get('state') ?? ''
+console.log('第一次 callback：', takePending(state) ? '通過，拿到 nonce 去驗 ID token' : '拒絕')
+console.log('同一個 state 再來一次：', takePending(state) ? '通過' : '拒絕')
+</script></div>
+<p>到這裡，callback 已經能確認手上的 ID token 是 LINE 為了這次登入、發給咖啡店的。接下來是第 ⑦ 步的第二件事：token 說這個人是 <code>iss</code> 為 <code>https://access.line.me</code>、<code>sub</code> 為某個字串的使用者，咖啡店要把它對應到哪一位會員？</p>
+
+<h2>驗完了，這是哪位會員？用 (iss, sub)，不是 email</h2>
+<p>payload 裡有 <code>email</code>，咖啡店的會員資料也有 email，直覺會想用 email 對應。OIDC Core §5.7 說得很直接：<strong><code>iss</code> 加上 <code>sub</code> 是唯一能當穩定識別的組合</strong>；email、電話、使用者名稱、姓名都 MUST NOT 當唯一識別。原因有四個，前三個是 email 的問題，第四個是 <code>sub</code> 單獨使用的問題：</p>
+<ul>
+  <li><strong>email 會變</strong>：使用者在 Google 改了主要 email，用 email 認人就變成另一個帳號，原本的點數和訂單都找不到。</li>
+  <li><strong>email 會被回收</strong>：規格明說發行者可以在不同時間把同一個 email 給不同的人。公司信箱在員工離職後被收回、再發給新人，新人就會登入成舊人的帳號。</li>
+  <li><strong>email 可能沒驗證過</strong>：有些 OP 讓使用者填任何 email，<code>email_verified</code> 是 <code>false</code>。</li>
+  <li><strong>只用 <code>sub</code> 也不夠</strong>：ID token 那一節說過，<code>sub</code> 只在同一個發行者內唯一，Google 的某個 <code>sub</code> 和你自家身分服務的某個 <code>sub</code> 可能是同一串字。</li>
+</ul>
+<p>所以外部身分單獨一張表，用 <code>(iss, sub)</code> 當唯一鍵（<a href="../../postgresql/lessons/12-constraints.html">PostgreSQL 課第 12 課</a>的 <code>UNIQUE</code> 約束：同一組值只能出現一次）。一位咖啡店會員可以連著好幾個外部身分，例如陳美華同時連了 LINE 和 Google：</p>
+<pre>CREATE TABLE external_identities (
+  id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  user_id    bigint NOT NULL REFERENCES users(id),
+  iss        text   NOT NULL,
+  sub        text   NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (iss, sub)
+);</pre>
+<p>callback 的查法就是：驗完 ID token，用 <code>(iss, sub)</code> 查這張表，查到就知道是哪位會員。LINE 的 <code>sub</code> 還有一個特性會影響這張表（同一個人在不同公司底下的 <code>sub</code> 不同），細節見課末「補充與查表」。</p>
+<p>查不到的時候才是難題。陳美華原本用 email 加密碼註冊，累積了 800 點；今天她第一次按「用 LINE 登入」，<code>external_identities</code> 裡還沒有她的 LINE <code>(iss, sub)</code>。咖啡店要決定：這是新顧客，還是陳美華？</p>
+
+<h2>陳美華第一次按 LINE 登入：帳號連結怎麼不被接管？</h2>
+<p>把一個外部登入身分接到既有的會員帳號上，叫<strong>帳號連結（account linking）</strong>。陳美華這種情況就需要它：咖啡店得把她的 LINE <code>(iss, sub)</code> 寫進 <code>external_identities</code>、指向她原本的帳號，之後她按 LINE 登入才會回到有 800 點的那個帳號。</p>
+<p>最直覺的寫法是「email 一樣就當成同一個人，自動接上」。看看攻擊者怎麼利用它。假設咖啡店除了 LINE，也接了一個不驗 email 的 OP「某論壇登入」。執行後看兩行輸出：攻擊者登入成了哪個使用者、拿到幾點，以及他的外部身分是不是已經永久接上：</p>
+<div class="lab"><script type="code">
+type User = { id: number; email: string | null; points: number }
+const users: User[] = [{ id: 1, email: 'meihua@example.com', points: 800 }]   // 陳美華
+const identities: { userId: number; iss: string; sub: string }[] = []
+
+// 錯誤做法：找不到外部身分時，用 email 找既有使用者並直接登入
+function naiveLogin(claims: { iss: string; sub: string; email?: string }) {
+  const found = identities.find(i => i.iss === claims.iss && i.sub === claims.sub)
+  if (found) return found.userId
+  const byEmail = users.find(u => u.email === claims.email)
+  if (byEmail) {
+    identities.push({ userId: byEmail.id, iss: claims.iss, sub: claims.sub })   // 自動合併
+    return byEmail.id
+  }
+  return -1
+}
+
+// 攻擊者在「某論壇」註冊，email 欄位填陳美華的 email（論壇沒寄驗證信）
+const attackerClaims = { iss: 'https://forum.example', sub: 'attacker-1', email: 'meihua@example.com', email_verified: false }
+const id = naiveLogin(attackerClaims)
+console.log('攻擊者登入成了 user', id, '，點數', users.find(u => u.id === id)?.points)
+console.log('而且外部身分已經接上，之後每次都能登入：', identities)
+</script></div>
+<p>這就是<strong>帳號接管（account takeover）</strong>：攻擊者取得了別人帳號的控制權。而且是永久的，因為他的 <code>(iss, sub)</code> 已經寫進陳美華的帳號，之後每次用「某論壇登入」都會直接進來，就算咖啡店後來修了程式也一樣。防守的規則有三條：</p>
+<ul>
+  <li><strong>不自動合併</strong>。找不到 <code>(iss, sub)</code>、但有同 email 的既有會員時，請使用者先用原本的方式（密碼，或已經連結的另一個 OP）登入，在已登入的狀態下確認「要把這個 LINE 帳號連到我的帳號嗎」，確認後才寫入 <code>external_identities</code>。攻擊者過不了「用原本的方式登入」這一關，因為他不知道陳美華的密碼。</li>
+  <li><strong>只有 <code>email_verified === true</code> 才把 email 當成有意義的資料</strong>，而且要是布林的 <code>true</code>。有些 OP 曾經回字串 <code>"true"</code>，你的程式不要猜，嚴格比對；字串 <code>"false"</code> 在 JavaScript 是 truthy，<code>if (claims.email_verified)</code> 會判成已驗證。</li>
+  <li>即使 <code>email_verified</code> 是 <code>true</code>，也只代表「OP 在某個時間點驗證過」，不代表這個 OP 對 email 的管理跟你一樣嚴格。所以它仍然只是「提示可以連結」，不是「直接登入」。</li>
+</ul>
+<p>練習 2 會把這段邏輯寫出來：查到 <code>(iss, sub)</code> 就登入，有同 email 的已驗證會員就要求確認連結，其他情況建立新會員。</p>
+<div class="callout practice"><strong>💡 實務上：社群登入上線後，客服常接到「我的點數不見了」</strong><br>
+多半是同一個人第一次按「用 LINE 登入」時被建成新帳號，他以為還是原本那個。上線前先跟 PM 把畫面談好：找到同 email 的既有會員時，提示「你可能已經有帳號，請先用原本的方式登入再連結」，不要默默建新帳號，也不要自動合併。會員設定頁要能看到、解除已連結的登入方式，但不能解除到一種都不剩。客服手動合併帳號也是一種帳號連結，要先確認是本人，不能只憑對方報上的 email。</div>
+<p>找到會員之後，就剩第 ⑦ 步的最後一件事：callback 要交給瀏覽器什麼，之後顧客打咖啡店的 API 才算「已登入」？</p>
+
+<h2>找到會員之後，callback 交出什麼？</h2>
+<p>前端工程師常有的直覺是：ID token 也是一張 JWT，那就把它交給 Vue，之後放進 <code>Authorization: Bearer</code> 去打咖啡店的訂單 API。這行不通，原因在流程裡的兩種 token 用途完全不同：</p>
+<div class="table-wrap">
+<table>
+  <tr><th></th><th>ID token</th><th>access token</th></tr>
+  <tr><td>給誰看</td><td>給 client（咖啡店）自己看</td><td>給 API（例如 LINE 的 UserInfo）看</td></tr>
+  <tr><td><code>aud</code></td><td>咖啡店的 client_id</td><td>那支 API</td></tr>
+  <tr><td>格式</td><td>一定是 JWT</td><td>OAuth 沒規定，可能是不透明字串</td></tr>
+  <tr><td>回答的問題</td><td>「剛剛登入的是誰」</td><td>「持有者可以做什麼」</td></tr>
+  <tr><td>能拿去打 API 嗎</td><td>不行</td><td>可以，只能打它的 <code>aud</code></td></tr>
+</table>
+</div>
+<p>拿 ID token 打訂單 API，會撞上三個問題。第一，ID token 的 <code>aud</code> 是咖啡店網站的 client_id，不是訂單 API；訂單 API 照第 9 課的規則驗 <code>aud</code>，就該拒絕它。第二，ID token 沒有 <code>scope</code>、沒有權限，它只說「誰登入了」，訂單 API 從它看不出這個人能做什麼。第三，兩種 JWT 混用，API 很難分辨收到的是哪一種：RFC 9068 規定 JWT 格式的 access token 要在 header 寫 <code>typ: "at+jwt"</code>，就是為了讓 API 分得出 ID token 和 access token；RFC 8725 也建議不同種類的 JWT 用互斥的驗證規則。同樣的道理，LINE、Google 發的 access token 是用來呼叫 LINE、Google 的 API 的，也不能拿來打你的 API。</p>
+<p>最常見、也最簡單的做法：callback 驗完 ID token、用 <code>(iss, sub)</code> 找到會員之後，<strong>建立咖啡店自己的 session</strong>（第 4 課），而且照第 4 課的規則換一個新的 session ID。之後前端打咖啡店 API 帶的是咖啡店自己的 session cookie，跟 LINE 的 token 再也沒有關係。ID token 完成了「證明這次是誰登入」的任務就可以丟掉。LINE 的 access token 如果之後還要用（例如查好友關係），存在後端，不給前端。</p>
+<div class="callout warn"><strong>只在前端驗 ID token 沒有用。</strong>Vue 裡驗完簽章、再把「已驗證」的使用者 ID 傳給後端，後端收到的就只是一個任何人都能改的 ID。驗證一定在後端做，前端頂多解碼來顯示名字。</div>
+<p>換成自己的 session 也決定了登出的樣子。登出有兩層：咖啡店的 session 和 LINE 的登入狀態。在咖啡店按登出，只會刪掉咖啡店的 session（第 4 課）；使用者在 LINE 還是登入的，下次按「用 LINE 登入」可能一秒就回來了。這通常是使用者想要的。店內共用的平板這種需要連 LINE 一起登出的情境，OIDC 有另一份規格，但 Google 和 LINE 都沒有支援，細節見課末「補充與查表」。</p>
+<p>callback 的三件事都做完了。回頭看整個流程，有一樣東西撐著第 2 步的簽章驗證：LINE 網頁登入的 HS256 金鑰，也就是 channel secret。它如果外流，前面每一步都會失效。</p>
+
+<h2>channel secret 外流會怎樣？</h2>
+<p>LINE 網頁登入的 ID token 用 HS256 簽，金鑰是你的 channel secret。HMAC 是對稱的（第 8 課）：用來驗的那把金鑰，同時也能簽。所以拿到 channel secret 的人，不只能驗 token，還能自己簽出 LINE 會簽的 token。假設有人把 channel secret 寫進了前端的 <code>.env</code>，打包後誰都看得到。執行後看第一行：攻擊者自己簽、<code>sub</code> 填陳美華的 ID token，咖啡店驗出來是 <code>true</code>：</p>
+<div class="lab"><script type="code">
+const enc = new TextEncoder()
+const b64url = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+const json = (v: unknown) => b64url(enc.encode(JSON.stringify(v)))
+
+// 有人把 channel secret 寫進了前端的 .env（VITE_LINE_CHANNEL_SECRET），打包後誰都看得到
+const channelSecret = '3f1c9a7e5b2d4c6e8a0b1d3f5a7c9e1b'
+const key = await crypto.subtle.importKey('raw', enc.encode(channelSecret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify'])
+
+// 攻擊者自己簽一張「LINE 發的」ID token，sub 填陳美華的 LINE sub
+const now = Math.floor(Date.now() / 1000)
+const input = json({ typ: 'JWT', alg: 'HS256' }) + '.' + json({
+  iss: 'https://access.line.me', sub: 'U-meihua', aud: '1660000000', exp: now + 3600, iat: now,
+})
+const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(input)))
+const forged = input + '.' + b64url(sig)
+
+// 咖啡店後端照規則驗：簽章對、iss 對、aud 對
+const ok = await crypto.subtle.verify('HMAC', key, sig, enc.encode(input))
+console.log('偽造的 ID token 驗證結果：', ok)
+console.log(forged.slice(0, 60) + '…')
+</script></div>
+<p>簽章、<code>iss</code>、<code>aud</code> 全部正確，因為從密碼學的角度，它就是一張有效的 token。channel secret 外洩，等於任何人都能用任何 LINE 使用者的身分登入你的網站。<code>nonce</code> 也擋不住：攻擊者自己在咖啡店發起登入，就知道自己 session 裡的 <code>nonce</code>，照填進去就好。</p>
+<p>規則：channel secret、client secret 只放在後端的環境變數或 secrets 管理系統（<a href="23-secrets-encryption.html">第 23 課</a>），絕不進前端的打包、不進 Git；懷疑外洩就到 LINE Developers Console 重新產生。這也解釋了 Discovery 那一節的「兩種簽法」：App 和 LIFF 拿到的是 ES256 的 token，因為 App 在使用者手上，放不了秘密，只能用公鑰驗。LINE 也提供一支由它替你驗 ID token 的 API，取捨見課末「補充與查表」。</p>
+<div class="callout practice"><strong>💡 實務上：開發、測試、正式環境各用各的頻道和 secret</strong><br>
+在同一個提供者底下為每個環境各開一個 LINE Login 頻道：<code>sub</code> 還是同一個，但測試環境（staging）的 secret 外洩不會波及正式站。每個 callback URL 都要先在 LINE Developers Console 登記，換網域或新增環境時忘了加，登入會直接失敗，這是上線當天很常見的狀況。Code review 看到 <code>VITE_</code>、<code>NEXT_PUBLIC_</code> 這類前綴的變數裡放著 secret，直接擋下：這些變數會被打包進前端。</div>
+<p>到這裡，「用 LINE 登入」的後端已經完整：產生 <code>state</code>、<code>nonce</code>、PKCE，驗六步，處理兩種簽章和 JWKS 快取，帳號連結，換成自己的 session，保管 channel secret。這是只接一個 OP 的工作量。最後一個問題是：這些要不要都自己做？</p>
+
+<h2>這麼多事，要自己做還是交給身分服務？</h2>
+<p>把剛才那份清單加上這門課後面幾課的內容：密碼儲存（<a href="03-password-storage.html">第 3 課</a>）、MFA（<a href="14-mfa-totp.html">第 14 課</a>）、passkey（<a href="15-passkeys.html">第 15 課</a>）、忘記密碼與防暴力破解（<a href="16-account-flows.html">第 16 課</a>），登入系統是一大塊工作。另一條路是交給<strong>身分服務（identity provider，IdP）</strong>：專門負責登入、MFA、帳號管理的系統。雲端代管的版本常叫 <strong>IDaaS</strong>（Identity as a Service）。例如 Keycloak（開源、自己架）、Amazon Cognito、Auth0（代管）。</p>
+<p>身分服務跟咖啡店的整合方式，正是這一課學的 OIDC：它是 OP，咖啡店是 client。顧客在身分服務的頁面登入，咖啡店拿到它簽的 ID token，照這課的六步驗。差別在於 LINE、Google 這些登入方式改成接在身分服務後面，咖啡店只需要接一個 OP。兩條路的取捨：</p>
+<div class="table-wrap">
+<table>
+  <tr><th>考量</th><th>自己做</th><th>身分服務</th></tr>
+  <tr><td>上線速度</td><td>慢：每個流程都要寫、要測</td><td>快：社群登入、MFA、passkey 多半是設定就有</td></tr>
+  <tr><td>費用</td><td>主要是人力與維護</td><td>代管服務多半依每月活躍使用者計價，使用者多了費用跟著漲；自架 Keycloak 換成維運成本</td></tr>
+  <tr><td>資料放哪裡</td><td>自己的資料庫</td><td>代管服務在對方的雲上，要看個資與法規要求</td></tr>
+  <tr><td>客製流程</td><td>想怎麼做都行，例如店員在 POS 用 4 位數 PIN 快速切換</td><td>受限於服務提供的擴充點</td></tr>
+  <tr><td>被綁定的程度</td><td>沒有</td><td>使用者的密碼雜湊、MFA 設定在對方那裡，搬家時不一定匯得出來</td></tr>
+</table>
+</div>
+<p>判斷的方向：團隊小、時程緊、需要的是標準流程（email＋密碼、社群登入、MFA），用身分服務通常比較划算，也比自己第一次寫的安全。登入流程本身是產品的核心差異、有特殊的法規或資料落地要求、使用者規模大到計價很痛，才值得自己做。</p>
+<p>不管選哪一種，下面這些都還是你的責任。身分服務只負責「你是誰」，這課後半段處理的事情大多落在它的範圍之外：</p>
+<ul>
+  <li><strong>授權</strong>：身分服務告訴你「這是陳美華」，「陳美華能不能看訂單 #42」是你的程式決定的（<a href="18-rbac.html">第 18</a>～<a href="20-multi-tenancy.html">20 課</a>）。</li>
+  <li><strong>token 驗證</strong>：你的 API 要照這課的步驟驗身分服務發的 token，加上 JWKS 快取。設定錯一個 <code>aud</code>，身分服務再好也沒用。</li>
+  <li><strong>session 與 token 的管理</strong>：登入之後的 session、登出、撤銷（<a href="10-refresh-rotation.html">第 10</a>、<a href="11-revocation-tradeoffs.html">11 課</a>）。</li>
+  <li><strong>帳號流程的安全</strong>：帳號連結、改 email、客服重設帳號，這些業務流程寫錯，一樣會被接管。</li>
+</ul>
+
+<h2>補充與查表</h2>
+<p>主線用不到、但接 LINE、Google 或設定驗證函式庫時會查的細節。</p>
+
+<h3><code>azp</code>（authorized party）</h3>
+<p>ID token 裡有時會看到 <code>azp</code>，意思是「這張 token 發給哪個 client」。OIDC Core 1.0 的 errata set 2（2023-12-15）把「多個 <code>aud</code> 時要檢查 <code>azp</code>」的規定拿掉了，現在只有用到擴充規格時才驗，一般情況可以忽略。練習 1 也不檢查它。</p>
+
+<h3>LINE 的 <code>sub</code> 是 pairwise</h3>
+<p>LINE 的 discovery 寫著 <code>"subject_types_supported": ["pairwise"]</code>。意思是：同一個 LINE 使用者，在 LINE Developers Console 裡不同「提供者（provider）」底下的 <code>sub</code> 不一樣；同一個提供者底下的各個頻道拿到的是同一個。提供者是管理頻道的單位，通常一間公司一個。這保護使用者隱私（不同公司無法用 <code>sub</code> 串起同一個人），也代表你把 LINE Login 頻道搬到另一個提供者底下時，<code>external_identities</code> 裡舊的 <code>sub</code> 就對不上了。前面「開發、測試、正式環境各用各的頻道」的建議，要在同一個提供者底下開，就是這個原因。</p>
+
+<h3>jose 的 JWKS 快取預設值</h3>
+<p>jose 6 的 <code>createRemoteJWKSet</code> 預設快取 10 分鐘（<code>cacheMaxAge</code>），遇到不認得的 <code>kid</code> 時，要距離上次成功抓取 30 秒（<code>cooldownDuration</code>）才會再抓。</p>
+
+<h3>LINE 的 ID token 驗證 API</h3>
+<p>LINE 提供一支驗證 API（<code>POST https://api.line.me/oauth2/v2.1/verify</code>，帶 <code>id_token</code> 與 <code>client_id</code>），由 LINE 替你驗。它省掉自己寫驗證，代價是每次登入多一個對外請求，而且 <code>nonce</code> 還是要自己負責比對（帶 <code>nonce</code> 參數讓它比對，或自己比）。</p>
+
+<h3>連 OP 一起登出：RP-Initiated Logout</h3>
+<p>需要連 OP 一起登出時（例如店內共用的平板），OIDC 有一份獨立的規格 RP-Initiated Logout：把使用者導到 OP 的 <code>end_session_endpoint</code>。不是每個 OP 都支援，Google 和 LINE 的 discovery 都沒有列這個端點，所以共用裝置的情境要另外處理，例如結帳後自動登出、提醒使用者。</p>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：咖啡店同時接了兩個發行者：LINE 網頁登入（HS256，金鑰是 channel secret）和自家的身分服務 <code>https://login.coffee-auth.example</code>（ES256，JWKS）。寫 <code>validateIdToken(idToken, ctx)</code>，依序檢查，遇到第一個失敗就回傳對應的錯誤：</p>
+  <ol>
+    <li>用 <code>decodeJwt</code> 解碼；解不開、header 或 payload 不是物件、payload 的 <code>iss</code> 不是字串 → <code>malformed</code>。</li>
+    <li>用 <code>iss</code> 在 <code>ctx.issuers</code> 找設定，<strong>完全相等</strong>才算，用 <code>Object.hasOwn</code>（<code>iss</code> 是 <code>'constructor'</code> 也要找不到）→ 找不到是 <code>unknown_issuer</code>。</li>
+    <li>header 的 <code>alg</code> 必須等於設定的 <code>alg</code> → 否則 <code>alg_mismatch</code>。</li>
+    <li>用<strong>設定的</strong>演算法與金鑰驗簽章 → 失敗是 <code>bad_signature</code>。HS256：<code>secret</code> 當 HMAC-SHA256 金鑰。ES256：header 的 <code>kid</code> 在設定的 <code>jwks</code> 找相同的那一把，必須是 <code>kty: 'EC'</code>、<code>crv: 'P-256'</code>，簽章剛好 64 bytes（第 8 課練習 3）。</li>
+    <li><code>sub</code> 是非空字串、<code>exp</code> 與 <code>iat</code> 是數字、<code>aud</code> 是字串或字串陣列 → 否則 <code>malformed</code>。</li>
+    <li><code>aud</code> 必須包含 <code>clientId</code>，其他值都必須在 <code>otherTrustedAudiences</code> 裡 → 否則 <code>wrong_audience</code>。不檢查 <code>azp</code>。</li>
+    <li><code>now &gt;= exp</code> → <code>expired</code>（時間都是秒）。</li>
+    <li><code>|now - iat| &gt; maxIatAgeSeconds</code> → <code>iat_too_old</code>。</li>
+    <li><code>nonce</code> 必須存在而且等於 <code>expectedNonce</code> → 否則 <code>nonce_mismatch</code>。</li>
+  </ol>
+  <p>全部通過回 <code>{ ok: true, claims }</code>。任何情況都不能丟出例外。</p>
+  <script type="start">
+// 已經寫好（第 2 課、第 8 課的答案）
+function base64urlEncode(bytes: Uint8Array<ArrayBuffer>): string {
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+function base64urlDecode(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('不是 base64url：' + text)
+  const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+
+const enc = new TextEncoder()
+
+function encodeJson(value: unknown): string {
+  return base64urlEncode(enc.encode(JSON.stringify(value)))
+}
+
+type DecodedJwt = { header: unknown; payload: unknown }
+
+function decodeJwt(token: string): DecodedJwt | null {
+  const parts = token.split('.')
+  if (parts.length !== 3) return null
+  try {
+    const decoder = new TextDecoder()
+    const header: unknown = JSON.parse(decoder.decode(base64urlDecode(parts[0])))
+    const payload: unknown = JSON.parse(decoder.decode(base64urlDecode(parts[1])))
+    base64urlDecode(parts[2])
+    return { header, payload }
+  } catch {
+    return null
+  }
+}
+
+type PublicJwk = JsonWebKey & { kid?: string }
+
+// 題目的型別
+type IssuerConfig =
+  | { alg: 'ES256'; jwks: PublicJwk[] }
+  | { alg: 'HS256'; secret: Uint8Array<ArrayBuffer> }
+
+type ValidateContext = {
+  issuers: Record<string, IssuerConfig>
+  clientId: string
+  otherTrustedAudiences: string[]
+  expectedNonce: string
+  now: number               // 秒
+  maxIatAgeSeconds: number
+}
+
+type IdTokenClaims = {
+  iss: string
+  sub: string
+  aud: string | string[]
+  exp: number
+  iat: number
+  nonce?: unknown
+  [claim: string]: unknown
+}
+
+type IdTokenError =
+  | 'malformed' | 'unknown_issuer' | 'alg_mismatch' | 'bad_signature'
+  | 'wrong_audience' | 'expired' | 'iat_too_old' | 'nonce_mismatch'
+
+type ValidateResult = { ok: true; claims: IdTokenClaims } | { ok: false; error: IdTokenError }
+
+async function validateIdToken(idToken: string, ctx: ValidateContext): Promise<ValidateResult> {
+  throw new Error('TODO')
+}
+
+// 試試看：用 channel secret 簽一張 LINE 網頁登入的 ID token
+const channelSecret = enc.encode('3f1c9a7e5b2d4c6e8a0b1d3f5a7c9e1b')
+const hmacKey = await crypto.subtle.importKey('raw', channelSecret, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+const now = 1793430000
+const input = encodeJson({ typ: 'JWT', alg: 'HS256' }) + '.' + encodeJson({
+  iss: 'https://access.line.me', sub: 'U-meihua', aud: 'coffee-web', exp: now + 3600, iat: now - 5, nonce: 'n-123', name: '陳美華',
+})
+const token = input + '.' + base64urlEncode(new Uint8Array(await crypto.subtle.sign('HMAC', hmacKey, enc.encode(input))))
+const ctx: ValidateContext = {
+  issuers: { 'https://access.line.me': { alg: 'HS256', secret: channelSecret } },
+  clientId: 'coffee-web', otherTrustedAudiences: [], expectedNonce: 'n-123', now, maxIatAgeSeconds: 600,
+}
+console.log(await validateIdToken(token, ctx))
+console.log(await validateIdToken(token, { ...ctx, expectedNonce: 'other' }))
+</script>
+  <script type="answer">
+// 已經寫好（第 2 課、第 8 課的答案）
+function base64urlEncode(bytes: Uint8Array<ArrayBuffer>): string {
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+function base64urlDecode(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('不是 base64url：' + text)
+  const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+
+const enc = new TextEncoder()
+
+function encodeJson(value: unknown): string {
+  return base64urlEncode(enc.encode(JSON.stringify(value)))
+}
+
+type DecodedJwt = { header: unknown; payload: unknown }
+
+function decodeJwt(token: string): DecodedJwt | null {
+  const parts = token.split('.')
+  if (parts.length !== 3) return null
+  try {
+    const decoder = new TextDecoder()
+    const header: unknown = JSON.parse(decoder.decode(base64urlDecode(parts[0])))
+    const payload: unknown = JSON.parse(decoder.decode(base64urlDecode(parts[1])))
+    base64urlDecode(parts[2])
+    return { header, payload }
+  } catch {
+    return null
+  }
+}
+
+type PublicJwk = JsonWebKey & { kid?: string }
+
+// 題目的型別
+type IssuerConfig =
+  | { alg: 'ES256'; jwks: PublicJwk[] }
+  | { alg: 'HS256'; secret: Uint8Array<ArrayBuffer> }
+
+type ValidateContext = {
+  issuers: Record<string, IssuerConfig>
+  clientId: string
+  otherTrustedAudiences: string[]
+  expectedNonce: string
+  now: number               // 秒
+  maxIatAgeSeconds: number
+}
+
+type IdTokenClaims = {
+  iss: string
+  sub: string
+  aud: string | string[]
+  exp: number
+  iat: number
+  nonce?: unknown
+  [claim: string]: unknown
+}
+
+type IdTokenError =
+  | 'malformed' | 'unknown_issuer' | 'alg_mismatch' | 'bad_signature'
+  | 'wrong_audience' | 'expired' | 'iat_too_old' | 'nonce_mismatch'
+
+type ValidateResult = { ok: true; claims: IdTokenClaims } | { ok: false; error: IdTokenError }
+
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+const isStringArray = (v: unknown): v is string[] => Array.isArray(v) && v.every(x => typeof x === 'string')
+const fail = (error: IdTokenError): ValidateResult => ({ ok: false, error })
+
+async function verifySignature(token: string, kid: unknown, cfg: IssuerConfig): Promise<boolean> {
+  const dot = token.lastIndexOf('.')
+  const data = enc.encode(token.slice(0, dot))
+  const sig = base64urlDecode(token.slice(dot + 1))   // decodeJwt 已經確認過是 base64url
+  try {
+    if (cfg.alg === 'HS256') {
+      const key = await crypto.subtle.importKey('raw', cfg.secret, { name: 'HMAC', hash: 'SHA-256' }, false, ['verify'])
+      return await crypto.subtle.verify('HMAC', key, sig, data)
+    }
+    if (typeof kid !== 'string') return false
+    const jwk = cfg.jwks.find(k => k.kid === kid)
+    if (!jwk || jwk.kty !== 'EC' || jwk.crv !== 'P-256' || sig.length !== 64) return false
+    const key = await crypto.subtle.importKey('jwk', jwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify'])
+    return await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, sig, data)
+  } catch {
+    return false
+  }
+}
+
+async function validateIdToken(idToken: string, ctx: ValidateContext): Promise<ValidateResult> {
+  const decoded = decodeJwt(idToken)
+  if (!decoded || !isObject(decoded.header) || !isObject(decoded.payload)) return fail('malformed')
+  const { header, payload } = decoded
+  if (typeof payload.iss !== 'string') return fail('malformed')
+
+  if (!Object.hasOwn(ctx.issuers, payload.iss)) return fail('unknown_issuer')
+  const cfg = ctx.issuers[payload.iss]
+  if (header.alg !== cfg.alg) return fail('alg_mismatch')
+  if (!(await verifySignature(idToken, header.kid, cfg))) return fail('bad_signature')
+
+  const { sub, aud, exp, iat } = payload
+  if (typeof sub !== 'string' || sub === '' || typeof exp !== 'number' || typeof iat !== 'number') return fail('malformed')
+  if (typeof aud !== 'string' && !isStringArray(aud)) return fail('malformed')
+
+  const audiences = typeof aud === 'string' ? [aud] : aud
+  if (!audiences.includes(ctx.clientId)) return fail('wrong_audience')
+  if (!audiences.every(a => a === ctx.clientId || ctx.otherTrustedAudiences.includes(a))) return fail('wrong_audience')
+
+  if (ctx.now >= exp) return fail('expired')
+  if (Math.abs(ctx.now - iat) > ctx.maxIatAgeSeconds) return fail('iat_too_old')
+  if (payload.nonce !== ctx.expectedNonce) return fail('nonce_mismatch')
+
+  return { ok: true, claims: { ...payload, iss: payload.iss, sub, aud, exp, iat } }
+}
+
+// 試試看：用 channel secret 簽一張 LINE 網頁登入的 ID token
+const channelSecret = enc.encode('3f1c9a7e5b2d4c6e8a0b1d3f5a7c9e1b')
+const hmacKey = await crypto.subtle.importKey('raw', channelSecret, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+const now = 1793430000
+const input = encodeJson({ typ: 'JWT', alg: 'HS256' }) + '.' + encodeJson({
+  iss: 'https://access.line.me', sub: 'U-meihua', aud: 'coffee-web', exp: now + 3600, iat: now - 5, nonce: 'n-123', name: '陳美華',
+})
+const token = input + '.' + base64urlEncode(new Uint8Array(await crypto.subtle.sign('HMAC', hmacKey, enc.encode(input))))
+const ctx: ValidateContext = {
+  issuers: { 'https://access.line.me': { alg: 'HS256', secret: channelSecret } },
+  clientId: 'coffee-web', otherTrustedAudiences: [], expectedNonce: 'n-123', now, maxIatAgeSeconds: 600,
+}
+console.log(await validateIdToken(token, ctx))
+console.log(await validateIdToken(token, { ...ctx, expectedNonce: 'other' }))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<typeof validateIdToken, (idToken: string, ctx: ValidateContext) => Promise<ValidateResult>>>  // validateIdToken 的簽章要跟題目一樣
+</script>
+  <script type="tests">
+const te = new TextEncoder()
+const b64 = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+const j = (v: unknown) => b64(te.encode(JSON.stringify(v)))
+const LINE = 'https://access.line.me'
+const SELF = 'https://login.coffee-auth.example'
+const NOW = 1800000000
+const secret = te.encode('8b7d5c3a1f0e9d8c7b6a5f4e3d2c1b0a')
+const hmac = await crypto.subtle.importKey('raw', secret, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+const own = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify'])
+const evil = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify'])
+const pub = await crypto.subtle.exportKey('jwk', own.publicKey)
+const jwks = [{ kty: pub.kty, crv: pub.crv, x: pub.x, y: pub.y, kid: 'k1', alg: 'ES256', use: 'sig' }]
+const signHS = async (header: object, payload: object) => {
+  const input = `${j(header)}.${j(payload)}`
+  return `${input}.${b64(new Uint8Array(await crypto.subtle.sign('HMAC', hmac, te.encode(input))))}`
+}
+const signES = async (key: CryptoKey, header: object, payload: object) => {
+  const input = `${j(header)}.${j(payload)}`
+  return `${input}.${b64(new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, te.encode(input))))}`
+}
+const ctx = {
+  issuers: { [LINE]: { alg: 'HS256' as const, secret }, [SELF]: { alg: 'ES256' as const, jwks } },
+  clientId: 'coffee-web', otherTrustedAudiences: ['coffee-pos'], expectedNonce: 'n-123', now: NOW, maxIatAgeSeconds: 600,
+}
+const base = { sub: 'U-meihua', aud: 'coffee-web', exp: NOW + 300, iat: NOW - 10, nonce: 'n-123', name: '陳美華' }
+const line = (over: object = {}) => signHS({ typ: 'JWT', alg: 'HS256' }, { iss: LINE, ...base, ...over })
+const self = (over: object = {}) => signES(own.privateKey, { typ: 'JWT', alg: 'ES256', kid: 'k1' }, { iss: SELF, ...base, ...over })
+const run = async (t: string, c = ctx) => {
+  try { return await validateIdToken(t, c) } catch (e) { return { thrown: String(e) } }
+}
+const err = async (t: string, c = ctx) => {
+  const r: any = await run(t, c)
+  return r.ok === false ? r.error : r.thrown ? '丟出了例外' : 'ok'
+}
+
+const r1: any = await run(await line())
+assert.equal(r1.ok, true, 'LINE 網頁登入（HS256、channel secret）的正常 token 要通過')
+assert.equal(r1.ok && r1.claims.sub, 'U-meihua', '通過時 claims 要帶回 payload 的內容（sub）')
+assert.equal(r1.ok && r1.claims.name, '陳美華', '通過時 claims 要保留其他欄位（name）')
+const r2: any = await run(await self())
+assert.equal(r2.ok, true, '自家身分服務（ES256、JWKS）的正常 token 要通過')
+assert.equal((await run(await self({ aud: ['coffee-web', 'coffee-pos'] })) as any).ok, true, "aud 是 ['coffee-web', 'coffee-pos']，coffee-pos 在信任清單裡，要通過")
+
+assert.equal(await err(await signES(own.privateKey, { typ: 'JWT', alg: 'ES256', kid: 'k1' }, { iss: LINE, ...base })), 'alg_mismatch', 'iss 是 LINE（設定 HS256），header 卻是 ES256：要回 alg_mismatch')
+assert.equal(await err(await signHS({ typ: 'JWT', alg: 'HS256' }, { iss: SELF, ...base, sub: 'admin' })), 'alg_mismatch', '有人拿 LINE 的 channel secret 簽了一張 iss 是自家身分服務的 HS256 token：自家設定是 ES256，要回 alg_mismatch，不能依 header 的 alg 去找 HS256 的金鑰')
+assert.equal(await err(await signHS({ typ: 'JWT', alg: 'none' }, { iss: LINE, ...base })), 'alg_mismatch', 'alg 是 none 要回 alg_mismatch')
+
+assert.equal(await err(await signHS({ typ: 'JWT', alg: 'HS256' }, { ...base, iss: 'https://login.other.example' })), 'unknown_issuer', '沒設定的 iss 要回 unknown_issuer')
+assert.equal(await err(await signHS({ typ: 'JWT', alg: 'HS256' }, { ...base, iss: LINE + '/evil' })), 'unknown_issuer', "iss 是 'https://access.line.me/evil'：要完全相等，不能用 startsWith")
+assert.equal(await err(await signHS({ typ: 'JWT', alg: 'HS256' }, { ...base, iss: 'https://access.line' })), 'unknown_issuer', "iss 是 'https://access.line'：要完全相等，不能用 includes 或 startsWith")
+assert.equal(await err(await signHS({ typ: 'JWT', alg: 'HS256' }, { ...base, iss: 'constructor' })), 'unknown_issuer', "iss 是 'constructor'：用 Object.hasOwn 查設定，不能查到原型鏈上的東西")
+assert.equal(await err(await signHS({ typ: 'JWT', alg: 'HS256' }, base)), 'malformed', '沒有 iss 要回 malformed')
+
+const good = await line()
+const [h, , s] = good.split('.')
+assert.equal(await err(`${h}.${j({ iss: LINE, ...base, sub: 'U-boss' })}.${s}`), 'bad_signature', '竄改 payload 要回 bad_signature')
+assert.equal(await err(await signES(evil.privateKey, { typ: 'JWT', alg: 'ES256', kid: 'k1' }, { iss: SELF, ...base })), 'bad_signature', '用別的私鑰簽、kid 寫 k1：要回 bad_signature')
+assert.equal(await err(await signES(own.privateKey, { typ: 'JWT', alg: 'ES256', kid: 'k9' }, { iss: SELF, ...base })), 'bad_signature', 'kid 在 JWKS 找不到要回 bad_signature')
+assert.equal(await err(await signES(own.privateKey, { typ: 'JWT', alg: 'ES256' }, { iss: SELF, ...base })), 'bad_signature', '沒有 kid 要回 bad_signature')
+
+assert.equal(await err(await line({ aud: 'coffee-web-evil' })), 'wrong_audience', "aud 是 'coffee-web-evil'：字串要完全相等，不能用 includes")
+assert.equal(await err(await line({ aud: ['coffee-web', 'evil-app'] })), 'wrong_audience', "aud 是 ['coffee-web', 'evil-app']：有不信任的受眾就要拒絕")
+assert.equal(await err(await line({ aud: ['coffee-pos'] })), 'wrong_audience', "aud 只有 coffee-pos、沒有自己：要拒絕")
+assert.equal(await err(await line({ aud: [] })), 'wrong_audience', 'aud 是空陣列要回 wrong_audience')
+assert.equal(await err(await line({ aud: 'coffee-pos' })), 'wrong_audience', "aud 是 'coffee-pos' 字串：沒有自己要拒絕")
+assert.equal(await err(await line({ aud: 42 })), 'malformed', 'aud 不是字串也不是字串陣列要回 malformed')
+assert.equal(await err(await line({ sub: '' })), 'malformed', 'sub 是空字串要回 malformed')
+assert.equal(await err(await line({ exp: String(NOW + 300) })), 'malformed', 'exp 不是數字要回 malformed')
+assert.equal(await err(await line({ iat: String(NOW) })), 'malformed', 'iat 不是數字要回 malformed')
+assert.equal(await err(await line({ sub: 12345 })), 'malformed', 'sub 不是字串要回 malformed')
+assert.equal(await err(await signES(evil.privateKey, { typ: 'JWT', alg: 'ES256', kid: 'k1' }, { iss: SELF, ...base, aud: 'evil-app', exp: NOW - 1 })), 'bad_signature', '簽章不對的 token 要先回 bad_signature：先驗簽章，再看 aud、exp 這些內容')
+
+assert.equal(await err(await line({ exp: NOW })), 'expired', 'exp 等於現在要回 expired')
+assert.equal(await err(await line({ exp: NOW - 1 })), 'expired', '過期要回 expired')
+assert.equal(await err(await line({ iat: NOW - 601 })), 'iat_too_old', 'iat 比現在早超過 600 秒要回 iat_too_old')
+assert.equal(await err(await line({ iat: NOW + 601 })), 'iat_too_old', 'iat 比現在晚超過 600 秒也要回 iat_too_old')
+assert.equal((await run(await line({ iat: NOW - 600 })) as any).ok, true, 'iat 剛好早 600 秒還在範圍內')
+
+assert.equal(await err(await line({ nonce: 'n-999' })), 'nonce_mismatch', 'nonce 不一樣要回 nonce_mismatch')
+assert.equal(await err(await line({ nonce: undefined })), 'nonce_mismatch', 'token 沒有 nonce 也要回 nonce_mismatch，不能略過')
+assert.equal(await err(await line({ nonce: 123 })), 'nonce_mismatch', 'nonce 不是字串要回 nonce_mismatch')
+
+assert.equal(await err('a.b.c'), 'malformed', '格式不對要回 malformed，不能丟出例外')
+assert.equal(await err(good.split('.').slice(0, 2).join('.')), 'malformed', '只有兩段要回 malformed')
+assert.equal(await err(`${j(['x'])}.${j({ iss: LINE, ...base })}.${s}`), 'malformed', 'header 不是物件要回 malformed')
+</script>
+  <script type="wrong">
+// 依 header 的 alg 選演算法：HS256 就去找任何一個 HS256 發行者的 secret，ES256 就去找 JWKS
+function base64urlEncode(bytes: Uint8Array<ArrayBuffer>): string {
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+function base64urlDecode(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('不是 base64url：' + text)
+  const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+const enc = new TextEncoder()
+type DecodedJwt = { header: unknown; payload: unknown }
+function decodeJwt(token: string): DecodedJwt | null {
+  const parts = token.split('.')
+  if (parts.length !== 3) return null
+  try {
+    const decoder = new TextDecoder()
+    const header: unknown = JSON.parse(decoder.decode(base64urlDecode(parts[0])))
+    const payload: unknown = JSON.parse(decoder.decode(base64urlDecode(parts[1])))
+    base64urlDecode(parts[2])
+    return { header, payload }
+  } catch {
+    return null
+  }
+}
+type PublicJwk = JsonWebKey & { kid?: string }
+type IssuerConfig = | { alg: 'ES256'; jwks: PublicJwk[] } | { alg: 'HS256'; secret: Uint8Array<ArrayBuffer> }
+type ValidateContext = { issuers: Record<string, IssuerConfig>; clientId: string; otherTrustedAudiences: string[]; expectedNonce: string; now: number; maxIatAgeSeconds: number }
+type IdTokenClaims = { iss: string; sub: string; aud: string | string[]; exp: number; iat: number; nonce?: unknown; [claim: string]: unknown }
+type IdTokenError = | 'malformed' | 'unknown_issuer' | 'alg_mismatch' | 'bad_signature' | 'wrong_audience' | 'expired' | 'iat_too_old' | 'nonce_mismatch'
+type ValidateResult = { ok: true; claims: IdTokenClaims } | { ok: false; error: IdTokenError }
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+const isStringArray = (v: unknown): v is string[] => Array.isArray(v) && v.every(x => typeof x === 'string')
+const fail = (error: IdTokenError): ValidateResult => ({ ok: false, error })
+
+async function validateIdToken(idToken: string, ctx: ValidateContext): Promise<ValidateResult> {
+  const decoded = decodeJwt(idToken)
+  if (!decoded || !isObject(decoded.header) || !isObject(decoded.payload)) return fail('malformed')
+  const { header, payload } = decoded
+  if (typeof payload.iss !== 'string') return fail('malformed')
+  if (!Object.hasOwn(ctx.issuers, payload.iss)) return fail('unknown_issuer')
+  const configs = Object.values(ctx.issuers)
+  const dot = idToken.lastIndexOf('.')
+  const data = enc.encode(idToken.slice(0, dot))
+  const sig = base64urlDecode(idToken.slice(dot + 1))
+  let valid = false
+  try {
+    if (header.alg === 'HS256') {
+      const cfg = configs.find(c => c.alg === 'HS256')
+      if (cfg && cfg.alg === 'HS256') {
+        const key = await crypto.subtle.importKey('raw', cfg.secret, { name: 'HMAC', hash: 'SHA-256' }, false, ['verify'])
+        valid = await crypto.subtle.verify('HMAC', key, sig, data)
+      }
+    } else if (header.alg === 'ES256') {
+      const cfg = configs.find(c => c.alg === 'ES256')
+      const jwk = cfg && cfg.alg === 'ES256' ? cfg.jwks.find(k => k.kid === header.kid) : undefined
+      if (jwk && sig.length === 64) {
+        const key = await crypto.subtle.importKey('jwk', jwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify'])
+        valid = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, sig, data)
+      }
+    } else {
+      return fail('alg_mismatch')
+    }
+  } catch {
+    valid = false
+  }
+  if (!valid) return fail('bad_signature')
+  const { sub, aud, exp, iat } = payload
+  if (typeof sub !== 'string' || sub === '' || typeof exp !== 'number' || typeof iat !== 'number') return fail('malformed')
+  if (typeof aud !== 'string' && !isStringArray(aud)) return fail('malformed')
+  const audiences = typeof aud === 'string' ? [aud] : aud
+  if (!audiences.includes(ctx.clientId)) return fail('wrong_audience')
+  if (!audiences.every(a => a === ctx.clientId || ctx.otherTrustedAudiences.includes(a))) return fail('wrong_audience')
+  if (ctx.now >= exp) return fail('expired')
+  if (Math.abs(ctx.now - iat) > ctx.maxIatAgeSeconds) return fail('iat_too_old')
+  if (payload.nonce !== ctx.expectedNonce) return fail('nonce_mismatch')
+  return { ok: true, claims: { ...payload, iss: payload.iss, sub, aud, exp, iat } }
+}
+</script>
+  <script type="wrong">
+// aud 是字串時用 includes 比對
+function base64urlDecode(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('不是 base64url：' + text)
+  const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+const enc = new TextEncoder()
+type DecodedJwt = { header: unknown; payload: unknown }
+function decodeJwt(token: string): DecodedJwt | null {
+  const parts = token.split('.')
+  if (parts.length !== 3) return null
+  try {
+    const decoder = new TextDecoder()
+    const header: unknown = JSON.parse(decoder.decode(base64urlDecode(parts[0])))
+    const payload: unknown = JSON.parse(decoder.decode(base64urlDecode(parts[1])))
+    base64urlDecode(parts[2])
+    return { header, payload }
+  } catch {
+    return null
+  }
+}
+type PublicJwk = JsonWebKey & { kid?: string }
+type IssuerConfig = | { alg: 'ES256'; jwks: PublicJwk[] } | { alg: 'HS256'; secret: Uint8Array<ArrayBuffer> }
+type ValidateContext = { issuers: Record<string, IssuerConfig>; clientId: string; otherTrustedAudiences: string[]; expectedNonce: string; now: number; maxIatAgeSeconds: number }
+type IdTokenClaims = { iss: string; sub: string; aud: string | string[]; exp: number; iat: number; nonce?: unknown; [claim: string]: unknown }
+type IdTokenError = | 'malformed' | 'unknown_issuer' | 'alg_mismatch' | 'bad_signature' | 'wrong_audience' | 'expired' | 'iat_too_old' | 'nonce_mismatch'
+type ValidateResult = { ok: true; claims: IdTokenClaims } | { ok: false; error: IdTokenError }
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+const isStringArray = (v: unknown): v is string[] => Array.isArray(v) && v.every(x => typeof x === 'string')
+const fail = (error: IdTokenError): ValidateResult => ({ ok: false, error })
+async function verifySignature(token: string, kid: unknown, cfg: IssuerConfig): Promise<boolean> {
+  const dot = token.lastIndexOf('.')
+  const data = enc.encode(token.slice(0, dot))
+  const sig = base64urlDecode(token.slice(dot + 1))
+  try {
+    if (cfg.alg === 'HS256') {
+      const key = await crypto.subtle.importKey('raw', cfg.secret, { name: 'HMAC', hash: 'SHA-256' }, false, ['verify'])
+      return await crypto.subtle.verify('HMAC', key, sig, data)
+    }
+    if (typeof kid !== 'string') return false
+    const jwk = cfg.jwks.find(k => k.kid === kid)
+    if (!jwk || jwk.kty !== 'EC' || jwk.crv !== 'P-256' || sig.length !== 64) return false
+    const key = await crypto.subtle.importKey('jwk', jwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify'])
+    return await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, sig, data)
+  } catch {
+    return false
+  }
+}
+async function validateIdToken(idToken: string, ctx: ValidateContext): Promise<ValidateResult> {
+  const decoded = decodeJwt(idToken)
+  if (!decoded || !isObject(decoded.header) || !isObject(decoded.payload)) return fail('malformed')
+  const { header, payload } = decoded
+  if (typeof payload.iss !== 'string') return fail('malformed')
+  if (!Object.hasOwn(ctx.issuers, payload.iss)) return fail('unknown_issuer')
+  const cfg = ctx.issuers[payload.iss]
+  if (header.alg !== cfg.alg) return fail('alg_mismatch')
+  if (!(await verifySignature(idToken, header.kid, cfg))) return fail('bad_signature')
+  const { sub, aud, exp, iat } = payload
+  if (typeof sub !== 'string' || sub === '' || typeof exp !== 'number' || typeof iat !== 'number') return fail('malformed')
+  if (typeof aud !== 'string' && !isStringArray(aud)) return fail('malformed')
+  if (typeof aud === 'string') {
+    if (!aud.includes(ctx.clientId)) return fail('wrong_audience')
+  } else {
+    if (!aud.includes(ctx.clientId)) return fail('wrong_audience')
+    if (!aud.every(a => a === ctx.clientId || ctx.otherTrustedAudiences.includes(a))) return fail('wrong_audience')
+  }
+  if (ctx.now >= exp) return fail('expired')
+  if (Math.abs(ctx.now - iat) > ctx.maxIatAgeSeconds) return fail('iat_too_old')
+  if (payload.nonce !== ctx.expectedNonce) return fail('nonce_mismatch')
+  return { ok: true, claims: { ...payload, iss: payload.iss, sub, aud, exp, iat } }
+}
+</script>
+  <script type="wrong">
+// aud 陣列只要包含 clientId 就接受
+function base64urlDecode(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('不是 base64url：' + text)
+  const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+const enc = new TextEncoder()
+type DecodedJwt = { header: unknown; payload: unknown }
+function decodeJwt(token: string): DecodedJwt | null {
+  const parts = token.split('.')
+  if (parts.length !== 3) return null
+  try {
+    const decoder = new TextDecoder()
+    const header: unknown = JSON.parse(decoder.decode(base64urlDecode(parts[0])))
+    const payload: unknown = JSON.parse(decoder.decode(base64urlDecode(parts[1])))
+    base64urlDecode(parts[2])
+    return { header, payload }
+  } catch {
+    return null
+  }
+}
+type PublicJwk = JsonWebKey & { kid?: string }
+type IssuerConfig = | { alg: 'ES256'; jwks: PublicJwk[] } | { alg: 'HS256'; secret: Uint8Array<ArrayBuffer> }
+type ValidateContext = { issuers: Record<string, IssuerConfig>; clientId: string; otherTrustedAudiences: string[]; expectedNonce: string; now: number; maxIatAgeSeconds: number }
+type IdTokenClaims = { iss: string; sub: string; aud: string | string[]; exp: number; iat: number; nonce?: unknown; [claim: string]: unknown }
+type IdTokenError = | 'malformed' | 'unknown_issuer' | 'alg_mismatch' | 'bad_signature' | 'wrong_audience' | 'expired' | 'iat_too_old' | 'nonce_mismatch'
+type ValidateResult = { ok: true; claims: IdTokenClaims } | { ok: false; error: IdTokenError }
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+const isStringArray = (v: unknown): v is string[] => Array.isArray(v) && v.every(x => typeof x === 'string')
+const fail = (error: IdTokenError): ValidateResult => ({ ok: false, error })
+async function verifySignature(token: string, kid: unknown, cfg: IssuerConfig): Promise<boolean> {
+  const dot = token.lastIndexOf('.')
+  const data = enc.encode(token.slice(0, dot))
+  const sig = base64urlDecode(token.slice(dot + 1))
+  try {
+    if (cfg.alg === 'HS256') {
+      const key = await crypto.subtle.importKey('raw', cfg.secret, { name: 'HMAC', hash: 'SHA-256' }, false, ['verify'])
+      return await crypto.subtle.verify('HMAC', key, sig, data)
+    }
+    if (typeof kid !== 'string') return false
+    const jwk = cfg.jwks.find(k => k.kid === kid)
+    if (!jwk || jwk.kty !== 'EC' || jwk.crv !== 'P-256' || sig.length !== 64) return false
+    const key = await crypto.subtle.importKey('jwk', jwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify'])
+    return await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, sig, data)
+  } catch {
+    return false
+  }
+}
+async function validateIdToken(idToken: string, ctx: ValidateContext): Promise<ValidateResult> {
+  const decoded = decodeJwt(idToken)
+  if (!decoded || !isObject(decoded.header) || !isObject(decoded.payload)) return fail('malformed')
+  const { header, payload } = decoded
+  if (typeof payload.iss !== 'string') return fail('malformed')
+  if (!Object.hasOwn(ctx.issuers, payload.iss)) return fail('unknown_issuer')
+  const cfg = ctx.issuers[payload.iss]
+  if (header.alg !== cfg.alg) return fail('alg_mismatch')
+  if (!(await verifySignature(idToken, header.kid, cfg))) return fail('bad_signature')
+  const { sub, aud, exp, iat } = payload
+  if (typeof sub !== 'string' || sub === '' || typeof exp !== 'number' || typeof iat !== 'number') return fail('malformed')
+  if (typeof aud !== 'string' && !isStringArray(aud)) return fail('malformed')
+  const audiences = typeof aud === 'string' ? [aud] : aud
+  if (!audiences.includes(ctx.clientId)) return fail('wrong_audience')
+  if (ctx.now >= exp) return fail('expired')
+  if (Math.abs(ctx.now - iat) > ctx.maxIatAgeSeconds) return fail('iat_too_old')
+  if (payload.nonce !== ctx.expectedNonce) return fail('nonce_mismatch')
+  return { ok: true, claims: { ...payload, iss: payload.iss, sub, aud, exp, iat } }
+}
+</script>
+  <script type="wrong">
+// token 沒有 nonce 時略過檢查
+function base64urlDecode(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('不是 base64url：' + text)
+  const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+const enc = new TextEncoder()
+type DecodedJwt = { header: unknown; payload: unknown }
+function decodeJwt(token: string): DecodedJwt | null {
+  const parts = token.split('.')
+  if (parts.length !== 3) return null
+  try {
+    const decoder = new TextDecoder()
+    const header: unknown = JSON.parse(decoder.decode(base64urlDecode(parts[0])))
+    const payload: unknown = JSON.parse(decoder.decode(base64urlDecode(parts[1])))
+    base64urlDecode(parts[2])
+    return { header, payload }
+  } catch {
+    return null
+  }
+}
+type PublicJwk = JsonWebKey & { kid?: string }
+type IssuerConfig = | { alg: 'ES256'; jwks: PublicJwk[] } | { alg: 'HS256'; secret: Uint8Array<ArrayBuffer> }
+type ValidateContext = { issuers: Record<string, IssuerConfig>; clientId: string; otherTrustedAudiences: string[]; expectedNonce: string; now: number; maxIatAgeSeconds: number }
+type IdTokenClaims = { iss: string; sub: string; aud: string | string[]; exp: number; iat: number; nonce?: unknown; [claim: string]: unknown }
+type IdTokenError = | 'malformed' | 'unknown_issuer' | 'alg_mismatch' | 'bad_signature' | 'wrong_audience' | 'expired' | 'iat_too_old' | 'nonce_mismatch'
+type ValidateResult = { ok: true; claims: IdTokenClaims } | { ok: false; error: IdTokenError }
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+const isStringArray = (v: unknown): v is string[] => Array.isArray(v) && v.every(x => typeof x === 'string')
+const fail = (error: IdTokenError): ValidateResult => ({ ok: false, error })
+async function verifySignature(token: string, kid: unknown, cfg: IssuerConfig): Promise<boolean> {
+  const dot = token.lastIndexOf('.')
+  const data = enc.encode(token.slice(0, dot))
+  const sig = base64urlDecode(token.slice(dot + 1))
+  try {
+    if (cfg.alg === 'HS256') {
+      const key = await crypto.subtle.importKey('raw', cfg.secret, { name: 'HMAC', hash: 'SHA-256' }, false, ['verify'])
+      return await crypto.subtle.verify('HMAC', key, sig, data)
+    }
+    if (typeof kid !== 'string') return false
+    const jwk = cfg.jwks.find(k => k.kid === kid)
+    if (!jwk || jwk.kty !== 'EC' || jwk.crv !== 'P-256' || sig.length !== 64) return false
+    const key = await crypto.subtle.importKey('jwk', jwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify'])
+    return await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, sig, data)
+  } catch {
+    return false
+  }
+}
+async function validateIdToken(idToken: string, ctx: ValidateContext): Promise<ValidateResult> {
+  const decoded = decodeJwt(idToken)
+  if (!decoded || !isObject(decoded.header) || !isObject(decoded.payload)) return fail('malformed')
+  const { header, payload } = decoded
+  if (typeof payload.iss !== 'string') return fail('malformed')
+  if (!Object.hasOwn(ctx.issuers, payload.iss)) return fail('unknown_issuer')
+  const cfg = ctx.issuers[payload.iss]
+  if (header.alg !== cfg.alg) return fail('alg_mismatch')
+  if (!(await verifySignature(idToken, header.kid, cfg))) return fail('bad_signature')
+  const { sub, aud, exp, iat } = payload
+  if (typeof sub !== 'string' || sub === '' || typeof exp !== 'number' || typeof iat !== 'number') return fail('malformed')
+  if (typeof aud !== 'string' && !isStringArray(aud)) return fail('malformed')
+  const audiences = typeof aud === 'string' ? [aud] : aud
+  if (!audiences.includes(ctx.clientId)) return fail('wrong_audience')
+  if (!audiences.every(a => a === ctx.clientId || ctx.otherTrustedAudiences.includes(a))) return fail('wrong_audience')
+  if (ctx.now >= exp) return fail('expired')
+  if (Math.abs(ctx.now - iat) > ctx.maxIatAgeSeconds) return fail('iat_too_old')
+  if (payload.nonce !== undefined && payload.nonce !== ctx.expectedNonce) return fail('nonce_mismatch')
+  return { ok: true, claims: { ...payload, iss: payload.iss, sub, aud, exp, iat } }
+}
+</script>
+  <script type="wrong">
+// 用 startsWith 比對 iss（也沒用 Object.hasOwn）
+function base64urlDecode(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('不是 base64url：' + text)
+  const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+const enc = new TextEncoder()
+type DecodedJwt = { header: unknown; payload: unknown }
+function decodeJwt(token: string): DecodedJwt | null {
+  const parts = token.split('.')
+  if (parts.length !== 3) return null
+  try {
+    const decoder = new TextDecoder()
+    const header: unknown = JSON.parse(decoder.decode(base64urlDecode(parts[0])))
+    const payload: unknown = JSON.parse(decoder.decode(base64urlDecode(parts[1])))
+    base64urlDecode(parts[2])
+    return { header, payload }
+  } catch {
+    return null
+  }
+}
+type PublicJwk = JsonWebKey & { kid?: string }
+type IssuerConfig = | { alg: 'ES256'; jwks: PublicJwk[] } | { alg: 'HS256'; secret: Uint8Array<ArrayBuffer> }
+type ValidateContext = { issuers: Record<string, IssuerConfig>; clientId: string; otherTrustedAudiences: string[]; expectedNonce: string; now: number; maxIatAgeSeconds: number }
+type IdTokenClaims = { iss: string; sub: string; aud: string | string[]; exp: number; iat: number; nonce?: unknown; [claim: string]: unknown }
+type IdTokenError = | 'malformed' | 'unknown_issuer' | 'alg_mismatch' | 'bad_signature' | 'wrong_audience' | 'expired' | 'iat_too_old' | 'nonce_mismatch'
+type ValidateResult = { ok: true; claims: IdTokenClaims } | { ok: false; error: IdTokenError }
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+const isStringArray = (v: unknown): v is string[] => Array.isArray(v) && v.every(x => typeof x === 'string')
+const fail = (error: IdTokenError): ValidateResult => ({ ok: false, error })
+async function verifySignature(token: string, kid: unknown, cfg: IssuerConfig): Promise<boolean> {
+  const dot = token.lastIndexOf('.')
+  const data = enc.encode(token.slice(0, dot))
+  const sig = base64urlDecode(token.slice(dot + 1))
+  try {
+    if (cfg.alg === 'HS256') {
+      const key = await crypto.subtle.importKey('raw', cfg.secret, { name: 'HMAC', hash: 'SHA-256' }, false, ['verify'])
+      return await crypto.subtle.verify('HMAC', key, sig, data)
+    }
+    if (typeof kid !== 'string') return false
+    const jwk = cfg.jwks.find(k => k.kid === kid)
+    if (!jwk || jwk.kty !== 'EC' || jwk.crv !== 'P-256' || sig.length !== 64) return false
+    const key = await crypto.subtle.importKey('jwk', jwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify'])
+    return await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, sig, data)
+  } catch {
+    return false
+  }
+}
+async function validateIdToken(idToken: string, ctx: ValidateContext): Promise<ValidateResult> {
+  const decoded = decodeJwt(idToken)
+  if (!decoded || !isObject(decoded.header) || !isObject(decoded.payload)) return fail('malformed')
+  const { header, payload } = decoded
+  const iss = payload.iss
+  if (typeof iss !== 'string') return fail('malformed')
+  const name = Object.keys(ctx.issuers).find(k => iss.startsWith(k))
+  if (!name) return fail('unknown_issuer')
+  const cfg = ctx.issuers[name]
+  if (header.alg !== cfg.alg) return fail('alg_mismatch')
+  if (!(await verifySignature(idToken, header.kid, cfg))) return fail('bad_signature')
+  const { sub, aud, exp, iat } = payload
+  if (typeof sub !== 'string' || sub === '' || typeof exp !== 'number' || typeof iat !== 'number') return fail('malformed')
+  if (typeof aud !== 'string' && !isStringArray(aud)) return fail('malformed')
+  const audiences = typeof aud === 'string' ? [aud] : aud
+  if (!audiences.includes(ctx.clientId)) return fail('wrong_audience')
+  if (!audiences.every(a => a === ctx.clientId || ctx.otherTrustedAudiences.includes(a))) return fail('wrong_audience')
+  if (ctx.now >= exp) return fail('expired')
+  if (Math.abs(ctx.now - iat) > ctx.maxIatAgeSeconds) return fail('iat_too_old')
+  if (payload.nonce !== ctx.expectedNonce) return fail('nonce_mismatch')
+  return { ok: true, claims: { ...payload, iss, sub, aud, exp, iat } }
+}
+</script>
+  <script type="wrong">
+// 先檢查 aud、exp 等內容，最後才驗簽章（偽造的 token 也能從錯誤訊息試探規則）
+function base64urlEncode(bytes: Uint8Array<ArrayBuffer>): string {
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+function base64urlDecode(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('不是 base64url：' + text)
+  const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+
+const enc = new TextEncoder()
+
+function encodeJson(value: unknown): string {
+  return base64urlEncode(enc.encode(JSON.stringify(value)))
+}
+
+type DecodedJwt = { header: unknown; payload: unknown }
+
+function decodeJwt(token: string): DecodedJwt | null {
+  const parts = token.split('.')
+  if (parts.length !== 3) return null
+  try {
+    const decoder = new TextDecoder()
+    const header: unknown = JSON.parse(decoder.decode(base64urlDecode(parts[0])))
+    const payload: unknown = JSON.parse(decoder.decode(base64urlDecode(parts[1])))
+    base64urlDecode(parts[2])
+    return { header, payload }
+  } catch {
+    return null
+  }
+}
+
+type PublicJwk = JsonWebKey & { kid?: string }
+
+// 題目的型別
+type IssuerConfig =
+  | { alg: 'ES256'; jwks: PublicJwk[] }
+  | { alg: 'HS256'; secret: Uint8Array<ArrayBuffer> }
+
+type ValidateContext = {
+  issuers: Record<string, IssuerConfig>
+  clientId: string
+  otherTrustedAudiences: string[]
+  expectedNonce: string
+  now: number               // 秒
+  maxIatAgeSeconds: number
+}
+
+type IdTokenClaims = {
+  iss: string
+  sub: string
+  aud: string | string[]
+  exp: number
+  iat: number
+  nonce?: unknown
+  [claim: string]: unknown
+}
+
+type IdTokenError =
+  | 'malformed' | 'unknown_issuer' | 'alg_mismatch' | 'bad_signature'
+  | 'wrong_audience' | 'expired' | 'iat_too_old' | 'nonce_mismatch'
+
+type ValidateResult = { ok: true; claims: IdTokenClaims } | { ok: false; error: IdTokenError }
+
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+const isStringArray = (v: unknown): v is string[] => Array.isArray(v) && v.every(x => typeof x === 'string')
+const fail = (error: IdTokenError): ValidateResult => ({ ok: false, error })
+
+async function verifySignature(token: string, kid: unknown, cfg: IssuerConfig): Promise<boolean> {
+  const dot = token.lastIndexOf('.')
+  const data = enc.encode(token.slice(0, dot))
+  const sig = base64urlDecode(token.slice(dot + 1))   // decodeJwt 已經確認過是 base64url
+  try {
+    if (cfg.alg === 'HS256') {
+      const key = await crypto.subtle.importKey('raw', cfg.secret, { name: 'HMAC', hash: 'SHA-256' }, false, ['verify'])
+      return await crypto.subtle.verify('HMAC', key, sig, data)
+    }
+    if (typeof kid !== 'string') return false
+    const jwk = cfg.jwks.find(k => k.kid === kid)
+    if (!jwk || jwk.kty !== 'EC' || jwk.crv !== 'P-256' || sig.length !== 64) return false
+    const key = await crypto.subtle.importKey('jwk', jwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify'])
+    return await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, sig, data)
+  } catch {
+    return false
+  }
+}
+
+async function validateIdToken(idToken: string, ctx: ValidateContext): Promise<ValidateResult> {
+  const decoded = decodeJwt(idToken)
+  if (!decoded || !isObject(decoded.header) || !isObject(decoded.payload)) return fail('malformed')
+  const { header, payload } = decoded
+  if (typeof payload.iss !== 'string') return fail('malformed')
+
+  if (!Object.hasOwn(ctx.issuers, payload.iss)) return fail('unknown_issuer')
+  const cfg = ctx.issuers[payload.iss]
+  if (header.alg !== cfg.alg) return fail('alg_mismatch')
+
+  const { sub, aud, exp, iat } = payload
+  if (typeof sub !== 'string' || sub === '' || typeof exp !== 'number' || typeof iat !== 'number') return fail('malformed')
+  if (typeof aud !== 'string' && !isStringArray(aud)) return fail('malformed')
+
+  const audiences = typeof aud === 'string' ? [aud] : aud
+  if (!audiences.includes(ctx.clientId)) return fail('wrong_audience')
+  if (!audiences.every(a => a === ctx.clientId || ctx.otherTrustedAudiences.includes(a))) return fail('wrong_audience')
+
+  if (ctx.now >= exp) return fail('expired')
+  if (Math.abs(ctx.now - iat) > ctx.maxIatAgeSeconds) return fail('iat_too_old')
+  if (payload.nonce !== ctx.expectedNonce) return fail('nonce_mismatch')
+
+  if (!(await verifySignature(idToken, header.kid, cfg))) return fail('bad_signature')
+  return { ok: true, claims: { ...payload, iss: payload.iss, sub, aud, exp, iat } }
+}
+</script>
+  <script type="wrong">
+// iat 沒檢查是不是數字，直接用 Number() 轉
+function base64urlEncode(bytes: Uint8Array<ArrayBuffer>): string {
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+function base64urlDecode(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('不是 base64url：' + text)
+  const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+
+const enc = new TextEncoder()
+
+function encodeJson(value: unknown): string {
+  return base64urlEncode(enc.encode(JSON.stringify(value)))
+}
+
+type DecodedJwt = { header: unknown; payload: unknown }
+
+function decodeJwt(token: string): DecodedJwt | null {
+  const parts = token.split('.')
+  if (parts.length !== 3) return null
+  try {
+    const decoder = new TextDecoder()
+    const header: unknown = JSON.parse(decoder.decode(base64urlDecode(parts[0])))
+    const payload: unknown = JSON.parse(decoder.decode(base64urlDecode(parts[1])))
+    base64urlDecode(parts[2])
+    return { header, payload }
+  } catch {
+    return null
+  }
+}
+
+type PublicJwk = JsonWebKey & { kid?: string }
+
+// 題目的型別
+type IssuerConfig =
+  | { alg: 'ES256'; jwks: PublicJwk[] }
+  | { alg: 'HS256'; secret: Uint8Array<ArrayBuffer> }
+
+type ValidateContext = {
+  issuers: Record<string, IssuerConfig>
+  clientId: string
+  otherTrustedAudiences: string[]
+  expectedNonce: string
+  now: number               // 秒
+  maxIatAgeSeconds: number
+}
+
+type IdTokenClaims = {
+  iss: string
+  sub: string
+  aud: string | string[]
+  exp: number
+  iat: number
+  nonce?: unknown
+  [claim: string]: unknown
+}
+
+type IdTokenError =
+  | 'malformed' | 'unknown_issuer' | 'alg_mismatch' | 'bad_signature'
+  | 'wrong_audience' | 'expired' | 'iat_too_old' | 'nonce_mismatch'
+
+type ValidateResult = { ok: true; claims: IdTokenClaims } | { ok: false; error: IdTokenError }
+
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+const isStringArray = (v: unknown): v is string[] => Array.isArray(v) && v.every(x => typeof x === 'string')
+const fail = (error: IdTokenError): ValidateResult => ({ ok: false, error })
+
+async function verifySignature(token: string, kid: unknown, cfg: IssuerConfig): Promise<boolean> {
+  const dot = token.lastIndexOf('.')
+  const data = enc.encode(token.slice(0, dot))
+  const sig = base64urlDecode(token.slice(dot + 1))   // decodeJwt 已經確認過是 base64url
+  try {
+    if (cfg.alg === 'HS256') {
+      const key = await crypto.subtle.importKey('raw', cfg.secret, { name: 'HMAC', hash: 'SHA-256' }, false, ['verify'])
+      return await crypto.subtle.verify('HMAC', key, sig, data)
+    }
+    if (typeof kid !== 'string') return false
+    const jwk = cfg.jwks.find(k => k.kid === kid)
+    if (!jwk || jwk.kty !== 'EC' || jwk.crv !== 'P-256' || sig.length !== 64) return false
+    const key = await crypto.subtle.importKey('jwk', jwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify'])
+    return await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, sig, data)
+  } catch {
+    return false
+  }
+}
+
+async function validateIdToken(idToken: string, ctx: ValidateContext): Promise<ValidateResult> {
+  const decoded = decodeJwt(idToken)
+  if (!decoded || !isObject(decoded.header) || !isObject(decoded.payload)) return fail('malformed')
+  const { header, payload } = decoded
+  if (typeof payload.iss !== 'string') return fail('malformed')
+
+  if (!Object.hasOwn(ctx.issuers, payload.iss)) return fail('unknown_issuer')
+  const cfg = ctx.issuers[payload.iss]
+  if (header.alg !== cfg.alg) return fail('alg_mismatch')
+  if (!(await verifySignature(idToken, header.kid, cfg))) return fail('bad_signature')
+
+  const { sub, aud, exp, iat } = payload
+  if (typeof sub !== 'string' || sub === '' || typeof exp !== 'number') return fail('malformed')
+  if (typeof aud !== 'string' && !isStringArray(aud)) return fail('malformed')
+
+  const audiences = typeof aud === 'string' ? [aud] : aud
+  if (!audiences.includes(ctx.clientId)) return fail('wrong_audience')
+  if (!audiences.every(a => a === ctx.clientId || ctx.otherTrustedAudiences.includes(a))) return fail('wrong_audience')
+
+  if (ctx.now >= exp) return fail('expired')
+  if (Math.abs(ctx.now - Number(iat)) > ctx.maxIatAgeSeconds) return fail('iat_too_old')
+  if (payload.nonce !== ctx.expectedNonce) return fail('nonce_mismatch')
+
+  return { ok: true, claims: { ...payload, iss: payload.iss, sub, aud, exp, iat: Number(iat) } }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：ID token 驗證通過後，用 claims 找出（或建立）咖啡店的使用者。寫 <code>linkOrCreateUser(db, claims)</code>：</p>
+  <ol>
+    <li>在 <code>db.identities</code> 用 <strong><code>(iss, sub)</code> 兩個都相等</strong>找外部身分。找到 → <code>{ action: 'login', userId }</code>。</li>
+    <li>找不到，而且 <code>claims.email_verified === true</code>（布林值）、<code>claims.email</code> 是字串、<code>db.users</code> 有同 email 的使用者 → <strong>不要自動合併</strong>，也不要寫入任何東西，回 <code>{ action: 'require_link_confirmation', userId: 那位使用者的 id }</code>，讓他先用原本的方式登入再確認。</li>
+    <li>其他情況 → 建立新使用者（<code>id</code> 是目前最大的 id + 1，沒有使用者時是 1），<code>email</code> 只有在 <code>email_verified === true</code> 而且是字串時才寫入，否則是 <code>null</code>；同時新增一筆外部身分。回 <code>{ action: 'created', userId }</code>。</li>
+  </ol>
+  <script type="start">
+type User = { id: number; email: string | null }
+type ExternalIdentity = { userId: number; iss: string; sub: string }
+type Db = { users: User[]; identities: ExternalIdentity[] }   // 用陣列代替資料表
+type ExternalClaims = { iss: string; sub: string; email?: string; email_verified?: unknown }
+type LinkResult =
+  | { action: 'login'; userId: number }
+  | { action: 'created'; userId: number }
+  | { action: 'require_link_confirmation'; userId: number }
+
+async function linkOrCreateUser(db: Db, claims: ExternalClaims): Promise<LinkResult> {
+  throw new Error('TODO')
+}
+
+const db: Db = {
+  users: [{ id: 1, email: 'meihua@example.com' }],
+  identities: [{ userId: 1, iss: 'https://accounts.google.com', sub: '1098' }],
+}
+console.log(await linkOrCreateUser(db, { iss: 'https://accounts.google.com', sub: '1098', email: 'new@example.com', email_verified: true }))
+console.log(await linkOrCreateUser(db, { iss: 'https://access.line.me', sub: 'U-1', email: 'meihua@example.com', email_verified: true }))
+console.log(await linkOrCreateUser(db, { iss: 'https://access.line.me', sub: 'U-2' }))
+console.log(db)
+</script>
+  <script type="answer">
+type User = { id: number; email: string | null }
+type ExternalIdentity = { userId: number; iss: string; sub: string }
+type Db = { users: User[]; identities: ExternalIdentity[] }   // 用陣列代替資料表
+type ExternalClaims = { iss: string; sub: string; email?: string; email_verified?: unknown }
+type LinkResult =
+  | { action: 'login'; userId: number }
+  | { action: 'created'; userId: number }
+  | { action: 'require_link_confirmation'; userId: number }
+
+async function linkOrCreateUser(db: Db, claims: ExternalClaims): Promise<LinkResult> {
+  const identity = db.identities.find(i => i.iss === claims.iss && i.sub === claims.sub)
+  if (identity) return { action: 'login', userId: identity.userId }
+
+  const verifiedEmail = claims.email_verified === true && typeof claims.email === 'string' ? claims.email : null
+  if (verifiedEmail !== null) {
+    const existing = db.users.find(u => u.email === verifiedEmail)
+    if (existing) return { action: 'require_link_confirmation', userId: existing.id }
+  }
+
+  const id = db.users.reduce((max, u) => Math.max(max, u.id), 0) + 1
+  db.users.push({ id, email: verifiedEmail })
+  db.identities.push({ userId: id, iss: claims.iss, sub: claims.sub })
+  return { action: 'created', userId: id }
+}
+
+const db: Db = {
+  users: [{ id: 1, email: 'meihua@example.com' }],
+  identities: [{ userId: 1, iss: 'https://accounts.google.com', sub: '1098' }],
+}
+console.log(await linkOrCreateUser(db, { iss: 'https://accounts.google.com', sub: '1098', email: 'new@example.com', email_verified: true }))
+console.log(await linkOrCreateUser(db, { iss: 'https://access.line.me', sub: 'U-1', email: 'meihua@example.com', email_verified: true }))
+console.log(await linkOrCreateUser(db, { iss: 'https://access.line.me', sub: 'U-2' }))
+console.log(db)
+</script>
+  <script type="types">
+type _1 = Expect<Equal<typeof linkOrCreateUser, (db: Db, claims: ExternalClaims) => Promise<LinkResult>>>  // linkOrCreateUser 的簽章要跟題目一樣
+</script>
+  <script type="tests">
+const GOOGLE = 'https://accounts.google.com'
+const LINE = 'https://access.line.me'
+const make = (): Db => ({
+  users: [{ id: 1, email: 'meihua@example.com' }, { id: 5, email: 'jianguo@example.com' }],
+  identities: [{ userId: 1, iss: GOOGLE, sub: 'g-111' }, { userId: 5, iss: LINE, sub: 'U-555' }],
+})
+const snap = (db: Db) => JSON.stringify(db)
+
+let db = make()
+assert.deepEqual(await linkOrCreateUser(db, { iss: GOOGLE, sub: 'g-111', email: 'meihua@example.com', email_verified: true }), { action: 'login', userId: 1 }, '同一個 (iss, sub) 要登入同一位使用者')
+assert.deepEqual(await linkOrCreateUser(db, { iss: GOOGLE, sub: 'g-111', email: 'meihua.new@example.com', email_verified: true }), { action: 'login', userId: 1 }, '使用者在 Google 改了 email，(iss, sub) 不變，仍然是同一位使用者')
+assert.equal(snap(db), snap(make()), '登入時不能改動資料表')
+
+db = make()
+const before = snap(db)
+assert.deepEqual(await linkOrCreateUser(db, { iss: LINE, sub: 'U-999', email: 'meihua@example.com', email_verified: true }), { action: 'require_link_confirmation', userId: 1 }, '不同 iss、相同的已驗證 email：要回 require_link_confirmation，不能自動合併登入')
+assert.equal(snap(db), before, 'require_link_confirmation 時不能寫入任何外部身分或使用者')
+
+db = make()
+assert.deepEqual(await linkOrCreateUser(db, { iss: 'https://forum.example', sub: 'attacker', email: 'meihua@example.com', email_verified: false }), { action: 'created', userId: 6 }, 'email 沒驗證過：不能拿它找既有使用者，要建立新使用者（id = 最大 id + 1 = 6）')
+assert.deepEqual(db.users.find(u => u.id === 6), { id: 6, email: null }, 'email_verified 是 false：新使用者的 email 要是 null')
+assert.deepEqual(db.identities.find(i => i.userId === 6), { userId: 6, iss: 'https://forum.example', sub: 'attacker' }, '建立新使用者時也要新增外部身分 (iss, sub)')
+assert.deepEqual(await linkOrCreateUser(db, { iss: 'https://forum.example', sub: 'attacker' }), { action: 'login', userId: 6 }, '建立之後，同一個 (iss, sub) 再來要登入')
+
+db = make()
+assert.deepEqual(await linkOrCreateUser(db, { iss: 'https://forum.example', sub: 'x1', email: 'meihua@example.com', email_verified: 'true' }), { action: 'created', userId: 6 }, "email_verified 是字串 'true'：不是布林 true，不能當成已驗證")
+assert.equal(db.users.find(u => u.id === 6)?.email, null, "email_verified 是字串 'true'：新使用者的 email 要是 null")
+assert.deepEqual(await linkOrCreateUser(db, { iss: 'https://forum.example', sub: 'x2', email: 'other@example.com', email_verified: 'false' }), { action: 'created', userId: 7 }, "email_verified 是字串 'false'：要建立新使用者")
+assert.equal(db.users.find(u => u.id === 7)?.email, null, "email_verified 是字串 'false'：新使用者的 email 要是 null")
+assert.deepEqual(await linkOrCreateUser(db, { iss: GOOGLE, sub: 'g-222', email: 'zhihao@example.com', email_verified: true }), { action: 'created', userId: 8 }, '已驗證、沒人用過的 email：建立新使用者')
+assert.equal(db.users.find(u => u.id === 8)?.email, 'zhihao@example.com', '已驗證的 email 要寫進新使用者')
+assert.deepEqual(await linkOrCreateUser(db, { iss: LINE, sub: 'U-noemail', email_verified: true }), { action: 'created', userId: 9 }, 'email_verified 是 true 但沒有 email：建立新使用者')
+assert.deepEqual(db.users.find(u => u.id === 9), { id: 9, email: null }, '沒有 email 時，新使用者的 email 要是 null（不是 undefined）')
+
+db = make()
+assert.deepEqual(await linkOrCreateUser(db, { iss: 'https://login.coffee-auth.example', sub: 'g-111' }), { action: 'created', userId: 6 }, '不同 iss 但 sub 剛好相同：是不同的身分，不能登入成 Google 的 g-111 那位')
+assert.deepEqual(await linkOrCreateUser(db, { iss: GOOGLE, sub: 'U-555' }), { action: 'created', userId: 7 }, 'Google 的 sub 剛好等於 LINE 某人的 sub：仍然是不同的身分')
+
+const empty: Db = { users: [], identities: [] }
+assert.deepEqual(await linkOrCreateUser(empty, { iss: LINE, sub: 'U-1' }), { action: 'created', userId: 1 }, '沒有任何使用者時，新使用者的 id 是 1')
+</script>
+  <script type="wrong">
+// 先用 email 找使用者並自動登入（帳號接管）
+type User = { id: number; email: string | null }
+type ExternalIdentity = { userId: number; iss: string; sub: string }
+type Db = { users: User[]; identities: ExternalIdentity[] }
+type ExternalClaims = { iss: string; sub: string; email?: string; email_verified?: unknown }
+type LinkResult = | { action: 'login'; userId: number } | { action: 'created'; userId: number } | { action: 'require_link_confirmation'; userId: number }
+async function linkOrCreateUser(db: Db, claims: ExternalClaims): Promise<LinkResult> {
+  const identity = db.identities.find(i => i.iss === claims.iss && i.sub === claims.sub)
+  if (identity) return { action: 'login', userId: identity.userId }
+  const byEmail = db.users.find(u => u.email !== null && u.email === claims.email)
+  if (byEmail) {
+    db.identities.push({ userId: byEmail.id, iss: claims.iss, sub: claims.sub })
+    return { action: 'login', userId: byEmail.id }
+  }
+  const verifiedEmail = claims.email_verified === true && typeof claims.email === 'string' ? claims.email : null
+  const id = db.users.reduce((max, u) => Math.max(max, u.id), 0) + 1
+  db.users.push({ id, email: verifiedEmail })
+  db.identities.push({ userId: id, iss: claims.iss, sub: claims.sub })
+  return { action: 'created', userId: id }
+}
+</script>
+  <script type="wrong">
+// 只用 sub 當 key
+type User = { id: number; email: string | null }
+type ExternalIdentity = { userId: number; iss: string; sub: string }
+type Db = { users: User[]; identities: ExternalIdentity[] }
+type ExternalClaims = { iss: string; sub: string; email?: string; email_verified?: unknown }
+type LinkResult = | { action: 'login'; userId: number } | { action: 'created'; userId: number } | { action: 'require_link_confirmation'; userId: number }
+async function linkOrCreateUser(db: Db, claims: ExternalClaims): Promise<LinkResult> {
+  const identity = db.identities.find(i => i.sub === claims.sub)
+  if (identity) return { action: 'login', userId: identity.userId }
+  const verifiedEmail = claims.email_verified === true && typeof claims.email === 'string' ? claims.email : null
+  if (verifiedEmail !== null) {
+    const existing = db.users.find(u => u.email === verifiedEmail)
+    if (existing) return { action: 'require_link_confirmation', userId: existing.id }
+  }
+  const id = db.users.reduce((max, u) => Math.max(max, u.id), 0) + 1
+  db.users.push({ id, email: verifiedEmail })
+  db.identities.push({ userId: id, iss: claims.iss, sub: claims.sub })
+  return { action: 'created', userId: id }
+}
+</script>
+  <script type="wrong">
+// 把字串 'true'、'false' 當成 true（只看 truthy）
+type User = { id: number; email: string | null }
+type ExternalIdentity = { userId: number; iss: string; sub: string }
+type Db = { users: User[]; identities: ExternalIdentity[] }
+type ExternalClaims = { iss: string; sub: string; email?: string; email_verified?: unknown }
+type LinkResult = | { action: 'login'; userId: number } | { action: 'created'; userId: number } | { action: 'require_link_confirmation'; userId: number }
+async function linkOrCreateUser(db: Db, claims: ExternalClaims): Promise<LinkResult> {
+  const identity = db.identities.find(i => i.iss === claims.iss && i.sub === claims.sub)
+  if (identity) return { action: 'login', userId: identity.userId }
+  const verifiedEmail = claims.email_verified && typeof claims.email === 'string' ? claims.email : null
+  if (verifiedEmail !== null) {
+    const existing = db.users.find(u => u.email === verifiedEmail)
+    if (existing) return { action: 'require_link_confirmation', userId: existing.id }
+  }
+  const id = db.users.reduce((max, u) => Math.max(max, u.id), 0) + 1
+  db.users.push({ id, email: verifiedEmail })
+  db.identities.push({ userId: id, iss: claims.iss, sub: claims.sub })
+  return { action: 'created', userId: id }
+}
+</script>
+  <script type="wrong">
+// email_verified 是 true 就寫入 email，沒確認 email 是字串（沒有 email 時寫進 undefined）
+type User = { id: number; email: string | null }
+type ExternalIdentity = { userId: number; iss: string; sub: string }
+type Db = { users: User[]; identities: ExternalIdentity[] }   // 用陣列代替資料表
+type ExternalClaims = { iss: string; sub: string; email?: string; email_verified?: unknown }
+type LinkResult =
+  | { action: 'login'; userId: number }
+  | { action: 'created'; userId: number }
+  | { action: 'require_link_confirmation'; userId: number }
+
+async function linkOrCreateUser(db: Db, claims: ExternalClaims): Promise<LinkResult> {
+  const identity = db.identities.find(i => i.iss === claims.iss && i.sub === claims.sub)
+  if (identity) return { action: 'login', userId: identity.userId }
+
+  const verifiedEmail = claims.email_verified === true ? (claims.email as string) : null
+  if (verifiedEmail !== null) {
+    const existing = db.users.find(u => u.email === verifiedEmail)
+    if (existing) return { action: 'require_link_confirmation', userId: existing.id }
+  }
+
+  const id = db.users.reduce((max, u) => Math.max(max, u.id), 0) + 1
+  db.users.push({ id, email: verifiedEmail })
+  db.identities.push({ userId: id, iss: claims.iss, sub: claims.sub })
+  return { action: 'created', userId: id }
+}
+
+const db: Db = {
+  users: [{ id: 1, email: 'meihua@example.com' }],
+  identities: [{ userId: 1, iss: 'https://accounts.google.com', sub: '1098' }],
+}
+console.log(await linkOrCreateUser(db, { iss: 'https://accounts.google.com', sub: '1098', email: 'new@example.com', email_verified: true }))
+console.log(await linkOrCreateUser(db, { iss: 'https://access.line.me', sub: 'U-1', email: 'meihua@example.com', email_verified: true }))
+console.log(await linkOrCreateUser(db, { iss: 'https://access.line.me', sub: 'U-2' }))
+console.log(db)
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：咖啡店的 API 要驗自家身分服務發的 ES256 token，寫一個 JWKS 快取 <code>createJwksCache(deps, opts)</code>，回傳 <code>{ getKey(kid) }</code>：</p>
+  <ul>
+    <li><strong>第一次</strong>呼叫時抓 JWKS（<code>deps.fetchJwks()</code>）。</li>
+    <li>距離上次<strong>成功</strong>抓取超過 <code>maxAgeMs</code>（<code>&gt;=</code>）就重抓。</li>
+    <li><code>kid</code> 找不到時，距離上次<strong>嘗試</strong>抓取已經 <code>&gt;= minRefetchIntervalMs</code> 才重抓一次；還在間隔內就直接回 <code>null</code>。抓取失敗也算一次嘗試。</li>
+    <li><strong>single-flight</strong>（<a href="10-refresh-rotation.html">第 10 課</a>）：正在抓的時候，其他呼叫等同一次抓取的結果，不另外抓。</li>
+    <li>抓取失敗（Promise reject 或直接 throw）時沿用手上的金鑰；手上沒有就回 <code>null</code>。<code>getKey</code> 不能丟出例外。</li>
+  </ul>
+  <p>時間一律用 <code>deps.now()</code>（毫秒），不要用 <code>Date.now()</code>，也不要留下 <code>setTimeout</code>、<code>setInterval</code>。</p>
+  <script type="start">
+type PublicJwk = JsonWebKey & { kid?: string }
+type JwksCacheDeps = { fetchJwks: () => Promise<PublicJwk[]>; now: () => number }
+type JwksCacheOptions = { maxAgeMs: number; minRefetchIntervalMs: number }
+type JwksCache = { getKey(kid: string): Promise<PublicJwk | null> }
+
+function createJwksCache(deps: JwksCacheDeps, opts: JwksCacheOptions): JwksCache {
+  throw new Error('TODO')
+}
+
+// 試試看：假的發行者與假時鐘
+let time = 0
+let fetches = 0
+let published: PublicJwk[] = [{ kty: 'EC', crv: 'P-256', x: 'x1', y: 'y1', kid: 'k1' }]
+const cache = createJwksCache(
+  { fetchJwks: async () => { fetches++; return published }, now: () => time },
+  { maxAgeMs: 600_000, minRefetchIntervalMs: 30_000 },
+)
+console.log('k1：', (await cache.getKey('k1'))?.kid, '抓了', fetches, '次')
+console.log('k1 再一次：', (await cache.getKey('k1'))?.kid, '抓了', fetches, '次')
+console.log('亂填的 kid：', await cache.getKey('zzz'), '抓了', fetches, '次')
+published = [...published, { kty: 'EC', crv: 'P-256', x: 'x2', y: 'y2', kid: 'k2' }]   // 發行者輪替金鑰
+time += 31_000
+console.log('31 秒後問 k2：', (await cache.getKey('k2'))?.kid, '抓了', fetches, '次')
+</script>
+  <script type="answer">
+type PublicJwk = JsonWebKey & { kid?: string }
+type JwksCacheDeps = { fetchJwks: () => Promise<PublicJwk[]>; now: () => number }
+type JwksCacheOptions = { maxAgeMs: number; minRefetchIntervalMs: number }
+type JwksCache = { getKey(kid: string): Promise<PublicJwk | null> }
+
+function createJwksCache(deps: JwksCacheDeps, opts: JwksCacheOptions): JwksCache {
+  let keys: PublicJwk[] | null = null
+  let fetchedAt = 0                       // 上次成功抓取的時間
+  let attemptedAt: number | null = null   // 上次嘗試抓取的時間（成功或失敗）
+  let inflight: Promise<void> | null = null
+
+  function refresh(): Promise<void> {
+    if (inflight) return inflight
+    attemptedAt = deps.now()
+    inflight = (async () => {
+      try {
+        const fresh = await deps.fetchJwks()
+        keys = fresh
+        fetchedAt = deps.now()
+      } catch {
+        // 抓取失敗：沿用手上的金鑰
+      } finally {
+        inflight = null
+      }
+    })()
+    return inflight
+  }
+
+  const canRefetch = () => attemptedAt === null || deps.now() - attemptedAt >= opts.minRefetchIntervalMs
+  const find = (kid: string) => keys?.find(k => k.kid === kid) ?? null
+
+  return {
+    async getKey(kid) {
+      if (inflight) await inflight
+      const stale = keys === null || deps.now() - fetchedAt >= opts.maxAgeMs
+      if (stale && canRefetch()) await refresh()   // 發行者掛掉時也不會每個請求都去打它
+      const key = find(kid)
+      if (key) return key
+      if (!canRefetch()) return null
+      await refresh()
+      return find(kid)
+    },
+  }
+}
+
+// 試試看：假的發行者與假時鐘
+let time = 0
+let fetches = 0
+let published: PublicJwk[] = [{ kty: 'EC', crv: 'P-256', x: 'x1', y: 'y1', kid: 'k1' }]
+const cache = createJwksCache(
+  { fetchJwks: async () => { fetches++; return published }, now: () => time },
+  { maxAgeMs: 600_000, minRefetchIntervalMs: 30_000 },
+)
+console.log('k1：', (await cache.getKey('k1'))?.kid, '抓了', fetches, '次')
+console.log('k1 再一次：', (await cache.getKey('k1'))?.kid, '抓了', fetches, '次')
+console.log('亂填的 kid：', await cache.getKey('zzz'), '抓了', fetches, '次')
+published = [...published, { kty: 'EC', crv: 'P-256', x: 'x2', y: 'y2', kid: 'k2' }]   // 發行者輪替金鑰
+time += 31_000
+console.log('31 秒後問 k2：', (await cache.getKey('k2'))?.kid, '抓了', fetches, '次')
+</script>
+  <script type="types">
+type _1 = Expect<Equal<typeof createJwksCache, (deps: JwksCacheDeps, opts: JwksCacheOptions) => JwksCache>>  // createJwksCache 的簽章要跟題目一樣
+</script>
+  <script type="tests">
+const k = (kid: string): PublicJwk => ({ kty: 'EC', crv: 'P-256', x: 'x-' + kid, y: 'y-' + kid, kid })
+const setup = () => {
+  const s = { time: 1_000_000, calls: 0, fail: false, keys: [k('k1')] }
+  const deps = {
+    fetchJwks: async () => {
+      s.calls++
+      await Promise.resolve()
+      if (s.fail) throw new Error('發行者掛了')
+      return s.keys.slice()
+    },
+    now: () => s.time,
+  }
+  return { s, cache: createJwksCache(deps, { maxAgeMs: 600_000, minRefetchIntervalMs: 30_000 }) }
+}
+const get = async (c: JwksCache, kid: string) => {
+  try { return await c.getKey(kid) } catch { return '丟出了例外' as const }
+}
+const kidOf = (v: unknown) => (v && typeof v === 'object' && 'kid' in v ? v.kid : v)
+
+let { s, cache } = setup()
+assert.equal(kidOf(await get(cache, 'k1')), 'k1', '第一次 getKey(k1) 要抓 JWKS 並回傳 k1')
+assert.equal(s.calls, 1, '第一次呼叫要抓一次')
+assert.equal(kidOf(await get(cache, 'k1')), 'k1', '第二次 getKey(k1) 要回傳 k1')
+assert.equal(s.calls, 1, '已知的 kid 第二次不能再抓')
+assert.equal(await get(cache, 'zzz'), null, '剛抓完就來一個不認得的 kid 要回 null')
+assert.equal(s.calls, 1, '剛抓完（第一次抓取也算一次嘗試），間隔內不認得的 kid 不能觸發重抓')
+s.time += 30_000
+assert.equal(await get(cache, 'zzz'), null, '不認得的 kid 要回 null')
+assert.equal(s.calls, 2, '距離上次抓取已經 30 秒，不認得的 kid 要觸發一次重抓')
+assert.equal(await get(cache, 'yyy'), null, '間隔內又來一個不認得的 kid 要回 null')
+assert.equal(await get(cache, 'xxx'), null, '間隔內又來一個不認得的 kid 要回 null')
+assert.equal(s.calls, 2, '30 秒內亂填的 kid 不能再觸發重抓，否則攻擊者能讓你一直打發行者')
+s.time += 29_999
+assert.equal(await get(cache, 'www'), null, '還差 1 毫秒才滿 30 秒，要回 null')
+assert.equal(s.calls, 2, '還在間隔內不能重抓')
+s.keys = [k('k1'), k('k2')]
+s.time += 1
+assert.equal(kidOf(await get(cache, 'k2')), 'k2', '發行者輪替新增 k2，過了間隔再問 k2 要重抓並拿到')
+assert.equal(s.calls, 3, '拿 k2 要重抓一次')
+assert.equal(kidOf(await get(cache, 'k1')), 'k1', '舊的 k1 仍然在')
+assert.equal(s.calls, 3, '已知的 kid 不能再抓')
+
+;({ s, cache } = setup())
+const all = await Promise.all(Array.from({ length: 10 }, () => get(cache, 'k1')))
+assert.deepEqual(all.map(kidOf), Array(10).fill('k1'), '10 個同時的呼叫都要拿到 k1')
+assert.equal(s.calls, 1, '10 個同時的呼叫只能抓一次（single-flight）')
+s.time += 600_000
+s.keys = [k('k1'), k('k3')]
+const after = await Promise.all(Array.from({ length: 5 }, () => get(cache, 'k1')))
+assert.deepEqual(after.map(kidOf), Array(5).fill('k1'), '過期重抓時，5 個同時的呼叫都要拿到 k1')
+assert.equal(s.calls, 2, '超過 maxAgeMs 要重抓，而且同時的呼叫只抓一次')
+assert.equal(kidOf(await get(cache, 'k3')), 'k3', '重抓之後拿得到新的 k3')
+assert.equal(s.calls, 2, 'k3 已經在新抓的 JWKS 裡，不能再抓')
+s.time += 30_000
+const unknown = await Promise.all(Array.from({ length: 10 }, (_, i) => get(cache, 'bogus-' + i)))
+assert.deepEqual(unknown, Array(10).fill(null), '10 個同時的亂填 kid 都要回 null')
+assert.equal(s.calls, 3, '10 個同時的亂填 kid 只能觸發一次重抓（single-flight，而且馬上算進間隔）')
+
+;({ s, cache } = setup())
+await get(cache, 'k1')
+s.fail = true
+s.time += 700_000
+assert.equal(kidOf(await get(cache, 'k1')), 'k1', '快取過期但重抓失敗：已知的 k1 要沿用舊的金鑰，不能丟出例外')
+assert.equal(s.calls, 2, '快取過期要嘗試重抓')
+assert.equal(kidOf(await get(cache, 'k1')), 'k1', '重抓失敗後馬上再問 k1，要沿用舊的金鑰')
+assert.equal(s.calls, 2, '重抓失敗後，間隔內不能每個請求都再去打發行者')
+s.time += 30_000
+assert.equal(await get(cache, 'nope'), null, '重抓失敗時，不認得的 kid 要回 null，不能丟出例外')
+assert.equal(kidOf(await get(cache, 'k1')), 'k1', '失敗之後 k1 仍然要拿得到，不能清空快取')
+s.fail = false
+s.time += 30_000
+assert.equal(kidOf(await get(cache, 'k1')), 'k1', '發行者恢復之後要拿得到 k1')
+
+;({ s, cache } = setup())
+s.fail = true
+assert.equal(await get(cache, 'k1'), null, '第一次就抓不到：要回 null，不能丟出例外')
+const syncThrow = createJwksCache({ fetchJwks: () => { throw new Error('同步丟出') }, now: () => 0 }, { maxAgeMs: 1000, minRefetchIntervalMs: 100 })
+assert.equal(await get(syncThrow, 'k1'), null, 'fetchJwks 直接 throw（不是回傳 rejected Promise）也要回 null')
+</script>
+  <script type="wrong">
+// kid 找不到就每次重抓
+type PublicJwk = JsonWebKey & { kid?: string }
+type JwksCacheDeps = { fetchJwks: () => Promise<PublicJwk[]>; now: () => number }
+type JwksCacheOptions = { maxAgeMs: number; minRefetchIntervalMs: number }
+type JwksCache = { getKey(kid: string): Promise<PublicJwk | null> }
+function createJwksCache(deps: JwksCacheDeps, opts: JwksCacheOptions): JwksCache {
+  let keys: PublicJwk[] | null = null
+  let fetchedAt = 0
+  let inflight: Promise<void> | null = null
+  function refresh(): Promise<void> {
+    if (inflight) return inflight
+    inflight = (async () => {
+      try { keys = await deps.fetchJwks(); fetchedAt = deps.now() } catch {} finally { inflight = null }
+    })()
+    return inflight
+  }
+  const find = (kid: string) => keys?.find(k => k.kid === kid) ?? null
+  return {
+    async getKey(kid) {
+      if (inflight) await inflight
+      if (keys === null || deps.now() - fetchedAt >= opts.maxAgeMs) await refresh()
+      const key = find(kid)
+      if (key) return key
+      await refresh()
+      return find(kid)
+    },
+  }
+}
+</script>
+  <script type="wrong">
+// 永遠不重抓：抓過一次就一直用
+type PublicJwk = JsonWebKey & { kid?: string }
+type JwksCacheDeps = { fetchJwks: () => Promise<PublicJwk[]>; now: () => number }
+type JwksCacheOptions = { maxAgeMs: number; minRefetchIntervalMs: number }
+type JwksCache = { getKey(kid: string): Promise<PublicJwk | null> }
+function createJwksCache(deps: JwksCacheDeps, opts: JwksCacheOptions): JwksCache {
+  let loading: Promise<PublicJwk[]> | null = null
+  return {
+    async getKey(kid) {
+      if (!loading) loading = (async () => { try { return await deps.fetchJwks() } catch { return [] } })()
+      const keys = await loading
+      return keys.find(k => k.kid === kid) ?? null
+    },
+  }
+}
+</script>
+  <script type="wrong">
+// 同時多個呼叫各自抓（沒有 single-flight）
+type PublicJwk = JsonWebKey & { kid?: string }
+type JwksCacheDeps = { fetchJwks: () => Promise<PublicJwk[]>; now: () => number }
+type JwksCacheOptions = { maxAgeMs: number; minRefetchIntervalMs: number }
+type JwksCache = { getKey(kid: string): Promise<PublicJwk | null> }
+function createJwksCache(deps: JwksCacheDeps, opts: JwksCacheOptions): JwksCache {
+  let keys: PublicJwk[] | null = null
+  let fetchedAt = 0
+  let attemptedAt: number | null = null
+  async function refresh() {
+    attemptedAt = deps.now()
+    try { keys = await deps.fetchJwks(); fetchedAt = deps.now() } catch {}
+  }
+  const canRefetch = () => attemptedAt === null || deps.now() - attemptedAt >= opts.minRefetchIntervalMs
+  const find = (kid: string) => keys?.find(k => k.kid === kid) ?? null
+  return {
+    async getKey(kid) {
+      if (keys === null || deps.now() - fetchedAt >= opts.maxAgeMs) await refresh()
+      const key = find(kid)
+      if (key) return key
+      if (!canRefetch()) return null
+      await refresh()
+      return find(kid)
+    },
+  }
+}
+</script>
+  <script type="wrong">
+// 抓取失敗時清空快取
+type PublicJwk = JsonWebKey & { kid?: string }
+type JwksCacheDeps = { fetchJwks: () => Promise<PublicJwk[]>; now: () => number }
+type JwksCacheOptions = { maxAgeMs: number; minRefetchIntervalMs: number }
+type JwksCache = { getKey(kid: string): Promise<PublicJwk | null> }
+function createJwksCache(deps: JwksCacheDeps, opts: JwksCacheOptions): JwksCache {
+  let keys: PublicJwk[] | null = null
+  let fetchedAt = 0
+  let attemptedAt: number | null = null
+  let inflight: Promise<void> | null = null
+  function refresh(): Promise<void> {
+    if (inflight) return inflight
+    attemptedAt = deps.now()
+    inflight = (async () => {
+      try { keys = await deps.fetchJwks(); fetchedAt = deps.now() } catch { keys = [] } finally { inflight = null }
+    })()
+    return inflight
+  }
+  const canRefetch = () => attemptedAt === null || deps.now() - attemptedAt >= opts.minRefetchIntervalMs
+  const find = (kid: string) => keys?.find(k => k.kid === kid) ?? null
+  return {
+    async getKey(kid) {
+      if (inflight) await inflight
+      if (keys === null ? attemptedAt === null || canRefetch() : deps.now() - fetchedAt >= opts.maxAgeMs) await refresh()
+      const key = find(kid)
+      if (key) return key
+      if (!canRefetch()) return null
+      await refresh()
+      return find(kid)
+    },
+  }
+}
+</script>
+  <script type="wrong">
+// 抓取失敗時把例外丟出去
+type PublicJwk = JsonWebKey & { kid?: string }
+type JwksCacheDeps = { fetchJwks: () => Promise<PublicJwk[]>; now: () => number }
+type JwksCacheOptions = { maxAgeMs: number; minRefetchIntervalMs: number }
+type JwksCache = { getKey(kid: string): Promise<PublicJwk | null> }
+function createJwksCache(deps: JwksCacheDeps, opts: JwksCacheOptions): JwksCache {
+  let keys: PublicJwk[] | null = null
+  let fetchedAt = 0
+  let attemptedAt: number | null = null
+  let inflight: Promise<void> | null = null
+  function refresh(): Promise<void> {
+    if (inflight) return inflight
+    attemptedAt = deps.now()
+    inflight = (async () => {
+      try { keys = await deps.fetchJwks(); fetchedAt = deps.now() } finally { inflight = null }
+    })()
+    return inflight
+  }
+  const canRefetch = () => attemptedAt === null || deps.now() - attemptedAt >= opts.minRefetchIntervalMs
+  const find = (kid: string) => keys?.find(k => k.kid === kid) ?? null
+  return {
+    async getKey(kid) {
+      if (inflight) await inflight
+      if (keys === null ? attemptedAt === null || canRefetch() : deps.now() - fetchedAt >= opts.maxAgeMs) await refresh()
+      const key = find(kid)
+      if (key) return key
+      if (!canRefetch()) return null
+      await refresh()
+      return find(kid)
+    },
+  }
+}
+</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：同事設計外部登入的資料表：<code>users.email</code> 設 <code>UNIQUE</code>，「用 Google 登入」時用 ID token 的 <code>email</code> 找使用者，找到就登入。理由是「email 是唯一的，而且 Google 驗證過」。最大的問題是什麼？</p>
+  <label data-key="a">沒問題，只要檢查 <code>email_verified</code> 就安全</label>
+  <label data-key="b">email 太長，當索引效能不好</label>
+  <label data-key="c">email 會變、可能被回收再分配，換一個 OP 也不一定驗證過；只有 <code>(iss, sub)</code> 是穩定的識別</label>
+  <label data-key="d">應該改用 <code>sub</code> 單獨當主鍵</label>
+  <p class="why">✓ OIDC Core §5.7 規定只有 <code>iss</code> 加 <code>sub</code> 能當穩定識別，email 這類欄位 MUST NOT 當唯一識別：使用者改 email 會變成另一個帳號；email 被回收給新人時，新人會登入成舊人的帳號。a 錯：<code>email_verified</code> 只代表 OP 在某個時間驗證過，不解決改名與回收，接了第二個 OP 後還有自動合併被接管的問題。b 不是重點。d 錯：<code>sub</code> 只在同一個發行者內唯一，不同發行者可能撞在一起，要搭配 <code>iss</code>。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：Vue 前端用 Google 登入後拿到了 ID token，同事想把它放進 <code>Authorization: Bearer</code> 去呼叫咖啡店的訂單 API，「反正都是 Google 簽的 JWT」。該怎麼回應？</p>
+  <label data-key="a">可以，ID token 有簽章，訂單 API 驗過簽章就能信任</label>
+  <label data-key="b">不行：ID token 的 <code>aud</code> 是咖啡店網站的 client_id，它是給 client 看的登入證明，不是 API 的授權憑證；後端驗完應該換成咖啡店自己的 session</label>
+  <label data-key="c">可以，只要改用 Google 的 access token 就好，它就是給 API 用的</label>
+  <label data-key="d">不行，因為 ID token 太大，放不進標頭</label>
+  <p class="why">✓ ID token 回答「誰登入了」，<code>aud</code> 是 client；API 照第 9 課驗 <code>aud</code> 就該拒絕它，RFC 9068 的 <code>typ: at+jwt</code> 也是為了區分兩者。a 錯在只看簽章，忽略了「給誰的」。c 錯：Google 的 access token 是給 Google 的 API 用的，<code>aud</code> 也不是你的訂單 API。d 不是原因。最簡單的做法是後端驗完 ID token、建立咖啡店自己的 session。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：咖啡店的 callback 已經檢查了 <code>state</code>。同事說「<code>nonce</code> 也是一個隨機值，有 <code>state</code> 就夠了，LINE 也說 nonce 是選填」。下面哪個說法正確？</p>
+  <label data-key="a">兩個都要：<code>state</code> 保護 callback 請求（CSRF），<code>nonce</code> 在 OP 的簽章裡，把 ID token 綁回這個 session 發起的這一次登入，擋重放和從別處拿來的 ID token</label>
+  <label data-key="b">有 <code>state</code> 就夠了，<code>nonce</code> 只是給 implicit 流程用的</label>
+  <label data-key="c">有 <code>nonce</code> 就夠了，<code>state</code> 可以拿掉</label>
+  <label data-key="d"><code>nonce</code> 是給 OP 檢查的，LINE 會幫你比對，client 拿到 ID token 不用再看它</label>
+  <p class="why">✓ <code>state</code> 不在 ID token 裡，只保護「導回來的這個請求」。App、LIFF 把 ID token 直接送到 API，或攻擊者重送一張舊的 ID token 時，只有簽章裡的 <code>nonce</code> 能證明它屬於這次登入。b 錯：規格只在 implicit 流程把 <code>nonce</code> 定為必填、授權碼流程是選填，但 ID token 只要不是由你這次的 code 換來（App、LIFF 直接送上來），就只剩 <code>nonce</code> 能把它綁回這次登入。c 錯：LINE 規定 <code>state</code> 必填，而且 <code>state</code> 是在換 token 之前就擋下偽造的 callback。d 錯：OP 只是把收到的 <code>nonce</code> 原樣寫進 ID token，它不知道你的 session 裡存了什麼；比對一定是 client 自己做（LINE 的驗證 API 也要你把 <code>nonce</code> 傳給它才會比）。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 7：LINE 網頁登入的 ID token 用 HS256 簽。下面哪一句正確？</p>
+  <label data-key="a">簽章金鑰是 LINE 的私鑰，只有 LINE 能簽出有效的 ID token</label>
+  <label data-key="b">簽章金鑰是 channel secret，所以可以放在前端，讓 Vue 自己驗 ID token</label>
+  <label data-key="c">HS256 已經不安全，應該拒絕 LINE 的 ID token</label>
+  <label data-key="d">簽章金鑰是你的 channel secret；HMAC 能驗就能簽，channel secret 外洩，任何人都能簽出任何 LINE 使用者的 ID token</label>
+  <p class="why">✓ HS256 是對稱的（第 8 課），LINE 和你共用 channel secret。a 錯：持有 channel secret 的你（以及偷到它的人）也簽得出來，「OP 簽的 token 只有 OP 能產生」只對非對稱簽章成立。b 錯得最嚴重：放到前端等於公開，而且前端驗證本來就沒有意義。c 錯：HS256 本身沒問題，問題在金鑰怎麼保管。channel secret 只放後端，外洩就到 LINE Developers Console 重新產生。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 8：團隊三個人，兩個月後要上線會員系統（email 登入、LINE 登入、MFA）。主管決定用代管的身分服務，並說「這樣安全就交給它了」。哪一句最準確？</p>
+  <label data-key="a">對，身分服務負責登入，所以授權、token 驗證都不用自己做</label>
+  <label data-key="b">選身分服務合理，但授權（誰能看哪筆訂單）、API 驗 token（含 <code>aud</code> 與 JWKS 快取）、session 管理、帳號連結這類流程的安全仍然是自己的責任</label>
+  <label data-key="c">不合理，自己寫才能確保安全</label>
+  <label data-key="d">選身分服務合理，而且之後要搬家很容易，因為 OIDC 是標準協定</label>
+  <p class="why">✓ 小團隊、時程緊、需求是標準流程，身分服務能省下大量工作，也比第一次自己寫的更不容易出錯，所以 c 不對。但它只負責「你是誰」：「你能做什麼」、API 怎麼驗它發的 token、登入後的 session 與撤銷、帳號連結和客服流程都還是你的，a 錯。d 錯：OIDC 讓整合方式標準化，但使用者的密碼雜湊、MFA 設定存在對方那裡，不一定匯得出來，搬家成本是選擇時要算進去的代價。</p>
+  <script type="wrong">
+// 不認得的 kid 直接呼叫 fetchJwks，沒有走 single-flight，抓完才記錄時間
+type PublicJwk = JsonWebKey & { kid?: string }
+type JwksCacheDeps = { fetchJwks: () => Promise<PublicJwk[]>; now: () => number }
+type JwksCacheOptions = { maxAgeMs: number; minRefetchIntervalMs: number }
+type JwksCache = { getKey(kid: string): Promise<PublicJwk | null> }
+
+function createJwksCache(deps: JwksCacheDeps, opts: JwksCacheOptions): JwksCache {
+  let keys: PublicJwk[] | null = null
+  let fetchedAt = 0                       // 上次成功抓取的時間
+  let attemptedAt: number | null = null   // 上次嘗試抓取的時間（成功或失敗）
+  let inflight: Promise<void> | null = null
+
+  function refresh(): Promise<void> {
+    if (inflight) return inflight
+    attemptedAt = deps.now()
+    inflight = (async () => {
+      try {
+        const fresh = await deps.fetchJwks()
+        keys = fresh
+        fetchedAt = deps.now()
+      } catch {
+        // 抓取失敗：沿用手上的金鑰
+      } finally {
+        inflight = null
+      }
+    })()
+    return inflight
+  }
+
+  const canRefetch = () => attemptedAt === null || deps.now() - attemptedAt >= opts.minRefetchIntervalMs
+  const find = (kid: string) => keys?.find(k => k.kid === kid) ?? null
+
+  return {
+    async getKey(kid) {
+      if (inflight) await inflight
+      const stale = keys === null || deps.now() - fetchedAt >= opts.maxAgeMs
+      if (stale && canRefetch()) await refresh()   // 發行者掛掉時也不會每個請求都去打它
+      const key = find(kid)
+      if (key) return key
+      if (!canRefetch()) return null
+      try { const fresh = await deps.fetchJwks(); keys = fresh; fetchedAt = deps.now() } catch {}
+      attemptedAt = deps.now()
+      return find(kid)
+    },
+  }
+}
+</script>
+</div>
+
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>依 header 的 <code>alg</code> 選演算法</strong>：LINE 同一個 <code>iss</code> 有 HS256 與 ES256，看 header 選就給了攻擊者選金鑰的機會。每個整合方式在設定裡寫死一種演算法和金鑰。</li>
+  <li><strong>每個請求都抓 JWKS，或 <code>kid</code> 找不到就無限重抓</strong>：慢、被發行者限流，還讓攻擊者用亂填的 <code>kid</code> 拖垮你。快取、限制重抓頻率、single-flight。</li>
+  <li><strong>Google 的 <code>iss</code> 只接受一種寫法</strong>：Google 的 ID token 可能是 <code>https://accounts.google.com</code> 或 <code>accounts.google.com</code>。兩個都接受，存之前統一。</li>
+  <li><strong>不驗 <code>aud</code>，或用 <code>includes</code> 驗</strong>：別的 client 的 ID token、<code>coffee-web-evil</code> 都混得進來。統一成陣列，必須有自己、其他每個都要信任。</li>
+  <li><strong>沒送 <code>nonce</code>，或 token 沒有 <code>nonce</code> 時略過</strong>：ID token 沒有綁回這次登入，重放、注入都擋不住。每次登入都產生、存在 session、用過即刪。</li>
+  <li><strong>用 email 找使用者、自動合併帳號</strong>：攻擊者在不驗 email 的 OP 註冊受害者的 email，一登入就接管。用 <code>(iss, sub)</code> 認人；有同 email 的帳號時，要使用者先用原本的方式登入再確認連結。</li>
+  <li><strong>只用 <code>sub</code>、不搭配 <code>iss</code></strong>：<code>sub</code> 只在同一個發行者內唯一。資料表用 <code>UNIQUE (iss, sub)</code>。</li>
+  <li><strong><code>if (claims.email_verified)</code></strong>：字串 <code>"false"</code> 是 truthy。用 <code>=== true</code>。</li>
+  <li><strong>只在前端驗 ID token</strong>：後端收到的「已驗證的使用者 ID」任何人都能改。在後端驗。</li>
+  <li><strong>把 ID token 當成 API 的 access token</strong>：<code>aud</code> 不對、沒有權限資訊。驗完換成自己的 session。</li>
+  <li><strong>channel secret、client secret 放進前端或 Git</strong>：HS256 的 channel secret 外洩，任何人都能簽出 LINE 使用者的 ID token。只放在後端的環境變數或 secrets 管理系統。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>OAuth 的 access token 只說「持有者可以做什麼」，不說「給誰的、為了哪一次登入」，不能拿來做登入。OIDC = OAuth 2.0 授權碼流程 + <code>openid</code> scope + ID token + <code>nonce</code> + UserInfo + Discovery。client（規格叫 RP）是咖啡店，OP 是 Google、LINE。</li>
+  <li>callback 拿到 ID token 後做三件事：驗證、用 <code>(iss, sub)</code> 找會員、建立咖啡店自己的 session。</li>
+  <li>簽章的演算法和金鑰寫死在設定裡，不看 discovery、不看 header。LINE：<code>iss</code> 是 <code>https://access.line.me</code>；網頁登入 HS256（金鑰是 channel secret），App／LIFF 用 ES256（JWKS）。Google：只用 RS256，<code>iss</code> 有兩種寫法。</li>
+  <li>JWKS 要快取：定時重抓、不認得的 <code>kid</code> 限頻率重抓、single-flight、抓不到時沿用舊鑰。</li>
+  <li>驗 ID token（OIDC Core §3.1.3.7）：<code>iss</code> 完全相等 → 依設定的演算法驗簽章 → <code>aud</code> 有自己、沒有不信任的 → <code>exp</code> → <code>iat</code> → <code>nonce</code>。每一步擋一種 token，在後端做。</li>
+  <li><code>state</code> 在網址上，保護 callback；<code>nonce</code> 在簽章裡，把 ID token 綁回這次登入。兩個都存在 session、用過即刪。</li>
+  <li>用 <code>(iss, sub)</code> 認人，不用 email；帳號連結不自動合併，要使用者先用原本的方式登入再確認，只有 <code>email_verified === true</code> 才考慮 email。</li>
+  <li>ID token 是給 client 看的登入證明，不能拿去打 API；驗完換成自己的 session。channel secret 能驗就能簽，只放後端。</li>
+  <li>身分服務能省下大量登入工作，但授權、token 驗證、session、帳號流程的安全仍是自己的責任；選擇時把費用、資料位置、客製需求、搬家成本算進去。</li>
+</ul>
+<p>下一課：多因素認證。只靠密碼或只靠一個 OP 登入，密碼外洩就失守；下一課自己實作 TOTP 與復原碼，並把它放進登入流程。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

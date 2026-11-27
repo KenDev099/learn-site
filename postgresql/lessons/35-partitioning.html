@@ -1,0 +1,754 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>35. 分割表與大表：分區、BRIN、資料保留</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="35">
+<header>
+  <div class="eyebrow">階段 10：資深必備｜上線與維運 · 第 35 課</div>
+  <h1>分割表與大表：分區、BRIN、資料保留</h1>
+</header>
+<main>
+
+<p>咖啡店開了三年，<code>orders</code> 長到上億筆。老闆說「訂單只要保留 13 個月」，於是每個月跑一次 <code>DELETE FROM orders WHERE ordered_at &lt; …</code>：一次刪幾百萬筆，跑了半小時，留下幾百萬個死版本，autovacuum 接著清好幾個小時，索引也沒變小。查「這週的營收」時，資料庫還是要在一棵涵蓋三年的索引裡找。</p>
+<p>這一課的任務是把這件每月的苦差事改掉：讓「刪掉過期的月份」變成一句瞬間完成的 <code>DROP TABLE</code>，讓「查這週」只碰這週所在的那一個月，而且整個每月作業都不會擋住線上的下單。做法是把 <code>orders</code> 依時間切成多個分區。做完之後，再處理同樣只會依時間往後長的收銀機紀錄：它適合一種極小的索引（BRIN），以及大表的主鍵該選 bigint 還是 UUID。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>為什麼 <code>DELETE</code> 一個月要半小時，分割表怎麼把它變成一句 <code>DROP TABLE</code>（開場問題的答案），以及哪些表不值得切。</li>
+  <li>把 <code>orders</code> 建成分割表：選切法、寫對月份邊界、沒有分區收的列怎麼辦、主鍵為什麼一定要包含分割鍵。</li>
+  <li>查「這週的營收」真的只讀 10 月嗎（分區修剪），以及進了分區之後，索引怎麼加才不擋下單。</li>
+  <li>每月的保留作業：9 月怎麼移除、12 月怎麼掛進來、還沒到的月份怎麼提前準備，每一步各拿什麼鎖。</li>
+  <li>同樣依時間寫入的收銀機紀錄：極小的 BRIN 索引，以及大表的主鍵選 bigint 還是 UUID。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="21-explain.html">第 21 課</a>的 <code>EXPLAIN</code>：印出查詢計畫，由內往外讀；<code>Seq Scan</code> 讀整張表，<code>Bitmap Index Scan</code> 先用索引把符合的位置記成一張地圖，再由 <code>Bitmap Heap Scan</code> 照存放順序讀回來。</li>
+  <li><a href="30-mvcc-vacuum.html">第 30 課</a>的死版本與 VACUUM：<code>DELETE</code> 不會立刻移除列，只留下死版本，要等 VACUUM 清掉，檔案也不會因此變小。</li>
+  <li><a href="32-locks.html">第 32 課</a>的表級鎖與等待佇列：每個指令對表拿某一種鎖，ACCESS EXCLUSIVE 連 <code>SELECT</code> 都擋；拿不到鎖的指令排隊等，後來的查詢又排在它後面。<code>pg_locks</code> 列出目前拿著的鎖。</li>
+  <li><a href="34-zero-downtime-migrations.html">第 34 課</a>的安全 DDL：<code>lock_timeout</code> 替等鎖設上限；<code>CREATE INDEX CONCURRENTLY</code> 建索引不擋寫入；約束先 <code>NOT VALID</code> 再 <code>VALIDATE</code>。</li>
+</ul></div>
+
+<div class="callout"><strong>這頁的環境：</strong>範例都包在 <code>BEGIN; … ROLLBACK;</code> 裡，或是會出錯整格取消，不會改到頁面上的資料。練習在全新的資料庫裡判分。</div>
+
+<p><strong>這頁的資料：</strong><code>orders</code>（已經依月分割的訂單，第一節介紹）、<code>orders_2026_12</code>（匯入好 12 月訂單、等著掛進 <code>orders</code> 的一般表，ATTACH 一節用）、<code>order_logs</code>（收銀機紀錄，BRIN 一節用）。</p>
+
+<h2>刪一個月的訂單，為什麼要跑半小時？</h2>
+<p>先弄清楚開場那句 <code>DELETE</code> 慢在哪裡。<a href="30-mvcc-vacuum.html">第 30 課</a>看過，<code>DELETE</code> 不會把列從檔案裡挖掉，而是在每一列上標記「這個交易刪了它」，留下一個死版本。刪幾百萬筆，就是逐列找到、逐列標記幾百萬次，每一次還要寫進 WAL（<a href="18-transactions.html">第 18 課</a>提過的預寫日誌）。交易提交後，這幾百萬個死版本和索引裡指向它們的項目，都要等 autovacuum 一頁一頁掃過才清得掉；清完之後，表和索引的檔案也不會變小，只是多出可以重複利用的空位。</p>
+<p>這些成本的根源是：對 PostgreSQL 來說，<code>orders</code> 只是一張表、一組資料檔、一棵索引。它不知道「9 月的訂單」是一塊可以整塊丟掉的東西，只能一列一列處理。反過來想，如果每個月的訂單本來就存在自己的一張表裡，刪掉一個月就只是刪掉一張表：<code>DROP TABLE</code> 直接移除那張表的檔案，不逐列標記、不留死版本，也不需要 VACUUM。</p>
+<p>可是應用程式不想面對幾十張表：下單的程式只想寫進 <code>orders</code>，報表只想查 <code>orders</code>。PostgreSQL 的<strong>分割表</strong>（partitioned table）就是把這兩件事合在一起：它是一張邏輯上的表，本身不存資料，資料實際存在底下多張子表裡，每張子表叫一個<strong>分區</strong>（partition）。決定一列該放進哪個分區的欄位叫<strong>分割鍵</strong>（partition key），在咖啡店就是下單時間 <code>ordered_at</code>。應用程式照常對 <code>orders</code> 下 <code>SELECT</code>、<code>INSERT</code>，PostgreSQL 依分割鍵把新的列送到對的分區，查詢時也只去讀可能有資料的分區。</p>
+<p>這頁的 <code>orders</code> 已經是分割表，依 <code>ordered_at</code> 每月一個分區：<code>orders_2026_09</code>、<code>orders_2026_10</code>、<code>orders_2026_11</code>，加上一個 <code>orders_default</code>。9/1～11/30 大約每 4 分半鐘一筆，共約 30,000 筆。下面這句查的是 <code>orders</code>，但用了一個隱藏欄位 <code>tableoid</code>：每張表都有這個欄位，代表「這一列實際存在哪張表」，轉成 <code>regclass</code> 型別就會印成表名。執行後看 <code>partition</code> 欄：</p>
+<div class="lab" data-sql="SELECT tableoid::regclass AS partition, count(*), min(ordered_at), max(ordered_at)
+FROM orders GROUP BY 1 ORDER BY 1;"></div>
+<p>查的是同一張 <code>orders</code>，資料卻來自四個分區，每個分區的最早、最晚時間剛好落在自己的月份裡。<code>orders_default</code> 裡的 3 筆是 8 月補登的紙本訂單，下一節講到 DEFAULT 分區時再回來看它們。</p>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="orders 是分割表，本身不存資料；依 ordered_at 把列送到 9 月、10 月、11 月與 DEFAULT 四個分區；12 月的一般表等著 ATTACH">
+    <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="230" y="14" width="240" height="56" rx="6"/>
+    <text class="d-text" x="250" y="38">orders（分割表，本身不存資料）</text>
+    <text class="d-small" x="250" y="58">PARTITION BY RANGE (ordered_at)</text>
+    <path class="d-line" d="M300,70 L90,128" marker-end="url(#arr)"/>
+    <path class="d-line" d="M330,70 L250,128" marker-end="url(#arr)"/>
+    <path class="d-line" d="M370,70 L410,128" marker-end="url(#arr)"/>
+    <path class="d-line" d="M400,70 L570,128" marker-end="url(#arr)"/>
+    <rect class="d-box" x="20" y="130" width="140" height="60" rx="6"/>
+    <text class="d-text" x="32" y="154">orders_2026_09</text>
+    <text class="d-small" x="32" y="176">9/1 ≤ t &lt; 10/1</text>
+    <rect class="d-box" x="180" y="130" width="140" height="60" rx="6"/>
+    <text class="d-text" x="192" y="154">orders_2026_10</text>
+    <text class="d-small" x="192" y="176">10/1 ≤ t &lt; 11/1</text>
+    <rect class="d-box" x="340" y="130" width="140" height="60" rx="6"/>
+    <text class="d-text" x="352" y="154">orders_2026_11</text>
+    <text class="d-small" x="352" y="176">11/1 ≤ t &lt; 12/1</text>
+    <rect class="d-box" x="500" y="130" width="140" height="60" rx="6"/>
+    <text class="d-text" x="512" y="154">orders_default</text>
+    <text class="d-small" x="512" y="176">其他都放這裡</text>
+    <text class="d-accent" x="20" y="226">保留期限到了 → DROP 整個分區</text>
+    <text class="d-accent" x="400" y="226">orders_2026_12（一般表）→ ATTACH</text>
+  </svg>
+  <figcaption>每個分區是一張真的表，有自己的資料檔和索引。刪一個月等於刪一張表。</figcaption>
+</figure>
+<p>把開場的兩個抱怨放回這張圖上看：</p>
+<ul>
+  <li><strong>刪舊資料</strong>：保留期限到了，<code>DROP TABLE orders_2026_09</code> 直接移除 9 月整個分區的檔案，沒有死版本、不需要 VACUUM。這就是開場問題最短的答案，「9 月的訂單過期了」那一節會把它寫成安全的每月作業。</li>
+  <li><strong>查這週</strong>：條件裡有 <code>ordered_at</code> 的範圍時，PostgreSQL 可以直接跳過不可能有資料的分區，只在 10 月那張表和它的索引裡找。這叫分區修剪，「查這週的營收」那一節實際看計畫。</li>
+  <li><strong>維護</strong>：VACUUM、重建索引都以分區為單位。舊月份的分區寫完就不再變動，autovacuum 很少需要再碰它，工作集中在當月的分區。</li>
+</ul>
+<p>看起來分割只有好處。但它改變了表的結構，也帶來一些代價，不是表大就該切。</p>
+
+<h3>分割不是免費的：哪些表才值得切？</h3>
+<p>第一個代價來自同一個機制的反面：修剪要靠條件裡的分割鍵。查詢不帶 <code>ordered_at</code> 時，例如客服查「顧客 42 的所有訂單」（<code>WHERE customer_id = 42</code>），PostgreSQL 不知道該去哪個月找，只能每個分區都查一次。分區越多，這種查詢越慢，常常比一張大表查一棵索引還慢。</p>
+<p>第二個代價是分區的數量本身。規劃查詢時，規劃器要逐一考慮每個分區；執行時，每個被碰到的分區和它的每個索引都要拿一把鎖。這些鎖記在一張固定大小的共享鎖表裡，大小由 <code>max_locks_per_transaction</code> 決定（它是「平均每個交易」能用的額度，預設值見課末）。如果每天一個分區、存好幾年，一句不帶分割鍵的查詢就可能碰上千個分區，鎖表用完就報錯。一般以「每個分區幾 GB 到幾十 GB、總數幾十到幾百個」為目標，咖啡店每月一個分區、保留 13 個月，正好落在這個範圍。</p>
+<p>第三個代價是限制變多：主鍵和唯一約束必須包含分割鍵，外鍵也跟著要參照兩個欄位。下一節建表時會親眼看到這個錯誤，也會說明原因。</p>
+<p>所以判斷的順序是：先確認瓶頸是不是「要定期刪舊資料」或「查詢幾乎都只看最近一段時間、但表太大」。兩者都不是的話，例如表只有幾 GB、常用查詢都有合適的索引，分割只會增加複雜度。咖啡店的 <code>orders</code> 兩個條件都符合：有明確的 13 個月保留期限，營收、出貨、對帳這些常用查詢都帶時間。</p>
+<div class="callout practice"><strong>💡 實務上：分割最好在表還小時就決定</strong><br>現有的一般表不能直接改成分割表，只能建一張新的分割表、把資料搬過去、再切換，對上億筆的線上表是一個要排期的專案。所以設計訂單、操作紀錄、通知這類「只會一直長」的表時，資深工程師會先問：一年大概多少筆？法規或 PM 要求保留多久？最常用的查詢有沒有帶時間？保留期限明確、查詢都看近期，就值得一開始建成分割表；答不出來的話，先用一般表加好索引，不要為了「以後可能很大」把每張表都切。</div>
+<p>確定 <code>orders</code> 值得切之後，下一個問題是：這頁的 <code>orders</code> 是怎麼建出來的，月份的邊界又要怎麼寫才不會漏掉或重複？</p>
+
+<h2>orders 要怎麼建成分割表？</h2>
+<p>建分割表的第一個決定是「依什麼規則把列分到分區」。PostgreSQL 有三種切法：</p>
+<div class="table-wrap">
+<table>
+  <tr><th>方式</th><th>分配依據</th><th>咖啡店的例子</th></tr>
+  <tr><td><strong>RANGE</strong></td><td>值落在哪個範圍（含下限、不含上限）</td><td>訂單依 <code>ordered_at</code> 每月一個分區</td></tr>
+  <tr><td><strong>LIST</strong></td><td>值在哪個清單裡</td><td>依地區：<code>('台北', '新北')</code> 一個分區</td></tr>
+  <tr><td><strong>HASH</strong></td><td>雜湊值除以分區數的餘數</td><td>會員依 <code>id</code> 平均分到 4 個分區</td></tr>
+</table>
+</div>
+<p>選哪一種，看你之後要「整塊處理」的是什麼。咖啡店要整塊刪的是「過期的月份」，查詢也是看一段時間，所以 <code>orders</code> 用 RANGE、以 <code>ordered_at</code> 為分割鍵、每月一個範圍。LIST 適合值是固定幾類、而且常常依類別整批處理的資料；HASH 適合沒有自然範圍、只想把資料平均分散的情況，本節最後會看一個例子。</p>
+<p>這頁的 <code>orders</code> 是這樣建的（<code>id</code> 用<a href="02-tables.html">第 2 課</a>的 <code>GENERATED ALWAYS AS IDENTITY</code> 自動編號）：</p>
+<pre>CREATE TABLE orders (
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  store_id integer NOT NULL,
+  customer_id integer NOT NULL,
+  ordered_at timestamptz NOT NULL,
+  total integer NOT NULL,
+  PRIMARY KEY (id, ordered_at)
+) PARTITION BY RANGE (ordered_at);
+
+CREATE TABLE orders_2026_10 PARTITION OF orders
+  FOR VALUES FROM ('2026-10-01 00:00+08') TO ('2026-11-01 00:00+08');
+-- 9 月、11 月同樣寫法
+CREATE TABLE orders_default PARTITION OF orders DEFAULT;
+CREATE INDEX orders_store_time_idx ON orders (store_id, ordered_at);</pre>
+<p>由上往下讀：</p>
+<ul>
+  <li><code>CREATE TABLE orders (…) PARTITION BY RANGE (ordered_at)</code> 建的是父表，也就是那張邏輯上的表。它定義欄位和分割方式，本身不存任何資料。</li>
+  <li><code>CREATE TABLE orders_2026_10 PARTITION OF orders FOR VALUES FROM (…) TO (…)</code> 建一個分區。分區是一張真的表，欄位照抄父表，自己有資料檔。</li>
+  <li><code>CREATE TABLE orders_default PARTITION OF orders DEFAULT</code> 建 DEFAULT 分區，後面說明。</li>
+  <li><code>CREATE INDEX … ON orders</code> 建在父表上，PostgreSQL 會替每個分區各建一個對應的索引，「查這週的營收」那一節再細看。</li>
+</ul>
+<p>邊界是最容易寫錯的地方。RANGE 的範圍是 <code>FROM</code> 含、<code>TO</code> 不含，所以每個月都寫「這個月 1 號到下個月 1 號」：10 月是 <code>FROM ('2026-10-01 …') TO ('2026-11-01 …')</code>，11 月從 <code>'2026-11-01 …'</code> 開始，相鄰兩個分區剛好接上，不重疊也不漏。如果寫成「10/1 到 10/31」，10/31 那一整天就沒有分區收。另一個陷阱是時區：<code>ordered_at</code> 是 <code>timestamptz</code>（<a href="13-data-types.html">第 13 課</a>），代表一個絕對的時間點，邊界要寫清楚是哪個時區的午夜。<code>+08</code> 是台北的午夜；寫成 <code>'2026-10-01 00:00Z'</code>（UTC）的話，分區會從台北的早上 8 點開始，每個月頭 8 小時的訂單都會落進上一個月。</p>
+<p>接著是「沒有分區收」的情況。插入一列時，PostgreSQL 依分割鍵找對應的分區；如果沒有任何分區的範圍包含這個值，寫入就失敗，錯誤碼 23514。<code>orders</code> 已經有 DEFAULT 分區，任何時間都收得下，在它身上看不到這個錯誤；所以下面這格另建一張沒有 DEFAULT、依地區 LIST 分割的示範表，只有「北部」一個分區，然後插入一筆台中的資料。執行後看錯誤：</p>
+<div class="lab" data-sql="-- 沒有 BEGIN：整格是同一個隱含交易，出錯就全部取消，這張示範表不會留下
+CREATE TABLE regions_demo (id int, region text, PRIMARY KEY (id, region))
+  PARTITION BY LIST (region);
+CREATE TABLE regions_north PARTITION OF regions_demo FOR VALUES IN ('台北', '新北');
+INSERT INTO regions_demo VALUES (1, '台中');"></div>
+<p>台中不在任何分區的清單裡，PostgreSQL 不會自己幫你建分區，只能拒絕這筆寫入。對 <code>orders</code> 來說，這代表任何一筆時間落在既有分區之外的訂單都會下單失敗。</p>
+<p><strong>DEFAULT 分區</strong>就是為這種情況準備的：它收「不屬於任何其他分區」的列。<code>orders</code> 有 DEFAULT，所以 8 月補登的紙本訂單沒有出錯，而是進了 <code>orders_default</code>，也就是第一節查到的那 3 筆。DEFAULT 是安全網，不是正常的去處：移除 9 月、掛上 12 月那兩節會看到，它裡面的資料越多，每月移除舊分區、加入新分區時就越麻煩，所以它要保持幾乎是空的。</p>
+<h3>為什麼主鍵是 (id, ordered_at)，不能只有 id？</h3>
+<p>回頭看 <code>orders</code> 的建表語法，主鍵寫的是 <code>PRIMARY KEY (id, ordered_at)</code>，不是熟悉的 <code>PRIMARY KEY (id)</code>。試著建一張主鍵只有 <code>id</code> 的分割表，執行後看錯誤：</p>
+<div class="lab" data-sql="CREATE TABLE pk_demo (id bigint, ordered_at timestamptz, PRIMARY KEY (id))
+  PARTITION BY RANGE (ordered_at);"></div>
+<p>錯誤 0A000，意思是「不支援的功能」。原因在索引的存放方式：主鍵靠一個唯一索引檢查「有沒有重複」，而分割表上的索引是每個分區各自一份，PostgreSQL 沒有「橫跨所有分區」的單一索引。</p>
+<p>主鍵包含分割鍵時，這不成問題：<code>(id, ordered_at)</code> 相同的兩列，<code>ordered_at</code> 一定相同，一定會被送到同一個分區，所以每個分區自己檢查不重複，就等於整張表不重複。主鍵只有 <code>id</code> 的話，<code>id = 5</code> 可能一筆在 9 月的分區、一筆在 10 月的分區，兩個分區各自的索引都看不到對方，沒有東西擋得住重複。PostgreSQL 選擇直接拒絕，不讓你建一個它保證不了的約束。</p>
+<p>這帶來兩個實際的後果。第一，<strong>id 本身不再有資料庫保證的唯一性</strong>，只有 <code>(id, ordered_at)</code> 這個組合是唯一的。實務上 id 來自 identity 序號，一直往上加，不會重複，但那是序號的行為，不是約束擋下來的。第二，其他表要用外鍵參照訂單時，也要參照這兩個欄位。例如退款表要記下訂單的 <code>id</code> 和 <code>ordered_at</code>。執行後看 <code>RETURNING</code> 的結果：</p>
+<div class="lab" data-sql="BEGIN;
+CREATE TABLE refunds (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  order_id bigint NOT NULL,
+  order_at timestamptz NOT NULL,
+  FOREIGN KEY (order_id, order_at) REFERENCES orders (id, ordered_at)
+);
+INSERT INTO refunds (order_id, order_at)
+SELECT id, ordered_at FROM orders WHERE id = 5
+RETURNING *;
+ROLLBACK;"></div>
+<p>退款這一列同時存了 <code>order_id</code> 和 <code>order_at</code>。設計會參照分割表的表時，要把分割鍵一起帶著走。分割表上的 identity 欄位有版本限制，見課末。</p>
+
+<h3>建好之後，怎麼確認每個分區的範圍？</h3>
+<p>每月作業會不斷新增、移除分區，你需要隨時確認「現在有哪些分區、各自收哪一段」，練習 1 也會用同樣的方式判分。下面兩句查詢：第一句列出整棵分區樹，第二句印出每個分區的範圍。</p>
+<div class="lab" data-sql="SELECT relid, parentrelid, isleaf, level FROM pg_partition_tree('orders');
+SELECT c.relname, pg_get_expr(c.relpartbound, c.oid) AS bound
+FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+WHERE i.inhparent = 'orders'::regclass ORDER BY 1;"></div>
+<p><code>pg_partition_tree()</code> 列出整棵分區樹（分區底下還可以再分區），<code>isleaf</code> 是 true 的才是真正存資料的分區，<code>level</code> 是第幾層。第二句從系統目錄找出 <code>orders</code> 的每個子表，<code>pg_get_expr(relpartbound, oid)</code> 把範圍印成看得懂的文字，可以直接檢查邊界和時區有沒有寫對。</p>
+
+<h3>訂單時間被改了，列會搬到別的分區嗎？</h3>
+<p>分割鍵決定一列住在哪個分區。如果客服把一筆訂單的時間從 10 月改成 11 月，這一列就不屬於 10 月的分區了。PostgreSQL 的處理是：從舊分區刪掉這一列，再插進新分區。執行後比較前後兩次的 <code>tableoid</code>：</p>
+<div class="lab" data-sql="BEGIN;
+SELECT tableoid::regclass, id, ordered_at FROM orders WHERE id = 1;
+UPDATE orders SET ordered_at = '2026-11-02 10:00+08' WHERE id = 1
+RETURNING tableoid::regclass, id, ordered_at;
+ROLLBACK;"></div>
+<p>同一個 <code>id</code>，<code>UPDATE</code> 前在 <code>orders_2026_10</code>，<code>RETURNING</code> 顯示它已經在 <code>orders_2026_11</code>。這是一次刪除加一次新增，比一般的 <code>UPDATE</code> 貴，舊分區也多了一個死版本。依時間分割的表，分割鍵最好選寫入後就不再改的欄位，下單時間正是如此。</p>
+<p>最後看 <code>orders</code> 不會用的 HASH。會員資料沒有「過期的月份」可以整塊刪，如果只是想把一張很大的會員表平均分散成幾份，就用 HASH：PostgreSQL 算出 <code>id</code> 的雜湊值，除以分區數（<code>MODULUS</code>），餘數（<code>REMAINDER</code>）決定放哪個分區。執行後看最後的 <code>SELECT</code>：1,000 筆會員分到兩個分區各幾筆。</p>
+<div class="lab" data-sql="BEGIN;
+CREATE TABLE members_demo (id int PRIMARY KEY, name text) PARTITION BY HASH (id);
+CREATE TABLE members_p0 PARTITION OF members_demo FOR VALUES WITH (MODULUS 2, REMAINDER 0);
+CREATE TABLE members_p1 PARTITION OF members_demo FOR VALUES WITH (MODULUS 2, REMAINDER 1);
+INSERT INTO members_demo SELECT g, 'm' || g FROM generate_series(1, 1000) g;
+SELECT tableoid::regclass, count(*) FROM members_demo GROUP BY 1 ORDER BY 1;
+ROLLBACK;"></div>
+<p>兩個分區的筆數接近，但不保證剛好相等。HASH 分割無法用「整個分區 DROP」做資料保留，查詢也只有在條件是 <code>id = …</code> 時才能修剪，所以咖啡店的訂單不會用它。</p>
+
+<p>表建好了，也知道列怎麼被分配。接下來驗證開場的第二個抱怨：查「這週的營收」，PostgreSQL 是不是真的只讀 10 月？</p>
+
+<h2>查「這週的營收」，真的只讀 10 月嗎？</h2>
+<p>第一節說過，條件有分割鍵時，PostgreSQL 可以跳過不可能有資料的分區。這個動作叫<strong>分區修剪</strong>（partition pruning）：規劃器把 <code>WHERE</code> 裡對分割鍵的條件，拿去和每個分區的範圍比對，範圍完全不重疊的分區直接從計畫裡移除。要做得到，條件必須直接拿分割鍵和一個值（常數，或後面「prepared statement」那一小節會看到的參數 <code>$1</code>）比較，規劃器才能算出「這段時間落在哪幾個分區」。</p>
+<p>先寫一個標準的寫法，查 10/1～10/7 的訂單數與營收。執行後看計畫裡出現哪些分區：</p>
+<div class="lab" data-sql="EXPLAIN
+SELECT count(*), sum(total) FROM orders
+WHERE ordered_at &gt;= '2026-10-01 00:00+08' AND ordered_at &lt; '2026-10-08 00:00+08';"></div>
+<p>計畫裡只出現 <code>orders_2026_10</code>。9 月、11 月和 DEFAULT 在規劃時就被排除了。</p>
+<p>在看反例之前，先認識一個節點：掃分割表時，計畫裡通常有一個 <code>Append</code> 節點，它把多個來源的列接成一份結果，每個要讀的分區是它底下的一個子節點。所以數 <code>Append</code> 底下有幾個子節點，就知道讀了幾個分區。現在換成很多人直覺會寫的「轉成日期再比」：</p>
+<div class="lab" data-sql="EXPLAIN
+SELECT count(*), sum(total) FROM orders
+WHERE ordered_at::date BETWEEN '2026-10-01' AND '2026-10-07';"></div>
+<p>查詢的意思一樣，計畫卻多了 <code>Append</code>，底下四個分區全部 <code>Seq Scan</code>。修剪完全失效。</p>
+<p>原因是分區的範圍是用 <code>ordered_at</code> 本身定義的，而條件比較的是 <code>ordered_at::date</code>，一個由欄位算出來的新值。規劃器不會反推「<code>ordered_at::date</code> 在 10/1～10/7」等於哪一段 <code>ordered_at</code>，何況 <code>timestamptz::date</code> 的結果還取決於連線的時區設定，同一個時間點在不同時區可能是不同的日期。<code>date_trunc('day', ordered_at)</code>、<code>ordered_at AT TIME ZONE …</code> 也一樣。這和<a href="20-indexes.html">第 20 課</a>的索引是同一條規則：<strong>函式套在常數那邊，不要套在欄位上</strong>。欄位保持原樣，規劃器才能拿它去比對分區範圍或索引。</p>
+<p>改回「直接比較分割鍵」之後，還要把範圍寫對。「一週」要寫成「含開頭、不含下一週開頭」，和分區邊界的 <code>FROM</code>／<code>TO</code> 同一個道理。這頁的資料裡有幾筆剛好落在邊界上的訂單：10/1 00:00 整、10/7 23:59:59.5、10/8 00:00 整。三種常見寫法都能修剪，但筆數不一樣。執行後比較三種寫法的筆數：</p>
+<div class="lab" data-sql="SELECT 'BETWEEN … 23:59:59' AS how, count(*) FROM orders
+WHERE ordered_at BETWEEN '2026-10-01 00:00+08' AND '2026-10-07 23:59:59+08'
+UNION ALL
+SELECT '&lt;= 下週一 00:00', count(*) FROM orders
+WHERE ordered_at &gt;= '2026-10-01 00:00+08' AND ordered_at &lt;= '2026-10-08 00:00+08'
+UNION ALL
+SELECT '&gt;= 開頭 AND &lt; 下週開頭', count(*) FROM orders
+WHERE ordered_at &gt;= '2026-10-01 00:00+08' AND ordered_at &lt; '2026-10-08 00:00+08';"></div>
+<p>第一種寫到 <code>23:59:59</code>，漏掉 10/7 23:59:59.5 那筆，因為 <code>timestamptz</code> 精確到微秒，一秒內還有很多時間點。第二種用 <code>&lt;=</code> 下週一 00:00，多算了 10/8 00:00 整的那筆。只有第三種剛好。練習 2 會讓你把一個掃全部分區的報表 view 改成這種寫法。</p>
+<p>最後看第一節提過的代價：查詢不帶分割鍵時會怎樣。下面查「2 號店的訂單數」，條件只有 <code>store_id</code>。執行後看 <code>Append</code> 底下的節點：</p>
+<div class="lab" data-sql="EXPLAIN SELECT count(*) FROM orders WHERE store_id = 2;"></div>
+<p>每個分區各做一次 Bitmap Index Scan，因為 <code>store_id = 2</code> 的訂單哪個月都可能有。現在只有 4 個分區還好；保留 13 個月加上預先建好的未來月份，就是十幾次索引查詢，比一張大表查一次慢。所以分割前要先確認最重要的查詢都帶分割鍵；不帶的那些，介面上能不能加一個時間範圍（例如「最近 3 個月」）。</p>
+
+<h3>App 用 prepared statement 查詢時，還修剪得到嗎？</h3>
+<p>上面的範例都把日期直接寫在 SQL 裡。後端程式通常不是這樣：時間是參數，SQL 只寫 <code>$1</code>、<code>$2</code>。<a href="29-query-tuning.html">第 29 課</a>提過，prepared statement 可能使用 <strong>generic plan</strong>：計畫只做一次、重複使用，不看參數的實際值。這時規劃器不知道 <code>$1</code> 是哪個月，沒辦法在規劃時修剪。</p>
+<p>PostgreSQL 的解法是在<strong>執行一開始</strong>、拿到參數值之後再修剪一次，叫執行期修剪。下面用 <code>plan_cache_mode = force_generic_plan</code> 強制使用 generic plan，模擬這個情況。執行後看 <code>Subplans Removed</code> 那一行：</p>
+<div class="lab" data-sql="DEALLOCATE ALL;
+PREPARE day_orders(timestamptz, timestamptz) AS
+  SELECT count(*) FROM orders WHERE ordered_at &gt;= $1 AND ordered_at &lt; $2;
+SET plan_cache_mode = force_generic_plan;
+EXPLAIN (ANALYZE, COSTS OFF) EXECUTE day_orders('2026-10-15 00:00+08', '2026-10-16 00:00+08');
+RESET plan_cache_mode;"></div>
+<p><code>Subplans Removed: 3</code>：計畫裡本來有 4 個分區，執行開始時去掉了 3 個，只剩 10 月。所以 App 用參數傳時間，修剪照樣有效，前提一樣是條件直接比較分割鍵。條件裡有子查詢、或 nested loop 每次從外層傳進來的值，也是在執行期修剪，這時 <code>EXPLAIN ANALYZE</code> 裡被跳過的分區會顯示 <code>never executed</code>。執行期修剪對鎖的影響見課末。</p>
+
+<h3>進了分區之後：替 orders 加索引，怎麼不擋住下單？</h3>
+<p>修剪決定讀哪幾個分區，進了分區之後，找資料還是靠索引。假設客服要常查「某位顧客的訂單」，需要一個 <code>customer_id</code> 的索引。在父表上建索引，PostgreSQL 會自動在每個分區建一個對應的索引，之後新加的分區也會自動有。執行後看 <code>tablename</code> 欄：</p>
+<div class="lab" data-sql="BEGIN;
+CREATE INDEX ON orders (customer_id);
+SELECT tablename, indexname FROM pg_indexes
+WHERE indexname LIKE '%customer_id%' ORDER BY 1;
+ROLLBACK;"></div>
+<p>一句 <code>CREATE INDEX ON orders</code>，四個分區各多了一個索引。方便，但在線上的大表這樣做有問題：<a href="34-zero-downtime-migrations.html">第 34 課</a>看過，一般的 <code>CREATE INDEX</code> 會擋住寫入直到建完，對分割表來說就是所有分區的下單都卡住；而第 34 課的解法 <code>CREATE INDEX CONCURRENTLY</code> 不能用在分割表的父表上。</p>
+<p>做法是把「在父表建索引」拆成三步，讓真正花時間的部分在每個分區上各自 <code>CONCURRENTLY</code> 進行：</p>
+<pre>-- 1. 只在父表建一個空殼索引（ON ONLY），先標成無效，不會動到分區
+CREATE INDEX orders_customer_idx ON ONLY orders (customer_id);
+
+-- 2. 每個分區各自 CONCURRENTLY 建，不擋寫入（每句單獨執行）
+CREATE INDEX CONCURRENTLY orders_2026_10_customer_idx ON orders_2026_10 (customer_id);
+
+-- 3. 把分區的索引掛到父表的索引底下
+ALTER INDEX orders_customer_idx ATTACH PARTITION orders_2026_10_customer_idx;
+
+-- 每個分區都做完 2、3 之後，父表的索引自動變成有效</pre>
+<ul>
+  <li><strong>第 1 步</strong>：<code>ON ONLY</code> 表示只在父表建，不往下建到分區。這個父表索引一開始是無效的（invalid），因為它底下還沒有任何分區的索引。它建得很快，因為父表本身沒有資料。</li>
+  <li><strong>第 2 步</strong>：在每個分區上用 <code>CONCURRENTLY</code> 建索引，不擋這個分區的寫入。每句要單獨執行，不能包在交易裡。</li>
+  <li><strong>第 3 步</strong>：<code>ALTER INDEX … ATTACH PARTITION</code> 把分區的索引掛到父表的索引底下，告訴 PostgreSQL「這個分區的這個索引，就是父表那個索引在這個分區的部分」。</li>
+</ul>
+<p>每個分區都做完第 2、3 步之後，父表的索引自動變成有效；之後新建的分區也會自動帶這個索引。別忘了，這個索引只讓每個分區內的查找變快，<code>WHERE customer_id = 42</code> 還是要每個分區各查一次，這點索引幫不上忙。</p>
+<p>到這裡，<code>orders</code> 的日常讀寫都安排好了：寫入自動分到對的月份，查近期只讀近期的分區，加索引也不擋下單。回到開場的每月作業：9 月已經超過保留期限，要把它移除。</p>
+
+<h2>9 月的訂單過期了，怎麼移除才不擋線上？</h2>
+<p>「只保留一段時間的資料，舊的定期移除」叫<strong>資料保留</strong>（retention）。在分割表上，資料保留的單位是整個分區，有兩種做法：</p>
+<ul>
+  <li><code>DROP TABLE orders_2026_09;</code>：直接刪掉這個分區和它的資料。</li>
+  <li><code>ALTER TABLE orders DETACH PARTITION orders_2026_09;</code>：把分區從 <code>orders</code> 拆出去，變回一張獨立的一般表。<code>orders</code> 查不到這些資料了，但資料還在，可以先備份或搬到便宜的儲存，確認沒問題再 <code>DROP</code>。</li>
+</ul>
+<p>兩種都不逐列處理、不產生死版本，這是它們和 <code>DELETE</code> 的根本差別。但「很快」不等於「不擋線上」，還要看它們拿什麼鎖。下面在交易裡 DETACH 9 月，再查 <code>pg_locks</code>。<code>pg_locks</code> 的 <code>mode</code> 欄把鎖名寫成 <code>AccessExclusiveLock</code> 這種形式，就是 ACCESS EXCLUSIVE，兩種寫法的對照表在<a href="32-locks.html">第 32 課</a>。執行後看 <code>mode</code> 欄：</p>
+<div class="lab" data-sql="BEGIN;
+ALTER TABLE orders DETACH PARTITION orders_2026_09;
+SELECT relation::regclass, mode FROM pg_locks
+WHERE locktype = 'relation'
+  AND relation IN ('orders'::regclass, 'orders_2026_09'::regclass, 'orders_default'::regclass)
+ORDER BY 1, 2;
+ROLLBACK;"></div>
+<ul>
+  <li>父表 <code>orders</code> 拿到 ACCESS EXCLUSIVE，連 <code>SELECT</code> 都會被擋住。</li>
+  <li>DEFAULT 分區也被鎖了：9 月拆出去之後，「不屬於任何分區」的範圍變了，9 月的時間以後歸 DEFAULT 收。</li>
+</ul>
+<p><code>DROP TABLE</code> 一個分區同樣要對父表拿 ACCESS EXCLUSIVE。這兩個動作本身只要一瞬間，危險在<a href="32-locks.html">第 32 課</a>的等待佇列：如果有一個報表查詢正在讀 <code>orders</code>、跑了十分鐘，DETACH 拿不到鎖，就排在它後面等；而所有後來的下單、查詢又排在 DETACH 後面，整個網站跟著卡住十分鐘。所以這一步要像第 34 課的 DDL 一樣，先設 <code>lock_timeout</code>，拿不到鎖就放棄、過一會兒重試：</p>
+<pre>SET lock_timeout = '3s';
+ALTER TABLE orders DETACH PARTITION orders_2026_09;   -- 失敗就等一下再跑一次</pre>
+<p>如果連這一瞬間的 ACCESS EXCLUSIVE 都不想拿，還有 <code>DETACH PARTITION … CONCURRENTLY</code>：它只對父表拿 SHARE UPDATE EXCLUSIVE，不擋讀寫（版本見課末）。它有兩個限制：不能在交易裡執行，而且父表有 DEFAULT 分區時不能用。<code>orders</code> 有 DEFAULT，執行後看錯誤碼：</p>
+<div class="lab" data-sql="ALTER TABLE orders DETACH PARTITION orders_2026_09 CONCURRENTLY;"></div>
+<p>錯誤 55000。這是 DEFAULT 分區要保持幾乎是空的、甚至乾脆不建的另一個理由：有它在，你就少了一個不擋線上的拆分區方式。練習 3 會讓你用最快、不產生死版本的方式移除 9 月。</p>
+<p>舊的月份移除了，每月作業的另一半是新的月份：12 月的訂單要能寫進 <code>orders</code>。</p>
+
+<h2>12 月的訂單怎麼掛進來？還沒到的月份呢？</h2>
+<p>加入新月份有兩種方式。最直接的是 <code>CREATE TABLE orders_2026_12 PARTITION OF orders FOR VALUES …</code>，建一個空分區等著收新訂單。另一種是先建一張一般表，在裡面匯入、整理資料，確定沒問題了再用 <code>ATTACH PARTITION</code> 把它掛成 <code>orders</code> 的分區。掛上去之前，<code>orders</code> 完全看不到這些資料；掛上去的那一刻，整批資料一次出現。從舊系統搬資料、批次匯入補登的訂單時，就用第二種。</p>
+<p>這頁的 <code>orders_2026_12</code> 就是這樣準備的，裡面已經匯入 12 月的 2,972 筆訂單：</p>
+<pre>CREATE TABLE orders_2026_12 (LIKE orders);   -- 照 orders 的欄位建一般表
+INSERT INTO orders_2026_12 (id, …) SELECT nextval(pg_get_serial_sequence('orders', 'id')), …;</pre>
+<p><code>CREATE TABLE … (LIKE 來源表)</code> 照另一張表的欄位與 NOT NULL 建一張新表。<code>id</code> 不能自己亂編，要和 <code>orders</code> 共用同一個序號，才不會和既有的訂單撞號：<code>pg_get_serial_sequence('orders', 'id')</code> 找出 <code>orders.id</code> 這個 identity 欄位背後的序號，<code>nextval</code> 從它取號。</p>
+<p>你可能會想加上 <code>INCLUDING ALL</code>，把預設值、索引、identity 一起複製過來，省得自己處理 id。但 identity 欄位只能存在父表上，分區不能有自己的 identity，所以這樣建出來的表 ATTACH 會失敗。執行後看錯誤：</p>
+<div class="lab" data-sql="CREATE TABLE orders_2027_01 (LIKE orders INCLUDING ALL);
+ALTER TABLE orders ATTACH PARTITION orders_2027_01
+  FOR VALUES FROM ('2027-01-01 00:00+08') TO ('2027-02-01 00:00+08');"></div>
+<p>所以要掛成分區的表用不加 <code>INCLUDING ALL</code> 的 <code>(LIKE orders)</code>，id 從父表的序號拿。</p>
+<p>表準備好了，接著掛上去。ATTACH 時，PostgreSQL 必須確認這張表的每一列都落在新分區的範圍內，否則 <code>orders</code> 裡就會有放錯分區的列。預設做法是<strong>整張表掃一遍</strong>，掃描期間這張表被 ACCESS EXCLUSIVE 鎖住。打開除錯訊息看它做了什麼，執行後看結果上方灰色的訊息：</p>
+<div class="lab" data-sql="BEGIN;
+SET LOCAL client_min_messages = debug1;
+ALTER TABLE orders ATTACH PARTITION orders_2026_12
+  FOR VALUES FROM ('2026-12-01 00:00+08') TO ('2027-01-01 00:00+08');
+ROLLBACK;"></div>
+<p>灰色的訊息由上到下：</p>
+<ul>
+  <li>建好兩個索引：父表的主鍵與 <code>(store_id, ordered_at)</code> 自動建到新分區。</li>
+  <li><code>verifying table "orders_2026_12"</code>：掃新表，確認每一列都在 12 月。</li>
+  <li><code>verifying table "orders_default"</code>：掃 DEFAULT，確認裡面沒有 12 月的資料。如果有，那些列掛上之後應該屬於 12 月分區，卻還待在 DEFAULT，所以 ATTACH 會以 23514 失敗。</li>
+</ul>
+<p>這頁的表只有幾千筆，掃一下就過去了；上千萬筆的一個月，就是在強鎖底下掃好幾分鐘。官方文件的建議是：<strong>先加一個和分區範圍完全相同的 CHECK 約束</strong>。ATTACH 看到這個約束，就知道「每一列都在範圍內」已經被證明過，不用再掃。執行後再看一次灰色的訊息：</p>
+<div class="lab" data-sql="BEGIN;
+ALTER TABLE orders_2026_12 ADD CONSTRAINT orders_2026_12_range
+  CHECK (ordered_at &gt;= '2026-12-01 00:00+08' AND ordered_at &lt; '2027-01-01 00:00+08');
+SET LOCAL client_min_messages = debug1;
+ALTER TABLE orders ATTACH PARTITION orders_2026_12
+  FOR VALUES FROM ('2026-12-01 00:00+08') TO ('2027-01-01 00:00+08');
+ROLLBACK;"></div>
+<p>這次是 <code>partition constraint for table "orders_2026_12" is implied by existing constraints</code>：既有的約束已經保證了分區範圍，不用掃了。但 DEFAULT 分區還是要掃（最後一行），因為 CHECK 加在新表上，管不到 DEFAULT 裡有什麼；這也是 DEFAULT 要保持很小的原因，另一個讓它也不用掃的做法見課末。</p>
+<p>加 CHECK 本身也要掃表，差別在時機：那時 <code>orders_2026_12</code> 還沒掛上去，線上的 <code>orders</code> 完全不受影響；表很大的話，也可以像第 34 課那樣先 <code>NOT VALID</code> 再 <code>VALIDATE</code>。ATTACH 完成後，分區自己的範圍就保證了同一件事，CHECK 變成多餘的，文件建議刪掉。練習 4 就是這一整套流程。</p>
+<p>最後是 ATTACH 的鎖：父表只要 SHARE UPDATE EXCLUSIVE，不擋讀寫；被掛上的表和 DEFAULT 分區是 ACCESS EXCLUSIVE。上面的訊息也看到，掛上時會替新分區建出父表的索引；大表的話，先在新表建好和父表一樣的索引，ATTACH 時會直接沿用，不用在掛上的那一刻現建。</p>
+
+<h3>12 月 1 日凌晨，12 月的分區還沒建好怎麼辦？</h3>
+<p>ATTACH 處理的是已經準備好資料的月份。但大多數月份沒有東西要匯入，只是時間到了，新訂單就開始寫進來。如果 12 月 1 日凌晨 12 月的分區還沒建好：</p>
+<ul>
+  <li>有 DEFAULT 的話，整個 12 月的訂單都掉進 DEFAULT。之後要補建 12 月分區時，ATTACH 會因為 DEFAULT 裡已經有 12 月的資料而失敗，得先把資料從 DEFAULT 搬出來。</li>
+  <li>沒有 DEFAULT 的話，每一筆下單都得到 23514，網站直接不能下單。</li>
+</ul>
+<p>所以未來的分區要用排程<strong>提前</strong>建好，例如每月 1 號建好未來 3 個月的分區，並監控「最後一個分區的上限離現在還有多久」，少於一個月就告警。也有外掛專門自動做這件事，見課末。分區的粒度（每月、每週）要一開始就想好，之後要改，只能自己建新分區、搬資料。</p>
+<div class="callout practice"><strong>💡 實務上：刪舊資料要有流程，不是一句 DROP</strong><br>常見做法是和建未來分區放在同一個每月排程裡：把超過保留期限的分區 DETACH、匯出備份到便宜的儲存（例如 S3），確認備份可以還原後才 DROP。這個排程本身要有告警，失敗了要有人知道，否則幾個月後才發現新分區沒建、或舊資料沒刪。保留期限要和 PM、法務確認並寫下來，因為刪掉就回不來，客服或會計常會在事後要查舊訂單。排程排在離峰時段，第一次上線前先在 staging 用接近正式的資料量跑一遍。</div>
+<p>到這裡，開場的任務完成了：<code>orders</code> 的保留作業從半小時的 <code>DELETE</code> 變成每月一次、拿短暫鎖、有逾時與重試的 DETACH／DROP 與提前建分區。咖啡店還有一張同樣只會依時間長大的表，它的問題不在刪除，而在索引。</p>
+
+<h2>收銀機紀錄只按時間查，索引能不能小一點？</h2>
+<p>這頁的 <code>order_logs</code> 是收銀機紀錄：每台收銀機每次動作寫一筆，只會依時間往後新增，從不修改。這裡有 30,000 筆，還沒有 <code>created_at</code> 的索引；查詢幾乎都是「某一小時的紀錄」。</p>
+<p>直覺是在 <code>created_at</code> 上建一個<a href="20-indexes.html">第 20 課</a>的 B-tree。B-tree 對每一列存一筆「值＋位置」，所以它的大小和列數成正比，每寫入一列也要多更新一次索引。對一張每天新增幾百萬筆、查詢只看一段時間的紀錄表來說，這份成本很高，而且大部分花在「精確記住每一列在哪」上，但查詢其實只需要找到「那一小時的資料大概在哪一段」。</p>
+<p><strong>BRIN</strong>（Block Range Index，區塊範圍索引）就是只記「大概在哪一段」的索引。它不記每一列，而是把表的資料頁每 128 頁（預設）分成一段，每段只記一組「這段裡的最小值、最大值」。查詢時，先看哪幾段的範圍可能包含目標，只讀那幾段，其他段整段跳過。</p>
+<p>這個做法有一個前提：每一段的範圍要窄，彼此不重疊。這取決於<strong>相關性</strong>（correlation），也就是欄位值的大小順序和資料在檔案裡實際存放順序一致的程度。<code>ANALYZE</code> 會把它算好放在 <code>pg_stats.correlation</code>：1 代表完全依序，0 代表毫無關係。執行後比較兩個欄位的 <code>correlation</code>：</p>
+<div class="lab" data-sql="SELECT attname, correlation FROM pg_stats
+WHERE tablename = 'order_logs' AND attname IN ('created_at', 'store_id');"></div>
+<p><code>created_at</code> 是 1：紀錄依時間寫入，越後面的資料頁時間越晚，每一段的最小～最大值互不重疊，BRIN 可以精準排除。<code>store_id</code> 每一頁都有 1～5 號店，每一段的範圍都是 1～5，BRIN 什麼都排除不了。</p>
+<figure>
+  <svg viewBox="0 0 700 200" role="img" aria-label="BRIN 對每 128 頁記錄最小與最大時間；查 10/10 09:00 到 10:00 時，只有一段的範圍包含它，其他段整段跳過">
+    <text class="d-small" x="20" y="22">BRIN：每 128 頁一筆「最小～最大」</text>
+    <rect class="d-box" x="20" y="36" width="150" height="54" rx="5"/>
+    <text class="d-text" x="30" y="58">第 1 段</text>
+    <text class="d-small" x="30" y="78">10/1 00:01～10/2 …</text>
+    <rect class="d-soft" x="185" y="36" width="150" height="54" rx="5"/>
+    <text class="d-text" x="195" y="58">第 N 段</text>
+    <text class="d-small" x="195" y="78">10/9 …～10/10 …</text>
+    <rect class="d-box" x="350" y="36" width="150" height="54" rx="5"/>
+    <text class="d-text" x="360" y="58">第 N+1 段</text>
+    <text class="d-small" x="360" y="78">10/10 …～10/11 …</text>
+    <rect class="d-box" x="515" y="36" width="150" height="54" rx="5"/>
+    <text class="d-text" x="525" y="58">…</text>
+    <text class="d-small" x="525" y="78">到 10/21</text>
+    <text class="d-accent" x="185" y="122">查 10/10 09:00～10:00 → 只讀這一段的 128 頁</text>
+    <text class="d-text" x="20" y="160">相關性低的欄位：每一段的範圍都很寬、互相重疊，</text>
+    <text class="d-text" x="20" y="182">每一段都「可能有」，結果還是讀整張表。</text>
+  </svg>
+  <figcaption>BRIN 不記錄每一列的位置，只記錄每一段的範圍，所以它極小，但只能排除「整段都不可能」的資料頁。</figcaption>
+</figure>
+<p>先比大小：在同一個欄位上各建一個 BRIN 和 B-tree，執行後看兩個索引的大小。</p>
+<div class="lab" data-sql="BEGIN;
+CREATE INDEX order_logs_brin ON order_logs USING brin (created_at);
+CREATE INDEX order_logs_btree ON order_logs (created_at);
+SELECT indexrelname, pg_size_pretty(pg_relation_size(indexrelid))
+FROM pg_stat_user_indexes WHERE relname = 'order_logs';
+ROLLBACK;"></div>
+<p>BRIN 24 kB，B-tree 672 kB。BRIN 的大小只和段數有關，表越大，差距越明顯。</p>
+<p>再看查詢怎麼用 BRIN：這次只建 BRIN，執行後由上往下讀計畫。</p>
+<div class="lab" data-sql="BEGIN;
+CREATE INDEX order_logs_brin ON order_logs USING brin (created_at);
+EXPLAIN ANALYZE
+SELECT * FROM order_logs
+WHERE created_at &gt;= '2026-10-10 09:00+08' AND created_at &lt; '2026-10-10 10:00+08';
+ROLLBACK;"></div>
+<p>計畫是 <code>Bitmap Index Scan</code> → <code>Bitmap Heap Scan</code>：BRIN 先列出可能有資料的頁，再照頁的順序讀回來。BRIN 只能說「這 128 頁可能有」，說不出是哪幾列，所以 <code>Bitmap Heap Scan</code> 底下的幾行是：</p>
+<ul>
+  <li><code>Recheck Cond</code>：讀到的每一列都要重新確認條件。</li>
+  <li><code>Rows Removed by Index Recheck</code>：讀了但不符合的列。</li>
+  <li><code>Heap Blocks: lossy=128</code>：只知道是哪幾頁、不知道是哪幾列，這 128 頁整頁讀。</li>
+</ul>
+<p>和 B-tree 比，它多讀了一些不需要的資料，換來小幾十倍的索引和幾乎沒有的寫入成本。對「每次查一段時間」的查詢，多讀的那一點通常可以接受。</p>
+<p>反過來，相關性一旦變低，BRIN 就失效：</p>
+<ul>
+  <li><strong>資料會被隨機更新</strong>：更新後的新版本可能寫到別的頁，那一段的範圍就變寬。</li>
+  <li><strong>亂序寫入</strong>：補登、批次匯入舊資料，讓一段裡混進很早的時間。</li>
+  <li><strong>要找單一一筆</strong>：BRIN 至少讀一整段，找一筆用 B-tree 才划算。</li>
+</ul>
+<p>還有一個時間差：新寫入的資料頁要等 VACUUM（或打開索引的 <code>autosummarize</code> 參數）把它們的最小～最大值摘要進 BRIN。在那之前，這些頁沒有範圍可比，一律被當成「可能有」，每次查詢都會讀。對收銀機紀錄來說，影響的只是最近寫入的那一小段。</p>
+<p>BRIN 和分割可以一起用：每月一個分區負責資料保留，分區裡的時間欄位用 BRIN 負責查一段時間。練習 5 會讓你替 <code>order_logs</code> 選對索引。</p>
+<div class="callout practice"><strong>💡 實務上：大量日誌不一定要放在 PostgreSQL</strong><br>API 請求紀錄、操作稽核、裝置回報這類只會 append、主要依時間查的資料，放在 PostgreSQL 時常用「每月分區＋時間欄位 BRIN」，成本低又夠用。但寫入量很大、主要拿來全文搜尋或做統計圖表時，團隊通常改送到專門的日誌或分析系統（例如 Elasticsearch、BigQuery），讓主資料庫專心處理交易。判斷的問題是：這些資料要不要和訂單在同一個交易裡寫入、要不要和業務資料 JOIN？要的話留在 PostgreSQL；不要的話，移出去能減輕主資料庫的備份與 VACUUM 負擔。</div>
+<p>BRIN 能這麼有效，靠的是「新資料一定寫在最後面」。大表的主鍵索引也有同樣的問題：新的 id 是寫在索引最後面，還是隨機的位置？這決定了大表主鍵該選什麼型別。</p>
+
+<h2>大表的主鍵該用 bigint 還是 UUID？</h2>
+<p><code>orders</code> 的 <code>id</code> 是 bigint identity。<a href="13-data-types.html">第 13 課</a>也提過 uuid，常有人為了「id 不能被猜到」改用 <code>gen_random_uuid()</code>。表小的時候兩者差別不大；表大的時候，差別在新的 id 寫進主鍵索引的<strong>位置</strong>。</p>
+<p>主鍵索引是 B-tree，裡面的值是排好序的，存在一頁一頁的索引頁裡。新值一定要插在它排序上該在的位置。一頁滿了，就要拆成兩頁，叫<strong>頁分裂</strong>（page split）。</p>
+<ul>
+  <li><strong>bigint 序號一直變大</strong>，每次都插在索引的最右邊。最右邊那頁滿了時，PostgreSQL 把它填到 B-tree 預設的 fillfactor（填充率）90% 就開新的一頁，舊頁之後不再被拆，整棵索引的頁都很滿。</li>
+  <li><strong><code>gen_random_uuid()</code> 是隨機值</strong>，每次插在索引裡隨機的位置。滿了的頁從中間拆開，兩頁各只剩一半，之後再慢慢被填，整棵索引平均比較空，同樣的資料要更多頁。</li>
+</ul>
+<p>下面三張表各寫入 2 萬筆，差別只在主鍵型別。執行後看 <code>index_size</code> 欄：</p>
+<div class="lab" data-sql="BEGIN;
+CREATE TABLE ids_bigint (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, n int);
+CREATE TABLE ids_v7 (id uuid DEFAULT uuidv7() PRIMARY KEY, n int);
+CREATE TABLE ids_v4 (id uuid DEFAULT gen_random_uuid() PRIMARY KEY, n int);
+INSERT INTO ids_bigint (n) SELECT g FROM generate_series(1, 20000) g;
+INSERT INTO ids_v7 (n) SELECT g FROM generate_series(1, 20000) g;
+INSERT INTO ids_v4 (n) SELECT g FROM generate_series(1, 20000) g;
+SELECT 'bigint' AS pk, pg_size_pretty(pg_relation_size('ids_bigint_pkey')) AS index_size
+UNION ALL SELECT 'uuidv7()', pg_size_pretty(pg_relation_size('ids_v7_pkey'))
+UNION ALL SELECT 'gen_random_uuid()', pg_size_pretty(pg_relation_size('ids_v4_pkey'));
+ROLLBACK;"></div>
+<ul>
+  <li>bigint 約 456 kB。</li>
+  <li>uuidv7 約 632 kB：uuid 16 bytes，本來就比 bigint 的 8 bytes 大。</li>
+  <li>隨機 uuid 約 848 kB：隨機值每次都不同，大小會變動，大致是這個量級。</li>
+</ul>
+<p>uuidv7 和隨機 uuid 一樣是 16 bytes，索引卻小了一截，多出來的就是頁分裂留下的空位。表到上億筆時，隨機寫入的代價會放大：索引更大；「最近的資料」分散在整棵索引裡，快取（shared buffers）放不下，命中率下降；每次拆頁還要多寫 WAL，備份和複寫都要處理它。</p>
+<p><code>uuidv7()</code> 就是為了兼顧兩邊：它把產生的時間放在最前面，所以新的值一直變大、寫在索引右邊，後面的部分仍然是隨機的，外人猜不到下一個 id（版本見課末）。代價是任何拿到 id 的人都看得出它的建立時間。執行後看第二欄：</p>
+<div class="lab" data-sql="SELECT u, uuid_extract_timestamp(u) FROM (SELECT uuidv7() AS u) t;"></div>
+<p>選擇的方式：</p>
+<ul>
+  <li>內部用、不對外的 id：bigint identity，最小、最快。</li>
+  <li>要放進網址、不想被猜出「第幾號」，又要集中寫入：<code>uuidv7()</code>，並接受它透露建立時間。</li>
+  <li>連建立時間都不能透露：才用隨機 uuid，並接受索引較大、快取效率較差。</li>
+</ul>
+<p>不論選哪一種，回到建表那一節的規則：分割表的主鍵都還要加上分割鍵，例如 <code>orders</code> 的 <code>(id, ordered_at)</code>。</p>
+
+<h2>補充與查表</h2>
+<ul>
+  <li><strong>分割表上的 identity 欄位</strong>：PostgreSQL 17 開始支援（release notes）；更早的版本要改用 <code>DEFAULT nextval(...)</code>。</li>
+  <li><strong><code>max_locks_per_transaction</code> 的預設值</strong>：PostgreSQL 18 預設 64，是「平均每個交易」的額度，不是單一交易的硬上限。</li>
+  <li><strong>執行期修剪仍然要上鎖</strong>：官方文件說明，執行開始時被修剪掉的分區仍然會被上鎖，分區很多時鎖的成本還在。</li>
+  <li><strong><code>DETACH PARTITION … CONCURRENTLY</code></strong>：PostgreSQL 14 開始提供。</li>
+  <li><strong>讓 ATTACH 不必掃 DEFAULT 分區</strong>：文件的另一個做法是在 DEFAULT 分區上也加一個「排除新分區範圍」的 CHECK，例如排除 12 月，ATTACH 就不用掃它。</li>
+  <li><strong>自動管理分區</strong>：常用的外掛 <code>pg_partman</code> 會自動建立未來的分區、移除過期的分區。</li>
+  <li><strong>拆分與合併分區</strong>：PostgreSQL 18 沒有把一個分區拆成兩個、或把兩個合併的指令（<code>ALTER TABLE … SPLIT／MERGE PARTITION</code> 在 18 是語法錯誤）。</li>
+  <li><strong><code>uuidv7()</code></strong>：PostgreSQL 18 新增；<code>uuid_extract_timestamp()</code> 取出它的建立時間。</li>
+</ul>
+
+<h2>練習</h2>
+
+<div class="exercise" data-isolated
+  data-start="-- 建立 order_events 分割表與它的分區
+"
+  data-answer="CREATE TABLE order_events (
+  event_id bigint GENERATED ALWAYS AS IDENTITY,
+  store_id integer,
+  created_at timestamptz NOT NULL,
+  payload jsonb,
+  PRIMARY KEY (event_id, created_at)
+) PARTITION BY RANGE (created_at);
+CREATE TABLE order_events_2026_09 PARTITION OF order_events
+  FOR VALUES FROM ('2026-09-01 00:00+08') TO ('2026-10-01 00:00+08');
+CREATE TABLE order_events_2026_10 PARTITION OF order_events
+  FOR VALUES FROM ('2026-10-01 00:00+08') TO ('2026-11-01 00:00+08');
+CREATE TABLE order_events_2026_11 PARTITION OF order_events
+  FOR VALUES FROM ('2026-11-01 00:00+08') TO ('2026-12-01 00:00+08');
+CREATE TABLE order_events_default PARTITION OF order_events DEFAULT;"
+  data-check="SELECT c.relname, pg_get_expr(c.relpartbound, c.oid)
+FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+WHERE i.inhparent = 'order_events'::regclass
+UNION ALL SELECT 'partition key', pg_get_partkeydef('order_events'::regclass)
+UNION ALL SELECT 'primary key', (SELECT string_agg(a.attname, ', ' ORDER BY a.attname)
+  FROM pg_index x JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = ANY (x.indkey)
+  WHERE x.indrelid = 'order_events'::regclass AND x.indisprimary)
+UNION ALL SELECT 'identity', (SELECT string_agg(attname, ', ') FROM pg_attribute
+  WHERE attrelid = 'order_events'::regclass AND attidentity &lt;&gt; '')
+UNION ALL SELECT 'columns', (SELECT string_agg(attname || ' ' || format_type(atttypid, atttypmod), ', ' ORDER BY attname)
+  FROM pg_attribute WHERE attrelid = 'order_events'::regclass AND attnum &gt; 0 AND NOT attisdropped);">
+  <p>練習 1：建立分割表 <code>order_events</code>，欄位：<code>event_id bigint GENERATED ALWAYS AS IDENTITY</code>、<code>store_id integer</code>、<code>created_at timestamptz NOT NULL</code>、<code>payload jsonb</code>。依 <code>created_at</code> 每月 RANGE 分割，分區 <code>order_events_2026_09</code>、<code>order_events_2026_10</code>、<code>order_events_2026_11</code>（以台北時間的月初為界），再加一個 <code>order_events_default</code>。主鍵要包含 <code>event_id</code>。判分會檢查每個分區的名稱與範圍、分割方式、主鍵欄位、identity 欄位、欄位型別。</p>
+  <script type="text/sql" data-role="wrong">CREATE TABLE order_events (
+  event_id bigint GENERATED ALWAYS AS IDENTITY,
+  store_id integer,
+  created_at timestamptz NOT NULL,
+  payload jsonb,
+  PRIMARY KEY (event_id)
+) PARTITION BY RANGE (created_at);
+CREATE TABLE order_events_2026_09 PARTITION OF order_events FOR VALUES FROM ('2026-09-01 00:00+08') TO ('2026-10-01 00:00+08');
+CREATE TABLE order_events_2026_10 PARTITION OF order_events FOR VALUES FROM ('2026-10-01 00:00+08') TO ('2026-11-01 00:00+08');
+CREATE TABLE order_events_2026_11 PARTITION OF order_events FOR VALUES FROM ('2026-11-01 00:00+08') TO ('2026-12-01 00:00+08');
+CREATE TABLE order_events_default PARTITION OF order_events DEFAULT;</script>
+  <script type="text/sql" data-role="wrong">CREATE TABLE order_events (
+  event_id bigint GENERATED ALWAYS AS IDENTITY,
+  store_id integer,
+  created_at timestamptz NOT NULL,
+  payload jsonb,
+  PRIMARY KEY (event_id, created_at)
+) PARTITION BY RANGE (created_at);
+CREATE TABLE order_events_2026_09 PARTITION OF order_events FOR VALUES FROM ('2026-09-01 00:00+08') TO ('2026-09-30 00:00+08');
+CREATE TABLE order_events_2026_10 PARTITION OF order_events FOR VALUES FROM ('2026-10-01 00:00+08') TO ('2026-10-31 00:00+08');
+CREATE TABLE order_events_2026_11 PARTITION OF order_events FOR VALUES FROM ('2026-11-01 00:00+08') TO ('2026-11-30 00:00+08');
+CREATE TABLE order_events_default PARTITION OF order_events DEFAULT;</script>
+  <script type="text/sql" data-role="wrong">CREATE TABLE order_events (
+  event_id bigint GENERATED ALWAYS AS IDENTITY,
+  store_id integer,
+  created_at timestamptz NOT NULL,
+  payload jsonb,
+  PRIMARY KEY (event_id, created_at)
+) PARTITION BY RANGE (created_at);
+CREATE TABLE order_events_2026_09 PARTITION OF order_events FOR VALUES FROM ('2026-09-01 00:00+08') TO ('2026-10-01 00:00+08');
+CREATE TABLE order_events_2026_10 PARTITION OF order_events FOR VALUES FROM ('2026-10-01 00:00+08') TO ('2026-11-01 00:00+08');
+CREATE TABLE order_events_2026_11 PARTITION OF order_events FOR VALUES FROM ('2026-11-01 00:00+08') TO ('2026-12-01 00:00+08');</script>
+  <script type="text/sql" data-role="wrong">CREATE TABLE order_events (
+  event_id bigint GENERATED ALWAYS AS IDENTITY,
+  store_id integer,
+  created_at timestamptz NOT NULL,
+  payload jsonb,
+  PRIMARY KEY (event_id, created_at)
+) PARTITION BY RANGE (created_at);
+CREATE TABLE order_events_2026_09 PARTITION OF order_events FOR VALUES FROM ('2026-09-01 00:00Z') TO ('2026-10-01 00:00Z');
+CREATE TABLE order_events_2026_10 PARTITION OF order_events FOR VALUES FROM ('2026-10-01 00:00Z') TO ('2026-11-01 00:00Z');
+CREATE TABLE order_events_2026_11 PARTITION OF order_events FOR VALUES FROM ('2026-11-01 00:00Z') TO ('2026-12-01 00:00Z');
+CREATE TABLE order_events_default PARTITION OF order_events DEFAULT;</script>
+  <script type="text/sql" data-role="wrong">CREATE TABLE order_events (
+  event_id bigint GENERATED ALWAYS AS IDENTITY,
+  store_id integer,
+  created_at timestamptz NOT NULL,
+  payload text,
+  PRIMARY KEY (event_id, created_at)
+) PARTITION BY RANGE (created_at);
+CREATE TABLE order_events_2026_09 PARTITION OF order_events FOR VALUES FROM ('2026-09-01 00:00+08') TO ('2026-10-01 00:00+08');
+CREATE TABLE order_events_2026_10 PARTITION OF order_events FOR VALUES FROM ('2026-10-01 00:00+08') TO ('2026-11-01 00:00+08');
+CREATE TABLE order_events_2026_11 PARTITION OF order_events FOR VALUES FROM ('2026-11-01 00:00+08') TO ('2026-12-01 00:00+08');
+CREATE TABLE order_events_default PARTITION OF order_events DEFAULT;</script>
+</div>
+
+<div class="exercise" data-isolated
+  data-forbid="\borders_(20|default)" data-forbid-msg="這題要查父表 orders，讓 PostgreSQL 自己修剪分區，不要直接指定分區。"
+  data-start="CREATE VIEW week_report AS
+SELECT * FROM orders
+WHERE ordered_at::date BETWEEN '2026-10-01' AND '2026-10-07';"
+  data-answer="CREATE VIEW week_report AS
+SELECT * FROM orders
+WHERE ordered_at &gt;= '2026-10-01 00:00+08' AND ordered_at &lt; '2026-10-08 00:00+08';"
+  data-check="SELECT count(*), sum(total),
+  (SELECT count(*) FROM pg_attribute WHERE attrelid = 'week_report'::regclass AND attnum &gt; 0) AS columns,
+  (SELECT string_agg(DISTINCT table_name, ', ') FROM plan_nodes('SELECT * FROM week_report') WHERE table_name IS NOT NULL)
+FROM week_report;">
+  <p>練習 2：建立 view <code>week_report</code>，列出 2026-10-01～2026-10-07（台北時間，整整 7 天）的所有訂單，欄位和 <code>orders</code> 一樣（<code>SELECT *</code>）。寫法要讓分區修剪生效。起始內容的結果是對的，但計畫掃了所有分區。判分會比對筆數、營收總和、欄位數，以及計畫掃到哪些表；view 要查父表 <code>orders</code>，不能直接指定分區。注意邊界上有 10/7 23:59:59.5 和 10/8 00:00 整的訂單。</p>
+  <script type="text/sql" data-role="wrong">CREATE VIEW week_report AS
+SELECT * FROM orders
+WHERE ordered_at BETWEEN '2026-10-01 00:00+08' AND '2026-10-07 23:59:59+08';</script>
+  <script type="text/sql" data-role="wrong">CREATE VIEW week_report AS
+SELECT * FROM orders
+WHERE date_trunc('day', ordered_at) BETWEEN '2026-10-01 00:00+08' AND '2026-10-07 00:00+08';</script>
+  <script type="text/sql" data-role="wrong">CREATE VIEW week_report AS
+SELECT * FROM orders
+WHERE ordered_at >= '2026-10-01 00:00+08' AND ordered_at <= '2026-10-08 00:00+08';</script>
+  <script type="text/sql" data-role="wrong">CREATE VIEW week_report AS
+SELECT * FROM orders
+WHERE ordered_at > '2026-10-01 00:00+08' AND ordered_at < '2026-10-08 00:00+08';</script>
+  <script type="text/sql" data-role="wrong">CREATE VIEW week_report AS
+SELECT * FROM orders_2026_10
+WHERE ordered_at >= '2026-10-01 00:00+08' AND ordered_at < '2026-10-08 00:00+08';</script>
+  <script type="text/sql" data-role="wrong">CREATE VIEW week_report AS
+SELECT id, total FROM orders
+WHERE ordered_at >= '2026-10-01 00:00+08' AND ordered_at < '2026-10-08 00:00+08';</script>
+</div>
+
+<div class="exercise" data-isolated
+  data-start="-- 9 月的訂單超過保留期限了
+SELECT count(*) FROM orders_2026_09;"
+  data-answer="DROP TABLE orders_2026_09;"
+  data-check="SELECT
+  (SELECT string_agg(c.relname, ', ' ORDER BY c.relname)
+   FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+   WHERE i.inhparent = 'orders'::regclass) AS partitions,
+  to_regclass('orders_2026_09') IS NULL AS table_gone,
+  (SELECT count(*) FROM orders) AS orders_left;">
+  <p>練習 3：9 月的訂單已經超過保留期限。用最快、不產生死版本的方式，移除 <code>orders_2026_09</code> 整個分區和它的資料（拆出來再刪，或直接刪都可以）。判分會檢查剩下的分區、<code>orders_2026_09</code> 這張表還在不在、<code>orders</code> 剩幾筆。</p>
+  <script type="text/sql" data-role="wrong">DELETE FROM orders WHERE ordered_at < '2026-10-01 00:00+08';</script>
+  <script type="text/sql" data-role="wrong">TRUNCATE orders_2026_09;</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE orders DETACH PARTITION orders_2026_09;</script>
+</div>
+
+<div class="exercise" data-isolated
+  data-require="\bADD\s+(CONSTRAINT\s+\S+\s+)?CHECK\b" data-require-msg="題目要求先替 orders_2026_12 加上限制，讓 ATTACH 不用掃表。"
+  data-start="-- orders_2026_12 已經匯入 12 月的訂單
+SELECT count(*), min(ordered_at), max(ordered_at) FROM orders_2026_12;"
+  data-answer="ALTER TABLE orders_2026_12 ADD CONSTRAINT orders_2026_12_range
+  CHECK (ordered_at &gt;= '2026-12-01 00:00+08' AND ordered_at &lt; '2027-01-01 00:00+08');
+ALTER TABLE orders ATTACH PARTITION orders_2026_12
+  FOR VALUES FROM ('2026-12-01 00:00+08') TO ('2027-01-01 00:00+08');
+ALTER TABLE orders_2026_12 DROP CONSTRAINT orders_2026_12_range;"
+  data-check="SELECT pg_get_expr(c.relpartbound, c.oid),
+  (SELECT count(*) FROM orders WHERE ordered_at &gt;= '2026-12-01 00:00+08' AND ordered_at &lt; '2027-01-01 00:00+08'),
+  (SELECT bool_and(tableoid = 'orders_2026_12'::regclass) FROM orders WHERE ordered_at &gt;= '2026-12-01 00:00+08')
+FROM pg_class c WHERE c.oid = 'orders_2026_12'::regclass;">
+  <p>練習 4：12 月的訂單已經批次匯入一般表 <code>orders_2026_12</code>（裡面有一筆 12/31 23:59:59.5 的訂單）。先替它加上和分區範圍相同的 CHECK，再 ATTACH 成 <code>orders</code> 的 12 月分區（以台北時間的月初為界）。ATTACH 之後要不要刪掉 CHECK 由你決定。判分會檢查 <code>orders_2026_12</code> 的分區範圍、<code>orders</code> 裡 12 月的筆數，以及這些列是不是都存在 <code>orders_2026_12</code>。</p>
+  <script type="text/sql" data-role="wrong">ALTER TABLE orders ATTACH PARTITION orders_2026_12
+  FOR VALUES FROM ('2026-12-01 00:00+08') TO ('2027-01-01 00:00+08');</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE orders_2026_12 ADD CONSTRAINT orders_2026_12_range
+  CHECK (ordered_at >= '2026-12-01 00:00+08' AND ordered_at < '2026-12-31 00:00+08');
+ALTER TABLE orders ATTACH PARTITION orders_2026_12
+  FOR VALUES FROM ('2026-12-01 00:00+08') TO ('2026-12-31 00:00+08');</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE orders_2026_12 ADD CONSTRAINT orders_2026_12_range
+  CHECK (ordered_at >= '2026-12-01 00:00Z' AND ordered_at < '2027-01-01 00:00Z');
+ALTER TABLE orders ATTACH PARTITION orders_2026_12
+  FOR VALUES FROM ('2026-12-01 00:00Z') TO ('2027-01-01 00:00Z');</script>
+  <script type="text/sql" data-role="wrong">-- 不 ATTACH，直接複製進 orders（CHECK 只是為了通過檢查）
+ALTER TABLE orders_2026_12 ADD CONSTRAINT orders_2026_12_range
+  CHECK (ordered_at >= '2026-12-01 00:00+08' AND ordered_at < '2027-01-01 00:00+08');
+INSERT INTO orders OVERRIDING SYSTEM VALUE SELECT * FROM orders_2026_12;</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE orders_2026_12 ADD CONSTRAINT orders_2026_12_range
+  CHECK (ordered_at >= '2026-12-01 00:00+08' AND ordered_at < '2027-01-01 00:00+08');
+INSERT INTO orders SELECT * FROM orders_2026_12;</script>
+  <script type="text/sql" data-role="wrong">SELECT 'CHECK';
+ALTER TABLE orders ATTACH PARTITION orders_2026_12
+  FOR VALUES FROM ('2026-12-01 00:00+08') TO ('2027-01-01 00:00+08');</script>
+</div>
+
+<div class="exercise" data-isolated
+  data-start="SELECT * FROM plan_nodes('SELECT * FROM order_logs WHERE created_at &gt;= ''2026-10-10 09:00+08'' AND created_at &lt; ''2026-10-10 10:00+08''');"
+  data-answer="CREATE INDEX ON order_logs USING brin (created_at);"
+  data-check="SELECT
+  (SELECT string_agg(am.amname, ', ' ORDER BY am.amname)
+   FROM pg_index x JOIN pg_class c ON c.oid = x.indexrelid JOIN pg_am am ON am.oid = c.relam
+   WHERE x.indrelid = 'order_logs'::regclass AND NOT x.indisprimary) AS access_methods,
+  (SELECT bool_and(pg_relation_size(indexrelid) &lt; 65536)
+   FROM pg_index WHERE indrelid = 'order_logs'::regclass AND NOT indisprimary) AS small,
+  EXISTS (SELECT 1 FROM plan_nodes('SELECT * FROM order_logs WHERE created_at &gt;= ''2026-10-10 09:00+08'' AND created_at &lt; ''2026-10-10 10:00+08''')
+          WHERE node = 'Bitmap Index Scan') AS bitmap_index_scan;">
+  <p>練習 5：<code>order_logs</code> 只會依時間新增，常用的查詢是「某一小時的紀錄」。替它建<strong>一個</strong>索引，讓起始內容那句查詢用上它，而且索引小於 64 kB。起始內容的 <code>plan_nodes()</code> 是<a href="27-index-design.html">第 27 課</a>的小工具，把計畫攤平成「節點、表、索引、條件」。判分會檢查 <code>order_logs</code> 上主鍵以外索引的類型、大小，以及計畫裡有沒有 <code>Bitmap Index Scan</code>。</p>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON order_logs (created_at);</script>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON order_logs USING brin (store_id);</script>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON order_logs USING brin (created_at);
+CREATE INDEX ON order_logs (created_at);</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 6：<code>orders</code> 只有 2 GB，常用查詢都有合適的索引、回應很快，沒有保留期限的需求。同事提議「表很大了，先做每月分割比較保險」。你的看法？</p>
+  <label data-key="a">應該做，分割之後所有查詢都會變快</label>
+  <label data-key="b">應該做，而且要每天一個分區，越細越快</label>
+  <label data-key="c">先不要：現在沒有要解決的問題，分割會帶來主鍵要含分割鍵、不帶分割鍵的查詢要查每個分區、要維護未來分區等成本</label>
+  <label data-key="d">不能做，PostgreSQL 的分割表不支援索引</label>
+  <p class="why">✓ 分割解決的是「刪舊資料」和「查詢只看某段時間但表太大」這類問題。沒有這些問題時，它只帶來限制與維運工作。每天一個分區會讓規劃與鎖的成本更高。分割表可以有索引，在父表建立就會建到每個分區。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：<code>orders</code> 依 <code>ordered_at</code> 每月分割、共 36 個分區，每個分區都有 <code>(customer_id)</code> 索引。<code>SELECT * FROM orders WHERE customer_id = 42</code> 會怎樣？</p>
+  <label data-key="a">只查一個分區，因為每個分區都有索引</label>
+  <label data-key="b">36 個分區各做一次索引查詢再合併，通常比沒分割的一張表慢</label>
+  <label data-key="c">會報錯，查詢一定要帶分割鍵</label>
+  <p class="why">✓ 條件沒有分割鍵，規劃器無法排除任何分區，只能每個分區各查一次（<code>Append</code> 底下 36 個掃描），再加上規劃與 36 個分區加索引的鎖。不會報錯，但比一棵大索引查一次慢。顧客查詢很重要的話，介面上要帶時間範圍（例如「最近 3 個月」），或重新考慮分割鍵。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 8：<code>stamp_cards.stamps</code>（集點卡的點數）經常被隨機更新，有人提議「BRIN 很小，替它建 BRIN 就好」。會怎樣？</p>
+  <label data-key="a">幾乎沒用：點數和資料存放順序沒有關係（相關性接近 0），每一段的最小～最大值都很寬，什麼都排除不了，還是要讀整張表</label>
+  <label data-key="b">很好：BRIN 比 B-tree 小，所以一定比較快</label>
+  <label data-key="c">會報錯：BRIN 只能建在 timestamptz 欄位上</label>
+  <p class="why">✓ BRIN 只靠「每一段資料頁的範圍」排除資料，依賴欄位值和實際存放順序一致（<code>pg_stats.correlation</code> 接近 1 或 -1）。隨機更新的欄位每一段都包含各種值。BRIN 可以建在任何有排序意義的型別上，不限時間；但只有依序寫入的欄位才有用。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>用 DELETE 做資料保留</strong>：一次刪幾百萬筆，產生同樣多的死版本，VACUUM 要清很久，索引也不會變小。改成依時間分割，到期整個分區 <code>DROP</code>（或先 <code>DETACH</code> 備份）。</li>
+  <li><strong>在 WHERE 裡對分割鍵轉型或套函式</strong>：<code>ordered_at::date = …</code>、<code>date_trunc('day', ordered_at)</code> 讓修剪失效、每個分區都掃。改成 <code>ordered_at &gt;= 開頭 AND ordered_at &lt; 下一段開頭</code>。</li>
+  <li><strong>範圍邊界寫成 <code>23:59:59</code> 或 <code>&lt;=</code> 下一天</strong>：前者漏掉最後一秒內的資料，後者多算下一天 00:00 的資料。一律含開頭、不含下一段開頭。</li>
+  <li><strong>邊界忘了寫時區</strong>：<code>'2026-12-01 00:00Z'</code> 是台北早上 8 點，分區會錯開 8 小時。寫 <code>+08</code>，或確定連線的時區設定。</li>
+  <li><strong>忘了建未來的分區</strong>：新資料寫入失敗（23514），或全部掉進 DEFAULT，之後 ATTACH 又失敗。用排程或 pg_partman 提前建好，並監控。</li>
+  <li><strong>DEFAULT 分區裡塞了大量資料</strong>：ATTACH 新分區時要掃它，而且有 DEFAULT 就不能 <code>DETACH … CONCURRENTLY</code>。DEFAULT 要保持幾乎是空的，有資料就告警。</li>
+  <li><strong>以為 id 在整張分割表都唯一</strong>：唯一約束只保證含分割鍵的組合。外鍵也要參照兩欄。</li>
+  <li><strong>分區切太細</strong>：每天一個、存好幾年，規劃變慢，一次查詢要鎖上千個分區，可能用完 <code>max_locks_per_transaction</code>。</li>
+  <li><strong>用 <code>LIKE … INCLUDING ALL</code> 建要 ATTACH 的表</strong>：identity 欄位只能在父表，ATTACH 得到 55000。用 <code>(LIKE orders)</code>，id 從父表的序號拿。</li>
+  <li><strong>ATTACH 前沒有加 CHECK</strong>：大表會在 ACCESS EXCLUSIVE 鎖下被整張掃過。先加符合範圍的 CHECK，ATTACH 後再刪。</li>
+  <li><strong>把 BRIN 用在亂序或常被更新的欄位</strong>：相關性低就排除不了任何資料頁。先看 <code>pg_stats.correlation</code>。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>用 <code>DELETE</code> 刪一個月，要逐列標記死版本、寫 WAL、等 VACUUM，檔案也不變小。分割表把一張邏輯上的表存成多個分區，刪一個月變成刪一張表。</li>
+  <li>值得分割的情況：要定期刪舊資料、查詢幾乎都只看某段時間且表很大。代價：主鍵要含分割鍵、不帶分割鍵的查詢要查每個分區、分區太多有規劃與鎖的成本、要維護未來的分區。</li>
+  <li>RANGE 含下限、不含上限，邊界寫清楚時區；LIST 依清單；HASH 平均分散。沒有分區收的列得到 23514，DEFAULT 分區是安全網，要保持幾乎是空的。主鍵必須包含分割鍵，id 單獨不再保證唯一。</li>
+  <li>分區修剪要條件直接拿分割鍵和常數比較；轉型、套函式會讓每個分區都被掃。範圍一律含開頭、不含下一段開頭。prepared statement 的 generic plan 在執行開始時修剪（<code>Subplans Removed</code>）。</li>
+  <li>父表上建索引會建到每個分區；要不擋寫入，用 <code>CREATE INDEX ON ONLY</code> 父表＋每個分區 <code>CONCURRENTLY</code>＋<code>ALTER INDEX … ATTACH PARTITION</code>。</li>
+  <li>資料保留：<code>DROP TABLE</code> 分區或先 <code>DETACH</code>，不產生死版本，但要對父表拿 ACCESS EXCLUSIVE，配 <code>lock_timeout</code> 與重試；沒有 DEFAULT 分區時可以 <code>DETACH … CONCURRENTLY</code>。新月份用 <code>(LIKE 父表)</code> 建表、匯入、加 CHECK、ATTACH；未來的分區用排程提前建好並監控。</li>
+  <li>BRIN 只記錄每段資料頁的最小～最大值，極小、寫入成本低，適合相關性接近 1 的依時間 append 資料。</li>
+  <li>大表主鍵：bigint 或 <code>uuidv7()</code> 讓寫入集中在索引右邊；隨機 uuid 讓索引一直頁分裂、變大、快取命中下降。</li>
+</ul>
+<p>下一課把資料庫推上線：連線數與連線池、應用程式的角色與權限、護欄設定與監控指標（<a href="36-connections-monitoring.html">第 36 課</a>）。</p>
+
+</main>
+
+<script type="text/sql" id="seed">
+-- 訂單：依 ordered_at 每月一個分區
+CREATE TABLE orders (
+  id bigint GENERATED ALWAYS AS IDENTITY,
+  store_id integer NOT NULL,
+  customer_id integer NOT NULL,
+  ordered_at timestamptz NOT NULL,
+  total integer NOT NULL,
+  PRIMARY KEY (id, ordered_at)
+) PARTITION BY RANGE (ordered_at);
+CREATE TABLE orders_2026_09 PARTITION OF orders
+  FOR VALUES FROM ('2026-09-01 00:00+08') TO ('2026-10-01 00:00+08');
+CREATE TABLE orders_2026_10 PARTITION OF orders
+  FOR VALUES FROM ('2026-10-01 00:00+08') TO ('2026-11-01 00:00+08');
+CREATE TABLE orders_2026_11 PARTITION OF orders
+  FOR VALUES FROM ('2026-11-01 00:00+08') TO ('2026-12-01 00:00+08');
+CREATE TABLE orders_default PARTITION OF orders DEFAULT;
+CREATE INDEX orders_store_time_idx ON orders (store_id, ordered_at);
+-- 9/1～11/30，每 262 秒一筆，共 30,000 筆
+INSERT INTO orders (store_id, customer_id, ordered_at, total)
+SELECT 1 + g % 5, 1 + (g * 7919) % 5000,
+       timestamptz '2026-09-01 00:00+08' + g * interval '262 seconds',
+       70 + (g * 37) % 400
+FROM generate_series(1, 30000) g;
+-- 邊界上的訂單：10/1 00:00 整、10/7 23:59:59.5、10/8 00:00 整
+INSERT INTO orders (store_id, customer_id, ordered_at, total) VALUES
+  (1, 42, '2026-10-01 00:00+08', 80),
+  (2, 43, '2026-10-07 23:59:59.5+08', 110),
+  (3, 44, '2026-10-08 00:00+08', 90);
+-- 8 月補登的 3 筆紙本訂單：沒有 8 月分區，落進 DEFAULT
+INSERT INTO orders (store_id, customer_id, ordered_at, total) VALUES
+  (1, 7, '2026-08-30 15:00+08', 80),
+  (4, 8, '2026-08-31 09:30+08', 120),
+  (5, 9, '2026-08-31 18:10+08', 70);
+
+-- 12 月的訂單先匯入一般表，等著 ATTACH（id 從 orders 的 identity 序號拿）
+CREATE TABLE orders_2026_12 (LIKE orders);
+INSERT INTO orders_2026_12 (id, store_id, customer_id, ordered_at, total)
+SELECT nextval(pg_get_serial_sequence('orders', 'id')), 1 + g % 5, 1 + (g * 7919) % 5000,
+       timestamptz '2026-12-01 00:30+08' + g * interval '15 minutes',
+       70 + (g * 37) % 400
+FROM generate_series(0, 2970) g;
+INSERT INTO orders_2026_12 (id, store_id, customer_id, ordered_at, total)
+VALUES (nextval(pg_get_serial_sequence('orders', 'id')), 2, 45, '2026-12-31 23:59:59.5+08', 120);
+
+-- 收銀機紀錄：只會依時間往後新增
+CREATE TABLE order_logs (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  store_id integer NOT NULL,
+  created_at timestamptz NOT NULL,
+  message text NOT NULL
+);
+INSERT INTO order_logs (store_id, created_at, message)
+SELECT 1 + g % 5, timestamptz '2026-10-01 00:00+08' + g * interval '1 minute',
+       'register ' || (1 + g % 5) || ' printed receipt #' || g || ' ' || repeat('.', 120)
+FROM generate_series(1, 30000) g;
+ANALYZE;
+
+-- 小工具：計畫攤平成「節點、表、索引、條件」（第 27 課）
+CREATE FUNCTION plan_json(query text) RETURNS jsonb
+LANGUAGE plpgsql AS $$
+DECLARE j json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) ' || query INTO j;
+  RETURN (j::jsonb) -> 0 -> 'Plan';
+END
+$$;
+CREATE FUNCTION plan_nodes(query text)
+RETURNS TABLE (node text, table_name text, index_name text, cond text)
+LANGUAGE sql AS $$
+  WITH RECURSIVE t(p) AS (
+    SELECT plan_json(query)
+    UNION ALL
+    SELECT c FROM t, jsonb_array_elements(t.p -> 'Plans') c
+  )
+  SELECT p ->> 'Node Type', p ->> 'Relation Name', p ->> 'Index Name',
+         coalesce(p ->> 'Index Cond', p ->> 'Recheck Cond', p ->> 'Filter')
+  FROM t
+$$;
+</script>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

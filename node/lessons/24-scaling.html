@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>24. 多核心與水平擴展</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="24" data-practice="node">
+<header>
+  <div class="eyebrow">階段 6：資深工程師的功課 · 第 24 課</div>
+  <h1>多核心與水平擴展</h1>
+</header>
+<main>
+
+<p>咖啡店開了第二十家分店，早上八點的點餐尖峰，API 主機的 CPU 只用到 12%，回應卻越來越慢。工程師查到原因：主機有 8 顆核心，而一個 Node 程序執行 JavaScript 只用得到其中一顆。他把服務改成同時跑 4 個程序，速度回來了，接著冒出三件怪事：同一張訂單被建立兩次、客人的手機畫面停在「製作中」不動、每分鐘 60 次的限流好像失效了。</p>
+<p>這一課就處理這場尖峰事故：先弄懂為什麼一個程序用不滿機器、要怎麼變成多份，再一件一件追查這三件怪事從哪裡來、怎麼修，最後算清楚修好之後還能擴展到多大。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>為什麼 CPU 只用到 12% 卻變慢：一個程序只用一顆核心，解法是開多份，通常交給容器平台去開。</li>
+  <li>（選讀）多份程式怎麼共用一個 port、崩潰了誰補回來：<code>node:cluster</code> 和監督者，看懂 pm2、Kubernetes 替你做的事。</li>
+  <li>三件怪事的共同原因：每個程序有自己的記憶體，存在變數裡的狀態不會共享。</li>
+  <li>逐一修好：冪等鍵移到 PostgreSQL 擋住重複訂單，LISTEN／NOTIFY 把狀態通知送到每個程序，限流計數搬到 Redis。</li>
+  <li>修好之後還能再加程序嗎：程序數乘上連線池的算術，和上線前的無狀態檢查清單。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="14-rest-api-design.html">第 14 課</a>的冪等鍵 <code>Idempotency-Key</code>：客戶端重送時帶同一個 key，伺服器只做一次，之後都回第一次的結果。</li>
+  <li><a href="16-streams-backpressure.html">第 16 課</a>的 SSE：伺服器用一條不關閉的 HTTP 回應，持續把事件推給前端。</li>
+  <li><a href="20-postgres-pool-transactions.html">第 20 課</a>的連線池與交易：從 pool 借一條連線，<code>BEGIN</code>／<code>COMMIT</code> 包住多句 SQL，出錯就 <code>ROLLBACK</code>。</li>
+  <li><a href="../../postgresql/lessons/31-isolation-upsert.html">PostgreSQL 課第 31 課</a>的 <code>INSERT … ON CONFLICT</code>：插入撞到唯一約束時改成不做事或改成更新，由資料庫決定誰先到。</li>
+</ul></div>
+
+<h2>CPU 只用到 12%，API 為什麼還會變慢？</h2>
+<p>先解開開場的第一個數字。<a href="07-event-loop.html">第 7 課</a>說過，一個 Node 程序只有一條執行 JavaScript 的主執行緒。等資料庫、等網路的時候，主執行緒閒著，可以去處理別的請求；但真的在算東西的時候（產生報表、驗證簽章、序列化大型 JSON），同一時間只有這一條執行緒在跑，也就只用得到一顆核心。</p>
+<p>咖啡店的主機有 8 顆核心。尖峰時那一顆核心已經滿了，請求在 event loop 上排隊，回應越來越慢；另外 7 顆幾乎沒事做。監控畫面上的 CPU 使用率是整台機器的平均，一顆滿載、七顆閒置，平均下來大約 1/8，就是那個 12%。所以「CPU 很低卻很慢」在 Node 上不矛盾：瓶頸是那一條主執行緒，不是整台機器。</p>
+<p>這台機器有幾顆核心可以用，用 <code>os.availableParallelism()</code> 查，它回傳的是「這個程式預設應該用多少平行數量」的估計值：</p>
+<pre>$ node -p "require('node:os').availableParallelism()"
+8</pre>
+<p>流量變大、一個程序撐不住時，有兩個方向。第一個是<strong>垂直擴展</strong>（scale up）：換一台更強的機器。它最簡單、程式不用改，但有上限，也越來越貴；而且對 Node 來說，核心變多不會自動變快，因為一個程序還是只用一顆。咖啡店的情況正是如此：8 顆核心已經在那裡了，問題是用不到。</p>
+<p>第二個是<strong>水平擴展</strong>（scale out）：同一份程式多開幾份，可以在同一台機器上開多個程序，也可以加機器。開 4 個程序，就有 4 條主執行緒同時處理請求，用得到 4 顆核心。它理論上沒有上限，還順便有了備援：一份掛了，其他份還在。代價是程式要能接受「同時有好幾份自己」，開場的三件怪事就是這個代價，這課後半會一件一件處理。</p>
+<p>那「多開幾份」由誰來開？有兩種做法。Node 內建的是 <code>node:cluster</code> 模組，在同一台機器上由一個程序開出多個程序，共用同一個 port，下一節（選讀）會實際跑一次。不過現在的正式環境多半把這件事交給<strong>容器平台</strong>，例如 Docker、Kubernetes。它們的慣例是<strong>一個容器一個程序</strong>，要用更多核心就開更多容器；程序崩潰後重啟、重啟前等一段時間、部署時逐一替換新版，都由平台負責（<a href="../../devops/lessons/07-containers.html">部署課第 7 課</a>起、<a href="../../devops/lessons/13-scaling.html">第 13 課</a>）。</p>
+<p>不管是哪一種，結果都一樣：同時有好幾份程式在跑，每份有自己的記憶體。這一點決定了後半的所有問題。</p>
+<div class="callout warn">在容器裡又開 cluster，是常見的重複擴展：容器平台以為這個容器只用一顆核心，實際上跑了 8 個程序，CPU 限制（例如 Kubernetes 的 1 CPU）會讓 8 個程序搶 1 顆核心，反而更慢。選一層做擴展就好，通常是容器。</div>
+<p>接下來兩節是選讀，用 <code>node:cluster</code> 自己做一次「多份程式共用一個 port」和「崩潰了補回來」，目的是看懂 pm2、Kubernetes 在背後替你做了什麼。正式環境很少自己寫這些；想直接處理三件怪事，可以跳到「<a href="#state">四個程序之後，為什麼會出現三件怪事？</a>」。</p>
+<div class="callout practice"><strong>💡 實務上：接手專案先看它是「誰」在擴展</strong><br>加入新團隊，先別急著改程式，先找部署設定：有 <code>Dockerfile</code>、Kubernetes 的 YAML，還是 pm2 的設定檔、systemd 的 service 檔？接著問三件事：現在開了幾份、崩潰了誰負責重啟、每份分到多少 CPU 和記憶體。答案通常在維運或 DevOps 同事手上，問清楚比自己猜快。咖啡店這次的事故，第一步也是先確認那 4 個程序是誰開的，因為後面的修法都建立在「同時有好幾份」這個前提上。</div>
+
+<h2>（選讀）四個程序怎麼共用同一個 port？</h2>
+<p>上一節說要開多份程式，第一個遇到的障礙是 port。一般情況下兩個程序不能 listen 同一個 port，第二個會得到 <code>EADDRINUSE</code>（<a href="01-what-is-node.html">第 1 課</a>）。可是客戶端只知道一個網址、一個 port，總不能請客人自己挑要連哪一份。</p>
+<p><code>node:cluster</code> 的解法是分工。它有兩種角色：一個 <strong>primary</strong>（主程序）負責管理，用 <code>child_process.fork()</code>（<a href="09-blocking-and-workers.html">第 9 課</a>）開出多個 <strong>worker</strong>（工作程序）負責處理請求。這裡的 worker 是獨立的程序，和第 9 課的 worker_threads（同一個程序裡的執行緒）是不同的東西。</p>
+<p>primary 和每個 worker 之間有一條管道，可以互傳訊息，甚至把一條網路連線交給對方。這種程序之間傳東西的機制叫 <strong>IPC</strong>（inter-process communication，程序間通訊）。有了它，port 的問題就解開了：worker 呼叫 <code>server.listen()</code> 時，實際的 listen 由 primary 做，primary 接受連線之後，再透過 IPC 把連線交給某一個 worker。</p>
+<pre>import cluster from 'node:cluster'
+import { createServer } from 'node:http'
+
+if (cluster.isPrimary) {
+  for (let i = 0; i &lt; 2; i++) cluster.fork()   // 再執行一次這個檔案，但 isPrimary 是 false
+} else {
+  let count = 0                                 // 每個 worker 各有一份
+  createServer((req, res) =&gt; {
+    count++
+    res.end(`worker ${process.pid}：這個程序已處理 ${count} 個請求\n`)
+  }).listen(3000)
+}</pre>
+<p>同一個檔案執行了三次：第一次是 primary，<code>cluster.isPrimary</code> 是 <code>true</code>，它 fork 出兩個 worker；兩個 worker 各自再執行這個檔案，這次 <code>isPrimary</code> 是 <code>false</code>，就走到 <code>else</code> 去開伺服器。注意 <code>count</code>：它寫在 worker 的程式裡，每個 worker 各有一份。</p>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs node 24</code> 建立 <code>work/24/</code>，到 <code>work/24</code> 執行 <code>node examples/cluster-state.ts</code>，另開終端機打幾次 <code>curl http://localhost:3000/</code>。看兩件事：pid 怎麼輪替，以及每個 worker 說自己處理了幾個：</p>
+<pre>worker 97840：這個程序已處理 1 個請求
+worker 97839：這個程序已處理 1 個請求
+worker 97840：這個程序已處理 2 個請求
+worker 97839：這個程序已處理 2 個請求</pre>
+<p>請求輪流落在兩個程序上。這種輪流分配叫 <strong>round-robin</strong>：primary 接受連線，再依序交給各個 worker。Node 24 文件寫明，除了 Windows 以外的作業系統預設都是這種方式（<code>cluster.SCHED_RR</code>）。另一件事是：送了 4 個請求，兩個 worker 都說自己處理了 2 個，沒有一個知道總數是 4。這就是開場三件怪事的源頭，<a href="#state">後面</a>會回來談。</p>
+<figure>
+  <svg viewBox="0 0 700 260" role="img" aria-label="cluster 架構：客戶端的連線先到 primary 的 port 3000，primary 以 round-robin 透過 IPC 把連線交給 worker 1、worker 2，每個 worker 有自己的記憶體">
+    <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="20" y="95" width="120" height="60" rx="8"/>
+    <text class="d-text" x="80" y="130" text-anchor="middle">客戶端</text>
+    <line class="d-line" x1="140" y1="125" x2="228" y2="125" marker-end="url(#arr)"/>
+    <text class="d-small" x="184" y="115" text-anchor="middle">連線</text>
+    <rect class="d-soft" x="230" y="80" width="170" height="90" rx="8"/>
+    <text class="d-text" x="315" y="115" text-anchor="middle">primary</text>
+    <text class="d-small" x="315" y="137" text-anchor="middle">listen :3000</text>
+    <text class="d-small" x="315" y="155" text-anchor="middle">round-robin 分配</text>
+    <line class="d-line" x1="400" y1="110" x2="498" y2="60" marker-end="url(#arr)"/>
+    <line class="d-line" x1="400" y1="140" x2="498" y2="190" marker-end="url(#arr)"/>
+    <text class="d-small" x="450" y="125" text-anchor="middle">IPC</text>
+    <rect class="d-box" x="500" y="20" width="180" height="80" rx="8"/>
+    <text class="d-text" x="590" y="52" text-anchor="middle">worker 1</text>
+    <text class="d-small" x="590" y="75" text-anchor="middle">自己的記憶體：count = 2</text>
+    <rect class="d-box" x="500" y="150" width="180" height="80" rx="8"/>
+    <text class="d-text" x="590" y="182" text-anchor="middle">worker 2</text>
+    <text class="d-small" x="590" y="205" text-anchor="middle">自己的記憶體：count = 2</text>
+    <text class="d-accent" x="315" y="230" text-anchor="middle">分配的單位是「連線」，不是請求</text>
+  </svg>
+  <figcaption>primary 只管分配和監督，處理請求的是 worker。每個 worker 是獨立的程序，記憶體互不相通。</figcaption>
+</figure>
+<p>圖下方那行字要特別記住：primary 分配的單位是<strong>連線</strong>，不是請求。一條 keep-alive 連線上的請求都會落在同一個 worker。瀏覽器、<code>fetch</code> 都會重用連線，所以「發 10 個請求」不代表會分散到每個 worker；練習的測試用 <code>node:http</code> 的 <code>agent: false</code> 讓每個請求開新連線，就是這個原因。自己做壓測時看到負載不平均，先檢查是不是連線被重用了。</p>
+<p>最後，primary 自己不要處理請求。它掛了，全部 worker 都跟著停，所以它只做分配和監督，越簡單越好。分配已經看過了；監督是什麼意思？worker 是程序，程序會崩潰，崩潰之後由誰補回來，是下一節的問題。（primary 端可以聽的事件、<code>listen(0)</code> 的行為等細節見課末「補充與查表」。）</p>
+
+<h2>（選讀）worker 崩潰了，誰把它補回來？</h2>
+<p>上一節的 primary 只做了「分配」；它的另一半工作是<strong>監督</strong>。<a href="18-error-handling.html">第 18 課</a>說過，程序崩潰後由<strong>監督者</strong>（supervisor）把它重新啟動。在 cluster 裡，primary 就是 worker 的監督者，它有三個責任，一個比一個容易寫錯。</p>
+<p>第一是<strong>補人</strong>。primary 收到 worker 的 <code>'exit'</code> 事件，就 <code>cluster.fork()</code> 一個新的。不補的話，每崩潰一次服務容量就少一份，4 個程序過幾天可能剩 1 個，又回到開場的 12%。</p>
+<p>第二是<strong>不陷入崩潰迴圈</strong>。如果 worker 一啟動就崩潰（環境變數寫錯、連不上資料庫、程式有語法錯誤），無條件重啟會變成<strong>崩潰迴圈</strong>（crash loop）：每秒重啟幾十次，CPU 花在啟動程序上，log 被同一個錯誤洗版，真正的錯誤訊息反而找不到。這種錯誤重啟幾次都不會好，需要人來修。做法跟<a href="21-graceful-shutdown.html">第 21 課</a>等資料庫一樣：重啟前<strong>退避</strong>，也就是等一段時間、而且一次比一次長；並設<strong>上限</strong>，例如 10 秒內崩潰超過 5 次就放棄，以結束碼 1 結束，交給上一層的監督者和值班的人。</p>
+<p>第三是<strong>一起優雅關機</strong>。部署新版時，primary 會收到 <code>SIGTERM</code>。這時它要對每個 worker 送 <code>SIGTERM</code>，讓它們各自做完進行中的請求（<a href="21-graceful-shutdown.html">第 21 課</a>），等全部結束才結束自己；這段期間結束的 worker 是正常下班，不能當成崩潰再補一個。</p>
+<p>第三點有個容易忽略的地方：primary 不等 worker 就先結束，會怎樣？這台電腦上實測，用 <code>SIGKILL</code> 砍掉 primary，兩個 worker 也立刻消失了。原因是 cluster 的 worker 發現 IPC 管道斷了（不是 primary 叫它斷的），就直接結束自己。父程序結束、子程序還繼續在跑，這種子程序叫<strong>孤兒程序</strong>，它會繼續占著 port 和記憶體，而且沒有人管。所以 primary 先走不會留下孤兒程序，但 worker <strong>不會優雅關機</strong>：正在處理的請求直接被切斷。primary 一定要等所有 worker 結束之後才結束。</p>
+<p>自己寫一次監督者，是為了看懂它要做的事；正式環境多半交給現成的工具。一種是<strong>程序管理器</strong>，例如 pm2：用設定檔就能開多個程序、崩潰重啟、重新部署時逐一替換，它的 cluster 模式底層就是 <code>node:cluster</code>。另一種是第一節提過的<strong>容器平台</strong>：一個容器一個程序，重啟、退避、滾動更新、健康檢查都由平台做。Kubernetes 的 CrashLoopBackOff 狀態，就是這節說的崩潰迴圈加上退避（<a href="../../devops/lessons/13-scaling.html">部署課第 13 課</a>、<a href="../../devops/lessons/16-cd.html">第 16 課</a>）。三種做法的差別：</p>
+<div class="table-wrap"><table>
+  <tr><th>做法</th><th>擴展什麼</th><th>一份掛了</th><th>適合</th></tr>
+  <tr><td>cluster（或 pm2）</td><td>同一台機器的多顆核心</td><td>primary 補一個；整台機器掛了就全掛</td><td>直接跑在虛擬機（<a href="../../devops/lessons/06-ssh-systemd.html">systemd</a>）上、沒有容器平台</td></tr>
+  <tr><td>多個容器</td><td>多顆核心、多台機器</td><td>平台補一個，可以排到別台機器</td><td>大多數正式環境</td></tr>
+  <tr><td>worker_threads（<a href="09-blocking-and-workers.html">第 9 課</a>）</td><td>一個程序裡的 CPU 運算</td><td>整個程序一起掛</td><td>少數特別吃 CPU 的工作（縮圖、壓縮）</td></tr>
+</table></div>
+<p>到這裡，咖啡店已經能穩定地跑 4 份程式：速度回來了，崩潰也有人補。但開場的三件怪事都還在，而且跟用哪一種做法無關，cluster、pm2、容器都會遇到。下一節回到必讀的主線，找出它們的共同原因。</p>
+
+<h2 id="state">四個程序之後，為什麼會出現三件怪事？</h2>
+<p>回到開場：服務從 1 個程序變成 4 個之後，訂單建兩次、畫面停在「製作中」、限流失效。三件事看起來無關，原因卻是同一個，選讀一節的計數器已經示範過了：模組層級的 <code>let count = 0</code> 在兩個程序裡各有一份，送 4 個請求，兩個程序都說自己處理了 2 個，沒有一份知道總數是 4（可以執行的範例是 <code>examples/cluster-state.ts</code>）。</p>
+<p>每個程序是作業系統分出來的獨立空間，有自己的記憶體。存在變數、<code>Map</code>、模組層級物件裡的東西，每個程序各一份，不會自動共享，也不會有誰替你同步。只有一個程序時，「記在記憶體裡」等於「記在服務裡」；開成多份之後，這個等式就不成立了。</p>
+<p>咖啡店的程式裡，前面幾課有好幾個這樣的地方。下表左欄是存在記憶體的東西，右欄是開成多個程序之後會發生的事；開場的三件怪事分別是第二、三、五列：</p>
+<div class="table-wrap"><table>
+  <tr><th>存在記憶體的東西</th><th>開成多個程序之後</th></tr>
+  <tr><td>快取（<a href="15-http-caching.html">第 15 課</a>、<a href="23-profiling-memory.html">第 23 課</a>）</td><td>每個程序一份，內容不一致：改了價格，有的請求看到新價格、有的看到舊的；清快取只清到一個程序</td></tr>
+  <tr><td>冪等鍵的 <code>Map</code>（<a href="14-rest-api-design.html">第 14 課</a>）</td><td>重送的請求落在另一個程序，查不到 key，又建立一筆訂單；程序重啟就全部忘記</td></tr>
+  <tr><td>SSE 的訂閱（<a href="16-streams-backpressure.html">第 16 課</a>）</td><td>客人的手機連在 worker A，狀態更新落在 worker B，B 的 <code>orderEvents</code> 上沒有人在聽，客人永遠收不到</td></tr>
+  <tr><td>程序內的佇列、鎖（<a href="10-file-system.html">第 10 課</a>）</td><td>Promise 鏈排隊的「同時只有一個在寫這個檔案」只在一個程序裡成立，兩個程序還是會同時寫；鎖檔擋得住同一台機器的程序，加第二台機器就看不到彼此</td></tr>
+  <tr><td>限流計數（<a href="../../system-design/lessons/10-rate-limiting.html">系統設計課第 10 課</a>）</td><td>每個程序各算各的，「每分鐘 60 次」實際變成 60 × 程序數</td></tr>
+</table></div>
+<p>要讓多份程式表現得像一份，程式必須是<strong>無狀態</strong>（stateless）的。無狀態的意思是：程序本身不保存跨請求的狀態，任何一個請求交給任何一個程序處理，結果都一樣。這樣負載平衡器愛把請求送到哪裡都可以，加一份、少一份也不影響正確性，這正是水平擴展的前提。</p>
+<p>可是冪等鍵、訂閱、限流這些東西確實需要跨請求記住。它們不能消失，只能搬家：放到所有程序都看得到的地方，叫<strong>共享狀態</strong>（shared state）。常見的地方是資料庫，或 Redis。Redis 是把資料放在記憶體裡的鍵值資料庫，和 PostgreSQL 一樣是獨立的伺服器，所有程序都連得到（<a href="../../nestjs/lessons/19-caching-redis.html">NestJS 課第 19 課</a>）。</p>
+<p>有沒有不改程式的做法？有一種叫<strong>黏性連線</strong>（sticky session）：負載平衡器依 cookie 或 IP，把同一個客戶端固定送到同一個程序。它讓同一個客戶端的狀態留在同一個程序，但沒有解決根本問題：那個程序重啟或崩潰，狀態就消失；不同客戶端之間的狀態（例如店員改了訂單、客人在等通知）還是不共享；而且負載會不平均。把它當止痛藥，不是解法。</p>
+<p>那是不是每個記憶體裡的東西都要搬？快取是例外。每個程序各有一份、內容稍微不同步，有時候可以接受，例如菜單快取 30 秒。判斷的問題是：<strong>這份資料不一致或遺失時，結果是錯的嗎？</strong>冪等鍵、限流、鎖不一致時結果就是錯的，一定要搬；短期快取通常只是多查一次資料庫、比較慢。</p>
+<div class="callout practice"><strong>💡 實務上：本機永遠只有一個程序，這類 bug 會等到上線才出現</strong><br>開發時 <code>npm run dev</code> 只跑一份，模組層級的 <code>Map</code>、計數器怎麼測都正常；到了正式環境開成多份，才出現「訂單重複」「通知收不到」這種偶發、難重現的問題，咖啡店的事故就是這樣冒出來的。所以 code review 看到模組層級的 <code>new Map()</code>、<code>let</code> 或陣列，資深工程師會順口問一句：「開兩份的時候這個還對嗎？」測試環境（staging）也至少開兩份，讓問題在上線前就冒出來。</div>
+<p>原因找到了，接下來一件一件搬。先處理最貴的那件：重複訂單，它直接關係到客人被扣幾次錢。</p>
+
+<h2>兩個程序同時收到同一個 key，怎麼只建一張訂單？</h2>
+<p><a href="14-rest-api-design.html">第 14 課</a>的冪等鍵用 <code>Map</code> 記住「這個 key 處理過了，回應是什麼」。上一節說它要搬到共享的地方，這裡選 PostgreSQL，因為訂單本來就存在那裡，可以放進同一個交易（後面會看到這點為什麼重要）。</p>
+<p>搬家要解決的核心問題是<strong>誰先到</strong>。客人按了兩次結帳，兩個請求帶著同一個 key，幾乎同時落在 worker A 和 worker B，只能有一個去建立訂單。</p>
+<p>直覺的寫法是「先 SELECT 看有沒有，沒有再 INSERT」。它擋不住：兩個請求同時 SELECT，都看到沒有，都去建立訂單。這種「先檢查、再行動」的寫法，在檢查和行動之間別人可以插進來，叫 check-then-act，是<a href="../../postgresql/lessons/19-concurrency.html">PostgreSQL 課第 19 課</a>講過的競爭條件。在單一程序裡它也有風險，但開成多份之後，兩個請求真的會同時執行，問題就從「理論上」變成「每天都在發生」。</p>
+<p>正確的做法是不要自己判斷，讓資料庫用<strong>唯一約束</strong>判斷。把 <code>key</code> 設成主鍵，用 <code>INSERT … ON CONFLICT (key) DO NOTHING</code> 插入：同一個 key 只會有一個插入成功，資料庫保證這件事。插入成功（<code>rowCount</code> 是 1）的那個就是先到的，插入不了（<code>rowCount</code> 是 0）的就是後到的。表的長相：</p>
+<pre>CREATE TABLE idempotency_keys (
+  key             text PRIMARY KEY,
+  fingerprint     text NOT NULL,       -- 請求內容的指紋：同一個 key 換了內容要擋下
+  response_status integer,
+  response_body   jsonb,               -- 第一次的回應，重送時原樣回傳
+  created_at      timestamptz NOT NULL DEFAULT now()
+);</pre>
+<p>除了 key，還存了兩樣東西。<code>fingerprint</code> 是請求內容的指紋：客戶端如果用同一個 key 送了不同的購物車，那是客戶端的錯，要擋下來，而不是回一個跟這次請求對不上的結果。<code>response_status</code> 和 <code>response_body</code> 是第一次的回應：冪等的承諾是「重送時回第一次的結果」，只記得 key 卻沒存回應，後到的請求就無話可回。</p>
+<p>接著把「佔位、建立訂單、存回應」放在<strong>同一個交易</strong>裡：</p>
+<pre>BEGIN;
+INSERT INTO idempotency_keys (key, fingerprint) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING;
+-- rowCount 1：我先到 → 建立訂單 → UPDATE idempotency_keys SET response_… → COMMIT
+-- rowCount 0：別人先到 → SELECT 存下來的指紋與回應 → 指紋不同回 422，相同就回第一次的回應
+COMMIT;</pre>
+<p>為什麼一定要同一個交易？看兩個請求同時到的情況。worker A 已經插入這個 key，正在建立訂單，還沒 COMMIT；這時 worker B 的 <code>INSERT … ON CONFLICT</code> 不會馬上回傳，而是<strong>等 A 的交易結束</strong>。A COMMIT 了，B 插入不了，接著 SELECT 一定看得到完整的回應；A ROLLBACK 了（例如建立訂單失敗），B 插入成功，換 B 做。所以不會有「key 佔了、回應卻是空的」的中間狀態，也不會因為建立失敗而永遠卡住這個 key。如果佔位和建立訂單分開在兩個交易，B 就可能在 A 做到一半時看到一個沒有回應的 key，不知道該回什麼。</p>
+<p>這個做法的代價是等待的請求會佔著一條連線，直到先到的交易結束。如果建立訂單的過程包含不能放進交易的事，例如呼叫金流 API（<a href="17-calling-external-apis.html">第 17 課</a>：外部呼叫可能要好幾秒，而且無法 ROLLBACK），就改成兩段：先用一個短交易佔位並標記「處理中」，處理完再存回應；其間重送的請求回 <code>409</code>（<a href="14-rest-api-design.html">第 14 課</a>），客戶端稍後再試。兩段式還要多處理一種情況：處理到一半程序死了，key 會一直停在「處理中」，例如超過幾分鐘的「處理中」可以重做。</p>
+<p>最後，冪等鍵不用永久保存，表會一直長大：用 <code>created_at</code> 定期刪掉超過 24 小時的。</p>
+<div class="callout practice"><strong>💡 實務上：冪等鍵最常保護的是「付錢」和「下單」</strong><br>咖啡店的重複訂單就是典型場景：客人在弱網路下按了兩次「結帳」、App 逾時後自動重送，兩次請求可能落在不同的程序。冪等鍵通常由前端在「這一次結帳」開始時產生（例如 <code>crypto.randomUUID()</code>），重送時沿用同一個；改了購物車內容才換新的，這點要跟前端說好。金流服務的 webhook 重送是同一個問題的另一面：通知裡會帶事件 ID，用它當 key、同樣靠唯一約束擋掉重複。保留 24 小時只是例子，實際要比客戶端最長的重試時間還久。</div>
+<p>重複訂單擋住了。第二件怪事是客人的畫面停在「製作中」，它沒辦法用同樣的方法修：冪等鍵是一筆要存起來、之後再查的<strong>資料</strong>，而 SSE 需要的是一個「剛剛發生了一件事」的<strong>通知</strong>，查詢解決不了。</p>
+
+<h2>狀態更新落在另一個程序，客人的畫面怎麼收到？</h2>
+<p>先把這件怪事的過程講清楚。客人下單後，手機用 SSE 連到 worker A，A 在自己的 <code>orderEvents</code> 上註冊了監聽器（<a href="16-streams-backpressure.html">第 16 課</a>）。店員在平板上按「完成」，這個 PATCH 請求落在 worker B，B 更新了訂單，並在 <code>orderEvents</code> 上 emit 一個事件。可是 B 的 <code>orderEvents</code> 是 B 記憶體裡的物件，上面沒有人在聽；A 的監聽器在另一個程序裡，什麼都沒收到。</p>
+<p>所以要的是一個「廣播」：任何一個程序發生的事，每個程序都要知道，再由各自轉給自己的 SSE 連線。PostgreSQL 內建這個功能（SQL 端在 <a href="../../postgresql/lessons/33-job-queue.html">PostgreSQL 課第 33 課</a>），由兩個指令組成：</p>
+<ul>
+  <li><code>LISTEN order_status</code>：這條連線訂閱 <code>order_status</code> 頻道。</li>
+  <li><code>NOTIFY order_status, '文字'</code> 或 <code>SELECT pg_notify('order_status', $1)</code>：通知所有訂閱這個頻道的連線。<code>pg_notify</code> 是函式，可以用 <code>$1</code> 傳參數，在程式裡比較好用。</li>
+</ul>
+<p>在 Node 這邊，用 <code>pg</code> 的 <code>Client</code> 監聽 <code>'notification'</code> 事件（node-postgres 文件）：</p>
+<pre>import pg from 'pg'
+
+const client = new pg.Client({ connectionString: url })   // 專用連線，不從 pool 借
+client.on('error', err =&gt; console.error(err))             // 連線斷掉時；沒有 listener 程序會崩潰
+client.on('notification', msg =&gt; {
+  // msg.channel：'order_status'；msg.payload：送出的字串
+  orderEvents.emit('status', JSON.parse(msg.payload!))
+})
+await client.connect()
+await client.query('LISTEN order_status')</pre>
+<p>每個 worker 啟動時各開一條這樣的連線。B 更新訂單時對資料庫 NOTIFY，資料庫把通知送給每一條 LISTEN 的連線，A 收到後轉給自己的 <code>orderEvents</code>，A 上的 SSE 連線就收到了。B 自己也有 LISTEN，同樣會收到並轉發，所以不管 SSE 連在哪一個程序都收得到；<a href="16-streams-backpressure.html">第 16 課</a>的 SSE 程式完全不用改。</p>
+<p>接下來的問題是 NOTIFY 什麼時候送出。執行 <code>node examples/notify.ts</code>，看左邊的時間，以及 ROLLBACK 的 B 和太長的 payload 各有什麼結果：</p>
+<pre>  55ms BEGIN; NOTIFY 'A'
+ 564ms COMMIT
+ 566ms 收到 demo：A
+ 766ms BEGIN; NOTIFY 'B'; ROLLBACK
+ 998ms 8000 位元組的 payload：payload string too long</pre>
+<p>這三行結果對應 PostgreSQL 18 文件寫明的兩條規則：</p>
+<ul>
+  <li><strong>交易 COMMIT 後才送出</strong>：A 在 55ms 就 NOTIFY 了，卻在 COMMIT 之後的 566ms 才收到；ROLLBACK 的 B 完全沒送。所以 NOTIFY 要和 UPDATE 放在<strong>同一個交易</strong>：更新成功才通知，失敗就不通知。在交易外先 NOTIFY 再更新，更新失敗時客人的畫面會顯示一個沒發生的狀態。</li>
+  <li><strong>payload 預設要小於 8000 位元組</strong>：只放識別資料（<code>{ orderId, status }</code>），完整資料讓收到的人自己查。</li>
+</ul>
+<p>還有一個地方最容易出錯：LISTEN 綁在<strong>連線</strong>上，不是綁在程序上。前面的程式特地開了一條專用的 <code>Client</code>，而不從 pool 借，原因跟下面幾點有關：</p>
+<ul>
+  <li><code>pool.query('LISTEN order_status')</code> 借了一條連線、執行完就還回去。那條連線確實在訂閱，但沒有人監聽它的 <code>'notification'</code>，閒置一陣子還會被 pool 關掉。所以要用專用的 <code>Client</code>（或 <code>pool.connect()</code> 借了永遠不還，但那會讓 pool 少一條）。</li>
+  <li>經過 PgBouncer 的 transaction 模式時不能用 LISTEN（<a href="../../postgresql/lessons/36-connections-monitoring.html">PostgreSQL 課第 36 課</a>）。PgBouncer 是放在應用程式和 PostgreSQL 中間的連線池伺服器，讓很多個用戶端共用少數幾條真正的資料庫連線。它有兩種常見的分配方式：<strong>transaction 模式</strong>是每個交易結束，就把那條實際連線收回去給別人用；<strong>session 模式</strong>是用戶端連著的時候，一直占著同一條。LISTEN 的訂閱記在實際連線上，transaction 模式下執行完 LISTEN 那條連線就被收走、借給別人，通知送到那條連線，你的程式卻已經不在上面了。所以 LISTEN 的連線要直連資料庫，或走 session 模式。</li>
+  <li>連線斷掉（資料庫重啟、網路中斷）時訂閱也跟著消失，而且斷線期間的通知<strong>不會補送</strong>。正式環境要在 <code>'error'</code>／<code>'end'</code> 時重新連線並重新 LISTEN；不能遺漏的事件，以資料庫裡的狀態為準（例如 SSE 重連時先送一次目前狀態），或改用佇列（<a href="../../system-design/lessons/12-queues-outbox.html">系統設計課第 12 課</a>）。</li>
+  <li>關機時要 <code>client.end()</code>，不然這條連線撐住 event loop，程序結束不了（<a href="21-graceful-shutdown.html">第 21 課</a>）。</li>
+</ul>
+<p>讀過選讀一節的人可能會想：cluster 的 primary 和每個 worker 之間本來就有 IPC 管道，為什麼不讓 primary 轉送事件？因為那只在同一台機器上有效；加第二台機器（或第二個容器）就又斷了。透過所有程序都連得到的資料庫，一台、十台都一樣。流量很大時，常換成 Redis 的 Pub/Sub，原理相同。</p>
+<p>前兩件怪事修好了，剩下第三件：每分鐘 60 次的限流失效。</p>
+
+<h2>限流的計數器要搬到哪裡？</h2>
+<p>先看咖啡店原本的限流長什麼樣。最直接的寫法是在模組層級放一個 <code>Map</code>：key 是客戶端 IP，值是這一分鐘到目前為止的次數。每個請求進來就把次數加 1，超過 60 就回 429，每分鐘歸零一次。只有一個程序時，這個 <code>Map</code> 看得到所有請求，數字是對的。</p>
+<p>開成 4 個程序之後，就是<a href="#state">「四個程序之後，為什麼會出現三件怪事？」</a>那一節的計數器：每個程序各有一份 <code>Map</code>，各自只看到分到自己這裡的請求，各自放行 60 次。同一個 IP 一分鐘內最多可以通過 60 × 4 = 240 次，限流等於放寬了 4 倍。</p>
+<p>修法跟冪等鍵一樣，把計數搬到所有程序共享的地方，通常是 Redis。但搬過去時要注意怎麼加 1。如果寫成「先 <code>GET</code> 讀出次數，在 Node 裡加 1，再 <code>SET</code> 寫回去」，兩個程序可能同時讀到 59、各自寫回 60，兩個請求都放行，計數還少算一次。這就是冪等鍵那一節的 check-then-act 競爭，只是換到了 Redis 上。正確做法是讓 Redis 自己加：<code>INCR</code> 把計數加 1 並回傳新值，整個動作是原子的，中間不會被別的程序插進來。回傳 1 代表這是這個時間窗的第一個請求，這時再用 <code>EXPIRE</code> 設 60 秒過期，時間到計數自動消失。<code>INCR</code> 和 <code>EXPIRE</code> 是兩個指令，程序如果剛好在兩者之間崩潰，這個 key 就永遠不會過期；所以 Redis 文件的寫法是把兩者包進 <code>MULTI</code>／<code>EXEC</code> 或一段 Lua 腳本，一次送出。</p>
+<p>這種「每個時間窗數次數」叫固定視窗，它在視窗交界處可以短時間放行兩倍的量；滑動視窗、token bucket 等演算法怎麼選、Redis 掛了限流要放行還是拒絕，是<a href="../../system-design/lessons/10-rate-limiting.html">系統設計課第 10 課</a>的主題，實務上也多半用 <code>rate-limiter-flexible</code> 這類現成的套件，不自己寫。這一課要記住的只有一點：限流的計數也是跨請求的狀態，開成多份就要搬到共享的地方，而且加 1 要用原子操作。</p>
+<p>三件怪事都修好了，速度也回來了，下一個自然的念頭是：尖峰再來，就再加程序。這樣行得通嗎？</p>
+
+<h2>修好之後，還能一直加程序嗎？</h2>
+<p>加程序不是免費的。每份程式除了用掉一顆核心，還帶著自己的一份資源，而其中最容易被忽略的是資料庫連線。</p>
+<p><strong>連線池 × 程序數 ≤ 資料庫上限</strong>。每個程序有自己的 pool（<a href="20-postgres-pool-transactions.html">第 20 課</a>），pool 是程序記憶體裡的物件，跟<a href="#state">「四個程序之後，為什麼會出現三件怪事？」</a>那一節講的 <code>Map</code> 一樣不會共享。<code>max: 10</code> 的 pool，開 8 個程序就是 80 條連線；再開 3 台機器就是 240 條，超過 PostgreSQL 預設的 <code>max_connections</code>（100），新連線會被拒絕。這一課還讓每個程序多了一條 LISTEN 的專用連線。擴展前先算這筆帳，連線不夠時調小每個 pool，或在前面加 PgBouncer（記得 LISTEN 那條要直連）。</p>
+<p><strong>加程序不會線性變快</strong>。咖啡店這次加程序有效，是因為瓶頸在那條主執行緒。瓶頸如果在資料庫（慢查詢、鎖），加程序只會讓更多請求一起排隊，連線數還跟著乘上去。先用<a href="23-profiling-memory.html">第 23 課</a>的方法量出瓶頸在哪，再決定要不要加。</p>
+<p>最後，把這課的教訓變成一張上線前的無狀態檢查清單，每次要擴展、或接手一個要擴展的服務時逐項問過（<a href="../../devops/lessons/13-scaling.html">部署課第 13 課</a>、<a href="../../system-design/lessons/04-redundancy-load-balancing.html">系統設計課第 4 課</a>會再用到）：記憶體裡有沒有跨請求的 <code>Map</code>、陣列、計數器？有沒有寫到本機硬碟、之後還要讀的檔案（上傳的圖片、匯出的報表）？有沒有計時器做排程工作（開 4 個程序就跑 4 次）？有沒有程序內的鎖？每一項都要移到共享的地方，或確認不一致也沒關係。</p>
+<div class="callout practice"><strong>💡 實務上：擴展前先算帳，擴展後先量</strong><br>要把咖啡店的服務從 4 份加到 8 份、或加一台機器之前，先拿出這三個數字：每份的 pool 上限、總份數、資料庫的 <code>max_connections</code>，相乘之後還要留給 migration、後台查詢和 LISTEN 的連線。加完之後看 p99 和資料庫的連線數有沒有照預期變化，沒有改善就表示瓶頸不在程序數。這張算式和上面的檢查清單，也是跟維運同事討論擴展時最先要對齊的東西。</div>
+
+<h2>練習</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs node 24</code> 建立 <code>work/24/</code>。練習 1、2 需要 PostgreSQL（Docker Desktop 打開後，在 <code>learn/node/practice</code> 執行 <code>docker compose up -d --wait</code>），測試會在測試程序裡用 cluster 開兩個 <code>server.ts</code>（它載入 <code>app.ts</code>，兩個檔案都不用改），每個測試檔用一個全新的資料庫。練習 3 是選做，只用 Node 內建模組。</p>
+
+<div class="local" data-test="ex1" data-files="schema.sql idempotency.ts">
+  <p>練習 1：<code>idempotency.ts</code> 的 <code>withIdempotency(pool, key, fingerprint, work)</code> 現在把冪等鍵存在記憶體的 <code>Map</code>。先照 <code>schema.sql</code> 裡的說明建立 <code>idempotency_keys</code> 表，再改寫這個函式：用 <code>INSERT … ON CONFLICT (key) DO NOTHING</code> 判斷誰先到，先到的執行 <code>work(client)</code>（它在你開的交易裡建立訂單，回傳 <code>{ status, body }</code>）並把回應存起來；後到的指紋不同就回傳 <code>'mismatch'</code>（<code>app.ts</code> 會回 422），相同就回傳存下來的回應。<code>db.ts</code> 有<a href="20-postgres-pool-transactions.html">第 20 課</a>的 <code>withTransaction</code> 可以用。測試會讓 20 個帶同一個 key 的請求同時打到兩個 worker：只能建立 1 筆訂單，其他回相同結果或 409；還會把兩個 worker 都重啟，再送同一個 key。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="events-bus.ts">
+  <p>練習 2：<code>events-bus.ts</code> 的事件現在只在程序裡傳。改成跨程序：(1) <code>updateStatus(pool, orderId, status)</code> 在同一個交易裡 <code>UPDATE orders SET status</code>，更新到才 <code>NOTIFY order_status</code>，payload 是 <code>JSON.stringify({ orderId, status })</code>；訂單不存在回傳 <code>false</code> 且不通知，違反約束（例如不認得的狀態）就把錯誤丟出去；(2) <code>startEventsBus({ url, orderEvents })</code> 用一條專用的 <code>pg.Client</code> <code>LISTEN order_status</code>，收到的通知 <code>JSON.parse</code> 後 <code>orderEvents.emit('status', 事件)</code>；回傳的 <code>close()</code> 要關掉這條連線。測試會讓 SSE 客戶端連在一個 worker、PATCH 輪流落在兩個 worker，每次都要 2 秒內收到、而且只收到一次；也會檢查 ROLLBACK 的更新沒有發出通知，以及 <code>close()</code> 之後資料庫裡沒有留下 LISTEN 的連線。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="primary.ts">
+  <p>練習 3（選做，對應選讀的 cluster 與監督者兩節）：<code>primary.ts</code> 已經依環境變數 <code>WORKERS</code>（預設 2）開出 <code>worker.ts</code>（不用改：<code>GET /pid</code> 回自己的 pid、<code>GET /slow?ms=1500</code> 慢慢回、<code>GET /crash</code> 回應後崩潰、<code>CRASH_ON_START=1</code> 時一啟動就崩潰、收到 <code>SIGTERM</code> 會優雅關機）。把它寫成完整的監督者：(1) worker 崩潰後補一個新的，重啟前等 <code>100ms × 2^(n−1)</code>（n 是最近 10 秒內的崩潰次數），最多等 2000 ms，所以等待時間一次比一次長；(2) 最近 10 秒內崩潰超過 5 次就不再重啟，以結束碼 1 結束；(3) 收到 <code>SIGTERM</code> 時不再重啟任何 worker（包括正在退避等待的），對每個 worker 送 <code>SIGTERM</code>，全部結束後以 0 結束。測試會用 20 條新連線確認 worker 數量、打 <code>/crash</code> 看幾秒內有沒有補上、讓 worker 一啟動就崩潰看你會不會停，並在一個慢請求進行中送 <code>SIGTERM</code>。手動試：<code>node primary.ts</code>，另開終端機 <code>curl http://localhost:3000/pid</code>；<code>CRASH_ON_START=1 node primary.ts</code> 看退避。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：菜單 API 有一個存在 <code>Map</code> 裡的快取，後台改價格時會清掉它。服務從 1 個程序改成 4 個 cluster worker 之後，後台改了拿鐵的價格，會發生什麼事？</p>
+  <label data-key="a">沒有影響：cluster 的 worker 是同一個程序裡的執行緒，共用同一份記憶體，清一次就全部清掉</label>
+  <label data-key="b">primary 會攔下每個 worker 對 <code>Map</code> 的修改，同步給其他 worker，幾毫秒內 4 份就一致</label>
+  <label data-key="c">變成 4 份各自獨立的快取；後台的請求只清到處理它的那個程序，其他 3 個在過期前還回舊價格</label>
+  <label data-key="d">4 個程序同時寫同一個 <code>Map</code> 會發生競爭條件，價格可能被寫成別的商品的</label>
+  <p class="why">✓ worker 是 <code>fork</code> 出來的獨立程序（不是執行緒），記憶體各自一份，沒有自動共享，所以 a 錯；primary 也不會替你同步任何東西，所以 b 錯。也因為不共享，根本沒有「同時寫同一個 <code>Map</code>」這回事，d 錯。解法是設短的過期時間並接受短暫不一致，或把快取移到 Redis，或用 LISTEN／NOTIFY 通知每個程序清快取。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：咖啡店的 API 要搬到 Kubernetes。同事問：「程式裡要不要用 cluster 開 8 個 worker，把每顆核心都用上？」比較好的回答是？</p>
+  <label data-key="a">要：不然容器只會用到一顆核心；在容器裡開 cluster 是用滿機器最直接的方法，其他設定都不用動</label>
+  <label data-key="b">通常不用：一個容器跑一個程序，要更多核心就增加容器數量，重啟、退避、滾動更新由 Kubernetes 做；硬要開 cluster，就得把 CPU 限制一起調大</label>
+  <label data-key="c">不用：Kubernetes 會把一個 Node 程序的 JavaScript 自動分散到節點的多顆核心上執行</label>
+  <p class="why">✓ 擴展選一層做就好，在容器平台上通常是容器數量：一份掛了平台補一份，還能排到別台機器，cluster 只能在同一台機器裡補。a 忽略了容器數量本身就能用滿核心，在容器裡開 cluster 卻不調 CPU 限制（例如 1 CPU），8 個程序只能搶那 1 顆核心。c 錯在沒有任何平台能讓一個 Node 程序的 JavaScript 跑在多顆核心上，一個程序就是一條主執行緒。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：為了讓<a href="16-streams-backpressure.html">第 16 課</a>的 SSE 在多程序下能用，有人提議在負載平衡器開黏性連線（sticky session）。它解決了什麼、沒解決什麼？</p>
+  <label data-key="a">讓同一個客戶端固定落在同一個程序；但更新訂單的是另一個客戶端（店員的平板），可能落在別的程序，客人還是收不到；程序重啟，狀態也會消失</label>
+  <label data-key="b">完全解決：負載平衡器會把所有請求都送到同一個程序，效果跟只有一個程序一樣，事件不會漏</label>
+  <label data-key="c">什麼都沒解決：SSE 是長連線，負載平衡器不會替它套用黏性連線，請求照樣隨機分配</label>
+  <p class="why">✓ 黏性連線只綁住「同一個客戶端」。SSE 的問題是事件來自別的客戶端：客人的手機和店員的平板是不同的客戶端，照樣可能落在不同程序。b 錯在黏性連線不會把所有請求都送到同一個程序（那就失去擴展的意義了）。c 錯在 SSE 本來就是一條連線綁在一個程序上，黏性連線不是對它無效，只是幫不上這個忙。真正的解法是讓事件經過共享的地方，例如 LISTEN／NOTIFY。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>看到 CPU 使用率低就以為不是 CPU 的問題</strong>：整台機器的平均會掩蓋一顆核心滿載。Node 的瓶頸常在單一主執行緒，要看單一程序的使用率。</li>
+  <li><strong>以為加程序就能線性變快</strong>：瓶頸在資料庫時只會排更長的隊，連線數還跟著乘上去。先量瓶頸，再算 pool 大小 × 程序數 × 機器數。</li>
+  <li><strong>把跨請求的狀態放在記憶體</strong>：冪等鍵、限流、鎖、訂閱在多程序下各算各的。移到 PostgreSQL 或 Redis，或確認不一致也沒關係。</li>
+  <li><strong>無條件重啟崩潰的 worker</strong>（選讀）：一啟動就崩潰時變成崩潰迴圈。重啟前退避，超過上限就以 1 結束。</li>
+  <li><strong>primary 收到 <code>SIGTERM</code> 就先結束</strong>（選讀）：worker 發現 IPC 斷了會立刻結束，進行中的請求被切斷。對每個 worker 送 <code>SIGTERM</code>，等全部 <code>'exit'</code> 再結束，關機期間不補人。</li>
+  <li><strong>用「先 SELECT 再 INSERT」判斷冪等鍵</strong>：兩個請求同時查都說沒有。讓唯一約束決定：<code>INSERT … ON CONFLICT DO NOTHING</code> 看 <code>rowCount</code>。</li>
+  <li><strong>只存 key 不存回應</strong>：重送時拿不到第一次的結果。把狀態碼和 body 一起存。</li>
+  <li><strong>LISTEN 用了會還回 pool 的連線</strong>：沒有人接通知。用專用的 <code>pg.Client</code>，並處理它的 <code>'error'</code>、關機時 <code>end()</code>。</li>
+  <li><strong>在交易外 NOTIFY</strong>：更新失敗也發出事件。和 UPDATE 放在同一個交易，COMMIT 才送出；payload 只放 id。</li>
+  <li><strong>在容器裡又開 cluster 卻沒調整 CPU 限制</strong>：多個程序搶分到的那一點 CPU。選一層做擴展。</li>
+</ul>
+
+<h2>補充與查表</h2>
+<h3>cluster 的其他細節</h3>
+<ul>
+  <li><strong>分配策略</strong>：除了預設的 round-robin（<code>cluster.SCHED_RR</code>），還有 <code>SCHED_NONE</code>，讓 worker 直接搶連線；Node 文件提到實測分配常常很不平均。</li>
+  <li><strong><code>listen(0)</code></strong>：一般是隨機 port，但在 cluster 裡第一次隨機之後，其他 worker 拿到同一個 port（Node 文件），所以測試照樣可以用 <code>PORT=0</code>。</li>
+  <li><strong>worker 的事件</strong>：primary 端可以聽 <code>cluster.on('exit', (worker, code, signal) =&gt; …)</code>、<code>'listening'</code>、<code>'online'</code>；worker 的 <code>worker.process</code> 就是<a href="09-blocking-and-workers.html">第 9 課</a>的 <code>ChildProcess</code>，<code>worker.process.kill('SIGTERM')</code> 送訊號給它。</li>
+</ul>
+<h3>不用 cluster 也能共用 port：<code>reusePort</code></h3>
+<p><code>server.listen({ port, reusePort: true })</code>（v23.1.0／v22.12.0 起）讓多個獨立的程序直接 listen 同一個 port，由作業系統（SO_REUSEPORT）分配連線，不需要 cluster 的 primary。Node 文件寫明只有部分平台支援（例如 Linux 3.9 以上、FreeBSD 12 以上），不支援的平台會丟錯；這台 macOS 實測得到 <code>listen ENOTSUP: operation not supported on socket</code>。</p>
+<h3>worker_threads 不能取代多程序</h3>
+<p>worker_threads 把 CPU 運算移出主執行緒（<a href="09-blocking-and-workers.html">第 9 課</a>），但所有執行緒在同一個程序裡，程序崩潰就全部一起停，也只在一台機器上。它適合把少數特別吃 CPU 的工作移出去，不能拿來取代多份程式帶來的容量和備援。</p>
+<h3>其他版本與規則</h3>
+<ul>
+  <li><code>os.availableParallelism()</code> 從 v19.4.0／v18.14.0 起可用。</li>
+  <li>NOTIFY：同一個交易裡內容相同的通知會合併成一次；不同交易的通知依 COMMIT 的順序送達（PostgreSQL 18 文件）。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>一個 Node 程序只用一顆核心執行 JavaScript（<code>os.availableParallelism()</code> 看有幾顆），所以 8 核心的機器可能 CPU 只用 12% 卻很慢。垂直擴展換大機器，水平擴展加程序或機器。</li>
+  <li>正式環境多半由容器平台擴展：一個容器一個程序，重啟、退避、滾動更新由平台做。選一層做擴展，不要在容器裡又開 cluster。</li>
+  <li>（選讀）<code>cluster</code>：primary <code>fork</code> 出多個 worker 共用一個 port，透過 IPC 交出連線；除了 Windows 預設 round-robin 分配<strong>連線</strong>，不是請求。</li>
+  <li>（選讀）監督者要補人、退避並設上限避免崩潰迴圈、關機時等所有 worker 優雅結束；primary 先走，worker 會立刻跟著結束。</li>
+  <li>多程序下記憶體不共享：快取、冪等鍵、SSE 訂閱、程序內的佇列與鎖、限流都會壞。黏性連線只是止痛藥；要讓程序無狀態，共享狀態放資料庫或 Redis。判斷標準是「不一致時結果是不是錯的」。</li>
+  <li>冪等鍵：<code>INSERT … ON CONFLICT DO NOTHING</code> 讓主鍵決定誰先到，和建立訂單、存回應放同一個交易，後到的會等先到的交易結束。</li>
+  <li>跨程序事件：專用連線 <code>LISTEN</code>，在更新的交易裡 <code>pg_notify</code>（COMMIT 才送、payload 小於 8000 位元組），斷線期間的通知不會補送；PgBouncer transaction 模式不能 LISTEN。</li>
+  <li>擴展前算帳：pool × 程序數（加上 LISTEN 連線）不能超過資料庫上限；瓶頸不在程序時，加程序不會變快。<code>reusePort</code>、worker_threads 見課末。</li>
+</ul>
+<p>下一課用攻擊者的角度看咖啡店的服務：輸入從哪裡進來、會流到哪裡，路徑穿越、ReDoS、資源上限和 Node 的 Permission Model。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

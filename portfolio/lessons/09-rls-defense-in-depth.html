@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>9. 租戶隔離（二）：PostgreSQL RLS 當第二道防線</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="9" data-practice="nestjs" data-task="pf09">
+<header>
+  <div class="eyebrow">階段 B1：多租戶 SaaS 的平台地基 · 第 9 課</div>
+  <h1>租戶隔離（二）：PostgreSQL RLS 當第二道防線</h1>
+</header>
+<main>
+
+<p>第 8 課結尾列過 Prisma extension 管不到的地方。這一課從其中一個最常見的情況開始：同事要在專案列表旁邊顯示「每個專案有幾個檔案」，覺得用 Prisma 的 API 拼不出想要的 <code>GROUP BY</code>，就改寫手寫 SQL：</p>
+<pre>// 假設的新程式：專案列表加上檔案數
+const rows = await this.db.client.$queryRaw`
+  SELECT p.id, p.name, count(f.id) AS file_count
+  FROM projects p LEFT JOIN files f ON f.project_id = p.id
+  GROUP BY p.id`</pre>
+<p>這段 SQL 沒有 <code>tenant_id</code> 條件。第 8 課的擴充只改寫 model 的操作（<code>project.findMany</code> 這類），<code>$queryRaw</code> 是你自己寫好的整句 SQL，擴充不會去動它。所以 A 租戶的使用者打開專案列表，會看到<strong>所有租戶</strong>的專案名稱。測試大概也抓不到：開發時資料庫裡多半只有一個租戶的資料。這就是一次跨租戶洩漏，在 SaaS 裡是要通報客戶的資安事件。</p>
+<p>這一課的任務：<strong>讓這句漏寫條件的 SQL 也洩漏不了</strong>。做法是在資料庫加第二道防線，PostgreSQL 的 Row Level Security（RLS）：就算程式漏了條件，資料庫也只交出目前租戶的列。做完之後，這句 SQL 最壞的結果是「查到 0 筆」，而不是「查到別人的」。</p>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../postgresql/lessons/24-rls.html">PostgreSQL 課第 24 課</a>的 RLS：表開了 RLS 之後，每個查詢都會被資料庫自動加上 policy 的條件；<code>USING</code> 管讀，<code>WITH CHECK</code> 管寫。</li>
+  <li><a href="../../auth/lessons/20-multi-tenancy.html">auth 課第 20 課</a>：RLS 用 <code>set_config('app.tenant_id', …, true)</code> 把租戶告訴資料庫；它跟應用層的條件是兩道各自擋不同錯誤的防線。</li>
+  <li><a href="../../postgresql/lessons/36-connections-monitoring.html">PostgreSQL 課第 36 課</a>的連線池（應用程式先開好幾條連線，請求輪流借用、用完歸還）與 <code>pg_stat_activity</code>（看現在有誰連著資料庫）。</li>
+  <li>第 8 課的 <code>TenantDb</code>：擴充過的 client，業務程式只用它的 <code>client</code> 與 <code>tx()</code>。</li>
+</ul></div>
+
+<p>這課的路線：</p>
+<ul>
+  <li>為什麼開了 RLS，上面那句 SQL 照樣洩漏？先換掉應用程式連線用的資料庫角色。</li>
+  <li>policy 要怎麼寫，才能在不知道租戶時一列都不給？在 migration 裡開 RLS。</li>
+  <li>現在連正常的查詢也是 0 筆：怎麼讓每個查詢告訴資料庫「現在是哪個租戶」，又不被連線池弄混？</li>
+  <li>好幾個操作要一起成功或失敗時怎麼辦？還沒有租戶的註冊、登入怎麼辦？</li>
+  <li>這道防線的代價是什麼、怎麼證明它真的在擋？最後套到你的業務模組。</li>
+</ul>
+
+<h2>開了 RLS，為什麼那句 SQL 照樣洩漏？</h2>
+<p>直覺的第一步是幫 <code>projects</code> 開 RLS、寫一條「只看得到自己租戶」的 policy。先複習 RLS 在做什麼：一張表執行 <code>ENABLE ROW LEVEL SECURITY</code> 之後，PostgreSQL 會在每個碰到這張表的查詢上，自動加上 policy 裡寫的條件，效果就像有人替你在 <code>WHERE</code> 後面補了一段。這段條件由資料庫加，程式寫的 SQL 有沒有 <code>tenant_id</code> 都一樣，所以它擋得住開場那句漏寫的 SQL。</p>
+<p>但如果你在現在的專案裡照做，再打開專案列表，會發現<strong>還是看得到所有租戶</strong>。原因不在 policy，而在<strong>是誰在連線</strong>。<a href="../../postgresql/lessons/24-rls.html">PostgreSQL 課第 24 課</a>講過，有三種角色不受 policy 限制：</p>
+<ul>
+  <li><strong>superuser</strong>：資料庫的最高管理者，所有權限檢查都跳過，RLS 也是。</li>
+  <li><strong>有 <code>BYPASSRLS</code> 屬性的角色</strong>：這個屬性的意思就是「RLS 對我無效」，通常給備份、資料搬遷這類工作用。</li>
+  <li><strong>表的擁有者</strong>：建立這張表的角色。PostgreSQL 預設認為擁有者可以管理自己的表，所以 policy 不套用在它身上，除非表另外加了 <code>FORCE ROW LEVEL SECURITY</code>（下一節會加）。</li>
+</ul>
+<p>第 6 課的 compose 只有一個帳號 <code>owner</code>。所有表都是它建立的，所以它是擁有者；而開發用的 PostgreSQL 映像裡，<code>POSTGRES_USER</code> 指定的帳號還是 superuser。應用程式一直用它連線，等於同時佔了三種例外中的兩種。這時寫多少 policy 都沒有作用，而且<strong>所有測試照樣通過</strong>：policy 存在、語法正確，只是對這個連線不生效，沒有任何錯誤訊息提醒你。</p>
+<p>解法是分成兩個角色，讓應用程式執行時用的那個不屬於任何一種例外：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th></th><th>擁有者（<code>owner</code>）</th><th>應用程式（參考實作叫 <code>pf_app</code>）</th></tr></thead>
+  <tbody>
+    <tr><td>做什麼</td><td><code>prisma migrate deploy</code>：建表、改表、建 policy</td><td>API 與 worker 執行時的所有查詢</td></tr>
+    <tr><td>屬性</td><td>表的擁有者（開發環境還是 superuser）</td><td><code>NOSUPERUSER NOBYPASSRLS</code>，不擁有任何表</td></tr>
+    <tr><td>權限</td><td>全部</td><td>只有 <code>GRANT</code> 給它的：<code>SELECT, INSERT, UPDATE, DELETE</code></td></tr>
+    <tr><td>環境變數</td><td><code>DATABASE_URL</code>（只有 <code>prisma.config.ts</code> 讀）</td><td><code>APP_DATABASE_URL</code>（只有 <code>PrismaService</code> 讀）</td></tr>
+  </tbody>
+</table></div>
+<p>擁有者仍然需要：改表結構、建 policy 都要有足夠的權限，這是 migration 的工作。但 migration 只在部署時跑一次，API 處理請求時用的是 <code>pf_app</code>。<code>pf_app</code> 沒有 superuser、沒有 <code>BYPASSRLS</code>、不擁有任何表，只能做 <code>GRANT</code> 給它的四種操作，policy 對它一定生效。</p>
+<p>兩個角色各用一個連線字串，而且環境變數名稱刻意取得不一樣：</p>
+<pre># .env.example
+# DATABASE_URL 是擁有者，只給 prisma migrate 用；APP_DATABASE_URL 是應用程式執行時用的 pf_app
+DATABASE_URL=postgresql://owner:owner@127.0.0.1:5434/my_saas
+APP_DATABASE_URL=postgresql://pf_app:pf_app@127.0.0.1:5434/my_saas</pre>
+<pre>// src/config/env.ts：應用程式只認得 APP_DATABASE_URL
+APP_DATABASE_URL: z.url(),   // 執行時只用 pf_app；DATABASE_URL（擁有者）只給 prisma migrate
+
+// src/prisma/prisma.service.ts
+constructor(config: ConfigService&lt;Env, true&gt;) {
+  super({ adapter: new PrismaPg({ connectionString: config.get('APP_DATABASE_URL', { infer: true }), connectionTimeoutMillis: 5_000 }) })
+}</pre>
+<p>名稱不一樣的用意是讓「拿錯帳號」做不到：應用程式的 zod schema 裡根本沒有 <code>DATABASE_URL</code>，<code>ConfigService</code> 讀不到它，就不會有人「順手」拿擁有者的連線字串來連。如果兩者都叫 <code>DATABASE_URL</code>、只是在不同環境填不同的值，某天有人在部署設定裡填錯一次，RLS 就安靜地失效。</p>
+<p><code>pf_app</code> 這個角色本身要有人建立，參考實作把它寫在 migration 最後，跟 policy 放在一起，也就是下一節要寫的那段手寫 SQL。</p>
+
+<div class="callout practice"><strong>💡 實務上：正式環境的資料庫帳號由基礎設施管</strong><br>migration 裡的 <code>CREATE ROLE pf_app … PASSWORD 'pf_app'</code> 只給開發與測試用，密碼寫在程式碼裡沒關係。正式環境的角色與密碼通常由基礎設施建立，密碼放在 secrets manager（<a href="../../devops/lessons/11-config-secrets.html">devops 第 11 課</a>），部署時只把 <code>APP_DATABASE_URL</code> 交給 API。資深工程師做資安檢查時會先問：「API 執行時用的資料庫帳號是誰？它擁有表嗎？」答案是擁有者或 superuser，後面的 policy 就不用看了。</div>
+
+<h2>policy 怎麼寫，才能在不知道租戶時一列都不給？</h2>
+<p>換成 <code>pf_app</code> 之後，policy 終於會生效，接下來要決定 policy 的條件寫什麼。條件要拿每一列的 <code>tenant_id</code> 跟「這個請求的租戶」比，但資料庫不認得 JWT，也不知道 NestJS 的請求上下文。所以要有一個地方讓應用程式把租戶告訴資料庫，PostgreSQL 的做法是<strong>自訂設定參數</strong>。</p>
+<p>PostgreSQL 有很多設定參數（例如 <code>statement_timeout</code>），也允許你自己取名字，只要名字裡有一個點，像 <code>app.tenant_id</code>。應用程式用 <code>set_config('app.tenant_id', 'A 的 id', …)</code> 把值寫進這條連線，SQL 裡用 <code>current_setting('app.tenant_id', true)</code> 讀出來。這個值只存在於這條連線（或這個交易，下一節會講差別），別的連線看不到。policy 的條件就是「這一列的 <code>tenant_id</code> 等於 <code>current_setting</code> 讀到的值」。</p>
+<p>Prisma 的 schema 寫不出 RLS，跟階段 A 的 CHECK 一樣：<code>migrate dev --create-only</code> 產生 migration 後，在最後手寫。參考實作的 <code>prisma/migrations/…_init/migration.sql</code> 最後一段：</p>
+<pre>-- ===== 以下手寫 =====
+-- 角色是整個 PostgreSQL 叢集共用的：已經有了就跳過
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'pf_app') THEN
+    CREATE ROLE pf_app LOGIN PASSWORD 'pf_app' NOSUPERUSER NOBYPASSRLS;
+  END IF;
+EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL;
+END $$;
+
+GRANT USAGE ON SCHEMA public TO pf_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO pf_app;
+-- 之後的 migration（同一個擁有者）新建的表也自動給權限；RLS 還是要每張表自己開
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO pf_app;
+
+-- 沒設 app.tenant_id 時 NULLIF(…) 是 NULL，條件不成立 → 一列都看不到（fail closed）
+-- FORCE：表的擁有者也受 policy 限制
+ALTER TABLE "projects" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "projects" FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON "projects"
+  USING ("tenant_id" = NULLIF(current_setting('app.tenant_id', true), '')::uuid)
+  WITH CHECK ("tenant_id" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+-- tags、files、exports、audit_logs、invitations 同上</pre>
+<p>由上往下分四段讀。</p>
+<p><strong>第一段建角色。</strong>角色不屬於某個資料庫，而是整個 PostgreSQL 叢集（一個 PostgreSQL 伺服器上的所有資料庫）共用的。開發資料庫跑過一次 migration 建了 <code>pf_app</code>，測試資料庫再跑同一份 migration 時角色已經在了，直接 <code>CREATE ROLE</code> 會報錯，所以先用 <code>IF NOT EXISTS</code> 查 <code>pg_roles</code>。兩個 migration 同時執行時（例如測試平行建好幾個資料庫），兩邊都可能查到「還沒有」再同時建立，後到的那個會撞錯；<code>EXCEPTION … THEN NULL</code> 把這種錯當成「已經有了」。</p>
+<p><strong>第二段給權限。</strong><code>pf_app</code> 不是擁有者，預設什麼表都不能碰，要明確 <code>GRANT</code>。<code>ON ALL TABLES</code> 只涵蓋執行當下已經存在的表；<code>ALTER DEFAULT PRIVILEGES</code> 讓擁有者之後的 migration 新建的表也自動給 <code>pf_app</code> 權限。注意它只自動處理權限，<strong>RLS 不會自動開</strong>：新表沒開 RLS 也不會報錯，<code>pf_app</code> 照樣讀寫得了全部的列。這是這套設計最容易漏的地方，所以練習 2 的測試檢查「每張有 <code>tenant_id</code> 的表」都開了。</p>
+<p><strong>第三段開 RLS。</strong><code>ENABLE</code> 打開 RLS；<code>FORCE</code> 讓表的擁有者也受 policy 限制。應用程式已經不是擁有者，沒有 <code>FORCE</code> 也受限制；<code>FORCE</code> 擋的是另一種情況：哪天有人用擁有者帳號跑腳本或修資料，那時一樣只看得到設定的租戶，不會一句 <code>UPDATE</code> 改到所有租戶。</p>
+<p><strong>第四段是 policy 的條件</strong>，三個細節各有理由：</p>
+<ul>
+  <li><strong><code>current_setting('app.tenant_id', true)</code></strong>：第二個參數 <code>true</code> 表示沒設定時回 NULL 而不是報錯。但同一條連線上設過、再結束交易後，它會變成<strong>空字串</strong>，<code>''::uuid</code> 會報錯；<code>NULLIF(…, '')</code> 把空字串也變成 NULL。</li>
+  <li><strong>NULL 讓條件不成立</strong>：<code>tenant_id = NULL</code> 的結果不是 true，所以沒有上下文的查詢一列都看不到。這叫 fail closed：資訊不足時選擇拒絕，而不是放行。</li>
+  <li><strong><code>WITH CHECK</code> 跟 <code>USING</code> 寫成一樣</strong>：<code>USING</code> 管「看得到、改得到、刪得到哪些列」，<code>WITH CHECK</code> 管「寫進去（INSERT、UPDATE 之後）的列要符合什麼」。只寫 <code>USING</code> 的話，PostgreSQL 會拿它同時當 <code>WITH CHECK</code>；真正的坑是 <code>WITH CHECK</code> 寫得比 <code>USING</code> 寬（例如只檢查「有設租戶」），那樣 A 的請求就能寫一筆 B 的資料進去。兩個寫成一樣最安全。</li>
+</ul>
+<p>不是每張表都屬於某個租戶，所以 policy 也不全一樣。有些請求發生時使用者還沒選租戶，例如登入：這時資料庫只能靠「這個人是誰」來過濾，所以有第二個自訂參數 <code>app.user_id</code>（目前登入的使用者）。它跟 <code>app.tenant_id</code> 一起設定，下一節會看到；完整的流程在「還沒有租戶」那一節。</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>表</th><th>policy</th><th>為什麼</th></tr></thead>
+  <tbody>
+    <tr><td><code>projects</code>、<code>tags</code>、<code>files</code>、<code>exports</code>、<code>audit_logs</code>、<code>invitations</code></td><td><code>tenant_id = app.tenant_id</code></td><td>屬於一個租戶的資料</td></tr>
+    <tr><td><code>memberships</code></td><td><code>tenant_id = app.tenant_id OR user_id = app.user_id</code>；寫入只看租戶</td><td>租戶內看得到所有成員；登入、列出自己的租戶時還沒選租戶，只看得到自己那幾列</td></tr>
+    <tr><td><code>refresh_tokens</code></td><td><code>user_id = app.user_id</code></td><td>屬於使用者、不屬於租戶</td></tr>
+    <tr><td><code>users</code>、<code>tenants</code></td><td>不開 RLS</td><td>全域的表：登入時要先用 email 找到人，那時什麼上下文都沒有。代價是這兩張表只靠應用層保護，查詢時只取需要的欄位</td></tr>
+  </tbody>
+</table></div>
+<p>回到開場那句 SQL。它碰的 <code>projects</code> 與 <code>files</code> 都開了 RLS，<code>pf_app</code> 又沒有設定 <code>app.tenant_id</code>，所以它現在回 0 列，洩漏擋住了。但問題換了一個：<strong>其他所有查詢也是 0 列</strong>，包括第 8 課那些寫得完全正確的 <code>project.findMany</code>。資料庫在等 <code>app.tenant_id</code>，還沒有人告訴它。</p>
+
+<h2>怎麼讓每個查詢告訴資料庫「現在是哪個租戶」？</h2>
+<p>最直覺的做法是每個請求開始時執行一次 <code>set_config('app.tenant_id', 'A', false)</code>，之後的查詢都帶著它。這行不通，原因在連線池，要先看清楚設定參數「活多久」。</p>
+<p><code>set_config</code> 的第三個參數 <code>is_local</code> 決定設定的壽命：</p>
+<ul>
+  <li><strong><code>false</code>：session 層級</strong>。設定留在這條連線上，直到連線關閉或被改掉。</li>
+  <li><strong><code>true</code>：交易層級</strong>，等於 SQL 的 <code>SET LOCAL</code>。設定只在目前這個交易有效，交易 <code>COMMIT</code> 或 <code>ROLLBACK</code> 時就消失。</li>
+</ul>
+<p>連線池會把同一條連線輪流借給不同的請求。這帶來兩個問題：</p>
+<ul>
+  <li><strong>兩句可能跑在不同連線上</strong>：先 <code>set_config</code>、再查詢，分成兩次執行，連線池可能給兩句不同的連線。設定落在 1 號連線，查詢跑在 2 號，而 2 號上留著別的請求設的租戶。</li>
+  <li><strong>session 層級的設定會留給下一個人</strong>：用 <code>is_local = false</code>，請求結束、連線還給池子時設定還在。這條連線下次借給一個沒設定的程式（例如背景工作），它就用上一個請求的租戶查詢。</li>
+</ul>
+<p>兩個錯誤一起發生時，時間軸是這樣（每一列是時間往下走）：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>時間</th><th>1 號連線</th><th>2 號連線</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>請求 B：<code>set_config('app.tenant_id', 'B', false)</code>，連線記住 B</td><td></td></tr>
+    <tr><td>2</td><td>（請求 B 結束，連線還給池子，仍然記著 B）</td><td>請求 A：<code>set_config('app.tenant_id', 'A', false)</code></td></tr>
+    <tr><td>3</td><td>請求 A 的查詢被分到這條：用的是 <strong>B</strong> 的租戶</td><td>（設定了 A，卻沒有查詢用它）</td></tr>
+  </tbody>
+</table></div>
+<p>請求 A 讀到了 B 的資料，而且 RLS 是幫兇：policy 照設定過濾，只是設定錯了。這比沒有 RLS 更難查，因為每一句 SQL 單獨看都對。</p>
+<p>解法是兩件事一起做：<strong>設定與查詢放在同一個交易</strong>，而且 <code>is_local = true</code>。一個交易從 <code>BEGIN</code> 到 <code>COMMIT</code> 一定在同一條連線上，所以設定與查詢不會分開；<code>COMMIT</code> 時設定消失，下一個借到這條連線的程式看到的是空的，套用上一節的 policy 就是 0 列，不會用到別人的租戶。</p>
+<p>剩下的問題是怎麼讓「每個操作都包成交易」不靠人記得。Prisma 有兩種交易：</p>
+<ul>
+  <li><strong>batch 交易</strong> <code>$transaction([a, b])</code>：傳一個陣列，Prisma 在同一條連線、同一個交易裡依序執行，全部完成後一起回傳結果。中間不能根據 <code>a</code> 的結果決定要不要做 <code>b</code>。</li>
+  <li><strong>互動式交易</strong> <code>$transaction(async tx =&gt; { … })</code>：傳一個函式，裡面用 <code>tx</code> 執行的操作都在同一個交易，可以寫判斷、迴圈，函式丟錯就回滾。</li>
+</ul>
+<p>「先 <code>set_config</code> 再查詢」不需要中間的判斷，用 batch 交易剛好。第 9 課在第 8 課的擴充外面再包一層：</p>
+<pre>// src/prisma/tenant-db.ts（第 9 課的版本）
+@Injectable()
+export class TenantDb {
+  readonly scoped: ScopedClient
+  readonly client: ScopedClient   // 一般的單一操作用這個
+
+  constructor(private readonly base: PrismaService, private readonly ctx: RequestContext) {
+    this.scoped = scoped(base, ctx)                     // 第 8 課：自動加 tenantId
+    this.client = this.scoped.$extends({                // 第 9 課：每個操作包一個交易，先 set_config
+      query: {
+        $allModels: {
+          async $allOperations({ args, query }) {
+            const [, result] = await base.$transaction([setContext(base, ctx.tenantId, ctx.userId), query(args)])
+            return result
+          },
+        },
+      },
+    }) as ScopedClient
+  }
+
+  // 互動式交易：開頭 set_config 一次（交易結束就失效），裡面的操作都在這條連線上
+  tx&lt;T&gt;(fn: (tx: Tx) =&gt; Promise&lt;T&gt;): Promise&lt;T&gt; {
+    return this.scoped.$transaction(async tx =&gt; {
+      await setContext(tx, this.ctx.tenantId, this.ctx.userId)
+      return fn(tx)
+    })
+  }
+}
+
+// is_local = true：只在這個交易有效
+const setContext = (db: Pick&lt;PrismaService, '$executeRaw'&gt;, tenantId?: string, userId?: string) =&gt;
+  db.$executeRaw`SELECT set_config('app.tenant_id', ${tenantId ?? ''}, true), set_config('app.user_id', ${userId ?? ''}, true)`</pre>
+<p>這段先看 <code>client</code>（<code>tx()</code> 是下一節的主題）。<code>scoped</code> 是第 8 課那層，<code>client</code> 是在它外面再 <code>$extends</code> 一次：每個 model 操作進來時，外層把 <code>setContext</code> 與 <code>query(args)</code> 放進同一個 batch 交易，回傳查詢的結果。外層拿到的 <code>args</code> 還沒有 <code>tenantId</code>；<code>query(args)</code> 執行時會先交給內層（第 8 課那層），內層把 <code>where</code> 加上 <code>tenantId</code> 之後才真正送出，所以外層不用自己處理租戶條件。<code>setContext</code> 一次設兩個值：<code>app.tenant_id</code> 與上一節表裡提到的 <code>app.user_id</code>，都從請求上下文讀。</p>
+<p>業務程式寫的一句 <code>this.db.client.project.findUnique({ where: { id } })</code>，在 A 租戶的請求裡會變成：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>步驟</th><th>在哪裡</th><th>發生什麼</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>兩層擴充</td><td>都從請求上下文讀出租戶 A：第 8 課那層把 <code>where</code> 改成 <code>{ id, tenantId: 'A' }</code>，第 9 課那層把 <code>setContext</code> 與這個查詢放進同一個 batch 交易</td></tr>
+    <tr><td>2</td><td>連線池</td><td>借出一條連線，依序送出 <code>BEGIN</code> → <code>set_config('app.tenant_id', 'A', true)</code> → <code>SELECT … WHERE id = $1 AND tenant_id = $2</code>（<code>$2</code> 是 A）→ <code>COMMIT</code></td></tr>
+    <tr><td>3</td><td>PostgreSQL</td><td>policy 再過濾一次：只留 <code>tenant_id</code> 等於 <code>app.tenant_id</code>（A）的列</td></tr>
+    <tr><td>4</td><td>連線池</td><td><code>COMMIT</code> 後 <code>app.tenant_id</code> 失效，連線還給池子，沒有留下任何租戶</td></tr>
+  </tbody>
+</table></div>
+<p>業務程式完全不用改，<code>this.db.client</code>、<code>this.db.tx()</code> 的用法跟第 8 課一樣。兩層擴充這樣疊在參考實作的版本上實測過，細節見課末「補充與查表」。</p>
+<p>現在回頭看開場那句 SQL 跟第 8 課列的其他洞：</p>
+<ul>
+  <li><strong>忘了加進 <code>SCOPED</code> 的 model</strong>：內層不加條件，但外層照樣設了 <code>app.tenant_id</code>，policy 只交出 A 的列。</li>
+  <li><strong><code>this.db.client.$queryRaw</code></strong>（開場那句）：<code>$queryRaw</code> 不是 model 操作，兩層擴充都不經過，跑在沒有設定的連線上，查到 0 列。</li>
+  <li><strong>透過 <code>tx()</code> 執行的 <code>$queryRaw</code></strong>：跑在設了 <code>app.tenant_id</code> 的交易裡，policy 只交出 A 的列。</li>
+</ul>
+<p>每一種的結果都從「查到別人的」變成「只查到自己的」或「查不到」。查不到會被測試或使用者回報抓到，查到別人的不會。開場那句 SQL 的正確寫法因此是：放進 <code>this.db.tx(tx =&gt; tx.$queryRaw…)</code> 裡執行，SQL 裡也寫上 <code>tenant_id</code> 條件，兩道防線都在。</p>
+
+<div class="callout practice"><strong>💡 實務上：連線池放大器（PgBouncer）也吃這一套</strong><br>正式環境常在 PostgreSQL 前面放 PgBouncer 這類連線池，用「transaction 模式」讓幾千個應用程式連線共用幾十條資料庫連線：每個交易結束，連線就可能給別的應用程式用。session 層級的 <code>SET</code> 在這個模式下會漏到別的客戶端，而交易內的 <code>set_config(…, true)</code> 不受影響，因為它跟著交易結束。你的作品現在每個操作都在交易裡設定，換成 PgBouncer 也不用改；面試被問到「RLS 跟連線池怎麼配合」，就講這一點。</div>
+
+<h2>好幾個操作要一起成功或失敗時，交易怎麼開？</h2>
+<p>上一節每個操作各自包一個 batch 交易。單一查詢沒問題，但「建立專案，同時寫一筆稽核紀錄」這種要嘛一起成功、要嘛一起失敗的工作，需要互動式交易。這裡有一個不明顯的坑：<strong>不能用 <code>client</code> 開互動式交易</strong>。</p>
+<p>原因是外層擴充對每個 model 操作都生效，包括在互動式交易<strong>裡面</strong>的操作。用 <code>client.$transaction(async tx =&gt; …)</code> 開交易時，裡面每個 <code>tx.project.create(…)</code> 仍會經過外層。上一節程式碼裡，外層呼叫的是 <code>base.$transaction([...])</code>，<code>base</code> 是最底層的 <code>PrismaService</code>，不知道外面已經有一個互動式交易，所以會從連線池另外借一條連線、另開一個 batch 交易。外面那個互動式交易形同虛設，<strong>回滾不了</strong>：實測在裡面 <code>create</code> 之後丟錯，資料還在。</p>
+<p>所以 <code>TenantDb</code> 另外提供 <code>tx()</code>：用只有內層（第 8 課那層）的 <code>scoped</code> 開互動式交易，開頭自己呼叫一次 <code>setContext</code>。設定是 <code>is_local = true</code>，在整個交易裡都有效、交易結束就消失；裡面的操作都在同一條連線上，內層照樣自動加 <code>tenantId</code>，函式丟錯就整個回滾。</p>
+<p>這個規則要寫進 ADR（最後一節會寫）：需要好幾個操作一起成功或失敗，一律用 <code>tx()</code>；單一操作用 <code>client</code>。</p>
+<p>到這裡，所有「有租戶的請求」都帶得上上下文了。但有一群請求在發生時還沒有租戶。</p>
+
+<h2>註冊、登入這些還沒有租戶的請求怎麼辦？</h2>
+<p>每個操作都要上下文，而註冊時租戶還不存在，登入時還不知道使用者要進哪個租戶。它們會碰到 <code>memberships</code>、<code>refresh_tokens</code> 這些開了 RLS 的表，沒有上下文就是 0 列，註冊寫不進去、登入找不到人。</p>
+<p>最省事的做法是給這些路徑另一條 <code>BYPASSRLS</code> 的連線。但那等於留一個什麼都看得到的後門：程式裡有兩個 client，只要有一個呼叫用錯，那一句就看得到所有租戶，而且跟第一節一樣，不會有任何錯誤提醒你。參考實作的原則是<strong>明確地設定「剛好夠用」的上下文</strong>，不關掉 RLS：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>路徑</th><th>上下文怎麼來</th><th>碰到哪些有 RLS 的表</th></tr></thead>
+  <tbody>
+    <tr><td>註冊</td><td>程式先產生 <code>tenantId</code>、<code>userId</code>（第 7 課），設進上下文再開 <code>tx()</code></td><td><code>memberships</code>（WITH CHECK：要是這個新租戶）</td></tr>
+    <tr><td>登入</td><td><code>users</code> 沒有 RLS，用 email 找到人；再把 <code>userId</code> 設進上下文，查他的 membership</td><td><code>memberships</code>（<code>user_id = app.user_id</code>）、<code>refresh_tokens</code></td></tr>
+    <tr><td>refresh、logout</td><td>token 的開頭是 <code>userId</code>（第 7 課的格式），先設進上下文再用雜湊查</td><td><code>refresh_tokens</code></td></tr>
+    <tr><td>接受邀請（第 10 課）</td><td>邀請 token 的開頭是 <code>tenantId</code>，先設進上下文再用雜湊查</td><td><code>invitations</code>、<code>memberships</code></td></tr>
+  </tbody>
+</table></div>
+<p>這張表也解釋了第二節 policy 表裡的 <code>app.user_id</code>：登入時只知道是誰、還不知道租戶，所以 <code>memberships</code> 的 policy 多一個 <code>OR user_id = app.user_id</code>，讓他看得到自己的成員身分、選出要進的租戶；<code>refresh_tokens</code> 屬於使用者，只看 <code>app.user_id</code>。<code>users</code>、<code>tenants</code> 不開 RLS，就是因為登入的第一步「用 email 找人」發生在任何上下文都還沒有的時候。</p>
+<p>程式裡的寫法是先把 id 寫進請求上下文，<code>TenantDb</code> 就會照常設定：</p>
+<pre>// src/auth/auth.service.ts 的 signup
+const tenantId = randomUUID(), userId = randomUUID()
+Object.assign(this.ctx.store!, { tenantId, userId })   // 明確的上下文：這個新租戶、這個新使用者
+const passwordHash = await this.passwords.hash(dto.password)
+return await this.db.tx(async tx =&gt; { … })
+
+// src/auth/auth.service.ts 的 defaultTenant（登入）
+this.ctx.store!.userId = userId
+const m = await this.db.client.membership.findFirst({ where: { userId }, orderBy: { createdAt: 'asc' } })</pre>
+<p>你可能會擔心 refresh token、邀請 token 的開頭帶著 id 是不是洩漏了什麼。id 不是秘密，秘密是後面的隨機值；id 只是讓資料庫知道「要在哪個範圍裡找」。這些路徑裡，資料庫仍然只交出這個人、這個租戶的列，就算程式哪裡寫錯，最多也只影響這個範圍。</p>
+<p>兩道防線到這裡都接好了，每一種請求都有上下文。最後要問的是：這樣做花了什麼，以及怎麼證明它真的在擋。</p>
+
+<h2>這道防線的代價是什麼，怎麼證明它真的在擋？</h2>
+<p>代價是<strong>每個操作多一個交易與一句 <code>set_config</code></strong>。原本一個 <code>findUnique</code> 是一句 SQL，現在是 <code>BEGIN</code>、<code>set_config</code>、查詢、<code>COMMIT</code> 一起送，同一條連線上多一次往返。交易數變多，也讓突發流量更容易用完連線池：連線都被借走時，新的交易要排隊等，等太久就失敗（Prisma 的等待上限見課末）。對這個規模的 SaaS 可以接受；這是寫進 ADR 的後果，量測到瓶頸時再處理，例如只讀的列表改成一個 <code>tx()</code> 裡做完多個查詢。</p>
+<p>代價要寫下來，選擇也要。<code>docs/adr/0002-rls-defense-in-depth.md</code> 比較三個選項：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>選項</th><th>問題</th></tr></thead>
+  <tbody>
+    <tr><td>只用 extension</td><td><code>$queryRaw</code>、新 model、新同事都會漏，漏了就是洩漏</td></tr>
+    <tr><td>只用 RLS</td><td>錯誤要到資料庫才發現；少了「用 id 查到 0 筆就 404」的明確程式路徑</td></tr>
+    <tr><td>兩者都用</td><td>多一個交易的效能代價</td></tr>
+  </tbody>
+</table></div>
+<p>決定是兩者都用。兩道擋的是不同的錯，各自補對方的洞，兩道都漏才會洩漏：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>出錯的情況</th><th>第 8 課 extension（應用程式裡）</th><th>第 9 課 RLS（資料庫裡）</th></tr></thead>
+  <tbody>
+    <tr><td>業務程式的查詢沒寫 <code>tenantId</code></td><td>擋：自動加條件</td><td>擋</td></tr>
+    <tr><td><code>$queryRaw</code> 忘了 <code>tenant_id</code>、直接用 <code>PrismaService</code>、新 model 沒加進 <code>SCOPED</code></td><td>擋不到</td><td>擋：沒設租戶就 0 列，設了只看到自己的</td></tr>
+    <tr><td>新表忘了開 RLS、應用程式用擁有者帳號連線</td><td>擋（model 在 <code>SCOPED</code> 裡的話）</td><td>擋不到</td></tr>
+    <tr><td>用別人的 id 查詢，要回 404</td><td>查到 0 筆，程式明確回 404</td><td>也是 0 筆，但只靠它的話錯誤要到資料庫才發現</td></tr>
+  </tbody>
+</table></div>
+<p>ADR 的後果寫三件事：上面的效能代價、「還沒有租戶的路徑要明確設定上下文，不能關掉 RLS」、「擴充過的 client 不能開互動式交易，一律用 <code>tx()</code>」。</p>
+<p>最後是證明。第一節說過，RLS 失效時所有測試照樣通過，所以只打 API 的黑箱測試不夠：它看得到回應，看不到 API 背後是用哪個角色連線。這一課的驗收測試是<strong>灰箱</strong>：除了打 API，還用你 API 實際使用的資料庫角色直連資料庫，檢查角色屬性、<code>FORCE</code> 與 policy。在 <code>work/portfolio.json</code> 填 <code>appDatabaseUrl</code>：</p>
+<pre>"saas": {
+  …
+  "appDatabaseUrl": "postgresql://pf_app:pf_app@localhost:5434/my_saas"
+}</pre>
+<p>測試只讀不寫（寫入的檢查在交易裡做完就 ROLLBACK）。其中一項查 <code>pg_stat_activity</code>：先打一次 API 讓連線池留著閒置連線，再看連著這個資料庫的有哪些角色，只能有 <code>appDatabaseUrl</code> 的那一個。這一項擋的是「填給測試的是 <code>pf_app</code>，API 實際用的卻是擁有者」。所以跑測試時先關掉你自己用擁有者開的 <code>psql</code> 或 Prisma Studio，它們也會出現在 <code>pg_stat_activity</code> 裡。</p>
+
+<h2>套到你的業務模組</h2>
+<p>專案列表的那句 SQL 擋住了，你自己的業務模組也要同樣處理。每加一張業務表，migration 裡就要有同樣的三句（ENABLE、FORCE、policy），練習 2 的測試會檢查每張有 <code>tenant_id</code> 的表。三個題目各有一個要多想一步的地方：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>題目</th><th>要注意</th></tr></thead>
+  <tbody>
+    <tr><td>客服工單</td><td>SLA 提醒是排程，沒有請求：排程要先列出「有快到期工單的租戶」再逐一 <code>ctx.run</code>。列出租戶這一步跨租戶，查的是沒有 RLS 的 <code>tenants</code> 表或專用的函式，不是給排程一個 <code>BYPASSRLS</code> 帳號（第 13 課）。</td></tr>
+    <tr><td>預約排程</td><td>排除約束檢查的是整張表，不受 RLS 影響；它的條件包含 <code>tenant_id</code>（第 8 課），衝突時回的錯誤也只說「時段重疊」，不會帶出別的租戶的資料。</td></tr>
+    <tr><td>進銷存</td><td>月結報表的 <code>$queryRaw</code> 透過 <code>this.db.tx(tx =&gt; tx.$queryRaw…)</code> 執行，才有 <code>app.tenant_id</code>；直接用 <code>this.db.client.$queryRaw</code> 不經過擴充、沒有設定，RLS 讓它查到 0 筆。</td></tr>
+  </tbody>
+</table></div>
+<p>客服工單的排程與開場那句 SQL 是同一個教訓的兩面：需要跨租戶的地方，明確地只拿需要的那一點（租戶清單），再回到逐一租戶、有上下文的查詢，而不是開一個看得到全部的後門。</p>
+
+<h2>練習</h2>
+
+<div class="local" data-test="ex1" data-files="">
+  <p>練習 1：應用程式改用自己的資料庫角色。測試用 <code>appDatabaseUrl</code> 直連：這個角色不是 superuser、沒有 <code>BYPASSRLS</code>、不是任何有 <code>tenant_id</code> 的表的擁有者；先打一次 API，<code>pg_stat_activity</code> 裡連著這個資料庫的只能有這個角色。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="">
+  <p>練習 2：每張有 <code>tenant_id</code> 欄位的表都 <code>ENABLE</code> 而且 <code>FORCE ROW LEVEL SECURITY</code>（測試讀 <code>pg_class</code> 的 <code>relrowsecurity</code>、<code>relforcerowsecurity</code>）。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="">
+  <p>練習 3：policy 真的有效：用 <code>appDatabaseUrl</code> 直連、沒設 <code>app.tenant_id</code> 時 <code>projects</code> 一列都看不到；在交易裡 <code>set_config</code> 成租戶 A 之後只看到 A 的；這時寫入一筆 <code>tenant_id</code> 是 B 的列要被 policy 擋下。另外 200 個 A、B 交錯的 <code>GET /api/v1/projects</code>（同時 20 個）每個都只看到自己的那一筆。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="">
+  <p>練習 4：RLS 開了之後，還沒有租戶的路徑照樣能用：註冊、登入、refresh、<code>/me</code> 正常；projects 建立、讀、改、刪正常，別的租戶讀不到（404）。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：新同事寫了一個「每晚清除 30 天前封存的 project」的排程，為了方便直接注入 <code>PrismaService</code>（沒有任何擴充），呼叫 <code>project.deleteMany({ where: { archivedAt: { lt: 三十天前 } } })</code>。在這一課的設定下會發生什麼？</p>
+  <label data-key="a">刪掉所有租戶 30 天前封存的 project，跟他想要的一樣：排程本來就該跨租戶</label>
+  <label data-key="b">PostgreSQL 回權限錯誤，因為 <code>pf_app</code> 沒有 DELETE 權限</label>
+  <label data-key="c">一筆都不會刪：沒有 <code>app.tenant_id</code>，RLS 讓 <code>pf_app</code> 看不到任何 project；同事會發現排程沒效果，而不是誤刪</label>
+  <label data-key="d">只刪掉最後一個登入的租戶的資料，因為連線上還留著那個請求的設定</label>
+  <p class="why">✓ 繞過擴充的程式碰到 RLS，沒有上下文就是 0 列：錯誤變成「沒效果」，會被發現、不會造成洩漏或誤刪。正確做法是逐一租戶 <code>ctx.run</code> 再用 <code>TenantDb</code>。如果只有擴充、應用程式又用擁有者連線，就會是 a：刪掉所有租戶的資料。d 只在用 session 層級的 <code>set_config</code> 時才會發生，這一課用的是只在交易內有效的設定。（第 9 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：正式環境在 PostgreSQL 前面加了 PgBouncer（transaction 模式）。下面哪一種設定租戶的方式在這個架構下是安全的？</p>
+  <label data-key="a">每個請求開始時執行一次 <code>SET app.tenant_id = '…'</code>，之後的查詢都會帶著它</label>
+  <label data-key="b">在交易裡 <code>SELECT set_config('app.tenant_id', $1, true)</code>，查詢也在同一個交易裡</label>
+  <label data-key="c">用 <code>set_config('app.tenant_id', $1, false)</code>，並在每個請求結束時 <code>RESET app.tenant_id</code></label>
+  <label data-key="d">每個租戶用不同的資料庫帳號連線，帳號名稱就是租戶</label>
+  <p class="why">✓ transaction 模式下，連線只在一個交易的期間屬於你；交易內有效的設定跟著交易結束，不會漏給下一個客戶端。a、c 是 session 層級的設定，下一句查詢可能已經在另一條連線上，或者這條連線先被別人借走；c 的 RESET 也救不了中間被借走的那段時間。d 讓連線池無法共用，幾千個租戶就是幾千組連線。（第 9 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 7：RLS 上線後，客服回報「工單列表突然是空的」，其他頁面都正常。程式最近只改了一處：列表的排序改成手寫 SQL。最先該查什麼？</p>
+  <label data-key="a">工單表的 policy 是不是少了 <code>WITH CHECK</code></label>
+  <label data-key="b"><code>pf_app</code> 是不是被拿掉了工單表的 SELECT 權限</label>
+  <label data-key="c">PostgreSQL 的 <code>row_security</code> 參數是不是被關掉了</label>
+  <label data-key="d">新的手寫 SQL 是不是用 <code>this.db.client.$queryRaw</code> 直接執行，沒有在設了 <code>app.tenant_id</code> 的交易裡</label>
+  <p class="why">✓ 「突然變空、其他正常、剛改成手寫 SQL」指向那句 SQL 沒有上下文：<code>$queryRaw</code> 不經過擴充，也就沒有 <code>set_config</code>，RLS 讓它看到 0 列。改成在 <code>tx()</code> 裡執行，並在 SQL 裡寫上 <code>tenant_id</code> 條件。a 錯：<code>WITH CHECK</code> 只管寫入，不影響讀取。b 會得到權限錯誤（500），不是空陣列。（第 9 課）</p>
+</div>
+
+<h2>自評清單</h2>
+<p>測試判不出來、但作品裡看得出來的事。每一項自己確認：</p>
+<ul>
+  <li><strong>擴充拿掉之後 RLS 還擋得住</strong>：暫時把 <code>SCOPED</code> 改成空集合，跑你 repo 的跨租戶測試：要全部仍然通過（別人的資料仍然 404），證明 RLS 真的在擋。試完改回來。</li>
+  <li><strong>互動式交易真的回滾</strong>：在某個 <code>tx()</code> 裡建立資料之後丟錯，資料庫裡不能留下那筆。</li>
+  <li><strong>應用程式的設定裡沒有擁有者的帳密</strong>：<code>grep -rn "DATABASE_URL" src</code> 只有 <code>APP_DATABASE_URL</code>；部署的環境變數（第 17 課）也只給 API 這一組。</li>
+  <li><strong>新表一定會開 RLS</strong>：新增一張有 <code>tenant_id</code> 的表，忘了寫 policy，<code>node check.mjs nestjs pf09</code> 的練習 2 要失敗；把這個檢查也放進你自己的測試（查 <code>pg_class</code>）。</li>
+  <li><strong>ADR 0002 寫了三個選項與代價</strong>：只用 extension、只用 RLS、兩者都用；後果有效能代價與「不能開互動式交易」。</li>
+</ul>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>應用程式用擁有者或 superuser 連線</strong>：RLS 對它沒有作用，所有測試照樣通過，你不會發現。分兩個角色、兩個環境變數。</li>
+  <li><strong>開了 RLS 沒有 <code>FORCE</code></strong>：擁有者不受限制，用擁有者跑的腳本、修資料的 SQL 看得到所有租戶。</li>
+  <li><strong>policy 沒有 <code>NULLIF</code></strong>：同一條連線設過一次後，沒設定時 <code>current_setting</code> 回空字串，<code>''::uuid</code> 讓查詢報錯，而不是安靜地回 0 列。</li>
+  <li><strong><code>WITH CHECK</code> 比 <code>USING</code> 寬</strong>：看得到的只有自己的，寫得進去的卻不限租戶。兩個寫成一樣。</li>
+  <li><strong>先設定、再查詢，分兩句</strong>：連線池可能給兩句不同的連線；用 <code>is_local = false</code> 時設定還會留給下一個請求。設定與查詢放在同一個交易，<code>is_local = true</code>。</li>
+  <li><strong>用外層擴充過的 client 開互動式交易</strong>：裡面每個操作各開一個交易，回滾不了。互動式交易一律用 <code>tx()</code>。</li>
+  <li><strong>為了註冊、登入開一個 <code>BYPASSRLS</code> 的連線</strong>：只要一個呼叫用錯 client 就是全部資料。明確設定剛好夠用的上下文。</li>
+</ul>
+
+<h2 id="appendix">補充與查表</h2>
+<ul>
+  <li><strong>兩層擴充疊起來的實測</strong>：內層加 <code>where.tenantId</code>，外層把改好的 <code>query(args)</code> 放進 batch 交易。2026-11 用 Prisma 7.10.1＋<code>@prisma/adapter-pg</code> 7.10.1 實測：兩句在同一個交易；60 個 A、B 交錯的請求沒有一個讀到別的租戶。</li>
+  <li><strong>連線池用完時的錯誤</strong>：等不到連線的交易在 Prisma 的 <code>maxWait</code>（預設 2 秒）後失敗，錯誤訊息是 <code>Unable to start a transaction in the given time</code>。看到它，先查是不是突發流量把連線池用完。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>開場那句漏寫 <code>tenant_id</code> 的 <code>$queryRaw</code>，extension 管不到；RLS 讓它最壞只查到 0 筆，不會查到別的租戶。</li>
+  <li>兩個資料庫角色：擁有者只跑 migration（<code>DATABASE_URL</code>），應用程式用 <code>NOSUPERUSER NOBYPASSRLS</code>、不擁有表的角色（<code>APP_DATABASE_URL</code>）。用擁有者或 superuser 連線，policy 不生效，測試也照樣通過。</li>
+  <li>每張有 <code>tenant_id</code> 的表 <code>ENABLE</code>＋<code>FORCE</code>；policy 用 <code>NULLIF(current_setting('app.tenant_id', true), '')::uuid</code>，<code>USING</code> 與 <code>WITH CHECK</code> 一樣嚴格；沒有上下文就 0 列（fail closed）。</li>
+  <li><code>TenantDb.client</code> 把每個操作包成 batch 交易：<code>set_config(…, true)</code>＋查詢，同一條連線、交易結束就失效，連線池不會把租戶留給下一個請求。</li>
+  <li>互動式交易用 <code>tx()</code>：只有內層擴充的 client 開交易，開頭設一次上下文。</li>
+  <li>還沒有租戶的路徑（註冊、登入、refresh、接受邀請）明確設定剛好夠用的上下文，不關掉 RLS。</li>
+  <li>代價是每個操作多一個交易；寫進 ADR 0002。灰箱測試用 <code>appDatabaseUrl</code> 檢查角色、FORCE 與 policy。</li>
+</ul>
+<p>下一課在租戶裡分角色：邀請成員加入（一次性、會過期、可撤銷的邀請 token）、owner／admin／member／viewer 的權限矩陣，以及成員被移除後，他手上還沒過期的 token 怎麼立刻失效。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

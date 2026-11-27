@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>16. 可觀測性：從一個 requestId 查到底</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="16" data-practice="nestjs" data-task="pf16">
+<header>
+  <div class="eyebrow">階段 B3：上線與作品 · 第 16 課</div>
+  <h1>可觀測性：從一個 requestId 查到底</h1>
+</header>
+<main>
+
+<p>想像你的 SaaS 上線了，一位客戶傳來截圖：「建立專案時跳出『伺服器發生錯誤』，代碼 <code>5f3c…</code>」。你手上只有這串代碼。如果 log 是一行行的純文字、沒有 requestId、也不知道是哪個租戶，你只能請客戶「再試一次，然後告訴我時間」。如果每一行 log 都帶著 requestId、租戶與使用者，你在 log 搜尋這串代碼，十秒內就看到 Prisma 說了什麼。</p>
+<p>「從外面看得到的線索，推回系統裡面發生了什麼」這種能力，叫做可觀測性（observability）。它不是一個套件，而是一組習慣：每個請求有一個身分證號碼、log 寫成機器能搜尋的格式、錯誤細節留在 log 而不是丟給使用者、平台隨時知道這個程序能不能接流量。這一課就用客戶回報的這個 500 當主線，一步一步把作品做到「拿到代碼，十秒查到原因」，過程中會修掉參考實作原本的一個洞：<strong>壞掉的 JSON 回應沒有 requestId</strong>。</p>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../nestjs/lessons/24-observability-shutdown.html">NestJS 課第 24 課</a>的 requestId、<code>AsyncLocalStorage</code>（同一個請求裡任何地方都讀得到的情境）、live 與 ready、SIGTERM 之後的優雅關機。</li>
+  <li><a href="../../node/lessons/19-structured-logging.html">Node 課第 19 課</a>的結構化 log：一行一個 JSON，可以用欄位搜尋；不記密碼與 token。</li>
+  <li><a href="../../devops/lessons/21-logs.html">DevOps 課第 21 課</a>的 log 收集，與<a href="../../devops/lessons/23-tracing.html">第 23 課</a>的分散式追蹤（trace 把跨服務的請求串起來）。</li>
+  <li>第 8 課的請求上下文 <code>RequestContext</code>（包住 <code>AsyncLocalStorage</code>），與第 13 課 worker 用 <code>ctx.run()</code> 重建上下文。</li>
+</ul></div>
+
+<div class="callout">判分照舊：啟動你的 API，執行 <code>node check.mjs nestjs pf16</code>。測試只看 HTTP 回應（標頭、body、狀態碼）；log 的內容黑箱看不到，放在自評清單。</div>
+
+<p>這課的路線：</p>
+<ul>
+  <li>客戶只給了一串代碼：requestId 要出現在哪些地方，才查得到底？這個 id 由誰決定？</li>
+  <li>試打一個壞掉的 JSON，requestId 卻是 <code>"none"</code>：middleware 的順序。</li>
+  <li>id 有了，log 怎麼每一行自動寫出 requestId、tenantId、userId，又不寫出秘密？</li>
+  <li>客戶看到的 500 該說多少：細節只進 log，而且只記一次。</li>
+  <li>不是 bug、是 Redis 斷了：live、ready 與優雅關機；最後套到你的業務模組。</li>
+</ul>
+
+<h2>客戶只給了一串代碼：requestId 要出現在哪些地方？</h2>
+<p>回到那張截圖。<code>5f3c…</code> 就是 requestId：伺服器替「這一次請求」配的一個號碼，像掛號單上的號碼牌。它本身不含任何資訊，價值在於<strong>同一個號碼出現在所有跟這次請求有關的紀錄裡</strong>，你拿著它搜尋，就能把散落各處的紀錄一次撈出來。所以第一個問題是：它要出現在哪些地方？答案是你之後可能要查的每一個地方。</p>
+<figure>
+  <svg viewBox="0 0 700 230" role="img" aria-label="requestId 從請求標頭進來，寫進回應標頭、錯誤 body、每一行 log、背景工作的 job 資料與稽核紀錄">
+    <defs><marker id="arr16" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="10" y="85" width="140" height="60" rx="8"/>
+    <text class="d-text" x="80" y="110" text-anchor="middle">請求</text>
+    <text class="d-small" x="80" y="130" text-anchor="middle">x-request-id（可能沒有）</text>
+    <rect class="d-box" x="200" y="85" width="150" height="60" rx="8"/>
+    <text class="d-text" x="275" y="110" text-anchor="middle">RequestIdMiddleware</text>
+    <text class="d-small" x="275" y="130" text-anchor="middle">合法就沿用，否則換新的</text>
+    <line class="d-line" x1="150" y1="115" x2="198" y2="115" marker-end="url(#arr16)"/>
+    <rect class="d-box" x="420" y="10" width="270" height="34" rx="6"/><text class="d-text" x="555" y="32" text-anchor="middle">回應標頭 x-request-id</text>
+    <rect class="d-box" x="420" y="52" width="270" height="34" rx="6"/><text class="d-text" x="555" y="74" text-anchor="middle">錯誤 body 的 requestId</text>
+    <rect class="d-box" x="420" y="94" width="270" height="34" rx="6"/><text class="d-text" x="555" y="116" text-anchor="middle">每一行 log（AppLogger）</text>
+    <rect class="d-box" x="420" y="136" width="270" height="34" rx="6"/><text class="d-text" x="555" y="158" text-anchor="middle">job 資料 → worker 的 ctx.run</text>
+    <rect class="d-box" x="420" y="178" width="270" height="34" rx="6"/><text class="d-text" x="555" y="200" text-anchor="middle">稽核紀錄的 requestId 欄位</text>
+    <line class="d-line" x1="350" y1="115" x2="418" y2="27" marker-end="url(#arr16)"/>
+    <line class="d-line" x1="350" y1="115" x2="418" y2="69" marker-end="url(#arr16)"/>
+    <line class="d-line" x1="350" y1="115" x2="418" y2="111" marker-end="url(#arr16)"/>
+    <line class="d-line" x1="350" y1="115" x2="418" y2="153" marker-end="url(#arr16)"/>
+    <line class="d-line" x1="350" y1="115" x2="418" y2="195" marker-end="url(#arr16)"/>
+  </svg>
+  <figcaption>middleware 決定一次，之後每個地方都從請求上下文讀，不再自己產生。</figcaption>
+</figure>
+<p>由上到下，每個地方各有用途：</p>
+<ul>
+  <li><strong>回應標頭 <code>x-request-id</code></strong>：每個回應都有，前端與 gateway 拿得到。</li>
+  <li><strong>錯誤 body 的 <code>requestId</code></strong>：前端把它顯示在錯誤畫面上，客戶截圖裡的代碼就是從這裡來的。</li>
+  <li><strong>每一行 log</strong>：你拿代碼去搜的地方。</li>
+  <li><strong>job 資料</strong>：請求觸發的背景工作（例如匯出），在 worker 裡的 log 也要帶同一個 id。</li>
+  <li><strong>稽核紀錄</strong>：第 11 課的稽核紀錄有 requestId 欄位，「誰在什麼時候做了什麼」可以接回那次請求的 log。</li>
+</ul>
+<p>五個地方都要拿到同一個值，最直覺的做法是把 requestId 當參數，從 controller 一路傳到 service、logger、<code>AuditService</code>。這樣寫一定會漏：每個函式簽章都要多一個參數，只要有一個人忘了傳，那段 log 就斷了。所以參考實作用的是 NestJS 課第 24 課的 <code>AsyncLocalStorage</code>：middleware 把 requestId 放進一個跟著這次請求的非同步流程走的儲存空間（store），之後同一個請求裡的 logger、exception filter、<code>AuditService</code> 都從第 8 課的 <code>RequestContext</code> 讀，不用任何人傳參數。</p>
+<p>唯一斷掉的地方是背景工作。job 是先存進 Redis、之後才由 worker 拿出來執行的，那已經是另一個時間、另一條非同步流程，<code>AsyncLocalStorage</code> 不會跟過去。所以第 13 課把 requestId 放進 job 資料，worker 開頭用 <code>ctx.run({ requestId, tenantId, userId }, …)</code> 把上下文接回來。做到這一步，客戶回報的那串代碼，就能一路查到他觸發的匯出 job 為什麼失敗。</p>
+<div class="callout practice"><strong>💡 實務上：客服流程從 requestId 開始</strong><br>錯誤畫面把 requestId 顯示出來（「錯誤代碼：5f3c…，請提供給客服」），是成本最低的除錯投資。客服單上有它，工程師在 log 平台搜 <code>requestId:"5f3c…"</code>，看到那個請求的每一行 log、哪個租戶、哪個使用者、錯在哪一行。沒有它，就是「大概下午三點、在建立專案的時候」，然後在幾萬行 log 裡猜。前端的 Vue 錯誤處理（axios interceptor 之類）讀回應的 <code>requestId</code> 顯示出來，這件事前後端各寫一行就完成。</div>
+<p>還剩一個問題：圖上那個「決定一次」的 middleware，到底用什麼規則決定這個號碼？</p>
+
+<h2>這個號碼由誰決定：沿用請求帶來的，還是自己產生？</h2>
+<p>上一節說 middleware 決定一次，之後大家都讀它。決定的規則只有三行：</p>
+<pre>// src/common/request-id.middleware.ts
+const VALID = /^[A-Za-z0-9_-]{1,64}$/
+
+use(req: Request, res: Response, next: NextFunction) {
+  const decided = res.getHeader('x-request-id')
+  const incoming = req.get('x-request-id')
+  const requestId = typeof decided === 'string' ? decided : incoming &amp;&amp; VALID.test(incoming) ? incoming : randomUUID()
+  res.setHeader('x-request-id', requestId)
+  this.ctx.run({ requestId }, next)
+}</pre>
+<p>先看 <code>incoming</code> 這條路：請求自己帶了 <code>x-request-id</code>，而且格式合法，就沿用；否則用 <code>randomUUID()</code> 產生一個新的。為什麼要沿用？你的 API 前面常常還有一層：負載平衡器、API gateway，或者前端自己在送出請求時就產生一個 id。如果你每次都自己產生，同一個請求在 gateway 的 log 裡叫 A、在你的 log 裡叫 B，客服拿著前端顯示的 A 來找你，你搜不到。沿用它，前端的錯誤回報、gateway 的 log、你的 log 就是同一個號碼。</p>
+<p>但沿用不能無條件。這個值會原封不動寫進每一行 log，而它是使用者送來的，使用者想送什麼都可以。假設有人送了一個含換行字元的值，例如 <code>abc\n{"level":"info","message":"管理員登入成功"}</code>：如果 log 是一行一筆，這個換行就會在你的 log 裡多造出一行看起來完全正常的假紀錄。這種把偽造內容塞進 log 的攻擊叫 log injection，它的危害是讓你在查事故時被假紀錄誤導。另一種是送一個 1 MB 的值，每一行 log 都跟著變成 1 MB，log 平台的費用與磁碟一起爆掉。所以 <code>VALID</code> 只接受 1～64 個英數、<code>-</code>、<code>_</code>，其他一律換成新的 UUID，不嘗試「清洗」它。</p>
+<p>決定之後做兩件事：<code>res.setHeader</code> 寫進回應標頭，<code>this.ctx.run({ requestId }, next)</code> 開一個 store、在裡面繼續處理請求。</p>
+<p>最前面那個 <code>decided</code> 是做什麼的？它讀的是<em>回應</em>標頭：如果這次請求已經有人決定過 id、寫進回應標頭了，就直接沿用，不再決定一次。照理說一個請求只會經過這個 middleware 一次，為什麼需要這個判斷？因為參考實作在測試時發現了一個洞，修法會讓它跑兩次，下一節就從那個洞開始。</p>
+
+<h2>試打一個壞掉的 JSON，requestId 為什麼是 "none"？</h2>
+<p>上一節的規則看起來涵蓋了所有請求，那就實際試一個邊界情況：對 API 送一個壞掉的 JSON。</p>
+<pre>curl -i -X POST http://localhost:3100/api/v1/auth/login -H 'content-type: application/json' -d '{"email":'</pre>
+<pre>HTTP/1.1 400 Bad Request
+X-Powered-By: Express
+                                          ← 沒有 x-request-id，也沒有 helmet 的安全標頭
+{"statusCode":400,"errorCode":"VALIDATION_FAILED","message":"Unexpected end of JSON input","requestId":"none"}</pre>
+<p>回應沒有 <code>x-request-id</code>，body 的 <code>requestId</code> 是 <code>"none"</code>，連 helmet 該加的安全標頭也不見了。換成客戶的情境：前端送出的 JSON 剛好壞了，錯誤畫面顯示的代碼是 <code>none</code>，客服拿著它什麼都查不到。</p>
+<p>原因是<strong>順序</strong>。一個請求在 Express 裡依序經過這些關卡，前一關沒有呼叫 <code>next()</code>，後面的就不會執行：</p>
+<ol>
+  <li><code>configureApp()</code> 裡用 <code>app.use()</code>、<code>useBodyParser()</code> 註冊的（依註冊順序）；</li>
+  <li>Nest 模組的 middleware（<code>AppModule.configure()</code> 裡的 <code>consumer.apply(RequestIdMiddleware)</code>）；</li>
+  <li>guard、pipe、controller。</li>
+</ol>
+<p>body parser 是把請求的原始文字解析成 <code>req.body</code> 物件的那一關。壞掉的 JSON 在第 1 步的 body parser 就解析失敗，請求直接被轉去錯誤處理，第 2 步的 <code>RequestIdMiddleware</code> 根本沒跑到：沒有人寫回應標頭，上下文也是空的，exception filter 找不到 id，只能填 <code>"none"</code>。helmet 原本也註冊在 body parser 後面，所以連安全標頭都沒有。</p>
+<p>修法是把這兩件事搬到 body parser 前面：</p>
+<pre>// src/app.setup.ts
+const requestId = new RequestIdMiddleware(app.get(RequestContext))
+app.use(requestId.use.bind(requestId))            // 在 body parser 之前：壞掉的 JSON 也有 x-request-id
+app.use(helmet())                                 // 被 body parser 拒絕的回應一樣有安全標頭
+express.useBodyParser('json', { limit: '1mb' })</pre>
+<p>模組那邊的 <code>consumer.apply(RequestIdMiddleware)</code> 還在，所以一個正常的請求會經過這個 middleware 兩次，兩次各有分工：</p>
+<ul>
+  <li><strong>第一次</strong>（<code>configureApp</code>，body parser 之前）：決定 id，寫進回應標頭。壞掉的 JSON 停在 body parser，也已經有 id。</li>
+  <li><strong>第二次</strong>（模組，body 讀完之後）：讀 <code>res.getHeader('x-request-id')</code> 沿用第一次的 id（上一節的 <code>decided</code>），重新開一個 store。</li>
+</ul>
+<p>為什麼不乾脆只留第一次？body parser 要把請求的資料流整個讀完才呼叫 <code>next()</code>，這段讀取是非同步的，<code>AsyncLocalStorage</code> 的 store 不保證撐過這段非同步的讀取。原因在 body parser 怎麼讀：它在請求的資料流上掛 <code>data</code> 與 <code>end</code> 事件，等 <code>end</code> 觸發、body 讀完才呼叫 <code>next()</code>。這些事件 callback 是由底層的 socket 觸發的，它們所在的非同步脈絡跟著 socket 走，不一定是當初 <code>ctx.run()</code> 開的那一個。所以就算是同一個請求，<code>next()</code> 之後的程式也不保證讀得到 store。如果只留第一次，guard 與 service 有可能讀到空的上下文。第二次在 body 讀完之後重開 store，guard 與 service 拿到的上下文才穩；而因為有 <code>decided</code>，第二次不會產生新的 id，回應標頭和上下文裡的永遠是同一個號碼。</p>
+<p>同樣的道理，exception filter 也不能只靠 store：壞掉的 JSON 進到 filter 時，store 可能根本沒開過。所以 filter 改成先從回應標頭拿 id，標頭在第一次 middleware 就寫好了：</p>
+<pre>// src/common/error.filter.ts
+const requestId = String(res.getHeader('x-request-id') ?? this.ctx.requestId)</pre>
+<div class="callout practice"><strong>💡 實務上：這是一個面試好故事</strong><br>「黑箱測試發現壞掉的 JSON 沒有 requestId，追到是 middleware 的順序」比「我加了 requestId」具體得多。面試官想聽的是你怎麼發現問題、怎麼找到原因：你送了一個邊界請求、看到 <code>"none"</code>、畫出請求經過的關卡、找到 body parser 在 middleware 前面。這個「先重現、再畫流程、再找斷點」的順序，也是查任何正式環境問題的順序。</div>
+<p>練習 1、2 會用壞掉的 JSON 檢查這兩件事。到這裡，每一個回應都帶著號碼，連被 body parser 擋下的也一樣。但號碼只是索引：客戶的代碼要查得到東西，log 必須把這個號碼寫出來。</p>
+
+<h2>號碼有了：log 怎麼每一行自己說出是誰？</h2>
+<p>上一節保證了每個請求都有 requestId，而且放在上下文裡。現在要讓 log 把它寫出來，而且是用搜得到的格式寫。</p>
+<p>先說為什麼格式重要。純文字的 log 長這樣：<code>[Nest] 45504 ERROR 建立專案失敗 5f3c…</code>。人看得懂，但 log 平台只能做全文搜尋，「這個租戶今天所有的錯誤」這種問題就問不出來。結構化 log 是一行一個 JSON 物件，每個資訊放在固定的欄位：<code>level</code>、<code>message</code>、<code>requestId</code>、<code>tenantId</code>。log 平台會把欄位解析出來，你就能下 <code>requestId:"5f3c…"</code> 或 <code>tenantId:"…" AND level:"error"</code> 這種精確的查詢（Node 課第 19 課）。</p>
+<p>Nest 12 的 <code>ConsoleLogger</code> 有 <code>json: true</code> 選項，一行一個 JSON；參考實作再覆寫 <code>getJsonLogObject</code>，也就是「組出這一行 JSON 物件」的那個方法，在原本的欄位後面自動加上請求上下文裡的三個欄位：</p>
+<pre>// src/common/app.logger.ts
+@Injectable()
+export class AppLogger extends ConsoleLogger {
+  constructor(private readonly ctx: RequestContext) {
+    super({ json: true })
+  }
+
+  protected override getJsonLogObject(message: unknown, options: JsonLogOptions) {
+    const s = this.ctx.store
+    return { ...super.getJsonLogObject(message, options), requestId: s?.requestId, tenantId: s?.tenantId, userId: s?.userId }
+  }
+}
+
+// src/main.ts
+const app = await NestFactory.create&lt;NestExpressApplication&gt;(AppModule, { bufferLogs: true, bodyParser: false })
+app.useLogger(app.get(AppLogger))</pre>
+<p><code>main.ts</code> 的兩行解決的是啟動順序的問題：<code>AppLogger</code> 要等 app 建好才拿得到，但 app 建立的過程本身就會印 log。<code>bufferLogs: true</code> 讓這些啟動過程的 log 先暫存，等 <code>useLogger</code> 換成 <code>AppLogger</code> 之後再一起印，啟動訊息也是 JSON，不會前幾行是純文字、後面才是 JSON。</p>
+<p>回到客戶的事故。用這個 logger，你拿代碼去搜，會找到這樣一行（這課的示範：用 <code>x-request-id: demo-req-1</code> 重現，觸發方式在下一節）：</p>
+<pre>{"level":"error","pid":45504,"timestamp":1795102360835,
+ "message":"PrismaClientKnownRequestError: … Database error. Code: `22021`. Message: `invalid byte sequence for encoding \"UTF8\": 0x00` …",
+ "requestId":"demo-req-1","tenantId":"0c0c38df-…","userId":"20da7dd8-…"}</pre>
+<p>一行就回答了三個問題：哪個請求（<code>requestId</code>）、哪個租戶的哪個使用者（<code>tenantId</code>、<code>userId</code>）、錯在哪（資料庫回了錯誤碼 22021）。而業務程式裡的 <code>new Logger('Exports').log('匯出完成')</code> 不用改任何一行，就自動帶上這三個欄位。這就是第一節選 <code>AsyncLocalStorage</code> 而不是參數傳遞的回報：要 log 的地方太多，靠每個人記得傳，一定有人忘。</p>
+<p>欄位自動帶上了，接下來要決定的是<strong>不記什麼</strong>，這跟記什麼一樣重要：密碼、token、cookie、整個 request body、個資的值都不能進 log。最常見的外洩路徑是「為了除錯，把整個 <code>req.body</code> 或 <code>req.headers</code> 印出來」：登入請求的 body 有密碼，headers 有 <code>authorization</code>。參考實作的規則是 log 只記 id 與事件，不記值；需要記請求時，用白名單挑欄位（記 <code>method</code>、<code>path</code>、<code>status</code>、耗時），不要用黑名單去遮。黑名單是「列出哪些欄位要遮掉」，問題在於它只擋得住你想到的欄位：下個月有人在 DTO 加了 <code>nationalId</code>，沒人記得更新黑名單，它就直接進了 log。白名單反過來，沒列出來的一律不記，新欄位預設是安全的。</p>
+<div class="callout practice"><strong>💡 實務上：log 是會被很多人看到的資料</strong><br>log 會被送到 log 平台（CloudWatch、Datadog、Loki），保存幾十天，公司裡很多人有權限看，備份也會留更久。寫進 log 的密碼，等於明文存在一個權限比資料庫寬鬆得多的地方。資安稽核常問的一題是「log 裡有沒有個資」。tenantId、userId 是 id 不是個資，可以記；email、姓名、電話不要記，需要時用 userId 回資料庫查。</div>
+<p>注意上面那行 log 的 <code>message</code>：裡面有 Prisma 的錯誤原文、PostgreSQL 的錯誤碼。這些細節放在 log 裡是對的，因為你需要它找原因。但同一個錯誤，客戶的畫面上該顯示多少？</p>
+
+<h2>客戶看到的 500 該說多少？</h2>
+<p>上一節的 log 已經記下完整的原因，所以回應就不用再帶。這條分工在第 6 課的 <code>ErrorFilter</code> 就定好了，它把錯誤分成兩種，各自的回應與 log 不同：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>錯誤</th><th>回應</th><th>log</th></tr></thead>
+  <tbody>
+    <tr><td>預期內的（<code>ApiError</code>、驗證失敗、404、429…，狀態碼 &lt; 500）</td><td>狀態碼＋<code>errorCode</code>＋給人看的 message</td><td>不記（這是正常的業務結果）</td></tr>
+    <tr><td>未預期的（程式 bug、資料庫錯誤、任何非 <code>HttpException</code>）</td><td>一律 500 <code>INTERNAL_ERROR</code>、固定的 message、requestId</td><td>記一次完整的 stack</td></tr>
+  </tbody>
+</table></div>
+<p>為什麼預期內的錯誤不記？「密碼錯誤」「專案不存在」是使用者操作的正常結果，一天可能發生上萬次，全記下來，真正的 bug 就淹沒在裡面。未預期的錯誤則相反：它代表程式有地方沒想到，你需要完整的 stack 去找是哪一行。對使用者來說，未預期錯誤的細節沒有任何用處，他修不了你的程式；對攻擊者來說，細節卻很有用，資料表名稱、欄位、檔案路徑都是下一步攻擊的線索。所以回應只給固定的訊息加上 requestId，細節進 log：</p>
+<pre>this.logger.error(exception instanceof Error ? exception.stack ?? exception.message : String(exception))
+res.status(500).json({ statusCode: 500, errorCode: 'INTERNAL_ERROR', message: '伺服器發生錯誤', requestId })</pre>
+<p>客戶截圖上的「伺服器發生錯誤，代碼 <code>5f3c…</code>」就是第二行產生的，而上一節那行 log 就是第一行寫的。兩邊靠同一個 requestId 接起來。</p>
+<p>自己要怎麼觸發一個真的 500 來驗證這件事？不用在程式裡留一個「故意丟錯」的後門，那種東西很容易忘了拿掉、跟著上線。用一個真實存在的漏洞就好：PostgreSQL 的 <code>text</code> 不能存 NUL 字元（<code>\u0000</code>），參考實作的 DTO 沒擋它，建立 project 時送 <code>{"name":"a\u0000b"}</code>，資料庫丟 22021，就是一個未預期的錯誤：回應是乾淨的 500，log 裡有上一節那一行完整的原因。這也就是開場那位客戶遇到的情況：他貼上的專案名稱裡夾了一個 NUL 字元。查到原因之後，正確的修法是在 DTO 驗證擋掉它，讓它變成預期內的 400，所以練習 3 兩種結果都接受。</p>
+<p>這條分工最常被兩種寫法破壞。第一種是「開發時方便」：<code>NODE_ENV !== 'production'</code> 就把 stack 與 <code>exception.message</code> 放進回應。問題在於 staging、demo 環境的 <code>NODE_ENV</code> 常常沒設成 production，而 demo 環境正是面試官會去點的地方，Prisma 的錯誤訊息就把資料表名稱、欄位、甚至查詢參數送給使用者。練習 3 會擋下這種寫法。</p>
+<p>第二種是每一層都 <code>catch</code>、log 一次再往上丟。service log 一次、controller 又 log 一次、filter 再 log 一次，同一個錯誤在 log 裡出現三次，告警算三次，查的人看到三行不知道哪一行是源頭。規則是<strong>只在最外層（filter）log 一次</strong>，中間層要嘛處理掉、要嘛轉成 <code>ApiError</code>、要嘛不碰。這樣「一個 requestId 只有一行 error」就成立，自評清單會檢查這一點。</p>
+<p>到這裡，客戶回報的那類問題（程式有 bug）已經能從代碼一路查到原因。但正式環境還有另一類事故，跟程式碼無關：Redis 斷了。這時每個請求都會失敗，而且是在客戶回報之前，平台就應該知道。</p>
+
+<h2>不是 bug、是 Redis 斷了：平台怎麼知道別送流量過來？</h2>
+<p>上一節的錯誤處理是給人看的；這一節是給平台看的。正式環境同一個 API 通常同時跑好幾個一模一樣的程序，叫做副本（replica），負載平衡器把請求分給它們。容器平台與負載平衡器會定期打你的健康檢查端點，而且是對每個副本各自打，依結果決定兩件事，這也是 NestJS 課第 24 課的 live 與 ready：</p>
+<ul>
+  <li><strong>live</strong>：「這個程序是不是壞了、卡死了？」失敗就重啟它。所以 live 不查任何外部依賴（第 1 課），否則資料庫一斷，所有副本會一起被重啟，問題沒解決，還多了一輪重啟。</li>
+  <li><strong>ready</strong>：「這個程序現在能不能接流量？」失敗就先不送流量給它，程序保留著，恢復後再送。</li>
+</ul>
+<p>第 6 課的 ready 只查資料庫。但現在 Redis 也是必要的依賴：限流與 BullMQ 佇列都靠它，Redis 斷了，請求進來會全部 500。ready 卻還是回 200，平台照樣把流量送進來，客戶就一直看到錯誤。所以 ready 要一起查 Redis：</p>
+<pre>// src/health/health.module.ts
+@Injectable()
+class RedisHealth {
+  constructor(private readonly indicator: HealthIndicatorService, private readonly redis: RedisService) {}
+  check() {
+    return this.indicator.check('redis').attempt(async () =&gt; { await this.redis.client.ping() }).withTimeout(1000)
+  }
+}
+
+@Public() @Get('ready') @HealthCheck()
+ready() {
+  return this.health.check([() =&gt; this.db.pingCheck('database', this.prisma, { timeout: 1000 }), () =&gt; this.redis.check()])
+}</pre>
+<p><code>HealthIndicatorService</code> 是 @nestjs/terminus 12.1.0 寫自訂檢查的方式，一行由左到右讀：</p>
+<ul>
+  <li><code>check('redis')</code> 給這個檢查一個名字，結果會出現在回應的 <code>details.redis</code>。</li>
+  <li><code>attempt(…)</code> 包住真正的檢查：這裡是對 Redis 送 <code>ping</code>，丟錯就是 down。</li>
+  <li><code>withTimeout(1000)</code> 限制最多等 1 秒，一個卡住、不回應的 Redis 不會讓 ready 也跟著卡住。</li>
+</ul>
+<p>任何一個檢查是 down，<code>/health/ready</code> 就回 503。哪些依賴該放進 ready？判斷標準是「沒有它就不能服務」：資料庫、Redis 是；可以降級的（例如快取，沒有它只是變慢）不要放，否則快取一抖動，整個服務就被拉下線。</p>
+<p>健康檢查管的是「依賴斷了」，還有一種會掉請求的時機是你自己造成的：部署換版。平台換版時會對舊的程序送 SIGTERM。SIGTERM 是作業系統通知程序「請準備結束」的訊號，程序可以先收尾再退出；平台通常會等一段寬限時間，時間到還沒結束就強制終止（寬限時間怎麼設，細節見 DevOps 課）。如果程序收到 SIGTERM 就立刻結束，正在處理的請求會被砍斷，worker 手上的 job 停在一半，匯出永遠卡在 <code>running</code>。<code>main.ts</code> 的 <code>app.enableShutdownHooks()</code> 讓 Nest 收到這個訊號時才開始收尾：在寬限時間內依序停止接新請求、等 worker 做完手上的 job、關掉連線池（NestJS 課第 24 課），部署換版時不會砍斷進行中的請求。</p>
+<p>平台這一層接好了，requestId、log 欄位、錯誤處理、健康檢查都由平台程式處理。剩下的是你自己寫的業務模組：它們該記什麼？</p>
+
+<h2>套到你的業務模組：哪些事件值得記？</h2>
+<p>因為前面幾節都在平台層完成，業務模組要做的只有兩件事：該記的事件用 <code>new Logger('模組名')</code> 記（帶 id，不帶值），自己丟的錯誤用 <code>ApiError</code>（才會是乾淨的 4xx，不會變成 500）。判斷一件事值不值得記，可以問：「它出問題時，我會想搜到它嗎？」三個題目各有一個值得 log 的地方：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>題目</th><th>值得記的事件</th></tr></thead>
+  <tbody>
+    <tr><td>客服工單</td><td>SLA 到期的排程（第 13 課的背景工作）：排程不是請求，沒有 requestId。在排程開始時自己產生一個（<code>ctx.run({ requestId: randomUUID(), tenantId }, …)</code>），一次排程的所有 log 才串得起來。</td></tr>
+    <tr><td>預約排程</td><td>重疊約束擋下的預約（409）：記 <code>resourceId</code> 與時段，不記預約人的名字；這類 409 太多，可能是前端的時段列表沒有即時更新。</td></tr>
+    <tr><td>進銷存</td><td>庫存不足的出庫：記品項 id 與數量。月結報表跑多久也值得記（開始、結束、筆數），報表變慢時才有基準。</td></tr>
+  </tbody>
+</table></div>
+<p>指標（metrics）與分散式追蹤要不要也做？作品的建議範圍與理由放在課末的「補充與查表」。</p>
+
+<h2>練習</h2>
+
+<div class="local" data-test="ex1" data-files="">
+  <p>練習 1：每個回應都有 <code>x-request-id</code>（包括 401、404 與壞掉的 JSON）；沒帶時每個請求的 id 都不同；帶合法的值（1～64 個英數、<code>-</code>、<code>_</code>）會被沿用；太長、有空白或符號的值會被換掉。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="">
+  <p>練習 2：錯誤回應 body 的 <code>requestId</code> 等於回應標頭的 <code>x-request-id</code>：400 驗證失敗、401、404、壞掉的 JSON 都一樣；請求帶來的合法 id 也出現在錯誤 body。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="">
+  <p>練習 3：壞掉的 JSON 回 400 <code>VALIDATION_FAILED</code>；建立 project 時名稱含 NUL 字元，回 400（驗證擋下）或 500 <code>INTERNAL_ERROR</code>。兩種回應都不含 stack、檔案路徑、Prisma 或 PostgreSQL 的錯誤原文。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="">
+  <p>練習 4：<code>GET /health/live</code> 200；<code>GET /health/ready</code> 200，<code>details.database.status</code> 與 <code>details.redis.status</code> 都是 <code>"up"</code>。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：同事為了查一個登入問題，在 <code>AuthController.login</code> 第一行加了 <code>this.logger.log(JSON.stringify(req.body))</code>，問題解決後忘了拿掉，上線了一個月。這件事要怎麼處理？</p>
+  <label data-key="a">拿掉那一行就好，log 平台的資料只有工程師看得到</label>
+  <label data-key="b">拿掉那一行，並把 log 等級調成 warn，以後 info 等級的 log 都不會輸出</label>
+  <label data-key="c">拿掉那一行，當成密碼外洩處理：清掉或限制那段期間的 log、通知受影響的使用者重設密碼，並在 review 規則加上「不 log request body」</label>
+  <label data-key="d">不用處理，密碼在資料庫裡是雜湊過的，log 裡的也一樣</label>
+  <p class="why">✓ login 的 body 有明文密碼，一個月的 log 就是一個月的明文密碼，保存期限、備份、看得到的人都比資料庫寬。拿掉程式只停止繼續外洩，已經寫出去的要當事件處理。a 低估了 log 的擴散範圍；d 錯在雜湊是 service 收到之後才做的，log 記的是請求原文。預防方法是只記 id 與事件，要記請求就用白名單挑欄位。（第 16 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：Redis 斷線了，<code>/health/ready</code> 回 503，但 <code>/health/live</code> 仍是 200。負載平衡器與容器平台會怎麼做？</p>
+  <label data-key="a">先不把流量送到這個副本，程序保留著；Redis 回來、ready 恢復 200 後再送</label>
+  <label data-key="b">把這個副本重啟，希望重啟後連得上 Redis</label>
+  <label data-key="c">什麼都不做，ready 只是給人看的</label>
+  <label data-key="d">把流量送到這個副本，但限制每秒的請求數</label>
+  <p class="why">✓ ready 回答「現在能不能接流量」，失敗就是暫停送流量；live 回答「程序是不是壞了」，失敗才重啟。Redis 斷線不是程序壞了，重啟解決不了（b，最多人會選）。所有副本共用同一個 Redis 時，全部都會 not ready，這時該響的是告警，不是重啟。（第 16 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：客戶回報匯出一直停在 <code>running</code>，給了建立匯出那個請求的 requestId。你在 log 搜這個 id，只找到 API 那邊「已排入佇列」的一行，worker 那邊什麼都沒有。最可能的原因是？</p>
+  <label data-key="a">worker 沒有用 <code>AppLogger</code>，所以 log 不是 JSON</label>
+  <label data-key="b">job 資料裡沒有放 requestId，或 worker 沒有用它 <code>ctx.run</code>：worker 的 log 有寫出來，只是帶的是別的 id 或沒有 id</label>
+  <label data-key="c">requestId 只在 HTTP 請求裡有效，背景工作本來就查不到</label>
+  <label data-key="d">worker 跟 API 在同一個程序，log 會互相覆蓋</label>
+  <p class="why">✓ <code>AsyncLocalStorage</code> 跟著同一個非同步流程走，job 是另一個時間從 Redis 拿出來執行的，不會繼承請求的上下文。要自己把 requestId 放進 job 資料，worker 開頭 <code>ctx.run({ requestId, tenantId, userId }, …)</code>，之後的 log 就自動帶上。c 把「預設不會」當成「做不到」。先用 tenantId 或匯出 id 搜 worker 的 log，再補上 requestId 的傳遞。（第 16 課）</p>
+</div>
+
+<h2>自評清單</h2>
+<p>log 的內容黑箱測試看不到，自己確認：</p>
+<ul>
+  <li><strong>每一行都是 JSON 且帶上下文</strong>：<code>npm run start:dev</code>，登入後打一個 API，log 裡那個請求的每一行都有 <code>requestId</code>、<code>tenantId</code>、<code>userId</code>。</li>
+  <li><strong>一個 id 查到底</strong>：送 <code>x-request-id: my-test-1</code> 建立一個匯出，<code>grep my-test-1</code> 找得到 API 與 worker 兩邊的 log，以及 <code>/audit-logs</code> 裡的那一筆。</li>
+  <li><strong>log 裡沒有秘密</strong>：登入、refresh、接受邀請各做一次，在 log 裡搜你的密碼、<code>eyJ</code>（JWT 的開頭）、<code>refresh_token</code> 的值，一個都找不到。</li>
+  <li><strong>500 只 log 一次</strong>：送 NUL 字元觸發 500，那個 requestId 的 error 只有一行。</li>
+  <li><strong>ready 真的會失敗</strong>：<code>docker compose stop redis</code>，<code>/health/ready</code> 變 503、live 還是 200；啟動回來後 ready 恢復。</li>
+  <li><strong>優雅關機</strong>：建立一個匯出後立刻 Ctrl-C，log 顯示 worker 做完（或把 job 放回佇列）才結束，沒有留下永遠 <code>running</code> 的匯出。</li>
+</ul>
+
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>requestId middleware 只掛在模組上</strong>：body parser 擋下的請求（壞 JSON、太大）沒有 id，filter 填 <code>"none"</code>。在 <code>configureApp</code> 裡、body parser 之前也套一次。</li>
+  <li><strong>無條件沿用請求帶來的 id</strong>：換行與超長的值直接進 log。只接受固定格式，其他換掉。</li>
+  <li><strong>filter 自己再產生一個 id</strong>，或讀<em>請求</em>的 <code>x-request-id</code>：前者跟標頭對不上，後者在請求沒帶時是 <code>undefined</code>。從上下文或<em>回應</em>標頭拿。</li>
+  <li><strong>非 production 就回傳 stack</strong>：staging、demo 的 <code>NODE_ENV</code> 常常不是 production。回應永遠不帶，細節進 log。</li>
+  <li><strong>每一層都 catch、log、再丟</strong>：同一個錯誤 log 三次。只在 filter log 一次。</li>
+  <li><strong>ready 只查資料庫</strong>：Redis 斷了，請求進來卻全部 500。每個「沒有它就不能服務」的依賴都放進 ready；可以降級的（例如快取）不要放。</li>
+  <li><strong>把依賴放進 live</strong>：依賴一斷，所有副本一起被重啟（第 1 課）。</li>
+</ul>
+
+<h2>補充與查表</h2>
+<p><strong>指標與追蹤要做到哪裡。</strong>可觀測性除了這課做的 log，還有兩種常見的工具。指標（metrics）是定期統計的數字，例如每秒請求數、錯誤率、延遲百分位（<a href="../../devops/lessons/22-metrics-slo.html">DevOps 課第 22 課</a>），用來畫圖與設告警，回答「整體現在好不好」。分散式追蹤（OpenTelemetry，DevOps 課第 23 課）把一個請求經過的每個服務、每段耗時串成一條時間軸，回答「這個請求慢在哪一段」。作品的建議範圍：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>項目</th><th>作品</th><th>理由</th></tr></thead>
+  <tbody>
+    <tr><td>requestId＋結構化 log＋health</td><td>必做</td><td>成本低，面試一定會問「出事怎麼查」</td></tr>
+    <tr><td>優雅關機</td><td>必做</td><td>一行 <code>enableShutdownHooks()</code>，換版不掉請求</td></tr>
+    <tr><td>指標（Prometheus 格式的 <code>/metrics</code>）</td><td>選做</td><td>要有地方收集與畫圖才有意義；demo 環境通常沒有</td></tr>
+    <tr><td>OpenTelemetry 追蹤</td><td>選做，寫 ADR</td><td>API 與 worker 同一個程序時，requestId 已經串得起來；拆成多個服務才真的需要</td></tr>
+  </tbody>
+</table></div>
+<p>ADR 是你 repo 裡記錄架構決策的短文件：當時的情況、做了什麼決定、為什麼。選做的部分不做也沒關係，但要寫進 ADR：「目前只有一個程序，requestId 串得起來；拆出 worker 服務時加 OpenTelemetry」。面試官看到的是你知道下一步在哪，而不是缺了什麼。</p>
+
+<h2>小結</h2>
+<ul>
+  <li>可觀測性的目標是拿到客戶給的一串代碼，就查得到那次請求發生了什麼。</li>
+  <li>requestId 由 middleware 決定一次：合法的沿用、不合法的換掉（防 log injection 與超長值）；之後回應標頭、錯誤 body、log、job、稽核都從上下文讀，背景工作要把它放進 job 資料再用 <code>ctx.run</code> 接回來。</li>
+  <li>middleware 的順序決定誰拿得到它：requestId 與 helmet 放在 body parser 之前，壞掉的 JSON 也有；模組那次沿用回應標頭的 id、重開 store。</li>
+  <li><code>AppLogger</code>（<code>json: true</code>＋覆寫 <code>getJsonLogObject</code>）讓每一行自動帶 requestId、tenantId、userId；log 只記 id 與事件，要記請求就用白名單，不記密碼、token、body。</li>
+  <li>未預期的錯誤一律 500 <code>INTERNAL_ERROR</code>，回應不帶細節，只在 filter log 一次。</li>
+  <li>ready 查所有必要的依賴（資料庫、Redis），live 不查；<code>enableShutdownHooks()</code> 讓換版不掉請求。</li>
+  <li>指標與追蹤是選做，不做就寫 ADR 說明什麼時候要做。</li>
+</ul>
+<p>下一課把作品送上線：CI 跑完整的測試、映像用 commit SHA 標記、migration 是獨立的一步，部署後自動跑冒煙測試。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

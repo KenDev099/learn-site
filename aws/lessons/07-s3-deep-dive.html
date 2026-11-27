@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>7. S3 深入：policy、版本、加密、靜態網站與 CloudFront OAC</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="7" data-practice="aws">
+<header>
+  <div class="eyebrow">階段 4：資料與機密 · 第 7 課</div>
+  <h1>S3 深入：policy、版本、加密、靜態網站與 CloudFront OAC</h1>
+</header>
+<main>
+
+<p>咖啡店的 Vue 前端要放上 S3。網頁一直顯示 403，有人上網找到一篇教學，關掉 Block Public Access、在 bucket policy 寫了 <code>"Principal": "*"</code>、<code>"Resource": "arn:aws:s3:::cafe-web/*"</code>，網頁終於出來了。三個月後資安掃描發現：同一個 bucket 的 <code>receipts/</code> 資料夾放著客人的收據 PDF，任何人知道網址都能下載。同一週，實習生清理舊檔時刪掉了整個 <code>receipts/2026-11/</code>。</p>
+<p>data-stores 課第 12 課已經教過 S3 的基本用法、presigned URL 與生命週期。這一課補上正式環境一定會碰到的四件事：誰能讀一個物件（三種權限與 Block Public Access）、Vue 網站怎麼放才不必公開 bucket（CloudFront＋OAC）、誤刪怎麼救（版本控制）、資料怎麼加密並強制 HTTPS。</p>
+<p>這課的路線：</p>
+<ul>
+  <li>誰能讀這個物件：IAM policy、bucket policy、ACL，以及 S3 怎麼判斷一個 bucket 是「公開」的。</li>
+  <li>Vue 網站放 S3：website endpoint 與 CloudFront＋OAC 的差別，SPA 的路由怎麼處理。</li>
+  <li>版本控制：刪除其實是加上 delete marker，救回來是把 marker 刪掉。</li>
+  <li>加密與 HTTPS：SSE-S3、SSE-KMS、bucket key，以及用 policy 拒絕非 HTTPS 的請求。</li>
+</ul>
+
+<div class="callout"><strong>這課會用到：</strong>data-stores 課<a href="../../data-stores/lessons/12-object-storage.html">第 12 課</a>的 bucket、key、presigned URL 與生命週期規則（依 prefix 與天數自動刪除）；<a href="02-account-iam.html">第 2 課</a>的身分型與資源型 policy（同帳號取聯集、跨帳號兩邊都要允許，明確的 Deny 最優先）；<a href="04-edge.html">第 4 課</a>的 CloudFront（edge 快取、TTL、invalidation）。</div>
+
+<div class="callout warn"><strong>練習環境：</strong>模擬器預設不評估 IAM 權限，但這課實測到它<strong>會</strong>套用 bucket policy 裡的 Deny：模擬器走 HTTP，你寫的「拒絕非 HTTPS」會真的把請求擋下來（練習 2）。「公不公開」用頁面上的練習判斷。</div>
+
+<h2>誰能讀這個物件：三種權限與 Block Public Access</h2>
+<p>一個 S3 請求能不能成功，會看三個地方：</p>
+<div class="table-wrap"><table>
+  <tr><th>機制</th><th>掛在哪裡</th><th>回答的問題</th></tr>
+  <tr><td>IAM policy（身分型）</td><td>role、使用者</td><td>這個身分能對哪些 bucket 做什麼</td></tr>
+  <tr><td>bucket policy（資源型）</td><td>bucket 本身</td><td>誰（可以是別的帳號、AWS 服務、所有人）能對這個 bucket 做什麼</td></tr>
+  <tr><td>ACL（存取控制清單）</td><td>bucket 或單一物件</td><td>舊機制。新 bucket 預設 Object Ownership 是 <code>BucketOwnerEnforced</code>：ACL 停用，物件一律屬於 bucket 擁有者</td></tr>
+</table></div>
+<p>評估規則就是第 2 課那一套：同帳號的 role 只要 IAM policy 或 bucket policy 其中一邊允許就行；別的帳號要兩邊都允許；任何一邊有明確的 Deny 就拒絕。ACL 保持停用，權限只在 policy 裡看。</p>
+<p>開場那個 bucket policy 的問題出在 <code>"Principal": "*"</code> 搭配整個 bucket 的 <code>/*</code>：它允許<strong>所有人</strong>讀<strong>所有物件</strong>，收據也包含在內。S3 為了擋這種事故，有一組 <strong>Block Public Access</strong>（BPA）設定。新 bucket 預設四個都開著，可以設在 bucket，也可以設在整個帳號：</p>
+<div class="table-wrap"><table>
+  <tr><th>設定</th><th>開啟後</th></tr>
+  <tr><td><code>BlockPublicAcls</code></td><td>拒絕設定公開 ACL 的請求</td></tr>
+  <tr><td><code>IgnorePublicAcls</code></td><td>已經存在的公開 ACL 一律不算數</td></tr>
+  <tr><td><code>BlockPublicPolicy</code></td><td>拒絕會讓 bucket 變成公開的 PutBucketPolicy</td></tr>
+  <tr><td><code>RestrictPublicBuckets</code></td><td>bucket policy 就算是公開的，也只有 AWS 服務與本帳號的身分能存取，匿名與其他帳號都被擋</td></tr>
+</table></div>
+<p>前兩個管 ACL，後兩個管 bucket policy。那什麼叫「公開的 bucket policy」？依官方文件「The meaning of public」（2026-11-20 查證），S3 先假設 policy 是公開的，只有每個允許所有人（<code>Principal</code> 是 <code>*</code>）的 statement 都被下列條件鍵之一<strong>限定到固定值</strong>（不含 <code>*</code>、<code>?</code> 萬用字元）時，才算不公開：</p>
+<ul>
+  <li><code>aws:SourceArn</code>、<code>aws:SourceAccount</code>、<code>aws:SourceOwner</code>：請求代表哪個資源、哪個帳號發出（例如某個 CloudFront distribution）。</li>
+  <li><code>aws:SourceVpc</code>、<code>aws:SourceVpce</code>：請求從哪個 VPC 或 VPC endpoint 來（第 3 課）。</li>
+  <li><code>aws:PrincipalOrgID</code>：呼叫者屬於哪個 AWS Organization。</li>
+  <li><code>aws:SourceIp</code>：來源 IP，但範圍太大（IPv4 比 /8 還寬）仍算公開。</li>
+</ul>
+<p>反過來，<code>Principal</code> 寫的是某個帳號、某個 role、或 <code>{ "Service": "cloudfront.amazonaws.com" }</code> 這種 AWS 服務，就不是「所有人」。<code>Effect: Deny</code> 的 statement 只會收緊，也不會讓 bucket 變公開。練習 1 把這套判斷寫成函式。</p>
+<p>開場的正確做法是：BPA 四個保持全開，網站要能被看到，交給下一節的 CloudFront；收據放另一個 bucket，不要跟公開內容共用。</p>
+<div class="callout practice"><strong>💡 實務上：帳號層級的 BPA 是最後一道防線</strong><br>bucket 層級的 BPA 有權限的人就能關掉，帳號層級的 BPA 開著時，任何 bucket 都公開不了（S3 取最嚴格的組合）。多數公司在所有帳號開啟帳號層級的 BPA，真的需要公開內容就一律走 CloudFront。新人第一次遇到「網頁 403」時，資深的回應不是「把 BPA 關掉」，而是「這個內容要給誰看？走 CloudFront 還是 presigned URL？」。IAM Access Analyzer 也會列出帳號裡對外公開或分享給其他帳號的 bucket，可以定期看一次。</div>
+
+<h2>Vue 網站放 S3：website endpoint 與 CloudFront＋OAC</h2>
+<p>上一節的結論是 bucket 不公開，那 Vue 網站怎麼讓客人看到？S3 有兩種做法：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>S3 website endpoint</th><th>CloudFront＋OAC</th></tr>
+  <tr><td>bucket 要公開嗎</td><td>要：只能提供公開可讀的內容</td><td>不用：bucket 保持私有，只讓這個 distribution 讀</td></tr>
+  <tr><td>HTTPS</td><td>不支援（官方文件明講 website endpoint 不支援 HTTPS）</td><td>支援，憑證用第 4 課的 ACM（us-east-1）</td></tr>
+  <tr><td>快取與速度</td><td>每個請求都到 S3</td><td>edge 快取，離客人近</td></tr>
+  <tr><td>適合</td><td>不在乎 HTTPS 的內部展示</td><td>正式環境的網站</td></tr>
+</table></div>
+<p><strong>OAC</strong>（Origin Access Control）讓 CloudFront 用 SigV4 簽名（第 1 課）向 S3 取檔，bucket policy 只允許「CloudFront 服務、而且是代表這一個 distribution」：</p>
+<pre>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "AllowCloudFrontOAC",
+    "Effect": "Allow",
+    "Principal": { "Service": "cloudfront.amazonaws.com" },
+    "Action": "s3:GetObject",
+    "Resource": "arn:aws:s3:::cafe-web/*",
+    "Condition": { "StringEquals": {
+      "AWS:SourceArn": "arn:aws:cloudfront::123456789012:distribution/E2ABC123" } }
+  }]
+}</pre>
+<ul>
+  <li><strong>Principal 是 CloudFront 服務</strong>，不是 <code>*</code>：這份 policy 不公開，BPA 全開也放得進去。</li>
+  <li><strong>條件用 <code>AWS:SourceArn</code> 指定 distribution</strong>：只寫 Principal 的話，任何人自己建一個 CloudFront distribution 指向你的 bucket 都讀得到。用 <code>AWS:SourceAccount</code> 只限到帳號，同帳號的其他 distribution 仍然可以。</li>
+  <li><strong>Resource 要有 <code>/*</code></strong>：<code>s3:GetObject</code> 作用在物件上，寫 <code>arn:aws:s3:::cafe-web</code>（bucket 本身）對讀檔沒有效果。</li>
+</ul>
+<p>官方文件另外提醒三點：OAC 的 origin 必須是一般的 bucket，不能是 website endpoint；Object Ownership 要是 BucketOwnerEnforced；物件用 SSE-KMS 加密時，KMS key policy 也要允許 CloudFront（後面加密那一節）。</p>
+<p>Vue 是單頁應用（SPA，<a href="../../vue/lessons/19-routing.html">Vue 課第 19 課</a>）：客人直接打開 <code>https://cafe.example.com/menu/latte</code>，CloudFront 去 S3 拿 <code>menu/latte</code> 這個 key，它不存在。CloudFront 沒有 <code>s3:ListBucket</code> 權限，S3 回的是 403 而不是 404（不讓沒有列表權限的人試出哪些 key 存在）。常見的處理是在 distribution 設定<strong>自訂錯誤回應</strong>：把 403 和 404 改成回傳 <code>/index.html</code>、狀態碼 200，交給 vue-router 處理路由。快取也要分開設：<code>index.html</code> 的 TTL 短（或不快取），Vite 打包出來、檔名帶雜湊的 JS、CSS 可以快取很久，部署新版時只要 invalidate <code>/index.html</code>。</p>
+<div class="callout practice"><strong>💡 實務上：部署 Vue SPA 的那一條 pipeline</strong><br>常見的流程是 CI 執行 <code>vite build</code>，把 <code>dist/</code> 同步到私有 bucket（雜湊檔設長快取、<code>index.html</code> 設 no-cache），最後對 CloudFront invalidate <code>/index.html</code>。要注意的坑：自訂錯誤回應套用在整個 distribution，如果同一個 distribution 也把 <code>/api/*</code> 轉到後端，API 的 404 會被改成 index.html，前端拿到一頁 HTML 而不是錯誤 JSON。API 用另一個 distribution 或另一個網域，或改用 CloudFront Functions 只對沒有副檔名的路徑改寫。</div>
+
+<h2>版本控制：刪除其實是加上一個 marker</h2>
+<p>網站放好了，回到開場的第二件事：<code>receipts/2026-11/</code> 被刪了。bucket 開了<strong>版本控制</strong>（versioning）時，每次覆蓋都保留舊版本，每個版本有自己的 <code>VersionId</code>。刪除則分兩種：</p>
+<ul>
+  <li><strong>不帶 VersionId 的 DeleteObject</strong>（主控台、<code>aws s3 rm</code>、一般程式的刪除）：不會真的刪資料，而是在最上面加一個 <strong>delete marker</strong>（刪除標記），讓它成為「目前版本」。之後 GetObject 回 404（NoSuchKey），ListObjectsV2 也看不到它，但舊版本都還在。</li>
+  <li><strong>帶 VersionId 的 DeleteObject</strong>：永久刪除那一個版本（或那一個 marker），救不回來。</li>
+</ul>
+<p>所以救回誤刪的檔案，是<strong>刪掉那個 delete marker</strong>：marker 不見了，它下面最新的資料版本重新成為目前版本，內容、metadata、VersionId 都跟刪除前一樣，也不會多出新版本。按執行，看一個 key 的版本堆疊怎麼變化：</p>
+<div class="lab"><script type="code">
+// 一個 key 的版本，第一個是目前版本（示範：用陣列模擬 S3 的行為）
+type V = { id: string, marker: boolean, body?: string }
+const stack: V[] = []
+const put = (id: string, body: string) => stack.unshift({ id, marker: false, body })
+const del = (id: string) => stack.unshift({ id, marker: true })
+const get = () => stack[0] && !stack[0].marker ? stack[0].body : '404 NoSuchKey'
+const show = (label: string) => console.log(label.padEnd(16), '目前：', get(), '｜堆疊：', stack.map(v => v.marker ? `[${v.id} marker]` : `${v.id}=${v.body}`).join(' '))
+
+put('v1', '收據 A'); show('上傳 v1')
+put('v2', '收據 A（更正）'); show('覆蓋成 v2')
+del('m1'); show('刪除（加 marker）')
+stack.splice(stack.findIndex(v => v.id === 'm1'), 1); show('刪掉 marker')
+</script></div>
+<p>要找出一個資料夾裡所有被刪的檔案，用 <code>ListObjectVersions</code>：它把資料版本放在 <code>Versions</code>、marker 放在 <code>DeleteMarkers</code>，每一筆都有 <code>IsLatest</code>。<code>IsLatest</code> 為 true 的 marker 才是「目前被刪掉」的；以前刪過又重新上傳的檔案，舊 marker 的 IsLatest 是 false，不能動。一頁最多回傳 1,000 筆，<code>IsTruncated</code> 為 true 時要帶 <code>NextKeyMarker</code> 與 <code>NextVersionIdMarker</code> 繼續列。練習 3 就寫這個還原程式。</p>
+<p>版本控制的代價是每個舊版本都照樣收儲存費。所以開了版本控制，生命週期規則（data-stores 第 12 課）通常要加一條 <code>NoncurrentVersionExpiration</code>：「變成舊版本 N 天後刪除」，給自己 N 天的反悔期。另外兩個要知道的行為：版本控制一旦開啟就關不掉，只能暫停（Suspended）；S3 對寫入與刪除提供強一致的讀取，上傳或刪除成功之後，接下來的讀取與列表馬上看得到結果。</p>
+<div class="callout practice"><strong>💡 實務上：誤刪先別急著重新上傳</strong><br>收到「檔案不見了」的回報，資深工程師的順序是：先確認 bucket 有沒有開版本控制，用 ListObjectVersions 看那個 prefix 的 delete marker 是誰、什麼時候加的（CloudTrail 的 data event 要另外開，第 2 課），再刪 marker 還原。不要從備份或本機重新上傳：VersionId 會變、metadata 可能不一樣，也多付一份儲存。重要的 bucket 另外用 Object Lock 或複寫到別的帳號，防止有權限的人連舊版本一起永久刪除。</div>
+
+<h2>加密與強制 HTTPS</h2>
+<p>最後是資料在磁碟上與傳輸中的保護。S3 的伺服器端加密（SSE，server-side encryption）有兩種常用的：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>SSE-S3</th><th>SSE-KMS</th></tr>
+  <tr><td>金鑰</td><td>S3 管理，你看不到</td><td>KMS 裡的 key（<a href="09-kms-secrets.html">第 9 課</a>），可以是你自己管理的 key</td></tr>
+  <tr><td>預設</td><td>新物件預設就用它（data-stores 第 12 課）</td><td>要在 bucket 的預設加密設定</td></tr>
+  <tr><td>誰能讀</td><td>有 S3 權限就能讀</td><td>要有 S3 權限<strong>而且</strong>有那把 key 的 <code>kms:Decrypt</code>（上傳要 <code>kms:GenerateDataKey</code>）</td></tr>
+  <tr><td>稽核</td><td>—</td><td>每次用 key 都記在 CloudTrail，key policy 可以再收緊誰能解密</td></tr>
+</table></div>
+<p>SSE-KMS 多了一層「拿得到檔案也要拿得到 key」的控制，有稽核或法規要求時用它。代價是每次讀寫都要呼叫 KMS，請求多時有費用與 KMS 的請求速率上限。<strong>bucket key</strong> 解決這件事：S3 向 KMS 拿一把短期的 bucket 層級金鑰，用它替多個物件產生資料金鑰，官方說可以減少最多 99% 的 KMS 請求費用（2026-11-20 查證）。開啟後 KMS 看到的 encryption context 變成 bucket 的 ARN 而不是物件的 ARN，原本依物件 ARN 寫的 key policy 條件要跟著改。</p>
+<pre>await s3.send(new PutBucketEncryptionCommand({
+  Bucket: 'cafe-web',
+  ServerSideEncryptionConfiguration: { Rules: [{
+    ApplyServerSideEncryptionByDefault: { SSEAlgorithm: 'aws:kms', KMSMasterKeyID: keyArn },
+    BucketKeyEnabled: true,
+  }] },
+}))</pre>
+<p>傳輸中的保護是只接受 HTTPS。寫法是一條 <strong>Deny</strong>：</p>
+<pre>{
+  "Sid": "DenyInsecureTransport",
+  "Effect": "Deny",
+  "Principal": "*",
+  "Action": "s3:*",
+  "Resource": ["arn:aws:s3:::cafe-web", "arn:aws:s3:::cafe-web/*"],
+  "Condition": { "Bool": { "aws:SecureTransport": "false" } }
+}</pre>
+<p>為什麼一定要用 Deny？如果寫成「Allow，條件是 SecureTransport 為 true」，它只是多給了一條允許的路；同帳號的 role 透過自己的 IAM policy 早就被允許了，走 HTTP 的請求照樣成功。只有明確的 Deny 能蓋過所有的 Allow。Resource 要同時寫 bucket 本身與 <code>/*</code>，ListBucket 這類 bucket 層級的動作才也被涵蓋。這條 statement 雖然 Principal 是 <code>*</code>，但它是 Deny，不會讓 bucket 變公開，BPA 全開也放得進去。</p>
+<div class="callout practice"><strong>💡 實務上：SSE-KMS 的 bucket，權限要給兩份</strong><br>bucket 改成 SSE-KMS 之後，最常見的事故是「程式的 role 明明有 s3:GetObject，卻突然 AccessDenied」：少了那把 key 的 kms:Decrypt。資深的檢查清單是：讀的 role 有 s3:GetObject＋kms:Decrypt，寫的 role 有 s3:PutObject＋kms:GenerateDataKey，KMS 的 key policy 也允許它們（跨帳號時兩邊都要）；CloudFront OAC 讀 KMS 加密的檔案，key policy 也要加 CloudFront 服務並用 SourceArn 限定 distribution。改加密設定前先把這張表對一遍。</div>
+
+<h2>在真的 AWS 帳號上做一次（選做）</h2>
+<p>這一節不判分，也不影響進度。用第 1 課建議的獨立練習帳號。開一個有版本控制的 bucket，親手刪除一個檔案再把它救回來。</p>
+<div class="callout warn"><strong>費用：</strong>計費項目：S3 的儲存量（每個版本都算）與請求數。這一節只放幾個小檔案，做完全部刪除。金額見 <a href="https://aws.amazon.com/s3/pricing/">S3 定價頁</a>。</div>
+<pre># 1. 建 bucket 並開版本控制（region 換成你 profile 的 region）
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text --profile learn-sandbox)
+BUCKET=cafe-learn-versions-$ACCOUNT
+aws s3api create-bucket --bucket $BUCKET --create-bucket-configuration LocationConstraint=ap-northeast-1 --profile learn-sandbox
+aws s3api put-bucket-versioning --bucket $BUCKET --versioning-configuration Status=Enabled --profile learn-sandbox
+
+# 2. 上傳兩版，再刪除
+echo '{"latte":110}' > menu.json
+aws s3api put-object --bucket $BUCKET --key menu.json --body menu.json --profile learn-sandbox
+echo '{"latte":120}' > menu.json
+aws s3api put-object --bucket $BUCKET --key menu.json --body menu.json --profile learn-sandbox
+aws s3api delete-object --bucket $BUCKET --key menu.json --profile learn-sandbox
+
+# 3. 看版本堆疊：兩個資料版本、一個 IsLatest 為 true 的 delete marker
+aws s3api list-object-versions --bucket $BUCKET --prefix menu.json \
+  --query '{versions: Versions[].[VersionId,IsLatest], markers: DeleteMarkers[].[VersionId,IsLatest]}' --profile learn-sandbox
+
+# 4. 刪掉 marker（&lt;markerId&gt; 換成上一步 markers 的 VersionId），再讀：應該是 {"latte":120}
+aws s3api delete-object --bucket $BUCKET --key menu.json --version-id &lt;markerId&gt; --profile learn-sandbox
+aws s3api get-object --bucket $BUCKET --key menu.json restored.json --profile learn-sandbox && cat restored.json</pre>
+<h3>清除</h3>
+<pre># 有版本的 bucket 要先刪掉每一個版本（&lt;versionId&gt; 依第 3 步的清單逐一替換）
+aws s3api delete-object --bucket $BUCKET --key menu.json --version-id &lt;versionId&gt; --profile learn-sandbox
+aws s3api delete-bucket --bucket $BUCKET --profile learn-sandbox
+aws s3api list-buckets --query "Buckets[?Name=='$BUCKET'].Name" --profile learn-sandbox     # 確認：空清單</pre>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：寫三個函式。(1) <code>oacBucketPolicy(bucket, distributionArn)</code>：回傳上面那份 OAC 的 bucket policy（Sid 用 <code>AllowCloudFrontOAC</code>，條件鍵寫 <code>AWS:SourceArn</code>）。(2) <code>isPublicPolicy(policy)</code>：有任何一個 statement 是 <code>Allow</code>、Principal 是所有人（<code>'*'</code>，或 <code>{ AWS: '*' }</code>、<code>{ AWS: [...] }</code> 裡含 <code>'*'</code>），而且<strong>沒有</strong>被固定值的條件限定，就回傳 true。「被固定值的條件限定」是指 Condition 裡任一個運算子底下，有一個條件鍵（不分大小寫）屬於 <code>aws:SourceArn</code>、<code>aws:SourceAccount</code>、<code>aws:SourceOwner</code>、<code>aws:SourceVpc</code>、<code>aws:SourceVpce</code>、<code>aws:PrincipalOrgID</code>，而且它的值（字串或陣列）都不含 <code>*</code> 或 <code>?</code>。（這題不處理 aws:SourceIp。）(3) <code>effectivelyPublic(policy, bpa)</code>：policy 是公開的、而且 <code>bpa.RestrictPublicBuckets</code> 沒開，才回傳 true。</p>
+  <script type="start">
+type Principal = '*' | { AWS?: string | string[], Service?: string | string[] }
+type Statement = {
+  Sid?: string, Effect: 'Allow' | 'Deny', Principal: Principal,
+  Action: string | string[], Resource: string | string[],
+  Condition?: Record<string, Record<string, string | string[]>>
+}
+type Policy = { Version: string, Statement: Statement[] }
+
+function oacBucketPolicy(bucket: string, distributionArn: string): Policy {
+  return { Version: '2012-10-17', Statement: [] }
+}
+
+function isPublicPolicy(policy: Policy): boolean {
+  return false
+}
+
+function effectivelyPublic(policy: Policy, bpa: { RestrictPublicBuckets: boolean }): boolean {
+  return false
+}
+
+console.log(JSON.stringify(oacBucketPolicy('cafe-web', 'arn:aws:cloudfront::123456789012:distribution/E2ABC123'), null, 2))
+</script>
+  <script type="answer">
+type Principal = '*' | { AWS?: string | string[], Service?: string | string[] }
+type Statement = {
+  Sid?: string, Effect: 'Allow' | 'Deny', Principal: Principal,
+  Action: string | string[], Resource: string | string[],
+  Condition?: Record<string, Record<string, string | string[]>>
+}
+type Policy = { Version: string, Statement: Statement[] }
+
+function oacBucketPolicy(bucket: string, distributionArn: string): Policy {
+  return {
+    Version: '2012-10-17',
+    Statement: [{
+      Sid: 'AllowCloudFrontOAC',
+      Effect: 'Allow',
+      Principal: { Service: 'cloudfront.amazonaws.com' },
+      Action: 's3:GetObject',
+      Resource: `arn:aws:s3:::${bucket}/*`,
+      Condition: { StringEquals: { 'AWS:SourceArn': distributionArn } },
+    }],
+  }
+}
+
+const RESTRICTING = ['aws:sourcearn', 'aws:sourceaccount', 'aws:sourceowner', 'aws:sourcevpc', 'aws:sourcevpce', 'aws:principalorgid']
+
+function everyone(p: Principal): boolean {
+  if (p === '*') return true
+  return [p.AWS ?? []].flat().includes('*')
+}
+
+function restricted(cond: Statement['Condition']): boolean {
+  for (const keys of Object.values(cond ?? {})) {
+    for (const [key, value] of Object.entries(keys)) {
+      const fixed = [value].flat().every(v => !/[*?]/.test(v))
+      if (RESTRICTING.includes(key.toLowerCase()) && fixed) return true
+    }
+  }
+  return false
+}
+
+function isPublicPolicy(policy: Policy): boolean {
+  return policy.Statement.some(s => s.Effect === 'Allow' && everyone(s.Principal) && !restricted(s.Condition))
+}
+
+function effectivelyPublic(policy: Policy, bpa: { RestrictPublicBuckets: boolean }): boolean {
+  return isPublicPolicy(policy) && !bpa.RestrictPublicBuckets
+}
+
+console.log(JSON.stringify(oacBucketPolicy('cafe-web', 'arn:aws:cloudfront::123456789012:distribution/E2ABC123'), null, 2))
+</script>
+  <script type="tests">
+const dist = 'arn:aws:cloudfront::123456789012:distribution/E2ABC123'
+const oac = oacBucketPolicy('cafe-web', dist)
+assert.equal(oac.Version, '2012-10-17', 'Version 用 2012-10-17')
+assert.equal(oac.Statement.length, 1, 'OAC policy 只要一個 statement')
+const st = oac.Statement[0]
+assert.equal(st.Sid, 'AllowCloudFrontOAC', 'Sid 用 AllowCloudFrontOAC')
+assert.equal(st.Effect, 'Allow', 'Effect 是 Allow')
+assert.deepEqual(st.Principal, { Service: 'cloudfront.amazonaws.com' }, 'Principal 是 CloudFront 服務，不是 *')
+assert.equal(st.Action, 's3:GetObject', 'Action 只給 s3:GetObject')
+assert.equal(st.Resource, 'arn:aws:s3:::cafe-web/*', 'Resource 要有 /*：GetObject 作用在物件上')
+assert.deepEqual(st.Condition, { StringEquals: { 'AWS:SourceArn': dist } }, '條件用 StringEquals 的 AWS:SourceArn 指定這一個 distribution（SourceAccount 只限到帳號）')
+assert.equal(oacBucketPolicy('cafe-assets', dist).Statement[0].Resource, 'arn:aws:s3:::cafe-assets/*', 'bucket 名稱要用參數')
+
+const allow = (Principal: Principal, Condition?: Statement['Condition']): Policy =>
+  ({ Version: '2012-10-17', Statement: [{ Effect: 'Allow', Principal, Action: 's3:GetObject', Resource: 'arn:aws:s3:::cafe-web/*', ...(Condition ? { Condition } : {}) }] })
+assert.equal(isPublicPolicy(oac), false, 'OAC 的 Principal 是 AWS 服務，不是所有人')
+assert.equal(isPublicPolicy(allow('*')), true, '開場的寫法：Principal * 沒有條件，是公開的')
+assert.equal(isPublicPolicy(allow({ AWS: '*' })), true, '{ AWS: "*" } 也是所有人')
+assert.equal(isPublicPolicy(allow({ AWS: ['arn:aws:iam::111122223333:root', '*'] })), true, '陣列裡有 * 也是所有人')
+assert.equal(isPublicPolicy(allow({ AWS: 'arn:aws:iam::111122223333:root' })), false, '指定帳號不是公開')
+assert.equal(isPublicPolicy(allow('*', { StringEquals: { 'aws:SourceVpce': 'vpce-0a1b2c' } })), false, '限定固定的 VPC endpoint：不公開')
+assert.equal(isPublicPolicy(allow('*', { StringEquals: { 'AWS:SourceAccount': '123456789012' } })), false, '條件鍵不分大小寫')
+assert.equal(isPublicPolicy(allow('*', { StringLike: { 'aws:SourceVpc': 'vpc-*' } })), true, '值有萬用字元就不是固定值：任何 VPC 都符合，仍是公開')
+assert.equal(isPublicPolicy(allow('*', { StringEquals: { 'aws:PrincipalOrgID': ['o-cafe1', 'o-cafe?'] } })), true, '陣列裡有一個值含萬用字元就不算固定')
+assert.equal(isPublicPolicy(allow('*', { StringEquals: { 'aws:UserAgent': 'cafe-app' } })), true, 'User-Agent 是請求者自己填的，不在限定清單裡：仍是公開')
+assert.equal(isPublicPolicy({ Version: '2012-10-17', Statement: [{ Effect: 'Deny', Principal: '*', Action: 's3:*', Resource: ['arn:aws:s3:::cafe-web', 'arn:aws:s3:::cafe-web/*'], Condition: { Bool: { 'aws:SecureTransport': 'false' } } }] }), false,
+  'Deny 的 statement 只會收緊，不會讓 bucket 公開')
+assert.equal(isPublicPolicy({ Version: '2012-10-17', Statement: [...oac.Statement, ...allow('*').Statement] }), true, '任何一個 statement 公開，整份就是公開的')
+assert.equal(effectivelyPublic(allow('*'), { RestrictPublicBuckets: true }), false, 'RestrictPublicBuckets 開著：公開的 policy 也只剩 AWS 服務與本帳號能用')
+assert.equal(effectivelyPublic(allow('*'), { RestrictPublicBuckets: false }), true, 'RestrictPublicBuckets 沒開：真的公開')
+assert.equal(effectivelyPublic(oac, { RestrictPublicBuckets: false }), false, 'policy 本身不公開就不是公開')
+</script>
+  <script type="wrong">
+type Principal = '*' | { AWS?: string | string[], Service?: string | string[] }
+type Statement = { Sid?: string, Effect: 'Allow' | 'Deny', Principal: Principal, Action: string | string[], Resource: string | string[], Condition?: Record<string, Record<string, string | string[]>> }
+type Policy = { Version: string, Statement: Statement[] }
+// OAC 的條件用 SourceAccount：同帳號的任何 distribution 都能讀
+function oacBucketPolicy(bucket: string, distributionArn: string): Policy {
+  const account = distributionArn.split(':')[4]
+  return { Version: '2012-10-17', Statement: [{ Sid: 'AllowCloudFrontOAC', Effect: 'Allow', Principal: { Service: 'cloudfront.amazonaws.com' }, Action: 's3:GetObject', Resource: `arn:aws:s3:::${bucket}/*`, Condition: { StringEquals: { 'AWS:SourceAccount': account } } }] }
+}
+const RESTRICTING = ['aws:sourcearn', 'aws:sourceaccount', 'aws:sourceowner', 'aws:sourcevpc', 'aws:sourcevpce', 'aws:principalorgid']
+function isPublicPolicy(policy: Policy): boolean {
+  return policy.Statement.some(s => s.Effect === 'Allow' && (s.Principal === '*' || [s.Principal.AWS ?? []].flat().includes('*')) &&
+    !Object.values(s.Condition ?? {}).some(k => Object.entries(k).some(([key, v]) => RESTRICTING.includes(key.toLowerCase()) && [v].flat().every(x => !/[*?]/.test(x)))))
+}
+function effectivelyPublic(policy: Policy, bpa: { RestrictPublicBuckets: boolean }): boolean { return isPublicPolicy(policy) && !bpa.RestrictPublicBuckets }
+</script>
+  <script type="wrong">
+type Principal = '*' | { AWS?: string | string[], Service?: string | string[] }
+type Statement = { Sid?: string, Effect: 'Allow' | 'Deny', Principal: Principal, Action: string | string[], Resource: string | string[], Condition?: Record<string, Record<string, string | string[]>> }
+type Policy = { Version: string, Statement: Statement[] }
+// Resource 漏了 /*
+function oacBucketPolicy(bucket: string, distributionArn: string): Policy {
+  return { Version: '2012-10-17', Statement: [{ Sid: 'AllowCloudFrontOAC', Effect: 'Allow', Principal: { Service: 'cloudfront.amazonaws.com' }, Action: 's3:GetObject', Resource: `arn:aws:s3:::${bucket}`, Condition: { StringEquals: { 'AWS:SourceArn': distributionArn } } }] }
+}
+const RESTRICTING = ['aws:sourcearn', 'aws:sourceaccount', 'aws:sourceowner', 'aws:sourcevpc', 'aws:sourcevpce', 'aws:principalorgid']
+function isPublicPolicy(policy: Policy): boolean {
+  return policy.Statement.some(s => s.Effect === 'Allow' && (s.Principal === '*' || [s.Principal.AWS ?? []].flat().includes('*')) &&
+    !Object.values(s.Condition ?? {}).some(k => Object.entries(k).some(([key, v]) => RESTRICTING.includes(key.toLowerCase()) && [v].flat().every(x => !/[*?]/.test(x)))))
+}
+function effectivelyPublic(policy: Policy, bpa: { RestrictPublicBuckets: boolean }): boolean { return isPublicPolicy(policy) && !bpa.RestrictPublicBuckets }
+</script>
+  <script type="wrong">
+type Principal = '*' | { AWS?: string | string[], Service?: string | string[] }
+type Statement = { Sid?: string, Effect: 'Allow' | 'Deny', Principal: Principal, Action: string | string[], Resource: string | string[], Condition?: Record<string, Record<string, string | string[]>> }
+type Policy = { Version: string, Statement: Statement[] }
+function oacBucketPolicy(bucket: string, distributionArn: string): Policy {
+  return { Version: '2012-10-17', Statement: [{ Sid: 'AllowCloudFrontOAC', Effect: 'Allow', Principal: { Service: 'cloudfront.amazonaws.com' }, Action: 's3:GetObject', Resource: `arn:aws:s3:::${bucket}/*`, Condition: { StringEquals: { 'AWS:SourceArn': distributionArn } } }] }
+}
+// 只認字串的 "*"，沒看 { AWS: "*" }
+function isPublicPolicy(policy: Policy): boolean {
+  const R = ['aws:sourcearn', 'aws:sourceaccount', 'aws:sourceowner', 'aws:sourcevpc', 'aws:sourcevpce', 'aws:principalorgid']
+  return policy.Statement.some(s => s.Effect === 'Allow' && s.Principal === '*' &&
+    !Object.values(s.Condition ?? {}).some(k => Object.entries(k).some(([key, v]) => R.includes(key.toLowerCase()) && [v].flat().every(x => !/[*?]/.test(x)))))
+}
+function effectivelyPublic(policy: Policy, bpa: { RestrictPublicBuckets: boolean }): boolean { return isPublicPolicy(policy) && !bpa.RestrictPublicBuckets }
+</script>
+  <script type="wrong">
+type Principal = '*' | { AWS?: string | string[], Service?: string | string[] }
+type Statement = { Sid?: string, Effect: 'Allow' | 'Deny', Principal: Principal, Action: string | string[], Resource: string | string[], Condition?: Record<string, Record<string, string | string[]>> }
+type Policy = { Version: string, Statement: Statement[] }
+function oacBucketPolicy(bucket: string, distributionArn: string): Policy {
+  return { Version: '2012-10-17', Statement: [{ Sid: 'AllowCloudFrontOAC', Effect: 'Allow', Principal: { Service: 'cloudfront.amazonaws.com' }, Action: 's3:GetObject', Resource: `arn:aws:s3:::${bucket}/*`, Condition: { StringEquals: { 'AWS:SourceArn': distributionArn } } }] }
+}
+// 有限定清單裡的條件鍵就算不公開，沒檢查值有沒有萬用字元
+function isPublicPolicy(policy: Policy): boolean {
+  const R = ['aws:sourcearn', 'aws:sourceaccount', 'aws:sourceowner', 'aws:sourcevpc', 'aws:sourcevpce', 'aws:principalorgid']
+  return policy.Statement.some(s => s.Effect === 'Allow' && (s.Principal === '*' || [s.Principal.AWS ?? []].flat().includes('*')) &&
+    !Object.values(s.Condition ?? {}).some(k => Object.keys(k).some(key => R.includes(key.toLowerCase()))))
+}
+function effectivelyPublic(policy: Policy, bpa: { RestrictPublicBuckets: boolean }): boolean { return isPublicPolicy(policy) && !bpa.RestrictPublicBuckets }
+</script>
+  <script type="wrong">
+type Principal = '*' | { AWS?: string | string[], Service?: string | string[] }
+type Statement = { Sid?: string, Effect: 'Allow' | 'Deny', Principal: Principal, Action: string | string[], Resource: string | string[], Condition?: Record<string, Record<string, string | string[]>> }
+type Policy = { Version: string, Statement: Statement[] }
+function oacBucketPolicy(bucket: string, distributionArn: string): Policy {
+  return { Version: '2012-10-17', Statement: [{ Sid: 'AllowCloudFrontOAC', Effect: 'Allow', Principal: { Service: 'cloudfront.amazonaws.com' }, Action: 's3:GetObject', Resource: `arn:aws:s3:::${bucket}/*`, Condition: { StringEquals: { 'AWS:SourceArn': distributionArn } } }] }
+}
+// 有任何條件就當成不公開；也沒排除 Deny
+function isPublicPolicy(policy: Policy): boolean {
+  return policy.Statement.some(s => (s.Principal === '*' || [s.Principal.AWS ?? []].flat().includes('*')) && !s.Condition)
+}
+function effectivelyPublic(policy: Policy, bpa: { RestrictPublicBuckets: boolean }): boolean { return isPublicPolicy(policy) && !bpa.RestrictPublicBuckets }
+</script>
+</div>
+
+<div class="local" data-test="ex2" data-files="site-bucket.ts">
+  <p>練習 2：完成 <code>site-bucket.ts</code> 的 <code>secureSiteBucket(s3, bucket, kmsKeyArn)</code>，建一個放 Vue 網站的私有 bucket。依序：(1) <code>CreateBucketCommand</code>，<code>us-east-1</code> 以外帶 <code>LocationConstraint</code>（第 1 課）。(2) <code>PutPublicAccessBlockCommand</code>：四個設定全開。(3) <code>PutBucketVersioningCommand</code>：Enabled。(4) <code>PutBucketEncryptionCommand</code>：<code>aws:kms</code>、<code>KMSMasterKeyID</code> 用 <code>kmsKeyArn</code>、<code>BucketKeyEnabled: true</code>。(5) <code>PutBucketPolicyCommand</code>：拒絕非 HTTPS 的請求，Resource 涵蓋 bucket 與物件（Policy 是 <code>JSON.stringify</code> 的字串）。測試會讀回每個設定，最後用模擬器的 HTTP 端點上傳一次，你的 policy 要真的把它擋下來（回 403）。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="restore.ts">
+  <p>練習 3：完成 <code>restore.ts</code> 的 <code>restoreDeleted(s3, bucket, prefix)</code>，把 prefix 底下「目前被刪掉」的檔案全部救回來。用 <code>ListObjectVersionsCommand</code>（帶 <code>Prefix</code>）列出版本，<code>IsTruncated</code> 為 true 時帶 <code>KeyMarker: NextKeyMarker</code>、<code>VersionIdMarker: NextVersionIdMarker</code> 繼續列到完。<code>DeleteMarkers</code> 裡 <code>IsLatest</code> 為 true 的才要處理，用 <code>DeleteObjectCommand</code> 帶那個 marker 的 <code>VersionId</code> 刪掉它。回傳還原的 key（依字母排序）。不能重新上傳或複製舊版本，也不能刪到資料版本。測試會把每頁壓到 2 筆，模擬資料夾很大的情況。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 4：咖啡店的 Vue 網站要用 <code>https://cafe.example.com</code>，bucket 裡不能有任何公開的東西。下面哪個做法符合？</p>
+  <label data-key="a">開啟 S3 的靜態網站功能，用 website endpoint，再把 DNS 指過去</label>
+  <label data-key="b">bucket 保持私有、BPA 全開，CloudFront 用 OAC 讀取，bucket policy 只允許 CloudFront 服務並用 AWS:SourceArn 限定這個 distribution</label>
+  <label data-key="c">bucket policy 寫 Principal *，但只開放 s3:GetObject，不開放寫入</label>
+  <label data-key="d">用 website endpoint 當 CloudFront 的 origin，再套上 OAC</label>
+  <p class="why">✓ OAC 讓 CloudFront 簽名取檔，bucket 不必公開，HTTPS 由 CloudFront 提供。a 的 website endpoint 需要公開可讀、也不支援 HTTPS；c 就是開場的事故，只開讀取還是讓所有人讀得到所有物件；d 錯在 OAC 不能用在 website endpoint，它只能當一般的自訂 origin。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：收據 bucket 開了版本控制。實習生用主控台刪除了 <code>receipts/2026-11/a.pdf</code>（沒有選版本）。下列哪個描述正確？</p>
+  <label data-key="a">檔案被永久刪除，只能從備份還原</label>
+  <label data-key="b">檔案還在，GetObject 照樣讀得到，只是列表看不到</label>
+  <label data-key="c">S3 加上一個 delete marker 成為目前版本，GetObject 回 404；舊版本都還在、也還在收儲存費，刪掉 marker 就能還原</label>
+  <label data-key="d">刪除後 S3 會自動在 30 天後還原檔案</label>
+  <p class="why">✓ 不帶 VersionId 的刪除只是加 delete marker。a 是沒開版本控制、或帶了 VersionId 才會發生；b 錯在目前版本是 marker，GetObject 回 404；d 沒有這種機制，反而要記得用 NoncurrentVersionExpiration 控制舊版本的儲存費。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：收據 bucket 改成 SSE-KMS（用自己管理的 key）之後，收據 Lambda 讀檔開始失敗，回 AccessDenied。它的 execution role 有 <code>s3:GetObject</code> on <code>arn:aws:s3:::cafe-receipts/*</code>。最可能的原因？</p>
+  <label data-key="a">role 沒有那把 KMS key 的 kms:Decrypt（或 key policy 沒允許它）：SSE-KMS 的物件要 S3 權限與 KMS 權限兩份都有</label>
+  <label data-key="b">SSE-KMS 的物件只能透過 CloudFront 讀取</label>
+  <label data-key="c">Resource 要改成 arn:aws:s3:::cafe-receipts（不含 /*）</label>
+  <label data-key="d">要在 GetObject 時帶上 KMS key 的 ARN</label>
+  <p class="why">✓ SSE-KMS 多了一層 KMS 的授權：讀要 kms:Decrypt，寫要 kms:GenerateDataKey，key policy 也要允許。c 把 Resource 改成 bucket 本身反而讓 GetObject 不再被允許；d 錯，讀取時 S3 從物件的 metadata 知道是哪把 key，不用呼叫端指定。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>為了讓網頁出來而關掉 BPA、寫 Principal *</strong>：整個 bucket 的物件都公開。網站走 CloudFront＋OAC，私人檔案放另一個 bucket。</li>
+  <li><strong>OAC 的條件只寫 SourceAccount 或不寫條件</strong>：同帳號其他 distribution、甚至任何人的 distribution 都能讀。用 AWS:SourceArn 指定 distribution。</li>
+  <li><strong>把公開判斷寫成「有條件就不公開」</strong>：條件鍵要在限定清單裡、值也要是固定值；User-Agent、帶萬用字元的值都擋不住人。</li>
+  <li><strong>SPA 深層連結回 403 就以為是權限問題</strong>：私有 bucket 找不到 key 時回 403，用 CloudFront 的自訂錯誤回應改成 index.html。</li>
+  <li><strong>誤刪後重新上傳舊檔</strong>：會多一個新版本、VersionId 改變。刪掉 delete marker 才是還原。</li>
+  <li><strong>還原時刪掉所有 delete marker</strong>：只有 IsLatest 為 true 的才是目前被刪的；也別忘了分頁。</li>
+  <li><strong>開了版本控制卻沒設舊版本的到期規則</strong>：每次覆蓋都多付一份儲存費。</li>
+  <li><strong>用 Allow＋SecureTransport true 強制 HTTPS</strong>：別的 Allow 照樣讓 HTTP 通過，要用 Deny＋SecureTransport false，Resource 涵蓋 bucket 與物件。</li>
+  <li><strong>改成 SSE-KMS 卻沒給 kms:Decrypt</strong>：讀檔一律 AccessDenied。開 bucket key 減少 KMS 請求。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>S3 的權限看 IAM policy、bucket policy 與 ACL；新 bucket 的 ACL 預設停用（BucketOwnerEnforced），權限只在 policy 裡看，評估規則同第 2 課。</li>
+  <li>BPA 四個設定：兩個管 ACL、兩個管 bucket policy；保持全開，帳號層級也開。policy 允許所有人、又沒有被固定值的 SourceArn、SourceAccount、SourceVpc(e)、PrincipalOrgID 這類條件限定，就是公開的；Deny 不會讓 bucket 公開。</li>
+  <li>Vue 網站用私有 bucket＋CloudFront OAC：Principal 是 CloudFront 服務、條件 AWS:SourceArn、Resource 帶 /*；SPA 的 403／404 改回 index.html；index.html 短快取、雜湊檔長快取。</li>
+  <li>版本控制下，不帶 VersionId 的刪除是加 delete marker；還原是刪掉 IsLatest 的 marker；帶 VersionId 才是永久刪除。舊版本照樣收費，用 NoncurrentVersionExpiration 控制。</li>
+  <li>SSE-KMS 讓讀檔同時需要 S3 與 KMS 權限，bucket key 大幅減少 KMS 請求；強制 HTTPS 用 Deny＋aws:SecureTransport false。</li>
+</ul>
+<p>下一課換關聯式資料庫：RDS 與 Aurora 的高可用、讀取副本、時間點還原，以及 Lambda 與 ECS 一起用時連線數怎麼算。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

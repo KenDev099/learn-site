@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>25. Node 安全</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="25" data-practice="node">
+<header>
+  <div class="eyebrow">階段 6：資深工程師的功課 · 第 25 課</div>
+  <h1>Node 安全</h1>
+</header>
+<main>
+
+<p>咖啡店的菜單圖片放在 <code>/images/latte.jpg</code> 這種網址。某天有人送了 <code>/images/..%2F..%2F.env</code>，伺服器把資料庫密碼當成圖片送了出去。程式沒有當掉、log 也只有一行 200，直到帳單異常才發現。安全問題通常就是這樣：功能都正常，只是有人用了你沒想到的輸入。</p>
+<p>修掉這一支 API 不算處理完。事故檢討要回答三個問題：這個輸入是怎麼走到危險的地方的？服務裡還有沒有同樣形狀的洞？萬一還有一個沒找到，損害能不能限制在很小的範圍？這一課就用這三個問題，從攻擊者的角度把咖啡店的 Node 服務完整檢查一遍，最後處理已經外洩的密碼。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>密碼是怎麼流出去的：用攻擊者的角度列出所有輸入和危險的去處，找出每一條需要檢查的線。</li>
+  <li><code>/images/..%2F..%2F.env</code> 為什麼讀得到密碼、怎麼擋：URL 編碼、原樣的 <code>req.url</code>、符號連結，以及「把路徑算到底再檢查」的寫法。</li>
+  <li>同樣形狀的洞還有哪些：body 流到物件合併、檔名流到 shell、值流到回應標頭，以及一個優惠碼怎麼卡死整台伺服器。</li>
+  <li>不讓一個人用光資源：每種資源的上限，以及限流需要的客戶端 IP 在反向代理後面要從哪裡拿。</li>
+  <li>萬一還有漏網的：用 Permission Model 限制程式能碰的檔案，再處理外洩的密碼和依賴。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="10-file-system.html">第 10 課</a>的路徑與 <code>fs</code>：<code>path.join</code> 把片段接起來並算掉 <code>..</code>，<code>path.resolve</code> 一定產生絕對路徑；相對路徑是相對於工作目錄，不是程式檔的位置。</li>
+  <li><a href="09-blocking-and-workers.html">第 9 課</a>的阻塞與子程序：同步的工作會卡住整條 event loop；<code>exec</code> 經過 shell，<code>execFile</code> 直接執行、參數不會被 shell 解讀。</li>
+  <li><a href="../../typescript/lessons/05-numbers-money.html">TypeScript 課第 5 課</a>的正規表示式：用 <code>/^…$/</code> 檢查整個字串的格式，<code>*</code>、<code>+</code> 是重複。</li>
+</ul></div>
+
+<h2>密碼是怎麼流出去的？用攻擊者的角度看服務</h2>
+<p>先回到事故本身。圖片 API 的寫法是「把網址最後一段接在 <code>public/images</code> 後面，讀出那個檔案送回去」。寫的人心裡想的是 <code>latte.jpg</code> 這種值，因為前端只會送這種值。但網址最後一段是誰決定的？是送請求的人。攻擊者不用你的前端，他用 curl 直接送任何位元組，你的前端做了什麼驗證，對他來說不存在。</p>
+<p>所以後端要換一個前提：<strong>任何從外面來的資料都可能是攻擊者寫的</strong>。這種還沒驗證過的資料，叫做<strong>不可信輸入</strong>（untrusted input）。它不只是 body，網址、查詢字串、標頭、上傳的檔名都算；上游 API 的回應、環境變數、設定檔也算，因為上游可能被入侵、設定可能被別人改過。外界能影響你的系統的這些入口，合起來叫做<strong>攻擊面</strong>（attack surface）。攻擊面越大，要守的地方越多。</p>
+<p>光有輸入不會出事。圖片 API 出事，是因為網址那一段最後被拿去當<strong>檔案路徑</strong>：路徑這種東西有自己的語法，<code>..</code> 的意思是「上一層」。輸入一旦被當成某種語法解讀，攻擊者就能用語法改變程式的行為。同樣的事會發生在每一個「會解讀字串」的地方：shell 解讀 <code>;</code>，SQL 解讀引號，正規表示式引擎會依輸入決定要試多少種走法。這些地方就是<strong>危險的去處</strong>。</p>
+<p>把兩邊列出來，畫線連起來，就是一份最簡單的<strong>威脅模型</strong>（threat model）：系統可能怎麼被攻擊的整理。每一條從不可信輸入連到危險去處的線，中間都要有一道檢查。這次的事故就是「網址 → 檔案路徑」這條線上沒有檢查。</p>
+<figure>
+  <svg viewBox="0 0 700 300" role="img" aria-label="左邊是不可信的輸入：網址、標頭、body、上傳檔名、上游回應、環境變數；中間是你的程式；右邊是危險的去處：檔案路徑、shell、SQL、物件合併、正規表示式、log 與回應標頭">
+    <defs><marker id="arr25" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <text class="d-accent" x="95" y="24" text-anchor="middle">不可信的輸入</text>
+    <rect class="d-soft" x="20" y="40" width="150" height="34" rx="6"/><text class="d-text" x="95" y="62" text-anchor="middle">網址、查詢字串</text>
+    <rect class="d-soft" x="20" y="82" width="150" height="34" rx="6"/><text class="d-text" x="95" y="104" text-anchor="middle">標頭</text>
+    <rect class="d-soft" x="20" y="124" width="150" height="34" rx="6"/><text class="d-text" x="95" y="146" text-anchor="middle">body</text>
+    <rect class="d-soft" x="20" y="166" width="150" height="34" rx="6"/><text class="d-text" x="95" y="188" text-anchor="middle">上傳的檔名</text>
+    <rect class="d-soft" x="20" y="208" width="150" height="34" rx="6"/><text class="d-text" x="95" y="230" text-anchor="middle">上游 API 的回應</text>
+    <rect class="d-soft" x="20" y="250" width="150" height="34" rx="6"/><text class="d-text" x="95" y="272" text-anchor="middle">環境變數、設定檔</text>
+    <rect class="d-box" x="275" y="110" width="150" height="80" rx="8"/>
+    <text class="d-text" x="350" y="145" text-anchor="middle">你的程式</text>
+    <text class="d-small" x="350" y="168" text-anchor="middle">每條線一道檢查</text>
+    <line class="d-line" x1="170" y1="57" x2="272" y2="130" marker-end="url(#arr25)"/>
+    <line class="d-line" x1="170" y1="141" x2="272" y2="150" marker-end="url(#arr25)"/>
+    <line class="d-line" x1="170" y1="267" x2="272" y2="175" marker-end="url(#arr25)"/>
+    <text class="d-accent" x="605" y="24" text-anchor="middle">危險的去處</text>
+    <rect class="d-box" x="530" y="40" width="150" height="34" rx="6"/><text class="d-text" x="605" y="62" text-anchor="middle">檔案路徑</text>
+    <rect class="d-box" x="530" y="82" width="150" height="34" rx="6"/><text class="d-text" x="605" y="104" text-anchor="middle">shell 指令</text>
+    <rect class="d-box" x="530" y="124" width="150" height="34" rx="6"/><text class="d-text" x="605" y="146" text-anchor="middle">SQL</text>
+    <rect class="d-box" x="530" y="166" width="150" height="34" rx="6"/><text class="d-text" x="605" y="188" text-anchor="middle">物件合併</text>
+    <rect class="d-box" x="530" y="208" width="150" height="34" rx="6"/><text class="d-text" x="605" y="230" text-anchor="middle">正規表示式</text>
+    <rect class="d-box" x="530" y="250" width="150" height="34" rx="6"/><text class="d-text" x="605" y="272" text-anchor="middle">log、回應標頭</text>
+    <line class="d-line" x1="425" y1="130" x2="527" y2="57" marker-end="url(#arr25)"/>
+    <line class="d-line" x1="425" y1="145" x2="527" y2="141" marker-end="url(#arr25)"/>
+    <line class="d-line" x1="425" y1="175" x2="527" y2="225" marker-end="url(#arr25)"/>
+  </svg>
+  <figcaption>威脅模型：左邊每一種輸入流到右邊任何一個去處，都要有對應的檢查。這次事故是「網址 → 檔案路徑」這條線</figcaption>
+</figure>
+<p>右邊每一個去處都有對應的攻擊和防法。有幾條在別的課已經學過，這一課處理標「本課」的那幾條，也就是 Node 服務本身最常出事的地方。下表是全課的地圖，現在先掃過，讀到各節時再回來對照：</p>
+<div class="table-wrap"><table>
+  <tr><th>去處</th><th>攻擊</th><th>防法</th><th>在哪學</th></tr>
+  <tr><td>檔案路徑</td><td>路徑穿越</td><td>resolve 後確認在根目錄下、realpath、白名單</td><td>本課</td></tr>
+  <tr><td>shell</td><td>指令注入</td><td><code>execFile</code>／<code>spawn</code> 加參數陣列</td><td><a href="09-blocking-and-workers.html">第 9 課</a></td></tr>
+  <tr><td>SQL</td><td>SQL injection</td><td>參數化查詢（<code>$1</code>）</td><td><a href="../../postgresql/lessons/25-backend.html">PostgreSQL 課第 25 課</a></td></tr>
+  <tr><td>物件合併</td><td>原型污染</td><td>略過危險的鍵、schema 驗證</td><td><a href="../../typescript/lessons/03-prototypes-classes.html">TypeScript 課第 3 課</a></td></tr>
+  <tr><td>正規表示式</td><td>ReDoS</td><td>改寫成線性的規則、限制長度</td><td>本課</td></tr>
+  <tr><td>回應標頭、log</td><td>標頭注入、log 偽造、洩漏祕密</td><td>Node 擋下 <code>\r\n</code>、結構化 log、遮蔽</td><td>本課、<a href="19-structured-logging.html">第 19 課</a></td></tr>
+  <tr><td>伺服器替你連線</td><td>SSRF：讓伺服器替攻擊者連內部網址</td><td>網址白名單、擋內部 IP</td><td><a href="../../auth/lessons/22-ssrf.html">Auth 課第 22 課</a></td></tr>
+</table></div>
+<p>這張表整理成更完整、更系統化的清單，就是 OWASP 的 API Security Top 10。OWASP 是一個整理常見資安風險的開放社群，<a href="../../auth/lessons/24-owasp-api-top10.html">Auth 課第 24 課</a>會逐條走一遍。</p>
+<div class="callout practice"><strong>💡 實務上：新增端點時先問「這個值是誰給的」</strong><br>威脅模型不用開會畫大圖，最常用在設計和 code review：咖啡店新增「上傳商品照片」或「匯出訂單 CSV」時，列出這支 API 收哪些輸入、最後流到檔案、SQL 還是 shell。審 PR 時資深工程師常問的就是「這個值是誰給的？流到哪裡之前驗證過？」。只給員工用的後台也不例外：帳號被盜或有人誤用時，它一樣是入口。不需要每支 API 都寫文件，碰到檔案、shell、金額、權限的那幾支多看一眼就夠了。這次的圖片 API 如果在 review 時被問過這一句，事故就不會發生。</div>
+<p>地圖有了，先處理出事的那條線：圖片網址到底經過什麼，才變成 <code>.env</code> 的路徑？</p>
+
+<h2>/images/..%2F..%2F.env 為什麼讀得到密碼？</h2>
+<p>這種攻擊叫<strong>路徑穿越</strong>（path traversal）：用 <code>../</code> 之類的寫法，讓伺服器讀到它本來不該讀的檔案。咖啡店的圖片伺服器把網址最後一段接在 <code>public/images</code> 後面：</p>
+<pre>const ROOT = join(import.meta.dirname, 'public', 'images')
+const file = join(ROOT, decodeURIComponent(name))   // name 是 /images/ 後面那一段
+createReadStream(file).pipe(res)</pre>
+<p>你可能會想：瀏覽器和 <code>URL</code> 不是會把 <code>../</code> 處理掉嗎？會，但只處理一部分，原因在 URL 編碼。</p>
+<p><a href="13-http-server.html">第 13 課</a>看過 URL 編碼（percent-encoding）：網址裡的字元可以寫成 <code>%</code> 加兩位十六進位，<code>.</code> 是 <code>%2e</code>，<code>/</code> 是 <code>%2F</code>。瀏覽器和 Node 的 <code>URL</code> 都照 WHATWG URL 標準解析網址，這個標準會把 <code>..</code> 和 <code>%2e%2e</code> 都當成「上一層」算掉；但 <code>%2F</code> 不被當成分隔符號，它只是「網址裡的一個普通字元」，原封不動留在同一段裡。問題出在下一步：你的程式呼叫 <code>decodeURIComponent</code>，<code>%2F</code> 才變回真的 <code>/</code>，這時候 <code>../</code> 才出現，而 URL 的正規化早就做完了。</p>
+<p>實際跑一次看看。在 <code>learn/</code> 執行 <code>node check.mjs node 25</code> 建立 <code>work/25/</code>，再到 <code>work/25</code> 執行 <code>node examples/traversal.ts</code>。看每個輸入經過「URL 解析 → 解碼 → 接路徑」後變成什麼（v24.22.1 實測，節錄）：</p>
+<pre>輸入 ..%2F..%2F..%2Fetc%2Fpasswd
+  new URL().pathname  /images/..%2F..%2F..%2Fetc%2Fpasswd
+  解碼後              ../../../etc/passwd
+  path.join           /etc/passwd
+輸入 %2Fetc%2Fpasswd
+  解碼後              /etc/passwd
+  path.join           /srv/menu/images/etc/passwd
+  path.resolve        /etc/passwd</pre>
+<p>第一個輸入：<code>URL</code> 完全沒動它，解碼後出現三個 <code>../</code>，<code>path.join</code> 照規則往上走三層，跑到了 <code>/etc/passwd</code>。事故裡的 <code>..%2F..%2F.env</code> 就是這樣走到專案根目錄的 <code>.env</code>。第二個輸入解碼後是絕對路徑，<code>join</code> 和 <code>resolve</code> 處理的方式不一樣，下一節會用到這個差異。</p>
+<p>就算不編碼也擋不住。Node 的 <code>req.url</code> 是客戶端送來的<strong>原樣字串</strong>，Node 不會替你做 URL 正規化。瀏覽器送請求前會先把 <code>../</code> 算掉，但攻擊者不用瀏覽器：用 curl 加 <code>--path-as-is</code>，或用 <code>node:net</code> 直接寫請求列，連沒編碼的 <code>/images/../../.env</code> 都送得進來。所以「URL 會擋掉 ..」不能當防線。</p>
+<p>到這裡原因清楚了：從網址到檔案路徑，中間的每一步（瀏覽器、<code>URL</code>、解碼）都不是為了安全設計的，各自只處理一部分寫法。那防線該放在哪裡？</p>
+
+<h2>怎麼擋？把路徑算到底，再檢查它在不在裡面</h2>
+<p>直覺的做法是在字串裡找 <code>..</code> 並拒絕。這條路走不通：<code>..</code> 可以編碼成 <code>%2e%2e</code>，<code>/</code> 可以是 <code>%2F</code>，還有雙重編碼、反斜線，寫法太多，總有一種漏網。換個角度：不管攻擊者怎麼寫，最後真正被打開的只有<strong>一個</strong>檔案。讓 Node 把路徑算到底，算出那個最終的絕對路徑，再檢查它在不在圖片資料夾裡面。檢查最終結果，就不用猜攻擊者會用哪種寫法。</p>
+<pre>import { realpath } from 'node:fs/promises'
+import { extname, join, resolve, sep } from 'node:path'
+
+const ROOT = await realpath(join(import.meta.dirname, 'public', 'images'))
+
+async function resolveImage(name: string): Promise&lt;string | null&gt; {
+  let rel: string
+  try { rel = decodeURIComponent(name) } catch { return null }   // %E0 這種壞掉的編碼會丟 URIError
+  if (rel.includes('\0')) return null                            // NUL 字元
+  if (!Object.hasOwn(TYPES, extname(rel).toLowerCase())) return null   // 白名單副檔名
+  const file = resolve(ROOT, rel)                                // ① 算出絕對路徑
+  if (!file.startsWith(ROOT + sep)) return null                  // ② 加上分隔符號再比
+  const real = await realpath(file)                              // ③ 符號連結換成真正的位置（不存在會丟錯）
+  if (!real.startsWith(ROOT + sep)) return null                  //    再比一次
+  return real
+}</pre>
+<p>先看主線的三步，它們是檢查的核心：</p>
+<ul>
+  <li><strong>① 用 <code>resolve</code> 算出絕對路徑</strong>：<code>path.resolve(ROOT, rel)</code> 把 <code>..</code> 算掉，遇到絕對路徑（<code>/etc/passwd</code>）就直接用它，結果一定是絕對路徑，才能拿來比較。為什麼不用 <code>join</code>？<code>join</code> 只負責把片段接起來再整理，不保證結果是絕對路徑：<code>ROOT</code> 一旦是相對路徑，結果也是相對路徑，拿來跟絕對路徑比對就會出錯。它也會把絕對路徑的輸入硬接在後面，得到一個跟攻擊者原意無關的路徑。<code>resolve</code> 照作業系統解讀路徑的方式，算出「這個輸入實際指到哪裡」，檢查的對象就是真正會被打開的位置；攻擊者給 <code>/etc/passwd</code>，算出來就是 <code>/etc/passwd</code>，下一步一比就被擋下。</li>
+  <li><strong>② 比較時加上 <code>sep</code></strong>：<code>sep</code> 是這個作業系統的路徑分隔符號（macOS、Linux 是 <code>/</code>）。只寫 <code>startsWith(ROOT)</code> 的話，<code>/srv/menu/images-private/recipe.jpg</code> 也以 <code>/srv/menu/images</code> 開頭，會被當成在裡面。加上 <code>sep</code> 之後，比的是「<code>/srv/menu/images/</code> 開頭」，隔壁的資料夾就進不來。</li>
+  <li><strong>③ 用 <code>realpath</code> 處理符號連結，再比一次</strong>：到 ② 為止都只是在算<strong>字串</strong>，但檔案系統裡還有一種東西會讓字串和真實位置不一樣。</li>
+</ul>
+<p>這種東西叫<strong>符號連結</strong>（symlink）：一個特殊的檔案，內容是「請去讀另一個路徑」，用 <code>ln -s 目標 連結名稱</code> 建立。假設 <code>public/images/evil.jpg</code> 是指向 <code>/etc/passwd</code> 的符號連結：路徑字串 <code>/srv/menu/images/evil.jpg</code> 完全在根目錄裡，② 會放行，但打開它讀到的是外面的檔案。資料夾也可以是符號連結：<code>public/images/linked</code> 指向 <code>/etc</code> 時，<code>linked/passwd.jpg</code> 這個檔案本身不是連結，只檢查最後的檔案是不是連結（<code>fs.lstat</code> 回傳的 <code>isSymbolicLink()</code>）會漏掉。<code>fs.realpath</code> 會把路徑上<strong>每一段</strong>的符號連結都換成真正的位置，換完再檢查一次，才是真正要打開的檔案。</p>
+<p>誰能在你的圖片資料夾裡放符號連結？上傳功能、解壓縮使用者給的壓縮檔、部署時的設定錯誤都可能。用了 realpath 還有一個連帶的坑：<strong>根目錄本身也要先 realpath</strong>。macOS 的 <code>/var</code> 其實是指向 <code>/private/var</code> 的符號連結，暫存資料夾都在那底下。ROOT 沒有先 realpath，③ 的結果是 <code>/private/var/…</code>，跟 <code>/var/…</code> 永遠比不上，正常的圖片也全部 404。所以程式一開始的 <code>ROOT</code> 就是用 <code>realpath</code> 算出來的。</p>
+<p>主線之前的三行是額外的保險，讓壞輸入在進入主線前就被擋下，伺服器也不會因為它們掛掉：</p>
+<ul>
+  <li><strong>壞掉的編碼</strong>：<code>%E0</code> 這種不完整的百分比編碼會讓 <code>decodeURIComponent</code> 丟 <code>URIError</code>。不接住就是 500，接住了回 404。</li>
+  <li><strong>NUL 字元</strong>：<code>%00</code> 解碼後是 NUL 字元，Node 的 fs 會直接丟 <code>ERR_INVALID_ARG_VALUE</code>，沒接住就是 500 或伺服器掛掉。先檢查、先拒絕。</li>
+  <li><strong>白名單副檔名</strong>：只允許 <code>.jpg</code>、<code>.png</code>、<code>.webp</code>。這是第二道防線：就算哪天主線的檢查有漏洞，<code>.env</code>、<code>.json</code>、原始碼也送不出去。用 <code>Object.hasOwn</code> 查表，不會被 <code>constructor</code> 這類從原型繼承來的鍵騙過（下一節的原型污染會看到 <code>__proto__</code>、<code>constructor</code> 這類鍵怎麼通到所有物件共用的原型）。</li>
+</ul>
+<p>還有一個平台差異：Windows 上 <code>\</code> 也是分隔符號，要在 Windows 執行的程式直接拒絕含 <code>\</code> 的檔名。</p>
+<div class="callout practice"><strong>💡 實務上：最安全的做法是不讓使用者給路徑</strong><br>正式環境的公開靜態檔案多半交給 Nginx 或 CDN（在各地機器上快取並送出檔案的服務），見<a href="../../devops/lessons/12-nginx.html">部署課第 12 課</a>，它們處理這些情況很多年了。需要自己用 Node 送的，通常是「下載自己的發票 PDF」「看訂單附件」這類要先檢查權限的檔案。這時資料庫存檔案的 id，id 對應到你自己產生的檔名（例如 UUID），使用者給的字串從來不碰檔案系統。上傳也一樣：不要用使用者的原始檔名存檔，原始檔名只存在資料庫裡拿來顯示。真的非讓使用者給路徑不可，才用上面那套 resolve 加 realpath 的檢查，並寫測試把 <code>..%2F</code>、符號連結這些輸入都跑過。</div>
+<p>圖片 API 補好了。但事故檢討的第二個問題還沒回答：同樣形狀的洞，服務裡還有沒有？</p>
+
+<h2>同樣形狀的洞還有哪些？輸入被當成結構的時候</h2>
+<p>回頭看路徑穿越的本質：使用者給的是<strong>資料</strong>（一個檔名），程式卻讓它被當成<strong>結構</strong>（路徑語法裡的「上一層」）解讀。照威脅模型的圖往右看，咖啡店服務裡還有三條線有同樣的形狀：body 流到物件合併、檔名流到 shell、使用者的值流到回應標頭。三個都在前面的課出現過，這裡看它們在 Node 服務裡從哪裡進來。</p>
+
+<h3>body 流到物件合併：原型污染</h3>
+<p>咖啡店有一支 <code>PATCH /settings</code>，把使用者送來的 JSON 合併進目前的設定。<a href="../../typescript/lessons/03-prototypes-classes.html">TypeScript 課第 3 課</a>學過：JavaScript 的每個一般物件都有一個<strong>原型</strong>，找不到的屬性會去原型上找，而所有 <code>{}</code> 共用同一個原型 <code>Object.prototype</code>。在一般物件上，<code>__proto__</code> 這個鍵不是普通的屬性，讀它會拿到原型本身。</p>
+<p>先看 <code>JSON.parse</code> 會不會出事。<code>JSON.parse('{"__proto__":{"isAdmin":true}}')</code> 把每個鍵當成資料，只會產生一個名叫 <code>__proto__</code> 的<strong>自有屬性</strong>，本身無害。危險的是之後那一步：天真的遞迴合併逐鍵執行 <code>target[key]</code>，當 key 是 <code>'__proto__'</code> 時，<code>target['__proto__']</code> 讀到的是 <code>Object.prototype</code>，再把 <code>isAdmin</code> 寫進去。先看天真的合併長什麼樣：</p>
+<pre>function naiveMerge(target, src) {
+  for (const key in src) {
+    if (typeof src[key] === 'object' &amp;&amp; src[key] !== null) {
+      target[key] ??= {}                 // key 是 '__proto__' 時，target[key] 就是 Object.prototype
+      naiveMerge(target[key], src[key])  // 於是往 Object.prototype 裡寫
+    } else {
+      target[key] = src[key]
+    }
+  }
+}</pre>
+<p><code>for...in</code> 會走到 <code>JSON.parse</code> 產生的那個自有鍵 <code>'__proto__'</code>。這時 <code>target['__proto__']</code> 經過存取器讀到 <code>Object.prototype</code>，它已經是物件，<code>??=</code> 不會換掉它，遞迴下一層就是 <code>Object.prototype.isAdmin = true</code>。v24.22.1 實測：</p>
+<pre>const body = JSON.parse('{"__proto__":{"isAdmin":true}}')
+Object.hasOwn(body, '__proto__')   // true：只是一個普通的鍵
+({}).isAdmin                        // undefined：還沒污染
+naiveMerge({}, body)
+({}).isAdmin                        // true：全程式的每個物件都「是管理員」了</pre>
+<p>這叫<strong>原型污染</strong>（prototype pollution）：透過 <code>__proto__</code>、<code>constructor.prototype</code> 這些鍵，改到所有物件共用的原型。後果不只是一個請求：同一個程序裡之後每個請求的每個物件都被影響，例如權限檢查寫成 <code>if (user.isAdmin)</code>，沒設這個欄位的使用者也會通過。在 Node 服務裡，入口都是「把 request body 或查詢字串解析成物件，再合併進設定或資料」：<code>PATCH /settings</code>、合併預設選項、把查詢字串 <code>a[b][c]=1</code> 解析成巢狀物件的函式庫。</p>
+<p><code>constructor</code> 也一樣：任何一般物件的 <code>constructor</code> 是 <code>Object</code>，<code>Object.prototype</code> 又是所有物件共用的原型，所以 <code>{"constructor":{"prototype":{"isAdmin":true}}}</code> 經過同一個天真的合併，一樣寫進 <code>Object.prototype</code>。</p>
+<p>防法有三層：先用 schema 驗證，只取你認得的欄位，不認得的鍵根本進不了合併；合併時略過 <code>__proto__</code>、<code>constructor</code>、<code>prototype</code>，只走 <code>Object.keys</code>；需要用使用者給的字串當鍵時，用 <code>Map</code> 或 <code>Object.create(null)</code>，它們沒有共用的原型可以污染。</p>
+
+<h3>檔名流到 shell：指令注入</h3>
+<p>假設咖啡店上傳商品照片後，用外部的命令列程式轉檔，檔名來自使用者。<a href="09-blocking-and-workers.html">第 9 課</a>學過：<code>exec</code> 把整個字串交給 shell 執行，shell 會解讀 <code>;</code>、<code>$()</code> 這些符號，檔名裡如果有 <code>; rm -rf ~</code>，後半段就被當成第二個指令執行。這叫<strong>指令注入</strong>（command injection）：輸入被 shell 當成指令。改用 <code>execFile</code>／<code>spawn</code> 加參數陣列，每個參數直接交給程式，不經過 shell 解讀。</p>
+<p>參數陣列擋得住 shell，卻擋不住被執行的程式自己的<strong>選項</strong>。命令列程式把 <code>-</code> 開頭的參數當成選項：使用者給的檔名如果是 <code>--output=/etc/cron.d/x</code>，很多程式會把它當成「把輸出寫到那裡」。大部分命令列程式支援用 <code>--</code> 表示「後面都是參數、不是選項」：<code>execFile('grep', ['-n', '--', pattern, file])</code>。最好的做法仍然是先驗證輸入的格式，例如檔名只能是你自己產生的 UUID。</p>
+
+<h3>值流到回應標頭：標頭注入</h3>
+<p>前面提到咖啡店要讓客人「下載自己的發票 PDF」。下載的回應常用 <code>Content-Disposition: attachment; filename="…"</code> 指定存檔時的檔名，如果這個檔名直接取自客人填的訂單備註，使用者給的值就進了回應標頭。HTTP 的標頭是一行一個，用換行（<code>\r\n</code>）隔開（<a href="12-http-protocol.html">第 12 課</a>）。如果程式把使用者給的值直接放進回應標頭，而值裡有 <code>\r\n</code>，攻擊者就能自己多寫一行，例如 <code>Set-Cookie</code>，這叫<strong>標頭注入</strong>（header injection）。Node 會擋：<code>res.setHeader('X-Name', 'a\r\nSet-Cookie: x')</code> 丟出 <code>ERR_INVALID_CHAR</code>（v24.22.1 實測）。擋下來是好事，但沒接住的話就是 500，所以放進標頭之前還是要先驗證格式。</p>
+<p>log 偽造（log injection）是同一種形狀，只是流向換成 log：如果用純文字一行一筆寫 log，使用者的值帶著換行寫進去，就能多偽造出一行看起來正常的假紀錄，誤導事後的調查。用<a href="19-structured-logging.html">第 19 課</a>的結構化 JSON log，值裡的換行會被 <code>JSON.stringify</code> 跳脫成 <code>\n</code>，整筆紀錄仍是一行，就偽造不了。</p>
+<p>三條線的防法有同一個模式：<strong>先驗證格式，再用不會把資料當結構的 API</strong>（schema 加安全的合併、參數陣列、Node 對標頭字元的檢查）。下一條線也是「輸入被引擎解讀」，但它不會讓攻擊者讀到或改到任何東西，而是讓伺服器停下來。</p>
+
+<h2>一個優惠碼怎麼卡死整台伺服器？</h2>
+<p>咖啡店的結帳 API 收一個優惠碼，先用正規表示式檢查格式。這條線是「body → 正規表示式」。正規表示式引擎遇到可以有好幾種比對方式的規則時，會一種一種試，失敗了退回去換下一種，這叫<strong>回溯</strong>（backtracking）。<a href="09-blocking-and-workers.html">第 9 課</a>看過 <code>/^(\w+\s?)*$/</code> 遇到 29 個字元就卡住超過一秒：要試的走法隨長度指數成長。</p>
+<p>這在 Node 特別嚴重。Node 只有一條執行緒在跑 JavaScript，正規表示式是同步執行的，它跑多久，event loop 就卡多久，這段時間所有請求都在等。攻擊者送出讓回溯爆炸的輸入，讓伺服器無法回應正常使用者，這叫 <strong>ReDoS</strong>（Regular expression Denial of Service）。「讓服務無法回應正常使用者」這一類攻擊統稱<strong>阻斷服務</strong>（DoS，Denial of Service）。</p>
+<p>優惠碼的規則是：英文大寫或數字組成的一段或多段，段與段之間用一個 <code>-</code>。有人寫成下面這樣。執行 <code>node examples/redos.ts</code>，看時間怎麼隨字元數成長（v24.22.1 實測，數字每次會有差異）：</p>
+<pre>const COUPON = /^([A-Z0-9]+-?)*[A-Z0-9]+$/
+
+16 個 A 加 !：3.1ms
+20 個 A 加 !：11.3ms
+22 個 A 加 !：46.4ms
+24 個 A 加 !：197.5ms
+改寫後，100,000 個 A 加 !：0.5ms</pre>
+<p>只多了 8 個字元，時間就從 3ms 變成將近 200ms，再長一點就是好幾秒。為什麼會爆？<code>-?</code> 可以不出現，所以 <code>AAAA</code> 可以切成 <code>A|AAA</code>、<code>AA|AA</code>、<code>A|A|A|A</code>…，每一種切法都讓 <code>[A-Z0-9]+</code> 搶不同長度。結尾的 <code>!</code> 讓每一種切法都失敗，引擎只好全部試完，n 個字元有 2<sup>n</sup> 級的組合。會這樣爆炸的規則有兩種形狀，看到就要警覺：</p>
+<ul>
+  <li><strong>巢狀量詞</strong>：量詞裡面還有量詞，而且裡面那段可以比對到長度不同的同一串字，例如 <code>(a+)+</code>、<code>(\w+\s?)*</code>、<code>([A-Z0-9]+-?)*</code>。</li>
+  <li><strong>重疊的選項</strong>：<code>(a|a)*</code>、<code>(\w|\d)+</code>：同一個字元可以被兩個選項吃掉。</li>
+</ul>
+<p>兩種形狀的共同點是「同一串字有很多種走法」。所以改寫的原則是：<strong>讓每個字元只有一種走法</strong>。優惠碼的問題出在可有可無的 <code>-?</code>，把它改成必要的分隔符號：</p>
+<pre>/^([A-Z0-9]+-?)*[A-Z0-9]+$/      // 危險：-? 可有可無，相鄰的 [A-Z0-9]+ 搶同一串字
+/^[A-Z0-9]+(-[A-Z0-9]+)*$/        // 安全：每一段一定由 - 開頭，A 只能屬於目前這一段</pre>
+<p>兩個接受的字串完全一樣，後者的時間跟長度成正比，就是上面 100,000 個字元只要 0.5ms 的那一行。改寫之外的其他防法：</p>
+<ul>
+  <li><strong>先限制長度</strong>：優惠碼不會超過 32 個字元，先檢查長度再跑正規表示式。這能大幅降低風險，但指數成長下 30 個字元就可能卡一秒，只靠長度不夠，規則本身還是要改。</li>
+  <li><strong>不用正規表示式</strong>：<code>code.split('-').every(part =&gt; /^[A-Z0-9]+$/.test(part))</code> 一樣清楚。</li>
+  <li><strong>RE2 類的引擎</strong>：RE2 是 Google 的正規表示式引擎，保證執行時間跟輸入長度成線性，代價是少了一些需要回溯才做得到的語法，例如用 <code>\1</code> 要求「跟前面括號比對到的內容一樣」。npm 上有綁定它的套件；這門課的練習不安裝。</li>
+  <li><strong>正規表示式是使用者給的</strong>（例如搜尋功能讓人輸入規則）：絕對不要直接 <code>new RegExp(input)</code>。要嘛跳脫特殊字元當純文字搜尋，要嘛用 RE2 這類引擎。</li>
+</ul>
+<p>ReDoS 讓我們看到另一種攻擊方式：不偷資料，而是把伺服器的某種資源（這裡是 event loop 的時間）用光。event loop 不是唯一會被用光的資源。</p>
+
+<h2>還有哪些資源會被一個人用光？</h2>
+<p>阻斷服務不一定要很聰明，只要讓你的伺服器把某種資源用光：記憶體、連線數、event loop、資料庫連線。任何一種用光了，所有客人一起受影響。所以每一種資源都要有上限。下表列出每種資源的攻擊方式和對應的上限，大部分在前面的課做過，這裡集中成一張檢查表（查表用，不用背）：</p>
+<div class="table-wrap"><table>
+  <tr><th>資源</th><th>攻擊</th><th>上限</th></tr>
+  <tr><td>記憶體</td><td>送 2GB 的 body</td><td>讀 body 時累計長度，超過回 413（<a href="13-http-server.html">第 13 課</a>）；反向代理也設上限</td></tr>
+  <tr><td>標頭</td><td>超大標頭、慢慢送標頭（慢速攻擊 slowloris）</td><td><code>http.maxHeaderSize</code> 預設 16384；<code>server.headersTimeout</code> 預設 60000ms；<code>server.requestTimeout</code> 預設 300000ms（v24.22.1 實測，<a href="13-http-server.html">第 13 課</a>）</td></tr>
+  <tr><td>event loop</td><td>ReDoS、超大 JSON</td><td>改寫規則、限制長度、body 上限；量 event loop 延遲（<a href="09-blocking-and-workers.html">第 9 課</a>）</td></tr>
+  <tr><td>上游</td><td>讓你等一個很慢的外部 API</td><td>每個外部呼叫都設逾時（<a href="17-calling-external-apis.html">第 17 課</a>）</td></tr>
+  <tr><td>連線、併發</td><td>同時開幾萬條連線、大量昂貴的請求</td><td><code>server.maxConnections</code>（超過就拒絕新連線，預設沒有上限）、昂貴的端點加併發上限；連線池大小（<a href="20-postgres-pool-transactions.html">第 20 課</a>）</td></tr>
+  <tr><td>次數</td><td>暴力猜密碼、刷優惠碼</td><td>限流（<a href="../../system-design/lessons/10-rate-limiting.html">系統設計課第 10 課</a>、<a href="../../auth/lessons/16-account-flows.html">Auth 課第 16 課</a>），以正確的客戶端 IP 或帳號為單位</td></tr>
+</table></div>
+<p>為什麼每一行都要有？因為攻擊者會找沒設上限的那一種：限了 body 大小，他就改送很多個很慢的請求；限了連線數，他就送一個會讓正規表示式爆炸的小請求。每一層各擋一種，合起來才擋得住。這種「不靠單一一道防線，每一層各負責一部分」的做法叫<strong>縱深防禦</strong>（defense in depth）。路徑穿越那一節的「白名單副檔名」也是縱深防禦：主線檢查失守時，還有一層擋著。</p>
+<p>表的最後一行有一個前提沒講清楚。回到事故：攻擊者在得手之前，很可能先試了幾百種路徑寫法；之後也可能對優惠碼一個一個猜。這種掃描靠限流擋，而限流要「以正確的客戶端 IP 為單位」。在正式環境裡，這個 IP 並不好拿。</p>
+
+<h2>限流要算在誰頭上？反向代理後面的客戶端 IP</h2>
+<p>正式環境的 Node 服務前面通常有一層<strong>反向代理</strong>（reverse proxy）：一台站在你的服務前面、替它接收所有請求的伺服器，例如 Nginx 或雲端的負載平衡器（<a href="../../devops/lessons/12-nginx.html">部署課第 12 課</a>）。客戶端連的是代理，代理再開一條新的連線到你的服務。所以從 Node 看，TCP 連線的另一端永遠是代理，<code>req.socket.remoteAddress</code> 永遠是代理的 IP。直接拿它來限流，等於全世界的客人共用一個額度。</p>
+<p>為了讓後面的服務知道真正的客戶端是誰，代理會把它看到的來源 IP <strong>附加</strong>在 <code>X-Forwarded-For</code> 標頭的最右邊；經過好幾層代理時，每一層都附加一個，用逗號串起來：</p>
+<pre>客戶端 203.0.113.9 → 代理 A 10.0.0.5 → 代理 B 10.0.0.6 → Node
+
+Node 看到：
+  req.socket.remoteAddress   10.0.0.6
+  X-Forwarded-For            203.0.113.9, 10.0.0.5</pre>
+<p>代理 A 附加了客戶端的 <code>203.0.113.9</code>，代理 B 附加了代理 A 的 <code>10.0.0.5</code>，代理 B 自己則是直連 Node 的 <code>remoteAddress</code>。看起來取最左邊就是客戶端了。陷阱在這裡：<code>X-Forwarded-For</code> 也只是一個標頭，也是不可信輸入，<strong>客戶端可以自己送</strong>。代理只是在後面附加，不會清掉原本的值：</p>
+<pre>攻擊者送出   X-Forwarded-For: 6.6.6.6
+代理附加後   X-Forwarded-For: 6.6.6.6, 203.0.113.9</pre>
+<p>取最左邊的值，你拿到的就是攻擊者想讓你看到的 <code>6.6.6.6</code>：他每個請求換一個值，限流永遠擋不住他；稽核紀錄裡記的是無辜的人。能相信的只有你自己的代理加上去的部分，也就是從最右邊算起。你知道 IP、確定會正確附加這個標頭的那幾台，叫做<strong>信任的代理</strong>（trusted proxy）。取客戶端 IP 的演算法：</p>
+<ol>
+  <li>直連位址 <code>req.socket.remoteAddress</code> <strong>不是</strong>信任的代理：對方直接連進來，<code>X-Forwarded-For</code> 是他自己寫的，完全不看，回傳直連位址。</li>
+  <li>是信任的代理：把 <code>X-Forwarded-For</code> 從右往左看，跳過信任的代理，第一個不信任的位址就是客戶端。它左邊的值都可能是偽造的。</li>
+</ol>
+<p>用上面的例子走一遍：直連的 <code>10.0.0.6</code> 是信任的代理，所以看標頭；從右往左，<code>10.0.0.5</code> 是信任的代理，跳過；<code>203.0.113.9</code> 不是，它就是客戶端。攻擊者偽造的 <code>6.6.6.6</code> 在它左邊，根本不會被讀到。</p>
+<p>真的寫程式時，有兩個地方的字串長得和上面的例子不一樣，比對前要先整理（v24.22.1 本機驗證）。第一，伺服器用預設的 <code>listen(port)</code> 時聽的是 IPv6 的 <code>::</code>，同時接受 IPv4，IPv4 的客戶端在 <code>remoteAddress</code> 會長成 <code>::ffff:127.0.0.1</code>（IPv4 對應的 IPv6 位址），跟信任清單比對之前要去掉 <code>::ffff:</code>。第二，請求裡有兩行 <code>X-Forwarded-For</code> 時，<code>node:http</code> 把它們用 <code>, </code> 合併成一個字串（<a href="12-http-protocol.html">第 12 課</a>學過哪些標頭會合併），所以一律當成逗號分隔的清單處理。框架通常有一個「trust proxy」設定做同一件事，設錯就等於取最左邊；另外還有一個標準化的 <code>Forwarded</code> 標頭，見課末。</p>
+<div class="callout practice"><strong>💡 實務上：上線前先搞清楚前面有幾層代理</strong><br>常見的架構是「CDN → 雲端負載平衡器 → Node」，每一層都會附加 <code>X-Forwarded-For</code>。信任清單少一層，拿到的是代理的 IP，所有人共用一個限流額度；設成全部信任，攻擊者就能偽造 IP。架構改了（加 CDN、換負載平衡器）時這個設定最容易被忘記，限流和稽核紀錄會默默失準。資深工程師會在測試環境用 curl 帶一個假的 <code>X-Forwarded-For</code> 打一次，確認 log 記到的是真正的 IP。代理有哪幾層、IP 範圍是什麼，問維運或查雲端服務的文件，不要用猜的。這次事故的事後調查也靠這個：稽核紀錄裡的 IP 不對，就查不出攻擊者試了多久。</div>
+<p>到這裡，事故檢討的前兩個問題都有答案了：每一條輸入到危險去處的線都有了檢查，資源也都有了上限。但這些全部都是「讓程式不犯錯」。第三個問題還在：萬一還有一條線沒找到呢？</p>
+
+<h2>萬一還有漏網的？Permission Model：只給程式需要的權限</h2>
+<p>漏網是一定會發生的：你自己的程式可能有沒發現的漏洞，你裝的依賴也可能被植入惡意程式。回頭看事故，圖片伺服器只需要讀 <code>public/images</code>，卻有權限讀整台機器上程序能讀的所有檔案，包括 <code>.env</code>。如果它一開始就只能讀圖片資料夾，就算路徑檢查寫錯，<code>.env</code> 也讀不到。這就是<strong>最小權限</strong>（least privilege）：只給完成工作所需的最少權限，萬一被入侵，損害也被限制在那個範圍裡。</p>
+<p>Node 的 <strong>Permission Model</strong> 讓你在啟動時決定這個程序能做什麼。加上 <code>--permission</code> 之後，檔案、子程序這些能力預設全部關閉，再用 <code>--allow-*</code> 旗標一項一項打開：</p>
+<pre>node --permission --allow-fs-read=./data '--allow-fs-write=./out/*' tools/report.ts</pre>
+<p>這一行的意思是：只能讀 <code>./data</code>，只能寫 <code>./out</code> 底下，其他檔案、子程序都不行。可以用的旗標：</p>
+<div class="table-wrap"><table>
+  <tr><th>旗標</th><th>開了 <code>--permission</code> 之後，沒給就會被擋</th></tr>
+  <tr><td><code>--allow-fs-read=路徑</code></td><td>讀檔（可以給好幾次；<code>*</code> 是全部）</td></tr>
+  <tr><td><code>--allow-fs-write=路徑</code></td><td>寫檔、建資料夾、刪檔</td></tr>
+  <tr><td><code>--allow-child-process</code></td><td>開子程序（<code>exec</code>、<code>spawn</code>…）</td></tr>
+  <tr><td><code>--allow-worker</code></td><td>開 worker 執行緒</td></tr>
+  <tr><td><code>--allow-addons</code>、<code>--allow-wasi</code></td><td>原生擴充模組、WASI</td></tr>
+</table></div>
+<p>程式碼碰到沒給的權限時，Node 丟出 <code>ERR_ACCESS_DENIED</code>，錯誤物件上有 <code>permission</code>（例如 <code>FileSystemRead</code>）和 <code>resource</code>（哪個路徑）。程式裡也可以用 <code>process.permission.has('fs.read', '/etc/hosts')</code> 先問。到 <code>work/25</code> 執行看看，注意哪幾行是 ✓、哪幾行是 ✗（v24.22.1 實測）：</p>
+<pre>$ node --permission --allow-fs-read=./data examples/permission.ts
+有沒有開 Permission Model： 有
+✓ 讀 data/orders.json
+✗ 讀 /etc/hosts：ERR_ACCESS_DENIED FileSystemRead /etc/hosts
+✗ 開子程序 ls：ERR_ACCESS_DENIED ChildProcess ls
+  回應： hi
+✓ 開伺服器、用 fetch 連線</pre>
+<p>讀 <code>data/</code> 成功，讀外面的檔案和開子程序都被擋，這是預期的。最後一行要特別注意：開伺服器、用 <code>fetch</code> 連線都成功了。<strong>Node 24 的 Permission Model 不限制網路</strong>，被入侵的程式在 Node 24 仍然可以把資料送出去（限制網路的旗標是之後的版本才加入，見課末）。</p>
+<p>寫旗標時有兩條規則最容易踩到：</p>
+<ul>
+  <li><strong>相對路徑</strong>以執行時的工作目錄為準，不是腳本所在的資料夾。在別的資料夾執行，<code>./data</code> 指的就是另一個地方。</li>
+  <li><strong>不存在的資料夾要自己加 <code>*</code></strong>：啟動時，存在的資料夾會自動變成「資料夾/*」；不存在的不會，權限只涵蓋那個路徑本身。<code>out/</code> 還沒建立時，<code>--allow-fs-write=./out</code> 能建出 <code>out</code>，卻寫不進 <code>out/report.json</code>。要寫成 <code>./out/*</code>，而且整個參數用單引號包起來，不然 shell 會先試著把 <code>*</code> 展開成檔名。<code>*</code> 之後的字元都會被忽略，<code>./out*</code> 連 <code>./outside</code> 都包含。</li>
+</ul>
+<p>最後，也是最重要的一點：<strong>它不是沙盒</strong>。官方文件明白寫著它不防惡意程式碼，惡意程式碼有辦法繞過它。文件列出的限制包括：符號連結會被跟過去，就算指到允許範圍之外；用已經開好的 file descriptor 操作檔案會繞過檢查；<code>--env-file</code> 這類在初始化之前讀檔的旗標不受管。它擋的是「你自己的程式和依賴不小心或被騙去做多餘的事」，像這次的路徑穿越；不是用來執行惡意程式碼的牢籠。要隔離不信任的程式碼，用容器、獨立的使用者帳號或虛擬機。</p>
+<div class="callout practice"><strong>💡 實務上：Permission Model 最適合範圍明確的工具程式</strong><br>很多團隊在正式環境靠的是容器、非 root 使用者和雲端的權限設定，Permission Model 是再多一層。它最好用在範圍很清楚的程式：例如咖啡店每晚產生報表的腳本、處理上傳檔案的轉檔工具，只讀一個資料夾、只寫一個資料夾。要套在整個 Web 服務上，先用 <code>--permission-audit</code>（只記錄、不阻擋，細節見課末）跑一段時間，看程式實際用到哪些權限，不然很容易在某個少用的功能上線後才撞到 <code>ERR_ACCESS_DENIED</code>。它不能取代前面那些輸入檢查，也擋不住 Node 24 的網路連線。</div>
+<p>洞補了、權限也收了，但事故還剩一筆帳沒處理：那組已經被讀走的資料庫密碼。</p>
+
+<h2>密碼已經外洩了，還有什麼要做？依賴與祕密</h2>
+<p>先處理外洩的祕密。資料庫密碼、API token 這類東西叫<strong>祕密</strong>（secret）。它們不進 git、不進 log（<a href="19-structured-logging.html">第 19 課</a>的遮蔽），從環境變數或祕密管理服務讀取（<a href="../../auth/lessons/23-secrets-encryption.html">Auth 課第 23 課</a>、<a href="../../devops/lessons/11-config-secrets.html">部署課第 11 課</a>）。一旦外洩過，就一律換掉：修掉漏洞只能阻止下一次被讀，已經被讀走的那一份要讓它失效才算處理完。同樣的道理，祕密不小心 commit 進 git 時，從 git 歷史刪除不算處理完，別人可能早就 clone 走了。</p>
+<p>事故檢討的最後一步是往外看：這次的洞在自己寫的程式裡，但你的服務有一大半的程式碼是別人寫的。<a href="03-npm-packages.html">第 3 課</a>學過的<strong>供應鏈</strong>防線（防的是「你依賴的套件本身出問題」），在這裡整理成上線前的檢查：</p>
+<ul>
+  <li><strong>lockfile 進 git，部署用 <code>npm ci</code></strong>：每次裝到的版本完全一樣，沒有人能在你不知情時換掉某一層依賴。</li>
+  <li><strong>install script 政策</strong>：<code>npm install</code> 時依賴可以執行任意程式（install script）。用 <code>allowScripts</code> 記下哪些審查過、哪些拒絕（<a href="03-npm-packages.html">第 3 課</a>：沒列入的目前仍會執行，只印警告），或用 <code>ignore-scripts=true</code> 全部關掉。加依賴之前先看它是誰維護的、下載量、最近有沒有異常的新版本。</li>
+  <li><strong><code>npm audit</code></strong>：比對已知的漏洞資料庫。放進 CI，但要看懂報告：很多是開發工具裡的、你的程式用不到的路徑，修不修要判斷，不要只為了讓數字歸零就盲目升級大版本。</li>
+  <li><strong>最少依賴、定期更新</strong>：十行能寫完的功能不值得多一個依賴（和它底下的幾十個依賴）；用的依賴要定期升級，不要等到要一次跳三個大版本。</li>
+</ul>
+<p>到這裡事故檢討的三個問題都回答完了：輸入怎麼進來（威脅模型）、同樣的洞還有哪些（路徑、合併、shell、標頭、正規表示式、資源、客戶端 IP），以及漏網時怎麼限制損害（Permission Model、換掉祕密、管好依賴）。練習會讓你親手修其中四條線。</p>
+
+<h2>練習</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs node 25</code> 建立 <code>work/25/</code>。四題互相獨立。測試會在暫存資料夾複製你的檔案、放隨機的資料再執行，所以寫死答案不會過。</p>
+
+<div class="local" data-test="ex1" data-files="image-server.ts">
+  <p>練習 1：<code>image-server.ts</code> 的 <code>GET /images/:file</code> 從 <code>public/images</code> 送出圖片，現在會被路徑穿越。改寫 <code>resolveImage</code>：可以有子資料夾（<code>seasonal/pumpkin.webp</code>、<code>seasonal%2Fpumpkin.webp</code>）；所有跑出根目錄的路徑（原始的 <code>../</code>、<code>..%2F</code>、<code>%2e%2e%2f</code>、反斜線、解碼後是絕對路徑、跑到 <code>public/images-private</code>）都回 404；指向根目錄外的符號連結回 404（檔案和資料夾的連結都算）；只送 <code>.jpg</code>、<code>.png</code>、<code>.webp</code>；NUL 字元（<code>%00</code>）與壞掉的百分比編碼回 404，伺服器不能掛掉。Content-Type 照現在的寫法即可。想手動試：在 <code>work/25</code> 執行 <code>ln -s ../../secret.env public/images/evil.jpg</code> 建一個符號連結，啟動伺服器後用 <code>curl --path-as-is localhost:3000/images/..%2Fimages-private%2Frecipe.jpg</code> 試各種寫法。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="client-ip.ts">
+  <p>練習 2：完成 <code>client-ip.ts</code> 的 <code>clientIp(req, { trustedProxies })</code>，回傳真正的客戶端 IP。直連位址是 <code>req.socket.remoteAddress</code>（先去掉 <code>::ffff:</code> 前綴）；它不是信任的代理 → 直接回傳它，不看 <code>X-Forwarded-For</code>；它是信任的代理 → 把 <code>X-Forwarded-For</code> 的位址（逗號分隔、前後可能有空白，也要去掉 <code>::ffff:</code>）從右往左看，跳過信任的代理，回傳第一個不信任的位址；全部都是信任的代理時回傳最左邊那個；沒有這個標頭時回傳直連位址。要回傳的值不是合法 IP（<code>net.isIP()</code> 回傳 0）時回傳 <code>null</code>。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="validators.ts">
+  <p>練習 3：<code>validators.ts</code> 的 <code>validateCouponCode</code> 與 <code>parseDrinkNote</code> 用了會指數回溯的正規表示式。改寫成語意完全相同、不會卡住的版本：測試會拿幾千個隨機字串和原本的規則比對結果，再送 29 到 5,000 多個字元的惡意輸入，每次呼叫要在 50ms 內回傳（測試在子程序裡量，2 秒沒跑完就砍掉）；幾千個字元的合法優惠碼、備註也要照樣接受，所以「太長就當成不合法」過不了。檔案裡的註解有兩條規則的白話說明和例子。備註規則裡的 <code>\p{L}</code> 是「任何語言的字母」（包括中文字），<code>\p{N}</code> 是「任何數字」，要加 <code>u</code> 旗標才能用。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="run-report.sh">
+  <p>練習 4：<code>tools/report.ts</code> 讀 <code>data/orders.json</code>、把統計寫到 <code>out/report.json</code>（不用改它）。在 <code>run-report.sh</code> 寫一行 <code>node</code> 指令執行它，用 Permission Model 只給它需要的權限：能讀 <code>data/</code>、能寫 <code>out/</code>；不能讀其他檔案（包括同一個資料夾的 <code>secret.env</code> 和 <code>/etc/hosts</code>）、不能開子程序、不能寫 <code>out/</code> 以外的地方。注意 <code>out/</code> 一開始不存在。測試在暫存資料夾以 <code>sh run-report.sh</code> 執行，用環境變數 <code>REPORT_MODE</code> 讓 <code>report.ts</code> 模擬被入侵後去讀 <code>/etc/hosts</code>、讀 <code>secret.env</code>、開子程序、寫 <code>data/hacked.txt</code>、寫 <code>out/</code> 旁邊的 <code>outbox.json</code>，每一種都要被 Permission Model 以 <code>ERR_ACCESS_DENIED</code> 擋下（測試用的是原本的 <code>tools/report.ts</code>，改它沒有用）。自己試：在 <code>work/25</code> 執行 <code>REPORT_MODE=spawn sh run-report.sh</code>。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：<code>new URL('/images/../secret', 'http://localhost').pathname</code> 和 <code>new URL('/images/..%2Fsecret', 'http://localhost').pathname</code> 分別是什麼？</p>
+  <label data-key="a">都是 <code>/secret</code>：URL 會把所有往上一層的寫法都算掉，所以用了 <code>URL</code> 就不怕路徑穿越</label>
+  <label data-key="b">前者是 <code>/secret</code>，後者還是 <code>/images/..%2Fsecret</code>：<code>%2F</code> 不被當成分隔符號，解碼之後才出現 <code>../</code></label>
+  <label data-key="c">兩個都丟出 <code>TypeError</code>，因為網址裡不能有 <code>..</code></label>
+  <p class="why">✓ WHATWG URL 會正規化 <code>..</code> 和 <code>%2e%2e</code> 這類路徑區段，但 <code>%2F</code> 只是一個被編碼的普通字元，留在同一個區段裡。等你的程式 <code>decodeURIComponent</code> 之後交給 <code>path.join</code>，才變成真的 <code>../</code>（v24.22.1 實測），所以 a 錯。這兩個網址都合法，不會丟錯，c 錯。而且 Node 的 <code>req.url</code> 是原樣字串，連沒編碼的 <code>../</code> 都可能送進來。防線要放在最後：resolve 出真正的路徑再檢查。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 6：<code>JSON.parse('{"__proto__":{"isAdmin":true}}')</code> 這一行本身會讓 <code>({}).isAdmin</code> 變成 <code>true</code> 嗎？</p>
+  <label data-key="a">會，<code>JSON.parse</code> 遇到 <code>__proto__</code> 就會設定原型，所以不能 parse 使用者的 JSON</label>
+  <label data-key="b">會，但只在非嚴格模式下</label>
+  <label data-key="c">不會，它只產生一個名叫 <code>__proto__</code> 的自有屬性；危險的是之後用 <code>target[key]</code> 逐鍵合併時，讀到的是 <code>Object.prototype</code></label>
+  <p class="why">✓ <code>JSON.parse</code> 把每個鍵當成資料，建立自有屬性，<code>Object.hasOwn(body, '__proto__')</code> 是 <code>true</code>，<code>({}).isAdmin</code> 仍是 <code>undefined</code>（v24.22.1 實測），跟嚴格模式無關，a、b 錯。問題出在天真的合併：<code>target['__proto__']</code> 經過存取器讀到 <code>Object.prototype</code>，再把 <code>isAdmin</code> 寫進去。所以防線在合併：先用 schema 驗證、略過 <code>__proto__</code>、<code>constructor</code>、<code>prototype</code>。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 7：服務用 Node 24 加上 <code>node --permission --allow-fs-read=./public server.ts</code> 啟動。程式裡的某段程式碼（例如被植入惡意程式的依賴）照一般的 API 呼叫下面三件事，哪一件會成功、不會丟 <code>ERR_ACCESS_DENIED</code>？</p>
+  <label data-key="a">用 <code>fetch</code> 把記憶體裡的環境變數（例如資料庫密碼）送到攻擊者的伺服器</label>
+  <label data-key="b">讀 <code>~/.ssh/id_rsa</code></label>
+  <label data-key="c">用 <code>child_process</code> 執行 <code>curl</code></label>
+  <p class="why">✓ Node 24 的 Permission Model 管檔案、子程序、worker、原生模組，不管網路：開了 <code>--permission</code>，<code>fetch</code> 照樣能連線（v24.22.1 實測），<code>--allow-net</code> 到 v25.0.0 才加入。<code>process.env</code> 已經在記憶體裡，不需要任何權限。<code>~/.ssh</code> 不在 <code>./public</code> 底下，讀取會 <code>ERR_ACCESS_DENIED</code>，b 錯；沒有 <code>--allow-child-process</code>，開子程序也被擋，c 錯。所以它是縱深防禦的一層，網路出口還要靠防火牆或容器的網路規則限制。另外官方文件也說，真正的惡意程式碼有辦法繞過 Permission Model；要隔離不信任的程式碼，用容器或虛擬機。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>只靠前端驗證</strong>：攻擊者不用你的前端，直接送請求。每一個檢查都要在伺服器上再做一次。</li>
+  <li><strong>用字串比對找 <code>..</code></strong>：編碼、雙重編碼、反斜線總有一種漏掉。resolve 出最後的路徑再檢查它在不在根目錄下。</li>
+  <li><strong>用 <code>startsWith(root)</code> 比對路徑卻沒加分隔符號</strong>：<code>images-private</code> 也以 <code>images</code> 開頭。比對 <code>root + sep</code>。</li>
+  <li><strong>忽略符號連結</strong>：路徑字串在裡面，檔案在外面。用 <code>realpath</code> 換成真正的位置再檢查，根目錄本身也先 realpath。</li>
+  <li><strong>用複雜的正規表示式驗證輸入</strong>：巢狀量詞遇到特製的輸入會卡死整個伺服器。讓分隔符號變成必要的、先限制長度，或乾脆用 <code>split</code>。</li>
+  <li><strong>用 <code>exec</code> 串字串</strong>：輸入變成 shell 指令。用 <code>execFile</code>／<code>spawn</code> 加參數陣列，需要時用 <code>--</code> 隔開選項（<a href="09-blocking-and-workers.html">第 9 課</a>）。</li>
+  <li><strong>深合併不檢查鍵</strong>：<code>__proto__</code>、<code>constructor</code> 讓所有物件都被改掉（<a href="../../typescript/lessons/03-prototypes-classes.html">TypeScript 課第 3 課</a>）。先驗證 schema，合併時略過危險的鍵。</li>
+  <li><strong>相信客戶端送來的 <code>X-Forwarded-For</code></strong>：取最左邊的值、或不管直連的是誰都看這個標頭，限流和稽核紀錄都會被騙。只在直連的是信任的代理時才看，從右邊跳過信任的代理。</li>
+  <li><strong>把 Permission Model 當成沙盒</strong>：Node 24 不限制網路，符號連結與已開啟的 file descriptor 也能繞過。它是縱深防禦的一層，不是隔離不信任程式碼的方法。</li>
+  <li><strong><code>--allow-fs-write=./out</code> 但 <code>out/</code> 還不存在</strong>：只允許 <code>out</code> 這個路徑本身。寫成 <code>'./out/*'</code>。</li>
+  <li><strong>沒看清楚就 <code>npm install</code></strong>：install script 會在你的電腦上執行任意程式。先看是誰維護的，用 <code>allowScripts</code> 或 <code>ignore-scripts</code> 控制，部署一律 <code>npm ci</code>。</li>
+  <li><strong>修好漏洞就當成事故結束</strong>：已經外洩的祕密還能用。外洩過的密碼、token 一律換掉。</li>
+</ul>
+
+<h2>補充與查表</h2>
+<h3>標準化的 Forwarded 標頭</h3>
+<p>RFC 7239 定義了標準化的 <code>Forwarded</code> 標頭（<code>Forwarded: for=203.0.113.9;proto=https</code>），但實務上大部分代理仍然用 <code>X-Forwarded-For</code> 這個事實標準，規則一樣：只相信自己的代理加上去的部分。</p>
+
+<h3>Permission Model 的版本變化</h3>
+<p>以下整理自 Node 24 的 permissions 與 cli 文件，加上本機驗證：</p>
+<ul>
+  <li>v23.5.0／v22.13.0 起是 Stable。</li>
+  <li>v24.0.0 起旗標從 <code>--experimental-permission</code> 改名為 <code>--permission</code>。</li>
+  <li>v24.2.0 起進入點檔案自動可讀，所以不用為 <code>tools/report.ts</code> 加 <code>--allow-fs-read</code>（<code>.ts</code> 進入點一樣可以）。</li>
+  <li>v24.20.0 加入 <code>--permission-audit</code>，只檢查、不阻擋，每一次違規發到 <code>node:diagnostics_channel</code> 的 <code>node:permission-model:fs</code> 等頻道。用它跑一陣子，看程式實際用到哪些權限，再換成 <code>--permission</code>。</li>
+  <li><code>--allow-net</code> 到 v25.0.0 才加入；Node 24 的 Permission Model 不限制網路。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>威脅模型：列出不可信的輸入（網址、標頭、body、檔名、上游回應），列出危險的去處（檔案、shell、SQL、合併、正規表示式、標頭與 log），每條線都要一道檢查。出事的地方，都是輸入被當成某種語法解讀。</li>
+  <li>路徑穿越：<code>req.url</code> 是原樣字串，<code>URL</code> 也不處理 <code>%2F</code>。不要在字串裡找 <code>..</code>，而是解碼 → 白名單副檔名 → <code>resolve</code> → 比對 <code>root + sep</code> → <code>realpath</code> 再比一次；更好的設計是不讓使用者給路徑。</li>
+  <li>同樣形狀的洞：原型污染的入口是合併使用者的物件；指令注入的入口是把輸入交給 shell 或當成選項；標頭注入靠換行，Node 會擋但要先驗證。防法都是先驗證格式，再用不會把資料當結構的 API。</li>
+  <li>ReDoS 來自巢狀量詞與重疊選項，會卡住整條 event loop；把可有可無的分隔符號改成必要的，讓每個字元只有一種走法。只限制長度不夠。</li>
+  <li>每一種資源都要有上限：body、標頭、逾時、上游、連線與併發、次數。單一一項擋不住阻斷服務，要縱深防禦。</li>
+  <li>反向代理後面：直連的是信任的代理才看 <code>X-Forwarded-For</code>，從右往左跳過信任的代理；記得去掉 <code>::ffff:</code>。</li>
+  <li>Permission Model（<code>--permission</code> 加 <code>--allow-*</code>）實踐最小權限，讓漏網的洞損害有限；不存在的資料夾要加 <code>/*</code>；Node 24 不限制網路，它不是沙盒。</li>
+  <li>依賴與祕密：外洩過的祕密一律換掉；lockfile＋<code>npm ci</code>、install script 政策、看懂 <code>npm audit</code>、最少依賴；祕密不進 git 和 log。</li>
+</ul>
+<p>下一課是期末專題：把這門課學過的路由、驗證、交易、log、優雅關機和這一課的安全檢查，全部放進一個不用框架的咖啡店訂單 API。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

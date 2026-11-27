@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>16. 查詢效能：N+1、分頁、索引與原生 SQL 報表</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="16" data-practice="nestjs">
+<header>
+  <div class="eyebrow">階段 3：資料庫（Docker、Prisma 7 ＋ PostgreSQL） · 第 16 課</div>
+  <h1>查詢效能：N+1、分頁、索引與原生 SQL 報表</h1>
+</header>
+<main>
+
+<p>咖啡店的 API 在本機很快：開發資料庫只有幾十張訂單。上線半年後，訂單變成幾十萬張，客服陸續收到三個抱怨：櫃台的訂單看板要等 3 秒才出現；App 的「我的訂單」捲到第 20 頁就一直轉圈，偶爾還看到同一張訂單出現兩次；月底老闆要看每日營收，報表直接逾時，而且就在報表跑的那幾分鐘，連下單都變慢了。</p>
+<p>這段期間程式一行都沒改。慢是資料量變大之後才出現的：同一段程式，處理 50 張訂單和處理 50 萬張訂單，花的時間可以差上千倍。這一課的任務是<strong>依序修好這三個畫面，並且讓「資料庫忙不過來」時，API 會在幾秒內回錯誤，而不是讓所有人一起轉圈</strong>。每一步都照同一個順序：先量出慢在哪裡，再改，改完再量一次確認。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>慢在哪裡：怎麼數出一個請求送了幾句 SQL；訂單看板為什麼送了 151 句，怎麼降到固定 3 句（開場問題的最小答案：先量測，問題通常是 SQL 送太多句，或某一句太慢）。</li>
+  <li>「我的訂單」：offset 分頁為什麼越後面越慢、還會重複或漏掉；改成 cursor 分頁，從上一頁最後一筆接著查。</li>
+  <li>cursor 查詢還是慢：用 migration 加複合索引，再用 EXPLAIN 確認資料庫真的用上。</li>
+  <li>月報：依台北時間算每日營收這種 ORM 寫不好的分組加總，怎麼在資料庫裡用一句安全的 <code>$queryRaw</code> 算完。</li>
+  <li>報表拖垮下單：連線池怎麼運作、為什麼會被占滿，怎麼設定逾時讓請求幾秒內失敗並留下紀錄。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="14-prisma-crud-relations.html">第 14 課</a>的 <code>select</code>／<code>include</code>：查詢時順便帶回關聯的資料，例如訂單連同明細和商品名稱。</li>
+  <li><a href="../../postgresql/lessons/20-indexes.html">PostgreSQL 課第 20 課</a>的索引與<a href="../../postgresql/lessons/21-explain.html">第 21 課</a>的 <code>EXPLAIN</code>：索引是依某些欄位排好的目錄，讓資料庫不必讀完整張表；<code>EXPLAIN</code> 顯示資料庫打算怎麼執行一句 SQL，看得出有沒有用上索引。</li>
+  <li><a href="15-transactions-concurrency.html">第 15 課</a>的 <code>$queryRaw</code>：用 tagged template 寫原生 SQL，<code>${}</code> 的值會變成參數另外送出，不會造成 SQL injection。</li>
+</ul></div>
+
+<h2>慢在哪裡？先數出一個請求送了幾句 SQL</h2>
+<p>三個畫面都慢，第一個衝動通常是「加快取」或「把資料庫升級成大台的」。這兩個都是在不知道原因時花錢買時間。資深工程師的第一步是量測：先知道時間花在哪裡，才知道要改哪裡。</p>
+<p>一個 API 請求的時間，大部分花在跟資料庫來回。後端最常見的慢有兩種：</p>
+<ul>
+  <li><strong>SQL 送太多句</strong>：每一句都很快，但一個請求送了幾百句，加起來就慢。</li>
+  <li><strong>某一句很慢</strong>：只送一句，但那一句要讀幾十萬列資料。</li>
+</ul>
+<p>這兩種的修法完全不同，所以要先分辨是哪一種。第一種最容易量：數出一個請求送了幾句 SQL。Prisma 可以在每送出一句 SQL 時發出一個 <strong>query 事件</strong>，事件裡有 SQL 本文、參數和這一句花了幾毫秒。起始專案的 <code>PrismaService</code> 已經接好了：</p>
+<pre>// src/prisma/prisma.service.ts（起始專案已經寫好）
+type QueryLogOptions = Prisma.PrismaClientOptions &amp; { log: [{ emit: 'event'; level: 'query' }] }
+
+export class PrismaService extends PrismaClient&lt;QueryLogOptions&gt; implements OnModuleInit {
+  constructor(private readonly config: ConfigService) {
+    super({
+      adapter: new PrismaPg({ connectionString: config.getOrThrow('DATABASE_URL'), /* 連線池設定，後面講 */ }),
+      log: [{ emit: 'event', level: 'query' }],   // 每一句 SQL 都發出事件，但不自己印
+    })
+  }
+
+  onModuleInit() {
+    if (!this.config.get&lt;boolean&gt;('LOG_SQL')) return
+    this.$on('query', e =&gt; this.logger.log(`${e.query}  params=${e.params}  ${e.duration}ms`))
+  }
+}</pre>
+<p>從上到下看這段程式做了三件事。第一，<code>log</code> 的 <code>emit: 'event'</code> 表示「每一句 SQL 發出事件給我處理」。另一種寫法 <code>emit: 'stdout'</code>（或直接寫 <code>log: ['query']</code>）是 Prisma 自己印到終端機。用事件比較有彈性：程式可以決定要不要印、印到哪裡，也能在測試裡計數。</p>
+<p>第二，<code>PrismaClient&lt;QueryLogOptions&gt;</code> 這個型別參數告訴 TypeScript：這個 client 會發出 query 事件。少了它，<code>this.$on('query', …)</code> 的 <code>e</code> 就沒有 <code>query</code>、<code>params</code>、<code>duration</code> 這些屬性可用。</p>
+<p>第三，要不要印由 <code>LOG_SQL</code> 決定，它用<a href="11-configuration.html">第 11 課</a>的 <code>z.stringbool()</code> 驗證成布林。在 <code>work/16/.env</code> 把它改成 <code>true</code>，<code>npm run start:dev</code> 之後打一次 API，終端機就會一句一句印出這個請求送了哪些 SQL，數一數就知道總共幾句。</p>
+<p>用眼睛數適合找問題；修好之後，要防止它再壞回去，就把同樣的事寫進測試：用一個會發出事件的 client 換掉 <code>PrismaService</code>，把每一句收進陣列，最後斷言陣列的長度。本課的判分就是這樣寫的，你在第 17 課也會這樣寫自己的測試：</p>
+<pre>const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: url }), log: [{ emit: 'event', level: 'query' }] })
+const sql: string[] = []
+prisma.$on('query', e =&gt; { sql.push(e.query) })
+const app = await createTestApp(AppModule, { override: b =&gt; b.overrideProvider(PrismaService).useValue(prisma) })
+
+await request(app.getHttpServer()).get('/orders')
+expect(sql.length).toBeLessThanOrEqual(3)   // 之後誰把查詢改回迴圈，這個測試就會失敗</pre>
+<p>為什麼斷言「句數」而不是「花了幾毫秒」？耗時會隨電腦負載起伏：同一個測試在你的筆電跑 80 毫秒，在忙碌的 CI 機器上可能跑 300 毫秒，用時間當標準，測試會時過時不過。句數在任何電腦上都一樣，適合寫成測試。至於「某一句很慢」這第二種問題，要看那一句的執行計畫（<code>EXPLAIN</code>，加索引那一節會用到）；找出整個系統裡哪幾句最慢，則用 <code>pg_stat_statements</code>（<a href="../../postgresql/lessons/29-query-tuning.html">PostgreSQL 課第 29 課</a>）。</p>
+<p>有了量測工具，先拿最常被抱怨的訂單看板來量。</p>
+
+<h2>訂單看板為什麼送了 151 句 SQL？</h2>
+<p>打開 <code>LOG_SQL</code> 打一次訂單看板的 API，終端機捲了好幾頁。看板要顯示最新 50 張訂單，每張要列出明細和商品名稱。起始專案是這樣寫的：</p>
+<pre>const orders = await this.prisma.order.findMany({ orderBy: { id: 'desc' }, take: 50 })   // 1 句
+for (const order of orders) {
+  const items = await this.prisma.orderItem.findMany({ where: { orderId: order.id } })     // 每張訂單 1 句：50 句
+  for (const item of items) {
+    const product = await this.prisma.product.findUniqueOrThrow({ where: { id: item.productId } })   // 每項明細 1 句：100 句
+  }
+}</pre>
+<p>這段程式讀起來很自然：拿到訂單，對每張訂單查明細，對每項明細查商品。結果也是對的。問題在句數：每張訂單兩項明細，這個請求總共送出 1 + 50 + 100 = 151 句 SQL。</p>
+<p>這種「先查 1 次拿到列表，再為列表裡的每一筆各查 1 次」的寫法叫 <strong>N+1 查詢</strong>（<a href="../../postgresql/lessons/25-backend.html">PostgreSQL 課第 25 課</a>提過）：列表有 N 筆，就多出 N 句。它慢的原因不在任何一句，每一句單獨看都很快，1 毫秒左右。慢在<strong>來回的次數</strong>：每一句 SQL 都要經過「API 把 SQL 送出去 → 資料庫解析、執行 → 結果傳回 API」，這一趟叫一次網路往返。資料庫在另一台機器上時，光是一趟往返就要 0.5–2 毫秒，151 趟一句接一句排隊，加起來就是幾百毫秒。</p>
+<p>更麻煩的是，這個時間會跟著資料長大。開發資料庫裡每張訂單只有一兩項明細，看起來沒事；店裡推出套餐、每張訂單平均 5 項明細時，同一個請求就變成 1 + 50 + 250 = 301 句。這就是為什麼 N+1 在本機永遠感覺不出來，上線之後才慢慢變慢。</p>
+
+<h3>改成 Promise.all 同時送出，為什麼沒有解決？</h3>
+<p>看到「一句一句排隊」，常見的直覺是讓它們同時送出：</p>
+<pre>await Promise.all(orders.map(order =&gt; this.prisma.orderItem.findMany({ where: { orderId: order.id } })))</pre>
+<p>單一請求確實可能快一點，因為不用等前一句回來才送下一句。但 SQL 還是 50 句，而且會造成另一個問題。Prisma 不會為每一句 SQL 新開一條資料庫連線，而是從一個預先開好的<strong>連線池</strong>借連線來用，用完歸還，預設最多 10 條（最後一節會細講）。50 句同時送出，一個請求就把 10 條全部占滿，剩下 40 句排隊；同一時間其他使用者的請求也只能跟著排。只有一個人在用時看起來變快了，流量一大，整台伺服器都會變慢。N+1 要減少的是 SQL 的句數，同時送出並不會讓句數變少。</p>
+
+<h3>修法：讓 Prisma 一次帶回關聯</h3>
+<p>真正的修法是改變「怎麼問」：不要對每張訂單各問一次明細，而是一次問「這 50 張訂單的明細全部給我」。第 14 課的 <code>select</code> 可以在查訂單時一起帶回關聯，Prisma 會替你做這件事：</p>
+<pre>const orders = await this.prisma.order.findMany({
+  orderBy: { id: 'desc' },
+  take: 50,
+  select: {
+    id: true, customerId: true, total: true, orderedAt: true,
+    items: {
+      orderBy: { id: 'asc' },
+      select: { productId: true, quantity: true, unitPrice: true, product: { select: { name: true } } },
+    },
+  },
+})</pre>
+<p>再打開 <code>LOG_SQL</code> 量一次，Prisma 7.10.1 會送出 3 句（實測）：</p>
+<pre>SELECT "id", ... FROM "orders" ORDER BY "id" DESC LIMIT $1 OFFSET $2
+SELECT ... FROM "order_items" WHERE "order_id" IN ($1,$2,...,$50) ...
+SELECT "id", "name" FROM "products" WHERE "id" IN ($1,$2,...) ...</pre>
+<p>三句由上到下：</p>
+<ol>
+  <li>先查出最新 50 張訂單。Prisma 一律帶上 <code>OFFSET</code> 參數，這裡沒寫 <code>skip</code>，值是 0，不會跳過任何資料；下一節講的 offset 問題只發生在 skip 很大的時候。</li>
+  <li>拿這 50 張訂單的 id，用一句 <code>WHERE order_id IN (...)</code> 查出它們全部的明細。</li>
+  <li>拿這些明細用到的商品 id，用一句 <code>IN (...)</code> 查出商品名稱。</li>
+</ol>
+<p>Prisma 預設每一層關聯各查一句，再在記憶體裡把結果組回巢狀物件。不管有 50 張還是 500 張訂單、每張有幾項明細，都是固定 3 句。句數不再跟著資料量長大，這才是修好了。</p>
+<p>如果資料沒有在 schema 定義關聯（例如商品資料來自另一個服務），沒辦法用 <code>select</code> 帶，就自己做 Prisma 剛才做的事：先 <code>const ids = orders.map(o =&gt; o.id)</code>，再 <code>findMany({ where: { orderId: { in: ids } } })</code> 一次查完，最後用 <code>Map</code> 依 <code>orderId</code> 分組，放回每張訂單。另外，Prisma 也能用一句 JOIN 帶回全部關聯，但那還是預覽功能，細節見課末。</p>
+<div class="callout warn">不要用「撈回整張表，再在 JavaScript 過濾」來把句數降到 3 句：<code>orderItem.findMany()</code> 不加 <code>where</code>，資料一多就把幾十萬列明細搬進記憶體。要減少句數，又要每一句只拿需要的資料。</div>
+<div class="callout practice"><strong>💡 實務上：N+1 多半在 code review 和上線後才被發現</strong><br>在開發資料庫只有幾筆資料，N+1 完全感覺不出來，常常是上線幾個月後客服回報「訂單看板很卡」才去查，就像這課的開場。review 時看到 <code>for</code> 或 <code>map</code> 裡面有 <code>await this.prisma…</code>，就先問「這個列表最多會有幾筆？」。它也常藏在不明顯的地方：某個 helper 函式裡查一次資料庫，被列表的每一筆呼叫。比起靠人眼抓，更可靠的是像第一節那樣替重要的列表 API 寫一個「最多幾句 SQL」的測試，之後誰改壞了 CI 會直接擋下來。</div>
+<p>訂單看板只看最新 50 張，修完句數就夠了。「我的訂單」不一樣：它要讓顧客一路往回翻幾百張訂單，問題不在句數，而在每一頁怎麼查。</p>
+
+<h2>「我的訂單」為什麼越後面越慢，還會重複？</h2>
+<p>App 的「我的訂單」一頁 20 筆，往下捲就載入下一頁。用 <code>LOG_SQL</code> 看，每一頁只送一句 SQL，句數沒有問題。問題出在這一句怎麼決定「下一頁從哪裡開始」。</p>
+<p>起始專案用的是 <strong>offset 分頁</strong>，也就是一般網頁「第 1、2、3 頁」的做法：第 <code>page</code> 頁就是跳過前面 <code>(page - 1) × limit</code> 筆，再拿 <code>limit</code> 筆。Prisma 寫成 <code>skip</code>、<code>take</code>，送出的 SQL 是 <code>LIMIT 20 OFFSET 40</code>（第 3 頁；<a href="../../postgresql/lessons/05-order-limit.html">PostgreSQL 課第 5 課</a>）。寫起來很簡單，但它記的是「跳過幾筆」這個位置，這帶來兩個問題。</p>
+<p><strong>第一個問題：越後面越慢。</strong>資料庫沒辦法直接跳到「第 10001 筆」。<code>OFFSET 10000</code> 的意思是：把符合條件的資料照順序讀出前 10000 筆，丟掉，再回傳接下來的 20 筆。第 1 頁讀 20 筆，第 500 頁要讀 10020 筆，丟掉其中 10000 筆。頁數越大，白讀的資料越多，這就是顧客捲到第 20 頁開始轉圈的原因。</p>
+<p><strong>第二個問題：翻頁中間資料變了，就會重複或漏掉。</strong>顧客看第 1 頁和載入第 2 頁之間，可能隔了幾分鐘。這幾分鐘裡有新訂單進來的話，整個列表往後推，「跳過前 10 筆」跳過的已經不是原本那 10 筆了。看下面的圖：</p>
+<figure>
+  <svg viewBox="0 0 700 240" role="img" aria-label="offset 分頁的時間軸：使用者先看第 1 頁，拿到訂單 30 到 21。接著有 2 張新訂單 32、31 進來。再要第 2 頁（OFFSET 10）時，整個列表往後推 2 格，第 2 頁變成 22 到 13，22 和 21 在第 1 頁已經看過，重複出現。">
+    <text class="d-text" x="20" y="30">① 第 1 頁：LIMIT 10 OFFSET 0</text>
+    <rect class="d-soft" x="20" y="42" width="300" height="34" rx="6"/>
+    <text class="d-text" x="170" y="64" text-anchor="middle">30 29 28 27 26 25 24 23 22 21</text>
+    <text class="d-text" x="20" y="112">② 新訂單 32、31 進來（排在最前面）</text>
+    <text class="d-text" x="20" y="160">③ 第 2 頁：LIMIT 10 OFFSET 10</text>
+    <rect class="d-box" x="20" y="172" width="60" height="34" rx="6"/>
+    <text class="d-small" x="50" y="194" text-anchor="middle">32 31</text>
+    <rect class="d-soft" x="80" y="172" width="240" height="34" rx="6"/>
+    <text class="d-small" x="200" y="194" text-anchor="middle">30 … 23（跳過的 10 筆）</text>
+    <rect class="d-box" x="330" y="172" width="340" height="34" rx="6"/>
+    <text class="d-accent" x="400" y="194" text-anchor="middle">22 21</text>
+    <text class="d-text" x="550" y="194" text-anchor="middle">20 19 18 17 16 15 14 13</text>
+    <text class="d-small" x="330" y="228">22、21 在第 1 頁看過：重複。反過來，有訂單被刪掉時會漏掉一筆</text>
+  </svg>
+  <figcaption>offset 記的是「跳過幾筆」，資料一變，同一個位置就換成別的訂單。</figcaption>
+</figure>
+<p>反過來，翻頁中間有訂單被刪掉時，列表往前縮，原本第 11 筆變成第 10 筆，被「跳過前 10 筆」跳掉，顧客永遠看不到它。咖啡店的訂單一直在增加，這種重複會天天發生。</p>
+<p>兩個問題的根源相同：offset 用「位置」描述下一頁從哪裡開始，而位置會隨資料變動，找到位置也要從頭數。要同時解決，就得換一種描述方式。</p>
+
+<h2>怎麼分頁才不會重複、第幾頁都一樣快？cursor 分頁</h2>
+<p>換個方式描述「下一頁從哪裡開始」：不記「跳過幾筆」，改記「上一頁最後一筆是哪一張訂單」，下一頁就查「排在它後面的 20 筆」。這叫 <strong>cursor 分頁</strong>，也叫 keyset 分頁。cursor 是游標的意思，指向你目前讀到的位置。</p>
+<p>它怎麼解決上一節的兩個問題：</p>
+<ul>
+  <li><strong>不會重複或漏掉</strong>：前面插入或刪掉多少訂單，「排在訂單 21 後面的 20 筆」都還是同一批。條件綁在資料本身的值上，不是綁在位置上。</li>
+  <li><strong>第幾頁都一樣快</strong>：條件是「時間比某個值早」這種範圍條件，資料庫可以靠索引直接跳到那個值的位置開始讀，不用先數過前面幾千筆（索引下一節加）。</li>
+</ul>
+
+<h3>只用時間排序為什麼不夠：平手處理</h3>
+<p>「我的訂單」要依 <code>orderedAt DESC</code> 排序，新的在前。直覺是 cursor 只記上一頁最後一筆的 <code>orderedAt</code>，下一頁查「時間比它早的」。但兩張訂單可能在同一毫秒建立，尤其是批次匯入或同時結帳的時候。這會出兩個錯：</p>
+<ul>
+  <li>排序值相同時，PostgreSQL 不保證它們的先後順序，同一句查詢跑兩次，順序都可能不一樣。</li>
+  <li>如果第 1 頁剛好停在兩張同時間訂單的第一張，下一頁查「時間比它早」，會把第二張一起跳過。</li>
+</ul>
+<p>所以排序一定要加<strong>平手處理（tie-breaker）</strong>：排序值相同時，再用一個不會重複的欄位排，通常是 <code>id</code>。排序變成「先比時間，時間一樣再比 id」，每一筆的位置就是唯一而固定的。cursor 也要同時帶這兩個值，條件寫成「時間更早，或時間相同但 id 更小」：</p>
+<pre>// 排在 cursor 之後 = 時間更早，或時間相同但 id 更小
+where: {
+  customerId,
+  OR: [
+    { orderedAt: { lt: after.orderedAt } },
+    { orderedAt: after.orderedAt, id: { lt: after.id } },
+  ],
+},
+orderBy: [{ orderedAt: 'desc' }, { id: 'desc' }],
+take: limit + 1,   // 多拿一筆：拿到 limit + 1 筆就代表後面還有</pre>
+
+<h3>前端怎麼知道還有沒有下一頁</h3>
+<p>回應的格式是 <code>{ items, nextCursor }</code>：<code>items</code> 是這一頁的訂單，<code>nextCursor</code> 是下一頁要帶回來的 cursor。最後一頁的 <code>nextCursor</code> 是 <code>null</code>，前端看到 <code>null</code> 就停止載入。</p>
+<p>伺服器怎麼知道這是不是最後一頁？直覺的判斷是「這頁剛好滿 <code>limit</code> 筆，就還有下一頁」。但總筆數剛好是 <code>limit</code> 的倍數時，例如 40 筆、一頁 20 筆，第 2 頁也是滿的，前端會再要一次，拿到一個空頁。所以上面的程式寫 <code>take: limit + 1</code>：多拿一筆，拿到 21 筆就代表後面還有，回傳前 20 筆並用第 20 筆做 cursor；不到 21 筆就是最後一頁，<code>nextCursor</code> 給 <code>null</code>。</p>
+
+<h3>cursor 要長什麼樣子</h3>
+<p><code>nextCursor</code> 對前端來說是一串不用看懂的字：把兩個值包成 JSON 再轉 base64url，例如 <code>Buffer.from(JSON.stringify([orderedAt.toISOString(), id])).toString('base64url')</code>。前端只負責原封不動帶回來。這樣做的好處是，以後要換排序方式或欄位，只要改伺服器的編碼和解碼，前端不用跟著改。</p>
+<p>反過來說，cursor 是使用者送來的資料，什麼都可能出現。解不開時要回 400，不能讓 <code>JSON.parse</code> 的錯誤變成 500。解得開但內容不對（時間不是有效的日期、id 不是整數）也一樣要回 400，不然壞掉的值送進查詢，還是 500。</p>
+<p>cursor 分頁的代價是沒辦法「跳到第 37 頁」，也不適合回傳「總共幾筆」：在 PostgreSQL 數總筆數要把符合條件的列一列一列數過，資料越多越慢（原因見課末）。App 往下捲的列表本來就不需要這兩樣。offset 分頁仍然適合後台要「跳到第 37 頁」、資料量小、資料幾乎不會變動的列表；給使用者無限捲動、資料一直在增加的列表，用 cursor 分頁。Prisma 也有內建的 cursor 寫法，本課練習用手寫 <code>where</code>，兩者的比較見課末。</p>
+<div class="callout practice"><strong>💡 實務上：分頁方式在 API 第一版就要和前端講好</strong><br>分頁的格式（<code>page</code> 還是 <code>cursor</code>、回應有沒有 <code>total</code>）一旦上線就很難改：App 的舊版本還在使用者手機上，不會跟著你一起更新。開發前先和 PM、前端確認畫面是「無限捲動」還是「有頁碼、要顯示總筆數」，再決定用哪一種。另外一定要替 <code>limit</code> 設上限（例如最多 100），並在 DTO 驗證，不然有人送 <code>limit=100000</code> 就等於叫你撈整張表。</div>
+<p>改成 cursor 分頁之後，重複和漏掉解決了。但「第幾頁都一樣快」有一個前提：資料庫要能直接跳到 cursor 的位置。現在 <code>orders</code> 表沒有對應的索引，這句查詢還是得讀完整張表。</p>
+
+<h2>cursor 查詢還是讀整張表？用 migration 加索引，用 EXPLAIN 確認</h2>
+<p>cursor 分頁送出的查詢是「<code>customer_id = 7</code> 的訂單，依 <code>ordered_at</code> 由新到舊，拿 21 筆」。沒有索引時，資料庫只能把 <code>orders</code> 幾十萬列全部讀一遍，挑出顧客 7 的，再排序，最後只回傳 21 筆。這種從頭讀到尾的方式叫<strong>循序掃描</strong>，執行計畫裡顯示為 <code>Seq Scan</code>。</p>
+<p><strong>索引</strong>是資料庫另外維護的一份目錄，依某些欄位排好順序，每一項指向資料表裡的那一列。有了依 <code>(customer_id, ordered_at)</code> 排好的索引，資料庫可以直接翻到「顧客 7、最新的那一筆」，往回讀 21 筆就結束，不管表有多大。這種讀法在執行計畫裡顯示為 <code>Index Scan</code>。</p>
+
+<h3>在 schema 宣告索引</h3>
+<p>Prisma 的索引寫在 <code>schema.prisma</code>，用 <strong>@@index</strong> 宣告：</p>
+<pre>model Order {
+  // ...
+  @@index([customerId, orderedAt])   // 先等值篩選的欄位，再排序的欄位
+}
+
+model OrderItem {
+  // ...
+  @@index([orderId])                 // 外鍵：PostgreSQL 不會自動替它建索引
+}</pre>
+<p><code>Order</code> 的索引有兩個欄位，叫<strong>複合索引</strong>，欄位順序很重要（<a href="../../postgresql/lessons/27-index-design.html">PostgreSQL 課第 27 課</a>）。把它想成先依 <code>customer_id</code>、再依 <code>ordered_at</code> 排好的通訊錄：同一位顧客的訂單連在一起，而且已經照時間排好，資料庫找到顧客 7 那一段，從尾端往回讀 21 筆就好。反過來寫成 <code>(ordered_at, customer_id)</code>，整份目錄先照時間排，同一位顧客的訂單會散在整個索引裡，資料庫還是得翻很多頁才湊得到 21 筆。原則是：<code>=</code> 篩選的欄位放前面，排序或範圍的欄位放後面。</p>
+<p><code>OrderItem</code> 的 <code>orderId</code> 索引是給前面訂單看板那一節用的：修好 N+1 之後的第二句 <code>WHERE order_id IN (...)</code>，沒有索引一樣要掃整張 <code>order_items</code>。這裡有一個容易誤會的地方：<code>order_id</code> 是外鍵，很多人以為外鍵會自動有索引。外鍵約束只要求被參照的一方（<code>orders.id</code>，它是主鍵，本來就有索引），參照的一方（<code>order_items.order_id</code>）不會自動建索引。刪除或更新訂單時，PostgreSQL 要檢查還有沒有明細指向它，沒有索引這個檢查也要掃 <code>order_items</code>，所以外鍵欄位幾乎都需要自己加索引。</p>
+
+<h3>為什麼一定要透過 migration</h3>
+<p>在 <code>work/16</code> 執行 <code>npx prisma migrate dev --name add_indexes</code>（<a href="13-prisma-setup.html">第 13 課</a>產生 migration 的指令），打開產生的 <code>migration.sql</code>：</p>
+<pre>CREATE INDEX "orders_customer_id_ordered_at_idx" ON "orders"("customer_id", "ordered_at");
+CREATE INDEX "order_items_order_id_idx" ON "order_items"("order_id");</pre>
+<p>這兩句就是 schema 改動翻譯成的 SQL。你可能會想：直接在 psql 打 <code>CREATE INDEX</code> 不是更快？那只有你的開發資料庫有這個索引。判分用的資料庫、同事的電腦、正式環境都是只套用 <code>prisma/migrations/</code> 建出來的，都不會有。反過來，只手寫 <code>migration.sql</code>、schema 卻沒有 <code>@@index</code> 也不行：下次 <code>migrate dev</code> 比對 schema，會產生刪掉這個索引的 migration。索引一定要宣告在 schema，再由 <code>migrate dev</code> 產生 migration 套用。</p>
+
+<h3>用 EXPLAIN 確認真的用上</h3>
+<p>加了索引不代表資料庫會用。要確認，就請資料庫說出它打算怎麼執行這句查詢：</p>
+<pre>const plan = await this.prisma.$queryRaw`
+  EXPLAIN SELECT id, total, ordered_at FROM orders
+  WHERE customer_id = ${7} ORDER BY ordered_at DESC, id DESC LIMIT 21`</pre>
+<p>想看 Prisma 實際送出的那一句，從 <code>LOG_SQL</code> 的輸出複製，把 <code>$1</code> 換成值，貼到 <code>psql</code> 加上 <code>EXPLAIN ANALYZE</code>（<a href="../../postgresql/lessons/21-explain.html">PostgreSQL 課第 21 課</a>），會連實際花的時間一起列出來。</p>
+<p>在開發資料庫只有 200 張訂單時，你多半會看到 <code>Seq Scan</code>，這是正常的，不是索引壞了。決定怎麼執行的是資料庫的<strong>規劃器（planner）</strong>，它依統計資訊估算每種做法的成本。資料少到整張表只有一兩個資料頁時，直接讀完比先查索引再回表還快，規劃器就選循序掃描。要有足夠資料，再執行 <code>ANALYZE</code> 更新統計，才看得到 <code>Index Scan</code>。練習 3 的測試會塞 5 萬張訂單再檢查。</p>
+<p>大表在正式環境加索引還有一件要注意的事：一般的 <code>CREATE INDEX</code> 會擋住寫入直到建完，做法見課末。</p>
+
+<h3>索引不是越多越好</h3>
+<p>索引也有代價：每次 INSERT／UPDATE 都要多更新一份索引，也占磁碟空間。每個欄位都加索引，下單反而變慢。只替真的常用、而且看過執行計畫的查詢加。索引是讓資料庫少讀資料；另一個少讀的方法在查詢本身：<code>select</code> 只列需要的欄位，傳輸和記憶體都比較少，也不會把不該給前端的欄位送出去（第 14 課）。</p>
+<p>到這裡，看板和「我的訂單」都修好了，它們的共同點是 Prisma 的查詢寫得出來，只是要寫對。月報不一樣：它要的計算，Prisma 的 API 根本寫不出來。</p>
+
+<h2>月報為什麼逾時又算錯？在資料庫裡分組加總</h2>
+<p>老闆要一張每日營收報表：指定日期範圍，每天有幾張訂單、營收多少。起始專案把範圍內的所有訂單撈回來，在 JavaScript 分組。量一下就看得出它有兩個問題。</p>
+<p><strong>第一個問題是慢。</strong>只送一句 SQL，但這一句把一年份十幾萬列訂單全部從資料庫傳到 API，再在 JavaScript 一筆一筆分組。資料越多，傳輸和記憶體都跟著長，最後逾時。這正是第一節說的第二種慢：句數不多，但某一句太重。</p>
+<p><strong>第二個問題是算錯。</strong>日期用 <code>toISOString().slice(0, 10)</code> 切出來。<code>toISOString()</code> 一律輸出 UTC 時間，台北是 UTC+8，所以台北晚上 8 點以後的訂單，UTC 已經是隔天，會被算到隔天的營收。老闆對帳時會發現每天的數字都對不上。</p>
+<p>「分組、加總、時區換算」正是 SQL 擅長的事（<code>GROUP BY</code> 見 <a href="../../postgresql/lessons/07-aggregate.html">PostgreSQL 課第 7 課</a>）：資料庫在自己那邊算完，只回傳每天一列，七天的報表就是七列。Prisma 有 <code>groupBy</code>，但它只能依欄位本身分組，沒辦法依「換成台北時間之後的日期」這種運算結果分組。ORM 表達不了的查詢，就寫一句 <code>$queryRaw</code>：</p>
+<pre>return this.prisma.$queryRaw&lt;DailySales[]&gt;`
+  SELECT to_char(ordered_at AT TIME ZONE 'Asia/Taipei', 'YYYY-MM-DD') AS day,
+         COUNT(*)::int AS orders,
+         SUM(total)::int AS revenue
+  FROM orders
+  WHERE ordered_at &gt;= ${from}::date::timestamp AT TIME ZONE 'Asia/Taipei'
+    AND ordered_at &lt;  (${to}::date + 1)::timestamp AT TIME ZONE 'Asia/Taipei'
+  GROUP BY day
+  ORDER BY day`</pre>
+<p>這一句有幾個地方各自擋掉一種錯，依程式由上到下看。</p>
+
+<h3>時區：先換成台北時間，再取日期</h3>
+<p><code>ordered_at</code> 的型別是 <code>timestamptz</code>，存的是一個絕對時間點，不帶「哪裡的幾點」。<code>AT TIME ZONE 'Asia/Taipei'</code> 把這個時間點換成台北的當地時間，再用 <code>to_char</code> 取出日期，晚上 9 點的訂單就留在當天。如果只寫 <code>ordered_at::date</code>，資料庫會用連線的時區換算（課程的容器是 UTC），報表就差 8 小時，跟 JavaScript 版犯同樣的錯。也可以寫成 <code>date_trunc('day', ordered_at AT TIME ZONE 'Asia/Taipei')</code>。</p>
+
+<h3>範圍條件：比欄位本身，不比運算結果</h3>
+<p><code>WHERE</code> 沒有寫成「換成台北日期之後介於 from 和 to 之間」，而是反過來：先把「台北 <code>from</code> 當天 00:00」和「台北 <code>to</code> 隔天 00:00」換成時間點，再直接和 <code>ordered_at</code> 比。兩種寫法結果相同，差別在索引：條件直接比欄位，<code>ordered_at</code> 有索引時就能用上；對欄位做了運算再比，資料庫只能每一列都算一次。注意本課加的 <code>(customer_id, ordered_at)</code> 索引開頭是 <code>customer_id</code>，報表沒有篩顧客，所以用不上；報表真的慢時，要另外替 <code>ordered_at</code> 建索引，並先用 <code>EXPLAIN</code> 確認。<code>::</code> 的優先順序比 <code>AT TIME ZONE</code> 高，所以 <code>${from}::date::timestamp AT TIME ZONE …</code> 是先轉成日期、再轉成時間、最後指定時區。</p>
+
+<h3>參數化：使用者給的日期不能拼進 SQL</h3>
+<p><code>${from}</code> 寫在 tagged template 裡，會變成 <code>$1</code>，值和 SQL 分開送給資料庫，所以不會有 SQL injection（第 15 課）。另一個 API <code>$queryRawUnsafe</code> 是把字串直接拼進 SQL，搭配使用者輸入就有 SQL injection 的風險，練習 4 不允許出現。條件要動態組合、或排序欄位由使用者決定時，做法見課末。</p>
+
+<h3>回傳型別：BigInt 會讓 API 回 500</h3>
+<p>PostgreSQL 的 <code>COUNT(*)</code> 回傳 <code>bigint</code>，整數欄位的 <code>SUM</code> 也是 <code>bigint</code>，從 <code>$queryRaw</code> 回來就是 JavaScript 的 <code>BigInt</code>（<a href="../../typescript/lessons/05-numbers-money.html">TypeScript 課第 5 課</a>，例如 <code>9n</code>，實測）；<code>numeric</code> 則會變成 <code>Decimal</code> 物件。Nest 回應時呼叫 <code>JSON.stringify</code>，遇到 <code>BigInt</code> 直接丟 <code>TypeError</code>，API 就回 500。在 SQL 裡加 <code>::int</code> 最簡單；值可能超過 int 範圍時，回傳前用 <code>Number()</code> 轉換，並先確認不超過 <code>Number.MAX_SAFE_INTEGER</code>。</p>
+<p>還有一點：<code>$queryRaw&lt;DailySales[]&gt;</code> 的型別參數只是你的宣告，Prisma 不會檢查實際回來的欄位。欄位名打錯、型別變了，TypeScript 都不會報錯。所以這種查詢一定要有測試。</p>
+
+<h3>日期在進 SQL 之前就驗證</h3>
+<p>最後，<code>from</code>、<code>to</code> 來自 query string，可能是任何字串。在送進 SQL 之前，DTO（<a href="07-pipes-validation.html">第 7 課</a>）先用 <code>@Matches(/^\d{4}-\d{2}-\d{2}$/)</code> 檢查格式，再用 <code>@IsISO8601({ strict: true })</code> 擋掉 2 月 30 日這種不存在的日期。兩個都要：只用 <code>@IsISO8601</code> 會放過 <code>2026-10-01T00:00:00Z</code> 這種帶時間的寫法，只用 <code>@Matches</code> 會放過 2 月 30 日。格式不對就在 ValidationPipe 回 400，不會等到資料庫轉型失敗才變成 500。</p>
+<div class="callout practice"><strong>💡 實務上：報表寫好之後，先拿一天的數字跟店家對帳</strong><br>報表的 SQL 跑得出結果不代表數字是對的。資深工程師會先問清楚定義：「一天」是從 0 點算，還是營業到凌晨 2 點也算前一天？取消、退款的訂單要不要算進營收？然後挑一天，用收銀機或會計的數字對一次，對得上才交出去。報表通常也是系統裡最慢的查詢，要注意不要在尖峰時段被一直重新整理，拖慢正在下單的顧客。</div>
+<p>這正是開場的最後一個抱怨：月底報表在跑的那幾分鐘，連下單都變慢了。報表和下單查的是不同的資料，為什麼會互相影響？答案在它們共用的東西：連線池。</p>
+
+<h2>報表一慢，為什麼整個 API 跟著卡住？連線池與逾時</h2>
+<p>先把連線池講清楚。API 要跟 PostgreSQL 說話，得先建立一條連線：TCP 連線、身分驗證、資料庫那邊為它開一個程序，每次都要花時間。如果每句 SQL 都新開一條、用完關掉，光是開關連線就比查詢本身還慢。所以 Prisma 7 透過 <code>PrismaPg</code> adapter 使用 pg 套件的<strong>連線池</strong>：先開好幾條連線放著，請求要查詢時借一條，用完歸還給下一個人用。起始專案的設定：</p>
+<pre>new PrismaPg({
+  connectionString,
+  max: 10,                          // 這個程序最多 10 條連線
+  connectionTimeoutMillis: 5_000,   // 借不到連線，等 5 秒就放棄
+  statement_timeout: 5_000,         // 每一句 SQL 最多跑 5 秒，超過由資料庫取消
+  application_name: 'coffee-api',   // 在 pg_stat_activity 認得出這是誰的連線
+})</pre>
+<p>這些都是 pg 的 <code>PoolConfig</code> 選項，寫在 adapter，不是寫在連線網址。</p>
+
+<h3>連線池耗盡：為什麼是一直轉圈，而不是報錯</h3>
+<p>現在回到月底那幾分鐘。報表一句要跑很久，老闆和會計一直按重新整理，每按一次就借走一條連線，跑完之前都不還。10 條連線被報表占滿之後，顧客下單的請求來借連線，池子裡一條都沒有，只能排隊等。這個狀態叫<strong>連線池耗盡</strong>（pool exhaustion）。</p>
+<p>排隊要等多久，由 <code>connectionTimeoutMillis</code> 決定。Prisma 7 搭配 pg adapter 的預設值是 <code>max</code> 10、<code>connectionTimeoutMillis</code> 0、<code>idleTimeoutMillis</code> 10 秒。<code>connectionTimeoutMillis</code> 是 0 代表<strong>永遠等</strong>：新請求會一直卡著，不回應、也不報錯，log 裡什麼都沒有，使用者只看到畫面一直轉。這比直接失敗更糟，因為你連出了什麼事都不知道。起始專案設成 5 秒之後，請求會在 5 秒內失敗並留下錯誤紀錄，前端可以顯示「請稍後再試」，服務自己也比較快恢復。</p>
+
+<h3>statement_timeout：不讓一句失控的 SQL 一直占著連線</h3>
+<p><code>connectionTimeoutMillis</code> 處理的是「借不到連線的人」，但占著連線的那句報表還在跑。<strong>statement_timeout</strong> 處理的是源頭：它是 PostgreSQL 替每一句 SQL 設的時間上限，超過就由資料庫取消那一句，連線歸還。這樣一句寫壞的報表最多占用連線 5 秒，不會拖垮整個 API。</p>
+<p>被取消的查詢會在 Prisma 丟出錯誤（各種錯誤碼的長相見課末），可以在 exception filter（<a href="08-exception-filters.html">第 8 課</a>）把它轉成 503，告訴客戶端「稍後再試」。報表這種本來就比較慢的查詢，可以在交易裡用 <code>SET LOCAL statement_timeout</code> 單獨放寬，或交給背景工作（第 20 課）。</p>
+
+<h3>連線池不是越大越好</h3>
+<p>看到「10 條不夠用」，下一個直覺是把 <code>max</code> 調大。但每條連線在資料庫端都是一個程序、會占記憶體，PostgreSQL 用 <code>max_connections</code> 限制總連線數，預設 100。而且每台 API 伺服器各自有自己的連線池，彼此不知道對方存在。總連線數是「每台的 pool 大小 × 伺服器台數（加上 migration、排程等其他程式）」，這個數字要小於資料庫的上限：</p>
+<div class="table-wrap"><table>
+  <tr><th>每台 pool</th><th>台數</th><th>總連線</th><th>資料庫上限 100</th></tr>
+  <tr><td>10</td><td>5</td><td>50</td><td>還留了空間給 migration、psql、監控</td></tr>
+  <tr><td>20</td><td>10</td><td>200</td><td>超過上限：新連線被拒絕（<code>sorry, too many clients already</code>），部署擴台時一次爆掉</td></tr>
+</table></div>
+<p>就算沒超過上限，pool 加大也沒有讓資料庫變快：資料庫的 CPU 核心數是固定的，同時跑的查詢越多，每一句分到的 CPU 越少，每一句越慢。查詢慢的時候，先修查詢和索引，不要先加大 pool。伺服器很多台時，再考慮 PgBouncer 這類連線池代理，讓所有伺服器共用一個集中管理的池（<a href="../../postgresql/lessons/36-connections-monitoring.html">PostgreSQL 課第 36 課</a>）。</p>
+<div class="callout practice"><strong>💡 實務上：慢了先量測、修查詢，快取放最後</strong><br>回頭看這課修過的三個畫面，沒有一個是靠快取修好的。第 19 課會加 Redis 快取，但快取不是慢查詢的第一個解法。快取會帶來資料過時和失效的問題，而且快取沒命中時，還是會跑那句慢查詢。順序是：量測 → 修 N+1 → 加索引 → 改寫查詢，都做了還不夠，再考慮快取。</div>
+
+<h2>練習</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs nestjs 16</code> 建立 <code>work/16/</code>。這是一個只有訂單相關功能的小專案（商品、顧客、訂單、明細四張表）。想用開發伺服器試，先在 <code>work/16</code> 執行 <code>npx prisma migrate dev</code>（建立開發資料庫 <code>nest_16</code>）和 <code>npx prisma db seed</code>（放入 6 種商品、6 位顧客、200 張訂單），把 <code>.env</code> 的 <code>LOG_SQL</code> 改成 <code>true</code>，再 <code>npm run start:dev</code>。判分用的是另一個每次重建的資料庫，測試會自己放資料。</p>
+
+<div class="local" data-test="ex1" data-files="src/orders/orders.service.ts">
+  <p>練習 1：<code>GET /orders</code> 回傳最新 50 張訂單（依 id 由新到舊），每張是 <code>{ id, customerId, total, orderedAt, items }</code>，<code>items</code> 依明細 id 排序，每項是 <code>{ productId, productName, quantity, unitPrice }</code>。起始程式的結果是對的，但會送出 151 句 SQL。先打開 <code>LOG_SQL</code> 打一次 <code>curl localhost:3100/orders</code> 數數看，再改寫 <code>findRecent</code>：回應的形狀不變，一個請求最多 3 句 SQL，而且查 <code>order_items</code> 的那一句要用 <code>order_id</code> 篩選（只查這 50 張訂單的明細）。測試會用 60 張訂單檢查內容，並數出實際送出的 SQL。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="src/customers/list-orders.query.ts src/customers/customers.service.ts">
+  <p>練習 2：把 <code>GET /customers/:id/orders</code> 從 offset 分頁改成 cursor 分頁。query 參數是 <code>cursor</code>（選填，上一頁的 <code>nextCursor</code>）和 <code>limit</code>（整數 1–50，預設 20，超出範圍回 400），拿掉 <code>page</code>。依 <code>orderedAt</code> 由新到舊排序，時間相同時 id 大的在前；回傳 <code>{ items, nextCursor }</code>，每筆是 <code>{ id, total, orderedAt }</code>；後面沒有資料時 <code>nextCursor</code> 是 <code>null</code>，包括筆數剛好是 <code>limit</code> 倍數的時候。<code>nextCursor</code> 的格式由你決定，解不開或內容不對的 cursor 都回 400。測試會放 25 張只有 5 種時間的訂單，翻頁的中間一直插入新訂單，檢查每一頁接起來剛好是原本的 25 張、沒有重複也沒有漏掉。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="prisma/schema.prisma">
+  <p>練習 3：在 <code>schema.prisma</code> 替 <code>orders(customer_id, ordered_at)</code> 加複合索引（欄位就是這個順序）、替 <code>order_items(order_id)</code> 加索引，在 <code>work/16</code> 執行 <code>npx prisma migrate dev --name add_indexes</code> 產生 migration，打開新的 <code>prisma/migrations/…_add_indexes/migration.sql</code> 看看內容。測試在全新的資料庫套用你的 migration，檢查索引的欄位，再放 5 萬張訂單、<code>ANALYZE</code>，確認「某位顧客的訂單、由新到舊」的執行計畫用到了這個複合索引。只在 psql 手動建索引不算；只手寫 <code>migration.sql</code>、schema 沒有 <code>@@index</code> 也不算（下次 <code>migrate dev</code> 會產生刪掉它的 migration）。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="src/reports/daily-sales.query.ts src/reports/reports.service.ts">
+  <p>練習 4：<code>GET /reports/daily-sales?from=2026-10-01&amp;to=2026-10-07</code> 回傳 <code>[{ day: '2026-10-01', orders: 3, revenue: 360 }, …]</code>：依<strong>台北時間</strong>的日期分組，<code>from</code>、<code>to</code> 兩天都包含，依日期排序，沒有訂單的日子不出現，<code>orders</code>、<code>revenue</code> 是 number。改寫 <code>ReportsService.dailySales</code>，用<strong>一句</strong> <code>$queryRaw</code> 在資料庫裡分組，日期用參數傳。在 <code>DailySalesQuery</code> 驗證 <code>from</code>、<code>to</code> 都是存在的 <code>YYYY-MM-DD</code> 日期（不能帶時間），不符合就回 400，而且不送任何 SQL。<code>src/</code> 裡不能出現 <code>$queryRawUnsafe</code>。測試的訂單會落在台北午夜的前後一秒。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：同事把 N+1 的迴圈改成 <code>await Promise.all(orders.map(o =&gt; prisma.orderItem.findMany({ where: { orderId: o.id } })))</code>，說「現在同時查，N+1 解決了」。對嗎？</p>
+  <label data-key="a">對，查詢同時進行，總時間只剩最慢那一句</label>
+  <label data-key="b">對，Prisma 會自動把同時送出的 findMany 合併成一句</label>
+  <label data-key="c">不對，還是 N 句 SQL，而且一個請求就同時占用多條連線，其他請求要排隊</label>
+  <label data-key="d">不對，Promise.all 只要有一句失敗，結果就會不完整</label>
+  <p class="why">✓ SQL 的句數沒變，每句的網路往返和資料庫的處理都還在。連線池預設 10 條，50 句同時送出會占滿整個池，同一時間其他使用者的請求只能等，所以流量一大反而更糟（a 錯：只看單一請求的時間）。Prisma 不會把這些 <code>findMany</code> 合併成一句（b 錯），開 query log 就能看到 50 句。d 說的是錯誤處理，跟 N+1 無關。正解是用 <code>include</code>／<code>select</code> 或 <code>{ in: ids }</code> 一次查完。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：「我的訂單」用 <code>LIMIT 20 OFFSET 20</code> 載入第 2 頁。使用者看完第 1 頁後，他又在另一台裝置下了一張新訂單，然後往下捲。第 2 頁會怎樣？</p>
+  <label data-key="a">正常，OFFSET 會自動避開新資料</label>
+  <label data-key="b">第 1 頁最後一張訂單在第 2 頁的開頭又出現一次</label>
+  <label data-key="c">第 2 頁的第一張訂單被跳過，永遠看不到</label>
+  <label data-key="d">回傳錯誤，因為資料在查詢之間改變了</label>
+  <p class="why">✓ 新訂單排在最前面，整個列表往後推一格；OFFSET 20 跳過的 20 筆裡，有一筆是新訂單，所以原本第 1 頁的最後一張被推到第 21 個位置，又出現在第 2 頁。OFFSET 只記「跳過幾筆」，不知道資料變過（a、d 錯）。漏掉（c）是刪除資料時的情況：列表往前縮一格，原本第 21 筆會變成第 20 筆而被跳過。cursor 分頁記的是最後一筆的排序值，兩種情況都不會發生。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 7：API 每台伺服器的連線池設 <code>max: 20</code>，平常跑 4 台；資料庫的 <code>max_connections</code> 是 100。促銷活動擴充到 10 台，會發生什麼？</p>
+  <label data-key="a">忙的時候總連線數最多要 200，超過資料庫上限，超出的連線被拒絕，拿不到連線的請求會失敗</label>
+  <label data-key="b">每台會自動把 pool 縮小，平分 100 條連線</label>
+  <label data-key="c">沒事，連線越多，資料庫能同時處理的查詢越多，反而更快</label>
+  <p class="why">✓ 每台各自建立自己的連線池，彼此不知道對方存在，不會自動平分（b 錯）。超過 <code>max_connections</code> 時，資料庫直接拒絕新連線（<code>sorry, too many clients already</code>），而且最需要伺服器的時候正好擴台。連線多也不會更快（c 錯）：CPU 核心數固定，同時跑的查詢越多，每一句越慢。要先算「pool × 台數 ＋ 其他程式」小於上限；台數會變動時，用 PgBouncer 這類代理集中管理連線。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>沒量測就加快取</strong>：真正的問題（N+1、少了索引）還在，只是被快取暫時蓋住；快取一失效或沒命中，慢查詢又出現，還多了資料過時的問題。先打開 query log、看 EXPLAIN。</li>
+  <li><strong>用 Promise.all 掩飾 N+1</strong>：句數沒變，還一次占滿連線池。用 <code>include</code>／<code>select</code> 或 <code>{ in: ids }</code>。</li>
+  <li><strong>排序沒有平手處理</strong>：只用 <code>orderedAt</code> 排，時間相同的資料順序不固定，cursor 分頁會跳過或重複。排序和 cursor 都加上 <code>id</code>。</li>
+  <li><strong>用「這頁滿了」判斷還有下一頁</strong>：總筆數剛好是 <code>limit</code> 的倍數時，前端多打一次拿到空頁。用 <code>take: limit + 1</code>。</li>
+  <li><strong>外鍵沒有索引</strong>：PostgreSQL 不會自動替外鍵欄位建索引，<code>include</code> 關聯和刪除時的檢查都會掃整張表。</li>
+  <li><strong>在 psql 手動建索引</strong>：只有你的資料庫有。索引寫在 schema、產生 migration。</li>
+  <li><strong>連線池逾時保持 0</strong>：資料庫一慢，所有請求卡住不回應，也沒有錯誤紀錄。設定 <code>connectionTimeoutMillis</code> 和 <code>statement_timeout</code>。</li>
+  <li><strong>把 COUNT(*) 的 BigInt 直接回傳</strong>：<code>JSON.stringify</code> 丟 <code>TypeError</code>，API 回 500。在 SQL 裡 <code>::int</code>，或確認範圍後轉 <code>Number</code>。</li>
+  <li><strong>用 UTC 日期分組台灣的營業日</strong>：晚上 8 點以後的訂單算到隔天。用 <code>AT TIME ZONE 'Asia/Taipei'</code>。</li>
+  <li><strong>用 $queryRawUnsafe 拼使用者輸入</strong>：SQL injection。用 <code>$queryRaw</code> 的 tagged template，排序欄位用白名單。</li>
+</ul>
+
+<h2>補充與查表</h2>
+
+<h3>Prisma 用一句 JOIN 帶回關聯</h3>
+<p><code>relationLoadStrategy: 'join'</code> 可以讓 Prisma 用一句 SQL 加 JOIN 帶回關聯，而不是每層關聯一句 <code>IN (...)</code>。但在 Prisma 7 它仍是預覽功能，要在 generator 加 <code>previewFeatures = ["relationJoins"]</code>。本課程不用它：每層一句的做法句數固定，已經夠快。</p>
+
+<h3>Prisma 內建的 cursor 和手寫 where 的比較</h3>
+<p>Prisma 也有 <code>cursor: { id }, skip: 1</code> 的寫法：給一筆的唯一鍵，從那一筆開始、<code>skip: 1</code> 跳過它自己。Prisma 7.10.1 實際送出的 SQL 會用子查詢讀出那一筆的 <code>ordered_at</code>，再組出和手寫一樣的條件，所以結果也是對的。兩種寫法的差別：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>手寫 <code>where</code>（本課練習）</th><th>Prisma <code>cursor</code> ＋ <code>skip: 1</code></th></tr>
+  <tr><td>cursor 內容</td><td>排序值本身（時間＋id）</td><td>只有 id</td></tr>
+  <tr><td>cursor 那一筆被刪掉</td><td>照樣能查下一頁</td><td>子查詢找不到那一筆，回傳空的一頁</td></tr>
+  <tr><td>SQL</td><td>一句，條件直接比欄位</td><td>多了幾個子查詢</td></tr>
+  <tr><td>程式量</td><td>要自己編碼、解碼 cursor</td><td>少</td></tr>
+</table></div>
+
+<h3>COUNT 為什麼不便宜</h3>
+<p><code>count()</code> 在 PostgreSQL 要實際數過每一列。原因是 PostgreSQL 用 <strong>MVCC</strong>（多版本並行控制）處理同時進行的交易：同一時間，不同交易可能看到同一列的不同版本，所以資料庫沒有一個「所有人都適用」的總數可以直接拿，只能一列一列確認這個交易看得到哪些（<a href="../../postgresql/lessons/30-mvcc-vacuum.html">PostgreSQL 課第 30 課</a>）。這也是 cursor 分頁通常不回傳 <code>total</code> 的原因之一。</p>
+
+<h3>正式環境的大表加索引：CONCURRENTLY</h3>
+<p>一般的 <code>CREATE INDEX</code> 會擋住這張表的寫入，直到索引建完；幾千萬列的表可能要好幾分鐘，這段時間都不能下單。正式環境要用 <code>CREATE INDEX CONCURRENTLY</code>：用 <code>npx prisma migrate dev --create-only</code> 產生檔案，手動在 <code>INDEX</code> 後面加上 <code>CONCURRENTLY</code>，再套用。<code>CONCURRENTLY</code> 不能在交易裡執行；Prisma 7.10.1 的 <code>migrate deploy</code> 不會把 migration 檔包進交易（實測），所以可以這樣做。建立失敗會留下一個 INVALID 的索引，要刪掉重建（<a href="../../postgresql/lessons/34-zero-downtime-migrations.html">PostgreSQL 課第 34 課</a>）。</p>
+
+<h3>動態條件與排序欄位</h3>
+<p><code>$queryRaw</code> 的條件要動態組合時，用 <code>Prisma.sql</code> 組片段、<code>Prisma.join</code> 串接多個片段，值仍然會被參數化。排序欄位不能當參數傳（參數只能是值，不能是欄位名稱），要用白名單：<code>const col = { day: Prisma.sql`day`, revenue: Prisma.sql`revenue` }[sort]</code>，查不到就回 400。</p>
+
+<h3>statement_timeout 取消查詢時的錯誤長相</h3>
+<p>被 <code>statement_timeout</code> 取消時，PostgreSQL 的 SQLSTATE 是 <code>57014</code>。在 Prisma 7.10.1（實測）：</p>
+<div class="table-wrap"><table>
+  <tr><th>查詢方式</th><th>Prisma 錯誤碼</th></tr>
+  <tr><td>一般查詢（<code>findMany</code> 等）</td><td><code>P2039</code>，訊息含 <code>57014</code></td></tr>
+  <tr><td><code>$queryRaw</code></td><td><code>P2010</code></td></tr>
+</table></div>
+<p>升級 Prisma 時重新確認，exception filter 要依實際的錯誤碼轉成 503。</p>
+
+<h2>小結</h2>
+<ul>
+  <li>先量測：<code>log: [{ emit: 'event', level: 'query' }]</code> 加 <code>$on('query')</code> 數出一個請求送了幾句 SQL，在測試裡斷言句數（句數穩定，耗時會隨負載起伏）。慢通常是兩種：句數太多，或某一句太重。</li>
+  <li>訂單看板：N+1 是迴圈裡的查詢，句數跟著資料量長大；<code>Promise.all</code> 不會減少句數，還會占滿連線池。用 <code>select</code>／<code>include</code> 帶回關聯，Prisma 7 每層關聯一句 <code>IN (...)</code>，句數固定。</li>
+  <li>「我的訂單」：offset 分頁記的是位置，越後面越慢，資料變動時會重複或漏掉。cursor 分頁用「排序值＋id」接著查，<code>take: limit + 1</code> 判斷是否還有下一頁，cursor 解不開或內容不對回 400。</li>
+  <li>索引寫在 schema 的 <code>@@index</code>，用 migration 套用；複合索引先放等值篩選的欄位、再放排序的欄位；外鍵要自己加索引；用 EXPLAIN 確認，資料少時 Seq Scan 是正常的；大表在正式環境用 <code>CONCURRENTLY</code>。</li>
+  <li>月報：在資料庫用一句 <code>$queryRaw</code> 分組，用 <code>AT TIME ZONE 'Asia/Taipei'</code> 換日、範圍條件直接比欄位、<code>::int</code> 處理 BigInt、參數化、DTO 先驗證，不用 <code>$queryRawUnsafe</code>。</li>
+  <li>報表拖垮下單：連線池設定寫在 <code>PrismaPg</code>；設定 <code>connectionTimeoutMillis</code> 與 <code>statement_timeout</code>，讓請求逾時失敗而不是一直卡住；pool × 台數要小於資料庫的 <code>max_connections</code>，查詢慢先修查詢，不先加大 pool。</li>
+</ul>
+<p>下一課學怎麼替這些查詢寫可靠的資料庫整合測試：每個測試怎麼準備乾淨的資料、怎麼測交易與並發。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

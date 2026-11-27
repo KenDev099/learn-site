@@ -1,0 +1,3 @@
+// 練習 3：用 zod 寫訂單的回應 schema，裡面的 customer 也要用顧客的回應 schema
+//   export const orderResponseSchema = …
+export {}

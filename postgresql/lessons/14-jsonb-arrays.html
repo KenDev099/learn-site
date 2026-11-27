@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>14. JSONB 與陣列</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="14">
+<header>
+  <div class="eyebrow">階段 3：資料品質 · 第 14 課</div>
+  <h1>JSONB 與陣列</h1>
+</header>
+<main>
+
+<p>咖啡店的點餐 App 要加上「客製」：點拿鐵時可以選甜度、冰塊，加一份濃縮，或把牛奶換成燕麥奶（加 20 元）。前端的選單已經做好，送到後端的是一包 JSON，例如 <code>{"sugar": "半糖", "ice": "少冰", "milk": {"type": "燕麥奶", "extra": 20}}</code>。你要決定這包資料怎麼存進 <code>order_items</code>，而且存好之後有三個地方等著用：吧台出單要印出「半糖、少冰」，後台要能篩出「無糖」的明細，訂單列表 API 要把結果組成 JSON 回給前端。同一次改版，菜單的商品卡片也要加上「熱門」「季節限定」標籤，讓使用者點標籤篩選。</p>
+<p><a href="11-normalization.html">第 11 課</a>說「一格只放一個值」，照這條規則，每個選項都該開一個欄位。這一課會用到 PostgreSQL 刻意提供的兩個例外：<strong>JSONB</strong>（一格放一整個 JSON 物件）和<strong>陣列</strong>（一格放一串值），學會怎麼存、怎麼取、怎麼查。這課最後會走到上線一個月後：老闆要看甜度分布，你會親眼看到把資料放進 JSONB 的代價，學會判斷什麼資料不該放進去。前端工程師對 JSON 很熟，最容易犯的錯正是「什麼都往 JSON 塞」，所以最後這段判斷和語法一樣重要。</p>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="11-normalization.html">第 11 課</a>的正規化：一格只放一個值，不把好幾個值塞進同一格。</li>
+  <li><a href="12-constraints.html">第 12 課</a>的 <code>CHECK</code>：寫入時檢查值符不符合規則，不符合就擋下。</li>
+  <li><a href="13-data-types.html">第 13 課</a>的型別轉換 <code>::</code>：<code>'42'::integer</code> 把文字當成整數使用。</li>
+  <li><a href="07-aggregate.html">第 7 課</a>的 <code>GROUP BY</code> 和聚合函式：把同一組的很多列算成一個值，例如 <code>COUNT</code>。</li>
+</ul></div>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>選項每杯都不一樣，要怎麼存：為什麼整包放進一個 <code>jsonb</code> 欄位，而不是開幾十個大多是 NULL 的欄位。</li>
+  <li>吧台出單：用 <code>-&gt;</code> 和 <code>-&gt;&gt;</code> 從 jsonb 取出一個值，兩者差在拿回來的型別。</li>
+  <li>後台篩選：用 <code>-&gt;&gt;</code> 比較一個值，或用 <code>@&gt;</code> 問「有沒有包含這些選項」；再看 API 寫入時，資料庫檢查了什麼、沒檢查什麼。</li>
+  <li>菜單標籤與訂單列表：一串值用陣列存；<code>array_agg</code> 和 <code>jsonb_build_object</code> 把多列整理成 API 要的形狀。</li>
+  <li>上線一個月後：老闆要看甜度分布，哪些資料不該放進 JSONB 或陣列。</li>
+</ol></div>
+
+<h2>每杯飲料的選項都不一樣，要怎麼存？</h2>
+<p>先試最直覺的做法：每個選項開一個欄位，<code>sugar</code>、<code>ice</code>、<code>extra_shot</code>、<code>milk_type</code>、<code>milk_extra</code>……問題馬上出現：選項跟著商品走。咖啡有甜度和冰塊，可頌只有「要不要加熱」，南瓜派什麼選項都沒有。於是可頌那一列的 <code>sugar</code>、<code>ice</code>、<code>milk_type</code> 全是 NULL，咖啡那一列的 <code>heat</code> 是 NULL。店裡有幾十種選項時，<code>order_items</code> 就有幾十個欄位，每一列只用到其中兩三個。更麻煩的是每推出一個新選項，例如冬季限定的「加肉桂粉」，就要改一次表結構。</p>
+<p>再看這些選項怎麼被使用：吧台出單、前端顯示訂單時，幾乎都是整包讀出來照著印，很少有人單獨拿「冰塊」去計算。這類資料有三個特徵：<strong>每一列的結構不一樣、主要是整包存取、很少單獨查詢</strong>。PostgreSQL 為這種資料準備了 <code>jsonb</code> 型別：一個欄位存一整個 JSON 物件，每一列的 key 可以不同，新增選項也不用改表。這頁的 <code>order_items</code> 就是這樣設計的，執行後看 <code>options</code> 那一欄：</p>
+<div class="lab" data-sql="SELECT * FROM order_items ORDER BY id;"></div>
+<p>可頌（<code>product_id</code> 6）只有 <code>heat</code>，南瓜派是空物件 <code>{}</code>，拿鐵有 <code>sugar</code>、<code>ice</code>，有幾列還多了一層巢狀的 <code>milk</code>。欄位宣告是 <code>options jsonb NOT NULL DEFAULT '{}'</code>：沒有選項就存空物件而不是 NULL，讀的人少處理一種情況。</p>
+<p>這張 <code>order_items</code> 用自己的 <code>id</code> 當主鍵，不是<a href="10-many-to-many.html">第 10 課</a>的複合主鍵 <code>(order_id, product_id)</code>，原因也出在客製選項：同一張訂單可能點兩杯拿鐵，一杯半糖、一杯無糖。這是兩個不同的品項，必須是兩列；複合主鍵會把它們當成重複而擋下第二杯。</p>
+<p>有了 jsonb，不代表所有欄位都該收進去。同一張表裡的 <code>order_id</code>、<code>product_id</code>、<code>quantity</code>、<code>unit_price</code> 仍然是一般欄位：每一列都有、要外鍵、要 NOT NULL，結帳時要拿來加總。這些是資料庫必須「理解」的值，放在一般欄位，資料庫才能替你把關。分工如下圖：</p>
+
+<figure>
+  <svg viewBox="0 0 720 250" role="img" aria-label="一般欄位和 jsonb 欄位的分工：要約束、外鍵、常查詢的放一般欄位；結構多變、整包存取的放 jsonb">
+    <rect class="d-soft" x="20" y="20" width="680" height="40" rx="6"/>
+    <text class="d-text" x="40" y="45">order_items</text>
+    <rect class="d-box" x="20" y="70" width="400" height="110" rx="8"/>
+    <text class="d-accent" x="220" y="95" text-anchor="middle">一般欄位</text>
+    <text class="d-text" x="220" y="122" text-anchor="middle">order_id、product_id、quantity、unit_price</text>
+    <text class="d-small" x="220" y="146" text-anchor="middle">要外鍵、要 NOT NULL／CHECK、要加總計算、</text>
+    <text class="d-small" x="220" y="166" text-anchor="middle">常出現在 WHERE／JOIN／GROUP BY</text>
+    <rect class="d-box" x="440" y="70" width="260" height="110" rx="8" style="fill:var(--accent-soft)"/>
+    <text class="d-accent" x="570" y="95" text-anchor="middle">options jsonb</text>
+    <text class="d-text" x="570" y="122" text-anchor="middle">{"sugar":"半糖","ice":"少冰"}</text>
+    <text class="d-small" x="570" y="146" text-anchor="middle">每列的結構不同、</text>
+    <text class="d-small" x="570" y="166" text-anchor="middle">多半整包讀出來顯示</text>
+    <text class="d-text" x="360" y="215" text-anchor="middle">判斷原則：資料庫需要「理解」的欄位，就不要藏進 JSON</text>
+    <text class="d-small" x="360" y="238" text-anchor="middle">藏進 JSON 的值，資料庫沒辦法替你加外鍵、加約束、檢查型別</text>
+  </svg>
+  <figcaption>JSONB 是給「附帶資訊」用的口袋，不是用來取代表格設計。</figcaption>
+</figure>
+<p>選項存好了。下一個問題在吧台：出單機要印出「半糖、少冰」，但甜度現在藏在一整包 JSON 裡，要怎麼只把 <code>sugar</code> 的值拿出來？</p>
+
+<h2>吧台出單要印「半糖」：怎麼從 jsonb 取出一個值？</h2>
+<p>在 JavaScript 裡你會寫 <code>options.sugar</code>。PostgreSQL 用兩個運算子做這件事：<code>-&gt;</code> 和 <code>-&gt;&gt;</code>。兩個都是「取出某個 key 的值」，差別在<strong>拿回來的型別</strong>：</p>
+<ul>
+  <li><code>options -&gt; 'sugar'</code> 回傳 <strong>jsonb</strong>：取出來的東西還是 JSON，可以繼續往下取。</li>
+  <li><code>options -&gt;&gt; 'sugar'</code> 回傳 <strong>text</strong>：把 JSON 值轉成一般文字，可以拿來顯示、比較、轉型別。多一個 <code>&gt;</code>，記成「取到底，變成文字」。</li>
+</ul>
+<p>為什麼要分兩種？因為 JSON 的值不只有字串，還可能是數字、<code>true</code>／<code>false</code>，或另一個物件。<code>-&gt;</code> 保留「這是一個 JSON 值」的身分，你還能對它做 JSON 的操作；<code>-&gt;&gt;</code> 用在已經取到最後一層、要交給一般 SQL 使用的時候。</p>
+<p>這頁的結果表格會用 <code>JSON.stringify</code> 顯示 JSON 值，所以兩者在畫面上看起來差不多。為了看出差別，下面多查兩樣東西：<code>pg_typeof()</code> 是回傳「這個值是什麼型別」的函式，<code>(…)::text</code> 把 jsonb 轉成資料庫實際存的文字。執行後比較 <code>arrow_raw</code> 和 <code>double_arrow</code> 兩欄：</p>
+<div class="lab" data-sql="SELECT id,
+  options -&gt; 'sugar' AS arrow,
+  pg_typeof(options -&gt; 'sugar') AS arrow_type,
+  (options -&gt; 'sugar')::text AS arrow_raw,
+  options -&gt;&gt; 'sugar' AS double_arrow,
+  pg_typeof(options -&gt;&gt; 'sugar') AS double_arrow_type
+FROM order_items
+WHERE id &lt;= 3;"></div>
+<ul>
+  <li><code>arrow_type</code> 是 <code>jsonb</code>，<code>double_arrow_type</code> 是 <code>text</code>。</li>
+  <li><code>arrow_raw</code> 是 <code>&quot;半糖&quot;</code>，帶著雙引號：這是 JSON 字串的寫法，引號是值的一部分。<code>double_arrow</code> 是 <code>半糖</code>，沒有引號，就是一般文字。</li>
+  <li>第 2 列是可頌，它沒有 <code>sugar</code> 這個 key，兩種寫法都回傳 NULL，不會出錯。</li>
+</ul>
+<p>出單機要印的是給人看的文字，所以用 <code>-&gt;&gt;</code>；用 <code>-&gt;</code> 印出來會多一對引號。</p>
+<p>燕麥奶的資訊多了一層：<code>milk</code> 本身又是一個物件 <code>{"type": "燕麥奶", "extra": 20}</code>。這時就看得出 <code>-&gt;</code> 的用處：先用 <code>-&gt;</code> 取出 <code>milk</code>，拿到的還是 jsonb，所以能繼續往下取，最後一層再用 <code>-&gt;&gt;</code> 取出文字。規則是<strong>中間每一層用 <code>-&gt;</code>，最後一層用 <code>-&gt;&gt;</code></strong>。執行後看 <code>milk_type</code> 欄，WHERE 只留下有 <code>milk</code> 的列：</p>
+<div class="lab" data-sql="SELECT id, options -&gt; 'milk' AS milk, options -&gt; 'milk' -&gt;&gt; 'type' AS milk_type
+FROM order_items
+WHERE options -&gt; 'milk' IS NOT NULL;"></div>
+<p>收銀機還要算出加了燕麥奶的價格。<code>extra</code> 存的是 JSON 數字 <code>20</code>，但 <code>-&gt;&gt;</code> 一律回傳文字，文字和 <code>unit_price</code> 相加會出錯，因為文字沒有加法。要當數字用，就用第 13 課的 <code>::</code> 把結果轉成整數：</p>
+<div class="lab" data-sql="SELECT id, (options -&gt; 'milk' -&gt;&gt; 'extra')::integer + unit_price AS price_with_milk
+FROM order_items
+WHERE options -&gt; 'milk' IS NOT NULL;"></div>
+<p>兩列都是 120 + 20 = 140。忘了轉型別時，相加會直接報錯，很快就會發現；比大小就危險了：文字和文字比較不會報錯，而是一個字一個字比，所以 <code>'9' &gt; '10'</code> 成立。要拿 JSON 裡的數字比大小或加總，一定先轉型別。</p>
+<p>吧台和收銀都讀得到選項了。接下來後台要的不是讀出某一筆，而是篩選：「列出所有無糖的明細」「哪些加了濃縮」。</p>
+
+<h2>後台要篩出「無糖」「加濃縮」：用 <code>-&gt;&gt;</code> 比較，還是用 <code>@&gt;</code>？</h2>
+<p>上一節的 <code>-&gt;&gt;</code> 可以直接放進 WHERE。用 <code>-&gt;&gt;</code> 而不是 <code>-&gt;</code> 的理由跟出單一樣：右邊的 <code>'去冰'</code> 是一般文字，左邊也要是文字才能比較。執行後看回傳的列是否都是去冰：</p>
+<div class="lab" data-sql="SELECT id, product_id, options
+FROM order_items
+WHERE options -&gt;&gt; 'ice' = '去冰';"></div>
+<p>如果寫成 <code>options -&gt; 'ice' = '去冰'</code>，左邊是 jsonb，PostgreSQL 會試著把右邊的 <code>'去冰'</code> 也當成 JSON 解析。<code>去冰</code> 沒有雙引號，不是合法的 JSON，查詢直接出錯；要讓它變成合法的 JSON 字串得寫成 <code>'&quot;去冰&quot;'</code>，多一層引號要顧。所以和一般值比較時，一律用 <code>-&gt;&gt;</code>。</p>
+<p><code>-&gt;&gt;</code> 適合比較一個 key 的文字值。但後台的篩選常常是「符合這幾個選項」，而且有些值不是文字：<code>extra_shot</code> 存的是 JSON 的 <code>true</code>，用 <code>-&gt;&gt;</code> 取出來會變成文字 <code>'true'</code>。每寫一個條件，你都得記得那個 key 存的是什麼型別、要怎麼比。PostgreSQL 為 jsonb 準備了另一個運算子 <code>@&gt;</code>，讓你直接用 JSON 描述要找的內容。</p>
+<p><code>A @&gt; B</code> 讀作「A 包含 B」：B 裡的每一個 key 和值，A 都要有，而且值要相同；A 多出來的 key 不影響結果。所以 <code>options @&gt; '{"sugar": "無糖"}'</code> 會找出甜度是無糖的明細，不管它還有沒有冰塊、濃縮這些其他選項。執行後看回傳的 4 列，它們的其他選項各不相同：</p>
+<div class="lab" data-sql="SELECT id, options
+FROM order_items
+WHERE options @&gt; '{&quot;sugar&quot;: &quot;無糖&quot;}';"></div>
+<p>右邊寫的是 JSON，比對時也照 JSON 的型別規則。找加了濃縮的明細，要寫 <code>true</code>（JSON 的布林值），不是 <code>"true"</code>（JSON 字串）：</p>
+<div class="lab" data-sql="-- 加了濃縮（值是 JSON 的 true，不是文字）
+SELECT id, options
+FROM order_items
+WHERE options @&gt; '{&quot;extra_shot&quot;: true}';"></div>
+<p>回傳 3 列。如果寫成 <code>'{"extra_shot": "true"}'</code>，一列都找不到：存的是布林值 <code>true</code>，和字串 <code>"true"</code> 不相等。要同時符合好幾個條件，就寫進同一個物件，例如 <code>'{"sugar": "無糖", "extra_shot": true}'</code>。</p>
+<p>兩種寫法怎麼選：比較單一個文字值，<code>-&gt;&gt; … =</code> 最直覺；要比對「包含這些選項」，或值是數字、布林、巢狀物件時，<code>@&gt;</code> 比較不容易寫錯。<code>@&gt;</code> 另一個好處是能用索引加速，細節見課末。</p>
+<p>讀和查都會了。但這些選項是怎麼進到資料庫的？點餐 API 收到前端的 JSON 就寫進 <code>options</code>，資料庫會替你檢查什麼？</p>
+
+<h2>點餐 API 要寫入選項：資料庫替你檢查了什麼？</h2>
+<p>寫入 jsonb 欄位時，給一個 JSON 格式的字串就好，PostgreSQL 會把它解析後存起來。新增一杯微糖、正常冰的美式咖啡，執行後看 <code>RETURNING</code> 回傳的 <code>options</code>：</p>
+<div class="lab" data-sql="INSERT INTO order_items (order_id, product_id, quantity, unit_price, options)
+VALUES (6, 1, 1, 80, '{&quot;sugar&quot;: &quot;微糖&quot;, &quot;ice&quot;: &quot;正常冰&quot;}')
+RETURNING *;"></div>
+<p>再試一個前端工程師常犯的錯：key 和字串值沒加雙引號。JavaScript 的物件寫法允許 <code>{sugar: '微糖'}</code>，但 JSON 規定 key 和字串都要用雙引號：</p>
+<div class="lab" data-sql="INSERT INTO order_items (order_id, product_id, quantity, unit_price, options)
+VALUES (6, 1, 1, 80, '{sugar: 微糖}');"></div>
+<p>這次會出錯，資料寫不進去。jsonb 在寫入時就會解析整段文字，格式不合法就拒絕。</p>
+<p>問題是，這就是資料庫替你做的全部檢查：它只確認「這是不是合法的 JSON」，不知道你的選單長什麼樣。<code>{"Sugar": "half"}</code> 是完全合法的 JSON，所以 key 的大小寫拼錯、值用了英文、多出一個沒人認得的 key，資料庫都照收。一般欄位有欄位名稱和型別，INSERT 寫錯欄位名稱會直接報錯；JSON 裡的 key 只是資料，你沒有告訴資料庫任何規則，它就不會檢查。這些寫錯的資料不會立刻出事，要等到有人拿它來統計才會浮現，這課最後一節會看到。</p>
+<div class="callout practice"><strong>💡 實務上：資料庫只檢查「是不是 JSON」，內容要在 API 把關</strong><br>咖啡店的點餐 API 收到前端送來的客製選項，資料庫只會擋下格式壞掉的 JSON，<code>{"Sugar": "half"}</code> 這種拼錯的照樣寫得進去。所以實務上會在後端先做 schema 驗證：事先寫好「允許哪些 key、每個 key 可以是哪些值」，不符合就回錯誤（TypeScript 專案常用 Zod 這類函式庫），通過才寫入資料庫。前端送選項時也盡量從固定的選單產生，不要讓使用者自由輸入 key。Code review 看到「直接把 request body 整包存進 jsonb」時，資深工程師會先問：這包內容誰來驗證？</div>
+<p>客製選項的存、讀、查、寫都有了。開場提到的改版還有另一半：菜單商品卡片上的標籤。</p>
+
+<h2>菜單上的「熱門」「季節限定」：一串值為什麼用陣列？</h2>
+<p>新版菜單的商品卡片要顯示「熱門」「季節限定」這類標籤，使用者點一下標籤就能篩選。標籤和客製選項的形狀不同：選項是一個物件，每個值有自己的 key（甜度是半糖、冰塊是少冰）；標籤只是一串同型別的文字，沒有 key。用 jsonb 也存得下 <code>["熱門", "冰飲"]</code>，但對「一串同型別的值」，PostgreSQL 有更直接的型別：<strong>陣列</strong>。</p>
+<p>任何型別後面加 <code>[]</code> 就是那個型別的陣列，例如 <code>text[]</code>、<code>integer[]</code>。陣列裡每個元素都是同一個型別，資料庫會檢查，<code>integer[]</code> 放不進文字；這是陣列比 JSON 多的一層保護。<code>products</code> 的 <code>tags</code> 就是 <code>text[]</code>，執行後看 <code>tags</code> 欄：</p>
+<div class="lab" data-sql="SELECT id, name, tags FROM products ORDER BY id;"></div>
+<p>拿鐵有兩個標籤，可頌是空陣列。寫入陣列有兩種寫法：SQL 語法 <code>ARRAY['熱門', '冰飲']</code>，或陣列的文字格式 <code>'{熱門,冰飲}'</code>，這頁建立範例資料的 SQL（頁尾的 seed）用的是前者。</p>
+<p>菜單的篩選就是「<code>tags</code> 裡有沒有某個標籤」。寫法是 <code>值 = ANY (陣列)</code>：只要陣列裡有任何一個元素等於這個值，條件就成立，這是查陣列最常用的寫法。下面篩出有「熱門」標籤的商品，順便取出第一個標籤和標籤數量：</p>
+<div class="lab" data-sql="SELECT name,
+  tags[1] AS first_tag,
+  cardinality(tags) AS tag_count
+FROM products
+WHERE '熱門' = ANY (tags);"></div>
+<ul>
+  <li><code>WHERE '熱門' = ANY (tags)</code> 留下美式咖啡、拿鐵、抹茶拿鐵三個商品。</li>
+  <li><code>tags[1]</code> 取第一個元素。<strong>PostgreSQL 的陣列從 1 開始數</strong>，不是 JavaScript 的 0；寫 <code>tags[0]</code> 不會報錯，只會拿到 NULL，所以這個錯不容易發現。</li>
+  <li><code>cardinality(tags)</code> 是陣列的元素個數，相當於 JavaScript 的 <code>length</code>。</li>
+</ul>
+<p>要「兩個標籤都要有」時，陣列也能用後台篩選時學過的 <code>@&gt;</code>：<code>tags @&gt; ARRAY['熱門', '冰飲']</code> 表示右邊的每個元素，左邊都要有，意思和用在 jsonb 上時一樣。</p>
+<div class="callout practice"><strong>💡 實務上：標籤用陣列，還是開一張表？</strong><br>後台只要「顯示標籤、用標籤篩選」時，<code>text[]</code> 很省事。但如果 PM 接著要「改標籤名稱一次套用到全部商品」「列出所有標籤和各有幾個商品」「標籤要有顏色和排序」，標籤就變成有自己屬性的東西，該拆成 <code>tags</code> 表加中間表（<a href="10-many-to-many.html">第 10 課</a>）。開發前先問 PM 標籤之後會不會被管理，比上線後再搬資料便宜得多。</div>
+<p>陣列除了存在欄位裡，還有一個常見的用法：查詢時把很多列收成一個陣列。這正是訂單列表 API 需要的。</p>
+
+<h2>訂單列表 API 要一張訂單一列：怎麼把多列收成陣列、組成 JSON？</h2>
+<p>後台的訂單列表要顯示「訂單 3：抹茶拿鐵、南瓜派」。品項在 <code>order_items</code>，一張訂單有好幾列。如果在程式裡先查出訂單，再對每張訂單各查一次明細，一頁 50 張訂單就是 51 次查詢。更好的做法是讓資料庫直接把同一張訂單的多列收成一格。</p>
+<p><code>array_agg</code> 就是做這件事的聚合函式。第 7 課的 <code>COUNT</code>、<code>SUM</code> 把一組列算成一個數字；<code>array_agg</code> 把一組列的值收集成一個陣列，同樣搭配 <code>GROUP BY</code>。陣列有順序，所以括號裡可以加 <code>ORDER BY</code> 決定元素的排列。訂單版本要先 JOIN <code>products</code> 才拿得到商品名稱，為了先單獨看清楚 <code>array_agg</code> 做了什麼，這裡先用不需要 JOIN 的 <code>products</code> 示範，執行後每個分類一列，<code>names</code> 是該分類的商品名稱，依 id 排列：</p>
+<div class="lab" data-sql="SELECT category, array_agg(name ORDER BY id) AS names
+FROM products
+GROUP BY category
+ORDER BY category;"></div>
+<p>換成訂單也是同一個寫法：<code>order_items</code> JOIN <code>products</code> 取得商品名稱，再依 <code>order_id</code> 分組。原本一張訂單好幾列，收完就是一張訂單一列，練習 4 會寫這一句。</p>
+<p>資料整理好了，API 最後要回傳 JSON。可以把列查回程式再組，也可以讓資料庫直接組好：<code>jsonb_build_object('key', 值, 'key', 值, …)</code> 依序接收 key 和值，把一般欄位組成一個 JSON 物件。它和前面的 <code>-&gt;</code> 方向相反：<code>-&gt;</code> 把 JSON 拆開，<code>jsonb_build_object</code> 把欄位組起來。執行後每一列都是一個 JSON 物件：</p>
+<div class="lab" data-sql="SELECT jsonb_build_object('id', id, 'name', name, 'price', price) AS item
+FROM products
+WHERE category = 'coffee'
+ORDER BY id;"></div>
+<p>值也可以是陣列：把 <code>tags</code> 放進去，會變成 JSON 陣列，練習 5 會用到。</p>
+<p>兩個工具合起來，就回到開場的訂單列表 API。一張訂單最後要長成 <code>{"order_id": 3, "items": ["抹茶拿鐵", "南瓜派"]}</code>：在依 <code>order_id</code> 分組的查詢裡寫 <code>jsonb_build_object('order_id', order_id, 'items', array_agg(…))</code>。<code>array_agg</code> 算出來的陣列本身就是一個值，所以可以直接當成 <code>jsonb_build_object</code> 的值放進去，查詢結果每一列就是一張訂單的 JSON，API 拿到後幾乎不用再加工。</p>
+<div class="callout practice"><strong>💡 實務上：列表 API 用一次查詢整理好，不要在迴圈裡查</strong><br><code>array_agg</code> 常出現在列表 API：訂單列表要附上每張訂單的品項名稱時，一次查詢就能整理好，不必在程式裡對每張訂單再查一次。後者在開發時資料少看不出問題，上線後一頁的訂單一多，查詢次數跟著翻倍，列表就變慢。Code review 看到「迴圈裡呼叫資料庫」時，先想能不能用 JOIN 加 <code>array_agg</code> 改成一次查詢。</div>
+<p>到這裡，存、讀、查、寫、回傳都做完了，App 也上線了。一個月後，問題從報表那一側冒出來。</p>
+
+<h2>上線一個月後，老闆要看甜度分布：什麼資料不該放進 JSONB？</h2>
+<p>老闆想知道大家都點幾分糖，好決定要不要調整預設甜度。這個需求看起來只是一句 GROUP BY：用 <code>-&gt;&gt;</code> 取出甜度，依甜度分組計數。只看咖啡類（<code>product_id</code> 1、2、3），執行後看各甜度的數量：</p>
+<div class="lab" data-sql="SELECT options -&gt;&gt; 'sugar' AS sugar, COUNT(*)
+FROM order_items
+WHERE product_id IN (1, 2, 3)
+GROUP BY options -&gt;&gt; 'sugar'
+ORDER BY COUNT(*) DESC;"></div>
+<p>結果有兩個問題。第 12 號明細的 key 被拼成 <code>Sugar</code>（大寫 S），<code>-&gt;&gt; 'sugar'</code> 找不到這個 key，回傳 NULL，於是它被算進 NULL 那一組；第 11 號明細的值寫成 <code>half</code>，自成一類，沒有算進「半糖」。這不是查詢寫錯，而是資料在寫入時就已經不一致：可能是舊版 App 送的，可能是有人手動補的，資料庫都照收了，因為它們都是合法的 JSON。</p>
+<p>對照一般欄位：如果甜度是 <code>sugar</code> 欄位，加上 <code>CHECK (sugar IN ('正常', '少糖', '半糖', '微糖', '無糖'))</code>，<code>half</code> 在寫入那一刻就會被擋下；欄位名稱拼成 <code>sugr</code> 的 INSERT 也會直接報錯。大小寫不同的 <code>Sugar</code> 反而不會出事：SQL 的識別字沒加雙引號時會自動轉成小寫，本來就對得上同一個欄位；JSON 的 key 卻是區分大小寫的字串，<code>Sugar</code> 和 <code>sugar</code> 是兩個不同的 key，這正是 JSON 比一般欄位容易出錯的地方。<strong>JSON 裡的內容，資料庫不會幫你檢查。</strong>甜度一開始被當成附帶資訊放進 <code>options</code>，等它變成老闆每週要看的數字，它就成了核心業務資料，該搬出來了。</p>
+<p>回到第一節的分工圖，現在可以把判斷原則講完整。符合下面任何一點，就應該是<strong>一般欄位</strong>（或一張獨立的表），不要放進 JSONB 或陣列：</p>
+<ul>
+  <li><strong>需要約束</strong>：必填、值的範圍、只能是幾種選項。這些是第 12 課的工作。</li>
+  <li><strong>需要外鍵</strong>：例如把 <code>customer_id</code> 放進 JSON，資料庫就擋不住不存在的顧客；陣列 <code>product_ids integer[]</code> 也不能加外鍵。這種多對多就該用第 10 課的中間表。</li>
+  <li><strong>經常查詢、篩選、加總、JOIN</strong>：例如每天都要統計甜度，那它就是一個重要的業務欄位。</li>
+  <li><strong>每一列都有、結構固定</strong>：那就是普通的欄位，沒有理由包進 JSON。</li>
+</ul>
+<p>這和第 11 課的正規化是同一件事：JSONB 和陣列是「一格裡放多個值」的<strong>有意識的例外</strong>，適合附帶的、結構多變的、整包存取的資料，例如客製選項、第三方 API 的原始回應、使用者的介面偏好設定、簡單的標籤。資料一旦變成核心業務資料，就把它拆成欄位。</p>
+<div class="callout practice"><strong>💡 實務上：設計審查時先問「之後會不會拿它來查」</strong><br>新功能的資料表設計時，常有人提議「先放 JSONB，之後比較好改」。但「好改」只是寫入的人方便，讀的人要自己處理各種格式。資深工程師會用上面的清單逐項確認，再多問一句：前端以外還有誰要讀這份資料（報表、客服後台）？只要有人要拿它來查，就開成一般欄位。如果已經放在 JSON 裡、後來才變成要統計的業務資料（例如這一節老闆想看每週甜度分布），就寫一份 migration，也就是一支有版本紀錄、會在每個環境依序執行的改表腳本，第 22 課會教，用它把甜度拆成欄位並補上 CHECK，而不是在每個報表查詢裡各自處理拼錯的 key。</div>
+
+<h2>補充與查表</h2>
+<h3>json 和 jsonb</h3>
+<p>這課一直用 <code>jsonb</code>，但 PostgreSQL 其實有兩種 JSON 型別。同一段文字分別轉成兩種型別，再用 <code>::text</code> 看資料庫實際存的內容（結果表格會用 <code>JSON.stringify</code> 顯示 JSON 值，所以要轉成文字才看得到原貌）：</p>
+<div class="lab" data-sql="SELECT '{&quot;b&quot;: 1, &quot;a&quot;: 2, &quot;a&quot;: 3}'::json::text AS as_json,
+  '{&quot;b&quot;: 1, &quot;a&quot;: 2, &quot;a&quot;: 3}'::jsonb::text AS as_jsonb;"></div>
+<ul>
+  <li><code>json</code>：把原始文字<strong>原封不動</strong>存起來（空白、key 的順序、重複的 key 都保留），每次查詢都要重新解析。</li>
+  <li><code>jsonb</code>：寫入時就解析成二進位格式，重複的 key 只留最後一個、key 會重新排序。寫入稍慢，但查詢快，而且支援 <code>@&gt;</code> 和索引。</li>
+</ul>
+<p><strong>幾乎都用 <code>jsonb</code></strong>。只有在需要保留原始文字（例如存下外部 API 的原始回應做稽核）時才用 <code>json</code>。</p>
+<h3>讓 <code>@&gt;</code> 變快：GIN 索引</h3>
+<p><code>@&gt;</code> 可以搭配 GIN 索引，資料多的時候不用一列一列檢查。第 20 課先講一般的索引，GIN 在<a href="28-gin-search.html">第 28 課</a>。</p>
+<h3>這課的運算子與函式（查表用，不用背）</h3>
+<div class="table-wrap"><table>
+  <tr><th>寫法</th><th>作用</th><th>回傳</th></tr>
+  <tr><td><code>jsonb -&gt; 'key'</code></td><td>取出 key 的值，可以繼續往下取</td><td>jsonb</td></tr>
+  <tr><td><code>jsonb -&gt;&gt; 'key'</code></td><td>取出 key 的值，轉成文字</td><td>text</td></tr>
+  <tr><td><code>jsonb @&gt; '{"k": v}'</code></td><td>左邊是否包含右邊的每個 key 和值</td><td>boolean</td></tr>
+  <tr><td><code>jsonb_build_object('k', v, …)</code></td><td>把欄位組成 JSON 物件</td><td>jsonb</td></tr>
+  <tr><td><code>值 = ANY (陣列)</code></td><td>陣列裡有任何一個元素等於這個值</td><td>boolean</td></tr>
+  <tr><td><code>陣列[n]</code></td><td>取第 n 個元素，從 1 開始</td><td>元素的型別</td></tr>
+  <tr><td><code>cardinality(陣列)</code></td><td>元素個數</td><td>integer</td></tr>
+  <tr><td><code>陣列 @&gt; 陣列</code></td><td>右邊每個元素，左邊都有</td><td>boolean</td></tr>
+  <tr><td><code>array_agg(x ORDER BY …)</code></td><td>聚合函式，把一組列的值收成陣列</td><td>陣列</td></tr>
+</table></div>
+
+<h2>練習</h2>
+
+<div class="exercise"
+  data-answer="SELECT id, options -&gt;&gt; 'sugar' FROM order_items WHERE options -&gt;&gt; 'ice' = '少冰' ORDER BY id;"
+  data-ordered>
+  <p>練習 1：找出冰塊選「少冰」的明細，欄位依序是 <code>id</code>、甜度（<code>sugar</code> 的值，文字），依 <code>id</code> 排列。</p>
+</div>
+
+<div class="exercise"
+  data-answer="SELECT COUNT(*) FROM order_items WHERE options @&gt; '{&quot;extra_shot&quot;: true}';">
+  <p>練習 2：用 <code>@&gt;</code> 算出有幾筆明細加了濃縮（<code>&quot;extra_shot&quot;: true</code>）。</p>
+</div>
+
+<div class="exercise"
+  data-answer="SELECT name FROM products WHERE '季節限定' = ANY (tags) ORDER BY id;"
+  data-ordered>
+  <p>練習 3：列出有「季節限定」標籤的商品 <code>name</code>，依商品 id 排列。</p>
+</div>
+
+<div class="exercise"
+  data-answer="SELECT oi.order_id, array_agg(p.name ORDER BY oi.id)
+FROM order_items oi
+JOIN products p ON oi.product_id = p.id
+GROUP BY oi.order_id
+ORDER BY oi.order_id;"
+  data-ordered>
+  <p>練習 4：每張訂單一列，列出訂單 id 和這張訂單買的商品名稱陣列（陣列裡依明細 <code>id</code> 排序），依訂單 id 排列。需要 JOIN <code>products</code>。</p>
+</div>
+
+<div class="exercise"
+  data-answer="SELECT jsonb_build_object('name', name, 'tags', tags) FROM products WHERE category = 'tea' ORDER BY id;"
+  data-ordered>
+  <p>練習 5：用 <code>jsonb_build_object</code> 把茶類（<code>category = 'tea'</code>）的商品組成 <code>{&quot;name&quot;: 名稱, &quot;tags&quot;: 標籤陣列}</code>，只要這一欄，依商品 id 排列。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 6：下面哪一個最適合放進 <code>jsonb</code> 欄位？</p>
+  <label data-key="a">訂單的 <code>customer_id</code></label>
+  <label data-key="b">商品價格，因為每天要算營業額</label>
+  <label data-key="c">使用者在 App 的介面偏好（深色模式、字體大小、通知開關），整包讀出來給前端用</label>
+  <p class="why">✓ 介面偏好結構會變、資料庫不需要理解內容、整包存取。<code>customer_id</code> 需要外鍵；價格需要 NOT NULL、CHECK 和加總，都該是一般欄位。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：<code>WHERE options -&gt; 'ice' = '去冰'</code> 和 <code>WHERE options -&gt;&gt; 'ice' = '去冰'</code>，哪一個是一般的正確寫法？</p>
+  <label data-key="a">第一個，<code>-&gt;</code> 比較短</label>
+  <label data-key="b">第二個，<code>-&gt;&gt;</code> 取出文字，跟文字 <code>'去冰'</code> 比較</label>
+  <label data-key="c">兩個完全一樣</label>
+  <p class="why">✓ <code>-&gt;</code> 回傳 jsonb，右邊的 <code>'去冰'</code> 會被當成 JSON 來解析，而 <code>去冰</code> 不是合法的 JSON（要寫成 <code>'&quot;去冰&quot;'</code>），會出錯。和一般值比較時用 <code>-&gt;&gt;</code>；要比對 JSON 結構時用 <code>@&gt;</code>。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>用 <code>-&gt;</code> 跟文字比較</strong>：<code>-&gt;</code> 回傳 jsonb，右邊的文字會被當成 JSON 解析而出錯。和一般值比較時改用 <code>-&gt;&gt;</code>，要比對 JSON 結構時用 <code>@&gt;</code>。</li>
+  <li><strong><code>-&gt;&gt;</code> 的結果直接當數字</strong>：<code>-&gt;&gt;</code> 一定是文字，要加總或比大小時先 <code>::integer</code>／<code>::numeric</code>，否則 <code>'9' &gt; '10'</code> 會成立（文字比較）。</li>
+  <li><strong>用 <code>@&gt;</code> 找布林值時寫成字串</strong>：<code>'{"extra_shot": "true"}'</code> 找不到存成 <code>true</code> 的資料，JSON 的布林值不加引號。</li>
+  <li><strong>陣列從 0 開始取</strong>：<code>tags[0]</code> 會得到 NULL，第一個元素是 <code>tags[1]</code>。</li>
+  <li><strong>JSON 裡的 key 拼錯</strong>：資料庫不會報錯，查詢時默默變成 NULL。內容要在 API 寫入前驗證。</li>
+  <li><strong>什麼都往 JSONB 塞</strong>：「這樣就不用改 schema」聽起來很方便，代價是失去約束、外鍵和型別檢查，最後要在程式裡自己處理各種格式不一致的資料。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>每列結構不同、整包存取的客製選項放進 <code>jsonb</code> 欄位；要外鍵、約束、加總的欄位留在一般欄位。</li>
+  <li>取值：<code>-&gt;</code> 取出 jsonb、可以繼續往下取，<code>-&gt;&gt;</code> 取出文字；巢狀的值中間用 <code>-&gt;</code>、最後一層用 <code>-&gt;&gt;</code>，當數字用要先轉型別。</li>
+  <li>篩選：比較一個文字值用 <code>-&gt;&gt; … =</code>，比對「包含這些選項」用 <code>@&gt;</code>，右邊照 JSON 的型別寫。</li>
+  <li>寫入：資料庫只檢查是不是合法的 JSON，key 和值的內容要在 API 驗證。幾乎都用 <code>jsonb</code> 而不是 <code>json</code>。</li>
+  <li>陣列 <code>text[]</code> 存一串同型別的值：<code>值 = ANY (陣列)</code> 查詢、索引從 1 開始；<code>array_agg</code> 把多列收成陣列，<code>jsonb_build_object</code> 把欄位組成 API 要的 JSON。</li>
+  <li>需要約束、外鍵、經常查詢的資料，拆成一般欄位或獨立的表。JSONB 是正規化的有意識例外，不是取代 schema 設計的捷徑。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 6 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="b">
+  <p>練習 8：註冊 API 先 <code>SELECT</code> 查這支手機有沒有人用，沒有才 <code>INSERT</code>，前端也擋了連點。上線後還是出現手機相同的兩位會員，最可能的原因是？</p>
+  <label data-key="a">資料庫有快取，<code>SELECT</code> 讀到的是幾秒前的舊結果</label>
+  <label data-key="b">兩個請求同時進來，都查到「沒有」，於是各新增一筆</label>
+  <label data-key="c"><code>phone</code> 沒有索引，資料一多 <code>SELECT</code> 就會漏掉幾列</label>
+  <p class="why">✓ 「先查再寫」中間有空檔，同時進來的請求都會通過檢查；前端擋得住連點，擋不住其他入口或直接呼叫 API。在 <code>phone</code> 加 UNIQUE，直接 INSERT，撞到 23505 再轉成「這支手機已經註冊過」回 409。a 錯在問題不是讀到舊資料，而是兩邊查的時候另一筆都還沒寫進去。（第 12 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 9：後台新增商品時沒填價格，API 把 <code>null</code> 照樣傳進 INSERT，等同下面最後一行。結果是？</p>
+<pre>CREATE TABLE products (
+  name  text NOT NULL,
+  price integer DEFAULT 0 CHECK (price &gt;= 0)
+);
+INSERT INTO products (name, price) VALUES ('拿鐵', NULL);</pre>
+  <label data-key="a">寫入成功，<code>price</code> 套用 DEFAULT 變成 0</label>
+  <label data-key="b">被 CHECK 擋下，NULL 不符合 <code>price &gt;= 0</code></label>
+  <label data-key="c">寫入成功，<code>price</code> 是 NULL</label>
+  <p class="why">✓ 明確寫了 NULL 就不會套用 DEFAULT；CHECK 的條件算出來是 NULL 不是 false，所以通過。這欄要加 NOT NULL，要用預設值時 INSERT 不寫這一欄，或寫 <code>DEFAULT</code>。a 錯在 DEFAULT 只在「沒寫到這一欄」時才填，傳 null 也算有寫。（第 12 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 10：集點規則是「每位會員每天只能集一次」，同事這樣建表。上線後會出什麼事？</p>
+<pre>CREATE TABLE stamps (
+  member_id  integer NOT NULL UNIQUE,
+  stamp_date date    NOT NULL UNIQUE
+);</pre>
+  <label data-key="a">同一天第二位會員會被擋，同一位會員隔天也集不到點</label>
+  <label data-key="b">同一位會員同一天仍能集兩次，兩欄都重複才會被擋</label>
+  <label data-key="c">規則正確，只是比寫成組合 UNIQUE 多建了一個索引</label>
+  <p class="why">✓ 兩欄各自 UNIQUE 是兩條規則：每位會員一輩子只能集一次、每天只有一個人能集點。要限制的是「會員＋日期」的組合，寫成表約束 <code>CONSTRAINT stamps_once_per_day UNIQUE (member_id, stamp_date)</code>。b 把兩條欄位約束當成了一條組合約束，實際上任一欄重複就會被擋。（第 12 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 11：Node 後端用 <code>pg</code> 查 <code>numeric(10,2)</code> 的 <code>price</code>，拿到的是字串 <code>'110.00'</code>。同事提議把欄位改成 <code>double precision</code>，API 就能直接回 number。怎麼回應？</p>
+  <label data-key="a">可以改，JS 的 number 本來就是浮點數，存成浮點也不會更糟</label>
+  <label data-key="b">欄位不用改，SQL 裡寫 <code>price::double precision</code> 再回傳就好</label>
+  <label data-key="c">不改，浮點數是近似值，字串回傳就是為了不丟掉精確度</label>
+  <p class="why">✓ 浮點數連 <code>0.1 + 0.2</code> 都算不準，金額存成浮點，加總、折扣、月底對帳都會差幾分錢。JS 的 number 就是浮點數，所以 <code>pg</code> 把 <code>numeric</code> 當字串回傳；前端顯示前也別 <code>parseFloat</code> 再相乘。a 錯在資料庫是對帳的依據，存成浮點，連 SUM 出來的營收都可能對不上。（第 13 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 12：<code>orders.ordered_at</code> 是 <code>timestamp</code>（無時區）。門市 POS 寫入 <code>14:30+08</code>，雲端點餐服務寫入同一瞬間的 <code>06:30+00</code>，報表上線上訂單都早了 8 小時。為什麼？</p>
+  <label data-key="a">timestamp 丟掉時區只留時鐘數字，同一瞬間存成 14:30 和 06:30</label>
+  <label data-key="b">timestamp 寫入時換算成 UTC 存，讀出時卻沒有換回台北時間</label>
+  <label data-key="c">報表的連線時區是 UTC，顯示時把線上訂單換算成了 UTC 時間</label>
+  <p class="why">✓ timestamp 只記牆上時鐘的數字，<code>+08</code>、<code>+00</code> 寫入時直接丟掉，事後也分不出哪筆是哪個時區。事件時間用 <code>timestamptz</code>：存的是絕對時間點，讀出時依連線時區顯示。b 描述的換算是 timestamptz 的行為，而 timestamptz 讀出時會換回連線的時區。（第 13 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 13：甜度一直放在 <code>order_items.options</code>（jsonb），資料裡已經混進 <code>Sugar</code>、<code>half</code> 這種寫法。老闆現在要每週看甜度分布，該怎麼做？</p>
+  <label data-key="a">報表查詢裡把 <code>Sugar</code>、<code>half</code> 這幾種寫法逐一對應回半糖</label>
+  <label data-key="b">用 migration 拆成 <code>sugar</code> 欄位加 CHECK，API 改寫入新欄位</label>
+  <label data-key="c">在 <code>options</code> 上建索引，讓每週的統計查詢跑得夠快</label>
+  <p class="why">✓ 要約束、要統計的資料是核心業務欄位，不該留在 JSONB；資料庫只檢查「是不是 JSON」，拼錯的 key 會一直進來。拆成欄位後，CHECK 從寫入就擋下 <code>half</code>。a 錯在每個報表都要各自補一次，出現新的拼法又要再改。（第 14 課）</p>
+</div>
+
+<p>這個階段的重點整理成<a href="../sheets/stage-3.html">一頁圖解</a>。</p>
+<p>下一課：進入進階查詢，學常用的字串、日期函式，以及 <code>COALESCE</code> 和 <code>CASE</code>。</p>
+
+</main>
+
+<script type="text/sql" id="seed">
+CREATE TABLE products (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL,
+  category text NOT NULL,
+  price integer NOT NULL,
+  tags text[] NOT NULL DEFAULT '{}'
+);
+INSERT INTO products (name, category, price, tags) VALUES
+  ('美式咖啡', 'coffee', 80, ARRAY['熱門']),
+  ('拿鐵', 'coffee', 120, ARRAY['熱門', '可換燕麥奶']),
+  ('卡布奇諾', 'coffee', 120, ARRAY['可換燕麥奶']),
+  ('伯爵紅茶', 'tea', 90, ARRAY['無咖啡因']),
+  ('抹茶拿鐵', 'tea', 130, ARRAY['季節限定', '熱門']),
+  ('可頌', 'food', 70, ARRAY[]::text[]),
+  ('南瓜派', 'food', 95, ARRAY['季節限定']);
+
+CREATE TABLE order_items (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  order_id integer NOT NULL,
+  product_id integer NOT NULL REFERENCES products (id),
+  quantity integer NOT NULL,
+  unit_price integer NOT NULL,
+  options jsonb NOT NULL DEFAULT '{}'
+);
+INSERT INTO order_items (order_id, product_id, quantity, unit_price, options) VALUES
+  (1, 2, 1, 120, '{"sugar": "半糖", "ice": "少冰"}'),
+  (1, 6, 1, 70,  '{"heat": true}'),
+  (2, 1, 1, 80,  '{"sugar": "無糖", "ice": "去冰", "extra_shot": true}'),
+  (2, 2, 1, 120, '{"sugar": "無糖", "ice": "正常冰", "milk": {"type": "燕麥奶", "extra": 20}}'),
+  (3, 5, 2, 130, '{"sugar": "微糖", "ice": "少冰"}'),
+  (3, 7, 1, 95,  '{}'),
+  (4, 3, 1, 120, '{"sugar": "半糖", "ice": "去冰", "milk": {"type": "燕麥奶", "extra": 20}}'),
+  (4, 4, 1, 90,  '{"sugar": "無糖", "ice": "少冰"}'),
+  (5, 1, 2, 80,  '{"sugar": "無糖", "ice": "去冰", "extra_shot": true}'),
+  (5, 6, 2, 70,  '{"heat": false}'),
+  (6, 2, 1, 120, '{"sugar": "half", "ice": "少冰"}'),
+  (6, 3, 1, 120, '{"Sugar": "半糖", "ice": "去冰", "extra_shot": true}');
+</script>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

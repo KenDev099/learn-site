@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>21. 排程與事件</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="21" data-practice="nestjs">
+<header>
+  <div class="eyebrow">階段 4：快取、背景工作與外部整合 · 第 21 課</div>
+  <h1>排程與事件</h1>
+</header>
+<main>
+
+<p>到目前為止，後端的每一行程式都是被請求「叫醒」的：客人按下付款，controller 才開始做事；沒有請求進來，程式就只是待在那裡。咖啡店準備正式上線，部署成三台伺服器，這時有三件工作沒有人會來按按鈕：每天凌晨把一年沒用的集點清掉；每天早上比對訂單和金流公司的付款紀錄，把卡住的訂單找出來；每次付款成功，順手在廚房看板加一張單、把金額加進當日營業額。</p>
+<p>前兩件是「照時間表觸發」，第三件是「某件事發生之後觸發」。這一課把三件工作依序做出來，每一件都會碰到同一組問題：誰來叫醒它、三台伺服器會不會各做一次、做到一半當機或失敗了怎麼辦。這一課用 <code>@nestjs/schedule</code> 12.0.2 和 <code>@nestjs/event-emitter</code> 12.0.1 實作。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>凌晨三點誰來叫醒程式：用 <code>@Cron</code> 讓清點數的工作照時間表自己跑，時區寫清楚、「現在」當參數傳進來（開場問題的最小答案）。</li>
+  <li>部署成三台，點數為什麼被扣了三次：每個程序都會跑排程，用 advisory lock 讓一台做，用冪等讓重跑也無害。</li>
+  <li>早上的對帳：訂單和付款紀錄有哪三種對不上，哪一種能讓程式自己修；訂單有一百萬筆時，怎麼分批、續跑、先試跑。</li>
+  <li>付款之後通知廚房：用領域事件讓付款程式不用認識廚房和營業額，而且等交易 commit 之後才發。</li>
+  <li>事件漏了會怎樣：程序內事件在失敗、當機、多台時的限制，漏一次就不行的工作為什麼要交給第 20 課的佇列。最後選讀 SSE。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="20-queues-bullmq.html">第 20 課</a>的佇列與 outbox：工作放進 BullMQ 由 worker 在背景做、失敗會重試，所以 worker 要冪等；outbox 在同一個交易裡記下要送的訊息，保證不會漏。</li>
+  <li><a href="../../node/lessons/08-events-cancellation.html">Node 課第 8 課</a>的 <code>EventEmitter</code>：<code>emit</code> 發出一個有名字的事件，所有用 <code>on</code> 登記這個名字的函式依序被呼叫。</li>
+</ul></div>
+
+<h2>凌晨三點，誰來叫醒程式？用 @Cron 排程</h2>
+<p>先看第一件工作。點數過期的規則是：一張集點卡的最後一筆紀錄早於一年前、餘額還大於 0，就把餘額歸零。這段邏輯寫成一個 service 方法不難，難的是「誰來呼叫它」。沒有客人會在凌晨三點發一個「請幫我清點數」的請求，所以程式得自己知道時間到了。</p>
+<p>讓程式「在指定的時間或間隔自動執行某段程式」，叫做<strong>排程</strong>（scheduling）。Linux 上傳統的做法是系統內建的 <code>cron</code>：你寫一行時間表和一個指令，作業系統時間到了就幫你執行。時間表的寫法叫 <strong>cron 表示式</strong>，用幾個以空白分隔的欄位描述「哪一秒、哪一分、哪一時……」。</p>
+<p><code>@nestjs/schedule</code> 把同樣的概念搬進 Nest：你在 provider 的方法上加一個裝飾器，寫上 cron 表示式，應用程式啟動時，Nest 會找出這些方法，在<strong>這個 Node 程序裡</strong>各排一個計時器，時間到了就呼叫它。這跟你在 Vue 元件裡寫 <code>setInterval</code> 是同一類東西，只是時間表更有表達力。也因為計時器活在程序的記憶體裡，程序停著的那段時間不會執行，重新啟動後只會從下一次時間開始，錯過的那一次不會自動補跑。</p>
+<p>它背後用的是 <code>cron</code> 套件（12.0.2 搭配 cron 4.4.0）。這個版本的 cron 表示式有 6 欄，第一欄是秒；省略秒那一欄、只寫 5 欄，就是傳統 Linux cron 的寫法：</p>
+<pre>* * * * * *
+│ │ │ │ │ └─ 星期（0–7，0 和 7 都是星期日）
+│ │ │ │ └─── 月（1–12）
+│ │ │ └───── 日（1–31）
+│ │ └─────── 時（0–23）
+│ └───────── 分（0–59）
+└─────────── 秒（0–59，可省略）</pre>
+<p><code>*</code> 表示「每一個值都符合」，<code>*/10</code> 表示「每隔 10」，<code>1-5</code> 表示範圍。幾個常見的寫法，第一列就是點數過期要用的：</p>
+<div class="table-wrap"><table>
+  <tr><th>表示式</th><th>意思</th></tr>
+  <tr><td><code>0 0 3 * * *</code></td><td>每天 03:00:00</td></tr>
+  <tr><td><code>0 */10 * * * *</code></td><td>每 10 分鐘（整點、10 分、20 分…）</td></tr>
+  <tr><td><code>0 30 9 * * 1-5</code></td><td>週一到週五 09:30</td></tr>
+  <tr><td><code>0 0 4 1 * *</code></td><td>每月 1 日 04:00</td></tr>
+</table></div>
+<p>使用分兩步。第一步，在 <code>AppModule</code> 匯入一次 <code>ScheduleModule.forRoot()</code>。官方文件明講只能在一個模組呼叫：匯入兩次，每個工作會被註冊兩次，時間到了就跑兩次。第二步，在 provider 的方法上加 <code>@Cron</code>：</p>
+<pre>@Injectable()
+export class StampCardsService {
+  @Cron('0 0 3 * * *', { name: 'expire-stamps', timeZone: 'Asia/Taipei', waitForCompletion: true })
+  async expireStampsDaily() {
+    const count = await this.expireStamps(new Date())
+    this.logger.log(`點數過期：${count} 張卡`)
+  }
+
+  async expireStamps(now: Date) { /* 真正的邏輯，時間由參數傳進來 */ }
+}</pre>
+<p>第二個參數裡的三個選項，各自防一種正式環境才會遇到的狀況。</p>
+<p><strong><code>timeZone</code></strong> 決定「03:00」是哪裡的三點。不寫的話，用的是伺服器所在的時區。你的筆電設在台北，開發時一切正常；但雲端主機和容器幾乎都設成 UTC，部署上去之後，「UTC 03:00」是台北 11:00，正好是早上營業的尖峰，清點數的工作跟客人搶資料庫。所以時區一律明確寫出 <code>'Asia/Taipei'</code>，不要依賴伺服器的設定。</p>
+<p><strong><code>name</code></strong> 替這個工作取名字。有了名字，就能從 Nest 提供的 <code>SchedulerRegistry</code> 用 <code>getCronJob('expire-stamps')</code> 拿到它：暫停（<code>stop()</code>）、手動觸發一次，或在測試裡檢查它的時區和下一次執行時間。這一課練習 1 的判分就是這樣檢查你的排程。</p>
+<p><strong><code>waitForCompletion: true</code></strong> 處理「上一次還沒跑完，下一次的時間又到了」。點數過期一天一次不太會重疊，但「每 10 分鐘同步一次外部資料」這種工作，偶爾某次跑了 12 分鐘，就會和下一次同時在跑。打開這個選項，上一次還沒跑完時就跳過這一次。注意它只管得到同一個程序裡的自己，管不到別台伺服器上的同一個工作，下一節會看到這個差別。</p>
+<p>除了 <code>@Cron</code>，還有兩個比較簡單的裝飾器：<code>@Interval(1000)</code> 每隔 1000 毫秒執行一次，<code>@Timeout(5000)</code> 在應用程式啟動 5 秒後執行一次。兩個都以毫秒為單位，適合「固定間隔」而不是「固定時刻」的工作，例如第 20 課 outbox 的 relay 每秒掃一次，下一節會再提到它。</p>
+<p>最後看程式碼的結構：為什麼要拆成 <code>expireStampsDaily()</code> 和 <code>expireStamps(now)</code> 兩個方法？如果把 <code>new Date()</code> 寫在邏輯裡面，想測「一年前的紀錄會不會過期」，就只能真的等一年，或去改電腦的時間。拆開之後，<code>@Cron</code> 方法只做一件事：取得「現在」，交給真正的邏輯；邏輯方法接收 <code>now</code> 參數，測試直接傳 2030 年的某一天進去，馬上就能看結果。這跟<a href="03-providers-di.html">第 3 課</a>注入 <code>CLOCK</code> 是同一個想法：時間是輸入，不是在邏輯裡偷偷讀的全域狀態。</p>
+<div class="callout practice"><strong>💡 實務上：排程工作最怕的是「沒跑」卻沒人知道</strong><br>常見的排程有：每天清過期資料、每天早上產生前一天的營業報表、每小時同步外部系統的資料。它們半夜自己跑，壞了不會有客人來報錯，往往等到會計問「昨天的報表呢？」才發現已經停了一週。所以除了失敗時記 error log，也要能發現「該跑的時間過了卻沒跑」：每次跑完記下完成時間和處理筆數，由監控在超過預期時間沒更新時通知。時間也要挑：避開營業尖峰，也不要把所有工作都排在 00:00 一起擠資料庫。新增一個排程時，資深工程師會先問：跑一次要多久、失敗了誰會收到通知、漏跑一天能不能補跑。</div>
+<p>到這裡，點數過期已經能每天凌晨自己跑。在你的電腦上只有一個程序，一切正常；但正式環境不會只有一個程序。</p>
+
+<h2>部署成三台，林志豪的點數為什麼變成 -6？</h2>
+<p>正式環境為了扛住流量，也為了某台掛掉時還有別台能接手，通常同時跑好幾個相同的程序，這叫水平擴展（<a href="../../node/lessons/24-scaling.html">Node 課第 24 課</a>）。上一節說過，<code>@Cron</code> 是在「這個程序裡」排計時器。三台伺服器跑的是同一份程式，每一台啟動時都會各自排好一個 03:00 的計時器，彼此完全不知道對方存在。官方文件的說法是：排程器會在應用程式的每一個程序裡執行每一個工作。</p>
+<p>於是上線第一天的凌晨三點，發生了這件事：</p>
+<figure>
+  <svg viewBox="0 0 700 260" role="img" aria-label="三台伺服器各自在 03:00 執行點數過期，同一張卡被加了三筆負數紀錄">
+    <defs><marker id="a21a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="20" y="20" width="180" height="60" rx="10"/>
+    <text class="d-text" x="110" y="46" text-anchor="middle">伺服器 A</text>
+    <text class="d-small" x="110" y="66" text-anchor="middle">03:00 expireStamps()</text>
+    <rect class="d-box" x="20" y="100" width="180" height="60" rx="10"/>
+    <text class="d-text" x="110" y="126" text-anchor="middle">伺服器 B</text>
+    <text class="d-small" x="110" y="146" text-anchor="middle">03:00 expireStamps()</text>
+    <rect class="d-box" x="20" y="180" width="180" height="60" rx="10"/>
+    <text class="d-text" x="110" y="206" text-anchor="middle">伺服器 C</text>
+    <text class="d-small" x="110" y="226" text-anchor="middle">03:00 expireStamps()</text>
+    <rect class="d-soft" x="330" y="70" width="350" height="120" rx="10"/>
+    <text class="d-text" x="505" y="98" text-anchor="middle">point_transactions（林志豪的卡，餘額 3）</text>
+    <text class="d-small" x="505" y="124" text-anchor="middle">-3 點數過期（A）</text>
+    <text class="d-small" x="505" y="144" text-anchor="middle">-3 點數過期（B）</text>
+    <text class="d-small" x="505" y="164" text-anchor="middle">-3 點數過期（C）</text>
+    <line class="d-line" x1="200" y1="50" x2="326" y2="110" marker-end="url(#a21a)"/>
+    <line class="d-line" x1="200" y1="130" x2="326" y2="130" marker-end="url(#a21a)"/>
+    <line class="d-line" x1="200" y1="210" x2="326" y2="150" marker-end="url(#a21a)"/>
+    <text class="d-accent" x="505" y="222" text-anchor="middle">餘額變成 -6</text>
+  </svg>
+  <figcaption>三台伺服器都在 03:00 讀到「餘額 3」，各自加一筆 -3。</figcaption>
+</figure>
+<p>三台幾乎同時讀到林志豪的卡「餘額 3、一年沒用」，各自判斷「該過期了」，各自寫入一筆 -3。每一筆單獨看都是合法的資料，資料庫沒有理由擋，結果餘額變成 -6。上一節的 <code>waitForCompletion</code> 幫不上忙：它只讓同一個程序跳過自己的下一次，三台是三個不同的程序。</p>
+<p>修法要兩層都有：第一層，<strong>讓同一時間只有一台在做</strong>；第二層，<strong>就算做了兩次，結果也一樣</strong>，也就是第 20 課講過的冪等。只做第一層不夠，因為鎖擋得住「同時」，擋不住「先後」：三台的時鐘差了幾秒，A 已經做完、把鎖放掉，B 才醒來，B 一樣拿得到鎖、再做一次。只做第二層也不理想：結果雖然對，但三台同時掃同一批資料是白做工，還可能在資料庫裡互相等鎖。</p>
+<p>先看第一層。「只讓一台做」需要一個三台都看得到的裁判，最現成的就是它們共用的那個 PostgreSQL。你在<a href="15-transactions-concurrency.html">第 15 課</a>看過資料庫的列鎖：<code>FOR UPDATE</code> 鎖住某幾列，別人要改同一列就得等。這裡要鎖的不是某一列，而是「點數過期這個工作」這件事，資料表裡沒有一列能代表它。</p>
+<p>PostgreSQL 為這種需求提供了 <strong>advisory lock</strong>（建議鎖）：一種不綁在任何資料列上的鎖，鎖的只是一個整數，這個整數代表什麼由應用程式自己決定，資料庫完全不管，只保證同一個整數同一時間只有一個人拿得到。「建議」的意思是資料庫不會因為它去擋任何讀寫，大家都說好「先拿到這把鎖才做事」，它才有效。我們想用「expire-stamps」這個名字當鎖，就用 <code>hashtext('expire-stamps')</code> 把字串轉成整數。<a href="../../postgresql/lessons/33-job-queue.html">PostgreSQL 課第 33 課</a>用 SQL 練過它。</p>
+<p>advisory lock 有好幾個版本的函式，這裡要的是 <code>pg_try_advisory_xact_lock</code>，名字裡的兩個部分各有原因：</p>
+<p><strong><code>try</code></strong>：拿不到鎖時立刻回傳 <code>false</code>，不等待。沒有 <code>try</code> 的 <code>pg_advisory_xact_lock</code> 拿不到會一直等，等 A 做完放掉鎖，B 接著拿到，然後照樣再做一次，等於只是把三次改成排隊做三次。我們要的是「拿不到就表示別人在做，我直接跳過」。</p>
+<p><strong><code>xact</code></strong>（transaction 的縮寫）：鎖跟著交易，交易 commit 或回滾時自動放掉。另一種是 session 層級的 <code>pg_try_advisory_lock</code>，鎖跟著資料庫連線，要自己呼叫 <code>pg_advisory_unlock</code> 才會放。麻煩在 Prisma 用連線池：上鎖和解鎖的兩句 SQL 不保證走同一條連線，解鎖那句可能在別條連線上執行，什麼也沒解開。鎖就一直留在原本那條連線上，那條連線不關，之後只有剛好借到同一條連線的那次拿得到鎖（session 層級的鎖在同一條連線上可以重複取得），其他時候每台都拿到 <code>false</code>，工作變成時有時無，而且不會報錯。</p>
+<p>所以點數過期的做法是：把整個工作放進一個互動式交易（<a href="15-transactions-concurrency.html">第 15 課</a>的 <code>$transaction(async tx =&gt; …)</code>，交易裡可以依序執行多句查詢、中間跑自己的邏輯），第一句執行 <code>SELECT pg_try_advisory_xact_lock(hashtext('expire-stamps'))</code>。拿到 <code>true</code> 的那台繼續做，拿到 <code>false</code> 的直接回傳，什麼都不做；交易結束，鎖自動放掉。練習 2 要你寫出這一段。</p>
+<p>再看第二層冪等。點數過期的冪等不靠額外機制，靠「怎麼算餘額」：餘額一律用這張卡<strong>所有</strong>紀錄加總，包含兌換和之前的過期紀錄。A 已經寫了一筆 -3，B 晚幾秒進來，算出來的餘額是 0，不符合「餘額大於 0」，就不會再寫。如果餘額是另外存在一個欄位、又沒跟著更新，B 讀到的就還是 3。</p>
+<p>advisory lock 不是唯一的做法。如果專案已經有第 20 課的佇列，也可以把「時間到了」這件事交給 BullMQ：</p>
+<div class="table-wrap"><table>
+  <tr><th>做法</th><th>怎麼運作</th><th>適合</th></tr>
+  <tr><td>PostgreSQL advisory lock</td><td>每台的 <code>@Cron</code> 照樣觸發，工作一開始在交易裡 <code>SELECT pg_try_advisory_xact_lock(hashtext('expire-stamps'))</code>，拿到 <code>true</code> 的那台做事，拿到 <code>false</code> 的直接跳過；交易結束自動放掉</td><td>已經有 PostgreSQL、工作在一個交易內做得完</td></tr>
+  <tr><td>BullMQ job scheduler</td><td>不用 <code>@Cron</code>，排程交給佇列：啟動時 <code>queue.upsertJobScheduler('expire-stamps', { pattern: '0 0 3 * * *', tz: 'Asia/Taipei' })</code>，同一個 id 不管呼叫幾次都只有一份時間表；時間到 BullMQ 產生一個 job，只有一個 worker 拿得到，失敗還能重試</td><td>已經有第 20 課的佇列、工作要能重試或跑很久</td></tr>
+</table></div>
+<p>兩者的差別在失敗時：advisory lock 版本失敗了就是失敗，只留一行 log，要等明天再跑；BullMQ 版本會照第 20 課設定的次數自動重試。官方文件另外推薦了一個專門的裝飾器，目前版本還很新，見課末「補充與查表」。</p>
+<p>並不是每個排程工作都需要鎖。第 20 課 outbox 的 relay 也是排程工作：</p>
+<pre>@Interval(1000)
+async relay() {
+  await this.outbox.publishPending()
+}</pre>
+<p>三台伺服器每秒都會呼叫它，但 relay 用 <code>FOR UPDATE SKIP LOCKED</code> 取資料：每一列被某一台鎖住時，其他台會直接跳過那一列去拿別的，所以每一列只會被一台處理。工作本身就是以「列」為單位分配的，多台同時跑反而分擔了負載，不需要額外的鎖。點數過期不一樣，它要先讀「餘額」再決定寫不寫，三台讀到的是同一個餘額，所以需要上面兩層。</p>
+<p>點數過期在一個交易內就做得完，鎖加冪等就夠了。早上的對帳不一樣：它不只是「做一件事」，而是要先找出哪些資料出了問題。</p>
+
+<h2>早上的對帳：訂單和付款紀錄對不上時，哪些能讓程式自己修？</h2>
+<p>第二件工作要先知道付款的完整流程：客人在前台付款 → 金流公司扣款 → 金流公司呼叫我們的網址通知結果（第 22 課的 webhook）→ 我們把訂單改成 paid。這條路上任何一步都可能出錯：金流公司的通知沒送到、我們收到通知後處理到一半當機、有人直接在資料庫手動改了狀態。出錯的結果是兩邊的紀錄不一致，而且沒有人會發現，直到客人來問「我付了錢，為什麼訂單還沒做」。</p>
+<p><strong>對帳</strong>（reconciliation）就是定期拿兩份「應該一致」的紀錄互相比對，把差異找出來。這裡的兩份紀錄是我們的 <code>orders</code>，和記錄金流公司回報結果的 <code>payments</code>。比對之後，會看到三種差異：</p>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="左邊是 orders，右邊是 payments，中間標出三種差異：已付款但沒有付款紀錄、付款成功但訂單還是 pending、金額不一致">
+    <defs><marker id="a21b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="20" y="20" width="170" height="210" rx="10"/>
+    <text class="d-text" x="105" y="46" text-anchor="middle">orders</text>
+    <text class="d-small" x="105" y="90" text-anchor="middle">#13 paid 120</text>
+    <text class="d-small" x="105" y="140" text-anchor="middle">#7 pending 110</text>
+    <text class="d-small" x="105" y="190" text-anchor="middle">#21 pending 80</text>
+    <rect class="d-soft" x="510" y="20" width="170" height="210" rx="10"/>
+    <text class="d-text" x="595" y="46" text-anchor="middle">payments</text>
+    <text class="d-small" x="595" y="90" text-anchor="middle">（沒有成功的紀錄）</text>
+    <text class="d-small" x="595" y="140" text-anchor="middle">#7 succeeded 110</text>
+    <text class="d-small" x="595" y="190" text-anchor="middle">#21 succeeded 70</text>
+    <text class="d-text" x="350" y="80" text-anchor="middle">已付款，卻沒有付款紀錄</text>
+    <text class="d-small" x="350" y="98" text-anchor="middle">只回報，交給人查</text>
+    <text class="d-text" x="350" y="130" text-anchor="middle">付款成功，訂單還是 pending</text>
+    <text class="d-accent" x="350" y="148" text-anchor="middle">可以安全地自動改成 paid</text>
+    <text class="d-text" x="350" y="180" text-anchor="middle">金額不一致</text>
+    <text class="d-small" x="350" y="198" text-anchor="middle">只回報，可能要退款或補收</text>
+    <line class="d-line" x1="190" y1="86" x2="230" y2="86" marker-end="url(#a21b)"/>
+    <line class="d-line" x1="506" y1="136" x2="466" y2="136" marker-end="url(#a21b)"/>
+    <line class="d-line" x1="506" y1="186" x2="440" y2="186" marker-end="url(#a21b)"/>
+  </svg>
+  <figcaption>三種差異，只有一種能讓程式自己修。</figcaption>
+</figure>
+<p>找到差異之後，最直覺的想法是「全部自動修好」。但修之前要問：程式知不知道正確答案是什麼？</p>
+<p>「付款成功，訂單還是 pending」（圖中的 #7）意思很明確：錢收到了，金額也對，只是我們沒記上，多半是通知漏了。把它改成 paid，就是補上本來該發生的事，不會錯。這一種可以讓程式自己修。</p>
+<p>「金額不一致」（#21，訂單 80 元、只收到 70 元）可能是客人該補收 10 元，也可能是我們的訂單金額算錯、該修的是訂單；「已付款，卻沒有付款紀錄」（#13）可能是有人手動改了資料，也可能是金流那邊漏了紀錄。這兩種，程式猜不出正確答案，猜錯了會多收或少收客人的錢。所以原則是：<strong>先回報；只有能確定正確答案、安全的差異才自動修，其他記下來交給人處理。</strong></p>
+<div class="callout practice"><strong>💡 實務上：對帳報告的讀者通常是財務和客服，不是工程師</strong><br>只要有收錢的系統，幾乎都會有每日對帳：電商、外送平台、訂閱制服務都是。程式找到差異後，要送到有人會處理的地方，例如寄給財務的每日報表、客服後台的待辦清單，而不是只留在 log 裡。動手前先跟財務確認兩件事：哪一份紀錄算數（通常以金流公司的資料為準），以及「一天」從幾點算到幾點、用哪個時區，否則跨夜的訂單會每天都被當成差異。自動修正也要留下修正紀錄（誰、何時、為什麼改），之後被問到「這筆怎麼變成 paid」才答得出來。</div>
+<p>比對規則清楚了，剩下的問題是量。對帳每天都要跑，訂單會一直累積到十萬、百萬筆，對帳程式得把它們全部看過一遍。</p>
+
+<h2>一百萬筆訂單怎麼對完？分批、續跑、重跑、試跑</h2>
+<p>對帳這種「把大量既有資料逐筆檢查、補齊或改正」的程式，跟另外兩種常見工作長得一樣：替新欄位把舊資料補上值，叫<strong>資料回填</strong>（backfill）；把一批壞掉的資料改正，叫<strong>資料修復</strong>（repair）。這一節的寫法三者通用。</p>
+<p>最直覺的寫法是 <code>const orders = await prisma.order.findMany()</code>，一次全部讀進來再用迴圈處理。資料少時沒事；一百萬筆時，一百萬個物件同時放在程序的記憶體裡，程序直接因為記憶體不足被終止。就算記憶體夠，把整件事包在一個大交易裡修，被修改的列在交易結束前都鎖著，別人要更新同一張訂單只能等好幾分鐘（<a href="../../postgresql/lessons/34-zero-downtime-migrations.html">PostgreSQL 課第 34 課</a>）。</p>
+<p>所以要<strong>分批</strong>：一次只讀一小批（例如 500 筆），處理完、提交，再讀下一批。每批一個短交易，鎖只會被拿住很短的時間。分批這個決定一做，就接連冒出四個問題：下一批從哪裡開始讀？跑到一半被中斷怎麼辦？重跑會不會修兩次？第一次在正式資料上跑，怎麼知道它會改什麼？下面依序回答。</p>
+
+<h3>下一批從哪裡開始？用 keyset 游標，不用 OFFSET</h3>
+<p>分頁最常見的寫法是 OFFSET：第 1 批 <code>skip: 0, take: 100</code>，第 2 批 <code>skip: 100, take: 100</code>。<a href="16-query-performance.html">第 16 課</a>講過它在資料多時很慢，因為資料庫得先數過前面那些列才能跳過。批次工作還有一個比「慢」更嚴重的問題：它會漏資料。</p>
+<p>對帳只看沒取消的訂單（<code>status &lt;&gt; 'cancelled'</code>），用 OFFSET 時會這樣：</p>
+<ol>
+  <li>第 1 批：符合條件的前 100 筆（<code>skip: 0</code>）。</li>
+  <li>這時有 30 位客人取消了第 1 批裡的訂單，它們不再符合條件。</li>
+  <li>第 2 批：<code>skip: 100</code>，跳過「現在」符合條件的前 100 筆。前面少了 30 筆，原本第 101～130 筆往前移進了前 100 筆，就這樣被跳過了。</li>
+</ol>
+<p>這 30 張訂單這一輪永遠不會被檢查，而且沒有任何錯誤訊息。OFFSET 的本質是「數第幾筆」，而批次工作跑的那幾分鐘裡，資料一直在變，「第幾筆」也跟著變。</p>
+<p>第 16 課的 keyset 分頁不數位置，只記「上一批最後一筆的 id」，下一批從比它大的 id 開始：<code>WHERE id &gt; $cursor ORDER BY id LIMIT 500</code>。前面的訂單被取消、被新增，都不影響「id 大於 1234 的是哪些」，後面的資料一筆都不會漏。這個 <code>cursor</code> 就叫<strong>游標</strong>。用 Prisma 寫就是 <code>where: { id: { gt: cursor } }</code> 加 <code>orderBy: { id: 'asc' }</code>（Prisma 另有一個 <code>cursor</code> 選項，這裡不用它的原因見課末）。</p>
+
+<h3>跑到一半被中斷？檢查點跟著那一批一起 commit</h3>
+<p>一百萬筆分成兩千批，中途很可能遇到部署重啟或當機。如果只能從頭來，每次部署都會讓前面的進度白費。解法是<strong>檢查點</strong>（checkpoint）：每處理完一批，就把游標（這批最後一張訂單的 id）存進資料庫，例如一張 <code>job_checkpoints</code> 表。下次啟動時先讀檢查點，從那裡繼續。</p>
+<p>檢查點存在哪裡、什麼時候存，決定它可不可靠。只放在記憶體的變數裡，程序一重啟就沒了。存進資料庫，但跟那一批的修正分開寫，兩者之間當機就會對不上：修正寫了、檢查點沒寫，下次會重做這一批；檢查點寫了、修正沒寫，這一批的修正就永遠漏掉了。所以<strong>檢查點要和那一批的修正寫在同一個交易裡</strong>，兩者一起成功或一起不算數。整輪跑完之後刪掉檢查點，下次對帳才會從頭開始。</p>
+
+<h3>重跑會不會修兩次？修正要冪等</h3>
+<p>有了檢查點，同一批還是可能被處理兩次：例如前面「部署成三台」那節說的，三台伺服器的 <code>@Cron</code> 同時觸發對帳，或者交易 commit 成功、但回應在網路上遺失，程式以為失敗又重試。所以每個修正都要冪等，重做也不會多改。</p>
+<p>第一個工具是<a href="18-layering-domain.html">第 18 課</a>的條件更新：<code>updateMany({ where: { id, status: 'pending' } })</code>。條件寫在 <code>where</code> 裡，資料庫在更新的那一刻才檢查：如果讀完之後訂單已經被別人改成 paid，或被客人取消了，這句就影響 0 列，什麼都不做。如果寫成無條件的 <code>update({ where: { id } })</code>，就會把一張剛被取消的訂單改回 paid。</p>
+<p>第二個工具是唯一鍵：修正紀錄表加上 <code>UNIQUE(order_id, kind)</code>，同一張訂單的同一種修正只能有一筆，就算程式邏輯出錯想記第二次，資料庫也會拒絕。兩者一起，不管重跑幾次、從哪一批續跑，最後的結果都一樣。</p>
+
+<h3>第一次在正式資料上跑？先 dry-run，跑完記摘要</h3>
+<p>修復工具第一次在正式資料上跑，沒有人敢直接按下去：條件寫錯一個字，可能改掉幾萬張訂單。<strong>dry-run</strong>（試跑）是讓程式照常讀資料、照常分類，但只回報「會修改什麼」，不真的寫入，也不讀、不移動檢查點。不移動，是因為試跑一次就會把正式那次的進度帶走；不從檢查點開始讀，是因為試跑要看的是完整一輪會改什麼，從中間開始只會看到剩下的一部分。先 dry-run，看摘要裡「要改成 paid：20 張」這種數字合不合理，確認了才正式跑。</p>
+<p>不論試跑還是正式跑，結束時都用一行 log 記下摘要：掃了幾筆、每一類差異幾筆、花了多久、是不是 dry-run。出事時，這一行是唯一能回答「那天到底改了什麼」的東西。四件事組合起來，程式的骨架是這樣：</p>
+<pre>async reconcilePayments({ dryRun = false, batchSize = 500 } = {}) {
+  const started = Date.now()
+  const summary = { scanned: 0, markPaid: 0, missingPayment: 0, amountMismatch: 0 }
+  const saved = dryRun ? null : await this.prisma.jobCheckpoint.findUnique({ where: { name: 'reconcile-payments' } })
+  let cursor = saved?.cursor ?? 0
+  for (;;) {
+    const orders = await this.prisma.order.findMany({
+      where: { id: { gt: cursor }, status: { not: 'cancelled' } },
+      orderBy: { id: 'asc' },
+      take: batchSize,
+    })
+    if (orders.length === 0) break
+    // …查這一批的付款、分類…
+    cursor = orders[orders.length - 1].id
+    if (dryRun) continue
+    await this.prisma.$transaction(async tx =&gt; {
+      // …條件式 UPDATE、寫修正紀錄…
+      await tx.jobCheckpoint.upsert({ where: { name: 'reconcile-payments' }, create: { name: 'reconcile-payments', cursor }, update: { cursor } })
+    })
+  }
+  // 整輪跑完：刪掉檢查點，下次從頭對帳（dryRun 不碰）
+  this.logger.log('對帳完成', { ...summary, dryRun, ms: Date.now() - started })
+  return summary
+}</pre>
+<p>每天的對帳用 <code>@Cron</code> 觸發；要手動試跑時，常寫一支只啟動 DI 容器、不開 HTTP 的小程式（<a href="20-queues-bullmq.html">第 20 課</a>提過的 <code>NestFactory.createApplicationContext</code>），讀 <code>--dry-run</code> 參數再呼叫同一個方法。</p>
+<p>回到前面「部署成三台」那節的問題：對帳也是 <code>@Cron</code>，三台都會觸發。它跨好幾個交易，沒辦法像點數過期那樣用一個交易層級的鎖包住整件事；但它的每一步都冪等，三台同時跑，結果也不會錯，只是重複做工。想要同一時間只有一個實例在跑，可以另外搭配 advisory lock，或改用 BullMQ 的 job scheduler。另外，大量回填該不該寫在 migration 裡，見課末「補充與查表」。</p>
+<p>前兩件工作都是「時間到了」觸發的。第三件不一樣：它不看時間，而是在「付款成功」這件事發生之後才要做。</p>
+
+<h2>付款之後要通知廚房和營業額，付款程式需要認識它們嗎？</h2>
+<p>付款成功後，廚房看板要多一張單、當日營業額要加上這筆金額。最直覺的寫法是在 <code>OrdersService.pay</code> 的最後依序呼叫 <code>kitchen.notify()</code>、<code>stats.add()</code>。這樣能動，但付款模組因此必須 import 廚房模組和統計模組，認識它們的 service。下個月行銷要「付款後發優惠券」，又得打開付款程式加一行；再下個月要「付款後通知外送平台」，再加一行。付款是全店最不該常常改動的程式，每改一次都可能把收錢的流程改壞。</p>
+<p>問題出在依賴的方向：每多一個「付款之後要做的事」，付款模組就得多認識一個模組。<strong>領域事件</strong>（domain event）把方向反過來。付款模組不再呼叫任何人，只宣布一件<strong>已經發生的事</strong>：「訂單已付款」。誰在乎這件事，誰自己來登記要聽。事件名稱用過去式（<code>order.paid</code>，而不是 <code>pay.order</code>），因為它描述的是既成事實，不是命令；聽的人不能拒絕它、也改變不了它，只能對它做出反應。</p>
+<p>這樣一來，付款模組不知道有誰在聽、有幾個在聽。新增優惠券功能，只要在優惠券模組裡加一個 listener，付款程式一行都不用改。這種「發送者和接收者不需要互相認識」的關係叫<strong>解耦</strong>。<a href="../../node/lessons/08-events-cancellation.html">Node 課第 8 課</a>的 <code>EventEmitter</code> 就是這個模式；<code>@nestjs/event-emitter</code> 把 <code>eventemitter2</code> 這個套件包成 Nest 的模組，讓 listener 可以用裝飾器寫在任何 provider 上：</p>
+<pre>// app.module.ts：整個應用程式匯入一次
+EventEmitterModule.forRoot()
+
+// orders/order-paid.event.ts：事件的內容，只放聽的人需要的事實
+export class OrderPaidEvent {
+  constructor(readonly orderId: number, readonly customerId: number, readonly total: number, readonly paidAt: Date) {}
+}
+
+// orders/orders.service.ts：發送
+constructor(private readonly events: EventEmitter2) {}
+this.events.emit('order.paid', new OrderPaidEvent(order.id, order.customerId, order.total, new Date()))
+
+// kitchen/kitchen.listener.ts：在別的模組聽
+@OnEvent('order.paid', { async: true })
+async handleOrderPaid(event: OrderPaidEvent) {
+  await this.prisma.kitchenNotice.create({ data: { orderId: event.orderId } })
+}</pre>
+<p>注意依賴的方向：事件類別 <code>OrderPaidEvent</code> 放在發送方的 <code>orders</code> 資料夾，廚房的 listener import 它；付款這一側完全沒有 import 廚房。事件內容只放聽的人需要的事實（哪張訂單、哪位客人、多少錢、什麼時候付的），不放整個 Prisma 物件，聽的人才不會跟付款的資料結構綁在一起。</p>
+<p><code>{ async: true }</code> 處理的是「付款要不要等 listener」。<code>emit</code> 預設是同步的：它會當場依序呼叫每一個 listener，全部呼叫完才回到付款程式的下一行。加上 <code>async: true</code>，listener 會被排到稍後執行，<code>emit</code> 馬上返回，付款的回應不用等廚房寫完資料。</p>
+<p>還有一件事決定了 <code>emit</code> 寫在哪一行：<strong>要在交易 commit 之後才發</strong>。如果寫在 <code>$transaction</code> 的 callback 裡，事件發出去的時候交易還沒結束，之後仍可能回滾：例如後面的加點失敗、或 commit 時遇到衝突。這時付款已經不算數，廚房卻已經收到通知，開始做一杯沒付錢的咖啡。這跟第 20 課「在 commit 前 <code>queue.add</code>」是同一個錯：在結果確定之前，就把結果告訴了別人。正確的寫法是等 <code>$transaction</code> 回傳，確定 commit 了，再 emit：</p>
+<pre>async pay(id: number) {
+  const order = await this.prisma.$transaction(async tx =&gt; { /* 改狀態、加點 */ })
+  this.events.emit('order.paid', new OrderPaidEvent(…))   // 交易已經 commit
+  return order
+}</pre>
+<p>付款失敗（交易回滾、回 422 或 409）時，<code>$transaction</code> 會丟出錯誤，程式根本走不到 emit 那一行，所以不會發出事件。到這裡，付款程式已經不認識廚房和營業額。但「發出去了」不等於「做完了」，接下來看事件在出錯時會怎樣。</p>
+
+<h2>營業額沒加上、伺服器剛好重啟，事件會怎樣？</h2>
+<p><code>EventEmitter2</code> 是<strong>程序內事件</strong>（in-process event）：<code>emit</code> 只是在同一個 Node 程序的記憶體裡，找出登記了這個名字的函式、呼叫它們。事件沒有被存到任何地方，也不會離開這個程序。這個設計讓它非常輕，但也決定了它在三種狀況下的行為。</p>
+
+<h3>listener 丟出錯誤時，預設只記一行 log</h3>
+<p>假設統計的 listener 寫入 <code>daily_stats</code> 時出錯了。<code>@OnEvent</code> 有一個選項 <code>suppressErrors</code>，預設是 <code>true</code>：listener 丟出的錯誤會被接住，用 <code>Logger.error</code> 記下來，不會傳回發送者。好處是統計壞掉不會連帶讓付款失敗，客人照樣付款成功、廚房照樣收到單。壞處是它可能默默失敗：營業額少算了一筆，系統裡只留下一行 error log。所以這些 log 一定要接到監控，有人會看到。</p>
+<p>你可能會想：那改成 <code>suppressErrors: false</code>，讓錯誤傳回付款，付款就知道失敗了？不會。前面加了 <code>async: true</code>，<code>emit</code> 早就返回了，付款程式已經往下走，錯誤沒有地方可以回去。它會變成一個沒有人 <code>catch</code> 的 Promise 失敗，也就是 unhandled rejection；Node 對這種錯誤的預設處理是讓整個程序結束，等於統計的一個錯誤讓整台伺服器重啟。</p>
+<p>真的要讓錯誤回到付款，得拿掉 <code>async: true</code>，發送者改成 <code>await this.events.emitAsync(…)</code>，等所有 listener 跑完、把錯誤丟回來，付款再回 500。但這時交易早就 commit 了：錢收了、訂單是 paid，客人卻看到「付款失敗」，可能再付一次。所以對 listener 的錯誤，正確的態度是「接受它只會記 log」，並據此決定什麼工作能交給事件。</p>
+
+<h3>程序當機時，事件就不見了</h3>
+<p>emit 之後、listener 把資料寫進資料庫之前，程序被重啟了（部署、記憶體不足、機器故障）。這個事件只存在於那個程序的記憶體裡，程序沒了，事件就沒了：沒有重試、沒有紀錄，重啟之後也不會有人知道曾經有一個 <code>order.paid</code> 沒處理完。</p>
+
+<h3>只在同一台伺服器上</h3>
+<p>三台伺服器是三個程序，A 伺服器發出的事件，只有 A 自己的 listener 聽得到，B 和 C 不知道。廚房看板和營業額寫進的是共用的資料庫，所以哪一台處理都沒差；但如果某個功能依賴「所有伺服器都收到這個事件」（例如清掉每台伺服器各自記憶體裡的快取），程序內事件就做不到。另外，應用程式還在啟動、listener 還沒登記好時發出的事件也可能沒人收到，細節見課末。</p>
+<p>把這些限制和第 20 課的佇列並排，差別就清楚了：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>程序內事件（EventEmitter2）</th><th>佇列（第 20 課 BullMQ ＋ outbox）</th></tr>
+  <tr><td>當機時</td><td>事件遺失</td><td>工作留在 Redis／outbox，恢復後繼續</td></tr>
+  <tr><td>失敗時</td><td>記一行 error log</td><td>自動重試，用完次數進 failed</td></tr>
+  <tr><td>成本</td><td>幾乎沒有：一次函式呼叫</td><td>Redis、outbox 表、relay、冪等的 worker</td></tr>
+  <tr><td>適合</td><td>掉了也沒關係、或有別的管道補救：廚房看板（店員還看得到訂單列表）、快取失效、即時通知</td><td>一定要完成：寄收據、加點、退款、通知外部系統</td></tr>
+</table></div>
+<p>判斷方法是問自己：「這件事漏了一次，會有人發現並補救嗎？」廚房看板漏了一張，店員看訂單列表就會發現，代價很小，用事件，簡單又解耦。寄收據、加點、退款漏了，沒有人會發現，或者補救的代價很高，就在付款的交易裡寫 outbox，交給佇列。不要讓 listener 去寫 outbox：listener 在 commit 之後才執行，commit 和 listener 之間當機一樣會漏，outbox 的保證來自「跟業務資料在同一個交易裡寫入」，listener 做不到這一點。</p>
+<div class="callout practice"><strong>💡 實務上：事件好寫，但多了之後很難追</strong><br>事件讓模組解耦，代價是讀程式的人看不出「付款之後到底會發生哪些事」，只能全專案搜尋 <code>'order.paid'</code> 這個字串。所以事件名稱集中定義成常數、事件類別放在發送方的模組裡，找起來才容易。也不是每個後續動作都值得變成事件：如果只有一個模組在乎、而且以後也不太會變，直接呼叫反而一眼就看得懂。code review 看到新的 <code>@OnEvent</code> 時，資深工程師會先問：這裡真的需要解耦嗎？還是只是把一次直接呼叫藏了起來？</div>
+<p>到這裡，開場的三件工作都有了答案：點數過期用 <code>@Cron</code> 加 advisory lock 和冪等；對帳用分批、檢查點、冪等修正和 dry-run；付款後的通知用領域事件，一定要完成的交給佇列。最後一節是選讀，看程序內事件還能怎麼用來推送畫面。</p>
+
+<h2>選讀：用 SSE 把訂單狀態推給前端</h2>
+<p>客人付完款，Vue 前台想即時顯示「製作中 → 可取餐」。前端每隔幾秒打一次 API 問狀態（輪詢）可以做到，但大部分請求都只得到「還沒好」。另一種做法是讓伺服器在狀態改變時主動推給前端。</p>
+<p><strong>SSE</strong>（Server-Sent Events）是伺服器維持一條 HTTP 連線、持續推送文字事件給瀏覽器的標準，前端用原生的 <code>new EventSource('/orders/7/events')</code> 接收，比 WebSocket 簡單（單向、會自動重連）。Nest 用 <code>@Sse()</code> 回傳<a href="09-interceptors-rxjs.html">第 9 課</a>的 RxJS <code>Observable</code>，每個值是一個 <code>MessageEvent</code>（<code>@nestjs/common</code> 的介面，<code>data</code> 是要送出的內容）。下面把程序內的 <code>order.ready</code> 事件轉成 Observable，只留下這張訂單的：</p>
+<pre>@Sse(':id/events')
+events(@Param('id', ParseIntPipe) id: number): Observable&lt;MessageEvent&gt; {
+  return fromEvent&lt;OrderReadyEvent&gt;(this.emitter, 'order.ready').pipe(
+    filter(e =&gt; e.orderId === id),
+    map(() =&gt; ({ data: { status: 'ready' } })),
+  )
+}</pre>
+<p>它聽的是程序內事件，所以碰到上一節「只在同一台」的限制：客人的 SSE 連線連到 A，廚房在 B 按下「可取餐」，事件只在 B 發出，A 收不到，客人的畫面就不會更新。多台時要讓各台透過 Redis pub/sub 互相轉發事件，這不在本課範圍。</p>
+
+<h2>練習</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs nestjs 21</code> 建立 <code>work/21/</code>。這一題用 PostgreSQL（在 <code>learn/nestjs/practice</code> 執行 <code>docker compose up -d --wait</code>，第 12 課）。專案已經有：</p>
+<ul>
+  <li>資料表 <code>customers</code>、<code>orders</code>、<code>stamp_cards</code>、<code>point_transactions</code>（集點的每一筆加減，餘額＝加總）、<code>payments</code>（<code>order_id</code>、<code>amount</code>、<code>status</code> 是 succeeded／failed）、<code>reconciliation_fixes</code>（<code>UNIQUE(order_id, kind)</code>）、<code>job_checkpoints</code>（<code>name</code>、<code>cursor</code>）、<code>kitchen_notices</code>、<code>daily_stats</code>，migration 都寫好了。</li>
+  <li>第 18 課的 <code>POST /orders/:id/pay</code>：同一個交易裡改狀態、加一點；顧客沒有集點卡時回 422 並回滾，重複付款回 409。</li>
+  <li><code>OrderPaidEvent</code>（<code>src/orders/order-paid.event.ts</code>）、<code>taipeiDay(date)</code>（<code>src/stats/taipei-day.ts</code>，回傳台北時間的日期字串）。</li>
+</ul>
+<p><code>@nestjs/schedule</code>、<code>@nestjs/event-emitter</code> 已經裝好。想親手看排程跑起來：在 <code>work/21</code> 執行 <code>npx prisma migrate dev</code>、<code>npx prisma db seed</code>，暫時把 cron 改成 <code>'*/10 * * * * *'</code>（每 10 秒），<code>npm run start:dev</code> 看 log，看完記得改回來。</p>
+
+<div class="local" data-test="ex1" data-files="src/stamp-cards/stamp-cards.service.ts src/app.module.ts">
+  <p>練習 1：點數過期。</p>
+  <ul>
+    <li>寫 <code>StampCardsService.expireStamps(now)</code>：一張卡的最後一筆紀錄早於 <code>now</code> 的一年前、而且餘額大於 0，就新增一筆 <code>points</code> 為負的餘額、<code>reason</code> 為 <code>'點數過期'</code>、<code>createdAt</code> 為 <code>now</code> 的紀錄（不要刪掉舊紀錄：客人來問點數去哪了，要查得到）。回傳這次讓幾張卡過期。只用傳進來的 <code>now</code>，不要在裡面 <code>new Date()</code>。</li>
+    <li><code>AppModule</code> 匯入 <code>ScheduleModule.forRoot()</code>，再加一個方法用 <code>@Cron</code> 在每天台北時間 03:00 呼叫 <code>this.expireStamps(new Date())</code>，工作名稱是 <code>expire-stamps</code>。</li>
+  </ul>
+  <p>判分：用 2030 年的固定時間呼叫 <code>expireStamps</code> 檢查每張卡的餘額與新增的紀錄；從 <code>SchedulerRegistry</code> 取出 <code>expire-stamps</code>，檢查時區、下一次執行時間，並觸發一次確認它呼叫了 <code>expireStamps</code>。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="src/stamp-cards/stamp-cards.service.ts">
+  <p>練習 2：讓 <code>expireStamps</code> 在多台伺服器上同一時間只執行一次，而且重跑不會多扣。</p>
+  <ul>
+    <li>把整個工作放進一個互動式交易（<a href="15-transactions-concurrency.html">第 15 課</a>的 <code>$transaction(async tx =&gt; …)</code>），第一句用 <code>$queryRaw</code> 執行 <code>pg_try_advisory_xact_lock(hashtext('expire-stamps'))</code>；拿不到鎖就立刻回傳 0，什麼都不做（不要用會一直等的 <code>pg_advisory_xact_lock</code>）。</li>
+    <li>冪等：餘額要用「所有紀錄」加總（包含兌換和之前的過期紀錄），同一天再跑一次，已經歸零的卡不會再加一筆。</li>
+  </ul>
+  <p>判分：兩個各自的 Nest 應用（各自的連線池，模擬兩台伺服器）同時呼叫 → 只有一組過期紀錄、一台回傳 0，而且回傳 0 的那台不用等另一台做完；同一天重跑 → 沒有新紀錄；之後幾天換不同的「伺服器」執行，都還拿得到鎖。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="src/reconciliation/reconciliation.service.ts">
+  <p>練習 3：寫 <code>ReconciliationService.reconcilePayments({ dryRun, batchSize })</code>，比對 <code>orders</code>（不含 cancelled）與成功的 <code>payments</code>，回傳 <code>{ scanned, markPaid, missingPayment, amountMismatch }</code>（檔案裡的註解有每個欄位的定義）：</p>
+  <ul>
+    <li>付款成功、金額加總等於 <code>total</code>、訂單還是 pending：用條件式 UPDATE 改成 paid，並寫一筆 <code>reconciliation_fixes { orderId, kind: 'mark_paid' }</code>。金額不一致、已付款卻沒有成功的付款：只計數，不修改。</li>
+    <li>用 <code>findMany({ where: { id: { gt: cursor }, … }, orderBy: { id: 'asc' }, take: batchSize })</code> 分批，每批的付款也只查這批訂單的。</li>
+    <li>每批一個交易：修正和 <code>job_checkpoints</code>（name 是 <code>'reconcile-payments'</code>，cursor 是這批最後一張的 id）一起 commit；開始時從檢查點繼續；整輪跑完刪掉檢查點。</li>
+    <li><code>dryRun: true</code>：照樣回傳統計，但不寫任何東西、不讀也不動檢查點。</li>
+    <li>結束時用 <code>this.logger.log</code> 記一行摘要，包含這些數字；再加一個 <code>@Cron</code> 方法，每天台北時間 04:00 執行，名稱 <code>reconcile-payments</code>。</li>
+  </ul>
+  <p>判分：1000 張訂單、四種差異各 20 張，<code>batchSize</code> 100：dryRun 的統計與「沒有改動」；正式執行後的訂單狀態與修正紀錄；每句查詢最多 100 列、不用 skip；途中有顧客取消已經看過的訂單時不漏掉後面的；讀完後被取消的訂單不會被改成 paid；第 7 批當機後，檢查點的位置、重跑從哪裡開始、最後結果；重跑沒有新修正；log 與排程。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="src/orders/orders.service.ts src/kitchen/kitchen.listener.ts src/app.module.ts">
+  <p>練習 4：付款成功後發出 <code>order.paid</code>。</p>
+  <ul>
+    <li><code>AppModule</code> 匯入 <code>EventEmitterModule.forRoot()</code>。</li>
+    <li><code>OrdersService</code> 注入 <code>EventEmitter2</code>，交易 commit 之後 <code>emit('order.paid', new OrderPaidEvent(orderId, customerId, total, new Date()))</code>。失敗（422、409）不發。</li>
+    <li><code>KitchenListener.handleOrderPaid</code> 加上 <code>@OnEvent('order.paid', { async: true })</code>，新增一筆 <code>kitchen_notices { orderId }</code>。</li>
+    <li><code>src/orders</code> 裡的檔案不能 import kitchen 或 stats。</li>
+  </ul>
+  <p>判分：攔截 <code>$transaction</code>，確認事件發出時交易已經結束；付款失敗回滾時沒有事件、沒有通知；靜態檢查 <code>src/orders</code> 的 import。</p>
+</div>
+
+<div class="local" data-test="ex5" data-files="src/stats/stats.listener.ts">
+  <p>練習 5：<code>StatsListener.handleOrderPaid</code> 也聽 <code>order.paid</code>（<code>async: true</code>），更新 <code>daily_stats</code>：<code>day</code> 是 <code>taipeiDay(event.paidAt)</code>，同一天只有一列，訂單數加 1、營業額加上 <code>total</code>（<code>upsert</code> ＋ <code>increment</code>）。統計寫入失敗時，付款仍要回 200、廚房通知照樣新增，而且要留下 error log：用 <code>@nestjs/event-emitter</code> 的預設行為，不要自己把錯誤吞掉。</p>
+  <p>判分：付款兩張訂單後的統計；把 <code>daily_stats</code> 暫時改名讓寫入失敗，檢查付款狀態碼、廚房通知與 <code>Logger.error</code>。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 6：應用程式部署成 3 台，每台都有 <code>@Cron('0 0 3 * * *', { timeZone: 'Asia/Taipei' })</code> 的點數過期工作，也設了 <code>waitForCompletion: true</code>。03:00 會發生什麼？</p>
+  <label data-key="a">只有一台會執行，Nest 會自動選出一台</label>
+  <label data-key="b">只有一台會執行，因為 waitForCompletion 讓其他台等第一台做完</label>
+  <label data-key="c">三台都會執行；要用 advisory lock 或 BullMQ 的 job scheduler 讓只有一台做，工作本身也要冪等</label>
+  <label data-key="d">三台都會執行，但同一個資料庫會自動擋掉重複的寫入</label>
+  <p class="why">✓ c。<code>@nestjs/schedule</code> 在每個程序裡執行每個工作，程序之間互不知道。a 錯：沒有自動選舉。b 錯：<code>waitForCompletion</code> 只讓同一個程序跳過「上一次還沒跑完」的那一次，管不到別台。d 錯：資料庫只會擋違反約束的寫入，三筆 -3 的紀錄都是合法的資料。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：對帳工作用 <code>skip: page * 500, take: 500</code> 分批讀 <code>status &lt;&gt; 'cancelled'</code> 的訂單。跑到一半，有客人取消了前面批次裡的訂單。會發生什麼？</p>
+  <label data-key="a">沒有影響，OFFSET 只是比 keyset 慢一點</label>
+  <label data-key="b">符合條件的列變少，後面的列往前移，有些訂單會被跳過，永遠沒被檢查；用 keyset 游標（<code>id &gt; 上一批最後的 id</code>）</label>
+  <label data-key="c">同一批會被讀兩次，但修正是冪等的，所以沒關係</label>
+  <label data-key="d">PostgreSQL 會報錯，因為資料在查詢途中被修改</label>
+  <p class="why">✓ b。OFFSET 數的是「現在」符合條件的第幾筆，前面少了 N 筆，下一批的起點就往後多跳 N 筆。a 只看到效能。c 是另一個方向：前面的位置「多出」符合條件的列時（例如訂單從 cancelled 被改回來），才會把同一列讀兩次；重複可以靠冪等收尾，跳過卻沒有任何東西能補救。d 錯：每一批是獨立的查詢，別人修改資料完全合法。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 8：「付款後幫客人加一點」要從付款交易裡搬出去。同事提議：「發 <code>order.paid</code> 事件，讓 StampCardsListener 去加點，最簡單。」你的看法？</p>
+  <label data-key="a">好，listener 出錯時 Nest 會自動重試</label>
+  <label data-key="b">好，只要設 <code>suppressErrors: false</code>，失敗時付款會跟著失敗，就不會漏</label>
+  <label data-key="c">好，程序內事件會先存進記憶體的佇列，當機重啟後會補送</label>
+  <label data-key="d">不好：加點是一定要完成的工作，程序內事件在當機時會遺失、失敗也不會重試。留在付款交易裡，或寫進 outbox 交給佇列</label>
+  <p class="why">✓ d。程序內事件適合「掉了也沒關係」的工作。a 錯：沒有重試，預設只記一行 error log。b 錯：<code>emit</code> 不等 listener，<code>suppressErrors: false</code> 只會讓錯誤變成沒人接的 rejection，付款照樣回 200；就算改成 <code>await emitAsync</code> 讓付款回 500，交易也早就 commit 了，客人以為沒付成功，點數照樣沒加；程序當機時更是什麼都沒有。c 錯：事件只是記憶體裡的一次函式呼叫，重啟後什麼都不剩。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>以為 cron 只會跑一次</strong>：每台伺服器、每個程序都會跑。用 advisory lock 或 BullMQ job scheduler 讓一台做，工作本身也要冪等。</li>
+  <li><strong>cron 沒指定時區</strong>：用的是伺服器的時區，雲端多半是 UTC，03:00 變成台北 11:00。一律寫 <code>timeZone: 'Asia/Taipei'</code>。</li>
+  <li><strong>邏輯裡直接 <code>new Date()</code></strong>：測試只能等到真的那一天。<code>@Cron</code> 方法取得現在時間，邏輯方法接收 <code>now</code>。</li>
+  <li><strong>用 session 層級的 advisory lock</strong>：<code>pg_try_advisory_lock</code> 沒 unlock 就一直鎖著，連線池裡的連線也不一定是同一條。用 <code>pg_try_advisory_xact_lock</code>。</li>
+  <li><strong>在交易裡發事件</strong>：交易回滾了，事件已經出去。commit 之後才 emit。</li>
+  <li><strong>以為程序內事件不會遺失</strong>：當機就沒了，失敗也不重試。一定要完成的工作交給佇列（outbox）。</li>
+  <li><strong>listener 自己 try/catch 把錯誤吞掉</strong>：連 error log 都沒有，壞了也沒人知道。讓預設的 <code>suppressErrors</code> 記 log，並監控 log。</li>
+  <li><strong>批次工作用 OFFSET</strong>：資料在途中變動時會跳過或重複。用 keyset 游標。</li>
+  <li><strong>一次把整張表載入記憶體</strong>：<code>findMany()</code> 不加 <code>take</code>，資料一多程序就爆。分批，每批短交易。</li>
+  <li><strong>修正不冪等</strong>：無條件 UPDATE 會把讀完之後被取消的訂單改回 paid，重跑也可能重複記錄。用條件式 UPDATE 加唯一鍵。</li>
+  <li><strong>沒有檢查點，或檢查點只在記憶體</strong>：中斷後只能從頭跑。檢查點寫進資料庫，和那一批的修正同一個交易。</li>
+  <li><strong>沒有 dry-run 就直接修正式資料</strong>：先 dry-run 看摘要，數字合理再正式跑。</li>
+  <li><strong>把大量回填塞進一個 migration</strong>：一個長交易鎖住大量資料列、失敗整個重來。migration 只改結構，資料用批次工作補。</li>
+</ul>
+
+<h2 id="appendix">補充與查表</h2>
+<h3>@OnOneInstance（@nestjs/locks）</h3>
+<p>官方文件推薦用 <code>@nestjs/locks</code> 的 <code>@OnOneInstance()</code> 裝飾器處理「多台只跑一次」，它用共用的鎖存放處（PostgreSQL 或 Redis）協調。目前是 0.0.x 版、才剛發布，先知道有它，正式專案等它穩定。</p>
+
+<h3>BullMQ 6 移除了 repeat 選項</h3>
+<p>BullMQ 6 已經移除舊的 <code>repeat</code> 選項，週期性工作一律用 <code>upsertJobScheduler</code>（BullMQ 官方的 v5 → v6 遷移指南）。網路上舊教學的 <code>queue.add(name, data, { repeat: … })</code> 在這門課的版本不能用。</p>
+
+<h3>Prisma 的 cursor 選項</h3>
+<p>Prisma 的 <code>findMany</code> 有一個 <code>cursor</code> 選項，但它會把游標那一筆也包含進結果，需要搭配 <code>skip: 1</code> 跳過。批次工作直接寫 <code>where: { id: { gt: cursor } }</code> 比較清楚。</p>
+
+<h3>啟動完成前發出的事件</h3>
+<p>官方文件說，在 <code>onApplicationBootstrap</code> 之前或期間發出的事件可能遺失，因為 listener 可能還沒註冊好。官方提供 <code>EventEmitterReadinessWatcher</code>，在那之前要發事件時先 <code>await watcher.waitUntilReady()</code>。</p>
+
+<h3>批次工作跟 migration 的分工</h3>
+<p>結構變更（加欄位、加 NOT NULL）照 PostgreSQL 課第 34 課的步驟用 migration 做；把幾百萬列舊資料補上新欄位的值，用這一課這種能分批、能續跑的工作做。不要把大量更新塞進 migration：一句 UPDATE 幾百萬列就是一個長交易，那些列在交易結束前都鎖著，別人要改同一列只能等；失敗了整個回滾、從頭來。</p>
+
+<h2>小結</h2>
+<ul>
+  <li>沒有請求會觸發的工作，用排程照時間表執行：<code>ScheduleModule.forRoot()</code> 匯入一次，<code>@Cron('秒 分 時 日 月 星期', { name, timeZone: 'Asia/Taipei', waitForCompletion })</code>、<code>@Interval</code>、<code>@Timeout</code>；<code>SchedulerRegistry</code> 可以取出工作。邏輯放在接收 <code>now</code> 的方法裡，測試才能指定時間。</li>
+  <li>排程的計時器活在每個程序裡，部署幾台就跑幾次。用 <code>pg_try_advisory_xact_lock</code> 或 BullMQ 的 <code>upsertJobScheduler</code> 讓一台做，工作本身也要冪等，因為鎖擋不住先後執行。</li>
+  <li>對帳比對兩份應該一致的紀錄：只自動修能確定答案的差異，其他回報給人。</li>
+  <li>大量資料的工作：keyset 游標、每批一個短交易、檢查點和修正同一個交易、條件式 UPDATE ＋唯一鍵、dry-run 與摘要 log。</li>
+  <li>領域事件讓發送者不用認識聽的人：commit 之後 <code>emit</code>，listener 用 <code>@OnEvent(…, { async: true })</code>。</li>
+  <li>程序內事件會遺失、預設只記錯誤 log、只在同一台：掉了沒關係的用事件，一定要完成的用佇列。</li>
+</ul>
+<p>下一課處理從外面進來的東西：檔案上傳的大小與格式限制，以及金流公司打來的 webhook 怎麼驗簽、怎麼做到重送也只處理一次。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

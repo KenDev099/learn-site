@@ -1,0 +1,1551 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>7. 分片與一致性雜湊</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="7">
+<header>
+  <div class="eyebrow">階段 2：擴展：冗餘、快取與資料 · 第 7 課</div>
+  <h1>分片與一致性雜湊</h1>
+</header>
+<main>
+
+<p>咖啡店開放加盟，三年後全球 5,000 家店、每天 300 萬筆訂單。讀取已經有<a href="05-caching.html">第 5 課</a>的快取和<a href="06-replication-consistency.html">第 6 課</a>的讀副本分擔，但<strong>寫入</strong>只能進 primary 那一台：每一筆訂單、每一次付款狀態更新都擠在同一台機器的 CPU、磁碟和連線上。再加讀副本也沒用，因為每個副本都要重播和 primary 一樣多的寫入，寫入量並沒有被分掉。</p>
+<p>這一課的任務是：<strong>把 <code>orders</code> 表拆到好幾台資料庫上，而且拆完之後，店員的待做清單、顧客的「我的訂單」、總部後台的「全公司最新訂單」都要照常運作</strong>。這件事一旦做了就很難回頭：分片鍵選錯，某一台會被打爆；分配方法用錯，加一台機器就要搬動八成資料；跨分片查詢寫錯，結果會少資料而且不會報錯；訂單編號沒設計好，不同機器會產生同一個號碼。這課就照這個順序，一個一個解決。大部分系統用不到分片，所以這課是選修；但它的每一個問題，在快取叢集、訊息佇列這些地方都會再出現。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>真的該分片了嗎、要依哪個欄位拆：什麼數字出現才該分片，依顧客還是依門市拆，選錯為什麼會有一台被打爆。</li>
+  <li>hash 值怎麼對到機器：<code>hash % N</code> 加一台機器為什麼要搬八成資料，一致性雜湊怎麼只搬一小部分；快取叢集加減機器也是同一個問題。</li>
+  <li>查詢沒帶分片鍵怎麼辦、訂單編號怎麼不撞號：總部後台的「全公司最新 20 筆訂單」怎麼查才不會少資料，各台怎麼產生不重複的訂單編號。</li>
+  <li>上線之後：某一片太滿時怎麼不停機搬資料，要看哪些指標。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="06-replication-consistency.html">第 6 課</a>的 primary 與讀副本：所有寫入只進 primary，讀副本只能分擔讀取。</li>
+  <li><a href="../../postgresql/lessons/35-partitioning.html">PostgreSQL 課第 35 課</a>的分割表：在同一台資料庫裡，把一張大表依某個欄位拆成好幾塊。</li>
+</ul></div>
+
+<h2>寫入擠在一台 primary：真的該分片了嗎？</h2>
+<p>開場的問題是「寫入只能進一台」。直覺的解法是把訂單拆開，放到好幾台資料庫，每台只負責一部分的訂單，寫入自然就分散了。這個做法叫<strong>分片（sharding）</strong>，拆出來的每一份叫一個<strong>分片（shard）</strong>。每個分片是一套完整、獨立的資料庫，有自己的 primary 和讀副本；訂單 A 只存在第 1 片，訂單 B 只存在第 3 片，兩片之間互不知道對方有什麼資料。</p>
+<p>你在 <a href="../../postgresql/lessons/35-partitioning.html">PostgreSQL 課第 35 課</a>看過很像的東西：<strong>分割表（partitioning）</strong>也是把一張大表依某個欄位拆成好幾塊。差別在於分割表的每一塊還在同一台機器上，PostgreSQL 自己知道每一塊在哪，查詢、交易、JOIN 都照常；分片則把每一塊放到不同的機器，這些機器之間沒有共同的資料庫幫你協調。這個差別就是分片所有代價的來源：一筆交易跨兩片時，沒有一個資料庫能保證兩邊一起成功或一起失敗；一個查詢要的資料散在各片時，得由應用程式自己去每一片問、自己合併。</p>
+<p>所以分片之前要先確認：單機真的撐不住了嗎？先回到<a href="02-estimation.html">第 2 課</a>算過的現況：每天 6 萬筆訂單，5 年含副本與索引約 284.7 GB，尖峰每秒 3.33 筆寫入。一台 PostgreSQL 完全撐得住，連讀副本都還不一定需要。開場的 300 萬筆是三年後的情境，而且我們假設那時監控圖已經顯示 primary 長期滿載。分片要解決的，正是單機在這三種地方撐不住的時候：</p>
+<ul>
+  <li><strong>寫入</strong>：primary 的 CPU、磁碟寫入量或 WAL 產生量到頂。讀副本幫不上忙，因為副本也要重播同樣的 WAL。</li>
+  <li><strong>儲存</strong>：資料大到單機的磁碟放不下，或是備份與還原的時間不能接受。例如還原 10 TB 可能要好幾個小時，這段時間服務都是停的。</li>
+  <li><strong>連線與記憶體</strong>：查詢經常碰到的那部分資料，稱為 <strong>working set</strong>。它大到放不進一台機器的記憶體時，查詢就一直要去讀磁碟，整體變慢。連線數也是單機上限：primary 能同時開的連線有限，每條連線還會佔用記憶體。</li>
+</ul>
+<p>就算真的撐不住，分片也不是第一個選擇。下面這張表由便宜到昂貴排列，每一步都比分片簡單，而且做錯了可以回頭。表中的 IOPS 是磁碟每秒能完成幾次讀寫，換大機器時它通常會跟著變大：</p>
+<div class="table-wrap"><table>
+  <tr><th>順序</th><th>做法</th><th>解決什麼</th><th>代價</th></tr>
+  <tr><td>1</td><td>垂直擴充（換大機器）</td><td>CPU、記憶體、IOPS 全部一起變大</td><td>有上限；越大越貴；換機要停機或切換</td></tr>
+  <tr><td>2</td><td>讀副本（<a href="06-replication-consistency.html">第 6 課</a>）</td><td>讀取</td><td>複寫延遲；不解決寫入</td></tr>
+  <tr><td>3</td><td>快取（<a href="05-caching.html">第 5 課</a>）</td><td>熱門讀取</td><td>過時與失效</td></tr>
+  <tr><td>4</td><td>分割表與封存（<a href="../../postgresql/lessons/35-partitioning.html">PostgreSQL 課第 35 課</a>）</td><td>大表的維護、舊資料的刪除</td><td>查詢要帶分割鍵才能只掃一塊</td></tr>
+  <tr><td>5</td><td>依功能拆資料庫</td><td>訂單、會員、菜單各自一台</td><td>跨庫 JOIN 要改成應用程式組合</td></tr>
+  <tr><td>6</td><td>分片</td><td>單一表的寫入與儲存</td><td>下面整課講的代價，而且一直要付</td></tr>
+</table></div>
+<p>第 6 步的代價為什麼說「一直要付」？因為它不是一次性的工程，而是之後每一天的工作方式：跨分片的 JOIN 和交易做不到或很貴；每寫一個查詢都要先想清楚它會去哪一片；增減機器要搬資料；備份、升級、監控的工作量乘以分片數。所以「什麼時候分片」的答案是：<strong>有數字證明前五步都不夠的時候</strong>。</p>
+
+<div class="callout practice"><strong>💡 實務上：有人提「我們該分片了」，先問證據</strong><br>會議上有人說「資料越來越多，該分片了」，資深工程師會先問：現在卡的是寫入、儲存還是記憶體？有沒有監控圖？上表前五步做過哪些、各換來多少空間？很多時候真正的問題是一支沒索引的慢查詢、一張該封存的舊表，修掉之後常常就不用分了。真的要分，也先評估現成方案（例如 Citus 這類 PostgreSQL 的分散式擴充），自己在應用程式裡寫分片路由是最後才考慮的選項。咖啡店的三年後情境，就是前五步都做過、寫入仍然到頂的那一天。</div>
+
+<p>假設那一天到了，監控證明 primary 的寫入已經到頂。下一個問題是：訂單要依什麼拆？「這筆訂單放第幾片」必須由訂單上的某個欄位決定，這個欄位選得好不好，決定了後面所有查詢的難易。</p>
+
+<h2>訂單要依什麼拆？從存取模式選分片鍵</h2>
+<p>決定一筆資料放在哪一片的欄位，叫<strong>分片鍵（shard key）</strong>，有些資料庫的文件叫 partition key，指的是同一件事。分片鍵一旦決定，每筆訂單的去處就固定了；之後任何查詢只要帶著分片鍵的值，就能算出該去哪一片，只問那一片；沒帶的話，系統不知道資料在哪，只能每一片都問一次。</p>
+<p>所以選分片鍵不是看哪個欄位好實作，而是看<strong>存取模式（access pattern）</strong>，也就是系統實際上會用什麼條件、多頻繁地讀寫這些資料。<a href="../../postgresql/lessons/27-index-design.html">PostgreSQL 課第 27 課</a>設計索引時也是從存取模式出發：先列出最常跑的查詢，再讓結構配合它們。好的分片鍵要滿足三個條件：</p>
+<ol>
+  <li><strong>大部分查詢都帶著它</strong>：查詢有分片鍵才知道去哪一片，否則要問每一片。</li>
+  <li><strong>不會產生熱點</strong>：<strong>熱點（hot spot，也叫 hot partition）</strong>指某一片承受的流量或資料遠多於其他片。分片的目的是把負載分攤到多台機器，如果有一片扛了三成的量，其他片再閒也幫不上它，整個系統的上限就變成那一片的上限。</li>
+  <li><strong>一筆交易落在同一片</strong>：同一片內可以用一般的資料庫交易；跨片就沒有資料庫幫你保證原子性，需要<a href="13-saga.html">第 13 課</a>的 saga 這類補償流程。</li>
+</ol>
+<p>拿這三個條件檢查咖啡店的三個候選欄位：</p>
+<ul>
+  <li><strong>store_id</strong>：店員的「待做清單」每幾秒更新一次，帶的都是 store_id，下單也帶著它，所以單片查詢的比例最高。問題在熱點：不管用什麼規則分配，同一個 store_id 的訂單一定在同一片。台北旗艦店佔全部訂單的 30%，分成 10 片時理想上每片 10%，旗艦店那一片卻至少扛 30%。</li>
+  <li><strong>customer_id</strong>：「我的訂單」「下單」都帶它；100 萬個會員，每個人的訂單量差不多，分布平均，一個顧客的下單交易也都在同一片。代價是店員的待做清單不帶 customer_id，會變成跨片查詢，要另外處理（後面「查詢沒帶分片鍵怎麼辦？」那節的全域次要索引）。</li>
+  <li><strong>order_id</strong>：每個值只有一筆，分布最平均。但除了查單筆訂單詳情，幾乎沒有查詢只帶 order_id，「我的訂單」也要問遍每一片。</li>
+</ul>
+<p>三個都有缺點，「哪個比較好」要用數字比，不要憑感覺。兩個指標分別對應前兩個條件：</p>
+<ul>
+  <li><strong>單片查詢比例</strong> = 帶分片鍵的查詢每秒次數 ÷ 全部查詢每秒次數。要用流量加權，不是數有幾種查詢：每秒 400 次的待做清單和每秒 5 次的日報，份量差了 80 倍。</li>
+  <li><strong>最熱的一片佔多少</strong> = 最大的那個值的資料量 ÷ 總量。旗艦店就是 store_id 最大的那個值。</li>
+</ul>
+<p>做法是先訂出能接受的熱點上限，在不超過上限的候選裡選單片比例最高的。咖啡店把熱點上限訂在 10%：store_id 光旗艦店一家就佔 30% 的資料，出局；customer_id 和 order_id 最熱的值都不到 1%，都符合。再比單片比例（依每秒查詢數加權）：customer_id 是 350 ÷ 755 ≈ 46%，order_id 只有訂單詳情帶它，約 13%，所以選 customer_id。練習 1 你會寫出這兩個指標和選擇規則，並看到門檻放寬時答案會變成 store_id。</p>
+
+<div class="callout practice"><strong>💡 實務上：多租戶 SaaS 幾乎都用租戶 ID 當分片鍵</strong><br>做給很多公司用的 SaaS（例如給各家咖啡店用的 POS 後台），幾乎每個查詢都帶著「哪一家店」，所以 <code>tenant_id</code> 是最自然的分片鍵：同一家的資料、交易都在同一片，也方便做資料隔離和單一客戶的匯出、刪除。坑在大客戶：連鎖品牌的量遠大於一般小店，就是上面旗艦店的熱點；常見做法是讓大客戶獨立一片，再用一張對照表記錄每個租戶在哪一片（後面「一致性雜湊與虛擬節點」那節會講的目錄表）。選鍵前先把<strong>前幾名查詢</strong>和<strong>最大的幾個租戶</strong>列出來看，比在白板上討論有用。</div>
+
+<p>決定用 customer_id 之後，還差一步：customer_id 是 <code>c1024</code> 這種值，要怎麼換算成「第幾片」？</p>
+
+<h2>customer_id 怎麼對到某一片？range 與 hash</h2>
+<p>把分片鍵的值對應到分片，有兩種基本規則。<strong>range 分片</strong>是依值的範圍分：例如依下單月份，2026-01 的訂單一片、2026-02 一片。<strong>hash 分片</strong>是先把值丟進雜湊函式，得到一個看起來隨機、但同樣的輸入永遠得到同樣輸出的數字，再依這個數字決定分片：hash(customer_id) 落在哪一段就去哪一片。兩者的取捨：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>range 分片</th><th>hash 分片</th></tr>
+  <tr><td>怎麼分</td><td>依值的範圍：2026-01 的訂單一片、2026-02 一片</td><td>依分片鍵的雜湊值：hash(customer_id) 落在哪一段就去哪一片</td></tr>
+  <tr><td>範圍查詢</td><td>快：「這個月的訂單」只打一片</td><td>慢：相鄰的值被打散，要問每一片</td></tr>
+  <tr><td>熱點</td><td>容易：新資料全部寫進「最新的那一片」</td><td>不同的值會平均，但<strong>同一個值</strong>永遠在同一片</td></tr>
+  <tr><td>適合</td><td>依時間查、舊資料要整片封存</td><td>依 ID 查單筆、寫入要平均</td></tr>
+</table></div>
+<p>咖啡店要分攤的是寫入，而 range 分片依時間分時，今天所有的新訂單都寫進同一片，等於沒分。customer_id 本身也沒有「範圍查詢」的需求，沒有人會查「c1000 到 c2000 的顧客」。所以選 hash 分片。</p>
+<p>表中「同一個值永遠在同一片」常被誤解成「hash 會自動消除熱點」。hash 只能把<strong>不同的值</strong>打散：如果當初選了 store_id，旗艦店的所有訂單雜湊值都一樣，全部進同一片，hash 一點忙都幫不上。熱門的值可以手動再拆：把旗艦店的 key 加上 0～7 的尾碼，變成 8 個不同的值，分到 8 片；代價是查旗艦店時要讀 8 片再合併。這也是 customer_id 的優勢：沒有任何一位顧客的訂單量大到需要這樣處理。</p>
+<p>現在規則是「依 hash(customer_id) 決定分片」，但「落在哪一段就去哪一片」的「段」要怎麼切？最直覺的寫法是取餘數，下一節就會看到它在加機器時出大問題。</p>
+
+<h2>加一台機器為什麼要搬八成資料？hash % N 的問題</h2>
+<p>最直覺的分配方式是 <code>hash(key) % N</code>：N 台機器，雜湊值除以 N 的餘數是幾就去第幾台。這裡用的雜湊函式是<strong>非加密雜湊函式（non-cryptographic hash）</strong>，它只負責把字串變成分布平均的數字，速度很快，但不防有人刻意製造碰撞。你在<a href="../../auth/lessons/02-crypto-toolbox.html">認證課第 2 課</a>看過的 SHA-256 是加密雜湊，設計目標是安全，計算比較慢；分片只是要決定位置，用快的就好。下面範例的 <code>hash32</code> 以 FNV-1a 這個常見的非加密雜湊為基礎（為什麼多了幾行收尾見課末）。</p>
+<p>平常 N 不變時，<code>% N</code> 分得很平均，看不出問題。問題出在 N 改變的時候。用快取叢集當例子，因為它最常加減機器：從 4 台加到 5 台，執行後看第一行，有多少 key 換了機器：</p>
+<div class="lab"><script type="code">
+function hash32(s: string): number {
+  let h = 0x811c9dc5
+  for (const b of new TextEncoder().encode(s)) {
+    h ^= b
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  h ^= h >>> 16
+  h = Math.imul(h, 0x85ebca6b)
+  h ^= h >>> 13
+  h = Math.imul(h, 0xc2b2ae35)
+  h ^= h >>> 16
+  return h >>> 0
+}
+
+const keys = Array.from({ length: 10000 }, (_, i) => `order-${i + 1}`)
+let moved = 0
+for (const k of keys) {
+  if (hash32(k) % 4 !== hash32(k) % 5) moved++
+}
+console.log('4 台 → 5 台，換機器的 key：', (moved / keys.length * 100).toFixed(1) + '%')
+console.log('理想上只需要搬：', (1 / 5 * 100).toFixed(1) + '%（新機器分到的那一份）')
+</script></div>
+<p>約 79% 的 key 換了機器，而理想上只需要搬新機器分到的那 20%。原因是除數變了：同一個雜湊值除以 4 和除以 5 的餘數，只有少數情況會相同。如果這是快取，加一台機器等於快取幾乎全部失效，所有請求同時打到資料庫，就是<a href="05-caching.html">第 5 課</a>的雪崩：大量 key 同時失效，所有未命中一起壓到資料庫，而且不是因為 TTL，是因為 key 換了機器。如果這是咖啡店的訂單分片，就是 80% 的訂單要在線上搬家，搬的期間每一筆都要確保不遺失、不重複。</p>
+<p>我們要的是：加一台機器時，只有新機器該負責的那一份需要移動，其他 key 原地不動。下一節的一致性雜湊就是為此設計的。</p>
+
+<h2>怎麼讓加機器只搬一小部分？一致性雜湊與虛擬節點</h2>
+<p><code>% N</code> 的毛病在於每個 key 的位置都依賴 N。<strong>一致性雜湊（consistent hashing）</strong>出自 Karger 等人 1997 年的論文，它的想法是讓 key 的位置不再依賴機器總數，只依賴「離它最近的是哪台機器」。做法是把雜湊值的範圍（0～2<sup>32</sup>−1）想像成首尾相接的一個環，機器和 key 用同一個雜湊函式放上環。規則只有一條：<strong>key 歸順時針方向遇到的第一台機器</strong>。</p>
+<figure>
+  <svg viewBox="0 0 700 260" role="img" aria-label="雜湊環：A、B、C 三台機器在環上，key 順時針找到 B；加入 D 之後，只有 B 到 D 之間原本屬於 C 的 key 改歸 D">
+    <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <circle class="d-line" cx="350" cy="130" r="95" fill="none"/>
+    <path class="d-line" d="M411.1,202.8 A95,95 0 0 1 333.5,223.6" stroke-width="7" opacity="0.5"/>
+    <circle class="d-box" cx="397.5" cy="47.7" r="10"/>
+    <text class="d-text" x="410" y="26" text-anchor="middle">A</text>
+    <circle class="d-box" cx="411.1" cy="202.8" r="10"/>
+    <text class="d-text" x="430" y="226" text-anchor="middle">B</text>
+    <circle class="d-box" cx="260.7" cy="162.5" r="10"/>
+    <text class="d-text" x="237" y="175" text-anchor="middle">C</text>
+    <circle class="d-soft" cx="333.5" cy="223.6" r="10"/>
+    <text class="d-accent" x="325" y="252" text-anchor="middle">D（新加入）</text>
+    <circle class="d-soft" cx="443.6" cy="146.5" r="5"/>
+    <text class="d-small" x="455" y="140">key：order-42</text>
+    <path class="d-line" d="M447,160 Q440,185 422,196" fill="none" marker-end="url(#arr)"/>
+    <text class="d-small" x="350" y="126" text-anchor="middle">0 在最上面</text>
+    <text class="d-small" x="350" y="142" text-anchor="middle">順時針增加</text>
+    <text class="d-text" x="20" y="40">key 往順時針找</text>
+    <text class="d-text" x="20" y="60">第一台機器</text>
+    <text class="d-small" x="20" y="90">order-42 → B</text>
+    <text class="d-text" x="520" y="40">加入 D：</text>
+    <text class="d-small" x="520" y="62">只有 B～D 這一段</text>
+    <text class="d-small" x="520" y="80">（原本屬於 C）</text>
+    <text class="d-small" x="520" y="98">改歸 D</text>
+    <text class="d-small" x="520" y="116">其他 key 都不動</text>
+  </svg>
+  <figcaption>加一台機器只會從它順時針方向的下一台搬走一段，其他機器完全不受影響</figcaption>
+</figure>
+<p>照這條規則，加入一台機器 D 時，只有 D 和它逆時針方向上一個點之間的那一段 key 會改變歸屬：這段 key 原本往順時針走會先遇到下一台，現在先遇到 D，於是全部搬到 D。環上其他段的 key，順時針遇到的第一台機器沒變，完全不動。移除一台時也一樣，只有原本屬於它的 key 要搬到下一台。平均下來，N 台加到 N+1 台只要搬 1/(N+1) 的 key，正好是新機器該分到的那一份。</p>
+<p>但每台機器只放一個點不夠平均。點的位置是雜湊決定的，等於隨機，有的機器運氣好分到一大段弧，有的只有一小段，負責的資料量就差很多。解法是<strong>虛擬節點（virtual node）</strong>：一台實體機器在環上放很多個點，例如 <code>db-1#0</code>、<code>db-1#1</code>…<code>db-1#99</code> 各自雜湊出一個位置。每個點仍然負責它和上一個點之間的那段弧，一台機器的總負擔就是它所有點的弧長加起來；點越多，隨機造成的大小段會互相抵消，每台的總和越接近平均。執行後比較三行，看每台的比例怎麼隨點數變平均：</p>
+<div class="lab"><script type="code">
+function hash32(s: string): number {
+  let h = 0x811c9dc5
+  for (const b of new TextEncoder().encode(s)) {
+    h ^= b
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  h ^= h >>> 16
+  h = Math.imul(h, 0x85ebca6b)
+  h ^= h >>> 13
+  h = Math.imul(h, 0xc2b2ae35)
+  h ^= h >>> 16
+  return h >>> 0
+}
+
+// 每台機器在環上「負責」的弧長比例：每個點負責它和上一個點之間的那一段
+function arcShares(nodes: string[], vnodes: number) {
+  const points = nodes.flatMap(n => Array.from({ length: vnodes }, (_, i) => ({ pos: hash32(`${n}#${i}`), n })))
+  points.sort((a, b) => a.pos - b.pos)
+  const share: Record<string, number> = {}
+  points.forEach((p, i) => {
+    const prev = i === 0 ? points[points.length - 1].pos - 2 ** 32 : points[i - 1].pos
+    share[p.n] = (share[p.n] ?? 0) + (p.pos - prev) / 2 ** 32
+  })
+  return nodes.map(n => (share[n] * 100).toFixed(1) + '%')
+}
+
+const nodes = ['db-1', 'db-2', 'db-3', 'db-4']
+for (const v of [1, 10, 100]) {
+  console.log(`每台 ${v} 個點：`, arcShares(nodes, v).join('  '))
+}
+</script></div>
+<p>每台 1 個點時，最多的一台分到 63%、最少的不到 9%；10 個點還是有一台分到 48%；100 個點時落在 22%～30% 之間。虛擬節點還有一個好處：可以<strong>依機器大小給不同數量的點</strong>，大一倍的機器放兩倍的點，就分到約兩倍的資料。Amazon 的 Dynamo（2007）就用這個做法。點多了也讓增減機器更平順：只放一個點時，加入的新機器只從順時針下一台分走一段，移除一台會把它的量全部倒給下一台，那位鄰居的負載直接翻倍。每台有 100 個點時，新機器的點散在環上各處，會從所有舊機器各分走一小段；移除一台時，它的量也分散到所有機器，不會壓在單一鄰居上。練習 2 你會寫出完整的雜湊環，並用 1 萬個 key 驗證搬動比例和分布。</p>
+<p>雜湊環不是唯一做法，還有 jump consistent hash、rendezvous hashing 等演算法，比較表放在課末。正式環境更常見的是一個折衷：<strong>固定數量的邏輯分片＋目錄</strong>。一開始就把 key 空間切成例如 1,024 個邏輯分片，key 用雜湊對應到邏輯分片，這個對應永遠不變；再用一張<strong>目錄表（directory）</strong>記錄「每個邏輯分片目前放在哪一台實體機器」。加機器時，把幾個邏輯分片整個搬到新機器、改目錄就好，不用重新計算任何 key。目錄的代價是它本身要高可用、要快取，是另一個要維運的元件；好處是最有彈性，前面說的大客戶獨立一片，也是靠目錄記錄。</p>
+<p>到這裡，每筆訂單依 customer_id 穩定地落在某一片，加機器也只搬一小部分。接著輪到查詢：帶著 customer_id 的查詢只問一片，但總部後台和店員的查詢沒帶它。</p>
+
+<h2>查詢沒帶分片鍵怎麼辦？scatter-gather</h2>
+<p>總部的後台要看「全公司最新的 20 筆訂單」。這個查詢沒帶 customer_id，系統不知道最新的訂單在哪幾片，只能每一片都問，再把結果合併。這個做法叫 <strong>scatter-gather</strong>：把查詢分散（scatter）到每一片，再收集（gather）回來合併。</p>
+<p>概念很簡單，但最常見的錯誤出在「每片要取幾筆」。直覺是要 6 筆、有 3 片，每片取 2 筆就好。下面的資料刻意讓最新的訂單都在第 0 片，像是某位大客戶正在辦活動。執行後比較兩行的結果：</p>
+<div class="lab"><script type="code">
+type Order = { id: string; orderedAt: number }
+// 3 片的訂單；剛好最新的訂單都在第 0 片（例如一位大客戶在辦活動）
+const shards: Order[][] = [
+  Array.from({ length: 10 }, (_, i) => ({ id: `a${i}`, orderedAt: 1000 - i })),
+  Array.from({ length: 10 }, (_, i) => ({ id: `b${i}`, orderedAt: 500 - i })),
+  Array.from({ length: 10 }, (_, i) => ({ id: `c${i}`, orderedAt: 400 - i })),
+]
+const newest = (rows: Order[], n: number) => rows.toSorted((x, y) => y.orderedAt - x.orderedAt).slice(0, n)
+const limit = 6
+
+const wrong = shards.flatMap(s => newest(s, limit / shards.length))   // 每片取 2 筆
+const right = shards.flatMap(s => newest(s, limit))                   // 每片都取 6 筆
+console.log('每片取 2 筆：', newest(wrong, limit).map(o => o.id).join(' '))
+console.log('每片取 6 筆：', newest(right, limit).map(o => o.id).join(' '))
+</script></div>
+<p>每片取 2 筆的結果混進了 b、c 的舊訂單，第 0 片真正最新的 a2～a5 被漏掉了，而且程式不會報任何錯。原因是「最新的 6 筆」是對全部資料的條件，某一片可能剛好擁有全部 6 筆；每片取 limit ÷ 片數，等於假設每片各有一樣多，這個假設在大客戶辦活動、某一片特別忙的時段就不成立。hash 分片保證的是長期總量平均，不保證某一段時間內每片都一樣多。正確做法是<strong>每片都取 limit 筆</strong>，合併排序後再取前 limit 筆：最壞情況下 6 筆都在同一片，也拿得到。代價是片數多時要讀很多資料，所以 API 的 limit 要設上限。</p>
+<p>每片都要問，就帶出延遲的問題：整個查詢要等所有分片都回來才能合併，所以<strong>延遲由最慢的一片決定</strong>。<a href="03-latency-percentiles.html">第 3 課</a>講過扇出：每片有 1% 的機率很慢，問 8 片時至少一片很慢的機率是 1 − 0.99<sup>8</sup> ≈ 7.7%，原本 p99 才會遇到的慢，變成幾乎每 13 次就遇到一次。所以各片一定要平行查詢（<code>Promise.all</code>），不能一片一片依序問；而且要為慢的分片設逾時，這是<a href="08-timeouts-retries-backoff.html">第 8 課</a>的主題。</p>
+<p>後台還要能翻頁。單機時常用 <code>OFFSET</code>，但跨片時翻到第 50 頁，每一片都要先跳過 50 頁的資料，越後面越慢；而且翻頁之間有新訂單進來，前面的資料往後擠，offset 會讓同一筆出現兩次或漏掉。改用 <a href="../../node/lessons/14-rest-api-design.html">Node 課第 14 課</a>的 cursor：記住上一頁最後一筆的 <code>(orderedAt, id)</code>，下一頁時每片只回傳排在它之後的資料。只記 orderedAt 不夠，同一毫秒可能有兩筆訂單，翻頁時會重複或遺漏；加上 id 讓每一筆的順序都唯一。練習 3 你會把平行查詢、每片取 limit 筆與 cursor 分頁寫在一起。</p>
+<p>scatter-gather 適合總部後台這種頻率低的查詢。但店員的待做清單每幾秒就查一次，每次都問遍所有分片太浪費，這時改用<strong>全域次要索引（global secondary index）</strong>：另外維護一張以 store_id 為分片鍵的「店 → 訂單」索引表，待做清單只查一片。代價是寫一筆訂單要寫兩個地方，通常用非同步的方式更新（<a href="12-queues-outbox.html">第 12 課</a>的 outbox），所以索引會短暫過時，店員可能晚一兩秒才看到新訂單。原則還是：選分片鍵時就讓最重要的查詢不必跨片，跨片的只留給頻率低、能容忍慢一點的查詢。</p>
+<p>查詢的問題處理完了，還剩寫入的一個細節：每一片都在各自新增訂單，訂單編號從哪裡來？</p>
+
+<h2>各片同時新增訂單，編號怎麼不撞？全域唯一 ID</h2>
+<p>單機時，PostgreSQL 用 identity 欄位自動編號，1、2、3 往上加，由那一台資料庫保證不重複。分片後每一片是獨立的資料庫，各自從 1 開始，第 0 片和第 1 片都會產生訂單 1 號。這不只是顯示上的問題：顧客拿 1 號訂單查詢，系統不知道是哪一筆；之後重新平衡把訂單搬到別片，兩筆 1 號就直接衝突。所以需要<strong>全域唯一 ID</strong>：不靠任何一台資料庫協調，也保證不重複的 ID。</p>
+<p>比較各種做法之前，先認識一個評估角度：ID 會被當成主鍵，存在 <strong>B-tree 索引</strong>裡。B-tree 是 PostgreSQL 預設的索引結構，把值依大小排序存放在一頁一頁的索引頁中。新的 ID 如果都比舊的大，就永遠插在最右邊那一頁，常用的頁一直在記憶體裡；如果 ID 是隨機的，每次插入的位置都不同，索引頁要不斷分裂，常用的頁也散到各處，快取命中率變差。所以表中的「依時間排序」不只是方便，也直接影響寫入效能：</p>
+<div class="table-wrap"><table>
+  <tr><th>做法</th><th>大小</th><th>依時間排序</th><th>優點</th><th>缺點</th></tr>
+  <tr><td>各片自動遞增</td><td>64 位元</td><td>片內是</td><td>簡單</td><td>跨片撞號；設不同起點與間隔也很難再加片</td></tr>
+  <tr><td>集中發號服務</td><td>64 位元</td><td>是</td><td>連號</td><td>發號服務是單點與瓶頸</td></tr>
+  <tr><td>UUIDv4</td><td>128 位元</td><td>否，完全隨機</td><td>不用協調</td><td>B-tree 索引的插入位置分散，索引頁一直分裂、快取命中率差</td></tr>
+  <tr><td>UUIDv7</td><td>128 位元</td><td>大致是（毫秒）</td><td>不用協調；新資料插在索引尾端</td><td>比 64 位元大一倍；會透露建立時間</td></tr>
+  <tr><td>Snowflake</td><td>64 位元</td><td>大致是（毫秒）</td><td>放得進 bigint；可以從 ID 讀出時間與機器</td><td>每台機器要有唯一編號；依賴時鐘</td></tr>
+</table></div>
+<p>前兩種各有硬傷：各片自動遞增會撞號，集中發號又把所有寫入重新集中到一台，正是分片要避免的事。UUIDv4 不用協調，但完全隨機，傷 B-tree。剩下的 UUIDv7 和 Snowflake 都是「開頭放時間、後面放不會重複的部分」，同時做到不用協調和大致依時間排序。</p>
+
+<h3>UUIDv7：開頭是時間的 UUID</h3>
+<p><strong>UUIDv7</strong> 定義在 RFC 9562（2024 年 5 月）：128 位元中，前 48 位元是 Unix 時間的毫秒數，接著是版本號、變體與隨機位元。因為開頭是時間，依 UUID 排序大致就是依建立時間排序，新資料都插在 B-tree 的右端；後面的隨機位元則讓不同機器在同一毫秒產生的 ID 也幾乎不可能相同。PostgreSQL 18 內建 <code>uuidv7()</code>，文件說它用毫秒時間戳加上次毫秒的時間與隨機值產生。因為時間就在 ID 裡，可以直接讀出來：下面從 PostgreSQL 18 文件的範例值讀出版本與建立時間。</p>
+<div class="lab"><script type="code">
+const id = '019535d9-3df7-79fb-b466-fa907fa17f9e'   // PostgreSQL 18 文件裡 uuidv7() 的範例輸出
+const hex = id.replaceAll('-', '')
+const ms = parseInt(hex.slice(0, 12), 16)           // 前 48 位元 = 12 個十六進位字
+console.log('版本：', hex[12])
+console.log('建立時間：', new Date(ms).toISOString())
+</script></div>
+<p>這裡說「大致依時間排序」，是因為不同機器的時鐘有幾毫秒的差，同一毫秒內的先後也不保證，但整體上越新的 ID 越大。這種「整體有序、誤差在一個小範圍內」的性質叫 <strong>k-sorted</strong>。對 B-tree 來說這就夠了：新 ID 都插在右端附近，不會散到各處。</p>
+<p>UUIDv7 的缺點是 128 位元，比 bigint 大一倍，每個索引、每個外鍵都跟著變大。如果想要 64 位元、又能從 ID 讀出是哪台機器產生的，就是 Snowflake。它要把幾個欄位擠進一個 64 位元整數，得先會位元運算。</p>
+
+<h3>拼裝 Snowflake 之前：位元運算</h3>
+<p><strong>Snowflake ID</strong> 是 Twitter 2010 年開源的做法：把一個 64 位元整數切成幾個欄位，分別放時間、機器編號、序號。要把三個數字拼成一個、再從一個拆回三個，要用位元運算。前面的課沒用過，先看這四個：</p>
+<div class="table-wrap"><table>
+  <tr><th>運算</th><th>意思</th><th>例子（二進位）</th></tr>
+  <tr><td><code>a &lt;&lt; n</code></td><td>左移 n 位，等於乘以 2<sup>n</sup>，右邊補 0</td><td><code>101 &lt;&lt; 2</code> = <code>10100</code>（5 → 20）</td></tr>
+  <tr><td><code>a &gt;&gt; n</code></td><td>右移 n 位，等於除以 2<sup>n</sup> 取整數，最右邊 n 位丟掉</td><td><code>10111 &gt;&gt; 2</code> = <code>101</code>（23 → 5）</td></tr>
+  <tr><td><code>a | b</code></td><td>或：任一邊是 1 就是 1。欄位不重疊時，等於把它們拼起來</td><td><code>10100 | 00011</code> = <code>10111</code></td></tr>
+  <tr><td><code>a &amp; b</code></td><td>且：兩邊都是 1 才是 1。用<strong>遮罩（mask）</strong>只留下想要的位元</td><td><code>10111 &amp; 00011</code> = <code>00011</code></td></tr>
+</table></div>
+<p>拼的方法是：把每個欄位左移到它該在的位置，再用 <code>|</code> 合起來；拆的方法是：右移把欄位移回最右邊，再用遮罩去掉左邊不要的位元。還有一個 JavaScript 特有的限制：number 做位元運算時會先被轉成 32 位元整數，64 位元的 ID 會被截掉，所以要用 <strong>bigint</strong>（<a href="../../typescript/lessons/05-numbers-money.html">TypeScript 課第 5 課</a>）。bigint 的字面值後面加 n，例如 <code>22n</code>；bigint 和 number 不能混著算，要用 <code>BigInt(x)</code> 與 <code>Number(x)</code> 轉換。下面先用一個縮小版練習拼和拆，後半段示範用 number 會出什麼錯：</p>
+<div class="lab"><script type="code">
+const ts = 5n, machine = 3n, seq = 2n
+const id = (ts << 6n) | (machine << 3n) | seq        // 小一點的版本：時間 | 3 位元機器 | 3 位元序號
+console.log('拼起來：', id.toString(2).padStart(9, '0'), '=', id)
+console.log('時間：', id >> 6n)
+console.log('機器：', (id >> 3n) & 0b111n)             // 先右移，再用 3 個 1 的遮罩
+console.log('序號：', id & 0b111n)
+
+// 為什麼不能用 number
+console.log('32 位元截斷：', 2 ** 40 << 1, '（2^40 先被截成 32 位元的 0）')
+console.log('2^53 + 1：', 2 ** 53 + 1, '（少了 1）')
+try {
+  JSON.stringify({ id: 1n })
+} catch (e) {
+  console.log('JSON：', (e as Error).name, '→ API 裡的 64 位元 ID 要轉成字串')
+}
+</script></div>
+
+<h3>Snowflake 的結構與兩個邊界情況</h3>
+<p>實際的 Snowflake 把 64 位元切成四段：</p>
+<figure>
+  <svg viewBox="0 0 700 150" role="img" aria-label="Snowflake 64 位元：最高 1 位元固定為 0，接著 41 位元毫秒時間、10 位元機器編號、12 位元序號">
+    <rect class="d-soft" x="20" y="40" width="10" height="45"/>
+    <rect class="d-box" x="30" y="40" width="423" height="45"/>
+    <rect class="d-soft" x="453" y="40" width="103" height="45"/>
+    <rect class="d-box" x="556" y="40" width="124" height="45"/>
+    <text class="d-text" x="241" y="68" text-anchor="middle">時間：41 位元（距離自訂 epoch 的毫秒）</text>
+    <text class="d-text" x="504" y="68" text-anchor="middle">機器 10</text>
+    <text class="d-text" x="618" y="68" text-anchor="middle">序號 12</text>
+    <text class="d-small" x="25" y="30" text-anchor="middle">63</text>
+    <text class="d-small" x="36" y="30">62</text>
+    <text class="d-small" x="447" y="30" text-anchor="end">22</text>
+    <text class="d-small" x="459" y="30">21</text>
+    <text class="d-small" x="550" y="30" text-anchor="end">12</text>
+    <text class="d-small" x="562" y="30">11</text>
+    <text class="d-small" x="676" y="30" text-anchor="end">0</text>
+    <text class="d-small" x="20" y="108">最高位固定 0：放得進有號的 64 位元整數（PostgreSQL bigint）</text>
+    <text class="d-accent" x="20" y="132">ID = (毫秒 − epoch) &lt;&lt; 22n | 機器 &lt;&lt; 12n | 序號</text>
+  </svg>
+  <figcaption>41 位元的毫秒可以用約 69 年；10 位元最多 1,024 台機器；12 位元每台每毫秒 4,096 個</figcaption>
+</figure>
+<p>最高位固定為 0，讓整個 ID 是正數，放得進 PostgreSQL 有號的 bigint。時間欄位存的不是 1970 年起的毫秒數，而是距離 <strong>epoch</strong> 的毫秒數；epoch 是自己選的起點，例如服務上線那天，這樣 41 位元從那天開始算，可以用 2<sup>41</sup> 毫秒 ≈ 69.7 年。機器編號讓不同機器產生的 ID 一定不同，序號讓同一台機器同一毫秒產生的 ID 不同。這個設計有兩個邊界情況，練習 4 都會測：</p>
+<p>第一個是<strong>序號用完</strong>。同一毫秒內，序號從 0 遞增，12 位元最多到 4,095。如果同一毫秒要產生第 4,097 個，序號會溢位到機器編號的位元，產生的 ID 可能和別台機器的重複。正確做法是等到下一毫秒，序號歸零再繼續。</p>
+<p>第二個是<strong>時鐘倒退</strong>。伺服器會透過 <strong>NTP</strong>（網路校時協定）定期跟時間伺服器對時，校時可能把時鐘往回調幾毫秒。這時再產生 ID，時間欄位比上一個小，序號又從 0 開始，可能和之前產生過的 ID 完全一樣。Twitter 開源的 Snowflake 專案在 README 裡寫的做法是：拒絕產生，直到時間超過上一次產生 ID 的時間。</p>
+<p>ID 產生的方式也會影響安全。連號的 ID 會洩漏營業量：今天的訂單號減昨天的，就是一天的單量；它也讓人可以一個一個試別人的訂單，就是<a href="../../auth/lessons/19-object-level-authz.html">認證課第 19 課</a>的 BOLA。Snowflake 和 UUIDv7 雖然不連號，但看得出建立時間，也不是完全猜不到。所以授權檢查一定要做，ID 難猜只是多一層保護。</p>
+
+<div class="callout practice"><strong>💡 實務上：64 位元 ID 進 API 一律用字串</strong><br>後端用 Snowflake 或 bigint 當訂單 ID 時，回給前端的 JSON 要放字串：<code>JSON.parse</code> 會把超過 2<sup>53</sup> 的數字悄悄改掉，畫面上看不出錯，直到用這個 ID 查訂單查不到才發現。Twitter 的 API 就是因此另外提供 <code>id_str</code>。新專案選 ID 時，單機 PostgreSQL 用 identity 就好；要在多個服務或分片產生 ID，UUIDv7 不用分配機器編號，時鐘倒退頂多讓順序亂一點、靠隨機位元也不會撞號，通常比自己寫 Snowflake 省事。咖啡店的訂單分片後，訂單編號就屬於這種情況。</div>
+
+<p>到這裡，訂單表的拆法、查法、編號都定好了，可以上線。但分片不是上線就結束：幾個月後，某一片可能因為一批大客戶而比其他片滿得快。</p>
+
+<h2>上線之後：某一片太滿怎麼辦、平常要看什麼？</h2>
+<p>增減節點、或某一片太滿時，把資料搬動讓各片重新平均，叫<strong>重新平衡（rebalancing）</strong>。前面選一致性雜湊或邏輯分片，就是為了讓這件事只需要搬一小部分；但就算只搬一小部分，也是在服務持續接單時搬，不能停機。常見的步驟是：</p>
+<ol>
+  <li>開始雙寫：新進的寫入同時寫到舊位置和新位置。</li>
+  <li>回填：把舊位置既有的資料複製到新位置。</li>
+  <li>比對兩邊是否一致。</li>
+  <li>讀取切到新位置。</li>
+  <li>停止寫舊位置。</li>
+</ol>
+<p>順序的用意是：任何時候舊位置都還有完整的資料，所以每一步出問題都能回頭，細節在<a href="19-evolution-compatibility.html">第 19 課</a>。搬動本身也會消耗磁碟 IO，跟正常的下單搶資源，所以要限速，並避開尖峰時段。</p>
+<p>重新平衡是事後補救，更好的是提早發現哪一片快出問題。分片上線後要看<strong>每一片各自的</strong>指標，不能只看平均：10 片的平均 CPU 是 40%，可能是 9 片 30%、1 片 100%，平均值會把熱點藏起來。</p>
+<ul>
+  <li><strong>資料量與成長速度</strong>：哪一片會最先滿，什麼時候該開始搬。</li>
+  <li><strong>QPS（每秒查詢數）與 p99 延遲</strong>：最熱的一片是不是遠高於中位數。比例持續失衡代表分片鍵有熱點。</li>
+  <li><strong>最熱的 key</strong>：一個大客戶或一家旗艦店可能就讓一片過熱，需要單獨搬走或加尾碼拆開。</li>
+  <li><strong>跨片查詢的比例</strong>：越來越高代表存取模式變了，選分片鍵時的假設已經不成立，分片鍵可能要重新評估。</li>
+</ul>
+<p>最後一個指標接回了這課的起點：分片鍵是依當時的存取模式選的，存取模式會變，所以選完之後還要持續驗證。</p>
+
+<h2>補充與查表</h2>
+<h3>hash32 為什麼多了收尾步驟</h3>
+<p>本課的 <code>hash32</code> 是 FNV-1a 再加上 MurmurHash3 的收尾步驟（fmix32），也就是範例裡 <code>h ^= h &gt;&gt;&gt; 16</code> 開始的那幾行。只用 FNV-1a 的話，<code>db-1#0</code>、<code>db-1#1</code> 這種只差一個字的字串，雜湊值會擠在一起，虛擬節點就散不開；收尾步驟把位元再攪亂一次，讓相近的輸入得到差很遠的輸出。</p>
+
+<h3>一致性雜湊的其他做法（查表用，不用背）</h3>
+<div class="table-wrap"><table>
+  <tr><th>做法</th><th>怎麼做</th><th>優點</th><th>限制</th></tr>
+  <tr><td>雜湊環＋虛擬節點</td><td>本課的做法</td><td>可以任意增減、可以依容量給權重</td><td>要存所有點；查詢要二分搜尋</td></tr>
+  <tr><td>jump consistent hash</td><td>Lamping 與 Veach（2014）的短演算法，輸入 key 與桶數，算出桶編號</td><td>不需要記憶體、分得比環更平均</td><td>桶必須是 0～N−1 連續編號，只能從尾端增減；中間壞一台不能直接拿掉</td></tr>
+  <tr><td>rendezvous hashing</td><td>對每台機器算 hash(key, 機器)，選最大的</td><td>不用環、移除一台只影響它的 key</td><td>每次查詢要算 N 次雜湊</td></tr>
+  <tr><td>目錄表（directory）</td><td>用一張表記錄「哪個範圍或哪個 key 在哪一片」</td><td>最有彈性：可以單獨把熱門的 key 搬走</td><td>目錄本身要高可用、要快取，是另一個要維運的元件</td></tr>
+</table></div>
+
+<h3>PostgreSQL 的其他 UUID 函式</h3>
+<p>除了 <code>uuidv7()</code>，PostgreSQL 18 還有 <code>uuidv4()</code> 與 <code>gen_random_uuid()</code>，兩者都產生隨機的 v4。</p>
+
+<h3>分片之外的分擔方式：資料儲存怎麼選</h3>
+<p>分片是把同一種資料拆到多台；另一種分擔方式是讓不同的資料去適合它的儲存。選法同樣從存取模式出發：</p>
+<div class="table-wrap"><table>
+  <tr><th>類型</th><th>擅長</th><th>咖啡店的例子</th></tr>
+  <tr><td>關聯式（PostgreSQL）</td><td>交易、約束、JOIN、各種查詢</td><td>訂單、付款、會員</td></tr>
+  <tr><td>鍵值（Redis 這類）</td><td>依 key 讀寫單筆，非常快，常有 TTL</td><td>session、購物車、限流計數（<a href="10-rate-limiting.html">第 10 課</a>）</td></tr>
+  <tr><td>文件資料庫</td><td>結構多變的 JSON 文件，依 ID 整份讀寫</td><td>各國加盟店不同格式的設定；PostgreSQL 的 JSONB 常常就夠</td></tr>
+  <tr><td>全文搜尋引擎</td><td>斷詞、相關度排序、模糊比對</td><td>菜單搜尋；先用 <a href="../../postgresql/lessons/28-gin-search.html">PostgreSQL 課第 28 課</a>的全文檢索</td></tr>
+  <tr><td>物件儲存（S3 這類）</td><td>大檔案，便宜、耐久</td><td>商品圖片、匯出的報表檔</td></tr>
+  <tr><td>資料倉儲</td><td>大量資料的彙總分析</td><td>營運報表，由 CDC 從主資料庫同步</td></tr>
+</table></div>
+<p>表中的 <strong>CDC（change data capture）</strong>是把資料庫的每一筆變更串流出去，讓其他系統跟著更新。每多一種儲存，就多一套要學、要監控、要備份、要和主資料同步的系統。原則是：<strong>先用 PostgreSQL，等數字證明它撐不住再加</strong>。資料同步到第二個儲存時，它一定會比主資料晚一點，要用第 6 課的眼光決定哪些讀取能容忍過時。</p>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：量化比較分片鍵。寫 <code>evaluateShardKey(key, queries, rowsByValue)</code>：<code>singleShardShare</code> 是「<code>filters</code> 包含 key 的查詢」的 <code>perSec</code> 總和 ÷ 全部查詢的 <code>perSec</code> 總和；<code>hottestShare</code> 是 <code>rowsByValue</code> 裡最大的值 ÷ 所有值的總和。再寫 <code>chooseShardKey(candidates, queries, maxHottestShare)</code>：在 <code>hottestShare ≤ maxHottestShare</code> 的候選中，選 <code>singleShardShare</code> 最大的；一樣大時選 <code>hottestShare</code> 較小的；還是一樣就選前面的；沒有候選符合時回傳 <code>null</code>。</p>
+  <script type="start">
+type Query = { name: string; perSec: number; filters: readonly string[] }
+type Candidate = { key: string; rowsByValue: Readonly<Record<string, number>> }
+
+function evaluateShardKey(
+  key: string,
+  queries: readonly Query[],
+  rowsByValue: Readonly<Record<string, number>>,
+): { singleShardShare: number; hottestShare: number } {
+  throw new Error('TODO')
+}
+
+function chooseShardKey(candidates: readonly Candidate[], queries: readonly Query[], maxHottestShare: number): string | null {
+  throw new Error('TODO')
+}
+
+const queries: Query[] = [
+  { name: '門市待做清單', perSec: 400, filters: ['store_id'] },
+  { name: '我的訂單', perSec: 200, filters: ['customer_id'] },
+  { name: '訂單詳情', perSec: 100, filters: ['order_id', 'customer_id'] },
+  { name: '下單', perSec: 50, filters: ['store_id', 'customer_id'] },
+]
+console.log(evaluateShardKey('store_id', queries, { '1': 300, '2': 350, '3': 350 }))
+// { singleShardShare: 0.6, hottestShare: 0.35 }
+</script>
+  <script type="answer">
+type Query = { name: string; perSec: number; filters: readonly string[] }
+type Candidate = { key: string; rowsByValue: Readonly<Record<string, number>> }
+
+function evaluateShardKey(
+  key: string,
+  queries: readonly Query[],
+  rowsByValue: Readonly<Record<string, number>>,
+): { singleShardShare: number; hottestShare: number } {
+  let total = 0
+  let single = 0
+  for (const q of queries) {
+    total += q.perSec
+    if (q.filters.includes(key)) single += q.perSec
+  }
+  const rows = Object.values(rowsByValue)
+  const sum = rows.reduce((a, b) => a + b, 0)
+  return { singleShardShare: single / total, hottestShare: Math.max(...rows) / sum }
+}
+
+function chooseShardKey(candidates: readonly Candidate[], queries: readonly Query[], maxHottestShare: number): string | null {
+  let best: { key: string; singleShardShare: number; hottestShare: number } | null = null
+  for (const c of candidates) {
+    const m = evaluateShardKey(c.key, queries, c.rowsByValue)
+    if (m.hottestShare > maxHottestShare) continue
+    if (best === null
+      || m.singleShardShare > best.singleShardShare
+      || (m.singleShardShare === best.singleShardShare && m.hottestShare < best.hottestShare)) {
+      best = { key: c.key, ...m }
+    }
+  }
+  return best?.key ?? null
+}
+
+const queries: Query[] = [
+  { name: '門市待做清單', perSec: 400, filters: ['store_id'] },
+  { name: '我的訂單', perSec: 200, filters: ['customer_id'] },
+  { name: '訂單詳情', perSec: 100, filters: ['order_id', 'customer_id'] },
+  { name: '下單', perSec: 50, filters: ['store_id', 'customer_id'] },
+]
+console.log(evaluateShardKey('store_id', queries, { '1': 300, '2': 350, '3': 350 }))
+</script>
+  <script type="tests">
+const near = (a: number, b: number, msg: string) => assert(Math.abs(a - b) < 1e-9, `${msg}（得到 ${a}，應該是 ${b}）`)
+const deepFreeze = <T,>(x: T): T => { if (x && typeof x === 'object') { Object.values(x).forEach(deepFreeze); Object.freeze(x) } return x }
+const shopQueries: Query[] = deepFreeze([
+  { name: '門市待做清單', perSec: 400, filters: ['store_id'] },
+  { name: '我的訂單', perSec: 200, filters: ['customer_id'] },
+  { name: '訂單詳情', perSec: 100, filters: ['order_id', 'customer_id'] },
+  { name: '下單', perSec: 50, filters: ['store_id', 'customer_id'] },
+  { name: '門市日報', perSec: 5, filters: ['store_id'] },
+])
+const storeRows: Record<string, number> = { '1': 300 }
+for (let s = 2; s <= 11; s++) storeRows[String(s)] = 70
+const customerRows: Record<string, number> = {}
+for (let c = 1; c <= 200; c++) customerRows[`c${c}`] = 5 + (c % 3)
+const orderRows: Record<string, number> = {}
+for (let o = 1; o <= 1000; o++) orderRows[`o${o}`] = 1
+const candidates: Candidate[] = deepFreeze([
+  { key: 'store_id', rowsByValue: storeRows },
+  { key: 'customer_id', rowsByValue: customerRows },
+  { key: 'order_id', rowsByValue: orderRows },
+])
+{
+  const m = evaluateShardKey('store_id', shopQueries, storeRows)
+  near(m.singleShardShare, 455 / 755, 'store_id 的單片比例要用 perSec 加權：(400 + 50 + 5) ÷ 755')
+  near(m.hottestShare, 0.3, '旗艦店佔 300 ÷ 1000 = 30%')
+  near(evaluateShardKey('customer_id', shopQueries, customerRows).singleShardShare, 350 / 755, 'customer_id 的單片比例')
+  near(evaluateShardKey('order_id', shopQueries, orderRows).hottestShare, 0.001, 'order_id 每個值 1 筆，最熱的佔 1/1000')
+  near(evaluateShardKey('payment_id', shopQueries, { x: 1 }).singleShardShare, 0, '沒有查詢帶這個欄位時單片比例是 0')
+  near(evaluateShardKey('id', shopQueries, { x: 1 }).singleShardShare, 0, 'filters 要比對完整的欄位名稱：帶 store_id 不算帶了 id')
+}
+assert.equal(chooseShardKey(candidates, shopQueries, 0.1), 'customer_id', '門檻 10%：store_id 太熱，customer_id 的單片比例比 order_id 高')
+assert.equal(chooseShardKey(candidates, shopQueries, 0.4), 'store_id', '門檻放寬到 40%：store_id 可以接受，它的單片比例（依流量加權）最高')
+assert.equal(chooseShardKey(candidates, shopQueries, 0.3), 'store_id', 'hottestShare 剛好等於門檻（0.3 ≤ 0.3）也算符合')
+assert.equal(chooseShardKey(candidates, shopQueries, 0.0001), null, '沒有候選符合熱點門檻時要回傳 null，不是隨便選一個')
+assert.equal(chooseShardKey([], shopQueries, 1), null, '沒有候選時回傳 null')
+{
+  const q: Query[] = deepFreeze([{ name: 'q', perSec: 10, filters: ['a', 'b'] }])
+  const tie: Candidate[] = deepFreeze([{ key: 'a', rowsByValue: { x: 6, y: 4 } }, { key: 'b', rowsByValue: { x: 5, y: 5 } }])
+  assert.equal(chooseShardKey(tie, q, 1), 'b', '單片比例一樣時選比較不熱的')
+  const same: Candidate[] = deepFreeze([{ key: 'a', rowsByValue: { x: 5, y: 5 } }, { key: 'b', rowsByValue: { x: 5, y: 5 } }])
+  assert.equal(chooseShardKey(same, q, 1), 'a', '完全一樣時選前面的')
+}
+function mulberry32(seed: number) {
+  return () => {
+    seed = seed + 0x6d2b79f5 | 0
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed)
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t
+    return ((t ^ t >>> 14) >>> 0) / 4294967296
+  }
+}
+const rnd = mulberry32(707)
+const keys = ['k1', 'k2', 'k3', 'k4', 'k5']
+function refEval(key: string, qs: readonly Query[], rows: Readonly<Record<string, number>>) {
+  let t = 0, s = 0
+  for (const q of qs) { t += q.perSec; if (q.filters.includes(key)) s += q.perSec }
+  const v = Object.values(rows)
+  return { singleShardShare: s / t, hottestShare: Math.max(...v) / v.reduce((a, b) => a + b, 0) }
+}
+for (let k = 0; k < 200; k++) {
+  const qs: Query[] = deepFreeze(Array.from({ length: 1 + Math.floor(rnd() * 6) }, (_, i) => ({
+    name: `q${i}`, perSec: 1 + Math.floor(rnd() * 500), filters: keys.filter(() => rnd() < 0.4),
+  })))
+  const cs: Candidate[] = deepFreeze(keys.slice(0, 1 + Math.floor(rnd() * 5)).map(key => {
+    const rows: Record<string, number> = {}
+    for (let v = 0; v < 1 + Math.floor(rnd() * 8); v++) rows[`v${v}`] = 1 + Math.floor(rnd() * 100)
+    return { key, rowsByValue: rows }
+  }))
+  const limit = Math.round(rnd() * 100) / 100
+  for (const c of cs) {
+    const got = evaluateShardKey(c.key, qs, c.rowsByValue), want = refEval(c.key, qs, c.rowsByValue)
+    near(got.singleShardShare, want.singleShardShare, `隨機第 ${k + 1} 組 ${c.key} 的 singleShardShare`)
+    near(got.hottestShare, want.hottestShare, `隨機第 ${k + 1} 組 ${c.key} 的 hottestShare`)
+  }
+  let best: { key: string; s: number; h: number } | null = null
+  for (const c of cs) {
+    const m = refEval(c.key, qs, c.rowsByValue)
+    if (m.hottestShare > limit) continue
+    if (!best || m.singleShardShare > best.s || (m.singleShardShare === best.s && m.hottestShare < best.h)) best = { key: c.key, s: m.singleShardShare, h: m.hottestShare }
+  }
+  assert.equal(chooseShardKey(cs, qs, limit), best?.key ?? null, `隨機第 ${k + 1} 組選錯了（門檻 ${limit}）`)
+}
+</script>
+  <script type="wrong">
+type Query = { name: string; perSec: number; filters: readonly string[] }
+type Candidate = { key: string; rowsByValue: Readonly<Record<string, number>> }
+function evaluateShardKey(key: string, queries: readonly Query[], rowsByValue: Readonly<Record<string, number>>) {
+  const single = queries.filter(q => q.filters.includes(key)).reduce((a, q) => a + q.perSec, 0)
+  const total = queries.reduce((a, q) => a + q.perSec, 0)
+  const rows = Object.values(rowsByValue)
+  return { singleShardShare: single / total, hottestShare: Math.max(...rows) / rows.reduce((a, b) => a + b, 0) }
+}
+function chooseShardKey(candidates: readonly Candidate[], queries: readonly Query[], maxHottestShare: number): string | null {
+  let best: { key: string; s: number } | null = null
+  for (const c of candidates) {
+    const m = evaluateShardKey(c.key, queries, c.rowsByValue)
+    if (!best || m.singleShardShare > best.s) best = { key: c.key, s: m.singleShardShare }
+  }
+  return best?.key ?? null
+}
+</script>
+  <script type="wrong">
+type Query = { name: string; perSec: number; filters: readonly string[] }
+type Candidate = { key: string; rowsByValue: Readonly<Record<string, number>> }
+function evaluateShardKey(key: string, queries: readonly Query[], rowsByValue: Readonly<Record<string, number>>) {
+  const single = queries.filter(q => q.filters.includes(key)).length
+  const rows = Object.values(rowsByValue)
+  return { singleShardShare: single / queries.length, hottestShare: Math.max(...rows) / rows.reduce((a, b) => a + b, 0) }
+}
+function chooseShardKey(candidates: readonly Candidate[], queries: readonly Query[], maxHottestShare: number): string | null {
+  let best: { key: string; s: number; h: number } | null = null
+  for (const c of candidates) {
+    const m = evaluateShardKey(c.key, queries, c.rowsByValue)
+    if (m.hottestShare > maxHottestShare) continue
+    if (!best || m.singleShardShare > best.s || (m.singleShardShare === best.s && m.hottestShare < best.h)) best = { key: c.key, s: m.singleShardShare, h: m.hottestShare }
+  }
+  return best?.key ?? null
+}
+</script>
+  <script type="wrong">
+type Query = { name: string; perSec: number; filters: readonly string[] }
+type Candidate = { key: string; rowsByValue: Readonly<Record<string, number>> }
+function evaluateShardKey(key: string, queries: readonly Query[], rowsByValue: Readonly<Record<string, number>>) {
+  const single = queries.filter(q => q.filters.includes(key)).reduce((a, q) => a + q.perSec, 0)
+  const total = queries.reduce((a, q) => a + q.perSec, 0)
+  const rows = Object.values(rowsByValue)
+  return { singleShardShare: single / total, hottestShare: Math.max(...rows) / rows.reduce((a, b) => a + b, 0) }
+}
+function chooseShardKey(candidates: readonly Candidate[], queries: readonly Query[], maxHottestShare: number): string | null {
+  let best: { key: string; h: number } | null = null
+  for (const c of candidates) {
+    const m = evaluateShardKey(c.key, queries, c.rowsByValue)
+    if (m.hottestShare > maxHottestShare) continue
+    if (!best || m.hottestShare < best.h) best = { key: c.key, h: m.hottestShare }
+  }
+  return best?.key ?? null
+}
+</script>
+  <script type="wrong">
+type Query = { name: string; perSec: number; filters: readonly string[] }
+type Candidate = { key: string; rowsByValue: Readonly<Record<string, number>> }
+function evaluateShardKey(key: string, queries: readonly Query[], rowsByValue: Readonly<Record<string, number>>) {
+  const single = queries.filter(q => q.filters.includes(key)).reduce((a, q) => a + q.perSec, 0)
+  const total = queries.reduce((a, q) => a + q.perSec, 0)
+  const rows = Object.values(rowsByValue)
+  return { singleShardShare: single / total, hottestShare: Math.max(...rows) / rows.reduce((a, b) => a + b, 0) }
+}
+function chooseShardKey(candidates: readonly Candidate[], queries: readonly Query[], maxHottestShare: number): string | null {
+  let best: { key: string; s: number; h: number } | null = null
+  for (const c of candidates) {
+    const m = evaluateShardKey(c.key, queries, c.rowsByValue)
+    if (m.hottestShare > maxHottestShare) continue
+    if (!best || m.singleShardShare > best.s || (m.singleShardShare === best.s && m.hottestShare < best.h)) best = { key: c.key, s: m.singleShardShare, h: m.hottestShare }
+  }
+  return best?.key ?? candidates[0]?.key ?? null
+}
+</script>
+  <script type="wrong">
+type Query = { name: string; perSec: number; filters: readonly string[] }
+type Candidate = { key: string; rowsByValue: Readonly<Record<string, number>> }
+function evaluateShardKey(key: string, queries: readonly Query[], rowsByValue: Readonly<Record<string, number>>) {
+  const single = queries.filter(q => q.filters.includes(key)).reduce((a, q) => a + q.perSec, 0)
+  const total = queries.reduce((a, q) => a + q.perSec, 0)
+  const rows = Object.values(rowsByValue)
+  return { singleShardShare: single / total, hottestShare: Math.max(...rows) / rows.reduce((a, b) => a + b, 0) }
+}
+function chooseShardKey(candidates: readonly Candidate[], queries: readonly Query[], maxHottestShare: number): string | null {
+  let best: { key: string; s: number; h: number } | null = null
+  for (const c of candidates) {
+    const m = evaluateShardKey(c.key, queries, c.rowsByValue)
+    if (m.hottestShare >= maxHottestShare) continue
+    if (!best || m.singleShardShare > best.s || (m.singleShardShare === best.s && m.hottestShare < best.h)) best = { key: c.key, s: m.singleShardShare, h: m.hottestShare }
+  }
+  return best?.key ?? null
+}
+</script>
+  <script type="wrong">
+type Query = { name: string; perSec: number; filters: readonly string[] }
+type Candidate = { key: string; rowsByValue: Readonly<Record<string, number>> }
+function evaluateShardKey(key: string, queries: readonly Query[], rowsByValue: Readonly<Record<string, number>>) {
+  const single = queries.filter(q => q.filters.join(',').includes(key)).reduce((a, q) => a + q.perSec, 0)
+  const total = queries.reduce((a, q) => a + q.perSec, 0)
+  const rows = Object.values(rowsByValue)
+  return { singleShardShare: single / total, hottestShare: Math.max(...rows) / rows.reduce((a, b) => a + b, 0) }
+}
+function chooseShardKey(candidates: readonly Candidate[], queries: readonly Query[], maxHottestShare: number): string | null {
+  let best: { key: string; s: number; h: number } | null = null
+  for (const c of candidates) {
+    const m = evaluateShardKey(c.key, queries, c.rowsByValue)
+    if (m.hottestShare > maxHottestShare) continue
+    if (!best || m.singleShardShare > best.s || (m.singleShardShare === best.s && m.hottestShare < best.h)) best = { key: c.key, s: m.singleShardShare, h: m.hottestShare }
+  }
+  return best?.key ?? null
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：完成 <code>HashRing</code>。<code>add(node)</code> 在環上放 <code>vnodes</code> 個點，第 i 個點（i 從 0 開始）的位置是 <code>hash(`${node}#${i}`)</code>；<code>remove(node)</code> 拿掉這台的所有點；<code>get(key)</code> 算出 <code>h = hash(key)</code>，回傳<strong>第一個位置 ≥ h</strong> 的點所屬的節點，超過最後一個點就繞回第一個點。兩個點位置相同時，節點名稱字母順序較小的排前面。環是空的時候，<code>get</code> 丟 <code>Error</code>。測試會用 1 萬個 key 檢查搬動比例和分布。</p>
+  <script type="start">
+function hash32(s: string): number {
+  let h = 0x811c9dc5
+  for (const b of new TextEncoder().encode(s)) {
+    h ^= b
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  h ^= h >>> 16
+  h = Math.imul(h, 0x85ebca6b)
+  h ^= h >>> 13
+  h = Math.imul(h, 0xc2b2ae35)
+  h ^= h >>> 16
+  return h >>> 0
+}
+
+class HashRing {
+  private readonly hash: (s: string) => number
+  private readonly vnodes: number
+
+  constructor(hash: (s: string) => number, vnodes: number) {
+    this.hash = hash
+    this.vnodes = vnodes
+  }
+
+  add(node: string): void {
+    throw new Error('TODO')
+  }
+
+  remove(node: string): void {
+    throw new Error('TODO')
+  }
+
+  get(key: string): string {
+    throw new Error('TODO')
+  }
+}
+
+const ring = new HashRing(hash32, 100)
+for (const n of ['db-1', 'db-2', 'db-3', 'db-4']) ring.add(n)
+console.log('order-42 →', ring.get('order-42'))
+</script>
+  <script type="answer">
+function hash32(s: string): number {
+  let h = 0x811c9dc5
+  for (const b of new TextEncoder().encode(s)) {
+    h ^= b
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  h ^= h >>> 16
+  h = Math.imul(h, 0x85ebca6b)
+  h ^= h >>> 13
+  h = Math.imul(h, 0xc2b2ae35)
+  h ^= h >>> 16
+  return h >>> 0
+}
+
+class HashRing {
+  private readonly hash: (s: string) => number
+  private readonly vnodes: number
+  private points: Array<{ pos: number; node: string }> = []
+
+  constructor(hash: (s: string) => number, vnodes: number) {
+    this.hash = hash
+    this.vnodes = vnodes
+  }
+
+  add(node: string): void {
+    for (let i = 0; i < this.vnodes; i++) {
+      this.points.push({ pos: this.hash(`${node}#${i}`), node })
+    }
+    this.points.sort((a, b) => a.pos - b.pos || (a.node < b.node ? -1 : a.node > b.node ? 1 : 0))
+  }
+
+  remove(node: string): void {
+    this.points = this.points.filter(p => p.node !== node)
+  }
+
+  get(key: string): string {
+    if (this.points.length === 0) throw new Error('環上沒有任何節點')
+    const h = this.hash(key)
+    let lo = 0
+    let hi = this.points.length
+    while (lo < hi) {                       // 找第一個 pos >= h 的點
+      const mid = (lo + hi) >>> 1
+      if (this.points[mid].pos < h) lo = mid + 1
+      else hi = mid
+    }
+    return this.points[lo === this.points.length ? 0 : lo].node
+  }
+}
+
+const ring = new HashRing(hash32, 100)
+for (const n of ['db-1', 'db-2', 'db-3', 'db-4']) ring.add(n)
+console.log('order-42 →', ring.get('order-42'))
+</script>
+  <script type="tests">
+{
+  const pos: Record<string, number> = { 'a#0': 100, 'b#0': 200, 'a#1': 300, 'b#1': 300, k50: 50, k100: 100, k150: 150, k200: 200, k250: 250, k300: 300, k400: 400 }
+  const asked: string[] = []
+  const fake = (s: string) => {
+    asked.push(s)
+    if (!(s in pos)) throw new Error(`測試的假 hash 沒有定義 ${s}`)
+    return pos[s]
+  }
+  const r = new HashRing(fake, 2)
+  let err: unknown
+  try { r.get('k50') } catch (e) { err = e }
+  assert(err instanceof Error, '環是空的時候 get 要丟 Error')
+  r.add('b')
+  r.add('a')
+  assert(asked.includes('a#0') && asked.includes('a#1') && asked.includes('b#1'), 'add 要放 vnodes 個點，位置是 hash(`${node}#${i}`)，i 從 0 開始')
+  assert.equal(r.get('k50'), 'a', 'h = 50：第一個 ≥ 50 的點在 100（a）')
+  assert.equal(r.get('k100'), 'a', 'h 剛好等於某個點的位置時，歸那個點（找 ≥ h，不是 > h）')
+  assert.equal(r.get('k150'), 'b', 'h = 150：第一個 ≥ 150 的點在 200（b）')
+  assert.equal(r.get('k250'), 'a', '位置相同（a#1 與 b#1 都在 300）時，名稱字母順序小的 a 排前面')
+  assert.equal(r.get('k400'), 'a', 'h 大於所有點時要繞回第一個點（100，a）')
+  r.remove('a')
+  assert.equal(r.get('k50'), 'b', '移除 a 之後，它在環上的點都要拿掉')
+  assert.equal(r.get('k250'), 'b', '移除 a 之後，300 只剩 b#1')
+  assert.equal(r.get('k400'), 'b', '移除 a 之後繞回的第一個點是 b#0')
+  r.remove('b')
+  err = undefined
+  try { r.get('k50') } catch (e) { err = e }
+  assert(err instanceof Error, '所有節點都移除之後 get 要丟 Error')
+  const r2 = new HashRing(fake, 2)
+  r2.add('a')
+  r2.add('b')
+  assert.equal(r2.get('k250'), 'a', '位置相同時不管哪台先加入，都是名稱字母順序小的 a 排前面（兩個點都要留在環上）')
+  r2.remove('a')
+  assert.equal(r2.get('k250'), 'b', '移除 a 之後，位置 300 的 b#1 還要在環上')
+}
+class RefRing {
+  points: Array<{ pos: number; node: string }> = []
+  constructor(nodes: string[], v: number) {
+    for (const n of nodes) for (let i = 0; i < v; i++) this.points.push({ pos: hash32(`${n}#${i}`), node: n })
+    this.points.sort((a, b) => a.pos - b.pos || (a.node < b.node ? -1 : a.node > b.node ? 1 : 0))
+  }
+  get(key: string) {
+    const h = hash32(key)
+    let lo = 0, hi = this.points.length
+    while (lo < hi) { const m = (lo + hi) >>> 1; if (this.points[m].pos < h) lo = m + 1; else hi = m }
+    return this.points[lo === this.points.length ? 0 : lo].node
+  }
+}
+const keys = Array.from({ length: 10000 }, (_, i) => `order-${i + 1}`)
+const four = ['db-1', 'db-2', 'db-3', 'db-4']
+const ring = new HashRing(hash32, 100)
+for (const n of four) ring.add(n)
+const before = keys.map(k => ring.get(k))
+const ref4 = new RefRing(four, 100)
+keys.forEach((k, i) => assert.equal(before[i], ref4.get(k), `4 台、每台 100 個點時 ${k} 應該在 ${ref4.get(k)}`))
+const counts = four.map(n => before.filter(x => x === n).length)
+assert(Math.max(...counts) / Math.min(...counts) < 1.5, `每台 100 個虛擬節點時，最多與最少的 key 數比要小於 1.5（得到 ${counts.join('、')}）`)
+ring.add('db-5')
+const after = keys.map(k => ring.get(k))
+let moved = 0
+keys.forEach((k, i) => {
+  if (before[i] !== after[i]) {
+    moved++
+    assert.equal(after[i], 'db-5', `加入 db-5 時，換機器的 key 只能搬到 db-5（${k} 從 ${before[i]} 搬到 ${after[i]}）`)
+  }
+})
+assert(moved / keys.length > 0.12 && moved / keys.length < 0.28, `4 台加到 5 台，搬動的 key 應該約 20%（得到 ${(moved / keys.length * 100).toFixed(1)}%）`)
+ring.remove('db-2')
+keys.forEach((k, i) => {
+  const now = ring.get(k)
+  assert(now !== 'db-2', `移除 db-2 之後不能再有 key 對應到它（${k}）`)
+  if (after[i] !== 'db-2') assert.equal(now, after[i], `移除 db-2 只能搬動原本屬於 db-2 的 key（${k} 從 ${after[i]} 變成 ${now}）`)
+})
+</script>
+  <script type="wrong">
+function hash32(s: string): number {
+  let h = 0x811c9dc5
+  for (const b of new TextEncoder().encode(s)) { h ^= b; h = Math.imul(h, 0x01000193) >>> 0 }
+  h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16
+  return h >>> 0
+}
+class HashRing {
+  private nodes: string[] = []
+  constructor(private readonly hash: (s: string) => number, private readonly vnodes: number) {}
+  add(node: string): void { this.nodes.push(node) }
+  remove(node: string): void { this.nodes = this.nodes.filter(n => n !== node) }
+  get(key: string): string {
+    if (this.nodes.length === 0) throw new Error('empty')
+    return this.nodes[this.hash(key) % this.nodes.length]
+  }
+}
+</script>
+  <script type="wrong">
+function hash32(s: string): number {
+  let h = 0x811c9dc5
+  for (const b of new TextEncoder().encode(s)) { h ^= b; h = Math.imul(h, 0x01000193) >>> 0 }
+  h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16
+  return h >>> 0
+}
+class HashRing {
+  private points: Array<{ pos: number; node: string }> = []
+  constructor(private readonly hash: (s: string) => number, private readonly vnodes: number) {}
+  add(node: string): void {
+    this.points.push({ pos: this.hash(`${node}#0`), node })
+    this.points.sort((a, b) => a.pos - b.pos || (a.node < b.node ? -1 : 1))
+  }
+  remove(node: string): void { this.points = this.points.filter(p => p.node !== node) }
+  get(key: string): string {
+    if (this.points.length === 0) throw new Error('empty')
+    const h = this.hash(key)
+    const p = this.points.find(p => p.pos >= h) ?? this.points[0]
+    return p.node
+  }
+}
+</script>
+  <script type="wrong">
+function hash32(s: string): number {
+  let h = 0x811c9dc5
+  for (const b of new TextEncoder().encode(s)) { h ^= b; h = Math.imul(h, 0x01000193) >>> 0 }
+  h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16
+  return h >>> 0
+}
+class HashRing {
+  private points: Array<{ pos: number; node: string }> = []
+  constructor(private readonly hash: (s: string) => number, private readonly vnodes: number) {}
+  add(node: string): void {
+    for (let i = 0; i < this.vnodes; i++) this.points.push({ pos: this.hash(`${node}#${i}`), node })
+    this.points.sort((a, b) => a.pos - b.pos || (a.node < b.node ? -1 : 1))
+  }
+  remove(node: string): void { this.points = this.points.filter(p => p.node !== node) }
+  get(key: string): string {
+    if (this.points.length === 0) throw new Error('empty')
+    const h = this.hash(key)
+    return this.points.find(p => p.pos >= h)?.node as string
+  }
+}
+</script>
+  <script type="wrong">
+function hash32(s: string): number {
+  let h = 0x811c9dc5
+  for (const b of new TextEncoder().encode(s)) { h ^= b; h = Math.imul(h, 0x01000193) >>> 0 }
+  h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16
+  return h >>> 0
+}
+class HashRing {
+  private points: Array<{ pos: number; node: string }> = []
+  constructor(private readonly hash: (s: string) => number, private readonly vnodes: number) {}
+  add(node: string): void {
+    for (let i = 0; i < this.vnodes; i++) this.points.push({ pos: this.hash(`${node}#${i}`), node })
+    this.points.sort((a, b) => a.pos - b.pos || (a.node < b.node ? -1 : 1))
+  }
+  remove(node: string): void { this.points = this.points.filter(p => p.node !== node) }
+  get(key: string): string {
+    if (this.points.length === 0) throw new Error('empty')
+    const h = this.hash(key)
+    let lo = 0, hi = this.points.length
+    while (lo < hi) { const mid = (lo + hi) >>> 1; if (this.points[mid].pos <= h) lo = mid + 1; else hi = mid }
+    return this.points[lo === this.points.length ? 0 : lo].node
+  }
+}
+</script>
+  <script type="wrong">
+function hash32(s: string): number {
+  let h = 0x811c9dc5
+  for (const b of new TextEncoder().encode(s)) { h ^= b; h = Math.imul(h, 0x01000193) >>> 0 }
+  h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16
+  return h >>> 0
+}
+class HashRing {
+  private points: Array<{ pos: number; node: string }> = []
+  constructor(private readonly hash: (s: string) => number, private readonly vnodes: number) {}
+  add(node: string): void {
+    for (let i = 0; i < this.vnodes; i++) this.points.push({ pos: this.hash(`${node}#${i}`), node })
+    this.points.sort((a, b) => a.pos - b.pos || (a.node < b.node ? -1 : 1))
+  }
+  remove(node: string): void {
+    const i = this.points.findIndex(p => p.node === node)
+    if (i >= 0) this.points.splice(i, 1)
+  }
+  get(key: string): string {
+    if (this.points.length === 0) throw new Error('empty')
+    const h = this.hash(key)
+    const p = this.points.find(p => p.pos >= h) ?? this.points[0]
+    return p.node
+  }
+}
+</script>
+  <script type="wrong">
+function hash32(s: string): number {
+  let h = 0x811c9dc5
+  for (const b of new TextEncoder().encode(s)) { h ^= b; h = Math.imul(h, 0x01000193) >>> 0 }
+  h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16
+  return h >>> 0
+}
+class HashRing {
+  private points: Array<{ pos: number; node: string }> = []
+  constructor(private readonly hash: (s: string) => number, private readonly vnodes: number) {}
+  add(node: string): void {
+    for (let i = 0; i < this.vnodes; i++) this.points.push({ pos: this.hash(`${node}#${i}`), node })
+    this.points.sort((a, b) => a.pos - b.pos)
+  }
+  remove(node: string): void { this.points = this.points.filter(p => p.node !== node) }
+  get(key: string): string {
+    if (this.points.length === 0) throw new Error('empty')
+    const h = this.hash(key)
+    const p = this.points.find(p => p.pos >= h) ?? this.points[0]
+    return p.node
+  }
+}
+</script>
+  <script type="wrong">
+function hash32(s: string): number {
+  let h = 0x811c9dc5
+  for (const b of new TextEncoder().encode(s)) { h ^= b; h = Math.imul(h, 0x01000193) >>> 0 }
+  h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16
+  return h >>> 0
+}
+class HashRing {
+  private byPos = new Map<number, string>()
+  constructor(private readonly hash: (s: string) => number, private readonly vnodes: number) {}
+  add(node: string): void {
+    for (let i = 0; i < this.vnodes; i++) this.byPos.set(this.hash(`${node}#${i}`), node)
+  }
+  remove(node: string): void {
+    for (const [pos, n] of this.byPos) if (n === node) this.byPos.delete(pos)
+  }
+  get(key: string): string {
+    if (this.byPos.size === 0) throw new Error('empty')
+    const h = this.hash(key)
+    const sorted = [...this.byPos].sort((a, b) => a[0] - b[0])
+    return (sorted.find(([pos]) => pos >= h) ?? sorted[0])[1]
+  }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：跨分片查最新訂單。寫 <code>latestOrders(shards, limit, before)</code>：每個 shard 函式回傳該片中排在 <code>before</code> 之後的前 <code>limit</code> 筆（<code>before</code> 是 <code>null</code> 時從最新開始）。順序是 <code>orderedAt</code> 由新到舊，相同時 <code>id</code> 由大到小（字串比較）。你要<strong>同時</strong>查詢所有分片，每片都要給 <code>limit</code> 與 <code>before</code>，合併後依同樣的順序取前 <code>limit</code> 筆。<code>next</code> 是最後一筆的 cursor（只有 <code>orderedAt</code> 與 <code>id</code> 兩個欄位）；取到的筆數不足 <code>limit</code> 時 <code>next</code> 是 <code>null</code>。</p>
+  <script type="start">
+type Order = { id: string; orderedAt: number; storeId: number }
+type Cursor = { orderedAt: number; id: string }
+type ShardQuery = (limit: number, before: Cursor | null) => Promise<Order[]>
+
+async function latestOrders(
+  shards: readonly ShardQuery[],
+  limit: number,
+  before: Cursor | null,
+): Promise<{ orders: Order[]; next: Cursor | null }> {
+  throw new Error('TODO')
+}
+
+const shardA: ShardQuery = async () => [{ id: 'a2', orderedAt: 30, storeId: 1 }, { id: 'a1', orderedAt: 10, storeId: 1 }]
+const shardB: ShardQuery = async () => [{ id: 'b1', orderedAt: 20, storeId: 2 }]
+console.log(await latestOrders([shardA, shardB], 2, null))
+// { orders: [a2, b1], next: { orderedAt: 20, id: 'b1' } }
+</script>
+  <script type="answer">
+type Order = { id: string; orderedAt: number; storeId: number }
+type Cursor = { orderedAt: number; id: string }
+type ShardQuery = (limit: number, before: Cursor | null) => Promise<Order[]>
+
+function newerFirst(a: Cursor, b: Cursor): number {
+  if (a.orderedAt !== b.orderedAt) return b.orderedAt - a.orderedAt
+  return a.id < b.id ? 1 : a.id > b.id ? -1 : 0
+}
+
+async function latestOrders(
+  shards: readonly ShardQuery[],
+  limit: number,
+  before: Cursor | null,
+): Promise<{ orders: Order[]; next: Cursor | null }> {
+  const pages = await Promise.all(shards.map(query => query(limit, before)))
+  const orders = pages.flat().sort(newerFirst).slice(0, limit)
+  const last = orders.at(-1)
+  const next = orders.length === limit && last ? { orderedAt: last.orderedAt, id: last.id } : null
+  return { orders, next }
+}
+
+const shardA: ShardQuery = async () => [{ id: 'a2', orderedAt: 30, storeId: 1 }, { id: 'a1', orderedAt: 10, storeId: 1 }]
+const shardB: ShardQuery = async () => [{ id: 'b1', orderedAt: 20, storeId: 2 }]
+console.log(await latestOrders([shardA, shardB], 2, null))
+</script>
+  <script type="tests">
+const cmp = (a: Cursor, b: Cursor) => a.orderedAt !== b.orderedAt ? b.orderedAt - a.orderedAt : a.id < b.id ? 1 : a.id > b.id ? -1 : 0
+const after = (o: Cursor, c: Cursor | null) => c === null || cmp(o, c) > 0
+const calls: Array<{ shard: number; limit: number; before: Cursor | null }> = []
+function makeShard(index: number, rows: Order[]): ShardQuery {
+  const sorted = Object.freeze(rows.map(r => Object.freeze({ ...r })).sort(cmp))
+  return async (limit, before) => {
+    calls.push({ shard: index, limit, before })
+    return Object.freeze(sorted.filter(o => after(o, before)).slice(0, limit)) as Order[]
+  }
+}
+const ids = (os: readonly Order[]) => os.map(o => o.id).join(' ')
+{
+  const hot = Array.from({ length: 20 }, (_, i) => ({ id: `h${String(i).padStart(2, '0')}`, orderedAt: 1000 + i, storeId: 1 }))
+  const cold1 = Array.from({ length: 20 }, (_, i) => ({ id: `x${String(i).padStart(2, '0')}`, orderedAt: 100 + i, storeId: 2 }))
+  const cold2 = Array.from({ length: 20 }, (_, i) => ({ id: `y${String(i).padStart(2, '0')}`, orderedAt: 200 + i, storeId: 3 }))
+  calls.length = 0
+  const r = await latestOrders([makeShard(0, cold1), makeShard(1, hot), makeShard(2, cold2)], 20, null)
+  assert.equal(ids(r.orders), ids(hot.toSorted(cmp)), '最新的 20 筆都在同一片時，結果要是那 20 筆：每片都要取 limit 筆，不是 limit ÷ 片數')
+  assert.deepEqual(r.next, { orderedAt: 1000, id: 'h00' }, 'next 是最後一筆的 { orderedAt, id }')
+  assert.equal(calls.length, 3, '每一片都要查詢一次')
+  assert(calls.every(c => c.limit === 20 && c.before === null), '每片都要收到 limit 與 before')
+}
+{
+  const empty = await latestOrders([makeShard(0, []), makeShard(1, [])], 5, null)
+  assert.deepEqual(empty, { orders: [], next: null }, '所有分片都是空的：orders 是 []、next 是 null')
+  const few = await latestOrders([makeShard(0, [{ id: 'a', orderedAt: 1, storeId: 1 }]), makeShard(1, [])], 5, null)
+  assert.equal(few.next, null, '取到的筆數不足 limit 時 next 是 null')
+}
+function mulberry32(seed: number) {
+  return () => {
+    seed = seed + 0x6d2b79f5 | 0
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed)
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t
+    return ((t ^ t >>> 14) >>> 0) / 4294967296
+  }
+}
+const rnd = mulberry32(77)
+for (let round = 0; round < 30; round++) {
+  const shardCount = 1 + Math.floor(rnd() * 4)
+  const all: Order[] = []
+  const perShard: Order[][] = Array.from({ length: shardCount }, () => [])
+  const n = Math.floor(rnd() * 60)
+  for (let i = 0; i < n; i++) {
+    const o = { id: `o${String(Math.floor(rnd() * 100000)).padStart(5, '0')}-${i}`, orderedAt: Math.floor(rnd() * 8), storeId: 1 + Math.floor(rnd() * 200) }
+    all.push(o)
+    perShard[Math.floor(rnd() * shardCount)].push(o)
+  }
+  const shards = perShard.map((rows, i) => makeShard(i, rows))
+  const limit = 1 + Math.floor(rnd() * 7)
+  const seen: string[] = []
+  let cursor: Cursor | null = null
+  for (let page = 0; page < 100; page++) {
+    calls.length = 0
+    const r: { orders: Order[]; next: Cursor | null } = await latestOrders(shards, limit, cursor)
+    assert(calls.every(c => c.limit === limit && c.before === cursor), '翻頁時每片都要收到同一個 before cursor 與 limit')
+    seen.push(...r.orders.map(o => o.id))
+    if (r.next === null) break
+    cursor = r.next
+  }
+  assert.equal(seen.join(' '), ids(all.toSorted(cmp)), `第 ${round + 1} 組：一頁一頁翻完要剛好等於全部訂單依 (orderedAt, id) 排序的結果，不重複、不遺漏（同一時間的訂單要用 id 決定順序）`)
+}
+{
+  const pending: Array<PromiseWithResolvers<Order[]>> = []
+  const slow: ShardQuery = async () => { const d = Promise.withResolvers<Order[]>(); pending.push(d); return d.promise }
+  const p = latestOrders([slow, slow, slow, slow], 3, null)
+  await new Promise(r => setTimeout(r, 0))
+  const started = pending.length
+  for (let i = 0; i < 10 && pending.length > 0; i++) {
+    pending.splice(0).forEach(d => d.resolve([]))
+    await new Promise(r => setTimeout(r, 0))
+  }
+  await p
+  assert.equal(started, 4, '要同時查詢所有分片（Promise.all），不是一片查完才查下一片：延遲會變成所有分片相加')
+}
+</script>
+  <script type="wrong">
+type Order = { id: string; orderedAt: number; storeId: number }
+type Cursor = { orderedAt: number; id: string }
+type ShardQuery = (limit: number, before: Cursor | null) => Promise<Order[]>
+const cmp = (a: Cursor, b: Cursor) => a.orderedAt !== b.orderedAt ? b.orderedAt - a.orderedAt : a.id < b.id ? 1 : a.id > b.id ? -1 : 0
+async function latestOrders(shards: readonly ShardQuery[], limit: number, before: Cursor | null) {
+  const per = Math.ceil(limit / shards.length)
+  const pages = await Promise.all(shards.map(q => q(per, before)))
+  const orders = pages.flat().sort(cmp).slice(0, limit)
+  const last = orders.at(-1)
+  return { orders, next: orders.length === limit && last ? { orderedAt: last.orderedAt, id: last.id } : null }
+}
+</script>
+  <script type="wrong">
+type Order = { id: string; orderedAt: number; storeId: number }
+type Cursor = { orderedAt: number; id: string }
+type ShardQuery = (limit: number, before: Cursor | null) => Promise<Order[]>
+const cmp = (a: Cursor, b: Cursor) => a.orderedAt !== b.orderedAt ? b.orderedAt - a.orderedAt : a.id < b.id ? 1 : a.id > b.id ? -1 : 0
+async function latestOrders(shards: readonly ShardQuery[], limit: number, before: Cursor | null) {
+  const pages: Order[][] = []
+  for (const q of shards) pages.push(await q(limit, before))
+  const orders = pages.flat().sort(cmp).slice(0, limit)
+  const last = orders.at(-1)
+  return { orders, next: orders.length === limit && last ? { orderedAt: last.orderedAt, id: last.id } : null }
+}
+</script>
+  <script type="wrong">
+type Order = { id: string; orderedAt: number; storeId: number }
+type Cursor = { orderedAt: number; id: string }
+type ShardQuery = (limit: number, before: Cursor | null) => Promise<Order[]>
+async function latestOrders(shards: readonly ShardQuery[], limit: number, before: Cursor | null) {
+  const pages = await Promise.all(shards.map(q => q(limit, before)))
+  const orders = pages.flat().sort((a, b) => b.orderedAt - a.orderedAt).slice(0, limit)
+  const last = orders.at(-1)
+  return { orders, next: orders.length === limit && last ? { orderedAt: last.orderedAt, id: last.id } : null }
+}
+</script>
+  <script type="wrong">
+type Order = { id: string; orderedAt: number; storeId: number }
+type Cursor = { orderedAt: number; id: string }
+type ShardQuery = (limit: number, before: Cursor | null) => Promise<Order[]>
+const cmp = (a: Cursor, b: Cursor) => a.orderedAt !== b.orderedAt ? b.orderedAt - a.orderedAt : a.id < b.id ? 1 : a.id > b.id ? -1 : 0
+// 用 offset 的想法：每片都從頭拿，再在合併後自己跳過 before 之前的
+async function latestOrders(shards: readonly ShardQuery[], limit: number, before: Cursor | null) {
+  const pages = await Promise.all(shards.map(q => q(limit, null)))
+  const merged = pages.flat().sort(cmp)
+  const start = before === null ? 0 : merged.findIndex(o => cmp(o, before) > 0)
+  const orders = start < 0 ? [] : merged.slice(start, start + limit)
+  const last = orders.at(-1)
+  return { orders, next: orders.length === limit && last ? { orderedAt: last.orderedAt, id: last.id } : null }
+}
+</script>
+  <script type="wrong">
+type Order = { id: string; orderedAt: number; storeId: number }
+type Cursor = { orderedAt: number; id: string }
+type ShardQuery = (limit: number, before: Cursor | null) => Promise<Order[]>
+const cmp = (a: Cursor, b: Cursor) => a.orderedAt !== b.orderedAt ? b.orderedAt - a.orderedAt : a.id < b.id ? 1 : a.id > b.id ? -1 : 0
+async function latestOrders(shards: readonly ShardQuery[], limit: number, before: Cursor | null) {
+  const pages = await Promise.all(shards.map(q => q(limit, before)))
+  const orders = pages.flat().sort(cmp).slice(0, limit)
+  const last = orders.at(-1)
+  return { orders, next: last ? { orderedAt: last.orderedAt, id: last.id } : null }
+}
+</script>
+  <script type="wrong">
+type Order = { id: string; orderedAt: number; storeId: number }
+type Cursor = { orderedAt: number; id: string }
+type ShardQuery = (limit: number, before: Cursor | null) => Promise<Order[]>
+const cmp = (a: Cursor, b: Cursor) => a.orderedAt !== b.orderedAt ? b.orderedAt - a.orderedAt : a.id < b.id ? 1 : a.id > b.id ? -1 : 0
+async function latestOrders(shards: readonly ShardQuery[], limit: number, before: Cursor | null): Promise<{ orders: Order[]; next: Cursor | null }> {
+  const pages = await Promise.all(shards.map(q => q(limit, before)))
+  const orders = pages.flat().sort(cmp).slice(0, limit)
+  const last = orders.at(-1)
+  return { orders, next: orders.length === limit && last ? last : null }
+}
+</script>
+  <script type="wrong">
+type Order = { id: string; orderedAt: number; storeId: number }
+type Cursor = { orderedAt: number; id: string }
+type ShardQuery = (limit: number, before: Cursor | null) => Promise<Order[]>
+const cmp = (a: Cursor, b: Cursor) => a.orderedAt !== b.orderedAt ? b.orderedAt - a.orderedAt : a.id < b.id ? 1 : a.id > b.id ? -1 : 0
+async function latestOrders(shards: readonly ShardQuery[], limit: number, before: Cursor | null) {
+  const pages = await Promise.all(shards.map(q => q(limit, before)))
+  const orders = pages.flat().sort((a, b) => b.orderedAt - a.orderedAt || (a.id < b.id ? -1 : 1)).slice(0, limit)
+  const last = orders.at(-1)
+  return { orders, next: orders.length === limit && last ? { orderedAt: last.orderedAt, id: last.id } : null }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 4：Snowflake ID 產生器。寫 <code>createSnowflake({ machineId, epochMs, now })</code>，回傳一個每次呼叫產生一個 bigint ID 的函式：ID = <code>(now − epochMs) &lt;&lt; 22n | machineId &lt;&lt; 12n | sequence</code>。規則：<code>machineId</code> 必須是 0～1023 的整數，否則丟 <code>RangeError</code>；同一毫秒內 sequence 從 0 遞增；換到新的毫秒時 sequence 歸零；序號用完（同一毫秒已經產生 4,096 個）時，一直呼叫 <code>now()</code> 直到進入下一毫秒；<code>now()</code> 比上一次產生 ID 的時間小時，丟 <code>ClockMovedBackwardsError</code>。另寫 <code>parseSnowflake(id, epochMs)</code> 把 ID 拆回三個欄位。時間只能用傳進來的 <code>now</code>。</p>
+  <script type="start">
+class ClockMovedBackwardsError extends Error {
+  name = 'ClockMovedBackwardsError'
+}
+
+function createSnowflake(opts: { machineId: number; epochMs: number; now: () => number }): () => bigint {
+  throw new Error('TODO')
+}
+
+function parseSnowflake(id: bigint, epochMs: number): { timestampMs: number; machineId: number; sequence: number } {
+  throw new Error('TODO')
+}
+
+const EPOCH = Date.UTC(2026, 0, 1)
+let t = EPOCH + 1000
+const nextId = createSnowflake({ machineId: 7, epochMs: EPOCH, now: () => t })
+const a = nextId()
+const b = nextId()
+console.log(a, b, b > a)
+console.log(parseSnowflake(b, EPOCH))   // { timestampMs: EPOCH + 1000, machineId: 7, sequence: 1 }
+</script>
+  <script type="answer">
+class ClockMovedBackwardsError extends Error {
+  name = 'ClockMovedBackwardsError'
+}
+
+const MAX_SEQUENCE = 0xfff     // 12 位元：0～4095
+
+function createSnowflake(opts: { machineId: number; epochMs: number; now: () => number }): () => bigint {
+  const { machineId, epochMs, now } = opts
+  if (!Number.isInteger(machineId) || machineId < 0 || machineId > 1023) {
+    throw new RangeError(`machineId 要是 0～1023 的整數：${machineId}`)
+  }
+  let lastMs = -Infinity
+  let sequence = 0
+  return () => {
+    let ms = now()
+    if (ms < lastMs) throw new ClockMovedBackwardsError(`時鐘倒退：上次 ${lastMs}，現在 ${ms}`)
+    if (ms === lastMs) {
+      if (sequence === MAX_SEQUENCE) {
+        while (ms <= lastMs) ms = now()      // 這一毫秒的序號用完，等到下一毫秒
+        sequence = 0
+      } else {
+        sequence++
+      }
+    } else {
+      sequence = 0
+    }
+    lastMs = ms
+    return (BigInt(ms - epochMs) << 22n) | (BigInt(machineId) << 12n) | BigInt(sequence)
+  }
+}
+
+function parseSnowflake(id: bigint, epochMs: number): { timestampMs: number; machineId: number; sequence: number } {
+  return {
+    timestampMs: Number(id >> 22n) + epochMs,
+    machineId: Number((id >> 12n) & 0x3ffn),
+    sequence: Number(id & 0xfffn),
+  }
+}
+
+const EPOCH = Date.UTC(2026, 0, 1)
+let t = EPOCH + 1000
+const nextId = createSnowflake({ machineId: 7, epochMs: EPOCH, now: () => t })
+const a = nextId()
+const b = nextId()
+console.log(a, b, b > a)
+console.log(parseSnowflake(b, EPOCH))
+</script>
+  <script type="tests">
+function noRealClock<T>(fn: () => T): T {
+  const g = globalThis as any
+  const saved = { now: Date.now, random: Math.random, setTimeout: g.setTimeout }
+  const boom = (name: string) => () => { throw new Error(`不能用 ${name}：時間要用傳進來的 now()`) }
+  Date.now = boom('Date.now')
+  Math.random = boom('Math.random')
+  g.setTimeout = boom('setTimeout')
+  try { return fn() } finally { Date.now = saved.now; Math.random = saved.random; g.setTimeout = saved.setTimeout }
+}
+const E = Date.UTC(2026, 0, 1)
+for (const bad of [-1, 1024, 1.5, NaN]) {
+  let err: unknown
+  try { createSnowflake({ machineId: bad, epochMs: E, now: () => E }) } catch (e) { err = e }
+  assert(err instanceof RangeError, `machineId = ${bad} 要丟 RangeError`)
+}
+{
+  let t = E + 5
+  const gen = createSnowflake({ machineId: 3, epochMs: E, now: () => t })
+  const first = noRealClock(gen)
+  assert.equal(first, (5n << 22n) | (3n << 12n), 'ID = (now − epoch) << 22n | machineId << 12n | sequence，第一個序號是 0')
+  const same = noRealClock(() => Array.from({ length: 9 }, gen))
+  same.forEach((id, i) => assert.equal(id, (5n << 22n) | (3n << 12n) | BigInt(i + 1), `同一毫秒的第 ${i + 2} 個 ID 序號要是 ${i + 1}`))
+  t = E + 6
+  assert.equal(noRealClock(gen), (6n << 22n) | (3n << 12n), '換到新的毫秒時序號要歸零')
+  t = E + 2
+  let err: unknown
+  try { noRealClock(gen) } catch (e) { err = e }
+  assert(err instanceof ClockMovedBackwardsError, '時鐘倒退時要丟 ClockMovedBackwardsError，不能產生可能重複的 ID')
+  t = E + 6
+  assert.equal(noRealClock(gen), (6n << 22n) | (3n << 12n) | 1n, '時鐘回到上次的毫秒之後可以繼續產生，序號接著往下')
+}
+{
+  let t = E + 100
+  let spinning = false
+  let spins = 0
+  const now = () => {
+    if (spinning && ++spins > 3) t = E + 101
+    return t
+  }
+  const gen = createSnowflake({ machineId: 1023, epochMs: E, now })
+  const ids = noRealClock(() => Array.from({ length: 4096 }, gen))
+  assert.equal(ids[4095], (100n << 22n) | (1023n << 12n) | 4095n, '同一毫秒可以產生 4,096 個 ID（序號 0～4095）')
+  spinning = true
+  const next = noRealClock(gen)
+  assert.equal(next, (101n << 22n) | (1023n << 12n), '序號用完時要一直呼叫 now() 等到下一毫秒，序號從 0 開始，不能溢位到機器編號的位元')
+  assert(spins > 1, '序號用完時要重新呼叫 now()，等時間前進')
+}
+{
+  const big = 2 ** 41 - 1
+  let t = big
+  const gen = createSnowflake({ machineId: 1023, epochMs: 0, now: () => t })
+  assert.equal(noRealClock(gen), (BigInt(big) << 22n) | (1023n << 12n), '時間接近 41 位元上限時 ID 仍要精確：要用 bigint 計算，number 超過 2^53 會失去精度')
+  assert.equal(noRealClock(gen), (BigInt(big) << 22n) | (1023n << 12n) | 1n, '大時間戳加上序號 1 也要精確')
+}
+function mulberry32(seed: number) {
+  return () => {
+    seed = seed + 0x6d2b79f5 | 0
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed)
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t
+    return ((t ^ t >>> 14) >>> 0) / 4294967296
+  }
+}
+const rnd = mulberry32(4096)
+for (let k = 0; k < 300; k++) {
+  const ts = Math.floor(rnd() * 2 ** 41)
+  const m = Math.floor(rnd() * 1024)
+  const s = Math.floor(rnd() * 4096)
+  const id = (BigInt(ts) << 22n) | (BigInt(m) << 12n) | BigInt(s)
+  assert.deepEqual(parseSnowflake(id, E), { timestampMs: ts + E, machineId: m, sequence: s }, `parseSnowflake 拆錯了：時間 ${ts}、機器 ${m}、序號 ${s}`)
+}
+{
+  let t = E
+  let calls = 0
+  const gen = createSnowflake({ machineId: 42, epochMs: E, now: () => { if (++calls % 7 === 0) t++; return t } })
+  const ids = noRealClock(() => Array.from({ length: 10000 }, gen))
+  assert.equal(new Set(ids).size, ids.length, '1 萬個 ID 不能重複')
+  assert(ids.every((id, i) => i === 0 || id > ids[i - 1]), '同一台機器產生的 ID 要遞增')
+  assert(ids.every(id => parseSnowflake(id, E).machineId === 42), '每個 ID 都要能拆回機器編號 42')
+}
+</script>
+  <script type="wrong">
+class ClockMovedBackwardsError extends Error { name = 'ClockMovedBackwardsError' }
+function createSnowflake(opts: { machineId: number; epochMs: number; now: () => number }): () => bigint {
+  const { machineId, epochMs, now } = opts
+  if (!Number.isInteger(machineId) || machineId < 0 || machineId > 1023) throw new RangeError('machineId')
+  let lastMs = -Infinity, sequence = 0
+  return () => {
+    let ms = now()
+    if (ms < lastMs) throw new ClockMovedBackwardsError('back')
+    if (ms === lastMs) {
+      if (sequence === 4095) { while (ms <= lastMs) ms = now(); sequence = 0 } else sequence++
+    } else sequence = 0
+    lastMs = ms
+    return BigInt((ms - epochMs) * 2 ** 22 + machineId * 2 ** 12 + sequence)
+  }
+}
+function parseSnowflake(id: bigint, epochMs: number) {
+  return { timestampMs: Number(id >> 22n) + epochMs, machineId: Number((id >> 12n) & 0x3ffn), sequence: Number(id & 0xfffn) }
+}
+</script>
+  <script type="wrong">
+class ClockMovedBackwardsError extends Error { name = 'ClockMovedBackwardsError' }
+function createSnowflake(opts: { machineId: number; epochMs: number; now: () => number }): () => bigint {
+  const { machineId, epochMs, now } = opts
+  if (!Number.isInteger(machineId) || machineId < 0 || machineId > 1023) throw new RangeError('machineId')
+  let lastMs = -Infinity, sequence = -1
+  return () => {
+    let ms = now()
+    if (ms < lastMs) throw new ClockMovedBackwardsError('back')
+    if (sequence === 4095) { while (ms <= lastMs) ms = now(); sequence = -1 }
+    sequence++
+    lastMs = ms
+    return (BigInt(ms - epochMs) << 22n) | (BigInt(machineId) << 12n) | BigInt(sequence)
+  }
+}
+function parseSnowflake(id: bigint, epochMs: number) {
+  return { timestampMs: Number(id >> 22n) + epochMs, machineId: Number((id >> 12n) & 0x3ffn), sequence: Number(id & 0xfffn) }
+}
+</script>
+  <script type="wrong">
+class ClockMovedBackwardsError extends Error { name = 'ClockMovedBackwardsError' }
+function createSnowflake(opts: { machineId: number; epochMs: number; now: () => number }): () => bigint {
+  const { machineId, epochMs, now } = opts
+  if (!Number.isInteger(machineId) || machineId < 0 || machineId > 1023) throw new RangeError('machineId')
+  let lastMs = -Infinity, sequence = 0
+  return () => {
+    const ms = now()
+    if (ms < lastMs) throw new ClockMovedBackwardsError('back')
+    sequence = ms === lastMs ? sequence + 1 : 0
+    lastMs = ms
+    return (BigInt(ms - epochMs) << 22n) | (BigInt(machineId) << 12n) | BigInt(sequence)
+  }
+}
+function parseSnowflake(id: bigint, epochMs: number) {
+  return { timestampMs: Number(id >> 22n) + epochMs, machineId: Number((id >> 12n) & 0x3ffn), sequence: Number(id & 0xfffn) }
+}
+</script>
+  <script type="wrong">
+class ClockMovedBackwardsError extends Error { name = 'ClockMovedBackwardsError' }
+function createSnowflake(opts: { machineId: number; epochMs: number; now: () => number }): () => bigint {
+  const { machineId, epochMs, now } = opts
+  if (!Number.isInteger(machineId) || machineId < 0 || machineId > 1023) throw new RangeError('machineId')
+  let lastMs = -Infinity, sequence = 0
+  return () => {
+    let ms = now()
+    if (ms <= lastMs) {
+      ms = lastMs
+      if (sequence === 4095) { while (ms <= lastMs) ms = now(); sequence = 0 } else sequence++
+    } else sequence = 0
+    lastMs = ms
+    return (BigInt(ms - epochMs) << 22n) | (BigInt(machineId) << 12n) | BigInt(sequence)
+  }
+}
+function parseSnowflake(id: bigint, epochMs: number) {
+  return { timestampMs: Number(id >> 22n) + epochMs, machineId: Number((id >> 12n) & 0x3ffn), sequence: Number(id & 0xfffn) }
+}
+</script>
+  <script type="wrong">
+class ClockMovedBackwardsError extends Error { name = 'ClockMovedBackwardsError' }
+function createSnowflake(opts: { machineId: number; epochMs: number; now: () => number }): () => bigint {
+  const { machineId, epochMs, now } = opts
+  if (!Number.isInteger(machineId) || machineId < 0 || machineId > 1023) throw new RangeError('machineId')
+  let lastMs = -Infinity, sequence = 0
+  return () => {
+    let ms = now()
+    if (ms < lastMs) throw new ClockMovedBackwardsError('back')
+    if (ms === lastMs) {
+      if (sequence === 4095) { while (ms <= lastMs) ms = now(); sequence = 0 } else sequence++
+    } else sequence = 0
+    lastMs = ms
+    return (BigInt(ms - epochMs) << 12n) | (BigInt(machineId) << 22n) | BigInt(sequence)
+  }
+}
+function parseSnowflake(id: bigint, epochMs: number) {
+  return { timestampMs: Number(id >> 12n) + epochMs, machineId: Number((id >> 22n) & 0x3ffn), sequence: Number(id & 0xfffn) }
+}
+</script>
+  <script type="wrong">
+class ClockMovedBackwardsError extends Error { name = 'ClockMovedBackwardsError' }
+function parseSnowflake(id: bigint, epochMs: number) {
+  return { timestampMs: Number(id >> 22n) + epochMs, machineId: Number((id >> 12n) & 0x3ffn), sequence: Number(id & 0xfffn) }
+}
+function createSnowflake(opts: { machineId: number; epochMs: number; now: () => number }): () => bigint {
+  const { machineId, epochMs, now } = opts
+  if (!Number.isInteger(machineId) || machineId < 0 || machineId > 1023) throw new RangeError('machineId')
+  let lastMs = -Infinity, sequence = 0
+  return () => {
+    let ms = now()
+    const prev = lastMs
+    lastMs = ms
+    if (ms < prev) throw new ClockMovedBackwardsError('back')
+    if (ms === prev) {
+      if (sequence === 4095) { while (ms <= prev) ms = now(); sequence = 0; lastMs = ms } else sequence++
+    } else sequence = 0
+    return (BigInt(ms - epochMs) << 22n) | (BigInt(machineId) << 12n) | BigInt(sequence)
+  }
+}
+</script>
+  <script type="wrong">
+class ClockMovedBackwardsError extends Error { name = 'ClockMovedBackwardsError' }
+function parseSnowflake(id: bigint, epochMs: number) {
+  return { timestampMs: Number(id >> 22n) + epochMs, machineId: Number((id >> 12n) & 0x3ffn), sequence: Number(id & 0xfffn) }
+}
+function createSnowflake(opts: { machineId: number; epochMs: number; now: () => number }): () => bigint {
+  const { machineId, epochMs, now } = opts
+  if (!Number.isInteger(machineId) || machineId < 0 || machineId > 1023) throw new RangeError('machineId')
+  let lastMs = -Infinity, sequence = 0
+  return () => {
+    let ms = now()
+    if (ms < lastMs) throw new ClockMovedBackwardsError('back')
+    if (ms === lastMs) {
+      if (sequence === 4095) { ms = lastMs + 1; sequence = 0 } else sequence++
+    } else sequence = 0
+    lastMs = ms
+    return (BigInt(ms - epochMs) << 22n) | (BigInt(machineId) << 12n) | BigInt(sequence)
+  }
+}
+</script>
+  <script type="wrong">
+class ClockMovedBackwardsError extends Error { name = 'ClockMovedBackwardsError' }
+function parseSnowflake(id: bigint, epochMs: number) {
+  return { timestampMs: Number(id >> 22n) + epochMs, machineId: Number((id >> 12n) & 0x3ffn), sequence: Number(id & 0xfffn) }
+}
+function createSnowflake(opts: { machineId: number; epochMs: number; now: () => number }): () => bigint {
+  const { machineId, epochMs, now } = opts
+  if (!Number.isInteger(machineId) || machineId < 0 || machineId > 1023) throw new RangeError('machineId')
+  let lastMs = -Infinity, sequence = 0
+  return () => {
+    let ms = now()
+    if (ms < lastMs) throw new ClockMovedBackwardsError('back')
+    if (ms === lastMs) {
+      if (sequence === 4095) { while (Date.now() <= lastMs) {} ms = now(); sequence = 0 } else sequence++
+    } else sequence = 0
+    lastMs = ms
+    return (BigInt(ms - epochMs) << 22n) | (BigInt(machineId) << 12n) | BigInt(sequence)
+  }
+}
+</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：4 台快取伺服器用 <code>hash(key) % N</code> 分配 key。加到 5 台時，大約多少 key 會換到別台？</p>
+  <label data-key="a">約 20%：新的那一台分到它的一份，其他不動</label>
+  <label data-key="b">約 25%：原本每台的四分之一</label>
+  <label data-key="c">約 80%：除數變了，大部分 key 的餘數都變</label>
+  <label data-key="d">0%：雜湊值沒變，key 不會換機器</label>
+  <p class="why">✓ 雜湊值沒變，但 % 4 和 % 5 的結果只有在少數情況下相同（本課範例實測約 79% 換機器）。對快取來說，這等於幾乎全部失效、所有請求同時打到資料庫。20% 是一致性雜湊才做得到的理想值：只有新機器負責的那一段要搬。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：用 store_id 當分片鍵、用 hash 分配。台北旗艦店佔全部訂單的 30%，會發生什麼事？</p>
+  <label data-key="a">沒問題，hash 會把資料平均分散</label>
+  <label data-key="b">旗艦店的所有訂單雜湊值都一樣、永遠在同一片，那一片扛 30% 的負載，成為熱點</label>
+  <label data-key="c">旗艦店的訂單會被自動拆到多片</label>
+  <p class="why">✓ hash 只能把<strong>不同的值</strong>打散，同一個值永遠雜湊到同一個位置。分成 10 片時，理想上每片 10%，旗艦店那片卻至少 30%。要嘛換分片鍵（例如 customer_id），要嘛替熱門值加尾碼拆成多個 key，代價是查旗艦店時要讀多片。用 store_id 做 hash 分片時，同一個值不會被自動拆到多片。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 7：訂單分在 4 片。要查全公司最新的 20 筆，工程師讓每片取 5 筆再合併。這樣對嗎？</p>
+  <label data-key="a">不對：最新的 20 筆可能都在同一片，每片都要取 20 筆再合併取前 20</label>
+  <label data-key="b">對：4 × 5 = 20，而且每片負擔一樣</label>
+  <label data-key="c">對，只要分片鍵是用 hash 分配的，每片的新訂單就一樣多</label>
+  <p class="why">✓ 平均而言每片各有 5 筆，但「最新的 20 筆」是全域的條件，某一片在某個時段特別忙（大客戶辦活動）時，前 20 筆可能全部來自它。只取 5 筆就會漏掉資料，而且沒有任何錯誤訊息。hash 讓長期總量平均，不保證某一段時間內每片都一樣多。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 8：資料庫分成 4 片之後，訂單 ID 還能繼續用每片 PostgreSQL 的 identity 自動編號嗎？</p>
+  <label data-key="a">可以，每片各自遞增就不會重複</label>
+  <label data-key="b">不行，不同片都會從 1 開始，訂單 ID 會撞號；改用 UUIDv7、Snowflake 或集中發號</label>
+  <label data-key="c">可以，只要 API 回傳時加上分片編號就好，之後增減分片也不受影響</label>
+  <p class="why">✓ identity 只保證在<strong>那一個</strong>資料庫裡唯一。第 0 片和第 1 片都會產生 1 號訂單。加上分片編號可以暫時區分，但資料一搬到別片（重新平衡）ID 就要改，外部系統存的 ID 全部失效。UUIDv7 和 Snowflake 不需要協調就全域唯一，而且大致依時間排序。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 9：訂單表 300 GB、尖峰每秒 5 筆寫入，「我的訂單」和報表越來越慢。同事提議馬上依 customer_id 分片，最恰當的回應是？</p>
+  <label data-key="a">先找出慢的查詢補索引，讀取多就加讀副本或快取；分片留給單機撐不住的寫入與儲存</label>
+  <label data-key="b">同意分片，先用 hash % 4 分配，之後不夠時再改成 % 8，路由邏輯最簡單</label>
+  <label data-key="c">同意分片，customer_id 打散得很平均，報表和其他查詢也不會因此變複雜</label>
+  <p class="why">✓ 這個量一台 PostgreSQL 撐得住，慢的是讀取；讀副本、快取、分割表都比分片便宜，而且可以回頭。分片的跨片查詢、重新平衡和維運代價會一直付下去。c 錯在報表不帶 customer_id，每次都要查遍所有分片，延遲由最慢的一片決定。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>太早分片</strong>：咖啡店 5 年才 284.7 GB，一台 PostgreSQL 就夠。先用垂直擴充、讀副本、快取、分割表、依功能拆庫；分片的代價（跨片查詢、重新平衡、維運）會一直付下去。</li>
+  <li><strong>選好實作而不是好查詢的分片鍵</strong>：從存取模式出發，量化「單片查詢比例（依流量加權）」和「最熱的一片佔多少」。</li>
+  <li><strong>以為 hash 就不會有熱點</strong>：hash 只打散不同的值，同一個值永遠在同一片。熱門的店或大客戶要單獨處理。</li>
+  <li><strong>用 hash % N 分配</strong>：增減一台機器幾乎所有資料都要搬、快取幾乎全部失效。用一致性雜湊或固定數量的邏輯分片。</li>
+  <li><strong>一致性雜湊不放虛擬節點</strong>：每台只放一個點時，分布可能差好幾倍。</li>
+  <li><strong>跨片查詢每片只取一部分</strong>：結果會少資料，而且不會報錯。每片都取 limit 筆，平行查詢，並且記得延遲由最慢的一片決定。</li>
+  <li><strong>跨片分頁用 offset 或只用時間當 cursor</strong>：會重複或遺漏。cursor 用 (orderedAt, id)。</li>
+  <li><strong>64 位元 ID 用 JavaScript number</strong>：超過 2<sup>53</sup> 就不精確。計算用 bigint，JSON 裡用字串。</li>
+  <li><strong>忽略時鐘倒退</strong>：NTP 校時後可能產生重複 ID。拒絕產生，等時鐘追上。</li>
+  <li><strong>連號 ID 直接對外</strong>：洩漏營業量、方便列舉他人的資料。授權檢查一定要做。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>分片是把同一張表拆到多台獨立的資料庫，解決單機撐不住的寫入、儲存與記憶體。代價是跨片交易與查詢要自己處理，所以先用垂直擴充、讀副本、快取、分割表、依功能拆庫，有數字證明都不夠才分片。</li>
+  <li>分片鍵從存取模式選：大部分查詢都帶、沒有熱點、一筆交易在同一片。用「單片查詢比例（依流量加權）」與「最熱的一片佔多少」量化比較；咖啡店因此選 customer_id。</li>
+  <li>range 分片利於範圍查詢，但新資料集中在最新的一片；hash 分片打散不同的值，但同一個值永遠在同一片。</li>
+  <li>hash % N 改變 N 時大部分 key 要搬；一致性雜湊只搬約 1/(N+1)（新機器分到的那一份），虛擬節點讓分布平均、也能依容量加權。正式環境常用固定數量的邏輯分片＋目錄。</li>
+  <li>沒帶分片鍵的查詢用 scatter-gather：平行查詢、每片都取 limit 筆再合併，用 (時間, id) 的 cursor 分頁，延遲由最慢的一片決定。高頻的跨片查詢改用全域次要索引。</li>
+  <li>全域唯一 ID：UUIDv7（RFC 9562，PostgreSQL 18 的 uuidv7()）或 Snowflake（41／10／12 位元），開頭是時間所以對 B-tree 友善；用 bigint 計算、JSON 用字串、處理序號用完與時鐘倒退。</li>
+  <li>上線後看每一片各自的資料量、QPS、延遲與跨片查詢比例；某一片太滿時用雙寫、回填、比對、切讀、停寫的步驟線上重新平衡。</li>
+  <li>不是所有資料都要放進分片的 PostgreSQL：先用 PostgreSQL，有數字證明撐不住再加別種儲存（見課末）。</li>
+</ul>
+
+<p>這個階段的重點整理成<a href="../sheets/stage-2.html">一頁圖解</a>。</p>
+<p>下一課進入階段 3：可靠性。分片之後一個請求可能要打好幾台機器，任何一台變慢都會拖住整個請求，所以要先學會逾時、重試與退避。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

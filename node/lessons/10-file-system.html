@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>10. 檔案系統：路徑、錯誤碼與原子寫入</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="10" data-practice="node">
+<header>
+  <div class="eyebrow">階段 3：檔案與位元組 · 第 10 課</div>
+  <h1>檔案系統：路徑、錯誤碼與原子寫入</h1>
+</header>
+<main>
+
+<p>咖啡店的小後台還沒有資料庫：菜單存在 <code>data/menu.json</code>，訂單存在 <code>orders.json</code>。本機測試一切正常，上線第一週卻接連出了四件事：</p>
+<ol>
+  <li>從別的資料夾啟動伺服器，就說找不到菜單。</li>
+  <li>有一天菜單檔的權限被設錯，網站沒有報錯，而是顯示「今天沒有商品」，直到客人抱怨才有人發現。</li>
+  <li>後台存訂單檔的同時有別的請求在讀它，讀到寫一半的 JSON，那段時間的請求全部 500。</li>
+  <li>兩筆訂單同時送出，<code>orders.json</code> 裡只存進一筆。</li>
+</ol>
+<p>這四件都不是語法錯誤，是對檔案系統的假設錯了：以為相對路徑一定從程式旁邊算、以為讀檔失敗就代表檔案不存在、以為寫檔是一瞬間的事、以為同一時間只有一個人在改檔案。這課依序修好它們，練習裡的 <code>loadMenu</code>、<code>print-menu.ts</code>、<code>saveOrders</code>、<code>addOrder</code> 就是這四個事故的修法。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>讀菜單用哪一種寫法：<code>node:fs</code> 有三種 API，為什麼處理請求只用 <code>fs/promises</code>。</li>
+  <li>換個資料夾就找不到菜單（事故 1）：相對路徑從哪裡算，程式自己帶的檔案怎麼找。</li>
+  <li>讀檔失敗怎麼分辨「還沒有資料」和「出事了」（事故 2）：看 <code>err.code</code>，不先檢查存在、不吞掉錯誤。</li>
+  <li>存檔時別人讀到半份 JSON（事故 3）：寫到暫存檔再 <code>rename</code> 的原子寫入。</li>
+  <li>兩筆訂單只存進一筆（事故 4）：一個程序內排隊，好幾個程序用鎖檔，什麼時候該換成資料庫；最後補上自己開的檔案為什麼一定要關。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="04-modules.html">第 4 課</a>的 <code>import.meta.dirname</code>：目前這個程式檔所在的資料夾，不受從哪裡執行 <code>node</code> 影響。</li>
+  <li><a href="07-event-loop.html">第 7 課</a>的 thread pool：非同步的檔案讀寫交給 libuv 管理的一組背景執行緒，主執行緒繼續處理別的事。</li>
+  <li><a href="09-blocking-and-workers.html">第 9 課</a>的阻塞：同步的工作佔住唯一的 JavaScript 執行緒時，所有請求一起等。</li>
+  <li><a href="../../typescript/lessons/12-races-concurrency.html">TypeScript 課第 12 課</a>的 Promise 鏈鎖：新工作接在上一個工作的 Promise 後面，讓非同步的操作一個一個來。</li>
+</ul></div>
+
+<p>範例在 <code>node/practice/work/10/examples/</code>，第一次執行 <code>node check.mjs node 10</code> 後就會出現；在 <code>work/10/</code> 裡執行 <code>node examples/檔名.ts</code>。</p>
+
+<h2>讀菜單要用 node:fs 的哪一種寫法？</h2>
+<p>修事故之前，先決定讀檔要怎麼寫。Node 操作檔案的內建模組是 <code>node:fs</code>（fs 是 file system 的縮寫）。因為歷史因素，同一件事有三種寫法，它們讀到的內容一樣，差別在「讀檔的這段時間，你的程式在做什麼」：</p>
+<ul>
+  <li><strong>callback</strong>：呼叫時多傳一個函式，Node 讀完後呼叫它，第一個參數是錯誤（沒出錯是 <code>null</code>），第二個是結果。這是 Node 最早的非同步風格，Promise 出現之前的程式和套件都這樣寫。</li>
+  <li><strong>Sync</strong>：函式名稱結尾是 <code>Sync</code>，例如 <code>readFileSync</code>。它一直到讀完才回傳，回傳值直接是內容，失敗時直接 <code>throw</code>。</li>
+  <li><strong>Promise</strong>：從 <code>node:fs/promises</code> 匯入，回傳 Promise，配 <code>await</code> 和 <code>try</code>／<code>catch</code> 用，寫起來跟前端的 <code>fetch</code> 一樣。</li>
+</ul>
+<p>執行 <code>node examples/api-styles.ts</code>，三種寫法依序讀同一份菜單：</p>
+<pre>import { readFile as readFileCb, readFileSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
+
+readFileCb(file, 'utf8', (err, text) => { … })   // 1. callback：做完時呼叫你的函式，第一個參數是錯誤
+const text = readFileSync(file, 'utf8')          // 2. Sync：讀完才往下走
+const text2 = await readFile(file, 'utf8')       // 3. fs/promises：回傳 Promise</pre>
+<pre>Sync      讀到 241 個字
+callback  讀到 241 個字
+promises  讀到 241 個字</pre>
+<p>看輸出的順序：callback 寫在最前面，卻比 Sync 晚印。原因是 callback 版把讀檔交給 thread pool（<a href="07-event-loop.html">第 7 課</a>），自己馬上回傳，主執行緒繼續往下跑，才先跑到了 Sync 那一行。Sync 版本則是主執行緒自己等：讀完之前，整個程序什麼都不能做。命令列工具只做一件事，等一下無所謂；但在伺服器裡，這段時間所有請求都一起等（<a href="09-blocking-and-workers.html">第 9 課</a>）。菜單檔很小，讀一次只要很短的時間，可是每個請求都讀一次，或者檔案變大、磁碟變慢，就會累積成第 9 課那種整站卡住。</p>
+<p>所以三種寫法的分工是：</p>
+<div class="table-wrap"><table>
+  <tr><th>寫法</th><th>什麼時候用</th></tr>
+  <tr><td><code>node:fs/promises</code></td><td>預設。處理請求時一律用它，配 <code>async</code>／<code>await</code> 和 <code>try</code>／<code>catch</code></td></tr>
+  <tr><td><code>readFileSync</code> 等 Sync</td><td>程式啟動時讀一次設定、命令列小工具。這時還沒有請求在等，卡住沒關係</td></tr>
+  <tr><td>callback</td><td>舊程式和舊套件。看得懂就好，新程式不用</td></tr>
+</table></div>
+<p>這課接下來都用 <code>fs/promises</code>，讀菜單寫成 <code>await readFile(path, 'utf8')</code>。第二個參數 <code>'utf8'</code> 告訴它把讀到的位元組轉成字串；不給的話回傳的是 Buffer，也就是原始的位元組，<a href="11-buffer-encoding.html">第 11 課</a>詳講。寫入、列出資料夾、刪除這些其他操作的函式整理在課末的「補充與查表」，用到時再查。</p>
+<p>寫法決定了，但事故 1 跟寫法無關：同一行 <code>readFile('./data/menu.json', 'utf8')</code>，換三種寫法都一樣，換個資料夾啟動就找不到檔。問題出在 <code>'./data/menu.json'</code> 這個路徑是怎麼算出來的。</p>
+
+<h2>為什麼換個資料夾啟動，就找不到菜單？</h2>
+<p>每個程序都有一個<strong>工作目錄</strong>（current working directory）：啟動它的程序替它決定的資料夾。從終端機手動執行時，就是你當下在終端機所在的資料夾；由 Docker、系統服務或排程工具啟動時，則是它們設定的資料夾。程式裡可以用 <code>process.cwd()</code> 查到它。不是 <code>/</code> 開頭的路徑叫<strong>相對路徑</strong>，例如 <code>'./data/menu.json'</code>；作業系統解讀相對路徑時，是從工作目錄算起，不是從程式檔放的位置算起。<a href="04-modules.html">第 4 課</a>已經碰過這件事，fs 的每個函式都照這條規則。</p>
+<p>所以在 <code>work/10/</code> 執行時，<code>'./data/menu.json'</code> 指到 <code>work/10/data/menu.json</code>，找得到；到上一層 <code>work/</code> 執行同一支程式，它指到 <code>work/data/menu.json</code>，那裡沒有檔案，讀檔就會失敗。這種失敗的錯誤碼是 ENOENT，意思是找不到檔案或資料夾，下一節會詳講錯誤碼。程式一個字都沒改，只是啟動的地方不同。</p>
+<p>親眼看一次：執行 <code>node examples/paths.ts</code>，再到上一層執行 <code>node 10/examples/paths.ts</code>，比較兩次的輸出。下面是在 <code>work/10/</code> 執行的結果：</p>
+<pre>process.cwd()         /Users/you/…/work/10
+import.meta.dirname   /Users/you/…/work/10/examples
+resolve('data/menu.json') /Users/you/…/work/10/data/menu.json
+join(import.meta.dirname, '..', 'data', 'menu.json') /Users/you/…/work/10/data/menu.json
+join('a/b', '../c', 'd.json') a/c/d.json
+resolve('/srv', 'menu', '/etc') /etc
+dirname  /srv/shop/data
+basename menu.json menu
+extname  .json
+new URL('../data/menu.json', import.meta.url) file:///Users/you/…/work/10/data/menu.json</pre>
+<p>換到上一層執行時，<code>process.cwd()</code> 和 <code>resolve('data/menu.json')</code> 跟著變，後者指到不存在的 <code>work/data/menu.json</code>；<code>import.meta.dirname</code> 和用它組出來的路徑不變。</p>
+<p>這就是修法：程式自己帶的檔案，要以<strong>程式檔所在的資料夾</strong>為起點，而不是工作目錄。<code>import.meta.dirname</code>（<a href="04-modules.html">第 4 課</a>）是 Node 載入這個模組時就決定的絕對路徑，跟從哪裡啟動無關。把它和後面的片段接起來，用的是 <code>node:path</code> 模組，不要自己用字串相加：自己接容易多一個或少一個斜線，也不會幫你處理 <code>..</code>。<code>node:path</code> 裡最常用的兩個函式行為不太一樣：</p>
+<div class="table-wrap"><table>
+  <tr><th>函式</th><th>做什麼</th></tr>
+  <tr><td><code>join(a, b, …)</code></td><td>用 <code>/</code> 接起來並整理 <code>..</code>、<code>.</code>、重複的斜線；結果可能還是相對路徑</td></tr>
+  <tr><td><code>resolve(a, b, …)</code></td><td>從右往左組到變成絕對路徑為止，不夠就補上工作目錄。遇到 <code>/</code> 開頭的片段，前面的全部丟掉（上面的 <code>/etc</code>）</td></tr>
+  <tr><td><code>dirname</code>／<code>basename</code>／<code>extname</code></td><td>取出資料夾、檔名、副檔名</td></tr>
+</table></div>
+<p>對照輸出看：<code>join('a/b', '../c', 'd.json')</code> 只是把片段接起來、把 <code>b/..</code> 抵銷，結果 <code>a/c/d.json</code> 還是相對路徑，拿去讀檔一樣從工作目錄算；<code>resolve('data/menu.json')</code> 片段不夠組成絕對路徑，就在前面補上工作目錄，所以它會跟著啟動位置變。菜單要寫成 <code>join(import.meta.dirname, '..', 'data', 'menu.json')</code>：起點本身是絕對路徑，接出來的結果就固定了。這裡多一個 <code>'..'</code>，是因為 <code>paths.ts</code> 在 <code>examples/</code> 裡，<code>data/</code> 在它的上一層；程式檔和 <code>data/</code> 在同一層時（例如練習 2 的 <code>print-menu.ts</code>），寫 <code>join(import.meta.dirname, 'data', 'menu.json')</code> 就好。另一種寫法 <code>new URL('../data/menu.json', import.meta.url)</code> 以程式檔的網址為基準，得到 <code>file://</code> 網址，fs 的函式也收這種 URL。</p>
+<p>那 <code>resolve()</code> 什麼時候用？看路徑是誰給的：</p>
+<ul>
+  <li><strong>程式自己帶的檔案</strong>（菜單範本、SQL、測試資料）：以程式檔為準，用 <code>join(import.meta.dirname, …)</code> 或 <code>new URL(…, import.meta.url)</code>。</li>
+  <li><strong>使用者給的路徑</strong>（命令列參數，例如 <code>node tool.ts ./orders.csv</code>）：使用者打 <code>./orders.csv</code> 時，指的就是他當下所在資料夾裡的檔案，所以以工作目錄為準，用 <code>resolve()</code> 轉成絕對路徑。</li>
+</ul>
+<div class="callout warn">上線後「找不到檔」還有一個跟工作目錄無關的原因：大小寫。macOS 預設的檔案系統（APFS）不分大小寫：<code>import './Menu.ts'</code> 找得到 <code>menu.ts</code>，<code>readFile('Data/menu.json')</code> 也讀得到。部署到 Linux（分大小寫）就變成 ENOENT。檔名一律小寫，程式裡照實際大小寫寫。</div>
+<div class="callout practice"><strong>💡 實務上：上線後的工作目錄常常不是你以為的那個</strong><br>本機你習慣在專案根目錄執行 <code>node</code>，但上線後程式通常不是你手動啟動的：容器（Docker）、系統服務、排程工具會照它們自己的設定決定工作目錄，可能是別的資料夾、甚至根目錄 <code>/</code>，相對路徑就在這時壞掉，事故 1 就是這樣來的。另一個常見坑是把使用者上傳的檔案（例如咖啡店的商品照片）存在程式資料夾裡：重新部署時程式資料夾整個被換掉，照片跟著不見。所以實務上會把「程式自己帶的檔案」和「執行時產生的檔案」分開：前者用 <code>import.meta.dirname</code> 找，後者的位置用環境變數設定（<a href="02-process-config.html">第 2 課</a>）。code review 看到 <code>'./data/…'</code> 這種寫法，資深工程師會先問：「這支程式在正式環境是從哪個資料夾啟動的？」</div>
+<p>路徑對了，<code>readFile</code> 就一定會成功嗎？不一定：檔案可能還沒建立、權限可能被設錯、路徑指到的可能是資料夾。事故 2 的菜單顯示「今天沒有商品」，就是把這些失敗混成了同一種情況。</p>
+
+<h2>讀檔失敗時，怎麼分辨「還沒有資料」和「出事了」？</h2>
+<p>讀檔失敗的原因很多，處理方式卻不一樣：菜單檔還沒建立，可以當成「還沒有商品」；權限被設錯，是設定壞了，要讓人知道。要分辨它們，看的是錯誤物件上的 <code>code</code> 屬性。fs 的函式最後都是請作業系統做事，作業系統做不到時會回傳一個<strong>錯誤碼</strong>（error code），Node 把它原封不動放進 <code>err.code</code>，是一個像 <code>'ENOENT'</code> 這樣的字串。錯誤訊息的文字可能因版本或作業系統而不同，錯誤碼是固定的，程式判斷一律看錯誤碼。</p>
+<p>執行 <code>node examples/errors.ts</code>，它在暫存資料夾裡故意製造幾種常見的失敗，印出每次的 <code>code</code> 和訊息：</p>
+<pre>讀不存在的檔案         ENOENT | ENOENT: no such file or directory, open '/var/folders/…/nope.json'
+把資料夾當檔案讀       EISDIR | EISDIR: illegal operation on a directory, read
+把檔案當資料夾         ENOTDIR | ENOTDIR: not a directory, open '/var/folders/…/menu.json/x'
+'wx' 開已經存在的檔案  EEXIST | EEXIST: file already exists, open '/var/folders/…/menu.json'
+建立已經存在的資料夾   EEXIST | EEXIST: file already exists, mkdir '/var/folders/…/images'</pre>
+<p>這幾個加上權限錯誤，就是工作上最常見的錯誤碼。每一個代表什麼、通常怎麼處理：</p>
+<div class="table-wrap"><table>
+  <tr><th>code</th><th>意思</th><th>通常怎麼處理</th></tr>
+  <tr><td><code>ENOENT</code></td><td>路徑上某一段不存在（No such file or directory）</td><td>看情況：可以當成「還沒有資料」，或回 404</td></tr>
+  <tr><td><code>EACCES</code>／<code>EPERM</code></td><td>沒有權限</td><td>設定錯了，要讓人知道：丟錯、記 log</td></tr>
+  <tr><td><code>EISDIR</code>／<code>ENOTDIR</code></td><td>是資料夾／路徑中間某段不是資料夾</td><td>路徑錯了，丟錯</td></tr>
+  <tr><td><code>EEXIST</code></td><td>已經存在</td><td>用 <code>'wx'</code> 建檔時代表「別人先建了」（後面的鎖檔就靠它）</td></tr>
+  <tr><td><code>EMFILE</code></td><td>這個程序開了太多檔案</td><td>通常是開了沒關，見最後一節</td></tr>
+</table></div>
+<p>表裡只有 <code>ENOENT</code> 對菜單來說是「正常情況」：還沒有菜單檔，就是還沒有商品。其他每一種都代表環境或程式有問題，該讓錯誤往外傳，讓呼叫的人和看 log 的人知道。往外丟之前還有一件事：注意上面 EISDIR 的訊息沒有寫路徑。只看到 <code>illegal operation on a directory, read</code>，在 log 裡根本不知道是哪個檔案出事。所以包裝錯誤時，要自己把路徑寫進訊息，並用 <code>cause</code> 保留原本的錯誤（<a href="../../typescript/lessons/04-errors.html">TypeScript 課第 4 課</a>），錯誤碼和原始訊息才不會在包裝時遺失：</p>
+<pre>try {
+  text = await readFile(path, 'utf8')
+} catch (err) {
+  if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { items: [] }   // 只有「不存在」是正常情況
+  throw new MenuLoadError(`讀不到菜單檔 ${path}`, { cause: err })             // 其他都往外丟
+}</pre>
+<p>這裡的 <code>as</code> 是因為 <code>catch</code> 拿到的 <code>err</code> 型別是 <code>unknown</code>（<a href="../../typescript/lessons/17-unknown-any-guards.html">TypeScript 課第 17 課</a>），TypeScript 不讓你直接讀 <code>.code</code>。<code>NodeJS.ErrnoException</code> 是 <code>@types/node</code> 提供的型別，描述 Node 系統錯誤上的 <code>code</code>、<code>path</code>、<code>syscall</code> 這幾個屬性。</p>
+<p>這段的寫法是「直接讀，失敗了再看錯誤碼」。很多人直覺會反過來寫，先檢查檔案在不在：</p>
+<pre>if (!existsSync(path)) return { items: [] }
+const text = await readFile(path, 'utf8')   // 還是可能 ENOENT</pre>
+<p>看起來更安全，其實有兩個問題。第一，檢查和讀取是兩個動作，中間有一段空檔，這段時間檔案可能被別的程序刪掉、被換掉。這類錯誤叫 <strong>TOCTOU</strong>（time-of-check to time-of-use）：檢查時的狀態，到使用時已經不一樣了。空檔很短，所以平常測不出來，上線後偶爾出現一次，最難查。Node 官方文件也明說不要在 <code>open</code>／<code>readFile</code>／<code>writeFile</code> 之前用 <code>fs.exists</code> 或 <code>fs.access</code> 檢查，直接做，再處理錯誤。第二，<code>existsSync</code> 只回答「在不在」：檔案在但沒有權限、路徑是個資料夾，它一樣回傳 <code>true</code>，接下來的 <code>readFile</code> 還是會失敗，<code>catch</code> 終究要寫。既然 <code>catch</code> 跑不掉，前面的檢查就只是多了一個 TOCTOU 的空檔。</p>
+<p>另一個極端是 <code>catch { return { items: [] } }</code>，把所有錯誤都吞掉。這正是事故 2：菜單檔權限設錯時，<code>readFile</code> 丟出 <code>EACCES</code>，被 catch 接住、變成空菜單，網站顯示「今天沒有商品」，沒有報錯、沒有 log，要等客人抱怨才發現。原則是：只把<strong>你預期、知道怎麼處理</strong>的錯誤碼當成正常情況，其他一律往外丟。練習 1 就是把 <code>loadMenu</code> 改成這樣。</p>
+<div class="callout practice"><strong>💡 實務上：正式環境最常遇到的是 EACCES 和磁碟滿</strong><br>本機用自己的帳號跑什麼都能寫；上線後程式常以權限較低的使用者執行（容器裡常見），要寫入的資料夾卻屬於系統管理員帳號（root），結果一寫就 <code>EACCES</code>。另一個是 <code>ENOSPC</code>（磁碟空間不足），常常是 log 或暫存檔沒清，把磁碟塞滿。這些都不是程式能自己修好的，所以錯誤訊息要帶路徑和錯誤碼、記進 log，維運才能一眼看出要改權限還是清磁碟。事故 2 如果一開始就這樣寫，那天 log 裡會有一行帶著菜單路徑的 <code>EACCES</code>。寫 <code>catch</code> 前先問自己：「這個錯誤碼我知道怎麼處理嗎？不知道就往外丟。」</div>
+<p>讀檔的兩個事故修好了。接下來是寫檔：事故 3 裡，後台存訂單檔的同時有人在讀，讀到的是半份 JSON。讀的那一方程式沒有錯，問題在 <code>writeFile</code> 寫檔的方式。</p>
+
+<h2>存訂單檔時，為什麼別人會讀到半份 JSON？</h2>
+<p><code>writeFile(path, text)</code> 的行為是：檔案不存在就建立，存在就<strong>先把它清成 0 位元組</strong>，再把新內容一段一段寫進去。小檔一下就寫完，看不出問題；訂單檔累積到幾 MB，寫一次要好幾毫秒，這段時間裡檔案是空的或只有前半段。<code>await writeFile</code> 只是讓<em>你這段程式</em>等它寫完，別的請求、別的程序照樣可以在這段時間去讀，讀到的就是殘缺的 JSON，<code>JSON.parse</code> 一 parse 就丟錯，請求變成 500。</p>
+<p>執行 <code>node examples/torn-write.ts</code> 看實際有多常發生：它一邊把約 5MB 的訂單檔存 20 次，一邊不停讀檔並 <code>JSON.parse</code>，數壞掉幾次。前一行是直接 <code>writeFile</code>，後一行是這一節要講的做法：</p>
+<pre>直接 writeFile：讀了 52 次，壞掉 51 次
+暫存檔 + rename：讀了 31 次，壞掉 0 次</pre>
+<p>次數每次不同，但直接 <code>writeFile</code> 幾乎每次讀都壞。要的效果是：讀的人只會看到完整的舊檔或完整的新檔，看不到中間狀態。這個性質叫<strong>原子性</strong>（atomicity）：一個動作要嘛完全沒發生、要嘛完全做完，外面的人看不到做一半的樣子；有這個性質的寫檔叫<strong>原子寫入</strong>（atomic write）。<code>writeFile</code> 一段一段寫，本身做不到。做法是不要在原本的檔案上寫：先把新內容寫到同一個資料夾裡的另一個暫存檔，寫完再一步把它換上去。</p>
+<figure>
+  <svg viewBox="0 0 700 230" role="img" aria-label="直接 writeFile：orders.json 先被清空再慢慢寫，讀的人會讀到一半。原子寫入：先寫 orders.json.隨機名.tmp，寫完再 rename 成 orders.json，讀的人只看得到舊檔或新檔">
+    <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="10" y="10" width="330" height="210" rx="10"/>
+    <text class="d-text" x="175" y="36" text-anchor="middle">直接 writeFile</text>
+    <rect class="d-box" x="40" y="55" width="270" height="36" rx="6"/>
+    <text class="d-text" x="175" y="78" text-anchor="middle">orders.json（舊內容）</text>
+    <rect class="d-box" x="40" y="115" width="270" height="36" rx="6"/>
+    <text class="d-accent" x="175" y="138" text-anchor="middle">orders.json（清空，寫到一半）</text>
+    <rect class="d-box" x="40" y="175" width="270" height="36" rx="6"/>
+    <text class="d-text" x="175" y="198" text-anchor="middle">orders.json（新內容）</text>
+    <line class="d-line" x1="175" y1="91" x2="175" y2="113" marker-end="url(#arr)"/>
+    <line class="d-line" x1="175" y1="151" x2="175" y2="173" marker-end="url(#arr)"/>
+    <rect class="d-soft" x="360" y="10" width="330" height="210" rx="10"/>
+    <text class="d-text" x="525" y="36" text-anchor="middle">暫存檔 + rename</text>
+    <rect class="d-box" x="380" y="55" width="140" height="36" rx="6"/>
+    <text class="d-small" x="450" y="78" text-anchor="middle">orders.json（舊）</text>
+    <rect class="d-box" x="535" y="55" width="140" height="36" rx="6"/>
+    <text class="d-small" x="605" y="78" text-anchor="middle">….tmp 慢慢寫</text>
+    <text class="d-small" x="525" y="135" text-anchor="middle">寫完：rename(tmp, orders.json)</text>
+    <line class="d-line" x1="605" y1="91" x2="540" y2="173" marker-end="url(#arr)"/>
+    <line class="d-line" x1="450" y1="91" x2="510" y2="173" marker-end="url(#arr)"/>
+    <rect class="d-box" x="410" y="175" width="230" height="36" rx="6"/>
+    <text class="d-text" x="525" y="198" text-anchor="middle">orders.json（新，一步換上）</text>
+  </svg>
+  <figcaption>左邊有一段時間檔案是壞的；右邊讀的人在 rename 之前看到舊檔、之後看到新檔，沒有中間狀態。</figcaption>
+</figure>
+<pre>const tmp = `${path}.${randomUUID()}.tmp`   // 同一個資料夾，每次不同的名字
+try {
+  await writeFile(tmp, JSON.stringify(orders))
+  await rename(tmp, path)                   // 一步把新檔換上去
+} catch (err) {
+  await rm(tmp, { force: true })            // 失敗時清掉暫存檔
+  throw err
+}</pre>
+<p>短短幾行，每一個細節都有原因，少一個就會在某種情況下壞掉。</p>
+<p><strong>為什麼 <code>rename</code> 能一步換上去。</strong>寫暫存檔的這段時間，<code>orders.json</code> 完全沒被動到，讀的人讀到的是完整的舊檔。<code>rename</code> 在同一個檔案系統上蓋過已存在的檔案，是一步完成的：它不搬動資料，只是把 <code>orders.json</code> 這個名字改成指向新檔，所以任何時刻這個路徑要嘛指向舊檔、要嘛指向新檔。已經打開舊檔在讀的人，也會讀完完整的舊內容。</p>
+<p><strong>為什麼暫存檔要放在同一個資料夾。</strong>直覺會想放到系統的 <code>/tmp</code>，但 <code>/tmp</code> 可能是另一個檔案系統（例如另一顆磁碟、或記憶體裡的檔案系統）。跨檔案系統沒辦法「只改名字」，<code>rename</code> 會失敗，錯誤碼是 <code>EXDEV</code>；有些搬移工具遇到這種情況會自動改成「複製再刪除」，複製的過程又是一段一段寫，就不是原子的了。放在目標檔旁邊，就保證是同一個檔案系統。</p>
+<p><strong>為什麼名字每次都要不同。</strong>如果固定叫 <code>orders.json.tmp</code>，兩個同時存檔的呼叫會寫進同一個暫存檔，內容互相蓋掉；先 rename 的那個把暫存檔搬走了，後 rename 的那個就找不到檔案，得到 ENOENT。官方文件也寫了：同一個檔案在前一次 <code>writeFile</code> 結束之前再呼叫一次，是不安全的。用 <code>randomUUID()</code> 產生隨機名字，每次呼叫各寫各的暫存檔。</p>
+<p><strong>為什麼失敗時要刪掉暫存檔。</strong>寫到一半磁碟滿了、或 rename 失敗時，暫存檔會留在資料夾裡。不清掉的話，每次失敗都留下一個幾 MB 的 .tmp，磁碟慢慢被吃光，又變成上一節的 <code>ENOSPC</code>。清完之後要把原本的錯誤再丟出去，呼叫的人才知道這次沒存成功。</p>
+<p>原子寫入保證的是「別人不會讀到寫一半的檔案」，不保證「斷電後資料還在」：<code>writeFile</code> 結束時，資料可能還在作業系統的記憶體裡沒寫到磁碟。這是另一件事，叫持久性，要靠 fsync 把資料真正寫到磁碟，細節見課末的「補充與查表」。練習 3 的 <code>saveOrders</code> 就是把上面這段寫完整。</p>
+<div class="callout practice"><strong>💡 實務上：後端什麼時候還會自己寫檔</strong><br>正式資料多半在資料庫，但後端還是常寫檔：匯出給會計的 CSV 報表、命令列工具的設定或狀態、下載到本機的暫存資料。只要「有別人可能同時讀這個檔」或「寫到一半程式可能被中斷」，就用暫存檔＋rename，成本只多兩三行。只有自己寫、寫完才有人用的一次性檔案（例如跑完才上傳的報表），直接 <code>writeFile</code> 就夠了。咖啡店的 <code>orders.json</code> 一邊被讀、一邊被寫，屬於前者。</div>
+<p>現在讀的人不會再讀到半份 JSON，事故 3 解決了。但事故 4 換上原子寫入之後還在：兩筆訂單同時送出，存進去的還是只有一筆。這次壞的不是「寫」這個動作，而是寫之前讀到的資料。</p>
+
+<h2>兩筆訂單同時送出，為什麼只存進一筆？</h2>
+<p>新增一筆訂單要做三件事：讀出 <code>orders.json</code>、在陣列裡加一筆、整份寫回。這種「讀出、修改、寫回」的模式叫 <strong>read-modify-write</strong>。三步之間有 <code>await</code>：在等讀檔、等寫檔的時候，event loop 會去處理別的請求，別的請求也可以開始自己的三步。</p>
+<p>執行 <code>node examples/lost-update.ts</code>：它讓 20 個請求同時把計數檔裡的數字加 1，每個請求都是讀出、加 1、寫回：</p>
+<pre>加了 20 次，結果是 1</pre>
+<p>過程是這樣：20 個呼叫幾乎同時開始，都在 <code>await readFile</code> 時讀到 0；接著各自在記憶體裡加成 1，再各自寫回 1。每一次寫入都把前一次的結果蓋掉，最後只剩 1。這就是 <a href="../../postgresql/lessons/19-concurrency.html">PostgreSQL 課第 19 課</a>的<strong>遺失更新</strong>（lost update），只是資料從資料表換成檔案。事故 4 的兩筆訂單一樣：兩個請求都讀到同一份舊的訂單陣列，各自加上自己那筆再寫回，後寫的蓋掉先寫的。</p>
+<p>換成上一節的原子寫入也沒用。原子寫入保證「寫進去的是一份完整的檔案」，但兩份完整的檔案，都是從舊資料算出來的，後寫的照樣蓋掉先寫的那筆訂單。問題不在「寫到一半」，而在「讀到的資料在寫回之前已經過時」。要修，就得讓 read-modify-write 這三步不能交錯：一個請求做完三步，下一個才能開始讀。</p>
+<p>最簡單的情況是只有一個 Node 程序在改這個檔案。這時用 <a href="../../typescript/lessons/12-races-concurrency.html">TypeScript 課第 12 課</a>的 Promise 鏈鎖就夠了：程式記住「最後一個排進來的工作」的 Promise，新工作用 <code>.then()</code> 接在它後面，再把自己記成最後一個。所有新增訂單的呼叫就像排隊，同一時間只有一個在做 read-modify-write。這種讓操作一個一個來的做法叫<strong>互斥</strong>（mutual exclusion，常簡稱 mutex），用佇列實作時也叫<strong>序列化佇列</strong>。</p>
+<p>但這個佇列是一個 JavaScript 變數，存在這個程序的記憶體裡。正式環境不一定只有一個程序在改 <code>orders.json</code>。</p>
+
+<h2>開成好幾個程序之後，怎麼讓它們排隊？</h2>
+<p>正式環境常把同一個伺服器開成好幾個程序，好用上多顆 CPU（<a href="24-scaling.html">第 24 課</a>）；也可能另有一支排程程式會改同一個檔。每個程序有自己的記憶體、自己的一份佇列，程序 A 的佇列根本不知道程序 B 在做什麼，兩邊還是會同時 read-modify-write。這時需要一個所有程序都看得到的東西，而它們共同看得到的就是檔案系統。做法是<strong>鎖檔</strong>（lock file）：約定好「<code>orders.json.lock</code> 這個檔案存在」代表「有人正在改 <code>orders.json</code>」。想改的人先建立鎖檔，建成功才算拿到鎖；改完刪掉鎖檔，就是放鎖。</p>
+<p>關鍵在「建立鎖檔」這一步本身不能有空檔。如果寫成 <code>if (!existsSync(lock)) await writeFile(lock, '')</code>，又是上一節的 TOCTOU：兩個程序同時檢查到「不存在」，都去建檔，都以為自己拿到了鎖。正確寫法是 <code>open(lockPath, 'wx')</code>。<code>open</code> 的第二個參數是開檔模式：<code>w</code> 是寫入，<code>x</code> 是「已經存在就失敗」。「檢查不存在」和「建立」由作業系統合成一步完成（底層是 <code>O_EXCL</code> 旗標），兩個程序同時搶，只會有一個成功，另一個拿到 <code>EEXIST</code>，也就是錯誤碼表裡說的「別人先建了」。</p>
+<pre>const handle = await open(lockPath, 'wx')   // 拿不到就丟 EEXIST
+try {
+  // 讀出 → 加一筆 → 寫回
+} finally {
+  await handle.close()
+  await rm(lockPath, { force: true })        // 成功、失敗都要放鎖
+}</pre>
+<p>拿到 <code>EEXIST</code> 代表別人正拿著鎖，等一下再試。等待時間要加一點隨機（例如 10～30ms）：如果大家都固定等 20ms，一群等鎖的程序會在同一瞬間一起重試、一起撞上，又一起等。放鎖一定要寫在 <code>finally</code>，因為中間任何一步都可能 <code>throw</code>（訂單格式不對、訂單檔壞掉）；沒刪掉鎖檔，之後每個人都在等一個永遠不會消失的鎖，整個新增訂單功能就停了。</p>
+<p>這樣在正常情況下就夠了。但鎖檔是「大家約定好」的機制，有幾種情況約定會失效，要知道它的極限在哪裡：</p>
+<p><strong>程序當掉留下的鎖</strong>（stale lock）。程序拿著鎖時被 <code>kill -9</code> 強制結束或機器斷電，<code>finally</code> 根本沒機會執行，鎖檔就永遠留著。常見做法是看鎖檔的修改時間（<code>stat</code> 的 <code>mtimeMs</code>），超過某個門檻就當成沒人要了，刪掉重拿。門檻要比「正常持有鎖的最長時間」長很多：太短的話，會把別人還在用的鎖刪掉，兩個人又同時寫。練習 4 用的門檻是 5 秒。</p>
+<p><strong>刪除舊鎖本身也有競態。</strong>兩個程序同時判定鎖過期：A 先刪掉，重新拿到鎖；B 這時才執行刪除，刪掉的其實是 A 的新鎖，接著 B 也拿到鎖，兩個人同時在改。機率小但存在。要完全正確，需要在鎖檔裡寫入自己的編號、刪之前比對內容，或改用作業系統提供的檔案鎖，複雜度跟著上升。</p>
+<p><strong>網路磁碟與多台機器。</strong>NFS 這類網路檔案系統上，「已經存在就失敗」不一定可靠。伺服器開在多台機器上時，每台機器有自己的磁碟，A 機器上的鎖檔，B 機器根本看不到。</p>
+<p>所以鎖檔適合的範圍有限。依情況選擇的方式：</p>
+<div class="table-wrap"><table>
+  <tr><th>情況</th><th>做法</th></tr>
+  <tr><td>一個程序，資料量小（設定檔、本機工具的狀態）</td><td>原子寫入＋程序內排隊</td></tr>
+  <tr><td>同一台機器上幾個程序，寫入不頻繁</td><td>原子寫入＋鎖檔</td></tr>
+  <tr><td>多台機器、寫入頻繁、需要查詢或交易</td><td>資料庫：交易與列鎖（<a href="20-postgres-pool-transactions.html">第 20 課</a>）、advisory lock（<a href="../../postgresql/lessons/33-job-queue.html">PostgreSQL 課第 33 課</a>）</td></tr>
+</table></div>
+<p>advisory lock 是 PostgreSQL 提供的「約定好的鎖」：概念跟鎖檔一樣，只是放在所有機器都連得到的資料庫裡，程序當掉時連線斷了，鎖也會自動釋放。</p>
+<p>咖啡店的訂單會一直增加、會被同時寫入，正式環境應該放資料庫。這一課還是用檔案練習，是因為鎖、原子性、當掉後的清理這些問題，換成資料庫也還在，只是資料庫替你處理好了；先在檔案上親手做一次，才知道它替你做了什麼。練習 4 的 <code>addOrder</code> 就是用鎖檔把「讀出 → 加一筆 → 寫回」包起來，四個事故到這裡都有了修法。</p>
+<p>還剩一個細節：鎖檔的程式碼裡，<code>open()</code> 回傳了一個 <code>handle</code>，在 <code>finally</code> 裡特地 <code>close()</code>。前面用的 <code>readFile</code>、<code>writeFile</code> 從來不用關，為什麼這裡要？</p>
+
+<h2>open() 拿到的檔案，為什麼一定要關？</h2>
+<p><code>readFile</code>、<code>writeFile</code> 是「一次做完」的函式：自己開檔、讀寫、關檔，你只拿到結果。需要更細的控制時，例如只讀檔案前幾個位元組、或像鎖檔那樣要用 <code>'wx'</code> 模式建檔，就要自己呼叫 <code>open()</code>。它回傳一個 <strong>FileHandle</strong>：代表「一個開著的檔案」的物件，之後的讀寫都透過它。</p>
+<p>為什麼開著的檔案要關？作業系統替每個開著的檔案記一個整數編號，叫<strong>檔案描述元</strong>（file descriptor，常簡稱 fd），FileHandle 裡面包著的就是這個編號。每個程序能同時持有的 fd 數量有上限，而且網路連線也佔 fd。開了不關，fd 一直累積，用完之後所有開檔都失敗，連接受新的網路連線也一起失敗，錯誤碼是 <code>EMFILE</code>。這種洩漏不會馬上出事，常常是伺服器跑了幾天、累積夠多才突然全面失敗。</p>
+<p>以前的寫法是用 <code>try</code>／<code>finally</code> 包起來，在 <code>finally</code> 裡 <code>close()</code>，就像鎖檔那段。Node 24 可以改用 JavaScript 新的 <strong><code>await using</code></strong> 宣告：用它宣告的變數，在離開所在的區塊時，會自動呼叫物件的 <code>[Symbol.asyncDispose]()</code> 方法並等它完成；不管是正常 <code>return</code> 還是 <code>throw</code> 離開都一樣。FileHandle 的這個方法做的就是 <code>close()</code>。執行 <code>node examples/filehandle.ts</code>，它印出 fd 編號和檔案的前 12 個位元組：</p>
+<pre>async function firstBytes(n: number) {
+  await using fh = await open(file, 'r')
+  const { bytesRead, buffer } = await fh.read(Buffer.alloc(n), 0, n, 0)
+  return buffer.subarray(0, bytesRead).toString('utf8')
+}   // ← 離開時自動 fh.close()，return 或 throw 都一樣</pre>
+<p>那鎖檔為什麼不用 <code>await using</code>？因為放鎖要做兩件事：關掉 FileHandle，<em>還要</em>刪掉鎖檔。<code>await using</code> 只負責關閉，刪檔還是得自己寫，所以練習 4 直接用 <code>try</code>／<code>finally</code> 把兩件事寫在一起比較清楚。<code>await using</code> 的支援版本見課末。</p>
+<p>回到開場的四件事：菜單路徑用 <code>import.meta.dirname</code> 組、讀檔失敗只把 <code>ENOENT</code> 當正常、存檔寫暫存檔再 <code>rename</code>、新增訂單用鎖檔排隊，自己開的檔案用完就關。下面的練習把這四個修法實際寫一次。</p>
+
+<h2>練習</h2>
+<p>練習檔在 <code>node/practice/work/10/</code>，在 <code>learn/</code> 執行 <code>node check.mjs node 10</code> 判分。測試在暫存資料夾裡建立各種情況（沒有權限的檔案、資料夾、壞掉的 JSON、舊的鎖檔），用隨機資料，也會開子程序。</p>
+
+<div class="local" data-test="ex1" data-files="load-menu.ts">
+  <p>練習 1：<code>load-menu.ts</code> 的 <code>loadMenu(path)</code> 現在先 <code>existsSync</code> 再讀，其他錯誤原封不動丟出去。改成：</p>
+  <ul>
+    <li>直接讀檔。檔案不存在（<code>ENOENT</code>）時回傳 <code>{ items: [] }</code>。</li>
+    <li>其他讀檔錯誤（沒有權限、是資料夾）和 JSON 格式錯，都丟出 <code>MenuLoadError</code>：訊息要包含完整的檔案路徑，<code>cause</code> 是原本的錯誤（<code>new MenuLoadError(訊息, { cause: err })</code>）。</li>
+  </ul>
+  <p>不能用 <code>catch</code> 把所有錯誤都變成空菜單。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="print-menu.ts">
+  <p>練習 2：<code>print-menu.ts</code> 印出旁邊 <code>data/menu.json</code> 的菜單。在 <code>work/10/</code> 執行 <code>node print-menu.ts</code> 正常，到上一層執行 <code>node 10/print-menu.ts</code> 就 ENOENT。修好它，從哪個資料夾執行都讀到程式旁邊的 <code>data/menu.json</code>。測試會把它複製到別處、換一份菜單，從三個不同的工作目錄執行。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="save-orders.ts">
+  <p>練習 3：<code>save-orders.ts</code> 的 <code>saveOrders(path, orders)</code> 現在直接 <code>writeFile</code>。改成原子寫入：</p>
+  <ul>
+    <li>寫入期間不管什麼時候讀，都是完整的舊內容或完整的新內容（測試一邊存約 5MB 的資料，一邊讓<strong>另一個程序</strong>不停讀檔；改成 <code>writeFileSync</code> 擋不住別的程序）。</li>
+    <li>暫存檔放在目標檔的同一個資料夾（測試會讓系統暫存資料夾不能用）。</li>
+    <li>同時呼叫好幾次存同一個檔，每次都要成功，最後檔案是其中一次的完整內容，資料夾裡不留暫存檔。</li>
+    <li>寫入失敗時 Promise 要 reject，而且不能留下暫存檔（測試把目標路徑先建成資料夾，讓 rename 失敗）。</li>
+  </ul>
+</div>
+
+<div class="local" data-test="ex4" data-files="add-order.ts">
+  <p>練習 4：<code>add-order.ts</code> 的 <code>addOrder(path, order)</code> 讀出 orders.json、加一筆（<code>id</code> 是最後一筆加 1）、用練習 3 的 <code>saveOrders</code> 寫回，回傳存進去的訂單。現在同時呼叫會遺失更新。用鎖檔 <code>path + '.lock'</code> 把「讀出 → 檢查 → 加一筆 → 寫回」包起來：</p>
+  <ul>
+    <li>用 <code>open(lockPath, 'wx')</code> 拿鎖。<code>EEXIST</code> 代表別人拿著，等 10～30ms（加一點隨機）再試；其他錯誤往外丟。</li>
+    <li>做完在 <code>finally</code> 關閉 FileHandle 並刪掉鎖檔，成功、失敗（訂單不合法、訂單檔壞掉）都一樣。</li>
+    <li>鎖檔的修改時間超過 5 秒，當成當掉的程序留下的：刪掉後重拿。剛建立的鎖檔是別人正在用，要等它消失。</li>
+  </ul>
+  <p>測試會在同一個程序同時呼叫 50 次、開 4 個程序各加 25 筆（只用程序內的佇列不會過），還會預先放一個 10 秒前的鎖檔和一個 300ms 後才被刪掉的鎖檔。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：程式先 <code>if (existsSync(path))</code>，成立才 <code>await readFile(path)</code>。這樣還可能拿到 ENOENT 嗎？</p>
+  <label data-key="a">不可能，檢查過存在才讀</label>
+  <label data-key="b">可能，檢查和讀取之間檔案可以被別的程序刪掉或改名</label>
+  <label data-key="c">只有在 Windows 上可能</label>
+  <p class="why">✓ 檢查和使用是兩個動作，中間的狀態變化叫 TOCTOU。正確做法是直接讀，再處理 <code>err.code === 'ENOENT'</code>。a 是這個誤解本身；c 錯：任何作業系統都一樣，只要有別的程序（或同一程序裡另一個 async 流程）會動這個檔案。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 6：設定檔每次都用 <code>writeFile(path, JSON.stringify(config))</code> 整份覆蓋。另一個程序偶爾讀到 <code>Unexpected end of JSON input</code>。原因是？</p>
+  <label data-key="a">JSON.stringify 偶爾會產生不完整的字串</label>
+  <label data-key="b">writeFile 是非同步的，要改成 writeFileSync 就好</label>
+  <label data-key="c">writeFile 先把檔案清空再寫入，讀的人剛好讀到清空後、寫完前的內容</label>
+  <p class="why">✓ 覆蓋寫入期間檔案是不完整的，別的程序隨時能讀。修法是寫到同一個資料夾的暫存檔，再 <code>rename</code> 蓋過去。b 錯：<code>writeFileSync</code> 只擋住自己這個程序，另一個程序照樣能在寫到一半時讀。a 錯：stringify 是同步的，回傳的一定是完整字串。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 7：<code>addOrder</code> 用 Promise 鏈排隊，單機測試 100 筆同時寫入都正確。部署時把伺服器開成 2 個程序，共用同一個 orders.json。還安全嗎？</p>
+  <label data-key="a">不安全：每個程序各有一份佇列，兩個程序還是會同時 read-modify-write</label>
+  <label data-key="b">安全：佇列保證同一時間只有一個寫入</label>
+  <label data-key="c">安全，只要 saveOrders 是原子寫入</label>
+  <p class="why">✓ Promise 鏈存在程序的記憶體裡，只管得到同一個程序裡的呼叫。跨程序要用所有程序都看得到的東西：鎖檔（<code>open(…, 'wx')</code>）或資料庫的鎖。c 錯：原子寫入只保證不會讀到寫一半的檔案，兩個程序都讀到舊資料、各自寫回，還是遺失更新。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>用相對路徑讀程式自己帶的檔案</strong>：相對路徑以工作目錄為準，換個資料夾啟動就 ENOENT。用 <code>join(import.meta.dirname, …)</code>。</li>
+  <li><strong>在 macOS 上能跑、到 Linux 就找不到檔</strong>：macOS 預設不分大小寫，Linux 分。檔名一律小寫，程式照實際名稱寫。</li>
+  <li><strong>先 existsSync 再讀</strong>：檢查和讀取之間狀態會變（TOCTOU），而且其他錯誤還是要處理。直接讀，看 <code>err.code</code>。</li>
+  <li><strong>吞掉所有錯誤</strong>：<code>catch { return [] }</code> 讓權限錯誤、壞掉的檔案看起來像「沒有資料」。只處理預期的錯誤碼，其他丟出去，保留 <code>cause</code>。</li>
+  <li><strong>直接覆寫重要檔案</strong>：<code>writeFile</code> 先清空再寫，讀的人會讀到一半，寫到一半當掉檔案就壞了。寫暫存檔再 <code>rename</code>。</li>
+  <li><strong>暫存檔用固定名字或放在 /tmp</strong>：固定名字讓同時存檔互相蓋掉；/tmp 可能是別的檔案系統，rename 不再原子。同資料夾、隨機名字。</li>
+  <li><strong>以為程式裡的鎖擋得住別的程序</strong>：Promise 鏈只在一個程序裡有效。跨程序用鎖檔，跨機器用資料庫。</li>
+  <li><strong>放鎖沒寫在 finally</strong>：中途出錯就留下鎖，之後所有人卡住。</li>
+  <li><strong>open 之後沒有 close</strong>：檔案描述元用完就 EMFILE，連新的網路連線都接不了。用 <code>await using</code> 或 <code>try</code>／<code>finally</code>。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>處理請求用 <code>node:fs/promises</code>；Sync 會佔住主執行緒，只用在啟動時或命令列工具；callback 看得懂就好。</li>
+  <li>事故 1：相對路徑從工作目錄算，不是從程式檔算。程式自己帶的檔案用 <code>import.meta.dirname</code> 組路徑，使用者給的路徑用 <code>resolve()</code>。</li>
+  <li>事故 2：直接做，失敗再看 <code>err.code</code>：ENOENT、EACCES、EISDIR、EEXIST、EMFILE。不先檢查存在（TOCTOU），只處理預期的錯誤碼，其他包成有路徑、有 <code>cause</code> 的錯誤丟出去。</li>
+  <li>事故 3：<code>writeFile</code> 先清空再寫。原子寫入用同資料夾、隨機名字的暫存檔，寫完 <code>rename</code>，失敗時刪掉暫存檔；防斷電還要 fsync。</li>
+  <li>事故 4：read-modify-write 會遺失更新，原子寫入擋不住。一個程序用 Promise 鏈排隊；多個程序用 <code>open(…, 'wx')</code> 的鎖檔，在 <code>finally</code> 放鎖，處理當掉留下的鎖；多台機器或寫入頻繁就交給資料庫。</li>
+  <li><code>open()</code> 回傳的 FileHandle 佔著一個檔案描述元，一定要關，<code>await using</code> 會自動關。</li>
+</ul>
+<p>下一課看檔案和網路底下真正流動的東西：位元組。為什麼「拿鐵」的長度是 2，存起來卻佔 6 個位元組，以及 Buffer 和編碼怎麼處理。</p>
+
+<h2>補充與查表</h2>
+<p>主線用不到、但工作上會查的細節集中在這裡。</p>
+
+<h3>常用的 fs/promises 函式</h3>
+<p>查表用，不用背。全部從 <code>node:fs/promises</code> 匯入。</p>
+<div class="table-wrap"><table>
+  <tr><th>要做的事</th><th>寫法</th></tr>
+  <tr><td>讀文字檔</td><td><code>await readFile(path, 'utf8')</code>（不給編碼會回傳 Buffer，<a href="11-buffer-encoding.html">第 11 課</a>）</td></tr>
+  <tr><td>寫文字檔</td><td><code>await writeFile(path, text)</code>：不存在就建立，存在就<strong>先清空</strong>再寫</td></tr>
+  <tr><td>附加到檔尾</td><td><code>await appendFile(path, line)</code></td></tr>
+  <tr><td>建資料夾</td><td><code>await mkdir(dir, { recursive: true })</code>：連中間的資料夾一起建，已經存在也不報錯</td></tr>
+  <tr><td>列出資料夾</td><td><code>await readdir(dir, { withFileTypes: true })</code> 回傳 Dirent，可以問 <code>isDirectory()</code>；加 <code>recursive: true</code> 連子資料夾一起列（v20.1.0 起）</td></tr>
+  <tr><td>找符合樣式的檔案</td><td><code>for await (const f of glob('**/*.json', { cwd }))</code>（v24.0.0 起 stable）</td></tr>
+  <tr><td>大小、修改時間</td><td><code>await stat(path)</code> 的 <code>size</code>、<code>mtime</code>、<code>mtimeMs</code></td></tr>
+  <tr><td>改名、搬移</td><td><code>await rename(from, to)</code></td></tr>
+  <tr><td>刪除</td><td><code>await rm(path, { force: true })</code>（不存在也不報錯）；資料夾加 <code>recursive: true</code></td></tr>
+  <tr><td>複製</td><td><code>await copyFile(from, to)</code>；整個資料夾 <code>await cp(from, to, { recursive: true })</code>（v22.3.0 起 stable）</td></tr>
+</table></div>
+<p>執行 <code>node examples/list.ts</code> 看 <code>readdir</code>、<code>stat</code>、<code>glob</code> 的輸出。<code>stat</code> 印出 menu.json 有 281 位元組，<code>api-styles.ts</code> 卻說讀到 241 個字：中文字在 UTF-8 裡一個字 3 個位元組，<a href="11-buffer-encoding.html">第 11 課</a>詳講。</p>
+
+<h3>持久性：斷電後資料還在嗎</h3>
+<p><strong>持久性</strong>（durability）和原子寫入是兩件事：<code>writeFile</code> 結束時，資料可能還在作業系統的記憶體裡，這時斷電，新檔可能是空的。要確定寫到磁碟，要呼叫 <strong>fsync</strong>：<code>writeFile(tmp, text, { flush: true })</code> 會在寫完後呼叫 <code>filehandle.sync()</code>。嚴格來說，<code>rename</code> 這個改名動作也要對資料夾做一次 fsync 才不會在斷電後消失。代價是每次存檔慢很多。只防「別人讀到一半」不需要它；防「斷電後資料壞掉」才需要。資料重要到這種程度，通常已經該放資料庫了。</p>
+
+<h3>版本備註</h3>
+<ul>
+  <li><code>readdir</code> 的 <code>recursive</code> 選項從 v20.1.0 起可用。</li>
+  <li><code>fs/promises</code> 的 <code>cp</code> 從 v22.3.0 起 stable；<code>glob</code> 從 v24.0.0 起 stable。</li>
+  <li>FileHandle 的 <code>[Symbol.asyncDispose]()</code>（讓 <code>await using</code> 自動關檔）從 v24.2.0 起不再是實驗功能。<code>await using</code> 是 JavaScript 的新語法，Node 24 的 V8 支援，type stripping 也能處理。</li>
+</ul>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

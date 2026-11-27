@@ -1,0 +1,683 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>37. 備份、還原、複寫與高可用</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="37" data-pg-extensions="pg_walinspect">
+<header>
+  <div class="eyebrow">階段 10：資深必備｜上線與維運 · 第 37 課</div>
+  <h1>備份、還原、複寫與高可用</h1>
+</header>
+<main>
+<p>星期五傍晚 18:10，有位同事想清掉二號分店的測試訂單，執行了 <code>DELETE FROM orders WHERE store_id = 2</code>，忘了加日期條件，二號分店整天的 100 筆訂單一起不見了。18:40 店長發現報表不對時，這半小時裡又進來了新訂單、也有一筆退款。同一個月，另一間店的資料庫主機硬碟壞掉，整台開不起來，店裡一整晚不能結帳。這兩件事都需要「把資料拿回來」，但用的工具完全不同。</p>
+<p>這課把這兩起事故當成一次事故檢討來做：先把二號分店的訂單救回來，而且不能抹掉 18:10 之後的新訂單和退款；再替咖啡店設計一套方案，讓下一次硬碟壞掉時不用停一整晚。過程中會學到 PostgreSQL 保護資料的底層機制 WAL，以及建在它上面的三種工具：備份、複寫、故障轉移。學完你能從 WAL 裡找出誤刪資料的那個交易、把還原出來的資料補回正式資料庫，並判斷 replica 落後了多少。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>先問兩個數字：能掉多少資料、能停多久？兩起事故各要用哪一種工具。</li>
+  <li>資料怎麼「確定寫下」？WAL 是備份和複寫共用的底層，誤刪的那個交易也記在裡面。</li>
+  <li>怎麼回到誤刪前一刻？備份的兩種做法、PITR，以及怎麼把缺的列補回正式資料庫、又不抹掉之後的訂單。</li>
+  <li>硬碟壞掉時怎麼不用等還原？串流複寫、replica 落後多少、primary 要不要等它；primary 壞掉時誰來接手。</li>
+  <li>replica 能不能順便分擔讀取？以及換新主機時，怎麼用邏輯複寫順便升級大版本。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="02-tables.html">第 2 課</a>的 <code>GENERATED ALWAYS AS IDENTITY</code>：每新增一列，資料庫自動給下一個號碼，你不用（也不能）自己填。</li>
+  <li><a href="18-transactions.html">第 18 課</a>的持久性（ACID 的 D）：<code>COMMIT</code> 成功之後，資料就確定寫下了，當機也不會不見。</li>
+  <li><a href="30-mvcc-vacuum.html">第 30 課</a>的 MVCC 與 VACUUM：每次 <code>UPDATE</code> 都寫一個新版本，舊的變成死版本等 VACUUM 清掉；還開著的長交易可能還要讀舊版本，會擋住清理。會寫資料的交易都有一個交易編號（XID）。</li>
+  <li><a href="36-connections-monitoring.html">第 36 課</a>的監控與告警：用 <code>pg_stat_*</code> 系統視圖看資料庫的狀態，指標超過門檻就通知人。</li>
+</ul></div>
+
+<div class="callout"><strong>這頁的環境：</strong>資料庫是 PGlite 0.5.13（PostgreSQL 18.6），只有一個程序：沒有 replica、沒有 WAL 封存，<code>pg_dump</code>、<code>pg_basebackup</code> 和還原設定只能看、不能在這頁執行。replica 的狀態用快照表看；誤刪和「還原出來的副本」在頁面載入時已經準備好。</div>
+
+<p><strong>這頁的資料：</strong><code>orders</code>（三家分店的訂單，已經發生過誤刪，WAL 一節介紹經過）、<code>markers</code>（記下某個時間點的 WAL 位置）、<code>orders_restored</code>（還原到誤刪前一刻的副本，備份一節用）、<code>replica_status</code>（某一刻的 replica 狀態快照）、<code>access_log</code>（空的，拿來產生大量寫入）。</p>
+
+<h2>先問兩個數字：能掉多少資料、能停多久？</h2>
+<p>事故檢討會上，最常聽到的一句話是「我們不是有備份嗎？」。這句話其實沒有回答任何事：備份是幾點的？還原要多久？還原之後，備份時間點到出事之間的資料去哪了？要把這些問題問清楚，業界用兩個數字描述一套方案「最壞會怎樣」：</p>
+<ul>
+  <li><strong>RPO</strong>（Recovery Point Objective，復原點目標）：出事之後，<strong>最多能接受遺失多久的資料</strong>。RPO 是 24 小時，代表最壞情況下一整天的訂單都沒了。</li>
+  <li><strong>RTO</strong>（Recovery Time Objective，復原時間目標）：出事之後，<strong>最多能接受停機多久</strong>才恢復服務。</li>
+</ul>
+<p>套到開場：二號分店的誤刪考驗的是 RPO，能不能回到 18:10 之前、少掉的訂單能不能全部拿回來；硬碟壞掉那間店考驗的是 RTO，店裡要多久不能結帳。這兩個數字由老闆和產品決定（掉一小時的訂單要賠多少錢、停一小時少賺多少），工程師負責挑方案、算成本、證明做得到。</p>
+<p>保護資料的工具分兩類，後面各節會一一細講，這裡先知道它們各自做什麼。<strong>備份</strong>是把某個時間點的資料另外存一份，出事時拿那一份回來。<strong>複寫</strong>是讓另一台資料庫持續跟著主機改資料，這台叫 <strong>replica</strong>（複本），主機壞掉時可以換它上場。常見的組合和它們做得到的程度：</p>
+<div class="table-wrap"><table>
+  <tr><th>方案</th><th>RPO（掉多少資料）</th><th>RTO（停多久）</th><th>救得了誤刪嗎</th></tr>
+  <tr><td>每天 02:00 跑一次 <code>pg_dump</code></td><td>最多 24 小時</td><td>資料大時好幾小時（要重建索引）</td><td>可以，但只能回到 02:00</td></tr>
+  <tr><td>實體備份＋WAL 封存（PITR）</td><td>幾分鐘以內（看 WAL 多久封存一次）</td><td>還原備份＋重播 WAL 的時間</td><td>可以，回到誤刪前一刻</td></tr>
+  <tr><td>非同步串流複寫＋自動故障轉移</td><td>主機壞掉時可能掉最後幾筆</td><td>幾十秒</td><td><strong>不行</strong></td></tr>
+  <tr><td>同步複寫＋自動故障轉移</td><td>主機壞掉時不掉已提交的資料</td><td>幾十秒</td><td><strong>不行</strong></td></tr>
+</table></div>
+<p>表裡的名詞（<code>pg_dump</code>、WAL 封存、PITR、同步與非同步、自動故障轉移）後面都會講，先看最重要的最後一欄：為什麼複寫救不了誤刪？因為 replica 會忠實地照做主機做的每一件事，<code>DELETE</code> 也一樣，幾毫秒後 replica 上的資料也沒了。所以<strong>複寫防的是「機器壞掉」，備份防的是「資料被改壞」</strong>（誤刪、程式 bug、被入侵），兩者都要有，不能拿一個代替另一個。</p>
+<p>這就是兩起事故的最小答案：二號分店的誤刪要靠 PITR 備份回到 18:10 之前；硬碟壞掉的那間店，有複寫加自動故障轉移就能幾十秒內換一台繼續營業，只有備份就要等還原（比較表裡備份兩列和複寫兩列的 RTO）。不管哪一種，備份都要放在<strong>別台機器、別的區域</strong>：跟資料庫放在同一顆硬碟上的備份，會和資料庫一起消失。</p>
+<div class="callout practice"><strong>💡 實務上：小團隊先從託管資料庫的自動備份＋PITR 開始</strong><br>咖啡店剛起步、訂單一天幾百筆時，雲端託管資料庫（例如 AWS RDS）內建的自動備份加 PITR 通常就夠了，不需要一開始就架複寫叢集。資深工程師跟 PM 或老闆談的時候會多問一題：備份要保留多久（帳務、個資相關的法規可能有要求）？談完把 RPO、RTO 和保留期限寫進文件，附上每個方案的每月成本讓對方選。RPO 要求越接近零、RTO 越短，成本和維運複雜度都會跳一級，沒有需求就別花這筆錢。</div>
+<p>表裡的備份和複寫看起來是兩回事，底下搬的卻是同一樣東西。要知道備份為什麼能停在「誤刪前一刻」、replica 為什麼會跟著誤刪，得先看 PostgreSQL 怎麼把一筆修改寫下來。</p>
+
+<h2>資料怎麼「確定寫下」？WAL：先記帳再改資料</h2>
+<p>第 18 課說過，<code>COMMIT</code> 成功之後就算馬上停電，資料也不會消失（持久性）。最直接的做法是每次 <code>COMMIT</code> 都把改過的資料頁寫回磁碟，但一個交易改到的列可能散在很多個資料頁，每一頁都要等它寫完，<code>COMMIT</code> 會很慢。</p>
+<p>PostgreSQL 的做法是 <strong>WAL</strong>（Write-Ahead Log，預寫日誌）：修改任何資料頁之前，先把「要怎麼改」寫成一筆紀錄，附加到 WAL 檔的尾端。<code>COMMIT</code> 時只要確定 WAL 寫進磁碟就回應成功；資料頁本身留在記憶體裡（<a href="36-connections-monitoring.html">第 36 課</a>的 <code>shared_buffers</code>，PostgreSQL 自己的資料頁快取），晚一點再寫回。就像店員先在帳本上記一筆，貨架晚點再整理：只要帳本在，貨架亂了也能照帳本整理回來。</p>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="寫入流程：交易先把變更寫進 WAL 並寫入磁碟，COMMIT 才回應；改過的資料頁留在記憶體，checkpoint 時才寫回資料檔；當機後從上次 checkpoint 重播 WAL">
+    <defs><marker id="arr37a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="20" y="90" width="130" height="60" rx="10"/><text class="d-text" x="85" y="117" text-anchor="middle">交易</text><text class="d-small" x="85" y="136" text-anchor="middle">UPDATE、COMMIT</text>
+    <rect class="d-soft" x="230" y="20" width="200" height="60" rx="10"/><text class="d-text" x="330" y="47" text-anchor="middle">WAL（依序附加）</text><text class="d-small" x="330" y="66" text-anchor="middle">COMMIT 前一定寫進磁碟</text>
+    <rect class="d-soft" x="230" y="160" width="200" height="60" rx="10"/><text class="d-text" x="330" y="187" text-anchor="middle">記憶體裡的資料頁</text><text class="d-small" x="330" y="206" text-anchor="middle">改過、還沒寫回</text>
+    <rect class="d-box" x="520" y="160" width="160" height="60" rx="10"/><text class="d-text" x="600" y="187" text-anchor="middle">磁碟上的資料檔</text><text class="d-small" x="600" y="206" text-anchor="middle">checkpoint 時寫回</text>
+    <rect class="d-box" x="520" y="20" width="160" height="60" rx="10"/><text class="d-text" x="600" y="47" text-anchor="middle">封存／replica</text><text class="d-small" x="600" y="66" text-anchor="middle">拿同一份 WAL</text>
+    <path class="d-line" d="M150,105 L226,60" marker-end="url(#arr37a)"/><text class="d-accent" x="150" y="58">① 先記帳</text>
+    <path class="d-line" d="M150,135 L226,180" marker-end="url(#arr37a)"/><text class="d-accent" x="150" y="198">② 再改</text>
+    <path class="d-line" d="M430,190 L516,190" marker-end="url(#arr37a)"/><text class="d-small" x="473" y="182" text-anchor="middle">③ 晚一點</text>
+    <path class="d-line" d="M430,50 L516,50" marker-end="url(#arr37a)"/>
+    <path class="d-line" d="M330,80 L330,156" marker-end="url(#arr37a)" stroke-dasharray="6 4"/><text class="d-small" x="340" y="123">當機後：從上次 checkpoint 重播 WAL</text>
+  </svg>
+  <figcaption>WAL 是唯一需要「立刻」寫進磁碟的東西。資料頁晚點寫沒關係，因為當機後可以照 WAL 重做一次。</figcaption>
+</figure>
+<p>「晚一點寫回」總要有個時間點。PostgreSQL 會定期做一次 <strong>checkpoint</strong>（檢查點）：把記憶體裡所有改過的資料頁寫回磁碟。checkpoint 完成後，它之前的 WAL 已經沒有用處，可以回收，WAL 才不會無限長大。當機重新啟動時，PostgreSQL 從最近一次 checkpoint 開始重播 WAL，把還沒寫回的變更補上，這就是當機復原。</p>
+<p>WAL 是一條只往後長的紀錄，每個位置都有編號，叫 <strong>LSN</strong>（Log Sequence Number），寫成 <code>0/1783198</code> 這種十六進位格式，越寫越大。兩個 LSN 相減，就是中間寫了多少位元組的 WAL；後面算 replica 落後多少，用的就是這個減法。實際存放時，WAL 切成一個個檔案（segment，預設 16 MB）。</p>
+<p>WAL 記下了每一個修改，而且依時間排好，所以它不只用來當機復原：把寫完的 WAL 檔複製到別處保存，就是<strong>封存</strong>，備份靠它回到任意時間點；把 WAL 即時傳給另一台、讓它照著重播，就是<strong>複寫</strong>。上一節表裡的工具，底下都是在「搬 WAL」。</p>
+<p>先看這頁資料庫跟 WAL 有關的設定。執行後先看第一欄 <code>fsync</code>，其他幾欄後面各節會用到：</p>
+<div class="lab" data-sql="SELECT current_setting('fsync') AS fsync,
+       current_setting('wal_level') AS wal_level,
+       current_setting('archive_mode') AS archive_mode,
+       current_setting('synchronous_commit') AS synchronous_commit,
+       current_setting('data_checksums') AS data_checksums;"></div>
+<p><code>fsync</code> 就是「確定寫進磁碟」的那一步：程式呼叫寫檔時，資料常常只停在作業系統的快取裡，fsync 要求作業系統把它真的寫到磁碟上。WAL 的保證全靠這一步，關掉它的後果見下面的提醒。最後一欄 <code>data_checksums</code> 跟 WAL 無關，說明在課末「補充與查表」。</p>
+<div class="callout warn"><strong>fsync = off 只能出現在教學環境。</strong>PGlite 為了在瀏覽器裡跑得快把它關了。正式環境關掉 fsync，停電時不只會掉最後幾筆，整個資料庫都可能損毀、開不起來。想換速度又能接受「當機時掉最後幾筆已提交的交易」，用的是 <code>synchronous_commit = off</code>（資料庫狀態仍然一致，只是最近的交易像沒發生過），不是關 fsync。</div>
+<p>接著看目前的 LSN，以及它在哪個 WAL 檔（看 <code>WAL_檔名</code> 欄；檔名的組成見課末）：</p>
+<div class="lab" data-sql="SELECT pg_current_wal_lsn() AS 目前位置,
+       pg_walfile_name(pg_current_wal_lsn()) AS WAL_檔名;"></div>
+<p>有了 LSN，就能量一句 <code>UPDATE</code> 寫了多少 WAL：先把 LSN 記進 <code>markers</code>，更新完再相減，執行後看 <code>這次寫的_WAL</code>。這裡用 <code>pg_current_wal_insert_lsn()</code>（WAL 的「寫入游標」），因為在同一個交易裡，還沒提交的紀錄可能還沒從記憶體寫出去，<code>pg_current_wal_lsn()</code> 不一定會動：</p>
+<div class="lab" data-sql="INSERT INTO markers VALUES ('demo', pg_current_wal_insert_lsn())
+  ON CONFLICT (name) DO UPDATE SET lsn = EXCLUDED.lsn;
+UPDATE orders SET total = total WHERE store_id = 1;   -- 值沒變，但每一列都寫了新版本
+SELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_insert_lsn(), lsn)) AS 這次寫的_WAL
+FROM markers WHERE name = 'demo';"></div>
+<p>連「值沒變」的更新都會產生 WAL，因為第 30 課說過，每次 <code>UPDATE</code> 都會寫一個新版本。所以 WAL 量也是監控指標：突然暴增通常代表有批次程式在大量改資料，備份和 replica 都要多搬這麼多。</p>
+<p>每一個修改都會寫進 WAL，那 18:10 的誤刪也一定在裡面。救資料的第一步，就是在 WAL 裡找到它。</p>
+
+<h3>誤刪的那個交易，在 WAL 的哪裡？</h3>
+<p>這頁在載入時重演了一段誤刪前後的經過，依序是：</p>
+<ol>
+  <li>建立一個 replication slot <code>old_replica</code>（複寫一節會解釋）。</li>
+  <li>把當下的 LSN 記到 <code>markers</code>，名稱 <code>'before'</code>。</li>
+  <li>新增兩筆訂單（id 301、302）。</li>
+  <li>刪掉一筆訂單 id 7（正常的取消）。</li>
+  <li>一位顧客一次取消兩筆訂單（id 8、9），一個交易刪兩列，也是正常的。</li>
+  <li><strong>誤刪</strong>：<code>DELETE FROM orders WHERE store_id = 2</code>。</li>
+  <li>之後的正常工作：訂單 12 改成退款，又來了一筆二號分店的新訂單（id 303）。</li>
+</ol>
+<p>要讀 WAL 的內容，用 <code>pg_walinspect</code>：PostgreSQL 內建的 contrib 擴充套件，其中 <code>pg_get_wal_records_info(起點 LSN, 終點 LSN)</code> 把這段 WAL 逐筆列出來。從 <code>'before'</code> 開始看，執行後先看 <code>xid</code> 和 <code>record_type</code> 兩欄：</p>
+<div class="lab" data-sql="SELECT start_lsn, xid, resource_manager, record_type, description
+FROM pg_get_wal_records_info(
+  (SELECT lsn FROM markers WHERE name = 'before'),
+  pg_current_wal_lsn())
+WHERE resource_manager IN ('Heap', 'Transaction')
+LIMIT 16;"></div>
+<ul>
+  <li><code>xid</code>：寫這筆紀錄的交易編號（第 30 課的 XID）。</li>
+  <li><code>resource_manager</code>：哪一類資料的紀錄。<code>Heap</code> 是表裡的列，<code>Btree</code> 是索引，<code>Transaction</code> 是交易的提交或取消。</li>
+  <li><code>record_type</code>：<code>Heap</code> 的有 <code>INSERT</code>、<code>UPDATE</code>、<code>HOT_UPDATE</code>、<code>DELETE</code>（後面加 <code>+INIT</code> 代表這筆紀錄寫在一個全新的資料頁上，例如表的第一列）；<code>Transaction</code> 的 <code>COMMIT</code> 在 <code>description</code> 裡記著提交時間（這頁顯示的是你打開頁面的時間）。</li>
+</ul>
+<p>結果由上到下對應上面的經過，前四個交易各以一筆 <code>COMMIT</code> 結尾：</p>
+<ol>
+  <li>記錄 marker 的交易。</li>
+  <li>新增兩筆訂單的交易：兩筆 <code>INSERT</code>。</li>
+  <li>刪掉訂單 7 的交易：一筆 <code>DELETE</code>。</li>
+  <li>取消訂單 8、9 的交易：兩筆 <code>DELETE</code>。</li>
+  <li>第五個交易從頭到尾都是 <code>DELETE</code>：查詢只取 16 列，還沒輪到它的 <code>COMMIT</code>，表示它一個交易就刪了很多列。</li>
+</ol>
+<p><strong>每刪一列就是一筆 WAL 紀錄</strong>，所以數「同一個交易刪了幾列」，就能縮小範圍、找出誤刪的那一個（練習 1）。WAL 裡也看得到每個交易的提交時間，可以拿來對照店長回報的時間。執行後對照 <code>xid</code> 和 <code>提交時間</code>：</p>
+<div class="lab" data-sql="SELECT start_lsn, xid, left(description, 30) AS 提交時間
+FROM pg_get_wal_records_info(
+  (SELECT lsn FROM markers WHERE name = 'before'),
+  pg_current_wal_lsn())
+WHERE resource_manager = 'Transaction' AND record_type = 'COMMIT';"></div>
+<p>找到誤刪交易的 <code>xid</code>，就知道要回到「這個交易之前」。但 WAL 只記錄「怎麼改」，光有它還不夠：要從某個起點照著 WAL 重做，才能得到誤刪前一刻的資料。這個起點就是備份。</p>
+
+<h2>怎麼回到誤刪前一刻？備份與 PITR</h2>
+<p>回到誤刪前一刻需要兩樣東西：一份起點的資料，和從起點到 18:10 之間的所有變更。先看起點，也就是備份本身。</p>
+
+<h3>邏輯備份與實體備份：複製的是什麼？</h3>
+<p>備份分成兩大類，差別在「複製的是什麼」：</p>
+<ul>
+  <li><strong>邏輯備份</strong>（logical backup）：把資料匯出成 SQL 或資料檔，工具是 <code>pg_dump</code>。內容是 <code>CREATE TABLE</code>、<code>CREATE INDEX</code>，以及用 <strong>COPY</strong> 匯入的資料。COPY 是大量匯入／匯出資料的指令，比逐筆 <code>INSERT</code> 快很多。</li>
+  <li><strong>實體備份</strong>（physical backup）：直接複製資料目錄裡的檔案（就是磁碟上的資料頁），工具是 <code>pg_basebackup</code>。</li>
+</ul>
+<pre># 邏輯備份：自訂格式（-Fc），之後可以用 pg_restore 只還原部分表、平行還原
+pg_dump -Fc -d coffee -f coffee.dump
+pg_restore -d coffee_new -j 4 coffee.dump
+pg_restore -d coffee_new -t orders coffee.dump      # 只還原 orders
+
+# 實體備份：整個 cluster（所有資料庫）＋備份期間的 WAL
+pg_basebackup -D /backup/base -Fp -X stream -c fast</pre>
+<p>上面的 cluster 指的是一個 PostgreSQL 伺服器管理的整組資料庫。兩種備份的差別：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th><code>pg_dump</code>（邏輯）</th><th><code>pg_basebackup</code>（實體）</th></tr>
+  <tr><td>一致性</td><td>在一個快照裡匯出，備份過程中別人照常讀寫，不會被擋（但會擋住 <code>ALTER TABLE</code> 這類要排他鎖的 DDL）</td><td>複製期間檔案在變，靠備份期間的 WAL 修正成一致</td></tr>
+  <tr><td>範圍</td><td>一個資料庫，可以只選某些表</td><td>整個 cluster，不能只挑一張表</td></tr>
+  <tr><td>跨大版本</td><td>可以：輸出可以匯入比 pg_dump 新的版本，大版本升級常用</td><td>只能還原到<strong>同一個大版本</strong></td></tr>
+  <tr><td>還原速度</td><td>慢：要重新寫入每一列、重建每個索引、重新驗證約束</td><td>快：檔案複製回去就能啟動</td></tr>
+  <tr><td>還原到任意時間點</td><td>不行，只能回到匯出那一刻</td><td>可以，搭配 WAL 封存（下一小節）</td></tr>
+</table></div>
+<p>資料只有幾 GB 時，每天 <code>pg_dump</code> 很合理；到了幾百 GB，<code>pg_restore</code> 可能要好幾個小時，RTO 撐不住，這時主力就要換成實體備份。<code>pg_dump</code> 還有一個代價：整段期間是同一個快照，等於一個很長的交易。第 30 課說過，長交易會擋住 VACUUM 清理死版本，所以大資料庫的 dump 通常在 replica 或低峰時段跑。</p>
+<p>套回事故：如果咖啡店只有每天 02:00 的 <code>pg_dump</code>，還原後只會回到 02:00，今天 02:00 到 18:10 的所有訂單也一起沒了，比誤刪本身還糟。要回到 18:10 之前的那一刻，得用表格最後一列：實體備份搭配 WAL 封存。（增量備份、雲端磁碟快照等其他做法，見課末「補充與查表」。）</p>
+
+<h3>PITR：基礎備份＋連續的 WAL</h3>
+<p><strong>PITR</strong>（Point-In-Time Recovery，時間點還原）就是把上面兩樣東西接起來：一份實體備份當起點，叫<strong>基礎備份</strong>，加上從那之後<strong>連續不斷</strong>的 WAL。還原時先放回基礎備份，再照著 WAL 重播，停在你指定的那一刻。</p>
+<figure>
+  <svg viewBox="0 0 700 200" role="img" aria-label="PITR 時間線：凌晨 02:00 的基礎備份之後，WAL 檔一個接一個封存；18:10 誤刪；還原時從基礎備份開始重播 WAL，停在誤刪交易之前">
+    <defs><marker id="arr37b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <path class="d-line" d="M30,90 L670,90" marker-end="url(#arr37b)"/>
+    <rect class="d-soft" x="40" y="60" width="90" height="60" rx="8"/><text class="d-text" x="85" y="87" text-anchor="middle">基礎備份</text><text class="d-small" x="85" y="106" text-anchor="middle">02:00</text>
+    <rect class="d-box" x="150" y="72" width="60" height="36" rx="6"/><text class="d-small" x="180" y="95" text-anchor="middle">WAL 1</text>
+    <rect class="d-box" x="220" y="72" width="60" height="36" rx="6"/><text class="d-small" x="250" y="95" text-anchor="middle">WAL 2</text>
+    <rect class="d-box" x="290" y="72" width="60" height="36" rx="6"/><text class="d-small" x="320" y="95" text-anchor="middle">…</text>
+    <rect class="d-box" x="360" y="72" width="60" height="36" rx="6"/><text class="d-small" x="390" y="95" text-anchor="middle">WAL n</text>
+    <path class="d-line" d="M470,40 L470,140" stroke-dasharray="5 4"/><text class="d-accent" x="470" y="30" text-anchor="middle">18:10 誤刪（xid 找得到）</text>
+    <path class="d-line" d="M85,150 L462,150" marker-end="url(#arr37b)"/><text class="d-small" x="275" y="172" text-anchor="middle">還原：放回基礎備份 → 重播 WAL → 停在誤刪交易之前</text>
+    <text class="d-small" x="560" y="120" text-anchor="middle">之後的正常寫入</text>
+  </svg>
+  <figcaption>中間任何一個 WAL 檔遺失，就只能還原到斷掉的地方為止。</figcaption>
+</figure>
+<p>要做到 PITR，primary 要開啟封存，還原的那台要知道去哪拿 WAL、停在哪裡。正式環境的設定大概是：</p>
+<pre># postgresql.conf（primary）
+wal_level = replica
+archive_mode = on
+archive_command = 'test ! -f /archive/%f &amp;&amp; cp %p /archive/%f'   # %p 是 WAL 檔路徑，%f 是檔名
+
+# 還原的那台機器：放回基礎備份後，設定停止點，再建立 recovery.signal 檔案啟動
+restore_command = 'cp /archive/%f %p'
+recovery_target_xid = '…'             # 或 recovery_target_time、recovery_target_name、recovery_target_lsn（只能選一個）
+recovery_target_inclusive = off       # off：停在這個交易「之前」；預設 on 是包含它</pre>
+<p>套到二號分店：<code>recovery_target_xid</code> 填上一節從 WAL 找到的那個 <code>xid</code>，<code>recovery_target_inclusive = off</code> 讓重播停在它之前，誤刪就不會被重做。</p>
+<p>整條 PITR 能不能用，取決於 WAL 有沒有一個不漏地封存下來，而這件事全看 <code>archive_command</code>。每寫完一個 WAL 檔，PostgreSQL 就呼叫一次這個指令，看它的回傳值決定下一步。<code>archive_command</code> <strong>只能在真的成功時回傳 0</strong>（官方文件特別強調）：回傳 0，PostgreSQL 就當作已經封存、把原檔回收掉；如果指令其實失敗卻回傳 0，那個 WAL 檔就永遠不見了，PITR 從那裡斷掉，而且要等到真的需要還原時才會發現。</p>
+<p>反過來，<code>archive_command</code> 一直失敗（回傳非 0）時，PostgreSQL 會不斷重試，還沒封存的 WAL 不能回收，全部堆在 <code>pg_wal</code> 目錄裡，最後塞滿磁碟。兩種情況都要監控：<code>pg_stat_archiver</code> 的 <code>failed_count</code>、<code>last_failed_time</code>。正式環境通常不自己寫 <code>cp</code>，而是交給專門的工具處理封存（見課末）。</p>
+<p>停止點除了時間、交易編號、LSN，還可以事先打一個<strong>具名還原點</strong>：用 <code>pg_create_restore_point('名稱')</code> 在 WAL 裡記下一個名字，例如每次部署 migration 之前打一個，migration 出事時就能用 <code>recovery_target_name</code> 停在部署前。這頁也打得出來，執行後看回傳的 LSN：</p>
+<div class="lab" data-sql="SELECT pg_create_restore_point('before_deploy_2026_10_30') AS 還原點的_LSN;"></div>
+<p>到這裡，技術上已經能還原到 18:10 前一刻了。但事故還沒處理完：18:10 到 18:40 之間，店裡還有新訂單和退款。</p>
+
+<h3>還原到另一台，再把缺的列補回來</h3>
+<p>直覺的做法是把正式資料庫整台倒回 18:10 之前，但這樣會把之後的正常寫入（這頁的訂單 12 退款、新訂單 303）一起抹掉，等於為了救 100 筆訂單又弄丟另外幾筆。實務流程是：<strong>在另一台機器還原</strong>到誤刪前一刻，把缺的列<strong>補回</strong>正式資料庫（練習 2）。這頁的 <code>orders_restored</code> 就是那台機器還原出來、再搬過來的副本。</p>
+<p>補回時有一個障礙：<code>orders.id</code> 是 <code>GENERATED ALWAYS</code>，第 2 課說過不能自己填值。但補回資料時必須保留原本的訂單編號，收據、付款紀錄都參照它，換了編號就對不上。這時用 <strong><code>OVERRIDING SYSTEM VALUE</code></strong> 明確表示「我知道，就用我給的值」：</p>
+<pre>INSERT INTO 表 OVERRIDING SYSTEM VALUE
+SELECT … FROM 還原出來的表 WHERE …;</pre>
+<p>自己填的值不會推進 identity 背後的序號。補回的 id 都比序號目前的值小就沒事（這頁是這樣）；如果補回的 id 比序號還大，之後要用 <code>setval()</code> 把序號調上去，否則新訂單會撞到補回來的編號。</p>
+<div class="callout practice"><strong>💡 實務上：沒演練過的備份不算備份</strong><br>這次能救回來，前提是基礎備份能用、WAL 一個不缺、有人知道怎麼還原。實際上備份檔可能是壞的、少了 WAL、密碼找不到、還原程序沒人會。定期（例如每季）真的還原一次到另一台機器，量出實際的 RTO，跑幾句查詢確認資料正確。<a href="../../devops/lessons/24-backup-dr.html">DevOps 課第 24 課</a>會把它做成固定的流程。</div>
+<p>二號分店的訂單救回來了。另一間店的問題卻不一樣：硬碟壞掉時，就算 PITR 能把資料還原到幾分鐘前，找機器、放回基礎備份、重播一整天的 WAL 都要時間，這段期間店裡不能結帳。要縮短停機，得在出事之前就準備好另一台資料庫。</p>
+
+<h2>硬碟壞掉時，怎麼不用等還原？串流複寫</h2>
+<p>如果另一台機器平常就一直跟著主機改資料，主機壞掉時它手上已經是最新的資料，不需要還原。這就是<strong>串流複寫</strong>（streaming replication）：一台 <strong>primary</strong>（可寫入的主機）把 WAL 即時傳給一台或多台 replica，replica 收到就重播，保持和 primary 幾乎一樣的資料。它用的就是 WAL 一節的機制：當機復原是「重播自己的 WAL」，複寫是「重播別人傳來的 WAL」。</p>
+<p>PostgreSQL 的文件和設定名稱把 replica 叫做 standby（例如後面的 <code>synchronous_standby_names</code>），指的是同一種機器，這課統一叫 replica。</p>
+
+<h3>replica 落後了多少？</h3>
+<p>「幾乎一樣」的「幾乎」就是風險：primary 壞掉那一刻 replica 還沒收到的 WAL，就是會掉的資料。所以第一件要會看的事，是 replica 落後多少。primary 上的 <code>pg_stat_replication</code> 每個 replica 一列，用四個 LSN 表示一段 WAL 走到哪一步：</p>
+<div class="table-wrap"><table>
+  <tr><th>欄位</th><th>意思</th></tr>
+  <tr><td><code>sent_lsn</code></td><td>primary 已經送出的位置</td></tr>
+  <tr><td><code>write_lsn</code></td><td>replica 已經寫進作業系統（還沒保證進磁碟）</td></tr>
+  <tr><td><code>flush_lsn</code></td><td>replica 已經寫進磁碟</td></tr>
+  <tr><td><code>replay_lsn</code></td><td>replica 已經<strong>重播</strong>，查詢看得到了</td></tr>
+</table></div>
+<p>這頁沒有 replica，<code>pg_stat_replication</code> 是空的，所以改看 <code>replica_status</code>：某間店正式環境 <code>pg_stat_replication</code> 的快照，只取了幾個欄位。執行後比較每一列的 <code>sent_lsn</code> 和 <code>replay_lsn</code>：</p>
+<div class="lab" data-sql="SELECT * FROM replica_status;"></div>
+<p>兩個 LSN 的差距就是<strong>複寫延遲</strong>（replication lag），用 WAL 一節的減法 <code>pg_wal_lsn_diff(前面的, 後面的)</code> 算出位元組數；<code>pg_stat_replication</code> 也有 <code>write_lag</code>、<code>flush_lag</code>、<code>replay_lag</code> 三個時間欄位。寫到了不代表查得到，要判斷「查詢會不會讀到舊資料」，看的是 <code>replay_lsn</code>（練習 3）。</p>
+<p>延遲有多大，很大一部分取決於 primary 回應 <code>COMMIT</code> 之前，有沒有等 replica。</p>
+
+<h3>primary 要不要等 replica？非同步與同步</h3>
+<p>預設是<strong>非同步</strong>：primary 寫進自己的磁碟就回應 <code>COMMIT</code> 成功，不等 replica。好處是 replica 慢不會拖慢寫入；代價是 primary 突然壞掉時，最後幾筆還沒送到 replica 的交易會遺失，就是 RPO 表裡「可能掉最後幾筆」那一格。</p>
+<p>如果咖啡店連最後幾筆都不能掉，就用<strong>同步複寫</strong>（synchronous replication）：在 <code>synchronous_standby_names</code> 指定 replica 之後，<code>COMMIT</code> 要等它們回報才回應。要等到哪一步，由 <code>synchronous_commit</code> 決定，對應上一小節的四個 LSN（PostgreSQL 18 文件）：</p>
+<div class="table-wrap"><table>
+  <tr><th><code>synchronous_commit</code></th><th>COMMIT 等到</th><th>保證</th></tr>
+  <tr><td><code>remote_apply</code></td><td>replica 重播完</td><td>不掉資料，而且 COMMIT 之後馬上在 replica 查得到；延遲最大</td></tr>
+  <tr><td><code>on</code>（預設）</td><td>replica 寫進磁碟</td><td>primary 和 replica 不會同時掉這筆資料</td></tr>
+  <tr><td><code>remote_write</code></td><td>replica 寫進作業系統</td><td>replica 的 PostgreSQL 當掉不會掉，但作業系統當掉可能掉</td></tr>
+  <tr><td><code>local</code></td><td>只等自己的磁碟</td><td>不等 replica</td></tr>
+  <tr><td><code>off</code></td><td>什麼都不等</td><td>當機時可能掉最近幾筆（狀態仍一致）</td></tr>
+</table></div>
+<p>同步的代價有兩個：每次 <code>COMMIT</code> 多一趟網路往返（跨區域就是幾十毫秒）；而且唯一的同步 replica 掛掉時，primary 上的 <code>COMMIT</code> 會一直等下去，寫入全部卡住，等於為了防 primary 壞掉，反而多了一個會讓寫入停擺的點。所以同步複寫通常會配兩台以上的 replica，設定成「任一台回報就好」（<code>ANY 1 (s1, s2)</code>）。</p>
+<p><code>synchronous_commit</code> 也可以只對某些交易設定，例如付款用 <code>on</code>、記錄點擊用 <code>off</code>，只在真的不能掉的資料上付延遲的代價。</p>
+<p>不管同步還是非同步，都假設 replica 一直連著。但 replica 也會重開機、網路也會斷，斷線期間的 WAL 要怎麼辦？</p>
+
+<h3>replica 斷線再回來，WAL 還在嗎？replication slot</h3>
+<p>WAL 一節說過，checkpoint 之後舊的 WAL 會被回收。replica 斷線一陣子再回來時，它需要的 WAL 如果已經被 primary 回收，就接不上了，只能整台重建。<strong>replication slot</strong> 解決這件事：primary 替某個 replica 記住「它收到哪裡了」，在那之後的 WAL 一律保留，等它回來接。</p>
+<p>這頁一開始建了一個沒有人在用的 slot <code>old_replica</code>，模擬一台已經拆掉、slot 卻忘了刪的 replica。執行後看 <code>active</code> 和 <code>替它保留的_WAL</code>：</p>
+<div class="lab" data-sql="SELECT slot_name, slot_type, active, restart_lsn, wal_status,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS 替它保留的_WAL
+FROM pg_replication_slots;"></div>
+<p>產生一些寫入，再回去執行上面那一格：</p>
+<div class="lab" data-sql="INSERT INTO access_log (path)
+SELECT '/menu/' || g FROM generate_series(1, 20000) g;"></div>
+<p>保留量只會越來越大，因為沒有人來取，primary 就一直替它留著。正式環境裡，一台 replica 被拆掉卻忘了刪 slot，幾天後 primary 磁碟塞滿、資料庫停擺，為了防一台機器壞掉而做的複寫，反而讓 primary 停了。防護有兩道：監控 <code>pg_replication_slots</code>，<code>active = false</code> 而且保留量持續增加就告警（第 36 課）；再設定 <code>max_slot_wal_keep_size</code>，每個 slot 最多保留多少 WAL，超過就讓 slot 失效（預設 -1 不限制）。PostgreSQL 18 另外有閒置逾時的設定，見課末。</p>
+<p>確定沒有人要用了，就刪掉：</p>
+<div class="lab" data-sql="SELECT pg_drop_replication_slot('old_replica');
+SELECT count(*) AS 剩下的_slot FROM pg_replication_slots;"></div>
+<p>現在咖啡店有一台隨時跟上的 replica，也知道怎麼看它落後多少。但 primary 真的壞掉時，replica 不會自己變成 primary。</p>
+
+<h2>primary 壞了，誰來接手？故障轉移</h2>
+<p><strong>故障轉移</strong>（failover）就是在 primary 壞掉時，把一台 replica 升級（promote）成新的 primary。PostgreSQL 本身只提供「升級」這個動作（<code>pg_promote()</code>），<strong>不會自己判斷要不要升級</strong>。硬碟壞掉那天如果只有 replica、沒有自動故障轉移，還是要等有人半夜被叫醒、確認狀況、手動升級，RTO 一樣是好幾十分鐘以上。</p>
+<p>自動切換要靠外部的管理程式。常見的是 Patroni，它搭配 etcd 這類<strong>共識服務</strong>：幾台機器用投票決定「現在誰是 primary」，少數幾台斷線也不會選出兩個。不想自己架的團隊，用雲端託管資料庫的 Multi-AZ：在同一區域的另一個機房放一台 replica，壞掉時自動切換（<a href="../../devops/lessons/18-aws-architecture.html">DevOps 課第 18 課</a>）。不管哪一種，都要解決三件事：</p>
+<ul>
+  <li><strong>判斷 primary 真的掛了</strong>：只是網路抖一下就切換，會造成不必要的停機。</li>
+  <li><strong>避免 split-brain</strong>（腦分裂）：舊 primary 其實還活著、只是連不到，結果兩台都以為自己是 primary、各自接受寫入，資料從此分岔，很難合併。管理程式要確保舊的那台被隔離（fencing）、不再接受寫入。</li>
+  <li><strong>讓應用程式找到新的 primary</strong>：做法見下面兩段。</li>
+</ul>
+<p>讓應用程式找到新 primary，常見的做法是 DNS 名稱指向新主機，或改由 pooler、負載平衡器轉送。另一種是在連線字串列出多台主機，加上 <code>target_session_attrs=read-write</code>，讓驅動程式依序連線、自動挑可寫入的那台：</p>
+<pre>postgresql://app@db1:5432,db2:5432/coffee?target_session_attrs=read-write</pre>
+<p>這個寫法由 libpq 處理。libpq 是 PostgreSQL 官方的 C 函式庫，<code>psql</code> 和 Python 的 psycopg 都建在它上面。<a href="25-backend.html">第 25 課</a>用的 node-postgres（<code>pg</code>）<strong>不支援</strong>：它只連一台主機，連線字串裡的 <code>target_session_attrs</code> 會被默默忽略，所以 Node 專案通常靠 DNS 或 pooler 指向新主機。換驅動前先查它的文件。</p>
+<p>資料庫換好了，應用程式這邊還有一段：切換的那幾十秒內，正在跑的交易會斷線、新連線會失敗。連線池要能丟掉壞連線、重新連線，交易要像<a href="31-isolation-upsert.html">第 31 課</a>那樣<strong>整個重試</strong>（而且要冪等，避免重複扣款）。沒有重試的 App，資料庫切換成功了，使用者還是會看到一堆 500。</p>
+<p>再提醒一次：自動故障轉移把 RTO 縮短到幾十秒，但對誤刪完全無效，新 primary 上的資料一樣是被刪過的，PITR 備份一樣要做。</p>
+<div class="callout practice"><strong>💡 實務上：大多數團隊不自己架 Patroni</strong><br>沒有專職 DBA 的團隊，通常直接用雲端託管資料庫的 Multi-AZ，把判斷故障、隔離舊主機、切換 DNS 交給廠商。但上面說的 App 那一側（重連、重試、冪等）廠商不會幫你做。資深工程師會在測試環境實際觸發一次故障轉移（託管服務通常有「重新開機並故障轉移」之類的操作），看 App 斷線多久、錯誤有沒有自己恢復，而不是只看廠商文件寫的秒數。做完把結果和處理步驟寫進值班手冊，下次硬碟壞掉時才不用現場摸索。</div>
+<p>到這裡，兩起事故都有了對策。但 replica 平常只是待命等故障，檢討會上一定有人問：既然它的資料幾乎和 primary 一樣，能不能讓它順便分擔查詢？</p>
+
+<h2>replica 能不能順便分擔讀取？</h2>
+<p>可以。replica 開著 <strong>hot standby</strong> 這個功能時，可以一邊重播 WAL、一邊接受唯讀查詢，報表、搜尋這類只讀的流量就可以分過去，減輕 primary 的負擔。replica 只能讀：<code>INSERT</code>、<code>UPDATE</code>、DDL、<code>SELECT … FOR UPDATE</code>、<code>nextval()</code> 都不行。分過去之前，要先知道兩個坑，它們都來自前面講過的事：replica 會落後，而且它在重播 primary 的 WAL。</p>
+
+<h3>剛寫完就讀，卻讀到舊資料</h3>
+<p>第一個坑來自延遲。把讀取分到 replica 之後，最常見的 bug 是這個：</p>
+<div class="tl">
+  <div class="table-wrap"><table>
+    <tr><th>步驟</th><th>App</th><th>primary</th><th>replica</th></tr>
+    <tr data-note="顧客按下「取消訂單」，App 在 primary 上更新。"><td>1</td><td><code>UPDATE orders SET status = 'cancelled' WHERE id = 42</code></td><td>status = cancelled</td><td>status = paid</td></tr>
+    <tr data-note="非同步複寫：primary 寫進自己的磁碟就回應成功，不等 replica。"><td>2</td><td>收到 COMMIT 成功</td><td>WAL 送出中…</td><td><span class="wait">還沒重播</span></td></tr>
+    <tr data-note="App 為了分散負載，把「重新載入訂單頁」的查詢送到 replica。"><td>3</td><td><code>SELECT status … WHERE id = 42</code>（走 replica）</td><td></td><td>回傳 <strong>paid</strong></td></tr>
+    <tr data-note="顧客看到訂單還是「已付款」，以為取消失敗，又按了一次。"><td>4</td><td>畫面顯示「已付款」</td><td></td><td><span class="wait">還沒重播</span></td></tr>
+    <tr data-note="幾十毫秒後 replica 重播完，資料才一致。平常延遲很小，但 replica 忙碌、網路慢、大量寫入時可能落後好幾秒甚至幾分鐘。"><td>5</td><td></td><td></td><td>status = cancelled</td></tr>
+  </table></div>
+  <div class="bar"><button data-prev>◀ 上一步</button><button class="primary" data-next>下一步 ▶</button><span class="kbd" data-count></span></div>
+  <p class="note"></p>
+</div>
+<p>修法：<strong>寫完要立刻讀的查詢走 primary</strong>（例如同一個請求、或使用者剛改過資料的幾秒內一律讀 primary）；只有能接受稍舊資料的查詢（報表、列表、搜尋）才走 replica。把 <code>synchronous_commit</code> 設成 <code>remote_apply</code> 也能讓 replica 馬上查得到，但每次 <code>COMMIT</code> 都要多等，通常不值得。<a href="../../system-design/lessons/06-replication-consistency.html">系統設計課第 6 課</a>會把這類一致性問題講完整。</p>
+
+<h3>replica 上的長查詢，為什麼會被取消？</h3>
+<p>第二個坑來自重播。把報表分到 replica 之後，長查詢可能和重播衝突，過程是這樣：</p>
+<ol>
+  <li>primary 的 VACUUM 清掉了死版本（第 30 課），這個清理也寫進 WAL。</li>
+  <li>replica 重播這個清理時，replica 上還在讀那些舊版本的查詢就得讓路。</li>
+  <li>重播等超過 <code>max_standby_streaming_delay</code>（預設 30 秒），查詢就被取消。</li>
+</ol>
+<p>開 <code>hot_standby_feedback</code> 可以讓 replica 告訴 primary「這些舊版本還有人在讀」，查詢就不會被取消。代價是 primary 延後清理、表開始膨脹，等於把第 30 課的「長交易擋住清理」搬到 primary 上。反過來，把 <code>max_standby_streaming_delay</code> 調大，查詢不容易被取消，但重播會被卡住，replica 落後變大，故障轉移時可能掉更多資料。兩個設定都在 replica 上：</p>
+<pre># postgresql.conf（replica）
+max_standby_streaming_delay = 30s   # 預設：重播最多等查詢 30 秒，之後取消查詢
+hot_standby_feedback = off          # on：請 primary 保留還有人在讀的舊版本，代價是 primary 膨脹</pre>
+<p>所以同一台 replica 很難同時當「隨時能接手的備援」又跑「十幾分鐘的大報表」，常見的做法是兩種用途分開放在不同台。</p>
+<div class="callout practice"><strong>💡 實務上：先別急著加 read replica</strong><br>咖啡店後台變慢時，先查是不是少了索引、查詢寫法有問題（<a href="21-explain.html">第 21 課</a>的 EXPLAIN），這些修好通常就夠了；replica 是 primary 真的忙不過來時才加。加了之後最常分過去的是後台報表、匯出 CSV、資料分析這類「慢一點也沒關係」的讀取，很多 ORM 和框架有讀寫分離的設定，接上前先確認團隊知道哪些查詢會走 replica。上線後在第 36 課的監控加一條「replica 延遲超過幾秒就告警」，不然延遲變大時只會收到「資料怪怪的」客訴。</div>
+<p>到這裡的複寫都是整台照抄：串流複寫複製的是整個 cluster 的 WAL，replica 一定是同一個大版本、一模一樣的內容。檢討會的最後一題就卡在這裡：硬碟壞掉那間店要換新主機，資料庫也跑在舊的大版本上，能不能趁換機時順便升級，又不停機？</p>
+
+<h2>換新主機時，能不能順便升級大版本？邏輯複寫</h2>
+<p>串流複寫做不到，因為 WAL 記的是「哪個資料頁的哪幾個位元組改成什麼」，不同大版本的資料頁格式不一定相同。<strong>邏輯複寫</strong>（logical replication）改用「列的變更」為單位，例如「orders 的 id 42 這一列，status 改成 cancelled」，所以可以只複寫指定的表，對方也可以是不同的大版本。來源叫 publisher，用 <code>PUBLICATION</code> 宣告要送哪些表；目的地叫 subscriber，用 <code>SUBSCRIPTION</code> 訂閱：</p>
+<pre>-- 來源（publisher）
+CREATE PUBLICATION coffee_pub FOR TABLE orders, customers;
+-- 目的地（subscriber），表要先自己建好
+CREATE SUBSCRIPTION coffee_sub
+  CONNECTION 'host=old-db dbname=coffee user=replicator'
+  PUBLICATION coffee_pub;</pre>
+<p>要從 WAL 還原出「哪一列變成什麼」，WAL 得多記一些資訊，所以它需要 <code>wal_level = logical</code>。這頁的 <code>wal_level</code> 是 <code>replica</code>（WAL 一節第一格看過），試著建立邏輯複寫用的 slot 會失敗，執行後看錯誤訊息：</p>
+<div class="lab" data-sql="SELECT pg_create_logical_replication_slot('to_search', 'pgoutput');"></div>
+<p>邏輯複寫有兩個限制，升級前一定要處理（PostgreSQL 18 文件）。第一，<strong>DDL 不會被複寫</strong>：schema 變更要兩邊自己同步，而且先改訂閱端（<a href="22-migrations.html">第 22 課</a>的 schema 變更），否則新欄位的資料送過去會沒地方放。第二，<strong>序號（sequence）的值不會被複寫</strong>：新主機上 <code>orders</code> 的資料雖然都到了，背後的序號還停在起點，切換前要手動把目的地的序號調到比來源大，不然第一筆新訂單就撞號。</p>
+<p>大版本升級有三種方式，停機時間和複雜度依序取捨（PostgreSQL 每個大版本支援 5 年，過了就沒有安全修補，遲早要升；各版本的支援期限見課末）：</p>
+<div class="table-wrap"><table>
+  <tr><th>方式</th><th>停機</th><th>說明</th></tr>
+  <tr><td><code>pg_dump</code> → <code>pg_restore</code></td><td>長（和資料量成正比）</td><td>最單純，小資料庫可以</td></tr>
+  <tr><td><code>pg_upgrade</code></td><td>短（<code>--link</code> 模式幾分鐘內）</td><td>直接轉換資料目錄；PostgreSQL 18 起的改進見課末</td></tr>
+  <tr><td>邏輯複寫</td><td>幾乎零停機</td><td>新版本當 subscriber 追上之後，切換連線；要處理 DDL 與序號</td></tr>
+</table></div>
+<p><code>pg_upgrade</code> 把舊版的資料目錄轉成新版能用的格式，不用像 <code>pg_dump</code> 一樣逐列重新寫入。<code>--link</code> 模式不複製資料檔，而是用硬連結讓新版直接沿用舊檔，所以幾分鐘就能完成；代價是新版啟動之後，舊版的叢集就不能再安全啟動，升級前一定要先有備份。</p>
+<p>套回咖啡店：新主機裝新版本、當 subscriber 追上舊主機，確認資料一致、調好序號之後，把連線切過去，停機只有切換那一下。</p>
+<p>同一套「把列的變更送出去」的機制還有另一個常見用途，叫 <strong>CDC</strong>（Change Data Capture，變更資料擷取）：把每一筆資料變更送到別的系統。例如 <a href="28-gin-search.html">第 28 課</a>的全文搜尋做不到時，把變更送去更新搜尋引擎；送進資料倉儲（專門做分析報表的資料庫）做報表；或發事件給其他服務，這是 <a href="33-job-queue.html">第 33 課</a> outbox 之外的另一種做法。常見工具是 Debezium。</p>
+
+<h2>補充與查表</h2>
+<ul>
+  <li><strong><code>data_checksums</code></strong>：PostgreSQL 18 的 <code>initdb</code> 預設開啟 data checksums，每個資料頁帶一個檢查碼，讀到被磁碟弄壞的頁時會報錯，而不是默默給你錯的資料。舊版升級上來的 cluster 不一定有開。</li>
+  <li><strong>WAL 檔名</strong>：24 個十六進位字元。前 8 個是時間線（timeline），每次 PITR 或故障轉移升級之後加一，用來區分「分岔」之後的歷史；後面是檔案編號。</li>
+  <li><strong>增量備份</strong>（PostgreSQL 17 起）：<code>pg_basebackup --incremental=上一次的 backup_manifest</code> 只複製改過的資料頁，還原前用 <code>pg_combinebackup</code> 把完整備份和增量合併成一份。伺服器要開 <code>summarize_wal</code>。</li>
+  <li><strong>雲端磁碟快照</strong>：RDS 等託管服務（雲端廠商替你管理的資料庫）的自動備份就是磁碟快照＋WAL（<a href="../../devops/lessons/18-aws-architecture.html">DevOps 課第 18 課</a>）。</li>
+  <li><strong>這頁的 PGlite 也有實體備份</strong>：它的 <code>dumpDataDir()</code> 把整個資料目錄打包（實測約 4.6 MB），<code>loadDataDir</code> 再載入成新的資料庫。</li>
+  <li><strong>封存工具</strong>：正式環境通常用 pgBackRest、WAL-G 這類工具處理封存、壓縮、上傳到別的區域與保留期限，而不是自己寫 <code>cp</code>。</li>
+  <li><strong><code>idle_replication_slot_timeout</code></strong>（PostgreSQL 18 新增）：閒置超過這段時間的 slot 在 checkpoint 時自動失效（預設 0 不啟用）。</li>
+  <li><strong>邏輯複寫與序號</strong>：PostgreSQL 19（目前只有 RC 版）會開始支援複寫序號。</li>
+  <li><strong><code>pg_upgrade</code> 與統計</strong>：PostgreSQL 18 起會保留規劃器統計（延伸統計除外），升級完不用等 <code>ANALYZE</code> 跑完查詢才變快。</li>
+  <li><strong>版本備註</strong>：截至 2026-10-31 最新正式版是 18.6，<strong>PostgreSQL 14 在 2026-11-12 停止支援</strong>，之後不再有安全修補。</li>
+</ul>
+
+<h2>練習</h2>
+
+<div class="exercise"
+  data-start="SELECT start_lsn, xid, resource_manager, record_type
+FROM pg_get_wal_records_info(
+  (SELECT lsn FROM markers WHERE name = 'before'),
+  pg_current_wal_lsn())
+LIMIT 20;"
+  data-answer="SELECT xid, count(*) AS deleted_rows
+FROM pg_get_wal_records_info(
+  (SELECT lsn FROM markers WHERE name = 'before'),
+  pg_current_wal_lsn())
+WHERE resource_manager = 'Heap' AND record_type = 'DELETE'
+GROUP BY xid
+HAVING count(*) &gt; 1;"
+  data-require="pg_get_wal_records_info"
+  data-require-msg="要用 pg_get_wal_records_info() 從 WAL 裡算出來，不能直接寫數字。">
+  <p>練習 1：從 <code>markers</code> 裡 <code>'before'</code> 的 LSN 掃到 <code>pg_current_wal_lsn()</code>，找出<strong>所有</strong>「一個交易裡刪了不只一列」的交易：每個交易一列，回傳交易編號 <code>xid</code> 和它刪除的列數。只刪一列的交易不能出現。</p>
+  <p>結果會有兩個交易。看列數和它們在 WAL 裡的提交時間，判斷哪一個是誤刪：那個 <code>xid</code> 就是 PITR 設定 <code>recovery_target_xid</code>（搭配 <code>recovery_target_inclusive = off</code>）要填的值。實務上「刪了很多列」只是線索，還要對照回報的時間和那段時間的部署、批次工作再確認。</p>
+  <script type="text/sql" data-role="wrong">SELECT count(*) AS deleted_rows
+FROM pg_get_wal_records_info(
+  (SELECT lsn FROM markers WHERE name = 'before'),
+  pg_current_wal_lsn())
+WHERE resource_manager = 'Heap' AND record_type = 'DELETE';</script>
+  <script type="text/sql" data-role="wrong">SELECT xid, count(*) AS deleted_rows
+FROM pg_get_wal_records_info(
+  (SELECT lsn FROM markers WHERE name = 'before'),
+  pg_current_wal_lsn())
+WHERE resource_manager = 'Heap' AND record_type = 'DELETE'
+GROUP BY xid;</script>
+  <script type="text/sql" data-role="wrong">SELECT xid, count(*) AS deleted_rows
+FROM pg_get_wal_records_info(
+  (SELECT lsn FROM markers WHERE name = 'before'),
+  pg_current_wal_lsn())
+WHERE resource_manager = 'Transaction' AND record_type = 'DELETE'
+GROUP BY xid
+HAVING count(*) > 1;</script>
+  <script type="text/sql" data-role="wrong">SELECT xid, count(*) AS deleted_rows
+FROM pg_get_wal_records_info(
+  (SELECT lsn FROM markers WHERE name = 'before'),
+  pg_current_wal_lsn())
+WHERE resource_manager = 'Heap' AND record_type = 'DELETE'
+GROUP BY xid
+ORDER BY deleted_rows DESC
+LIMIT 1;</script>
+  <script type="text/sql" data-role="wrong">SELECT 757::text::xid AS xid, 100 AS deleted_rows;</script>
+  <script type="text/sql" data-role="wrong">SELECT xid, count(*) AS deleted_rows
+FROM pg_get_wal_records_info(
+  (SELECT lsn FROM markers WHERE name = 'before'),
+  pg_current_wal_lsn())
+WHERE resource_manager = 'Heap' AND record_type = 'DELETE'
+GROUP BY xid
+HAVING count(*) > 2;</script>
+</div>
+
+<div class="exercise"
+  data-start="SELECT (SELECT count(*) FROM orders) AS 正式資料庫,
+       (SELECT count(*) FROM orders_restored) AS 還原副本;"
+  data-answer="INSERT INTO orders OVERRIDING SYSTEM VALUE
+SELECT * FROM orders_restored r
+WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.id = r.id);"
+  data-check="SELECT (SELECT count(*) FROM orders) AS orders_rows,
+       (SELECT count(*) FROM (SELECT * FROM orders_restored WHERE store_id = 2 EXCEPT SELECT * FROM orders) m) AS still_missing,
+       (SELECT count(*) FROM orders WHERE (id = 12 AND status = 'refunded') OR id = 303) AS later_work_kept;"
+  data-max-statements="1">
+  <p>練習 2：<code>orders_restored</code> 是在另一台機器上 PITR 還原到誤刪前一刻、再搬過來的副本（欄位和 <code>orders</code> 完全一樣）。寫<strong>一句</strong> <code>INSERT … SELECT</code>，只把 <code>orders</code> 裡<strong>不見的列</strong>補回來，保留原本的 <code>id</code>。誤刪之後的正常工作（訂單 12 退款、新訂單 303）要留著。</p>
+  <script type="text/sql" data-role="wrong">INSERT INTO orders OVERRIDING SYSTEM VALUE
+SELECT * FROM orders_restored;</script>
+  <script type="text/sql" data-role="wrong">INSERT INTO orders
+SELECT * FROM orders_restored r
+WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.id = r.id);</script>
+  <script type="text/sql" data-role="wrong">INSERT INTO orders (store_id, ordered_at, total, status)
+SELECT store_id, ordered_at, total, status FROM orders_restored r
+WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.id = r.id);</script>
+  <script type="text/sql" data-role="wrong">INSERT INTO orders OVERRIDING USER VALUE
+SELECT * FROM orders_restored r
+WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.id = r.id);</script>
+  <script type="text/sql" data-role="wrong">INSERT INTO orders OVERRIDING SYSTEM VALUE
+SELECT * FROM orders_restored
+EXCEPT
+SELECT * FROM orders;</script>
+  <script type="text/sql" data-role="wrong">INSERT INTO orders OVERRIDING SYSTEM VALUE
+SELECT * FROM orders_restored
+ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status;</script>
+  <script type="text/sql" data-role="wrong">WITH gone AS (DELETE FROM orders RETURNING id)
+INSERT INTO orders OVERRIDING SYSTEM VALUE
+SELECT * FROM orders_restored;</script>
+  <script type="text/sql" data-role="wrong">TRUNCATE orders;
+INSERT INTO orders OVERRIDING SYSTEM VALUE SELECT * FROM orders_restored;</script>
+</div>
+
+<div class="exercise"
+  data-start="SELECT application_name, sent_lsn, write_lsn, flush_lsn, replay_lsn, sync_state
+FROM replica_status;"
+  data-answer="SELECT application_name,
+       pg_wal_lsn_diff(sent_lsn, replay_lsn) AS replay_lag_bytes,
+       pg_wal_lsn_diff(sent_lsn, replay_lsn) &gt; 16 * 1024 * 1024 AS over_16mb
+FROM replica_status
+ORDER BY replay_lag_bytes DESC;"
+  data-ordered>
+  <p>練習 3：監控要在 replica 落後太多時告警。從 <code>replica_status</code> 列出每個 replica 的名稱、<strong>重播</strong>落後的位元組數（從 <code>sent_lsn</code> 算起）、以及是否<strong>超過</strong> 16 MB（16 × 1024 × 1024 位元組；剛好等於不算超過，true／false），依落後量由大到小排序。</p>
+  <script type="text/sql" data-role="wrong">SELECT application_name,
+       pg_wal_lsn_diff(sent_lsn, write_lsn) AS lag_bytes,
+       pg_wal_lsn_diff(sent_lsn, write_lsn) > 16 * 1024 * 1024 AS over_16mb
+FROM replica_status
+ORDER BY lag_bytes DESC;</script>
+  <script type="text/sql" data-role="wrong">SELECT application_name,
+       pg_wal_lsn_diff(sent_lsn, replay_lsn) AS replay_lag_bytes,
+       pg_wal_lsn_diff(sent_lsn, replay_lsn) > 16000000 AS over_16mb
+FROM replica_status
+ORDER BY replay_lag_bytes DESC;</script>
+  <script type="text/sql" data-role="wrong">SELECT application_name,
+       pg_wal_lsn_diff(replay_lsn, sent_lsn) AS replay_lag_bytes,
+       pg_wal_lsn_diff(replay_lsn, sent_lsn) > 16 * 1024 * 1024 AS over_16mb
+FROM replica_status
+ORDER BY replay_lag_bytes DESC;</script>
+  <script type="text/sql" data-role="wrong">SELECT application_name,
+       pg_wal_lsn_diff(sent_lsn, replay_lsn) AS replay_lag_bytes,
+       pg_wal_lsn_diff(sent_lsn, replay_lsn) >= 16 * 1024 * 1024 AS over_16mb
+FROM replica_status
+ORDER BY replay_lag_bytes DESC;</script>
+  <script type="text/sql" data-role="wrong">SELECT application_name,
+       pg_wal_lsn_diff(sent_lsn, replay_lsn) AS replay_lag_bytes,
+       pg_wal_lsn_diff(sent_lsn, replay_lsn) > 16 * 1024 * 1024 AS over_16mb
+FROM replica_status
+ORDER BY replay_lag_bytes;</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：咖啡店有一台非同步 replica。有人在 primary 誤執行了沒有 <code>WHERE</code> 的 <code>DELETE FROM orders</code>，五分鐘後才發現。replica 能救回資料嗎？</p>
+  <label data-key="a">可以，把 replica 升級成 primary 就有完整的訂單</label>
+  <label data-key="b">可以，replica 不會複寫 <code>DELETE</code></label>
+  <label data-key="c">不行，<code>DELETE</code> 也是 WAL 裡的變更，replica 早就重播了；要靠 PITR 備份還原到誤刪前</label>
+  <p class="why">✓ c：replica 會重播 primary 的每一筆 WAL，包括 <code>DELETE</code>，通常幾毫秒內就跟上了。a 錯：五分鐘後 replica 上的訂單早就一起被刪了，升級它只是換一台一樣空的主機。b 錯：串流複寫複製的是整份 WAL，不會挑掉哪一種變更。複寫防的是機器壞掉，不是資料被改壞；只有基礎備份＋WAL 封存才能回到「誤刪前一刻」。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：每天 02:00 跑一次 <code>pg_dump</code> 並上傳到另一個區域，沒有 WAL 封存。某天 18:00 主機硬碟壞掉，最多會遺失多少資料？</p>
+  <label data-key="a">不會遺失，備份就是為了這個</label>
+  <label data-key="b">02:00 之後的所有變更，大約 16 小時；RPO 最差是 24 小時</label>
+  <label data-key="c">只會遺失 18:00 那一刻正在跑的交易</label>
+  <p class="why">✓ b：<code>pg_dump</code> 只能還原到匯出那一刻，02:00 到 18:00 的變更只存在壞掉的那顆硬碟上。a 錯：備份只保護到備份那一刻，之後的資料要靠 WAL 封存或複寫。c 錯：那是 WAL 封存或同步複寫才做得到的程度；這裡沒有 WAL 封存。要把 RPO 縮到分鐘級，需要實體備份＋持續的 WAL 封存（PITR），或再加上複寫。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：把 <code>synchronous_commit</code> 設成 <code>remote_apply</code>（並設定了同步 replica），保證了什麼？代價是什麼？</p>
+  <label data-key="a">COMMIT 回應時，同步 replica 已經重播完，馬上查得到；代價是每次 COMMIT 都要等重播，延遲最大，replica 掛掉時寫入會卡住</label>
+  <label data-key="b">保證所有 replica 永遠和 primary 一致，而且沒有額外成本</label>
+  <label data-key="c">保證誤刪的資料可以從 replica 救回來</label>
+  <p class="why">✓ a：<code>remote_apply</code> 是最強的等級：資料不會遺失，而且在同步 replica 上讀得到剛寫的資料。代價是 COMMIT 延遲（多一趟網路加上重播時間），以及同步 replica 不可用時 COMMIT 會一直等。b 錯：它只涵蓋同步 replica，其他非同步 replica 照樣會落後，而且每次 COMMIT 都要付延遲。c 錯：replica 會重播誤刪，同步只會讓它刪得更快。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>把 replica 當備份</strong>：誤刪和程式 bug 會被立刻複寫過去。複寫防機器壞掉，備份防資料被改壞，兩者都要。</li>
+  <li><strong>備份和資料庫放在同一台機器或同一個區域</strong>：硬碟壞掉、區域故障、帳號被入侵時一起消失。備份要放在別的區域，最好連權限也分開。</li>
+  <li><strong>只有 <code>pg_dump</code></strong>：資料變大後還原要好幾小時，而且只能回到匯出那一刻。資料大或 RPO 要求高時，改用實體備份＋WAL 封存。</li>
+  <li><strong><code>archive_command</code> 失敗沒人發現</strong>：WAL 堆積塞滿磁碟，或 PITR 從某處斷鏈。監控 <code>pg_stat_archiver</code>；指令只能在真的成功時回傳 0。</li>
+  <li><strong>把正式資料庫整台倒回去</strong>：會抹掉誤刪之後的正常寫入。還原到另一台，再把缺的資料補回來。</li>
+  <li><strong>從來沒演練過還原</strong>：真的出事才發現備份壞了、少了 WAL、沒人會還原。定期還原到另一台機器，量出實際 RTO。</li>
+  <li><strong>忘了刪除不用的 replication slot</strong>：primary 會一直保留 WAL 直到磁碟滿。監控 inactive slot，設定 <code>max_slot_wal_keep_size</code> 或 18 的 <code>idle_replication_slot_timeout</code>。</li>
+  <li><strong>故障轉移後 App 沒有重連與重試</strong>：資料庫切換成功，使用者仍看到錯誤。連線池要能重連，交易要能整個重試。</li>
+  <li><strong>剛寫完就從 replica 讀</strong>：非同步複寫有延遲，會讀到舊資料。寫完要立刻讀的查詢走 primary。</li>
+  <li><strong>大版本過了支援期還在跑</strong>：沒有安全修補。PostgreSQL 14 在 2026-11-12 停止支援，提早規劃升級。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>先定 RPO（最多掉多少資料）與 RTO（最多停多久），再選方案。複寫防機器壞掉、備份防資料被改壞，replica 救不了誤刪；備份要放在別的區域。</li>
+  <li>WAL 先記帳再改資料：COMMIT 時 WAL 進磁碟就算數，資料頁在 checkpoint 時寫回，當機後從 checkpoint 重播。備份和複寫都是在搬 WAL。fsync 在正式環境絕對不能關。</li>
+  <li>每刪一列就是一筆 WAL 紀錄，用 <code>pg_walinspect</code> 數「一個交易刪了幾列」，再對照提交時間，就能找出誤刪的 <code>xid</code>。</li>
+  <li><code>pg_dump</code>：一致快照、可跨大版本、可只還原部分表，但還原慢、只能回到匯出那一刻；<code>pg_basebackup</code>：還原快、只能同大版本。</li>
+  <li>PITR = 基礎備份＋連續的 WAL 封存，可以停在某個時間、交易或具名還原點。還原到另一台，再用 <code>OVERRIDING SYSTEM VALUE</code> 把缺的列補回來，保留之後的正常寫入。</li>
+  <li>串流複寫預設非同步；同步複寫用 <code>synchronous_commit</code> 決定等到哪一步。replica 落後看 <code>replay_lsn</code>。replication slot 會保留 WAL，沒人用的 slot 會塞滿磁碟。</li>
+  <li>PostgreSQL 不會自己故障轉移，要靠 Patroni 或雲端服務，並防 split-brain；App 要能重連與重試。</li>
+  <li>replica 可以分擔讀取，但寫完要立刻讀的查詢走 primary；長查詢可能被重播取消，<code>hot_standby_feedback</code> 的代價是 primary 膨脹。</li>
+  <li>邏輯複寫只複寫指定的表、可跨大版本，但不複寫 DDL 與序號；它是幾乎零停機升級與 CDC 的基礎。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 8 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="a">
+  <p>練習 7：晚上部署 <code>ALTER TABLE orders ADD COLUMN note text</code>，這句本來瞬間完成，網站卻卡了 10 分鐘，剛好有一份跑了 10 分鐘的報表在讀 <code>orders</code>。為什麼？</p>
+  <label data-key="a">ALTER 要的強鎖排在報表後面等，之後的查詢又全部排在 ALTER 後面</label>
+  <label data-key="b">報表拿著的讀取鎖本來就會擋住寫入，跟這次 ALTER 沒有關係</label>
+  <label data-key="c">orders 很大，加欄位要重寫整張表，重寫花了 10 分鐘</label>
+  <p class="why">✓ ALTER 要 ACCESS EXCLUSIVE，跟報表的 ACCESS SHARE 衝突，只能排隊；排隊中的 ALTER 又擋住後面所有人，連 SELECT 都進不來。修法是交易裡 <code>SET LOCAL lock_timeout</code>，等不到就放棄、稍後重試。b 錯在 ACCESS SHARE 只跟 ACCESS EXCLUSIVE 衝突，平常報表不擋寫入。（第 34 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 8：<code>orders</code> 有 4,000 萬列，營業時間執行下面這段 migration。哪裡會出事？</p>
+<pre>BEGIN;
+SET LOCAL lock_timeout = '3s';
+ALTER TABLE orders
+  ADD CONSTRAINT orders_total_nonneg CHECK (total &gt;= 0);
+COMMIT;</pre>
+  <label data-key="a">3 秒內掃不完整張表，lock_timeout 會讓約束加到一半就失敗</label>
+  <label data-key="b">沒寫 NOT VALID 時只檢查新資料，表裡已有的負數會留下來</label>
+  <label data-key="c">拿到鎖之後在 ACCESS EXCLUSIVE 底下掃全表，期間讀寫都被擋</label>
+  <label data-key="d">加 CHECK 要重寫整張表和索引，WAL 暴增、replica 跟著落後</label>
+  <p class="why">✓ 直接加 CHECK 要確認每一列都符合，在強鎖底下掃全表。拆成兩步：<code>ADD CONSTRAINT … NOT VALID</code> 瞬間加上，再 <code>VALIDATE CONSTRAINT</code>，它只拿 SHARE UPDATE EXCLUSIVE，讀寫照常。a 錯在 lock_timeout 只限制等鎖的時間，拿到鎖之後掃多久它管不到。（第 34 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 9：API 有 6 台、滾動部署。這次要把 <code>customers.phone</code> 改名為 <code>mobile</code>，做法是先跑 <code>RENAME COLUMN phone TO mobile</code>，再部署讀寫 <code>mobile</code> 的新版。哪裡會出事？</p>
+  <label data-key="a">RENAME 要重寫整張表，大表上會鎖很久</label>
+  <label data-key="b">改名後 <code>phone</code> 上的索引失效，要重建才查得快</label>
+  <label data-key="c">新版上線前，新舊欄位的資料會不同步</label>
+  <label data-key="d">新版還沒換完的那段時間，舊版查 <code>phone</code> 全部報錯</label>
+  <p class="why">✓ 滾動部署期間新舊兩版同時在跑，schema 要兩版都能用。用 expand／contract：先加 <code>mobile</code> 並用 trigger 同步、回填，部署新版，舊版全部下線後才刪 <code>phone</code>。a 錯在 RENAME 只改目錄、瞬間完成，問題出在還在用舊名稱的程式。（第 34 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 10：上線前 review 設定：API 平常 4 台、自動擴展上限 20 台，每台 pool max 10；worker 2 台、每台 pool max 5；<code>max_connections</code> 是 100。平常只用到約 50 條連線。你的判斷？</p>
+  <label data-key="a">平常只用一半，還有 50 條的空間，尖峰也夠用</label>
+  <label data-key="b">擴到上限要 210 條，超過 100；縮小 pool 或在前面加 pooler</label>
+  <label data-key="c">擴到上限要 210 條，把 <code>max_connections</code> 調到 250 就好</label>
+  <p class="why">✓ 連線預算要用擴展上限算：20 × 10 ＋ 2 × 5 = 210，還要留位置給 migration 和自己登入查問題。不夠就縮小 pool 或加 pooler，讓很多客戶連線共用少量伺服器連線。c 錯在每條連線一個程序、各有記憶體，同時在做事的連線太多，吞吐量反而下降。（第 36 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 11：每日結帳的 worker 透過 PgBouncer 的 transaction 模式連線，用 advisory lock 確保只有一台在跑。下面每一句各自是一個交易，哪裡會出事？</p>
+<pre>SELECT pg_try_advisory_lock(42);   -- 拿到才結帳
+UPDATE orders SET settled = true WHERE …;
+INSERT INTO settlements …;
+SELECT pg_advisory_unlock(42);</pre>
+  <label data-key="a">PgBouncer 不支援 advisory lock 函式，第一句就會報錯</label>
+  <label data-key="b">advisory lock 在第一句的交易結束時就釋放了，鎖不住任何東西</label>
+  <label data-key="c">鎖留在第一句用的伺服器連線上，unlock 可能跑在另一條，解不掉</label>
+  <p class="why">✓ session 級的鎖跟著伺服器連線，transaction 模式每個交易都可能換一條，鎖就留在那條被別人借走的連線上，隔天可能再也拿不到。改成把結帳放在同一個交易裡，用 <code>pg_try_advisory_xact_lock</code>，交易結束自動釋放。b 錯在交易結束才釋放的是 xact 版本，<code>pg_try_advisory_lock</code> 會一直留到明確解鎖或連線斷掉。（第 36 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 12：上線時用 postgres 執行過 <code>ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_user</code>。這次 migration 由 <code>migrator</code> 建了 <code>gift_cards</code>，App 一查就 permission denied。原因是？</p>
+  <label data-key="a">預設權限綁在建立物件的角色上，這句只套用在 postgres 建的表</label>
+  <label data-key="b">預設權限只管執行當下已經存在的表，新表要再 GRANT 一次</label>
+  <label data-key="c">app_user 少了 identity 背後序號的權限，新增時才被擋</label>
+  <label data-key="d">預設權限要等 App 重新登入才會載入，重啟連線池就好</label>
+  <p class="why">✓ 省略 <code>FOR ROLE</code> 時，預設權限屬於執行這句的角色。要寫 <code>ALTER DEFAULT PRIVILEGES FOR ROLE migrator …</code>，並寫進 migration 進版控。b 把它和 <code>GRANT … ON ALL TABLES</code> 弄反了：只管現有表的是後者，預設權限管的是之後建的表。（第 36 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 13：顧客在會員頁改了電話，按儲存後頁面重新載入，顯示的還是舊號碼，過幾秒再整理就對了。App 的讀取走非同步 replica。怎麼修最恰當？</p>
+  <label data-key="a">把 <code>synchronous_commit</code> 設成 <code>on</code>，replica 就一定查得到</label>
+  <label data-key="b">把隔離等級改成 SERIALIZABLE，讀到的就是最新的資料</label>
+  <label data-key="c">把 replica 換成規格更好的機器，讓它重播得比 App 讀得快</label>
+  <label data-key="d">寫完要立刻讀的查詢走 primary，能接受稍舊的才走 replica</label>
+  <p class="why">✓ 非同步複寫有延遲，COMMIT 回應時 replica 可能還沒重播，剛寫完就去讀會讀到舊資料。同一個請求、或使用者剛改過資料的幾秒內一律讀 primary。a 錯在 <code>on</code> 只等 replica 寫進磁碟，要等到重播完、查得到是 <code>remote_apply</code>，代價是每次 COMMIT 都更慢。（第 37 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 14：18:10 有人誤刪了二號分店的訂單，18:40 才發現，這 30 分鐘裡還有新訂單和退款。有基礎備份和連續的 WAL 封存，怎麼救？</p>
+  <label data-key="a">把正式資料庫 PITR 倒回 18:09，誤刪的訂單就全部回來了</label>
+  <label data-key="b">在另一台 PITR 還原到誤刪前一刻，再把缺的列補回正式資料庫</label>
+  <label data-key="c">把 replica 升級成 primary，它上面還留著誤刪前的資料</label>
+  <label data-key="d">用今天 02:00 的基礎備份整台還原，再請店員補登今天的單</label>
+  <p class="why">✓ 用 <code>recovery_target_xid</code> 加 <code>recovery_target_inclusive = off</code> 停在誤刪的交易之前，再用 <code>INSERT … OVERRIDING SYSTEM VALUE SELECT …</code> 補回原本的 id。a 錯在整台倒回去，18:10 之後的新訂單和退款也一起不見了。（第 37 課）</p>
+</div>
+<p>這個階段的重點整理成<a href="../sheets/stage-10.html">一頁圖解</a>。</p>
+<p>下一課回到資料表的設計：軟刪除、稽核紀錄、時間區間與多租戶這幾種常見的資料建模模式。</p>
+
+</main>
+
+<script type="text/sql" id="seed">
+CREATE EXTENSION pg_walinspect;
+
+-- 三家分店的訂單：id 1–300，store_id = 1 + id % 3
+CREATE TABLE orders (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  store_id integer NOT NULL,
+  ordered_at timestamptz NOT NULL,
+  total integer NOT NULL,
+  status text NOT NULL DEFAULT 'paid'
+);
+INSERT INTO orders (store_id, ordered_at, total)
+SELECT 1 + g % 3,
+       timestamptz '2026-10-30 08:00' + g * interval '2 minutes',
+       (ARRAY[80, 110, 90, 70, 120])[1 + g % 5]
+FROM generate_series(1, 300) g;
+
+-- PITR 還原到誤刪前一刻的副本：訂單 301、302 已經新增，訂單 7、8、9 已經正常取消，訂單 12 還沒退款
+CREATE TABLE orders_restored AS SELECT * FROM orders WHERE id NOT IN (7, 8, 9);
+INSERT INTO orders_restored VALUES
+  (301, 2, '2026-10-30 18:05', 110, 'paid'),
+  (302, 1, '2026-10-30 18:06', 80, 'paid');
+
+-- 記下某個時間點的 WAL 位置
+CREATE TABLE markers (
+  name text PRIMARY KEY,
+  lsn pg_lsn NOT NULL
+);
+
+-- 某一刻 primary 上 pg_stat_replication 的快照
+CREATE TABLE replica_status (
+  application_name text,
+  state text,
+  sent_lsn pg_lsn,
+  write_lsn pg_lsn,
+  flush_lsn pg_lsn,
+  replay_lsn pg_lsn,
+  sync_state text
+);
+INSERT INTO replica_status VALUES
+  ('replica_sync',   'streaming', '5/A0000000', '5/A0000000', '5/A0000000', '5/A0000000', 'sync'),
+  ('replica_read',   'streaming', '5/A0000000', pg_lsn '5/A0000000' - 8192, pg_lsn '5/A0000000' - 8192, pg_lsn '5/A0000000' - 16500000, 'async'),
+  ('replica_report', 'streaming', '5/A0000000', pg_lsn '5/A0000000' - 4096, pg_lsn '5/A0000000' - 4096, pg_lsn '5/A0000000' - 52428800, 'async'),
+  ('replica_dr',     'streaming', '5/A0000000', '5/A0000000', '5/A0000000', pg_lsn '5/A0000000' - 2000000, 'async'),
+  ('replica_backup', 'streaming', '5/A0000000', '5/A0000000', '5/A0000000', pg_lsn '5/A0000000' - 16777216, 'async');
+
+-- 拿來產生大量寫入
+CREATE TABLE access_log (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  path text NOT NULL
+);
+</script>
+<script type="text/sql" id="seed-after">
+SELECT pg_create_physical_replication_slot('old_replica', true);
+--;;
+INSERT INTO markers VALUES ('before', pg_current_wal_lsn());
+--;;
+INSERT INTO orders (store_id, ordered_at, total) VALUES
+  (2, '2026-10-30 18:05', 110),
+  (1, '2026-10-30 18:06', 80);
+--;;
+DELETE FROM orders WHERE id = 7;
+--;;
+DELETE FROM orders WHERE id IN (8, 9);
+--;;
+DELETE FROM orders WHERE store_id = 2;
+--;;
+UPDATE orders SET status = 'refunded' WHERE id = 12;
+--;;
+INSERT INTO orders (store_id, ordered_at, total) VALUES (2, '2026-10-30 18:20', 90);
+</script>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

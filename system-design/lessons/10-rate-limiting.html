@@ -1,0 +1,1299 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>10. 限流：保護服務，也保護其他客戶</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="10">
+<header>
+  <div class="eyebrow">階段 3：可靠性：失敗是常態 · 第 10 課</div>
+  <h1>限流：保護服務，也保護其他客戶</h1>
+</header>
+<main>
+
+<p>咖啡店開放下單 API 給外送平台和企業團購客戶，每個合作夥伴用自己的 API key 呼叫。某天其中一家外送平台更新了程式，裡面有個 bug：收到錯誤就立刻重試，完全不等待。伺服器一忙就回錯誤，錯誤又引發更多重試，很快變成每秒 3,000 個請求的無窮迴圈。API 的容量被它一家吃光，其他合作夥伴送來的訂單一路排隊到逾時，200 家門市的顧客點不了餐。</p>
+<p><a href="08-timeouts-retries-backoff.html">第 8 課</a>站在呼叫方，讓<em>你的</em>程式失敗後有節制地重試；這一課站到另一邊：別人送得太多時，你的 API 要怎麼擋。整課只做一件事：替咖啡店的合作夥伴 API 加上限流（rate limiting），讓這家外送平台的 bug 只傷到它自己，不拖垮其他客戶。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>為什麼一家暴衝會拖垮所有人，最簡單的擋法是什麼：容量先搶先贏；固定視窗每分鐘數次數、超過就拒絕，以及它在視窗交界的漏洞。</li>
+  <li>怎麼數得更準、又允許合理的突發：滑動視窗看「剛剛這 60 秒」，token bucket 把突發和長期平均分開管。</li>
+  <li>依誰計數、被擋了回什麼：依 API key 還是 IP，多層限流的檢查順序，回 429 並用 <code>Retry-After</code> 告訴客戶端何時再來。</li>
+  <li>搬上正式環境：好幾台 API 時計數放在哪裡，限流器自己壞了要放行還是拒絕，規則怎麼安全上線。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="03-latency-percentiles.html">第 3 課</a>的使用率與排隊：機器越接近滿載，排隊時間越暴增。</li>
+  <li><a href="08-timeouts-retries-backoff.html">第 8 課</a>的 <code>Retry-After</code> 與退避：伺服器告訴客戶端多久之後再來，客戶端每次重試前等的時間加倍。</li>
+</ul></div>
+
+<h2>一家合作夥伴暴衝，為什麼其他人也點不了餐？</h2>
+<p>API 伺服器同一時間能處理的請求數是固定的：CPU、資料庫連線、記憶體都有上限。請求來得比處理得快，多出來的就排隊。<a href="03-latency-percentiles.html">第 3 課</a>講過，使用率越接近 100%，排隊時間不是慢慢變長，而是暴增。</p>
+<p>關鍵在於：所有合作夥伴的請求排在<strong>同一條隊伍</strong>裡，伺服器不知道誰是誰，先到先處理。外送平台每秒送 3,000 個，其他合作夥伴加起來每秒可能只有幾十個，隊伍裡幾乎全是外送平台的請求。其他人的訂單排在它後面，等到逾時都還沒輪到。沒有任何保護時，<strong>誰送得最多，誰就拿到最多的容量</strong>，安分的客戶反而被擠掉。流量暴增的原因很多，合作夥伴的程式寫錯是一種，爬蟲、搶購活動、有人故意攻擊也是，結果都一樣。</p>
+<p>限流就是替每個客戶設一個「一段時間內最多幾個請求」的上限，超過的請求在入口直接拒絕，不進入下單流程。一段時間內允許的總量叫<strong>配額</strong>（quota），例如「每個 API key 每分鐘 100 次」。拒絕一個請求只要查一個計數，不碰資料庫，所以外送平台再怎麼狂送，它多出來的請求只花掉極少的資源，容量留給其他人。</p>
+<p>所以限流有兩個目的：<strong>保護自己</strong>，不要被壓垮；<strong>保護其他客戶</strong>，一家出事不拖累所有人。後者常被忽略，但對有很多客戶的 API 來說才是主要理由：就算伺服器勉強撐得住，你也不希望一家的 bug 變成所有人的事故。</p>
+<p>「限制請求」其實有三種機制，常被混在一起。它們擋的是不同的問題：</p>
+<ul>
+  <li><strong>限流</strong>（rate limiting）：限制<em>一段時間內</em>的請求數，例如每個 API key 每分鐘 100 次。外送平台的事故就是這一種：一個客戶送太多。</li>
+  <li><strong>並行數限制</strong>（concurrency limit）：限制<em>同時進行中</em>的請求數，例如每個客戶最多 20 個。用 <a href="03-latency-percentiles.html">第 3 課</a>的 Little's Law 看：並行數 = 速率 × 每個請求的時間。匯出報表一個要 2 秒，每秒 10 個就有 20 個同時在跑。速率限制管不到「每個都很慢」的請求，並行數限制可以。</li>
+  <li><strong>負載卸除</strong>（load shedding）：伺服器<em>整體</em>過載時，主動拒絕一部分（通常是低優先的）請求，不管它屬於誰。<a href="11-circuit-breaker-bulkhead.html">第 11 課</a>詳談。</li>
+</ul>
+<p>前兩個針對<strong>某個客戶</strong>，最後一個針對<strong>整台伺服器</strong>。這課專注在前者，以及怎麼讓兩者配合；Stripe 怎麼把這三種疊成線上的四層，見課末「補充與查表」。</p>
+<div class="callout practice"><strong>💡 實務上：先從「最貴、最容易被濫用」的端點開始</strong><br>小專案不需要一開始就設計完整的多層限流。先找出這幾類端點：登入和忘記密碼（暴力破解）、寄簡訊或 Email 驗證碼（每封都要錢，被灌爆就是帳單爆炸）、搜尋和匯出報表（一個請求就很吃資料庫）、開放給合作夥伴的 API。咖啡店的菜單查詢通常有快取擋著，不是第一優先；合作夥伴的下單 API 就在這份清單上，這也是本課從它開始的原因。資深工程師會先問：這個端點被狂打時，壞掉的是什麼？伺服器、資料庫、帳單，還是其他客戶的體驗？答案決定要用限流、並行數限制，還是別的保護。</div>
+<p>接下來要回答的是：怎麼替每個 API key 數「一段時間內幾次」？</p>
+
+<h2>最簡單的擋法：每分鐘數次數，夠嗎？</h2>
+<p>「數一段時間內幾次」最直覺的做法是<strong>固定視窗</strong>（fixed window）。把時間切成整分鐘：0:00 到 0:59.999 是第 0 個視窗，1:00 到 1:59.999 是第 1 個，以此類推。每個 API key 在每個視窗有一個計數器。請求進來時，先用 <code>Math.floor(現在時間 ÷ 60000)</code> 算出它屬於第幾個視窗，把那個視窗的計數加 1；加之前已經到上限，就拒絕。下一分鐘換成新的視窗，計數自然從 0 開始。每個 key 只要存一個數字，很好懂，<a href="../../auth/lessons/16-account-flows.html">認證課第 16 課</a>就用它擋登入的暴力破解。</p>
+<p>套到開場的事故：外送平台的合約是每分鐘 100 次。它每秒送 3,000 個，一分鐘就是 180,000 個；每分鐘的前 100 個通過，剩下的 179,900 個在入口就被拒絕，不碰資料庫。其他合作夥伴的請求不用再排在它後面。這就是開場問題的最小答案。</p>
+<p>但它有一個漏洞，出在視窗交界。上限每分鐘 100 次，有人在 0:59 送 100 個、1:01 再送 100 個：兩波請求分屬不同視窗，各自都沒超過上限，全部通過。<strong>2 秒內通過了 200 個</strong>，是你以為的兩倍。</p>
+<figure>
+  <svg viewBox="0 0 700 220" role="img" aria-label="固定視窗每分鐘 100 次：0 分 59 秒送 100 個屬於第一個視窗、1 分 1 秒送 100 個屬於第二個視窗，2 秒內通過 200 個">
+    <defs><marker id="a10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="40" y="60" width="300" height="70" rx="6"/>
+    <rect class="d-soft" x="350" y="60" width="300" height="70" rx="6"/>
+    <text class="d-text" x="190" y="50" text-anchor="middle">視窗 0：0:00～0:59.999（上限 100）</text>
+    <text class="d-text" x="500" y="50" text-anchor="middle">視窗 1：1:00～1:59.999（上限 100）</text>
+    <rect class="d-box" x="300" y="75" width="36" height="40" rx="4"/>
+    <text class="d-small" x="318" y="100" text-anchor="middle">100</text>
+    <rect class="d-box" x="356" y="75" width="36" height="40" rx="4"/>
+    <text class="d-small" x="374" y="100" text-anchor="middle">100</text>
+    <line class="d-line" x1="345" y1="40" x2="345" y2="150"/>
+    <text class="d-small" x="318" y="150" text-anchor="middle">0:59</text>
+    <text class="d-small" x="374" y="150" text-anchor="middle">1:01</text>
+    <line class="d-line" x1="300" y1="175" x2="392" y2="175" marker-start="url(#a10)" marker-end="url(#a10)"/>
+    <text class="d-accent" x="346" y="200" text-anchor="middle">2 秒內 200 個全部通過</text>
+  </svg>
+  <figcaption>兩波請求各自落在不同視窗，每個視窗都沒超過上限。</figcaption>
+</figure>
+<p>下面這格照圖上的時間點送兩波，執行後看印出的通過數量。</p>
+<div class="lab"><script type="code">
+// 固定視窗：每分鐘 100 次，視窗對齊整分鐘
+const limit = 100
+const windowMs = 60_000
+const counts = new Map<number, number>()
+
+function fixedWindow(now: number): boolean {
+  const w = Math.floor(now / windowMs)       // 第幾個視窗
+  const n = counts.get(w) ?? 0
+  if (n >= limit) return false
+  counts.set(w, n + 1)
+  return true
+}
+
+let passed = 0
+for (let k = 0; k < 100; k++) if (fixedWindow(59_000)) passed++   // 0:59 送 100 個
+for (let k = 0; k < 100; k++) if (fixedWindow(61_000)) passed++   // 1:01 再送 100 個
+console.log('2 秒內通過：', passed)
+</script></div>
+<p>這個誤差要不要緊，看限流是為了什麼。擋暴力破解時無所謂：攻擊者一小時能試的次數還是被限制住了。但這課的限流是為了<strong>保護容量</strong>：你照「每個合作夥伴每分鐘 100」規劃資料庫的負載，實際瞬間湧進來的是兩倍，固定視窗就不夠了。要堵住這個漏洞，限流器看的不能是「時鐘上的這一分鐘」，而要是「剛剛這 60 秒」。</p>
+
+<h2>怎麼數「剛剛這 60 秒」？滑動視窗</h2>
+<p>最直接的做法是把每個請求的時間都記下來，這叫<strong>滑動視窗紀錄</strong>（sliding window log）。每個 key 存下最近每個請求的時間戳；新請求來時，先丟掉一分鐘前的紀錄，剩下的數量還沒到上限才放行，並把這次的時間記進去。它看的永遠是「剛剛這 60 秒」，視窗跟著時間滑動，沒有交界，所以沒有邊界問題，而且精確。代價是記憶體：上限每分鐘 1,000 次，每個 key 就要存最多 1,000 個時間戳；客戶一多，這就是大量記憶體。</p>
+<p>能不能只存幾個數字，又沒有固定視窗的漏洞？<strong>滑動視窗計數</strong>（sliding window counter）是 Cloudflare 用的近似法。它照樣把時間切成固定視窗，但只存「上一個視窗」和「目前視窗」兩個計數。要估「剛剛這 60 秒」有幾個請求時，目前視窗的請求全部都在範圍內；上一個視窗只有後半段還在範圍內，但我們不知道它的請求落在哪些時間點，所以<strong>假設它們是平均分布的</strong>，照還留在範圍內的時間比例去算：</p>
+<pre>估計值 = 上一個視窗的數量 × (視窗長度 − 目前視窗已經過的時間) ÷ 視窗長度 + 目前視窗的數量</pre>
+<p>用 Cloudflare 文章裡的數字來算，練習 2 的測試也用這一組：上限每分鐘 50 次，上一分鐘有 42 個，這一分鐘過了 15 秒、已經有 18 個。「剛剛這 60 秒」涵蓋上一分鐘的後 45 秒，所以拿 42 的 45/60。執行後看兩行：這個請求和下一個請求各自放行還是拒絕。</p>
+<div class="lab"><script type="code">
+const limit = 50
+const windowMs = 60_000
+const prev = 42          // 上一分鐘的數量
+const cur = 18           // 這一分鐘到目前的數量
+const elapsed = 15_000   // 這一分鐘已經過了 15 秒
+
+const estimate = prev * ((windowMs - elapsed) / windowMs) + cur
+console.log('估計值：', estimate, estimate < limit ? '→ 放行' : '→ 拒絕')
+console.log('放行後下一個：', estimate + 1, estimate + 1 < limit ? '→ 放行' : '→ 拒絕')
+</script></div>
+<p>42 × 45/60 + 18 = 49.5 &lt; 50，這個請求放行；放行後目前視窗變成 19，下一個請求的估計值 50.5，被拒絕。注意比較的是「加入這個請求<strong>之前</strong>的估計值 &lt; 上限」，不是「加 1 之後 ≤ 上限」，兩種寫法在小數時結果不同。</p>
+<p>回到上一節的漏洞：上限每分鐘 100 次，0:59 送了 100 個，1:01 再來時目前視窗才過 1 秒，估計值是 100 × 59/60 ≈ 98.3，只能再放行 2 個，不是固定視窗的 100 個。</p>
+<p>它只是近似：上一個視窗的請求如果全擠在最後一秒，估計值會偏低。但 Cloudflare 在約 4 億個請求、27 萬個來源的樣本裡量到，只有 0.003% 的請求被誤判放行或誤擋。每個 key 只要兩個數字，換來接近精確的結果，這是正式環境常見的選擇。練習 2 你會寫一個。</p>
+<p>滑動視窗解決了邊界問題，但它和固定視窗回答的是同一個問題：「這段時間用了幾次」，到上限就一律拒絕。真實流量常常是一陣一陣的：客戶的 App 開啟時一次打 6 支 API，是正常行為，不該被擋。要讓這種短暫的一波通過，同時長期平均還是被限制住，就需要能把「突發」和「平均」分開調的方法。</p>
+
+<h2>想允許短暫突發，又要限制長期平均？Token bucket</h2>
+<p>先把名詞說清楚。<strong>突發</strong>（burst）是短時間內超過平均速率的一波請求，例如平均每秒 5 個的客戶，某一瞬間連送 6 個。前面的方法都在「數一段時間內的次數」，突發只要讓那段時間的總數超過上限就會被擋。</p>
+<p><strong>Token bucket</strong> 換一個角度：每個 key 有一個桶子，裡面裝 token，可以想成「預先發好的入場券」。桶子以固定速率補充 token，滿了就不再增加；每個請求拿走一個 token，沒有 token 就拒絕。一個請求要拿走幾個 token 叫它的 <strong>cost</strong>，預設 1；很吃資源的端點（例如匯出報表）可以設成一次拿 5 個，同樣的桶就只夠它用較少次。</p>
+<p>外送平台的合約「每分鐘 100 次」換成 token bucket，就是補充速率每秒約 1.67 個（100 ÷ 60），容量則決定一次能突發多少。1.67 這種小數不好心算，所以這節的例子改用練習 1 的設定：容量 10、每秒補 5 個。原理完全一樣，只是數字不同；合約的上限沒有變。</p>
+<figure>
+  <svg viewBox="0 0 700 260" role="img" aria-label="token bucket：每秒補充 5 個 token 進桶，桶的容量 10 個，請求拿走 token，桶空時拒絕">
+    <defs><marker id="b10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="20" y="20" width="170" height="50" rx="6"/>
+    <text class="d-text" x="105" y="50" text-anchor="middle">每秒補 5 個 token</text>
+    <line class="d-line" x1="190" y1="45" x2="270" y2="90" marker-end="url(#b10)"/>
+    <path class="d-box" d="M270 80 L270 220 L430 220 L430 80"/>
+    <rect class="d-soft" x="275" y="140" width="150" height="75" rx="4"/>
+    <text class="d-text" x="350" y="183" text-anchor="middle">目前 6.5 個</text>
+    <text class="d-small" x="350" y="105" text-anchor="middle">容量 10（最多突發 10 個）</text>
+    <rect class="d-box" x="500" y="60" width="180" height="50" rx="6"/>
+    <text class="d-text" x="590" y="90" text-anchor="middle">請求：拿 1 個 → 放行</text>
+    <rect class="d-box" x="500" y="170" width="180" height="50" rx="6"/>
+    <text class="d-text" x="590" y="200" text-anchor="middle">桶空 → 拒絕（429）</text>
+    <line class="d-line" x1="430" y1="150" x2="500" y2="90" marker-end="url(#b10)"/>
+    <line class="d-line" x1="430" y1="180" x2="500" y2="195" marker-end="url(#b10)"/>
+    <text class="d-accent" x="350" y="250" text-anchor="middle">補充速率 = 長期平均；容量 = 允許的突發</text>
+  </svg>
+  <figcaption>兩個參數分開調：容量決定一次能衝多少，補充速率決定長期平均。</figcaption>
+</figure>
+<p>兩個參數各管一件事。<strong>容量</strong>（capacity）決定允許多大的突發：客戶一段時間沒送請求，桶子會補滿到 10 個，下一波最多一次可以衝 10 個，App 開啟時一次打 6 支 API 就不會被擋。<strong>補充速率</strong>決定長期平均：桶子空了以後，每秒只會多出 5 個 token，所以不管怎麼送，長期下來每秒最多 5 個。套到外送平台的無窮迴圈：前 10 個請求用掉桶裡的 token 通過，之後每秒只有 5 個通過，其餘全部拒絕。</p>
+<p>實作上有兩個細節，練習 1 會檢查。第一，<strong>不要用計時器補充</strong>。每個 key 開一個 <code>setInterval</code>，一百萬個客戶就是一百萬個計時器，還要記得清掉，而且計時器本身不準。改成記下「上次計算的時間」，下次有請求時用時間差一次補足：<code>tokens = min(容量, tokens + 經過秒數 × 速率)</code>。閒置的 key 完全不花 CPU。</p>
+<p>第二，<strong>token 用小數記</strong>。每 100ms 來一個請求、每秒補 5 個，每次只補 0.5 個。如果每次都向下取整，0.5 變成 0，永遠補不到。</p>
+<p>拒絕時也要算出「多久後可以再試」：還差 <code>cost − tokens</code> 個，除以速率就是秒數。這個數字之後會變成回應裡的 <code>Retry-After</code>，後面「被擋的請求要回什麼」那一節會用到。</p>
+<p>還有一個名字很像的方法：<strong>leaky bucket</strong>。它的方向相反：請求進到桶子（佇列）裡，以固定速率流出去處理，桶子滿了就拒絕。它讓<strong>輸出</strong>變平滑，後端看到的是穩定的速率；代價是排在桶裡的請求要等。<a href="../../devops/lessons/12-nginx.html">部署課第 12 課</a>的 nginx <code>limit_req</code> 就是 leaky bucket，它的參數怎麼對應這兩種桶，見課末「補充與查表」。</p>
+<p>五種方法放在一起比：</p>
+<div class="table-wrap"><table>
+  <tr><th>方法</th><th>每個 key 存什麼</th><th>突發</th><th>精確度</th><th>適合</th></tr>
+  <tr><td>固定視窗</td><td>1 個計數</td><td>交界處可達 2 倍</td><td>邊界不準</td><td>擋暴力破解、每日配額</td></tr>
+  <tr><td>滑動視窗紀錄</td><td>每個請求的時間戳</td><td>沒有</td><td>精確</td><td>上限很小、key 很少</td></tr>
+  <tr><td>滑動視窗計數</td><td>2 個計數</td><td>幾乎沒有</td><td>近似（很接近）</td><td>大量 key 的 API 限流</td></tr>
+  <tr><td>token bucket</td><td>token 數＋時間</td><td>可控（容量）</td><td>精確</td><td>API 限流，想允許合理突發</td></tr>
+  <tr><td>leaky bucket</td><td>佇列</td><td>排隊延後</td><td>精確</td><td>保護需要穩定輸入的後端（nginx）</td></tr>
+</table></div>
+<p>咖啡店的合作夥伴 API 選 token bucket：合作夥伴的系統常會一次送一批訂單，容量讓這種正常的突發通過，補充速率守住長期平均。不選 leaky bucket，是因為它會讓超量的下單請求在桶裡排隊等，合作夥伴那邊看到的會是逾時，而不是明確被拒絕、知道該多久後再來；它適合放在需要穩定輸入的後端前面，例如部署課的 nginx。演算法選好了，但「每秒 5 個」還沒說清楚是<em>誰的</em>每秒 5 個。</p>
+
+<h2>「每秒 5 個」是誰的？限流的鍵與多層順序</h2>
+<p>限流器替每個「誰」各準備一個桶子，這個「誰」叫限流的<strong>鍵</strong>（key）。外送平台的事故裡，鍵很明顯是 API key：每個合作夥伴一把，各用各的桶，外送平台的桶空了，不影響別人的桶。但不是每個端點都有 API key，例如登入前的請求只有 IP，所以要知道每種鍵的優缺點。</p>
+<p>用 IP 當鍵之前，要先知道兩件事。第一是 NAT（網路位址轉譯）：公司、學校、行動網路常讓很多台裝置透過同一個對外 IP 上網，所以一個 IP 背後可能是一整間公司。第二，經過代理或負載平衡器時，伺服器看到的連線來源是代理，原始 IP 要從 <code>X-Forwarded-For</code> 標頭讀；但這個標頭客戶端也能自己填，只能信任自己的代理加上的那一段（<a href="../../devops/lessons/12-nginx.html">部署課第 12 課</a>）。</p>
+<div class="table-wrap"><table>
+  <tr><th>鍵</th><th>優點</th><th>要小心</th></tr>
+  <tr><td>使用者 ID</td><td>登入後最準</td><td>未登入的請求沒有</td></tr>
+  <tr><td>API key（<a href="../../auth/lessons/17-api-keys-m2m.html">認證課第 17 課</a>）</td><td>對應到付費方案，可以給不同配額</td><td>一個客戶可能申請很多把 key，必要時再加租戶層</td></tr>
+  <tr><td>IP</td><td>不用登入就有</td><td>NAT 後面很多人共用一個 IP；<code>X-Forwarded-For</code> 可以偽造，只信任自己代理加上的那一段</td></tr>
+  <tr><td>端點</td><td>貴的端點（搜尋、匯出報表）給較低上限或較高的 cost</td><td>端點太細會讓設定爆炸</td></tr>
+  <tr><td>租戶（tenant）</td><td>企業客戶底下所有使用者合計</td><td>大客戶的配額要另外談</td></tr>
+</table></div>
+<p>實務上不會只選一種，而是疊好幾層，由外到內：入口先依 IP 擋掉明顯的濫用，再依 API key 確保每個客戶公平，最後有一個全站的桶守住總容量。</p>
+<figure>
+  <svg viewBox="0 0 700 170" role="img" aria-label="多層限流：入口 nginx 依 IP，接著每個客戶的桶，最後全站的桶，才進到服務">
+    <defs><marker id="c10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="10" y="40" width="150" height="70" rx="6"/>
+    <text class="d-text" x="85" y="70" text-anchor="middle">入口（nginx）</text>
+    <text class="d-small" x="85" y="92" text-anchor="middle">依 IP，擋明顯的濫用</text>
+    <rect class="d-box" x="190" y="40" width="150" height="70" rx="6"/>
+    <text class="d-text" x="265" y="70" text-anchor="middle">每個客戶</text>
+    <text class="d-small" x="265" y="92" text-anchor="middle">依 API key，公平</text>
+    <rect class="d-box" x="370" y="40" width="150" height="70" rx="6"/>
+    <text class="d-text" x="445" y="70" text-anchor="middle">全站</text>
+    <text class="d-small" x="445" y="92" text-anchor="middle">總容量上限</text>
+    <rect class="d-soft" x="550" y="40" width="140" height="70" rx="6"/>
+    <text class="d-text" x="620" y="80" text-anchor="middle">下單服務</text>
+    <line class="d-line" x1="160" y1="75" x2="190" y2="75" marker-end="url(#c10)"/>
+    <line class="d-line" x1="340" y1="75" x2="370" y2="75" marker-end="url(#c10)"/>
+    <line class="d-line" x1="520" y1="75" x2="550" y2="75" marker-end="url(#c10)"/>
+    <text class="d-accent" x="350" y="150" text-anchor="middle">被某一層拒絕的請求，不能消耗後面任何一層的配額</text>
+  </svg>
+  <figcaption>越外層越便宜、越粗略；越內層越了解客戶。</figcaption>
+</figure>
+<p>檢查的順序很重要。如果先扣全站的 token、再檢查客戶的，外送平台每秒 3,000 個請求雖然都被它自己的限制擋下，卻在被擋之前先把全站的 token 拿光了，其他客戶全部被拒絕：限流反而幫它拖垮了大家。正確的順序是先檢查客戶，通過了才去拿全站的。反過來也要處理：客戶通過、全站拒絕時，要把客戶的 token 還回去，不然它是因為別人而被扣了配額。</p>
+<p>每個 key 一個桶，還有記憶體的問題。攻擊者只要每次換一個假的 API key 或 IP，存桶子的 Map 就無限長大，直到程序記憶體耗盡。用 <a href="../../node/lessons/23-profiling-memory.html">Node 課第 23 課</a>的有上限 LRU 限制數量，淘汰最久沒用的。代價：被淘汰的客戶下次從滿的桶開始，等於拿到一次額外的突發。只要上限比「同時活躍的客戶數」大得多，被淘汰的都是很久沒來的客戶，它們的桶本來也早就補滿了，這個誤差可以接受。練習 4 把這幾件事寫在一起。</p>
+<div class="callout practice"><strong>💡 實務上：上限數字要跟 PM 和業務一起定</strong><br>對外 API 的上限常常直接對應付費方案，例如免費方案每分鐘 60 次、企業方案另外談，這是產品決策，不是工程師自己決定。訂數字前先拉出各客戶現有的用量，上限放在正常尖峰之上並留餘裕，不然規則一上線就擋到大客戶。上限要寫進 API 文件，讓串接的工程師開發時就知道，而不是上線後才看到 429。大客戶快碰到上限時，最好由業務或客服先聯絡，不要讓對方從錯誤報表發現。外送平台的配額也一樣：寫進合約和文件，對方的工程師才知道自己的程式該控速到多少。</div>
+<p>鍵和層次決定了誰被擋，下一個問題是被擋下的那些請求，要回什麼給外送平台。</p>
+
+<h2>被擋的請求要回什麼？429 與 Retry-After</h2>
+<p>被限流時回 <strong>429 Too Many Requests</strong>（RFC 6585，2012）：意思是「<em>你</em>在一段時間內送太多了」。RFC 6585 只定義狀態碼，不規定怎麼辨識使用者或怎麼計數，那是前面幾節的設計。</p>
+<p>它和 <strong>503 Service Unavailable</strong> 不一樣：503 是「<em>我</em>現在撐不住」，跟哪個客戶無關，是負載卸除（<a href="11-circuit-breaker-bulkhead.html">第 11 課</a>）該回的。分清楚，外送平台看錯誤報表時才知道是自己的問題還是你的問題，你的告警也才不會把「某客戶送太多」當成「服務掛了」。nginx 的 <code>limit_req</code> 被拒絕時預設回 503，部署課把它改成 429，就是這個原因。</p>
+<p>光回 429 還不夠。外送平台的 bug 是「收到錯誤就立刻重試」，如果回應裡沒有說多久之後再來，客戶端只能用猜的，最常見的猜法就是立刻重試，於是被拒絕的請求變成更多請求。所以 429 要附 <code>Retry-After</code>（RFC 9110 §10.2.3），503 也可以附：值是 HTTP 日期或<strong>非負整數秒數</strong>，例如 <code>Retry-After: 12</code>。有它，<a href="08-timeouts-retries-backoff.html">第 8 課</a>的客戶端就能照著等。注意單位是秒，token bucket 算出來的是毫秒，要除以 1000 並<strong>無條件進位</strong>，四捨五入會讓客戶端早到、又被拒絕一次。</p>
+<p><code>Retry-After</code> 是被擋<em>之後</em>才告訴客戶端。如果合作夥伴能在<em>被擋之前</em>就知道還剩多少配額，它可以自己放慢，根本不會碰到 429。這就是 IETF 的 RateLimit 標頭要做的事。它目前<strong>還是草案</strong>，欄位名稱和參數在成為 RFC 前還可能改。本課依草案 -11 的格式（練習 3 也是）；撰寫時最新版已是 -12，它把 <code>RateLimit</code> 的參數 <code>r</code>、<code>t</code> 改名為 <code>a</code>、<code>w</code>，這正是「還可能改」的例子，版本與日期見課末「補充與查表」：</p>
+<pre>HTTP/1.1 429 Too Many Requests
+RateLimit-Policy: "default";q=100;w=60
+RateLimit: "default";r=0;t=12
+Retry-After: 12</pre>
+<ul>
+  <li><code>RateLimit-Policy</code>：政策名稱（Structured Field 字串，<strong>要加雙引號</strong>），<code>q</code> 是配額、<code>w</code> 是視窗秒數。上面是「每 60 秒 100 個」。可以列好幾個政策，例如 <code>"burst";q=100;w=60,"daily";q=1000;w=86400</code>。</li>
+  <li><code>RateLimit</code>：<code>r</code> 是剩下幾個；<code>t</code> 是有效視窗的秒數，意思是「接下來 <code>t</code> 秒內最多只能再用 <code>r</code> 個」，實務上就是配額多久後重置。</li>
+  <li>同時有 <code>Retry-After</code> 時，客戶端以 <code>Retry-After</code> 為準；草案也建議（SHOULD NOT）伺服器不要讓 <code>Retry-After</code> 指向比有效視窗結束還早的時間。</li>
+</ul>
+<p>你會看到很多服務和套件還在用 <code>X-RateLimit-Limit</code>、<code>X-RateLimit-Remaining</code> 這類非標準的欄位（NestJS 的例子見課末）。新設計照草案的格式寫，並在文件裡註明它是草案。練習 3 會產生這三個標頭。</p>
+<div class="callout practice"><strong>💡 實務上：前端和串接第三方時，你是被限流的那一方</strong><br>這課的外送平台事故反過來看，就是你自己的程式可能犯的錯。串地圖、簡訊、金流這類第三方 API，或前端呼叫自己的後端時，都要預期會收到 429。照 <code>Retry-After</code> 等待再試，不要立刻重試。搜尋框加 debounce：使用者停止輸入一小段時間才送出，不要每打一個字就送一個請求。畫面上顯示「操作太頻繁，請稍後再試」，而不是通用的「系統錯誤」。批次同步資料的排程也要自己控速，一次處理一小批、批與批之間留間隔。被擋時記 log，才看得出是該升級方案，還是該改呼叫方式。</div>
+<p>到這裡，單台 API 的限流已經完整：數得準、允許合理突發、依 API key 分開、被擋時告訴客戶端何時再來。但咖啡店的 API 不只一台。</p>
+
+<h2>API 有 4 台時，計數要放在哪裡？</h2>
+<p>到目前為止，桶子和計數都存在程序的記憶體裡。<a href="04-redundancy-load-balancing.html">第 4 課</a>之後咖啡店的 API 有 4 台，負載平衡器把請求分給它們，每台只看得到自己收到的那部分。每台各算各的會怎樣？下面這格模擬三種情況，執行後比較三行印出的通過數量。</p>
+<div class="lab"><script type="code">
+// 4 台 API，每台在記憶體裡限制「每個客戶每分鐘 100 次」
+// route 決定第 k 個請求送到哪一台；total 是這個客戶一分鐘內送出的請求數
+function run(route: (k: number) => number, perServerLimit: number, total: number): number {
+  const used = [0, 0, 0, 0]
+  let passed = 0
+  for (let k = 0; k < total; k++) {
+    const s = route(k)
+    if (used[s] < perServerLimit) { used[s]++; passed++ }
+  }
+  return passed
+}
+
+// round robin：輪流分給 4 台
+console.log('狂送 1000 個，round robin、每台 100：', run(k => k % 4, 100, 1000))
+console.log('狂送 1000 個，round robin、每台 100 ÷ 4：', run(k => k % 4, 25, 1000))
+// 長連線或一致性雜湊讓這個客戶 9 成的請求都到 0 號；它只送了配額內的 100 個
+console.log('只送 100 個，分配不均、每台 100 ÷ 4：', run(k => (k % 10 === 0 ? 1 + (k / 10) % 3 : 0), 25, 100))
+</script></div>
+<p>三行的結果依序是：</p>
+<ul>
+  <li>每台各限 100，請求輪流分給 4 台，每台都只看到四分之一，各自放行 100 個：客戶實際能送 400 個。</li>
+  <li>改成每台限 100 ÷ 4 = 25，請求平均分配時，總共剛好 100。</li>
+  <li>但分配不均時（長連線、<a href="07-sharding-consistent-hashing.html">第 7 課</a>的一致性雜湊），9 成請求落在同一台。這個客戶只送了配額內的 100 個，卻只有 35 個通過，65 個被冤枉擋下。機器數量變動時還要記得改這個數字。</li>
+</ul>
+<p>要準確，計數就要<strong>集中</strong>在所有機器共用的地方，通常是 Redis。但集中之後馬上有新問題：4 台同時在改同一個計數，會不會互相覆蓋？這要靠<strong>原子操作</strong>：一個操作從開始到結束不會被其他請求插進來，從外面看只有「還沒做」和「做完了」兩種狀態，沒有「做到一半」。</p>
+<p>固定視窗用 Redis 很直接。<code>INCR rl:{key}:{視窗編號}</code> 把計數加 1 並回傳新值，本身就是原子操作；回傳 1 時代表是這個視窗的第一個請求，再用 <code>EXPIRE</code> 設過期時間，舊視窗的計數才會自動清掉。</p>
+<p>Token bucket 就麻煩了。它要「讀 token 數 → 算補充 → 扣掉 → 寫回」，是先讀再寫。兩台同時讀到 1 個 token、各自扣掉，兩個請求都放行，這就是<a href="09-idempotency.html">第 9 課</a>的競態。解法是把整段邏輯交給 Redis 自己執行。Redis 內建 Lua 這種小型程式語言的執行環境，可以把整段邏輯寫成 Lua 腳本，用 <code>EVAL</code> 送給 Redis；Redis 執行一個腳本時不會穿插其他指令，整段就是一次原子操作。Stripe 就是把 token bucket 放在 Redis 裡做。</p>
+<p>代價是每個請求多一次 Redis 往返，而且 Redis 變成限流的依賴。實務上不用自己寫：<code>rate-limiter-flexible</code> 的 <code>RateLimiterRedis</code> 搭配 <code>ioredis</code> 就有原子的計數，它被拒絕時給 <code>msBeforeNext</code>（毫秒）可以換算 <code>Retry-After</code>。要注意它的演算法是「每個 key 從第一個請求開始算的固定視窗」，有第二節說的邊界突發；要壓低突發，常見做法是再加一個短視窗的限制（例如每秒 5 個），用它的 <code>RateLimiterUnion</code> 同時套用兩個限流器。版本見課末。</p>
+<p>計數集中到 Redis 之後，限流器多了一個會壞的零件。下一節處理它壞掉的時候，以及整套規則怎麼安全上線。</p>
+
+<h2>Redis 壞了、規則要上線：限流器自己出事怎麼辦？</h2>
+<p>Redis 連不上時，限流器沒辦法判斷這個請求該不該放行，只有兩個選擇：</p>
+<ul>
+  <li><strong>fail open</strong>：放行全部。服務繼續運作，只是暫時沒有限流保護。</li>
+  <li><strong>fail closed</strong>：拒絕全部。安全，但限流器的故障直接變成整個 API 的故障。</li>
+</ul>
+<p>選哪一個，看你保護的是什麼。保護容量的 API 限流通常 fail open：Stripe 的建議是限流器出錯或 Redis 掛掉時要放行，各層都要 catch 例外。咖啡店的合作夥伴 API 屬於這一種：為了限流器的故障拒絕所有訂單，比暫時沒有限流更糟。</p>
+<p>折衷的做法是退回每台各自的記憶體限流。<code>rate-limiter-flexible</code> 的 <code>insuranceLimiter</code> 就是做這件事：Redis 壞掉時改用本機的限流器，每台設 100 ÷ 4，不準但還有保護。</p>
+<pre>// rate-limiter-flexible 11.2.3 的基本用法（示意，不能在頁面執行）
+const limiter = new RateLimiterRedis({
+  storeClient: redis,               // new Redis({ enableOfflineQueue: false })
+  points: 100,                      // 配額
+  duration: 60,                     // 視窗秒數
+  insuranceLimiter: new RateLimiterMemory({ points: 25, duration: 60 }),  // Redis 壞掉時改用本機
+})</pre>
+<p>保護登入的暴力破解防護就要保守一點，例如退回本機的嚴格限制，因為那裡放行的代價是帳號被盜。不管哪一種，都要告警：fail open 是暫時的取捨，要有人知道並盡快修好。</p>
+<p>限流器本身沒壞，規則也可能訂錯。<strong>上線前先 dark launch</strong>：先只記錄「這個請求<em>會</em>被擋」、不真的擋，觀察一兩週：會被擋的是哪些客戶、多少比例。不然第一天就可能擋到最大的客戶，因為它的正常用量本來就很高。</p>
+<p>Stripe 還建議每個限流器都要有開關，誤擋時能馬上關掉。這種開關叫功能旗標：不用重新部署、改設定就能切換程式行為，<a href="19-evolution-compatibility.html">第 19 課</a>詳談。上線後要監控：被擋的比例、被擋最多的是哪些客戶、限流器本身的延遲與錯誤。</p>
+<p>回到開場：同一家外送平台的 bug 再發生一次，它每秒 3,000 個請求在入口就被它自己的桶擋下，收到附 <code>Retry-After</code> 的 429；全站的 token 沒被它動到，其他合作夥伴照常下單；告警告訴你是哪一把 API key 被擋最多，業務可以直接聯絡對方修程式。</p>
+
+<h2>補充與查表</h2>
+<p>主線省略的出處、參數與版本，查表用，不用背。</p>
+<h3>Stripe 線上的四層限流</h3>
+<p>Stripe 在 2017 年的文章〈Scaling your API with rate limiters〉描述他們線上用的四層，剛好涵蓋第一節的三種機制。前兩個是針對某個客戶，後兩個是針對整台伺服器：</p>
+<div class="table-wrap"><table>
+  <tr><th>機制</th><th>做什麼</th><th>屬於</th></tr>
+  <tr><td>請求速率限制</td><td>每個使用者每秒最多 N 個，允許短暫突發</td><td>限流</td></tr>
+  <tr><td>同時請求限制</td><td>每個使用者同時進行中的請求數上限（文中例子是 20）</td><td>並行數限制</td></tr>
+  <tr><td>整體用量卸除</td><td>保留一部分基礎設施給重要請求（例子：留 20%），非重要請求超過它的 80% 就回 503</td><td>負載卸除</td></tr>
+  <tr><td>worker 使用率卸除</td><td>worker 忙不過來時，從最低優先的流量開始丟</td><td>負載卸除</td></tr>
+</table></div>
+<h3>nginx <code>limit_req</code> 的參數</h3>
+<ul>
+  <li><code>limit_req</code> 是 leaky bucket：<code>rate=1r/s</code> 是流出速率。</li>
+  <li><code>burst=5</code> 是桶的大小：超過速率的請求先排隊延後處理，超過 burst 就拒絕。</li>
+  <li>加上 <code>nodelay</code> 時，burst 內的請求立刻處理、不再延後，行為就很接近 token bucket。</li>
+  <li>被拒絕的請求預設回 <strong>503</strong>（<code>limit_req_status</code> 的預設值），部署課改成了 429，原因見「被擋的請求要回什麼」那一節。</li>
+</ul>
+<h3>RateLimit 標頭草案版本</h3>
+<ul>
+  <li>draft-ietf-httpapi-ratelimit-headers-11：2026-05-23 發布、2026-11-24 到期。本課正文與練習 3 依這版：<code>RateLimit</code> 用 <code>r</code>（剩下）與 <code>t</code>（有效視窗秒數）。</li>
+  <li>draft-ietf-httpapi-ratelimit-headers-12：2026-11-20 發布、2027-05-24 到期。<code>RateLimit</code> 的參數改成 <code>a</code>（available quota）與 <code>w</code>（effective window）；<code>RateLimit-Policy</code> 的 <code>q</code>、<code>w</code> 不變。實作前到 IETF datatracker 確認最新版。</li>
+</ul>
+<h3>套件版本</h3>
+<ul>
+  <li><code>@nestjs/throttler</code> 6.7.1 預設送 <code>X-RateLimit-*</code> 標頭（<a href="../../nestjs/lessons/06-middleware-guards.html">NestJS 課第 6 課</a>）。</li>
+  <li><code>rate-limiter-flexible</code>（npm 11.2.3）搭配 <code>ioredis</code>（6.0.0）。</li>
+</ul>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：完成 <code>TokenBucket</code>。一開始是滿的。<code>tryTake(cost = 1)</code>：先依距離上次計算的時間補充 token（可以是小數、不超過 <code>capacity</code>），夠就扣掉並回傳 <code>{ ok: true, remaining: Math.floor(剩下的 token) }</code>；不夠回傳 <code>{ ok: false, retryAfterMs }</code>，<code>retryAfterMs = Math.ceil((cost − 目前 token) ÷ refillPerSec × 1000)</code>。<code>cost</code> 不是正數或大於 <code>capacity</code>（永遠拿不到）時丟 <code>RangeError</code>。時間只能用 <code>opts.now()</code>，不能用計時器或 <code>Date.now</code>。</p>
+  <script type="start">
+type BucketOptions = { capacity: number; refillPerSec: number; now: () => number }
+type TakeResult = { ok: true; remaining: number } | { ok: false; retryAfterMs: number }
+
+class TokenBucket {
+  constructor(opts: BucketOptions) {
+    throw new Error('TODO')
+  }
+
+  tryTake(cost = 1): TakeResult {
+    throw new Error('TODO')
+  }
+}
+
+let t = 0
+const bucket = new TokenBucket({ capacity: 10, refillPerSec: 5, now: () => t })
+for (let k = 0; k < 11; k++) console.log(bucket.tryTake())   // 10 次 ok，第 11 次 retryAfterMs 200
+t += 200
+console.log(bucket.tryTake())                               // 補了 1 個 → ok
+</script>
+  <script type="answer">
+type BucketOptions = { capacity: number; refillPerSec: number; now: () => number }
+type TakeResult = { ok: true; remaining: number } | { ok: false; retryAfterMs: number }
+
+class TokenBucket {
+  private opts: BucketOptions
+  private tokens: number
+  private last: number
+
+  constructor(opts: BucketOptions) {
+    this.opts = opts
+    this.tokens = opts.capacity
+    this.last = opts.now()
+  }
+
+  tryTake(cost = 1): TakeResult {
+    const { capacity, refillPerSec, now } = this.opts
+    if (!(cost > 0) || cost > capacity) throw new RangeError('cost 要大於 0 且不超過 capacity')
+    const t = now()
+    this.tokens = Math.min(capacity, this.tokens + (t - this.last) / 1000 * refillPerSec)
+    this.last = t
+    if (this.tokens >= cost) {
+      this.tokens -= cost
+      return { ok: true, remaining: Math.floor(this.tokens) }
+    }
+    return { ok: false, retryAfterMs: Math.ceil((cost - this.tokens) / refillPerSec * 1000) }
+  }
+}
+
+let t = 0
+const bucket = new TokenBucket({ capacity: 10, refillPerSec: 5, now: () => t })
+for (let k = 0; k < 11; k++) console.log(bucket.tryTake())
+t += 200
+console.log(bucket.tryTake())
+</script>
+  <script type="tests">
+const real = { setTimeout: globalThis.setTimeout, setInterval: globalThis.setInterval, now: Date.now }
+const boom = () => { throw new Error('不能用計時器或 Date.now：記下上次的時間，用 opts.now() 的時間差補充') }
+function guard<T>(fn: () => T): T {
+  globalThis.setTimeout = boom as unknown as typeof setTimeout
+  globalThis.setInterval = boom as unknown as typeof setInterval
+  Date.now = boom
+  try { return fn() } finally {
+    globalThis.setTimeout = real.setTimeout
+    globalThis.setInterval = real.setInterval
+    Date.now = real.now
+  }
+}
+let clock = 1_000_000
+const b = guard(() => new TokenBucket({ capacity: 10, refillPerSec: 5, now: () => clock }))
+for (let k = 0; k < 10; k++) {
+  const r = guard(() => b.tryTake())
+  assert(r.ok, `一開始桶子要是滿的：第 ${k + 1} 次要成功`)
+  if (r.ok) assert.equal(r.remaining, 9 - k, `第 ${k + 1} 次之後 remaining 要是 ${9 - k}`)
+}
+assert.deepEqual(guard(() => b.tryTake()), { ok: false, retryAfterMs: 200 }, '容量 10、每秒 5：第 11 次要失敗，還差 1 個 → 200 毫秒後可以再試（單位是毫秒）')
+assert.equal(guard(() => b.tryTake()).ok, false, '時鐘沒前進時不能補充')
+let okCount = 0
+for (let k = 0; k < 20; k++) {
+  clock += 100
+  if (guard(() => b.tryTake()).ok) okCount++
+}
+assert.equal(okCount, 10, '每 100ms 呼叫一次、每次補 0.5 個，2 秒內要成功 10 次：token 要用小數累積，不能每次向下取整')
+clock += 600_000
+let burst = 0
+for (let k = 0; k < 20; k++) if (guard(() => b.tryTake()).ok) burst++
+assert.equal(burst, 10, '閒置 10 分鐘後最多也只有 capacity 個 token，補充不能超過容量')
+
+let t2 = 0
+const c = guard(() => new TokenBucket({ capacity: 10, refillPerSec: 5, now: () => t2 }))
+assert.deepEqual(guard(() => c.tryTake(3)), { ok: true, remaining: 7 }, 'cost 3 要一次扣 3 個')
+guard(() => c.tryTake(3))
+guard(() => c.tryTake(3))
+assert.deepEqual(guard(() => c.tryTake(3)), { ok: false, retryAfterMs: 400 }, '剩 1 個、要 3 個：還差 2 個 → 400 毫秒')
+t2 += 100
+assert.deepEqual(guard(() => c.tryTake(1)), { ok: true, remaining: 0 }, '補了 0.5 個變成 1.5 個，拿 1 個後剩 0.5，remaining 是 Math.floor 後的 0')
+
+let t3 = 0
+const d = guard(() => new TokenBucket({ capacity: 2, refillPerSec: 3, now: () => t3 }))
+guard(() => d.tryTake(2))
+t3 += 100
+const r = guard(() => d.tryTake())
+assert(!r.ok && r.retryAfterMs === 234, '有 0.3 個、還差 0.7 個、每秒 3 個 → 233.3… 毫秒，要無條件進位成 234')
+
+for (const bad of [0, -1, 11, NaN]) {
+  let err: unknown
+  try { guard(() => b.tryTake(bad)) } catch (e) { err = e }
+  assert(err instanceof RangeError, `cost = ${bad} 要丟 RangeError`)
+}
+</script>
+  <script type="wrong">
+// 每次補充都向下取整
+type BucketOptions = { capacity: number; refillPerSec: number; now: () => number }
+type TakeResult = { ok: true; remaining: number } | { ok: false; retryAfterMs: number }
+class TokenBucket {
+  private opts: BucketOptions
+  private tokens: number
+  private last: number
+  constructor(opts: BucketOptions) { this.opts = opts; this.tokens = opts.capacity; this.last = opts.now() }
+  tryTake(cost = 1): TakeResult {
+    const { capacity, refillPerSec, now } = this.opts
+    if (!(cost > 0) || cost > capacity) throw new RangeError('cost')
+    const t = now()
+    this.tokens = Math.min(capacity, this.tokens + Math.floor((t - this.last) / 1000 * refillPerSec))
+    this.last = t
+    if (this.tokens >= cost) { this.tokens -= cost; return { ok: true, remaining: Math.floor(this.tokens) } }
+    return { ok: false, retryAfterMs: Math.ceil((cost - this.tokens) / refillPerSec * 1000) }
+  }
+}
+</script>
+  <script type="wrong">
+// 補充沒有上限
+type BucketOptions = { capacity: number; refillPerSec: number; now: () => number }
+type TakeResult = { ok: true; remaining: number } | { ok: false; retryAfterMs: number }
+class TokenBucket {
+  private opts: BucketOptions
+  private tokens: number
+  private last: number
+  constructor(opts: BucketOptions) { this.opts = opts; this.tokens = opts.capacity; this.last = opts.now() }
+  tryTake(cost = 1): TakeResult {
+    const { capacity, refillPerSec, now } = this.opts
+    if (!(cost > 0) || cost > capacity) throw new RangeError('cost')
+    const t = now()
+    this.tokens = this.tokens + (t - this.last) / 1000 * refillPerSec
+    this.last = t
+    if (this.tokens >= cost) { this.tokens -= cost; return { ok: true, remaining: Math.floor(this.tokens) } }
+    return { ok: false, retryAfterMs: Math.ceil((cost - this.tokens) / refillPerSec * 1000) }
+  }
+}
+</script>
+  <script type="wrong">
+// 一開始是空的
+type BucketOptions = { capacity: number; refillPerSec: number; now: () => number }
+type TakeResult = { ok: true; remaining: number } | { ok: false; retryAfterMs: number }
+class TokenBucket {
+  private opts: BucketOptions
+  private tokens = 0
+  private last: number
+  constructor(opts: BucketOptions) { this.opts = opts; this.last = opts.now() }
+  tryTake(cost = 1): TakeResult {
+    const { capacity, refillPerSec, now } = this.opts
+    if (!(cost > 0) || cost > capacity) throw new RangeError('cost')
+    const t = now()
+    this.tokens = Math.min(capacity, this.tokens + (t - this.last) / 1000 * refillPerSec)
+    this.last = t
+    if (this.tokens >= cost) { this.tokens -= cost; return { ok: true, remaining: Math.floor(this.tokens) } }
+    return { ok: false, retryAfterMs: Math.ceil((cost - this.tokens) / refillPerSec * 1000) }
+  }
+}
+</script>
+  <script type="wrong">
+// 用 setInterval 補充
+type BucketOptions = { capacity: number; refillPerSec: number; now: () => number }
+type TakeResult = { ok: true; remaining: number } | { ok: false; retryAfterMs: number }
+class TokenBucket {
+  private opts: BucketOptions
+  private tokens: number
+  constructor(opts: BucketOptions) {
+    this.opts = opts
+    this.tokens = opts.capacity
+    setInterval(() => { this.tokens = Math.min(opts.capacity, this.tokens + opts.refillPerSec) }, 1000)
+  }
+  tryTake(cost = 1): TakeResult {
+    const { capacity, refillPerSec } = this.opts
+    if (!(cost > 0) || cost > capacity) throw new RangeError('cost')
+    if (this.tokens >= cost) { this.tokens -= cost; return { ok: true, remaining: Math.floor(this.tokens) } }
+    return { ok: false, retryAfterMs: Math.ceil((cost - this.tokens) / refillPerSec * 1000) }
+  }
+}
+</script>
+  <script type="wrong">
+// retryAfterMs 用四捨五入
+type BucketOptions = { capacity: number; refillPerSec: number; now: () => number }
+type TakeResult = { ok: true; remaining: number } | { ok: false; retryAfterMs: number }
+class TokenBucket {
+  private opts: BucketOptions
+  private tokens: number
+  private last: number
+  constructor(opts: BucketOptions) { this.opts = opts; this.tokens = opts.capacity; this.last = opts.now() }
+  tryTake(cost = 1): TakeResult {
+    const { capacity, refillPerSec, now } = this.opts
+    if (!(cost > 0) || cost > capacity) throw new RangeError('cost')
+    const t = now()
+    this.tokens = Math.min(capacity, this.tokens + (t - this.last) / 1000 * refillPerSec)
+    this.last = t
+    if (this.tokens >= cost) { this.tokens -= cost; return { ok: true, remaining: Math.floor(this.tokens) } }
+    return { ok: false, retryAfterMs: Math.round((cost - this.tokens) / refillPerSec * 1000) }
+  }
+}
+</script>
+  <script type="wrong">
+// retryAfterMs 用秒
+type BucketOptions = { capacity: number; refillPerSec: number; now: () => number }
+type TakeResult = { ok: true; remaining: number } | { ok: false; retryAfterMs: number }
+class TokenBucket {
+  private opts: BucketOptions
+  private tokens: number
+  private last: number
+  constructor(opts: BucketOptions) { this.opts = opts; this.tokens = opts.capacity; this.last = opts.now() }
+  tryTake(cost = 1): TakeResult {
+    const { capacity, refillPerSec, now } = this.opts
+    if (!(cost > 0) || cost > capacity) throw new RangeError('cost')
+    const t = now()
+    this.tokens = Math.min(capacity, this.tokens + (t - this.last) / 1000 * refillPerSec)
+    this.last = t
+    if (this.tokens >= cost) { this.tokens -= cost; return { ok: true, remaining: Math.floor(this.tokens) } }
+    return { ok: false, retryAfterMs: Math.ceil((cost - this.tokens) / refillPerSec) }
+  }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：完成 <code>SlidingWindowCounter</code>。視窗以 <code>Math.floor(now ÷ windowMs)</code> 對齊。<code>hit()</code>：<code>estimate = 上一個視窗的數量 × ((windowMs − 目前視窗已經過的毫秒) ÷ windowMs) + 目前視窗的數量</code>；<code>estimate &lt; limit</code> 時允許並把目前視窗加 1。回傳 <code>{ allowed, estimate }</code>，<code>estimate</code> 是加入這個請求<strong>之前</strong>的值。被拒絕的請求不計入。中間隔了一個以上的空視窗時，「上一個視窗」的數量是 0。</p>
+  <script type="start">
+type WindowOptions = { limit: number; windowMs: number; now: () => number }
+
+class SlidingWindowCounter {
+  constructor(opts: WindowOptions) {
+    throw new Error('TODO')
+  }
+
+  hit(): { allowed: boolean; estimate: number } {
+    throw new Error('TODO')
+  }
+}
+
+// Cloudflare 的例子：上一分鐘 42 個，這一分鐘 15 秒時已經有 18 個
+let t = 0
+const counter = new SlidingWindowCounter({ limit: 50, windowMs: 60_000, now: () => t })
+for (let k = 0; k < 42; k++) counter.hit()
+t = 74_000
+for (let k = 0; k < 18; k++) counter.hit()
+t = 75_000
+console.log(counter.hit())   // { allowed: true, estimate: 49.5 }
+console.log(counter.hit())   // { allowed: false, estimate: 50.5 }
+</script>
+  <script type="answer">
+type WindowOptions = { limit: number; windowMs: number; now: () => number }
+
+class SlidingWindowCounter {
+  private opts: WindowOptions
+  private index = -Infinity   // 目前視窗的編號
+  private prev = 0
+  private cur = 0
+
+  constructor(opts: WindowOptions) {
+    this.opts = opts
+  }
+
+  hit(): { allowed: boolean; estimate: number } {
+    const { limit, windowMs, now } = this.opts
+    const t = now()
+    const w = Math.floor(t / windowMs)
+    if (w !== this.index) {
+      this.prev = w === this.index + 1 ? this.cur : 0
+      this.cur = 0
+      this.index = w
+    }
+    const elapsed = t - w * windowMs
+    const estimate = this.prev * ((windowMs - elapsed) / windowMs) + this.cur
+    if (estimate < limit) {
+      this.cur++
+      return { allowed: true, estimate }
+    }
+    return { allowed: false, estimate }
+  }
+}
+
+let t = 0
+const counter = new SlidingWindowCounter({ limit: 50, windowMs: 60_000, now: () => t })
+for (let k = 0; k < 42; k++) counter.hit()
+t = 74_000
+for (let k = 0; k < 18; k++) counter.hit()
+t = 75_000
+console.log(counter.hit())
+console.log(counter.hit())
+</script>
+  <script type="tests">
+const realNow = Date.now
+Date.now = () => { throw new Error('不能用 Date.now，請用 opts.now()') }
+try {
+  const near = (a: number, b: number) => Math.abs(a - b) < 1e-9
+  let t = 0
+  const c = new SlidingWindowCounter({ limit: 50, windowMs: 60_000, now: () => t })
+  for (let k = 0; k < 42; k++) assert(c.hit().allowed, '第一分鐘的 42 個都要允許')
+  t = 74_000
+  for (let k = 0; k < 18; k++) assert(c.hit().allowed, `第二分鐘 14 秒時的第 ${k + 1} 個要允許（42 × 46/60 + ${k} < 50）`)
+  t = 75_000
+  const a = c.hit()
+  assert(a.allowed && near(a.estimate, 49.5), `Cloudflare 的例子：42 × (60 − 15)/60 + 18 = 49.5 < 50 要允許，你回傳 ${JSON.stringify(a)}（權重是視窗「剩下」的比例）`)
+  const r1 = c.hit()
+  assert(!r1.allowed && near(r1.estimate, 50.5), `下一個請求估計值 50.5 要拒絕，你回傳 ${JSON.stringify(r1)}`)
+  const r2 = c.hit()
+  assert(!r2.allowed && near(r2.estimate, 50.5), `被拒絕的請求不能計入：再一次估計值還是 50.5，你回傳 ${JSON.stringify(r2)}`)
+  t = 180_000
+  const fresh = c.hit()
+  assert(fresh.allowed && fresh.estimate === 0, `中間隔了一整個空視窗（第 2 分鐘），上一個視窗的數量要是 0，估計值 0，你回傳 ${JSON.stringify(fresh)}`)
+
+  let u = 0
+  const d = new SlidingWindowCounter({ limit: 100, windowMs: 60_000, now: () => u })
+  u = 59_000
+  let first = 0
+  for (let k = 0; k < 100; k++) if (d.hit().allowed) first++
+  assert.equal(first, 100, '0:59 的 100 個都要允許')
+  u = 61_000
+  let second = 0
+  for (let k = 0; k < 100; k++) if (d.hit().allowed) second++
+  assert(second <= 10, `1:01 再送 100 個時大部分要被擋（固定視窗會全部放行），你放行了 ${second} 個`)
+  assert.equal(second, 2, '1:01 時估計值 100 × 59/60 ≈ 98.3，只能再允許 2 個')
+} finally {
+  Date.now = realNow
+}
+</script>
+  <script type="wrong">
+// 只看目前視窗：就是固定視窗
+type WindowOptions = { limit: number; windowMs: number; now: () => number }
+class SlidingWindowCounter {
+  private opts: WindowOptions
+  private index = -Infinity
+  private cur = 0
+  constructor(opts: WindowOptions) { this.opts = opts }
+  hit(): { allowed: boolean; estimate: number } {
+    const w = Math.floor(this.opts.now() / this.opts.windowMs)
+    if (w !== this.index) { this.cur = 0; this.index = w }
+    const estimate = this.cur
+    if (estimate < this.opts.limit) { this.cur++; return { allowed: true, estimate } }
+    return { allowed: false, estimate }
+  }
+}
+</script>
+  <script type="wrong">
+// 權重用已經過的比例
+type WindowOptions = { limit: number; windowMs: number; now: () => number }
+class SlidingWindowCounter {
+  private opts: WindowOptions
+  private index = -Infinity
+  private prev = 0
+  private cur = 0
+  constructor(opts: WindowOptions) { this.opts = opts }
+  hit(): { allowed: boolean; estimate: number } {
+    const { limit, windowMs, now } = this.opts
+    const t = now()
+    const w = Math.floor(t / windowMs)
+    if (w !== this.index) { this.prev = w === this.index + 1 ? this.cur : 0; this.cur = 0; this.index = w }
+    const estimate = this.prev * ((t - w * windowMs) / windowMs) + this.cur
+    if (estimate < limit) { this.cur++; return { allowed: true, estimate } }
+    return { allowed: false, estimate }
+  }
+}
+</script>
+  <script type="wrong">
+// 跨過兩個以上視窗時仍沿用舊的計數
+type WindowOptions = { limit: number; windowMs: number; now: () => number }
+class SlidingWindowCounter {
+  private opts: WindowOptions
+  private index = -Infinity
+  private prev = 0
+  private cur = 0
+  constructor(opts: WindowOptions) { this.opts = opts }
+  hit(): { allowed: boolean; estimate: number } {
+    const { limit, windowMs, now } = this.opts
+    const t = now()
+    const w = Math.floor(t / windowMs)
+    if (w !== this.index) { this.prev = this.cur; this.cur = 0; this.index = w }
+    const estimate = this.prev * ((windowMs - (t - w * windowMs)) / windowMs) + this.cur
+    if (estimate < limit) { this.cur++; return { allowed: true, estimate } }
+    return { allowed: false, estimate }
+  }
+}
+</script>
+  <script type="wrong">
+// 被拒絕的請求也加 1
+type WindowOptions = { limit: number; windowMs: number; now: () => number }
+class SlidingWindowCounter {
+  private opts: WindowOptions
+  private index = -Infinity
+  private prev = 0
+  private cur = 0
+  constructor(opts: WindowOptions) { this.opts = opts }
+  hit(): { allowed: boolean; estimate: number } {
+    const { limit, windowMs, now } = this.opts
+    const t = now()
+    const w = Math.floor(t / windowMs)
+    if (w !== this.index) { this.prev = w === this.index + 1 ? this.cur : 0; this.cur = 0; this.index = w }
+    const estimate = this.prev * ((windowMs - (t - w * windowMs)) / windowMs) + this.cur
+    this.cur++
+    return { allowed: estimate < limit, estimate }
+  }
+}
+</script>
+  <script type="wrong">
+// 判斷寫成 estimate + 1 <= limit
+type WindowOptions = { limit: number; windowMs: number; now: () => number }
+class SlidingWindowCounter {
+  private opts: WindowOptions
+  private index = -Infinity
+  private prev = 0
+  private cur = 0
+  constructor(opts: WindowOptions) { this.opts = opts }
+  hit(): { allowed: boolean; estimate: number } {
+    const { limit, windowMs, now } = this.opts
+    const t = now()
+    const w = Math.floor(t / windowMs)
+    if (w !== this.index) { this.prev = w === this.index + 1 ? this.cur : 0; this.cur = 0; this.index = w }
+    const estimate = this.prev * ((windowMs - (t - w * windowMs)) / windowMs) + this.cur
+    if (estimate + 1 <= limit) { this.cur++; return { allowed: true, estimate } }
+    return { allowed: false, estimate }
+  }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：寫 <code>rateLimitHeaders(policy, state)</code>，照 IETF 草案 -11 的格式產生回應標頭。一律包含 <code>RateLimit-Policy</code>（政策名稱加雙引號，接 <code>;q=配額;w=視窗秒數</code>）與 <code>RateLimit</code>（政策名稱加雙引號，接 <code>;r=剩下;t=幾秒後恢復</code>）；<code>allowed</code> 是 <code>false</code> 時另加 <code>Retry-After</code>，值跟 <code>t</code> 相同。<code>r</code> 和 <code>t</code> 都要是非負整數：<code>resetSec</code> 無條件進位，<code>remaining</code> 向下取整、小於 0 時當成 0。欄位名稱的大小寫要跟上面一樣。</p>
+  <script type="start">
+type Policy = { name: string; quota: number; windowSec: number }
+type LimitState = { remaining: number; resetSec: number; allowed: boolean }
+
+function rateLimitHeaders(policy: Policy, state: LimitState): Record<string, string> {
+  throw new Error('TODO')
+}
+
+console.log(rateLimitHeaders({ name: 'default', quota: 100, windowSec: 60 }, { remaining: 0, resetSec: 11.2, allowed: false }))
+</script>
+  <script type="answer">
+type Policy = { name: string; quota: number; windowSec: number }
+type LimitState = { remaining: number; resetSec: number; allowed: boolean }
+
+function rateLimitHeaders(policy: Policy, state: LimitState): Record<string, string> {
+  const r = Math.max(0, Math.floor(state.remaining))
+  const t = Math.max(0, Math.ceil(state.resetSec))
+  const headers: Record<string, string> = {
+    'RateLimit-Policy': `"${policy.name}";q=${policy.quota};w=${policy.windowSec}`,
+    'RateLimit': `"${policy.name}";r=${r};t=${t}`,
+  }
+  if (!state.allowed) headers['Retry-After'] = String(t)
+  return headers
+}
+
+console.log(rateLimitHeaders({ name: 'default', quota: 100, windowSec: 60 }, { remaining: 0, resetSec: 11.2, allowed: false }))
+</script>
+  <script type="tests">
+const p = Object.freeze({ name: 'default', quota: 100, windowSec: 60 })
+assert.deepEqual(rateLimitHeaders(p, Object.freeze({ remaining: 50, resetSec: 30, allowed: true })), {
+  'RateLimit-Policy': '"default";q=100;w=60',
+  'RateLimit': '"default";r=50;t=30',
+}, '允許時只有 RateLimit-Policy 與 RateLimit，政策名稱要加雙引號，不能有 Retry-After')
+assert.deepEqual(rateLimitHeaders(p, Object.freeze({ remaining: 0, resetSec: 11.2, allowed: false })), {
+  'RateLimit-Policy': '"default";q=100;w=60',
+  'RateLimit': '"default";r=0;t=12',
+  'Retry-After': '12',
+}, '拒絕時要加 Retry-After（單位是秒、跟 t 相同），11.2 秒要無條件進位成 12')
+const daily = Object.freeze({ name: 'daily', quota: 1000, windowSec: 86400 })
+assert.deepEqual(rateLimitHeaders(daily, Object.freeze({ remaining: -3, resetSec: 0.4, allowed: false })), {
+  'RateLimit-Policy': '"daily";q=1000;w=86400',
+  'RateLimit': '"daily";r=0;t=1',
+  'Retry-After': '1',
+}, 'remaining 小於 0 要當成 0；0.4 秒進位成 1')
+assert.equal(rateLimitHeaders(daily, { remaining: 7.9, resetSec: 5, allowed: true })['RateLimit'], '"daily";r=7;t=5', 'remaining 要向下取整（7.9 → 7）')
+</script>
+  <script type="wrong">
+// 用舊的 X-RateLimit-* 欄位
+type Policy = { name: string; quota: number; windowSec: number }
+type LimitState = { remaining: number; resetSec: number; allowed: boolean }
+function rateLimitHeaders(policy: Policy, state: LimitState): Record<string, string> {
+  const t = Math.ceil(state.resetSec)
+  const h: Record<string, string> = {
+    'X-RateLimit-Limit': String(policy.quota),
+    'X-RateLimit-Remaining': String(Math.max(0, Math.floor(state.remaining))),
+    'X-RateLimit-Reset': String(t),
+  }
+  if (!state.allowed) h['Retry-After'] = String(t)
+  return h
+}
+</script>
+  <script type="wrong">
+// 政策名稱沒加雙引號
+type Policy = { name: string; quota: number; windowSec: number }
+type LimitState = { remaining: number; resetSec: number; allowed: boolean }
+function rateLimitHeaders(policy: Policy, state: LimitState): Record<string, string> {
+  const r = Math.max(0, Math.floor(state.remaining))
+  const t = Math.ceil(state.resetSec)
+  const h: Record<string, string> = {
+    'RateLimit-Policy': `${policy.name};q=${policy.quota};w=${policy.windowSec}`,
+    'RateLimit': `${policy.name};r=${r};t=${t}`,
+  }
+  if (!state.allowed) h['Retry-After'] = String(t)
+  return h
+}
+</script>
+  <script type="wrong">
+// Retry-After 用毫秒
+type Policy = { name: string; quota: number; windowSec: number }
+type LimitState = { remaining: number; resetSec: number; allowed: boolean }
+function rateLimitHeaders(policy: Policy, state: LimitState): Record<string, string> {
+  const r = Math.max(0, Math.floor(state.remaining))
+  const t = Math.ceil(state.resetSec)
+  const h: Record<string, string> = {
+    'RateLimit-Policy': `"${policy.name}";q=${policy.quota};w=${policy.windowSec}`,
+    'RateLimit': `"${policy.name}";r=${r};t=${t}`,
+  }
+  if (!state.allowed) h['Retry-After'] = String(t * 1000)
+  return h
+}
+</script>
+  <script type="wrong">
+// 允許時也送 Retry-After
+type Policy = { name: string; quota: number; windowSec: number }
+type LimitState = { remaining: number; resetSec: number; allowed: boolean }
+function rateLimitHeaders(policy: Policy, state: LimitState): Record<string, string> {
+  const r = Math.max(0, Math.floor(state.remaining))
+  const t = Math.ceil(state.resetSec)
+  return {
+    'RateLimit-Policy': `"${policy.name}";q=${policy.quota};w=${policy.windowSec}`,
+    'RateLimit': `"${policy.name}";r=${r};t=${t}`,
+    'Retry-After': String(t),
+  }
+}
+</script>
+  <script type="wrong">
+// 秒數四捨五入、remaining 沒處理負數
+type Policy = { name: string; quota: number; windowSec: number }
+type LimitState = { remaining: number; resetSec: number; allowed: boolean }
+function rateLimitHeaders(policy: Policy, state: LimitState): Record<string, string> {
+  const t = Math.round(state.resetSec)
+  const h: Record<string, string> = {
+    'RateLimit-Policy': `"${policy.name}";q=${policy.quota};w=${policy.windowSec}`,
+    'RateLimit': `"${policy.name}";r=${state.remaining};t=${t}`,
+  }
+  if (!state.allowed) h['Retry-After'] = String(t)
+  return h
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 4：寫 <code>createLimiter(opts)</code>，組合每個客戶的桶和全站的桶。下面已經提供練習 1 的 <code>TokenBucket</code>，另外多了 <code>refund(cost)</code>：把 token 加回去、不超過容量。<code>check(customerId)</code> 每次消耗 1 個 token：</p>
+  <ul>
+    <li>先檢查這個客戶的桶，被拒絕就回傳 <code>{ ok: false, scope: 'customer', retryAfterMs }</code>，<strong>不能動到全站的桶</strong>。</li>
+    <li>客戶通過再拿全站的；全站被拒絕時把客戶的 token 還回去，回傳 <code>scope: 'global'</code> 與全站的 <code>retryAfterMs</code>。</li>
+    <li>客戶的桶最多保留 <code>maxCustomers</code> 個，超過時淘汰<strong>最久沒用</strong>的（被拒絕的 <code>check</code> 也算使用）；新客戶從滿的桶開始。<code>trackedCustomers()</code> 回傳目前保留幾個。</li>
+  </ul>
+  <script type="start">
+type BucketOptions = { capacity: number; refillPerSec: number; now: () => number }
+type TakeResult = { ok: true; remaining: number } | { ok: false; retryAfterMs: number }
+
+// 已經寫好：練習 1 的參考解，加上 refund
+class TokenBucket {
+  private opts: BucketOptions
+  private tokens: number
+  private last: number
+  constructor(opts: BucketOptions) {
+    this.opts = opts
+    this.tokens = opts.capacity
+    this.last = opts.now()
+  }
+  private refill() {
+    const t = this.opts.now()
+    this.tokens = Math.min(this.opts.capacity, this.tokens + (t - this.last) / 1000 * this.opts.refillPerSec)
+    this.last = t
+  }
+  tryTake(cost = 1): TakeResult {
+    if (!(cost > 0) || cost > this.opts.capacity) throw new RangeError('cost 要大於 0 且不超過 capacity')
+    this.refill()
+    if (this.tokens >= cost) {
+      this.tokens -= cost
+      return { ok: true, remaining: Math.floor(this.tokens) }
+    }
+    return { ok: false, retryAfterMs: Math.ceil((cost - this.tokens) / this.opts.refillPerSec * 1000) }
+  }
+  refund(cost = 1) {
+    this.refill()
+    this.tokens = Math.min(this.opts.capacity, this.tokens + cost)
+  }
+}
+
+type Rate = { capacity: number; refillPerSec: number }
+type LimiterOptions = { perCustomer: Rate; global: Rate; maxCustomers: number; now: () => number }
+type CheckResult = { ok: true } | { ok: false; scope: 'customer' | 'global'; retryAfterMs: number }
+
+function createLimiter(opts: LimiterOptions): { check(customerId: string): CheckResult; trackedCustomers(): number } {
+  throw new Error('TODO')
+}
+
+let t = 0
+const limiter = createLimiter({
+  perCustomer: { capacity: 10, refillPerSec: 1 },
+  global: { capacity: 50, refillPerSec: 10 },
+  maxCustomers: 1000,
+  now: () => t,
+})
+let noisyOk = 0
+for (let k = 0; k < 1000; k++) if (limiter.check('partner-loop').ok) noisyOk++
+console.log('吵鬧的客戶通過：', noisyOk)                  // 10
+console.log('王小明：', limiter.check('王小明'))          // { ok: true }
+</script>
+  <script type="answer">
+type BucketOptions = { capacity: number; refillPerSec: number; now: () => number }
+type TakeResult = { ok: true; remaining: number } | { ok: false; retryAfterMs: number }
+
+class TokenBucket {
+  private opts: BucketOptions
+  private tokens: number
+  private last: number
+  constructor(opts: BucketOptions) {
+    this.opts = opts
+    this.tokens = opts.capacity
+    this.last = opts.now()
+  }
+  private refill() {
+    const t = this.opts.now()
+    this.tokens = Math.min(this.opts.capacity, this.tokens + (t - this.last) / 1000 * this.opts.refillPerSec)
+    this.last = t
+  }
+  tryTake(cost = 1): TakeResult {
+    if (!(cost > 0) || cost > this.opts.capacity) throw new RangeError('cost 要大於 0 且不超過 capacity')
+    this.refill()
+    if (this.tokens >= cost) {
+      this.tokens -= cost
+      return { ok: true, remaining: Math.floor(this.tokens) }
+    }
+    return { ok: false, retryAfterMs: Math.ceil((cost - this.tokens) / this.opts.refillPerSec * 1000) }
+  }
+  refund(cost = 1) {
+    this.refill()
+    this.tokens = Math.min(this.opts.capacity, this.tokens + cost)
+  }
+}
+
+type Rate = { capacity: number; refillPerSec: number }
+type LimiterOptions = { perCustomer: Rate; global: Rate; maxCustomers: number; now: () => number }
+type CheckResult = { ok: true } | { ok: false; scope: 'customer' | 'global'; retryAfterMs: number }
+
+function createLimiter(opts: LimiterOptions): { check(customerId: string): CheckResult; trackedCustomers(): number } {
+  const global = new TokenBucket({ ...opts.global, now: opts.now })
+  const buckets = new Map<string, TokenBucket>()   // Map 依插入順序走訪：第一個就是最久沒用的
+
+  return {
+    check(customerId) {
+      let bucket = buckets.get(customerId)
+      if (bucket) buckets.delete(customerId)          // 移到最後面 = 最近使用
+      else bucket = new TokenBucket({ ...opts.perCustomer, now: opts.now })
+      buckets.set(customerId, bucket)
+      if (buckets.size > opts.maxCustomers) {
+        const oldest = buckets.keys().next().value
+        if (oldest !== undefined) buckets.delete(oldest)
+      }
+
+      const mine = bucket.tryTake()
+      if (!mine.ok) return { ok: false, scope: 'customer', retryAfterMs: mine.retryAfterMs }
+      const all = global.tryTake()
+      if (!all.ok) {
+        bucket.refund()
+        return { ok: false, scope: 'global', retryAfterMs: all.retryAfterMs }
+      }
+      return { ok: true }
+    },
+    trackedCustomers: () => buckets.size,
+  }
+}
+
+let t = 0
+const limiter = createLimiter({
+  perCustomer: { capacity: 10, refillPerSec: 1 },
+  global: { capacity: 50, refillPerSec: 10 },
+  maxCustomers: 1000,
+  now: () => t,
+})
+let noisyOk = 0
+for (let k = 0; k < 1000; k++) if (limiter.check('partner-loop').ok) noisyOk++
+console.log('吵鬧的客戶通過：', noisyOk)
+console.log('王小明：', limiter.check('王小明'))
+</script>
+  <script type="tests">
+const realNow = Date.now
+Date.now = () => { throw new Error('不能用 Date.now，請用 opts.now()') }
+try {
+  let t = 0
+  const now = () => t
+  // 參數都凍結：createLimiter 不能改動傳進來的設定
+  const frozen = (o: LimiterOptions) => Object.freeze({ ...o, perCustomer: Object.freeze({ ...o.perCustomer }), global: Object.freeze({ ...o.global }) })
+  const a = createLimiter(frozen({ perCustomer: { capacity: 10, refillPerSec: 1 }, global: { capacity: 50, refillPerSec: 10 }, maxCustomers: 100, now }))
+  let noisy = 0
+  for (let k = 0; k < 1000; k++) {
+    const r = a.check('partner-loop')
+    if (r.ok) noisy++
+    else assert.deepEqual(r, { ok: false, scope: 'customer', retryAfterMs: 1000 }, '吵鬧的客戶被擋時 scope 要是 customer，retryAfterMs 用客戶自己的桶（還差 1 個、每秒 1 個 → 1000）')
+  }
+  assert.equal(noisy, 10, '吵鬧的客戶只能用掉自己的 10 個')
+  for (const name of ['王小明', '陳美華', '林志豪', '張雅婷']) {
+    for (let k = 0; k < 10; k++) assert.deepEqual(a.check(name), { ok: true }, `${name} 的第 ${k + 1} 個要通過：被客戶層拒絕的請求不能消耗全站的 token`)
+  }
+
+  const b = createLimiter(frozen({ perCustomer: { capacity: 5, refillPerSec: 0.01 }, global: { capacity: 3, refillPerSec: 1 }, maxCustomers: 100, now }))
+  for (let k = 0; k < 3; k++) assert.deepEqual(b.check('李建國'), { ok: true }, '前 3 個要通過')
+  for (let k = 0; k < 5; k++) {
+    assert.deepEqual(b.check('李建國'), { ok: false, scope: 'global', retryAfterMs: 1000 }, '全站的桶空了：scope 是 global，retryAfterMs 用全站的（還差 1 個、每秒 1 個 → 1000）')
+  }
+  t += 2000
+  assert.deepEqual(b.check('李建國'), { ok: true }, '全站拒絕時要把客戶的 token 還回去：李建國還有 2 個')
+  assert.deepEqual(b.check('李建國'), { ok: true }, '全站拒絕時要把客戶的 token 還回去：李建國還有 2 個')
+  const third = b.check('李建國')
+  assert(!third.ok && third.scope === 'customer', '李建國自己的 5 個用完後要被客戶層擋下')
+
+  const c = createLimiter(frozen({ perCustomer: { capacity: 5, refillPerSec: 1 }, global: { capacity: 1_000_000, refillPerSec: 1_000_000 }, maxCustomers: 500, now }))
+  for (let k = 0; k < 10_000; k++) c.check('fake-key-' + k)
+  assert(c.trackedCustomers() <= 500, `1 萬個不同的客戶後最多只能保留 500 個桶，你保留了 ${c.trackedCustomers()} 個`)
+  assert.equal(c.trackedCustomers(), 500, '沒超過上限前要保留：剛好 500 個')
+
+  const d = createLimiter(frozen({ perCustomer: { capacity: 2, refillPerSec: 0.001 }, global: { capacity: 1000, refillPerSec: 1000 }, maxCustomers: 3, now }))
+  d.check('黃淑芬'); d.check('黃淑芬')
+  d.check('王小明'); d.check('王小明')
+  d.check('陳美華')
+  assert.equal(d.check('黃淑芬').ok, false, '黃淑芬的 2 個用完了')
+  d.check('林志豪')
+  assert.equal(d.trackedCustomers(), 3, '最多 3 個')
+  assert.equal(d.check('黃淑芬').ok, false, '黃淑芬剛剛才用過，不能被淘汰；要淘汰最久沒用的王小明，不是最早建立的黃淑芬')
+  assert.equal(d.check('王小明').ok, true, '加入林志豪時要淘汰最久沒用的王小明（不是剛加入的林志豪）：王小明再來時從滿的桶開始')
+} finally {
+  Date.now = realNow
+}
+</script>
+  <script type="wrong">
+// 先扣全站再扣客戶
+type BucketOptions = { capacity: number; refillPerSec: number; now: () => number }
+type TakeResult = { ok: true; remaining: number } | { ok: false; retryAfterMs: number }
+class TokenBucket {
+  private opts: BucketOptions
+  private tokens: number
+  private last: number
+  constructor(opts: BucketOptions) { this.opts = opts; this.tokens = opts.capacity; this.last = opts.now() }
+  private refill() { const t = this.opts.now(); this.tokens = Math.min(this.opts.capacity, this.tokens + (t - this.last) / 1000 * this.opts.refillPerSec); this.last = t }
+  tryTake(cost = 1): TakeResult {
+    this.refill()
+    if (this.tokens >= cost) { this.tokens -= cost; return { ok: true, remaining: Math.floor(this.tokens) } }
+    return { ok: false, retryAfterMs: Math.ceil((cost - this.tokens) / this.opts.refillPerSec * 1000) }
+  }
+  refund(cost = 1) { this.refill(); this.tokens = Math.min(this.opts.capacity, this.tokens + cost) }
+}
+type Rate = { capacity: number; refillPerSec: number }
+type LimiterOptions = { perCustomer: Rate; global: Rate; maxCustomers: number; now: () => number }
+type CheckResult = { ok: true } | { ok: false; scope: 'customer' | 'global'; retryAfterMs: number }
+function createLimiter(opts: LimiterOptions): { check(customerId: string): CheckResult; trackedCustomers(): number } {
+  const global = new TokenBucket({ ...opts.global, now: opts.now })
+  const buckets = new Map<string, TokenBucket>()
+  return {
+    check(customerId) {
+      let bucket = buckets.get(customerId)
+      if (bucket) buckets.delete(customerId)
+      else bucket = new TokenBucket({ ...opts.perCustomer, now: opts.now })
+      buckets.set(customerId, bucket)
+      if (buckets.size > opts.maxCustomers) { const oldest = buckets.keys().next().value; if (oldest !== undefined) buckets.delete(oldest) }
+      const all = global.tryTake()
+      if (!all.ok) return { ok: false, scope: 'global', retryAfterMs: all.retryAfterMs }
+      const mine = bucket.tryTake()
+      if (!mine.ok) return { ok: false, scope: 'customer', retryAfterMs: mine.retryAfterMs }
+      return { ok: true }
+    },
+    trackedCustomers: () => buckets.size,
+  }
+}
+</script>
+  <script type="wrong">
+// 全站拒絕時沒有把客戶的 token 還回
+type BucketOptions = { capacity: number; refillPerSec: number; now: () => number }
+type TakeResult = { ok: true; remaining: number } | { ok: false; retryAfterMs: number }
+class TokenBucket {
+  private opts: BucketOptions
+  private tokens: number
+  private last: number
+  constructor(opts: BucketOptions) { this.opts = opts; this.tokens = opts.capacity; this.last = opts.now() }
+  private refill() { const t = this.opts.now(); this.tokens = Math.min(this.opts.capacity, this.tokens + (t - this.last) / 1000 * this.opts.refillPerSec); this.last = t }
+  tryTake(cost = 1): TakeResult {
+    this.refill()
+    if (this.tokens >= cost) { this.tokens -= cost; return { ok: true, remaining: Math.floor(this.tokens) } }
+    return { ok: false, retryAfterMs: Math.ceil((cost - this.tokens) / this.opts.refillPerSec * 1000) }
+  }
+  refund(cost = 1) { this.refill(); this.tokens = Math.min(this.opts.capacity, this.tokens + cost) }
+}
+type Rate = { capacity: number; refillPerSec: number }
+type LimiterOptions = { perCustomer: Rate; global: Rate; maxCustomers: number; now: () => number }
+type CheckResult = { ok: true } | { ok: false; scope: 'customer' | 'global'; retryAfterMs: number }
+function createLimiter(opts: LimiterOptions): { check(customerId: string): CheckResult; trackedCustomers(): number } {
+  const global = new TokenBucket({ ...opts.global, now: opts.now })
+  const buckets = new Map<string, TokenBucket>()
+  return {
+    check(customerId) {
+      let bucket = buckets.get(customerId)
+      if (bucket) buckets.delete(customerId)
+      else bucket = new TokenBucket({ ...opts.perCustomer, now: opts.now })
+      buckets.set(customerId, bucket)
+      if (buckets.size > opts.maxCustomers) { const oldest = buckets.keys().next().value; if (oldest !== undefined) buckets.delete(oldest) }
+      const mine = bucket.tryTake()
+      if (!mine.ok) return { ok: false, scope: 'customer', retryAfterMs: mine.retryAfterMs }
+      const all = global.tryTake()
+      if (!all.ok) return { ok: false, scope: 'global', retryAfterMs: all.retryAfterMs }
+      return { ok: true }
+    },
+    trackedCustomers: () => buckets.size,
+  }
+}
+</script>
+  <script type="wrong">
+// 客戶的桶用沒有上限的 Map
+type BucketOptions = { capacity: number; refillPerSec: number; now: () => number }
+type TakeResult = { ok: true; remaining: number } | { ok: false; retryAfterMs: number }
+class TokenBucket {
+  private opts: BucketOptions
+  private tokens: number
+  private last: number
+  constructor(opts: BucketOptions) { this.opts = opts; this.tokens = opts.capacity; this.last = opts.now() }
+  private refill() { const t = this.opts.now(); this.tokens = Math.min(this.opts.capacity, this.tokens + (t - this.last) / 1000 * this.opts.refillPerSec); this.last = t }
+  tryTake(cost = 1): TakeResult {
+    this.refill()
+    if (this.tokens >= cost) { this.tokens -= cost; return { ok: true, remaining: Math.floor(this.tokens) } }
+    return { ok: false, retryAfterMs: Math.ceil((cost - this.tokens) / this.opts.refillPerSec * 1000) }
+  }
+  refund(cost = 1) { this.refill(); this.tokens = Math.min(this.opts.capacity, this.tokens + cost) }
+}
+type Rate = { capacity: number; refillPerSec: number }
+type LimiterOptions = { perCustomer: Rate; global: Rate; maxCustomers: number; now: () => number }
+type CheckResult = { ok: true } | { ok: false; scope: 'customer' | 'global'; retryAfterMs: number }
+function createLimiter(opts: LimiterOptions): { check(customerId: string): CheckResult; trackedCustomers(): number } {
+  const global = new TokenBucket({ ...opts.global, now: opts.now })
+  const buckets = new Map<string, TokenBucket>()
+  return {
+    check(customerId) {
+      let bucket = buckets.get(customerId)
+      if (!bucket) { bucket = new TokenBucket({ ...opts.perCustomer, now: opts.now }); buckets.set(customerId, bucket) }
+      const mine = bucket.tryTake()
+      if (!mine.ok) return { ok: false, scope: 'customer', retryAfterMs: mine.retryAfterMs }
+      const all = global.tryTake()
+      if (!all.ok) { bucket.refund(); return { ok: false, scope: 'global', retryAfterMs: all.retryAfterMs } }
+      return { ok: true }
+    },
+    trackedCustomers: () => buckets.size,
+  }
+}
+</script>
+  <script type="wrong">
+// 淘汰最早建立的，而不是最久沒用的
+type BucketOptions = { capacity: number; refillPerSec: number; now: () => number }
+type TakeResult = { ok: true; remaining: number } | { ok: false; retryAfterMs: number }
+class TokenBucket {
+  private opts: BucketOptions
+  private tokens: number
+  private last: number
+  constructor(opts: BucketOptions) { this.opts = opts; this.tokens = opts.capacity; this.last = opts.now() }
+  private refill() { const t = this.opts.now(); this.tokens = Math.min(this.opts.capacity, this.tokens + (t - this.last) / 1000 * this.opts.refillPerSec); this.last = t }
+  tryTake(cost = 1): TakeResult {
+    this.refill()
+    if (this.tokens >= cost) { this.tokens -= cost; return { ok: true, remaining: Math.floor(this.tokens) } }
+    return { ok: false, retryAfterMs: Math.ceil((cost - this.tokens) / this.opts.refillPerSec * 1000) }
+  }
+  refund(cost = 1) { this.refill(); this.tokens = Math.min(this.opts.capacity, this.tokens + cost) }
+}
+type Rate = { capacity: number; refillPerSec: number }
+type LimiterOptions = { perCustomer: Rate; global: Rate; maxCustomers: number; now: () => number }
+type CheckResult = { ok: true } | { ok: false; scope: 'customer' | 'global'; retryAfterMs: number }
+function createLimiter(opts: LimiterOptions): { check(customerId: string): CheckResult; trackedCustomers(): number } {
+  const global = new TokenBucket({ ...opts.global, now: opts.now })
+  const buckets = new Map<string, TokenBucket>()
+  return {
+    check(customerId) {
+      let bucket = buckets.get(customerId)
+      if (!bucket) {
+        bucket = new TokenBucket({ ...opts.perCustomer, now: opts.now })
+        buckets.set(customerId, bucket)
+        if (buckets.size > opts.maxCustomers) { const oldest = buckets.keys().next().value; if (oldest !== undefined) buckets.delete(oldest) }
+      }
+      const mine = bucket.tryTake()
+      if (!mine.ok) return { ok: false, scope: 'customer', retryAfterMs: mine.retryAfterMs }
+      const all = global.tryTake()
+      if (!all.ok) { bucket.refund(); return { ok: false, scope: 'global', retryAfterMs: all.retryAfterMs } }
+      return { ok: true }
+    },
+    trackedCustomers: () => buckets.size,
+  }
+}
+</script>
+  <script type="wrong">
+// 超過上限時淘汰剛加入的（Map 最後一個），而不是最久沒用的
+type BucketOptions = { capacity: number; refillPerSec: number; now: () => number }
+type TakeResult = { ok: true; remaining: number } | { ok: false; retryAfterMs: number }
+class TokenBucket {
+  private opts: BucketOptions
+  private tokens: number
+  private last: number
+  constructor(opts: BucketOptions) { this.opts = opts; this.tokens = opts.capacity; this.last = opts.now() }
+  private refill() { const t = this.opts.now(); this.tokens = Math.min(this.opts.capacity, this.tokens + (t - this.last) / 1000 * this.opts.refillPerSec); this.last = t }
+  tryTake(cost = 1): TakeResult {
+    this.refill()
+    if (this.tokens >= cost) { this.tokens -= cost; return { ok: true, remaining: Math.floor(this.tokens) } }
+    return { ok: false, retryAfterMs: Math.ceil((cost - this.tokens) / this.opts.refillPerSec * 1000) }
+  }
+  refund(cost = 1) { this.refill(); this.tokens = Math.min(this.opts.capacity, this.tokens + cost) }
+}
+type Rate = { capacity: number; refillPerSec: number }
+type LimiterOptions = { perCustomer: Rate; global: Rate; maxCustomers: number; now: () => number }
+type CheckResult = { ok: true } | { ok: false; scope: 'customer' | 'global'; retryAfterMs: number }
+function createLimiter(opts: LimiterOptions): { check(customerId: string): CheckResult; trackedCustomers(): number } {
+  const global = new TokenBucket({ ...opts.global, now: opts.now })
+  const buckets = new Map<string, TokenBucket>()
+  return {
+    check(customerId) {
+      let bucket = buckets.get(customerId)
+      if (bucket) buckets.delete(customerId)
+      else bucket = new TokenBucket({ ...opts.perCustomer, now: opts.now })
+      buckets.set(customerId, bucket)
+      if (buckets.size > opts.maxCustomers) buckets.delete(customerId)
+      const mine = bucket.tryTake()
+      if (!mine.ok) return { ok: false, scope: 'customer', retryAfterMs: mine.retryAfterMs }
+      const all = global.tryTake()
+      if (!all.ok) { bucket.refund(); return { ok: false, scope: 'global', retryAfterMs: all.retryAfterMs } }
+      return { ok: true }
+    },
+    trackedCustomers: () => buckets.size,
+  }
+}
+</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：固定視窗限制每分鐘 100 次。最壞情況下，2 秒內最多能通過幾次？</p>
+  <label data-key="a">100 次，上限就是 100</label>
+  <label data-key="b">約 3 次，100 ÷ 60 × 2</label>
+  <label data-key="c">約 200 次</label>
+  <p class="why">✓ 在前一個視窗的最後一秒送 100 個、下一個視窗的第一秒再送 100 個，兩波分屬不同視窗，都沒超過各自的上限。上限只保證「每個對齊的整分鐘」內不超過 100，不保證任意 60 秒。(b) 是平均速率，固定視窗完全不管平均。要擋住這種突發，用滑動視窗或 token bucket。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：4 台 API 各自在記憶體裡限制「每個客戶每分鐘 100 次」，負載平衡用 round robin。同一個客戶實際上每分鐘最多能送幾次？</p>
+  <label data-key="a">100 次，設定就是 100</label>
+  <label data-key="b">約 400 次，每台各算各的</label>
+  <label data-key="c">25 次，100 平均分給 4 台</label>
+  <p class="why">✓ 每台只看到四分之一的請求，各自放行 100 個，加起來約 400 個；實際值還取決於負載平衡怎麼分。要準確就集中計數（Redis 原子操作或 Lua 腳本）；或每台設 100 ÷ 4 並接受分配不均時的誤差，而且機器數量一變就要改。(c) 把「每台的上限」和「客戶的總量」搞混了：每台各自放行，總量是加起來的；就算把每台設成 25，客戶總共也還有約 100 個，不是 25。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 7：限流用的 Redis 連不上了。API 限流器應該怎麼做？</p>
+  <label data-key="a">一律拒絕所有請求，安全第一</label>
+  <label data-key="b">一律放行，限流不重要</label>
+  <label data-key="c">看保護什麼：保護容量的 API 限流通常 fail open（或退回本機的近似限流），保護登入的暴力破解防護要更保守；兩者都要告警</label>
+  <p class="why">✓ 一律 fail closed 會讓 Redis 的故障直接變成整個 API 的故障，Stripe 的建議是限流器出錯時放行。但登入防護放行的代價是帳號被盜，可以退回本機較嚴格的限制。(b) 錯在「不重要」：fail open 是暫時的取捨，要有告警、盡快修好，最好有本機的備用限流器。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 8：某個客戶送太多回 429。如果是伺服器整體過載（跟哪個客戶無關），應該回什麼？</p>
+  <label data-key="a">503 Service Unavailable，可以附 Retry-After</label>
+  <label data-key="b">也是 429，反正都是請求太多</label>
+  <label data-key="c">500 Internal Server Error</label>
+  <p class="why">✓ 429 的意思是「你送太多了」，是針對這個客戶的；整體過載是伺服器自己的問題，用 503，兩者都可以附 Retry-After。回錯狀態碼，客戶會以為是自己的程式有問題，你的告警也分不出「某客戶太吵」和「服務撐不住」。500 表示程式出錯，客戶端不會知道該等多久再試。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>用固定視窗保護容量</strong>：視窗交界前後可以送出兩倍的量。擋暴力破解可以用；保護容量用滑動視窗計數或 token bucket。</li>
+  <li><strong>每台伺服器各自限流，卻當成全域上限</strong>：N 台就是 N 倍。集中計數，或明確地把上限除以台數並接受誤差。</li>
+  <li><strong>先讀再寫的集中計數</strong>：兩台同時讀到「還剩 1 個」，兩個請求都放行。用 <code>INCR</code> 或 Lua 腳本做成原子操作。</li>
+  <li><strong>只用 IP 當鍵</strong>：NAT 後面整間公司共用一個 IP，一個人觸發就全公司被擋；<code>X-Forwarded-For</code> 可以偽造，只信任自己代理加上的部分。登入後改用使用者或 API key。</li>
+  <li><strong>被拒絕的請求也消耗其他層的配額</strong>：吵鬧的客戶被自己的限制擋下，卻先吃光全站的 token。先檢查客戶層，全站拒絕時把客戶的 token 還回去。</li>
+  <li><strong>每個 key 一個計數器卻沒有上限</strong>：攻擊者每次換一個假 key，記憶體無限成長。用有上限的 LRU。</li>
+  <li><strong>用計時器補充 token</strong>：每個 key 一個計時器，又多又不準。記下上次的時間，請求來時用時間差計算；token 用小數記。</li>
+  <li><strong>429 沒附 Retry-After，或秒數四捨五入</strong>：客戶端只能猜，通常會立刻重試；四捨五入讓它早到又被拒絕。用整數秒、無條件進位。</li>
+  <li><strong>沒有 dark launch 就啟用</strong>：第一天就擋到正常用量最大的客戶。先只記錄「會被擋」的請求，觀察後再啟用，並準備開關。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>沒有限流時，誰送得最多誰就拿到最多容量。限流替每個客戶設一段時間內的上限，除了保護自己，也保護其他客戶。限流管「一段時間幾次」、並行數限制管「同時幾個」、負載卸除管「整體過載時丟掉低優先的」。</li>
+  <li>固定視窗簡單但交界處可達兩倍；滑動視窗紀錄精確但耗記憶體；滑動視窗計數只存兩個數字、誤差很小。</li>
+  <li>Token bucket：容量是突發、補充速率是平均；用時間差和小數補充，不用計時器。nginx <code>limit_req</code> 是 leaky bucket，<code>nodelay</code> 讓它接近 token bucket。</li>
+  <li>選對鍵（使用者、API key、IP、端點、租戶），多層由外到內；先檢查客戶再拿全站的，被拒絕的請求不消耗後面的配額；每個 key 的狀態要有上限。</li>
+  <li>被限流回 429 加 <code>Retry-After</code>（整數秒、無條件進位），客戶端才不會立刻重試；整體過載回 503。RateLimit／RateLimit-Policy 標頭還是草案，本課依 -11 的格式。</li>
+  <li>多台伺服器要集中、原子地計數，或接受「除以台數」的誤差；限流器壞掉時 API 限流通常 fail open 並告警；上線前 dark launch、準備開關。</li>
+</ul>
+<p>下一課：限流擋的是太多的請求；如果是你依賴的金流變慢，請求卡住、連線池用光，就要用斷路器、隔艙和負載卸除，不讓一個依賴拖垮整個系統。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

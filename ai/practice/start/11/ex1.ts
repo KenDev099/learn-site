@@ -1,0 +1,12 @@
+// 練習 1：檢索的指標 recall@k 與 MRR
+// 每一題：retrieved 是檢索回傳的資料 id（依名次排好，第 1 名在最前面），relevant 是人工標記「應該找到」的 id
+export type RetrievalResult = { retrieved: string[]; relevant: string[] }
+export type RetrievalMetrics = { recallAtK: number; mrr: number }
+
+// recall@k：每一題「前 k 名裡找到的相關 id 數 ÷ 相關 id 總數」，再對題目取平均
+// MRR：每一題「整個 retrieved 裡第一個相關結果的名次」的倒數（名次從 1 開始；完全沒找到算 0），再對題目取平均
+// relevant 是空陣列的題目（例如超出範圍、應該拒答的問題）兩個指標都不計入，分母也不算它
+// 沒有任何可以計算的題目時丟出 Error
+export function retrievalMetrics(results: RetrievalResult[], k: number): RetrievalMetrics {
+  throw new Error('TODO')
+}

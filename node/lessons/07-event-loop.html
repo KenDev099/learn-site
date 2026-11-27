@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>7. Node 的 event loop</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="7" data-practice="node">
+<header>
+  <div class="eyebrow">階段 2：非同步與 event loop · 第 7 課</div>
+  <h1>Node 的 event loop</h1>
+</header>
+<main>
+
+<p>咖啡店的 API 伺服器白天接訂單，晚上還有一件固定的工作：在同一個程序裡，把白天累積的訂單通知一筆一筆送出去。上線後維運回報一件怪事：每到跑通知的那幾分鐘，部署平台定期打的健康檢查網址 <code>/health</code> 就沒有回應。平台判定服務死了，把它重啟，通知做到一半被砍掉，隔天又從頭來一次。</p>
+<p>通知的程式沒有丟任何錯誤，<code>/health</code> 也只是回一個 <code>ok</code>，為什麼會回不了？要回答這個問題，得先知道 Node 怎麼用一條執行緒同時顧這麼多事。答案是 <strong>event loop</strong>：一個不斷繞圈、檢查「哪件事做完了，就接著處理它」的迴圈。這課沿著這個事故把 event loop 拆開來看；學完你能預測 Node 裡非同步工作的執行順序，並找出讓伺服器卡住、讓腳本不結束、讓登入變慢的原因。</p>
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>一條執行緒怎麼同時服務很多請求，等待的工作交給誰：先得到事故的最小答案，「/health 回不了，代表那條執行緒被佔住了」。</li>
+  <li>做完的工作按什麼順序回來：event loop 每一圈的 phases，<code>setTimeout</code> 和 <code>setImmediate</code> 誰先。</li>
+  <li>nextTick 與 microtask 為什麼能插隊，通知批次怎麼靠插隊把 <code>/health</code> 擋在門外，怎麼修。</li>
+  <li>把通知搬到獨立腳本後，它做完了卻不結束：程序什麼時候才會結束，怎麼找出是誰撐著它。</li>
+  <li>尖峰時登入變慢，連讀檔也跟著慢：thread pool 為什麼要排隊。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../typescript/lessons/07-event-loop.html">TypeScript 課第 7 課</a>的瀏覽器 event loop：同步程式在 call stack 上跑完，才輪到排隊的 task；每個 task 之後先清空 microtask（<code>Promise.then</code> 的 callback 就排在這裡）。</li>
+  <li><a href="04-modules.html">第 4 課</a>的 ES module 與 CommonJS：Node 的兩套模組系統，<code>.cts</code> 一定是 CommonJS。</li>
+</ul></div>
+
+<h2>只有一條執行緒，怎麼同時服務很多請求？</h2>
+<p>先回到熟悉的地方。TypeScript 課第 7 課講過瀏覽器的模型：JavaScript 跑在一個 <strong>call stack</strong> 上，一次只執行一段程式；<code>setTimeout</code>、點擊事件這些 callback 排在 <strong>task</strong> 佇列；<code>Promise.then</code>、<code>queueMicrotask</code> 排在 <strong>microtask</strong> 佇列。每段程式跑完，先把 microtask 全部清空，才輪到下一個 task。Node 沿用同一套想法，只是要服務的對象從一個使用者的畫面，變成同時連進來的很多個請求。</p>
+<p>要理解這件事，先講清楚「執行緒」。<strong>執行緒</strong>（thread）是程式裡一條獨立的執行路線：一條執行緒在同一時間只能做一件事，要同時做兩件事，就需要兩條執行緒，或是讓一條執行緒在兩件事之間切換。Node 執行你的 JavaScript 只用<strong>一條</strong>執行緒，所以同一時間只有一段 JavaScript 在跑。好處是兩個 callback 不會同時改到同一個變數，你不用處理多執行緒搶資料的問題。</p>
+<p>聽起來一條執行緒應該一次只能服務一個請求。看一個下單請求實際花時間的地方：收到請求、驗證資料只要零點幾毫秒，接著查資料庫，要等資料庫回應 30ms，拿到結果再組回應。這 30ms 裡，執行緒其實沒有事做，只是在等。</p>
+<p>如果執行緒就這樣停下來等，叫做<strong>阻塞</strong>（blocking）：在等的 30ms 裡別的請求全部進不來，一秒最多服務三十幾個請求。Node 的做法是<strong>非阻塞 I/O</strong>（non-blocking I/O）：發出「查資料庫」「讀檔案」這類輸入輸出（I/O）的請求後，不等它完成就先回去處理別的事；I/O 完成時，再把你事先交代的 callback 排進佇列，等執行緒有空時執行。這個「看佇列裡有什麼做完了、輪流交給執行緒」的迴圈，就是 event loop。</p>
+<p>所以「單執行緒」不等於「一次只服務一個請求」。一個請求在等資料庫的 30ms 裡，執行緒是空的，可以去處理別的請求。反過來說，真正會讓所有請求一起卡住的，只有一種情況：<strong>你的 JavaScript 自己佔著執行緒不放</strong>，例如一段跑很久的運算，或這課後面會看到的「不斷插隊的工作」。</p>
+<p>這就是事故的最小答案：<code>/health</code> 的處理函式只回一個 <code>ok</code>，幾乎不花時間，它回不了，代表那條唯一的執行緒一直沒空去接它。是誰佔著？通知程式看起來每一筆都是非同步的，不像在佔執行緒。要找出原因，得先知道「等待交給別人」裡的「別人」是誰，以及做完的工作怎麼回到執行緒上。</p>
+
+<h2>等待的工作交給誰？</h2>
+<p>上一節說，Node 把等待交出去、做完再排 callback 回來。負責這件事的是 <strong>libuv</strong>，<a href="01-what-is-node.html">第 1 課</a>提過的那個 C 函式庫。event loop 本身也是 libuv 實作的。libuv 手上有兩種交出去的做法，看工作的種類決定：</p>
+<figure>
+  <svg viewBox="0 0 700 300" role="img" aria-label="Node 的架構：一條 JavaScript 執行緒跑 V8 和 event loop。網路 I/O 交給作業系統的 kqueue 或 epoll；檔案、dns.lookup、部分 crypto、zlib 交給 libuv 的 thread pool，預設 4 條執行緒。完成後都回到 event loop 排 callback">
+    <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="20" y="20" width="250" height="260" rx="10"/>
+    <text class="d-text" x="145" y="48" text-anchor="middle">一條 JavaScript 執行緒</text>
+    <rect class="d-box" x="40" y="65" width="210" height="60" rx="6"/>
+    <text class="d-accent" x="145" y="92" text-anchor="middle">V8：執行你的程式</text>
+    <text class="d-small" x="145" y="112" text-anchor="middle">一次只跑一段 callback</text>
+    <rect class="d-box" x="40" y="145" width="210" height="115" rx="6"/>
+    <text class="d-accent" x="145" y="172" text-anchor="middle">event loop（libuv）</text>
+    <text class="d-small" x="145" y="196" text-anchor="middle">一圈一圈檢查：</text>
+    <text class="d-small" x="145" y="216" text-anchor="middle">哪些工作完成了？</text>
+    <text class="d-small" x="145" y="236" text-anchor="middle">把它們的 callback 交給 V8</text>
+    <line class="d-line" x1="145" y1="145" x2="145" y2="127" marker-end="url(#arr)"/>
+    <rect class="d-box" x="380" y="30" width="300" height="100" rx="8"/>
+    <text class="d-text" x="530" y="58" text-anchor="middle">作業系統的非同步 I/O</text>
+    <text class="d-small" x="530" y="82" text-anchor="middle">macOS：kqueue　Linux：epoll</text>
+    <text class="d-small" x="530" y="104" text-anchor="middle">網路：TCP、HTTP 伺服器、fetch</text>
+    <rect class="d-box" x="380" y="160" width="300" height="120" rx="8"/>
+    <text class="d-text" x="530" y="188" text-anchor="middle">libuv thread pool（預設 4 條）</text>
+    <text class="d-small" x="530" y="212" text-anchor="middle">檔案（node:fs）、dns.lookup</text>
+    <text class="d-small" x="530" y="234" text-anchor="middle">pbkdf2、scrypt、randomBytes</text>
+    <text class="d-small" x="530" y="256" text-anchor="middle">zlib（壓縮）</text>
+    <line class="d-line" x1="250" y1="180" x2="378" y2="90" marker-end="url(#arr)"/>
+    <line class="d-line" x1="250" y1="220" x2="378" y2="220" marker-end="url(#arr)"/>
+    <text class="d-small" x="314" y="125" text-anchor="middle">交出去</text>
+    <text class="d-small" x="314" y="212" text-anchor="middle">交出去</text>
+  </svg>
+  <figcaption>JavaScript 只有一條執行緒；等待交給作業系統或 thread pool，做完再回到 event loop 排隊。</figcaption>
+</figure>
+<p>圖的右邊就是兩種做法：</p>
+<ul>
+  <li><strong>網路 I/O 交給作業系統</strong>。作業系統本身就有「同時盯著上千個連線，哪個有資料進來再通知我」的機制，macOS 叫 kqueue、Linux 叫 epoll。libuv 把所有連線登記給它，自己只要等通知。所以一個 Node 程序能同時掛著上千個連線，不需要上千條執行緒。咖啡店伺服器收請求、回應、對外 <code>fetch</code>，都走這條路。</li>
+  <li><strong>作業系統沒有好的非同步介面的工作，交給 thread pool</strong>。有些工作作業系統只提供「呼叫了就要等它做完」的版本，例如讀寫檔案。libuv 的解法是預先準備一組背景執行緒，叫 <strong>thread pool</strong>，讓背景執行緒去等，主執行緒不用等。交給它的工作有：<code>node:fs</code> 的非同步檔案操作、<code>dns.lookup</code>（把網域名稱查成 IP，<code>http.get('http://shop.example')</code> 預設會用到）、<code>crypto.pbkdf2</code>／<code>scrypt</code>／<code>randomBytes</code> 這類耗時的密碼學運算，以及 <code>zlib</code> 壓縮。</li>
+</ul>
+<p>注意一件容易誤會的事：thread pool 的背景執行緒<strong>不會執行你的 JavaScript</strong>。它們只做 C 寫的那段工作（讀檔、雜湊），做完把結果交回 event loop，你的 callback 還是在那條唯一的 JavaScript 執行緒上跑。所以「Node 只有一條執行緒」這句話只對你的 JavaScript 成立；Node 整個程序裡其實有好幾條執行緒在工作。</p>
+<p>回到事故。送通知本身是網路 I/O，已經交給作業系統去等；<code>/health</code> 的連線也一樣，作業系統收到後就在它那裡排好了。交出去的這一側是作業系統在等，跟 JavaScript 的執行緒無關，沒有理由擋住 <code>/health</code>。會卡住的只剩另一側：通知程式每一筆在 JavaScript 這一側要做的事（組內容、呼叫送通知的函式）是同步跑完的，練習 3 裡每筆大約 1ms。所以疑點不在等待，而在排隊：不管工作交給作業系統還是 thread pool，做完之後都要回到 event loop 排隊，等執行緒來處理。同時有計時器到期、檔案讀完、新連線進來時，event loop 先處理哪個？</p>
+
+<h2>做完的工作按什麼順序回來？event loop 的 phases</h2>
+<p>event loop 不是把所有做完的工作丟進同一個佇列。它每繞一圈，依序經過幾個階段，叫做 <strong>phase</strong>。每個 phase 負責一類 callback，有自己的佇列；輪到它時，把佇列裡該跑的 callback 跑完，再往下一個 phase 走，五個走完就是一圈：</p>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="event loop 一圈的 phases：timers、pending callbacks、poll、check、close callbacks，然後回到 timers。setTimeout 在 timers，I/O callback 在 poll，setImmediate 在 check">
+    <defs><marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="10" y="40" width="120" height="70" rx="8"/>
+    <text class="d-accent" x="70" y="70" text-anchor="middle">timers</text>
+    <text class="d-small" x="70" y="92" text-anchor="middle">setTimeout</text>
+    <rect class="d-box" x="150" y="40" width="120" height="70" rx="8"/>
+    <text class="d-accent" x="210" y="70" text-anchor="middle">pending</text>
+    <text class="d-small" x="210" y="92" text-anchor="middle">延後的系統 callback</text>
+    <rect class="d-soft" x="290" y="40" width="120" height="70" rx="8"/>
+    <text class="d-accent" x="350" y="70" text-anchor="middle">poll</text>
+    <text class="d-small" x="350" y="92" text-anchor="middle">I/O callback、等待</text>
+    <rect class="d-box" x="430" y="40" width="120" height="70" rx="8"/>
+    <text class="d-accent" x="490" y="70" text-anchor="middle">check</text>
+    <text class="d-small" x="490" y="92" text-anchor="middle">setImmediate</text>
+    <rect class="d-box" x="570" y="40" width="120" height="70" rx="8"/>
+    <text class="d-accent" x="630" y="70" text-anchor="middle">close</text>
+    <text class="d-small" x="630" y="92" text-anchor="middle">'close' 事件</text>
+    <line class="d-line" x1="130" y1="75" x2="148" y2="75" marker-end="url(#arr2)"/>
+    <line class="d-line" x1="270" y1="75" x2="288" y2="75" marker-end="url(#arr2)"/>
+    <line class="d-line" x1="410" y1="75" x2="428" y2="75" marker-end="url(#arr2)"/>
+    <line class="d-line" x1="550" y1="75" x2="568" y2="75" marker-end="url(#arr2)"/>
+    <path class="d-line" d="M630,110 L630,150 L70,150 L70,112" fill="none" marker-end="url(#arr2)"/>
+    <text class="d-small" x="350" y="168" text-anchor="middle">下一圈</text>
+    <rect class="d-soft" x="110" y="190" width="480" height="44" rx="8"/>
+    <text class="d-text" x="350" y="217" text-anchor="middle">每一段 callback 跑完：先清 nextTick 佇列，再清 microtask 佇列</text>
+  </svg>
+  <figcaption>一圈的五個主要 phase。phase 之間、每段 callback 之後，都會先清空 nextTick 和 microtask。</figcaption>
+</figure>
+<div class="table-wrap"><table>
+  <tr><th>phase</th><th>處理什麼</th></tr>
+  <tr><td>timers</td><td>時間到了的 <code>setTimeout</code>、<code>setInterval</code></td></tr>
+  <tr><td>pending callbacks</td><td>上一圈被延後的少數系統層 callback，例如某些 TCP 錯誤</td></tr>
+  <tr><td>poll</td><td>收 I/O 事件、執行 I/O callback（讀完檔案、收到連線、收到資料）。沒事做時在這裡<strong>等待</strong>，最多等到最近的計時器到期</td></tr>
+  <tr><td>check</td><td><code>setImmediate</code> 的 callback：poll 之後立刻執行</td></tr>
+  <tr><td>close callbacks</td><td><code>socket.on('close')</code> 這類關閉事件</td></tr>
+</table></div>
+<p>表裡最要記住的是 poll。它是 event loop 接收外界的地方：檔案讀完、新連線進來、請求的資料到了，都在 poll 被收進來並執行 callback。咖啡店的 <code>/health</code> 請求也一樣，要等 event loop 走到 poll，伺服器才會開始處理它。沒有任何事要做時，event loop 會停在 poll 等，最多等到最近一個計時器該觸發的時間，這也是閒置的 Node 程序幾乎不吃 CPU 的原因。</p>
+<p>知道 phase 之後，就能回答一個常被問的問題：<code>setTimeout(fn, 0)</code> 和 <code>setImmediate(fn)</code> 誰先？<code>setImmediate</code> 是 Node 專屬的 API，意思是「這一圈的 poll 結束後馬上執行」，它的 callback 排在 check。<code>setTimeout(fn, 0)</code> 的 callback 排在 timers。兩者看起來都是「盡快執行」，但在不同的 phase，所以順序看你在哪裡呼叫它們：</p>
+<ul>
+  <li><strong>在主程式裡</strong>同時排兩者：誰先<strong>不保證</strong>。<code>setTimeout(fn, 0)</code> 實際上是 1ms，event loop 第一次走到 timers 時，如果 1ms 還沒過，就先跑到 check 執行 <code>setImmediate</code>；過了就先跑 timeout。這台 Mac 連續執行六次，兩種順序都出現過。</li>
+  <li><strong>在 I/O callback 裡</strong>（例如讀完檔案）排兩者：<code>setImmediate</code> <strong>一定先</strong>。I/O callback 在 poll 執行，接下來就是 check，timers 要等下一圈。</li>
+</ul>
+<p>這課的範例以 Node 24.22.1 為準；不同 Node 版本在 timers 的實作上有調整，但上面的 phase 順序和兩條規則不受影響，細節見課末。</p>
+<p>到這裡，所有 callback 都屬於某個 phase，event loop 一圈一圈轉，每一圈都會經過 poll，<code>/health</code> 照理一定輪得到。但通知程式排下一筆用的是 <code>process.nextTick</code>，它不在上面任何一個 phase 裡。圖下方那條「每段 callback 跑完先清 nextTick、再清 microtask」說的就是它。</p>
+
+<h2>不屬於任何 phase 的兩個佇列：nextTick 與 microtask 為什麼能插隊？</h2>
+<p>上一節的五個 phase 之外，還有兩個佇列，它們的優先權比所有 phase 都高：</p>
+<ul>
+  <li><strong><code>process.nextTick(fn)</code></strong>：Node 專屬。在<strong>目前這段程式結束後</strong>、event loop 往下走之前就執行。名字裡有 tick，但它跟「下一圈」無關，比 <code>setImmediate</code> 早得多。</li>
+  <li><strong>microtask</strong>：<code>Promise.then</code>、<code>await</code> 之後的程式、<code>queueMicrotask</code>，和瀏覽器一樣。</li>
+</ul>
+<p>它們的規則只有一條：每段 callback 跑完，Node 先清空 nextTick 佇列，再清空 microtask 佇列，然後才繼續 event loop 的下一步。「清空」的意思是一直做到佇列沒有東西為止，清的過程中新加進來的，也會在同一次被清掉。這兩個佇列等於排在所有 phase 前面插隊。</p>
+<p>用範例確認這條規則。先在 <code>learn/</code> 執行 <code>node check.mjs node 07</code>，它會建立 <code>work/07/</code>，裡面的 <code>examples/</code> 就是這課的範例。在 <code>work/07</code> 裡執行三個範例，它們在同一段程式裡各排一個 <code>setTimeout</code>、<code>setImmediate</code>、<code>Promise.then</code>、<code>process.nextTick</code>，再印一行同步的文字；看每個結果的印出順序：</p>
+<pre>$ node examples/order.ts     # ES module
+sync
+promise
+nextTick
+timeout
+immediate
+
+$ node examples/order.cts    # 同樣的程式，CommonJS
+sync
+nextTick
+promise
+timeout
+immediate
+
+$ node examples/in-io.ts     # 在 readFile 的 callback 裡
+readFile callback
+nextTick
+promise
+immediate
+timeout</pre>
+<p>先看三個結果共同的地方：同步的那行永遠第一，因為它就是「目前這段程式」；nextTick 和 promise 一定排在 timeout、immediate 前面，因為它們插隊。最後一個結果在 readFile 的 callback 裡，也就是 poll phase，所以接下來的 check（immediate）比下一圈的 timers（timeout）先，跟上一節的規則一致。</p>
+<p>前兩個結果的 nextTick 和 promise 順序卻相反。CommonJS 的頂層程式是一段普通的同步程式，跑完先清 nextTick，所以 nextTick 先；ES module 的頂層程式本身就在一個非同步的載入流程裡執行（為了支援頂層 <code>await</code>），它結束時 Node 正在清 microtask，所以 promise 先。這是這台 Node 24.22.1 的實測結果（timeout 和 immediate 在主程式裡的先後也可能對調）。</p>
+<p>同一段程式換個模組格式順序就變，代表這種先後是執行環境的細節。資深的做法是<strong>不要寫依賴 nextTick 和 Promise 先後的程式</strong>。需要「晚一點再做」時，Node 官方文件建議優先用 <code>setImmediate</code>，行為最好預測。<code>process.nextTick</code> 適合一個特定用途：讓 callback 在呼叫端的同步程式跑完之後、任何 I/O 之前執行，練習 1 會用到。</p>
+<p>回頭看那條規則裡的「清的過程中新加進來的，也會在同一次被清掉」。如果 nextTick 的 callback 自己又排了一個 nextTick，會發生什麼事？通知程式就是這樣寫的。</p>
+
+<h2>通知批次為什麼讓 /health 回不了？</h2>
+<p>通知程式的寫法大致如下（練習 3 的起始檔）：處理一筆，再用 <code>process.nextTick</code> 排下一筆，直到全部做完。</p>
+<pre>const step = () =&gt; {
+  if (i === items.length) return resolve()
+  handle(items[i++])
+  process.nextTick(step)
+}
+step()</pre>
+<p>照上一節的規則一步一步走：<code>step</code> 跑完，Node 去清 nextTick 佇列，裡面有下一個 <code>step</code>；執行它，它又排了一個 <code>step</code>，因為清空時新加進來的也要清，所以接著執行。佇列要等最後一筆做完才會真的空掉，在那之前 event loop 一步也沒有往下走，永遠到不了 poll。<code>/health</code> 的連線其實早就到了，已經在作業系統那裡排好，但 libuv 要等 event loop 走到 poll 才會去問作業系統有哪些事件，所以一直沒有人去收。</p>
+<p>這種情況叫 <strong>I/O 飢餓</strong>（starvation）：插隊的工作一直佔著，I/O 永遠輪不到。每一筆通知都很短，看起來像非同步，但串起來就是一段沒有空檔的同步工作。範例 <code>starve.ts</code> 用遞迴 nextTick 空轉 1 秒，同時排了一個 10ms 的計時器，看計時器實際在幾毫秒執行：</p>
+<pre>$ node examples/starve.ts
+nextTick 迴圈結束
+10ms 的計時器在 1003 ms 才執行</pre>
+<p>計時器晚了將近一秒，因為 timers phase 也一直輪不到。修法是把插隊改成排隊：把範例裡的 <code>process.nextTick(spin)</code> 改成 <code>setImmediate(spin)</code> 再跑一次，計時器就準時在 10ms 執行。<code>setImmediate</code> 在 check phase 排的新 callback 要等下一圈，中間 event loop 會經過 timers 和 poll，計時器和新連線都有機會被處理。通知程式也一樣，每一筆之間用 <code>setImmediate</code> 讓出 event loop，<code>/health</code> 就能在兩筆通知之間被回應，這就是練習 3 要做的事。</p>
+<p>同樣的陷阱也藏在 <code>async</code> 函式裡。把迴圈塞滿 <code>await Promise.resolve()</code> 一樣會餓死 I/O：<code>await</code> 一個已經完成的 Promise 只是排一個 microtask，microtask 也是插隊的，沒有讓出 event loop。「有寫 <code>await</code>」不等於「有讓別人跑」，要看等的東西是不是真的要等 I/O。</p>
+<div class="callout practice"><strong>💡 實務上：批次工作要記得讓出 event loop</strong><br>咖啡店晚上產生每日報表、或匯入幾千筆商品的 CSV，常見寫法是直接在 API 的程序裡跑迴圈。如果迴圈裡都是同步運算或 <code>await</code> 已完成的 Promise，event loop 一直輪不到 poll，這段時間顧客的請求全部卡住。部署平台還會定期打一個檢查網址（例如 <code>/health</code>）確認服務活著，回不了就把它重啟，批次做到一半就斷掉，看起來像「服務莫名其妙一直重開」。code review 看到處理大量資料的迴圈時，資深會先問：每一批之間有沒有用 <code>setImmediate</code> 讓出 event loop？中途被重啟能不能從斷點接著做？要跑好幾分鐘的工作，通常就移到另一個程序或排程去做，不跟對外的 API 擠在一起。</div>
+<p>咖啡店照這個建議，把通知改成一支獨立的腳本，每晚由排程啟動。API 伺服器不再受影響，但新的狀況出現了：排程報告說這支腳本從來沒有「完成」過，它印出了最後一筆，卻一直掛著不結束。</p>
+
+<h2>腳本做完了，為什麼不結束？</h2>
+<p><a href="02-process-config.html">第 2 課</a>說過，程式「跑完」就會以結束碼 0 結束。有了 event loop 的模型，這句話可以說得更精確：<strong>event loop 裡沒有任何還撐著程序的東西</strong>，Node 就結束。反過來說，只要還有東西撐著，event loop 就會一直繞、一直在 poll 等，程序就不會結束，不管你的程式碼是不是已經跑到最後一行。撐著程序的東西有名字：</p>
+<ul>
+  <li><strong>handle</strong>：event loop 追蹤的長期資源，例如計時器、伺服器、socket、子程序。只要還有一個在活動，loop 就繼續繞，程序就不結束。這就是<a href="01-what-is-node.html">第 1 課</a>的伺服器不會自己停的原因：它開著一個等連線的 handle。</li>
+  <li><strong>ref／unref</strong>：handle 預設是 ref 的，意思是「撐住程序」。呼叫 <code>unref()</code> 後，這個 handle 照樣會運作，但如果只剩它，程序就不等它直接結束。</li>
+  <li><code>process.getActiveResourcesInfo()</code>：列出目前撐著程序的資源種類，程式不結束時用它查是誰。</li>
+</ul>
+<p>範例 <code>alive.ts</code> 開了一個伺服器、一個 interval 和一個 unref 的 timeout，先印出撐著程序的清單，再關掉伺服器、清掉 interval：</p>
+<pre>$ node examples/alive.ts
+開著： [ 'TCPServerWrap', 'Timeout' ]
+beforeExit：loop 空了 []
+exit：結束碼 0</pre>
+<ul>
+  <li>第一行的清單只有兩個：<code>TCPServerWrap</code> 是伺服器，<code>Timeout</code> 是 interval。unref 的 timeout 不撐住程序，所以不在清單裡。</li>
+  <li>關掉伺服器、清掉 interval 之後清單變空，event loop 沒有理由再繞，觸發 <code>beforeExit</code>。</li>
+  <li>最後觸發 <code>exit</code>，程序以結束碼 0 結束。</li>
+</ul>
+<p><code>unref()</code> 的寫法通常是在建立時直接接上去：</p>
+<pre>setInterval(() =&gt; console.log('已送出', sent, '筆'), 60_000).unref()</pre>
+<p>它適合「順便做的事」：每分鐘印一次統計、定期清快取，主要工作做完時這些事沒有理由把程序留下來。它不能拿來處理「該關卻沒關」的資源。資料庫連線沒關時，如果去找底層 socket 把它 unref，程序是結束了，但連線沒有正常關閉，資料庫那一端要等逾時才知道連線斷了；該送出的查詢或交易也可能還沒完成。判斷方式很簡單：這個資源是你開的、用完就該關，就關掉它；只有「主要工作做完就不需要」的背景工作才用 <code>unref()</code>。</p>
+<p>這兩個結束前的事件用途不同：<code>beforeExit</code> 在 loop 空了時觸發，這時還能排新的非同步工作，排了 loop 就會繼續；<code>exit</code> 在真的要結束時觸發，只能做同步的事。</p>
+<p>找到撐著的 handle 之後，怎麼讓程式結束也有對錯之分。</p>
+<div class="callout warn">程式不結束時，不要用 <code>process.exit()</code> 硬砍。stdout 接到管線（pipe，例如被另一個程式或 log 收集器讀取）時是非同步寫出的，<code>process.exit()</code> 會把還沒寫出去的輸出丟掉（<a href="02-process-config.html">第 2 課</a>實測過）。正確做法是找出撐著的 handle，關掉它（<code>clearInterval</code>、<code>server.close()</code>），讓程式自然結束；要回報失敗就設 <code>process.exitCode</code>。</div>
+<p>咖啡店的通知腳本就是這種情況：它開了資料庫連線來讀待送的通知，做完卻沒有關。資料庫連線本質上是一條 TCP socket，這時 <code>process.getActiveResourcesInfo()</code> 的清單裡會多出一項 <code>'TCPSocketWrap'</code>（這台 Node 24.22.1 連上一個 TCP 服務後實測的名稱），而不只是 <code>Timeout</code>；連線池開了幾條連線，就可能看到幾個。練習 2 是同一類問題的小版本，一支報表程式開著狀態伺服器和進度計時器，做完不結束，你要用 <code>process.getActiveResourcesInfo()</code> 找出撐著的 handle 並關掉。</p>
+<div class="callout practice"><strong>💡 實務上：腳本跑完卻不結束，多半是連線沒關</strong><br>最常遇到的地方不是伺服器，而是一次性的腳本：資料庫 migration、每天凌晨的對帳、補資料的 script。它們印出「完成」卻一直掛著，常見原因是資料庫連線池或快取（例如 Redis）的連線還開著，它們是撐住程序的 handle（連線池在<a href="20-postgres-pool-transactions.html">第 20 課</a>）。放在排程或 CI 裡就麻煩了：工作永遠不算完成，最後被判逾時失敗，或下一次排程又啟動一份。資深的寫法是在 <code>finally</code> 裡關掉自己開的連線，而不是在結尾補一行 <code>process.exit()</code>；伺服器收到關機訊號時怎麼有順序地關，<a href="21-graceful-shutdown.html">第 21 課</a>再談。</div>
+<p>通知腳本關好連線、每晚準時結束之後，API 伺服器又出了一個問題，這次跟通知無關：週末早上的點單尖峰，客服回報登入很慢，維運還發現連讀菜單設定檔都變慢了。登入和讀檔看起來毫無關係，JavaScript 也沒有佔著執行緒，慢在哪裡？</p>
+
+<h2>尖峰時登入變慢，為什麼連讀檔也跟著慢？</h2>
+<p>答案在第二節的 thread pool。登入時要用 <code>pbkdf2</code> 驗證密碼，讀設定檔要用 <code>node:fs</code>，這兩件工作都交給同一個 thread pool。而 thread pool 預設只有 <strong>4 條</strong>執行緒，同時丟進去超過 4 件工作，多的要排隊。<code>examples/threadpool.ts</code> 同時做 8 次 <code>pbkdf2</code>（把密碼反覆雜湊 30 萬次的運算，存密碼時用來拖慢暴力破解），印出每個做完的時間：</p>
+<pre>$ node examples/threadpool.ts
+第 1 個完成：105 ms
+…（4 個在 100ms 左右）
+第 5 個完成：214 ms
+…（另外 4 個在 200ms 左右）
+
+$ UV_THREADPOOL_SIZE=8 node examples/threadpool.ts
+第 4 個完成：123 ms
+…（8 個都在 120–150ms 之間）</pre>
+<p>預設時分成兩波：前 4 個佔滿 4 條執行緒，後 4 個排隊，等前一波做完才開始，所以多等了一整輪。把 <code>UV_THREADPOOL_SIZE</code> 環境變數設成 8，8 個同時開始，幾乎一起完成。尖峰時段的登入就是這樣：很多人同時登入，pbkdf2 把 4 條執行緒佔滿，這時要讀設定檔的工作只能排在它們後面，所以看起來毫無關係的讀檔也變慢了。</p>
+<p>這也劃清了 thread pool 的影響範圍。網路的收發（伺服器處理連線、<code>fetch</code> 傳送和接收資料）交給作業系統，不佔 thread pool，不受影響；但連到網域名稱前的 <code>dns.lookup</code> 那一步會佔。真正吃 CPU 的 JavaScript 運算則是另一回事，它佔的是唯一那條 JavaScript 執行緒，<a href="09-blocking-and-workers.html">第 9 課</a>處理。</p>
+<p>看到這裡，直覺的修法是把 <code>UV_THREADPOOL_SIZE</code> 調大。它可以調，但有兩個限制：</p>
+<ul>
+  <li><strong>要在啟動前設定</strong>：Node 文件說明，thread pool 可能在你的程式執行前就建好了，在程式裡寫 <code>process.env.UV_THREADPOOL_SIZE = '8'</code> 不保證有效。放在啟動指令或部署設定裡。</li>
+  <li><strong>調大不是免費的</strong>：執行緒多於 CPU 核心數時，CPU 運算不會變快，只是輪流做。它主要幫的是「很多檔案 I/O 或 DNS 查詢在等」的情況。</li>
+</ul>
+<div class="callout practice"><strong>💡 實務上：調 UV_THREADPOOL_SIZE 之前先確認瓶頸</strong><br>常見情境：尖峰時段登入變慢，有人在網路上看到「把 <code>UV_THREADPOOL_SIZE</code> 調大」就直接改。資深會先確認慢的是什麼：是密碼雜湊（pbkdf2）在 pool 裡排隊、大量檔案讀寫，還是 JavaScript 自己的運算佔住執行緒（這種調 pool 完全沒用）。容器分到的 CPU 核心常常不多，pool 開再大，密碼雜湊也不會變快。決定要調的話，寫在部署設定的環境變數裡，並在 PR 裡附上調整前後量到的結果，讓之後的人知道這個數字怎麼來的。</div>
+<p>咖啡店這一路遇到的三件事，都可以用同一個模型解釋：一條 JavaScript 執行緒、把等待交出去的 libuv、一圈一圈轉的 event loop，以及能插隊的 nextTick 和 microtask。下面的練習讓你親手修這三類問題。</p>
+
+<h2>練習</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs node 07</code> 建立 <code>work/07/</code>，裡面有內文的範例（<code>examples/</code>）和三題的起始檔。</p>
+
+<div class="local" data-test="ex1" data-files="shop.ts">
+  <p>練習 1：<code>shop.ts</code> 的 <code>Shop</code> 繼承 <code>EventEmitter</code>（Node 內建的事件工具：<code>on(名稱, fn)</code> 掛監聽器，<code>emit(名稱, 參數)</code> 會<strong>同步</strong>呼叫目前掛著的監聽器，<a href="08-events-cancellation.html">第 8 課</a>詳講）。它在建構子裡 <code>emit('open', 店名)</code>，但使用者一定是 <code>new Shop('信義店')</code> 之後才 <code>on('open', …)</code>，永遠收不到。修改 <code>Shop</code>：建構完立刻掛上的監聽器一定收得到、每個只收到一次，而且要在 event loop 進入下一個 phase 之前發出：<code>setTimeout</code> 和 <code>setImmediate</code> 都太晚（測試用假時鐘，<code>setTimeout</code> 根本不會觸發）。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="report.ts">
+  <p>練習 2：<code>report.ts</code> 產生報表時每 100ms 印一次 <code>處理中…</code>，做完印出 2 萬行明細和 <code>報表完成</code>，但之後程式一直不結束。修正它：做完就自然結束、結束碼 0，「處理中…」照常印。測試會在程式結束後才開始讀它的輸出，所以用 <code>process.exit()</code> 收尾會丟掉輸出而過不了。先執行 <code>node report.ts</code> 看它停住，可以在最後加一行 <code>console.error(process.getActiveResourcesInfo())</code> 看是誰撐著（看完記得拿掉）。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="drain-queue.ts">
+  <p>練習 3：<code>drain-queue.ts</code> 的 <code>drainQueue(items, handle)</code> 用遞迴 <code>process.nextTick</code> 一筆一筆處理訂單通知，處理期間同一個程序裡的伺服器回應不了 <code>/health</code>。改寫它：處理期間 <code>/health</code> 仍能回應，處理的筆數與順序不變，全部做完時回傳的 Promise 才完成。測試讓 600 筆通知各花 1ms，處理到第 20 筆時送出 <code>/health</code>，回應時處理的筆數要還不到一半；也會檢查沒有改到傳進來的陣列、空陣列時直接完成。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：一個 ES module（<code>.ts</code>，package.json 有 <code>"type": "module"</code>）的最外層同時寫了 <code>Promise.resolve().then(() =&gt; console.log('promise'))</code> 和 <code>process.nextTick(() =&gt; console.log('tick'))</code>，在 Node 24 誰先印？</p>
+  <label data-key="a">tick 先，nextTick 永遠比 Promise 早</label>
+  <label data-key="b">順序隨機，每次執行都可能不同</label>
+  <label data-key="c">promise 先；同樣的程式寫成 CommonJS 則是 tick 先，所以不要寫依賴兩者先後的程式</label>
+  <p class="why">✓ 實測 Node 24.22.1：ESM 的頂層程式在非同步的載入流程裡執行，結束時正在清 microtask，所以 promise 先；CommonJS 的頂層是普通同步程式，跑完先清 nextTick。「nextTick 永遠最先」只在 CommonJS 或一般 callback 裡成立。它也不是隨機，同樣的模組格式每次結果一樣，只是規則依賴執行環境，所以不要依賴。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：<code>setTimeout(a, 0)</code> 和 <code>setImmediate(b)</code>，誰先執行？</p>
+  <label data-key="a">一定是 a，延遲 0 就是立刻</label>
+  <label data-key="b">在主程式裡不保證；在 I/O callback（例如 readFile 的 callback）裡一定是 b</label>
+  <label data-key="c">一定是 b，setImmediate 名字就是「立即」</label>
+  <p class="why">✓ 兩者在不同 phase：timeout 在 timers，immediate 在 check。主程式裡要看 loop 第一次到 timers 時那 1ms 過了沒，所以不保證；I/O callback 在 poll 執行，下一個就是 check，所以 immediate 一定先。<code>setTimeout(fn, 0)</code> 也不是立刻，最少 1ms，而且要等目前的程式、nextTick、microtask 都跑完。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：<code>fs.readFile</code> 和 <code>fetch</code> 都會佔用 libuv 的 thread pool 嗎？</p>
+  <label data-key="a">只有 fs.readFile 會；網路 I/O 交給作業系統的非同步機制（kqueue、epoll），不佔 thread pool</label>
+  <label data-key="b">都會，Node 所有非同步工作都在 thread pool 裡做</label>
+  <label data-key="c">都不會，Node 只有一條執行緒</label>
+  <p class="why">✓ 作業系統能同時盯著大量的網路連線，所以網路的收發不需要 thread pool（只有連線前把網域名稱查成 IP 的 <code>dns.lookup</code> 那一步會用到）；檔案、<code>dns.lookup</code>、pbkdf2 這類沒有好的非同步介面的工作才交給 thread pool。「Node 只有一條執行緒」只對你的 JavaScript 成立，libuv 在背後還有 thread pool。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>以為 <code>setTimeout(fn, 0)</code> 會立刻執行</strong>：至少要等目前的程式、nextTick、microtask 都跑完，再等 event loop 走到 timers phase，實際最少 1ms。</li>
+  <li><strong>用遞迴 nextTick 或 microtask 處理大量工作</strong>：佇列清不完，event loop 到不了 poll，整個伺服器沒反應。分批處理時用 <code>setImmediate</code> 讓出 event loop。</li>
+  <li><strong>以為把函式改成 <code>async</code> 就會在背景執行</strong>：<code>async</code> 函式裡的同步部分照樣佔著唯一的執行緒，<code>await</code> 已完成的 Promise 也不會讓出 event loop。</li>
+  <li><strong>用 <code>process.exit()</code> 收尾</strong>：輸出接到管線時會被截斷。關掉撐著的 handle 讓程式自然結束，用 <code>process.exitCode</code> 設定結束碼。</li>
+  <li><strong>在程式裡設定 <code>process.env.UV_THREADPOOL_SIZE</code></strong>：thread pool 可能已經建好了，不保證有效。在啟動指令或部署設定裡用環境變數設定。</li>
+  <li><strong>用 <code>setTimeout</code> 排很久以後的事</strong>：延遲超過 2<sup>31</sup>−1 毫秒（約 24.8 天）時，Node 印出 <code>TimeoutOverflowWarning</code> 並改成 1 毫秒後就觸發（本機實測）。而且程序重啟計時器就不見了。長時間的排程交給排程器或資料庫。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>Node 用一條執行緒跑 JavaScript，靠非阻塞 I/O 把等待交出去，所以能同時服務很多請求；會讓所有請求一起卡住的，是 JavaScript 自己佔著執行緒。</li>
+  <li>等待交給 libuv：網路 I/O 交給作業系統（kqueue、epoll），檔案、<code>dns.lookup</code>、部分 crypto、zlib 交給預設 4 條的 thread pool；callback 一律回到那條 JavaScript 執行緒上跑。</li>
+  <li>event loop 每圈經過 timers → pending callbacks → poll → check → close callbacks；新連線和 I/O callback 在 poll。<code>setTimeout</code> 在 timers、<code>setImmediate</code> 在 check：主程式裡兩者順序不保證，I/O callback 裡 <code>setImmediate</code> 一定先。</li>
+  <li>每段 callback 跑完先清 nextTick 再清 microtask，清空時新加的也一起清；ESM 和 CommonJS 頂層的先後不同，不要依賴。遞迴排 nextTick／microtask 會讓 I/O 餓死（<code>/health</code> 回不了），改用 <code>setImmediate</code> 讓出 event loop。</li>
+  <li>沒有 ref 的 handle 時程序就結束；<code>unref()</code> 讓計時器不撐住程序；用 <code>process.getActiveResourcesInfo()</code> 查是誰撐著。關掉資源讓程式自然結束，不用 <code>process.exit()</code>。</li>
+  <li>超過 thread pool 大小的工作會排隊，所以密碼雜湊的尖峰會拖慢讀檔；<code>UV_THREADPOOL_SIZE</code> 要在啟動前設定，調之前先確認瓶頸。</li>
+</ul>
+<p>下一課看 event loop 上最常見的通知機制 EventEmitter，以及怎麼用 AbortController 取消還在等的工作。</p>
+
+<h2>補充與查表</h2>
+<h3>版本備註</h3>
+<ul>
+  <li>官方的 event loop 文件註明：Node 20（libuv 1.45.0）起，timers 改成在每一圈的 poll 之後才執行。正文的 phase 順序和 <code>setTimeout</code>／<code>setImmediate</code> 的兩條規則不受影響。這課以 Node 24.22.1（libuv 1.52.1）為準。</li>
+  <li><code>process.getActiveResourcesInfo()</code> 從 v24.0.0 起是穩定功能。</li>
+</ul>
+<h3>thread pool 的細節</h3>
+<ul>
+  <li><code>node:fs</code> 的非同步操作都交給 thread pool，只有監看檔案變動的 <code>fs.watch</code> 例外。</li>
+  <li><code>UV_THREADPOOL_SIZE</code> 的上限是 1024。</li>
+</ul>
+<h3><code>AbortSignal.timeout</code> 不撐住程序</h3>
+<p><code>AbortSignal.timeout(ms)</code> 內部的計時器不會撐住程序：如果頂層 <code>await</code> 只在等它，程序會直接以結束碼 13（頂層 await 沒有完成）結束，而不是等它逾時。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

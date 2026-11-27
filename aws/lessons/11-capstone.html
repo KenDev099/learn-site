@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>11. 期末專題：把作品部署上 AWS</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="11" data-practice="aws">
+<header>
+  <div class="eyebrow">階段 5：事件與上線 · 第 11 課</div>
+  <h1>期末專題：把作品部署上 AWS</h1>
+</header>
+<main>
+
+<p>你在作品專案課做出了一個多租戶 SaaS 後台 my-saas：NestJS＋Prisma＋PostgreSQL（RLS）＋Redis（限流與 BullMQ 匯出佇列），用 <code>docker compose --profile app up</code> 就能在本機跑起來。<a href="../../portfolio/lessons/17-ci-cd-deploy.html">作品專案課第 17 課</a>留了一句話：部署到哪裡是你的選擇，想上 AWS 的話，就是這一課。</p>
+<p>這一課把整門課組起來：先把 compose 裡的每個服務對應到 AWS 的服務，依需求做取捨並寫下理由；再用一支可以重複執行的部署程式，在模擬器裡建出 ECR、RDS、S3、Secrets Manager、ALB、ECS 與 CloudWatch 告警；接著處理「上線第一晚」埋好的四個事故並寫事後檢討；最後談成本，以及在真的帳號上部署一次的步驟與清除順序。</p>
+<p>這課的路線：</p>
+<ul>
+  <li>從 compose 到 AWS：每個服務換成什麼、程式要改哪幾個地方。</li>
+  <li>架構與取捨：依需求選每一層（練習 1）。</li>
+  <li>部署的順序與冪等：一支可以重複執行的部署程式（練習 2）。</li>
+  <li>上線第一晚的四個事故與事後檢討（練習 3）。</li>
+  <li>看得到、算得出：CloudWatch 告警、成本分攤標籤與每小時計費的資源。</li>
+</ul>
+
+<div class="callout"><strong>這課會用到：</strong>作品的部署方式（<a href="../../portfolio/lessons/17-ci-cd-deploy.html">作品專案課第 17 課</a>：映像用 commit SHA 標記、migration 用 build 階段的映像獨立執行、只有 migration 拿得到擁有者帳號，api 用 <code>pf_app</code>）；execution role 與 task role（<a href="05-ecs-fargate.html">第 5 課</a>）；ECS 注入 secret（<a href="09-kms-secrets.html">第 9 課</a>：<code>secrets</code> 的 <code>valueFrom</code>，由 execution role 在啟動時讀）；OpenTofu（<a href="../../devops/lessons/20-iac.html">devops 課第 20 課</a>：宣告式描述基礎設施，plan 之後再 apply）。</div>
+
+<div class="callout warn"><strong>練習環境：</strong>模擬器會記下 RDS、ECS、ALB 的設定，但不會真的開資料庫、跑容器或接流量；它也不檢查 IAM 權限。所以練習 3 的事故，測試檢查的是 policy 文件與 task definition 本身；「真的跑得起來」交給選做的真實帳號部署與課末的自評清單。</div>
+
+<h2>從 compose 到 AWS：每個服務換成什麼</h2>
+<p>先回答開場的問題：本機的每一樣東西，在 AWS 上由誰負責。左邊是參考實作 <code>nestjs/practice/portfolio-ref/saas</code> 的 <code>compose.yaml</code> 與 <code>.env.example</code>：</p>
+<div class="table-wrap"><table>
+  <tr><th>本機（compose）</th><th>AWS</th><th>課</th></tr>
+  <tr><td><code>api</code>：Dockerfile 最後一個 stage，非 root、HEALTHCHECK 打 <code>/health/ready</code></td><td>ECR 的映像（標籤是 commit SHA）＋ ECS Fargate service，兩個 task 分在兩個 AZ 的私有子網路</td><td>5</td></tr>
+  <tr><td><code>migrate</code>：<code>target: build</code> 的一次性服務，跑 <code>prisma migrate deploy</code></td><td>同一個 repository 的 <code>&lt;SHA&gt;-build</code> 映像、另一個 task definition，部署前用 <code>aws ecs run-task</code> 跑一次</td><td>5</td></tr>
+  <tr><td><code>db</code>：postgres 容器＋volume</td><td>RDS for PostgreSQL：Multi-AZ、自動備份（PITR）、儲存加密、私有子網路</td><td>8</td></tr>
+  <tr><td><code>redis</code>：redis 容器</td><td>ElastiCache（Valkey 或 Redis OSS），自訂參數群組設 <code>noeviction</code>，開傳輸加密（網址變成 <code>rediss://</code>）</td><td>—</td></tr>
+  <tr><td><code>STORAGE_DIR</code>：本機磁碟</td><td>S3：封鎖公開存取、SSE-KMS（客戶管理金鑰）</td><td>7、9</td></tr>
+  <tr><td><code>mailpit</code>：<code>SMTP_URL</code></td><td>寄信服務的 SMTP（Amazon SES 或第三方），網址含帳密，放 Secrets Manager</td><td>—</td></tr>
+  <tr><td><code>JWT_SECRET</code>、兩個資料庫連線字串寫在 compose</td><td>Secrets Manager，task definition 的 <code>secrets</code> 在啟動時注入</td><td>9</td></tr>
+  <tr><td><code>127.0.0.1:3101</code></td><td>ALB（公有子網路、HTTPS 443＋ACM 憑證、80 轉址到 443）→ target group（健康檢查 <code>/health/ready</code>）</td><td>4</td></tr>
+  <tr><td><code>docker logs</code></td><td><code>awslogs</code> log driver → CloudWatch Logs（保留 30 天）＋告警通知 SNS</td><td>—</td></tr>
+</table></div>
+<p>程式本身大部分不用改，因為設定都從環境變數來（devops 課第 11 課的「同一個映像，不同的設定」）。要改的是這幾個地方：</p>
+<ul>
+  <li><strong>檔案改存 S3</strong>：<code>StorageService</code> 的 <code>put</code>／<code>get</code>／<code>delete</code> 換成 <code>PutObjectCommand</code>、<code>GetObjectCommand</code>、<code>DeleteObjectCommand</code>，key 照舊是 <code>tenants/&lt;tenantId&gt;/files/&lt;隨機 id&gt;</code>；<code>env.ts</code> 的 <code>STORAGE_DIR</code> 換成 <code>S3_BUCKET</code>。程式用 task role 的憑證（第 1 課的憑證鏈 container 那一步），不需要任何金鑰。這是一個新的決定，寫一份 ADR「0007 正式環境的檔案存 S3」。</li>
+  <li><strong><code>pf_app</code> 的密碼</strong>：參考實作的 migration 用 <code>CREATE ROLE pf_app LOGIN PASSWORD 'pf_app'</code> 建角色，密碼寫死在 git 裡。正式環境在第一次 migration 之後，要用擁有者執行一次 <code>ALTER ROLE pf_app PASSWORD …</code>，換成 Secrets Manager 裡 <code>APP_DATABASE_URL</code> 的那個密碼（例如寫一支只在部署時執行的小程式，兩個連線字串都由 secret 注入）。</li>
+  <li><strong>信任 ALB 這一層代理</strong>：參考實作的 <code>app.setup.ts</code> 設了 <code>trust proxy: 'loopback'</code>，只信任本機的代理。放到 ALB 後面，<code>req.ip</code> 會變成 ALB 節點的私有 IP，log 裡就看不到客戶端的 IP。因為 app-sg 只允許 alb-sg 進來，可以改成只信任最近一跳（<code>1</code>）。</li>
+</ul>
+<div class="callout practice"><strong>💡 實務上：先列「要改的程式」，再開始建資源</strong><br>資深工程師接到「把這個服務搬上雲」時，第一份產出通常不是架構圖，而是這張對照表加上「程式要改的地方」清單：檔案存哪、密碼從哪來、代理信任幾層、健康檢查打哪裡。每一項都是一個小 PR，可以在本機先做完、測完（例如 S3 的部分用這門課的模擬器測）。等到真的部署時，剩下的只是設定，出事時也比較好判斷是程式還是設定的問題。</div>
+
+<h2>架構與取捨：依需求選每一層</h2>
+<p>對照表說的是「可以換成什麼」，但每一層都有好幾種選法。決定之前先把需求寫清楚。my-saas 正式環境的需求：</p>
+<ul>
+  <li><strong>可用性</strong>：一個 AZ 故障時，15 分鐘內恢復服務（RTO，recovery time objective，可以容忍的停機時間）。</li>
+  <li><strong>資料</strong>：最多遺失 5 分鐘的資料（RPO，recovery point objective，可以容忍遺失多久的資料），而且能還原到過去 7 天內的任一時間點。</li>
+  <li><strong>團隊</strong>：兩個人，沒有專職維運，不想自己修補作業系統。</li>
+  <li><strong>現有設計</strong>：租戶隔離靠 PostgreSQL 的 RLS（ADR 0001、0002）；匯出 worker 用 BullMQ、跟 API 同一個程序（ADR 0005）；每租戶限流用 Redis（ADR 0006）；檔案經過 API 上傳下載（ADR 0004）。</li>
+  <li><strong>檔案與機密</strong>：檔案可能含客戶資料；log 依規定至少保留 30 天。</li>
+</ul>
+<p>逐層對照需求：</p>
+<div class="table-wrap"><table>
+  <tr><th>層</th><th>選擇</th><th>為什麼不是另一個</th></tr>
+  <tr><td>運算</td><td>ECS Fargate</td><td>Lambda：API 是長時間執行的程序，BullMQ worker 要一直連著 Redis 等工作，Prisma 的連線池也不適合一次一個請求的執行環境（第 6 課）。EC2：要自己修補作業系統，違反團隊條件（第 5 課）</td></tr>
+  <tr><td>worker</td><td>先跟 API 同一個程序；匯出量影響 API 延遲時，同一個映像換 command 拆成第二個 service</td><td>兩種都合理，重點是寫下「什麼時候要拆」</td></tr>
+  <tr><td>資料庫</td><td>RDS PostgreSQL，Multi-AZ，自動備份保留 7 天</td><td>單一 AZ 的 RDS 在那個 AZ 故障時只能從備份還原，時間不可控，達不到 15 分鐘；自動備份是 PITR 的前提，RDS 的 PITR 通常能還原到最近 5 分鐘內（第 8 課）</td></tr>
+  <tr><td>Redis</td><td>ElastiCache，自訂參數群組 <code>maxmemory-policy noeviction</code></td><td>就算匯出改用 SQS，限流仍然要 Redis。BullMQ 文件寫明 maxmemory-policy 一定要是 <code>noeviction</code>；ElastiCache 預設參數群組是 <code>volatile-lru</code>（ElastiCache 文件，2026-11-20 查證），記憶體滿時會清掉有 TTL 的 key</td></tr>
+  <tr><td>檔案</td><td>S3，不公開，SSE-KMS</td><td>檔案經過 API 下載，不需要 CloudFront＋OAC 對外；SSE-KMS 讓「誰能解密」可以用 key policy 與 IAM 控制（第 7、9 課）</td></tr>
+  <tr><td>機密</td><td>Secrets Manager</td><td>寫在 task definition 的 environment，每個舊版本都留著明文（第 9 課）</td></tr>
+  <tr><td>網路</td><td>兩個 AZ，每個 AZ 一個 NAT gateway</td><td>只有一個 NAT 時，它所在的 AZ 故障，另一個 AZ 的 task 寄不了信、拉不了映像（第 3 課）。staging 可以只放一個省錢，正式環境不行</td></tr>
+</table></div>
+<p>把選擇與理由寫進 <code>design.json</code>，就是練習 1。測試檢查的是違反需求的硬限制（例如 Lambda、單一 AZ 的資料庫、少了 Redis），理由由你寫。這份 JSON 之後可以改寫成作品 repo 裡的 ADR（<a href="../../system-design/lessons/18-design-docs-adr.html">系統設計課第 18 課</a>），面試時被問「為什麼這樣部署」，答案就在裡面。</p>
+
+<h2>部署的順序與冪等</h2>
+<p>選好了，接著把它們建出來。資源之間有相依關係，順序大致是：</p>
+<ol>
+  <li><strong>網路</strong>：VPC、子網路、NAT、安全群組（第 3 課）與 ACM 憑證（第 4 課）。練習裡由測試先準備好。</li>
+  <li><strong>不依賴別人的資源</strong>：ECR repository、CloudWatch log group、KMS 金鑰、S3 bucket。</li>
+  <li><strong>資料庫</strong>：先把擁有者的密碼產生好放進 Secrets Manager（<code>GetRandomPassword</code>，排除標點，連線字串才不用處理跳脫），再用它建 RDS；拿到端點後，組出 migration 與 api 的連線字串，各放一個 secret。</li>
+  <li><strong>IAM</strong>：execution role（拉映像、寫 log、讀 secret）與 task role（存取 S3 與 KMS 金鑰）。</li>
+  <li><strong>入口</strong>：target group、ALB、HTTPS 與轉址的 listener。</li>
+  <li><strong>應用程式</strong>：兩個 task definition（api、migrate）、cluster、service；最後是告警。</li>
+</ol>
+<p>部署程式一定會重跑：第一次跑到一半失敗、修好再跑；每次發新版本也要跑。所以每一步都寫成 <strong>ensure</strong>（確保存在）：先查，存在就沿用，不存在才建。最容易出事的是機密：<strong>secret 已經存在時，絕對不能重新產生值覆寫</strong>，資料庫的密碼還是舊的，覆寫之後所有服務都連不上。練習 2 的測試會把部署跑兩次，檢查第二次沒有多建任何東西、沒有改掉任何機密。</p>
+<p>這門課用 SDK 一步步寫，是為了讓你看清楚每個資源與它們之間的關係。真的專案用 OpenTofu（devops 課第 20 課）：你描述「最後要長什麼樣子」，工具算出要建、改、刪哪些，冪等是它內建的；變更先 <code>plan</code> 給人審查再 <code>apply</code>。要注意的是，用 OpenTofu 產生並寫入 secret 的值時，那個值也會出現在 state 裡，state 要加密、權限要收緊（devops 課第 20 課）。</p>
+<p>部署一個新版本時，順序是：build 兩個映像（最後的 stage 標 <code>&lt;SHA&gt;</code>、build stage 標 <code>&lt;SHA&gt;-build</code>）並推到 ECR → 用 migrate 的 task definition <code>run-task</code>，等它結束、確認 exit code 是 0 → 註冊新的 api task definition、更新 service → 等 service 穩定 → 跑冒煙測試。migration 失敗就停在這裡，舊版的 api 照常服務；新版的 task 起不來，service 的 circuit breaker 會自動回滾到上一個 task definition（第 5 課）。</p>
+<div class="callout practice"><strong>💡 實務上：在 Mac 上 build 的映像，Fargate 跑不起來</strong><br>Apple Silicon 的 Mac 預設 build 出 <code>linux/arm64</code> 的映像，Fargate 預設的 CPU 架構是 x86_64，task 一啟動就失敗，log 裡是 <code>exec format error</code>。兩個解法：build 時加 <code>--platform linux/amd64</code>，或在 task definition 設 <code>runtimePlatform: { cpuArchitecture: 'ARM64', operatingSystemFamily: 'LINUX' }</code> 改跑 ARM。更好的做法是不要從自己的電腦推映像：讓 CI（作品專案課第 17 課的 GitHub Actions）在固定的平台 build、用 OIDC（devops 課第 19 課）拿臨時憑證推到 ECR，線上的每一個映像都能對回一個 commit。</div>
+
+<h2>上線第一晚：四個事故</h2>
+<p>練習 2 的部署程式是從一份「已經在模擬器上跑過」的版本改來的，但它在真的 AWS 上第一次部署時，出了四件事。模擬器不檢查權限、不真的跑容器，所以這四件事在本機都沒有現形。每一件先看症狀，再找原因：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>症狀</th><th>原因</th><th>修法</th></tr>
+  <tr><td>a</td><td>task 一直停在啟動階段，ECS 事件是 <code>ResourceInitializationError: unable to pull secrets</code></td><td><code>secretsmanager:GetSecretValue</code> 給在 task role。注入 secret 發生在容器啟動前，是 execution role 在讀</td><td>移到 execution role，task role 拿掉多的權限</td></tr>
+  <tr><td>b</td><td>task 起來了，target group 顯示 unhealthy，部署被 circuit breaker 回滾</td><td>健康檢查路徑寫成 <code>/api/v1/health/ready</code>。參考實作的 <code>HealthController</code> 沒有 <code>/api/v1</code> 前綴，打到的是 404</td><td><code>HealthCheckPath</code> 改成 <code>/health/ready</code>，也確認 port 跟容器一樣是 3100</td></tr>
+  <tr><td>c</td><td>沒有錯誤訊息；code review 時發現 api 的 task definition 注入了 <code>DATABASE_URL</code></td><td>為了「方便在容器裡手動跑 migration」把擁有者的連線字串也給了 api。擁有者不受 RLS 限制，api 被攻破時等於整個資料庫外洩</td><td>api 只注入 <code>APP_DATABASE_URL</code> 與 <code>JWT_SECRET</code>；migration 只在獨立的 task definition 執行</td></tr>
+  <tr><td>d</td><td>上傳、下載檔案都回 500，log 是 S3 的 <code>AccessDenied</code></td><td>bucket 用 SSE-KMS，task role 只有 S3 的權限，少了這把金鑰的 <code>kms:Decrypt</code>（讀）與 <code>kms:GenerateDataKey</code>（寫）</td><td>task role 補上這兩個動作，Resource 只寫這把金鑰的 ARN</td></tr>
+</table></div>
+<p>a 和 b 是「起不來」，會被發現；c 是「跑得起來但不安全」，只有讀設定的人看得到；d 要等到有人用了某個功能才會出現。這也是為什麼冒煙測試（作品專案課第 17 課）除了 <code>/health/ready</code>，還要真的走過一次註冊、登入、建立資料、上傳檔案。</p>
+<p>修好之後寫<strong>事後檢討</strong>（postmortem，devops 課第 25 課）：影響、時間線、根本原因、修正、改善項目（每一項有負責人與期限）。不究責：寫發生了什麼、為什麼會發生，不寫誰的錯。這四件事有一個共同的改善方向：模擬器測不到的東西，要在部署前用別的方法檢查，例如把練習 3 的測試（檢查 policy 與 task definition）放進 CI。</p>
+<div class="callout practice"><strong>💡 實務上：ECS 部署失敗，先看這三個地方</strong><br>task 起不來時，資深工程師的查找順序是：一、service 的 <strong>Events</strong> 分頁與停止的 task 的 <strong>stoppedReason</strong>（<code>aws ecs describe-tasks</code>），拉映像、讀 secret、記憶體不足都寫在這裡；二、task 有啟動的話看 <strong>CloudWatch Logs</strong>，程式自己的錯誤（環境變數驗證失敗、連不上資料庫）在這裡；三、task 跑著但被判定不健康，看 <strong>target group 的健康檢查</strong>設定與回應碼。分清楚是「ECS 沒把容器開起來」、「程式起來後自己掛了」還是「程式活著但 ALB 不認」，就知道要查 IAM、程式還是網路。</div>
+
+<h2>看得到、算得出：告警與成本</h2>
+<p>上線之後，要能在客人抱怨之前知道出事，也要知道錢花在哪。log、指標、告警的觀念 devops 課第 21～25 課教過，這裡只做 AWS 上的設定。練習 2 建三個告警，都通知一個 SNS topic（訂閱你的 email，或接到聊天工具）：</p>
+<div class="table-wrap"><table>
+  <tr><th>告警</th><th>指標</th><th>重點</th></tr>
+  <tr><td>5xx 變多</td><td><code>AWS/ApplicationELB</code> 的 <code>HTTPCode_Target_5XX_Count</code>，Sum，5 分鐘裡有 3 分鐘超過 10</td><td>沒有流量時 ALB 不送資料，<code>TreatMissingData</code> 設 <code>notBreaching</code></td></tr>
+  <tr><td>有 target 不健康</td><td><code>UnHealthyHostCount</code>，Minimum，連續 2 分鐘大於 0</td><td>ALB 文件建議用 Minimum：每個 ALB 節點都認為它不健康才算</td></tr>
+  <tr><td>資料庫空間不足</td><td><code>AWS/RDS</code> 的 <code>FreeStorageSpace</code>，小於 2 GiB</td><td>單位是 bytes</td></tr>
+</table></div>
+<p>ALB 指標有一個常見的坑：維度 <code>LoadBalancer</code> 與 <code>TargetGroup</code> 的值<strong>不是整個 ARN</strong>，而是 ARN 的最後一段，<code>app/my-saas-prod/50dc6c495c0c9188</code> 與 <code>targetgroup/my-saas-prod/73e2d6bc24d8a067</code>（ALB 使用者指南，2026-11-20 查證）。寫成整個 ARN，<code>PutMetricAlarm</code> 照樣成功，只是這個告警永遠收不到資料。設好告警之後，用 <code>aws cloudwatch set-alarm-state</code> 手動把它設成 ALARM 一次，確認通知真的會送到。</p>
+<p>成本的部分，先看<strong>哪些資源沒有流量也在計費</strong>，查表用，不用背（各服務定價頁，2026-11-20 查證計費方式；金額以定價頁為準）：</p>
+<div class="table-wrap"><table>
+  <tr><th>資源</th><th>怎麼計費</th><th>這個架構有幾個</th></tr>
+  <tr><td>NAT gateway</td><td>每小時＋每 GB 處理量</td><td>2（每個 AZ 一個）</td></tr>
+  <tr><td>ALB</td><td>每小時＋用量（LCU）</td><td>1</td></tr>
+  <tr><td>RDS</td><td>執行個體每小時（Multi-AZ 多一台備援）＋儲存＋超過免費額度的備份</td><td>1 組</td></tr>
+  <tr><td>ElastiCache</td><td>節點每小時</td><td>依節點數</td></tr>
+  <tr><td>Fargate</td><td>依 task 的 vCPU 與記憶體，按執行時間計費</td><td>2 個 task 一直在跑</td></tr>
+  <tr><td>公開 IPv4 位址</td><td>每個每小時（ALB、NAT 都會用到）</td><td>好幾個</td></tr>
+  <tr><td>Secrets Manager、KMS 客戶管理金鑰</td><td>每個每月＋API 呼叫次數</td><td>3 個 secret、1 把金鑰</td></tr>
+  <tr><td>CloudWatch Logs</td><td>寫入量＋保存量</td><td>保留 30 天就不會一直累積</td></tr>
+</table></div>
+<p>小流量的作品，帳單主要是前四列這些「開著就算錢」的資源，跟流量幾乎無關。所以給面試官看的 demo 環境，常見的省法是：單一 AZ 的 RDS、一個 NAT、一個 task，並在 README 寫明「demo 環境為了成本是單一 AZ，正式環境的設計見 ADR」；這本身就是一個能在面試時講的取捨。</p>
+<p>每個資源都帶 <code>Project</code> 與 <code>Environment</code> 兩個標籤（練習 2 會檢查），到 Billing 的 Cost allocation tags 頁面<strong>啟用</strong>這兩個標籤鍵之後，Cost Explorer 才能依專案、依環境拆帳單。依 Billing 使用者指南（2026-11-20 查證），標籤鍵最多要 24 小時才會出現在可以啟用的清單，啟用後最多再 24 小時才生效，所以第一天就要打上標籤。用 OpenTofu 的話，AWS provider 的 <code>default_tags</code> 可以一次替所有資源加上。</p>
+<div class="callout practice"><strong>💡 實務上：部署完先算一次「一個月要多少」</strong><br>資深工程師上線一個新環境後，會用 AWS Pricing Calculator 依實際建出來的資源估一次月費，寫進 README 或 ADR，並設一個比它高一點的 Budgets 警示（第 1 課）。月底帳單跟估算差很多時，到 Cost Explorer 依服務、再依用量類型展開，最常見的意外是 NAT 的處理量（例如 task 經由 NAT 從 ECR 拉映像、存取 S3，可以改走 VPC endpoint，第 3 課）和沒設保存天數的 log。</div>
+
+<h2>在真的 AWS 帳號上做一次（選做）</h2>
+<p>這一節不判分，也不影響進度。用第 1 課建議的<strong>獨立練習帳號</strong>與 <code>learn-sandbox</code> profile，把作品真的部署一次，最後一定要清除。需要一個自己的網域與 Route 53 hosted zone、已驗證的 ACM 憑證（第 4 課）。</p>
+<div class="callout warn"><strong>費用：</strong>這一節會建立<strong>按小時計費</strong>的資源：NAT gateway（每小時＋每 GB 處理量）、ALB（每小時＋LCU）、RDS 執行個體（Multi-AZ 多一台備援）、ElastiCache 節點、Fargate task（vCPU 與記憶體依執行時間）、公開 IPv4 位址（每個每小時），另有 Secrets Manager、KMS、CloudWatch Logs 的月費與用量費。開著一天就會產生明顯的費用，做完當天就清除。金額查各服務的官方定價頁，或用 <a href="https://calculator.aws/">AWS Pricing Calculator</a> 估算；建議先把 RDS 改成單一 AZ、NAT 改成一個，再估一次。</div>
+<p><strong>1. 建基礎設施（OpenTofu）。</strong>照練習 2 <code>deploy.ts</code> 的資源清單，在作品 repo 的 <code>infra/</code> 用 OpenTofu 寫一份設定（devops 課第 20 課），對應的資源類型是：<code>aws_vpc</code>、<code>aws_subnet</code>、<code>aws_nat_gateway</code>、<code>aws_security_group</code>、<code>aws_ecr_repository</code>、<code>aws_cloudwatch_log_group</code>、<code>aws_kms_key</code>、<code>aws_s3_bucket</code>（加上 <code>aws_s3_bucket_public_access_block</code>、<code>aws_s3_bucket_server_side_encryption_configuration</code>）、<code>aws_db_subnet_group</code>、<code>aws_db_instance</code>、<code>aws_elasticache_parameter_group</code>、<code>aws_elasticache_replication_group</code>、<code>aws_secretsmanager_secret</code>、<code>aws_iam_role</code>、<code>aws_iam_role_policy</code>、<code>aws_lb</code>、<code>aws_lb_target_group</code>、<code>aws_lb_listener</code>、<code>aws_ecs_cluster</code>、<code>aws_ecs_task_definition</code>、<code>aws_ecs_service</code>、<code>aws_sns_topic</code>、<code>aws_cloudwatch_metric_alarm</code>。provider 設 <code>default_tags</code>。RDS 先把 <code>deletion_protection</code> 設成 false，不然清除時刪不掉。</p>
+<pre>cd infra
+tofu init
+tofu plan -out plan.bin           # 讀一遍：+ 建立了哪些資源，有沒有你沒預期的
+tofu apply plan.bin</pre>
+<p><strong>2. 推映像、跑 migration、部署 api。</strong>以下的 <code>&lt;…&gt;</code> 換成你的值（<code>tofu output</code> 可以印出來）：</p>
+<pre># 登入 ECR，build 兩個映像（Fargate 預設 x86_64），標籤用 commit SHA
+SHA=$(git rev-parse --short HEAD)
+REPO=&lt;帳號&gt;.dkr.ecr.ap-northeast-1.amazonaws.com/my-saas-prod
+aws ecr get-login-password --region ap-northeast-1 --profile learn-sandbox | docker login --username AWS --password-stdin &lt;帳號&gt;.dkr.ecr.ap-northeast-1.amazonaws.com
+docker build --platform linux/amd64 -t $REPO:$SHA .
+docker build --platform linux/amd64 --target build -t $REPO:$SHA-build .
+docker push $REPO:$SHA
+docker push $REPO:$SHA-build
+
+# 跑一次 migration，等它結束，看 exit code（要是 0）
+TASK=$(aws ecs run-task --cluster my-saas-prod --task-definition my-saas-prod-migrate --launch-type FARGATE \
+  --network-configuration 'awsvpcConfiguration={subnets=[&lt;私有子網路1&gt;,&lt;私有子網路2&gt;],securityGroups=[&lt;app-sg&gt;],assignPublicIp=DISABLED}' \
+  --query 'tasks[0].taskArn' --output text --profile learn-sandbox --region ap-northeast-1)
+aws ecs wait tasks-stopped --cluster my-saas-prod --tasks $TASK --profile learn-sandbox --region ap-northeast-1
+aws ecs describe-tasks --cluster my-saas-prod --tasks $TASK --query 'tasks[0].containers[0].exitCode' --profile learn-sandbox --region ap-northeast-1
+
+# 更新 api 並等它穩定；看 log
+aws ecs update-service --cluster my-saas-prod --service api --task-definition my-saas-prod-api --force-new-deployment --profile learn-sandbox --region ap-northeast-1
+aws ecs wait services-stable --cluster my-saas-prod --services api --profile learn-sandbox --region ap-northeast-1
+aws logs tail /ecs/my-saas-prod --since 10m --profile learn-sandbox --region ap-northeast-1
+
+# 冒煙測試：健康檢查，再跑作品專案課第 17 課練習 3（在 work/portfolio.json 填 deployUrl）
+curl -sS https://api.&lt;你的網域&gt;/health/ready
+
+# 確認告警真的會通知：手動把一個告警設成 ALARM
+aws cloudwatch set-alarm-state --alarm-name my-saas-prod-alb-5xx --state-value ALARM --state-reason 'test notification' --profile learn-sandbox --region ap-northeast-1</pre>
+<p>第一次 migration 完成後，別忘了上面「程式要改的地方」裡的 <code>pf_app</code> 密碼。部署成功後，把網址與示範帳號寫進作品的 README（<a href="../../portfolio/lessons/19-package-the-portfolio.html">作品專案課第 19 課</a>）。</p>
+<h3>清除</h3>
+<p>反向順序：先停掉流量與運算，再刪資料與網路。用 OpenTofu 建的就用它刪：</p>
+<pre>aws ecs update-service --cluster my-saas-prod --service api --desired-count 0 --profile learn-sandbox --region ap-northeast-1
+aws s3 rm s3://my-saas-prod-files-&lt;帳號&gt; --recursive --profile learn-sandbox   # bucket 不是空的，destroy 會失敗
+cd infra &amp;&amp; tofu destroy
+
+# 確認：下面每一個都應該是空的（KMS 金鑰會進入等待期，狀態是 PendingDeletion）
+aws ecs list-clusters --profile learn-sandbox --region ap-northeast-1
+aws rds describe-db-instances --query 'DBInstances[].DBInstanceIdentifier' --profile learn-sandbox --region ap-northeast-1
+aws elasticache describe-replication-groups --query 'ReplicationGroups[].ReplicationGroupId' --profile learn-sandbox --region ap-northeast-1
+aws elbv2 describe-load-balancers --query 'LoadBalancers[].LoadBalancerName' --profile learn-sandbox --region ap-northeast-1
+aws ec2 describe-nat-gateways --filter Name=state,Values=available --query 'NatGateways[].NatGatewayId' --profile learn-sandbox --region ap-northeast-1
+aws ec2 describe-addresses --query 'Addresses[].PublicIp' --profile learn-sandbox --region ap-northeast-1
+aws ecr describe-repositories --query 'repositories[].repositoryName' --profile learn-sandbox --region ap-northeast-1</pre>
+<p>RDS 在 destroy 時預設會要求最後一份快照；練習帳號可以在設定裡寫 <code>skip_final_snapshot = true</code>，正式環境不要。ECR repository 裡還有映像時，要設 <code>force_delete</code> 或先刪映像。隔天再看一次 Cost Explorer，確認費用停止增加。</p>
+
+<h2>練習</h2>
+<p>本機練習在 <code>aws/practice/work/11/</code>。練習 2、3 的測試會先建好網路（VPC、兩個 AZ 的公有與私有子網路、alb-sg／app-sg／db-sg）與 ACM 憑證，再呼叫你的 <code>deploy</code>；每次執行用一個新的環境名稱（例如 <code>my-saas-ex2-mf3k</code>），重跑不會撞到上一次建的資源。</p>
+
+<div class="local" data-test="ex1" data-files="design.json">
+  <p>練習 1：照「架構與取捨」的需求填 <code>design.json</code>。<code>compute.choice</code> 是 <code>ecs-fargate</code>／<code>lambda</code>／<code>ec2</code>；<code>worker.choice</code> 是 <code>same-process</code>／<code>separate-service</code>；<code>database</code> 有 <code>engine</code>、<code>multiAz</code>、<code>backupRetentionDays</code>；<code>redis</code> 有 <code>choice</code>（<code>elasticache</code>／<code>none</code>）與 <code>maxmemoryPolicy</code>；<code>files</code> 有 <code>choice</code>、<code>publicAccess</code>、<code>encryption</code>（<code>sse-s3</code>／<code>sse-kms</code>）；<code>secrets.choice</code> 是 <code>secrets-manager</code>／<code>environment</code>；<code>network</code> 有 <code>azs</code> 與 <code>natGateways</code>；<code>logs.retentionDays</code> 是 CloudWatch Logs 接受的天數（<code>null</code> 代表永久）。除了 <code>logs</code>，每一層的 <code>reason</code> 至少 10 個字，寫出為什麼。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="deploy.ts">
+  <p>練習 2：讀懂 <code>deploy.ts</code>，完成四個標了「練習 2」的函式。<code>ensureLogGroup</code>：log group 不存在才建（<code>tags</code> 轉成物件），保留天數設 30。<code>ensureSecret</code>：<code>DescribeSecretCommand</code> 找得到就回傳 ARN，不呼叫 <code>makeValue</code>、不覆寫；找不到（<code>ResourceNotFoundException</code>）才 <code>CreateSecretCommand</code>（帶 <code>Tags</code>）。<code>ensureDatabase</code>：找不到（<code>DBInstanceNotFoundFault</code>）才先建 DB subnet group（私有子網路），再建 RDS：<code>Engine: 'postgres'</code>、<code>DBName: 'my_saas'</code>、帳號密碼用 <code>owner</code>、<code>MultiAZ</code>、<code>BackupRetentionPeriod: 7</code>、<code>StorageEncrypted</code>、<code>PubliclyAccessible: false</code>、<code>DeletionProtection</code>、<code>VpcSecurityGroupIds: [net.dbSg]</code>、<code>Tags</code>；回傳 Endpoint 的 <code>{ host, port }</code>。<code>ensureAlarms</code>：照「看得到、算得出」的表建三個告警，名稱是 <code>&lt;name&gt;-alb-5xx</code>、<code>&lt;name&gt;-unhealthy-hosts</code>、<code>&lt;name&gt;-db-free-storage</code>，<code>AlarmActions</code> 與 <code>OKActions</code> 都是 <code>[topic]</code>，帶 <code>Tags</code>；ALB 的維度值用 ARN 的最後一段。測試會把整個部署跑兩次。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="deploy.ts postmortem.md">
+  <p>練習 3：修好 <code>deploy.ts</code> 裡「上線第一晚」的四個事故：讀 secret 的權限移到 execution role（task role 拿掉）；健康檢查路徑改成 <code>/health/ready</code>；api 只注入 <code>APP_DATABASE_URL</code> 與 <code>JWT_SECRET</code>；task role 加上對 bucket 金鑰的 <code>kms:Decrypt</code> 與 <code>kms:GenerateDataKey</code>（Resource 只寫 <code>keyArn</code>）。再完成 <code>postmortem.md</code>：<code>## 影響</code>、<code>## 時間線</code>（至少 4 行有 HH:MM 時間）、<code>## 根本原因</code>（四個事故都要寫到）、<code>## 修正</code>、<code>## 改善項目</code>（至少 3 項，每項有「負責人」與 YYYY-MM-DD 的期限）。練習 2 沒寫完時，這題的部署也跑不起來。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：你在 M 系列晶片的 Mac 上 <code>docker build</code>、推到 ECR，task definition 沒設 <code>runtimePlatform</code>。Fargate 上的 task 一啟動就停止，log 只有一行 <code>exec format error</code>。原因是？</p>
+  <label data-key="a">execution role 沒有 ECR 的權限，拉到的映像不完整</label>
+  <label data-key="b">Dockerfile 的 <code>USER node</code> 在 Fargate 上沒有執行權限</label>
+  <label data-key="c">映像是 linux/arm64，Fargate 預設跑 x86_64；build 時加 <code>--platform linux/amd64</code>，或在 task definition 設 ARM64</label>
+  <label data-key="d">Node 24 在 Fargate 上還不支援，要換成 Node 22 的基底映像</label>
+  <p class="why">✓ c。exec format error 是「這個執行檔不是這顆 CPU 的指令集」。Apple Silicon 預設 build 出 arm64 映像，Fargate 沒指定時用 x86_64。a 的症狀是拉不到映像（CannotPullContainerError），容器根本不會開始執行；d 錯在映像裡的 Node 跟 Fargate 無關，Fargate 只負責跑容器。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 5：my-saas 上線一個月後，偶爾有客戶回報「匯出一直卡在處理中」。查 log 發現那些匯出的 job 根本不在 BullMQ 的佇列裡，而 ElastiCache 的記憶體使用率常常接近上限。最可能的原因是？</p>
+  <label data-key="a">ElastiCache 用預設參數群組（<code>volatile-lru</code>），記憶體滿時把有 TTL 的 key 清掉，BullMQ 的資料也被清了；要用 <code>noeviction</code> 的自訂參數群組，並加大節點</label>
+  <label data-key="b">BullMQ 不支援 ElastiCache，要改用自己在 EC2 上架的 Redis</label>
+  <label data-key="c">worker 跟 API 同一個程序，API 忙的時候 worker 就把 job 丟掉</label>
+  <label data-key="d">ElastiCache 的 Multi-AZ 切換時會清空所有資料</label>
+  <p class="why">✓ a。BullMQ 文件寫明 maxmemory-policy 一定要是 noeviction，只有它能保證佇列的資料不會被清掉；ElastiCache 預設是 volatile-lru。改成 noeviction 後，記憶體滿時寫入會失敗而不是默默丟資料，所以還要對記憶體使用率告警。c 的「同一個程序」只會讓匯出變慢，job 仍然在佇列裡。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 6：部署時每個資源都帶了 <code>Project=my-saas</code> 標籤，但隔天在 Cost Explorer 依標籤分組，my-saas 的費用是 0，全部歸在「No tag key」。最可能的原因是？</p>
+  <label data-key="a">標籤的大小寫錯了，Cost Explorer 只認全小寫的 project</label>
+  <label data-key="b">只有 EC2 的費用能依標籤分組，Fargate 與 RDS 不行</label>
+  <label data-key="c">Cost Explorer 只顯示上個月的資料，要等到下個月</label>
+  <label data-key="d">標籤鍵還沒在 Billing 的 Cost allocation tags 頁面啟用；出現在清單與啟用後生效各要最多 24 小時</label>
+  <p class="why">✓ d。資源上的標籤要先在 Billing 啟用成成本分攤標籤，帳單才會依它拆分，而且出現在清單、啟用生效各可能要 24 小時，所以第一天就要打標籤並啟用。a 錯在標籤鍵不限大小寫寫法，只要跟啟用的那個一致；b 錯在 Fargate、RDS 這些支援標籤的資源都能分攤。</p>
+</div>
+
+<h2>自評清單</h2>
+<p>測試檢查的是設定寫對沒有，真的跑得起來要自己確認。部署到真的帳號之後：</p>
+<ul>
+  <li>從另一台電腦（或手機網路）打開 <code>https://api.&lt;你的網域&gt;/health/ready</code> 是 200，<code>http://</code> 會被 301 轉到 https。</li>
+  <li>作品專案課第 17 課練習 3 的冒煙測試對線上環境全部通過（註冊、登入、建立 project、別的租戶 404）。</li>
+  <li>上傳一個檔案再下載回來（驗證 task role 的 S3 與 KMS 權限）；S3 主控台裡物件的加密是 SSE-KMS。</li>
+  <li>觸發一次匯出並下載結果（驗證 Redis 與 worker）。</li>
+  <li>RDS 主控台：Multi-AZ 是 Yes、自動備份保留 7 天、Publicly accessible 是 No；從你的電腦直接連 5432 連不上。</li>
+  <li>api 的 task definition 裡只有 <code>APP_DATABASE_URL</code> 與 <code>JWT_SECRET</code> 兩個 secret，<code>environment</code> 裡沒有任何密碼；<code>pf_app</code> 的密碼已經不是 migration 裡寫死的那個。</li>
+  <li>手動把一個告警設成 ALARM，通知有送到；log group 的保留天數是 30。</li>
+  <li>部署第二個 commit，再把上一個 SHA 的 task definition 部署回去，冒煙測試照樣通過（回滾演練）。</li>
+  <li>用 Pricing Calculator 估過月費，寫進 README；Budgets 警示已設好；做完後清除並在隔天確認費用停止增加。</li>
+</ul>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>讀 secret 的權限給 task role</strong>：注入是 execution role 在讀，task 停在啟動階段。</li>
+  <li><strong>健康檢查路徑照抄 API 的前綴</strong>：作品的 <code>/health/ready</code> 沒有 <code>/api/v1</code>，所有 task 都被判定不健康。</li>
+  <li><strong>把擁有者的連線字串給 api</strong>：RLS 被繞過的風險。只有 migration 的 task definition 拿得到。</li>
+  <li><strong>SSE-KMS 的 bucket 只給 S3 權限</strong>：讀要 <code>kms:Decrypt</code>、寫要 <code>kms:GenerateDataKey</code>。</li>
+  <li><strong>重新部署時重新產生密碼</strong>：資料庫還是舊密碼，所有服務連不上。secret 已存在就沿用。</li>
+  <li><strong>migration 放在 api 的啟動指令</strong>：多個 task 同時跑 migration，而且最後的映像裡沒有 prisma CLI。用獨立的 task definition 與 <code>run-task</code>。</li>
+  <li><strong>ElastiCache 用預設參數群組跑 BullMQ</strong>：volatile-lru 會在記憶體滿時清掉 key。用 noeviction。</li>
+  <li><strong>ALB 告警的維度寫整個 ARN</strong>：告警建立成功但永遠收不到資料。用 ARN 的最後一段，並手動觸發一次確認。</li>
+  <li><strong>log 沒設保存天數</strong>：預設永久保存，費用一直累積。</li>
+  <li><strong>只放一個 NAT gateway 卻宣稱跨 AZ 高可用</strong>：NAT 所在的 AZ 故障，另一邊的 task 出不去。</li>
+  <li><strong>在 Mac 上 build 映像直接推</strong>：arm64 的映像在預設的 Fargate 上 exec format error。指定平台，或交給 CI。</li>
+  <li><strong>練習帳號的資源沒清</strong>：NAT、ALB、RDS、ElastiCache、公開 IPv4 沒流量也在計費。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>從 compose 到 AWS：api → ECR＋ECS Fargate（兩個 AZ）；migrate → build 階段的映像、獨立的 task definition、部署前 run-task；db → RDS PostgreSQL Multi-AZ；redis → ElastiCache（noeviction）；檔案 → S3（SSE-KMS）；機密 → Secrets Manager 注入；入口 → ALB＋ACM；log → CloudWatch Logs。</li>
+  <li>程式要改的只有幾處：檔案改存 S3、<code>pf_app</code> 換掉寫死的密碼、trust proxy 信任 ALB 這一跳。每一項是一個小 PR，寫成 ADR。</li>
+  <li>每一層的選擇對照需求寫下理由：RTO 決定 Multi-AZ 與每 AZ 一個 NAT，RPO 決定自動備份，團隊大小決定 Fargate，現有設計決定 Redis 不能拿掉。</li>
+  <li>部署程式每一步都是「先查、沒有才建」，可以重複執行；已經存在的 secret 絕對不覆寫。真的專案用 OpenTofu，state 裡的機密要保護。</li>
+  <li>新版本的順序：推兩個 SHA 標籤的映像 → run-task 跑 migration 並確認 exit code → 更新 service → 等穩定 → 冒煙測試；起不來時 circuit breaker 回滾。</li>
+  <li>部署失敗依序看 ECS 事件與 stoppedReason、CloudWatch Logs、target group 健康檢查；事後檢討寫影響、時間線、根本原因、修正、有負責人與期限的改善項目。</li>
+  <li>告警通知 SNS：5xx（沒資料不算異常）、UnHealthyHostCount（Minimum）、FreeStorageSpace；ALB 的維度用 ARN 的最後一段。小流量時帳單主要是 NAT、ALB、RDS、ElastiCache、公開 IPv4 這些按小時計費的資源；成本分攤標籤要在 Billing 啟用。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 8 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：加點數的 worker 拉到訊息後，第一行就呼叫 <code>DeleteMessage</code>，接著才寫資料庫。某次部署重啟時有幾筆點數沒加上，DLQ 卻是空的。為什麼？</p>
+  <label data-key="a">DLQ 的 maxReceiveCount 設太大，訊息還沒輪到移過去</label>
+  <label data-key="b">訊息在處理之前就刪掉了，程式在寫資料庫前被重啟，SQS 已經沒有這則訊息可以重送</label>
+  <label data-key="c">visibility timeout 太短，訊息被另一個 worker 拿走並處理失敗</label>
+  <label data-key="d">標準佇列偶爾會遺失訊息，要改用 FIFO</label>
+  <p class="why">✓ b。先刪再處理是「至多一次」：處理失敗就永遠失去這則訊息，它也不會進 DLQ，因為 DLQ 只接「被收了很多次還沒刪」的訊息。修法是處理成功才刪，並讓處理冪等。a 錯在訊息已經被刪，根本不會再被接收。d 錯在 SQS 不會遺失訊息，是程式自己刪的。（第 10 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 8：結帳把訂單 JSON 發布到 SNS，廚房的佇列訂閱時設了 FilterPolicy <code>{"type":["drink"]}</code>，沒有設其他訂閱屬性。上線後廚房一杯飲料的訊息都沒收到，也沒有任何錯誤。先查什麼？</p>
+  <label data-key="a">廚房佇列的 visibility timeout</label>
+  <label data-key="b">SNS topic 是不是 FIFO</label>
+  <label data-key="c">廚房 worker 的 DeleteMessage 有沒有寫錯</label>
+  <label data-key="d">訂閱的 FilterPolicyScope：預設比對的是 message attributes，type 在訊息內容裡，要設成 MessageBody</label>
+  <p class="why">✓ d。filter policy 預設看 message attributes，發布時沒帶 type 屬性，所以沒有任何訊息符合，SNS 也不會報錯。設 FilterPolicyScope: MessageBody，或發布時把 type 放進 message attributes。另一個也要查的是 queue policy 有沒有允許這個 topic，但在這個情境裡，其他沒過濾的訂閱者有收到的話，問題就在過濾。（第 10 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 9：寄收據的 worker 用 SQS 的 <code>MessageId</code> 當冪等鍵，在 DynamoDB 記下處理過的 MessageId。結果還是有客人收到兩封收據。最可能的原因是？</p>
+  <label data-key="a">結帳 API 逾時重試，把同一張訂單發了兩次：兩則訊息的 MessageId 不同，但是同一張訂單；冪等鍵要用訂單 ID</label>
+  <label data-key="b">DynamoDB 的寫入是最終一致的，條件寫入擋不住重複</label>
+  <label data-key="c">SQS 重送同一則訊息時會換一個新的 MessageId</label>
+  <label data-key="d">worker 沒有用 long polling，所以同一則訊息被拉了兩次</label>
+  <p class="why">✓ a。重複不只來自 SQS 重送，也來自生產者自己重送；MessageId 是 SQS 替每一次 SendMessage 產生的，認不出「同一個業務意圖」。冪等鍵要用業務上的 ID。b 錯在條件寫入在單一 item 上是原子的；c 錯在 SQS 重送的是同一則訊息，MessageId 不變（變的是 receipt handle）。（第 10 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 10：門市上傳 <code>sales/門市 A.csv</code>，匯入的 Lambda 用事件裡的 key 呼叫 <code>GetObject</code>，收到 <code>NoSuchKey</code>。程式碼是 <code>const key = decodeURIComponent(record.s3.object.key)</code>。哪裡錯了？</p>
+  <label data-key="a">S3 事件可能比物件寫入還早到，要重試幾次</label>
+  <label data-key="b">key 根本不需要解碼，S3 事件給的就是原本的 key</label>
+  <label data-key="c">事件裡的空白是 <code>+</code>，decodeURIComponent 不會把 <code>+</code> 變回空白；要先把 <code>+</code> 換成空白再解碼</label>
+  <label data-key="d">中文檔名不能放在 S3，要改成英文</label>
+  <p class="why">✓ c。S3 事件的 key 是 form 編碼：空白是 <code>+</code>、真正的 <code>+</code> 是 <code>%2B</code>。所以先換 <code>+</code> 再 decodeURIComponent，順序不能反。a 錯在 S3 是強一致的，收到建立事件時物件已經讀得到；b 錯在文件寫明 key 是 URL 編碼的。（第 10 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 11：my-saas 第一次部署，ECS 的 task 一直停在啟動階段，事件是 <code>ResourceInitializationError: unable to pull secrets or registry auth</code>。task role 的 policy 裡有 <code>secretsmanager:GetSecretValue</code>。先改哪裡？</p>
+  <label data-key="a">task role 的 Resource 改成 <code>*</code>，可能是 secret 的 ARN 寫錯了</label>
+  <label data-key="b">把 GetSecretValue（以及拉 ECR 映像的權限）給 execution role：注入 secret 與拉映像都發生在容器啟動前，由 ECS 用 execution role 做</label>
+  <label data-key="c">把 secret 改寫在 environment，避開 Secrets Manager 的權限問題</label>
+  <label data-key="d">把 task 改放公有子網路並開公開 IP，讓它連得到 Secrets Manager</label>
+  <p class="why">✓ b。execution role 是 ECS 替你做事用的（拉映像、寫 log、注入 secret），task role 是你的程式呼叫 AWS 用的。容器還沒啟動，task role 根本還沒派上用場。d 在私有子網路沒有 NAT 或 VPC endpoint 時確實也會出現同樣的訊息，但這個情境的 policy 給錯 role 是先要修的；不要為了繞過去把 task 放到公有子網路。（第 5、11 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 12：同事建了「5xx 太多」的告警，Dimensions 寫 <code>LoadBalancer = arn:aws:elasticloadbalancing:…:loadbalancer/app/my-saas-prod/50dc…</code>。PutMetricAlarm 成功了，告警狀態一直是 INSUFFICIENT_DATA，昨晚 API 大量 500 時也沒響。原因是？</p>
+  <label data-key="a">維度的值要是 ARN 的最後一段 <code>app/my-saas-prod/50dc…</code>；寫整個 ARN 對應不到任何指標，告警永遠收不到資料</label>
+  <label data-key="b">ALB 的指標要先在主控台開啟才會送到 CloudWatch</label>
+  <label data-key="c">TreatMissingData 沒設成 breaching，所以沒資料時不會告警</label>
+  <label data-key="d">5xx 告警要用 Average，Sum 會被大量的 2xx 稀釋</label>
+  <p class="why">✓ a。CloudWatch 用「名稱＋維度」找指標，維度值不一致就是另一個不存在的指標，API 不會報錯。設好後用 set-alarm-state 手動觸發一次、並看告警圖上有沒有資料。c 只會讓它變成一直告警，掩蓋了真正的問題；d 錯在 HTTPCode_Target_5XX_Count 的有意義統計就是 Sum。（第 11 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 13：為了省事，有人把 api 的啟動指令改成 <code>npx prisma migrate deploy &amp;&amp; node dist/main.js</code>，service 有 2 個 task。哪裡會出事？</p>
+  <label data-key="a">沒問題：Prisma 會用鎖確保 migration 只跑一次，第二個 task 會等</label>
+  <label data-key="b">只會讓啟動變慢幾秒，可以接受</label>
+  <label data-key="c">migration 會用 pf_app 執行，因為 api 只有 APP_DATABASE_URL，所以會失敗；改成給 api 擁有者的連線字串就好</label>
+  <label data-key="d">最後的映像只有正式依賴，裡面沒有 prisma CLI；就算有，也要給 api 擁有者的權限，而且 migration 失敗時 api 也起不來、分不清是程式還是 schema 的問題</label>
+  <p class="why">✓ d。作品專案課第 17 課的做法是 migration 用 build 階段的映像、獨立一步、只有它拿得到擁有者帳號；在 ECS 上就是獨立的 task definition＋run-task，跑完確認 exit code 再更新 service。c 的「給 api 擁有者的連線字串」正是第一晚的事故 c，等於讓 api 繞過 RLS。（第 11 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 14：作品上線一個月，幾乎沒有人用，帳單卻比預期高很多。用 Cost Explorer 依服務展開之前，你最先懷疑哪一類資源？</p>
+  <label data-key="a">S3 的儲存量：上傳的檔案越來越多</label>
+  <label data-key="b">Secrets Manager 的 API 呼叫：每個請求都讀一次 secret</label>
+  <label data-key="c">按小時計費、沒流量也在算錢的資源：兩個 NAT gateway、ALB、Multi-AZ 的 RDS、ElastiCache 節點、公開 IPv4</label>
+  <label data-key="d">Fargate 的流量費：每個請求都要付錢</label>
+  <p class="why">✓ c。小流量時，帳單主要是「開著就算錢」的固定費用，跟使用量幾乎無關；demo 環境常見的取捨是單一 AZ、一個 NAT，並在 README 說明。d 錯在 Fargate 依 task 的 vCPU 與記憶體按執行時間計費，不是按請求；a、b 在沒什麼人用時金額很小。（第 1、11 課）</p>
+</div>
+
+<p>這個階段的重點整理成<a href="../sheets/stage-5.html">一頁圖解</a>。</p>
+
+<h2>接下來可以學什麼</h2>
+<ul>
+  <li>回到<a href="../../portfolio/lessons/19-package-the-portfolio.html">作品專案課第 19 課</a>：把線上的網址、示範帳號、這一課的部署架構圖與 ADR 放進 README；面試時「為什麼這樣部署、花多少錢、出過什麼事」都是能講深的題目。</li>
+  <li>把練習 2 的 <code>deploy.ts</code> 改寫成 OpenTofu，並把 build、推映像、run-task、更新 service、冒煙測試接進作品的 GitHub Actions（<a href="../../portfolio/lessons/17-ci-cd-deploy.html">作品專案課第 17 課</a>、<a href="../../devops/lessons/19-aws-iam.html">devops 課第 19 課</a>的 OIDC），讓 merge 到 main 就自動部署到 staging。</li>
+  <li>可觀測性往下做：把 log 結構化查詢（CloudWatch Logs Insights）、追蹤（devops 課第 23 課）與 SLO 告警（devops 課第 22、25 課）套到線上的 my-saas。</li>
+</ul>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

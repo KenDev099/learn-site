@@ -1,0 +1,3 @@
+-- 練習 1：顧客只讀得到自己的訂單。表 orders(id, customer_id uuid, total, note, ordered_at) 已經建好，沒開 RLS、沒有 GRANT。
+-- 要做到：開 RLS；登入的人只看得到 customer_id 是自己的訂單；沒登入的人什麼都看不到；
+--         policy 裡的 auth.uid() 包一層 (select …)；policy 用到的欄位加索引。不要寫 public. 前綴

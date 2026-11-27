@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>13. 分析與時序資料：報表什麼時候該離開 OLTP 資料庫</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="13" data-practice="data-stores">
+<header>
+  <div class="eyebrow">階段 5：分析、規模與期末專題 · 第 13 課</div>
+  <h1>分析與時序資料：報表什麼時候該離開 OLTP 資料庫</h1>
+</header>
+<main>
+<p>每個月 1 號早上，老闆會在後台按「全年營收：依門市與品項」。這個報表直接查正式的 PostgreSQL，要跑 4 分鐘。這 4 分鐘裡資料庫 CPU 衝到 100%，門市的結帳 API 從 50 ms 變成 3 秒，排隊的客人開始抱怨。</p>
+<p>這一課的任務是讓這張報表不再拖慢結帳，而且照樣算得出正確的數字。先在 PostgreSQL 裡找辦法；量大到 PostgreSQL 撐不住時，再把資料搬到為分析設計的<strong>欄式資料庫</strong>，用 DuckDB 寫出老闆要的營運報表，並每晚把新訂單搬過去。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>報表為什麼會拖慢結帳：它跟結帳搶了哪些資源；升級機器之前，索引、物化檢視、讀副本各能撐到哪（開場問題的最小答案）。</li>
+  <li>PostgreSQL 撐不住時，分析型資料庫為什麼掃得快：列式與欄式儲存的差別；DuckDB 怎麼在 Node 程序裡跑分析，不用架伺服器。</li>
+  <li>老闆要的報表怎麼寫：每日營收、每月前三名、製作時間 p95，以及時間範圍怎麼切才不漏資料。</li>
+  <li>資料怎麼每晚搬過去：增量 ETL 與水位線，重跑也不重複、當機也不漏；搬好後依門市匯出成 Parquet 給別人查。</li>
+  <li>資料到數億列、一直寫入時：ClickHouse 與時序資料，只講概念與怎麼選。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../postgresql/lessons/17-window-functions.html">PostgreSQL 課第 17 課</a>的視窗函式：每一列保留下來，同時算出它所在分組的排名、累計等值。</li>
+  <li><a href="../../postgresql/lessons/30-mvcc-vacuum.html">PostgreSQL 課第 30 課</a>的 MVCC 與 VACUUM：更新、刪除只是留下舊版本列，要等沒有交易還看得到它們時，VACUUM 才能清掉。</li>
+</ul></div>
+
+<h2>報表為什麼會拖慢結帳？升級機器前先在 PostgreSQL 裡解決</h2>
+<p>先比較結帳和年度報表各自要資料庫做什麼。結帳寫一筆訂單、幾筆品項，再讀一兩筆商品價格，每次只碰幾列，而且都靠主鍵或索引直接找到；一秒鐘可能有幾十次。年度報表一個月才跑一次，但它要把一整年的每一筆訂單明細讀出來，依門市和品項加總。</p>
+<p>這兩種存取模式在<a href="01-choosing-a-store.html">第 1 課</a>分過，各有名字。像結帳這樣大量、小而短的讀寫叫 <strong>OLTP</strong>（online transaction processing，線上交易處理）。像年度營收這樣次數少、每次掃大量資料做統計的叫 <strong>OLAP</strong>（online analytical processing，線上分析處理）。PostgreSQL 是為 OLTP 設計的，它能跑 OLAP 的查詢，只是兩種工作跑在同一台資料庫上，會搶同一份 CPU、磁碟與記憶體。開場那 4 分鐘裡，報表把 CPU 吃滿，結帳的查詢排隊等 CPU，從 50 ms 拖到 3 秒。</p>
+
+<h3>看不到的三種傷害</h3>
+<p>搶 CPU 是看得到的傷害，報表一跑完就消失。一個跑很久的報表查詢還會留下三種看不到、而且跑完後還在的傷害。</p>
+<p>第一種是<strong>快取被沖掉</strong>。PostgreSQL 讀資料是一次讀一整頁（page），讀過的頁會留在一塊共用的記憶體裡，這塊記憶體叫 shared buffers。結帳一直讀的是那幾千個熱門商品、最近的訂單，它們的頁常駐在 shared buffers 裡，所以結帳不用碰磁碟。年度報表把一整年的訂單頁全部讀一遍，這些大多是平常沒人看的冷資料，這些冷資料會佔掉作業系統的檔案快取，部分也會進到 shared buffers（PostgreSQL 對大表的循序掃描會限制只用一小塊 buffer，但其他讀法不一定），結帳要的熱資料因此可能被擠出記憶體。所以報表跑完之後，結帳還要從磁碟把熱資料重新讀回來，會再慢一陣子。</p>
+<p>第二種是<strong>擋住 VACUUM</strong>。PostgreSQL 的查詢開始時會拿一份快照（snapshot），記下「這一刻哪些交易已經提交」，查詢從頭到尾只看這份快照裡的資料，所以跑 4 分鐘也不會讀到一半資料被別人改掉。代價是：在這個查詢結束前，之後被更新、刪除的舊版本列都不能清掉，因為它的快照可能還要看（<a href="../../postgresql/lessons/30-mvcc-vacuum.html">PostgreSQL 課第 30 課</a>）。結帳一直在更新訂單狀態、扣庫存，報表跑 4 分鐘，表和索引就累積 4 分鐘份清不掉的舊版本列；如果後台有人開更大的報表跑 20 分鐘，累積的量就是五倍，表和索引因此變得更大、更慢。</p>
+<p>第三種是<strong>佔住連線</strong>。API 透過連線池跟資料庫溝通，池裡的連線數是固定的。報表佔著一條連線 4 分鐘，API 能用的連線就少一條；如果後台好幾個人同時開報表，結帳要等空出來的連線。</p>
+<p>這三種傷害都不會讓結帳出錯，只會讓它變慢。一般的 <code>SELECT</code> 也不會擋住寫入，所以這類問題常被誤判成「資料庫不夠大」，於是去升級機器。機器變大，報表會跑得快一點，但它還是跟結帳搶同一台資料庫。升級之前，先照下面的順序檢查，每一步都比前一步貴：</p>
+<div class="table-wrap"><table>
+  <tr><th>做法</th><th>解決什麼</th><th>資料新鮮度</th><th>代價</th></tr>
+  <tr><td>1. <code>EXPLAIN (ANALYZE, BUFFERS)</code>，補索引、更新統計資訊（<a href="../../postgresql/lessons/29-query-tuning.html">第 29 課</a>）</td><td>其實只需要讀少量列，卻在全表掃描</td><td>即時</td><td>幾乎沒有；索引會讓寫入稍慢</td></tr>
+  <tr><td>2. 物化檢視（materialized view）</td><td>固定的報表，每次都重算同樣的彙總</td><td>上次 REFRESH 的時間</td><td>REFRESH 本身也是一次大查詢，要排在離峰</td></tr>
+  <tr><td>3. 把報表導到讀副本（read replica）</td><td>報表搶主資料庫的資源</td><td>落後幾毫秒到幾秒</td><td>多一台機器；長查詢可能被取消（見下方）</td></tr>
+  <tr><td>4. 分析型資料庫（OLAP）</td><td>量大到單台 PostgreSQL 掃不動</td><td>看 ETL 多久跑一次，常見是每晚</td><td>多一套系統、資料搬運、一致性要自己顧</td></tr>
+</table></div>
+
+<h3>第 1 步：先確認報表是不是真的要讀這麼多列</h3>
+<p>很多「慢報表」其實不需要掃全表。例如門市店長看的「本店本月營收」只要讀一家門市一個月的訂單，卻因為缺索引或寫法讓索引用不上，變成全表掃描。用 <code>EXPLAIN (ANALYZE, BUFFERS)</code> 看實際讀了多少頁、走了哪個計畫，補上索引就解決，資料也是即時的。老闆的全年報表不一樣：它真的要讀一整年的每一筆明細，索引幫不上忙，要往下一步。</p>
+
+<h3>第 2 步：把算好的結果存起來，物化檢視</h3>
+<p>全年報表每次被按下，都要把幾百萬筆明細重新加總成「每月 × 門市 × 品項」幾千列，而且是在老闆按下按鈕、結帳最忙的早上。如果先算好存起來，讀的時候就只是讀幾千列，重算的時間也能自己挑。</p>
+<p>一般的檢視（view，<a href="../../postgresql/lessons/23-views-functions-triggers.html">PostgreSQL 課第 23 課</a>）只是存起來的查詢，每次讀它都重新執行一次。<strong>物化檢視</strong>（materialized view）則是把查詢的<em>結果</em>存成一張表，讀它就是讀那張表，跟原本的訂單無關；原本的資料變了，要下 <code>REFRESH MATERIALIZED VIEW</code> 才會重算。一般的 REFRESH 會鎖住物化檢視，重算期間連讀取都要等；加上 <code>CONCURRENTLY</code> 就不擋讀取，條件是物化檢視上要有一個唯一索引，PostgreSQL 靠它比對新舊結果的每一列：</p>
+<pre>CREATE MATERIALIZED VIEW monthly_sales AS
+SELECT date_trunc('month', o.ordered_at) AS month, o.store_id, i.product_id,
+       sum(i.quantity) AS qty, sum(i.quantity * i.unit_price) AS amount
+FROM orders o JOIN order_items i ON i.order_id = o.id
+GROUP BY 1, 2, 3;
+
+CREATE UNIQUE INDEX ON monthly_sales (month, store_id, product_id);   -- CONCURRENTLY 需要它
+
+-- 每天凌晨由排程執行：重算期間，老闆照樣讀得到昨天的結果
+REFRESH MATERIALIZED VIEW CONCURRENTLY monthly_sales;</pre>
+<p>老闆的全年報表改成讀 <code>monthly_sales</code>，只要加總幾千列，一下就回來，也不再碰訂單表。代價是兩個：數字只更新到上次 REFRESH 的時間；REFRESH 本身還是那個掃一整年的大查詢，只是從老闆按下按鈕的早上 9 點，移到沒人結帳的凌晨。</p>
+
+<h3>第 3 步：讓報表去另一台機器跑，讀副本</h3>
+<p>如果報表種類很多、沒辦法每一種都做成物化檢視，或老闆要看到今天為止的數字，下一步是把報表從主資料庫移走。<strong>讀副本</strong>（read replica）是從主資料庫即時複寫資料的唯讀伺服器（<a href="../../postgresql/lessons/37-backup-replication.html">PostgreSQL 課第 37 課</a>）。把報表的連線字串改指向它，報表吃的 CPU、沖掉的快取、佔的連線都在副本上，主資料庫的結帳不受影響。</p>
+<p>讀副本有一個要先知道的狀況，它跟前面「擋住 VACUUM」是同一件事換到另一台機器。主資料庫 VACUUM 清掉舊版本列之後，會把「這些列清掉了」的紀錄送到副本，副本照著套用。如果副本上有一個長報表的快照還需要那些舊列，兩邊就衝突了：副本要嘛暫停套用、讓資料越落越後面，要嘛取消那個報表。PostgreSQL 預設等一段時間（<code>max_standby_streaming_delay</code>，預設 30 秒）後取消查詢，報表收到的錯誤是 <code>canceling statement due to conflict with recovery</code>。</p>
+<p>打開副本的 <code>hot_standby_feedback</code> 可以避免取消：副本會告訴主資料庫「我這邊還有查詢需要這些舊列」，主資料庫就先不清。代價是副本上的長查詢回頭擋住主資料庫的 VACUUM，等於把第二種傷害帶回主資料庫。報表很長、又很頻繁，在讀副本上不是被取消、就是拖累主資料庫時，就是該離開 PostgreSQL 的訊號之一。</p>
+<div class="callout">不論用哪一種，報表專用的資料庫帳號都設 <code>statement_timeout</code>（例如 <code>ALTER ROLE report SET statement_timeout = '60s'</code>）。寫錯的報表會被截斷，不會拖垮資料庫。</div>
+<p>到這裡，開場的問題已經有答案：咖啡店的全年報表做成物化檢視、每天凌晨 REFRESH，結帳就不會再被拖慢。表裡的第 4 步留給量真的大到 PostgreSQL 掃不動的時候，也就是 REFRESH 在凌晨跑不完、讀副本上的報表一直被取消。到那時要換的不只是機器，而是資料存放的方式。</p>
+<div class="callout practice"><strong>💡 實務上：「報表很慢」先問兩個問題再動手</strong><br>這類回報通常來自營運或老闆，描述只有「後台報表很慢」。先用 <code>pg_stat_statements</code>（<a href="../../postgresql/lessons/29-query-tuning.html">PostgreSQL 課第 29 課</a>）找出是哪一支查詢、一次跑多久、一天跑幾次。再問使用報表的人：「數字要即時，還是昨天以前的就可以？」多數月報、年報接受昨天的資料，物化檢視或讀副本就解決了。這兩個答案決定你在上表停在第幾步，也讓 PM 知道新鮮度是可以談的取捨。</div>
+
+<h2>PostgreSQL 撐不住時，分析型資料庫為什麼掃得快？</h2>
+<p>從這一節起換一個假設情境：咖啡店擴展到上百家門市，訂單明細累積到幾千萬筆，凌晨的 REFRESH 跑到早上還沒完，讀副本上的報表一直被取消。後面的 DuckDB、每晚 ETL、匯出 Parquet，都是在這個規模下才需要的做法。</p>
+<p>上一節說，量大到 PostgreSQL 掃不動時要換的是資料存放的方式。要知道為什麼，先看 PostgreSQL 怎麼把一張表放在磁碟上。</p>
+<p>PostgreSQL、MySQL 是<strong>列式儲存</strong>（row-oriented）：一列的所有欄位存在一起，一頁裡放的是一列接一列的完整資料。結帳要讀「訂單 10042 的全部欄位」，索引指到那一頁，讀一個位置就全部拿到，這正是 OLTP 要的。分析型資料庫反過來，用<strong>欄式儲存</strong>（column-oriented）：同一欄的值存在一起，所有訂單的 id 放一塊、所有金額放另一塊。</p>
+<figure>
+  <svg viewBox="0 0 700 300" role="img" aria-label="同一份 orders 資料的兩種存法：列式把每一列的 id、門市、時間、金額等欄位放在一起；欄式把所有 id 放在一起、所有金額放在一起。查詢每日營收只需要時間與金額兩欄時，欄式只讀這兩塊">
+    <text class="d-accent" x="170" y="22" text-anchor="middle">列式（PostgreSQL）</text>
+    <text class="d-accent" x="530" y="22" text-anchor="middle">欄式（DuckDB、ClickHouse）</text>
+    <rect class="d-box" x="20" y="40" width="300" height="40" rx="4"/>
+    <text class="d-small" x="30" y="65">10042 · 門市11 · 03-05 14:07 · 顧客104 · 96.8 · …</text>
+    <rect class="d-box" x="20" y="88" width="300" height="40" rx="4"/>
+    <text class="d-small" x="30" y="113">10043 · 門市12 · 03-05 14:08 · 顧客215 · 110 · …</text>
+    <rect class="d-box" x="20" y="136" width="300" height="40" rx="4"/>
+    <text class="d-small" x="30" y="161">10044 · 門市11 · 03-05 14:08 · 顧客 —  · 80 · …</text>
+    <text class="d-small" x="170" y="200" text-anchor="middle">算每日營收：每一列整列讀進來，</text>
+    <text class="d-small" x="170" y="218" text-anchor="middle">再丟掉用不到的欄位</text>
+    <rect class="d-box" x="380" y="40" width="70" height="136" rx="4"/>
+    <text class="d-small" x="415" y="62" text-anchor="middle">id</text>
+    <text class="d-small" x="415" y="100" text-anchor="middle">10042</text>
+    <text class="d-small" x="415" y="120" text-anchor="middle">10043</text>
+    <text class="d-small" x="415" y="140" text-anchor="middle">10044</text>
+    <rect class="d-box" x="455" y="40" width="70" height="136" rx="4"/>
+    <text class="d-small" x="490" y="62" text-anchor="middle">門市</text>
+    <text class="d-small" x="490" y="100" text-anchor="middle">11</text>
+    <text class="d-small" x="490" y="120" text-anchor="middle">12</text>
+    <text class="d-small" x="490" y="140" text-anchor="middle">11</text>
+    <rect class="d-soft" x="530" y="40" width="80" height="136" rx="4"/>
+    <text class="d-text" x="570" y="62" text-anchor="middle">時間</text>
+    <text class="d-small" x="570" y="100" text-anchor="middle">03-05 14:07</text>
+    <text class="d-small" x="570" y="120" text-anchor="middle">03-05 14:08</text>
+    <text class="d-small" x="570" y="140" text-anchor="middle">03-05 14:08</text>
+    <rect class="d-soft" x="615" y="40" width="65" height="136" rx="4"/>
+    <text class="d-text" x="647" y="62" text-anchor="middle">金額</text>
+    <text class="d-small" x="647" y="100" text-anchor="middle">96.8</text>
+    <text class="d-small" x="647" y="120" text-anchor="middle">110</text>
+    <text class="d-small" x="647" y="140" text-anchor="middle">80</text>
+    <text class="d-small" x="530" y="200" text-anchor="middle">算每日營收：只讀「時間」「金額」兩塊；</text>
+    <text class="d-small" x="530" y="218" text-anchor="middle">同一欄的值很像，壓縮後更小</text>
+    <text class="d-text" x="350" y="262" text-anchor="middle">讀單筆、改單筆：列式快 ｜ 掃很多列、只看幾欄：欄式快</text>
+  </svg>
+  <figcaption>同一份 orders 的兩種存法。淡色底是「每日營收」查詢需要讀的部分。</figcaption>
+</figure>
+<p>報表查詢的特徵是「掃很多列，但只看幾欄」。每日營收只用到時間和金額，在列式儲存裡，資料庫還是得把每一列整列讀進來，再丟掉用不到的門市、顧客、備註。欄式儲存在這種查詢上快，是因為兩件事。</p>
+<p>第一件是<strong>只讀需要的欄</strong>。orders 有 12 欄、報表只用 3 欄，欄式資料庫只讀那 3 欄的區塊，大約是全部資料的四分之一。報表的瓶頸多半是從磁碟讀多少資料，讀的量少了四分之三，速度就跟著上來。</p>
+<p>第二件是<strong>壓縮率高</strong>。壓縮靠的是資料裡有重複、有規律。列式的一頁裡，數字、時間、文字交錯，很難壓；欄式的一塊裡全是同一種型別，而且值很像：門市欄只有 6 種值一直重複，時間欄依序遞增，相鄰兩筆只差幾秒。這種資料能壓得很小。磁碟讀得少，記憶體也放得下更多。</p>
+<p>代價來自同一個設計。改一筆訂單的狀態和金額，在列式裡是改一頁裡的一列；在欄式裡，這筆訂單的每個欄位散在不同的區塊，還都壓縮過，要動好幾個地方。所以欄式資料庫做一筆一筆的小寫入很慢，適合「大批寫入、很少修改、大量讀取」，不能拿來當結帳的資料庫。實務上兩種資料庫各做各的：結帳照樣寫 PostgreSQL，定期把資料搬一份到欄式資料庫給報表用，這段搬運在後面「資料怎麼每晚搬過去」一節處理。</p>
+<p>欄式不一定是一套資料庫伺服器，也可以只是一種檔案格式。<strong>Parquet</strong> 是最常見的欄式檔案格式：一個檔案裡依欄存放、帶有每一欄的型別（schema）、有壓縮。DuckDB、ClickHouse、Spark、BigQuery、pandas 都能直接讀，常用來在系統之間交換分析資料，或把舊資料封存到物件儲存（<a href="12-object-storage.html">第 12 課</a>）。</p>
+<p>知道欄式為什麼快之後，下一個問題是用什麼工具。幾千萬筆的量還不到要架一套分析資料庫伺服器的程度，最好能在現有的 Node 程式裡直接跑。</p>
+
+<h2>DuckDB：不架伺服器，在 Node 裡跑分析</h2>
+<p>上一節留下的需求是：要欄式的分析能力，但不想多維運一台伺服器。<strong>DuckDB</strong> 就是這樣的工具。它是欄式的分析資料庫，但跟 SQLite 一樣是一個函式庫：沒有另外的伺服器程序，直接在你的 Node 程序裡執行，就像 import 一個套件。資料可以放在記憶體、一個 .duckdb 檔案，或不匯入、直接查 CSV、Parquet 檔。</p>
+<p>它適合單機能處理的量（幾千萬到幾億列）：每晚的報表批次、把匯出檔做一次性分析、在資料管線中轉換資料。它不是給很多使用者同時連線寫入的伺服器，這個限制在這一節最後會再談。</p>
+<p>這門課用 <code>@duckdb/node-api</code> 1.4.5-r.1（DuckDB 1.4 LTS 系列，版本說明見課末）。它在程序內執行，不需要 Docker。下面這段把後台匯出的訂單 CSV 讀成一張表，再算每家門市的訂單數與營收：</p>
+<pre>import { DuckDBInstance } from '@duckdb/node-api'
+
+const instance = await DuckDBInstance.create(':memory:')   // 或 'reports.duckdb'：資料存在這個檔案
+const duck = await instance.connect()
+
+// read_csv 讀 CSV；columns 指定每一欄的型別，不讓 DuckDB 自己猜
+await duck.run(`CREATE TABLE orders AS
+  SELECT * FROM read_csv('exports/orders.csv', header = true, columns = {
+    'id': 'BIGINT', 'store_id': 'INTEGER', 'customer_id': 'INTEGER',
+    'ordered_at': 'TIMESTAMP', 'total': 'DECIMAL(10,1)', 'prep_ms': 'INTEGER'
+  })`)
+
+const reader = await duck.runAndReadAll(
+  'SELECT store_id, count(*) AS orders, sum(total) AS revenue FROM orders GROUP BY store_id ORDER BY store_id')
+console.log(reader.getRowObjectsJson())
+// [ { store_id: 11, orders: '25391', revenue: '2412088.6' }, … ]   ← orders、revenue 是字串
+
+duck.closeSync()
+instance.closeSync()</pre>
+<p>先看流程：<code>DuckDBInstance.create</code> 開一個資料庫（<code>':memory:'</code> 表示只放在記憶體，程序結束就沒了），<code>connect()</code> 取得一條連線，之後所有 SQL 都透過這條連線執行，用完要關掉。執行 SQL 有兩個方法：<code>duck.run(sql, params?)</code> 執行不需要結果的 SQL，例如建表；<code>duck.runAndReadAll(sql, params?)</code> 執行並把結果全部讀進來，回傳一個 reader，用 <code>getRowObjectsJson()</code> 轉成物件陣列。SQL 裡的參數用 <code>$1</code>、<code>$2</code> 表示，第二個引數傳陣列，跟 <code>pg</code> 的寫法一樣。</p>
+<p>再看輸出：<code>store_id</code> 是 number，<code>orders</code> 和 <code>revenue</code> 卻是字串。<code>getRowObjectsJson()</code> 會把 BIGINT（<code>count(*)</code> 的型別）、DECIMAL、DATE、TIMESTAMP 轉成字串，因為它們放進 JS 的 number 可能失真：number 能精確表示的整數有上限，BIGINT 可以超過它；DECIMAL 是精確的十進位小數，轉成 number 就變回浮點數。INTEGER、DOUBLE 本來就放得進 number，所以是 number。需要 number 做計算時自己 <code>Number(r.orders)</code>。</p>
+<p>資料是 Parquet 檔時，用 <code>read_parquet('dir/*.parquet')</code> 讀，可以用萬用字元一次讀多個檔。Parquet 自帶型別，不用指定 columns。CSV 沒有型別，所以上面的範例特地寫了 <code>columns</code>，原因在下面。</p>
+
+<h3>金額不要讓 DuckDB 猜成 DOUBLE</h3>
+<p>不給 <code>columns</code> 時，<code>read_csv</code> 會看前面的資料猜型別，<code>96.8</code> 會被猜成 <code>DOUBLE</code>，也就是 JS 的 number 那種二進位浮點數。0.1 這類小數在二進位裡沒有精確值，每一筆都差一點點，加總幾百筆就累積出看得到的誤差。練習 1 的資料用 DOUBLE 加總某一天的營收，結果是：</p>
+<pre>預期 327166.8
+DOUBLE 加總的結果 327166.8000000003</pre>
+<p>報表上差的是 0.0000000003 元，但對帳程式用「相等」比對就會判定不符；再經過幾次四捨五入，會在某天差出 1 元。金額欄一律指定 <code>DECIMAL</code>（固定小數位數的十進位數），它照十進位存，加總是精確的。結果傳回 JS 時保持字串，跟 PostgreSQL 的 numeric 由 <code>pg</code> 回傳字串是同一個道理。</p>
+<p>表建好、型別也對了，接下來就能把老闆要的報表寫成 SQL。在那之前，先記下 DuckDB 適合和不適合的地方。</p>
+<div class="callout practice"><strong>💡 實務上：DuckDB 常是第一個上手的分析工具</strong><br>還不需要分析型資料庫時，DuckDB 已經很好用：財務給你一份幾百 MB 的匯出檔要對帳、客服要查「上個月某門市退款最多的品項」、排程每晚把前一天的訂單匯出成 Parquet 存到物件儲存。這些都能在一支 Node 腳本或本機的 DuckDB CLI 裡完成，不用動正式資料庫。要注意的是它不是共用的伺服器：一個程序以讀寫模式開著 .duckdb 檔時，其他程序連讀都打不開；多人要查同一份資料時，匯出成 Parquet 檔讓各自讀取。</div>
+
+<h2>老闆要的報表怎麼寫：每日營收、前三名與 p95</h2>
+<p>資料進了 DuckDB，接著寫報表。DuckDB 的 SQL 跟 PostgreSQL 幾乎一樣，<a href="../../postgresql/lessons/17-window-functions.html">PostgreSQL 課第 17 課</a>的視窗函式可以直接用。後台的營運報表頁要三種數字：每天的營收、每個月賣最好的前三個品項、每家門市的出餐速度。它們剛好是營運報表最常見的三種寫法，也是練習 1 要完成的三個函式。</p>
+
+<h3>每日營收：依天分組</h3>
+<p>訂單的 <code>ordered_at</code> 是精確到秒以下的時間，要依天加總，就把它轉成日期再分組。<code>CAST(ordered_at AS DATE)</code> 取日期；依月分組時，<code>strftime(ordered_at, '%Y-%m')</code> 取「2026-03」這樣的月份字串，<code>date_trunc('month', ordered_at)</code> 則截到月初的時間（2026-03-01 00:00）。</p>
+<pre>SELECT CAST(ordered_at AS DATE) AS day, count(*) AS orders, sum(total) AS revenue
+FROM orders
+GROUP BY day
+ORDER BY day;</pre>
+
+<h3>每月前三名：每組各自排名</h3>
+<p>「每個月銷量前三名」不能寫成 <code>ORDER BY qty DESC LIMIT 3</code>：那是全部月份加起來只取 3 列。要的是每個月各自排名、各取 3 名。做法分兩步：先彙總出每個月每個品項的銷量，再用 <code>ROW_NUMBER() OVER (PARTITION BY 月份 ORDER BY 銷量 DESC, product_id)</code> 在每個月裡編號。</p>
+<p><code>PARTITION BY month</code> 把資料依月份分組，每個月各自從 1 開始編號；<code>ORDER BY qty DESC</code> 決定組內的順序，銷量最高的是 1。最後加上的 <code>product_id</code> 是決勝欄位：兩個品項銷量相同時，沒有它，誰排第 3、誰排第 4 由資料庫當下讀到的順序決定，同一份資料每次跑可能不一樣。加上它，名次就固定了。</p>
+<p>視窗函式的結果不能直接寫在 WHERE 裡，因為 WHERE 在視窗函式算出來之前就執行了。PostgreSQL 要包一層子查詢，在外層 <code>WHERE rank &lt;= 3</code>。DuckDB 有 <code>QUALIFY</code>，專門篩選視窗函式的結果，可以直接寫：</p>
+<pre>WITH monthly AS (
+  SELECT strftime(o.ordered_at, '%Y-%m') AS month, i.product_id, sum(i.quantity) AS qty
+  FROM order_items i JOIN orders o ON o.id = i.order_id
+  GROUP BY month, i.product_id
+)
+SELECT month, product_id, qty,
+       ROW_NUMBER() OVER (PARTITION BY month ORDER BY qty DESC, product_id) AS rank
+FROM monthly
+QUALIFY rank &lt;= 3          -- PostgreSQL 沒有 QUALIFY，要寫成子查詢再 WHERE rank &lt;= 3
+ORDER BY month, rank;</pre>
+<p>編號函式不只 <code>ROW_NUMBER</code> 一種，三種在並列時的結果不同。兩個商品都賣 7 杯並列第一時，<code>ROW_NUMBER</code> 給 1、2（依 ORDER BY 的下一個欄位決定誰先）；<code>RANK</code> 給 1、1，下一名是 3；<code>DENSE_RANK</code> 給 1、1，下一名是 2。用 <code>RANK</code> 篩「前 3 名」，遇到並列可能回傳 5 列。報表要「剛好 N 筆」就用 <code>ROW_NUMBER</code>，並把並列規則寫清楚。</p>
+
+<h3>出餐速度：為什麼看 p95 而不是平均</h3>
+<p>出餐速度如果看平均，會被少數極端值拉動：100 杯裡有 99 杯 3 分鐘做好、1 杯因為機器故障等了 60 分鐘，平均就變成約 3 分 34 秒，看不出大多數客人等多久，也看不出有人等很久。看服務品質常用 <strong>p95</strong>（第 95 百分位數）：把所有訂單的製作時間由小排到大，排在 95% 位置的那個值，意思是 95% 的訂單在這個時間內做好。p95 變大，就表示等很久的客人變多了。</p>
+<p>百分位數的位置常常落在兩筆資料之間，這時取哪個值有兩種定義，DuckDB 各有一個函式：</p>
+<div class="table-wrap"><table>
+  <tr><th>函式</th><th>做法</th><th>資料 1、2、3、4、10、20 的 p95</th></tr>
+  <tr><td><code>quantile_cont(x, 0.95)</code></td><td>連續：位置 (6−1)×0.95 = 4.75，在第 5、6 筆（10 與 20）之間內插</td><td>10 + (20 − 10) × 0.75 = 17.5</td></tr>
+  <tr><td><code>quantile_disc(x, 0.95)</code></td><td>離散：回傳資料裡實際存在的一筆</td><td>20</td></tr>
+</table></div>
+<p>兩個都是正確的定義，差在跟誰比對：PostgreSQL 的 <code>percentile_cont</code> 也是內插法。同一份儀表板的數字要跟其他系統對得上，就要用同一種定義，並寫在報表說明裡。練習 1 用 <code>quantile_cont</code>。</p>
+
+<h3>時間範圍用「大於等於起點、小於下一個起點」</h3>
+<p>三種報表都會加上時間範圍，例如「只看 3 月」。「3 月的訂單」寫成 <code>ordered_at BETWEEN '2026-03-01' AND '2026-03-31'</code> 是常見的錯：<code>'2026-03-31'</code> 轉成時間是 3 月 31 日 00:00:00，31 日白天的訂單全部漏掉。改成 <code>&lt;= '2026-03-31 23:59:59'</code> 也不對，時間精確到秒以下，23:59:59.5 的訂單照樣漏掉。正確寫法是半開區間：包含起點、不包含下一個起點。</p>
+<pre>WHERE ordered_at &gt;= DATE '2026-03-01'
+  AND ordered_at &lt;  DATE '2026-03-01' + INTERVAL 1 MONTH    -- 2026-04-01 00:00，不含</pre>
+<p>每個月的天數不同，下個月 1 日用 <code>+ INTERVAL 1 MONTH</code> 算，不要寫死 31 天。這個寫法也能用到 <code>ordered_at</code> 上的索引或分區，因為欄位本身沒有被函式包起來。</p>
+<p>到這裡報表 SQL 都有了，但它們查的是一份手動匯出的 CSV，只到匯出那一刻。在上面假設的規模下，物化檢視已經 REFRESH 不完，所以要每晚把新訂單增量搬進 DuckDB。</p>
+
+<h2>資料怎麼每晚搬過去：增量 ETL 與水位線</h2>
+<p>上一節的報表要每天更新，就需要一支定期把資料從 PostgreSQL 搬到 DuckDB 的程式。這種程式叫 <strong>ETL</strong>，是 extract、transform、load 三步：從來源抽取資料、整理成分析要的形狀、載入目的地。</p>
+<p>最簡單的做法是每晚全量複製：清空 DuckDB 的訂單表，把 PostgreSQL 的訂單整張重新複製一次。資料少時這樣最不會出錯，因為每次都是完整的一份。但訂單有幾千萬筆時，每晚都把全部資料讀一遍，ETL 自己就變成本課開頭那種在主資料庫上跑很久的查詢。</p>
+<p>這時改用<strong>增量</strong>同步：每次只搬上次之後新增的資料。要做到這點，ETL 得記住「上次處理到哪」，這個標記叫<strong>水位線</strong>（watermark），通常是最後一筆的 id 或 updated_at。水位線存在 DuckDB 的一張小表 <code>etl_state</code> 裡，每批資料寫完就往前推。整個流程如下：</p>
+<pre>每一批：
+  1. 讀水位線                      SELECT last_id FROM etl_state WHERE name = 'orders'   （DuckDB）
+  2. 從 PostgreSQL 取下一批         SELECT … FROM orders WHERE id &gt; $1 ORDER BY id LIMIT 1000
+  3. 在 DuckDB 的同一個交易裡：
+       BEGIN TRANSACTION
+       INSERT OR REPLACE INTO orders VALUES …             -- 冪等：同一個 id 再寫一次會覆蓋，不會多一筆
+       UPDATE etl_state SET last_id = &lt;這批最大的 id&gt;
+       COMMIT                                              -- 出錯就 ROLLBACK，資料和水位線一起不算數
+  4. 這批不滿 1000 筆就是追上了；否則回到 1</pre>
+<p>這幾行看起來很普通，但每一個寫法都是為了擋一種故障。ETL 在半夜自己跑，出錯時沒有人看著，所以要假設它隨時會在任何一行當掉、會被重跑。下面一步一步看。</p>
+
+<h3>分批：為什麼用 <code>id &gt; 水位線</code>，不用 OFFSET</h3>
+<p>一次把幾萬筆讀進記憶體太大，所以分批，每批 1,000 筆。分批最直覺的寫法是 <code>LIMIT 1000 OFFSET 50000</code>，但 OFFSET 的意思是「跳過前 5 萬列」，資料庫還是得把那 5 萬列一列一列數過去，越後面的批次越慢。更糟的是，分批途中有訂單新增或刪除，前面的列數變了，OFFSET 會跳過或重複幾筆。</p>
+<p>改用 <code>WHERE id &gt; 上一批最大的 id ORDER BY id LIMIT 1000</code>，資料庫靠 id 的索引直接跳到上次結束的位置，每一批都一樣快，也不受前面資料增減影響。這種「記住上一批最後一個鍵、從它之後繼續」的分頁叫 keyset 分頁，而上一批最大的 id 正好就是水位線。</p>
+
+<h3>交易：為什麼資料和水位線要一起提交</h3>
+<p>每一批要做兩件事：寫入資料、推進水位線。如果分開做，程序在兩步之間當機會怎樣？先更新水位線再寫資料：水位線已經越過這批，資料卻沒寫進去，下一次從新的水位線開始，這一批永遠漏掉。先寫資料再更新水位線：當機時資料寫進去了、水位線沒動，下一次會把這一批再送一次。</p>
+<p>把兩件事放進 DuckDB 的同一個交易，就只剩兩種結果：兩件都成功，或兩件都不算數。不會出現「資料進去了、水位線沒動」或反過來的狀態。</p>
+<p>出錯時要記得 ROLLBACK。交易中途出錯時，交易還開著。如果是 DuckDB 回的錯（例如違反主鍵），交易進入「已中止」狀態，之後的語句都回 <code>Current transaction is aborted (please ROLLBACK)</code>；如果是你自己的程式丟錯，下一次 <code>BEGIN TRANSACTION</code> 會因為「交易裡不能再開交易」而失敗。兩種都要先 ROLLBACK 再把錯誤丟出去：<code>try { … COMMIT } catch (e) { ROLLBACK; throw e }</code>。</p>
+<p>水位線要記這批最後一筆的 id，不要寫成「舊水位線＋這批筆數」。正式資料庫的 id 一定有跳號：結帳的交易回滾時，它已經取得的序號不會退回，那個 id 就永遠空著。用筆數推算，水位線會落在錯誤的位置。</p>
+
+<h3>冪等：為什麼同一批重送也不能多出資料</h3>
+<p>有了交易，一般的當機不會造成重送。但水位線還是可能因為別的原因退回：從備份還原 DuckDB、發現資料有誤而手動把水位線調回去重跑。這時同一批訂單會再寫一次，寫入方式必須保證「寫幾次結果都一樣」。這個性質叫<strong>冪等</strong>（idempotent）。</p>
+<p>普通的 <code>INSERT</code> 不冪等，重跑一次就多一份訂單，營收變兩倍。冪等的寫法是讓目的表有主鍵，用 <code>INSERT OR REPLACE</code>（DuckDB）或 <code>INSERT … ON CONFLICT (id) DO UPDATE</code>（PostgreSQL、DuckDB 都有）：同一個 id 已經存在就覆蓋，不會多一筆；而且來源的訂單如果改過，覆蓋後拿到的是新的金額。也可以先 <code>DELETE</code> 這一批的 id 範圍再寫入。</p>
+<p>最後一個細節是型別。<code>pg</code> 會把 <code>timestamp</code> 轉成 JS 的 Date，用主機的時區解讀；金額在 JS 端只要轉成 number，就變回浮點數。從 PostgreSQL 讀的時候在 SQL 裡寫 <code>ordered_at::text</code>、<code>total::text</code>，原樣以文字交給 DuckDB，讓 DuckDB 自己轉型，就避開了時區與浮點數的問題。</p>
+<p>交易、冪等、keyset 分批都做到了，ETL 看起來已經不會漏也不會重複。但用 id 當水位線本身還有一個漏洞，跟資料庫怎麼發 id 有關。</p>
+
+<h3>水位線的坑：晚提交的資料</h3>
+<p>遞增的 id 看起來可以保證「比水位線大的都是新的」，其實不行。序號在 <code>INSERT</code> 執行時就取得，交易可能過一陣子才提交；交易提交前，別的連線看不到這筆資料。結帳比較慢的時候會這樣：</p>
+<div class="table-wrap"><table>
+  <tr><th>時間</th><th>交易 A（結帳比較慢）</th><th>交易 B</th><th>ETL</th></tr>
+  <tr><td>10:00:00</td><td>INSERT，取得 id 101</td><td></td><td></td></tr>
+  <tr><td>10:00:01</td><td>（還在呼叫金流）</td><td>INSERT 取得 id 102，提交</td><td></td></tr>
+  <tr><td>10:00:02</td><td></td><td></td><td>讀到 102（101 還沒提交，看不到），水位線 = 102</td></tr>
+  <tr><td>10:00:03</td><td>提交</td><td></td><td></td></tr>
+  <tr><td>之後</td><td colspan="3">ETL 只讀 id &gt; 102，訂單 101 永遠不會被搬過去</td></tr>
+</table></div>
+<p>改用 <code>updated_at</code> 當水位線也一樣：<code>now()</code> 是交易開始的時間，提交可能晚很多；同一個時間戳還可能有好幾筆，分批切在中間就會漏。常見的處理方式有三種：</p>
+<ul>
+  <li><strong>回溯一段重疊範圍</strong>：每次從「水位線往前 5 分鐘」或「往前 1000 個 id」開始讀，搭配冪等寫入，重疊的部分覆蓋掉。回溯多長，要大於系統裡最長的交易。</li>
+  <li><strong>只搬夠舊的資料</strong>：只讀 <code>updated_at &lt; now() - interval '5 minutes'</code> 的列，讓還沒提交的交易有時間提交。</li>
+  <li><strong>CDC</strong>（change data capture，變更資料擷取）：不查表，改讀資料庫自己的變更紀錄，依提交順序拿到每一筆新增、修改、刪除，晚提交的資料也依提交的時間出現。工具見課末。</li>
+</ul>
+<p>前兩種都靠冪等寫入才成立，這也是上一步堅持冪等的另一個理由。水位線方式還有一個看不到的範圍：被刪除的列根本不在查詢結果裡，重跑幾次都不會出現。需要刪除也同步時，就要改用軟刪除（加一個 deleted_at 欄位，刪除變成更新）或 CDC。</p>
+<p>練習 2 用 id 當水位線，專心在交易、冪等與分批；回溯與 CDC 在正式環境必須考慮，這裡只需要知道問題在哪。</p>
+<div class="callout practice"><strong>💡 實務上：ETL 會安靜地壞掉，要有對帳和告警</strong><br>ETL 失敗時沒有使用者會馬上看到錯誤畫面，通常是幾天後財務發現報表的數字跟後台對不上。上線時至少準備三件事：每次執行記錄開始時間、筆數與結果；水位線超過一段時間沒前進就告警；每天比對來源與目的地前一天的筆數與 <code>SUM(total)</code>，對不上就通知負責的人。報表上也寫出「資料更新到幾點」，讓看報表的人知道新鮮度。</div>
+
+<h2>搬好的資料怎麼交給別人查：依門市匯出成 Parquet</h2>
+<p>資料每晚進了 DuckDB，老闆的報表有了。接著財務要拿 3 月的訂單去對帳、各門市店長想查自己門市的明細。前面 DuckDB 那節提過它不是共用的伺服器：ETL 以讀寫模式開著 .duckdb 檔時，其他程序連讀都打不開。所以要給別人的資料，匯出成 Parquet 檔，各自用自己的工具讀。</p>
+<p>分析資料常依月份、門市切成很多個 Parquet 檔，存進物件儲存，查詢時只讀需要的那幾個檔。店長只看自己的門市，就只讀那家門市的檔案，不用把全部門市的資料讀一遍。DuckDB 用 <code>COPY … TO</code> 匯出，<code>PARTITION_BY</code> 會依欄位值建立資料夾。月份範圍照前面講的半開區間寫：</p>
+<pre>COPY (
+  SELECT * FROM orders
+  WHERE ordered_at &gt;= CAST($1 AS DATE) AND ordered_at &lt; CAST($1 AS DATE) + INTERVAL 1 MONTH
+) TO 'exports/2026-03' (FORMAT parquet, PARTITION_BY (store_id));
+
+-- 產生：exports/2026-03/store_id=11/data_0.parquet
+--       exports/2026-03/store_id=12/data_0.parquet …
+
+SELECT store_id, sum(total)
+FROM read_parquet('exports/2026-03/*/*.parquet', hive_partitioning = true)
+WHERE store_id = 11          -- 只會讀 store_id=11 資料夾裡的檔案
+GROUP BY store_id;</pre>
+<p><code>欄位=值/</code> 這種資料夾命名叫 Hive 分區，各種分析工具都認得。門市寫在資料夾名稱上；讀的時候加 <code>hive_partitioning = true</code>，DuckDB 會把資料夾名稱還原成 <code>store_id</code> 欄位，<code>WHERE store_id = 11</code> 也因此只需要打開那一個資料夾。</p>
+<p>匯出這一步也會被重跑（例如 3 月的資料修正後再匯一次），要注意兩件事。DuckDB 預設不覆蓋已存在的分區資料夾，重跑同一個月要先清掉，或加 <code>OVERWRITE</code> 選項。預設檔名是 <code>data_0.parquet</code>，但資料多時 DuckDB 會在同一個資料夾寫出好幾個檔，程式要列出整個資料夾，不要假設只有 data_0。</p>
+<p>到這裡，咖啡店的整條分析流程都在單機上完成：PostgreSQL 負責結帳，每晚增量搬進 DuckDB 出報表，再匯出 Parquet 給別人查。這條路線的上限是一台機器。資料到數億列、報表要給很多人同時查、資料要一直寫入時，就要換另一類工具。</p>
+
+<h2>資料到數億列、一直寫入時：ClickHouse 與時序資料（資深）</h2>
+<p>DuckDB 是單機函式庫。資料到了數億、數十億列，或報表要給很多人同時查、資料要一直寫入時，就需要伺服器型的欄式資料庫。開源最常見的是 <strong>ClickHouse</strong>，雲端託管有 ClickHouse Cloud；其他選擇見課末。這門課不啟動 ClickHouse，只用一張表看懂決定效能的三個設定：</p>
+<pre>CREATE TABLE order_lines (
+  store_id    UInt16,
+  ordered_at  DateTime,
+  order_id    UInt64,
+  product_id  UInt16,
+  quantity    UInt8,
+  amount      Decimal(10, 1)
+) ENGINE = MergeTree
+PARTITION BY toYYYYMM(ordered_at)                 -- 每月一個分區
+ORDER BY (store_id, ordered_at)                   -- 資料在磁碟上依這個順序排
+TTL ordered_at + INTERVAL 3 YEAR DELETE;          -- 3 年後自動刪除</pre>
+<p><strong>MergeTree</strong> 是 ClickHouse 主要的表引擎，決定資料怎麼寫進去。每次寫入產生一個已排序的資料片段（part），背景再把小片段合併成大片段。這跟前面說的欄式「適合大批寫入」是同一件事：一次寫幾千、幾萬列，只產生一個片段；一筆一筆寫，每筆都產生一個小片段，合併跟不上就會出錯。所以要<strong>大批寫入</strong>，把資料累積起來再寫。</p>
+<p><strong>ORDER BY</strong> 決定資料在磁碟上的排序，沒寫 PRIMARY KEY 時它就是主鍵。這個主鍵跟 PostgreSQL 的不一樣：它是稀疏索引，不是每一列記一筆，而是每 8192 列（預設的 granule 大小）記一筆。查詢靠它判斷哪些區塊不可能有符合的資料，整塊跳過。所以最常出現在 WHERE 的欄位要放前面：報表多半先篩門市再篩時間，就是 <code>(store_id, ordered_at)</code>。它也不是唯一約束，同一個值可以出現很多次。</p>
+<p><strong>PARTITION BY</strong> 通常用月份，方便整個月一起刪除或搬移。分區不會讓查詢變快，變快靠的是 ORDER BY；分區是資料管理的工具。官方文件建議多數情況不需要分區，需要時也不要比「月」更細；不要依顧客 id 這種值很多的欄位分區，要篩顧客就把它放在 ORDER BY 的第一欄。</p>
+<p>這張表最後一行的 <code>TTL</code> 會讓 3 年前的資料自動刪除。為什麼開表時就要寫到刪除？因為這類一直寫入的資料有自己的特性。</p>
+
+<h3>時序資料：一直新增、很少修改</h3>
+<p><strong>時序資料</strong>（time-series）是以時間為主軸、持續新增、幾乎不修改的資料：咖啡機每 10 秒回報的溫度、每一次 API 呼叫、每一筆訂單事件。它有兩個特性：量一直長，而且越舊的資料越少被細看。三年前某一台咖啡機在某個 10 秒的溫度，幾乎不會有人查；但那個月的平均溫度可能還有用。所以時序資料一定要有兩個規則：</p>
+<ul>
+  <li><strong>保留期</strong>（retention）：細資料留多久，到期整批刪除。依時間分區時，刪除就是丟掉整個分區，不用逐列 DELETE。</li>
+  <li><strong>降採樣</strong>（downsampling）：把細的資料彙總成較粗的時間粒度。例如咖啡機溫度每 10 秒一筆只留 7 天，之後只留每小時的平均、最高、最低。一年的資料從 315 萬筆變成 8,760 筆。ClickHouse 可以用 <code>TTL … GROUP BY</code> 在到期時自動彙總。</li>
+</ul>
+<p>時序資料不一定要上 ClickHouse，依量和需求有三種選擇：</p>
+<div class="table-wrap"><table>
+  <tr><th>選擇</th><th>適合</th><th>要付出的</th></tr>
+  <tr><td>PostgreSQL 分割表＋BRIN（<a href="../../postgresql/lessons/35-partitioning.html">第 35 課</a>）</td><td>每天幾十萬筆以內，查詢多半看最近的資料，還要跟其他表 JOIN</td><td>保留期與降採樣要自己寫排程</td></tr>
+  <tr><td>TimescaleDB（PostgreSQL 擴充套件）</td><td>想留在 PostgreSQL 生態，但需要自動依時間分區、連續彙總、保留策略</td><td>多一個擴充套件要維運；託管的 PostgreSQL 不一定能裝</td></tr>
+  <tr><td>ClickHouse 等欄式資料庫</td><td>數億列以上、以聚合查詢為主、大批寫入</td><td>另一套系統、資料要搬、不適合逐筆更新與交易</td></tr>
+</table></div>
+<p>回到咖啡店。判斷順序跟本課開頭一樣：一天 2,000 筆訂單，一年不到 100 萬筆，PostgreSQL 加索引或物化檢視綽綽有餘。<a href="01-choosing-a-store.html">第 1 課</a>估算的門檻（約 5,000 萬列、50 GB）以下，多一套分析資料庫的維運成本通常不值得。先量測、先調校，數字證明 PostgreSQL 撐不住了，再搬。咖啡店現在的規模停在物化檢視；DuckDB、ETL、Parquet 那條路線是規模成長後才需要的。</p>
+<div class="callout practice"><strong>💡 實務上：保留期要在開表時就談好，不是工程師一個人決定</strong><br>API 呼叫紀錄、咖啡機回報、訂單事件這類資料，最常見的坑是上線時沒人定保留期，一年後磁碟快滿，表又沒依時間分區，只能逐列 DELETE 慢慢刪；或刪了之後財務說還要對帳。開表前先問三個人：財務或法務「訂單明細依規定要留多久」、PM「報表最遠會回看幾個月」、資安「裡面有沒有個資，留越久風險越大」。答案寫進設計文件，再對應成 TTL 或刪除分區的排程。細資料留短、彙總資料留長，通常能同時滿足這三方。</div>
+
+<h2>補充與查表</h2>
+<ul>
+  <li><strong>ETL 與 ELT</strong>：先原封不動載入、到分析資料庫裡再用 SQL 轉換的叫 <strong>ELT</strong>（extract, load, transform），現在很常見，因為分析資料庫做轉換很快。這課的增量同步搬的是原樣的訂單，報表 SQL 在 DuckDB 裡做轉換，也算是這種做法。</li>
+  <li><strong>CDC 的工具</strong>：PostgreSQL 的變更紀錄透過 logical replication 讀出，常見的工具是 Debezium。</li>
+  <li><strong>其他伺服器型分析資料庫</strong>：除了 ClickHouse，另一類是 BigQuery、Snowflake、Redshift 這些雲端資料倉儲。</li>
+  <li><strong>版本備註</strong>：課程練習用 <code>@duckdb/node-api</code> 1.4.5-r.1（DuckDB 1.4 LTS 系列）；2026-10-21 已經發布 2.0.0-r.1，課程先用長期支援版。LTS（long-term support）是官方承諾較長時間提供修補的版本系列，課程練習選它是為了避免新大版本的 API 變動。ClickHouse 目前的長期支援系列是 26.8。</li>
+</ul>
+
+<h2>練習</h2>
+<p>練習 1、3、4 只用 DuckDB（在 Node 程序裡執行，不用 Docker）。練習 2 要用 PostgreSQL，先在 <code>learn/data-stores/practice</code> 執行 <code>docker compose --profile pg up -d --wait</code>。每一題都在 <code>learn/</code> 執行 <code>node check.mjs data-stores 13</code> 判分。PostgreSQL 用 schema <code>t13</code>，每個測試檔開始前會重建；DuckDB 每個測試檔各自建立一個記憶體資料庫。每個檔案最上面的註解寫了表的欄位與規則。</p>
+
+<div class="local" data-test="ex1" data-files="reports.ts">
+  <p>練習 1：在 <code>reports.ts</code> 完成四個函式。<code>loadCsv(duck, dir)</code> 用 <code>read_csv</code> 把 <code>orders.csv</code>、<code>order_items.csv</code> 建成兩張表，<code>total</code> 要是 <code>DECIMAL(10,1)</code>。三個報表各自<strong>只能呼叫一次</strong> <code>duck.runAndReadAll</code>，計算全部在 SQL 裡完成：<code>dailyRevenue</code> 每天的訂單數與營收（營收是精確的金額字串）；<code>topProducts</code> 每個月銷量前 3 名，並列時 product_id 小的優先；<code>prepP95</code> 每家門市製作時間的 p95，用 <code>quantile_cont</code>。測試用固定 seed 產生約 45 萬列的半年資料，另外用一份「六個商品銷量全部並列」的資料確認名次固定，在 Node 端用整數「角」算出預期結果比對，並檢查 SQL 查出的列數就是函式回傳的列數。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="etl.ts">
+  <p>練習 2：在 <code>etl.ts</code> 實作 <code>syncOrders(db, duck)</code>，把 PostgreSQL 的訂單增量同步到 DuckDB：讀 <code>etl_state</code> 的水位線，每批 <code>WHERE id &gt; 水位線 ORDER BY id LIMIT 1000</code>，在同一個 DuckDB 交易裡用冪等的 INSERT 寫入並更新水位線，出錯時 ROLLBACK 再丟錯，回傳寫入的筆數。測試會先同步 3,200 筆，新增 2,500 筆後確認只讀新的資料；再讓第 2 批的 INSERT 丟錯模擬當機，重跑後筆數與 <code>SUM(total)</code> 要跟 PostgreSQL 一致；最後把水位線退回並修改一筆訂單，重送後不能重複、金額要是新的。測試資料的 id 會跳號（模擬回滾的結帳），全程不能用 OFFSET。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="export.ts">
+  <p>練習 3：在 <code>export.ts</code> 實作 <code>exportMonth(duck, month, outDir)</code>：檢查 <code>month</code> 是 <code>YYYY-MM</code>，把那個月的訂單用 <code>COPY … TO</code> 匯出成 Parquet、依 <code>store_id</code> 分區，回傳所有 .parquet 檔的相對路徑。測試用 <code>read_parquet</code> 讀回，比對筆數、金額合計與門市；資料裡有 2 月 28 日 23:59:59.999、3 月 1 日 00:00、3 月 31 日 23:59:59.999、4 月 1 日 00:00 的訂單，也會匯出 2 月（28 天）與 4 月。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="choose.ts">
+  <p>練習 4：在 <code>choose.ts</code> 實作 <code>choose(need)</code>，依檔案註解裡的五條規則與門檻，替報表需求回傳 <code>'postgres-index'</code>、<code>'materialized-view'</code>、<code>'read-replica'</code> 或 <code>'olap'</code>。寫之前先自己判斷檔案裡五個咖啡店需求的答案，再對照規則。測試除了這五個，還有 10 組卡在門檻邊界的情境。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：「全年依品項的營收」只用到 3 個欄位，但要掃 5,000 萬列。為什麼欄式資料庫特別快？</p>
+  <label data-key="a">它有更多索引</label>
+  <label data-key="b">只讀需要的 3 欄，而且同一欄的值相似、壓縮率高，要讀的資料量少很多</label>
+  <label data-key="c">它把資料全部放在記憶體</label>
+  <label data-key="d">它不支援 JOIN，所以比較快</label>
+  <p class="why">✓ 欄式儲存把同一欄的值放在一起，查詢只讀用到的欄，加上壓縮，磁碟讀取量少很多。分析型資料庫多半沒有傳統的逐列索引，靠的是排序與跳過區塊（a 錯）；DuckDB、ClickHouse 都能處理比記憶體大的資料，也都支援 JOIN（c、d 錯）。代價是單筆寫入與更新慢，不能當 OLTP 用。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：報表在主資料庫上跑 20 分鐘。除了 CPU 之外，還會造成什麼傷害？</p>
+  <label data-key="a">沒有，SELECT 只讀不寫</label>
+  <label data-key="b">它的快照讓 VACUUM 清不掉這段時間被更新、刪除的舊版本列，表與索引膨脹</label>
+  <label data-key="c">會鎖住所有表，不能寫入</label>
+  <label data-key="d">會讓 WAL 停止寫入</label>
+  <p class="why">✓ 一般的 SELECT 不擋寫入（c 錯），WAL 也照常寫（d 錯）；但長查詢開著舊快照，VACUUM 必須保留它可能還要看的舊版本列，跑多久就膨脹多久（PostgreSQL 課第 30 課）。另外還會把熱資料擠出快取、佔住連線，所以 a 錯。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：增量 ETL 用 <code>updated_at</code> 當水位線，最容易漏掉哪些資料？</p>
+  <label data-key="a">新增的資料</label>
+  <label data-key="b">交易較晚提交但 updated_at 較早的資料，以及跟水位線時間相同、分批時被切開的資料</label>
+  <label data-key="c">什麼都不會漏，時間戳一定遞增</label>
+  <label data-key="d">刪除的資料重跑一次就會出現</label>
+  <p class="why">✓ <code>now()</code> 是交易開始的時間，提交可能更晚；ETL 讀的時候它還沒提交，水位線卻已經越過它（c 錯）。正常新增的資料讀得到（a 錯）。常見做法是回溯一段重疊範圍並冪等寫入，或只搬幾分鐘以前的資料。刪除的列根本不在查詢結果裡，重跑幾次都不會出現（d 錯），要靠軟刪除或 CDC。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 8：一天 2,000 筆訂單的咖啡店，月報表變慢了。最先該做什麼？</p>
+  <label data-key="a">導入 ClickHouse 叢集</label>
+  <label data-key="b">在 PostgreSQL 用 EXPLAIN 找原因，補索引，或改用物化檢視、讀副本</label>
+  <label data-key="c">改用 Hadoop</label>
+  <label data-key="d">每天手動匯出 Excel</label>
+  <p class="why">✓ 一年不到 100 萬筆，單台 PostgreSQL 綽綽有餘，慢通常是少了索引或查詢寫法的問題。分析型資料庫要多維運一套系統、多寫一條資料管線，量到了（約 5,000 萬列以上）才值得（a、c 錯）。手動匯出不能重現也不能自動化（d 錯）。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>還沒調校查詢就導入新的分析資料庫</strong>：先 <code>EXPLAIN (ANALYZE, BUFFERS)</code>，大多數慢報表是少了索引或寫法讓索引用不上。</li>
+  <li><strong>在主資料庫跑長時間報表</strong>：除了搶 CPU，還會擋住 VACUUM、沖掉快取、佔住連線。導到讀副本或改用物化檢視，報表帳號加上 <code>statement_timeout</code>。</li>
+  <li><strong>金額用浮點數加總</strong>：<code>read_csv</code> 會把 96.8 猜成 DOUBLE，加總出現 327166.8000000003。金額欄指定 DECIMAL，結果用字串傳回。</li>
+  <li><strong>月份範圍寫成 BETWEEN 月初 AND 月底</strong>：月底那天 00:00 之後的資料全部漏掉。用 <code>&gt;= 月初 AND &lt; 下個月 1 日</code>，下個月用 <code>+ INTERVAL 1 MONTH</code> 算。</li>
+  <li><strong>前 N 名用整體的 LIMIT，或用 RANK 不處理並列</strong>：每組前 N 名要 <code>ROW_NUMBER() OVER (PARTITION BY 組 ORDER BY 值 DESC, 決勝欄位)</code>。</li>
+  <li><strong>ETL 不冪等</strong>：重跑或水位線退回就產生重複資料。目的表要有主鍵，用 <code>INSERT OR REPLACE</code>／<code>ON CONFLICT DO UPDATE</code>，或先刪該批再寫。</li>
+  <li><strong>水位線在資料寫入成功前更新</strong>：當機時那一批永遠漏掉。資料與水位線放在同一個交易，出錯就 ROLLBACK。</li>
+  <li><strong>用 OFFSET 分批</strong>：越後面越慢，資料變動時會跳過或重複。用 <code>WHERE id &gt; 上一批最後的 id ORDER BY id LIMIT n</code>。</li>
+  <li><strong>以為遞增 id 一定依提交順序出現</strong>：晚提交的交易會拿到比水位線小的 id。回溯一段重疊範圍、只搬夠舊的資料，或改用 CDC。</li>
+  <li><strong>時序資料沒有保留期與降採樣</strong>：資料無限成長，查詢與備份越來越慢。依時間分區、到期整批刪除，舊資料只留彙總。</li>
+  <li><strong>ClickHouse 一筆一筆寫入</strong>：每次寫入都產生一個資料片段，背景合併跟不上。累積成大批再寫。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>報表拖慢結帳，是因為 OLTP（大量小讀寫）和 OLAP（少量大掃描）搶同一台資料庫。長報表除了搶 CPU，還會沖掉快取、擋住 VACUUM、佔住連線，跑完後傷害還在。</li>
+  <li>升級機器前先在 PostgreSQL 解決：EXPLAIN 與索引 → 物化檢視（<code>REFRESH … CONCURRENTLY</code> 需要唯一索引）→ 讀副本（注意長查詢被取消與 <code>hot_standby_feedback</code> 的代價）。咖啡店的全年報表做成物化檢視就夠了；量到約 5,000 萬列再考慮分析型資料庫。</li>
+  <li>欄式儲存只讀需要的欄、同一欄的值相似所以壓縮率高，適合掃描；代價是單筆寫入與更新慢，所以結帳留在 PostgreSQL，資料定期搬過去。Parquet 是欄式的檔案格式。</li>
+  <li>DuckDB 是在程序內執行的分析資料庫：<code>read_csv</code>／<code>read_parquet</code> 直接查檔案。金額指定 DECIMAL，結果用 <code>getRowObjectsJson()</code> 取字串。它不是共用伺服器，要給別人查就匯出 Parquet。</li>
+  <li>報表 SQL：日期用半開區間；每組前 N 名用 <code>ROW_NUMBER</code> 加決勝欄位；p95 比平均更能看出等很久的客人，要說清楚是 <code>quantile_cont</code> 還是 <code>quantile_disc</code>。</li>
+  <li>增量 ETL：水位線＋keyset 分批、資料與水位線同一個交易、冪等寫入。水位線會漏掉晚提交與被刪除的資料，正式環境用回溯重疊或 CDC。</li>
+  <li>匯出用 <code>COPY … TO (FORMAT parquet, PARTITION_BY …)</code> 建 Hive 分區，讀時 <code>hive_partitioning = true</code>；重跑要清掉或 <code>OVERWRITE</code>，資料夾裡可能不只 data_0。</li>
+  <li>超過單機時用 ClickHouse：效能取決於 ORDER BY（稀疏主鍵）與大批寫入，分區是管理工具；時序資料一定要有保留期與降採樣。</li>
+</ul>
+<p>下一課換到另一種規模問題：每秒數萬次查詢時，DynamoDB 這類 key-value 資料庫怎麼靠分區鍵設計撐住流量。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

@@ -1,0 +1,2 @@
+#!/bin/sh
+echo 3f2a9c1d8e7b6a5f4e3d2c1b0a9f8e7d6c5b4a39 > answer.txt

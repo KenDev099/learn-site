@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>26. 模組邊界與架構決策</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="26" data-practice="nestjs">
+<header>
+  <div class="eyebrow">階段 5：上線、維運與架構（資深） · 第 26 課</div>
+  <h1>模組邊界與架構決策</h1>
+</header>
+<main>
+
+<p>咖啡店 API 上線半年，功能一個一個加：集點、電子收據、廚房看板、每日統計。每次都是「哪裡最快」就寫在哪裡：付款的 <code>OrdersService</code> 直接呼叫 <code>LoyaltyService</code> 加點，加點時又回頭呼叫 <code>OrdersService</code> 查訂單金額；收據的 listener 直接拿訂單的 repository 來用；報價、寄信、訂單存取全部塞進一個 <code>@Global()</code> 的 <code>SharedModule</code>，誰要用誰注入。這個月老闆要改集點規則（每滿 100 元 1 點，改成依商品分類給點），工程師打開專案發現：加點牽涉的程式散在 <code>orders</code>、<code>loyalty</code> 兩個地方，而且這兩個模組互相 import，靠 <code>forwardRef</code> 才啟動得起來，一邊改了另一邊就可能啟動失敗。</p>
+<p>這一課的任務：把這個專案整理到「改集點規則只需要動 <code>loyalty</code>」，並且讓它在之後的每一個 PR 都維持這個狀態。做法是在<strong>模組化單體</strong>裡畫邊界。模組化單體（modular monolith）指的是：整個 API 還是一份程式、一起部署，但裡面切成幾個邊界清楚的模組，模組之間只透過刻意公開的入口往來。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>改集點規則為什麼要動兩個模組？先看懂「邊界」是什麼，以及現在的專案缺了什麼。</li>
+  <li>邊界畫在哪？三條規則：資料歸誰、模組公開什麼、誰可以依賴誰，用它們找出專案裡所有違規的地方。</li>
+  <li>違規一個一個修：先用領域事件解開 <code>orders ↔ loyalty</code> 的循環，再把什麼都放的 <code>SharedModule</code> 拆回各模組。</li>
+  <li>修好之後怎麼不被下一個 PR 改回去：寫架構測試，讓 CI 擋下違規的 import 和資料存取。</li>
+  <li>邊界都畫好了，要不要乾脆拆成微服務？以及半年後新同事問「為什麼這樣規定」時，答案寫在哪裡（ADR）。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="04-modules.html">第 4 課</a>的 <code>imports</code>／<code>exports</code> 與 <code>@Global</code>：模組只公開 <code>exports</code> 裡的 provider，別的模組 <code>imports</code> 它才用得到；<code>@Global</code> 讓所有模組不用 import 就能注入，方便但看不出誰依賴誰。</li>
+  <li><a href="21-scheduling-events.html">第 21 課</a>的領域事件：發送者用 <code>EventEmitter2</code> 宣布「訂單已付款」，想知道的模組用 <code>@OnEvent</code> 自己聽；它是程序內事件，程序當機時會漏。</li>
+  <li><a href="25-debugging-performance.html">第 25 課</a>的循環 import：兩個檔案互相 import，Vitest 會過，<code>nest build</code> 後卻在啟動時 <code>ReferenceError</code>；<code>forwardRef</code> 只能讓它啟動，問題還在。</li>
+</ul></div>
+
+<h2>改集點規則，為什麼要動兩個模組？</h2>
+<p>先把開場的問題看清楚。這是練習起始專案裡，付款與加點的程式（只留相關的幾行）：</p>
+<pre>// src/orders/orders.service.ts
+constructor(
+  private readonly repo: OrdersRepository,
+  @Inject(forwardRef(() =&gt; LoyaltyService)) private readonly loyalty: LoyaltyService,
+) {}
+
+async pay(id: number) {
+  const order = await this.repo.markPaid(id)
+  // …
+  await this.loyalty.addPointsForOrder(order.id)        // orders 呼叫 loyalty
+}
+
+// src/loyalty/loyalty.service.ts
+async addPointsForOrder(orderId: number) {
+  const order = await this.orders.findOne(orderId)      // loyalty 回頭呼叫 orders
+  const points = Math.floor(order.total / 100)
+  // …寫 stampCard、pointTransaction
+}</pre>
+<p>改集點規則時，要動的是 <code>addPointsForOrder</code> 的算法，看起來只在 <code>loyalty</code>。但這個方法是 <code>orders</code> 呼叫的：要改它的參數（例如依商品分類給點，需要訂單明細），就得同時改 <code>OrdersService.pay</code> 的呼叫方式；而它拿資料的方式是回頭呼叫 <code>OrdersService.findOne</code>，<code>orders</code> 一改 <code>findOne</code> 的回傳形狀，<code>loyalty</code> 也跟著壞。兩個模組都知道對方的內部細節，所以誰改都會牽動另一個。</p>
+<p>這就是沒有<strong>模組邊界</strong>的狀況。模組邊界（module boundary）是一條線：線裡面的東西，例如資料表、repository、內部的 helper，只有這個模組自己碰；線外面的人只能透過模組刻意公開的幾個入口跟它互動，例如 <code>exports</code> 出去的 service、它發出的事件。前端有一樣的概念：一個 Vue 元件的 <code>props</code>、<code>emits</code> 和 <code>defineExpose</code> 是它的公開介面，別的元件不會伸手進去改它內部的 <code>ref</code>。父元件如果直接改子元件的內部狀態，子元件一重構，父元件就壞；後端模組也是一樣的道理。</p>
+<p>邊界畫對了，會得到三個具體的好處。第一，改得安心：集點規則只在 <code>loyalty</code> 裡，改完跑 <code>loyalty</code> 的測試就知道有沒有壞；沒有邊界時，要先 grep 整個專案，找出所有寫 <code>pointTransaction</code> 的地方。第二，測得獨立：<code>LoyaltyModule</code> 單獨建立就能測，不必把 <code>OrdersModule</code> 和它的所有依賴一起拉起來。第三，以後拆得開：有一天真的要把集點拆成另一個服務，邊界就是切口，程序內事件換成佇列訊息，其他程式不動；沒有邊界的專案拆不開，只能重寫。</p>
+<p><a href="18-layering-domain.html">第 18 課</a>在一個模組<em>裡面</em>分層（controller → service → repository）；這一課在模組<em>之間</em>畫線。兩件事都在回答同一個問題：這段程式歸誰管。但「畫一條線」太抽象，接下來要把它變成可以逐項檢查的規則，才知道現在的專案到底哪裡越線了。</p>
+
+<h2>線要畫在哪？三條規則：資料歸屬、最小公開、單向依賴</h2>
+<p>咖啡店 API 有四個業務模組：<code>catalog</code>（商品與報價）、<code>orders</code>（下單與付款）、<code>loyalty</code>（集點）、<code>notifications</code>（收據）。邊界用三條規則畫出來，每條規則都回答一個問題，也都能拿來檢查現在的專案。</p>
+
+<h3>規則一：一張表只有一個模組碰（資料歸屬）</h3>
+<p>這條規則回答「資料歸誰」。<code>products</code> 歸 <code>catalog</code>；<code>orders</code>、<code>order_items</code> 歸 <code>orders</code>；<code>stamp_cards</code>、<code>point_transactions</code> 歸 <code>loyalty</code>。別的模組要讀資料，呼叫擁有者的 service；要改資料，請擁有者改。</p>
+<p>為什麼要這麼嚴格？因為資料表的欄位意義、哪些欄位要一起更新、狀態怎麼轉換，這些規則都寫在擁有者的程式裡。別的模組直接寫這張表，就繞過了這些規則；擁有者要改表結構時，也不知道還有誰在用。</p>
+<p>要注意的是，Nest 不會替你守這條規則。<code>PrismaService</code> 是全域的，任何模組都注入得到，<code>notifications</code> 想直接 <code>this.prisma.order.findUnique</code> 完全做得到。所以這條規則一開始只能靠自律，這也是後面要寫架構測試的原因。</p>
+<p>拿它檢查起始專案：<code>stampCard</code>、<code>pointTransaction</code> 只出現在 <code>loyalty</code>，目前沒違規；但 <code>notifications</code> 的收據 listener 直接用 <code>OrdersRepository</code> 讀訂單，等於繞過 <code>orders</code> 的公開入口碰它的資料，這一點留到規則二一起看。</p>
+
+<h3>規則二：exports 只放別人真的需要的（最小公開）</h3>
+<p>這條規則回答「模組公開什麼」。<code>orders</code> 模組正確的樣子是：</p>
+<pre>// orders.module.ts
+@Module({
+  imports: [CatalogModule],                    // orders 依賴 catalog 的報價
+  controllers: [OrdersController],
+  providers: [OrdersService, OrdersRepository],
+  exports: [OrdersService],                    // repository 是內部，不給別人
+})
+export class OrdersModule {}</pre>
+<p><code>OrdersRepository</code> 不 export，原因是它的方法形狀是 <code>orders</code> 內部的約定：<code>findWithItems</code> 找不到時回傳 <code>null</code>、會 include 哪些欄位，這些都可能因為 <code>orders</code> 自己的需求而改。別的模組一旦依賴它，<code>orders</code> 每次調整 repository 都得先找遍所有使用者。<code>OrdersService.findOne</code> 則是刻意維護的公開契約：找不到時丟 404 例外，回傳的形狀不會隨便改。<code>notifications</code> 要訂單內容，就該注入 <code>OrdersService</code> 呼叫 <code>findOne</code>。公開的東西每一個都是承諾，公開得越少，將來能自由改的東西越多。</p>
+<p>判斷「有沒有公開」時，看的是別人實際上拿到什麼，不是名字。用 <code>{ provide: 'ORDERS_REPO', useExisting: OrdersRepository }</code> 換一個字串 token 再 export，別的模組注入 <code>'ORDERS_REPO'</code> 拿到的還是同一個 repository；還有一種是 barrel 檔：一個自己不寫程式、只用 <code>export * from</code> 把其他檔案的東西整批轉出去的檔案，讓別人從一個入口 import。把 <code>src/orders/events/</code> 做成 barrel，裡面轉 export 了 <code>orders.module.js</code>，別人「看起來只 import 了 events/」，實際上拿到整個模組。這兩種都算公開。</p>
+<p>拿它檢查起始專案：<code>OrdersRepository</code> 被放進 <code>SharedModule</code> 的 exports，等於公開給所有模組，收據 listener 就是這樣拿到它的。這是一個違規。</p>
+
+<h3>規則三：依賴只能單向</h3>
+<p>這條規則回答「誰可以依賴誰」。把模組畫成方塊，「A import B」就畫一個從 A 指向 B 的箭頭。健康的圖沒有環：<code>orders → catalog</code>（下單要報價）、<code>notifications → orders</code>（寄收據要讀訂單內容），箭頭一路往下，不會繞回來。</p>
+<p>一旦出現 <code>orders → loyalty</code> 又 <code>loyalty → orders</code>，就是<strong>循環依賴</strong>：兩個模組互相需要對方才能成立。第 25 課看過它的症狀：Vitest 能跑，<code>nest build</code> 之後 <code>node dist/main.js</code> 在啟動時 <code>ReferenceError</code>；<code>forwardRef</code> 可以讓它啟動，但兩個模組還是綁在一起，單獨建立任何一個都不行。</p>
+<p>拿它檢查起始專案：<code>orders ↔ loyalty</code> 正是開場那段程式，這是第二個違規。三條規則檢查下來，要修的有兩處：循環依賴，以及把 repository 公開給全世界的 <code>SharedModule</code>。這就是開場問題的答案：改集點規則要動兩個模組，是因為規則三被打破；修好這兩處，<code>loyalty</code> 才真正自己管集點。</p>
+<div class="callout practice"><strong>💡 實務上：邊界照「誰會來要求改」畫，不是照技術分層畫</strong><br>接手舊專案時，資深工程師通常先問：過去半年哪些需求總是要一起改好幾個資料夾？那就是邊界畫錯的地方。邊界跟著業務能力走：集點規則是行銷提的、付款流程是店長和金流商在意的，它們分開改，就該是不同模組；<code>controllers/</code>、<code>services/</code> 這種依技術分的資料夾不算邊界。也別一開始就切得太細，一兩個人做的新專案先分三四個模組就好，等某塊開始被不同的人、用不同的節奏修改，再把它切出來。</div>
+
+<h2>orders 和 loyalty 互相 import，怎麼解開？</h2>
+<p>先修循環依賴，因為它是讓集點規則動不了的直接原因。解循環的第一步不是改程式，而是看清楚循環裡的兩個箭頭各自要什麼：</p>
+<ul>
+  <li><code>orders → loyalty</code>：付款成功後，要通知 loyalty 加點。</li>
+  <li><code>loyalty → orders</code>：加點要知道是哪位客人（<code>customerId</code>）、花了多少錢（<code>total</code>），所以回頭 <code>findOne</code>。</li>
+</ul>
+<p>兩個箭頭其實在傳遞同一件事：「訂單付款了，這是這張訂單的事實」。如果 <code>orders</code> 把這件事連同事實一起宣布出去，<code>orders</code> 就不必知道誰要加點，<code>loyalty</code> 也不必回頭查訂單，兩個箭頭同時消失。這個「宣布已經發生的事」的物件，叫做<strong>領域事件</strong>（domain event）。</p>
+
+<figure>
+  <svg viewBox="0 0 700 300" role="img" aria-label="左邊：orders 與 loyalty 互相指向，形成循環；右邊：orders 發出 order.paid 事件放在 events 資料夾，loyalty 與 notifications 各自訂閱，所有箭頭單向">
+    <defs><marker id="a26" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <text class="d-accent" x="160" y="28" text-anchor="middle">改之前：互相認識</text>
+    <rect class="d-box" x="40" y="60" width="110" height="50" rx="8"/>
+    <text class="d-text" x="95" y="90" text-anchor="middle">orders</text>
+    <rect class="d-box" x="190" y="60" width="110" height="50" rx="8"/>
+    <text class="d-text" x="245" y="90" text-anchor="middle">loyalty</text>
+    <line class="d-line" x1="150" y1="75" x2="186" y2="75" marker-end="url(#a26)"/>
+    <line class="d-line" x1="190" y1="97" x2="154" y2="97" marker-end="url(#a26)"/>
+    <text class="d-small" x="170" y="135" text-anchor="middle">addPointsForOrder</text>
+    <text class="d-small" x="170" y="152" text-anchor="middle">findOne（拿 total）</text>
+    <text class="d-small" x="170" y="185" text-anchor="middle">forwardRef 讓它啟動，</text>
+    <text class="d-small" x="170" y="202" text-anchor="middle">循環還在</text>
+    <line class="d-line" x1="340" y1="40" x2="340" y2="280" stroke-dasharray="4 4"/>
+    <text class="d-accent" x="530" y="28" text-anchor="middle">改之後：只認識事件</text>
+    <rect class="d-box" x="380" y="60" width="110" height="50" rx="8"/>
+    <text class="d-text" x="435" y="90" text-anchor="middle">orders</text>
+    <rect class="d-soft" x="380" y="150" width="110" height="60" rx="8"/>
+    <text class="d-text" x="435" y="174" text-anchor="middle">events/</text>
+    <text class="d-small" x="435" y="194" text-anchor="middle">OrderPaidEvent</text>
+    <rect class="d-box" x="560" y="60" width="110" height="50" rx="8"/>
+    <text class="d-text" x="615" y="90" text-anchor="middle">loyalty</text>
+    <rect class="d-box" x="560" y="230" width="110" height="50" rx="8"/>
+    <text class="d-text" x="615" y="260" text-anchor="middle">notifications</text>
+    <line class="d-line" x1="435" y1="110" x2="435" y2="146" marker-end="url(#a26)"/>
+    <text class="d-small" x="447" y="133">emit</text>
+    <line class="d-line" x1="560" y1="100" x2="494" y2="160" marker-end="url(#a26)"/>
+    <line class="d-line" x1="560" y1="245" x2="494" y2="200" marker-end="url(#a26)"/>
+    <text class="d-small" x="540" y="140">@OnEvent</text>
+    <text class="d-small" x="540" y="230">@OnEvent</text>
+    <text class="d-small" x="530" y="296" text-anchor="middle">orders 不知道誰在聽；聽的人只碰 events/</text>
+  </svg>
+  <figcaption>解循環不是把箭頭藏起來，是讓其中一方不再認識另一方：orders 只宣布「訂單付款了」，需要知道的模組自己訂閱。</figcaption>
+</figure>
+
+<p>事件本身是一個只有資料的類別，放在 <code>orders</code> 底下一個專門對外的資料夾：</p>
+<pre>// src/orders/events/order-paid.event.ts：orders 的公開契約
+export class OrderPaidEvent {
+  constructor(
+    readonly orderId: number,
+    readonly customerId: number,
+    readonly total: number,
+    readonly paidAt: Date,
+  ) {}
+}
+export const ORDER_PAID = 'order.paid'</pre>
+<p>事件裡放什麼，決定了依賴會不會長回來。原則是放<strong>聽的人需要的事實</strong>：有了 <code>customerId</code>、<code>total</code>，loyalty 就不必回頭查訂單。如果只放 <code>orderId</code>，聽的人還是得注入 <code>OrdersService</code> 去查，<code>loyalty → orders</code> 的箭頭就又回來了。</p>
+<p>第 21 課寫過發與聽的程式，這一課的重點是它對依賴圖的影響。<code>orders</code> 付款完只負責宣布，<code>loyalty</code> 只 import 事件檔：</p>
+<pre>// orders.service.ts：付款只宣布，不知道誰在聽
+async pay(id: number) {
+  const order = await this.repo.markPaid(id)
+  if (!order) { await this.findOne(id); throw new ConflictException(`訂單 ${id} 已經付過了`) }
+  this.events.emit(ORDER_PAID, new OrderPaidEvent(order.id, order.customerId, order.total, new Date()))
+  return order
+}
+
+// loyalty.service.ts：只 import src/orders/events/，不認識 OrdersService
+@OnEvent(ORDER_PAID, { async: true })
+async handleOrderPaid(event: OrderPaidEvent) {
+  const points = Math.floor(event.total / 100)
+  if (points === 0) return
+  const card = await this.prisma.stampCard.upsert({ where: { customerId: event.customerId }, create: { customerId: event.customerId }, update: {} })
+  await this.prisma.pointTransaction.create({ data: { cardId: card.id, orderId: event.orderId, points, reason: '消費' } })
+}</pre>
+<p>改完之後，<code>LoyaltyModule</code> 不 import <code>OrdersModule</code>，<code>OrdersModule</code> 也不 import <code>LoyaltyModule</code>，<code>forwardRef</code> 全部拿掉。<code>src/orders/events/</code> 這個資料夾成了 <code>orders</code> 對外的契約：別的模組只能從這裡 import，裡面的檔案也不能轉 export <code>orders</code> 的其他東西（規則二講過的 barrel 問題）。回到任務：現在要改集點規則，只要改 <code>handleOrderPaid</code>；如果新規則需要訂單明細，就在事件裡加欄位，<code>orders</code> 只負責把事實放進去，不必知道點數怎麼算。</p>
+<p>解循環時，有三種做法看起來解了，其實沒有。第一種是<strong>留著 <code>forwardRef</code> 以防萬一</strong>：循環已經不存在，<code>forwardRef</code> 只是把一條不存在的依賴藏起來，讓下一個讀程式的人以為還需要它，應該拿掉。第二種是<strong>把加點搬進 <code>orders</code></strong>：<code>orders</code> 自己寫 <code>pointTransaction</code>，確實沒有循環了，但違反資料歸屬，集點規則一改，要改的變成 <code>orders</code>，任務等於倒退。第三種是<strong>訂閱事件，但 handler 裡還是 <code>this.orders.findOne</code></strong>：<code>loyalty</code> 依舊 import <code>orders.service.ts</code>，依賴圖完全沒變，只是呼叫的時機換了；把事實放進事件，就不用回頭查。</p>
+<p>還有一個限制要記得：第 21 課說過程序內事件在當機時會遺失、也沒有重試，所以只適合「掉了也不會出大事」的工作。這一課先用它把依賴方向弄對；第 27 課把同一個事件改成 outbox 加佇列，事件的形狀不變，只換傳遞的方式。能這樣換，正是邊界畫對的好處：<code>loyalty</code> 只認識事件，不在乎事件是怎麼送來的。</p>
+<div class="callout practice"><strong>💡 實務上：事件用來「通知已經發生的事」，需要答案時還是直接呼叫</strong><br><code>orders</code> 算總價時要報價，結果拿不到就不能下單，這種情況直接呼叫 <code>CatalogService</code>，不要改成發事件再等回覆。事件適合「付款完成後順便要做的事」：加點、寄收據、更新看板。代價是流程變得不好追：客服回報「付款了點數沒加」，你得知道 <code>order.paid</code> 有哪些 handler，所以事件名稱集中成常數、handler 裡記錄 <code>orderId</code> 的 log，搜尋一次就能找全。把每個呼叫都改成事件，最後沒人說得清楚付款後到底發生什麼事。</div>
+
+<h2>什麼都放的 SharedModule，怎麼拆回各模組？</h2>
+<p>循環解開了，三條規則檢查出的第二個違規還在：那個誰要用誰注入的 <code>@Global()</code> <code>SharedModule</code>。起始專案的 <code>AppModule</code> 裡有這一段：</p>
+<pre>@Global()
+@Module({
+  providers: [Mailer, PricingService, OrdersRepository],
+  exports: [Mailer, PricingService, OrdersRepository],
+})
+export class SharedModule {}</pre>
+<p>它的誕生很自然：「報價大家都會用」「寄信大家都會用」，放進一個全域模組最省事，任何模組都不用 import 就能注入。問題是這份方便讓三件事一起消失了。</p>
+<p>第一，<strong>歸屬消失</strong>。<code>PricingService</code> 要查 <code>products</code>，它是 <code>catalog</code> 的；<code>OrdersRepository</code> 是 <code>orders</code> 的內部。放進 <code>SharedModule</code> 之後，沒有一個業務模組擁有它們，誰都能用、誰都能改，規則一失去了依據。</p>
+<p>第二，<strong>依賴圖消失</strong>。打開 <code>NotificationsModule</code>，看不出它依賴 <code>orders</code>，因為它什麼都沒 import，卻注入了 <code>OrdersRepository</code>。規則三要靠模組的 <code>imports</code> 畫出箭頭，全域模組讓這些箭頭隱形，循環也可能藏在裡面。第 4 課說過 <code>@Global</code> 只該留給「幾乎每個模組都要、整個應用只有一份」的基礎設施，例如設定、資料庫連線。</p>
+<p>第三，<strong>封裝消失</strong>。<code>OrdersRepository</code> 被 export 給全世界，違反規則二；<code>orders</code> 想改 repository 的介面，就得先找出所有用它的地方。</p>
+<p>拆的方法是把每個 provider 送回擁有它的模組，再把依賴寫回 <code>imports</code>。每個 provider 要回答三個問題：它屬於誰、誰需要它、需要的人怎麼正當地拿到：</p>
+<div class="table-wrap"><table>
+  <tr><th>provider</th><th>搬到</th><th>誰需要它</th><th>怎麼拿</th></tr>
+  <tr><td><code>PricingService</code></td><td><code>CatalogModule</code>，export</td><td><code>orders</code></td><td><code>OrdersModule</code> imports <code>CatalogModule</code></td></tr>
+  <tr><td><code>OrdersRepository</code></td><td><code>OrdersModule</code>，不 export</td><td>只有 <code>orders</code> 自己</td><td><code>notifications</code> 改注入 <code>OrdersService</code></td></tr>
+  <tr><td><code>Mailer</code></td><td><code>NotificationsModule</code>，不 export</td><td>只有 <code>notifications</code> 自己</td><td>—</td></tr>
+</table></div>
+<p>拆完之後，<code>@Global()</code> 只剩 <code>PrismaModule</code>。有兩種拆法看起來完成了，其實沒過關。一種是拿掉 <code>@Global</code> 但留著 <code>SharedModule</code>，改成到處 import 它：箭頭看得到了，但三個 provider 還是沒有歸屬，<code>OrdersRepository</code> 還是公開的。另一種是因為 <code>PrismaService</code> 全域拿得到，<code>notifications</code> 乾脆自己 <code>this.prisma.order.findUnique</code>，省掉 import <code>OrdersModule</code>：這直接違反資料歸屬，比原本還糟。</p>
+<p>拆對之後，每個模組檔就是一份依賴說明書：<code>OrdersModule imports [CatalogModule]</code>、<code>NotificationsModule imports [OrdersModule]</code>，看一眼就知道誰靠誰。Nest 也會幫你守住一半：注入了沒 import 的模組裡的 provider，或對方沒 export 的 provider，啟動時就是第 4 課那個 <code>Nest can't resolve dependencies</code>。到這裡，起始專案的兩個違規都修好了，改集點規則只需要動 <code>loyalty</code>。但 Nest 守住的只是一半：循環只要加上 <code>forwardRef</code>，它就放行了，而檔案之間的循環要到 <code>nest build</code> 之後啟動才會炸；不碰別人的表，它完全不檢查。下一個趕進度的 PR 隨手加一行 import，今天的成果就沒了。</p>
+
+<h2>修好了，怎麼不被下一個 PR 改回去？架構測試</h2>
+<p>規則寫在 README 裡，三個月後就沒人記得；寫在 code review 的檢查表裡，趕進度的那週就被跳過。唯一不會累的守門員是測試。<strong>架構測試</strong>（architecture test）是一種特別的測試：它不啟動 Nest、不連資料庫，只讀 <code>src</code> 底下的原始碼文字，檢查 import 關係與資料存取有沒有違反規則。違規的 PR 在 CI 上就紅，合併不進來。</p>
+<p>要寫的是三個檢查，對應前面的規則：沒有循環 import（規則三）、<code>orders</code> 不 import <code>loyalty</code>（讓這次修好的方向固定下來）、只有 <code>loyalty</code> 碰集點的表（規則一）。為了做到這三件事，需要先準備三樣東西：檔案清單、每個檔案 import 了誰、找環的方法。</p>
+<p>第一步，列出所有要檢查的檔案。一定要每次執行時重新掃描，新加的檔案才會被管到；寫死清單的話，明天新加的違規檔案根本不在檢查範圍裡。Prisma 產生的程式碼（<code>src/generated/</code>）不是我們寫的，它的註解裡就有 <code>prisma.stampCard.findMany()</code> 這樣的範例，不略過的話資料歸屬那條會誤報：</p>
+<pre>const SRC = join(import.meta.dirname, '..', 'src')
+const files = readdirSync(SRC, { recursive: true, encoding: 'utf8' })
+  .filter(f =&gt; f.endsWith('.ts') &amp;&amp; !f.endsWith('.spec.ts') &amp;&amp; !f.startsWith('generated/'))
+  .map(f =&gt; join(SRC, f))
+const code = new Map(files.map(f =&gt; [f, readFileSync(f, 'utf8')]))</pre>
+<p>第二步，從每個檔案找出它 import 了 <code>src</code> 裡的哪些檔案，這就是依賴圖的箭頭。有兩個細節要處理。一是路徑：專案用 ESM（Node 原生的模組格式，<a href="01-why-nestjs.html">第 1 課</a>建立專案時選的），規定相對 import 要寫編譯後的檔名，所以 import 寫的是 <code>'./x.js'</code>；但原始碼檔案是 <code>x.ts</code>，要換回 <code>.ts</code> 才對得上清單。二是 <code>import type</code>：它只用來檢查型別，編譯後整行消失，不會在執行時載入對方，所以它算依賴（<code>orders</code> 不該 import <code>loyalty</code> 的型別），但不會造成啟動時的循環問題。函式用參數 <code>types</code> 決定要不要算它：</p>
+<pre>function importsOf(file: string, { types = true } = {}) {
+  const found: string[] = []
+  for (const m of code.get(file)!.matchAll(/(import|export)\s+(type\s+)?[^'"]*?from\s+['"](\.[^'"]+)['"]|import\s+['"](\.[^'"]+)['"]/g)) {
+    if (m[2] &amp;&amp; !types) continue
+    const target = resolve(dirname(file), m[3] ?? m[4]).replace(/\.js$/, '.ts')
+    if (code.has(target)) found.push(target)
+  }
+  return found
+}</pre>
+<p>第三步，找循環。兩個檔案互相 import 只是最短的環；<code>a → b → c → a</code> 也是環，而且更難用肉眼發現，只檢查「兩兩互相 import」抓不到它。找任意長度的環，用的是<strong>深度優先搜尋</strong>（depth-first search，DFS）：從一個檔案出發，沿著它的 import 一路往下走到底，走不下去才退回來換另一條路。走的時候記住「目前這條路徑經過了哪些檔案」；如果下一步要走到的檔案已經在目前路徑上，代表繞回來了，那一段路徑就是一個環。已經完整走過、確定沒有環的檔案記在 <code>done</code>，下次遇到就不必再走：</p>
+<pre>function findCycle(): string[] | undefined {
+  const done = new Set&lt;string&gt;()
+  const path: string[] = []
+  const visit = (f: string): string[] | undefined =&gt; {
+    if (path.includes(f)) return [...path.slice(path.indexOf(f)), f]   // 繞回來了
+    if (done.has(f)) return                                           // 這條路走過，沒有環
+    path.push(f)
+    for (const next of importsOf(f, { types: false })) {
+      const cycle = visit(next)
+      if (cycle) return cycle
+    }
+    path.pop()
+    done.add(f)
+  }
+  for (const f of files) { const cycle = visit(f); if (cycle) return cycle }
+}</pre>
+<p>第四步，把三個檢查寫成三個 <code>it</code>。失敗訊息要讓三個月後的同事知道該怎麼修，不是只說「不行」；找到環時，把整個環印成 <code>a → b → c → a</code>，修的人一眼就知道從哪裡下手：</p>
+<pre>const rel = (f: string) =&gt; relative(SRC, f)
+const under = (folder: string) =&gt; (f: string) =&gt; rel(f).startsWith(folder + '/')
+
+it('src 裡沒有循環 import', () =&gt; {
+  expect(findCycle()?.map(rel).join(' → ')).toBeUndefined()
+})
+it('src/orders 不 import src/loyalty', () =&gt; {
+  const bad = files.filter(under('orders')).flatMap(f =&gt; importsOf(f).filter(under('loyalty')).map(t =&gt; `${rel(f)} → ${rel(t)}`))
+  expect(bad, 'orders 不能認識 loyalty：改成發事件').toEqual([])
+})
+it('只有 src/loyalty 會碰 stampCard、pointTransaction', () =&gt; {
+  const bad = files.filter(f =&gt; !under('loyalty')(f) &amp;&amp; /\.(stampCard|pointTransaction)\./.test(code.get(f)!)).map(rel)
+  expect(bad, '這些檔案直接查 loyalty 的資料表：改成呼叫 loyalty 的公開 service').toEqual([])
+})</pre>
+<p>寫完之後還有一個問題：怎麼知道這份測試真的有用？一份在正確程式上全綠的測試，可能只是什麼都沒檢查。驗證方法是故意把程式改壞，看測試會不會紅：新加一個 <code>catalog/vip.ts</code> 直接查 <code>prisma.stampCard</code>，測試要紅；三個新檔案繞成一圈，測試要紅。反過來，也要拿它跑在合法的修改上，例如 <code>catalog</code> 多一個遵守規則的檔案，測試要綠，否則它會擋下正常開發。這種「故意製造錯誤版本，確認測試抓得到」的做法叫突變測試（mutation testing），第 5 課寫測試練習時用過，練習 2 也用它判分。</p>
+<p>常見的三種假測試，都過不了這一關。<strong>寫死檔案清單</strong>：只檢查現在的 19 個檔案，新加的違規檔案完全不管。<strong>只檢查兩個檔案</strong>：<code>orders.service.ts</code> 和 <code>loyalty.service.ts</code> 之間沒有互相 import，但新加的 <code>orders/points-preview.ts</code> import 了 <code>loyalty</code> 卻沒人看。<strong>拍快照</strong>：<code>expect(files.length).toBe(19)</code>、檢查某個檔案的長度，任何合法的修改都會讓它紅，兩天後大家就學會直接改期望值，測試名存實亡。</p>
+<p>架構測試跟一般測試一起放在 CI（部署課第 15 課），每個 PR 都跑。它只讀檔案，幾毫秒就跑完；比起循環 import 拖到正式環境啟動失敗才發現，代價小得多。現在邊界畫好了，也有測試守住，任務完成。</p>
+<div class="callout practice"><strong>💡 實務上：現成工具可以接手，舊專案先把現況當基準</strong><br>自己寫架構測試是為了看懂原理；團隊裡常直接用 <code>dependency-cruiser</code>、<code>eslint-plugin-boundaries</code> 這類套件，用設定檔描述「哪個資料夾不能 import 哪個」，Nest 專案也適用。把它導入已經很亂的舊專案時，第一天一定滿江紅，常見做法是把目前的違規列成允許清單，規則只擋「新增」的違規，之後每週清掉幾條。規則數量寧少勿多：先守住「沒有循環」和「不碰別人的表」，剩下的等真的被踩到再加。</div>
+
+<h2>邊界都畫好了，為什麼不直接拆成微服務？</h2>
+<p>邊界畫清楚、模組之間只靠事件和公開 service 往來，常有人接著問：既然每個模組都能獨立了，為什麼不乾脆拆成微服務，各自部署？</p>
+<p><a href="../../system-design/lessons/15-monolith-microservices.html">系統設計課第 15 課</a>算過拆開的代價。原本在同一個程序裡的函式呼叫，變成網路呼叫：一次結帳要經過的每一段延遲會相加，每個服務的可用性會相乘，任何一個服務掛掉都可能讓結帳失敗。資料分散到不同服務之後，也不能用一個資料庫交易保證一起成功或一起失敗，只能接受<strong>最終一致</strong>：資料會有一小段時間對不上，最後才變成一致。例如付款成功了，點數可能晚幾秒才加上，這幾秒內查點數會看到舊的數字，系統和使用者都要能容忍。為了讓「最後一定會一致」成立，要靠<a href="27-capstone.html">第 27 課</a>會用到的 outbox，以及 saga 這類失敗時逐步補償回去的流程（<a href="../../system-design/lessons/13-saga.html">系統設計課第 13 課</a>）。查詢也變麻煩：原本一個 JOIN 就能查的資料，要分別呼叫幾個服務，再在程式裡把結果組起來，這種做法叫 API composition。</p>
+<p>更關鍵的是邊界畫錯時的代價。在模組化單體裡，邊界畫錯只要搬幾個檔案、改幾個 import；拆成微服務之後，同一個錯誤被網路和部署流程固定下來，要改 API 合約、改部署、搬資料，代價高得多。兩種做法的差別整理如下：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>模組化單體</th><th>微服務</th></tr>
+  <tr><td>邊界靠什麼守</td><td>模組的 exports、架構測試、code review</td><td>程序與網路：想越界也做不到</td></tr>
+  <tr><td>跨模組一致性</td><td>同一個資料庫交易</td><td>outbox、saga、最終一致</td></tr>
+  <tr><td>部署</td><td>一份，一起上</td><td>各自部署，各自版本</td></tr>
+  <tr><td>除錯</td><td>一個程序、一份 log</td><td>要分散式追蹤</td></tr>
+  <tr><td>邊界畫錯的代價</td><td>搬幾個檔案、改幾個 import</td><td>改 API、改部署、資料搬遷</td></tr>
+</table></div>
+<p>所以順序是：先在單體裡用這一課的方法畫好邊界、用事件解開耦合、用架構測試守住；等某個模組真的有獨立擴展或獨立部署的需求（例如集點要給十家分店共用），再沿著已經畫好的線拆出去。那時 <code>OrderPaidEvent</code> 從程序內事件變成佇列訊息，<code>loyalty</code> 的 handler 幾乎不用改。這一課做的幾個決定，包括事件、只留 Prisma 全域、repository 不公開、先不拆服務，都會在之後被質疑；最後一件事是把它們留下紀錄。</p>
+
+<h2>半年後新同事問「為什麼」，答案寫在哪？ADR</h2>
+<p>半年後新同事接手集點功能，會問：「為什麼 loyalty 不能直接查訂單？多查一次很慢嗎？」如果答案只在你腦子裡，規則就會被「合理地」打破：他有一個說得通的理由，架構測試擋住他，他就把測試改掉。規則需要一個寫得清楚的出處。</p>
+<p>這個出處叫 <strong>ADR</strong>，全名 Architecture Decision Record（架構決策紀錄）：一份短文件，記下一個決定的背景、考慮過的選項、最後的決定，以及這個決定帶來的後果。<a href="../../system-design/lessons/18-design-docs-adr.html">系統設計課第 18 課</a>教過寫法，這一課的第一份可以長這樣：</p>
+<pre>docs/adr/0001-modules-communicate-by-events.md
+
+# 1. 模組之間用領域事件，不互相呼叫 service
+
+狀態：已採用（2026-11）
+
+## 背景
+orders 與 loyalty 互相 import，nest build 後啟動失敗，forwardRef 暫時撐著。
+集點規則每季會改，改的時候不想碰 orders。
+
+## 選項
+A. 保留 forwardRef：零改動；循環仍在，之後每加一個模組都可能再繞一圈。
+B. 把加點搬進 orders：解掉循環；loyalty 的資料表被 orders 寫，違反資料歸屬。
+C. orders 發 order.paid，loyalty 訂閱：orders 不認識 loyalty；事件遺失時點數會漏（第 21 課），
+   第 27 課改 outbox 補上。
+
+## 決定
+C。src/orders/events/ 是 orders 唯一的對外契約，架構測試擋 orders → loyalty 的 import。
+
+## 後果
++ loyalty 可以單獨建立與測試；拆服務時切口已經在。
+- 程序內事件不可靠，付款後加點在當機時會漏；追蹤單 #142 排定改 outbox。</pre>
+<p>注意這份 ADR 的內容幾乎都來自這一課的推導：背景是開場的事故，選項 A、B 是「看起來解了」的兩種做法，C 是最後的做法，後果寫明程序內事件的限制。ADR 不是設計文件，一頁以內就好；重點在「選項」和「後果」，尤其是你放棄了什麼、留下了什麼債。有了它，架構測試的失敗訊息可以直接寫「見 ADR 0001」，新同事被測試擋下時，順著訊息就能讀到當初的理由。</p>
+<div class="callout practice"><strong>💡 實務上：不是每個決定都要寫 ADR</strong><br>值得寫的是「之後很難改」或「一定會有人質疑」的決定：模組怎麼溝通、選哪個佇列、要不要拆服務。選哪個日期套件、變數怎麼命名就不用。ADR 放在 repo 裡跟著程式一起 review，PR 描述附上連結，審的人才知道這個改動背後的理由。決定改變時不要刪舊的，新寫一份並把舊的狀態改成「已被 000X 取代」，歷史才看得出當初為什麼那樣做。</div>
+
+<h2>練習</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs nestjs 26</code> 建立 <code>work/26/</code>。這一題用到 PostgreSQL，先確認容器在跑（在 <code>learn/nestjs/practice</code> 執行 <code>docker compose up -d --wait</code>，第 12 課）。專案已經有：</p>
+<ul>
+  <li>四個業務模組：<code>catalog</code>（<code>PricingService.quote</code>、<code>GET /products</code>）、<code>orders</code>（<code>POST /orders</code>、<code>GET /orders/:id</code>、<code>POST /orders/:id/pay</code>，<code>OrdersRepository</code> 用條件更新 <code>markPaid</code>）、<code>loyalty</code>（<code>GET /loyalty/:customerId</code> 查餘額）、<code>notifications</code>（<code>ReceiptsListener</code> 聽 <code>order.paid</code> 寄收據，<code>Mailer</code> 只記在記憶體）。</li>
+  <li>資料表與 migration 都建好，<code>schema.prisma</code> 的註解寫了每張表歸哪個模組；<code>point_transactions.order_id</code> 有唯一約束，同一張訂單只能加一次點。</li>
+  <li><code>src/orders/events/order-paid.event.ts</code>：<code>OrderPaidEvent</code>（<code>orderId</code>、<code>customerId</code>、<code>total</code>、<code>paidAt</code>）與 <code>ORDER_PAID</code>；<code>OrdersService.pay</code> 已經會 <code>emit</code>。</li>
+  <li>兩個要修的問題：<code>orders ↔ loyalty</code> 用 <code>forwardRef</code> 撐著的循環（練習 1）；<code>AppModule</code> 裡 <code>@Global()</code> 的 <code>SharedModule</code>（練習 3）。</li>
+</ul>
+<p>想親眼看循環的症狀：在 <code>work/26</code> 執行 <code>npm run build</code> 再 <code>node dist/main.js</code>（要先 <code>npx prisma migrate deploy</code> 建開發用資料庫 nest_26），對照第 25 課讀錯誤訊息；做完練習 1 再啟動一次。</p>
+
+<div class="local" data-test="ex1" data-files="src/orders/orders.module.ts src/orders/orders.service.ts src/loyalty/loyalty.module.ts src/loyalty/loyalty.service.ts">
+  <p>練習 1：用 <code>order.paid</code> 事件打破 <code>orders ↔ loyalty</code> 的循環。</p>
+  <ul>
+    <li><code>OrdersService.pay</code> 不再呼叫 <code>LoyaltyService</code>，只 <code>emit</code> 事件（已經有）；拿掉 constructor 裡的 <code>LoyaltyService</code>，<code>OrdersModule</code> 不再 import <code>LoyaltyModule</code>。</li>
+    <li><code>LoyaltyService</code> 把 <code>addPointsForOrder</code> 改成 <code>@OnEvent(ORDER_PAID, { async: true })</code> 的 handler，用事件裡的 <code>customerId</code>、<code>total</code> 算點數（每滿 100 元 1 點，0 點不寫），加點紀錄的 <code>orderId</code> 用事件裡的；不注入 <code>OrdersService</code>。<code>LoyaltyModule</code> 不 import <code>OrdersModule</code>。</li>
+    <li><code>src</code> 裡一個 <code>forwardRef</code> 都不留。</li>
+  </ul>
+  <p>判分：掃描 <code>src</code> 確認沒有 <code>forwardRef</code>、沒有任何長度的循環 import、<code>src/orders</code> 不 import <code>src/loyalty</code>、<code>src/loyalty</code> 走任何 import 鏈都只碰得到 <code>src/orders/events/</code>（所以 <code>events/</code> 裡做 barrel 轉 export 也會被抓到）、只有 <code>src/loyalty</code> 出現 <code>stampCard</code>／<code>pointTransaction</code>（<code>prisma['stampCard']</code>、原生 SQL 的 <code>stamp_cards</code> 都算）。行為：付款 220 元後 <code>GET /loyalty/7</code> 是 2 點，重複付款回 409 不再加點；只用 <code>ConfigModule</code>、<code>EventEmitterModule</code>、<code>PrismaModule</code>、<code>LoyaltyModule</code> 建立應用，直接 <code>emit</code> 一個 <code>OrderPaidEvent(41, 9, 350, …)</code> 要加 3 點、<code>orderId</code> 是 41；最後 <code>nest build</code> 之後 <code>node dist/main.js</code> 要能啟動並回應 <code>GET /loyalty/1</code>。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="test/architecture.spec.ts">
+  <p>練習 2：寫架構測試 <code>test/architecture.spec.ts</code>（起始檔是三個 <code>it.todo</code>），在 <code>work/26</code> 用 <code>npm test</code> 跑。三條規則：</p>
+  <ul>
+    <li><code>src</code> 裡沒有循環 import（任意長度；<code>import type</code> 不算）。</li>
+    <li><code>src/orders</code> 底下的檔案不 import <code>src/loyalty</code> 的任何檔案。</li>
+    <li>只有 <code>src/loyalty</code> 底下的檔案可以出現 <code>.stampCard.</code> 或 <code>.pointTransaction.</code>（<code>this.prisma.stampCard.…</code>、<code>tx.pointTransaction.…</code> 都算）。</li>
+  </ul>
+  <p>每次都用 <code>readdirSync(SRC, { recursive: true })</code> 列出 <code>src</code> 底下現在所有的 <code>.ts</code>，略過 <code>src/generated/</code> 和 <code>*.spec.ts</code>；不要寫死檔案清單、檔案數量或內容。</p>
+  <p>判分：你的測試會先在正確的程式上跑（要全部通過、沒有 skip／todo、每個測試至少一個 <code>expect</code>），然後被拿去跑在多個故意違規的版本上，每一個都要有測試失敗：三個新檔案繞成 <code>catalog → orders → prisma → catalog</code> 的環；<code>orders</code> 新加的檔案 import <code>loyalty.service.ts</code>；<code>orders.service.ts</code> 多一行 import <code>LoyaltyModule</code>；<code>catalog</code> 新加的檔案查 <code>prisma.stampCard</code>；<code>orders</code> 新加的檔案在交易裡寫 <code>tx.pointTransaction</code>。另外有一個合法的修改（<code>catalog</code>、<code>loyalty</code> 各多一個遵守規則的檔案，<code>orders.service.ts</code> 多一個 export），你的測試在它上面要照樣通過。這一題只讀檔案，不需要資料庫。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="src/app.module.ts src/catalog/catalog.module.ts src/orders/orders.module.ts src/notifications/notifications.module.ts src/notifications/receipts.listener.ts">
+  <p>練習 3：拆掉 <code>SharedModule</code>，每個 provider 回到擁有它的模組。</p>
+  <ul>
+    <li><code>PricingService</code> → <code>CatalogModule</code> 的 providers 並 export；<code>OrdersModule</code> imports <code>CatalogModule</code>。</li>
+    <li><code>OrdersRepository</code> → <code>OrdersModule</code> 的 providers，<strong>不</strong> export；<code>OrdersModule</code> 的 exports 只有 <code>OrdersService</code>。</li>
+    <li><code>Mailer</code> → <code>NotificationsModule</code> 的 providers。<code>ReceiptsListener</code> 改注入 <code>OrdersService</code>，用 <code>findOne</code> 讀訂單（找不到會丟 404，不用再判 <code>null</code>）；<code>NotificationsModule</code> imports <code>OrdersModule</code>。</li>
+    <li>刪掉 <code>SharedModule</code>。<code>@Global()</code> 只留 <code>PrismaModule</code>。</li>
+  </ul>
+  <p>判分：掃描 <code>src</code> 與模組的 metadata：<code>@Global()</code> 只在 <code>prisma.module.ts</code>；<code>Mailer</code>、<code>PricingService</code>、<code>OrdersRepository</code> 各只由一個模組提供（換個名字再做一個什麼都放的模組也會被抓到）；沒有任何模組 export <code>OrdersRepository</code>，包括用字串 token 轉手；<code>src/orders</code> 以外沒有檔案查 <code>order</code>／<code>orderItem</code> 或 import <code>orders.repository.js</code>；每個注入的依賴都在 imports 裡而且對方有 export。行為：下單拿鐵 ×2、起司蛋糕 ×1 再付款，<code>Mailer.sent</code> 有一封主旨「收據：訂單 N」、內容三行（每項一行、最後「合計 340 元」）；不存在的商品回 404。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：<code>loyalty</code> 訂閱 <code>order.paid</code> 之後，同事說：「事件裡只有 <code>orderId</code> 就夠了，handler 再注入 <code>OrdersService.findOne</code> 查 <code>total</code>，事件保持精簡。」哪個說法正確？</p>
+  <label data-key="a">對，事件越小越好，查一次訂單的成本可以忽略</label>
+  <label data-key="b">對，只要 <code>OrdersService</code> 有 export，注入它就不算越界</label>
+  <label data-key="c">不對：handler 一注入 <code>OrdersService</code>，<code>loyalty</code> 就又 import 了 <code>orders</code> 的內部，依賴圖回到原點；聽的人需要的事實（<code>customerId</code>、<code>total</code>）應該放進事件</label>
+  <label data-key="d">不對，應該讓 <code>loyalty</code> 直接用 <code>PrismaService</code> 查 <code>orders</code> 表，不經過 service</label>
+  <p class="why">✓ c。事件的用途是讓發的人不認識聽的人、聽的人也不必認識發的人的內部。a 錯：問題不在成本，在依賴方向。b 錯：export 讓注入「做得到」，但 <code>loyalty → orders</code> 這個箭頭就回來了，<code>LoyaltyModule</code> 也不再能單獨建立。d 錯：直接查 <code>orders</code> 表違反資料歸屬，比注入 service 更糟。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：為什麼 <code>OrdersRepository</code> 不 export，卻讓 <code>notifications</code> 透過 <code>OrdersService.findOne</code> 讀訂單？多包一層不是多餘嗎？</p>
+  <label data-key="a">因為 Nest 不允許 export 兩個以上的 provider</label>
+  <label data-key="b">repository 的方法形狀（回傳 <code>null</code>、include 什麼欄位）是 <code>orders</code> 的內部約定，export 出去之後 <code>orders</code> 想改就得先找遍所有使用者；service 的公開方法才是刻意維護的契約</label>
+  <label data-key="c">因為 repository 直接碰 Prisma，效能比 service 差</label>
+  <label data-key="d">兩種做法一樣，只是風格問題</label>
+  <p class="why">✓ b。最小公開的目的是保留「之後可以改」的自由：公開的東西每一個都是承諾。a 錯：exports 可以放任何數量。c 錯：service 也是呼叫同一個 repository，沒有效能差異。d 錯：差在改動成本，<code>findWithItems</code> 改回傳形狀時，export 過的版本要同時改 <code>notifications</code>。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 6：架構測試裡「沒有循環 import」這一條，哪個寫法擋得住之後新加的程式？</p>
+  <label data-key="a">檢查 <code>orders.service.ts</code> 和 <code>loyalty.service.ts</code> 有沒有互相 import</label>
+  <label data-key="b">把目前 19 個檔案列成陣列，兩兩檢查有沒有互相 import</label>
+  <label data-key="c">斷言 <code>src</code> 底下的檔案數是 19</label>
+  <label data-key="d">每次 <code>readdirSync</code> 掃出 <code>src</code> 底下所有 <code>.ts</code>，從每個檔案沿 import 做深度優先搜尋，走到還在目前路徑上的檔案就回報整個環</label>
+  <p class="why">✓ d。規則要對「現在所有的檔案」成立，而且環可以是任意長度（<code>a → b → c → a</code>）。a 只看兩個檔案，新檔案的循環完全不管。b 寫死清單，新加的檔案不在裡面；兩兩檢查也只找得到長度 2 的環。c 是快照，不檢查規則本身，任何合法的新檔案都會讓它失敗。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>用 <code>forwardRef</code> 當解法</strong>：它只讓循環依賴啟動得起來，兩個模組還是綁在一起。找出循環裡的兩個箭頭各自要什麼，改成事件或搬動歸屬。</li>
+  <li><strong>解循環時把程式搬到錯的模組</strong>：加點搬進 <code>orders</code>，循環沒了，但 <code>orders</code> 寫了 <code>loyalty</code> 的表。先問「這段程式歸誰」，再問「怎麼接」。</li>
+  <li><strong>事件裡只放 id，handler 回頭查</strong>：依賴又長回來。把聽的人需要的事實放進事件。</li>
+  <li><strong><code>events/</code> 做成 barrel</strong>：<code>export * from '../orders.module.js'</code> 讓別人「看起來只 import events/」，實際上拿到整個模組。契約資料夾只放事件。</li>
+  <li><strong>什麼都放的 Shared／Common 模組</strong>：provider 失去歸屬、依賴圖消失。拿掉 <code>@Global</code> 但留著它到處 import，問題一樣。每個 provider 回到擁有它的模組。</li>
+  <li><strong>因為 <code>PrismaService</code> 全域就直接查別人的表</strong>：<code>notifications</code> 自己 <code>this.prisma.order.findUnique</code>，省了一個 import，違反資料歸屬。注入擁有者的 service。</li>
+  <li><strong>export repository 或用字串 token 轉手</strong>：公開了內部約定。exports 只放 service。</li>
+  <li><strong>架構測試寫死清單、只查固定幾個檔案、或拍快照</strong>：新加的違規抓不到，合法的修改反而紅。每次掃描、檢查規則本身。</li>
+  <li><strong>架構測試掃到 <code>src/generated/</code></strong>：Prisma Client 的註解裡就有 <code>prisma.stampCard.findMany()</code>，資料歸屬那條會誤報。略過產生的程式。</li>
+  <li><strong>規則只在某個人腦子裡</strong>：三個月後被「合理地」打破。寫 ADR，架構測試的訊息指向它。</li>
+  <li><strong>一開始就拆微服務</strong>：邊界還沒畫對就用網路固定下來，之後要改得動 API、部署和資料，比在單體裡搬檔案貴得多。先在單體裡畫好線。</li>
+</ul>
+
+<h2 id="appendix">補充與查表</h2>
+<h3>資料歸屬和系統設計課的「資料擁有權」</h3>
+<p>規則一是<a href="../../system-design/lessons/15-monolith-microservices.html">系統設計課第 15 課</a>「資料擁有權」在單體裡的版本。現在還是同一個資料庫裡的幾張表，看起來誰查都一樣；但規則先立好，將來拆成多個服務時，每個服務才知道該帶走哪幾張表，也不會有別的服務還偷偷在查它。</p>
+<h3>三條規則：違規長什麼樣子、誰會擋（查表用，不用背）</h3>
+<div class="table-wrap"><table>
+  <tr><th>規則</th><th>常見的違規寫法</th><th>誰會擋</th></tr>
+  <tr><td>資料歸屬</td><td>別的模組直接用全域的 <code>PrismaService</code> 查 <code>stampCard</code>、<code>order</code>；把加點搬進 <code>orders</code></td><td>架構測試（Nest 不會擋）</td></tr>
+  <tr><td>最小公開</td><td>export repository；用 <code>useExisting</code> 換字串 token 再 export；<code>events/</code> 做成 barrel；放進 <code>@Global</code> 的 Shared 模組</td><td>code review、架構測試；沒 export 卻注入時 Nest 啟動報錯</td></tr>
+  <tr><td>單向依賴</td><td>兩個模組互相 import，用 <code>forwardRef</code> 撐著；任意長度的 import 環</td><td>架構測試的 DFS；不加 <code>forwardRef</code> 時 <code>nest build</code> 後啟動失敗</td></tr>
+</table></div>
+
+<h2>小結</h2>
+<ul>
+  <li>改集點規則要動兩個模組，是因為沒有邊界：模組邊界決定「改一處要看幾處」，裡面的資料表與 repository 只有自己碰，外面只透過 exports 的 service 與發出的事件互動。</li>
+  <li>三條規則：一張表只有一個模組碰（資料歸屬）、exports 只放別人真的需要的（最小公開；換名字、barrel 都算公開）、依賴只能單向。用它們逐項檢查，就找得出專案裡要修的地方。</li>
+  <li>循環依賴用領域事件解：發的人只宣布事實（<code>src/orders/events/</code> 是公開契約），聽的人從事件裡拿需要的欄位，不回頭查。<code>forwardRef</code>、把程式搬進對方、handler 裡注入對方的 service，都不算解。</li>
+  <li><code>@Global</code> 只留基礎設施（Prisma、設定）；什麼都放的 SharedModule 要拆，每個 provider 回到擁有它的模組，依賴寫回 <code>imports</code>。</li>
+  <li>架構測試讓規則不被下一個 PR 打破：每次掃描 <code>src</code>、解析 import、DFS 找任意長度的環、檢查資料存取；用故意違規的版本驗證它抓得到，用合法修改驗證它不誤報；放進 CI。</li>
+  <li>先做模組化單體，邊界畫對、用事件解耦、用測試守住，真的需要時再沿著線拆出去；每個決定寫一份 ADR，記下選項與後果。</li>
+</ul>
+<p>下一課是期末專題：把前面各課的做法組成一個完整的咖啡店訂單 API，用 Idempotency-Key 擋重送、用 outbox 把這一課的 <code>order.paid</code> 變成可靠的加點與收據，再寫一份抓得到 bug 的 e2e 測試。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

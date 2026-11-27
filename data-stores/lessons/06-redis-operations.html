@@ -1,0 +1,826 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>6. Redis 上線（資深）：記憶體、淘汰、持久化、大 key 與 Cluster</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="6" data-practice="data-stores">
+<header>
+  <div class="eyebrow">階段 2：Redis 不只是快取 · 第 6 課</div>
+  <h1>Redis 上線（資深）：記憶體、淘汰、持久化、大 key 與 Cluster</h1>
+</header>
+<main>
+
+<p>週年慶晚上八點，結帳 API 開始回 500，log 裡全是 <code>OOM command not allowed when used memory &gt; 'maxmemory'</code>。這台 Redis 同時放著菜單快取、登入 session、限流計數和第 5 課的訂單事件 stream。記憶體滿了，Redis 照設定拒絕所有寫入，連「這位客人剛登入」都寫不進去。有人提議「改成 allkeys-lru 讓它自己淘汰」，那被淘汰的會是誰？可能是快取，也可能是正在結帳的客人的 session。</p>
+<p>前五課教的是怎麼用 Redis。這一課從這場事故出發，一步一步把這台 Redis 改到撐得過下一次週年慶：先量清楚記憶體被誰吃掉，決定滿了之後誰該消失，再處理當機、大 key、一台不夠用的情況，最後整理成上線清單和監控。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>記憶體被誰吃掉？先學會量，再估下一次週年慶要多大的機器。</li>
+  <li>滿了之後誰該消失？maxmemory 與淘汰策略，以及為什麼快取和 session 要分兩台（開場問題的答案）。</li>
+  <li>拆出來放 session 的那台當機，會丟多少？RDB 與 AOF 兩種持久化。</li>
+  <li>記憶體夠了，為什麼每天早上還是整台慢 2 秒？找出並處理大 key 與熱 key。</li>
+  <li>一台壞了、或一台放不下怎麼辦？複寫、Sentinel 與 Cluster，以及 key 會落在哪一台。</li>
+  <li>怎麼確認這些都做到了？上線清單與要設告警的指標。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="02-redis-data-structures.html">第 2 課</a>的單執行緒與 <code>KEYS</code>：Redis 主要用一個執行緒依序處理指令，一個走完整個 key 空間的指令會讓所有請求排隊。</li>
+  <li><a href="../../system-design/lessons/07-sharding-consistent-hashing.html">系統設計課第 7 課</a>的分片：資料依 key 分散到多台，跨片的操作變難，熱 key 會讓一台特別忙。</li>
+</ul></div>
+
+<h2>記憶體被誰吃掉了？先量，再估</h2>
+<p>開場的錯誤訊息說的是「記憶體用量超過 maxmemory」。在決定怎麼處理之前，要先知道兩件事：現在到底用了多少，以及是哪些資料用掉的。不知道這兩件事就調設定，等於閉著眼睛換輪胎。</p>
+<p>先講為什麼記憶體對 Redis 這麼關鍵。PostgreSQL 把資料放在磁碟上，記憶體只是加速用的快取，資料再多也只是變慢。Redis 則是把<strong>所有資料都放在記憶體裡</strong>，這是它快的原因，也代表記憶體就是它能放多少資料的硬上限：記憶體用完，不是變慢，而是放不下。所以上線前要回答「需要多大的機器」，上線後要回答「現在用了多少、還能撐多久」，兩件事都從量開始。</p>
+
+<h3>整台的狀況：INFO memory</h3>
+<p><code>INFO memory</code> 會列出整台 Redis 的記憶體狀況。讀這個輸出之前，要先分清楚兩種「用了多少記憶體」。第一種是 Redis 自己記帳的數字：它為資料、key、內部結構、緩衝區向系統要了多少。第二種是作業系統看到的數字，叫 <strong>RSS</strong>（resident set size），意思是這個程序實際佔住的實體記憶體。兩者會不一樣，因為 Redis 刪掉資料之後，釋放出來的空間不一定還給作業系統，而是留在程序裡等下次用；這些零散、暫時沒用到的空間叫做<strong>碎片</strong>（fragmentation）。</p>
+<p>還有一個名詞要先講：<strong>swap</strong>。實體記憶體不夠時，作業系統會把一部分記憶體內容搬到磁碟上的 swap 空間，需要時再搬回來。對一般程式這只是變慢，對 Redis 是災難，因為它每個指令都假設資料在記憶體裡，碰到被搬到磁碟的部分，延遲會從微秒變成毫秒以上。</p>
+<p>有了這兩個概念，最常看的幾個欄位：</p>
+<div class="table-wrap"><table>
+  <tr><th>欄位</th><th>意思</th><th>怎麼看</th></tr>
+  <tr><td><code>used_memory</code></td><td>Redis 自己分配出去的記憶體（資料、key、內部結構、緩衝區）</td><td>跟 <code>maxmemory</code> 比，就是「多滿了」</td></tr>
+  <tr><td><code>used_memory_rss</code></td><td>作業系統看到這個程序實際佔用的實體記憶體（RSS）</td><td>機器會不會被吃光，看這個</td></tr>
+  <tr><td><code>mem_fragmentation_ratio</code></td><td>rss ÷ used_memory</td><td>長期大於 1.5 表示碎片多（刪了很多資料但記憶體沒還給系統）；小於 1 表示被換到 swap，延遲會暴增</td></tr>
+  <tr><td><code>maxmemory</code>、<code>maxmemory_policy</code></td><td>上限與滿了之後的處理方式</td><td>下一節</td></tr>
+</table></div>
+<p>讀 <code>mem_fragmentation_ratio</code> 有一個陷阱：剛啟動、幾乎沒資料的 Redis，這個比例常是十幾。原因是 rss 裡有程式本身和預先分配的空間，used_memory 卻很小，除出來自然很大。這個比例要在資料量大的時候看才有意義，不要看到十幾就以為出事了。</p>
+
+<h3>單一 key 的大小：MEMORY USAGE</h3>
+<p>整台的數字告訴你「滿了」，但不告訴你「是誰」。要知道每一種資料各佔多少，用 <code>MEMORY USAGE key</code> 量單一 key，單位是 bytes，包含 key 名稱、值和 Redis 為了管理這個 key 而多用的內部結構。下面是在 redis:8.10.3 實際量到的例子，先看第一段：值本身和整個 key 的差距。</p>
+<pre>127.0.0.1:6379&gt; SET cache:menu:12 '{"id":12,"name":"拿鐵","price":110}'
+127.0.0.1:6379&gt; STRLEN cache:menu:12
+(integer) 37          ← 值本身 37 bytes
+127.0.0.1:6379&gt; MEMORY USAGE cache:menu:12
+(integer) 80          ← 加上 key 名稱和每個 key 的固定開銷
+
+127.0.0.1:6379&gt; OBJECT ENCODING mid:h        ← 500 個欄位的 hash
+"listpack"
+127.0.0.1:6379&gt; MEMORY USAGE mid:h
+(integer) 5815
+127.0.0.1:6379&gt; OBJECT ENCODING big:h        ← 600 個欄位的 hash
+"hashtable"
+127.0.0.1:6379&gt; MEMORY USAGE big:h
+(integer) 26056</pre>
+<p>第一段：一份 37 bytes 的拿鐵 JSON，整個 key 卻佔了 80 bytes。多出來的是 key 名稱本身，以及 Redis 為了管理每個 key 而固定多用的空間，例如記錄型別與編碼的物件標頭、key 雜湊表裡的項目。這個固定開銷不管值多小都會有，所以小 key 的開銷可能比值還大。一億個小 key，光開銷就是好幾 GB。這就是為什麼「很多小東西」常用一個 hash 裝起來，例如每位顧客一個 hash，而不是每個欄位各一個 key：一個 key 的固定開銷由很多欄位分攤。</p>
+<p>第二段：兩個 hash 只差 100 個欄位，記憶體卻差了 4.5 倍。原因在 <code>OBJECT ENCODING</code> 顯示的<strong>編碼</strong>，也就是 Redis 在記憶體裡實際怎麼排這份資料。元素少的 hash、set、sorted set 會用 <strong>listpack</strong> 編碼：把所有元素一個接一個連續排在同一塊記憶體裡，沒有額外的指標和索引，非常省空間，代價是找一個欄位要從頭掃，所以只適合元素少的時候。元素數量或單一值的長度超過門檻，Redis 就把它轉成 <strong>hashtable</strong> 編碼：每個元素各自配置、用雜湊表索引，查詢變快，但每個元素都多了管理用的開銷。500 個欄位還在 listpack，600 個已經轉成 hashtable，差距就是這樣來的。門檻是可以調的設定值，預設值和查詢方式見課末「補充與查表」。</p>
+
+<h3>估下一次週年慶要多少記憶體</h3>
+<p>會量了，就能估算。做法是：建一些真實形狀的樣本資料，用 MEMORY USAGE 量出每種 key 的平均大小，乘上預期數量，再留餘裕。下面用開場那台 Redis 裡的四種資料估一次，執行後看最後一行的 maxmemory 建議值：</p>
+<div class="lab"><script type="code">
+// 週年慶要準備多少記憶體？樣本用 MEMORY USAGE 量出來的平均大小
+const items = [
+  { name: '登入 session（hash，6 個欄位）', count: 200_000, bytes: 280 },
+  { name: '菜單與商品快取（JSON string）', count: 5_000, bytes: 900 },
+  { name: '限流計數（string，60 秒 TTL）', count: 300_000, bytes: 72 },
+  { name: '訂單事件 stream（MAXLEN ~ 100000）', count: 1, bytes: 25_000_000 },
+]
+const MB = 1024 * 1024
+let total = 0
+for (const it of items) {
+  const size = it.count * it.bytes
+  total += size
+  console.log(`${it.name}：${(size / MB).toFixed(1)} MB`)
+}
+// 碎片、client 的輸入輸出緩衝、複寫與 AOF 緩衝都不在上面；保守乘 1.5
+console.log(`資料合計 ${(total / MB).toFixed(1)} MB，maxmemory 至少設 ${Math.ceil(total * 1.5 / MB)} MB`)
+</script></div>
+<p>最後乘 1.5 是經驗值，不是公式。資料本身之外，碎片、每條 client 連線的輸入輸出緩衝區、複寫和持久化用的緩衝區都會吃記憶體，而這些很難事先精確估算。上線後要用 <code>used_memory</code> 的實際成長回頭修正這個數字。另外，機器的實體記憶體還要比 maxmemory 再大一截，原因要到持久化那一節講 fork 時才會清楚。</p>
+<p>估出了 maxmemory 該設多少，下一個問題就來了：設了上限，記憶體真的用到這個上限時，Redis 會怎麼做？開場的 OOM 錯誤，就是其中一種做法。</p>
+
+<h2>記憶體滿了，誰該消失？</h2>
+<p><strong>maxmemory</strong> 是 Redis 可用記憶體的上限。先看不設會怎樣：64 位元系統的預設值是 0，意思是沒有上限。Redis 會一直長大，直到機器的記憶體用完。這時作業系統的 <strong>OOM killer</strong> 會出手，它是 Linux 在記憶體耗盡時依記憶體用量挑一個程序強制終止的機制，佔最多記憶體的 Redis 通常就是被挑中的那個。程序被殺掉，所有還沒寫到磁碟的資料一起消失。比起開場「拒絕寫入」，這更糟，所以正式環境一定要設 maxmemory。</p>
+
+<h3>淘汰策略：滿了之後怎麼騰出空間</h3>
+<p>設了上限之後，到了上限要怎麼辦，由<strong>淘汰策略</strong>（eviction policy）決定，設定名稱是 <code>maxmemory-policy</code>。運作方式是：每次有指令要新增資料，Redis 先檢查記憶體，超過上限就依策略刪掉一些 key，直到降回上限以下，再執行這個指令。</p>
+<p>策略的名字看起來很多，其實是兩個選擇的組合。第一個選擇是「從哪些 key 裡挑」：<code>allkeys-*</code> 從所有 key 裡挑，<code>volatile-*</code> 只從有設 TTL（過期時間）的 key 裡挑。第二個選擇是「用什麼規則挑」，最常用的兩種是：</p>
+<ul>
+  <li><strong>LRU</strong>（least recently used，最近最少使用）：挑「最久沒被碰過」的。一個 key 上次被讀或寫是一小時前，另一個是一秒前，先淘汰一小時前那個。背後的假設是：最近用過的，接下來也比較可能被用到。</li>
+  <li><strong>LFU</strong>（least frequently used，最不常使用）：挑「被用得最少次」的。它記的是存取頻率，不是最後一次的時間。適合熱門商品長期被讀、但偶爾有一次性的大量掃描的情境：掃描碰過的冷資料只被讀了一次，LFU 不會因為「剛被讀過」就把它當成熱資料留下來。</li>
+</ul>
+<p>除了這些之外，還有一個完全不淘汰的選擇：<strong>noeviction</strong>，也是預設值。它不刪任何 key，新增資料的指令直接回 OOM 錯誤，讀取照常。開場那台 Redis 就是用這個設定，所以才會看到那串錯誤訊息。</p>
+<p>完整的策略清單如下，查表用，不用背；要記住的是上面兩個選擇的組合方式：</p>
+<div class="table-wrap"><table>
+  <tr><th>策略</th><th>刪哪些 key</th><th>適合</th></tr>
+  <tr><td><code>noeviction</code>（預設）</td><td>不刪；新增資料的指令回 OOM 錯誤，讀取照常</td><td>不能丟的資料：session、佇列（BullMQ 要求這個設定）</td></tr>
+  <tr><td><code>allkeys-lru</code></td><td>所有 key 裡<strong>最近最少使用</strong>的</td><td>純快取的預設選擇</td></tr>
+  <tr><td><code>allkeys-lfu</code></td><td>所有 key 裡<strong>最不常使用</strong>的</td><td>熱門商品長期被讀、偶爾有一次性掃描的快取</td></tr>
+  <tr><td><code>allkeys-lrm</code>（8.6 起）</td><td>所有 key 裡<strong>最久沒被修改</strong>（LRM，least recently modified）的；只有寫入會更新時間，讀取不算</td><td>想淘汰「很久沒更新的舊資料」，不管它還被讀多少次</td></tr>
+  <tr><td><code>allkeys-random</code></td><td>隨機</td><td>每個 key 被讀的機率差不多時</td></tr>
+  <tr><td><code>volatile-lru</code>／<code>-lfu</code>／<code>-lrm</code>／<code>-random</code></td><td>同上，但只從<strong>有設 TTL</strong> 的 key 裡挑</td><td>同一台混放快取（有 TTL）和不能丟的資料（沒 TTL）</td></tr>
+  <tr><td><code>volatile-ttl</code></td><td>有 TTL 的 key 裡，剩餘時間最短的</td><td>程式能用 TTL 長短表達「誰比較不重要」</td></tr>
+</table></div>
+<p>Redis 的 LRU、LFU 是近似演算法，不是精確排序，實際效果跟精確版本幾乎一樣，原理見課末。</p>
+
+<h3>回到開場：為什麼要分成兩台</h3>
+<p>現在可以回答開場的問題了。關鍵在於：<strong>淘汰策略不知道每個 key 是做什麼用的</strong>，它只看冷熱或 TTL。快取、session、限流放在同一台：</p>
+<ul>
+  <li>用任何 <code>allkeys-*</code>：一位客人逛了二十分鐘商品頁沒操作，他的 session 在 LRU 眼裡就是「很久沒用」，會被淘汰，客人在結帳前突然被登出。限流計數被淘汰，被擋的人又能刷了。</li>
+  <li>用 <code>noeviction</code>：快取越長越多，塞滿後整台拒絕寫入，連 session 也寫不進去，就是開場的事故。</li>
+  <li>看起來折衷的 <code>volatile-*</code>，也有兩個坑，見下面的警告。</li>
+</ul>
+<div class="callout warn">volatile-* 在<strong>沒有任何 key 設 TTL</strong> 時，行為等於 noeviction。混放時，忘了給快取設 TTL，滿了一樣寫入失敗。反過來，給 session 設了 TTL（<a href="03-redis-patterns.html">第 3 課</a>的滑動過期），volatile-lru 就可能把它淘汰。所以官方文件建議：快取和需要保留的資料，能分開就分成兩台 Redis。</div>
+<p>正解是依「被淘汰時能不能接受」把資料分成兩台，各自選策略：</p>
+<div class="table-wrap"><table>
+  <tr><th>實例</th><th>放什麼</th><th>策略</th><th>滿了的時候</th></tr>
+  <tr><td>cache</td><td>菜單、商品、查詢結果（都能從 PostgreSQL 重建）</td><td><code>allkeys-lru</code> 或 <code>allkeys-lfu</code></td><td>淘汰冷資料，命中率下降，資料庫負載上升</td></tr>
+  <tr><td>state</td><td>session、限流、佇列、stream</td><td><code>noeviction</code></td><td>寫入失敗並觸發告警，人工擴容或清理；不會悄悄丟資料</td></tr>
+</table></div>
+<p>cache 那台滿了是正常狀態：它本來就該一直裝滿最常用的資料，被淘汰的下次再從 PostgreSQL 讀回來。代價是<strong>命中率</strong>下降，也就是請求在快取裡找得到資料的比例變低（<a href="../../system-design/lessons/05-caching.html">系統設計課第 5 課</a>），更多請求落到資料庫。state 那台用 noeviction，意思是「寧可報錯，也不要默默丟資料」：報錯會被看見、會觸發告警，悄悄被登出的客人卻只會默默離開。也因為它滿了就會報錯，state 那台的記憶體用量告警比快取那台重要得多。這兩台的設定，就是練習 3 要做的。</p>
+<div class="callout practice"><strong>💡 實務上：每加一種 key，先回答「它被淘汰或消失會怎樣」</strong><br>很多團隊的 Redis 一開始只放快取，後來陸續加了 session、限流、BullMQ 佇列，沒人回頭改淘汰策略，直到週年慶才出事，就像開場這台。新增一種 key 時（例如在 PR 裡），資深工程師會問三件事：它能不能從 PostgreSQL 重建？被淘汰時使用者看到什麼？它該放在哪一台？答案寫進 key 的前綴規範（例如 <code>ds:cache:*</code> 只能放在 cache 那台），code review 才看得出放錯地方。state 那台的淘汰數（<code>INFO stats</code> 裡的 <code>evicted_keys</code>）應該永遠是 0，不是 0 就是設定錯了。</div>
+<p>拆成兩台之後，state 那台不會再因為淘汰而悄悄丟掉 session。但資料還有另一種消失的方式：Redis 程序當機或主機斷電，記憶體裡的東西全部歸零。下一節看這台當機時會丟多少。</p>
+
+<h2>放 session 的那台當機了，會丟多少？</h2>
+<p>記憶體裡的資料，程序一死就沒了，除非先寫到磁碟。把資料寫到磁碟、重啟後能讀回來，叫做<strong>持久化</strong>（persistence）。Redis 有兩種寫法，可以都不開、開一種，或兩種一起開。它們丟資料的範圍差很多，所以要分開看。</p>
+
+<h3>RDB：定期拍一張快照</h3>
+<p><strong>RDB</strong> 是快照：每隔一段時間，把整個資料集存成一個 <code>dump.rdb</code> 檔。重啟時讀這個檔，就回到存檔那一刻的狀態。存檔的時機用 <code>save 秒數 變更數</code> 規則表示，意思是「過了這麼多秒、而且至少有這麼多次變更，就存一次」。8.10.3 的預設是 <code>save 3600 1 300 100 60 10000</code>，三組規則分別是：一小時內至少 1 次變更、五分鐘內至少 100 次、一分鐘內至少 10000 次，任一組成立就存。</p>
+<p>問題是，存一份可能好幾 GB 的檔案需要時間，這段時間 Redis 不能停下來不服務。它的做法是呼叫 <code>fork()</code>：作業系統把 Redis 程序複製出一個子程序，由子程序慢慢把資料寫進檔案，主程序照常處理指令。</p>
+<p>複製整個程序聽起來要把記憶體也複製一份，實際上作業系統用了<strong>寫入時複製</strong>（copy-on-write）：fork 之後，父子程序先共用同一份實體記憶體，誰都不複製；直到主程序要修改某一頁記憶體時，作業系統才把那一頁複製出來給主程序改，子程序看到的仍是 fork 那一刻的舊內容。這樣子程序寫出的快照是一致的，而且平常不必多花記憶體。</p>
+<p>但這裡藏著第一節留下的問題的答案。存檔期間寫入越多，被複製出來的頁就越多；寫入很頻繁時，複製出來的部分可能接近整份資料。也就是說，Redis 在存 RDB 的那段時間，最壞可能需要接近兩倍的記憶體。如果 maxmemory 設成機器記憶體的上限，存檔時就會被 OOM killer 殺掉。這就是機器的實體記憶體要比 maxmemory 大一截的原因。另外，資料集很大時，fork 這個動作本身也可能讓 Redis 停頓幾毫秒到一秒。</p>
+<p>RDB 的弱點很明顯：兩次快照之間的寫入，當機時全部消失。</p>
+
+<h3>AOF：每個寫入都記下來</h3>
+<p><strong>AOF</strong>（append-only file）換一個方向：每個寫入指令都附加到檔案尾端，重啟時把檔案從頭重播一遍，就重建出當機前的資料。</p>
+<p>聽起來不會丟資料，但「寫進檔案」不等於「寫到磁碟」。程式呼叫寫檔時，作業系統為了效率，會先把內容放在記憶體裡的緩衝區，累積一陣子再一起寫到磁碟。這時主機斷電，緩衝區裡的內容就沒了。程式要呼叫 <strong>fsync</strong>，作業系統才會把緩衝區的內容真的寫到磁碟上，並在完成後才回傳。fsync 很慢，因為它要等磁碟真的寫完，所以多久 fsync 一次，就是安全和速度之間的取捨。<code>appendfsync</code> 設定的就是這件事：</p>
+<div class="table-wrap"><table>
+  <tr><th>設定</th><th>做法</th><th>主機斷電最多丟</th><th>速度</th></tr>
+  <tr><td><code>always</code></td><td>每批寫入都 fsync 才回覆 client</td><td>幾乎不丟</td><td>很慢</td></tr>
+  <tr><td><code>everysec</code>（預設、官方建議）</td><td>背景執行緒每秒 fsync 一次</td><td>約 1 秒（最壞約 2 秒）</td><td>接近不持久化</td></tr>
+  <tr><td><code>no</code></td><td>交給作業系統決定（Linux 通常約 30 秒）</td><td>數十秒</td><td>最快</td></tr>
+</table></div>
+<p>把兩種方式放在同一條時間軸上，看同一次當機各丟多少：</p>
+<figure>
+  <svg viewBox="0 0 700 230" role="img" aria-label="時間軸：10:00 做了 RDB 快照，10:04:59 最後一次 AOF fsync，10:05:00 當機。只開 RDB 會丟 10:00 之後五分鐘的寫入；AOF everysec 只丟最後約 1 秒">
+    <defs><marker id="arr6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <line class="d-line" x1="40" y1="60" x2="660" y2="60" marker-end="url(#arr6)"/>
+    <text class="d-small" x="640" y="45" text-anchor="end">時間</text>
+    <line class="d-line" x1="120" y1="50" x2="120" y2="70"/>
+    <text class="d-text" x="120" y="92" text-anchor="middle">10:00 RDB 快照</text>
+    <line class="d-line" x1="560" y1="50" x2="560" y2="70"/>
+    <text class="d-small" x="530" y="40" text-anchor="middle">10:04:59 fsync</text>
+    <line class="d-line" x1="600" y1="45" x2="600" y2="75"/>
+    <text class="d-accent" x="610" y="92" text-anchor="middle">10:05 當機</text>
+    <rect class="d-soft" x="120" y="115" width="480" height="34" rx="4"/>
+    <text class="d-text" x="360" y="137" text-anchor="middle">只開 RDB：這五分鐘的寫入全部消失</text>
+    <rect class="d-soft" x="560" y="165" width="40" height="34" rx="4"/>
+    <text class="d-text" x="545" y="187" text-anchor="end">AOF everysec：只丟最後約 1 秒</text>
+    <text class="d-small" x="40" y="222">兩個都開時，重啟用 AOF 重建（它最完整）；RDB 留著當備份</text>
+  </svg>
+  <figcaption>同一個當機時間點，不同設定丟掉的範圍。</figcaption>
+</figure>
+
+<h3>state 那台該怎麼設</h3>
+<p>官方的建議是：想要接近 PostgreSQL 的資料安全，RDB 和 AOF 一起開；能接受當機丟幾分鐘，只開 RDB；不鼓勵只開 AOF，因為 RDB 檔小、適合備份，重啟時載入也比較快。兩個都開時，重啟用 AOF 重建，因為它最完整。</p>
+<p>套回這一課的兩台：state 那台放 session 和限流，丟最後一兩秒能接受、丟五分鐘不行，所以開 AOF everysec，並保留預設的 RDB 規則當備份。cache 那台可以完全不持久化（<code>save ""</code>、<code>appendonly no</code>），重啟後從空的開始，由資料庫重新填。要注意的是空快取上線的那一刻，所有請求都直接打到資料庫，也就是系統設計課第 5 課的快取雪崩。</p>
+<div class="callout warn"><strong>開了 AOF 也不等於 PostgreSQL。</strong>everysec 仍可能丟 1～2 秒；always 很慢；主從複寫是非同步的（後面會講），切換時還會再丟一段。所以「不能丟的正式紀錄」（訂單、付款、點數）寫在 PostgreSQL，Redis 放的是可以重建、或丟一點能接受的資料。</div>
+<p>持久化防的是當機，防不了機器整台壞掉或被誤刪，這要靠<strong>備份</strong>：把 RDB 檔定期複製到別台機器或 S3。RDB 是寫完一份新檔之後才改名取代舊檔，所以 Redis 執行中複製也安全，不會複製到寫一半的檔案。較新的版本另有專用的備份指令，見課末。不管用哪種，<a href="../../devops/lessons/24-backup-dr.html">DevOps 課第 24 課</a>的原則一樣：沒還原過的備份不算備份。</p>
+<div class="callout practice"><strong>💡 實務上：上線前演練一次「Redis 重啟」</strong><br>在 staging 環境把 Redis 重啟（或 <code>docker kill</code>），看三件事：API 有沒有自動重連、使用者會不會被登出、快取清空後資料庫的負載升到多高。結果要讓 PM 知道，例如「Redis 掛掉時（state 那台開 AOF everysec），購物車可能少最後 1 秒的變更，登入狀態保留」，這就是 Redis 的資料保證，寫進設計文件。正式環境的重啟、升級排在離峰時段；快取那台重啟後，可以先預熱菜單、首頁這類最熱的 key 再放流量進來。</div>
+<p>到這裡，記憶體夠了、滿了不會亂丟、當機也知道會丟多少。但事故後的第一週，監控又出現新的狀況：每天早上 9 點，所有用到 Redis 的 API 一起慢 2 秒，Redis 主機的 CPU 平均卻不到 10%，記憶體也還很空。這不是整台的容量問題，下一節看為什麼。</p>
+
+<h2>記憶體夠了，為什麼每天早上整台慢 2 秒？</h2>
+<p>答案要回到<a href="02-redis-data-structures.html">第 2 課</a>講過的單執行緒：Redis 用一個主執行緒依序執行指令，一次只做一件事。一個指令跑 2 秒，這 2 秒內所有 client 的所有指令都在排隊，不管它們要的資料多小。這也解釋了 CPU 為什麼看起來很低：一天裡只有這 2 秒忙，攤到整天的平均，幾乎看不出來。所以 Redis 變慢時，問題常常不是「整體資料太多」，而是「某一個指令太慢」，而慢指令背後，多半是某一個 key 太大或太熱。</p>
+
+<h3>先找出是哪個指令：SLOWLOG</h3>
+<p>延遲突然飆高時，第一步是 <code>SLOWLOG GET</code>：Redis 會記下最近執行時間超過門檻的指令，包括指令內容和花了多久。這次的事故一查就看到：每天 9 點的會員報表排程要列出本月累計來店的會員，所以對一個 key 下了 <code>SMEMBERS</code>。那個 key 是「本月來店顧客」的 set，每位來店會員都 SADD 進去，月中已經有幾百萬個成員。</p>
+
+<h3>大 key：單一 key 的值很大</h3>
+<p>這種單一 key 的值非常大的情況叫<strong>大 key</strong>（big key）。它會從三個方向造成問題：</p>
+<ul>
+  <li><strong>讀取</strong>：<code>SMEMBERS</code>、<code>HGETALL</code> 這類指令是 O(N)，也就是花的時間跟元素數量成正比。對大 key 執行，一次回傳幾百 MB，主執行緒被佔住，網路也被塞爆。</li>
+  <li><strong>刪除</strong>：<code>DEL</code> 要在主執行緒釋放每一個成員的記憶體，刪一個 500 萬成員的 set 可能卡住好幾秒；TTL 到期時的自動刪除也一樣。</li>
+  <li><strong>分散</strong>：等一下會講的 Cluster 裡，一個 key 只能放在一個節點上，那個節點的記憶體和流量會特別高，搬移資料時也搬不動。</li>
+</ul>
+<h3>怎麼安全地找出大 key：SCAN</h3>
+<p>這次是 SLOWLOG 剛好抓到，但更好的做法是定期掃描，在它造成事故之前就找出來。直覺的寫法是 <code>KEYS *</code> 列出所有 key 再一個個量，但這正是第 2 課說過不能做的事：KEYS 一次走完所有 key，key 多的時候它本身就是一個卡住整台的慢指令。</p>
+<p>要用 <code>SCAN</code>，它把「走完所有 key」切成很多小批。用法是：你給一個<strong>游標</strong>（cursor），代表「上次走到哪裡」，第一次給 <code>0</code>；Redis 回兩樣東西：下一次要給的游標，以及這一批的 key。一直把拿到的游標送回去，直到游標又變成 <code>0</code> 才算走完。<code>MATCH</code> 只留下符合模式的 key，<code>COUNT</code> 是每一批大約要看幾個 key，只是提示，不是保證回傳幾個：</p>
+<pre>127.0.0.1:6379&gt; SCAN 0 MATCH ds:visitors:* COUNT 100
+1) "1792"                      # 下一次要給的游標
+2) 1) "ds:visitors:2026-11"
+   2) "ds:visitors:2026-10"
+127.0.0.1:6379&gt; SCAN 1792 MATCH ds:visitors:* COUNT 100
+1) "0"                         # 游標回到 0：走完了
+2) (empty array)               # 這一批剛好沒有符合的，很正常</pre>
+<p>每一批都很快，其他請求可以插在批與批之間執行，所以不會讓整台停住。代價是走訪期間有人新增或刪除 key 時，結果可能少掉新的 key，也可能同一個 key 出現兩次，程式要能接受重複（例如先放進 <code>Set</code>）。另外要注意第二批的空陣列：中間某一批沒有符合的 key 很正常，只有游標回到 0 才代表走完。</p>
+<p>redis-cli 已經把「SCAN 加量大小」包成指令：</p>
+<pre>redis-cli --bigkeys -i 0.1     # 每種型別元素最多的 key（-i 0.1：每 100 次 SCAN 休息 0.1 秒，減少對正式環境的影響）
+redis-cli --memkeys -i 0.1     # 每種型別佔記憶體最多的 key
+redis-cli --keystats           # 兩者合併，並列出前 10 大（--top N 可以改）</pre>
+<p>這幾個工具輸出的是每種型別的冠軍和統計。要依自己的門檻列出所有超標的 key、排程掃描或做成報表時，就要自己寫：SCAN 走到游標回到 0，每一批 key 用 pipeline 一次查 MEMORY USAGE。練習 4 就是這個。</p>
+
+<h3>找到之後怎麼處理</h3>
+<p>處理大 key 有三個方向，從「怎麼安全刪掉」到「不讓它再長出來」：</p>
+<ul>
+  <li><strong>刪除用 UNLINK</strong>：<code>UNLINK</code> 先把 key 從資料庫移除，這一步是 O(1)，立刻回覆；釋放成員記憶體的工作交給背景執行緒做，不佔主執行緒。8.10.3 的 <code>lazyfree-lazy-user-del</code> 預設是 <code>no</code>，所以 <code>DEL</code> 仍然在主執行緒同步釋放，刪大 key 一定要明確用 UNLINK。</li>
+  <li><strong>拆小</strong>：依 id 取餘數分成多個桶，例如 <code>ds:visitors:2026-11:{0..15}</code> 的寫法是 <code>ds:visitors:2026-11:${customerId % 16}</code>，讀全部時走 16 個小 key；或依時間切，例如每天一個 key，舊的整個過期。這次的「本月來店顧客」就該改成每天一個 key 並設 TTL。</li>
+  <li><strong>從源頭限制大小</strong>：第 2 課的 LTRIM、<a href="05-redis-pubsub-streams.html">第 5 課</a>的 <code>XADD MAXLEN ~</code>，都是讓 key 不會無限成長。</li>
+</ul>
+
+<h3>同一個問題的另一面：熱 key</h3>
+<p>大 key 是「一個 key 太大」，還有一種是「一個 key 太熱」。<strong>熱 key</strong>（hot key）是被極大量存取的 key，例如週年慶首頁的「今日特價」，每秒被讀 20 萬次。每次讀取都很快，但量大到一台 Redis 的那個主執行緒忙不過來。更麻煩的是，單一 key 只在一台機器上，加再多台機器也分擔不了它。</p>
+<p>找熱 key 用 <code>redis-cli --hotkeys</code>。它靠的是 LFU 策略記錄的存取頻率，所以只有在 <code>maxmemory-policy</code> 是 <code>*-lfu</code> 時能用，否則回 <code>An LFU maxmemory policy is not selected</code>。處理方式都是「讓讀取不要全部打到同一個地方」：</p>
+<ul>
+  <li><strong>在 API 伺服器的記憶體裡再快取一層</strong>，TTL 幾秒，絕大部分讀取不會到 Redis。代價是各台伺服器看到的資料最多晚幾秒。</li>
+  <li><strong>複製多份</strong>：寫入時同時寫 <code>ds:deal:today:0</code>～<code>:7</code>，讀取時隨機挑一份。這 8 個 key 會算出不同的 slot，在 Cluster 裡會分散到多個節點。</li>
+  <li><strong>讀副本</strong>：讀取送到另一台複製了同樣資料的 Redis（下一節的 replica），要接受資料可能稍微落後。</li>
+</ul>
+<div class="callout practice"><strong>💡 實務上：大 key 多半是功能慢慢長出來的</strong><br>常見的來源：「本月來店顧客」這類只加不減的 set、沒設 MAXLEN 的 stream、把整份菜單或報表 JSON 塞進一個 string、從不清理的 hash。上線第一個月都很小，半年後才變成問題，就像這次的報表事故。做法是排程在 replica 或離峰時段跑 <code>redis-cli --memkeys</code> 或練習 4 的掃描，結果接到報表或告警；code review 看到 <code>SMEMBERS</code>、<code>HGETALL</code>、<code>LRANGE 0 -1</code> 時，先問「這個 key 最大會長到多大」。延遲突然飆高時，先看 <code>SLOWLOG GET</code>。</div>
+<p>熱 key 的最後一招「讀副本」，以及大 key 提到的「多台節點」，都超出了一台 Redis 的範圍。到目前為止處理的都是一台機器裡面的事，下一節看一台不夠的時候怎麼辦。</p>
+
+<h2>一台壞了、或一台放不下，怎麼辦？</h2>
+<p>「一台不夠」其實是兩個不同的問題。第一個是<strong>可用性</strong>：機器會壞，壞了之後服務要能繼續，資料要有另一份。第二個是<strong>容量</strong>：資料或寫入量多到一台機器放不下、處理不完。Redis 有三個工具，前兩個解決可用性，第三個解決容量。</p>
+
+<h3>主從複寫：多一份完整的副本</h3>
+<p><strong>主從複寫</strong>（replication）是讓一台 <strong>primary</strong> 接受所有寫入，另外一台或多台 <strong>replica</strong> 持續複製它的資料。replica 有完整的資料，所以可以分擔讀取（上一節熱 key 的「讀副本」），primary 掛了也還有一份資料。</p>
+<p>要特別理解的是：Redis 的複寫是<strong>非同步</strong>的。primary 收到寫入、執行完、回覆 client「OK」之後，才把這個寫入送給 replica。中間有一小段時間差，就是<a href="../../system-design/lessons/06-replication-consistency.html">系統設計課第 6 課</a>的複寫延遲。後果有兩個：從 replica 讀可能讀到稍舊的資料；primary 在把寫入送出去之前掛掉，把 replica 升級成新 primary，這幾筆已經回過 OK 的寫入就消失了。這也是前面說「開了 AOF 也不等於 PostgreSQL」的另一半原因。</p>
+
+<h3>Sentinel：primary 掛了，自動換一台</h3>
+<p>有 replica 還不夠，primary 掛掉時，要有人發現、決定把哪台 replica 升級、並通知所有人改連新的 primary。半夜三點靠人工做太慢，這就是 <strong>Sentinel</strong> 的工作。Sentinel 是另外執行的幾個監控程序，通常 3 個，避免單一 Sentinel 因為自己網路不通而誤判。它們持續檢查 primary，多數 Sentinel 同意 primary 掛了，就挑一台 replica 升級，並通知其他 replica 改跟新的 primary。client 不寫死 primary 的位址，而是問 Sentinel「現在誰是 primary」。</p>
+<p>Sentinel 解決的是<strong>高可用</strong>，也就是壞了能自動恢復。它沒有解決容量：所有資料還是在一台 primary 上，資料量仍受限於一台機器的記憶體。</p>
+
+<h3>Cluster：把資料分散到多台</h3>
+<p>資料太多或寫入太多，一台 primary 撐不住時，要把資料分散到多台，這就是 <strong>Cluster</strong>。分散的關鍵問題是：一個 key 該放在哪一台？讀的時候又怎麼知道去哪一台找？</p>
+<p>Redis Cluster 不用<a href="../../system-design/lessons/07-sharding-consistent-hashing.html">系統設計課第 7 課</a>的一致性雜湊環，而是把所有可能的 key 先分進固定的 <strong>16384 個 hash slot</strong>（可以想成 16384 個格子）。每個 key 屬於哪一格，用 key 算出來：</p>
+<pre>slot = CRC16(key) mod 16384</pre>
+<p>CRC16 是一個把任意字串算成 0～65535 之間數字的函式，同一個字串永遠算出同一個數字，再取 16384 的餘數就是 slot 編號。接著每台 primary 負責一段 slot，例如三台各負責約三分之一；每台 primary 再各有自己的 replica，primary 掛掉時 Cluster 自己做切換，不需要 Sentinel。要加機器時，只要把一部分 slot 連同裡面的 key 搬到新機器，不必重算所有 key 的位置。</p>
+<p>client 怎麼知道 key 在哪一台？看圖中的三個步驟：</p>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="Redis Cluster：三個 primary 各負責一段 slot，client 送 GET 到錯的節點會收到 MOVED，改送到正確的節點">
+    <defs><marker id="arr6b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="30" y="150" width="190" height="70" rx="6"/>
+    <text class="d-text" x="125" y="178" text-anchor="middle">primary A</text>
+    <text class="d-small" x="125" y="200" text-anchor="middle">slot 0～5460</text>
+    <rect class="d-box" x="255" y="150" width="190" height="70" rx="6"/>
+    <text class="d-text" x="350" y="178" text-anchor="middle">primary B</text>
+    <text class="d-small" x="350" y="200" text-anchor="middle">slot 5461～10922</text>
+    <rect class="d-box" x="480" y="150" width="190" height="70" rx="6"/>
+    <text class="d-text" x="575" y="178" text-anchor="middle">primary C</text>
+    <text class="d-small" x="575" y="200" text-anchor="middle">slot 10923～16383</text>
+    <rect class="d-soft" x="270" y="20" width="160" height="44" rx="6"/>
+    <text class="d-text" x="350" y="47" text-anchor="middle">client</text>
+    <line class="d-line" x1="300" y1="64" x2="140" y2="146" marker-end="url(#arr6b)"/>
+    <text class="d-small" x="150" y="96" text-anchor="middle">1. GET {user:1}:cart</text>
+    <line class="d-line" x1="160" y1="146" x2="320" y2="70" marker-end="url(#arr6b)"/>
+    <text class="d-small" x="275" y="125" text-anchor="middle">2. MOVED 10778 C</text>
+    <line class="d-line" x1="400" y1="64" x2="560" y2="146" marker-end="url(#arr6b)"/>
+    <text class="d-small" x="555" y="96" text-anchor="middle">3. 改送到 C，並記住</text>
+  </svg>
+  <figcaption>slot 10778 屬於 C。client 送錯會收到 MOVED，之後直接送對；ioredis 會自動處理並快取 slot 表。</figcaption>
+</figure>
+<p>送錯節點時，節點回 <code>MOVED &lt;slot&gt; &lt;host:port&gt;</code>，意思是「這個 slot 歸那台管，以後直接找它」，client 更新自己記住的 slot 表。slot 正在從一台搬到另一台時，則回 <code>ASK</code>，意思是「這一次先去問那台」，不更新 slot 表，因為搬家還沒完成。</p>
+
+<h3>Cluster 最大的限制：多個 key 要在同一個 slot</h3>
+<p>資料分散之後，同一個指令裡的多個 key 可能分在不同機器上，而 Redis 不會替你跨機器協調。所以 Cluster 規定：<strong>一個指令或 Lua 腳本用到的所有 key 必須在同一個 slot</strong>，否則回 <code>CROSSSLOT Keys in request don't hash to the same slot</code>。例如 <code>MGET user:1:cart user:1:session</code> 在單機正常，在 Cluster 會失敗，因為這兩個 key 實際算出來分別是 slot 6211 和 14032。</p>
+<p>解法是 <strong>hash tag</strong>：讓你指定「key 的哪一段拿來算 slot」。key 裡有 <code>{…}</code> 時，只用大括號裡的內容算 slot，所以 <code>{user:1}:cart</code> 和 <code>{user:1}:session</code> 都只用 <code>user:1</code> 算，一定落在同一格。精確的規則是：</p>
+<ul>
+  <li>找第一個 <code>{</code>，再找它<strong>後面</strong>的第一個 <code>}</code>；兩者之間<strong>不是空字串</strong>，就只用中間那段算 hash。</li>
+  <li>其他情況（沒有 <code>{</code>、後面沒有 <code>}</code>、<code>{}</code> 是空的）用整個 key。</li>
+</ul>
+<p>對照幾個例子，特別看後三列的邊界情況：</p>
+<div class="table-wrap"><table>
+  <tr><th>key</th><th>拿來算 hash 的部分</th><th>slot</th></tr>
+  <tr><td><code>{user:1}:cart</code>、<code>{user:1}:session</code></td><td><code>user:1</code></td><td>10778（兩個一樣）</td></tr>
+  <tr><td><code>foo{}{bar}</code></td><td>整個 key（第一組是空的）</td><td>8363</td></tr>
+  <tr><td><code>foo{{bar}}zap</code></td><td><code>{bar</code></td><td>4015</td></tr>
+  <tr><td><code>foo{bar}{zap}</code></td><td><code>bar</code>（只看第一組）</td><td>5061</td></tr>
+</table></div>
+<p>hash tag 也有代價：同一個 tag 的 key 一定在同一台。把所有 key 都包成 <code>{shop}</code>，CROSSSLOT 確實不會再出現，但所有資料都擠在一個節點，Cluster 等於只有一台。tag 要選「需要一起操作的最小範圍」，通常是使用者 id 或訂單 id。這也是<a href="04-redis-atomicity.html">第 4 課</a>要求 Lua 的 key 從 KEYS 傳入的原因：Cluster 靠 KEYS 判斷腳本該送到哪個節點、key 是否在同一個 slot。</p>
+<details><summary>練習 1 會用到：CRC16 的逐位元算法</summary>
+<p>slot 用的 CRC16 是 XMODEM 版本（多項式 0x1021、初始值 0），對 key 的<strong>位元組</strong>計算，中文 key 要先轉成 UTF-8。逐位元計算的步驟：</p>
+<pre>crc = 0
+對每個 byte：
+  crc = crc XOR (byte 左移 8 位)
+  重複 8 次：
+    如果 crc 的最高位（0x8000）是 1：crc = ((crc 左移 1) XOR 0x1021) AND 0xFFFF
+    否則：crc = (crc 左移 1) AND 0xFFFF
+CRC16("123456789") = 0x31C3</pre>
+</details>
+
+<h3>在 Node 裡連 Cluster</h3>
+<p>Node 這邊用 ioredis 的 <code>Cluster</code>。它啟動時先向 Cluster 要 slot 表，之後每個指令自己算 slot、送到對的節點，收到 MOVED／ASK 也會自動處理：</p>
+<pre>import { Cluster } from 'ioredis'
+
+const cluster = new Cluster([{ host: 'redis-1.internal', port: 6379 }], {
+  scaleReads: 'master',        // 預設；'slave' 把讀取送到 replica（要接受複寫延遲）
+})
+await cluster.mget('{user:1}:cart', '{user:1}:session')   // 同一個 slot，OK
+// SCAN 一次只走一個節點：要在每台 primary 上各走一次
+for (const node of cluster.nodes('master')) { /* node.scan(…) */ }</pre>
+<p>程式裡有兩個跟單機不同的地方。第一，SCAN 只會走它送達的那個節點，要找全部的大 key，得在每台 primary 上各走一次。第二，pipeline 裡的 key 必須都在<strong>同一個節點</strong>上，因為整個 pipeline 會送給同一台。另外 Redis Cluster 只有 DB 0，練習 4 用的 DB 編號這類用法在 Cluster 上不能用（各實作的差異見課末）。</p>
+
+<h3>該選哪一個</h3>
+<p>大多數服務一台 primary 加 replica 就夠了，託管服務會幫你做切換。記憶體超過單機能給的、或寫入量超過一台的上限，才上 Cluster。Cluster 的限制（CROSSSLOT、只有 DB 0、SCAN 要逐台走）要在設計 key 時就考慮，事後改 key 名稱很痛。</p>
+<div class="callout practice"><strong>💡 實務上：還沒上 Cluster，key 也可以先照 Cluster 的規則設計</strong><br>咖啡店這種規模，一台 primary 加一台 replica 通常就夠，不必一開始就上 Cluster。但要放進同一個 Lua 腳本、MGET、MULTI 的 key，現在就用 hash tag 包起使用者或訂單 id，成本幾乎是零；等到真的要上 Cluster，就不用一邊搬資料一邊改 key 名稱和程式。本機開發用單機 Redis 時不會出現 CROSSSLOT，所以可以像練習 2 一樣寫一個 <code>assertSameSlot</code> 放進單元測試，提早抓出跨 slot 的 key。</div>
+<p>到這裡，這場事故牽出的設計決定都做完了：maxmemory 怎麼估、拆成哪兩台、各自怎麼持久化、大 key 怎麼防、要不要複寫或 Cluster。最後一個問題是：上線前怎麼確認這些都做到了，上線後又怎麼在下一次出事之前先知道？</p>
+
+<h2>怎麼確認都做到了？上線清單與監控</h2>
+<p>把前面每一節的結論整理成上線前逐項確認的清單，再加上一項前面沒講、但正式環境一定要有的安全設定：</p>
+<ul>
+  <li>設定 <code>maxmemory</code>，機器的實體記憶體要留給 fork 和緩衝區；依用途分開實例，各自選淘汰策略與持久化。</li>
+  <li>程式裡沒有 <code>KEYS</code>、沒有對大 key 的 O(N) 指令；大 key 用 UNLINK 刪。</li>
+  <li>限制誰能連、連上後能做什麼（下面說明）。</li>
+</ul>
+<p>最後一項是安全設定。Redis 預設的連線沒有權限限制：連得上就能讀、能寫、能清空。所以第一步是讓外面連不到：<code>bind</code> 只綁內網位址，並且設密碼，否則對外網開放的 Redis 可能被任何人清空或寫入。</p>
+<p>第二步是限制「連得上的程式能做什麼」，用的是 <strong>ACL</strong>（access control list，存取控制清單）：Redis 的使用者權限設定，每個使用者可以設密碼、能碰哪些 key、能用哪些指令。為什麼內網也需要？預設的連線什麼都能做，程式一個 bug 或一行誤打的 <code>FLUSHALL</code>，就能清空整台。例如 <code>ACL SETUSER app on &gt;密碼 ~ds:* +@all -@dangerous</code>：app 只能碰 <code>ds:</code> 開頭的 key，<code>FLUSHALL</code>、<code>KEYS</code>、<code>CONFIG</code> 這類 dangerous 類別的指令會得到 <code>NOPERM</code>。</p>
+<p>清單確保上線那一刻是對的，但資料會長、流量會變。開場的事故之所以在晚上八點才被發現，是因為沒有任何指標在記憶體快滿時先叫人。下面這些指標都來自 <code>INFO</code>，託管服務會轉成 CloudWatch 之類的指標；告警怎麼設見<a href="../../devops/lessons/22-metrics-slo.html">DevOps 課第 22 課</a>。每一列都對應到這課的某一節：</p>
+<div class="table-wrap"><table>
+  <tr><th>指標</th><th>來源</th><th>代表什麼</th></tr>
+  <tr><td>記憶體使用率</td><td><code>used_memory</code> ÷ <code>maxmemory</code></td><td>state 那台超過 80% 就該告警；cache 那台滿是正常的</td></tr>
+  <tr><td>淘汰數</td><td><code>evicted_keys</code></td><td>快取持續大量淘汰：容量不夠或 TTL 設太長</td></tr>
+  <tr><td>命中率</td><td><code>keyspace_hits ÷ (hits + misses)</code></td><td>突然下降：淘汰太兇、key 名稱改了、TTL 太短</td></tr>
+  <tr><td>每秒指令數</td><td><code>instantaneous_ops_per_sec</code></td><td>流量基準，異常尖峰可能是熱 key 或迴圈呼叫</td></tr>
+  <tr><td>延遲</td><td><code>SLOWLOG GET</code>、<code>LATENCY LATEST</code>、client 端的 p99</td><td>找出慢指令（大 key、Lua）和 fork 造成的停頓</td></tr>
+  <tr><td>連線數</td><td><code>connected_clients</code></td><td>持續上升：程式沒重用連線</td></tr>
+  <tr><td>複寫延遲</td><td>primary 的 <code>master_repl_offset</code> 減 replica 的 offset</td><td>差距變大：replica 跟不上，切換時會丟更多</td></tr>
+</table></div>
+<p>表裡有三個第一次出現的名詞。<strong>p99</strong> 是把請求依耗時排序後，100 個裡最慢那 1 個的耗時，看的是尾端延遲：大 key 造成的 2 秒停頓只影響少數請求，平均值幾乎看不出來，p99 會直接跳上去（詳見<a href="../../system-design/lessons/03-latency-percentiles.html">系統設計課第 3 課</a>）。<code>LATENCY LATEST</code> 列出 Redis 自己記錄到的延遲事件，例如 fork。<strong>replication offset</strong> 是複寫資料的位元組累計數：primary 的 <code>master_repl_offset</code> 是累計送出了多少，replica 的 offset 是累計收到了多少，兩者相減就是 replica 還沒追上的量。</p>
+<p>如果開場那台 Redis 當時有第一列的告警，記憶體到 80% 時就會有人收到通知，事故就會變成一次白天的擴容。</p>
+<p>最後，多數團隊不自己架 Redis，而是用雲端的託管服務。這時要多確認一件事：託管服務實際跑的是什麼、哪個版本。這門課用 Docker 跑的 Redis 8，和雲端上常見的 Valkey，在這門課教的指令上都相同。Valkey 是 Redis 2024 年改授權後，Linux Foundation 從 Redis 7.2.4 分支出來的相容版本，AWS 等雲端主要提供它；但 8.6 的 lrm 淘汰策略這類新功能，要查託管服務的版本有沒有。授權變化、Valkey 的由來、AWS 各服務的差異，整理在課末「補充與查表」。</p>
+
+<h2>練習</h2>
+<p>練習 1、2 在頁面上寫。練習 3、4 是本機練習：先確認 Redis 有在跑（在 <code>learn/data-stores/practice</code> 執行 <code>docker compose --profile redis up -d --wait</code>），在 <code>learn/</code> 執行 <code>node check.mjs data-stores 06</code> 判分。練習 3 會另外啟動兩個專用的 Redis 容器（測完自動刪除），練習 4 用 DB 6。</p>
+
+<div class="exercise">
+  <p>練習 1：實作 <code>crc16(s)</code>（XMODEM：多項式 0x1021、初始值 0，對字串的 UTF-8 位元組計算，用 <code>new TextEncoder().encode(s)</code>）和 <code>keySlot(key)</code>：照上面的 hash tag 規則決定要算哪一段，再 <code>mod 16384</code>。測試會用官方規格的例子、中文 key 和各種大括號的邊界情況比對真實 Redis 算出的 slot。</p>
+  <script type="start">
+const SLOTS = 16384
+
+function crc16(s: string): number {
+  // 寫在這裡
+  return 0
+}
+
+function keySlot(key: string): number {
+  // 寫在這裡
+  return 0
+}
+
+console.log(crc16('123456789').toString(16))                   // 31c3
+console.log(keySlot('{user:1}:cart'), keySlot('{user:1}:session'))  // 10778 10778
+console.log(keySlot('拿鐵'))                                     // 15612
+</script>
+  <script type="answer">
+const SLOTS = 16384
+
+function crc16(s: string): number {
+  let crc = 0
+  for (const byte of new TextEncoder().encode(s)) {
+    crc ^= byte << 8
+    for (let i = 0; i < 8; i++) {
+      crc = crc & 0x8000 ? ((crc << 1) ^ 0x1021) & 0xffff : (crc << 1) & 0xffff
+    }
+  }
+  return crc
+}
+
+function keySlot(key: string): number {
+  const open = key.indexOf('{')
+  if (open !== -1) {
+    const close = key.indexOf('}', open + 1)
+    if (close > open + 1) key = key.slice(open + 1, close)
+  }
+  return crc16(key) % SLOTS
+}
+
+console.log(crc16('123456789').toString(16))                   // 31c3
+console.log(keySlot('{user:1}:cart'), keySlot('{user:1}:session'))  // 10778 10778
+console.log(keySlot('拿鐵'))                                     // 15612
+</script>
+  <script type="tests">
+assert.equal(crc16('123456789'), 0x31c3, "crc16('123456789') 要是 0x31C3：檢查多項式 0x1021、初始值 0，每一步都 AND 0xFFFF")
+assert.equal(crc16(''), 0, '空字串的 CRC16 是 0')
+// 以下的 slot 都是在 Redis 8.10.3（cluster-enabled）用 CLUSTER KEYSLOT 算出來的
+const cases: [string, number, string][] = [
+  ['123456789', 12739, '沒有大括號：用整個 key'],
+  ['user1000', 3443, '沒有大括號：用整個 key'],
+  ['{user1000}.following', 3443, '{user1000}.following 只用 user1000 算'],
+  ['foo{}{bar}', 8363, 'foo{}{bar} 的第一組大括號是空的：用整個 key，不是 bar'],
+  ['foo{{bar}}zap', 4015, 'foo{{bar}}zap 用第一個 { 到它後面第一個 } 之間的 {bar'],
+  ['foo{bar}{zap}', 5061, 'foo{bar}{zap} 只用第一組 bar，不是到最後一個 }'],
+  ['a}b{c}', 7365, 'a}b{c} 的 } 要從 { 後面開始找：用 c'],
+  ['abc{', 3048, '只有 { 沒有 }：用整個 key'],
+  ['abc}def{x', 1765, '{ 後面沒有 }：用整個 key'],
+  ['{}', 15257, '{} 是空的 tag：用整個 key'],
+  ['order:10086', 7437, 'order:10086'],
+  ['拿鐵', 15612, '中文 key 要先轉成 UTF-8 位元組再算，不能直接用 charCodeAt'],
+  ['ds:{門市:台北}:cart', 7191, 'tag 裡有中文：用 門市:台北 的 UTF-8 位元組算'],
+  ['user:1:cart', 6211, 'user:1:cart'],
+  ['user:1:session', 14032, 'user:1:session'],
+]
+for (const [key, slot, msg] of cases) assert.equal(keySlot(key), slot, `keySlot('${key}') 應該是 ${slot}：${msg}`)
+function refCrc(s: string): number {
+  let crc = 0
+  for (const byte of new TextEncoder().encode(s)) {
+    crc ^= byte << 8
+    for (let i = 0; i < 8; i++) crc = crc & 0x8000 ? ((crc << 1) ^ 0x1021) & 0xffff : (crc << 1) & 0xffff
+  }
+  return crc
+}
+for (let i = 0; i < 300; i++) {
+  const key = i % 3 === 0 ? `ds:{顧客:${i * 7919}}:cart` : `ds:menu:${i * 7919}`
+  const open = key.indexOf('{'), close = key.indexOf('}', open + 1)
+  const expected = refCrc(open !== -1 && close > open + 1 ? key.slice(open + 1, close) : key) % 16384
+  assert.equal(keySlot(key), expected, `keySlot('${key}') 應該是 ${expected}：每個 key 都要真的算 CRC16，不能只對範例寫死答案`)
+  assert.equal(crc16(key), refCrc(key), `crc16('${key}') 應該是 ${refCrc(key)}`)
+}
+</script>
+  <script type="wrong">
+const SLOTS = 16384
+function crc16(s: string): number {
+  let crc = 0
+  for (const byte of new TextEncoder().encode(s)) {
+    crc ^= byte << 8
+    for (let i = 0; i < 8; i++) crc = crc & 0x8000 ? ((crc << 1) ^ 0x1021) & 0xffff : (crc << 1) & 0xffff
+  }
+  return crc
+}
+function keySlot(key: string): number {
+  const open = key.indexOf('{')
+  const close = key.indexOf('}', open + 1)
+  if (open !== -1 && close !== -1) key = key.slice(open + 1, close)
+  return crc16(key) % SLOTS
+}
+</script>
+  <script type="wrong">
+const SLOTS = 16384
+function crc16(s: string): number {
+  let crc = 0
+  for (const byte of new TextEncoder().encode(s)) {
+    crc ^= byte << 8
+    for (let i = 0; i < 8; i++) crc = crc & 0x8000 ? ((crc << 1) ^ 0x1021) & 0xffff : (crc << 1) & 0xffff
+  }
+  return crc
+}
+function keySlot(key: string): number {
+  const open = key.indexOf('{')
+  const close = key.lastIndexOf('}')
+  if (open !== -1 && close > open + 1) key = key.slice(open + 1, close)
+  return crc16(key) % SLOTS
+}
+</script>
+  <script type="wrong">
+const SLOTS = 16384
+function crc16(s: string): number {
+  let crc = 0
+  for (let k = 0; k < s.length; k++) {
+    crc ^= s.charCodeAt(k) << 8
+    for (let i = 0; i < 8; i++) crc = crc & 0x8000 ? ((crc << 1) ^ 0x1021) & 0xffff : (crc << 1) & 0xffff
+  }
+  return crc
+}
+function keySlot(key: string): number {
+  const open = key.indexOf('{')
+  if (open !== -1) {
+    const close = key.indexOf('}', open + 1)
+    if (close > open + 1) key = key.slice(open + 1, close)
+  }
+  return crc16(key) % SLOTS
+}
+</script>
+  <script type="wrong">
+function crc16(s: string): number {
+  let crc = 0
+  for (const byte of new TextEncoder().encode(s)) {
+    crc ^= byte << 8
+    for (let i = 0; i < 8; i++) crc = crc & 0x8000 ? ((crc << 1) ^ 0x1021) & 0xffff : (crc << 1) & 0xffff
+  }
+  return crc
+}
+function keySlot(key: string): number {
+  const open = key.indexOf('{')
+  if (open !== -1) {
+    const close = key.indexOf('}', open + 1)
+    if (close > open + 1) key = key.slice(open + 1, close)
+  }
+  return crc16(key) % 16383
+}
+</script>
+  <script type="wrong">
+const SLOTS = 16384
+function crc16(s: string): number {
+  let crc = 0
+  for (const byte of new TextEncoder().encode(s)) {
+    crc ^= byte << 8
+    for (let i = 0; i < 8; i++) crc = crc & 0x8000 ? ((crc << 1) ^ 0x1021) & 0xffff : (crc << 1) & 0xffff
+  }
+  return crc
+}
+function keySlot(key: string): number {
+  const open = key.indexOf('{')
+  const close = key.indexOf('}')
+  if (open !== -1 && close > open + 1) key = key.slice(open + 1, close)
+  return crc16(key) % SLOTS
+}
+</script>
+  <script type="wrong">
+const known: Record<string, number> = { '123456789': 12739, 'user1000': 3443, '{user1000}.following': 3443, 'foo{}{bar}': 8363, 'foo{{bar}}zap': 4015, 'foo{bar}{zap}': 5061, 'a}b{c}': 7365, 'abc{': 3048, 'abc}def{x': 1765, '{}': 15257, 'order:10086': 7437, '拿鐵': 15612, 'ds:{門市:台北}:cart': 7191, 'user:1:cart': 6211, 'user:1:session': 14032 }
+function crc16(s: string): number {
+  return s === '123456789' ? 0x31c3 : 0
+}
+function keySlot(key: string): number {
+  return known[key] ?? 0
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：購物車和 session 之後要在同一個 Lua 腳本裡一起操作（結帳時清空購物車並記錄最後結帳時間），所以同一位使用者的這兩個 key 要在同一個 slot；不同使用者則要分散到不同 slot。實作 <code>planKeys(userId)</code> 回傳 <code>cart</code>、<code>session</code>、<code>rateLimit</code> 三個 key（都以 <code>ds:</code> 開頭、含使用者 id、互不相同）。再實作 <code>assertSameSlot(keys, slotOf)</code>：用傳進來的 <code>slotOf</code> 算每個 key 的 slot，只要有一個不同就丟 <code>Error</code>，訊息列出每個 key 和它的 slot。測試會傳入真正的 slot 函式，檢查 100 位使用者至少分到 50 個不同的 slot。</p>
+  <script type="start">
+type Plan = { cart: string, session: string, rateLimit: string }
+
+function planKeys(userId: number): Plan {
+  // 寫在這裡
+  return { cart: `ds:cart:${userId}`, session: `ds:session:${userId}`, rateLimit: `ds:ratelimit:${userId}` }
+}
+
+function assertSameSlot(keys: string[], slotOf: (key: string) => number): void {
+  // 寫在這裡
+}
+
+console.log(planKeys(42))
+// 用「key 的長度」假裝成 slot 函式試試看：長度不同，應該要丟 Error（測試會傳入真正的 CRC16 slot）
+try {
+  assertSameSlot(['ds:a', 'ds:bb'], key => key.length)
+  console.log('沒有丟 Error')
+} catch (e) {
+  console.log((e as Error).message)
+}
+</script>
+  <script type="answer">
+type Plan = { cart: string, session: string, rateLimit: string }
+
+function planKeys(userId: number): Plan {
+  const tag = `{user:${userId}}`
+  return { cart: `ds:${tag}:cart`, session: `ds:${tag}:session`, rateLimit: `ds:ratelimit:user:${userId}` }
+}
+
+function assertSameSlot(keys: string[], slotOf: (key: string) => number): void {
+  const slots = keys.map(slotOf)
+  if (new Set(slots).size > 1) {
+    throw new Error(`這些 key 不在同一個 slot：${keys.map((k, i) => `${k} → ${slots[i]}`).join('、')}`)
+  }
+}
+
+console.log(planKeys(42))
+// 用「key 的長度」假裝成 slot 函式試試看：長度不同，應該要丟 Error（測試會傳入真正的 CRC16 slot）
+try {
+  assertSameSlot(['ds:a', 'ds:bb'], key => key.length)
+  console.log('沒有丟 Error')
+} catch (e) {
+  console.log((e as Error).message)
+}
+</script>
+  <script type="tests">
+function realSlot(key: string): number {
+  const open = key.indexOf('{')
+  if (open !== -1) {
+    const close = key.indexOf('}', open + 1)
+    if (close > open + 1) key = key.slice(open + 1, close)
+  }
+  let crc = 0
+  for (const byte of new TextEncoder().encode(key)) {
+    crc ^= byte << 8
+    for (let i = 0; i < 8; i++) crc = crc & 0x8000 ? ((crc << 1) ^ 0x1021) & 0xffff : (crc << 1) & 0xffff
+  }
+  return crc % 16384
+}
+const slots = new Set<number>()
+for (let id = 10; id < 110; id++) {
+  const plan = planKeys(id)
+  for (const k of [plan.cart, plan.session, plan.rateLimit]) {
+    assert(k.startsWith('ds:') && k.includes(String(id)), `使用者 ${id} 的 key「${k}」要以 ds: 開頭並包含使用者 id`)
+  }
+  assert.equal(new Set([plan.cart, plan.session, plan.rateLimit]).size, 3, `使用者 ${id} 的三個 key 要互不相同`)
+  assert.equal(realSlot(plan.cart), realSlot(plan.session),
+    `使用者 ${id} 的 cart（${plan.cart} → slot ${realSlot(plan.cart)}）和 session（${plan.session} → slot ${realSlot(plan.session)}）不在同一個 slot：用 hash tag 把兩個 key 共同的使用者部分包起來`)
+  slots.add(realSlot(plan.cart))
+}
+assert(slots.size >= 50, `100 位使用者的購物車只分到 ${slots.size} 個 slot：hash tag 裡要有使用者 id，不能所有人共用同一個 tag，否則全部擠在一個節點`)
+
+const p = planKeys(42)
+assertSameSlot([p.cart, p.session], realSlot)
+assertSameSlot(['ds:only-one'], realSlot)
+assertSameSlot([], realSlot)
+const throws = (fn: () => void) => { try { fn() } catch { return true } return false }
+assert(throws(() => assertSameSlot(['user:1:cart', 'user:1:session'], realSlot)), 'user:1:cart（slot 6211）和 user:1:session（slot 14032）不同，要丟 Error')
+assert(throws(() => assertSameSlot(['{u:1}:a', '{u:1}:b', 'user:1:session'], realSlot)), '第三個 key 的 slot 不同也要丟 Error：每個 key 都要比，不是只比前兩個')
+let message = ''
+try { assertSameSlot(['user:1:cart', 'user:1:session'], realSlot) } catch (e) { message = String((e as Error).message) }
+assert(message.includes('user:1:session') && message.includes('14032'), `錯誤訊息要列出 key 和它的 slot，例如 user:1:session → 14032；目前是「${message}」`)
+assertSameSlot(['ds:aa', 'ds:bb'], key => key.length)
+assert(throws(() => assertSameSlot(['ds:a', 'ds:bb'], key => key.length)), '要用傳進來的 slotOf 算 slot：slotOf 回傳 4 和 5，要丟 Error')
+</script>
+  <script type="wrong">
+type Plan = { cart: string, session: string, rateLimit: string }
+function planKeys(userId: number): Plan {
+  return { cart: `ds:{user}:cart:${userId}`, session: `ds:{user}:session:${userId}`, rateLimit: `ds:ratelimit:user:${userId}` }
+}
+function assertSameSlot(keys: string[], slotOf: (key: string) => number): void {
+  const slots = keys.map(slotOf)
+  if (new Set(slots).size > 1) throw new Error(keys.map((k, i) => `${k} → ${slots[i]}`).join('、'))
+}
+</script>
+  <script type="wrong">
+type Plan = { cart: string, session: string, rateLimit: string }
+function planKeys(userId: number): Plan {
+  return { cart: `ds:user:${userId}:cart`, session: `ds:user:${userId}:session`, rateLimit: `ds:ratelimit:user:${userId}` }
+}
+function assertSameSlot(keys: string[], slotOf: (key: string) => number): void {
+  const slots = keys.map(slotOf)
+  if (new Set(slots).size > 1) throw new Error(keys.map((k, i) => `${k} → ${slots[i]}`).join('、'))
+}
+</script>
+  <script type="wrong">
+type Plan = { cart: string, session: string, rateLimit: string }
+function planKeys(userId: number): Plan {
+  const tag = `{user:${userId}}`
+  return { cart: `ds:${tag}:cart`, session: `ds:${tag}:session`, rateLimit: `ds:ratelimit:user:${userId}` }
+}
+function assertSameSlot(keys: string[], slotOf: (key: string) => number): void {
+  if (keys.length >= 2 && slotOf(keys[0]) !== slotOf(keys[1])) throw new Error(keys.map(k => `${k} → ${slotOf(k)}`).join('、'))
+}
+</script>
+  <script type="wrong">
+type Plan = { cart: string, session: string, rateLimit: string }
+function planKeys(userId: number): Plan {
+  const tag = `{user:${userId}}`
+  return { cart: `ds:${tag}:cart`, session: `ds:${tag}:session`, rateLimit: `ds:ratelimit:user:${userId}` }
+}
+function assertSameSlot(keys: string[], slotOf: (key: string) => number): void {
+  const slots = keys.map(slotOf)
+  if (new Set(slots).size > 1) throw new Error('不在同一個 slot')
+}
+</script>
+</div>
+
+<div class="local" data-test="ex3" data-files="cache.conf session.conf">
+  <p>練習 3：開場的那台 Redis 要拆成兩台。改 <code>cache.conf</code> 和 <code>session.conf</code>（起始檔已經有讓容器外連得進來的 <code>bind</code>、<code>protected-mode</code>，不要動，只加記憶體與持久化的設定）。<code>cache.conf</code> 給純快取：<code>maxmemory 32mb</code>、適合快取的淘汰策略、關掉 RDB（<code>save ""</code>）和 AOF。<code>session.conf</code> 給 session 與限流：<code>maxmemory 32mb</code>、滿了不淘汰、AOF 每秒 fsync、保留預設的 RDB 規則。測試用你的設定檔各啟動一個 redis:8.10.3-alpine 容器，用 <code>CONFIG GET</code> 檢查設定；對快取寫入 64 MB 要全部成功而且有淘汰；session 寫入後等 2 秒用 <code>docker kill</code>（SIGKILL，<a href="../../devops/lessons/03-processes-signals.html">DevOps 課第 3 課</a>）模擬當機再啟動，資料要還在；session 寫滿時新的寫入要得到 OOM 錯誤、原本的資料讀得到。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="bigkeys.ts">
+  <p>練習 4：在 <code>bigkeys.ts</code> 實作 <code>findBigKeys(redis, pattern, thresholdBytes, scanCount)</code>：用 <code>SCAN … MATCH pattern COUNT scanCount</code> 走訪到 cursor 回到 <code>'0'</code>，每一輪的 key 用 pipeline 一次查 <code>MEMORY USAGE</code>，回傳超過門檻的 <code>{ key, bytes }</code>，依 bytes 由大到小。再實作 <code>deleteBig(redis, key)</code> 用 UNLINK 刪除。測試會建立一個 5 萬成員的 set、一個 2 萬欄位的 hash、一個不符合 pattern 的大 set、一個 50 KB 的 string 和 2,000 個小 key，記錄你送出的每個指令：不能有 KEYS、DEL，SCAN 要用測試給的 COUNT 走完全程。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：同一台 Redis 同時放快取與 session，設定 <code>allkeys-lru</code>，記憶體滿時會怎樣？</p>
+  <label data-key="a">只會淘汰快取，session 不受影響</label>
+  <label data-key="b">session 也可能被淘汰，使用者突然被登出</label>
+  <label data-key="c">Redis 會自動擴充記憶體</label>
+  <label data-key="d">所有寫入失敗</label>
+  <p class="why">✓ 淘汰策略不知道哪個 key 是什麼用途，只看最近有沒有被用到；放了一陣子沒操作的 session 正是 LRU 會挑的。a 錯在策略不分用途；c 錯在 Redis 不會超過 maxmemory 去要記憶體；d 是 noeviction 的行為。快取和不能丟的資料要分開實例，不能丟的那台用 noeviction 並留足記憶體。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：AOF 設定 <code>appendfsync everysec</code>，Redis 主機突然斷電，最壞會丟多少寫入？</p>
+  <label data-key="a">完全不會丟，AOF 會記錄每個寫入</label>
+  <label data-key="b">大約最近 1～2 秒</label>
+  <label data-key="c">最近一次 RDB 快照之後的全部</label>
+  <label data-key="d">全部資料</label>
+  <p class="why">✓ 每個寫入都有寫進 AOF，但還在作業系統的緩衝區裡，everysec 每秒才 fsync 一次，斷電時還沒落到磁碟的就沒了。a 是 always 才接近的保證（代價是很慢）；c 是只開 RDB 的情況；d 不會發生，重啟時會重播 AOF。真的不能丟的資料，記錄系統放在 PostgreSQL。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：在 Redis Cluster 執行 <code>MGET user:1:cart user:1:session</code> 得到 CROSSSLOT 錯誤，最直接的修法是？</p>
+  <label data-key="a">改用 KEYS 把兩個 key 找出來</label>
+  <label data-key="b">把 key 改成 <code>{user:1}:cart</code>、<code>{user:1}:session</code>，讓它們落在同一個 slot</label>
+  <label data-key="c">所有 key 都加上同一個 tag <code>{coffee}</code>，以後就不會再有 CROSSSLOT</label>
+  <label data-key="d">改用 pipeline 送兩個 GET 一定能解決</label>
+  <p class="why">✓ 多 key 指令與 Lua 腳本要求所有 key 在同一個 slot，hash tag 只用 <code>{}</code> 裡的內容算 slot。c 確實不會再有 CROSSSLOT，但所有資料都落在同一個節點，Cluster 等於只有一台；a 跟問題無關，而且 KEYS 會阻塞；d 在單一節點的 slot 範圍內才行，ioredis 的 pipeline 要求所有 key 在同一個節點。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 8：要刪除一個有 500 萬成員的 set，哪個指令比較安全？</p>
+  <label data-key="a"><code>DEL</code></label>
+  <label data-key="b"><code>UNLINK</code></label>
+  <label data-key="c"><code>FLUSHALL</code></label>
+  <label data-key="d"><code>EXPIRE key 0</code></label>
+  <p class="why">✓ UNLINK 先把 key 從資料庫移除並立刻回覆，記憶體在背景執行緒釋放。DEL 在主執行緒逐一釋放 500 萬個成員，這段時間 Redis 不處理任何指令（8.10.3 的 <code>lazyfree-lazy-user-del</code> 預設是 no）；c 會刪掉所有資料；d 讓 key 立刻過期，會不會在背景釋放要看其他 lazyfree 設定（8.10.3 的 <code>lazyfree-lazy-expire</code> 預設也是 no），不如直接用意圖清楚的 UNLINK。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>沒設 maxmemory</strong>：預設沒有上限，Redis 長到機器記憶體用完，被作業系統 OOM kill，沒持久化的資料全部消失。</li>
+  <li><strong>快取和 session 共用一台，又用 allkeys-*</strong>：淘汰不分用途，使用者會被登出、限流會失效。分開實例，不能丟的那台用 noeviction 並監控記憶體。</li>
+  <li><strong>以為開了 AOF 就跟 PostgreSQL 一樣安全</strong>：everysec 會丟 1～2 秒，複寫切換還會再丟。正式紀錄寫在 PostgreSQL。</li>
+  <li><strong>maxmemory 設成機器記憶體的上限</strong>：fork 的寫入時複製、緩衝區都要額外的記憶體，RDB 存檔時整台被 OOM kill。</li>
+  <li><strong>用 KEYS 找 key、用 DEL 刪大 key</strong>：兩者都會讓整台 Redis 停住。用 SCAN 分批、用 UNLINK 刪。</li>
+  <li><strong>SCAN 拿到 0 個 key 就停</strong>：中間某一輪回傳空陣列很正常，cursor 回到 0 才是走完。</li>
+  <li><strong>所有 key 用同一個 hash tag</strong>：Cluster 只用到一個節點。tag 只包「需要一起操作的最小範圍」。</li>
+  <li><strong>以為複寫是同步的</strong>：primary 回 OK 之後才送給 replica，故障切換後最近的寫入可能消失；從 replica 讀也可能讀到舊資料。</li>
+</ul>
+
+<h2 id="appendix">補充與查表</h2>
+<p>這一節收的是主線用不到、但查資料、調設定或選服務時會遇到的細節，查表用，不用背。</p>
+
+<h3>listpack 轉換門檻</h3>
+<p>小集合用 listpack、超過門檻轉成 hashtable 的門檻是設定值。8.10.3 的 hash 預設 <code>hash-max-listpack-entries 512</code>、<code>hash-max-listpack-value 64</code>（單一值超過 64 bytes 也會轉換），用 <code>CONFIG GET 'hash-max-listpack*'</code> 看。第一節的例子裡，500 個欄位還在門檻內，600 個就超過了。</p>
+
+<h3>LRU、LFU 為什麼是近似值</h3>
+<p>Redis 不維護所有 key 的完整排序（太耗記憶體），而是隨機抽 <code>maxmemory-samples</code>（預設 5）個 key，淘汰其中最舊或最冷的，並保留一小池候選。對實際的存取模式，效果跟真正的 LRU 幾乎一樣。</p>
+
+<h3>Redis 8.10 的備份指令</h3>
+<p>Redis 8.10 另外加了 <code>BACKUP START</code>／<code>BACKUP SEAL</code> 指令，產生快照加增量的完整備份。託管服務不一定有，使用前先查版本。</p>
+
+<h3>Cluster 的多個 DB</h3>
+<p>Redis Cluster 只有 DB 0。Valkey 9.0 起 cluster 模式可以用多個 DB，Redis 8.10 還不行。</p>
+
+<h3>授權與託管服務</h3>
+<p>Redis 7.2 以前是 BSD 授權；7.4 起改成 RSALv2／SSPLv1；<strong>Redis 8 起可以選 AGPLv3</strong>（另外兩個仍可選）。2024 年授權變更後，Linux Foundation 從 7.2.4 分支出 <strong>Valkey</strong>，維持 BSD 授權，指令相容。</p>
+<p>AWS ElastiCache 目前提供 Valkey（到 9.1）和 Redis OSS（到 7.1），沒有 Redis 8；AWS 的 MemoryDB 用多可用區的交易日誌持久化，定位是「可以當主要資料庫的記憶體資料庫」。ElastiCache 的 Valkey 9.0 也加了多可用區的交易日誌，可以選同步寫入（不丟資料、寫入延遲到個位數毫秒）或非同步寫入（最多可能丟約 10 秒）。8.6 的 lrm 策略、8.10 的 BACKUP 這類新功能，要查託管服務的版本有沒有。</p>
+
+<h2>小結</h2>
+<ul>
+  <li>先量再調：用 <code>INFO memory</code> 看整台、<code>MEMORY USAGE</code> 量單一 key；小 key 的固定開銷可觀，小集合的 listpack 編碼很省。估算 = 樣本平均 × 數量 × 餘裕，上線後用實際成長修正。</li>
+  <li>一定要設 maxmemory。淘汰策略不分用途：快取用 allkeys-lru／lfu；不能丟的資料用 noeviction 放在另一台；volatile-* 沒有 TTL 的 key 時等於 noeviction。</li>
+  <li>RDB 是定期快照（fork、寫入時複製，所以機器要比 maxmemory 大），AOF 記錄每個寫入；everysec 斷電最多丟約 1～2 秒。要安全就兩個一起開；純快取可以都不開。</li>
+  <li>整台變慢先看 SLOWLOG。大 key 用 SCAN＋MEMORY USAGE 或 <code>redis-cli --bigkeys／--memkeys</code> 找，用 UNLINK 刪、拆小、限制成長；熱 key 用本機快取、複製多份或讀副本分攤，<code>--hotkeys</code> 要 LFU 策略。</li>
+  <li>複寫是非同步的；Sentinel 做自動切換，解決可用性；Cluster 用 16384 個 slot 分散資料，解決容量，多 key 指令要同 slot，用 hash tag 讓相關的 key 在一起。</li>
+  <li>上線要監控記憶體、淘汰數、命中率、延遲、連線數、複寫延遲；用 ACL 限制指令。託管服務要注意 Redis 8 與 Valkey 的版本與授權差異。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 8 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 9：咖啡店要算每天來店的不同會員數，月底還要找出「這 3 天每天都來」的會員。每天一個 key，用哪種結構？</p>
+  <label data-key="a">string：會員每來一次就 INCR，當天的數字就是來店人數</label>
+  <label data-key="b">list：每次來店 RPUSH 會員 id，LLEN 是人數，再比對三天的 list</label>
+  <label data-key="c">set：每次來店 SADD 會員 id，SCARD 是人數，SINTER 找三天都在的</label>
+  <p class="why">✓ set 自動去重，同一位會員一天來三次只算一個；SINTER 直接在伺服器上算交集。b 錯在 list 不去重，LLEN 是來店次數，不是人數；a 也一樣，而且留不下是誰來過。key 帶日期並設 TTL，才不會長成大 key。（第 2 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 10：限量券每人限領一張。程式先 SISMEMBER 看領過沒、GET 看剩幾張，都通過才 DECR 庫存並 SADD 名單。開賣時有客人連點兩下領到兩張，怎麼修？</p>
+  <label data-key="a">把讀、判斷、扣庫存、記名單寫成一個 Lua 腳本，兩個 key 從 KEYS 傳入</label>
+  <label data-key="b">把這四個指令包進 MULTI／EXEC，讓它們連續執行、不被別人插隊</label>
+  <label data-key="c">拿掉 GET，直接 DECR，回傳值小於 0 就加回去並回「已領完」</label>
+  <label data-key="d">四個指令改用 pipeline 一次送出，縮短兩個請求之間的空隙</label>
+  <p class="why">✓ 問題在「讀 → 判斷 → 寫」分成多步，兩個請求都在對方寫入前讀到「沒領過」。Lua 腳本在 Redis 裡一次做完，執行期間沒有別的指令插進來。b 錯在 MULTI 裡的指令要到 EXEC 才有結果，沒辦法依 SISMEMBER 的答案決定扣不扣；c 只解決了超發，同一個人連點兩下照樣通過。（第 4 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 11：登入 API 每分鐘最多 5 次，限流這樣寫。哪裡會出事？</p>
+<pre>const key = `ds:rl:login:${ip}`
+const count = await redis.incr(key)
+if (count === 1) await redis.pexpire(key, 60_000)
+if (count &gt; 5) throw new TooManyRequestsError()</pre>
+  <label data-key="a">ioredis 的 INCR 回傳字串 <code>'1'</code>，<code>count === 1</code> 不成立，key 不會過期</label>
+  <label data-key="b">同一個 IP 同時送 20 個請求，好幾個都拿到 1，計數被重設</label>
+  <label data-key="c">TTL 只在第 1 次設定，後面的請求沒有延長，限流會提早解除</label>
+  <label data-key="d">INCR 之後程式當掉，key 就沒有 TTL，這個 IP 之後都登入不了</label>
+  <p class="why">✓ INCR 和 PEXPIRE 是兩個指令，中間當掉、部署被砍或連線斷掉，key 就留下來而且沒有 TTL；之後 INCR 回 2、3、4，不會再是 1，也就不會補上過期。修法是每次都送 <code>PEXPIRE key ms NX</code>，key 帶上視窗編號。a 錯在 ioredis 的整數回覆就是 number，GET 這類回覆才是字串。（第 3 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 12：每天早上 9 點，所有用到 Redis 的 API 一起慢 2 秒，那時排程會產生「昨日來店會員」報表。Redis 主機的 CPU 平均不到 10%，先查什麼？</p>
+  <label data-key="a">API 伺服器的 GC 紀錄：Redis 的 CPU 那麼低，瓶頸應該不在 Redis</label>
+  <label data-key="b">Redis 的 SLOWLOG：報表有沒有對很大的 key 下 SMEMBERS 這類指令</label>
+  <label data-key="c">複寫延遲：replica 跟不上時，primary 要等它同步完才回覆 client</label>
+  <p class="why">✓ Redis 用一個主執行緒依序執行指令，一個跑 2 秒的指令讓所有 client 一起等。SLOWLOG GET 列出慢指令，找到後改用 SCAN 分批、把 key 拆小，刪除用 UNLINK。a 錯在 2 秒的阻塞攤在一整天裡，平均 CPU 幾乎看不出來；c 錯在複寫是非同步的，primary 不等 replica。（第 6 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 13：飲料做好時，店內 4 台平板都要跳出提示；當下關機的平板不用補。API 用什麼傳這個事件？</p>
+  <label data-key="a">Stream 加 consumer group，每台平板是 group 裡的一個 consumer</label>
+  <label data-key="b">pub/sub：每台平板訂閱同一個頻道，API 每做好一杯就 PUBLISH</label>
+  <label data-key="c">list：API 每做好一杯就 LPUSH，每台平板用 BRPOP 等著拿</label>
+  <p class="why">✓ 需求是廣播、丟了沒關係，正是 pub/sub：當下訂閱的每條連線都收到同一則。a 錯在 consumer group 是分工，每筆只交給 group 裡的一個 consumer，4 台裡只有 1 台會跳提示；c 也一樣，一筆只會被一個 BRPOP 拿走。（第 5 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 14：收據 worker 用 consumer group，處理成功才 XACK，另有排程用 XAUTOCLAIM 接手閒置超過 30 秒的訊息。偶爾有客人收到兩封同一筆訂單的收據，最可能的原因是？</p>
+  <label data-key="a">用 <code>&gt;</code> 讀取時，同一筆新訊息會同時交給 group 裡的兩個 worker</label>
+  <label data-key="b">XADD 用了 <code>MAXLEN ~</code> 近似修剪，被修掉的訊息會重新送一次</label>
+  <label data-key="c">信寄出了但還沒 XACK，訊息被 XAUTOCLAIM 交給別的 worker 又寄一次</label>
+  <label data-key="d">worker 重新部署後，consumer group 會從 stream 開頭重讀一遍</label>
+  <p class="why">✓ Streams 是至少一次送達：處理完、XACK 之前的空隙裡當機或處理太久，訊息留在 PEL，被接手後會再處理一次。修法是讓處理冪等，用事件 id 去重。a 錯在 group 裡每筆只交給一個 consumer，重複來自重送，不是分配。（第 5 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 15：原本只放快取的 Redis 設 <code>allkeys-lru</code>，後來也放了 session（TTL 30 分鐘）。週年慶流量一大，客人陸續被登出，Redis 沒有任何錯誤。怎麼修？</p>
+  <label data-key="a">改成 <code>volatile-lru</code>，只淘汰有 TTL 的 key，session 就不會被挑到</label>
+  <label data-key="b">拿掉 maxmemory，記憶體沒有上限，Redis 就不必淘汰任何 key</label>
+  <label data-key="c">改成 <code>allkeys-lfu</code>，常用的 session 存取頻率高，不會被淘汰</label>
+  <label data-key="d">session 搬到另一台 <code>noeviction</code> 的 Redis 並監控記憶體，快取那台照舊</label>
+  <p class="why">✓ 淘汰策略不分用途，只看冷熱；一陣子沒操作的 session 正是會被挑走的。能從 PostgreSQL 重建的放快取那台，不能丟的放 noeviction 那台，滿了寫入失敗並告警，<code>evicted_keys</code> 應該是 0。a 錯在 session 本來就有 TTL，volatile-lru 一樣會淘汰它；b 讓 Redis 長到被作業系統 OOM kill。（第 6 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 16：會員點數想從 PostgreSQL 搬到 Redis，用 HINCRBY 加減。同事說：「開 AOF everysec，再加 replica 和 Sentinel，就跟資料庫一樣安全。」對嗎？</p>
+  <label data-key="a">不對：斷電會丟最近 1～2 秒，複寫是非同步的，切換時還會再丟</label>
+  <label data-key="b">對：AOF 記下每個寫入，replica 再多存一份，兩層保護就夠了</label>
+  <label data-key="c">不對：Redis 是單執行緒，兩個請求同時扣點會互相覆蓋，要加 WATCH</label>
+  <label data-key="d">對：只要再把 appendfsync 改成 always，就一筆都不會丟</label>
+  <p class="why">✓ 錯了要賠錢的數字不能只放 Redis：everysec 每秒才 fsync，primary 回 OK 之後才送給 replica，故障切換後最近的寫入可能消失。點數留在 PostgreSQL，用條件更新扣。d 錯在 always 只顧到單台斷電，複寫仍是非同步的，切換一樣會丟；c 錯在 HINCRBY 是單一指令，在伺服器上一步完成。（第 3、6 課）</p>
+</div>
+<p>這個階段的重點整理成<a href="../sheets/stage-2.html">一頁圖解</a>。</p>
+<p>下一課離開 Redis，進入 MongoDB：資料長得像一份文件、欄位每月都在變的時候，該怎麼決定內嵌還是參照。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

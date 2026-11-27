@@ -1,0 +1,3 @@
+-- 錯誤：只給表的權限，忘了序列
+ALTER DEFAULT PRIVILEGES FOR ROLE cafe_migrator IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO cafe_app;

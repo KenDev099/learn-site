@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>10. SQS、SNS、EventBridge 與 S3 事件：visibility timeout、DLQ、fan-out 與冪等</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="10" data-practice="aws">
+<header>
+  <div class="eyebrow">階段 5：事件與上線 · 第 10 課</div>
+  <h1>SQS、SNS、EventBridge 與 S3 事件：visibility timeout、DLQ、fan-out 與冪等</h1>
+</header>
+<main>
+
+<p>咖啡店的結帳成功後要做三件事：寄電子收據、替會員加點數、通知廚房做飲料。一開始全部寫在結帳 API 裡，郵件服務一慢，結帳就跟著慢。改成丟訊息給背景程式處理之後，新的問題出現了：有客人收到兩封一樣的收據；有一筆點數一直沒加上去，訊息也找不到了；門市每晚上傳到 S3 的銷售 CSV，檔名有空白的那幾家永遠沒被匯入，也沒有人發現。</p>
+<p>這一課是 AWS 上「服務之間怎麼傳話」：SQS（佇列）、SNS（推播）、EventBridge（事件匯流排）各自做什麼、怎麼選，以及每一種都會遇到的同一件事：<strong>訊息會重複、會失敗、會靜默地沒送到</strong>。學完你能設定 visibility timeout 與 DLQ、寫出冪等的消費者、用 SNS 做 fan-out、讀懂 EventBridge 的 event pattern，並正確處理 S3 事件。</p>
+<p>這課的路線：</p>
+<ul>
+  <li>三個服務一句話，以及開場三件事各自錯在哪。</li>
+  <li>SQS：visibility timeout、long polling、DLQ；消費者用 DynamoDB 做冪等（練習 1）。</li>
+  <li>SNS fan-out：一則訊息推給好幾個佇列，各自過濾（練習 3）。</li>
+  <li>EventBridge：用 event pattern 把事件送到對的地方（練習 2）。</li>
+  <li>S3 事件經過 SQS 送到 Lambda：URL 編碼的 key、測試訊息、部分失敗（練習 4）；最後一段 Step Functions 與 EventBridge Scheduler。</li>
+</ul>
+
+<div class="callout"><strong>這課會用到：</strong>佇列的送達語意（<a href="../../system-design/lessons/12-queues-outbox.html">系統設計課第 12 課</a>：先處理再 ack 是「至少一次」，visibility timeout 是租約，超過接收次數進 DLQ）；冪等（<a href="../../system-design/lessons/09-idempotency.html">系統設計課第 9 課</a>：同一件事做很多次，效果跟做一次相同）；DynamoDB 的條件寫入（<a href="../../data-stores/lessons/14-dynamodb-design.html">資料儲存課第 14 課</a>：<code>attribute_not_exists</code> 讓「不存在才寫入」變成一個原子動作）；Lambda 的 handler 與 <code>batchItemFailures</code>（<a href="06-lambda-api-gateway.html">第 6 課</a>）。</div>
+
+<div class="callout warn"><strong>練習環境：</strong>模擬器的 SQS 會真的照 visibility timeout 重新送出、超過次數移到 DLQ，SNS 的過濾與 S3 事件也會真的送到佇列，所以練習 1、3、4 會等幾秒。模擬器不檢查 queue policy，也不會執行 Lambda：handler 由測試直接呼叫。</div>
+
+<h2>三個服務各做什麼</h2>
+<p>三個服務都在「一方送出、另一方之後再處理」，差別在訊息怎麼流：</p>
+<div class="table-wrap"><table>
+  <tr><th>服務</th><th>模型</th><th>一則訊息給幾個人</th><th>咖啡店的例子</th></tr>
+  <tr><td><strong>SQS</strong>（Simple Queue Service）</td><td>佇列：訊息放著，消費者自己來拉（poll），處理完刪掉</td><td>一個：同一則訊息只有一個消費者在處理</td><td>寄收據的工作，由 worker 一則則處理</td></tr>
+  <tr><td><strong>SNS</strong>（Simple Notification Service）</td><td>發布／訂閱：發布到 topic，SNS 推給每個訂閱者</td><td>每個訂閱者一份</td><td>「訂單成立」同時推給收據、點數、廚房</td></tr>
+  <tr><td><strong>EventBridge</strong></td><td>事件匯流排：事件送到 bus，rule 依內容（event pattern）決定送給哪些目標</td><td>符合 rule 的每個目標一份</td><td>AWS 服務的事件、跨帳號的事件、依欄位細分的路由</td></tr>
+</table></div>
+<p>SNS 和 EventBridge 都不保存訊息給你慢慢處理：消費者忙不過來或暫時掛掉，訊息就要有地方放。所以常見的組合是<strong>前面用 SNS 或 EventBridge 分送，每個消費者前面各放一個 SQS</strong>，由佇列吸收尖峰、負責重試。</p>
+<p>開場三件事對應這課的三個重點：</p>
+<ul>
+  <li><strong>收據寄兩封</strong>：SQS 標準佇列保證「至少一次」送達，同一則訊息可能被收到兩次；處理太久超過 visibility timeout，也會被另一個 worker 再拿一次。消費者必須冪等。</li>
+  <li><strong>點數漏加、訊息不見</strong>：worker 一收到就把訊息刪掉，接著加點數時程式掛了，訊息已經沒了。要「處理成功才刪」，失敗的留在佇列重試，一直失敗的進 DLQ，並且對 DLQ 告警。</li>
+  <li><strong>有空白的檔名沒被匯入</strong>：S3 事件裡的 key 是 URL 編碼的，<code>門市 A.csv</code> 變成 <code>%E9%96%80%E5%B8%82+A.csv</code>，直接拿去讀 S3 會找不到；錯誤又被吞掉，所以沒人發現。</li>
+</ul>
+
+<h2>SQS：visibility timeout、long polling 與 DLQ</h2>
+<p>先把 SQS 的三個設定看清楚，開場的前兩件事都出在這裡。消費者用 <code>ReceiveMessage</code> 拉訊息時，訊息<strong>不會從佇列消失</strong>，只是在 <strong>visibility timeout</strong>（可見性逾時）這段時間內別人看不到；消費者處理完要自己 <code>DeleteMessage</code>。時間到了還沒刪，訊息重新出現，別的消費者會再拿到它。依 SQS 開發者指南（2026-11-20 查證），預設 30 秒，從第一次收到算起最長 12 小時。</p>
+<ul>
+  <li><strong>visibility timeout 要比處理時間長</strong>：處理要 40 秒、timeout 30 秒，第 30 秒時訊息重新出現，另一個 worker 也開始處理，收據就寄了兩封。不確定要多久時，處理期間用 <code>ChangeMessageVisibility</code> 定期延長（heartbeat）。Lambda 讀 SQS 時，Lambda 文件建議佇列的 visibility timeout 至少是函式 timeout 的 6 倍。</li>
+  <li><strong>long polling</strong>：<code>ReceiveMessage</code> 帶 <code>WaitTimeSeconds</code>（最多 20 秒），佇列是空的時候等到有訊息或時間到才回應。不帶（short polling）會立刻回傳空結果，worker 在空佇列上不停打 API，浪費請求費用。</li>
+  <li><strong>DLQ</strong>（dead-letter queue，死信佇列）：在來源佇列設 <code>RedrivePolicy</code>（DLQ 的 ARN＋<code>maxReceiveCount</code>），同一則訊息被接收超過這個次數還沒刪，SQS 就把它移到 DLQ，不再一直重試。修好程式後，可以把 DLQ 裡的訊息 redrive 回原本的佇列。</li>
+</ul>
+<pre>aws sqs create-queue --queue-name cafe-receipts-dlq
+aws sqs create-queue --queue-name cafe-receipts --attributes '{
+  "VisibilityTimeout": "60",
+  "ReceiveMessageWaitTimeSeconds": "20",
+  "RedrivePolicy": "{\"deadLetterTargetArn\":\"arn:aws:sqs:ap-northeast-1:123456789012:cafe-receipts-dlq\",\"maxReceiveCount\":\"5\"}"
+}'</pre>
+<p><code>ReceiveMessageWaitTimeSeconds</code> 是佇列層級的 long polling 預設值，請求裡的 <code>WaitTimeSeconds</code> 會蓋過它。</p>
+<p>佇列分兩種：<strong>標準佇列</strong>（standard）吞吐量高，至少一次送達、順序盡量但不保證；<strong>FIFO 佇列</strong>在同一個 message group 內保證順序，並在 5 分鐘的去重間隔內，同一個 deduplication ID 的 <code>SendMessage</code> 不會產生重複的訊息。FIFO 的「exactly-once processing」指的是「佇列裡不會多出重複的訊息」，你的 worker 處理到一半當機、訊息重新出現，照樣會處理第二次，所以消費者仍然要冪等。</p>
+<div class="callout practice"><strong>💡 實務上：DLQ 不告警，等於訊息被丟進垃圾桶</strong><br>DLQ 最常見的狀態是：設好了，三個月後才有人發現裡面躺了兩千則訊息。資深的做法是對 DLQ 的 <code>ApproximateNumberOfMessagesVisible</code> 大於 0 設 CloudWatch 告警，對主佇列的 <code>ApproximateAgeOfOldestMessage</code>（最老的訊息等了多久）設告警，前者告訴你「有東西一直失敗」，後者告訴你「處理跟不上」。值班手冊寫清楚：DLQ 有訊息時，先看訊息內容與錯誤 log，修好之後再 redrive，不要直接清空。</div>
+
+<h2>冪等的消費者：重複一定會發生</h2>
+<p>visibility timeout 與 DLQ 解決了「失敗的不要丟」，但「至少一次」代表重複一定會發生：網路斷在 <code>DeleteMessage</code> 之前、處理超時、生產者自己重送。系統設計課第 9、12 課講過觀念，這裡用 AWS 的元件做出來：</p>
+<ol>
+  <li>每則訊息找出一個<strong>業務上的冪等鍵</strong>：寄收據就是訂單 ID。不要用 SQS 的 MessageId，生產者重送同一張訂單時，MessageId 是新的。</li>
+  <li>處理前，用 DynamoDB 查這個鍵有沒有「完成標記」（<code>GetItem</code>，<code>ConsistentRead: true</code>）；有的話是重複的，直接刪訊息。</li>
+  <li>處理。失敗就不要刪，讓它在 visibility timeout 之後重新出現。</li>
+  <li>成功後寫完成標記，用條件寫入 <code>attribute_not_exists(pk)</code>：兩個 worker 同時做完時，只有一個寫得進去，另一個收到 <code>ConditionalCheckFailedException</code>，一樣當成完成。最後刪訊息。</li>
+</ol>
+<p>順序很重要：<strong>先寫完成標記再處理</strong>，處理失敗時標記已經在了，重試會被當成重複而跳過，這封收據永遠不會寄出（就是點數漏加的另一種版本）。<strong>完成標記記在程式的記憶體</strong>（一個 <code>Set</code>），worker 重啟或有第二台 worker 就失效。</p>
+<p>這個做法還有一個縫：處理成功、寫標記之前程序當機，下次會再處理一次。所以副作用本身最好也冪等：寄信時把訂單 ID 當成郵件服務的冪等鍵、加點數用「這筆訂單的點數紀錄」這種有唯一約束的寫入，而不是「點數 + 10」。更嚴謹的做法是先寫一筆有到期時間的「處理中」紀錄當租約，AWS 的 Powertools for AWS Lambda 有現成的 idempotency 工具採用這種做法。練習 1 先做最基本的版本。</p>
+<p>DynamoDB 的 GSI 與部分讀取是最終一致的；完成標記要用主表的 <code>ConsistentRead</code> 查。模擬器寫完立刻讀得到，不會暴露這個差異。</p>
+
+<h2>SNS fan-out：一則訊息，好幾個消費者</h2>
+<p>寄收據的 worker 寫好之後，加點數、通知廚房也要收到同一張訂單。不要讓結帳 API 分別送三次，那樣結帳要知道所有下游，加一個下游就要改結帳。<strong>fan-out</strong>（扇出）的做法：結帳只發布一次到 SNS topic <code>cafe-orders</code>，三個佇列各自訂閱。</p>
+<p>三個設定決定 fan-out 會不會動、收到的是什麼：</p>
+<ul>
+  <li><strong>queue policy</strong>：SQS 佇列預設不讓別人送訊息進來。要在佇列的 <code>Policy</code> 屬性允許 <code>sns.amazonaws.com</code> 做 <code>sqs:SendMessage</code>，並用條件 <code>aws:SourceArn</code> 限定只有這個 topic；少了條件，任何帳號的任何 topic 都能把訊息塞進你的佇列。</li>
+  <li><strong>RawMessageDelivery</strong>：預設 SNS 會把訊息包在一層 JSON 信封裡（<code>Type</code>、<code>TopicArn</code>、<code>Message</code>…），消費者要解兩次。訂閱時設 <code>RawMessageDelivery: true</code>，佇列收到的就是原本的訊息。</li>
+  <li><strong>filter policy</strong>（過濾政策）：每個訂閱可以只收符合條件的訊息，例如廚房只要飲料。預設比對的是 <strong>message attributes</strong>（訊息的附加屬性）；要比對訊息內容（JSON body）的欄位，訂閱屬性要加 <code>FilterPolicyScope: MessageBody</code>。寫錯範圍不會報錯，只會什麼都收不到。</li>
+</ul>
+<pre>aws sns subscribe --topic-arn arn:aws:sns:ap-northeast-1:123456789012:cafe-orders \
+  --protocol sqs --notification-endpoint arn:aws:sqs:ap-northeast-1:123456789012:cafe-kitchen \
+  --attributes '{"RawMessageDelivery":"true","FilterPolicyScope":"MessageBody","FilterPolicy":"{\"type\":[\"drink\"]}"}'</pre>
+<p>過濾放在 SNS 而不是在 worker 裡丟掉不要的訊息，好處是不要的訊息根本不會進佇列，不佔處理量也不用付佇列的請求費用。</p>
+<div class="callout practice"><strong>💡 實務上：先問「要不要保證送到」</strong><br>SNS 推給 SQS 時，訊息有佇列接著；推給 HTTP 端點或 email 時，對方掛太久，重試用完訊息就沒了（可以替訂閱設 DLQ 接住）。所以團隊內部的服務間溝通，資深工程師幾乎都用「SNS → 每個消費者自己的 SQS」，而不是讓 SNS 直接打服務的 HTTP API。另外，新增一個消費者時只要新增一個訂閱，不用改發布端，這也是 code review 時判斷「這個功能該不該改結帳程式」的依據。</div>
+
+<h2>EventBridge：用 event pattern 路由事件</h2>
+<p>SNS 的過濾是「每個訂閱一條規則」；當事件的種類、來源越來越多，或要接 AWS 服務自己發出的事件（例如 ECS task 停止、S3 物件建立），就用 <strong>EventBridge</strong>。事件送到一條 <strong>event bus</strong>（事件匯流排；每個帳號有一條 default bus 接 AWS 服務的事件，也可以自己建），<strong>rule</strong>（規則）用 <strong>event pattern</strong> 比對事件，符合的送給 rule 的目標（SQS、Lambda、Step Functions、另一個帳號的 bus…）。</p>
+<pre>// 結帳發出的事件（PutEvents）
+{ "source": "cafe.orders", "detail-type": "OrderPaid",
+  "detail": { "orderId": "o-1", "total": 190, "channel": "app", "store": "taipei-01", "items": ["latte", "croissant"] } }
+
+// rule 的 event pattern：台北門市、App 下單、金額 100 以上
+{ "source": ["cafe.orders"],
+  "detail": { "store": [{ "prefix": "taipei-" }], "channel": ["app"], "total": [{ "numeric": [">=", 100] }] } }</pre>
+<p>依 EventBridge 使用者指南的比較運算子一節（2026-11-20 查證），規則是：</p>
+<ul>
+  <li>pattern 裡不同的欄位是 AND；同一個欄位的陣列是 OR（<code>"channel": ["app", "kiosk"]</code>）。</li>
+  <li>巢狀的物件一層層往下比對；最底層（leaf）一定寫成陣列。</li>
+  <li>事件裡的值是陣列時，只要有一個元素符合就算符合（<code>items</code> 含 <code>croissant</code>）。</li>
+  <li><code>prefix</code> 只比對字串；<code>numeric</code> 只比對數字（事件裡的 <code>"190"</code> 是字串，不會符合）；<code>exists: false</code> 比對「沒有這個欄位」；<code>anything-but</code> 是「不是這些值」。</li>
+</ul>
+<p>event pattern 最大的風險是<strong>寫錯不會報錯</strong>：大小寫不同、數字寫成字串、欄位放錯層，rule 照樣建立成功，只是永遠不觸發。所以上線前用 <code>aws events test-event-pattern --event-pattern … --event …</code> 拿真的事件測，並對 rule 的 <code>TriggeredRules</code>／目標的 <code>FailedInvocations</code> 指標設監控。練習 2 寫一個 pattern 比對函式，把這些規則練一次。</p>
+<p>EventBridge 還有兩個 SNS 沒有的功能：<strong>archive／replay</strong>（把 bus 上的事件存起來，修好消費者後重播一段時間的事件），以及跨帳號、跨 region 把事件轉送到另一條 bus。代價是設定比 SNS 多、延遲通常也比較高；只是「一則訊息推給幾個佇列」的話，SNS 就夠了。</p>
+
+<h2>S3 事件：URL 編碼的 key、測試訊息與部分失敗</h2>
+<p>最後是開場第三件事。S3 可以在物件建立、刪除時發出<strong>事件通知</strong>（event notification），送到 SQS、SNS、Lambda，或打開 EventBridge 整合送到 default bus。設定時可以用前綴、後綴過濾，例如只要 <code>sales/</code> 底下的檔案：</p>
+<pre>aws s3api put-bucket-notification-configuration --bucket cafe-sales --notification-configuration '{
+  "QueueConfigurations": [{
+    "QueueArn": "arn:aws:sqs:ap-northeast-1:123456789012:cafe-sales-import",
+    "Events": ["s3:ObjectCreated:*"],
+    "Filter": { "Key": { "FilterRules": [{ "Name": "prefix", "Value": "sales/" }] } }
+  }]
+}'</pre>
+<p>為什麼中間放 SQS，而不是讓 S3 直接觸發 Lambda？佇列吸收尖峰（月底一次上傳幾百個檔案），失敗的訊息有 visibility timeout 重試、有 DLQ 接住，Lambda 也能一次拿一批處理。消費端要處理的事，依 S3 使用者指南「Event message structure」（2026-11-20 查證）：</p>
+<ul>
+  <li><strong>key 是 URL 編碼的</strong>：文件的例子是 <code>red flower.jpg</code> 變成 <code>red+flower.jpg</code>，中文與括號會變成 <code>%XX</code>。解法是<strong>先把 <code>+</code> 換成空白，再 <code>decodeURIComponent</code></strong>；順序反過來，檔名裡真正的 <code>+</code>（編碼成 <code>%2B</code>）會被解成 <code>+</code> 再被換成空白。</li>
+  <li><strong>測試訊息</strong>：設定通知後，S3 會送一則 <code>{"Service":"Amazon S3","Event":"s3:TestEvent",…}</code>，格式跟一般事件不同、沒有 <code>Records</code>。把它當錯誤，它就會一直重試、最後進 DLQ。</li>
+  <li><strong>至少一次、不保證順序</strong>：同一個事件可能送兩次。冪等鍵用 bucket＋key＋<code>versionId</code>（開了版本控制時才有；沒有時用 <code>eTag</code>），同一個 key 被重新上傳也能分辨。同一個 key 的先後順序看 <code>sequencer</code>。</li>
+  <li><strong>SQS 的 body 是 S3 事件</strong>：一則 SQS 訊息的 <code>body</code> 是字串，解析後的 <code>Records</code> 陣列才是一個個物件。</li>
+</ul>
+<p>Lambda 從 SQS 拿到一批訊息時，預設整批成功或整批失敗：一個檔案壞掉，同一批的其他檔案也回到佇列重做。在 event source mapping 開啟 <code>ReportBatchItemFailures</code>，handler 回傳 <code>{ batchItemFailures: [{ itemIdentifier: messageId }] }</code>，只有列出的訊息回到佇列（<a href="06-lambda-api-gateway.html">第 6 課</a>）。練習 4 用模擬器真的上傳檔案、從佇列拿到真實格式的事件，交給你的 handler。</p>
+<div class="callout practice"><strong>💡 實務上：吞掉錯誤的匯入程式最難查</strong><br>開場的 CSV 沒被匯入，真正的問題不是編碼，而是「找不到物件」的錯誤被 <code>catch {}</code> 吞掉、訊息被刪掉，所以 DLQ 也是空的。檢查匯入類程式時，資深工程師會看三件事：失敗會不會留在佇列（或進 DLQ）、有沒有對失敗數量告警、每天有沒有一個對帳（例如「今天 S3 上有 42 個檔案、資料庫匯入了 42 份」）。最後這個對帳，往往是唯一能抓到「事件根本沒送出來」這種靜默錯誤的方法。</div>
+
+<h3>Step Functions 與 EventBridge Scheduler</h3>
+<p>兩個常跟佇列一起出現的服務，這課不出題。<strong>Step Functions</strong> 用狀態機描述多步驟的流程（付款 → 扣庫存 → 通知外送），每一步可以設 <code>Retry</code> 與 <code>Catch</code>，失敗時走補償的分支（<a href="../../system-design/lessons/13-saga.html">系統設計課第 13 課</a>的 saga）。依 Step Functions 開發者指南（2026-11-20 查證），Standard 工作流程最長一年、每次執行 exactly-once，適合不能重複的步驟；Express 最長五分鐘、非同步執行是 at-least-once，適合量大、可以冪等的處理。<strong>EventBridge Scheduler</strong> 用來排定一次性或週期性（cron、rate）的呼叫，例如每天凌晨觸發對帳；比起自己開一台機器跑 cron，它不用維護主機，也能直接呼叫 SQS、Lambda、Step Functions 等目標。</p>
+<p>三者怎麼選，一句話：<strong>工作要排隊、要重試</strong>用 SQS；<strong>同一件事要通知很多人</strong>用 SNS（或 EventBridge，事件種類多、要依內容路由、接 AWS 服務事件時）；<strong>好幾步要依序完成、失敗要補償</strong>用 Step Functions。</p>
+
+<h2>在真的 AWS 帳號上做一次（選做）</h2>
+<p>這一節不判分，也不影響進度。用第 1 課建議的<strong>獨立練習帳號</strong>與 <code>learn-sandbox</code> profile。</p>
+<div class="callout warn"><strong>費用：</strong>SQS、SNS 依請求次數計費，S3 依儲存量與請求次數計費；這一節的量很小，但仍以官方定價為準：<a href="https://aws.amazon.com/sqs/pricing/">SQS 定價</a>、<a href="https://aws.amazon.com/sns/pricing/">SNS 定價</a>、<a href="https://aws.amazon.com/s3/pricing/">S3 定價</a>。這幾項沒有按小時計費的部分，做完照「清除」刪掉即可。</div>
+<pre># 0. 這一節的指令都用同一組設定；先把帳號 ID 存起來
+export AWS_PROFILE=learn-sandbox AWS_REGION=ap-northeast-1
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+
+# 1. 建 DLQ 與主佇列：visibility timeout 10 秒、接收 2 次失敗就進 DLQ
+aws sqs create-queue --queue-name cafe-learn-10-dlq
+aws sqs create-queue --queue-name cafe-learn-10 --attributes "{\"VisibilityTimeout\":\"10\",\"RedrivePolicy\":\"{\\\"deadLetterTargetArn\\\":\\\"arn:aws:sqs:ap-northeast-1:$ACCOUNT:cafe-learn-10-dlq\\\",\\\"maxReceiveCount\\\":\\\"2\\\"}\"}"
+Q=$(aws sqs get-queue-url --queue-name cafe-learn-10 --query QueueUrl --output text)
+
+# 2. 送一則訊息，收兩次但不刪（每次間隔超過 10 秒），第三次收的時候它已經在 DLQ
+aws sqs send-message --queue-url $Q --message-body '{"orderId":"o-1"}'
+aws sqs receive-message --queue-url $Q --wait-time-seconds 20 --attribute-names ApproximateReceiveCount
+sleep 11; aws sqs receive-message --queue-url $Q --wait-time-seconds 20 --attribute-names ApproximateReceiveCount
+sleep 11; aws sqs receive-message --queue-url $Q --wait-time-seconds 5
+aws sqs receive-message --queue-url $(aws sqs get-queue-url --queue-name cafe-learn-10-dlq --query QueueUrl --output text) --wait-time-seconds 5
+
+# 3. S3 事件：建 bucket、允許 S3 送訊息到佇列、設通知、上傳有空白的檔名，看佇列裡的 key
+aws s3api create-bucket --bucket cafe-learn-10-$ACCOUNT --create-bucket-configuration LocationConstraint=ap-northeast-1
+aws sqs set-queue-attributes --queue-url $Q --attributes "{\"Policy\":\"{\\\"Version\\\":\\\"2012-10-17\\\",\\\"Statement\\\":[{\\\"Effect\\\":\\\"Allow\\\",\\\"Principal\\\":{\\\"Service\\\":\\\"s3.amazonaws.com\\\"},\\\"Action\\\":\\\"sqs:SendMessage\\\",\\\"Resource\\\":\\\"arn:aws:sqs:ap-northeast-1:$ACCOUNT:cafe-learn-10\\\",\\\"Condition\\\":{\\\"ArnEquals\\\":{\\\"aws:SourceArn\\\":\\\"arn:aws:s3:::cafe-learn-10-$ACCOUNT\\\"}}}]}\"}"
+aws s3api put-bucket-notification-configuration --bucket cafe-learn-10-$ACCOUNT --notification-configuration "{\"QueueConfigurations\":[{\"QueueArn\":\"arn:aws:sqs:ap-northeast-1:$ACCOUNT:cafe-learn-10\",\"Events\":[\"s3:ObjectCreated:*\"]}]}"
+echo 'item,qty' &gt; sales.csv
+aws s3api put-object --bucket cafe-learn-10-$ACCOUNT --key 'sales/門市 A (1).csv' --body sales.csv
+aws sqs receive-message --queue-url $Q --wait-time-seconds 20 --max-number-of-messages 10 --query 'Messages[].Body'</pre>
+<p>第 3 步會先收到一則 <code>s3:TestEvent</code>，接著是上傳事件，看它的 <code>s3.object.key</code> 長什麼樣子。shell 裡的多層跳脫很容易打錯，可以改成把 JSON 寫進檔案，用 <code>file://policy.json</code> 傳入。</p>
+<h3>清除</h3>
+<pre>aws s3 rm s3://cafe-learn-10-$ACCOUNT --recursive
+aws s3api delete-bucket --bucket cafe-learn-10-$ACCOUNT
+aws sqs delete-queue --queue-url $Q
+aws sqs delete-queue --queue-url $(aws sqs get-queue-url --queue-name cafe-learn-10-dlq --query QueueUrl --output text)
+rm sales.csv
+# 確認：沒有 cafe-learn-10 開頭的佇列與 bucket（刪除佇列後可能要等一下才從清單消失）
+aws sqs list-queues --queue-name-prefix cafe-learn-10
+aws s3api list-buckets --query "Buckets[?starts_with(Name, 'cafe-learn-10')].Name"
+unset AWS_PROFILE AWS_REGION</pre>
+
+<h2>練習</h2>
+<p>本機練習在 <code>aws/practice/work/10/</code>，都會連到模擬器。練習 1 要等 visibility timeout（每次約 1 秒），整題約 10 秒。</p>
+
+<div class="local" data-test="ex1" data-files="worker.ts">
+  <p>練習 1：完成 <code>worker.ts</code> 的 <code>pollOnce(sqs, ddb, { queueUrl, table, waitSeconds }, handle)</code>。送 <code>ReceiveMessageCommand</code>（<code>MaxNumberOfMessages: 10</code>、<code>WaitTimeSeconds: waitSeconds</code>）。每則訊息的 body 是 <code>{ orderId, email }</code>，完成標記的 key 是 <code>pk = receipt#&lt;orderId&gt;</code>：先用 <code>GetCommand</code>（<code>ConsistentRead: true</code>）查，有標記就刪訊息、算 <code>duplicates</code>；沒有就呼叫 <code>handle</code>，失敗算 <code>failed</code>、不刪、繼續下一則；成功就用 <code>PutCommand</code> 加 <code>ConditionExpression: 'attribute_not_exists(pk)'</code> 寫標記（<code>ConditionalCheckFailedException</code> 當成已完成），再刪訊息、算 <code>done</code>。回傳 <code>{ done, duplicates, failed }</code>。測試的佇列 visibility timeout 是 1 秒、<code>maxReceiveCount</code> 是 2，會檢查重複只處理一次、失敗的會重試、一直失敗的進 DLQ。</p>
+</div>
+
+<div class="exercise">
+  <p>練習 2：寫 <code>matchPattern(pattern, event)</code>，照上面 EventBridge 的規則判斷事件符不符合。這題支援的寫法：</p>
+  <ul>
+    <li>pattern 的每個欄位都要符合（AND）。值是物件就往下一層比對（事件裡沒有那一層、或那一層不是物件，就不符合）；值是陣列就是這個欄位的比對條件，任一個符合即可（OR）。</li>
+    <li>比對條件：字串、數字、<code>null</code> 用 <code>===</code> 比；<code>{ prefix }</code> 只對字串；<code>{ numeric: [運算子, 數字, 運算子?, 數字?] }</code> 只對數字，運算子是 <code>=</code>、<code>&gt;</code>、<code>&gt;=</code>、<code>&lt;</code>、<code>&lt;=</code>，全部成立才算；<code>{ exists: true/false }</code> 看欄位在不在；<code>{ 'anything-but': 值或值的陣列 }</code> 是字串或數字、而且不在清單裡。</li>
+    <li>事件裡沒有這個欄位時，只有 <code>{ exists: false }</code> 會符合。事件裡的值是陣列時，任一個元素符合任一個條件就算符合。</li>
+  </ul>
+  <script type="start">
+type Matcher = string | number | null | { prefix: string } | { numeric: (string | number)[] } | { exists: boolean } | { 'anything-but': string | number | (string | number)[] }
+type Pattern = { [key: string]: Pattern | Matcher[] }
+
+function matchPattern(pattern: Pattern, event: unknown): boolean {
+  return false
+}
+
+const order = { source: 'cafe.orders', detail: { total: 190, channel: 'app', store: 'taipei-01', items: ['latte', 'croissant'] } }
+console.log(matchPattern({ source: ['cafe.orders'], detail: { store: [{ prefix: 'taipei-' }], total: [{ numeric: ['>=', 100] }] } }, order))
+</script>
+  <script type="answer">
+type Matcher = string | number | null | { prefix: string } | { numeric: (string | number)[] } | { exists: boolean } | { 'anything-but': string | number | (string | number)[] }
+type Pattern = { [key: string]: Pattern | Matcher[] }
+
+function matchPattern(pattern: Pattern, event: unknown): boolean {
+  if (typeof event !== 'object' || event === null || Array.isArray(event)) return false
+  const obj = event as Record<string, unknown>
+  return Object.entries(pattern).every(([key, rule]) => {
+    const present = key in obj
+    if (!Array.isArray(rule)) return present && matchPattern(rule, obj[key])
+    if (!present) return rule.some(m => typeof m === 'object' && m !== null && 'exists' in m && m.exists === false)
+    const values = Array.isArray(obj[key]) ? obj[key] as unknown[] : [obj[key]]
+    return rule.some(m => values.some(v => matchOne(m, v)))
+  })
+}
+
+function matchOne(m: Matcher, v: unknown): boolean {
+  if (m === null || typeof m !== 'object') return v === m
+  if ('exists' in m) return m.exists
+  if ('prefix' in m) return typeof v === 'string' && v.startsWith(m.prefix)
+  if ('anything-but' in m) {
+    const list = [m['anything-but']].flat()
+    return (typeof v === 'string' || typeof v === 'number') && !list.includes(v)
+  }
+  if (typeof v !== 'number') return false
+  for (let i = 0; i < m.numeric.length; i += 2) {
+    const op = m.numeric[i], n = Number(m.numeric[i + 1])
+    const ok = op === '=' ? v === n : op === '>' ? v > n : op === '>=' ? v >= n : op === '<' ? v < n : op === '<=' ? v <= n : false
+    if (!ok) return false
+  }
+  return true
+}
+
+const order = { source: 'cafe.orders', detail: { total: 190, channel: 'app', store: 'taipei-01', items: ['latte', 'croissant'] } }
+console.log(matchPattern({ source: ['cafe.orders'], detail: { store: [{ prefix: 'taipei-' }], total: [{ numeric: ['>=', 100] }] } }, order))
+</script>
+  <script type="tests">
+const ev = { source: 'cafe.orders', 'detail-type': 'OrderPaid', detail: { orderId: 'o-1', total: 190, channel: 'app', store: 'taipei-01', items: ['latte', 'croissant'], note: null } }
+const yes = (p: Pattern, msg: string, e: unknown = ev) => assert.equal(matchPattern(p, e), true, '應該符合：' + msg)
+const no = (p: Pattern, msg: string, e: unknown = ev) => assert.equal(matchPattern(p, e), false, '不應該符合：' + msg)
+yes({ source: ['cafe.orders'] }, '值相等')
+no({ source: ['cafe.payments'] }, '值不相等')
+yes({ source: ['cafe.payments', 'cafe.orders'] }, '同一個欄位的陣列是 OR，任一個符合即可')
+no({ source: ['cafe.orders'], 'detail-type': ['OrderRefunded'] }, '不同欄位是 AND，detail-type 不符合')
+yes({ detail: { channel: ['app'] } }, '巢狀物件往下一層比對')
+no({ detail: { channel: ['kiosk'] } }, '巢狀欄位不相等')
+no({ payment: { method: ['card'] } }, '事件裡沒有 payment 這一層')
+yes({ detail: { items: ['croissant'] } }, '事件的值是陣列時，任一個元素符合就算')
+no({ detail: { items: ['cheesecake'] } }, '陣列裡沒有起司蛋糕')
+yes({ detail: { store: [{ prefix: 'taipei-' }] } }, 'prefix 比對字串開頭')
+no({ detail: { store: [{ prefix: 'tainan-' }] } }, 'prefix 不符合')
+no({ detail: { total: [{ prefix: '19' }] } }, 'prefix 只比對字串，total 是數字 190')
+yes({ detail: { total: [{ numeric: ['>=', 100, '<', 200] }] } }, 'numeric 範圍：100 <= 190 < 200')
+no({ detail: { total: [{ numeric: ['>', 190] }] } }, 'numeric：190 > 190 不成立')
+yes({ detail: { total: [{ numeric: ['=', 190] }] } }, 'numeric 等於')
+no({ detail: { total: [{ numeric: ['>', 100] }] } }, 'numeric 只比對數字：事件裡的 "190" 是字串', { detail: { total: '190' } })
+no({ detail: { total: ['190'] } }, '字串 "190" 跟數字 190 不相等')
+yes({ detail: { total: [190] } }, '數字相等')
+yes({ detail: { coupon: [{ exists: false }] } }, '事件沒有 coupon，exists: false 符合')
+no({ detail: { orderId: [{ exists: false }] } }, '事件有 orderId，exists: false 不符合')
+yes({ detail: { orderId: [{ exists: true }] } }, 'exists: true')
+no({ detail: { coupon: [{ exists: true }] } }, '沒有 coupon，exists: true 不符合')
+no({ detail: { coupon: ['SUMMER'] } }, '沒有這個欄位時，一般的值不會符合')
+yes({ detail: { channel: [{ 'anything-but': ['kiosk', 'pos'] }] } }, 'anything-but 清單裡沒有 app')
+no({ detail: { channel: [{ 'anything-but': 'app' }] } }, 'anything-but 單一值')
+no({ detail: { total: [{ 'anything-but': [190] }] } }, 'anything-but 數字清單')
+yes({ detail: { note: [null] } }, 'null 比對 null')
+no({ detail: { channel: [null] } }, 'channel 不是 null')
+yes({ source: ['cafe.orders'], detail: { store: [{ prefix: 'taipei-' }], channel: ['app', 'kiosk'], total: [{ numeric: ['>=', 100] }], coupon: [{ exists: false }] } }, '組合起來')
+</script>
+  <script type="wrong">
+type Matcher = string | number | null | { prefix: string } | { numeric: (string | number)[] } | { exists: boolean } | { 'anything-but': string | number | (string | number)[] }
+type Pattern = { [key: string]: Pattern | Matcher[] }
+// 把陣列當成 AND：每個條件都要符合
+function matchPattern(pattern: Pattern, event: unknown): boolean {
+  if (typeof event !== 'object' || event === null) return false
+  const obj = event as Record<string, unknown>
+  return Object.entries(pattern).every(([key, rule]) => {
+    if (!Array.isArray(rule)) return key in obj && matchPattern(rule, obj[key])
+    if (!(key in obj)) return rule.some(m => typeof m === 'object' && m !== null && 'exists' in m && !m.exists)
+    const values = Array.isArray(obj[key]) ? obj[key] as unknown[] : [obj[key]]
+    return rule.every(m => values.some(v => one(m, v)))
+  })
+}
+function one(m: Matcher, v: unknown): boolean {
+  if (m === null || typeof m !== 'object') return v === m
+  if ('exists' in m) return m.exists
+  if ('prefix' in m) return typeof v === 'string' && v.startsWith(m.prefix)
+  if ('anything-but' in m) return (typeof v === 'string' || typeof v === 'number') && ![m['anything-but']].flat().includes(v)
+  if (typeof v !== 'number') return false
+  for (let i = 0; i < m.numeric.length; i += 2) {
+    const op = m.numeric[i], n = Number(m.numeric[i + 1])
+    if (!(op === '=' ? v === n : op === '>' ? v > n : op === '>=' ? v >= n : op === '<' ? v < n : v <= n)) return false
+  }
+  return true
+}
+</script>
+  <script type="wrong">
+type Matcher = string | number | null | { prefix: string } | { numeric: (string | number)[] } | { exists: boolean } | { 'anything-but': string | number | (string | number)[] }
+type Pattern = { [key: string]: Pattern | Matcher[] }
+// prefix 與 numeric 都先轉型：數字也能比 prefix，字串也能比 numeric
+function matchPattern(pattern: Pattern, event: unknown): boolean {
+  if (typeof event !== 'object' || event === null) return false
+  const obj = event as Record<string, unknown>
+  return Object.entries(pattern).every(([key, rule]) => {
+    if (!Array.isArray(rule)) return key in obj && matchPattern(rule, obj[key])
+    if (!(key in obj)) return rule.some(m => typeof m === 'object' && m !== null && 'exists' in m && !m.exists)
+    const values = Array.isArray(obj[key]) ? obj[key] as unknown[] : [obj[key]]
+    return rule.some(m => values.some(v => one(m, v)))
+  })
+}
+function one(m: Matcher, v: unknown): boolean {
+  if (m === null || typeof m !== 'object') return v === m
+  if ('exists' in m) return m.exists
+  if ('prefix' in m) return String(v).startsWith(m.prefix)
+  if ('anything-but' in m) return (typeof v === 'string' || typeof v === 'number') && ![m['anything-but']].flat().includes(v)
+  const x = Number(v)
+  for (let i = 0; i < m.numeric.length; i += 2) {
+    const op = m.numeric[i], n = Number(m.numeric[i + 1])
+    if (!(op === '=' ? x === n : op === '>' ? x > n : op === '>=' ? x >= n : op === '<' ? x < n : x <= n)) return false
+  }
+  return true
+}
+</script>
+  <script type="wrong">
+type Matcher = string | number | null | { prefix: string } | { numeric: (string | number)[] } | { exists: boolean } | { 'anything-but': string | number | (string | number)[] }
+type Pattern = { [key: string]: Pattern | Matcher[] }
+// 欄位不存在就一律不符合：忘了 exists: false
+function matchPattern(pattern: Pattern, event: unknown): boolean {
+  if (typeof event !== 'object' || event === null) return false
+  const obj = event as Record<string, unknown>
+  return Object.entries(pattern).every(([key, rule]) => {
+    if (!(key in obj)) return false
+    if (!Array.isArray(rule)) return matchPattern(rule, obj[key])
+    const values = Array.isArray(obj[key]) ? obj[key] as unknown[] : [obj[key]]
+    return rule.some(m => values.some(v => one(m, v)))
+  })
+}
+function one(m: Matcher, v: unknown): boolean {
+  if (m === null || typeof m !== 'object') return v === m
+  if ('exists' in m) return m.exists
+  if ('prefix' in m) return typeof v === 'string' && v.startsWith(m.prefix)
+  if ('anything-but' in m) return (typeof v === 'string' || typeof v === 'number') && ![m['anything-but']].flat().includes(v)
+  if (typeof v !== 'number') return false
+  for (let i = 0; i < m.numeric.length; i += 2) {
+    const op = m.numeric[i], n = Number(m.numeric[i + 1])
+    if (!(op === '=' ? v === n : op === '>' ? v > n : op === '>=' ? v >= n : op === '<' ? v < n : v <= n)) return false
+  }
+  return true
+}
+</script>
+  <script type="wrong">
+type Matcher = string | number | null | { prefix: string } | { numeric: (string | number)[] } | { exists: boolean } | { 'anything-but': string | number | (string | number)[] }
+type Pattern = { [key: string]: Pattern | Matcher[] }
+// 事件的值是陣列時，拿整個陣列去比
+function matchPattern(pattern: Pattern, event: unknown): boolean {
+  if (typeof event !== 'object' || event === null) return false
+  const obj = event as Record<string, unknown>
+  return Object.entries(pattern).every(([key, rule]) => {
+    if (!Array.isArray(rule)) return key in obj && matchPattern(rule, obj[key])
+    if (!(key in obj)) return rule.some(m => typeof m === 'object' && m !== null && 'exists' in m && !m.exists)
+    return rule.some(m => one(m, obj[key]))
+  })
+}
+function one(m: Matcher, v: unknown): boolean {
+  if (m === null || typeof m !== 'object') return v === m
+  if ('exists' in m) return m.exists
+  if ('prefix' in m) return typeof v === 'string' && v.startsWith(m.prefix)
+  if ('anything-but' in m) return (typeof v === 'string' || typeof v === 'number') && ![m['anything-but']].flat().includes(v)
+  if (typeof v !== 'number') return false
+  for (let i = 0; i < m.numeric.length; i += 2) {
+    const op = m.numeric[i], n = Number(m.numeric[i + 1])
+    if (!(op === '=' ? v === n : op === '>' ? v > n : op === '>=' ? v >= n : op === '<' ? v < n : v <= n)) return false
+  }
+  return true
+}
+</script>
+</div>
+
+<div class="local" data-test="ex3" data-files="fanout.ts">
+  <p>練習 3：完成 <code>fanout.ts</code> 的 <code>setupFanout(sns, sqs, name)</code>：建 topic <code>name</code>、兩個佇列 <code>&lt;name&gt;-kitchen</code> 與 <code>&lt;name&gt;-receipts</code>。每個佇列的 queue policy 只有一條 Statement：<code>Principal: { Service: 'sns.amazonaws.com' }</code>、<code>Action: 'sqs:SendMessage'</code>、<code>Resource</code> 是佇列 ARN、<code>Condition: { ArnEquals: { 'aws:SourceArn': topic ARN } }</code>（用 <code>SetQueueAttributesCommand</code> 設 <code>Policy</code>）。兩個訂閱都設 <code>RawMessageDelivery: 'true'</code>；廚房另外設 <code>FilterPolicy</code> 為 <code>{"type":["drink"]}</code> 與 <code>FilterPolicyScope: 'MessageBody'</code>（訂閱屬性的值都是字串）。回傳 <code>{ topicArn, kitchenUrl, receiptsUrl }</code>。測試會發布一杯拿鐵、一個可頌，看兩個佇列各收到什麼，並再執行一次確認不會多出訂閱。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="ingest.ts">
+  <p>練習 4：完成 <code>ingest.ts</code> 的 <code>makeHandler(deps)</code>，回傳 SQS 觸發的 Lambda handler。每則 SQS 訊息：body 解析成 JSON，<code>Event</code> 是 <code>'s3:TestEvent'</code> 就略過；否則對 <code>Records</code> 裡每個物件，bucket 是 <code>s3.bucket.name</code>，key 先把 <code>+</code> 換成空白再 <code>decodeURIComponent</code>；冪等的 id 是 <code>`${bucket}/${key}#${versionId ?? eTag}`</code>，<code>deps.isDone(id)</code> 是 true 就跳過，否則 <code>deps.importCsv(bucket, key)</code>，成功後 <code>deps.markDone(id)</code>。一則訊息出任何錯（JSON 壞掉、匯入失敗），把它的 <code>messageId</code> 放進回傳的 <code>batchItemFailures</code>，繼續處理下一則。測試會在模擬器真的上傳 <code>sales/門市 A/2026-11-20 (1).csv</code> 與 <code>sales/a+b.csv</code>，把佇列收到的訊息交給你的 handler。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 5：寄收據的 worker 平均 20 秒處理一則，尖峰時 45 秒；佇列的 visibility timeout 是預設的 30 秒。最可能看到什麼？</p>
+  <label data-key="a">處理超過 30 秒的訊息會被 SQS 丟掉，客人收不到收據</label>
+  <label data-key="b">處理超過 30 秒的訊息直接進 DLQ</label>
+  <label data-key="c">worker 處理到第 30 秒時被 SQS 中斷，下一個 worker 從頭開始</label>
+  <label data-key="d">慢的那些訊息在第 30 秒重新出現，被另一個 worker 再處理一次，客人收到兩封收據</label>
+  <p class="why">✓ d。visibility timeout 只是「別人暫時看不到」，到期沒刪，訊息就重新出現；第一個 worker 並不知道，仍然繼續做完。修法是把 timeout 設得比最長處理時間長，或處理期間用 ChangeMessageVisibility 延長，並讓消費者冪等。c 錯在 SQS 不會中斷你的程式；b 要等接收次數超過 maxReceiveCount 才會發生。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：同事說：「我們改用 FIFO 佇列，它有 exactly-once processing，所以點數的 worker 不用再做冪等了。」你怎麼回？</p>
+  <label data-key="a">對，FIFO 保證每則訊息只會被處理一次</label>
+  <label data-key="b">不對：FIFO 只保證去重間隔內佇列裡不會多出重複的訊息；worker 處理到一半當機、訊息重新出現，一樣會處理第二次</label>
+  <label data-key="c">對，但只有在開啟 content-based deduplication 時才成立</label>
+  <label data-key="d">不對：FIFO 跟標準佇列一樣是至少一次，順序也不保證</label>
+  <p class="why">✓ b。FIFO 的去重發生在「送進佇列」這一端（5 分鐘的去重間隔內同一個 deduplication ID 只收一次），管不到「消費者處理完、刪除前當機」的情況。所以加點數要用訂單 ID 當冪等鍵，或寫成有唯一約束的紀錄。c 只是去重 ID 的產生方式；d 錯在 FIFO 確實保證同一個 message group 內的順序。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 7：門市的銷售 CSV 上傳到 S3 後要匯入資料庫。月底結算時幾百家門市同時上傳，匯入的 Lambda 偶爾因為資料庫忙而失敗。S3 直接觸發 Lambda，和中間放一個 SQS，差在哪？</p>
+  <label data-key="a">中間放 SQS：尖峰時訊息在佇列排隊，Lambda 依設定的並行數慢慢消化；失敗的有 visibility timeout 重試、有 DLQ 接住，還能一次拿一批</label>
+  <label data-key="b">沒有差別：S3 直接觸發 Lambda 也會無限重試，直到成功為止</label>
+  <label data-key="c">中間放 SQS 會讓事件變成恰好一次送達，不用再處理重複</label>
+  <label data-key="d">S3 直接觸發比較可靠，因為少了一個元件，少一個會壞的地方</label>
+  <p class="why">✓ a。佇列把「事件發生」和「處理」拆開：處理端慢或暫時失敗，事件留在佇列裡，不會打爆資料庫，也不會丟掉。b 錯在非同步呼叫的重試有次數上限，用完就丟（要另外設 destination 或 DLQ）。c 錯在 SQS 標準佇列仍是至少一次，S3 事件本身也可能重複。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>收到就刪訊息</strong>：處理失敗時訊息已經沒了，DLQ 也是空的。處理成功才刪。</li>
+  <li><strong>visibility timeout 比處理時間短</strong>：同一則訊息被兩個 worker 同時處理。設長一點，或處理中用 ChangeMessageVisibility 延長。</li>
+  <li><strong>用 SQS 的 MessageId 當冪等鍵</strong>：生產者重送時是新的 MessageId。用業務上的 ID（訂單 ID、物件版本）。</li>
+  <li><strong>先寫完成標記再處理</strong>：處理失敗的訊息重試時被當成重複跳過。成功之後才寫。</li>
+  <li><strong>以為 FIFO 讓消費者不用冪等</strong>：FIFO 去重的是送進佇列的訊息，不是你的處理。</li>
+  <li><strong>DLQ 沒有告警</strong>：失敗的訊息靜靜地堆著。對 DLQ 的訊息數與主佇列最老訊息的年齡告警。</li>
+  <li><strong>SNS 訂閱沒有 RawMessageDelivery</strong>：消費者收到 SNS 的信封，要多解一層。</li>
+  <li><strong>filter policy 比對 body 卻沒設 FilterPolicyScope</strong>：預設比對 message attributes，結果什麼都收不到，而且不會報錯。</li>
+  <li><strong>queue policy 沒限定 aws:SourceArn</strong>：任何 topic 或 bucket 都能把訊息送進你的佇列。</li>
+  <li><strong>event pattern 寫錯</strong>：大小寫、數字寫成字串、放錯層都不會報錯，只會永遠不觸發。用 test-event-pattern 拿真的事件測。</li>
+  <li><strong>S3 事件的 key 沒有解碼，或先 decode 再換 <code>+</code></strong>：有空白、中文、<code>+</code> 的檔名找不到。先把 <code>+</code> 換成空白，再 decodeURIComponent。</li>
+  <li><strong>把 s3:TestEvent 當錯誤</strong>：它會一直重試、最後進 DLQ。認出來，略過。</li>
+  <li><strong>一筆失敗就讓整批失敗</strong>：成功的也要重做。用 batchItemFailures 只回報失敗的那幾則。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>SQS 是佇列（一則訊息一個消費者、消費者自己拉）、SNS 是發布／訂閱（推給每個訂閱者）、EventBridge 是依 event pattern 路由的事件匯流排。常見組合是 SNS 或 EventBridge 分送、每個消費者前面各放一個 SQS。</li>
+  <li>visibility timeout 是租約：預設 30 秒，要比處理時間長，處理中可以延長；Lambda 讀 SQS 時建議至少是函式 timeout 的 6 倍。用 long polling（WaitTimeSeconds 最多 20 秒）。</li>
+  <li>處理成功才刪訊息；一直失敗的由 RedrivePolicy 的 maxReceiveCount 移到 DLQ，DLQ 一定要告警。</li>
+  <li>至少一次代表重複一定會發生，FIFO 也一樣。冪等鍵用業務 ID；處理前查 DynamoDB 的完成標記，成功後用 attribute_not_exists 條件寫入，再刪訊息。副作用本身也盡量冪等。</li>
+  <li>SNS fan-out：queue policy 允許 sns.amazonaws.com 並限定 aws:SourceArn；RawMessageDelivery 拿到原本的訊息；filter policy 預設比 message attributes，比 body 要設 FilterPolicyScope: MessageBody。</li>
+  <li>EventBridge 的 pattern：欄位之間 AND、陣列裡 OR、事件陣列任一元素符合即可；prefix 只對字串、numeric 只對數字、exists: false 比對欄位不存在。寫錯不會報錯，上線前用 test-event-pattern 測。</li>
+  <li>S3 事件：key 是 URL 編碼（先換 <code>+</code> 再 decode）、設定時會先送 s3:TestEvent、至少一次而且不保證順序（冪等鍵用 bucket＋key＋versionId）。中間放 SQS 吸收尖峰與重試，Lambda 用 batchItemFailures 只回報失敗的訊息。</li>
+  <li>多步驟、要補償的流程用 Step Functions（Standard 最長一年、exactly-once；Express 最長五分鐘）；排程用 EventBridge Scheduler。</li>
+</ul>
+<p>下一課是期末專題：把作品專案課的多租戶 SaaS 後台部署上 AWS，把整門課的服務組起來，並處理上線第一晚的事故。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>15. 期末專題：咖啡店的資料儲存組合與一致性</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="15" data-practice="data-stores">
+<header>
+  <div class="eyebrow">階段 5：分析、規模與期末專題 · 第 15 課</div>
+  <h1>期末專題：咖啡店的資料儲存組合與一致性</h1>
+</header>
+<main>
+
+<p>前面十四課各自教了一種儲存。這一課把其中四種組成咖啡店的結帳系統，並在上線前通過一次設計審查。審查會上被問的，幾乎都是同一個問題換個說法：「顧客按下『結帳』的那一刻，如果 X 剛好出事，會怎樣？」X 可能是 Redis、PostgreSQL、Elasticsearch、物件儲存，也可能是手機斷線、程式當機。這個問題難回答，是因為一個結帳請求會碰到四個系統：當下要用 Redis（限流、冪等、購物車）和 PostgreSQL（訂單），之後還要讓 Elasticsearch 的熱銷度更新、在物件儲存放一張電子收據。四個系統沒有共同的交易，任何一個都可能在任何時間點故障。所以每一種「X 出事」都要回答三件事：<strong>核心功能還能不能用？資料最後會不會對？出事後怎麼修？</strong></p>
+<p>這一課從頭到尾跟著同一筆訂單走：王小明用手機 App 買兩杯拿鐵、一個可頌，訂單編號 1001。我們替這筆訂單經過的每一個系統、每一個可能當機的時間點，把上面三個問題答出來。做完這個專題，你能替一個多儲存的系統畫出「誰是權威、壞了怎麼辦」的地圖，這是資深工程師在設計審查時最常被問的問題。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>誰說了算、結帳要等誰：先估規模，把「每種資料放哪、誰是權威」寫成 ADR；再決定結帳只同步依賴 PostgreSQL（開場問題的最小答案）。</li>
+  <li>App 重送了結帳：五道關卡（限流、兩層冪等、讀購物車、一個交易）怎麼擋住重複扣款，每個當機時間點的結果。</li>
+  <li>熱銷度與收據誰來補：worker 為什麼每一步都要能重做。</li>
+  <li>ES 卡住、Redis 被清空時會怎樣：預期行為先寫成表再演練；資料對不上時照哪支程式修。</li>
+  <li>上線之後：每種儲存要備份、監控什麼，什麼時候該拿掉一種。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="01-choosing-a-store.html">第 1 課</a>的記錄系統：每份資料只有一個權威來源，快取、搜尋索引這些衍生資料都要能從它重建。</li>
+  <li><a href="03-redis-patterns.html">第 3 課</a>的固定視窗限流與冪等鍵：INCR 數一段時間內的請求；帶同一個冪等鍵重送時，回上次的結果。</li>
+  <li><a href="11-search-sync.html">第 11 課</a>的 outbox、外部版本號與別名切換：事件跟資料在同一個交易寫入；Elasticsearch 只接受較新的版本；重建索引後切換別名。</li>
+  <li><a href="12-object-storage.html">第 12 課</a>的物件儲存：檔案依 key 放進 bucket，資料庫只記 key 與狀態。</li>
+</ul></div>
+
+<h2>四個系統資料不一致時，誰說了算？先寫 ADR 的儲存表</h2>
+<p>設計審查前要交的第一份東西不是程式，而是一份文件。原因很實際：「X 出事會怎樣」的答案，取決於 X 裡放的資料丟了要不要緊，而這件事要在寫程式之前決定，不能等出事時才討論。所以先把需求列清楚：</p>
+<ul>
+  <li><strong>結帳 API</strong>：從購物車建立訂單、扣庫存；手機網路不穩時 App 會重送，不能重複扣款。</li>
+  <li><strong>購物車</strong>：加入、修改很頻繁，保留 7 天（<a href="02-redis-data-structures.html">第 2 課</a>的 hash）。</li>
+  <li><strong>菜單搜尋</strong>：依關鍵字找商品，「熱銷」排序要反映最近賣了多少。</li>
+  <li><strong>電子收據</strong>：每筆訂單一份，保存 7 年，顧客隨時可以下載。</li>
+</ul>
+<p>接著估規模，目的是確認每一種儲存被選進來的理由。用<a href="01-choosing-a-store.html">第 1 課</a>的方法：每天約 3,000 筆訂單，尖峰每秒 20 次結帳、200 次搜尋；收據每份約 2 KB，7 年約 3,000 × 365 × 7 × 2 KB ≈ 15 GB。這個量級 PostgreSQL 一台就撐得住訂單；搜尋放 Elasticsearch、收據放物件儲存，是為了功能與成本，不是因為 PostgreSQL 撐不住。這個結論後面會用到：既然不是被迫多加系統，每多一種都要說得出它換到了什麼。</p>
+<p>估完之後，把決定寫成 <strong>ADR</strong>。ADR 是 Architecture Decision Record 的縮寫，中文叫架構決策紀錄：一份短文件，記下一個架構決定的背景、決定本身、考慮過但沒選的方案、要付出的代價。它的用途是讓一年後接手的人知道「當初為什麼這樣做」，寫法在<a href="../../system-design/lessons/18-design-docs-adr.html">系統設計課第 18 課</a>。</p>
+<p>多儲存系統的 ADR，核心是一張「每種資料放哪」的表。表裡最關鍵的一欄是「記錄系統」，所以先把這個詞講清楚。<strong>記錄系統</strong>（system of record）是一份資料唯一的權威來源：同一份資料出現在兩個地方、內容不一致時，以它為準。其他地方的副本都叫衍生資料，它們是為了查得快、搜得到、方便下載而存在的，丟了可以從記錄系統重新算出來。拿訂單 1001 來說：PostgreSQL 的 <code>orders</code> 記著這筆訂單成立了，Elasticsearch 裡拿鐵的熱銷度卻還沒加上這兩杯，這時候的解讀是「ES 落後了」，而不是「訂單有問題」。</p>
+<p>表的每一列回答同一組問題：這份資料放在哪、它是不是記錄系統、丟了怎麼重建、能不能接受遺失。</p>
+<div class="table-wrap"><table>
+  <tr><th>資料</th><th>儲存</th><th>記錄系統</th><th>重建方式</th><th>可接受遺失</th></tr>
+  <tr><td>訂單、品項</td><td>PostgreSQL</td><td>是</td><td>從備份還原</td><td>否</td></tr>
+  <tr><td>商品、庫存、熱銷度</td><td>PostgreSQL</td><td>是</td><td>從備份還原</td><td>否</td></tr>
+  <tr><td>購物車</td><td>Redis</td><td>否</td><td>不重建，顧客重新加入</td><td>是：只影響體驗</td></tr>
+  <tr><td>限流計數、冪等結果</td><td>Redis</td><td>否</td><td>不重建；冪等由資料庫 UNIQUE 兜底</td><td>是</td></tr>
+  <tr><td>菜單搜尋索引</td><td>Elasticsearch</td><td>否</td><td>從 products 全量重建後切換別名</td><td>是：重建期間搜尋品質下降</td></tr>
+  <tr><td>收據檔案</td><td>物件儲存</td><td>否</td><td>由訂單重新產生</td><td>是</td></tr>
+</table></div>
+<p>這張表直接決定三件事：哪些要做備份與還原演練（只有記錄系統是「是」的那幾列）、哪些要寫重建工具（「否」的那幾列）、故障時誰受影響（看「可接受遺失」）。收據這一列要多想一下：檔案本身放在物件儲存，但因為它可以由訂單重新產生，它不是記錄系統。如果收據是人工上傳、無法重新產生的檔案（第 12 課由店員在後台上傳的情況），它就變成「是」，物件儲存也要開版本控制或跨區複寫。判斷的依據永遠是「丟了能不能從別處算回來」，而不是「檔案放在哪種儲存」。</p>
+<p>表之外，ADR 還有幾節要寫。<strong>替代方案</strong>寫出考慮過但沒選的（例如「只用 PostgreSQL 的全文檢索」），以及沒選的理由；<strong>後果</strong>寫代價（多了哪些要維運的系統、哪些地方只有最終一致）；<strong>重新評估的條件</strong>寫具體的數字，例如「商品數仍在 200 項以下時，評估拿掉 Elasticsearch」。沒有最後這一節，ADR 一年後就沒人敢改，因為沒人知道當初的前提還成不成立。</p>
+<div class="callout practice"><strong>💡 實務上：要加一種儲存，先交 ADR 再開 PR</strong><br>團隊裡有人說「搜尋用 Elasticsearch 比較好」時，資深工程師不會直接同意或反對，而是請他把這張表填出來：記錄系統是誰、壞了怎麼重建、誰負責維運、每月多少錢。ADR 放在專案的 <code>docs/</code>，跟程式一起 code review，PR 描述附上連結。會看這份文件的人各有重點：維運看備份與監控，PM 看「最終一致」會讓畫面晚多久，主管看成本。決定被推翻時不刪舊的 ADR，寫一份新的並標註「取代 ADR-001」，之後的人才查得到當初為什麼這樣做。</div>
+<p>到這裡，開場問題的「資料最後會不會對」有了一半的答案：真正丟不起、只能從備份還原的，只有 PostgreSQL 的那兩列。但這張表只說了「資料丟了」的後果，沒說「服務卡住」的後果。如果結帳時要等 Elasticsearch 回應才能完成，ES 卡住的那幾分鐘，即使索引一筆資料都沒丟，王小明也下不了單。下一節要決定：結帳到底要同步等哪些系統。</p>
+
+<h2>結帳要同步等哪些系統？核心流程只依賴記錄系統</h2>
+<p>先說清楚「同步依賴」是什麼意思：結帳 API 要等某個系統回應，才能回應顧客，那個系統就是結帳的同步依賴。同步依賴越多，結帳越脆弱，因為每多一個要等的系統，就多一個能讓結帳失敗或卡住的原因。上一節的表已經告訴我們，Elasticsearch 和物件儲存裡放的都是衍生資料，晚一點更新沒關係。所以架構這樣畫：</p>
+<figure>
+  <svg viewBox="0 0 700 320" role="img" aria-label="結帳 API 同步使用 Redis（限流、冪等、購物車）與 PostgreSQL（訂單、品項、商品、outbox），不碰 Elasticsearch 和物件儲存。worker 用 SKIP LOCKED 讀 outbox，更新 Elasticsearch 的熱銷度、把收據上傳到物件儲存，再把 receipt_key 寫回 PostgreSQL">
+    <defs><marker id="arr15" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="20" y="130" width="120" height="50" rx="6"/>
+    <text class="d-text" x="80" y="152" text-anchor="middle">結帳 API</text>
+    <text class="d-small" x="80" y="170" text-anchor="middle">checkout</text>
+    <rect class="d-soft" x="230" y="20" width="200" height="60" rx="6"/>
+    <text class="d-text" x="330" y="44" text-anchor="middle">Redis</text>
+    <text class="d-small" x="330" y="64" text-anchor="middle">限流、冪等、購物車（可丟）</text>
+    <rect class="d-box" x="230" y="125" width="200" height="60" rx="6"/>
+    <text class="d-accent" x="330" y="149" text-anchor="middle">PostgreSQL（記錄系統）</text>
+    <text class="d-small" x="330" y="169" text-anchor="middle">orders、order_items、products、outbox</text>
+    <rect class="d-box" x="230" y="240" width="200" height="50" rx="6"/>
+    <text class="d-text" x="330" y="262" text-anchor="middle">outbox worker</text>
+    <text class="d-small" x="330" y="280" text-anchor="middle">SKIP LOCKED 取事件</text>
+    <rect class="d-soft" x="510" y="125" width="170" height="60" rx="6"/>
+    <text class="d-text" x="595" y="149" text-anchor="middle">Elasticsearch</text>
+    <text class="d-small" x="595" y="169" text-anchor="middle">別名 menu（可重建）</text>
+    <rect class="d-soft" x="510" y="240" width="170" height="50" rx="6"/>
+    <text class="d-text" x="595" y="262" text-anchor="middle">物件儲存</text>
+    <text class="d-small" x="595" y="280" text-anchor="middle">receipts/（可重建）</text>
+    <line class="d-line" x1="140" y1="145" x2="225" y2="60" marker-end="url(#arr15)"/>
+    <line class="d-line" x1="140" y1="155" x2="225" y2="155" marker-end="url(#arr15)"/>
+    <text class="d-small" x="180" y="148" text-anchor="middle">一個交易</text>
+    <line class="d-line" x1="330" y1="235" x2="330" y2="190" marker-end="url(#arr15)"/>
+    <text class="d-small" x="385" y="217" text-anchor="middle">讀事件、寫回</text>
+    <line class="d-line" x1="430" y1="255" x2="505" y2="170" marker-end="url(#arr15)"/>
+    <line class="d-line" x1="430" y1="265" x2="505" y2="265" marker-end="url(#arr15)"/>
+  </svg>
+  <figcaption>實線是同步呼叫。結帳 API 只同步依賴 Redis 與 PostgreSQL；Elasticsearch 和物件儲存只由 worker 非同步寫入，它們故障不會擋住下單。</figcaption>
+</figure>
+<p>這張圖的設計原則只有一條：<strong>核心流程只同步依賴記錄系統</strong>，以及少數「壞了也有退路」的元件。Redis 是後者：它在結帳路徑上，但它被清空了，冪等還有資料庫兜底，下一節會看到怎麼做。</p>
+<p>那熱銷度和收據怎麼更新？答案是第 11 課的 outbox。outbox 是 PostgreSQL 裡的一張表，結帳的交易在寫入訂單 1001 的同時，也插入一筆「<code>order.paid</code>，訂單 1001」的事件。因為它跟訂單在同一個交易，兩者一起成功或一起失敗：訂單成立了，事件就一定在；訂單回滾了，事件也跟著消失。另一支叫 worker 的程式在背景不斷讀這張表，拿到事件後去更新 Elasticsearch、上傳收據。結帳 API 寫完 outbox 就可以回應顧客，不用等這些事做完。</p>
+<p>這樣做的代價是搜尋與收據變成<strong>最終一致</strong>（eventual consistency）：不保證結帳完成的那一刻就更新，但只要沒有新的變更，worker 處理完事件後終究會一致。對王小明來說，結帳完立刻點「下載收據」，可能會看到「收據產生中」，幾秒後才有檔案；菜單上拿鐵的熱銷排名也會晚幾秒才反映這兩杯。這個代價要寫進 ADR 的「後果」，並讓產品知道「熱銷排序可能晚幾秒」。</p>
+<p>開場問題的最小答案就在這張圖裡：Elasticsearch 或物件儲存出事，結帳照常；Redis 被清空時，重送靠資料庫的 UNIQUE 兜底，結帳照常；Redis 完全連不上時讀不到購物車，結帳也會停，限流要放行還是拒絕得事先決定（後面的故障表會處理）；PostgreSQL 出事，結帳一定停。接下來把這個答案落實到程式，先從結帳 API 本身開始。只依賴 PostgreSQL 和 Redis 還不夠：王小明在電梯裡網路斷了，App 自動重送結帳，結帳 API 要怎麼確保 1001 只成立一次？</p>
+
+<h2>App 重送了結帳：五道關卡怎麼擋住重複扣款？</h2>
+<p>先把問題看清楚。王小明按下結帳，請求送到了，訂單 1001 也成立了，但回應在回程時因為斷線沒送到手機。App 只知道「逾時」，不知道訂單到底有沒有成立，於是自動重送。如果後端把第二個請求當成新的結帳，王小明就會被扣兩次款、收到兩份拿鐵。擋住這件事的工具是第 3 課的冪等鍵：App 每次結帳帶一個鍵，重送時帶同一個；後端看到用過的鍵，就回傳上次的結果，不再做一次。</p>
+<p>冪等鍵只是結帳要處理的一種狀況。完整的 <code>checkout(deps, { customerId, idempotencyKey, now })</code> 依序做五件事，順序有理由，每一步都對應一種故障：</p>
+<div class="table-wrap"><table>
+  <tr><th>步驟</th><th>用什麼</th><th>為什麼放這裡</th></tr>
+  <tr><td>1. 限流</td><td>Redis <code>INCR</code>＋<code>PEXPIRE … NX</code>（<a href="03-redis-patterns.html">第 3 課</a>的固定視窗）</td><td>最便宜的檢查放最前面，擋掉灌請求的人；<code>INCR</code> 是原子的，並發請求各拿到不同的計數</td></tr>
+  <tr><td>2. 冪等（快）</td><td>Redis <code>GET ds:idem:checkout:&lt;key&gt;</code></td><td>重送的請求大多在這裡直接回傳，不碰資料庫</td></tr>
+  <tr><td>3. 冪等（準）</td><td><code>SELECT … WHERE idempotency_key = $1</code></td><td>Redis 被清空時靠這一步；一定要在讀購物車之前，因為購物車可能也跟著沒了</td></tr>
+  <tr><td>4. 讀購物車</td><td>Redis <code>HGETALL</code></td><td>值都是字串，數量要 <code>Number()</code></td></tr>
+  <tr><td>5. 一個交易</td><td>PostgreSQL</td><td>訂單、品項、扣庫存、熱銷度、outbox 一起成功或一起失敗</td></tr>
+</table></div>
+<p>跟著王小明的兩個請求走一次。第一個請求通過五關，訂單 1001 成立，結帳 API 把結果寫進 Redis 的冪等 key、刪掉購物車。重送的請求在第 1 關被多算一次限流，在第 2 關從 Redis 找到上次的結果，直接回傳 1001，完全沒碰資料庫。只有 Redis 剛好被清空時，重送才會走到第 3 關，由資料庫的 <code>orders.idempotency_key</code> 找出 1001。第 3 關排在第 4 關前面，是因為 Redis 被清空時購物車也沒了：如果先讀購物車，會讀到空的，然後回「購物車是空的」這種錯誤的失敗，而不是回傳已經成立的 1001。</p>
+<p>前四關都只是檢查，真正的寫入全部集中在第 5 關的交易。交易裡的關鍵幾行：</p>
+<pre>BEGIN;
+-- a. 冪等的最後防線：同一個鍵只會有一筆，第二個請求在這裡等第一個提交，然後什麼都不做
+INSERT INTO orders (customer_id, idempotency_key, created_at) VALUES ($1, $2, $3)
+ON CONFLICT (idempotency_key) DO NOTHING RETURNING id;
+-- 沒有回傳列：ROLLBACK，回傳已經存在的那筆訂單
+
+-- b. 扣庫存與累加熱銷度，條件寫在 WHERE 裡，不先讀再判斷（品項依 id 排序，避免兩個交易互相等鎖）
+UPDATE products SET stock = stock - $2, sold = sold + $2, version = version + 1
+ WHERE id = $1 AND stock >= $2 RETURNING price;
+-- 沒有回傳列：庫存不足，ROLLBACK
+
+-- c、d. 品項、總額、outbox 事件
+INSERT INTO order_items …;  UPDATE orders SET total = …;
+INSERT INTO outbox (type, aggregate_id) VALUES ('order.paid', $訂單id);
+COMMIT;</pre>
+<p>a 處理的是第 2、3 關擋不住的情況：App 的重送剛好跟第一個請求同時到達，兩個請求都查不到 1001，都走進了交易。這時兩個交易都想插入同一個 <code>idempotency_key</code>，UNIQUE 約束讓第二個等第一個提交，然後什麼都不插入、沒有回傳列，程式就知道要回滾並回傳已經存在的那筆訂單。所以冪等要兩層：只放 Redis 的話，Redis 重啟、記憶體淘汰、主從切換時沒同步到的那幾筆，重送就會重複下單；只放資料庫也可以，但每次重送都要查資料庫。Redis 是快的第一道門，<code>orders.idempotency_key</code> 的 UNIQUE 約束才是保證。</p>
+<p>b 把「庫存夠不夠」寫在 <code>WHERE</code> 裡，是因為先 <code>SELECT stock</code> 再判斷的話，兩個人同時買最後一杯拿鐵時，兩邊都會讀到「剩 1 杯」，然後都扣下去。寫在 <code>UPDATE</code> 的條件裡，第二個交易會等第一個提交，再用更新後的庫存重新檢查條件，不夠就沒有回傳列。同一句也累加 <code>sold</code>，也就是熱銷度。熱銷度放在交易裡算，是因為 <code>sold</code> 是 PostgreSQL 的欄位，跟訂單一起提交，所以它永遠正確。Elasticsearch 裡的熱銷度只是從它複製過去的衍生資料，worker 每次寫「目前的值」，不是「加上這次的數量」。<code>version</code> 也跟著加 1，給 ES 當外部版本號（第 11 課），下一節會用到。</p>
+<p>這個交易裡刻意沒有呼叫 ES、S3，原因有兩個。第一，外部呼叫慢或卡住時，交易一直開著、鎖住商品列，其他人的結帳全部排隊。第二，外部呼叫成功但交易回滾時，就多了一筆不存在的訂單的副作用，例如一張沒有訂單的收據。這兩件事都交給 outbox 事件，在 COMMIT 之後由 worker 處理。</p>
+<p>COMMIT 之後還有兩件收尾：把結果寫進 Redis 的冪等 key、清空購物車。這兩件失敗時只記 log，不回錯誤。訂單已經成立，這時回 500 會讓 App 以為失敗而重送（雖然有冪等，但使用者會看到錯誤）。購物車沒清掉的代價只是顧客多看到一次已買的品項。</p>
+<p>五道關卡講完，回到設計審查的問法：「如果程式在某兩步之間當機呢？」把每個可能當機的時間點列出來，確認結果都可以接受：</p>
+<div class="table-wrap"><table>
+  <tr><th>在哪裡當機</th><th>結果</th><th>顧客重送之後</th></tr>
+  <tr><td>限流之後、交易之前</td><td>沒有訂單</td><td>正常下單（多算一次限流）</td></tr>
+  <tr><td>交易進行中</td><td>PostgreSQL 自動回滾，沒有訂單</td><td>正常下單</td></tr>
+  <tr><td>COMMIT 之後、寫 Redis 之前</td><td>訂單成立，Redis 沒有冪等結果，購物車還在</td><td>第 3 步從資料庫找到原訂單回傳，不會重複</td></tr>
+  <tr><td>寫完 Redis、刪購物車之前</td><td>購物車還在</td><td>第 2 步直接回傳；顧客手動清購物車</td></tr>
+</table></div>
+<div class="callout warn">每一列的「結果」都不能是「重複扣款」或「有扣款沒訂單」。設計審查時把這張表畫出來，比解釋程式碼有效得多。</div>
+<div class="callout practice"><strong>💡 實務上：冪等鍵由前端產生，重試時沿用同一個</strong><br>這是前後端要一起約定的事。Vue 的結帳頁在顧客按下「結帳」時用 <code>crypto.randomUUID()</code> 產生一個鍵，放在 <code>Idempotency-Key</code> 標頭；逾時、斷線自動重試，或顧客再按一次，都沿用同一個鍵；成功或明確失敗（庫存不足、購物車是空的）之後才換新的。常見的錯是每次送出都產生新鍵，冪等就形同虛設。按鈕在送出期間 disable 只能擋一般的重複點擊，擋不住網路層的重送，後端仍要靠冪等鍵。Stripe 等支付 API 也用同名的標頭，串金流時會再遇到同一套規則。</div>
+<p>結帳 API 到這裡只碰了 PostgreSQL 與 Redis。訂單 1001 的事件已經躺在 outbox 裡，但 ES 裡拿鐵的熱銷度還沒變，收據也還沒產生。這些事交給 worker，而 worker 一樣會當機，而且它當機的後果比結帳 API 更難處理。</p>
+
+<h2>熱銷度與收據由誰補上？worker 的每一步都要能重做</h2>
+<p>outbox worker（<a href="11-search-sync.html">第 11 課</a>、<a href="../../postgresql/lessons/33-job-queue.html">PostgreSQL 課第 33 課</a>）在背景一批一批地取事件。它用 <code>FOR UPDATE SKIP LOCKED</code> 取一批 <code>order.paid</code> 事件：<code>FOR UPDATE</code> 把取到的事件鎖住，<code>SKIP LOCKED</code> 讓別的 worker 跳過已經被鎖住的列，所以多開幾個 worker 時，同一筆事件不會被兩個 worker 同時拿到，它們也不用互相等。拿到 1001 的事件後，worker 做兩件事：把拿鐵、可頌目前的熱銷度寫進 ES，把收據上傳到物件儲存並把 <code>receipt_key</code> 寫回訂單。兩件都成功，才設 <code>processed_at</code> 標記完成。</p>
+<p>麻煩在於，worker 是<strong>至少一次</strong>（at-least-once）處理。看它處理 1001 的順序：更新 ES、上傳收據、標記完成、COMMIT。如果它在上傳收據之後、COMMIT 之前當機，資料庫裡的「標記完成」沒有生效，下一輪事件會再被拿出來，ES 與收據都會再做一次。這不是程式寫得不好：ES 和物件儲存不在 PostgreSQL 的交易裡，worker 沒辦法讓「做事」和「標記完成」一起成功或一起失敗。反過來先標記完成再做事，當機時事件就直接遺失，那更糟。所以只能保證每個事件至少處理一次，偶爾兩次。</p>
+<p>既然重做擋不住，就讓重做無害：每件事都要冪等，做兩次跟做一次結果相同。</p>
+<div class="table-wrap"><table>
+  <tr><th>處理器</th><th>冪等的寫法</th><th>錯誤寫法與後果</th></tr>
+  <tr><td>熱銷度 → ES</td><td>從 PostgreSQL 讀商品目前的 <code>sold</code>、<code>version</code>，<code>es.index</code> 帶 <code>version_type: 'external'</code>；回 409 算成功</td><td>用 script <code>sold += 數量</code>：重做一次就多算一次，而且永遠修不回來</td></tr>
+  <tr><td>收據 → 物件儲存</td><td>key 只由訂單決定：<code>receipts/2026/10/1001.txt</code>；重做就是覆蓋同一個物件</td><td>key 含 UUID 或時間戳：重做會多一份收據，舊的那份變成沒人記得的孤兒檔</td></tr>
+  <tr><td>寫回 <code>receipt_key</code></td><td>跟 <code>processed_at</code> 在同一個交易</td><td>先標記完成再上傳：上傳失敗就再也不會補</td></tr>
+</table></div>
+<p>用 1001 看第一列為什麼這樣寫。worker 不寫「拿鐵 +2」，而是去 PostgreSQL 讀拿鐵現在的 <code>sold</code> 與 <code>version</code>，整個值寫進 ES。重做一次，寫進去的還是同一個值，不會多算。<code>version_type: 'external'</code> 讓 ES 只接受版本號比現有的大的寫入：如果重做時拿鐵已經又賣出幾杯、ES 裡已經是更新的版本，這次的舊值會被 ES 拒絕並回 409，這代表 ES 已經有更新的資料，所以當成成功。第二列的道理一樣：1001 的收據 key 只由訂單決定，重做就是把同一個物件覆蓋一次。</p>
+<p>整個迴圈寫起來是這樣：</p>
+<pre>for (const e of events) {
+  try {
+    await syncPopularity(deps, client, e.aggregate_id)   // 寫目前的值 + 外部版本號
+    await uploadReceipt(deps, client, e.aggregate_id)    // 固定 key，覆蓋也沒關係
+    await client.query('UPDATE outbox SET processed_at = now() WHERE id = $1', [e.id])
+  } catch (err) {
+    // 一個事件失敗不影響同一批的其他事件；留下 attempts 與原因給值班的人看
+    await client.query('UPDATE outbox SET attempts = attempts + 1, last_error = $2 WHERE id = $1', [e.id, String(err)])
+  }
+}</pre>
+<p>失敗的事件不標記完成，只把 <code>attempts</code> 加一、記下 <code>last_error</code>，下一輪會再被取出重試。這帶出另一個要決定的事：<strong>毒事件</strong>，也就是永遠失敗的事件（例如資料壞了）。它會一直被重試、一直失敗。上線時加一條規則：<code>attempts</code> 超過某個次數就不再取出，並觸發告警，人工處理。</p>
+<p>這個寫法在處理 ES、S3 的期間一直開著 PostgreSQL 交易。專題的量用這個簡單的版本就夠了；事件量大時的改法見課末「補充與查表」。</p>
+<p>worker 保證衍生資料「最終」會對，但這個「最終」有前提：ES 和物件儲存終究要恢復，worker 要一直在跑，而且沒有別的地方偷偷同步呼叫了它們。這些前提在出事時成不成立，要實際製造故障才知道。</p>
+
+<h2>ES 卡住、Redis 被清空時會怎樣？預期行為先寫成表，再演練</h2>
+<p>設計審查最後一定會問到每一種故障。回答的方式叫<strong>降級</strong>（graceful degradation，<a href="../../system-design/lessons/11-circuit-breaker-bulkhead.html">系統設計課第 11 課</a>）：依賴故障時，保留核心功能、關掉或延後次要功能。哪些是核心、故障時要怎麼表現，要在出事前決定。如果等到 ES 真的掛了才討論「搜尋壞了要不要擋結帳」，這個決定通常是在客訴電話裡、在沒有資料的情況下做的。所以先寫成表格：</p>
+<div class="table-wrap"><table>
+  <tr><th>故障</th><th>結帳</th><th>其他功能</th><th>恢復後</th></tr>
+  <tr><td>Elasticsearch 掛掉</td><td>照常，因為不碰 ES</td><td>搜尋改用 PostgreSQL 的 <code>ILIKE</code> 簡易查詢，或顯示分類清單；收據也會延後，因為同一個事件裡收據排在 ES 之後</td><td>outbox 累積的事件自動補上</td></tr>
+  <tr><td>物件儲存掛掉</td><td>照常</td><td>下載收據顯示「收據產生中」</td><td>worker 重試後補上；漏掉的由對帳找出</td></tr>
+  <tr><td>Redis 被清空</td><td>照常；重送不會重複下單（資料庫 UNIQUE）</td><td>購物車消失（ADR 已接受）</td><td>不用處理</td></tr>
+  <tr><td>Redis 完全連不上</td><td>要事先決定：限流 fail open（放行）還是 fail closed（拒絕），第 3 課</td><td>購物車不能用</td><td>—</td></tr>
+  <tr><td>PostgreSQL 掛掉</td><td>回 503，不能下單</td><td>全部停擺</td><td>記錄系統沒有降級，只能靠高可用與還原</td></tr>
+</table></div>
+<p>表裡的每一格都來自前面幾節。ES 和物件儲存那兩列能寫「照常」，是因為第二節讓結帳不碰它們；Redis 被清空能寫「不會重複下單」，是因為上一節的第 3 關與 UNIQUE 約束；PostgreSQL 那一列沒有退路，是因為它是記錄系統。唯一要另外決定的是「Redis 完全連不上」時的限流：fail open 是放行所有請求，代價是限流暫時失效；fail closed 是拒絕請求，代價是 Redis 一壞結帳就跟著壞。這是取捨，要團隊在 ADR 裡選一個。</p>
+<p>表寫的是預期，不是事實，所以要實際演練一次。在本機演練，可以暫停課程的容器。暫停時容器的程序被凍結，連線不會被拒絕，請求只會一直等，比直接關掉更像真實的「卡住」：</p>
+<pre>cd learn/data-stores/practice
+docker pause learn-data-stores-es        # 這時候下單，應該照常成功、而且不會變慢
+docker unpause learn-data-stores-es      # 恢復後跑一次 worker，熱銷度應該補上</pre>
+<p>演練最常抓到的問題是<strong>逾時沒設</strong>。課程用的 Elasticsearch 與 Redis client，預設都不會替你設請求逾時（各版本的預設值見課末），服務卡住時請求會一直等。如果某個地方同步呼叫了它，例如有人在結帳裡順手查了一次 ES，API 就跟著卡住，表上的「照常」就不成立了。所以每個 client 都要自己設逾時（ES 的 <code>requestTimeout</code>、Redis 的 <code>commandTimeout</code>），並且確認核心路徑上沒有它們。練習 2 的測試用一個「收下連線、不回應」的假伺服器模擬卡住的 ES 和 S3，效果跟 <code>docker pause</code> 一樣，但不會影響其他課正在使用的共用容器。</p>
+<div class="callout practice"><strong>💡 實務上：故障演練排進行事曆，先在 staging 做</strong><br>很多團隊會定期排一次「演練日」（game day）：事先公告時間、在 staging 環境照上面的表一項一項製造故障，記下實際的結果、花多久發現、告警有沒有響。最有價值的發現通常不是程式錯，而是告警沒設、runbook 的步驟過時、沒人知道 ES 重建要多久。結果跟預期不同的那一格，開成待辦事項並更新 ADR。上正式環境演練前要先跟維運和客服說好，並準備好隨時停止的方法。</div>
+<p>演練證明了結帳撐得住，但有些不一致 worker 補不回來：例如有人誤刪了搜尋索引，worker 只會寫入之後有新訂單的那幾項商品，其他商品不會自己回來；有人誤刪了 bucket 裡 1001 的收據，資料庫裡的 <code>receipt_key</code> 仍然有值，worker 根本不知道要補。這些需要另一套程序去比對、修回來。</p>
+
+<h2>資料對不上時怎麼修？把 runbook 寫成可以執行的程式</h2>
+<p>這套程序叫 <strong>runbook</strong>：處理特定狀況的步驟手冊，凌晨三點被叫醒的人照著做，不用從頭想。每一種衍生資料都要有一份，而且最好是一支可以直接執行的程式，而不是一段要手動輸入的指令。手動輸入的指令會打錯、會漏步驟，半夜的人也沒力氣判斷「這一步可以跳過嗎」。這個系統有兩種衍生資料要修，所以有兩支。</p>
+<p><strong>rebuild-search</strong>：搜尋結果錯了、mapping 要改、索引被誤刪時用。步驟跟第 11 課的零停機重建相同：建一個新索引，從 PostgreSQL 的 products 全量寫進去，再把別名 <code>menu</code> 從舊索引切到新索引。搜尋一律查別名，所以切換的那一刻搜尋就換到新索引，不用改程式。差別在要處理「別名已經不在」的情況：索引被刪時，指向它的別名也跟著消失，這時沒有舊索引可以移除。</p>
+<pre>const old = await es.indices.existsAlias({ name: alias })
+  ? Object.keys(await es.indices.getAlias({ name: alias }))
+  : []                                       // 索引被誤刪：沒有舊索引要移除
+// 建新索引 → 從 products 全量 bulk（帶外部版本號）→ refresh
+await es.indices.updateAliases({ actions: [
+  ...old.map(index => ({ remove: { index, alias } })),
+  { add: { index: newIndex, alias } },        // 一個請求，搜尋不會有空窗
+] })
+// 最後才刪舊索引</pre>
+<p><strong>find-missing-receipts</strong>：worker 停了一陣子、有人誤刪了 bucket 裡的檔案、或 <code>receipt_key</code> 被改壞時用。缺收據有兩種：<code>receipt_key</code> 是空的，或 key 指向的物件不在了。第二種只看資料庫查不出來，1001 的 <code>receipt_key</code> 明明寫著 <code>receipts/2026/10/1001.txt</code>，檔案卻可能已經不在，所以一定要對照物件儲存的實際清單。剛付款的訂單 worker 還沒處理，要排除，所以只看付款超過 10 分鐘的。找到之後不自己上傳，而是把事件排回 outbox：</p>
+<pre>-- 找到之後重新排入事件；outbox 有部分唯一索引，同一筆訂單只會有一筆待處理
+CREATE UNIQUE INDEX outbox_one_pending ON outbox (type, aggregate_id) WHERE processed_at IS NULL;
+INSERT INTO outbox (type, aggregate_id) SELECT 'order.paid', unnest($1::int[]) ON CONFLICT DO NOTHING;</pre>
+<p>對帳工具不修資料，只把事件排回 outbox，修的事交給本來就冪等的 worker。這樣修復的路徑跟平常的路徑是同一條，不會多一套沒測過的程式。部分唯一索引是只對符合 <code>WHERE</code> 條件的列檢查唯一性的索引。這裡只看 <code>processed_at IS NULL</code> 的列，所以同一筆訂單同時只能有一筆待處理的事件，處理完之後又可以重新排入；對帳工具重跑幾次，<code>ON CONFLICT DO NOTHING</code> 都會擋下重複的事件。列出 bucket 裡的物件時記得分頁（<code>ListObjectsV2</code> 一次最多 1,000 筆，第 12 課）；訂單很多時，改成只檢查最近幾天的訂單，或按月份前綴分批比對。</p>
+<p>這兩支工具都要有人想到去跑。最後一塊是讓系統主動告訴你出事了：<strong>同步延遲指標</strong>，也就是最舊一筆未處理事件等了多久。worker 停了、ES 掛了、毒事件卡住，這個值都會持續上升，設告警就能在顧客抱怨之前知道：</p>
+<pre>SELECT coalesce(extract(epoch FROM now() - min(created_at)), 0) AS lag_seconds
+  FROM outbox WHERE processed_at IS NULL;</pre>
+<p>到這裡，訂單 1001 經過的每一個系統、每一種故障，都有了「核心還能不能用、資料最後會不會對、怎麼修」的答案。設計審查還剩最後一個問題，它跟故障無關，而是關於平常的每一天：每多一種儲存，團隊要多顧什麼？</p>
+
+<h2>上線之後要顧什麼？每種儲存的維運清單，與該不該拿掉一種</h2>
+<p>上線不是程式寫完就好。每多一種儲存，就要多一份這張表的一列：</p>
+<div class="table-wrap"><table>
+  <tr><th>儲存</th><th>備份</th><th>監控</th><th>容量</th></tr>
+  <tr><td>PostgreSQL</td><td>每日全量＋WAL 歸檔，定期演練還原到某個時間點</td><td>連線數、複寫延遲、慢查詢、outbox 延遲</td><td>磁碟成長、表與索引膨脹</td></tr>
+  <tr><td>Redis</td><td>依 ADR：購物車可丟就只開 RDB 或不備份</td><td>記憶體使用率、淘汰數、寫入錯誤（noeviction）</td><td>maxmemory 與大 key（第 6 課）</td></tr>
+  <tr><td>Elasticsearch</td><td>不備份，靠 rebuild-search（要量過重建要多久）</td><td>叢集狀態、查詢延遲、JVM heap</td><td>分片大小、磁碟水位</td></tr>
+  <tr><td>物件儲存</td><td>收據可重新產生就不另外備份；不能重新產生的開版本控制</td><td>4xx／5xx 比例、find-missing-receipts 的結果</td><td>生命週期規則、7 年後刪除（第 12 課）</td></tr>
+</table></div>
+<p>這張表的「備份」欄完全是第一節 ADR 儲存表的延伸：記錄系統做完整的備份與還原演練，衍生資料靠前一節的重建工具。監控欄則收進了這一課做出來的東西，例如 outbox 延遲與對帳的結果。</p>
+<p>最後回到 ADR 的「重新評估的條件」誠實看一次：咖啡店只有幾十項商品，PostgreSQL 的全文檢索加上 <code>pg_trgm</code> 就能做菜單搜尋；如果產品沒有要同義詞與相關性排序，拿掉 Elasticsearch 能少一整列維運工作、少一個同步問題。Redis 的購物車與限流則值得保留：寫入頻繁、可以丟、而且 Redis 本來就為這種用途設計。資深工程師的價值不只在把四種儲存接起來，也在知道什麼時候該拿掉一種。</p>
+
+<h2>補充與查表</h2>
+<p><strong>worker 的租約寫法</strong>：正文的 worker 在處理 ES、S3 的期間一直開著 PostgreSQL 交易（鎖住那幾列事件），外部呼叫很慢時會佔住連線。事件量大時的改法是「租約」：取事件時只寫 <code>locked_until = now() + interval '1 minute'</code> 就提交，處理完再另開交易標記完成。專題的量用簡單的版本就夠了。</p>
+<p><strong>client 的逾時預設值</strong>：@elastic/elasticsearch 從 9.0 起預設完全不設逾時（8.x 是 30 秒），ioredis 的 <code>commandTimeout</code> 預設也沒有值。這門課的練習用的是 @elastic/elasticsearch 9.5.1 與 ioredis 6.0.0（<code>data-stores/practice/package.json</code>）。</p>
+
+<h2>練習</h2>
+<p>先啟動四個服務（在 <code>learn/data-stores/practice</code> 執行 <code>docker compose --profile pg --profile redis --profile search --profile s3 up -d --wait</code>，記憶體上限合計約 2.1 GB；Docker Desktop 的 Resources → Memory 至少給 4 GB），每一題都在 <code>learn/</code> 執行 <code>node check.mjs data-stores 15</code> 判分。測試用 PostgreSQL 的 schema <code>t15</code>、Redis 的 DB 15、<code>t15-</code> 開頭的索引與 bucket，每個測試檔開始前會清空。表、常數、key 的格式、錯誤類別寫在 <code>schema.ts</code>（不用改）；每個檔案最上面的註解寫了要做的步驟。</p>
+
+<div class="local" data-test="ex1" data-files="docs/adr-001-data-stores.md">
+  <p>練習 1：寫完 <code>docs/adr-001-data-stores.md</code>：背景、決定、替代方案、後果、重新評估的條件五節都要有內容；決定裡的儲存表至少 5 列（訂單、商品、購物車、限流／冪等、搜尋索引、收據），「記錄系統」「可接受遺失」用「是」或「否」開頭。測試只檢查結構與關鍵決定（訂單的記錄系統是 PostgreSQL、Redis 與 Elasticsearch 都不是記錄系統、購物車可接受遺失、搜尋索引寫出從 PostgreSQL 重建）；內容寫得好不好，用下面的清單自己檢查：背景有沒有數字？替代方案有沒有寫「只用 PostgreSQL」以及沒選的理由？後果有沒有寫出最終一致與維運成本？重新評估的條件是不是具體的數字或事件？</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="checkout.ts">
+  <p>練習 2：在 <code>checkout.ts</code> 實作 <code>checkout(deps, { customerId, idempotencyKey, now })</code>，照「五道關卡」的順序，回傳 <code>{ orderId, total }</code>。測試的 Elasticsearch 與 S3 都指向一個不回應的伺服器，結帳必須照常成功、4 秒內完成，而且完全不能連過去（COMMIT 之後不 await 的呼叫也不行）；會用一個 CHECK 約束讓 outbox 寫入失敗，確認訂單也回滾；同一個鍵重送 5 次、清空 Redis 後再送、5 個請求並發送同一個鍵，都只能有一筆訂單；庫存不足時沒有任何寫入；讓刪購物車失敗，結帳仍要成功；同一位顧客同時送 15 次，剛好 5 次被限流。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="worker.ts">
+  <p>練習 3：在 <code>worker.ts</code> 實作 <code>processBatch(deps, batchSize)</code>（<code>runWorker</code> 已寫好）：用 <code>SKIP LOCKED</code> 取 <code>order.paid</code> 事件，把商品目前的熱銷度帶外部版本號寫進 ES、把收據上傳到 <code>receipts/&lt;yyyy&gt;/&lt;mm&gt;/&lt;訂單id&gt;.txt</code> 並寫回 <code>receipt_key</code>，兩件都成功才標記完成。測試會把處理過的事件再處理一次（中間夾著一筆新訂單），熱銷度不能多算也不能倒退、收據不能多一份；用連不上的 S3 確認事件留著並記下 attempts（這筆訂單的 <code>created_at</code> 是 UTC 9 月 30 日晚上、台灣時間已經是 10 月 1 日，年月要取 UTC，月份補成兩位數）；最後讓兩個 worker 並發處理 12 個事件，每張收據只上傳一次、而且兩個 worker 真的同時在做。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="runbook.ts">
+  <p>練習 4：在 <code>runbook.ts</code> 實作 <code>rebuildSearch(deps, newIndex)</code> 與 <code>findMissingReceipts(deps, now)</code>。測試在重建期間不停查詢別名，不能有一次出錯或筆數不對；再把索引整個刪掉，重建要照樣成功。補收據的測試會刪掉 2 個收據物件、清掉 1 筆 <code>receipt_key</code>，並放一筆一分鐘前才付款的訂單；要剛好找到那 3 筆、各排入一筆事件，重跑不能多排；測試讓列物件每頁只回 2 筆，沒有照 <code>NextContinuationToken</code> 分頁就會漏看；最後用你在練習 3 寫的 worker 把收據全部補齊。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：結帳時 Elasticsearch 掛了，正確的行為是？</p>
+  <label data-key="a">回 503，請使用者稍後再試</label>
+  <label data-key="b">照常完成訂單；熱銷度的更新留在 outbox，ES 恢復後由 worker 補上</label>
+  <label data-key="c">跳過 outbox，當作已經更新</label>
+  <label data-key="d">把訂單也寫一份到 Redis 備用</label>
+  <p class="why">✓ b。搜尋是衍生資料，不能讓它的故障擋住核心的下單；outbox 事件跟訂單在同一個交易，保證之後一定會補上。a 讓次要功能拖垮核心功能；c 讓搜尋永遠少算這筆；d 多了一份沒有交易保護的副本，反而多一個不一致的來源。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：Redis 被清空後，使用者帶同一個冪等鍵重送結帳，系統要怎麼確保不重複下單？</p>
+  <label data-key="a">做不到，只能請使用者不要重送</label>
+  <label data-key="b">先查 <code>orders.idempotency_key</code>，有就回傳原訂單；並發的請求由 UNIQUE 約束加 <code>ON CONFLICT DO NOTHING</code> 擋下</label>
+  <label data-key="c">重啟 Redis，讓它從 RDB 載回冪等結果</label>
+  <label data-key="d">在 Redis 改用 <code>SET … NX</code>，就不會被清空</label>
+  <p class="why">✓ b。Redis 是快的第一道門，記錄系統裡的約束才是保證。c 的 RDB 只有上次快照的資料，最近幾分鐘的冪等結果還是會不見，而且 Redis 不一定有開持久化；d 的 <code>NX</code> 只防並發寫入，不防資料被清空。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：worker 上傳收據成功，但在寫回 <code>receipt_key</code>、標記事件完成之前當機。事件被重新處理時，要避免什麼？</p>
+  <label data-key="a">避免再上傳一次，所以上傳前要先查物件存不存在</label>
+  <label data-key="b">避免產生第二份不同 key 的收據；key 由訂單 id 決定，重傳只是覆蓋同一個物件</label>
+  <label data-key="c">避免讀 PostgreSQL，直接用記憶體裡的訂單資料</label>
+  <label data-key="d">沒有需要避免的，物件儲存會自動去除重複</label>
+  <p class="why">✓ b。固定、可推導的 key 讓上傳本身就是冪等的，重傳的代價只是一次 PUT。a 多一次請求而且沒有必要（覆蓋同一個 key 結果相同）；c 讓重做用到過期資料；d 錯在物件儲存只看 key，兩個不同 key 就是兩個物件，隨機 key 會留下沒人記得的孤兒檔。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 8：這套系統裡，哪些資料遺失後必須從備份還原，而不能重建？</p>
+  <label data-key="a">Elasticsearch 的菜單索引</label>
+  <label data-key="b">Redis 的購物車與限流計數</label>
+  <label data-key="c">PostgreSQL 的訂單、品項與商品（收據可以由訂單重新產生，所以不在此列）</label>
+  <label data-key="d">四種儲存都要，資料都一樣重要</label>
+  <p class="why">✓ c。只有記錄系統需要完整的備份與還原演練；衍生資料要的是重建程序。搜尋索引從 products 重建；購物車與限流計數可以接受遺失；收據由訂單重新產生。d 會讓團隊把力氣平均分給四個系統，結果最重要的那個反而沒演練過還原。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>核心流程同步呼叫衍生資料的儲存</strong>：結帳裡更新 ES、上傳收據，ES 一卡住結帳就跟著卡，交易還鎖著商品列。核心流程只寫記錄系統與 outbox。</li>
+  <li><strong>冪等、唯一性只靠 Redis</strong>：Redis 重啟、淘汰、主從切換都可能讓 key 消失，重送就重複下單。資料庫要有 UNIQUE 約束，並在讀購物車之前先查。</li>
+  <li><strong>outbox 在另一個交易或交易之後寫</strong>：訂單成立了、事件沒寫，搜尋與收據永遠不會更新。訂單與 outbox 用同一個 client 的同一個 BEGIN … COMMIT。</li>
+  <li><strong>收尾失敗讓結帳失敗</strong>：COMMIT 之後刪購物車、寫冪等結果失敗，回 500 給使用者，但訂單其實成立了。收尾 try/catch，只記 log。</li>
+  <li><strong>限流先 GET 再 SET</strong>：並發的請求都讀到同一個舊值，全部放行。用 <code>INCR</code> 的回傳值判斷，或用 Lua（<a href="04-redis-atomicity.html">第 4 課</a>）。</li>
+  <li><strong>worker 的處理器不冪等</strong>：熱銷度用 <code>+數量</code> 累加、收據 key 含隨機值，重做就多算、多一份。寫目前的值加外部版本號，key 由訂單決定。</li>
+  <li><strong>外部呼叫失敗也標記完成</strong>：那張收據永遠不會補上。失敗時只加 attempts、記 last_error，讓下一輪重試，超過次數才告警。</li>
+  <li><strong>沒有 SKIP LOCKED</strong>：沒鎖會重複處理，只有 FOR UPDATE 會互等，多開 worker 也不會變快。</li>
+  <li><strong>重建時先刪索引或分兩次切換別名</strong>：中間的搜尋全部出錯。新索引寫好、refresh 後，用一個 <code>updateAliases</code> 請求切換，最後才刪舊的。</li>
+  <li><strong>對帳只看資料庫</strong>：<code>receipt_key</code> 有值不代表物件還在。要對照物件儲存的實際清單。</li>
+  <li><strong>每種儲存都上線了，卻沒有各自的備份、監控與容量計畫</strong>：出事時才發現 ES 重建要兩小時、Redis 滿了在拒絕寫入。上線前把維運清單的每一格填完。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>多儲存系統的設計審查，問的都是「X 出事時，核心還能不能用、資料最後會不會對、怎麼修」。答案從 ADR 的儲存表開始：每種資料放哪、記錄系統是誰、衍生資料怎麼重建、能不能接受遺失、什麼時候重新評估。這張表決定了備份、重建工具與故障時的行為。</li>
+  <li>核心流程只同步依賴記錄系統（加上有退路的 Redis）；衍生資料的更新寫成 outbox 事件，跟業務資料在同一個交易，代價是搜尋與收據變成最終一致。</li>
+  <li>結帳的順序：限流（原子的 <code>INCR</code>）→ Redis 冪等 → 資料庫冪等 → 讀購物車 → 一個交易（<code>ON CONFLICT DO NOTHING</code>、條件式扣庫存、outbox）→ 收尾失敗只記 log。把每個當機時間點列成表，沒有一格是重複扣款或有扣款沒訂單。</li>
+  <li>worker 至少一次處理，所以每個處理器都要冪等：寫目前的值加外部版本號、固定的物件 key；失敗記 attempts，不標記完成；用 SKIP LOCKED 讓多個 worker 並行。</li>
+  <li>故障的預期行為先寫成表再演練：ES、物件儲存故障時照常下單，Redis 清空時不重複下單，PostgreSQL 故障就是真的停擺。每個 client 都要自己設逾時。</li>
+  <li>每種衍生資料都要有可執行的 runbook：rebuild-search（處理別名不存在、一個請求切換）、find-missing-receipts（對照物件儲存、排回 outbox 讓 worker 修），加上 outbox 延遲告警。</li>
+  <li>維運成本跟著儲存的數量成長；能用 PostgreSQL 做到的，就要有理由才多加一種。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 8 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 9：店長下午要在後台看「今天到目前為止」各品項的營收。<code>orders</code> 有 200 萬列，這支查詢在主資料庫上跑 8 秒，最先該做什麼？</p>
+  <label data-key="a">建一個物化檢視，每晚離峰時 REFRESH，報表改讀它</label>
+  <label data-key="b">每晚用增量 ETL 把訂單搬到 DuckDB，報表改查 DuckDB</label>
+  <label data-key="c"><code>EXPLAIN (ANALYZE, BUFFERS)</code> 看計畫，只讀今天的訂單卻要 8 秒，多半是全表掃描</label>
+  <label data-key="d">報表帳號設 <code>statement_timeout = '5s'</code>，不讓它拖慢結帳</label>
+  <p class="why">✓ 先問新鮮度：店長要的是即時數字，而且只讀今天的少量資料，正是第一步「補索引」的情境，例如 <code>ordered_at</code> 上的索引。a 最多人選，但物化檢視只到上次 REFRESH，店長看不到今天的營收，結果是錯的；b 也一樣。d 只保護資料庫，報表會直接被取消。（第 13 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 10：增量 ETL 每分鐘跑一次，把 PostgreSQL 的訂單搬到 DuckDB。這段程式哪裡會出事？</p>
+<pre>const last = await getWatermark(duck)                 // 上次搬到的 id
+const { rows } = await pg.query(
+  'SELECT id, total::text, ordered_at::text FROM orders WHERE id > $1 ORDER BY id LIMIT 1000', [last])
+if (rows.length === 0) return
+await setWatermark(duck, rows.at(-1).id)
+await insertOrders(duck, rows)                        // INSERT INTO orders VALUES …</pre>
+  <label data-key="a">兩次寫入之間當機或寫入出錯，水位線已經前進，這一批永遠不會再搬</label>
+  <label data-key="b">水位線要記「舊水位線＋這批筆數」，記最後一筆的 id 遇到跳號會漏資料</label>
+  <label data-key="c">用 <code>id &gt; 水位線</code> 分批，搬的期間有新訂單就會跳過，要改用 OFFSET</label>
+  <p class="why">✓ 水位線先前進、資料後寫入，中間失敗那 1,000 筆就漏了。修法：資料與水位線放在 DuckDB 的同一個交易，出錯就 ROLLBACK；寫入改成冪等的 <code>INSERT OR REPLACE</code>，重跑才不會重複。b 剛好說反：交易回滾時序號不會退回，id 一定有跳號，記「筆數」才會算錯位置。（第 13 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 11：門市平板每 3 秒刷新「今天待做的訂單」，GSI2 的 sort key 只放時間，查詢這樣寫，結果是對的。上線後哪裡會出事？</p>
+<pre>await doc.send(new QueryCommand({
+  TableName: 'coffee', IndexName: 'GSI2',
+  KeyConditionExpression: 'GSI2PK = :pk',
+  FilterExpression: '#s = :pending',
+  ExpressionAttributeNames: { '#s': 'status' },
+  ExpressionAttributeValues: { ':pk': 'STORE#4#2026-11-14', ':pending': 'pending' },
+}))</pre>
+  <label data-key="a">GSI 不支援 FilterExpression，要改成查主表才篩得出來</label>
+  <label data-key="b">不會出事：篩選在分區上先做，只有 pending 的訂單會被讀出、計費</label>
+  <label data-key="c">GSI 是全域的，查詢會讀到其他門市的訂單，要再加一個門市條件</label>
+  <label data-key="d">每次都讀出當天全部訂單再丟掉做完的，越接近打烊讀得越多、費用越高</label>
+  <p class="why">✓ FilterExpression 在讀出來之後才篩，讀取量照讀到的算，超過 1 MB 還要分頁。把條件放進 key：GSI2SK 改成 <code>STATUS#pending#時間</code>，用 <code>begins_with</code> 只讀待做的，狀態改變時更新 GSI2SK。b 是最常見的誤解：「讀少一點」要靠 key 設計，不是靠篩選。（第 14 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 12：領限量優惠碼用 TransactWriteItems 寫兩筆（優惠碼、「這位顧客領過」的標記），都帶 <code>attribute_not_exists(PK)</code>；App 第一次請求逾時、自動重送，第二次收到 <code>TransactionCanceledException</code>。API 該怎麼回應？</p>
+  <label data-key="a">回「領取失敗」：條件不成立，代表這張碼已經被別人領走了</label>
+  <label data-key="b">再讀一次優惠碼的 item：主人是自己就回「已經領過」，是別人才回失敗</label>
+  <label data-key="c">改成先 GetItem 確認沒人領、再 PutItem，重送就不會撞到條件</label>
+  <label data-key="d">拿掉顧客標記的條件，重送時只檢查優惠碼那一筆就好</label>
+  <p class="why">✓ 第一次請求其實成功了，只是回應沒送到。條件失敗時要分辨是別人領走，還是自己的重送，重送不能改變結果，這就是冪等。a 會讓明明領到的顧客看到失敗。c 是「先讀再寫」，兩個請求同時查到沒人領就都寫進去了。（第 14 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 13：某連鎖品牌的訂單放在 DynamoDB，看板用 <code>PK=ORDERS#&lt;日期&gt;</code>、SK 是時間。週年慶時 API 偶爾 5xx，CloudWatch 的 throttle 指標在跳，但整張表用掉的容量遠低於設定值，先做什麼？</p>
+  <label data-key="a">改成 on-demand 依實際讀寫計費，不用預估容量就不會再被限流</label>
+  <label data-key="b">調高整張表的寫入容量，讓週年慶的尖峰有更多空間可以用</label>
+  <label data-key="c">用 Contributor Insights 找出被限流的 key，再替它加分片後綴</label>
+  <label data-key="d">調高 SDK 的重試次數，撐到 DynamoDB 自動把熱的分區拆開</label>
+  <p class="why">✓ 每個分區每秒最多 1,000 WCU，當天的新訂單全寫在同一個 key 的尾端，表的總容量再大也用不上。先找出是哪個 key，寫多的就用計算出來的後綴分片，讀取時平行查 N 片再合併排序。a 最多人選，但分區上限不管哪種計費模式都存在，熱 key 加錢也救不了；d 的自動拆分對跟著遞增 sort key 走的寫入沒用。（第 14 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 14：有人把收據改成結帳 COMMIT 之後直接上傳。物件儲存停機半小時（連線立刻被拒），恢復後會怎樣？</p>
+<pre>await client.query('COMMIT')
+try {
+  await s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: receiptText }))
+  await pool.query('UPDATE orders SET receipt_key = $2 WHERE id = $1', [orderId, key])
+} catch (err) {
+  log.warn('receipt upload failed', err)
+}
+return { orderId, total }</pre>
+  <label data-key="a">這半小時的訂單都沒有收據，不會自動補上，只能等對帳工具找出來</label>
+  <label data-key="b">這半小時的結帳都失敗，上傳的錯誤會讓訂單跟著回滾</label>
+  <label data-key="c">物件儲存恢復後，SDK 會把之前失敗的上傳補送，收據自動補齊</label>
+  <p class="why">✓ 這是雙寫：訂單已經提交，失敗的上傳只存在那次請求裡，記一行 log 之後就沒人記得了；程序在 COMMIT 之後當機也一樣。修法是在交易裡寫 outbox 事件，交給會重試的 worker。b 錯在 COMMIT 已經完成，錯誤也被 catch 吃掉了，訂單照常成立。（第 11、15 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 15：worker 這樣更新熱銷度，某個事件的收據上傳逾時，下一輪整個事件重做成功。ES 裡那幾項商品的熱銷度會怎樣？</p>
+<pre>for (const e of events) {
+  try {
+    await es.update({ index: 'menu', id: e.product_id,
+      script: { source: 'ctx._source.sold += params.n', params: { n: e.qty } } })
+    await uploadReceipt(deps, client, e.order_id)
+    await client.query('UPDATE outbox SET processed_at = now() WHERE id = $1', [e.id])
+  } catch (err) { /* attempts + 1，下一輪重試 */ }
+}</pre>
+  <label data-key="a">正確：ES 會用文件自己的版本號擋下重複的更新</label>
+  <label data-key="b">多算一次這筆訂單的數量，之後的事件也修不回來</label>
+  <label data-key="c">正確：事件要全部步驟成功才標記完成，不會重複</label>
+  <p class="why">✓ worker 是至少一次處理，「加上這次的數量」重做一次就多加一次，之後的 <code>+=</code> 都建立在錯的值上，只能全量重建。修法：從 PostgreSQL 讀商品目前的 <code>sold</code> 與 <code>version</code>，寫目前的值並帶外部版本號。c 最多人選，但「全部成功才標記」保證的是失敗會重試，不是重試不會重複。（第 11、15 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 16：同事提議「我的訂單」列表改查 Elasticsearch（由 outbox worker 同步），減輕 PostgreSQL 的負擔。上線後顧客結帳完跳到這頁，常常看不到剛下的單，怎麼處理最恰當？</p>
+  <label data-key="a">在結帳的交易裡同步寫一份到 ES，兩邊同時更新</label>
+  <label data-key="b">worker 寫 ES 時加 <code>refresh: 'wait_for'</code>，寫完就搜得到</label>
+  <label data-key="c">前端在結帳成功後等 1 秒，再去查列表</label>
+  <label data-key="d">「我的訂單」改回讀 PostgreSQL，ES 只負責可以晚幾秒的菜單搜尋</label>
+  <p class="why">✓ ES 是衍生資料，經過 worker 非同步同步，只保證最終一致；要讀到自己剛寫的資料，就讀記錄系統，跟第 14 課「剛下單讀主表、不讀 GSI」是同一個道理。每天 3,000 筆訂單，PostgreSQL 依顧客查訂單完全撐得住。b 最多人選，但延遲大多是 worker 還沒處理到這個事件，refresh 只縮短最後那一秒，ES 或 worker 停了照樣看不到。（第 1、11 課）</p>
+</div>
+<p>這個階段的重點整理成<a href="../sheets/stage-5.html">一頁圖解</a>。</p>
+<p>接下來可以學什麼：這門課到這裡結束。想把這套系統放到雲端，<a href="../../devops/lessons/18-aws-architecture.html">DevOps 課</a>教部署與託管服務（RDS、ElastiCache、OpenSearch Service、S3）的取捨；想更深入一致性與分散式交易，回到<a href="../../system-design/lessons/22-capstone.html">系統設計課的期末專題</a>，把這一課的 outbox、冪等、降級放進整個點餐系統的設計文件裡。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

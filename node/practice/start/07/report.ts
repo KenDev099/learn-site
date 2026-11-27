@@ -1,0 +1,22 @@
+// 執行：node report.ts
+// 產生每日訂單報表：處理期間每 100ms 印一次「處理中…」，做完印出明細和「報表完成」
+// 問題：報表印完了，程式卻一直不結束（按 Ctrl+C 才停）
+import { createServer } from 'node:http'
+import { setTimeout as sleep } from 'node:timers/promises'
+
+// 狀態伺服器：報表跑的時候，別的程式可以來問進度
+// 寫法第 13 課才教，這裡只要知道它有 close() 可以關掉
+let done = 0
+const status = createServer((req, res) => res.end(JSON.stringify({ done })))
+status.listen(Number(process.env.PORT ?? 3000))
+
+const ticker = setInterval(() => console.log('處理中…'), 100)
+
+// 假裝在查資料庫、算報表：等 450ms
+await sleep(450)
+const items = ['美式咖啡', '拿鐵', '卡布奇諾', '伯爵紅茶', '可頌', '起司蛋糕']
+for (let i = 1; i <= 20_000; i++) {
+  console.log(`#${String(i).padStart(5, '0')} ${items[i % items.length]}`)
+  done = i
+}
+console.log('報表完成')

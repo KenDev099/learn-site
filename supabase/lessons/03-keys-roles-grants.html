@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>3. API key、角色與 GRANT：誰能碰到哪張表</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="3" data-practice="supabase">
+<header>
+  <div class="eyebrow">階段 1：起步：一個 Postgres 加上一組服務 · 第 3 課</div>
+  <h1>API key、角色與 GRANT：誰能碰到哪張表</h1>
+</header>
+<main>
+
+<p>咖啡店的專案出了兩件事。第一件：一位工程師覺得 publishable key 讀不到訂單很麻煩，把 secret key 放進 <code>.env</code> 的 <code>VITE_SUPABASE_KEY</code>，前端從此什麼都讀得到。第二件：另一位工程師建了一張新的 <code>coupons</code> 表，前端讀的時候回 <code>42501 permission denied</code>，他上網查到「把 RLS 關掉就好」，照做之後還是 42501。</p>
+<p>兩件事的根源一樣：不知道一個請求在資料庫裡「是誰」、要過哪幾道門。這一課講清楚 key 代表什麼、請求怎麼變成 PostgreSQL 的角色、GRANT 和 RLS 各擋什麼，最後寫出一張新表正確開放給前端的完整步驟。</p>
+
+<div class="callout"><strong>這課的路線</strong>
+<ul>
+  <li>兩種 key：它代表哪個 app，不代表哪個人；為什麼 secret key 不能進前端。</li>
+  <li>請求怎麼變成資料庫角色：apikey 與 JWT 各決定什麼，<code>auth.uid()</code> 從哪裡來。</li>
+  <li>五個角色各做什麼，service_role 到底繞過了什麼。</li>
+  <li>兩道門：GRANT 回 42501、RLS 回空陣列；2026 年起新表不會自動開放。</li>
+  <li>一張新表開放給前端的正確步驟，以及什麼時候才用 secret key。</li>
+</ul></div>
+
+<div class="callout"><strong>這課會用到：</strong>第 1 課的兩道門（GRANT 決定能不能碰這張表、RLS 決定能碰哪幾列）；JWT 的結構（header.payload.signature 三段，payload 是 base64url 編碼的 JSON，<a href="../../auth/lessons/08-jwt-signatures.html">認證課第 8 課</a>）；role 與 GRANT（資料庫的帳號，<code>grant select on 表 to 角色</code> 給它權限，<a href="../../postgresql/lessons/24-rls.html">PostgreSQL 課第 24 課</a>）。</div>
+
+<div class="callout warn"><strong>環境</strong>：這課用到資料庫、gateway、Data API、Auth（db、kong、rest、auth），<code>npm run up</code> 預設都會開。練習 1 的測試會建兩個真的使用者，用他們登入後的 JWT 打 API。</div>
+
+<h2>兩種 key：代表哪個 app，不代表哪個人</h2>
+<p>先回答第一件事為什麼危險。<code>npx supabase status</code> 印出兩把 key：</p>
+<div class="table-wrap"><table>
+  <tr><th>key</th><th>開頭</th><th>在資料庫裡是</th><th>放哪裡</th></tr>
+  <tr><td>Publishable</td><td><code>sb_publishable_</code></td><td><code>anon</code>；請求另外帶了使用者的 JWT 時是 <code>authenticated</code></td><td>前端，本來就是公開的</td></tr>
+  <tr><td>Secret</td><td><code>sb_secret_</code></td><td><code>service_role</code>：不受 RLS 限制</td><td>只放伺服器、Edge Function 的環境變數</td></tr>
+</table></div>
+<p>API key 的作用是告訴 gateway「這是哪個 app 的請求」，不是「這是哪個人」。publishable key 打包進前端，任何人打開 DevTools 都看得到，這是設計上就預期的；所以 Supabase 的安全<strong>不能靠 key 保密，只能靠資料庫裡的 GRANT 與 RLS</strong>。</p>
+<p>secret key 不一樣：拿到它的人在資料庫裡就是 <code>service_role</code>，RLS 對它無效，所有列都看得到、改得到。開場的工程師把它放進 <code>VITE_</code> 開頭的變數：Vite 會把 <code>VITE_</code> 開頭的環境變數直接寫進打包後的 JavaScript，所以那把 key 已經在每個顧客的瀏覽器裡了。不是「可能外洩」，是已經外洩。雲端專案會擋下帶著瀏覽器 User-Agent 的 secret key 請求（回 401），算是最後一道保險，但 curl、Postman 不是瀏覽器，擋不住；本機則完全不擋。</p>
+<p>你在網路上還會看到另一組舊的 key：<code>anon</code> key 和 <code>service_role</code> key，都是 <code>eyJ</code> 開頭的長字串（其實就是 JWT）。它們跟 publishable／secret 一一對應，<code>supabase status -o env</code> 也還印得出來（<code>ANON_KEY</code>、<code>SERVICE_ROLE_KEY</code>）。官方文件說舊的 JWT key 在 2026 年底淘汰，新專案只用 publishable／secret。</p>
+<div class="callout practice"><strong>💡 實務上：secret key 外洩時的處理順序</strong><br>發現 secret key 進了前端或 git：(1) 在 Dashboard 的 API Keys 建一把新的 secret key，換掉伺服器與 Edge Function 的環境變數；(2) 刪掉舊的那把，它從那一刻起失效；(3) 從程式碼移除，並假設資料已經被讀過，評估要不要通知（顧客個資、訂單）。新制的 secret key 可以有好幾把、各自撤銷，所以平常就讓不同的伺服器用不同的 key，外洩時只換一把。publishable key 被看到則不用換，它本來就是公開的。</div>
+
+<h2>請求怎麼變成資料庫角色</h2>
+<p>key 只說了「哪個 app」，那「哪個人」從哪裡來？從 <code>Authorization: Bearer &lt;JWT&gt;</code> 這個 header：使用者登入後，Auth 簽發一張 JWT（access token），supabase-js 之後的每個請求都帶著它。一個請求經過三站：</p>
+<figure>
+  <svg viewBox="0 0 700 270" role="img" aria-label="請求先到 gateway 檢查 apikey，沒有使用者 JWT 時依 key 換成 anon 或 service_role 的 JWT；PostgREST 驗 JWT 的簽章，用 role claim 切換資料庫角色，並把整包 claims 放進 request.jwt.claims，auth.uid() 讀其中的 sub">
+    <defs><marker id="k1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="10" y="30" width="150" height="90" rx="8"/>
+    <text class="d-text" x="85" y="58" text-anchor="middle">請求</text>
+    <text class="d-small" x="85" y="80" text-anchor="middle">apikey: sb_publishable_…</text>
+    <text class="d-small" x="85" y="100" text-anchor="middle">Authorization: Bearer JWT</text>
+    <path class="d-line" d="M160,75 L200,75" marker-end="url(#k1)"/>
+    <rect class="d-box" x="205" y="30" width="150" height="90" rx="8"/>
+    <text class="d-text" x="280" y="58" text-anchor="middle">gateway</text>
+    <text class="d-small" x="280" y="80" text-anchor="middle">認得這把 key 嗎</text>
+    <text class="d-small" x="280" y="100" text-anchor="middle">沒帶 JWT 就依 key 補一張</text>
+    <path class="d-line" d="M355,75 L395,75" marker-end="url(#k1)"/>
+    <rect class="d-box" x="400" y="30" width="150" height="90" rx="8"/>
+    <text class="d-text" x="475" y="58" text-anchor="middle">PostgREST</text>
+    <text class="d-small" x="475" y="80" text-anchor="middle">驗 JWT 簽章與 exp</text>
+    <text class="d-small" x="475" y="100" text-anchor="middle">讀 role claim</text>
+    <path class="d-line" d="M475,120 L475,155" marker-end="url(#k1)"/>
+    <rect class="d-soft" x="230" y="160" width="460" height="95" rx="8"/>
+    <text class="d-text" x="460" y="185" text-anchor="middle">PostgreSQL（一個交易）</text>
+    <text class="d-small" x="460" y="208" text-anchor="middle">set local role authenticated</text>
+    <text class="d-small" x="460" y="226" text-anchor="middle">request.jwt.claims = 整包 payload（sub、role、email…）</text>
+    <text class="d-accent" x="460" y="246" text-anchor="middle">auth.uid() = claims 的 sub → GRANT → RLS</text>
+  </svg>
+  <figcaption>key 決定「哪個 app」與沒登入時的角色；JWT 決定「哪個人」；角色決定過哪幾道門。</figcaption>
+</figure>
+<ol>
+  <li><strong>gateway</strong> 檢查 apikey 是不是這個專案的 key（雲端認不得就回 401；本機不檢查，第 1 課提過）。請求沒有帶使用者的 JWT 時，gateway 依 key 補上一張代表 <code>anon</code> 或 <code>service_role</code> 的 JWT。</li>
+  <li><strong>PostgREST</strong> 驗證 JWT 的簽章與到期時間（<code>exp</code>），讀出 payload 的 <code>role</code>（例如 <code>authenticated</code>）。</li>
+  <li><strong>PostgreSQL</strong>：PostgREST 在一個交易裡執行 <code>set local role authenticated</code>，並把整包 payload 放進設定 <code>request.jwt.claims</code>。SQL 裡的 <code>auth.uid()</code> 就是讀這包 claims 的 <code>sub</code>（使用者 id）；沒登入時沒有 sub，<code>auth.uid()</code> 是 NULL。</li>
+</ol>
+<p>所以「這個請求是誰」完全由 JWT 決定，而 JWT 有簽章，使用者改不了內容（改了驗章就失敗）。各種組合在本機實測的結果：</p>
+<div class="table-wrap"><table>
+  <tr><th>apikey</th><th>Authorization</th><th>資料庫角色</th><th><code>auth.uid()</code></th></tr>
+  <tr><td>publishable</td><td>沒帶</td><td><code>anon</code></td><td>NULL</td></tr>
+  <tr><td>publishable</td><td>使用者的 JWT</td><td><code>authenticated</code></td><td>使用者 id</td></tr>
+  <tr><td>secret</td><td>沒帶</td><td><code>service_role</code></td><td>NULL</td></tr>
+  <tr><td>secret</td><td>使用者的 JWT</td><td><code>authenticated</code>（JWT 優先，RLS 照樣套用）</td><td>使用者 id</td></tr>
+  <tr><td>任何</td><td>過期或簽章不對的 JWT</td><td>不執行，回 401</td><td>—</td></tr>
+</table></div>
+<p>第四列常讓人意外：用 secret key 建的 client，只要帶著使用者的 JWT，在資料庫裡就是那個使用者。第 8 課的 Edge Function 會用到這個行為：伺服器端程式「代替使用者」查資料時，RLS 仍然有效。</p>
+
+<h2>五個角色</h2>
+<p>知道請求會變成哪個角色之後，看這些角色各自是什麼。role 與 GRANT 的語法在 <a href="../../postgresql/lessons/24-rls.html">PostgreSQL 課第 24 課</a>教過，這裡只看 Supabase 預先建好的這幾個：</p>
+<div class="table-wrap"><table>
+  <tr><th>角色</th><th>誰會變成它</th><th>特性</th></tr>
+  <tr><td><code>anon</code></td><td>沒登入的請求</td><td>只有你 GRANT 給它的權限</td></tr>
+  <tr><td><code>authenticated</code></td><td>帶著使用者 JWT 的請求</td><td>所有登入的人共用這一個角色，「是哪個人」要用 <code>auth.uid()</code> 分</td></tr>
+  <tr><td><code>service_role</code></td><td>secret key、沒帶使用者 JWT</td><td>有 <code>BYPASSRLS</code>：不受 RLS 限制。<strong>但仍然要有 GRANT</strong></td></tr>
+  <tr><td><code>authenticator</code></td><td>PostgREST 連資料庫用的帳號</td><td>自己幾乎沒有權限，只能切換成上面三個角色</td></tr>
+  <tr><td><code>postgres</code></td><td>直連資料庫（Studio、<code>db query</code>、migration）</td><td>表的擁有者，不受 GRANT、RLS 限制；不會出現在 API 請求裡</td></tr>
+</table></div>
+<p>「service_role 仍然要有 GRANT」可以直接驗證：課程的 <code>public.products</code> 只 GRANT 給 anon 和 authenticated，用 secret key 讀它，回的是 <code>42501 permission denied for table products</code>。BYPASSRLS 只跳過第二道門（列），第一道門（表）照樣要過。Supabase 的 Dashboard 建表時會順便 GRANT 給 service_role，所以平常感覺不到；自己寫 SQL 建表就要記得。</p>
+<p><code>authenticated</code> 只有一個，是這門課最重要的觀念之一：「有登入」不等於「是這筆資料的主人」。<code>grant select on orders to authenticated</code> 之後，如果沒有 RLS，每個登入的顧客都讀得到所有人的訂單。分辨是哪個人，是第 4 課 RLS 的工作。</p>
+
+<h2>兩道門：GRANT 回 42501，RLS 回空陣列</h2>
+<p>角色清楚了，看它們怎麼被兩道門擋。兩道門擋下來的樣子不同，這是除錯時最有用的線索：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>第一道門：GRANT</th><th>第二道門：RLS</th></tr>
+  <tr><td>管什麼</td><td>這個角色能不能對這張表做 select／insert／update／delete</td><td>能做的話，是哪幾列</td></tr>
+  <tr><td>沒過時 API 回</td><td>錯誤 <code>42501 permission denied for table …</code>（anon 是 HTTP 401、登入後是 403），hint 直接寫出要下的 GRANT</td><td>讀取：<code>[]</code>，沒有錯誤；寫入：<code>42501 new row violates row-level security policy</code></td></tr>
+  <tr><td>怎麼開</td><td><code>grant select on 表 to 角色</code></td><td><code>alter table 表 enable row level security</code> 再寫 policy</td></tr>
+</table></div>
+<p>回到開場第二件事。新表 <code>coupons</code> 回 42501，是第一道門：沒有 GRANT。關掉 RLS 動的是第二道門，所以錯誤一樣；更糟的是，之後補上 GRANT 時，因為 RLS 已經關了，所有列對那個角色全部開放。</p>
+<p>為什麼新表沒有 GRANT？Supabase 從 2026 年起改了預設值：<strong>新建的表不會自動開放給 Data API</strong>（新專案 2026-05-30、所有專案 2026-10-30 起）。以前在 public 建表，anon、authenticated、service_role 會自動拿到全部權限，很多專案就這樣不小心把表公開了。現在新表只會給這三個角色 <code>TRUNCATE</code>、<code>REFERENCES</code>、<code>TRIGGER</code> 這幾個 API 用不到的權限，要讀寫必須自己 GRANT。本機用 <code>config.toml</code> 的 <code>[api] auto_expose_new_tables = false</code> 對齊雲端（CLI 沒設時是舊行為），所以你在這門課看到的就是雲端的樣子。2025 年以前的教學、AI 給的範例常常省略 GRANT，照抄就會遇到 42501。</p>
+
+<h2>一張新表開放給前端的正確步驟</h2>
+<p>兩道門都要自己開，順序也重要。以「顧客能讀可用的優惠券」為例：</p>
+<pre>-- 1. 建表
+create table public.coupons (id bigint generated always as identity primary key, code text not null, active boolean not null default true);
+
+-- 2. 先開 RLS：從這一刻起，沒有 policy 的角色一列都看不到
+alter table public.coupons enable row level security;
+
+-- 3. 寫 policy：誰能看到哪幾列
+create policy "可用的優惠券大家都看得到" on public.coupons for select to anon, authenticated using (active);
+
+-- 4. 最後才 GRANT，而且只給需要的角色、需要的動作
+grant select on public.coupons to anon, authenticated;</pre>
+<p>先開 RLS、最後才 GRANT 的理由：在第 4 步之前，表對 API 是完全關著的；如果先 GRANT，在你寫完 policy 之前，那張表有一段時間是對所有人敞開的（migration 跑到一半失敗就會停在那個狀態）。</p>
+<p>不要寫 <code>grant all</code>：它包含 insert、update、delete、truncate，等於讓前端也能改菜單，只剩 RLS 一道門擋著，而 RLS 只要一個 policy 寫錯就失守。只讀的表就只 grant select。</p>
+<div class="callout practice"><strong>💡 實務上：上線前讓工具幫你找漏掉的 RLS</strong><br>Supabase 的 Security Advisor（Dashboard 的 Advisors 頁，或 CLI 的 <code>npx supabase db advisors --type security</code>）會列出 public 裡沒開 RLS 的表（<code>rls_disabled_in_public</code>）、會繞過 RLS 的 view、沒鎖 search_path 的函式等問題。把它放進 CI（<code>--fail-on warn</code> 讓它有問題時失敗），比靠人記得可靠。審 migration 的 PR 時，每個 <code>create table</code> 後面都應該看到 <code>enable row level security</code>、policy 和最小的 GRANT 三件事。</div>
+
+<h3>什麼時候才用 secret key</h3>
+<p>secret key 適合「本來就該看到全部資料」的伺服器端工作：後台的每日報表、從舊系統匯入資料、金流通知進來時更新訂單狀態（第 8 課）。判斷方式是問：這個動作是代表某個使用者做的嗎？是的話，就該用那個使用者的 JWT，讓 RLS 照常檢查。</p>
+<p>它不是「解決權限錯誤」的工具。前端遇到 42501，答案是補上正確的 GRANT 與 policy；換成 secret key 讓錯誤消失，等於把所有人的資料都開放給所有人。</p>
+<div class="callout practice"><strong>💡 實務上：key 放哪裡、本機服務開在哪裡</strong><br>前端專案的 <code>.env</code> 只放 <code>VITE_SUPABASE_URL</code> 與 <code>VITE_SUPABASE_PUBLISHABLE_KEY</code>；secret key 只出現在伺服器的環境變數或雲端的 secrets 設定，而且 <code>.env*</code> 不進 git。另外，本機 Supabase 啟動時會提醒服務綁在 0.0.0.0：同一個 Wi-Fi 的其他電腦也能連到你的 55421、55422，而本機的 key 與資料庫密碼是人人都知道的預設值。在咖啡廳或共用網路上不用的時候就 <code>npm run down</code>，或用 macOS 的防火牆擋掉外來連線。</div>
+
+<h2>練習</h2>
+
+<div class="local" data-test="ex1" data-files="grants.sql">
+  <p>練習 1：測試會在你專屬的 schema 建好 <code>products</code>（6 項菜單）與 <code>orders</code>（<code>customer_id</code> 預設是 <code>auth.uid()</code>），再套用你的 <code>grants.sql</code>。要做到：沒登入和登入的人都能讀菜單，但任何人都不能透過 API 改菜單；登入的人能用自己的身分新增訂單，沒登入的人不能；訂單先不開放讀取；兩張表都開 RLS。下單的 policy 已經寫好在檔案裡。SQL 不要寫 <code>public.</code> 前綴（判分時表在你專屬的 schema）。</p>
+</div>
+
+<div class="exercise">
+  <p>練習 2：寫 <code>requestRole(headers, keys, now)</code>，照上面「請求怎麼變成資料庫角色」的表，推出這個請求在資料庫裡是哪個角色、<code>auth.uid()</code> 是什麼：</p>
+  <ul>
+    <li>header 名稱都是小寫。<code>apikey</code> 不是 <code>keys.publishable</code> 也不是 <code>keys.secret</code>（或沒帶）時，回傳 <code>{ error: … }</code>（雲端會回 401）。</li>
+    <li><code>authorization</code> 沒帶，或 <code>Bearer</code> 後面不是 JWT（不是三段、例如 <code>Bearer sb_publishable_…</code>）時：publishable 是 <code>anon</code>、secret 是 <code>service_role</code>，uid 是 <code>null</code>。</li>
+    <li>帶著 JWT 時以 JWT 為準：解出 payload（base64url 編碼的 JSON），<code>exp</code> 小於等於 <code>now</code>（秒）回傳 <code>{ error: … }</code>；否則角色是 payload 的 <code>role</code>，uid 是 <code>sub</code>（沒有就是 <code>null</code>）。</li>
+  </ul>
+  <p>這題只解讀、不驗簽章（驗章是 PostgREST 的工作，<a href="../../auth/lessons/09-jwt-verification.html">認證課第 9 課</a>寫過完整的驗證）。</p>
+  <script type="start">
+type Role = 'anon' | 'authenticated' | 'service_role'
+type Result = { role: Role; uid: string | null } | { error: string }
+type Keys = { publishable: string; secret: string }
+
+function requestRole(headers: Record<string, string | undefined>, keys: Keys, now: number): Result {
+  // 1. 檢查 apikey
+  // 2. 取出 Bearer 後面的 token；不是三段就當成沒帶 JWT
+  // 3. 解 payload：base64url → 字串 → JSON，檢查 exp
+  return { error: '還沒寫' }
+}
+
+const keys = { publishable: 'sb_publishable_demo', secret: 'sb_secret_demo' }
+console.log(requestRole({ apikey: 'sb_publishable_demo' }, keys, 1800000000))
+</script>
+  <script type="answer">
+type Role = 'anon' | 'authenticated' | 'service_role'
+type Result = { role: Role; uid: string | null } | { error: string }
+type Keys = { publishable: string; secret: string }
+
+function decodePayload(part: string): any {
+  const base64 = part.replace(/-/g, '+').replace(/_/g, '/')
+  const bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0))
+  return JSON.parse(new TextDecoder().decode(bytes))
+}
+
+function requestRole(headers: Record<string, string | undefined>, keys: Keys, now: number): Result {
+  const { apikey, authorization } = headers
+  if (apikey !== keys.publishable && apikey !== keys.secret) return { error: '不認得的 apikey' }
+  const token = authorization?.replace(/^Bearer /, '') ?? ''
+  const parts = token.split('.')
+  if (parts.length !== 3) return { role: apikey === keys.secret ? 'service_role' : 'anon', uid: null }
+  const payload = decodePayload(parts[1])
+  if (typeof payload.exp !== 'number' || payload.exp <= now) return { error: 'JWT 已過期' }
+  return { role: payload.role, uid: payload.sub ?? null }
+}
+
+const keys = { publishable: 'sb_publishable_demo', secret: 'sb_secret_demo' }
+console.log(requestRole({ apikey: 'sb_publishable_demo' }, keys, 1800000000))
+</script>
+  <script type="tests">
+const enc = (o: object) => btoa(String.fromCharCode(...new TextEncoder().encode(JSON.stringify(o)))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+const jwt = (payload: object) => `${enc({ alg: 'ES256', typ: 'JWT' })}.${enc(payload)}.c2lnbmF0dXJl`
+const K = { publishable: 'sb_publishable_ACJW', secret: 'sb_secret_N7UN' }
+const now = 1790000000
+const mei = jwt({ sub: '6f1c2a4e-0b7d-4c2e-9a51-3d8e7f6a2b10', role: 'authenticated', exp: 1800000000, user_metadata: { name: '陳美華' } })
+assert(mei.split('.')[1].includes('-') || mei.split('.')[1].includes('_'), '（測試自我檢查）這張 JWT 的 payload 要含 base64url 特有的字元')
+assert.deepEqual(requestRole({ apikey: K.publishable }, K, now), { role: 'anon', uid: null }, 'publishable、沒帶 JWT → anon')
+assert.deepEqual(requestRole({ apikey: K.secret }, K, now), { role: 'service_role', uid: null }, 'secret、沒帶 JWT → service_role')
+assert.deepEqual(requestRole({ apikey: K.publishable, authorization: `Bearer ${mei}` }, K, now), { role: 'authenticated', uid: '6f1c2a4e-0b7d-4c2e-9a51-3d8e7f6a2b10' },
+  'publishable＋使用者 JWT → authenticated，uid 是 sub。payload 是 base64url（- 與 _），atob 只認 base64，要先換回 + 與 /')
+assert.deepEqual(requestRole({ apikey: K.secret, authorization: `Bearer ${mei}` }, K, now), { role: 'authenticated', uid: '6f1c2a4e-0b7d-4c2e-9a51-3d8e7f6a2b10' },
+  'secret＋使用者 JWT → 還是 authenticated：帶了 JWT 就以 JWT 為準，RLS 照樣套用')
+assert.deepEqual(requestRole({ apikey: K.publishable, authorization: `Bearer ${K.publishable}` }, K, now), { role: 'anon', uid: null }, 'Bearer 後面是 key 不是 JWT（不是三段）→ 當成沒帶 JWT')
+assert.deepEqual(requestRole({ apikey: K.secret, authorization: `Bearer ${K.secret}` }, K, now), { role: 'service_role', uid: null }, 'secret 放在 Authorization 也是 service_role')
+const svc = jwt({ role: 'service_role', exp: 1800000000 })
+assert.deepEqual(requestRole({ apikey: K.publishable, authorization: `Bearer ${svc}` }, K, now), { role: 'service_role', uid: null }, 'JWT 的 role 是 service_role、沒有 sub → uid 是 null')
+assert('error' in requestRole({ apikey: K.publishable, authorization: `Bearer ${jwt({ sub: 'x', role: 'authenticated', exp: now - 1 })}` }, K, now), '過期的 JWT（exp 小於 now）要回傳 error')
+assert('error' in requestRole({ apikey: K.publishable, authorization: `Bearer ${jwt({ sub: 'x', role: 'authenticated', exp: now })}` }, K, now), 'exp 等於 now 也算過期')
+assert('error' in requestRole({ apikey: 'sb_publishable_wrong' }, K, now), '不認得的 apikey 要回傳 error（本機會放行，雲端回 401）')
+assert('error' in requestRole({}, K, now), '沒帶 apikey 要回傳 error')
+</script>
+  <script type="wrong">
+type Role = 'anon' | 'authenticated' | 'service_role'
+type Result = { role: Role; uid: string | null } | { error: string }
+type Keys = { publishable: string; secret: string }
+// 直接 atob：base64url 的 - 與 _ 會讓 atob 丟錯
+function requestRole(headers: Record<string, string | undefined>, keys: Keys, now: number): Result {
+  const { apikey, authorization } = headers
+  if (apikey !== keys.publishable && apikey !== keys.secret) return { error: '不認得的 apikey' }
+  const parts = (authorization?.replace(/^Bearer /, '') ?? '').split('.')
+  if (parts.length !== 3) return { role: apikey === keys.secret ? 'service_role' : 'anon', uid: null }
+  const payload = JSON.parse(atob(parts[1]))
+  if (payload.exp <= now) return { error: 'JWT 已過期' }
+  return { role: payload.role, uid: payload.sub ?? null }
+}
+</script>
+  <script type="wrong">
+type Role = 'anon' | 'authenticated' | 'service_role'
+type Result = { role: Role; uid: string | null } | { error: string }
+type Keys = { publishable: string; secret: string }
+// 沒檢查 exp
+function requestRole(headers: Record<string, string | undefined>, keys: Keys, now: number): Result {
+  const { apikey, authorization } = headers
+  if (apikey !== keys.publishable && apikey !== keys.secret) return { error: '不認得的 apikey' }
+  const parts = (authorization?.replace(/^Bearer /, '') ?? '').split('.')
+  if (parts.length !== 3) return { role: apikey === keys.secret ? 'service_role' : 'anon', uid: null }
+  const bytes = Uint8Array.from(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0))
+  const payload = JSON.parse(new TextDecoder().decode(bytes))
+  return { role: payload.role, uid: payload.sub ?? null }
+}
+</script>
+  <script type="wrong">
+type Role = 'anon' | 'authenticated' | 'service_role'
+type Result = { role: Role; uid: string | null } | { error: string }
+type Keys = { publishable: string; secret: string }
+// 以為 secret key 一律是 service_role
+function requestRole(headers: Record<string, string | undefined>, keys: Keys, now: number): Result {
+  const { apikey, authorization } = headers
+  if (apikey !== keys.publishable && apikey !== keys.secret) return { error: '不認得的 apikey' }
+  if (apikey === keys.secret) return { role: 'service_role', uid: null }
+  const parts = (authorization?.replace(/^Bearer /, '') ?? '').split('.')
+  if (parts.length !== 3) return { role: 'anon', uid: null }
+  const bytes = Uint8Array.from(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0))
+  const payload = JSON.parse(new TextDecoder().decode(bytes))
+  if (payload.exp <= now) return { error: 'JWT 已過期' }
+  return { role: payload.role, uid: payload.sub ?? null }
+}
+</script>
+  <script type="wrong">
+type Role = 'anon' | 'authenticated' | 'service_role'
+type Result = { role: Role; uid: string | null } | { error: string }
+type Keys = { publishable: string; secret: string }
+// 沒檢查 apikey：本機會放行，就以為不用檢查
+function requestRole(headers: Record<string, string | undefined>, keys: Keys, now: number): Result {
+  const { apikey, authorization } = headers
+  const parts = (authorization?.replace(/^Bearer /, '') ?? '').split('.')
+  if (parts.length !== 3) return { role: apikey === keys.secret ? 'service_role' : 'anon', uid: null }
+  const bytes = Uint8Array.from(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0))
+  const payload = JSON.parse(new TextDecoder().decode(bytes))
+  if (payload.exp <= now) return { error: 'JWT 已過期' }
+  return { role: payload.role, uid: payload.sub ?? null }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：專案的 code review 工具要掃出「放在前端的 key 安不安全」。寫 <code>classifyKey(value)</code>，回傳 <code>{ kind, browserSafe }</code>：</p>
+  <ul>
+    <li><code>sb_publishable_</code> 開頭：<code>'publishable'</code>，可以放前端；<code>sb_secret_</code> 開頭：<code>'secret'</code>，不行。</li>
+    <li>JWT（三段、payload 解得開）：payload 的 <code>role</code> 是 <code>anon</code> 就是 <code>'legacy-anon'</code>（可以放前端），是 <code>service_role</code> 就是 <code>'legacy-service_role'</code>（不行）；其他 role（例如使用者的 access token）是 <code>'unknown'</code>。</li>
+    <li>其他都是 <code>'unknown'</code>。不認得的東西一律當成不能放前端。</li>
+  </ul>
+  <script type="start">
+type Kind = 'publishable' | 'secret' | 'legacy-anon' | 'legacy-service_role' | 'unknown'
+
+function classifyKey(value: string): { kind: Kind; browserSafe: boolean } {
+  return { kind: 'unknown', browserSafe: true }
+}
+
+console.log(classifyKey('sb_publishable_ACJWlzQHlZjBrEguHvfOxg_3BJgxAaH'))
+</script>
+  <script type="answer">
+type Kind = 'publishable' | 'secret' | 'legacy-anon' | 'legacy-service_role' | 'unknown'
+
+function jwtRole(value: string): unknown {
+  const parts = value.split('.')
+  if (parts.length !== 3) return undefined
+  try {
+    return JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/'))).role
+  } catch {
+    return undefined
+  }
+}
+
+function classifyKey(value: string): { kind: Kind; browserSafe: boolean } {
+  if (value.startsWith('sb_publishable_')) return { kind: 'publishable', browserSafe: true }
+  if (value.startsWith('sb_secret_')) return { kind: 'secret', browserSafe: false }
+  const role = jwtRole(value)
+  if (role === 'anon') return { kind: 'legacy-anon', browserSafe: true }
+  if (role === 'service_role') return { kind: 'legacy-service_role', browserSafe: false }
+  return { kind: 'unknown', browserSafe: false }
+}
+
+console.log(classifyKey('sb_publishable_ACJWlzQHlZjBrEguHvfOxg_3BJgxAaH'))
+</script>
+  <script type="tests">
+const anonKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0'
+const serviceKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.c2ln'
+const userToken = 'eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI2ZjFjIiwicm9sZSI6ImF1dGhlbnRpY2F0ZWQifQ.c2ln'
+assert.deepEqual(classifyKey('sb_publishable_ACJWlzQHlZjBrEguHvfOxg_3BJgxAaH'), { kind: 'publishable', browserSafe: true }, 'publishable key 可以放前端')
+assert.deepEqual(classifyKey('sb_secret_example'), { kind: 'secret', browserSafe: false }, 'secret key 不能放前端')
+assert.deepEqual(classifyKey(anonKey), { kind: 'legacy-anon', browserSafe: true }, '舊的 anon key（JWT，role 是 anon）可以放前端')
+assert.deepEqual(classifyKey(serviceKey), { kind: 'legacy-service_role', browserSafe: false }, '舊的 service_role key 也是 eyJ 開頭，但 role 是 service_role：不能只看開頭，要解 payload')
+assert.deepEqual(classifyKey(userToken), { kind: 'unknown', browserSafe: false }, '使用者的 access token 不是 API key：unknown')
+assert.deepEqual(classifyKey('eyJhbGciOiJIUzI1NiJ9.不是base64.x'), { kind: 'unknown', browserSafe: false }, 'payload 解不開時是 unknown，不要丟錯')
+assert.deepEqual(classifyKey('AIzaSyD-example'), { kind: 'unknown', browserSafe: false }, '不認得的字串一律當成不能放前端')
+assert.deepEqual(classifyKey('my_sb_secret_x'), { kind: 'unknown', browserSafe: false }, '要比對開頭，不是包含')
+</script>
+  <script type="wrong">
+type Kind = 'publishable' | 'secret' | 'legacy-anon' | 'legacy-service_role' | 'unknown'
+// 所有 eyJ 開頭的都當成 anon key
+function classifyKey(value: string): { kind: Kind; browserSafe: boolean } {
+  if (value.startsWith('sb_publishable_')) return { kind: 'publishable', browserSafe: true }
+  if (value.startsWith('sb_secret_')) return { kind: 'secret', browserSafe: false }
+  if (value.startsWith('eyJ')) return { kind: 'legacy-anon', browserSafe: true }
+  return { kind: 'unknown', browserSafe: false }
+}
+</script>
+  <script type="wrong">
+type Kind = 'publishable' | 'secret' | 'legacy-anon' | 'legacy-service_role' | 'unknown'
+// 不認得的預設為安全
+function classifyKey(value: string): { kind: Kind; browserSafe: boolean } {
+  if (value.startsWith('sb_secret_')) return { kind: 'secret', browserSafe: false }
+  if (value.startsWith('sb_publishable_')) return { kind: 'publishable', browserSafe: true }
+  const parts = value.split('.')
+  if (parts.length === 3) {
+    try {
+      const role = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/'))).role
+      if (role === 'anon') return { kind: 'legacy-anon', browserSafe: true }
+      if (role === 'service_role') return { kind: 'legacy-service_role', browserSafe: false }
+    } catch {}
+  }
+  return { kind: 'unknown', browserSafe: true }
+}
+</script>
+  <script type="wrong">
+type Kind = 'publishable' | 'secret' | 'legacy-anon' | 'legacy-service_role' | 'unknown'
+// 用 includes：名字裡有 sb_secret_ 的都當成 secret key
+function classifyKey(value: string): { kind: Kind; browserSafe: boolean } {
+  if (value.includes('sb_publishable_')) return { kind: 'publishable', browserSafe: true }
+  if (value.includes('sb_secret_')) return { kind: 'secret', browserSafe: false }
+  const parts = value.split('.')
+  if (parts.length === 3) {
+    try {
+      const role = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/'))).role
+      if (role === 'anon') return { kind: 'legacy-anon', browserSafe: true }
+      if (role === 'service_role') return { kind: 'legacy-service_role', browserSafe: false }
+    } catch {}
+  }
+  return { kind: 'unknown', browserSafe: false }
+}
+</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：前端查 <code>coupons</code>，一個回 <code>42501 permission denied for table coupons</code>，另一個環境回 <code>[]</code>。各是哪道門擋下的？</p>
+  <label data-key="a">兩個都是 RLS：42501 是 policy 寫錯，<code>[]</code> 是表裡沒資料</label>
+  <label data-key="b">42501 是 RLS 沒開，<code>[]</code> 是 GRANT 沒給</label>
+  <label data-key="c">42501 是沒有 GRANT（表層級）；<code>[]</code> 是有 GRANT，但 RLS 沒有讓這個角色看到任何一列</label>
+  <label data-key="d">兩個都是 key 用錯，換成 secret key 就都正常了</label>
+  <p class="why">✓ 第一道門 GRANT 沒過是錯誤 42501，hint 會寫出要下的 GRANT；第二道門 RLS 沒有符合的 policy 時，讀取不是錯誤而是空陣列。b 剛好說反了，也是開場那位工程師的誤會：關 RLS 解決不了 42501。d 能讓錯誤消失，但等於把整張表交給所有人。（第 3 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：資安掃描報告指出「前端打包檔裡有 <code>sb_publishable_…</code>，以及 <code>eyJ…</code> 開頭、payload 的 role 是 <code>service_role</code> 的字串」。該怎麼處理？</p>
+  <label data-key="a">兩個都要輪替：任何 key 出現在前端都算外洩</label>
+  <label data-key="b">publishable key 不用處理；service_role 的那把是舊制的 secret key，要立刻輪替並從前端移除</label>
+  <label data-key="c">兩個都不用處理：<code>eyJ</code> 開頭的是 JWT，有簽章所以安全</label>
+  <label data-key="d">把兩個都改放到 <code>VITE_</code> 開頭的環境變數</label>
+  <p class="why">✓ publishable key 設計上就是公開的；舊制的 service_role key 跟 secret key 一樣繞過 RLS，出現在前端就是外洩。c 錯在簽章只保證內容沒被改，不代表能公開：拿到它的人就有 service_role 的權限。d 沒有用，<code>VITE_</code> 變數會被寫進打包檔。（第 3 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：後台的匯入程式用 secret key 連 Supabase，寫入自己用 SQL 新建的 <code>imports</code> 表，回 <code>42501</code>。service_role 不是不受 RLS 限制嗎？</p>
+  <label data-key="a">BYPASSRLS 只跳過 RLS，表層級的 GRANT 仍然要有；要 <code>grant insert on imports to service_role</code></label>
+  <label data-key="b">secret key 過期了，要到 Dashboard 重新產生</label>
+  <label data-key="c">要在請求裡加 <code>Authorization: Bearer</code> 一張使用者的 JWT，service_role 才會生效</label>
+  <label data-key="d">要先 <code>alter table imports disable row level security</code></label>
+  <p class="why">✓ 兩道門是分開的：service_role 有 BYPASSRLS，但第一道門 GRANT 照樣要過，而新表預設不會自動 GRANT。c 正好相反：帶了使用者 JWT，請求就變成那個使用者，連 RLS 都會套用。d 關 RLS 動的是第二道門，42501 不會消失。（第 3 課）</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>secret key 放進前端</strong>（包括 <code>VITE_</code> 變數、舊制的 service_role key）：拿到的人繞過所有 RLS。前端只放 publishable key。</li>
+  <li><strong>遇到 42501 就關 RLS</strong>：42501 是沒有 GRANT，跟 RLS 無關；關掉 RLS 只會讓之後補上的 GRANT 開放整張表。</li>
+  <li><strong><code>grant all</code></strong>：前端也能改、能刪、能 truncate，只剩 RLS 擋。只給需要的動作。</li>
+  <li><strong>先 GRANT 再寫 RLS</strong>：中間那段時間表是全開的。順序是建表 → 開 RLS → policy → GRANT。</li>
+  <li><strong>以為 service_role 不用 GRANT</strong>：它只跳過 RLS。自己用 SQL 建的表要記得 GRANT 給它。</li>
+  <li><strong>以為 <code>authenticated</code> 等於「資料的主人」</strong>：所有登入的人共用這個角色，分辨是誰要靠 <code>auth.uid()</code> 與 RLS。</li>
+  <li><strong>用 secret key 解決前端的權限錯誤</strong>：問題被藏起來，資料被打開。代表使用者做的事，就用使用者的 JWT。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>publishable key（→ <code>anon</code>）放前端、本來就公開；secret key（→ <code>service_role</code>，繞過 RLS）只放伺服器。key 代表哪個 app，不代表哪個人，安全只能靠 GRANT＋RLS。舊制的 anon／service_role JWT key 一一對應，2026 年底淘汰。</li>
+  <li>請求的身分由 JWT 決定：gateway 認 key、沒帶 JWT 時依 key 補一張；PostgREST 驗 JWT、<code>set local role</code>、把 payload 放進 <code>request.jwt.claims</code>；<code>auth.uid()</code> 讀 <code>sub</code>。帶了使用者 JWT 時，就算用 secret key 也是那個使用者。</li>
+  <li>角色：<code>anon</code>、<code>authenticated</code>（所有登入的人共用）、<code>service_role</code>（BYPASSRLS，但仍要 GRANT）、<code>authenticator</code>（PostgREST 連線用）、<code>postgres</code>（直連、表的擁有者）。</li>
+  <li>兩道門：沒有 GRANT 是 42501；有 GRANT、RLS 沒有符合的 policy 時讀取是 <code>[]</code>。2026 年起新表不會自動 GRANT（本機 <code>auto_expose_new_tables = false</code>）。</li>
+  <li>新表的步驟：建表 → 開 RLS → policy → 最小的 GRANT；用 Security Advisor 檢查。secret key 只用在本來就該看到全部資料的伺服器端工作。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 6 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 7：面試官問：「用了 Supabase，前端直接打資料庫的 API，那後端的權限檢查去哪了？」最好的回答是？</p>
+  <label data-key="a">在 supabase-js 裡：它會依登入的人自動過濾資料</label>
+  <label data-key="b">在 API gateway：它依 apikey 決定能讀哪些表</label>
+  <label data-key="c">搬進資料庫：請求依 JWT 變成 PostgreSQL 角色，由 GRANT 決定能碰哪些表、RLS 決定哪幾列</label>
+  <label data-key="d">不需要權限檢查，因為只有自己的前端知道 API 網址</label>
+  <p class="why">✓ PostgREST 直接查資料庫，中間沒有你寫的程式，權限只能寫成資料庫的 GRANT 與 RLS。a 是最常見的錯：前端的程式與請求使用者都改得到，在瀏覽器過濾等於沒擋。b 錯在 apikey 只代表哪個 app。（第 1、3 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 8：訂單明細頁打開要等快一秒，Network 分頁看到同一頁打了 7 個 <code>/rest/v1/</code> 請求：1 個 orders、1 個 order_items、5 個 products。怎麼改？</p>
+  <label data-key="a">在 orders 的 select 裡嵌入 <code>order_items(…, products(name))</code>，靠外鍵在資料庫裡 JOIN，一個請求取回</label>
+  <label data-key="b">用 <code>Promise.all</code> 讓 5 個 products 請求同時發出</label>
+  <label data-key="c">把 products 整張表在 App 啟動時抓下來放進 Pinia，之後在前端對照</label>
+  <label data-key="d">把 <code>max_rows</code> 調大，讓一個請求能回更多資料</label>
+  <p class="why">✓ 這是 N+1，用嵌入一次取回；兩張表之間要有外鍵。b 是最多人會先想到的，請求數不變、只是並行，手機網路下仍慢，而且列表頁會變成 N 倍。c 在菜單很小時可行，但它繞開問題而非解決，換成顧客、訂單這類大表就做不到。（第 2 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 9：下面的結帳程式，測試環境一切正常，上線後客服說「有人付款成功卻沒有訂單」。最可能的原因？</p>
+<pre>const { data } = await supabase.from('orders').insert({ customer_id, total }).select('id').single()
+await supabase.from('order_items').insert(items.map(i =&gt; ({ order_id: data.id, ...i })))
+return data.id</pre>
+  <label data-key="a">insert 沒加 <code>.select()</code>，拿不到 id</label>
+  <label data-key="b"><code>single()</code> 在新增時一定回錯誤</label>
+  <label data-key="c">supabase-js 的 insert 是非同步的，第二行執行時第一行還沒寫入</label>
+  <label data-key="d">沒檢查 <code>error</code>：supabase-js 不丟例外，失敗時程式照樣往下跑；而且兩個請求不是同一個交易</label>
+  <p class="why">✓ 失敗的結果放在 <code>error</code>，程式不會停；第二個 insert 失敗也沒人知道，留下沒有品項或沒有訂單的狀態。每一步都要檢查 error，多步驟寫入要放進 RPC 才會在同一個交易（第 8 課）。a 錯在程式已經有 <code>.select('id')</code>。c 錯在每行都有 await。（第 2 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 10：新同事在 SQL 裡建了 <code>coupons</code> 表，前端讀到 42501。他打算執行下面哪一個？你該建議哪一個？</p>
+  <label data-key="a"><code>alter table coupons disable row level security</code></label>
+  <label data-key="b">先 <code>enable row level security</code>、寫 select policy，再 <code>grant select on coupons to anon, authenticated</code></label>
+  <label data-key="c"><code>grant all on coupons to anon, authenticated</code></label>
+  <label data-key="d">前端改用 secret key 讀 coupons</label>
+  <p class="why">✓ 42501 是沒有 GRANT，2026 年起新表不會自動開放；正確順序是 RLS → policy → 最小的 GRANT。c 會讓錯誤消失，但前端也能改、能刪優惠券，只剩 RLS 一道門。a 根本解決不了 42501，還拿掉了列層級保護。（第 3 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 11：Edge Function 用 secret key 建 client，並把呼叫者的 <code>Authorization: Bearer &lt;使用者 JWT&gt;</code> 帶上去查 orders。查詢在資料庫裡以什麼身分執行？</p>
+  <label data-key="a"><code>service_role</code>：有 secret key 就繞過 RLS</label>
+  <label data-key="b"><code>anon</code>：兩個憑證衝突時降成最低權限</label>
+  <label data-key="c"><code>authenticated</code>，<code>auth.uid()</code> 是那個使用者：帶了 JWT 就以 JWT 為準，RLS 照常套用</label>
+  <label data-key="d">回 401：一個請求不能同時帶 secret key 與使用者 JWT</label>
+  <p class="why">✓ key 只代表 app，身分由 Authorization 的 JWT 決定；只有沒帶使用者 JWT 時，gateway 才依 secret key 補上 service_role。a 是最常見的誤解。這個行為讓伺服器端程式能代替使用者查資料，同時保住 RLS（第 8 課會用到）。（第 3 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 12：本機測試時，前端忘了帶 apikey 也查得到菜單，同事說「看吧，apikey 根本不用帶」。怎麼回應？</p>
+  <label data-key="a">本機的 gateway 不檢查 apikey，雲端會回 401；程式要照雲端的規則每個請求都帶</label>
+  <label data-key="b">對，apikey 只是統計用，雲端也不檢查</label>
+  <label data-key="c">因為菜單有 <code>using (true)</code> 的 policy，所以不用 key</label>
+  <label data-key="d">因為沒帶 key 時會變成 service_role</label>
+  <p class="why">✓ 本機和雲端在這點不同：本機沒帶或帶錯 key 都以 anon 放行，雲端直接 401。c 混淆了兩件事：policy 決定 anon 看得到哪幾列，key 決定請求能不能進來。d 錯在沒帶 key 時是 anon。（第 1、3 課）</p>
+</div>
+
+
+<p>這個階段的重點整理成<a href="../sheets/stage-1.html">一頁圖解</a>。</p>
+<p>下一課進入第二道門：用 <code>auth.uid()</code> 寫 RLS，讓顧客只看得到、只改得到自己的訂單。</p>
+
+<div class="callout">版本備註：Supabase CLI 3.1.0、PostgREST 16.5、Auth（GoTrue）2.197.0、Kong 2.8.1。表中的 key 與 JWT 組合、service_role 對沒有 GRANT 的表回 42501、新表預設權限，都是 2026-11-20 在本機實測；雲端擋瀏覽器 User-Agent 的 secret key、舊 JWT key 的淘汰時程依官方文件 getting-started/api-keys；新表不自動開放依 2026-04-28 的 changelog。</div>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

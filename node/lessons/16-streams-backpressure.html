@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>16. Stream 與背壓</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="16" data-practice="node">
+<header>
+  <div class="eyebrow">階段 4：HTTP 服務 · 第 16 課</div>
+  <h1>Stream 與背壓</h1>
+</header>
+<main>
+
+<p>咖啡店後台有一支「匯出訂單 CSV」的 API。剛上線時只有幾百筆訂單，程式一次從資料庫查完、組成一個大字串再回給瀏覽器，完全沒問題。一年後訂單到了 50 萬筆，會計月底按下匯出，伺服器的記憶體一路往上衝，接著程序被砍掉重啟，同一時間正在點餐的客人也一起斷線。同一個月，總部每天匯入各門市幾百 MB 的訂單檔，也開始偶爾失敗。</p>
+<p>兩件事的原因一樣：程式先把「全部」放進記憶體才開始處理，而「全部」有多大，是由外部決定的。這一課把這兩支功能改成一段一段處理資料，用的是 Node 的 stream（串流），讓記憶體用量不再跟著資料變大。最後再處理一個根本沒有「全部」的需求：客人點餐後，手機畫面要即時從「製作中」變成「可取餐」，它用的是同一套串流觀念。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>為什麼「先全部讀進來」會撐爆記憶體：量一次整個讀進來和逐行讀的差距，認識串流和 chunk；Node 的串流有哪幾種。</li>
+  <li>匯入：用 <code>for await</code> 和 readline 逐行讀幾百 MB 的訂單檔，記憶體不跟著檔案變大。</li>
+  <li>匯出：客戶端收得比資料庫慢時，資料堆到哪裡去（背壓）；怎麼用 <code>pipeline</code> 接出一條會壓縮、出錯會一起停的下載。</li>
+  <li>寫對了卻卡住：怎麼用最小重現判斷是自己的 bug 還是 Node 的。</li>
+  <li>即時推播：用 Server-Sent Events 把訂單狀態推給客人的手機。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../typescript/lessons/10-iterators-generators.html">TypeScript 課第 10 課</a>的 async generator 與 <code>for await</code>：<code>async function*</code> 每次 <code>yield</code> 一個值，<code>for await…of</code> 一個一個等著拿。</li>
+  <li><a href="08-events-cancellation.html">第 8 課</a>的 EventEmitter：<code>on</code> 掛監聽器、<code>emit</code> 觸發；不用的監聽器要移除，不然會洩漏。stream 就是 emitter。</li>
+  <li><a href="13-http-server.html">第 13 課</a>的 <code>req</code>／<code>res</code>：處理函式拿到的請求與回應物件，伺服器出錯時回 500。</li>
+</ul></div>
+
+<h2>為什麼「先全部讀進來」會撐爆記憶體？</h2>
+<p>匯出和匯入原本的寫法是同一個模式：先拿到全部資料，再開始處理。<a href="10-file-system.html">第 10 課</a>的 <code>readFile</code> 就是這樣，它等整個檔案讀完，才把內容交給你。這種寫法的記憶體成本到底多高，用一個 120 MB 的 log 檔量給你看：任務是找出所有含 <code>ERROR</code> 的行，邏輯比解析訂單單純，兩種寫法之間唯一的差別就是「怎麼讀」。在 <code>learn/</code> 執行 <code>node check.mjs node 16</code> 建立 <code>work/16/</code>，再到 <code>work/16</code> 執行（第一次會先產生檔案）：</p>
+<pre>$ node examples/memory.ts readFile
+readFile：找到 2000 行 ERROR，記憶體最高 431 MB
+$ node examples/memory.ts readline
+readline：找到 2000 行 ERROR，記憶體最高 97 MB</pre>
+<p>記憶體的數字每台電腦、每次執行都會有些不同，要看的是兩者的差距：同一個檔案、同樣的結果，第一種多用了三百多 MB。</p>
+<p>差距從哪裡來？<code>readFile</code> 先把整個檔案變成一個字串，程式再 <code>split</code> 成 200 萬個字串，每一行都是一個獨立的字串物件。原本的大字串、200 萬個小字串，在處理期間同時存在，記憶體就是檔案大小的好幾倍。檔案再大下去，會先碰到兩道牆的其中一道：V8 的字串最多約 5.4 億個字元，超過時 <code>readFile</code> 讀成字串會直接丟 <code>ERR_STRING_TOO_LONG</code>；還沒到那個上限之前，也可能先把容器的記憶體用光，程序被砍掉。開場那支匯出 API 撞到的就是後者。</p>
+<p>第二種寫法用的是<strong>串流</strong>（stream）。它不等資料全部到齊：檔案從磁碟一次讀進一小塊，交給你的程式處理，處理完那一塊就可以丟掉，再讀下一塊。每一小塊叫一個 <strong>chunk</strong>。因為記憶體裡同時只有少數幾個 chunk，檔案是 120 MB 還是 12 GB，記憶體用量都差不多；上面的 97 MB 裡，有約 40 MB 是 Node 本身。</p>
+<p>串流還有第二個好處：<strong>第一個位元組早到</strong>。匯出 50 萬筆訂單時，一次組好再送的版本，要等全部查完、全部組成字串，才送出第一個位元組，客戶端這段時間只看到瀏覽器在轉圈；串流版查到第一筆就開始送，客戶端馬上看到下載進度。對使用者來說，「下載中」和「好像當掉了」是很不一樣的體驗。</p>
+<p>那是不是所有東西都該用串流？不是。串流的程式比較難寫、比較難除錯。資料小、而且有大小上限時（例如 1 MB 以內的 JSON body），一次讀完最簡單。判斷的問題只有一個：<strong>資料的大小是不是由外部決定</strong>，例如使用者上傳的檔案、資料庫的筆數、門市送來的檔案大小。是的話，就用串流，或者至少加上大小上限。開場的匯出和匯入都是：訂單筆數會一直長，門市的檔案多大也不是你決定的。</p>
+
+<div class="callout practice"><strong>💡 實務上：最常見的場景是「匯出」和「上傳」</strong><br>code review 看到 <code>readFile</code>、把查詢結果一次全拿回來、把整個上傳的 body 讀成字串，資深工程師會先問：「這份資料一年後會多大？大小由誰決定？」串流也不是唯一解：資料大到要跑好幾分鐘時，常見做法是改成背景工作產生檔案，完成後通知使用者下載，請求本身不用一直掛著。先跟 PM 確認使用者能不能接受「稍後寄給你」，再決定做法。</div>
+
+<p>決定要改成串流之後，下一個問題是：Node 裡的串流長什麼樣子，匯入和匯出各要用哪一種？</p>
+
+<h2>Node 的串流有哪幾種？</h2>
+<p>其實你已經用過串流，只是之前沒叫它的名字：</p>
+<ul>
+  <li><code>req</code>（<a href="13-http-server.html">第 13 課</a>的請求）是可讀的串流，body 一段一段到。</li>
+  <li><code>res</code> 是可寫的串流，<code>res.write()</code> 就是寫一段。</li>
+  <li><code>process.stdin</code>、<code>process.stdout</code>（<a href="02-process-config.html">第 2 課</a>）也是。</li>
+  <li><code>fs.createReadStream(path)</code> 把檔案變成可讀的串流。</li>
+</ul>
+<p>這些東西來源不同，但都遵守同一套介面，所以可以互相接起來：檔案的串流可以直接接到 <code>res</code>，不用先讀進記憶體。Node 依資料往哪個方向流，把串流分成四種：</p>
+<div class="table-wrap"><table>
+  <tr><th>種類</th><th>做什麼</th><th>例子</th></tr>
+  <tr><td><strong>Readable</strong>（可讀）</td><td>產生資料，你從它讀</td><td><code>req</code>、<code>fs.createReadStream</code>、<code>process.stdin</code></td></tr>
+  <tr><td><strong>Writable</strong>（可寫）</td><td>接收資料，你寫進它</td><td><code>res</code>、<code>fs.createWriteStream</code>、<code>process.stdout</code></td></tr>
+  <tr><td><strong>Duplex</strong>（雙向）</td><td>同時可讀可寫，兩邊各自獨立</td><td>TCP socket：讀的是對方送來的，寫的是送給對方的</td></tr>
+  <tr><td><strong>Transform</strong>（轉換）</td><td>Duplex 的一種，寫進去的資料經過轉換後從另一端讀出來</td><td><code>zlib.createGzip()</code>：寫入原文，讀出壓縮後的位元組</td></tr>
+</table></div>
+<p>對應到這課的任務：匯入是從一個 Readable（訂單檔）讀；匯出是把資料寫進一個 Writable（<code>res</code>），中間可能經過幾個 Transform（把訂單轉成 CSV、再壓縮）。</p>
+<p>還有兩個設定會在這課反覆出現，先把它們講清楚。</p>
+<p>第一個是 <strong>objectMode</strong>。一般的串流傳的是位元組（Buffer）或字串，因為檔案和網路本來就是位元組。但匯出時，資料庫給你的是一筆一筆的訂單物件，不是位元組。objectMode 的串流可以傳任意 JavaScript 物件，一個物件算一個單位。匯出的管線就是從一個 objectMode 的串流（一筆一筆訂單）開始，中途轉成位元組，再寫給客戶端。</p>
+<p>第二個是 <strong>highWaterMark</strong>。每個串流內部都有一個緩衝區，暫放「已經進來、還沒被處理」的資料。highWaterMark 是這個緩衝區的門檻：位元組串流以位元組計，objectMode 以物件個數計。到了門檻，串流就會開始要求上游放慢。它是背壓那一節的主角，這裡先記得「每個串流都有緩衝區、緩衝區有門檻」就好；各版本的預設值見課末。</p>
+<p>有了這些名詞，先從方向最單純的匯入開始：把幾百 MB 的訂單檔讀進來。</p>
+
+<h2>匯入：怎麼一行一行讀幾百 MB 的訂單檔？</h2>
+<p>Readable 可以直接用 <code>for await</code> 讀，每一輪拿到一個 chunk，處理完再拿下一個：</p>
+<pre>import { createReadStream } from 'node:fs'
+
+let bytes = 0
+for await (const chunk of createReadStream('orders.csv')) {
+  bytes += chunk.length          // chunk 是 Buffer，大小由串流決定
+}</pre>
+<p>這段只是算總共讀了多少位元組，還沒辦法拿來匯入，因為訂單檔要一行一行解析，而 chunk 的邊界和「行」完全無關。串流是依位元組數切 chunk 的，切點落在哪裡就是哪裡。假設檔案裡有一行 <code>拿鐵,2,110</code>，切點可能落在這一行中間，前半段在這個 chunk、後半段在下一個；更糟的是，中文字在 UTF-8 裡占 3 個位元組，切點也可能落在一個字的中間，各自解碼就會出現<a href="11-buffer-encoding.html">第 11 課</a>看過的 <code>�</code>。</p>
+<p>自己處理這件事需要：跨 chunk 保留沒解碼完的位元組、保留還沒遇到換行的半行、處理 Windows 的換行。這些 Node 內建的 <code>node:readline</code> 已經做好了：</p>
+<pre>import { createInterface } from 'node:readline'
+
+const rl = createInterface({ input: createReadStream('orders.csv'), crlfDelay: Infinity })
+let lines = 0
+for await (const line of rl) {
+  lines++
+  if (lines % 10_000 === 0) console.log(`已處理 ${lines} 行`)   // 邊處理邊回報進度
+}</pre>
+<p>readline 接在檔案串流後面，負責三件事：</p>
+<ul>
+  <li>跨 chunk 正確解碼 UTF-8，中文字被切開也會等下一個 chunk 補齊。</li>
+  <li>依換行切開，半行會留著跟下一個 chunk 接起來，所以每次給你的都是完整的一行。檔案最後一行沒有換行，readline 也會給出來。</li>
+  <li>去掉 Windows 換行 <code>\r\n</code> 的 <code>\r</code>。門市的檔案常是 Windows 上的 Excel 匯出的，沒去掉的話，每行最後一欄會多一個看不見的 <code>\r</code>，數字解析就會失敗。<code>crlfDelay: Infinity</code> 的作用是：<code>\r</code> 和 <code>\n</code> 剛好分在兩個 chunk、中間隔了很久才到時，仍然當成同一個換行，而不是多出一行空行。</li>
+</ul>
+<p>這段迴圈的記憶體為什麼不跟著檔案變大？readline 內部最多先緩衝約一千行，堆滿就暫停檔案串流，等你的 <code>for await</code> 迴圈消化掉再繼續讀；所以你處理得慢，它就讀得慢，記憶體有上限，不會跟著檔案變大。讀的速度由讀的人決定，這正是下一節背壓要做到的事，只是在讀檔這個方向，<code>for await</code> 已經幫你做好了。</p>
+<p>最後一個細節：有時候不用讀完整個檔案，例如只想找到某張訂單就停。中途 <code>break</code> 或 <code>throw</code> 離開 <code>for await</code> 時，串流會被<strong>銷毀</strong>：關掉檔案、釋放資源，這是 Node 文件寫明的行為。所以找到要的那一行就可以直接 <code>break</code>，不會留下開著的檔案。（想離開迴圈之後還保留串流繼續讀的寫法，見課末。）</p>
+<p>匯入的速度由我們自己決定，讀多快就處理多快。匯出反過來：資料要寫給客戶端，而客戶端收得多快，不是伺服器能決定的。</p>
+
+<h2>匯出：客戶端收得比資料庫慢，資料堆到哪裡去了？</h2>
+<p>匯出 CSV 時有兩方：上游是資料庫，產生資料很快；下游是客戶端的網路，可能很慢，甚至暫停不讀，例如會計的筆電網路不好，或瀏覽器在問要存到哪個資料夾。下面的 <code>listOrders()</code> 是一個 async generator，模擬資料庫游標：每次 <code>yield</code> 一筆訂單，不會一次把 50 萬筆全拿回來；<code>toCsvLine(order)</code> 把一筆訂單轉成一行 CSV 字串。用它寫匯出，最直覺的寫法是：</p>
+<pre>for await (const order of listOrders()) res.write(toCsvLine(order))
+res.end()</pre>
+<p>看起來已經是串流了：一筆一筆讀、一筆一筆寫。問題在 <code>res.write()</code>：它不會等資料真的送到客戶端才回來。客戶端讀得慢時，送不出去的資料會先堆在 Node 的記憶體裡（就是上一節說的緩衝區），而迴圈完全不知道，繼續從資料庫拉下一筆。範例模擬一個拿到回應後暫停 300 ms 的客戶端，比較這個寫法（<code>/ignore</code>）和下一節的寫法（<code>/pipeline</code>）：</p>
+<pre>$ node examples/backpressure.ts
+/ignore   客戶端暫停時拉了 500000 / 500000 筆，記憶體增加約 296 MB
+/pipeline 客戶端暫停時拉了 19197 / 500000 筆，記憶體增加約 23 MB</pre>
+<p>客戶端只停了 300 ms，第一種寫法就把 50 萬筆全部從資料庫拉出來、全部堆進記憶體，多吃了將近 300 MB。結果和一次全部查完再送一樣糟，串流的好處完全沒了。一個慢客戶端多 300 MB，十個同時下載的慢客戶端就是 3 GB。結果和開場那支一次查完的匯出一樣：伺服器因為記憶體不足被砍掉。兩種寫法結局相同，原因不同：開場是先把資料全部讀進來，這裡是資料一筆一筆讀了，卻沒管下游收不收得完。</p>
+<p>缺的東西叫<strong>背壓</strong>（backpressure）：下游處理不完時，通知上游先停；下游消化完了，再通知上游繼續。這樣不管下游多慢，中間堆著的資料都有上限。</p>
+<figure>
+  <svg viewBox="0 0 700 230" role="img" aria-label="背壓示意：資料庫經由水管把資料送進 res 的緩衝區，再流向客戶端。緩衝區超過 highWaterMark 時 write 回傳 false，上游暫停；緩衝區消化完時觸發 drain，上游繼續">
+    <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="20" y="60" width="140" height="70" rx="8"/>
+    <text class="d-text" x="90" y="92" text-anchor="middle">上游</text>
+    <text class="d-small" x="90" y="112" text-anchor="middle">listOrders()</text>
+    <line class="d-line" x1="160" y1="95" x2="268" y2="95" marker-end="url(#arr)"/>
+    <text class="d-small" x="214" y="85" text-anchor="middle">write(chunk)</text>
+    <rect class="d-box" x="270" y="40" width="160" height="110" rx="8"/>
+    <rect class="d-soft" x="272" y="100" width="156" height="48" rx="6"/>
+    <line class="d-line" x1="270" y1="80" x2="430" y2="80" stroke-dasharray="5 4"/>
+    <text class="d-small" x="350" y="74" text-anchor="middle">highWaterMark</text>
+    <text class="d-text" x="350" y="130" text-anchor="middle">緩衝區</text>
+    <line class="d-line" x1="430" y1="95" x2="538" y2="95" marker-end="url(#arr)"/>
+    <text class="d-small" x="484" y="85" text-anchor="middle">網路</text>
+    <rect class="d-box" x="540" y="60" width="140" height="70" rx="8"/>
+    <text class="d-text" x="610" y="92" text-anchor="middle">下游</text>
+    <text class="d-small" x="610" y="112" text-anchor="middle">慢的客戶端</text>
+    <text class="d-accent" x="350" y="185" text-anchor="middle">超過門檻：write() 回傳 false → 上游先停</text>
+    <text class="d-accent" x="350" y="212" text-anchor="middle">緩衝區清空：觸發 'drain' → 上游繼續寫</text>
+  </svg>
+  <figcaption>水管接著水庫：水庫快滿了就關上游的閘門，放空了再打開。</figcaption>
+</figure>
+<p>Writable 用兩個訊號實作背壓，正好對應圖下方的兩行：</p>
+<ul>
+  <li><strong><code>write()</code> 的回傳值</strong>：緩衝區到達 highWaterMark 時回傳 <code>false</code>。資料<strong>沒有被丟掉</strong>，已經收進緩衝區了；<code>false</code> 的意思是「請先別再寫」。</li>
+  <li><strong><code>'drain'</code> 事件</strong>：緩衝區消化完、可以繼續寫的通知。</li>
+</ul>
+<p>把這兩個訊號接上，匯出迴圈改成：寫完一筆看回傳值，<code>false</code> 就停在原地，等 <code>'drain'</code> 來了再拉下一筆。<code>once(res, 'drain')</code> 回傳一個 Promise，事件觸發時 resolve，剛好可以 <code>await</code>：</p>
+<pre>import { once } from 'node:events'
+
+for await (const order of listOrders()) {
+  if (!res.write(toCsvLine(order))) await once(res, 'drain')   // 滿了就等
+}
+res.end()</pre>
+<p>迴圈停在 <code>await</code> 時，就不會去要 <code>listOrders()</code> 的下一筆，資料庫游標也跟著停。背壓就這樣從客戶端一路傳回資料庫。</p>
+<p>為什麼 Node 不乾脆在緩衝區滿的時候拒絕寫入？Node 文件特別說明：highWaterMark 是<strong>門檻，不是上限</strong>。<code>write()</code> 回傳 <code>false</code> 之後你還是可以寫，Node 也會收，只是記憶體會一直長，最後就是上面那 300 MB。為什麼這樣設計？<code>write()</code> 是同步呼叫，資料一交出去，就由 Node 負責把它送出。如果緩衝區滿了就拒絕，呼叫端就得自己保存被拒的那筆資料、之後再重送，還要記得哪些送過、哪些沒送，處理不好就會重複或遺漏，反而更麻煩。所以 Node 一律先收下，再用回傳值告訴你「該停了」，停不停由呼叫端決定。也就是說，Node 只負責發出訊號，遵守背壓是呼叫端的責任。</p>
+<p>這段手寫版本解決了記憶體，但還留著一個問題：錯誤處理。客戶端下載到一半關掉分頁，<code>res</code> 的緩衝區永遠不會清空，<code>'drain'</code> 永遠不會來，迴圈就卡在 <code>await</code>，資料庫游標也一直開著。資料庫中途斷線時，<code>res</code> 也沒有人去關。要把每一種出錯的路都補齊並不容易，所以實務上不手寫這個迴圈，而是交給 <code>pipeline</code>。</p>
+
+<h2>pipeline：怎麼把匯出接成一條出錯會一起停的管線？</h2>
+<p><code>pipeline</code>（從 <code>node:stream/promises</code> 匯入）把好幾個串流接成一條，自動處理每一段之間的背壓，也就是上一節手寫的「滿了就等」；任何一段出錯，就銷毀全部串流，回傳的 Promise 以那個錯誤 reject（Node 文件）。匯出接成管線長這樣：</p>
+<pre>import { Readable, Transform } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
+import { createGzip } from 'node:zlib'
+
+await pipeline(
+  Readable.from(listOrders()),   // async generator → Readable（objectMode）
+  toCsv,                         // Transform：訂單物件 → 一行 CSV 的 Buffer
+  createGzip(),                  // Transform：壓縮
+  res,                           // Writable：送給客戶端
+)</pre>
+<p>從上往下，資料依序流過每一段，每一段只做一件事：</p>
+<ul>
+  <li><strong><code>Readable.from(iterable)</code></strong> 把陣列或 async generator 變成 Readable，預設是 objectMode，一筆訂單就是一個單位。產生器只在下游要資料時才往下跑，所以資料庫游標也跟著被背壓控制，效果和上一節的 <code>await once(res, 'drain')</code> 一樣。</li>
+  <li><strong>Transform</strong> 邊讀邊轉換。<code>toCsv</code> 的寫入端收訂單物件、讀出端給位元組，兩端的模式不同，所以只在寫入端設定 <code>writableObjectMode: true</code>。<code>transform</code> 函式每收到一筆訂單就被呼叫一次，處理完呼叫 <code>callback(null, 結果)</code> 把結果交給下一段：
+<pre>const toCsv = new Transform({
+  writableObjectMode: true,
+  transform(order, _encoding, callback) {
+    callback(null, Buffer.from(`${order.id},${order.customer},${order.total}\n`))
+  },
+})</pre>
+  這裡刻意輸出 Buffer 而不是字串，原因在下一節。</li>
+  <li><strong><code>createGzip()</code></strong> 也是 Transform，寫入原文、讀出壓縮後的位元組；為什麼要壓縮、什麼時候才壓縮，見下面的「加上 gzip」。</li>
+  <li><strong><code>res</code></strong> 是最後一段，把位元組送給客戶端。</li>
+</ul>
+<p>你可能在別的程式碼看過舊寫法 <code>a.pipe(b).pipe(c)</code>。<code>.pipe()</code> 也會處理背壓，但 Node 文件寫明它<strong>不會轉送錯誤</strong>：上游出錯時，下游不會被關閉。匯出到一半資料庫斷線，<code>res</code> 就一直開著，客戶端永遠等不到結尾，也沒有人知道出了事。要用 <code>.pipe()</code> 寫對，每一段都要自己掛 <code>'error'</code> 監聽器並逐一銷毀，很容易漏；<code>pipeline</code> 一次處理好。</p>
+
+<h3>加上 gzip：讓匯出的檔案小好幾倍</h3>
+<p>管線接好之後，加一段壓縮只是多放一個 Transform。值得加，因為 CSV 這種重複很多的文字，用 gzip 壓縮常常能小 5 倍以上，50 萬筆訂單下載得快很多。但不能無條件壓縮：不是每個客戶端都看得懂壓縮後的位元組。HTTP 用<strong>內容協商</strong>決定要不要壓縮，也就是客戶端先說自己能接受什麼，伺服器再從中選一種：</p>
+<ol>
+  <li>客戶端在請求帶 <code>Accept-Encoding: gzip, deflate, br</code>，表示它看得懂這些壓縮格式（瀏覽器和 <code>fetch</code> 會自動帶）。</li>
+  <li>伺服器有看到 <code>gzip</code> 才壓縮，並回 <code>Content-Encoding: gzip</code>，客戶端才知道要先解壓。沒有帶的客戶端（例如 <code>curl</code> 不加 <code>--compressed</code>）一律送原文，這時管線裡就不放 <code>createGzip()</code> 那一段。</li>
+  <li>不管壓不壓縮，都回 <code>Vary: Accept-Encoding</code>：同一個網址的內容依這個標頭而不同，<a href="15-http-caching.html">第 15 課</a>的快取才會分開存。少了它，CDN 可能把 gzip 版給不支援的客戶端，對方只看到亂碼。</li>
+</ol>
+<p>壓縮也有代價。它要花 CPU（zlib 的工作在 libuv 的 thread pool 執行，<a href="07-event-loop.html">第 7 課</a>），而且已經壓縮過的格式（圖片、影片、zip）再壓幾乎不會變小。正式環境常把壓縮交給反向代理或 CDN；這課自己做，是為了看清楚它在串流裡的位置。</p>
+
+<h3>匯出到一半出錯，但標頭已經送出了怎麼辦？</h3>
+<p>串流回應最麻煩的地方在這裡：送出第一段資料時，狀態碼 <code>200</code> 和標頭就已經跟著送出去了。匯出到第 5000 筆時資料庫斷線，已經不能改成 <code>500</code>（<a href="13-http-server.html">第 13 課</a>練習 3 遇過同樣的狀況）。這時要怎麼讓客戶端知道檔案壞了？</p>
+<p>答案在串流回應的傳法。一次組好的回應知道總長度，會帶 <code>Content-Length</code>；串流回應開始送時還不知道總長度，所以 HTTP/1.1 用 <strong>chunked</strong> 傳輸：每一段前面標上這段的長度，全部送完時再送一個長度為 0 的結尾標記。客戶端收到結尾標記，才知道回應完整結束。</p>
+<p>所以唯一誠實的做法是<strong>中斷連線</strong>，不送結尾標記。chunked 回應少了結尾，客戶端就知道檔案不完整，而不是存下一份殘缺卻看起來正常的 CSV。最糟的做法反而是「出錯了，好好地 <code>res.end()</code>」：結尾標記送出，客戶端存下一份少了一半訂單的檔案，還以為是完整的。<code>pipeline</code> 出錯時銷毀 <code>res</code>，正好就是中斷連線；你要做的是 <code>.catch()</code> 它回傳的 Promise，記錄錯誤，避免變成 unhandled rejection。</p>
+
+<div class="callout practice"><strong>💡 實務上：串流匯出上線前，要測「慢」和「斷」</strong><br>本機網路又快又穩，背壓和中途斷線這兩條路幾乎走不到，所以這類 bug 常常上線後才出現。上線前至少試兩件事：用很慢的客戶端下載（例如 <code>curl --limit-rate 10k</code>），看伺服器記憶體有沒有一直長；下載到一半按 Ctrl+C，確認資料庫查詢有停下來、log 有記到錯誤。也要問維運：前面的反向代理或 CDN 會不會把整個回應收齊才轉送？會的話，第一個位元組早到的好處就沒了。客服回報「匯出的檔案少資料」時，先查 log 有沒有 pipeline 的錯誤，通常比直接懷疑資料庫快。</div>
+
+<p>到這裡，匯出的寫法照著 Node 文件都做對了：遵守背壓、會壓縮、出錯會中斷。但製作這課時，用這種正確的寫法匯出顧客名稱是中文的 CSV，程式卻卡住了。</p>
+
+<h2>不是你的 bug 的時候：寫對了卻卡住，怎麼判斷？</h2>
+<p>卡住的症狀是：<code>write()</code> 回傳 <code>false</code> 之後，<code>'drain'</code> 一直沒有來。照上一節的說法，這通常是自己的錯，例如客戶端已經斷線卻沒處理。但這次客戶端好好的在讀。這時候要怎麼判斷是自己寫錯，還是 Node 本身有問題？</p>
+<p>第一步是寫<strong>最小重現</strong>（minimal reproduction）：把無關的程式碼全部拿掉，只保留能重現問題的最少程式碼，再一次只改一個變因比較。只剩幾十行時，自己寫錯的地方很難藏得住；改一個變因結果就不同，就能指出問題跟哪個變因有關。<code>examples/drain-bug.ts</code> 用同一段「<code>write()</code> 回傳 <code>false</code> 就等 <code>'drain'</code>」的程式，分別寫中文字串、ASCII 字串、中文 Buffer：</p>
+<pre>$ node examples/drain-bug.ts
+Node v24.22.1
+中文字串：卡住了：寫到第 4156 列後一直等不到 drain
+ASCII 字串：完成 20000 列
+中文 Buffer：完成 20000 列</pre>
+<p>程式邏輯完全一樣，只有寫入的資料型別不同，結果卻不同，這就是「問題可能不在我」的證據。下一步是到 Node 的 issue tracker（github.com/nodejs/node/issues）搜尋關鍵字，例如 <code>drain chunked multi-byte</code>，找到 <a href="https://github.com/nodejs/node/issues/66781">nodejs/node#66781</a>：v24.22.0 起，把含非 ASCII 字元的<strong>字串</strong>寫進 chunked 的 <code>ServerResponse</code>，<code>write()</code> 回傳 <code>false</code> 之後 <code>'drain'</code> 不會觸發；24.21.0 沒有這個問題。2026-10-31 時這個 issue 還沒修好，10 月 27 日發布的 24.22.2 也沒有修。</p>
+<p>這類「以前正常、新版壞掉」的 bug 叫<strong>回歸</strong>（regression）。確認之後的做法是<strong>在邊界把字串轉成 Buffer</strong>：寫進回應之前 <code>Buffer.from(line)</code>，或用 <code>Readable.from(gen, { objectMode: false })</code> 讓串流自己轉成位元組。上一節的 <code>toCsv</code> 輸出 Buffer，就是這個原因。在程式碼裡留一行註解連到 issue，等 Node 修好、升級之後就知道哪裡可以拿掉。</p>
+<div class="callout"><strong>判斷力</strong>：絕大多數時候 bug 在自己的程式裡，先懷疑自己。有了最小重現、而且能說出「只改了這一個變因，結果就不同」，才去懷疑工具。反過來，從不懷疑工具也不對：執行環境、套件、資料庫都有 bug，每次升級都可能帶來新的回歸。最小重現同時也是回報 issue 時最有用的東西。</div>
+<p>匯入和匯出到這裡都有了上限：記憶體不跟著資料變大、慢客戶端拖不垮伺服器、出錯會中斷。開場還剩最後一個需求，它的資料根本沒有「全部」：訂單狀態什麼時候改變，伺服器事先不知道。</p>
+
+<h2>訂單狀態變了，怎麼立刻推給客人的手機？</h2>
+<p>客人點了拿鐵，手機頁面要在狀態從「製作中」變成「可取餐」時立刻更新。困難在於 HTTP 的模式是「客戶端問、伺服器答」：伺服器只能回應請求，沒辦法在狀態改變時主動找客戶端。</p>
+<p>但前面幾節已經看到，回應本身是一個串流，可以分很多次寫，中間隔多久都可以。<strong>Server-Sent Events</strong>（SSE）利用的就是這點：客戶端發一個請求，伺服器回應之後<strong>不結束</strong>，有新事件就往同一個回應裡多寫一段。它就是一個永遠寫不完的串流回應。</p>
+<p>為了讓瀏覽器知道這是一串事件而不是普通檔案，回應的 <code>Content-Type</code> 是 <code>text/event-stream</code>，加上 <code>Cache-Control: no-cache</code> 避免被快取。內容是有固定格式的純文字：</p>
+<pre>id: 1
+event: status
+data: {"orderId":42,"status":"brewing"}
+
+: heartbeat
+
+id: 2
+event: status
+data: {"orderId":42,"status":"ready"}
+
+</pre>
+<ul>
+  <li>每個欄位一行：<code>event:</code> 事件名稱、<code>data:</code> 內容（通常放 JSON）、<code>id:</code> 事件編號。</li>
+  <li><strong>空行</strong>代表一個事件結束。少了空行，客戶端會一直等，或把兩個事件黏在一起。</li>
+  <li>冒號開頭的行是<strong>註解</strong>，客戶端會略過。拿來當<strong>心跳</strong>（heartbeat）：定時送一行，讓連線不會因為太久沒有資料，被中間的代理伺服器或負載平衡器切斷。客人等一杯咖啡可能要好幾分鐘，這段時間沒有任何事件，沒有心跳連線就可能被切掉。</li>
+</ul>
+<p>瀏覽器用 <code>EventSource</code> 接收，它在連線斷掉時會<strong>自動重連</strong>，重連時用 <code>Last-Event-ID</code> 標頭帶上最後收到的 <code>id</code>，伺服器可以從那裡補送漏掉的事件。這就是每個事件要帶 <code>id</code> 的原因。在 Vue 元件裡接收：</p>
+<pre>// Vue 元件裡
+const source = new EventSource(`/orders/${orderId}/events`)
+source.addEventListener('status', e =&gt; { status.value = JSON.parse(e.data).status })
+onUnmounted(() =&gt; source.close())</pre>
+<p>自己試試：執行 <code>node examples/sse-demo.ts</code>，在另一個終端機執行 <code>curl -N http://localhost:3000/events</code>（<code>-N</code> 讓 curl 收到就印、不等緩衝），會看到每秒一個事件、每 5 秒一行心跳；按 Ctrl+C 關掉 curl，伺服器會印出 <code>client left</code>。</p>
+<p>伺服器印出 <code>client left</code> 不是裝飾：一個不會自己結束的回應，最容易出事的地方就是客戶端離開的那一刻。</p>
+
+<h3>客戶端離開時要清乾淨</h3>
+<p>訂單狀態改變時，程式會在整個程式共用的 EventEmitter <code>orderEvents</code> 上發出 <code>'status'</code> 事件。SSE 的處理函式要做兩件事才能推送：在 <code>orderEvents</code> 上掛監聽器，收到事件就寫進 <code>res</code>；再開一個心跳計時器。客人關掉分頁時，如果什麼都沒做，監聽器和計時器會留在記憶體裡：每關一次分頁就多一組，正是<a href="08-events-cancellation.html">第 8 課</a>的監聽器洩漏，Node 印出 <code>MaxListenersExceededWarning</code> 時往往已經累積很久了。</p>
+<pre>res.on('close', () =&gt; {
+  clearInterval(heartbeat)
+  orderEvents.off('status', onStatus)
+})</pre>
+<p>為什麼清理要掛在 <code>res</code> 的 <code>'close'</code>？SSE 的連線有兩種結束方式：一種是你自己結束，例如訂單狀態變成 <code>picked_up</code>（客人取走了），送出最後一筆就 <code>res.end()</code>；另一種是客戶端中途離開。<code>'close'</code> 在這兩種情況都會觸發，把清理寫在這裡，兩條路都會走到。<a href="13-http-server.html">第 13 課</a>的 <code>req.signal</code> 只在客戶端中途離開時 abort，你自己 <code>res.end()</code> 時不會觸發，所以只靠它清理，<code>picked_up</code> 正常結束的那條路就漏了。</p>
+
+<h3>SSE、WebSocket、輪詢怎麼選</h3>
+<p>SSE 不是推播的唯一做法。訂單狀態這個需求，也可以用另外兩種方式做，差別在誰需要說話、能不能晚幾秒：</p>
+<div class="table-wrap"><table>
+  <tr><th>做法</th><th>是什麼</th><th>適合</th><th>代價</th></tr>
+  <tr><td>輪詢（polling）</td><td>客戶端每隔幾秒問一次</td><td>更新不頻繁、可以晚幾秒</td><td>大部分請求白問；間隔越短負擔越大</td></tr>
+  <tr><td>SSE</td><td>一條長連線，伺服器單向推送</td><td>訂單狀態、通知、進度：只有伺服器要說話</td><td>每個客戶端佔一條連線；只能傳文字</td></tr>
+  <tr><td>WebSocket</td><td>一條雙向的長連線協定</td><td>聊天、多人協作：雙方都常常說話</td><td>協定和重連都要自己處理；Node 24 內建客戶端，伺服器端要另外裝套件</td></tr>
+</table></div>
+<p>訂單狀態只有伺服器要說話，所以選 SSE。SSE 就是普通的 HTTP 回應，現有的路由、驗證、log 都能沿用，這是它最大的優點。要注意的是：部署成多個程序時（<a href="24-scaling.html">第 24 課</a>），客人可能連到 A 程序，訂單狀態卻在 B 程序被更新，A 程序上的 <code>orderEvents</code> 收不到這個事件。事件來源必須是所有程序共用的（例如資料庫的 NOTIFY 或訊息佇列）。大規模推送的取捨在 <a href="../../system-design/lessons/17-realtime-push.html">系統設計課第 17 課</a>。</p>
+
+<div class="callout practice"><strong>💡 實務上：SSE 上線常卡在中間那一層</strong><br>本機用 curl 每秒都收到事件，部署後前端卻等很久才一次收到一堆，或連線每隔一段時間就斷：通常是反向代理在緩衝回應，或負載平衡器的閒置逾時比心跳間隔短。上線前要跟維運確認這條路徑不緩衝（Nginx 可以讓回應帶 <code>X-Accel-Buffering: no</code>）、逾時比心跳長。另一個坑在瀏覽器：HTTP/1.1 下同一個網域能同時開的連線數有限（MDN 寫的是 6 條），使用者開好幾個分頁就可能卡住；走 HTTP/2 時上限由雙方協商（MDN 寫預設 100），通常就不是問題。如果需求其實是「晚 10 秒也沒關係」，輪詢更簡單，這些都不用處理。</div>
+
+<h2>補充與查表</h2>
+<ul>
+  <li><strong>highWaterMark 的預設值</strong>：從 v22.0.0 起，位元組串流預設 65536 位元組（64 KiB，Windows 上是 16 KiB），objectMode 預設 16 個物件（Node 24 文件，可以用 <code>stream.getDefaultHighWaterMark(false)</code> 查）。</li>
+  <li><strong>Readable 的兩種模式</strong>：Readable 有 <strong>flowing</strong>（資料自己流出來，透過 <code>'data'</code> 事件交給你）和 <strong>paused</strong>（你要讀才給）兩種模式。<code>for await</code> 和 <code>pipeline</code> 會幫你切換，平常不用自己管。要記得的只有一點：掛上 <code>'data'</code> 監聽器或呼叫 <code>resume()</code> 會切到 flowing，這時如果沒有人接 <code>'data'</code>，流出來的資料就掉了。</li>
+  <li><strong>離開 <code>for await</code> 但保留串流</strong>：預設 <code>break</code> 會銷毀串流；要保留串流之後繼續讀，改用 <code>readable.iterator({ destroyOnReturn: false })</code>。</li>
+  <li><strong>Web Streams：fetch 用的那一套</strong>：瀏覽器和 <code>fetch</code> 用的是 Web 標準的 <strong>Web Streams</strong>（<code>ReadableStream</code>、<code>WritableStream</code>）。Node 的 <code>fetch</code> 回應的 <code>res.body</code> 也是 Web 的 <code>ReadableStream</code>，不是 Node 的 Readable，兩套 API 不同。要互轉就用 <code>Readable.fromWeb(webStream)</code> 和 <code>Readable.toWeb(nodeStream)</code>（v24.0.0 起是 stable）；<code>pipeline</code> 也能直接接 Web Streams。<a href="17-calling-external-apis.html">第 17 課</a>處理上游 API 的回應時會用到。</li>
+</ul>
+
+<h2>練習</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs node 16</code> 建立 <code>work/16/</code>，裡面有內文的範例（<code>examples/</code>）和三題的起始檔。三題都只用 Node 內建的模組。</p>
+
+<div class="local" data-test="ex1" data-files="import-orders.ts">
+  <p>練習 1：門市的訂單檔每行是「品項,數量,單價」，例如 <code>拿鐵,2,110</code>。<code>import-orders.ts</code> 的 <code>importOrders(input, onProgress)</code> 要回傳各品項營收的 <code>Map</code>（品項 → 數量×單價的總和）和格式錯誤的行數 <code>badLines</code>，每處理 10,000 行呼叫一次 <code>onProgress(已處理行數)</code>（格式錯誤的行也算已處理，空行略過）。解析一行的 <code>parseLine</code> 已經寫好。現在的版本先把整個檔案收進記憶體才開始處理，改成逐行處理。測試會用 30 萬行的資料（含中文、<code>\r\n</code>、空行，切點常落在中文字中間，最後一行沒有換行），而且資料源會「握手」：它送出的行數比你回報的進度多 2 萬行以上就暫停，等不到進度就判失敗。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="export-app.ts">
+  <p>練習 2：<code>export-app.ts</code> 的 <code>GET /orders/export.csv</code> 要從 <code>listOrders()</code>（async generator，模擬資料庫游標）串流輸出 CSV：第一行是 <code>CSV_HEADER</code>，每筆訂單用 <code>toCsvLine</code> 轉成一行。要求：(1) 遵守背壓，客戶端暫停讀取時不能把訂單全部拉出來；(2) 請求的 <code>Accept-Encoding</code> 含 <code>gzip</code> 時用 <code>zlib.createGzip()</code> 壓縮並回 <code>Content-Encoding: gzip</code>，沒有就送原文；(3) 都要回 <code>Vary: Accept-Encoding</code>；(4) <code>listOrders</code> 中途丟錯時中斷連線，不能讓客戶端收到看起來正常結束的殘缺檔案。測試資料的顧客名稱是中文，留意「不是你的 bug 的時候」那一節。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="sse-app.ts">
+  <p>練習 3：<code>sse-app.ts</code> 的 <code>GET /orders/:id/events</code> 用 SSE 推送那張訂單的狀態。<code>orderEvents</code> 會發出 <code>'status'</code> 事件，內容是 <code>{ orderId, status }</code>，只推送 <code>orderId</code> 相符的。每個事件寫成 <code>id: 序號</code>（每條連線從 1 開始遞增）、<code>event: status</code>、<code>data: 事件物件的 JSON</code>，最後空一行；每隔 <code>heartbeatMs</code> 送一行冒號開頭的心跳註解（測試用 50 ms）；狀態變成 <code>picked_up</code> 時送出這最後一筆就結束串流；串流結束或客戶端離開時，移除 <code>orderEvents</code> 上的監聽器並停掉心跳。測試會讓 50 個客戶端同時連線再離開，200 ms 內監聽器數量要回到 0。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 4：<code>res.write(chunk)</code> 回傳了 <code>false</code>。這代表什麼？</p>
+  <label data-key="a">這段資料被丟掉了，要重送一次</label>
+  <label data-key="b">資料已經收進緩衝區，但緩衝區到了 highWaterMark，請先停下來，等 <code>'drain'</code> 再寫</label>
+  <label data-key="c">連線已經斷了，要呼叫 <code>res.end()</code></label>
+  <label data-key="d">再寫就會丟出錯誤，因為 highWaterMark 是緩衝區的上限</label>
+  <p class="why">✓ <code>false</code> 是背壓的訊號，不是失敗：資料沒丟，只是「先別再寫」。重送會讓客戶端收到重複的資料。連線斷掉是另一回事，會透過錯誤或 <code>'close'</code> 事件告訴你。highWaterMark 只是門檻，超過了還是能寫、也不會丟錯，代價是記憶體一直長，所以要自己等 <code>'drain'</code>，或交給 <code>pipeline</code>。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：匯出功能原本寫成 <code>Readable.from(rows).pipe(gzip).pipe(res)</code>。改成 <code>await pipeline(Readable.from(rows), gzip, res)</code> 主要解決了什麼？</p>
+  <label data-key="a">背壓：<code>.pipe()</code> 不會處理背壓</label>
+  <label data-key="b">效能：<code>pipeline</code> 會把資料平行處理</label>
+  <label data-key="c">錯誤：<code>.pipe()</code> 不轉送錯誤，上游出錯時下游不會被關閉；<code>pipeline</code> 會銷毀全部串流並 reject</label>
+  <p class="why">✓ <code>.pipe()</code> 其實有處理背壓，它缺的是錯誤處理：<code>rows</code> 出錯時 <code>gzip</code> 和 <code>res</code> 不會被關閉，客戶端永遠等不到結尾，你也收不到通知。<code>pipeline</code> 在任一段出錯時銷毀所有串流，並把錯誤交給回傳的 Promise。它也不會平行處理，串流本來就是依序一段一段走。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：SSE 的處理函式在 <code>orderEvents</code> 上掛了監聽器、開了心跳計時器，卻沒有處理 <code>res</code> 的 <code>'close'</code>。客人關掉分頁後會怎樣？</p>
+  <label data-key="a">監聽器和計時器留在記憶體裡，每關一次分頁就多一組，記憶體越用越多，之後的事件還會寫進已經關掉的連線</label>
+  <label data-key="b">沒有影響，Node 會在連線關閉時自動移除那個請求掛上的監聽器</label>
+  <label data-key="c">伺服器會立刻當掉，因為寫進關掉的連線會丟出錯誤</label>
+  <p class="why">✓ <code>orderEvents</code> 是整個程式共用的，Node 不知道哪些監聽器屬於哪個請求，不會幫你移除；計時器也一樣會一直跑。所以是慢慢累積的洩漏，不是立刻當掉：寫進已關閉的 <code>res</code> 通常不會讓程序崩潰，只是白做工。要在 <code>'close'</code>（或 <code>req.signal</code> 的 abort）裡 <code>off</code> 監聽器、<code>clearInterval</code> 計時器。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>大檔案用 <code>readFile</code> 或先收集全部 chunk</strong>：記憶體跟著檔案大小長，檔案夠大就會撐爆容器。資料大小由外部決定時，用串流或設上限。</li>
+  <li><strong>每個 chunk 各自解碼、各自切行</strong>：中文被切壞、一行被切成兩半。逐行用 <code>readline</code>，自己處理就用 <code>StringDecoder</code> 並保留沒結束的那一段（<a href="11-buffer-encoding.html">第 11 課</a>）。</li>
+  <li><strong>忽略 <code>write()</code> 的回傳值</strong>：慢客戶端讓資料全部堆在記憶體裡。用 <code>pipeline</code>，或回傳 <code>false</code> 時等 <code>'drain'</code>。</li>
+  <li><strong>用 <code>.pipe()</code> 卻沒處理錯誤</strong>：上游出錯時下游一直開著。改用 <code>stream/promises</code> 的 <code>pipeline</code>，並 <code>.catch()</code> 它的 Promise。</li>
+  <li><strong>壓縮回應忘了 <code>Vary: Accept-Encoding</code></strong>：快取可能把 gzip 版給看不懂的客戶端。不壓縮的回應也要帶。</li>
+  <li><strong>標頭送出後才出錯，卻正常結束回應</strong>：客戶端存下殘缺的檔案還以為是完整的。中斷連線（<code>pipeline</code> 會做）。</li>
+  <li><strong>在 Node 24.22 把含中文的字串大量寫進回應</strong>：碰到 #66781 會卡住。在邊界轉成 Buffer。</li>
+  <li><strong>一出問題就怪 Node，或從不懷疑工具</strong>：先寫最小重現，一次只改一個變因，有證據再查 issue tracker。</li>
+  <li><strong>SSE 沒清監聽器和計時器、沒有心跳</strong>：前者每次離開都洩漏一組，後者讓安靜的連線被代理伺服器切斷。在 <code>res</code> 的 <code>'close'</code> 裡清理，定時送註解行。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>開場的匯出和匯入會撐爆記憶體，是因為先把「全部」讀進來；串流一次只處理一個 chunk，讓記憶體用量和資料大小脫鉤，也讓第一個位元組早點送到。判斷要不要串流：資料大小是不是由外部決定。</li>
+  <li><code>req</code>、<code>res</code>、檔案、stdin 都是串流，分成 Readable、Writable、Duplex、Transform 四種；objectMode 傳物件，highWaterMark 是緩衝區的門檻（v22 起位元組串流預設 64 KiB、objectMode 16 個）。</li>
+  <li>匯入：逐行讀用 <code>readline</code> 的 <code>createInterface({ input, crlfDelay: Infinity })</code> 配 <code>for await</code>，它處理跨 chunk 的中文、半行和 <code>\r\n</code>。</li>
+  <li>匯出：客戶端比資料庫慢時要靠背壓，<code>write()</code> 回傳 <code>false</code> 就等 <code>'drain'</code>；實務上用 <code>pipeline</code>，它同時處理背壓和錯誤。</li>
+  <li>gzip 回應看 <code>Accept-Encoding</code>、回 <code>Content-Encoding</code> 和 <code>Vary</code>；標頭送出後才出錯就中斷連線，讓 chunked 回應少了結尾。</li>
+  <li>寫對了卻卡住時，先寫最小重現、一次只改一個變因；確定是執行環境的 bug，就繞過它、留下 issue 連結。</li>
+  <li>SSE 是不結束的串流回應：<code>text/event-stream</code>、空行分隔事件、註解當心跳、<code>id</code> 配 <code>Last-Event-ID</code> 重連；在 <code>'close'</code> 裡清掉監聽器和計時器。</li>
+</ul>
+<p>這課的資料都是伺服器自己產生或收到的。下一課換成伺服器去呼叫別人：用 <code>fetch</code> 呼叫外部 API 時，怎麼設逾時、什麼情況可以重試、怎麼限制同時發出的請求數。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

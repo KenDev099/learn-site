@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>16. 期末專題：把咖啡店 NestJS 服務搬上 Kubernetes 並處理事故</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="16" data-practice="kubernetes">
+<header>
+  <div class="eyebrow">階段 5：正式環境與期末專題 · 第 16 課</div>
+  <h1>期末專題：把咖啡店 NestJS 服務搬上 Kubernetes 並處理事故</h1>
+</header>
+<main>
+
+<p>前十五課，每一課練一個零件：Pod、Service、probe、HPA、PDB、NetworkPolicy、Helm、除錯流程。真正接手一個服務時，這些零件會同時出現，而且互相影響：NetworkPolicy 寫錯會讓 readiness 失敗，readiness 失敗會讓 Helm 回滾，回滾之後資料庫的 migration 卻不會退回去。期末專題把它們組成一次完整的上線：咖啡店的 API、寄收據的 worker、資料庫 migration，從一份「同事在自己電腦上跑得起來」的 chart 開始，做到能交給值班的人。</p>
+<p>做完你會有一份能交給值班同事的 chart、部署腳本、事故紀錄與 runbook，這些也是面試或接手新服務時，資深工程師會問的東西。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>需求：把老闆說的「尖峰不能卡」「收據不能漏」翻成可以自動檢查的項目。</li>
+  <li>架構：API、寄收據的 worker、migration 為什麼是三種不同的物件，資料庫為什麼要分兩個帳號。</li>
+  <li>步驟一、二：把同事留下的 chart 修到上線標準，部署腳本為什麼「順序就是可靠性」。</li>
+  <li>步驟三、四：在持續流量下換版、維護節點，證明一個請求都沒掉；再照固定的除錯流程處理三個埋好的事故。</li>
+  <li>步驟五、上線那天：寫給半夜被叫醒的同事看的 runbook 與決策紀錄，以及程式碼以外決定上線成敗的事。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>前面每一課，下面四課最常翻回去：
+<ul>
+  <li><a href="13-helm.html">第 13 課</a>的 Helm：chart 的範本加上 values，<code>helm upgrade</code> 加上 <code>--wait</code> 與 <code>--rollback-on-failure</code>，一個指令完成部署、等待、失敗自動回滾。</li>
+  <li><a href="10-jobs-cronjobs.html">第 10 課</a>的 migration Job：每個版本跑一次，部署腳本等它成功才更新應用，失敗就停。</li>
+  <li><a href="14-debugging.html">第 14 課</a>的除錯流程：先看狀態，再看事件與 <code>logs --previous</code>，往外查 Service、NetworkPolicy，最後修在 chart 裡並寫事故紀錄。</li>
+  <li><a href="15-gitops-eks.html">第 15 課</a>的交付清單：交付服務前逐項確認 requests 與 memory limit、probe 與優雅關機、多副本＋PDB＋分散、securityContext 與 NetworkPolicy、映像釘版本與機密分開、dashboard 與告警。</li>
+</ul></div>
+
+<h2>需求：把老闆的話翻成檢查項目</h2>
+<p>咖啡店老闆不會說「我要 PDB」。他會這樣說：</p>
+<div class="callout">「中午尖峰的客人是平常的三倍，不能卡。白天換版不能讓點餐失敗。付了錢一定要收到收據，不能漏也不能寄兩張。真的出事，十分鐘內要恢復。新來的工程師要能照文件部署和回滾，不用打電話問你。」</div>
+<p>工程師的工作是把每一句翻成可以檢查的項目。這種「上線前逐項確認服務能被安全地維運」的流程叫<strong>上線準備度檢查</strong>（production readiness review，<a href="../../devops/lessons/26-capstone.html">devops 課第 26 課</a>）。一項沒有辦法自動檢查的要求，上線後通常會悄悄壞掉，所以這一課每一項都對應到一個測試：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>老闆的話</th><th>翻成</th><th>哪一課</th><th>哪個練習檢查</th></tr></thead>
+  <tbody>
+    <tr><td>尖峰三倍不能卡</td><td>HPA 2～4 個 api，依 CPU 擴展；requests 是量過的數字</td><td><a href="08-resources-autoscaling.html">第 8 課</a></td><td>練習 1</td></tr>
+    <tr><td>換版不能失敗</td><td>readiness、preStop、寬限期；先 migration 再換版；migration 只做 expand；負載下換版 0 錯誤</td><td>第 7、9、10 課</td><td>練習 1、2、3</td></tr>
+    <tr><td>收據不漏不重複</td><td>worker 收到 SIGTERM 做完手上的 job，寬限期大於最長的 job；寄送本身冪等</td><td><a href="07-probes-shutdown.html">第 7 課</a>、<a href="../../nestjs/lessons/20-queues-bullmq.html">NestJS 課第 20 課</a></td><td>練習 1、3</td></tr>
+    <tr><td>十分鐘內恢復</td><td>部署失敗自動回滾；一個指令手動回滾；節點維護不中斷（PDB、分散）</td><td>第 9、13 課</td><td>練習 2、3</td></tr>
+    <tr><td>出事查得到原因</td><td>照固定流程蒐證，修在 chart，寫事故紀錄</td><td>第 14 課</td><td>練習 4</td></tr>
+    <tr><td>新人照文件做</td><td>runbook 的指令都能直接執行；設計的取捨寫成 ADR</td><td>devops 課第 26 課</td><td>練習 5</td></tr>
+    <tr><td>（老闆沒說，但你要做）</td><td>Pod Security restricted、NetworkPolicy 預設拒絕、專屬 ServiceAccount、機密不進 chart</td><td>第 6、12 課</td><td>練習 1</td></tr>
+  </tbody>
+</table></div>
+
+<h2>架構：三種工作負載，兩種帳號</h2>
+<p><a href="../../nestjs/lessons/27-capstone.html">NestJS 課期末專題</a>的咖啡店服務有三個部分：處理 HTTP 的 API、從 BullMQ 佇列拿工作寄收據的 worker、資料庫 migration。部署到 Kubernetes 時，它們變成三種不同的物件，因為它們的生命週期不同：</p>
+<figure>
+  <svg viewBox="0 0 700 330" role="img" aria-label="架構：Gateway 經 HTTPRoute 到 Service cafe-api，再到 api Deployment（HPA 2 到 4 個）；worker Deployment 2 個；migrate Job 每版一次。api 連 postgres 與 redis，worker 只連 redis，migrate 只連 postgres；postgres 與 redis 在另一個 namespace，正式環境換成 RDS 與 ElastiCache">
+    <defs><marker id="d16a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="10" y="10" width="440" height="310" rx="10"/>
+    <text class="d-small" x="22" y="30">namespace k8s-16（Pod Security restricted、預設拒絕）</text>
+    <rect class="d-box" x="30" y="45" width="130" height="44" rx="6"/>
+    <text class="d-text" x="95" y="65" text-anchor="middle">HTTPRoute</text>
+    <text class="d-small" x="95" y="81" text-anchor="middle">掛在平台的 Gateway</text>
+    <rect class="d-box" x="190" y="45" width="120" height="44" rx="6"/>
+    <text class="d-text" x="250" y="72" text-anchor="middle">Service cafe-api</text>
+    <path class="d-line" d="M160,67 L188,67" marker-end="url(#d16a)"/>
+    <rect class="d-box" x="190" y="110" width="160" height="56" rx="6"/>
+    <text class="d-text" x="270" y="132" text-anchor="middle">api Deployment</text>
+    <text class="d-small" x="270" y="152" text-anchor="middle">HPA 2～4、PDB、分散</text>
+    <path class="d-line" d="M250,89 L250,108" marker-end="url(#d16a)"/>
+    <rect class="d-box" x="190" y="186" width="160" height="56" rx="6"/>
+    <text class="d-text" x="270" y="208" text-anchor="middle">worker Deployment</text>
+    <text class="d-small" x="270" y="228" text-anchor="middle">2 個、寬限期 60 秒</text>
+    <rect class="d-box" x="190" y="258" width="160" height="50" rx="6"/>
+    <text class="d-text" x="270" y="279" text-anchor="middle">migrate Job</text>
+    <text class="d-small" x="270" y="297" text-anchor="middle">每個版本一次</text>
+    <rect class="d-soft" x="490" y="80" width="200" height="210" rx="10"/>
+    <text class="d-small" x="502" y="100">k8s-16-data（開發用）</text>
+    <rect class="d-box" x="520" y="115" width="140" height="56" rx="6"/>
+    <text class="d-text" x="590" y="137" text-anchor="middle">postgres</text>
+    <text class="d-small" x="590" y="157" text-anchor="middle">正式：RDS</text>
+    <rect class="d-box" x="520" y="205" width="140" height="56" rx="6"/>
+    <text class="d-text" x="590" y="227" text-anchor="middle">redis</text>
+    <text class="d-small" x="590" y="247" text-anchor="middle">正式：ElastiCache</text>
+    <path class="d-line" d="M350,132 L518,138" marker-end="url(#d16a)"/>
+    <path class="d-line" d="M350,146 L518,222" marker-end="url(#d16a)"/>
+    <path class="d-line" d="M350,214 L518,232" marker-end="url(#d16a)"/>
+    <path class="d-line" d="M350,282 L518,158" marker-end="url(#d16a)"/>
+    <text class="d-small" x="372" y="122">cafe_app</text>
+    <text class="d-small" x="372" y="300">cafe_migrator</text>
+  </svg>
+  <figcaption>箭頭是 NetworkPolicy 放行的連線，其他一律擋掉。api 用 cafe_app 帳號（只能讀寫資料），migrate 用 cafe_migrator 帳號（能改表）</figcaption>
+</figure>
+<ul>
+  <li><strong>api</strong>：長時間執行、要收流量、數量隨負載變動 → Deployment＋Service＋HPA＋PDB。</li>
+  <li><strong>worker</strong>：長時間執行、不收流量、數量固定 → Deployment，沒有 Service；關鍵是被終止時不能把寄到一半的收據丟掉。</li>
+  <li><strong>migration</strong>：每個版本跑一次、跑完就結束 → Job（第 10 課），排在換版之前。</li>
+</ul>
+<p>為了不在你的電腦上建置 NestJS 映像（安裝套件、映像約 400 MB、載入叢集要好幾分鐘），練習用課程的 <code>learn-k8s/cafe-api</code> 映像代替 NestJS API（端點、健康檢查、SIGTERM 的行為跟 <a href="../../nestjs/lessons/24-observability-shutdown.html">NestJS 課第 24 課</a>一樣），用一個沒有任何套件的 Node 程式（<code>chart/files/worker.mjs</code>）代替 BullMQ worker，migration 用 postgres 映像的 psql 執行 SQL 檔，代替 <code>prisma migrate deploy</code>。對 Kubernetes 來說，三者的形狀跟真的 NestJS 服務完全一樣，換成真的映像只是改 <code>image</code>。</p>
+<p>資料庫與 Redis 放在另一個 namespace（<code>k8s-16-data</code>），由課程的 <code>dev-up.sh</code> 建立。正式環境它們是 RDS 與 ElastiCache（第 11 課），不屬於這個服務的 chart，所以這裡也刻意分開：chart 只知道 Secret <code>cafe-secrets</code> 裡的連線字串。</p>
+
+<h2>步驟一：把 chart 做到上線標準</h2>
+<p>起始的 chart 是前一位同事留下的：<code>helm install</code> 跑得起來，api 也收得到請求，但離上線還差很多。打開 <code>chart/</code> 對照上面的表格，你會找到這些問題（每一個都是前面某一課的常見錯誤）：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>同事的寫法</th><th>會出什麼事</th><th>改成</th></tr></thead>
+  <tbody>
+    <tr><td><code>replicas: 2</code></td><td>開了 HPA 之後，每次部署都把擴出來的 Pod 縮回 2</td><td>不輸出 replicas，交給 HPA（第 13 課）</td></tr>
+    <tr><td>liveness 打 <code>/health/ready</code></td><td>Redis 斷線 → 所有 api 一起被重啟 → 雪崩</td><td>liveness 打 <code>/health/live</code>，加 startupProbe（第 7 課）</td></tr>
+    <tr><td>沒有 preStop</td><td>換版時有幾秒的請求被送到已經關門的 Pod</td><td><code>preStop.sleep.seconds: 5</code>，寬限期涵蓋 preStop＋關機時間</td></tr>
+    <tr><td>worker 沒寫寬限期（預設 30 秒）</td><td>寄信服務最慢 45 秒，job 做到一半被 SIGKILL</td><td><code>terminationGracePeriodSeconds: 60</code></td></tr>
+    <tr><td>worker 沒有 memory limit</td><td>記憶體洩漏時拖垮整台節點</td><td>requests＋limits（第 8 課）</td></tr>
+    <tr><td><code>config.DATABASE_URL</code> 寫在 values</td><td>密碼進了 git、ConfigMap 和 <code>helm get values</code> 的輸出</td><td>從 Secret <code>cafe-secrets</code> 用 secretKeyRef 取（第 6 課）</td></tr>
+    <tr><td>沒有 securityContext、用 default ServiceAccount</td><td>restricted 的 namespace 直接拒絕 Pod；Pod 帶著用不到的 token</td><td>共用的 <code>cafe.podSecurity</code>、專屬 ServiceAccount、不掛 token（<a href="12-security.html">第 12 課</a>）</td></tr>
+    <tr><td>沒有 HPA、PDB、分散、NetworkPolicy</td><td>尖峰撐不住；drain 一次驅逐全部；兩個副本可能在同一台節點；任何 Pod 都能連資料庫</td><td>補上四個範本</td></tr>
+  </tbody>
+</table></div>
+<p><code>_helpers.tpl</code> 已經有 <code>cafe.podSecurity</code> 與 <code>cafe.containerSecurity</code> 兩段共用的安全設定，api 與 worker 都 <code>include</code> 它們，restricted 的規則只寫一次。</p>
+<p>NetworkPolicy 是這一步最容易寫錯的地方，有兩件事前面的課沒遇過。第一，資料庫在<strong>另一個 namespace</strong>：peer 只寫 <code>podSelector</code> 時只會選到同一個 namespace 的 Pod，要在同一個 peer 裡加上 <code>namespaceSelector</code>（兩者寫在同一個 <code>-</code> 底下是「而且」，分成兩個 <code>-</code> 是「或者」）：</p>
+<pre>egress:
+  - to:
+      - namespaceSelector: {}           # 任何 namespace……
+        podSelector:                    # ……裡 label 是 postgres 的 Pod（同一個 - 底下＝而且）
+          matchLabels: { app.kubernetes.io/name: postgres }
+    ports:
+      - { protocol: TCP, port: 5432 }</pre>
+<p>正式環境的 RDS 不是 Pod，這條要改成 RDS 子網路的 <code>ipBlock</code>；所以這段放在 values 或範本裡都可以，但要在 ADR 寫清楚 EKS 上怎麼做。</p>
+<p>第二，<strong>migration Job 也要一條規則</strong>。第一次部署時，Job 在 <code>helm upgrade</code> 之前跑，那時預設拒絕還不存在，所以會過；第二次部署時預設拒絕已經在了，Job 連不到資料庫，部署卡住。這種「第一次會過、第二次才壞」的錯誤，只有真的部署兩次才會發現，練習 3 會幫你部署三次。</p>
+<p>做完用三個指令自己檢查，跟測試做的事一樣：</p>
+<pre>cd kubernetes/practice/work/16
+helm lint chart -f chart/values-local.yaml --set image.tag=v1
+helm template cafe chart -n k8s-16 -f chart/values-local.yaml --set image.tag=v1 | kubeconform -strict -summary -
+helm template cafe chart -n k8s-16 -f chart/values-local.yaml --set image.tag=v1 \
+  | kubectl apply --dry-run=server -n k8s-16 -f -     # namespace 有 restricted 標籤時，違規會在這裡被拒絕</pre>
+<p>最後一行的 <code>--dry-run=server</code> 會把物件送到 API server 走完驗證與 admission（包括 Pod Security），但不存下來。只靠 kubeconform 檢查不出「這個 Pod 在 restricted 的 namespace 會被拒絕」。</p>
+
+<div class="callout practice"><strong>💡 實務上：接手同事的 chart，不要一次全改</strong><br>上面那張表有八列問題，最直覺的做法是一個 PR 全部改完。在正式環境這很危險：部署後如果出事，你不知道是 probe、NetworkPolicy 還是寬限期造成的（第 14 課的「一次只改一個變數」）。動手前先用 <code>helm template … | kubectl diff -n &lt;ns&gt; -f -</code> 確認叢集現在跟 chart 一致，有不一致的先弄清楚是誰手動改的。接著依影響範圍拆成幾個 PR：先改 resources、preStop 這類小的，再改 securityContext 和 probe，最後才上 NetworkPolicy，每個 PR 部署後觀察一段時間再做下一個。</div>
+
+<h2>步驟二：deploy.sh，順序就是可靠性</h2>
+<p>部署腳本只做三件事，但順序不能換：</p>
+<ol>
+  <li><strong>這一版的 migration</strong>：用 <code>migrate/sql/</code> 建 ConfigMap <code>cafe-migrate-&lt;版本&gt;</code>，把 <code>migrate/job.yaml</code> 的 <code>__VERSION__</code> 換掉再套用，等 Job 的 condition：<code>Complete</code> 繼續，<code>Failed</code> 印出 log 並以非 0 結束。這時線上的應用完全沒被動到。</li>
+  <li><strong>helm 換版</strong>：<code>helm upgrade --install cafe ./chart -n "$NS" -f chart/values-local.yaml --set image.tag="$VERSION" --wait --timeout 5m --rollback-on-failure</code>。新版沒 Ready 就自動回到上一個 revision，腳本以非 0 結束。</li>
+  <li><strong>煙霧測試</strong>（smoke test）：部署後用幾個關鍵請求確認主要功能可用。從叢集內經過 Service 打 <code>/health/ready</code> 與 <code>/products</code>：<code>kubectl exec -n k8s-tools deploy/probe -- curl -fsS -m 5 -o /dev/null http://cafe-api.$NS.svc.cluster.local/products</code>。<code>-f</code> 讓 curl 遇到 4xx／5xx 時以非 0 結束，沒有它的話 503 也算「成功」。</li>
+</ol>
+<p>為什麼 migration 不放在 api 的 initContainer（第 10 課）？initContainer 每個 Pod 都跑一次：HPA 擴到 4 個就跑 4 次、滾動更新時新 Pod 的 migration 跟線上的舊版搶鎖，而且 api 得拿著能改表的帳號。這就是架構圖裡兩種帳號的意義：<code>dev-up.sh</code> 在資料庫建了 <code>cafe_migrator</code>（擁有資料表，可以 ALTER）和 <code>cafe_app</code>（只能 SELECT／INSERT／UPDATE／DELETE），Secret 裡分別是 <code>DATABASE_URL_MIGRATOR</code> 與 <code>DATABASE_URL</code>。api 被入侵時，攻擊者拿到的帳號刪不了表。</p>
+<p>還有兩個細節。同一版重新部署時（例如回滾之後再上一次 v2），<code>cafe-migrate-v2</code> 已經存在，Job 的 Pod 範本建立後不能改：先 <code>kubectl delete job "$JOB" --ignore-not-found --wait</code> 再建立；migration 執行器會略過 <code>schema_migrations</code> 裡已經有的檔案，所以重跑是安全的。另外，叢集很忙時 <code>kubectl get</code> 偶爾會逾時，在 <code>set -e</code> 底下 <code>state=$(kubectl get …)</code> 失敗會讓整個腳本直接結束；查詢失敗要當成「還在跑」：<code>state=$(kubectl get …) || state=""</code>。</p>
+<p><code>rollback.sh</code> 一行就夠：<code>helm rollback cafe -n "$NS" --wait --timeout 3m</code>（不給 revision 就回到上一個）。不要用 <code>kubectl rollout undo</code>：它只改 Deployment，Helm 的紀錄、ConfigMap、HPA 都不會跟著回去，下次 <code>helm upgrade</code> 又是另一個樣子。回滾<strong>不碰資料庫</strong>，這是下一步要 expand 的原因。</p>
+
+<h2>步驟三：上線驗收，在流量下證明</h2>
+<p>「我部署過，沒問題」不算驗收。驗收要在持續流量下做會出事的動作，看錯誤數是不是 0。練習 3 的測試會用 loadgen 每秒送 10 個請求，同時依序做：</p>
+<ol>
+  <li><code>deploy.sh v2</code>：v2 帶一個新的 migration。</li>
+  <li><code>rollback.sh</code>：回到 v1，但資料庫已經是 v2 的樣子。</li>
+  <li>再 <code>deploy.sh v2</code>：同一版第二次部署。</li>
+  <li>drain 一個 worker 節點（測試只驅逐這一題的 Pod，不打擾其他練習），同時送 20 張收據進佇列。</li>
+</ol>
+<p>第 2 步決定了 v2 的 migration 怎麼寫。v1 的程式在新的資料庫上要能正常跑，所以只能做 <strong>expand</strong>：加一個可以是 NULL 的欄位。改名、刪欄位、加 NOT NULL 都是 contract，要等確定不會再回到 v1 的下一版才做（<a href="../../devops/lessons/17-deploy-migrations.html">devops 課第 17 課</a>）：</p>
+<pre>-- migrate/sql/002_add_receipt_sent_at.sql
+SET lock_timeout = '5s';
+ALTER TABLE orders ADD COLUMN receipt_sent_at timestamptz;</pre>
+<p><code>lock_timeout</code> 是給 <code>ALTER TABLE</code> 的保險。ALTER 要拿到表的排他鎖，如果剛好有一個長交易拿著鎖，ALTER 會排隊，而排在它後面的所有查詢也一起等，整個訂單功能就停了。設了 lock_timeout，拿不到鎖就失敗，Job 變 Failed，deploy.sh 停下來，線上照常運作，換個時間再部署。</p>
+<p>第 4 步驗證兩件事。api 這邊，PDB 的 <code>maxUnavailable: 1</code> 讓 drain 一次只驅逐一個 Pod，分散規則的 <code>nodeTaintsPolicy: Honor</code> 讓新的 Pod 排到另一台節點（<a href="09-rollouts-pdb.html">第 9 課</a>）；如果 PDB 寫成 <code>minAvailable: 2</code>，而 HPA 的最小值也是 2，drain 會永遠卡住。worker 這邊，被驅逐的 worker 收到 SIGTERM 後不再拿新的 job，把手上那張收據寄完才結束，留在佇列的由另一個 worker 接手。</p>
+<div class="callout">「不漏」靠優雅關機與寬限期，「不重複」靠冪等，兩者都要。就算優雅關機寫對了，節點突然斷電時 job 還是會中斷，BullMQ 在鎖過期後會重試它（NestJS 課第 20 課）。所以寄送本身要能安全地重複：<code>worker.mjs</code> 用 <code>SET receipt:&lt;訂單&gt; … NX</code>，同一張訂單只會記一次。測試比對的是「收據數＝訂單數」，而不是「worker 沒有出錯」。</div>
+<p>HPA 的擴縮在第 8 課已經在叢集上驗證過，這裡只靜態檢查它的設定。要自己看它動作，可以在部署好之後對 <code>/burn?ms=200</code> 加壓，用 <code>kubectl get hpa -n k8s-16 -w</code> 看副本數變化；values-local 把縮容穩定視窗設成 60 秒，加壓停止後大約一兩分鐘就縮回 2。如果擴出來的 Pod 一直 Pending，看事件裡的 <code>Insufficient cpu</code>：本機叢集只有兩個 worker 節點，節點數不會自己增加。</p>
+
+<h2>步驟四：事故演練</h2>
+<p>同事把 v3 的變更合併進了團隊的正式版 chart（<code>ex4/chart/</code>），部署後值班的人收到三個告警：</p>
+<ul>
+  <li><strong>事故 A</strong>：cafe-api 部署後一直沒有 Ready。</li>
+  <li><strong>事故 B</strong>：cafe-worker 一直重啟。</li>
+  <li><strong>事故 C</strong>：中午尖峰時 cafe-api 的 Pod 數沒有增加。</li>
+</ul>
+<p>執行 <code>bash kubernetes/practice/work/16/ex4/start.sh</code>，它會在 <code>k8s-16-incident</code> 從零建立環境、部署這份 chart（不加 <code>--wait</code>，壞掉的狀態會留著給你查），再放 5 張收據進佇列。用第 14 課的流程：<code>kubectl get pods -o wide</code> 看狀態 → <code>describe</code> 看事件與 Last State → <code>logs --previous</code> → 往外查相關的物件（Service、EndpointSlice、NetworkPolicy、HPA）。先蒐證，不要先改。</p>
+<p>事故 C 跟另外兩個不同：它不會讓任何 Pod 壞掉，平常的流量也看不出來，要到尖峰才會發現。這類「設定錯了但不會立刻爆」的問題，只能靠主動檢查物件的狀態找到。HPA 的狀態寫在 <code>kubectl describe hpa</code> 的 Conditions：<code>AbleToScale</code> 表示找不找得到要擴展的目標，<code>ScalingActive</code> 表示拿不拿得到指標。</p>
+<p>找到原因之後，修在 <code>ex4/chart/</code>，然後再執行一次 <code>start.sh</code>，確認<strong>從零部署</strong>也不會再出事。用 <code>kubectl edit</code> 在叢集上改好只是止血，下一次部署會把錯誤帶回來。修的時候也不能拿掉安全措施：把整個 NetworkPolicy 刪掉，Redis 確實連得到了，但那是用一個更大的問題蓋住原本的問題。</p>
+<p>根因代碼從這裡選（多數是干擾選項）：</p>
+<pre>netpol-dns-blocked     netpol-redis-port       secret-key-renamed     image-tag-typo
+readiness-wrong-path   worker-oom-limit        worker-no-grace-period hpa-wrong-target
+hpa-no-requests        pdb-blocks-drain        migration-no-lock-timeout</pre>
+<p>做完執行 <code>kubectl delete namespace k8s-16-incident k8s-16-incident-data</code>。</p>
+
+<h2>步驟五：寫給下一個人的文件</h2>
+<p>服務能跑之後，剩下的風險是「只有你知道怎麼操作它」。兩份文件解決這件事：</p>
+<p><strong>runbook</strong>：照著做就能部署、回滾、擴展、處理告警的操作手冊。讀的人通常是半夜被叫醒、對這個服務不熟的同事，所以每一節是一兩句說明加上可以直接複製執行的指令，不是解釋原理的文章。寫 runbook 時最常見的錯誤是指令跑不動：少了 <code>-n</code> 打到 default namespace、release 名稱跟部署腳本不一樣、少了一個步驟。每個指令都要真的執行過一次。</p>
+<div class="callout practice"><strong>💡 實務上：輪替資料庫密碼，容易漏最後一步</strong><br>員工離職、密碼外洩，或資安要求定期更換時，都要照 runbook 輪替資料庫密碼。Secret 用環境變數注入時，只在容器啟動時讀一次；更新 Secret 之後，正在跑的 Pod 還拿著舊密碼，等到舊密碼停用的那一刻才一起失敗。所以順序是：資料庫加新密碼（舊的先不停）→ 更新 Secret → <code>kubectl rollout restart</code> api 與 worker → 確認新 Pod 都 Ready → 停用舊密碼。第一次做選在離峰時段，先在 staging 跑一遍，順便確認 runbook 的每個指令都能直接執行。</div>
+<p><strong>ADR</strong>（架構決策紀錄，devops 課第 26 課）：每個重要的設計決定一份，寫背景、決策、後果、以及在 EKS 上的做法。「後果」最重要也最常被省略：沒有寫代價的決策紀錄，一年後的人不知道當初接受了什麼風險，也就不知道什麼時候該重新考慮。這個專題值得寫的決定，例如 migration 用 Job 而不是 initContainer、資料庫用 RDS 而不是叢集裡的 StatefulSet、Helm 還是 Kustomize、HPA 用 CPU 還是請求數。</p>
+
+<h2>實務：上線那天與之後</h2>
+<p>這一課的練習在本機叢集跑完。真正的上線還有幾件跟程式碼無關、但決定成敗的事：</p>
+<ul>
+  <li><strong>挑時間、找人</strong>：第一次上線避開尖峰與週五下午；確定誰按部署、誰看監控、誰有權限決定回滾。回滾的條件事先講好（例如 5xx 比例超過 1% 持續 2 分鐘），不要出事時才開會討論。</li>
+  <li><strong>先看得到，再上線</strong>：dashboard 至少有請求數、錯誤率、延遲、Pod 數與重啟次數、佇列長度；告警設在使用者感受得到的症狀上（錯誤率、延遲、佇列堆積），而不是 CPU 高。這一項沒有自動測試，但第 15 課的交付清單裡有它。</li>
+  <li><strong>交接</strong>：值班的人要知道 runbook 在哪、有哪些告警、上游下游是誰。上線後一週內出的第一個事故，事後檢討通常會改 runbook。</li>
+  <li><strong>清單會長大</strong>：每一份事故紀錄的「預防」都可能變成上線檢查的一項。練習 1 的測試就是一份可以執行的清單，放進 CI 之後，同樣的錯誤就不會再進到叢集。</li>
+</ul>
+<p>回頭看，從第 1 課的控制迴圈到這裡，你寫的每一個物件都是在宣告期望狀態，由某個控制器負責讓現實追上它：Deployment 控制器維持副本、HPA 調整副本數、Job 控制器跑到完成、kube-proxy 與 NetworkPolicy 的實作把規則寫進節點。除錯就是找出「哪一個迴圈追不上、為什麼」。</p>
+
+<h2>練習</h2>
+<p>在 <code>learn</code> 資料夾執行 <code>export KUBECONFIG="$PWD/kubernetes/practice/.kube/config"</code>，再執行頁面上的指令，起始檔會複製到 <code>kubernetes/practice/work/16/</code>。五題是同一個專案：練習 2、3 用的是你在練習 1 改好的 chart。想自己先試時，<code>bash kubernetes/practice/work/16/dev-up.sh</code> 會從零建立 <code>k8s-16</code> 與 <code>k8s-16-data</code>（約 2～5 分鐘），之後在 <code>work/16/</code> 執行 <code>bash deploy.sh v1</code>；用完 <code>kubectl delete namespace k8s-16 k8s-16-data</code>。練習 1、5 和練習 4 的檔案檢查幾秒就跑完；練習 2、3、4 的叢集部分要部署到測試自己的 namespace（<code>k8s-16-ex2</code> 等），每題要 5～20 分鐘。</p>
+
+<div class="local" data-test="ex1" data-files="chart/values.yaml chart/values-local.yaml chart/templates/api.yaml chart/templates/worker.yaml chart/templates/hpa.yaml chart/templates/pdb.yaml chart/templates/serviceaccount.yaml chart/templates/networkpolicy.yaml">
+  <p>練習 1：把 <code>chart/</code> 做到上線標準。api：不輸出 replicas、startupProbe 與 livenessProbe 打 <code>/health/live</code>、readinessProbe 打 <code>/health/ready</code>、<code>preStop.sleep</code> 至少 3 秒、寬限期 ≥ preStop＋15 秒、<code>topologySpreadConstraints</code>（hostname、maxSkew 1、<code>nodeTaintsPolicy: Honor</code>）、<code>DATABASE_URL</code> 與 <code>REDIS_URL</code> 用 secretKeyRef 從 <code>cafe-secrets</code> 的同名 key 取。worker：寬限期 ≥ 60 秒、memory limit。每個容器都有 CPU／記憶體 requests 與 memory limit、明確的映像 tag 與 <code>IfNotPresent</code>；api、worker 用 chart 的 ServiceAccount 且不掛 token、Pod 範本有 checksum annotation，並套用 <code>_helpers.tpl</code> 的兩段安全設定。補上 HPA（cafe-api，2～4、CPU，縮容穩定視窗用 values 控制，values-local 設 ≤ 60 秒）、PDB（只選 api，<code>maxUnavailable: 1</code>）、NetworkPolicy（預設拒絕；所有 Pod 能查 DNS；api 收 3000、連 postgres 5432 與 redis 6379；worker 只連 redis；<code>component: migrate</code> 的 Pod 只連 postgres）。values 檔裡不能有連線字串或密碼。測試跑 helm lint、kubeconform、上面每一項，最後把 chart 與 migration Job 用 <code>--dry-run=server</code> 送到 restricted 的 namespace。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="deploy.sh">
+  <p>練習 2：完成 <code>deploy.sh &lt;版本&gt;</code>（namespace 用 <code>NS</code> 環境變數，預設 <code>k8s-16</code>）：用 <code>migrate/sql/</code> 建 ConfigMap <code>cafe-migrate-&lt;版本&gt;</code>、刪掉同名的舊 Job、把 <code>migrate/job.yaml</code> 的 <code>__VERSION__</code> 換成版本後套用；等 Job 完成（Failed 就印 log 並以非 0 結束，查詢失敗當成還在跑）；再 <code>helm upgrade --install cafe ./chart -f chart/values-local.yaml --set image.tag=&lt;版本&gt; --wait --timeout 5m --rollback-on-failure</code>；最後用 <code>kubectl exec -n k8s-tools deploy/probe -- curl -fsS …</code> 對 <code>/health/ready</code> 與 <code>/products</code> 做煙霧測試。api 不能用 migrator 帳號，migration 不能放在 initContainer。測試用 <code>dev-up.sh</code> 從零建環境、執行 <code>deploy.sh v1</code>：Job 要在 api 的 Deployment 建立前完成、<code>orders</code> 的擁有者是 <code>cafe_migrator</code>、api 與 worker 各 2 個 Ready、煙霧測試的 curl 有 <code>-f</code>，放進佇列的 3 張收據要被寄出。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="migrate/sql/002_add_receipt_sent_at.sql rollback.sh">
+  <p>練習 3：寫 v2 的 migration <code>migrate/sql/002_add_receipt_sent_at.sql</code>：先 <code>SET lock_timeout</code>，再在 <code>orders</code> 加可以是 NULL 的 <code>receipt_sent_at timestamptz</code>，不改名、不刪除。完成 <code>rollback.sh</code>：用 <code>helm rollback cafe</code>、<code>-n "$NS"</code>、<code>--wait</code>。測試先部署 v1，然後在每秒 10 個請求下依序 <code>deploy.sh v2</code> → <code>rollback.sh</code> → <code>deploy.sh v2</code>：每一步結束時 Ready 的 api 全部是那一版、helm history 有 4 個 revision、全程 0 錯誤、回滾後欄位還在、每個 migration 只套用一次；接著在流量下 drain <code>learn-k8s-worker2</code>（只驅逐這一題的 Pod）同時送 20 張收據：drain 成功、0 錯誤、收據剛好 20 張。PDB 要允許驅逐（練習 1 寫對的話不用改）。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="incidents.json ex4/chart/values.yaml ex4/chart/templates/networkpolicy.yaml ex4/chart/templates/hpa.yaml INCIDENTS.md">
+  <p>練習 4：事故演練。執行 <code>ex4/start.sh</code>，用第 14 課的流程查出 A、B、C 三個事故的根因，在 <code>incidents.json</code> 填 <code>cause</code>（上面的根因代碼）與 <code>evidence</code>（你看到證據的那一行 kubectl 指令）；修在 <code>ex4/chart/</code>（不能拿掉預設拒絕、不能把 egress 放寬成任何 port、不能拿掉 worker 的 memory limit）；在 <code>INCIDENTS.md</code> 的三份紀錄寫時間軸（至少 3 個時間點）、影響、根因（寫出根因代碼並說明怎麼造成症狀）、修正、預防（至少一條，用 <code>-</code> 開頭）。測試檢查這三個檔案，再從零部署你的 <code>ex4/chart</code>：api 與 worker 都 Ready、worker 沒有重啟且寄得出收據、HPA 的 AbleToScale 是 True。</p>
+</div>
+
+<div class="local" data-test="ex5" data-files="RUNBOOK.md DECISIONS.md">
+  <p>練習 5：完成 <code>RUNBOOK.md</code> 的五節（部署、回滾、擴展、處理 CrashLoopBackOff、輪替資料庫密碼），每節一兩句說明加上一個 <code>```bash</code> 區塊。每個 kubectl、helm 指令都明寫 <code>-n k8s-16</code>（不屬於 namespace 的指令除外），helm 的 release 是 <code>cafe</code>，區塊要通過 <code>bash -n</code>；CrashLoopBackOff 一節要有 <code>describe</code> 與 <code>logs --previous</code>；輪替密碼一節要更新 Secret，再 <code>rollout restart</code> cafe-api 與 cafe-worker。完成 <code>DECISIONS.md</code>：至少 3 個 ADR（<code>##</code> 標題），每個都有內容充實的 <code>### 背景</code>、<code>### 決策</code>、<code>### 後果</code>、<code>### 在 EKS 上</code>。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：worker 正在寄收據時，Pod 因為滾動更新被終止。這張收據會怎樣？最穩妥的設計是？</p>
+  <label data-key="a">一定會遺失，只能接受</label>
+  <label data-key="b">收到 SIGTERM 先停止拿新的 job、把手上的做完，寬限期大於最長的 job；就算還是被中斷，job 也會在鎖過期後重試，所以寄送本身要冪等</label>
+  <label data-key="c">把 terminationGracePeriodSeconds 設成 0，讓它快點換掉</label>
+  <label data-key="d">worker 不要用 Deployment，改成手動啟動的 Pod</label>
+  <p class="why">✓ 優雅關機讓中斷變少，冪等讓中斷之後的重試不會寄兩張，兩者都要（NestJS 課第 20、24 課）。a 不對：佇列會重試沒有完成的 job，不一定遺失；c 會在寄到一半時直接 SIGKILL，正好造成中斷；d 失去了自我修復與滾動更新，節點一掛 worker 就沒了，也不會讓 SIGTERM 消失。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：你修好了事故 A（NetworkPolicy 擋掉 Redis），服務恢復了。最該確認的是？</p>
+  <label data-key="a">叢集現在正常就好</label>
+  <label data-key="b">修正在 chart 裡，從零部署也不會再出現，並補上能提早發現的檢查（例如煙霧測試打 /health/ready、CI 檢查每個依賴都被放行）</label>
+  <label data-key="c">刪掉所有 NetworkPolicy，避免再發生</label>
+  <label data-key="d">重啟 Redis</label>
+  <p class="why">✓ 修在宣告裡、加上預防，同樣的錯才不會回來。a 只是止血，下次部署會把錯誤帶回來；c 用移除安全措施換方便，是掩蓋而不是修正，被入侵的 Pod 從此可以連任何地方；d 跟根因無關，Redis 本身一直是好的。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 8：上線驗收時 HPA 擴到 4，但新的 Pod 一直 Pending，事件是 <code>Insufficient cpu</code>。在 kind 和在 EKS 上分別怎麼處理？</p>
+  <label data-key="a">兩邊都把 HPA 的 maxReplicas 調高</label>
+  <label data-key="b">kind：節點數固定，降低 requests（先確認量測值）或減少其他工作負載；EKS：由 Karpenter 或 Auto Mode 加節點，並確認 requests 是量測出來的</label>
+  <label data-key="c">把 requests 拿掉，Pod 就排得進去</label>
+  <label data-key="d">改用 Recreate 策略</label>
+  <p class="why">✓ HPA 只負責建立 Pod，節點的容量是另一層（第 8、15 課）。a 會建立更多 Pending 的 Pod；c 讓排程器以為 Pod 不用資源，節點被塞爆，HPA 也算不出使用率；d 是換版策略，跟容量無關，還會在換版時停機。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>只顧 API 忘了 worker</strong>：worker 也要 resources、優雅關機、寬限期、NetworkPolicy 與告警（佇列長度）。它沒有 Service，壞了不會有人收到 5xx，只會有客人沒收到收據。</li>
+  <li><strong>migration 與應用同時上線</strong>：寫在 initContainer 或啟動程式裡，每個副本都跑、跟舊版搶鎖、應用拿著能改表的帳號。先 Job、等成功、再換版。</li>
+  <li><strong>migration 不是 expand</strong>：改名或刪欄位之後，回滾到舊版也救不回來。這一版只加，下一版才刪。</li>
+  <li><strong>忘了 migration Job 的 NetworkPolicy</strong>：第一次部署會過（預設拒絕還不存在），第二次就卡住。部署兩次再說它能用。</li>
+  <li><strong>修在叢集上</strong>：<code>kubectl edit</code> 止血之後沒改 chart，下次部署事故又回來。</li>
+  <li><strong>為了過關移除安全設定</strong>：NetworkPolicy、memory limit、probe 都是上線標準的一部分。拿掉它們讓症狀消失，問題還在。</li>
+  <li><strong>煙霧測試不會失敗</strong>：curl 沒加 <code>-f</code>、指令後面接 <code>|| true</code>，壞掉的部署也顯示成功。</li>
+  <li><strong>文件裡的指令跑不動</strong>：少了 <code>-n</code>、release 名稱打錯、輪替密碼後沒有 rollout restart。runbook 的每個指令都要實際執行過。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>上線準備度檢查：把需求翻成可以自動檢查的項目，每一項對應到一個設定、一課、一個測試。</li>
+  <li>三種工作負載三種物件：api 是 Deployment＋Service＋HPA＋PDB，worker 是沒有 Service 的 Deployment（寬限期大於最長的 job），migration 是每版一次的 Job。</li>
+  <li>chart 的上線標準：不輸出 replicas、三種 probe 各司其職、preStop 與寬限期、requests 與 limits、restricted、專屬 ServiceAccount、預設拒絕的 NetworkPolicy、機密只從 Secret 來。</li>
+  <li>部署順序：migration（migrator 帳號，失敗就停）→ <code>helm upgrade --wait --rollback-on-failure</code> → 會失敗的煙霧測試。回滾不碰資料庫，所以 migration 只做 expand，加上 lock_timeout。</li>
+  <li>驗收要在流量下做會出事的動作：換版、回滾、再換版、drain，錯誤數是 0；收據數等於訂單數。</li>
+  <li>事故照第 14 課的流程查，修在 chart，從零部署驗證，寫事故紀錄與預防；runbook 的指令都能直接執行，ADR 寫出後果與 EKS 上的做法。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 8 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 9：上線一週後，cafe-api 在尖峰時偶爾重啟。<code>logs --previous</code> 是空的，describe 的 Last State 是 <code>Terminated</code>、Exit Code <code>137</code>，下一步的判斷哪個對？</p>
+  <label data-key="a">沒有 log 代表 Node 還沒啟動就失敗了，先查映像的指令與 entrypoint</label>
+  <label data-key="b">137 就是記憶體不夠，先把 memory limit 調高一倍再觀察</label>
+  <label data-key="c">137 只說明被 SIGKILL，看 reason 是不是 OOMKilled，再決定查 limit 還是 liveness</label>
+  <label data-key="d">137 是程式自己指定的結束碼，到程式碼裡找呼叫 process.exit 的地方</label>
+  <p class="why">✓ 大於 128 是被訊號結束，137－128＝9，也就是 SIGKILL；被殺的程序沒機會寫 log，所以空的 log 本身就是線索。OOM 會殺，liveness 失敗、寬限期到了 kubelet 也用 SIGKILL，要看 reason 才知道是哪一個。b 錯在沒看證據就改設定：如果是 liveness 殺的，加大 limit 什麼都沒修到，還多改了一個變數。（第 14 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 10：deploy.sh 的煙霧測試失敗：api 都是 <code>1/1 Running</code>，<code>port-forward pod/</code> 直接打 <code>/products</code> 是 200，從 k8s-tools 用 Service 名字打卻連不上。<code>kubectl get endpointslice</code> 的 ENDPOINTS 是 <code>&lt;unset&gt;</code>，最可能的原因？</p>
+  <label data-key="a">預設拒絕的 NetworkPolicy 擋住了 k8s-tools 到 api 的連線</label>
+  <label data-key="b">kube-proxy 還沒把轉送規則寫進節點，等幾秒再測就會好</label>
+  <label data-key="c">Service 的 targetPort 跟容器實際聽的 port 不一樣</label>
+  <label data-key="d">Service 的 selector 跟 Pod 的 label 對不上，沒有 Pod 被挑進來</label>
+  <p class="why">✓ EndpointSlice 是控制器依 Service 的 selector 挑出 Ready 的 Pod 寫進去的；Pod 都 Ready 卻一個都沒有，就是 selector 沒選到。用 <code>describe service</code> 的 Selector 對照 <code>get pods --show-labels</code>，修在 chart。a 錯在 NetworkPolicy 擋的是封包，不會讓 EndpointSlice 變空，症狀是連線逾時。（第 4、14 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 11：期末專題的 chart 改由 Argo CD（automated、selfHeal）部署到 prod。v4 合併後 Argo CD 顯示 Synced 但 Degraded，新 Pod 一直 CrashLoopBackOff，要怎麼回到 v3？</p>
+  <label data-key="a">在 config repo 開 PR revert 改 image.tag 的那個 commit，合併後讓 Argo CD 同步</label>
+  <label data-key="b"><code>kubectl rollout undo deployment/cafe-api</code> 回到上一個 ReplicaSet，等 Pod Ready</label>
+  <label data-key="c">在 Argo CD 介面再按一次 Sync，讓它重新把 git 的設定套到叢集上</label>
+  <label data-key="d">刪掉 CrashLoopBackOff 的 Pod，讓 Deployment 重新建立一批再試一次</label>
+  <p class="why">✓ Synced 只表示叢集跟 git 一樣，git 裡就是壞掉的 v4；GitOps 的回滾是 <code>git revert</code>，Argo CD 再把叢集同步成 v3。b 錯在 rollout undo 是叢集上的手動修改，對 selfHeal 來說就是 drift，幾秒後又被改回 v4；真的等不及時，要先暫停這個 Application 的自動同步並留紀錄。（第 15 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 12：資安要求「CI 被入侵，也不能改到正式叢集」，而 deploy.sh 現在在 CI 裡跑。怎麼改才符合？</p>
+  <label data-key="a">CI 改用只能部署 cafe-prod namespace 的最小權限角色執行 deploy.sh</label>
+  <label data-key="b">CI 只推映像，再用專屬 token 對 config repo 開 PR 改 tag，由叢集裡的 Argo CD 拉取</label>
+  <label data-key="c">把 kubeconfig 加密存成 GitHub secret，只有 main 分支的 workflow 能解開</label>
+  <label data-key="d">CI 用 <code>GITHUB_TOKEN</code> 直接推到 config repo 的 main，不開 PR 也不碰叢集</label>
+  <p class="why">✓ GitOps 是 pull 型：CI 手上沒有叢集的憑證，被入侵最多開一個 PR，還要有人 review 才會上線。a 最多人選，它縮小了範圍，但被入侵的 CI 照樣能改 cafe-prod 裡的任何東西，不符合要求。d 也不行：<code>GITHUB_TOKEN</code> 推不到別的 repo，跳過 PR 也就跳過了 review。（第 15 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 13：部署完成後，同事想省資源，執行 <code>kubectl scale deployment cafe-api --replicas=1</code>，不到一分鐘又變回 2 個。是誰改回去的？</p>
+  <label data-key="a">Deployment 控制器記得 helm 部署時的副本數，發現不一樣就改回來</label>
+  <label data-key="b">Helm 發現叢集跟 chart 不一樣，自動把 release 重新套用一次</label>
+  <label data-key="c">PDB 的 maxUnavailable 是 1，不允許 api 的 Pod 少於 2 個</label>
+  <label data-key="d">HPA 的控制迴圈把副本數夾回 minReplicas 2，寫回 Deployment</label>
+  <p class="why">✓ 每個物件都是期望狀態，由各自的控制器不斷比對、動作；HPA 每 15 秒算一次，結果夾在 2～4 之間，再改 Deployment 的 replicas。要改常態的副本數，就改 chart 裡 HPA 的 minReplicas 走正常部署。a 錯在 Deployment 控制器只追 <code>spec.replicas</code>，scale 已經把它改成 1，它照做；chart 也沒輸出 replicas。（第 1、8 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 14：平台團隊升級節點時說 cafe-api 所在的節點 drain 一直卡住。chart 的 PDB 是下面這樣，HPA 最小 2 個，現在正好 2 個 api，為什麼？</p>
+<pre>apiVersion: policy/v1
+kind: PodDisruptionBudget
+spec:
+  minAvailable: 2
+  selector: { matchLabels: { app.kubernetes.io/name: cafe-api } }</pre>
+  <label data-key="a">副本數等於 minAvailable，允許中斷 0 個，驅逐一直被拒絕，drain 只能一直重試</label>
+  <label data-key="b">PDB 只在 HPA 擴到最大值時才生效，卡住的原因要去查節點本身的狀態</label>
+  <label data-key="c">drain 遇到 PDB 會改成直接刪 Pod，卡住是因為寬限期太長、Pod 還沒結束</label>
+  <label data-key="d">兩個 api 在同一台節點，drain 要等分散規則先把其中一個搬到別台</label>
+  <p class="why">✓ drain 走驅逐 API，要先問 PDB 還能中斷幾個；2 個副本、至少要 2 個可用，答案永遠是 0，節點升級就被你的服務擋下。改成 <code>maxUnavailable: 1</code>，一次驅逐一個，新 Pod 在別台 Ready 後再驅逐下一個。c 錯在 drain 不會繞過 PDB 改用刪除，它就是因為尊重 PDB 才卡住。（第 9、15 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 15：同事想讓一台節點多放幾個 api，把 requests 寫得比量測值小很多。這樣會出什麼事？</p>
+<pre>resources:
+  requests: { cpu: 50m, memory: 128Mi }   # 量測：平常 300m、400Mi
+  limits:   { memory: 512Mi }</pre>
+  <label data-key="a">limits 比 requests 大很多，Pod 被歸成 BestEffort，記憶體不足時最先被驅逐</label>
+  <label data-key="b">執行時 CPU 被限制在 50m，尖峰時請求在排隊，延遲跟著變高</label>
+  <label data-key="c">排程器照 requests 把節點塞太滿，尖峰時互搶；HPA 的使用率一直偏高，停在最大值</label>
+  <label data-key="d">沒寫 CPU limit，一個 Pod 尖峰時吃光節點的 CPU，讓其他 Pod 被 OOMKilled</label>
+  <p class="why">✓ requests 是保留量，排程器只看它，實際用量加起來會超過節點；HPA 以 requests 為分母，300m 對 50m 是 600%，永遠擴到最大。requests 要設在量測的平常用量附近。b 最多人選，但 requests 不是上限，節點有空閒 CPU 時可以用超過，只有 CPU limit 才會節流。（第 8 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 16：負載下換版時出現少量 connection refused，都在某個舊 Pod 開始終止後的一兩秒內。readiness 設定正確、maxUnavailable 是 0，原因與修法？</p>
+  <label data-key="a">maxSurge 只有 1，新 Pod 不夠多時舊 Pod 就被關掉，要把 maxSurge 調大</label>
+  <label data-key="b">移出端點和 SIGTERM 同時開始，規則還沒更新完就關門；加 preStop sleep 並加長寬限期</label>
+  <label data-key="c">舊 Pod 要等 readinessProbe 連續失敗才移出端點，periodSeconds 要調短</label>
+  <label data-key="d">寬限期 30 秒太短，處理到一半的請求被 SIGKILL，要調成 60 秒</label>
+  <p class="why">✓ Pod 終止時，EndpointSlice 移除它和 kubelet 執行 preStop→SIGTERM 是平行的；kube-proxy 與 Gateway 還沒更新前，新連線仍會送到已經關門的程序。preStop 先等幾秒再讓應用關門，寬限期 ≥ preStop＋最長請求＋收尾。c 錯在終止中的 Pod 一開始就被移出端點，不用等 probe 失敗。（第 7、9 課）</p>
+</div>
+<p>這個階段的重點整理成<a href="../sheets/stage-5.html">一頁圖解</a>。</p>
+<p>接下來可以學什麼：把練習 1 的測試放進 CI，讓每個 PR 都跑一次上線檢查；用 Argo CD 部署這個 chart（第 15 課），把 migration Job 變成 PreSync hook；在雲端的 EKS 上做一次真的部署，把 postgres 換成 RDS、NetworkPolicy 換成 ipBlock；最後補上 dashboard 與告警，讓這個服務能被別人值班。</p>
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

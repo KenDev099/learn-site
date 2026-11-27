@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>12. 期末專題：咖啡店的 GraphQL 菜單與訂單歷史、gRPC 庫存服務與契約測試</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="12" data-practice="api-styles">
+<header>
+  <div class="eyebrow">階段 5：契約與整合架構 · 第 12 課</div>
+  <h1>期末專題：咖啡店的 GraphQL 菜單與訂單歷史、gRPC 庫存服務與契約測試</h1>
+</header>
+<main>
+
+<p>前面十一課各練一塊：schema、resolver、DataLoader、分頁、授權、防護、codegen、protobuf、gRPC、契約、BFF。上線的系統不會一次只出一種問題：訂單歷史慢，是因為某個欄位繞過了 loader；下單重複扣庫存，是因為逾時後重試；前端突然壞掉，是因為後端改了一個欄位名。這一課把它們組成一條完整的路徑：App → GraphQL（菜單、訂單歷史、下單）→ gRPC 庫存服務，資料在 PGlite。</p>
+<p>起始專案「功能都有」，但每個上線會出事的地方都還沒處理。你要照需求一塊一塊修好。做完之後，你會有一個能拿來說明「我怎麼設計一個 API」的完整專案。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>需求與架構：產品經理只給畫面，工程師怎麼補上效能、可靠性、安全的具體數字，起始專案哪些檔案歸你寫。</li>
+  <li>驗收測試與 GraphQL 這一側：測試怎麼判分、從哪裡開始修；DataLoader、分頁、授權接起來後，訂單歷史為什麼最多 6 句 SQL。</li>
+  <li>防護與下單：白名單、深度、成本、錯誤遮罩一次設好；逾時重試時怎麼不重複扣庫存，庫存服務掛掉時菜單照樣顯示。</li>
+  <li>契約檢查：一個指令在合併前擋下 schema、proto、App 契約的破壞性變更。</li>
+  <li>ADR 與回顧：把設計決定寫成一頁文件，面試時拿它說明取捨，並列出上線前還缺什麼。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="04-n-plus-1-dataloader.html">第 4 課</a>的 DataLoader：同一層的 <code>load()</code> 合成一句 <code>WHERE id = ANY($1)</code>，loader 每個請求建立一份；測試靠 SQL 記錄數句數。</li>
+  <li><a href="06-authz-limits-persisted.html">第 6 課</a>的授權與防護：每條拿得到訂單的路徑都檢查擁有者，敏感欄位只給店員；深度、成本限制與 persisted operations 白名單擋住惡意查詢。</li>
+  <li><a href="09-grpc-services.html">第 9 課</a>的 deadline 與狀態碼：呼叫庫存服務一定設 deadline；庫存不足回 <code>FAILED_PRECONDITION</code>，暫時連不上回 <code>UNAVAILABLE</code>。</li>
+  <li><a href="../../system-design/lessons/09-idempotency.html">系統設計課第 9 課</a>的冪等：請求帶一個唯一的 key，同一個 key 送幾次都只生效一次，逾時後重試才安全。</li>
+</ul></div>
+
+<h2>需求：三個畫面、一個店員後台、六條非功能需求</h2>
+<p>產品經理給的需求只有畫面。工程師要自己補上「怎樣才算做好」，也就是非功能需求：效能、可靠性、安全的具體數字。沒有數字就沒辦法驗收，也沒辦法在設計時取捨。</p>
+<div class="table-wrap"><table>
+  <tr><th>畫面</th><th>需要的資料</th><th>對應的操作</th></tr>
+  <tr><td>App：菜單</td><td>商品名稱、價格、分類、還剩幾份</td><td><code>query Menu { menuWithStock { … } }</code></td></tr>
+  <tr><td>App：我的訂單</td><td>訂單時間、金額、品項與商品名稱，往下捲動載入更多</td><td><code>query OrderHistory</code>（cursor 分頁）</td></tr>
+  <tr><td>App：下單</td><td>下單結果：成功、某個商品不夠、庫存服務暫時不能用</td><td><code>mutation PlaceOrder</code></td></tr>
+  <tr><td>店員後台</td><td>顧客 email、訂單的內部備註、任何顧客的訂單</td><td>同一份 schema，依角色回不同資料</td></tr>
+</table></div>
+<div class="table-wrap"><table>
+  <tr><th>非功能需求</th><th>數字</th><th>為什麼</th></tr>
+  <tr><td>資料庫負載</td><td>最深的訂單歷史查詢（20 筆、含品項、商品、顧客）最多 6 句 SQL</td><td>N+1 會讓一個請求發出幾十句 SQL，人一多資料庫就撐不住</td></tr>
+  <tr><td>查詢防護</td><td>深度 6、成本 1000；正式環境只接受登記過的操作</td><td>客戶端決定查詢的形狀，伺服器要設上限</td></tr>
+  <tr><td>授權</td><td>顧客從任何路徑都看不到別人的訂單；email、備註只有店員看得到</td><td>BOLA、BOPLA（<a href="06-authz-limits-persisted.html">第 6 課</a>）</td></tr>
+  <tr><td>延遲預算</td><td>整個請求 500 ms</td><td>App 的轉圈圈不能無限轉；下游要知道剩多少時間</td></tr>
+  <tr><td>降級</td><td>庫存服務掛掉時菜單仍可顯示</td><td>庫存是附加資訊，不該拖垮整個畫面</td></tr>
+  <tr><td>正確性</td><td>不能超賣；同一筆下單重送只算一次；失敗不留下半張訂單</td><td>錢與庫存出錯要人工對帳，代價最高</td></tr>
+</table></div>
+
+<h2>架構與起始專案</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs api-styles 12</code>，建立 <code>api-styles/practice/work/12/</code>（還沒裝套件的話，先照<a href="02-graphql-schema-queries.html">第 2 課</a>開頭的步驟 <code>npm install</code>）。每次執行前，<code>check.mjs</code> 會先用 <code>buf generate</code> 產生 <code>gen/</code>（protobuf 的程式碼），再用 <code>graphql-codegen</code> 產生 <code>app/gql/</code>（App 的型別與白名單）。全部的測試在忙碌的電腦上大約要一到兩分鐘。</p>
+
+<figure>
+  <svg viewBox="0 0 700 260" role="img" aria-label="App 用 GraphQL 呼叫 GraphQL 伺服器（BFF）；BFF 查 PGlite 資料庫，並用 gRPC 呼叫庫存服務（GetStock、Reserve）；契約檢查比對 schema、proto 與 App 的 Pact 契約">
+    <defs><marker id="a12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="10" y="90" width="120" height="60" rx="8"/>
+    <text class="d-text" x="70" y="117" text-anchor="middle">App（Vue）</text>
+    <text class="d-small" x="70" y="136" text-anchor="middle">app/*.graphql</text>
+    <line class="d-line" x1="130" y1="120" x2="238" y2="120" marker-end="url(#a12)"/>
+    <text class="d-small" x="184" y="110" text-anchor="middle">GraphQL</text>
+    <text class="d-small" x="184" y="140" text-anchor="middle">只送雜湊</text>
+    <rect class="d-box" x="240" y="70" width="200" height="100" rx="8"/>
+    <text class="d-text" x="340" y="98" text-anchor="middle">GraphQL 伺服器（BFF）</text>
+    <text class="d-small" x="340" y="120" text-anchor="middle">graphql/：resolver、loader、</text>
+    <text class="d-small" x="340" y="138" text-anchor="middle">授權、防護、下單</text>
+    <text class="d-small" x="340" y="156" text-anchor="middle">預算 500 ms</text>
+    <line class="d-line" x1="440" y1="100" x2="548" y2="60" marker-end="url(#a12)"/>
+    <text class="d-small" x="490" y="66" text-anchor="middle">SQL</text>
+    <rect class="d-soft" x="550" y="30" width="140" height="50" rx="8"/>
+    <text class="d-text" x="620" y="60" text-anchor="middle">PGlite</text>
+    <line class="d-line" x1="440" y1="145" x2="548" y2="180" marker-end="url(#a12)"/>
+    <text class="d-small" x="484" y="186" text-anchor="middle">gRPC</text>
+    <rect class="d-soft" x="550" y="160" width="140" height="60" rx="8"/>
+    <text class="d-text" x="620" y="185" text-anchor="middle">庫存服務</text>
+    <text class="d-small" x="620" y="204" text-anchor="middle">GetStock、Reserve</text>
+    <rect class="d-box" x="160" y="205" width="300" height="44" rx="8"/>
+    <text class="d-text" x="310" y="226" text-anchor="middle">contracts/run.ts</text>
+    <text class="d-small" x="310" y="242" text-anchor="middle">schema 比對、buf breaking、Pact</text>
+  </svg>
+  <figcaption>GraphQL 伺服器就是 App 的 BFF（<a href="11-gateway-bff.html">第 11 課</a>）：自己查資料庫，庫存透過 gRPC 問庫存服務。契約檢查守住三條邊界。</figcaption>
+</figure>
+
+<div class="table-wrap"><table>
+  <tr><th>檔案</th><th>責任</th><th>誰寫</th></tr>
+  <tr><td><code>graphql/schema.graphql</code></td><td>App 看得到的契約</td><td>練習 3 加型別</td></tr>
+  <tr><td><code>graphql/app.ts</code>、<code>context.ts</code></td><td>組裝 Yoga；每個請求建立 context（loader、viewer、<code>deadline</code>、<code>now</code>）</td><td>給好的</td></tr>
+  <tr><td><code>graphql/auth.ts</code>、<code>cursor.ts</code>、<code>cost.ts</code>、<code>cost-plugin.ts</code></td><td>第 5、6 課寫過的授權規則、游標、成本計算</td><td>給好的</td></tr>
+  <tr><td><code>graphql/resolvers.ts</code>、<code>loaders.ts</code>、<code>orders.ts</code></td><td>欄位怎麼取資料、批次、分頁</td><td>練習 1</td></tr>
+  <tr><td><code>graphql/protect.ts</code></td><td>深度、成本、白名單、CSRF、錯誤遮罩</td><td>練習 2</td></tr>
+  <tr><td><code>graphql/inventory.ts</code>、<code>place-order.ts</code>、<code>inventory/server.ts</code></td><td>呼叫庫存服務、下單流程、庫存服務本身</td><td>練習 3</td></tr>
+  <tr><td><code>contracts/</code></td><td><code>run.ts</code>、<code>consumer.ts</code>、<code>provider.ts</code>；<code>baseline/</code> 是線上版本</td><td>練習 4</td></tr>
+  <tr><td><code>adr.md</code></td><td>設計決定與理由</td><td>練習 5</td></tr>
+  <tr><td><code>proto/</code>、<code>app/</code>、<code>db.ts</code>、<code>codegen.ts</code></td><td>庫存服務的 proto、App 的操作與呼叫程式、資料庫、codegen 設定</td><td>給好的</td></tr>
+</table></div>
+<p>想先親手玩一下：在 <code>work/12</code> 執行 <code>node examples/serve.ts</code>，瀏覽器打開 <code>http://localhost:4000/graphql</code> 是 GraphiQL（開發模式），標頭加 <code>Authorization: Bearer wang</code> 就是王小明。終端機會印出每個請求發出幾句 SQL。起始程式查一次「我的訂單」（10 筆、含品項與商品）大約要三十句。</p>
+
+<h2>驗收測試怎麼判分，建議的順序</h2>
+<p><strong>驗收測試（acceptance test）</strong>從系統外面確認需求有沒有被滿足：它只看 HTTP 與 gRPC 的回應、資料庫裡的 SQL 記錄、庫存數字、pact 檔、指令的結束碼，不管你的函式怎麼拆。跟單元測試的差別是：單元測試告訴你「這個函式對不對」，驗收測試告訴你「這個需求做到了沒」。內部怎麼寫由你決定，只要外部行為對。</p>
+<p>每次執行都換資料：300 張訂單用不同的亂數種子產生，價格、庫存、備註也隨機，所以寫死答案不會過。建議照這個順序做，每完成一塊就跑一次 <code>node check.mjs api-styles 12</code>，不要全部寫完才跑：</p>
+<ol>
+  <li>練習 1：菜單（起始就能跑）→ 訂單歷史改 keyset → DataLoader → 授權。</li>
+  <li>練習 2：深度、成本 → 白名單 → 錯誤遮罩。</li>
+  <li>練習 3：庫存服務的冪等 → BFF 的 deadline 與降級 → 下單流程的順序與交易 → schema 加 <code>InventoryUnavailable</code>。</li>
+  <li>練習 4：契約檢查（provider 用正式模式，需要練習 2 的白名單）。</li>
+  <li>練習 5：ADR。</li>
+</ol>
+
+<h2>GraphQL 這一側：把第 4–6 課接起來</h2>
+<p>SQL 上限 6 句是怎麼算出來的：GraphQL 一層一層執行，DataLoader 把同一層的 <code>load()</code> 合成一句，所以句數跟「資料有幾筆」無關，只跟「查詢有幾層關聯」有關。</p>
+<div class="table-wrap"><table>
+  <tr><th>層</th><th>欄位</th><th>SQL</th></tr>
+  <tr><td>1</td><td><code>me</code></td><td><code>customers WHERE id = ANY($1)</code>（customerById）</td></tr>
+  <tr><td>2</td><td><code>orders(first: 20)</code></td><td>一句 keyset 查詢，<code>LIMIT 21</code></td></tr>
+  <tr><td>3</td><td>20 張訂單的 <code>items</code>、<code>customer</code></td><td>itemsByOrderId 一句；<code>customer</code> 都是第 1 層載入過的同一位顧客，loader 的快取直接回傳，不發 SQL</td></tr>
+  <tr><td>4</td><td>所有品項的 <code>product</code></td><td>productById 一句</td></tr>
+</table></div>
+<p>合計 4 句（實測）。店員查好幾位顧客的訂單時，第 3 層的 customerById 才會真的發一句，變成 5 句；上限 6 留了餘裕。超過 6 句幾乎都是兩種原因：某個關聯欄位直接 <code>ctx.db.query</code>、沒走 loader；或 batch 函式裡用 <code>Promise.all(ids.map(…))</code> 每個 id 各查一次（看起來用了 DataLoader，其實還是 N 句）。查法：印出 <code>log</code>，找重複出現、只差參數的句子。</p>
+<p>loader 要每個請求一份（<code>app.ts</code> 在 context 裡呼叫 <code>createLoaders(db)</code>）。放在模組層級共用，第一個請求載入的資料會一直留在快取裡，資料改了也看不到，而且不同使用者會共用快取。</p>
+<p>授權照第 6 課的原則：每條拿得到訂單的路徑都要經過 <code>auth.ts</code>。這個 schema 有四條：</p>
+<ul>
+  <li><code>order(id)</code>：單一物件，用 <code>requireOrder</code>（沒登入 <code>UNAUTHENTICATED</code>、別人的 <code>FORBIDDEN</code>）。</li>
+  <li><code>me.orders</code>、<code>customer(id).orders</code>：都是 <code>Customer.orders</code>，用 <code>canSeeOrdersOf</code>，看不到就回空的 connection（<code>EMPTY</code>）。</li>
+  <li><code>Product.orders</code>：最容易漏掉。顧客只能看到自己的，條件要寫進 SQL（<code>AND o.customer_id = $2</code>），不要先查出全部再在 JavaScript 濾掉：先查再濾，<code>first: 10</code> 濾完可能只剩 2 筆，還多讀了別人的資料。</li>
+  <li><code>Order.customer.orders</code>：訂單看得到，代表你是本人或店員，所以這條自然安全。</li>
+</ul>
+<p>個資欄位 <code>Customer.email</code>、<code>Order.internalNote</code> 寫在欄位自己的 resolver（<code>staffOnly</code>），不論 Customer 從哪條路徑來都會經過。</p>
+<div class="callout practice"><strong>💡 實務上：GraphQL 的資料外洩多半出在「另一條路徑」</strong><br>資安回報的 GraphQL 漏洞，常見的不是主要查詢沒擋，而是從關聯欄位繞進去（例如從商品查到所有人的訂單）。新增任何回傳 Customer 或 Order 的欄位時，code review 要先問：「這條路徑誰能走到？授權寫在哪？」授權放在欄位或資料層，而不是只放在最上層的 query，新路徑才會自動受保護。資深的做法是每加一條路徑就補一個「別人的資料拿不到」的測試，像練習 1 那樣。</div>
+
+<h2>防護：protect.ts 回傳給 createYoga 的設定</h2>
+<p><code>app.ts</code> 把 <code>protect({ dev, operations, logger })</code> 的回傳值展開進 <code>createYoga</code>。你要回傳 <code>{ plugins, maskedErrors }</code>：</p>
+<pre>plugins: [
+  usePersistedOperations({ getPersistedOperation: key =&gt; …, allowArbitraryOperations: dev }),
+  useCSRFPrevention({ requestHeaders: ['x-graphql-yoga-csrf'] }),
+  useDepthLimit({ maxDepth: MAX_DEPTH }),
+  useCostLimit(MAX_COST),          // cost-plugin.ts：用這次請求的 variables 算成本
+],
+maskedErrors: { maskError(error, message, isDev) { … } },</pre>
+<p>白名單從哪來（<a href="07-graphql-client-caching.html">第 7 課</a>）：<code>codegen.ts</code> 設了 <code>persistedDocuments: true</code>，codegen 會把 <code>app/</code> 底下每個操作寫進 <code>app/gql/persisted-documents.json</code>，鍵是 <code>"sha256:&lt;雜湊&gt;"</code>。App 送出的 <code>sha256Hash</code> 只有 <code>&lt;雜湊&gt;</code> 那段，所以 <code>app.ts</code> 的 <code>loadOperations()</code> 讀檔時已經去掉前綴，交給你的是 <code>Map&lt;雜湊, 查詢文字&gt;</code>。用 <code>Map</code> 查，不要用一般物件（<code>operations['toString']</code> 會拿到原型上的函式）。</p>
+<p>在 Yoga 6.0.1 實測，正式模式（<code>allowArbitraryOperations: false</code>）送查詢文字會得到 <code>PersistedQueryOnly</code>，送不在清單裡的雜湊得到 <code>PersistedQueryNotFound</code>，兩者都不會執行任何 resolver。<code>allowArbitraryOperations</code> 只能看伺服器自己的設定（<code>dev</code>），不能看請求帶了什麼標頭。</p>
+<p>錯誤遮罩沿用<a href="05-pagination-errors.html">第 5 課</a>：用 <code>graphql-yoga</code> 匯出的 <code>maskError</code> 包一層，回傳值跟原本的 <code>error</code> 不是同一個，就代表被遮罩了，把原錯誤（<code>GraphQLError</code> 的話取 <code>originalError</code>）交給 <code>logger.error</code>。Yoga 遮罩後的錯誤是 <code>message: "Unexpected error."</code>、<code>extensions.code: "INTERNAL_SERVER_ERROR"</code>；你刻意丟的 <code>GraphQLError</code>（<code>FORBIDDEN</code>、<code>BAD_USER_INPUT</code>）保留原訊息。</p>
+
+<h2>下單：先預留庫存，成功才建立訂單</h2>
+<p>下單牽涉兩個系統：庫存服務（記憶體裡的數字）和資料庫（訂單）。兩邊沒有共用的交易，所以順序決定了「失敗時留下什麼」。</p>
+<div class="table-wrap"><table>
+  <tr><th>順序</th><th>庫存服務掛掉時</th><th>資料庫寫入失敗時</th></tr>
+  <tr><td>✗ 先建訂單，再 Reserve</td><td>資料庫多一張沒有庫存的訂單，店員會照單做</td><td>沒事</td></tr>
+  <tr><td>✓ 先 Reserve，成功再建訂單</td><td>什麼都沒留下，回 <code>InventoryUnavailable</code></td><td>庫存被扣了但沒有訂單（少賣幾杯）</td></tr>
+</table></div>
+<p>第二種的失敗代價小（少賣不會做錯單），而且可以補救：資料庫寫入失敗時呼叫一個「釋放預留」的 RPC，或讓預留在一段時間後自動過期。這就是 saga 的補償動作（<a href="../../system-design/lessons/13-saga.html">系統設計課第 13 課</a>）。這個專題刻意不做補償，在 ADR 和回顧裡寫出來就好。完整流程：</p>
+<ol>
+  <li><strong>驗證</strong>：要登入的顧客；數量 1–20（不對回 <code>InvalidQuantity</code>）；商品存在（不存在丟 <code>BAD_USER_INPUT</code>）。起始程式已經寫好。</li>
+  <li><strong>重送檢查</strong>：<code>SELECT … FROM orders WHERE customer_id = $1 AND client_order_id = $2</code>，有就直接回那張訂單，不再扣庫存。</li>
+  <li><strong>Reserve</strong>：<code>reserveFor(ctx, `${顧客 id}:${clientOrderId}`, lines)</code>。key 加上顧客 id，兩位顧客的 App 剛好產生同一個 clientOrderId 也不會互相影響。</li>
+  <li><strong>交易裡建立訂單與品項</strong>：<code>ctx.db.transaction(async tx =&gt; …)</code>，訂單和品項一起成功或一起失敗。</li>
+</ol>
+<p><code>clientOrderId</code> 是 App 按下「下單」時產生的唯一編號（例如 <code>crypto.randomUUID()</code>）。網路斷掉、App 重試時帶同一個值，伺服器就知道「這是同一筆」。冪等要做在三層，因為重試可能來自任何一層（<a href="../../system-design/lessons/09-idempotency.html">系統設計課第 9 課</a>）：</p>
+<ul>
+  <li><strong>庫存服務</strong>：記住做過的 <code>idempotency_key</code> 與第一次的回應，同一個 key 再來時不扣，直接回第一次的回應。BFF 呼叫 Reserve 逾時，不代表庫存服務沒扣，重試時就靠這一層。</li>
+  <li><strong>BFF</strong>：第 2 步的重送檢查。</li>
+  <li><strong>資料庫</strong>：<code>UNIQUE (customer_id, client_order_id)</code>。同一個 clientOrderId 同時送兩次，兩個請求都通過第 2 步，最後一道防線是唯一約束（<a href="../../postgresql/lessons/12-constraints.html">PostgreSQL 課第 12 課</a>）：<code>INSERT … ON CONFLICT (customer_id, client_order_id) DO NOTHING RETURNING …</code>，沒插入（回傳 0 列）就查出已存在的那張。</li>
+</ul>
+<p>不能超賣靠庫存服務：Reserve 先檢查全部品項、再全部扣，中間沒有 <code>await</code>。Node 是單執行緒，一個 handler 在沒有 <code>await</code> 的區段裡不會被別的請求插隊，所以 30 個請求同時搶 10 杯拿鐵，恰好 10 個成功。換成資料庫或多個程序時要改用交易與列鎖（<a href="../../postgresql/lessons/19-concurrency.html">PostgreSQL 課第 19 課</a>）。</p>
+<div class="callout practice"><strong>💡 實務上：跨系統的寫入，先問「中途失敗會留下什麼」</strong><br>下單、付款、寄送通知這類跨兩個系統的動作，客服最常收到的回報是「扣款了但沒有訂單」或「同一筆被建立兩次」。設計時逐一列出每一步失敗後的狀態，選留下的爛攤子最小、最容易補救的順序。補償動作本身也可能失敗，所以實務上常再加一個定期對帳的排程：比對兩邊的資料，找出「庫存扣了卻沒有訂單」這類不一致，再釋放或通知人處理。PM 關心的是「使用者會不會被多扣、店員會不會做錯單」，用這個語言跟他說明取捨。</div>
+
+<h3>庫存不夠：用錯誤細節帶出是哪個商品</h3>
+<p>第 9 課說過，庫存不夠回 <code>FAILED_PRECONDITION</code>。但 App 要顯示「拿鐵只剩 2 杯」，只有狀態碼和一段訊息不夠，訊息是給人看的，程式不該去解析它。gRPC 的做法是<strong>錯誤細節（error details）</strong>：錯誤可以附帶任意個 protobuf 訊息，放在回應的 trailer（<code>grpc-status-details-bin</code>）裡。這個專案的 proto 定義了 <code>OutOfStockDetail { product_id, available }</code>，庫存服務這樣丟（起始程式已經寫好）：</p>
+<pre>throw new ConnectError(`庫存不足：…`, Code.FailedPrecondition, undefined,
+  [{ desc: OutOfStockDetailSchema, value: { productId, available } }])</pre>
+<p>呼叫端用 <code>findDetails</code> 取出（<code>@connectrpc/connect</code> 2.3.0 的 <code>ConnectError</code>：第三個參數是 metadata、第四個是要送出的細節）：</p>
+<pre>const err = ConnectError.from(e)
+const [detail] = err.findDetails(OutOfStockDetailSchema)   // 沒有這種細節時是空陣列
+if (detail) return { ok: false, outOfStock: { productId: detail.productId, available: detail.available } }</pre>
+
+<h3>deadline 預算與降級</h3>
+<p>context 裡有兩個欄位：<code>deadline</code>（收到請求時的 <code>now() + 500</code>）和 <code>now</code>（測試會換成假的時鐘）。每次呼叫庫存服務時算一次：</p>
+<pre>const timeoutMs = ctx.deadline - ctx.now() - MARGIN_MS   // 留 20 ms 給之後寫資料庫、回應
+if (timeoutMs &lt; MIN_CALL_MS) → 不呼叫，直接當成逾時
+await ctx.inventory.reserve(req, { timeoutMs })</pre>
+<p>剩不到 20 ms 還呼叫，庫存服務幾乎一定來不及，還白白占用它的資源，不如直接回 <code>TIMEOUT</code>。錯誤怎麼對應：</p>
+<div class="table-wrap"><table>
+  <tr><th>情況</th><th><code>stockFor</code>（菜單）</th><th><code>reserveFor</code>（下單）</th></tr>
+  <tr><td>成功</td><td>Map（商品 id → 剩幾份）</td><td><code>{ ok: true }</code></td></tr>
+  <tr><td><code>FAILED_PRECONDITION</code> 帶 <code>OutOfStockDetail</code></td><td>—</td><td><code>{ ok: false, outOfStock }</code> → <code>OutOfStock</code></td></tr>
+  <tr><td><code>DEADLINE_EXCEEDED</code>，或預算不夠沒呼叫</td><td>null</td><td><code>failure: 'TIMEOUT'</code></td></tr>
+  <tr><td>其他錯誤（連不上是 <code>UNAVAILABLE</code>）</td><td>null</td><td><code>failure: 'DOWN'</code></td></tr>
+</table></div>
+<p><code>stockFor</code> 回 null 時，<code>MenuItem.available</code> 的 resolver（給好的）丟 <code>INVENTORY_UNAVAILABLE</code>，因為 <code>available</code> 是可為 null 的欄位，錯誤只讓這個欄位變 null，菜單其他欄位照常回傳（<a href="03-resolvers-mutations.html">第 3 課</a>的 null 傳播）。降級時一定要 <code>ctx.logger.error(err)</code>：使用者看不出問題，監控也看不到的話，庫存服務掛一整天都沒人發現。持續失敗時應該加斷路器（<a href="../../system-design/lessons/11-circuit-breaker-bulkhead.html">系統設計課第 11 課</a>）直接跳過呼叫，這個專題不判分。</p>
+<p>schema 要加上這個結果，App 才分得出「庫存不夠」和「暫時不能下單」：</p>
+<pre>enum InventoryFailure { TIMEOUT DOWN }
+type InventoryUnavailable { reason: InventoryFailure! }
+union PlaceOrderResult = OrderPlaced | OutOfStock | InvalidQuantity | InventoryUnavailable</pre>
+<p>union 多一個成員對舊的 App 不是破壞性變更，但有風險：舊 App 的 <code>PlaceOrder</code> 沒選 <code>... on InventoryUnavailable</code>，只拿得到 <code>__typename</code>。所以 <code>app/placeOrder.graphql</code> 一開始就選了 <code>__typename</code>，不認識的結果一律顯示「暫時無法下單」。</p>
+
+<h2>契約檢查：一個指令跑完四步</h2>
+<p><code>node contracts/run.ts</code> 是 CI 在每次合併前要跑的指令，把<a href="08-protobuf-codegen.html">第 8 課</a>與<a href="10-contract-evolution-testing.html">第 10 課</a>的檢查串在一起。四步各守一條邊界：</p>
+<div class="table-wrap"><table>
+  <tr><th>步驟</th><th>守什麼</th><th>怎麼做</th></tr>
+  <tr><td><code>graphql-schema</code></td><td>所有 GraphQL 客戶端</td><td><code>findSchemaChanges(baseline, 目前)</code>（graphql 17）</td></tr>
+  <tr><td><code>buf-breaking</code></td><td>呼叫庫存服務的所有服務</td><td><code>buf breaking --against contracts/baseline/proto</code></td></tr>
+  <tr><td><code>pact-consumer</code></td><td>產生 App 的契約</td><td><code>node --test contracts/consumer.ts</code></td></tr>
+  <tr><td><code>pact-provider</code></td><td>真的伺服器滿足 App 的契約</td><td><code>node --test contracts/provider.ts</code></td></tr>
+</table></div>
+<p><strong>baseline</strong> 是線上正在被使用的版本（<code>contracts/baseline/</code>），由發布流程在部署後更新；實務上常取 main 分支或 schema registry 上的最新版本。檢查時只讀不寫。每次先用目前的 schema 重新產生 baseline，就永遠是自己跟自己比，永遠不會失敗。</p>
+<p><code>findSchemaChanges</code> 回傳每一個變更的 <code>{ type, description }</code>。<code>type</code> 屬於 <code>BreakingChangeType</code>（例如 <code>FIELD_REMOVED</code>）就失敗；其他的（例如 <code>TYPE_ADDED_TO_UNION</code> 屬於 dangerous）印出來提醒就好：</p>
+<pre>const breaking = new Set&lt;string&gt;(Object.values(BreakingChangeType))
+const changes = findSchemaChanges(buildSchema(baseline), buildSchema(current))
+const bad = changes.filter(c =&gt; breaking.has(c.type))</pre>
+<p>schema 檢查只知道「型別變了」，不知道哪個客戶端在用哪個欄位；Pact 補上這一塊。consumer 測試（App 這一方）描述「我送什麼、期待什麼形狀的回應」，用 App 真正的 <code>fetchOrderHistory</code> 打 Pact 開的 mock server，通過後寫出 pact 檔。provider 驗證（伺服器這一方）開一個<strong>真的</strong> GraphQL 伺服器，Pact 把 pact 檔裡的請求重播一次、比對回應。對著 mock 驗證永遠會通過，等於沒驗。用的 API（<code>@pact-foundation/pact</code> 17.1.4 的 V4）：</p>
+<pre>await new PactV4({ consumer: 'coffee-app', provider: 'coffee-graphql', dir })
+  .addInteraction()
+  .given('顧客 1 已登入且有訂單')                 // provider state：provider 驗證前要準備好的前提
+  .uponReceiving('App 查詢我的訂單第一頁')
+  .withRequest('POST', '/graphql', b =&gt; b.headers({ … }).jsonBody({ … }))
+  .willRespondWith(200, b =&gt; b.jsonBody({ data: { me: { id: like('1'), orders: { edges: eachLike({ … }) } } } }))
+  .executeTest(async server =&gt; { await fetchOrderHistory(server.url, 'pact-customer-1', { first: 2 }) })
+
+await new Verifier({ provider: 'coffee-graphql', providerBaseUrl: url, pactUrls: [pact 檔的絕對路徑],
+  stateHandlers: { '顧客 1 已登入且有訂單': async () =&gt; { /* 登記 session */ } } }).verifyProvider()</pre>
+<p>回應用 matcher（<code>MatchersV3</code> 的 <code>like</code>、<code>eachLike</code>、<code>integer</code>、<code>boolean</code>）描述形狀與型別，不要寫死值：provider 的資料不會跟範例一模一樣。請求 body 是 App 會送的內容，正式環境只送雜湊（<code>ORDER_HISTORY_HASH</code>），所以 provider 也要用正式模式（<code>dev: false</code>）驗證，跟上線的設定一致。</p>
+<p>結束碼是 CI 唯一看得懂的訊號：任何一步失敗都要讓 <code>node contracts/run.ts</code> 以非 0 結束（<code>process.exitCode = 1</code>），並停止後面的步驟。起始程式 catch 了錯誤卻什麼都沒做，CI 會顯示綠燈。</p>
+<div class="callout practice"><strong>💡 實務上：契約檢查擋的是「舊版 App 還在用」的欄位</strong><br>App 已經上架、使用者不一定會更新，後端刪掉一個欄位，舊版 App 就壞了，而且沒辦法馬上修好。所以檢查要在合併前擋下（通常設定成 CI 沒過就不能合併），而不是上線後才看錯誤率。真的要移除欄位時，先標 <code>@deprecated</code>、從監控確認沒有舊版在用，再刪。確定要做破壞性變更時，資深的做法是在 PR 寫清楚影響哪些客戶端、讓 reviewer 同意，而不是把那一步關掉或連 baseline 一起改掉。</div>
+
+<h2>ADR：把決定和理由寫下來</h2>
+<p>ADR（Architecture Decision Record，架構決策紀錄，<a href="../../system-design/lessons/18-design-docs-adr.html">系統設計課第 18 課</a>）是一頁短文件：當時的狀況、決定了什麼、考慮過哪些替代方案、要付出什麼代價。一年後新同事問「為什麼庫存用 gRPC」時，答案在這裡，不在某個離職同事的腦袋裡。<code>adr.md</code> 的範本有五個章節：狀態、背景、決定、替代方案、後果。寫完用這份清單自我檢查：</p>
+<ul>
+  <li>背景有具體的數字或限制（客戶端種類、500 ms 預算、團隊大小），不是「為了更好的架構」。</li>
+  <li>決定說了 App、服務之間、外部合作夥伴各用什麼，以及各自的理由。</li>
+  <li>替代方案至少兩個，每個寫出為什麼不選；沒有替代方案的決定，讀的人無法判斷你有沒有想過。</li>
+  <li>後果同時有好處與代價：要維運三套工具、學習曲線、GraphQL 的 HTTP 快取比較難、BFF 多一跳。只寫優點的 ADR 不可信。</li>
+  <li>寫出演進方式：欄位怎麼淘汰（<code>@deprecated</code>、proto 的 <code>reserved</code>）、誰更新 baseline。</li>
+</ul>
+<p>測試只檢查結構（章節、三種風格、替代方案數量、後果有沒有提到代價、400–2000 字），內容好不好要自己對照清單。參考答案在 <code>answer/12/adr.md</code>，也可以在練習 5 按「看答案」。</p>
+
+<h2>交付後的回顧：刻意的簡化與上線前還缺什麼</h2>
+<p>專題為了在一台電腦、一分鐘內跑完，做了幾個刻意的簡化。資深工程師交付時會把它們寫出來，而不是假裝沒有：</p>
+<ul>
+  <li><strong>單一程序、記憶體裡的庫存與冪等紀錄</strong>：重啟就消失、不能開多台。正式環境放資料庫（冪等紀錄設保存期限），扣庫存用交易與列鎖。</li>
+  <li><strong>沒有補償</strong>：Reserve 成功但訂單寫入失敗時，庫存不會還回去。要加釋放預留的 RPC 或預留過期。</li>
+  <li><strong>沒有斷路器</strong>：庫存服務持續掛掉時，每個請求還是會試一次。</li>
+  <li><strong>沒有 Pact Broker 與 schema registry</strong>：pact 檔與 baseline 放在 repo 裡。團隊多了以後，用 broker 管理「哪個版本的 consumer 部署在哪裡」，provider 才知道要驗證哪些契約。</li>
+  <li><strong>觀測</strong>：上線前要有跨 GraphQL 與 gRPC 的分散式追蹤，把 trace context 從 Yoga 傳到 gRPC 的 metadata（<a href="../../devops/lessons/23-tracing.html">DevOps 課第 23 課</a>），一個慢請求才查得到慢在哪一段。</li>
+</ul>
+
+<h2>練習</h2>
+<p>五題都在同一個專案裡，測試每次建立新的資料庫與伺服器。練習 4 需要練習 2 完成（provider 用正式模式驗證，要有白名單），也會用到練習 1、3 的程式。</p>
+
+<div class="local" data-test="ex1" data-files="graphql/resolvers.ts graphql/loaders.ts graphql/orders.ts">
+  <p>練習 1：GraphQL 菜單與訂單歷史。在 <code>loaders.ts</code> 寫三個 DataLoader（<code>customerById</code>、<code>productById</code>、<code>itemsByOrderId</code>，每個 batch 函式一句 SQL）；把 <code>orders.ts</code> 的 OFFSET 分頁改成 keyset（用 <code>cursor.ts</code>）；改 <code>resolvers.ts</code>：關聯欄位走 <code>ctx.loaders</code>，<code>order</code>、<code>Customer.orders</code>、<code>Product.orders</code> 都經過 <code>auth.ts</code>，<code>email</code>、<code>internalNote</code> 只給店員。測試確認：菜單 6 筆含庫存、價格來自資料庫；一位顧客的訂單逐頁走完不重複不遺漏（翻頁途中會插入新訂單）；最深的訂單歷史查詢最多 6 句 SQL；顧客從任何路徑都看不到別人的訂單、email 與備註，<code>Product.orders(first: k)</code> 拿得到自己的前 k 張（條件寫在 SQL，不是查完再濾）；資料改了，下一個請求看得到（loader 不跨請求）。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="graphql/protect.ts">
+  <p>練習 2：防護。在 <code>protect.ts</code> 回傳 <code>{ plugins, maskedErrors }</code>：深度上限 6、成本上限 1000（<code>useCostLimit</code>）、persisted operations（只有 <code>dev</code> 為 true 時允許任意查詢）、CSRF 防護、錯誤遮罩並把原錯誤交給 <code>logger.error</code>。測試確認：App 的 OrderHistory（深度 6）可以執行、深度 7 在執行前被擋（一句 SQL 都沒有）；成本剛好 1000 可以執行、1001 被擋；正式模式送查詢文字或未知雜湊被拒、送 codegen 白名單裡的雜湊成功；沒帶 CSRF 標頭的 GET 回 403；資料庫錯誤對外只顯示 <code>Unexpected error.</code> 並被記錄，<code>UNAUTHENTICATED</code> 這類刻意的錯誤保留代碼。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="inventory/server.ts graphql/inventory.ts graphql/place-order.ts graphql/schema.graphql">
+  <p>練習 3：庫存 gRPC 與下單。<code>inventory/server.ts</code> 的 Reserve 加上冪等（同一個 key 回第一次的回應、不再扣）；<code>inventory.ts</code> 的 <code>stockFor</code>、<code>reserveFor</code> 用剩餘預算當 deadline、預算不夠不呼叫、失敗時降級並記錄；<code>place-order.ts</code> 改成「重送檢查 → Reserve → 交易裡建立訂單」，Reserve 失敗回 <code>OutOfStock</code> 或 <code>InventoryUnavailable</code>；<code>schema.graphql</code> 加上 <code>InventoryFailure</code> 與 <code>InventoryUnavailable</code>。測試確認：直接對庫存服務重送同一個 key 只扣一次；30 張訂單搶最後幾杯拿鐵恰好成功那幾張、不超賣；同一個 clientOrderId（依序或同時）只建立一張訂單；兩位顧客剛好用了同一個 clientOrderId 時各扣各的庫存；品項寫入失敗時訂單跟著回滾；庫存服務不回應時在預算內回 <code>TIMEOUT</code>、<code>grpc-timeout</code> 等於預算減 20 ms、不留訂單；預算不夠時不呼叫；庫存服務掛掉時菜單照常、下單回 <code>DOWN</code>。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="contracts/run.ts contracts/consumer.ts contracts/provider.ts">
+  <p>練習 4：契約檢查。完成 <code>run.ts</code>（四個步驟，名稱照檔案開頭的說明；成功印 <code>✓ 名稱</code>、失敗印 <code>✗ 名稱</code>、停止後面的步驟並以非 0 結束）、<code>consumer.ts</code>（App 的 OrderHistory 互動，回應用 matcher）、<code>provider.ts</code>（對著真的 GraphQL 伺服器驗證，正式模式）。自己在 <code>work/12</code> 執行 <code>node contracts/run.ts</code> 看輸出。測試先確認目前的程式四步都通過、pact 檔存在且用了 matcher；再複製一份專案，分別注入三種破壞：移除 <code>Order.total</code>、proto 改欄位編號、把 <code>total</code> 改名並連 baseline 一起改，確認各自在對的步驟失敗、結束碼非 0。</p>
+</div>
+
+<div class="local" data-test="ex5" data-files="adr.md">
+  <p>練習 5：照範本寫 <code>adr.md</code>：選 GraphQL 給 App、gRPC 給庫存、REST 加 webhook 給合作夥伴的決定，考慮過的替代方案（至少兩個，列點）、取捨、後果與演進方式。測試檢查五個章節都有內容、「決定」提到三種風格、「後果」寫到代價（例如出現代價、成本、風險、維運、複雜、學習曲線其中一個詞）、全文 400 到 2000 字（不含空白與註解）。寫完用上面的清單自我檢查。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：驗收測試要求訂單歷史查詢最多 6 句 SQL，你的實作發出 25 句。最可能的原因是？</p>
+  <label data-key="a">分頁用了 keyset，比 OFFSET 多查幾句</label>
+  <label data-key="b">某個關聯欄位沒有走 DataLoader，或 batch 函式裡還是每個 id 各查一次</label>
+  <label data-key="c">成本限制設太低</label>
+  <label data-key="d">用了 persisted operations</label>
+  <p class="why">✓ 每一層關聯一句 SQL 是正常的，句數跟資料筆數成正比就代表有地方在逐筆查。印出 SQL 記錄，找只差參數、重複出現的句子。keyset 和 OFFSET 都是一句（a 錯）；成本限制與白名單在執行前判斷，不會增加 SQL（c、d 錯）。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：placeOrder 呼叫 Reserve 逾時，App 用同一個 clientOrderId 重送。正確的系統行為是？</p>
+  <label data-key="a">再扣一次庫存，因為上次逾時代表失敗</label>
+  <label data-key="b">庫存服務認得這個 key：第一次已經扣了就回第一次的結果，沒扣就正常執行；訂單也靠 (customer_id, client_order_id) 唯一約束不會重複</label>
+  <label data-key="c">拒絕重送，請使用者換一個編號</label>
+  <label data-key="d">回 DEADLINE_EXCEEDED，讓 App 自己決定</label>
+  <p class="why">✓ 逾時只代表呼叫端沒等到回應，庫存服務可能已經扣了。冪等 key 讓重試安全，資料庫的唯一約束是最後一道防線。a 會重複扣；c 讓使用者重下一張，可能變成兩張訂單；d 把問題丟給前端，前端一樣不知道到底扣了沒有。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 8：同事的契約檢查每次先用目前的 schema 產生 baseline，再拿目前的 schema 跟它比。問題是？</p>
+  <label data-key="a">比較慢</label>
+  <label data-key="b">永遠是自己跟自己比，不可能偵測到破壞性變更；baseline 要來自線上正在用的版本（main 分支或 registry）</label>
+  <label data-key="c">沒有問題，只要 Pact 有跑</label>
+  <label data-key="d">findSchemaChanges 會報錯</label>
+  <p class="why">✓ 相容性檢查的意義是跟正在被客戶端使用的版本比。Pact 只涵蓋寫了契約的客戶端與互動，其他客戶端靠 schema 檢查（c 錯）。比對兩份一樣的 schema 不會報錯，只會回傳空陣列（d 錯），這正是問題所在。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>先寫完全部程式才跑驗收測試</strong>：一次冒出十幾個失敗，分不出哪裡壞。照建議的順序，每完成一塊就跑。</li>
+  <li><strong>為了 SQL 句數寫一個 JOIN 所有關聯的大查詢</strong>：客戶端沒選的欄位也被查出來，查詢越長越難維護。DataLoader 只查被選到的那一層。</li>
+  <li><strong>授權只做在入口或只做在 Customer.orders</strong>：<code>Product.orders</code> 也拿得到訂單。每條路徑都要經過同一套規則。</li>
+  <li><strong>冪等只做在 GraphQL 層</strong>：BFF 呼叫 Reserve 逾時後重試，GraphQL 層看不到資料庫有訂單，只能靠庫存服務認得 key。重試可能來自任何一層。</li>
+  <li><strong>先建訂單再預留庫存</strong>：庫存服務掛掉時留下一張沒有庫存的訂單。先 Reserve，成功才寫資料庫。</li>
+  <li><strong>deadline 寫死</strong>：<code>timeoutMs: 1000</code> 不管請求已經用掉多少時間，整條路徑就超過 500 ms 的預算。每次從 <code>ctx.deadline − ctx.now()</code> 算。</li>
+  <li><strong>降級時不記錄</strong>：菜單照常顯示，但庫存服務掛了一整天沒人知道。</li>
+  <li><strong>契約檢查失敗仍以 0 結束</strong>：CI 只看結束碼。catch 之後要設 <code>process.exitCode</code>。</li>
+  <li><strong>provider 驗證對著 mock</strong>：mock 就是照 pact 檔寫的，永遠會通過。要開真的伺服器。</li>
+  <li><strong>ADR 只寫優點</strong>：讀的人無法判斷代價能不能接受，之後條件改變時也不知道該不該重新決定。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>非功能需求要寫成數字（SQL 句數、深度、成本、延遲預算），才能設計、才能驗收。</li>
+  <li>GraphQL 的 SQL 句數跟查詢的層數有關、跟資料筆數無關：關聯一律走每個請求一份的 DataLoader。</li>
+  <li>授權放在每條路徑都會經過的地方；列表濾掉、單一物件報錯、個資欄位回 null。</li>
+  <li>上線的 GraphQL 要有深度與成本限制、只接受白名單、遮罩非預期錯誤並記錄。</li>
+  <li>跨系統的寫入，順序決定失敗時留下什麼：先預留、再寫入；冪等做在每一層，資料庫唯一約束是最後一道防線。</li>
+  <li>每次呼叫下游都用剩餘預算當 deadline；非必要的下游失敗時降級並記錄。</li>
+  <li>契約檢查跟線上版本比：GraphQL schema、proto、Pact 各守一條邊界，失敗要讓 CI 看得到（非 0 結束）。</li>
+  <li>ADR 寫下背景、決定、替代方案與代價，讓之後的人知道為什麼、何時該重新決定。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段與整門課一定要講得出來的 8 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 9：App 與店員後台都改查新欄位 <code>Order.totalTwd</code>，舊的 <code>Order.total</code> 已經加上 <code>@deprecated(reason: "改用 totalTwd")</code>。什麼時候可以把 <code>total</code> 從 schema 刪掉？</p>
+  <label data-key="a">App 與後台的新版都部署上線、程式裡不再查 <code>total</code> 之後</label>
+  <label data-key="b">標記滿一段固定期限（例如 90 天），並在 changelog 預告過之後</label>
+  <label data-key="c">欄位使用量歸零（registry 或 resolver 指標），舊版 App 也不再查之後</label>
+  <p class="why">✓ 刪欄位是破壞性變更，還在查它的客戶端整個查詢會在驗證階段失敗。新版上架不代表舊版消失，使用者手機上的舊 App 可能好幾個月才更新，所以用使用量決定，不用日期猜。a 錯在只看到自己部署得了的程式，商店裡的舊版 App 照樣會送出查 <code>total</code> 的查詢。（第 10 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 10：一個 PR 改了 <code>schema.graphql</code>，<code>contracts/run.ts</code> 的 <code>graphql-schema</code> 步驟用 <code>findSchemaChanges</code> 跟 baseline 比對。下面哪一個改動應該讓這一步失敗？</p>
+  <label data-key="a"><code>PlaceOrderInput</code> 多一個必填欄位 <code>storeId: ID!</code></label>
+  <label data-key="b"><code>PlaceOrderResult</code> 這個 union 多一個成員 <code>Maintenance</code></label>
+  <label data-key="c"><code>Order</code> 新增一個欄位 <code>itemCount: Int!</code></label>
+  <label data-key="d"><code>InventoryFailure</code> 這個 enum 多一個值 <code>MAINTENANCE</code></label>
+  <p class="why">✓ 輸入多一個必填欄位是 breaking：舊 App 的 <code>PlaceOrder</code> 沒帶 <code>storeId</code>，請求直接被拒。union 與 enum 多一個成員是 dangerous，CI 提醒、通知前端就好；新增輸出欄位是 safe。b 最多人選，但它不會讓舊查詢失敗，App 有選 <code>__typename</code>，不認識的結果一律顯示「暫時無法下單」；把它擋下，團隊只會想辦法繞過檢查。（第 10、12 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 11：官網要做自己的 BFF，App 的 BFF 就是這個專題的 GraphQL 伺服器。新規則「會員第二杯半價」該寫在哪裡？</p>
+  <label data-key="a">兩個 BFF 各寫一份，各自配合自己畫面的需求</label>
+  <label data-key="b">API gateway：所有請求都會經過它，寫一次就好</label>
+  <label data-key="c">前端結帳時先算好折扣後的金額，再送給伺服器</label>
+  <label data-key="d">擁有價格與訂單資料的服務，兩個 BFF 都呼叫它</label>
+  <p class="why">✓ 價格是商業規則，放在擁有資料的服務，每個前端算出來才會一樣；BFF 只做組合與轉換，gateway 只做 TLS、路由、認證、限流這類橫切的事。a 最常見，兩份實作遲早算出不同的價錢。c 的金額任何人都能改掉再送出。（第 11 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 12：同事覺得「庫存一定有數字」，把 <code>MenuItem.available</code> 從 <code>Int</code> 改成 <code>Int!</code>，schema 檢查也放行了。之後庫存服務掛掉，<code>available</code> 的 resolver 丟出 <code>INVENTORY_UNAVAILABLE</code>，App 會收到什麼？</p>
+<pre>type Query { menuWithStock: [MenuItem!]! }
+type MenuItem { product: Product!  available: Int! }</pre>
+  <label data-key="a">每個商品的 <code>available</code> 是 null，其他欄位照常，errors 標出路徑</label>
+  <label data-key="b"><code>data</code> 整個是 null，菜單也顯示不出來，errors 標出路徑</label>
+  <label data-key="c">列表只剩查得到庫存的商品，其他商品被略過</label>
+  <label data-key="d"><code>available</code> 被補成 0，errors 附上 <code>INVENTORY_UNAVAILABLE</code></label>
+  <p class="why">✓ 非空欄位放不進 null，只能讓父物件變 null；<code>MenuItem</code> 在 <code>[MenuItem!]!</code> 裡也不能是 null，一路傳到根，降級變成整個失敗。附加資料的欄位要宣告成可為 null。a 是 <code>Int</code> 才有的結果；輸出欄位變非空對舊客戶端是 safe，所以 schema 檢查擋不住這個錯。（第 3、11 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 13：<code>placeOrder</code> 要呼叫庫存服務的 <code>Reserve</code>，也要在資料庫建立訂單，兩邊沒有共用的交易。哪個寫法中途失敗時留下的問題最小？</p>
+  <label data-key="a">先在交易裡建立訂單，再呼叫 <code>Reserve</code>；失敗就回錯誤讓 App 重試</label>
+  <label data-key="b">用 <code>Promise.all</code> 同時送 <code>Reserve</code> 與建立訂單，兩個都成功才回成功</label>
+  <label data-key="c">先 <code>Reserve</code>，成功才在交易裡建立訂單；寫入失敗時釋放預留或讓它過期</label>
+  <p class="why">✓ 順序決定失敗時留下什麼。先 Reserve：庫存服務掛掉時什麼都沒留下；資料庫寫入失敗時只是庫存被扣、少賣幾杯，可以用釋放預留的補償動作或預留過期補救。a 最多人選，但庫存服務掛掉時資料庫已經多一張沒有庫存的訂單，店員會照單做。（第 12 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 14：「我的訂單」要在每張訂單旁顯示總杯數，同事在 <code>resolvers.ts</code> 加了 <code>Order.itemCount</code>。哪裡會出事？</p>
+<pre>Order: {
+  itemCount: async (order, _args, ctx) =&gt; {
+    const { rows } = await ctx.db.query(
+      'SELECT quantity FROM order_items WHERE order_id = $1', [order.id])
+    return rows.reduce((sum, r) =&gt; sum + r.quantity, 0)
+  },
+},</pre>
+  <label data-key="a">每張訂單各發一句 SQL，一頁 20 張就多 20 句，句數跟著筆數長</label>
+  <label data-key="b">GraphQL 會把同一層的查詢合併成一句，但 <code>order_id</code> 少了索引會很慢</label>
+  <label data-key="c">沒有經過 <code>auth.ts</code>，顧客可以查到別人訂單的杯數</label>
+  <label data-key="d">結果被 DataLoader 快取，品項改了之後下一個請求還是舊的杯數</label>
+  <p class="why">✓ GraphQL 對每張訂單各呼叫一次 resolver，不會幫你合併，這就是搬到伺服器上的 N+1。改成 <code>ctx.loaders.itemsByOrderId.load(order.id)</code> 再加總：同一層合成一句，跟 <code>items</code> 一起查時還會命中快取、不多發 SQL。b 就是「GraphQL 解決了 N+1」的誤解。（第 4、12 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 15：下單的預算是 500 ms，呼叫庫存服務要保留 20 ms 給寫資料庫與回應。這次資料庫很慢，驗證與重送檢查就用掉 490 ms，接下來的 Reserve 該怎麼處理？</p>
+  <label data-key="a">照公式把 <code>timeoutMs: -10</code> 傳給 Connect，讓它立刻判定逾時</label>
+  <label data-key="b">改用固定的 <code>timeoutMs: 500</code> 呼叫，讓這次下單有機會完成</label>
+  <label data-key="c">不帶 <code>timeoutMs</code> 呼叫，交給 App 那一端的逾時去中斷</label>
+  <label data-key="d">不呼叫庫存服務，直接回 <code>InventoryUnavailable</code>（<code>TIMEOUT</code>）</label>
+  <p class="why">✓ deadline 是整條呼叫鏈的剩餘預算，算出來不夠就不呼叫：App 快要放棄了，這時才去扣庫存，只是白占庫存服務的資源。a 最多人選，但 Connect 的 <code>timeoutMs</code> 小於等於 0 代表不設逾時，結果跟 c 一樣，庫存服務會一直做下去。b 讓整個請求超過 500 ms，App 早就放棄了，伺服器還在扣庫存。（第 9、11、12 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 16：同事整理 <code>inventory.proto</code>，把 <code>StockLevel</code> 的 <code>int32 available = 2;</code> 改成 <code>= 3</code>。庫存服務先部署了，BFF 還是舊版、用二進位格式呼叫。菜單會怎樣？</p>
+  <label data-key="a">欄位名稱沒變，舊 BFF 照樣讀到正確的庫存數字</label>
+  <label data-key="b">舊 BFF 收不到編號 2，<code>available</code> 是預設值 0，每樣都顯示賣完</label>
+  <label data-key="c">舊 BFF 遇到不認得的編號 3 就解碼失敗，菜單的庫存變 null</label>
+  <label data-key="d">舊 BFF 把編號 3 對到別的欄位，庫存讀成另一個欄位的值</label>
+  <p class="why">✓ 二進位裡只有編號、沒有名稱，改編號等於刪掉舊欄位再新增一個。舊 BFF 跳過不認得的編號 3，編號 2 沒送，proto3 就給預設值 0：不報錯、不降級，看起來像全部賣完。c 錯在不認得的編號會被跳過、不會丟錯，所以這種改動只能靠 CI 的 <code>buf breaking</code> 在合併前擋下。（第 8、10 課）</p>
+</div>
+<p>這個階段的重點整理成<a href="../sheets/stage-5.html">一頁圖解</a>。</p>
+<p>接下來可以學什麼：把這個專題接上 DevOps 課的容器、CI 與分散式追蹤，實際部署並觀察跨 GraphQL 與 gRPC 的請求；讀 GraphQL federation（Hive Gateway）與 Pact Broker 的文件，了解團隊變多以後契約怎麼管理；或回到系統設計課的期末專題，用這門課的 API 設計整個咖啡店的系統。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

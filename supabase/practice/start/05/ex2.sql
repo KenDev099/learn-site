@@ -1,0 +1,4 @@
+-- 練習 2：店長（app_metadata 的 role 是 'manager'）看得到所有分店的訂單。
+-- 測試已經開好 orders 的 RLS、grant select 給 authenticated，目前沒有任何 policy（一般顧客、店員什麼都看不到）。
+-- 角色由後台用 secret key 的 admin API 寫進使用者的 app_metadata，登入後會出現在 JWT 裡。
+-- 只要寫一個 policy；表名寫 public.orders

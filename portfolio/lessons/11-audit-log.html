@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>11. 稽核紀錄</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="11" data-practice="nestjs" data-task="pf11">
+<header>
+  <div class="eyebrow">階段 B2：平台功能 · 第 11 課</div>
+  <h1>稽核紀錄</h1>
+</header>
+<main>
+
+<p>你的 SaaS 上線一個月，客戶的管理員寫信來：「我們有一個 project 不見了，是誰刪的？什麼時候？」你打開伺服器的 log，裡面有幾十萬行，沒有租戶欄位，而且保留 7 天的那份已經被輪替掉了。就算找到了，也只能截圖貼給客戶，客戶自己查不到。</p>
+<p>這一課就是要讓這封信有答案，而且下一次客戶不用寫信，自己打開後台就查得到。做法是在你的 SaaS 加上 <code>audit</code> 模組，存一份稽核紀錄（audit log）：每一列回答「誰、在什麼時候、對什麼、做了什麼」。整課都圍繞這個「誰刪了 project」的問題推進。B2 階段之後的每個功能（檔案、匯出、方案）都會寫稽核，所以它排在 B2 的第一課。</p>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="09-rls-defense-in-depth.html">第 9 課</a>的 <code>TenantDb.tx()</code>：開一個互動式交易，裡面的每個操作用同一條連線、一起 commit 或一起回滾；開頭用 <code>set_config</code> 設好租戶與使用者。也會用到那課的兩個資料庫角色：migration 用擁有者，API 執行時用受 RLS 限制的 <code>pf_app</code>。</li>
+  <li><a href="10-members-invitations-rbac.html">第 10 課</a>的 <code>@Permissions()</code>：在 controller 方法上宣告需要的權限，權限矩陣決定哪些角色有，沒宣告就拒絕。</li>
+  <li><a href="06-plan-the-saas.html">第 6 課</a>的 <code>x-request-id</code> 與 <code>RequestContext</code>：每個請求一個 id，存在 AsyncLocalStorage 裡；<a href="08-tenant-isolation-prisma.html">第 8 課</a>再把 tenantId、userId 放進同一個 store，同一個請求裡任何地方都讀得到。</li>
+  <li><a href="08-tenant-isolation-prisma.html">第 8 課</a>的游標分頁：用上一頁最後一筆的 <code>(createdAt, id)</code> 當下一頁的起點。</li>
+</ul></div>
+
+<div class="callout">程式寫在你自己的 SaaS repo。判分時先啟動你的 API，在 learn 資料夾執行 <code>node check.mjs nestjs pf11</code>。練習 4 會用 <code>work/portfolio.json</code> 的 <code>saas.appDatabaseUrl</code> 直連你的資料庫，只查權限、不寫資料。</div>
+
+<p>這課的路線：</p>
+<ul>
+  <li>log 為什麼回答不了客戶的問題，稽核的一筆要存哪些欄位、哪些絕對不能存（第 1–2 節）。</li>
+  <li>什麼時候寫才不會跟業務對不上：同一個交易；以及由誰負責呼叫：service、Prisma extension 還是 trigger（第 3–4 節）。</li>
+  <li>寫進去之後怎麼保證沒人改得掉：在資料庫收回 UPDATE、DELETE（第 5 節）。</li>
+  <li>客戶的管理員怎麼自己查、資料要存多久，最後套到你的業務模組（第 6–7 節）。</li>
+</ul>
+
+<h2>為什麼伺服器的 log 回答不了「誰刪的」？</h2>
+<p>先看開場那份 log 為什麼派不上用場。伺服器的 log 是寫給工程師除錯用的：哪個請求進來、花了多久、丟了什麼錯。它的設計目標是「出事時工程師查得到細節」，所以有幾個特性，剛好跟客戶的需求相反。</p>
+<p>第一，log 會被刪。log 寫得很快、量很大，為了不塞爆磁碟，會定期把舊的檔案切掉、只留最近幾天，這叫輪替（rotation）。客戶一個月後才發現 project 不見，那天的 log 早就沒了。第二，log 的格式隨時會改：哪天有人調整了 log 的欄位，沒有人會覺得這是破壞相容。第三，log 沒有租戶隔離：一行 log 裡混著所有租戶的請求，就算加上 tenantId，你也不可能把整份 log 開給客戶查。所以就算找到那一行，你也只能截圖貼給客戶。</p>
+<p>稽核紀錄是另一種東西：它是<strong>產品功能</strong>，不是除錯工具。它存在資料庫的一張表裡，有固定的欄位與 action 名稱（寫在契約裡，不能隨便改），依租戶隔離，有權限控管（誰能看），有明確的保存期限，客戶的管理員可以自己在後台查。它只記「已經成功的、有業務意義的事」，例如「某人刪除了某個 project」，不記請求花了幾毫秒。</p>
+<p>兩者不是二選一，而是分工，靠 <code>requestId</code> 串起來。客戶在稽核裡看到「12:03 某人刪除 project」，回報說「我們沒有人按刪除」；你拿那一筆的 requestId 去 log 查，就找得到同一個請求的所有細節：從哪個 IP 來、帶的是哪個 token、經過哪些步驟（log 怎麼查是第 16 課）。前提是那天的 log 還在；就算不在了，稽核那一筆仍然回答了「誰、什麼時候」。</p>
+<p>所以要回答客戶，需要一張專門的表。下一個問題是：這張表的每一列要存什麼？</p>
+
+<h2>一筆稽核紀錄要存哪些欄位，哪些絕對不能存？</h2>
+<p>從客戶的問題倒推：「誰刪的、什麼時候」需要做事的人與時間，「刪了什麼」需要動作與被操作的東西，再加上隔離用的租戶，以及串到 log 的 requestId。每一列代表一件<strong>已經成功</strong>的事。契約（<a href="../CONTRACT-saas.md">SaaS 契約</a>的「稽核 action」）規定了欄位與 action 名稱：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>欄位</th><th>存什麼</th><th>回答哪個問題</th></tr></thead>
+  <tbody>
+    <tr><td><code>tenantId</code></td><td>哪個租戶</td><td>隔離用，API 不回傳</td></tr>
+    <tr><td><code>actorId</code></td><td>做這件事的使用者 id</td><td>誰</td></tr>
+    <tr><td><code>action</code></td><td><code>&lt;資源&gt;.&lt;動作&gt;</code>，例如 <code>project.deleted</code>、<code>member.role_changed</code></td><td>做了什麼</td></tr>
+    <tr><td><code>targetType</code>、<code>targetId</code></td><td>被操作的東西，例如 <code>project</code> 與它的 id</td><td>對什麼</td></tr>
+    <tr><td><code>requestId</code></td><td>那次請求的 <code>x-request-id</code></td><td>從哪個請求來：拿它去 log 查細節（第 16 課）</td></tr>
+    <tr><td><code>createdAt</code></td><td>寫入時間</td><td>什麼時候</td></tr>
+  </tbody>
+</table></div>
+<p>開場那封信，有了這張表就是一列：<code>action = 'project.deleted'</code>、<code>targetId</code> 是那個 project 的 id、<code>actorId</code> 是按下刪除的人、<code>createdAt</code> 是時間。客戶要的答案全在裡面，而且這一列會一直留到保存期限。</p>
+<p>不記的東西跟記的東西一樣重要：<strong>密碼、token、個資的值</strong>都不能進稽核。原因在稽核的三個特性：它保存得比業務資料還久、會被客戶的管理員讀、會被匯出成檔案帶走。裡面只要有一個密碼雜湊或 refresh token，就多了一個外洩的地方，而且這個地方存得最久、看得到的人最多（<a href="../../auth/lessons/23-secrets-encryption.html">auth 課第 23 課</a>）。</p>
+<p>所以稽核只記 id。<code>member.role_changed</code> 記被改的那個人的 userId，不記他的 email；後台要顯示名字時，查的時候再用 userId JOIN 使用者表。這樣那個人改了 email 或刪了帳號，稽核裡也不會留著他的個資。同樣的道理，要記「改了什麼」時只記欄位名稱（<code>["name", "archived"]</code>），不記舊值與新值：舊值本身可能就是個資。</p>
+<p>action 的名稱是契約的一部分，客戶會拿它篩選、寫進自己的流程，拼錯一個字就等於少記一種操作。參考實作把所有 action 寫成一個 TypeScript 型別，拼錯就編譯不過：</p>
+<pre>// src/audit/audit.service.ts
+export type AuditAction =
+  | 'project.created' | 'project.updated' | 'project.deleted'
+  | 'member.role_changed' | 'member.removed'
+  | 'invitation.created' | 'invitation.revoked' | 'invitation.accepted'
+  | 'file.uploaded' | 'file.deleted' | 'export.requested' | 'billing.plan_changed'
+  | …                                        // tag.*：示範用的第二個業務模組</pre>
+<p>欄位定好了，但表格上面那句「每一列代表一件已經成功的事」還沒有保證。刪除失敗了卻留下 <code>project.deleted</code>，或刪除成功了卻沒有紀錄，客戶拿到的答案都是錯的。下一節處理「什麼時候寫」。</p>
+
+<h2>稽核什麼時候寫，才不會跟業務對不上？</h2>
+<p>「什麼時候寫」是這一課最容易做錯的地方。先看一個看起來很合理的寫法：先記稽核，再做事，兩者各自開一個交易：</p>
+<pre>// 錯誤：稽核在自己的交易裡先 commit 了
+await this.db.tx(tx =&gt; this.audit.record(tx, 'project.updated', 'project', id))
+return this.db.tx(async tx =&gt; { … if (!count) throw notFound() … })</pre>
+<p>PATCH 一個不存在的 id：第一個交易已經 commit，稽核裡多了一筆 <code>project.updated</code>；第二個交易找不到資料，客戶收到 404。稽核說「改了」，實際上什麼都沒改。</p>
+<p>那反過來，先做事、交易 commit 之後再記呢？大部分時候沒問題，但 commit 和記稽核之間只要程序掛掉（部署重啟、記憶體不足被系統砍掉），或記稽核那一步丟錯，資料已經刪了，稽核卻沒有這一筆。偏偏這種「少一筆」最難發現：沒有錯誤畫面、沒有人抱怨，直到客戶來問「誰刪的」，你才發現答不出來。</p>
+<p>兩種寫法的毛病一樣：業務與稽核是兩次獨立的寫入，中間任何一步失敗，兩邊就對不上。所以規則只有一條：<strong>業務改了、稽核沒寫，或稽核寫了、業務沒改，兩種都不能發生</strong>。資料庫剛好提供這個保證：把兩次寫入放進同一個交易，它們就一起 commit 或一起回滾，不會只成功一半。這就是第 9 課 <code>TenantDb.tx()</code> 給你的東西。</p>
+<p>規則有了，接下來要讓它「不可能被寫錯」。參考實作的 <code>AuditService.record()</code> 第一個參數只收交易物件 <code>tx</code>，不收一般的 client：手上沒有 <code>tx</code> 就呼叫不了，也就不可能在交易外面記稽核。誰做的、哪個請求，從 <code>RequestContext</code> 拿，呼叫的人只要給 action 與目標：</p>
+<pre>// src/audit/audit.service.ts
+@Injectable()
+export class AuditService {
+  constructor(private readonly ctx: RequestContext) {}
+
+  async record(tx: Tx, action: AuditAction, targetType: string, targetId: string) {
+    await tx.auditLog.create({
+      data: { tenantId: this.ctx.tenantId!, actorId: this.ctx.userId!, action, targetType, targetId, requestId: this.ctx.requestId },
+    })
+  }
+}
+
+@Global()
+@Module({ providers: [AuditService], exports: [AuditService] })
+export class AuditCoreModule {}</pre>
+<p><code>AuditCoreModule</code> 標成 <code>@Global()</code>，是因為每個業務模組都要寫稽核，這樣不用在每個模組各 import 一次；模組怎麼拆見課末「補充與查表」。業務的 service 這樣用，<code>record</code> 放在交易的最後一步：</p>
+<pre>// src/projects/projects.service.ts
+async update(id: string, dto: UpdateProjectDto) {
+  return this.db.tx(async tx =&gt; {
+    const { count } = await tx.project.updateMany({ where: { id }, data: { … } })
+    if (!count) throw notFound()              // 不存在或別的租戶的：丟錯，整個交易回滾
+    await this.audit.record(tx, 'project.updated', 'project', id)   // 最後一步：前面都成功才寫
+    return projectView(await tx.project.findUniqueOrThrow({ where: { id } }))
+  })
+}</pre>
+<p>放在最後一步，是讓「前面都成功才寫」在讀程式時一眼看得出來。真正的保證還是交易：就算 <code>record</code> 之後的那行出錯，稽核也會跟著回滾。用這個寫法再看一次失敗的請求，三種情況都不會留下紀錄：</p>
+<ul>
+  <li><strong>400 驗證失敗、403 沒有權限</strong>：ValidationPipe 與 AccessGuard 在 controller 之前就擋下，service 根本沒執行。</li>
+  <li><strong>404、409 這類業務錯誤</strong>：在交易裡丟錯，稽核還沒寫；就算寫了也一起回滾。</li>
+  <li><strong>commit 失敗</strong>（死結、連線斷了）：兩者一起消失，客戶收到 500，稽核也沒有這件事，這是對的。</li>
+</ul>
+<p>練習 3 測的就是這張清單：送一堆會失敗的請求，之後稽核裡不能有任何 <code>project.*</code>。</p>
+<div class="callout warn"><code>record()</code> 一定要用 <code>db.tx()</code> 給的 <code>tx</code>。第 9 課講過，<code>db.client</code>（每個操作各自包一個交易的那個 client）不能拿來開互動式交易：在它的 <code>$transaction(async tx =&gt; …)</code> 裡，每個操作仍會各自開交易、各拿一條連線，回滾不了。</div>
+
+<div class="callout practice"><strong>💡 實務上：稽核是業務需求，不是除錯工具</strong><br>B2B 的客戶在採購時常會問「有沒有稽核紀錄、保存多久、能不能匯出」。很多客戶也會要求供應商提供 SOC 2 報告：那是第三方會計師依一套標準檢查公司資安控管後出的報告，裡面同樣會問稽核紀錄。所以 PM 會關心 action 的命名（客戶看得懂嗎），資安會關心裡面有沒有個資。寫新功能時把「這個操作要不要記、action 叫什麼」放進需求清單；code review 時看到改資料的 service 方法沒有 <code>audit.record</code> 就留言：這正是開場那封信答不出來的原因。</div>
+<p>寫的時機解決了。但這個寫法要求每個改資料的 service 方法都記得呼叫 <code>record</code>，下一節看能不能讓它自動發生。</p>
+
+<h2>誰負責呼叫 <code>record</code>：service、Prisma extension 還是 trigger？</h2>
+<p>上一節的寫法靠人記得：新增一個刪除端點卻忘了 <code>record</code>，那種刪除就永遠查不到是誰做的。能不能讓稽核自動發生？有兩個自動的位置可以考慮。</p>
+<p>一個是 Prisma extension：第 8 課用 <code>$extends</code> 攔下每個查詢、自動加上 <code>tenantId</code> 條件，同樣的機制也能在每個 create、update、delete 之後自動寫一筆稽核。另一個是 PostgreSQL 的 trigger（<a href="../../postgresql/lessons/23-views-functions-triggers.html">PostgreSQL 課第 23 課</a>）：掛在資料表上、資料一變動就由資料庫自動執行的函式，連應用程式以外的寫入都攔得到。三種位置各有代價：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>做法</th><th>優點</th><th>代價</th></tr></thead>
+  <tbody>
+    <tr><td>service 明確呼叫 <code>audit.record(tx, …)</code>（參考實作）</td><td>action 是業務語言（<code>invitation.accepted</code>，不是「invitations 表 UPDATE」）；看程式就知道記了什麼</td><td>新功能可能忘了寫，要靠 code review 與練習 1 這類測試</td></tr>
+    <tr><td>Prisma extension 在每個 create／update／delete 後自動記</td><td>不會忘</td><td>只知道「哪張表、哪個操作」，不知道業務意思；<code>$queryRaw</code> 與 <code>updateMany</code> 拿不到每一列的 id；一個業務動作會變成好幾筆</td></tr>
+    <tr><td>PostgreSQL trigger</td><td>連手動 SQL、別的服務寫的資料都記得到</td><td>拿不到 actor 與 requestId，除非應用程式先 <code>set_config</code>；邏輯分散在 migration 裡</td></tr>
+  </tbody>
+</table></div>
+<p>表中「業務意思」的差別，拿接受邀請來看最清楚。這一個動作至少會改邀請的狀態、新增一筆成員。extension 與 trigger 看到的是兩張表各一次寫入，記成「邀請表 UPDATE」「成員表 INSERT」這樣的好幾筆；客戶要的是一筆 <code>invitation.accepted</code>，actor 是新成員。這層翻譯只有 service 做得到，因為只有它知道這幾次寫入合起來是什麼意思。</p>
+<p>trigger 拿不到 actor 的問題，你在第 9 課其實已經鋪好了解法：<code>TenantDb</code> 每個交易開頭除了 <code>app.tenant_id</code>，也設了 <code>app.user_id</code>（<code>src/prisma/tenant-db.ts</code> 的 <code>setContext</code>）。trigger 裡讀 <code>current_setting('app.user_id', true)</code> 就是這次操作的人。所以 trigger 不是做不到，而是它記到的是「資料表變了」，不是「使用者做了什麼」。</p>
+<p>作品選 service 明確呼叫：要的是客戶看得懂的紀錄，「忘了寫」這個代價用練習 1 這類測試與 code review 來補。現在稽核會在對的時機、用業務語言寫進去了；但寫進去之後，誰能把它改掉或刪掉？</p>
+
+<h2>寫進去的紀錄，怎麼保證沒人改得掉？</h2>
+<p>稽核寫進去了，還要確定沒有人改得掉，包括你自己的程式。一個條件寫錯的 <code>deleteMany</code>、一段被 SQL injection 的查詢，都可能把紀錄刪掉。更麻煩的是：會想刪稽核的人，通常就是做了壞事的那個人。如果開場那個刪 project 的人也能刪掉 <code>project.deleted</code> 那一筆，稽核就失去意義。</p>
+<p>「程式裡不寫刪除稽核的程式碼」擋不住這些情況：bug 與 injection 本來就不照你的約定走。規則要放在比程式更底層的地方，也就是資料庫的權限。PostgreSQL 的每個角色，對每張表有哪些操作可以做，是用 <code>GRANT</code>（給權限）與 <code>REVOKE</code>（收回權限）決定的；沒有權限的操作，不管 SQL 從哪裡來，資料庫都直接拒絕。所以做法是：應用程式執行時用的角色（第 9 課的 <code>pf_app</code>；練習題裡寫成 <code>app_user</code> 的，指的也是這個角色）對稽核表只有 SELECT 與 INSERT，能讀、能新增，不能改、不能刪。這叫「只能追加」（append-only）。</p>
+<p>參考實作寫在 migration 最後的手寫段落：</p>
+<pre>-- prisma/migrations/20261119000000_init/migration.sql（手寫段落）
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO pf_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO pf_app;
+-- 稽核紀錄只能追加
+REVOKE UPDATE, DELETE ON "audit_logs" FROM pf_app;</pre>
+<p>第一行把四種權限給到目前所有的表。第二行讓之後由同一個角色建立的新表，也自動給 <code>pf_app</code> 這四種權限，不用每加一張表就補一次 GRANT。第三行才是重點：只對 <code>audit_logs</code> 收回 UPDATE 與 DELETE。</p>
+<p>順序不能反。權限是依序套用的，先 REVOKE、再寫 <code>GRANT … ON ALL TABLES</code>，後面那行會把稽核表的 UPDATE、DELETE 加回去。同樣的事也會發生在以後：哪天另一個 migration 又寫了 <code>GRANT … ON ALL TABLES</code>，稽核表的權限也會一起被給回去，所以那個 migration 結尾要再 REVOKE 一次。</p>
+<p>另外，四種權限是一個一個列出來的，沒有用 <code>GRANT ALL</code>。<code>GRANT ALL</code> 除了這四種，還會一起給 <code>TRUNCATE</code>（以及 <code>REFERENCES</code>、<code>TRIGGER</code> 等這課用不到的權限）。<code>TRUNCATE</code> 是一次清空整張表，不用逐列刪除。上面的 REVOKE 只收回 UPDATE、DELETE，如果一開始用了 <code>GRANT ALL</code>，<code>pf_app</code> 仍然可以一句話清空整張稽核表。只列四種，<code>TRUNCATE</code> 從一開始就沒給。</p>
+<p>寫好之後要驗證，不要只相信 migration 跑過了。用 app 角色連上資料庫，直接問 PostgreSQL 這個角色有沒有權限（練習 4 的測試就是這樣查）：</p>
+<pre>SELECT has_table_privilege('audit_logs', 'INSERT'),          -- t
+       has_any_column_privilege('audit_logs', 'UPDATE'),     -- f（連單一欄位都不能改）
+       has_table_privilege('audit_logs', 'DELETE');          -- f</pre>
+<p>這個保護還有一個前提：<strong>API 真的用 app 角色連線</strong>。superuser 跳過所有權限檢查；表的擁有者天生擁有自己表上的全部權限，對 <code>pf_app</code> 做的 REVOKE 管不到它。如果 <code>PrismaService</code> 用的是擁有者的 <code>DATABASE_URL</code>，權限收得再乾淨也沒用。怎麼確認？PostgreSQL 有一個系統視圖 <code>pg_stat_activity</code>，列出目前每一條連線與它用的角色（第 9 課用過）。練習 4 第二個測試會先打一次 API 讓它建立連線，再查這個視圖：連著你的資料庫的，只能是 appDatabaseUrl 的那個角色。</p>
+<div class="callout">擁有者還是刪得掉，這是故意的：保存期限到了要清舊資料，是一個用擁有者身分跑的排程（或直接丟掉整個分割，見練習 7），不是 API。這樣「誰能刪稽核」就縮小成「誰拿得到擁有者的密碼」，那是基礎設施的權限管理（<a href="../../devops/lessons/11-config-secrets.html">devops 課第 11 課</a>）。</div>
+<p>資料現在寫得對、改不掉。接下來回到開場：客戶不想寫信問你，想自己查。</p>
+
+<h2>客戶的管理員怎麼自己查？</h2>
+<p>契約是 <code>GET /api/v1/audit-logs?action=&amp;cursor=</code>：新的在前，可以用 action 篩選，admin 以上可讀。客戶的管理員打開後台的「稽核紀錄」頁，篩選 <code>project.deleted</code>，就看到開場那封信的答案。</p>
+<p>稽核只會一直變多，一個租戶一年可能有幾萬筆，所以一定要分頁。這裡沿用<a href="08-tenant-isolation-prisma.html">第 8 課</a>的游標分頁：游標是上一頁最後一筆的 <code>(createdAt, id)</code>，下一頁從它之後接著拿。共用的三個函式是 <code>decodeCursor()</code>（把客戶傳來的游標字串解回 <code>(createdAt, id)</code>）、<code>after()</code>（產生「在這筆之後」的 where 條件）與 <code>page()</code>（組出回應與下一頁的游標）。查詢時多拿一筆（<code>take: limit + 1</code>），是為了知道還有沒有下一頁：拿到 limit + 1 筆就代表還有。參考實作整個 controller：</p>
+<pre>// src/audit/audit.controller.ts
+export class AuditQuery {
+  @IsOptional() @Matches(/^[a-z_]+\.[a-z_]+$/) action?: string
+  @IsOptional() @IsString() cursor?: string
+  @IsOptional() @Type(() =&gt; Number) @IsInt() @Min(1) @Max(100) limit?: number
+}
+
+@Controller('audit-logs')
+export class AuditController {
+  constructor(private readonly db: TenantDb) {}
+
+  @Permissions('audit:read')
+  @Get()
+  async list(@Query() q: AuditQuery) {
+    const limit = q.limit ?? PAGE
+    const rows = await this.db.client.auditLog.findMany({
+      where: { ...(q.action ? { action: q.action } : {}), ...after(decodeCursor(q.cursor), 'desc') },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: limit + 1,
+    })
+    return page(rows, limit, r =&gt; ({ id: r.id, actorId: r.actorId, action: r.action, … }))
+  }
+}</pre>
+<p>這段程式短，但每一行都對應一個要求：</p>
+<ul>
+  <li><strong>隔離</strong>：用 <code>TenantDb</code>，<code>AuditLog</code> 在它的自動條件清單裡，RLS 再擋一次。查詢沒有寫 <code>tenantId</code>，這是對的；寫了 <code>PrismaService</code> 才是錯的（練習 2）。</li>
+  <li><strong>權限</strong>：<code>audit:read</code> 只在 admin 與 owner 的清單裡（<code>src/tenancy/permissions.ts</code>）。稽核裡有「誰把誰降級」，member 看得到就洩漏了管理動作。</li>
+  <li><strong>分頁</strong>：跟 projects 共用 <code>src/common/cursor.ts</code>，只是方向是 <code>desc</code>。schema 的 <code>@@index([tenantId, createdAt, id])</code> 讓「這個租戶、最新的 20 筆」不用掃全表。</li>
+  <li><strong>篩選</strong>：<code>action</code> 用正規表示式驗證格式，不合法的 400，而不是查出空陣列讓人以為沒有紀錄。</li>
+</ul>
+<p>「只會一直變多」也帶出最後一個問題：要存多久？這一課不實作保存期限與匯出，但要把決定寫進你的 ADR（例如 <code>docs/adr/000N-audit-log.md</code>）：保存多久（常見是 1 年，看客戶合約與法規）、過期怎麼刪（擁有者身分的排程，或依月份分割後丟掉舊分割）、客戶要怎麼拿走（匯出，第 13 課的機制可以重用）。面試時被問「稽核表很大怎麼辦」，ADR 裡有答案。</p>
+
+<div class="callout practice"><strong>💡 實務上：稽核會被拿來當證據</strong><br>開場那封「誰刪的」只是最輕微的版本。客戶之間的糾紛（「不是我刪的」）、離職員工的權限爭議、資安事件調查，最後都會回到稽核。到那時候才發現少記一種操作、或 actor 記成系統帳號，已經補不回來。資深工程師上線前會列一張「改資料的端點 × 有沒有稽核」的表，並問客服與 PM：「客戶最常問哪三種『誰做的』？」先保證那三種一定記得到。</div>
+<p>平台的稽核到這裡完整了：寫得對、改不掉、查得到。剩下的是讓你自己的業務模組也照這個方式記。</p>
+
+<h2>你的業務模組要記哪些 action？</h2>
+<p>規則跟 projects 一樣：每個改資料的 service 方法，在 <code>db.tx()</code> 的最後一步 <code>audit.record</code>，新的 action 加進 <code>AuditAction</code> 型別。三個建議題目各有一個要想清楚的地方：</p>
+<ul>
+  <li><strong>客服工單</strong>：狀態機的每一步都是一個 action（<code>ticket.assigned</code>、<code>ticket.status_changed</code>）。SLA 到期的自動升級是背景工作做的，actor 是誰？不要用一個假的使用者 id 冒充，第 13 課會講 worker 的上下文怎麼帶；稽核表的 <code>actorId</code> 可以改成允許空值、另加 <code>actorType</code>（user／system）。</li>
+  <li><strong>預約排程</strong>：取消是客戶最常爭議的操作，<code>booking.cancelled</code> 要記是誰取消的（本人、管理員），取消原因如果有個資就不記內容。</li>
+  <li><strong>進銷存</strong>：庫存異動表（入庫、出庫）本身就是只追加的帳本，它是業務資料，不是稽核；稽核記的是「誰建立了這筆異動」。不要把兩者合成一張表：帳本要能做庫存計算，稽核要能長期保存與匯出，需求不一樣。</li>
+</ul>
+
+<h2>練習</h2>
+
+<div class="local" data-test="ex1" data-files="">
+  <p>練習 1：加上 <code>audit</code> 模組，讓建立、修改、刪除 project，修改成員角色，建立與接受邀請，各寫一筆契約規定的 action。測試會檢查每種恰好一筆、<code>actorId</code> 是做這件事的人（接受邀請的 actor 是新成員）、<code>targetId</code> 正確、<code>project.created</code> 的 <code>requestId</code> 等於那次回應的 <code>x-request-id</code>、列表新的在前、<code>?action=</code> 只回那一種。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="">
+  <p>練習 2：<code>GET /api/v1/audit-logs</code> 只回自己租戶的紀錄（另一個剛註冊的租戶看到空陣列），owner 與 admin 200，member、viewer 403 <code>FORBIDDEN</code>，沒登入 401。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="">
+  <p>練習 3：失敗的操作不能留下紀錄。測試會送空白名稱（400）、viewer 建立（403）、修改與刪除不存在的 id 與別的租戶的 project（404），之後稽核裡不能有任何 <code>project.*</code>。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="">
+  <p>練習 4：在 migration 收回 app 角色對稽核表的 UPDATE、DELETE（TRUNCATE 也不能有）。在 <code>work/portfolio.json</code> 填好 <code>saas.appDatabaseUrl</code>（第 9 課），測試會用它連線檢查權限，並確認 API 實際也是用這個角色連線。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：同事提議把稽核改成事件：service 在交易 commit 之後 <code>eventEmitter.emit('project.deleted', …)</code>，由 listener 寫稽核，「這樣 service 比較乾淨」。這個改法會漏掉什麼？</p>
+  <label data-key="a">什麼都不會漏：EventEmitter 是同步呼叫，emit 一定會執行到 listener</label>
+  <label data-key="b">會重複：同一個事件可能被 listener 處理兩次，稽核多一筆</label>
+  <label data-key="c">commit 之後、listener 寫完之前程序掛掉或 listener 丟錯，資料已經刪了，稽核卻沒有這一筆</label>
+  <label data-key="d">listener 拿不到 actor：事件裡沒有請求，所以 actorId 一定是空的</label>
+  <p class="why">✓ 稽核與業務分成兩次寫入，中間任何失敗都會讓兩者不一致，而缺的那一筆剛好是最需要的。要分開寫就得用 outbox（同一個交易寫進 outbox 表、再非同步處理），複雜度比直接在交易裡 <code>record(tx, …)</code> 高很多。d 不對：listener 在同一個請求的 ALS 裡同步執行時讀得到上下文，問題不在這裡。（第 11 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：你的進銷存模組有些庫存調整是營運同事用 SQL 腳本直接改的，service 的 <code>audit.record</code> 記不到。你想加一個 trigger 補記，但 trigger 裡要知道是誰改的。哪個做法可行？</p>
+  <label data-key="a">應用程式在交易開頭 <code>set_config('app.user_id', …, true)</code>，trigger 讀 <code>current_setting('app.user_id', true)</code>；腳本也要在同一個交易先設好，沒設的記成空值，事後追查</label>
+  <label data-key="b">trigger 用 <code>current_user</code> 就好：每個使用者連資料庫都是自己的角色</label>
+  <label data-key="c">trigger 讀 <code>pg_stat_activity</code> 裡最近一次的請求，找出 requestId 再對應到使用者</label>
+  <label data-key="d">做不到，trigger 只能記資料改了什麼，記不到是誰</label>
+  <p class="why">✓ 交易層級的設定是應用程式與資料庫之間傳上下文的標準做法，參考實作的 <code>setContext</code> 已經同時設了 <code>app.tenant_id</code> 與 <code>app.user_id</code>。b 錯在前提：API 所有請求共用同一個 <code>app_user</code> 角色，<code>current_user</code> 永遠是它，分不出使用者。（第 11 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：一年後 <code>audit_logs</code> 有 3 億列，合約規定保留 13 個月。每晚 <code>DELETE … WHERE created_at &lt; now() - interval '13 months'</code> 跑了好幾個小時，還讓資料表膨脹。比較好的做法是？</p>
+  <label data-key="a">把 <code>app_user</code> 的 DELETE 權限加回來，讓 API 自己分批刪</label>
+  <label data-key="b">依月份分割（partition），由擁有者身分的排程直接丟掉超過保存期限的整個分割</label>
+  <label data-key="c">加一個 <code>created_at</code> 的索引，DELETE 就會變快</label>
+  <label data-key="d">改用 <code>TRUNCATE audit_logs</code>，一次清空比較快</label>
+  <p class="why">✓ 丟掉一個分割是改目錄資訊，不會逐列刪除、也不會留下要 VACUUM 的死列（<a href="../../postgresql/lessons/35-partitioning.html">PostgreSQL 課第 35 課</a>），而且一樣不需要把刪除權限還給應用程式。a 讓「只能追加」的保護失效。c 只讓找到要刪的列變快，3 億列的逐列刪除與膨脹還在。d 會把還在保存期限內的紀錄一起刪掉。（第 11 課）</p>
+</div>
+
+<h2>自評清單</h2>
+<p>測試判不出來、但作品裡看得出來的事。每一項自己確認：</p>
+<ul>
+  <li><strong>每個改資料的端點都有 action</strong>：列出你所有的 POST／PATCH／DELETE，每個對到一個 action 或寫明為什麼不記。業務模組的 action 也在 <code>AuditAction</code> 型別裡。</li>
+  <li><strong>稽核真的跟業務一起回滾</strong>：在 <code>projects.service.ts</code> 的 <code>audit.record</code> 之後暫時加一行 <code>throw new Error()</code>，呼叫一次，資料庫裡 project 沒變、稽核也沒有新的一筆。</li>
+  <li><strong>沒有個資與秘密</strong>：<code>SELECT DISTINCT target_type, action FROM audit_logs</code> 看一遍，沒有任何欄位存了 email、密碼雜湊、token。</li>
+  <li><strong>測試抓得到漏記</strong>：把 <code>members.service.ts</code> 改角色的 <code>audit.record</code> 刪掉，你自己的 <code>npm test</code> 至少有一個測試失敗。</li>
+  <li><strong>ADR 寫了保存期限</strong>：保存多久、怎麼刪、客戶怎麼匯出。</li>
+</ul>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>稽核寫在交易外</strong>：先記再做、或 commit 之後才記，失敗或當機時兩邊對不上。<code>record()</code> 只收 <code>tx</code>，放在交易的最後一步。</li>
+  <li><strong>用 <code>db.client</code> 開互動式交易再呼叫 <code>record</code></strong>：每個操作各自一個交易，回滾不了。用 <code>db.tx()</code>。</li>
+  <li><strong>查詢用 <code>PrismaService</code></strong>：沒有自動的租戶條件；如果 API 又用 superuser 連線，RLS 也擋不到，別的租戶的稽核全部看得到。</li>
+  <li><strong>只在程式裡「不呼叫」刪除</strong>：只能追加要靠資料庫權限，程式的約定擋不住 bug 與 injection。REVOKE 寫在 migration，之後的 <code>GRANT … ON ALL TABLES</code> 後面再 REVOKE 一次。</li>
+  <li><strong>收回了權限，API 卻用擁有者連線</strong>：擁有者不受 GRANT 限制。API 一律用 app 角色，擁有者只給 migration 與保存期限的排程。</li>
+  <li><strong>把 email、舊值新值整包記進去</strong>：稽核保存得比業務資料久，個資會在這裡留到過期。記 id 與欄位名稱。</li>
+</ul>
+
+
+<h2>補充與查表</h2>
+<ul>
+  <li><strong>稽核的模組怎麼拆</strong>：寫入用的 <code>AuditService</code> 放在 <code>@Global()</code> 的 <code>AuditCoreModule</code>，每個業務模組直接注入、不用 import。查詢的 controller 放在另一個 <code>AuditModule</code>，這樣業務模組只依賴「寫稽核」這一小塊，平台模組的依賴方向不變（<code>docs/architecture.md</code>）。</li>
+  <li><strong>這課用到的資料表權限</strong>（查表用，不用背）：<code>SELECT</code> 讀、<code>INSERT</code> 新增、<code>UPDATE</code> 修改、<code>DELETE</code> 逐列刪除、<code>TRUNCATE</code> 一次清空整張表。<code>GRANT ALL</code> 會連 <code>TRUNCATE</code>（還有 <code>REFERENCES</code>、<code>TRIGGER</code> 等）一起給，所以參考實作逐一列出。</li>
+  <li><strong>ADR 要回答的三件事</strong>：保存多久（看客戶合約與法規）、過期怎麼刪（擁有者身分的排程，或依月份分割後丟掉舊分割，見練習 7 與 <a href="../../postgresql/lessons/35-partitioning.html">PostgreSQL 課第 35 課</a>）、客戶怎麼匯出（第 13 課的背景工作）。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>log 是給工程師除錯的，會被輪替、沒有租戶隔離、客戶看不到；稽核是產品功能，存在資料庫、依租戶隔離、有權限與保存期限，兩者用 requestId 串起來。</li>
+  <li>稽核回答「誰、什麼時候、對什麼、做了什麼」：actorId、action（<code>&lt;資源&gt;.&lt;動作&gt;</code>）、target、requestId、時間。只記 id，不記密碼、token、個資的值。</li>
+  <li>稽核跟業務在同一個交易：<code>record(tx, …)</code> 只收交易物件，放在最後一步；失敗的操作一起回滾，不會留下成功的紀錄。先記再做、或 commit 之後才記，都會讓兩邊對不上。</li>
+  <li>service 明確呼叫記得到業務意思；extension 與 trigger 不會忘，但只知道資料表變了。trigger 要 actor 就靠 <code>set_config('app.user_id', …, true)</code>。</li>
+  <li>只能追加靠資料庫：migration 先 GRANT、再 REVOKE UPDATE, DELETE，不用 <code>GRANT ALL</code>；而且 API 真的要用 app 角色連線。</li>
+  <li>查詢 API 用 TenantDb、admin 以上、游標分頁新的在前；保存期限與刪除方式寫進 ADR。</li>
+</ul>
+<p>下一課做檔案上傳：檔案存在哪、key 怎麼產生、怎麼看內容判斷型別，以及下載時怎麼不讓上傳的 HTML 在你的網域上執行。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

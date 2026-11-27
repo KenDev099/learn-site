@@ -1,0 +1,1666 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>22. SSRF 與呼叫外部服務</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="22">
+<header>
+  <div class="eyebrow">階段 6：資深工程師的資安實務 · 第 22 課</div>
+  <h1>SSRF 與呼叫外部服務</h1>
+</header>
+<main>
+
+<p>咖啡店後台上週上線了「從網址匯入商品圖片」：店員在商品編輯頁貼上供應商網站的圖片網址，伺服器把圖片抓回來存，順便回一張預覽給店員確認。上線第三天，資安測試回報了一個問題：他們在網址欄填了 <code>http://169.254.169.254/latest/meta-data/iam/security-credentials/</code>，預覽區顯示的不是圖片，而是一行文字：這台主機綁定的 IAM 角色名稱。他們把角色名稱接在網址後面再匯入一次，預覽區就出現一段 JSON，裡面是這台伺服器的雲端臨時金鑰（<code>AccessKeyId</code>、<code>SecretAccessKey</code>、<code>Token</code>）。拿著這組金鑰，任何人都能用伺服器的身分呼叫雲端的 API。</p>
+<p>這課的任務是把這支匯入 API 修到安全，而且把修好的做法寫成一個共用的 <code>safeFetch</code>：咖啡店接下來要做的外送平台 webhook 通知、留言的連結預覽，也都是「<strong>伺服器照著別人給的網址發請求</strong>」，全部走同一個函式。最後再看反方向：呼叫物流商的 API 時，對方回來的資料能不能直接用。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>匯入圖片的 API 為什麼能讀到雲端金鑰、擋掉 <code>127.0.0.1</code> 字串為什麼不夠：SSRF 是什麼、伺服器能替攻擊者連到哪裡；修法的輪廓是先解析網址，再檢查實際要連的 IP（開場問題的最小答案）。</li>
+  <li>拿到一個 IP 怎麼判斷能不能連：CIDR 與位元遮罩、IANA 特殊用途位址表，IPv6 為什麼反過來預設拒絕。</li>
+  <li>檢查時是公開位址，連線時怎麼變成 <code>127.0.0.1</code>：DNS rebinding，為什麼要拿驗證過的 IP 直接連。</li>
+  <li>對方回 302、回 10 GB 或一直不回怎麼辦；程式還是漏了一個地方時，網路層能擋什麼。</li>
+  <li>反方向：呼叫物流商的 API，回來的資料為什麼也是不可信的輸入。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="05-same-origin-cors.html">第 5 課</a>的 URL 解析：<code>new URL()</code> 把網址拆成 <code>protocol</code>、<code>hostname</code>、<code>port</code>，各種寫法都會被整理成標準形式。</li>
+  <li><a href="../../node/lessons/11-buffer-encoding.html">Node 課第 11 課</a>的位元運算：<code>&lt;&lt;</code> 把位元往左移、<code>&amp;</code> 只留兩邊都是 1 的位元；這課用它們比對位址範圍。</li>
+  <li><a href="../../node/lessons/17-calling-external-apis.html">Node 課第 17 課</a>的 <code>fetch</code> 與 <code>AbortSignal.timeout</code>：從後端呼叫外部服務，超過時間就中止。</li>
+  <li><a href="../../node/lessons/16-streams-backpressure.html">Node 課第 16 課</a>的 Stream：資料一塊一塊讀進來，不必等整份下載完，讀到一半也能停。</li>
+</ul></div>
+
+<h2>匯入圖片的 API 為什麼能讀到雲端金鑰？</h2>
+<p>先看出事的程式。「從網址匯入商品圖片」最直覺的寫法是這樣：</p>
+<pre>// 不要這樣寫
+app.post('/products/:id/image-from-url', async (req, res) =&gt; {
+  const r = await fetch(req.body.url)            // 照著使用者給的網址抓
+  const body = Buffer.from(await r.arrayBuffer())
+  await saveImage(req.params.id, body)
+  res.json({ ok: true, preview: body.toString('base64') })
+})</pre>
+<p>店員正常使用時，<code>req.body.url</code> 是供應商網站上的一張 PNG：伺服器下載它、存起來、把內容轉成 base64 回給前端當預覽。程式沒有任何地方問過「這個網址指向哪裡」，它只是照做。</p>
+<p>資安測試填的 <code>169.254.169.254</code> 是<strong>雲端 metadata 服務（instance metadata service）</strong>的位址。雲端主機（例如 AWS 的 EC2）上的程式可以向這個位址查詢主機自己的資訊：主機 ID、網路設定，還有主機綁定的 IAM 角色的臨時憑證。IAM 是 AWS 管理「誰能對哪些資源做什麼」的權限系統，<strong>角色</strong>是一組權限。把角色綁在主機上之後，主機上的程式不用把長期金鑰寫在設定檔裡，而是隨時向 metadata 服務領一組會過期的<strong>臨時憑證</strong>，用它呼叫 S3（檔案儲存）、資料庫等雲端 API。</p>
+<p>這個設計的前提是「只有主機自己的程式問得到」。<code>169.254.169.254</code> 從網際網路連不到，外面的攻擊者直接敲它沒有用。但匯入 API 就跑在這台主機上，它當然連得到；而它又把抓到的內容當成「圖片預覽」原封不動回給了攻擊者。攻擊者自己一個封包都沒送進內網，是你的伺服器替他送的。</p>
+<p>這種攻擊叫 <strong>SSRF（Server-Side Request Forgery，伺服器端請求偽造）</strong>：攻擊者讓你的伺服器去請求他指定的網址。「偽造」指的是請求從你的伺服器發出、帶著你的伺服器在網路裡的位置，收到請求的內部服務會以為是自己人。OWASP API Security Top 10（2023 版）把它列為 API7。</p>
+<figure>
+  <svg viewBox="0 0 700 260" role="img" aria-label="攻擊者從外部把網址交給 API，API 在內網裡替他請求 metadata 服務、管理介面和資料庫">
+    <defs><marker id="arr22" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="20" y="105" width="130" height="50" rx="6"/><text class="d-text" x="85" y="128" text-anchor="middle">攻擊者</text><text class="d-small" x="85" y="146" text-anchor="middle">在網際網路上</text>
+    <rect class="d-soft" x="210" y="20" width="470" height="225" rx="10"/><text class="d-small" x="225" y="40">你的雲端網路（外面連不進來）</text>
+    <rect class="d-box" x="240" y="105" width="140" height="50" rx="6"/><text class="d-text" x="310" y="128" text-anchor="middle">咖啡店 API</text><text class="d-small" x="310" y="146" text-anchor="middle">照網址發請求</text>
+    <rect class="d-box" x="460" y="55" width="200" height="40" rx="6"/><text class="d-text" x="560" y="80" text-anchor="middle">169.254.169.254 metadata</text>
+    <rect class="d-box" x="460" y="110" width="200" height="40" rx="6"/><text class="d-text" x="560" y="135" text-anchor="middle">127.0.0.1:9090 管理介面</text>
+    <rect class="d-box" x="460" y="165" width="200" height="40" rx="6"/><text class="d-text" x="560" y="190" text-anchor="middle">10.0.3.7 內部服務</text>
+    <line class="d-line" x1="150" y1="130" x2="236" y2="130" marker-end="url(#arr22)"/>
+    <text class="d-small" x="193" y="122" text-anchor="middle">網址</text>
+    <line class="d-line" x1="380" y1="122" x2="456" y2="78" marker-end="url(#arr22)"/>
+    <line class="d-line" x1="380" y1="130" x2="456" y2="130" marker-end="url(#arr22)"/>
+    <line class="d-line" x1="380" y1="138" x2="456" y2="182" marker-end="url(#arr22)"/>
+    <text class="d-accent" x="445" y="236" text-anchor="middle">防火牆擋的是外面進來的連線，擋不到你的伺服器自己發出的請求</text>
+  </svg>
+  <figcaption>SSRF：攻擊者連不到內網，但他可以叫你的伺服器去連。</figcaption>
+</figure>
+<p>圖裡另外兩個目標說明了為什麼 SSRF 不只是 metadata 的問題。只要伺服器願意照網址發請求，攻擊者就能拿它碰這幾類東西：</p>
+<ul>
+  <li><strong>本機的管理介面</strong>：很多服務在 <code>127.0.0.1</code> 開了不需要登入的管理或監控端點，理由是「只有本機連得到」。SSRF 讓「本機」包括了攻擊者。</li>
+  <li><strong>內網</strong>：<strong>私有位址（private address）</strong>是 <code>10.0.0.0/8</code>、<code>172.16.0.0/12</code>、<code>192.168.0.0/16</code> 這幾段。網際網路上不會路由到這些位址，所以外面連不到，但同一個網路裡的伺服器連得到。內部服務常常沒有認證，因為大家假設能連進來的都是自己人。</li>
+  <li><strong>掃描</strong>：就算回應內容沒有傳回給攻擊者，從「多久才回應」「錯誤是連線被拒還是逾時」也能推出內網有哪些主機、哪些 port 是開的。</li>
+</ul>
+<p>匯入圖片不是唯一會出事的地方。從網址匯入檔案、webhook 網址、連結預覽、PDF／截圖產生器（HTML 裡的圖片網址會被產生器抓）、OAuth／OIDC 的 discovery 網址設定、<a href="09-jwt-verification.html">第 9 課</a>的 <code>jku</code>，全都是「伺服器照網址發請求」。只要網址的任何一部分來自使用者，就有同樣的風險。這也是這課要做共用 <code>safeFetch</code> 的原因：咖啡店的 webhook 和連結預覽就在這份清單裡，修一個地方，三個功能一起受保護。</p>
+
+<div class="callout practice"><strong>💡 實務上：code review 看到「伺服器照網址發請求」就停下來</strong><br>這類功能常藏在不起眼的需求裡：PM 說「讓店員貼網址匯入圖片比較方便」、「訂單確認信改用 HTML 轉 PDF」，PR 裡就多了一行 <code>fetch(url)</code> 或一個會載入圖片的 PDF 產生器。資深工程師會先問三件事：網址的哪一部分是使用者能控制的？目的地是不是固定幾家，可以用允許清單（只放行事先列好的網域）？這個功能能不能改成讓店員直接上傳檔案，根本不用伺服器去抓？能不抓就不抓，是最省事的防法。真的要抓，就統一走專案裡同一個安全的請求函式，不要每個功能各寫一份。</div>
+
+<p>咖啡店的情況是：供應商的圖片散在各家網站上，店員不想先下載再上傳，所以匯入功能要留著，只能在程式裡擋。第一個想到的修法通常是把網址裡的 <code>127.0.0.1</code> 擋掉。下一節看它為什麼擋不住。</p>
+
+<h2>擋掉「127.0.0.1」字串為什麼不夠？</h2>
+<p>最直覺的修法是黑名單：網址字串裡出現 <code>127.0.0.1</code> 或 <code>localhost</code> 就拒絕。問題在於同一個位址有很多寫法。IPv4 位址本質上是一個 32 位元的整數，「四段十進位」只是最常見的寫法；網址標準也接受一個大整數、十六進位、八進位、省略中間段落等寫法。<code>new URL()</code> 遵循 WHATWG URL 標準（瀏覽器和 Node 都用它），會把這些寫法全部轉成標準的四段十進位，而 HTTP client 連的就是轉換後的結果。</p>
+<p>下面七個網址，執行後看每一列的 <code>hostname</code>，和最後一欄字串黑名單有沒有擋下：</p>
+<div class="lab"><script type="code">
+const inputs = [
+  'http://127.0.0.1/',
+  'http://2130706433/',            // 一個十進位整數：127*2^24 + 1
+  'http://0x7f.1/',                // 十六進位，加上省略的段落
+  'http://0177.0.0.1/',            // 0 開頭是八進位
+  'http://127.1/',                 // 只寫兩段
+  'http://[::ffff:127.0.0.1]/',    // IPv4 包在 IPv6 裡
+  'https://coffee.example@127.0.0.1/',  // @ 前面是帳號，不是主機
+]
+const naiveBlocked = (s: string) => /127\.0\.0\.1|localhost/.test(s)
+
+for (const input of inputs) {
+  const u = new URL(input)
+  console.log(input.padEnd(36), '→ hostname', u.hostname.padEnd(16), '字串黑名單擋下？', naiveBlocked(input))
+}
+</script></div>
+<p>七個網址連的都是本機，字串黑名單只擋下三個。其中 <code>[::ffff:127.0.0.1]</code> 會被擋，只是剛好字面上出現了 <code>127.0.0.1</code>；改寫成等價的 <code>[::ffff:7f00:1]</code> 就擋不到了。</p>
+<p>最後一個網址用的是 <strong>userinfo</strong>。網址可以在主機前面寫「帳號:密碼@」，例如 <code>https://帳號:密碼@主機/</code>，這是很早期讓網址帶登入資訊的寫法。<code>new URL()</code> 會把 <code>@</code> 前面的部分放進 <code>username</code>、<code>password</code>。所以 <code>https://coffee.example@127.0.0.1/</code> 裡，<code>coffee.example</code> 只是帳號名稱，真正的主機是 <code>127.0.0.1</code>。如果檢查寫成「網址裡有沒有出現合作夥伴的網域」，一樣會被騙。</p>
+<p>所以第一條規則是：<strong>先用 <code>new URL()</code> 解析，再拿解析後的欄位判斷</strong>，不要對原始字串用 <code>includes</code>、<code>startsWith</code> 或正規表示式。解析後的 IPv4 一定是四段十進位，IPv6 一定在方括號裡，判斷程式只要處理這兩種標準格式。</p>
+<p>解析之後，有三個欄位不用知道 IP 就能先擋：</p>
+<ul>
+  <li><strong>協定只接受 <code>https:</code></strong>：<code>http:</code>、<code>file:</code>、<code>ftp:</code>，以及某些 HTTP client 支援的 <code>gopher:</code> 這類協定，都能拿來打內部服務。</li>
+  <li><strong>port 只接受預設的 443</strong>：<code>new URL()</code> 會把 <code>https</code> 網址的 <code>:443</code> 正規化掉，所以 <code>url.port</code> 是空字串才放行。否則攻擊者用 <code>:6379</code>、<code>:5432</code> 去敲內網的 Redis、PostgreSQL。</li>
+  <li><strong>拒絕 userinfo</strong>：<code>url.username</code> 或 <code>url.password</code> 不是空字串就拒絕。正常的圖片網址不會帶帳號密碼，帶了就是可疑。</li>
+</ul>
+<p>到這裡可以先給出整個修法的輪廓，後面每一節補上其中一步：</p>
+<ol>
+  <li>用 <code>new URL()</code> 解析，只收 https、預設 port、沒有 userinfo。</li>
+  <li>找出實際要連的 IP，每一個都必須是公開位址。</li>
+  <li>連線時就用檢查過的那個 IP，不讓 HTTP client 自己再查一次。</li>
+  <li>不自動跟隨重導向，限制回應的大小和時間，錯誤訊息不透露內網的狀況。</li>
+</ol>
+<p>第 2 步要先會兩件事：一是拿到一個 IP，怎麼判斷它是不是公開位址（下一節）；二是 <code>hostname</code> 常常是網域名稱（例如 <code>img.attacker.example</code>），攻擊者能讓它解析成 <code>127.0.0.1</code>，所以要先解析成 IP 再檢查（DNS 那節）。先從判斷 IP 開始。</p>
+
+<h2>拿到一個 IP，怎麼判斷能不能連？</h2>
+<p>「不能連」的位址不只 <code>127.0.0.1</code>：整段 <code>127.x.x.x</code> 都是本機，私有位址也是一整段一整段的。所以判斷的單位是「一段位址」，而一段位址的標準寫法是 CIDR。</p>
+<h3>CIDR：一段位址的寫法</h3>
+<p>IPv4 位址是 32 個位元，寫成四個 0～255 的數字，每個數字是一個位元組（8 個位元）。<strong>CIDR 表示法</strong>的 <code>10.0.0.0/8</code> 意思是「前 8 個位元固定是 <code>10.0.0.0</code> 的前 8 個位元，後面隨意」，也就是 <code>10.0.0.0</code>～<code>10.255.255.255</code>。斜線後面的數字叫前綴長度。判斷一個 IP 在不在範圍裡，就是比較它和範圍的前 N 個位元是否相同。</p>
+<p><code>/8</code>、<code>/16</code> 剛好切在位元組的邊界，比較整個位元組就好。<code>172.16.0.0/12</code> 切在第二個位元組中間：前 8 個位元是 172，第二個位元組只比前 4 個位元。這時要用<strong>位元遮罩（mask）</strong>：遮罩是一個「要比的位元是 1、不比的位元是 0」的數字，和 IP 做 <code>&amp;</code> 之後，不比的位元都變成 0，剩下的才拿去比。執行後看每一列的「&amp; 遮罩」結果，和最後的判斷：</p>
+<div class="lab"><script type="code">
+const bin = (n: number) => n.toString(2).padStart(8, '0')
+const mask = 0xff << (8 - 4) & 0xff      // 第二個位元組只看前 4 位：11110000
+console.log('遮罩         ', bin(mask))
+for (const second of [16, 31, 32, 15]) {
+  const inside = (second & mask) === (16 & mask)
+  console.log(`172.${second}.x.x 第二個位元組`, bin(second), '& 遮罩 =', bin(second & mask), inside ? '在 172.16.0.0/12 裡' : '不在')
+}
+</script></div>
+<p>16 是 <code>0001 0000</code>、31 是 <code>0001 1111</code>，前 4 位都是 <code>0001</code>；32 是 <code>0010 0000</code>，前 4 位不同。所以 <code>172.16.0.0/12</code> 是 <code>172.16.0.0</code>～<code>172.31.255.255</code>，<code>172.32.0.1</code> 是公開位址。這就是不能用字串比對的另一個原因：寫成 <code>startsWith('172.')</code> 會把 <code>172.32.x.x</code> 以後幾百萬個公開位址也擋掉，寫成 <code>startsWith('172.16.')</code> 又漏掉 <code>172.17</code>～<code>172.31</code>。</p>
+
+<h3>IPv4：不能連的範圍</h3>
+<p>會比對一段位址之後，下一個問題是要比哪些段。除了私有位址和本機，還有不少位址也不在網際網路上路由。IANA（管理網際網路位址分配的機構）維護一份「特殊用途位址表」列出它們。下表是 IPv4 的摘要（2026-10-31 查詢 <a href="https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xhtml">IANA IPv4 Special-Purpose Address Registry</a>），出站請求的目的地落在任何一段都拒絕。查表用，不用背；練習 1 會照這張表寫判斷：</p>
+<div class="table-wrap"><table>
+  <tr><th>範圍</th><th>用途</th></tr>
+  <tr><td><code>0.0.0.0/8</code></td><td>「這個網路」；很多系統把 <code>0.0.0.0</code> 當成本機</td></tr>
+  <tr><td><code>10.0.0.0/8</code>、<code>172.16.0.0/12</code>、<code>192.168.0.0/16</code></td><td>私有位址（內網）</td></tr>
+  <tr><td><code>100.64.0.0/10</code></td><td>電信業者的共享位址（CGNAT），雲端內部也會用到</td></tr>
+  <tr><td><code>127.0.0.0/8</code></td><td>本機（loopback），不只 <code>127.0.0.1</code></td></tr>
+  <tr><td><code>169.254.0.0/16</code></td><td>鏈路本地（link-local），雲端 metadata 的 <code>169.254.169.254</code> 在這裡</td></tr>
+  <tr><td><code>192.0.0.0/24</code></td><td>協定保留</td></tr>
+  <tr><td><code>192.0.2.0/24</code>、<code>198.51.100.0/24</code>、<code>203.0.113.0/24</code></td><td>文件範例用</td></tr>
+  <tr><td><code>198.18.0.0/15</code></td><td>網路效能測試用</td></tr>
+  <tr><td><code>224.0.0.0/4</code></td><td>multicast（群播）</td></tr>
+  <tr><td><code>240.0.0.0/4</code></td><td>保留，包含廣播位址 <code>255.255.255.255</code></td></tr>
+</table></div>
+<p>開場那次事故的 <code>169.254.169.254</code> 落在 <code>169.254.0.0/16</code>，有這張表就會被擋下。</p>
+
+<h3>IPv6：反過來，預設拒絕</h3>
+<p>先看 IPv6 位址長什麼樣子。它是 128 位元（16 個位元組），寫成 8 組 16 位元的十六進位數字、用冒號分隔，例如 <code>2001:4860:4860:0:0:0:0:8888</code>；連續的 0 組可以用 <code>::</code> 省略一次，所以也寫成 <code>2001:4860:4860::8888</code>，本機是 <code>::1</code>。放進網址時要加方括號，例如 <code>http://[::1]/</code>。</p>
+<p>IPv6 用同一套 CIDR 比對，差別在規則的方向。IPv6 的特殊範圍比 IPv4 多，而且一直在增加：2024 年 IANA 才加入 <code>3fff::/20</code>（文件用）和 <code>5f00::/16</code>（SRv6 路由技術用）。照著清單一段一段擋，清單一更新你就漏了。所以 IPv6 反過來做<strong>預設拒絕</strong>：只放行 <code>2000::/3</code>，也就是開頭為 2 或 3 的位址：網際網路上真正在用的一般位址（全域單播），再排除裡面的特殊範圍。另外，<code>::ffff:127.0.0.1</code> 這種把 IPv4 包在 IPv6 裡的寫法，系統實際上會當成 IPv4 連線，所以要取出最後 4 個位元組，改用 IPv4 的規則檢查。前面字串黑名單那節提到、黑名單擋不住的 <code>[::ffff:7f00:1]</code>，就是靠這一條擋下。</p>
+<p>練習 1 已經把 IPv6 的解析與規則寫好，你只要完成 CIDR 比對和 IPv4 的部分。要自己寫或審查 IPv6 檢查時，完整的範圍與理由在課末「補充與查表」。</p>
+
+<div class="callout practice"><strong>💡 實務上：目的地已知就用允許清單</strong><br>上面都是「禁止清單」思維，因為匯入圖片的網址可能來自任何一家供應商。目的地是已知的合作夥伴時（例如物流商只會在 <code>api.courier.example</code>），直接寫<strong>網域允許清單</strong>：hostname 完全相等才放行（不能用 <code>endsWith('courier.example')</code>：<code>evilcourier.example</code> 這種網域任何人都能註冊）。允許清單之外，仍然要做位址檢查，因為合作夥伴的 DNS 也可能被設錯或被入侵。允許清單放在設定裡集中管理，新增一家合作夥伴要經過 code review，不要散落在各個功能的程式碼裡。</div>
+
+<p>判斷一個 IP 的函式有了。可是匯入圖片的網址多半是網域名稱，要先經過 DNS 解析成 IP 才能檢查。解析、檢查都通過之後，連線時用的還是不是那個 IP？下一節看這個時間差。</p>
+
+<h2>檢查時是公開位址，連線時怎麼變成 127.0.0.1？</h2>
+<p>先把 DNS 的幾個名詞講清楚。<strong>DNS 解析</strong>把網域名稱轉成 IP。回答分成幾種紀錄：<strong>A 紀錄</strong>是 IPv4 位址，<strong>AAAA 紀錄</strong>是 IPv6 位址，一個網域可以同時有好幾筆。每筆紀錄都帶一個 <strong>TTL</strong>，表示這個答案可以快取多久，單位是秒；TTL 是 0 就代表不要快取，每次都重新問。最重要的一點：<strong>DNS 的答案由網域的擁有者決定</strong>。攻擊者註冊 <code>attacker.example</code>、架自己的 DNS 伺服器，就能讓 <code>img.attacker.example</code> 每次被問時回不同的位址。</p>
+<p>有了上一節的位址檢查，常見的寫法是「先 <code>dns.lookup</code> 解析、確認是公開位址，再 <code>fetch(url)</code>」。問題在於 <code>fetch</code> 拿到的是網址，連線前會<strong>自己再解析一次</strong>。攻擊者把 TTL 設成 0，第一次（你檢查時）回公開位址，第二次（<code>fetch</code> 連線時）回 <code>127.0.0.1</code>。這叫 <strong>DNS rebinding（DNS 重新綁定）</strong>。</p>
+<p>這類漏洞有個通用的名字：<strong>TOCTOU（time of check to time of use）</strong>。檢查和使用是兩個時間點，中間東西被換掉了，檢查就白做了。這裡被換掉的是 IP：你檢查的位址和實際連線的位址不是同一個。執行下面的示範，看兩種寫法各解析了幾次 DNS，最後連到哪裡：</p>
+<div class="lab"><script type="code">
+// 攻擊者的 DNS：TTL 0，第一次回公開位址，之後都回 127.0.0.1
+function makeResolver() {
+  let calls = 0
+  return async (host: string): Promise<string> => {
+    calls++
+    console.log(`  DNS 第 ${calls} 次解析 ${host}`)
+    return calls === 1 ? '93.184.215.14' : '127.0.0.1'
+  }
+}
+// 這裡只示範時間差；位址檢查請用練習 1 的完整版本
+const isPublic = (ip: string) => ip !== '127.0.0.1'
+const connect = async (ip: string) =>
+  ip === '127.0.0.1' ? '連到 127.0.0.1:9090，管理介面回傳了設定檔' : '連到公開伺服器，拿到一張咖啡豆圖片'
+
+async function checkThenFetch(host: string) {
+  const resolve = makeResolver()
+  const ip = await resolve(host)                 // 檢查用的解析
+  if (!isPublic(ip)) return '擋下'
+  return connect(await resolve(host))            // fetch(url) 內部又解析一次
+}
+async function pinnedFetch(host: string) {
+  const resolve = makeResolver()
+  const ip = await resolve(host)                 // 只解析一次
+  if (!isPublic(ip)) return '擋下'
+  return connect(ip)                             // 連線用的就是檢查過的 IP
+}
+
+console.log('先檢查再 fetch(url)：')
+console.log('  →', await checkThenFetch('img.attacker.example'))
+console.log('用檢查過的 IP 連線：')
+console.log('  →', await pinnedFetch('img.attacker.example'))
+</script></div>
+<p>第一種寫法解析了兩次，檢查過的是公開位址，連線用的卻是 <code>127.0.0.1</code>；第二種只解析一次，連線用的就是檢查過的 IP。這就是解法：<strong>自己解析、檢查所有位址、連線時直接用檢查過的 IP</strong>。實際做的時候有兩個地方容易漏。</p>
+<p>第一，<strong>要檢查每一筆 A／AAAA 紀錄</strong>，不能只看第一筆。攻擊者可以讓 DNS 回 <code>[公開位址, 127.0.0.1]</code>：你看第一筆是公開的就放行，HTTP client 連第一個連不上時會試下一個，最後還是連到本機。有任何一筆不合格就整個拒絕。</p>
+<p>第二，<strong>連線用驗證過的 IP，但請求內容要維持原本的網域</strong>。一台伺服器常常同時服務很多網站，它靠 HTTP 的 <code>Host</code> 標頭知道你要哪一個，所以 <code>Host</code> 仍然要是原本的網域。HTTPS 還多一層：TLS 連線一開始，client 會用 <strong>SNI（Server Name Indication）</strong>欄位告訴對方「我要連哪個網域」，對方才會拿出那個網域的憑證；你這邊驗證憑證時，比對的也應該是網域，不是 IP。如果直接把網址裡的網域換成 IP 去 <code>fetch</code>，這兩樣都會壞掉。</p>
+<p>在 Node 裡，最直接的做法是把檢查放進 HTTP client 的 DNS 查詢。undici（Node 內建 <code>fetch</code> 的實作）的 <code>Agent</code> 接受 <code>connect.lookup</code>，簽名和 <code>node:dns</code> 的 <code>dns.lookup(hostname, options, callback)</code> 一樣（undici 7 文件）。在這裡檢查，連線用的就是剛檢查過的位址，Host 與 SNI 也維持原本的網域，兩個問題一起解決。下面是示意，不在頁面上執行：</p>
+<pre>import dns from 'node:dns'
+import { Agent, fetch } from 'undici'    // 用 undici 套件自己的 fetch 搭配它的 Agent
+
+const ssrfSafeAgent = new Agent({
+  connect: {
+    lookup(hostname, options, callback) {
+      dns.lookup(hostname, { all: true }, (err, addresses) =&gt; {
+        if (err) return callback(err)
+        // 每一筆都要通過，不是只看第一筆
+        if (addresses.length === 0 || !addresses.every(a =&gt; isPublicAddress(a.address))) {
+          return callback(Object.assign(new Error('blocked address'), { code: 'EBLOCKED' }))
+        }
+        if (options.all) callback(null, addresses)
+        else callback(null, addresses[0].address, addresses[0].family)
+      })
+    },
+  },
+})
+
+// hostname 本身是 IP 時不會經過 lookup（Node 24 的 net.connect 實測），所以 URL 層的檢查（https、port、IP 字面值）仍然要先做
+const res = await fetch(url, { dispatcher: ssrfSafeAgent, redirect: 'manual', signal: AbortSignal.timeout(5000) })</pre>
+<p>練習 2 會把這個流程寫成可以測試的形式：DNS 解析和實際連線用參數注入，測試就能模擬 rebinding。</p>
+<p>同一個時間差也會出現在外送平台的 webhook 上。外送平台登記 webhook 網址時，你檢查一次是公開位址，並不代表之後每次通知時還是：</p>
+<div class="callout warn">webhook 網址在<strong>登記時</strong>檢查一次不夠：DNS 隨時可以改，三個月後同一個網域可能已經指向內網。每次<strong>送出</strong>時都要走完整的檢查。</div>
+<p>到這裡，第一個請求連到哪裡已經掌握在你手上。但連上之後，對方的回應還可以叫你去別的地方，或者根本不是一張正常的圖片。</p>
+
+<h2>對方回 302、回 10 GB 或一直不回，怎麼辦？</h2>
+<p>前面的檢查都發生在送出請求之前。這一節處理回應：攻擊者控制的伺服器能回任何東西，有三種回法會讓前面的檢查白做，或讓你的伺服器自己出問題。</p>
+<h3>重導向：每一跳都要重新檢查</h3>
+<p>HTTP 的 3xx 回應（例如 302）叫重導向，意思是「你要的東西在別的地方」，新位置寫在 <code>Location</code> 標頭。假設你檢查了 <code>https://img.attacker.example/a.png</code>，DNS 是公開位址、全部通過，它卻回 <code>302 Location: http://169.254.169.254/latest/meta-data/</code>。<code>fetch</code> 預設會自動跟過去，而這一跳完全不經過你的網址檢查，開場的事故就換個方式重演了。</p>
+<p>所以要設 <code>redirect: 'manual'</code>，讓 <code>fetch</code> 把 3xx 回應直接交給你，自己決定要不要跟。在 Node 的 <code>fetch</code>（undici）裡，這時拿到的是真正的 3xx 回應，讀得到 <code>Location</code>（瀏覽器的行為不同，見課末）。自己處理時：</p>
+<ul>
+  <li><code>Location</code> 可能是相對網址，用 <code>new URL(location, 目前的網址)</code> 解析。</li>
+  <li>新網址重新走<strong>整個</strong>流程：https、port、userinfo、DNS、每個位址。</li>
+  <li>限制跳數（例如 3），超過就放棄，避免無限重導向。</li>
+</ul>
+<h3>大小與時間：邊讀邊算</h3>
+<p>就算目的地完全合法，回應本身也能拖垮你。攻擊者的伺服器可以回一個 10 GB 的「圖片」把記憶體塞爆，或每秒只送 1 個位元組，讓連線掛一小時（Node 課第 17 課的逾時）。<code>Content-Length</code> 標頭是對方寫的，可以不寫或寫假的，不能拿來當上限。唯一可靠的做法是<strong>邊讀邊算</strong>：用 Stream 一塊一塊讀，累計超過上限就中止（Node 課第 16 課）。下面模擬一個永遠送不完的回應，執行後看讀了幾塊就停下：</p>
+<div class="lab"><script type="code">
+// 模擬一個永遠送不完的回應：每次送 64 KB
+let sent = 0
+const endless = new ReadableStream<Uint8Array>({
+  pull(controller) { sent++; controller.enqueue(new Uint8Array(64 * 1024)) },
+})
+const res = new Response(endless, { headers: { 'content-type': 'image/png' } })
+
+async function readLimited(res: Response, maxBytes: number): Promise<Uint8Array | 'too_large'> {
+  if (!res.body) return new Uint8Array()
+  const reader = res.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    total += value.byteLength
+    if (total > maxBytes) {
+      await reader.cancel()            // 停止讀取，連線也會被關掉
+      return 'too_large'
+    }
+    chunks.push(value)
+  }
+  const out = new Uint8Array(total)
+  let offset = 0
+  for (const c of chunks) { out.set(c, offset); offset += c.byteLength }
+  return out
+}
+
+console.log('上限 5 MB：', await readLimited(res, 5 * 1024 * 1024), `（讀了 ${sent} 塊就停下）`)
+</script></div>
+<p>沒有上限的話，這個迴圈會一直讀到記憶體用完。時間用 <code>AbortSignal.timeout(5000)</code> 限制整個請求，包括讀 body 的時間，才擋得住「每秒 1 個位元組」。另外只接受需要的 <code>Content-Type</code>：匯入圖片就只收 <code>image/png</code>、<code>image/jpeg</code>、<code>image/webp</code>，存檔前再用圖片函式庫解碼一次確認真的是圖片。這一步也順便修掉開場的另一半問題：回應不是圖片，就不會被當成預覽回給使用者。</p>
+<h3>錯誤訊息：不要替攻擊者掃描內網</h3>
+<p>請求失敗時，最順手的做法是把錯誤原樣回給前端，例如「<code>connect ECONNREFUSED 10.0.3.7:6379</code>」或「逾時」。這樣攻擊者就能拿你的 API 當內網掃描器：連線被拒代表主機在但 port 沒開，逾時代表沒有這台主機，這正是第一節說的「掃描」。對使用者一律回「無法取得這個網址的內容」，細節寫進 log（<a href="../../node/lessons/19-structured-logging.html">Node 課第 19 課</a>）。被位址檢查擋下的請求也記下來，有人反覆嘗試內網位址就是攻擊的訊號。</p>
+<p>到這裡，<code>safeFetch</code> 的每一步都齊了，練習 2 會把它們組起來。但這些全是程式裡的檢查，只要有一個地方沒用到它，防線就破了。</p>
+
+<h2>程式漏了一個地方，網路還能擋什麼？</h2>
+<p>應用程式的檢查是第一道防線，但程式總會有漏洞：某個新功能忘了用 <code>safeFetch</code>、某個套件自己發請求（例如 PDF 產生器自己去抓 HTML 裡的圖片）、解析器有沒想到的邊界情況。資深的做法是假設程式一定會漏，讓網路本身也擋一層。</p>
+<p>第一層是<strong>出站流量控制（egress filtering）</strong>。一般的防火牆設定在意的是「外面誰能連進來」，出站流量控制管的是反方向：這台伺服器能連到哪裡。可以用防火牆或雲端的 security group（雲端主機的防火牆規則）限制伺服器只能連到需要的目的地；或讓所有對外請求經過一個<strong>出站代理（egress proxy）</strong>，由代理統一檢查網域與位址，這樣就算某個套件繞過了 <code>safeFetch</code>，還是要經過代理。抓使用者網址這類高風險功能，也可以拆到獨立的服務裡，那台主機沒有任何雲端權限、連不到內網，就算被 SSRF 打到，能碰到的東西也很少。</p>
+<p>第二層針對開場的目標本身：<strong>AWS IMDSv2</strong>，metadata 服務的第二版。它不再讓一個 <code>GET</code> 就拿到資料：程式要先送 <code>PUT /latest/api/token</code>、帶 <code>X-aws-ec2-metadata-token-ttl-seconds</code> 標頭取得 token，之後的 <code>GET</code> 都要帶 <code>X-aws-ec2-metadata-token</code> 標頭。這擋住 SSRF 的原因是：一般的 SSRF 只能讓伺服器照網址發 <code>GET</code>，攻擊者改不了方法、加不了標頭，所以拿不到 token。開場那個匯入 API 只會 <code>fetch(url)</code>，在 IMDSv2 下就讀不到憑證。IMDSv2 還有另外兩層保護，見課末（<a href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html">AWS EC2 使用者指南</a>）。</p>
+<div class="callout warn">EC2 預設 IMDSv1 和 v2 <strong>都能用</strong>，只要 v1 還開著，攻擊者用最簡單的 GET 就拿得到憑證。要另外設定成只接受 v2（metadata 選項的 <code>HttpTokens</code> 設成 <code>required</code>），並讓主機的 IAM 角色只有最小權限（<a href="../../devops/lessons/19-aws-iam.html">部署課第 19 課</a>）。IMDSv2 只保護 metadata 這一個目標，內網服務和本機管理介面還是靠應用程式檢查與出站限制。</div>
+
+<div class="callout practice"><strong>💡 實務上：網路層的防線要找維運一起確認</strong><br>寫應用程式的人通常改不到 security group、出站代理或 EC2 的 metadata 設定，這些在維運或平台團隊手上。上線一個會抓外部網址的功能前，直接問他們：這台主機能連到內網和 metadata 嗎？IMDSv1 關了沒？主機的 IAM 角色有哪些權限？如果答案是「什麼都連得到、角色權限很大」，SSRF 一出事就可能波及整個雲端帳號的資源；這時把抓網址的功能拆到獨立、沒有權限的服務裡，比只靠程式裡的檢查可靠得多。</div>
+
+<p>到這裡處理的都是「請求送去哪裡」。咖啡店還有一種對外請求方向剛好相反：目的地是固定的物流商，不怕被指到內網，風險在於它回來的東西。</p>
+
+<h2>呼叫物流商 API，回來的資料能直接用嗎？</h2>
+<p>咖啡店的訂單頁要顯示外送進度，資料來自物流商：你呼叫它的 API，它也會用 webhook 通知你配送狀態。目的地是固定的 <code>api.courier.example</code>，用前面「拿到一個 IP」那節最後提到的網域允許清單就解決了 SSRF。問題出在回應：開發者對自己使用者的輸入會驗證，對合作夥伴的回應卻常常直接存進資料庫、放進頁面，好像它一定是對的。OWASP API10（2023）<strong>Unsafe Consumption of APIs（不安全的 API 使用）</strong>說的就是這件事。第三方可能被入侵、可能有 bug、你和它之間的設定可能被改，所以它的回應和使用者的輸入一樣，都是不可信的輸入。具體要做五件事。</p>
+<p><strong>回應當成不可信輸入</strong>：先當成 <code>unknown</code>，逐欄驗證型別、範圍、長度、列舉值，只取需要的欄位（TypeScript 課<a href="../../typescript/lessons/17-unknown-any-guards.html">第 17 課</a>、<a href="../../typescript/lessons/26-runtime-validation.html">第 26 課</a>）。不要 <code>as DeliveryUpdate</code> 就用：<code>as</code> 只是告訴編譯器「相信我」，執行時什麼都沒檢查。</p>
+<p><strong>它給的網址不能直接用</strong>：物流商回傳的 <code>trackingUrl</code> 要放進寄給顧客的 email 或頁面的 <code>&lt;a href&gt;</code>。如果它是 <code>javascript:</code> 或釣魚網站，你的 email 就替攻擊者背書。要檢查 <code>https:</code>，而且 hostname 完全等於約定的網域。要讓伺服器去抓它給的網址，就走這課的 <code>safeFetch</code>。</p>
+<p><strong>重導向不要帶著憑證走</strong>：呼叫第三方時帶了 <code>Authorization</code>，它重導向到別的網域時，不能把同樣的標頭送過去。<code>fetch</code> 跟過去時如果還帶著 <code>Authorization</code>，重導向目標的網域（可能是攻擊者的）就會收到你的物流商 API key，之後能用你的身分呼叫物流商。前面處理 302 那節已經改成自己處理重導向，跨網域時就拿掉憑證，或乾脆拒絕。</p>
+<p><strong>逾時與斷路器</strong>：第三方慢了或掛了，不能把你的服務一起拖垮。設逾時，再加上<strong>斷路器（circuit breaker）</strong>：對方連續失敗就暫時不再呼叫、直接回錯誤，等一段時間再試（<a href="../../system-design/lessons/11-circuit-breaker-bulkhead.html">系統設計課第 11 課</a>）。</p>
+<p><strong>用 TLS、驗證 webhook 簽章</strong>：物流商打你的 webhook 時，照<a href="17-api-keys-m2m.html">第 17 課</a>驗簽章，不要因為「來源 IP 對」就相信。簽章證明「這是物流商送的」，上面四件事確保「它送的內容不會傷到你」，兩者都要。</p>
+<p>設計時問一句：<strong>這個第三方被入侵的話，我的系統會怎樣？</strong>答案是「它能讓我的顧客收到釣魚連結」或「它能讓我的資料庫存進 10 MB 的字串」，就是驗證不夠。練習 3 會照這個標準驗證物流商的 webhook 內容。</p>
+
+<div class="callout practice"><strong>💡 實務上：串接金流、物流 API 時先想好「對方出問題怎麼辦」</strong><br>串接時大家只測「正常回應」，上線後遇到的卻是欄位突然變 <code>null</code>、日期格式換了、回應慢到 30 秒。咖啡店的訂單頁如果直接顯示物流商回傳的狀態，就要先決定：驗證失敗或逾時時，頁面顯示「物流狀態暫時無法取得」，而不是整頁錯誤。原始回應在 log 留一份方便客服和你追問題，但要先拿掉個資與 token。對方的測試環境（sandbox）和正式環境行為常常不完全一樣，上線初期多看幾天 log 裡被驗證擋下的回應。</div>
+
+<h2>補充與查表</h2>
+<h3>IPv6 位址的檢查細節</h3>
+<p>要自己寫或審查位址檢查、或服務要支援 IPv6 時再看這節。</p>
+<p><strong>IPv6 位址</strong>是 128 位元，寫成 8 組 16 位元的十六進位數字、用冒號分隔，例如 <code>2001:4860:4860:0:0:0:0:8888</code>。連續的 0 組可以用 <code>::</code> 省略<strong>一次</strong>：上面那個寫成 <code>2001:4860:4860::8888</code>，本機是 <code>::1</code>（前面 7 組都是 0），<code>::</code> 是全部 0。放進網址時要加方括號：<code>http://[::1]/</code>，所以 <code>new URL()</code> 的 <code>hostname</code> 會是 <code>[::1]</code>。</p>
+<p>預設拒絕的規則分兩步（<code>5f00::/16</code> 是 SRv6，一種 IPv6 路由技術用的位址）：</p>
+<ol>
+  <li>只有<strong>全域單播（global unicast）</strong>的 <code>2000::/3</code>（開頭是 <code>2</code> 或 <code>3</code> 的位址）可以連。<code>::</code>、<code>::1</code>、<code>fc00::/7</code>（私有，類似 IPv4 的 10/8）、<code>fe80::/10</code>（鏈路本地）、<code>ff00::/8</code>（multicast）、<code>5f00::/16</code>、<code>100::/64</code> 都不在 <code>2000::/3</code> 裡，自然被擋。</li>
+  <li>再排除 <code>2000::/3</code> 裡面的特殊範圍：<code>2001::/23</code>（協定用，裡面少數子區塊其實可連，全部擋掉比較單純）、<code>2001:db8::/32</code>（文件用）、<code>2002::/16</code>（6to4，位址裡內嵌了一個 IPv4，<code>2002:7f00:1::1</code> 就包著 <code>127.0.0.1</code>）、<code>3fff::/20</code>。</li>
+</ol>
+<p>有兩種 IPv6 位址裡面包著 IPv4，要<strong>取出最後 4 個位元組，改用 IPv4 的規則檢查</strong>：</p>
+<ul>
+  <li><strong>IPv4-mapped</strong>（<code>::ffff:0:0/96</code>）：<code>::ffff:127.0.0.1</code>，<code>new URL()</code> 會把它寫成 <code>[::ffff:7f00:1]</code>（<code>7f00:1</code> 就是 127.0.0.1 的四個位元組 <code>7f 00 00 01</code>）。系統的網路層把它當 IPv4 連線，所以它就是 127.0.0.1。</li>
+  <li><strong>NAT64</strong>（<code>64:ff9b::/96</code>）：只有 IPv6 的網路透過轉換閘道連 IPv4 用的前綴。<code>64:ff9b::808:808</code> 是連 8.8.8.8，可以放行；<code>64:ff9b::7f00:1</code> 指向 127.0.0.1。規格（RFC 6052）規定這個前綴不能用來表示非公開的 IPv4，但你無法確定網路上的每台閘道都照做，所以一樣取出內嵌的 IPv4 檢查。</li>
+</ul>
+<h3>瀏覽器與 Node 的 <code>redirect: 'manual'</code></h3>
+<p>瀏覽器的 <code>fetch</code> 在 <code>redirect: 'manual'</code> 時只給一個看不到內容的回應（opaque redirect），但 Node 的 <code>fetch</code>（undici）會回傳真正的 3xx 回應，讀得到 <code>Location</code>，伺服器端才能自己處理（undici 文件的 Manual Redirect 一節）。</p>
+<h3>IMDSv2 的另外兩層保護</h3>
+<p>PUT 回應的 IP 封包 hop limit 預設是 1。hop limit 是封包能經過幾次轉送，每經過一個路由器或容器網路減 1，到 0 就被丟掉；所以 token 只到得了主機本身，經過容器網路或一層轉送就到不了。另外，帶 <code>X-Forwarded-For</code> 標頭的 PUT 會被拒絕，擋掉經過反向代理轉來的請求（<a href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html">AWS EC2 使用者指南</a>）。</p>
+
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：判斷一個 IP 能不能連。起始程式已經會解析 IPv4 與 IPv6，IPv6 的規則也寫好了（都會呼叫你寫的 <code>inCidr</code>），你要完成：</p>
+  <ul>
+    <li><code>inCidr(bytes, prefix, bits)</code>：<code>bytes</code> 和 <code>prefix</code> 長度不同就回 <code>false</code>；比較前 <code>bits</code> 個位元是否相同（切在位元組中間時用遮罩）。IPv4 是 4 個位元組、IPv6 是 16 個，同一個函式都要能用。</li>
+    <li><code>isPublicAddress(text)</code> 的 IPv4 分支：落在課文表格的任何一段就回 <code>false</code>，其他回 <code>true</code>。</li>
+  </ul>
+  <script type="start">
+type Ip = { family: 4; bytes: number[] } | { family: 6; bytes: number[] }
+
+// 只接受標準的四段十進位（new URL() 已經正規化過）
+function parseIPv4(text: string): number[] | null {
+  const parts = text.split('.')
+  if (parts.length !== 4) return null
+  if (!parts.every(p => /^(0|[1-9]\d{0,2})$/.test(p) && Number(p) <= 255)) return null
+  return parts.map(Number)
+}
+
+// 已經寫好：解析 IPv4 與 IPv6（含 :: 展開）
+function parseIp(text: string): Ip | null {
+  let s = text.startsWith('[') && text.endsWith(']') ? text.slice(1, -1) : text
+  if (!s.includes(':')) {
+    const v4 = parseIPv4(s)
+    return v4 ? { family: 4, bytes: v4 } : null
+  }
+  // 結尾內嵌 IPv4（::ffff:127.0.0.1）：換成兩組十六進位
+  const lastColon = s.lastIndexOf(':')
+  const tail = s.slice(lastColon + 1)
+  if (tail.includes('.')) {
+    const v4 = parseIPv4(tail)
+    if (!v4) return null
+    s = s.slice(0, lastColon + 1) + ((v4[0] << 8) | v4[1]).toString(16) + ':' + ((v4[2] << 8) | v4[3]).toString(16)
+  }
+  const halves = s.split('::')
+  if (halves.length > 2) return null
+  const split = (part: string) => (part === '' ? [] : part.split(':'))
+  let groups = split(halves[0])
+  if (halves.length === 2) {
+    const right = split(halves[1])
+    const missing = 8 - groups.length - right.length
+    if (missing < 1) return null
+    groups = [...groups, ...Array.from({ length: missing }, () => '0'), ...right]
+  }
+  if (groups.length !== 8) return null
+  const bytes: number[] = []
+  for (const g of groups) {
+    if (!/^[0-9a-f]{1,4}$/i.test(g)) return null
+    const n = parseInt(g, 16)
+    bytes.push(n >> 8, n & 0xff)
+  }
+  return { family: 6, bytes }
+}
+
+function inCidr(bytes: number[], prefix: number[], bits: number): boolean {
+  // TODO
+  return false
+}
+
+// 已經寫好：IPv6 的規則（選讀節「IPv6 位址的檢查」）
+function v6(text: string): number[] {
+  const ip = parseIp(text)
+  if (!ip) throw new Error('bad prefix ' + text)
+  return ip.bytes
+}
+const V6_GLOBAL: [number[], number] = [v6('2000::'), 3]
+const V6_BLOCKED: [number[], number][] = [[v6('2001::'), 23], [v6('2001:db8::'), 32], [v6('2002::'), 16], [v6('3fff::'), 20]]
+const V6_EMBEDS_V4: [number[], number][] = [[v6('::ffff:0:0'), 96], [v6('64:ff9b::'), 96]]
+
+function isPublicAddress(text: string): boolean {
+  const ip = parseIp(text)
+  if (!ip) return false
+  if (ip.family === 4) {
+    // TODO：落在課文 IPv4 表的任何一段就回 false
+    return true
+  }
+  // 包著 IPv4 的，取出最後 4 個位元組用 IPv4 規則
+  if (V6_EMBEDS_V4.some(([p, b]) => inCidr(ip.bytes, p, b))) return isPublicAddress(ip.bytes.slice(12).join('.'))
+  // 預設拒絕：只有 2000::/3，再排除特殊範圍
+  if (!inCidr(ip.bytes, V6_GLOBAL[0], V6_GLOBAL[1])) return false
+  return !V6_BLOCKED.some(([p, b]) => inCidr(ip.bytes, p, b))
+}
+
+for (const ip of ['8.8.8.8', '172.31.255.255', '172.32.0.1', '::1', '[::ffff:7f00:1]', '2001:4860:4860::8888']) {
+  console.log(ip, isPublicAddress(ip))
+}
+</script>
+  <script type="answer">
+type Ip = { family: 4; bytes: number[] } | { family: 6; bytes: number[] }
+
+// 只接受標準的四段十進位（new URL() 已經正規化過）
+function parseIPv4(text: string): number[] | null {
+  const parts = text.split('.')
+  if (parts.length !== 4) return null
+  if (!parts.every(p => /^(0|[1-9]\d{0,2})$/.test(p) && Number(p) <= 255)) return null
+  return parts.map(Number)
+}
+
+function parseIp(text: string): Ip | null {
+  let s = text.startsWith('[') && text.endsWith(']') ? text.slice(1, -1) : text
+  if (!s.includes(':')) {
+    const v4 = parseIPv4(s)
+    return v4 ? { family: 4, bytes: v4 } : null
+  }
+  // 結尾內嵌 IPv4（::ffff:127.0.0.1）：換成兩組十六進位
+  const lastColon = s.lastIndexOf(':')
+  const tail = s.slice(lastColon + 1)
+  if (tail.includes('.')) {
+    const v4 = parseIPv4(tail)
+    if (!v4) return null
+    s = s.slice(0, lastColon + 1) + ((v4[0] << 8) | v4[1]).toString(16) + ':' + ((v4[2] << 8) | v4[3]).toString(16)
+  }
+  const halves = s.split('::')
+  if (halves.length > 2) return null
+  const split = (part: string) => (part === '' ? [] : part.split(':'))
+  let groups = split(halves[0])
+  if (halves.length === 2) {
+    const right = split(halves[1])
+    const missing = 8 - groups.length - right.length
+    if (missing < 1) return null
+    groups = [...groups, ...Array.from({ length: missing }, () => '0'), ...right]
+  }
+  if (groups.length !== 8) return null
+  const bytes: number[] = []
+  for (const g of groups) {
+    if (!/^[0-9a-f]{1,4}$/i.test(g)) return null
+    const n = parseInt(g, 16)
+    bytes.push(n >> 8, n & 0xff)
+  }
+  return { family: 6, bytes }
+}
+
+function inCidr(bytes: number[], prefix: number[], bits: number): boolean {
+  if (bytes.length !== prefix.length) return false
+  for (let i = 0; i < bytes.length; i++) {
+    const take = Math.min(8, bits - i * 8)     // 這個位元組要比幾個位元
+    if (take <= 0) return true
+    const mask = (0xff << (8 - take)) & 0xff
+    if ((bytes[i] & mask) !== (prefix[i] & mask)) return false
+  }
+  return true
+}
+
+const V4_BLOCKED: [number[], number][] = [
+  [[0, 0, 0, 0], 8], [[10, 0, 0, 0], 8], [[100, 64, 0, 0], 10], [[127, 0, 0, 0], 8],
+  [[169, 254, 0, 0], 16], [[172, 16, 0, 0], 12], [[192, 0, 0, 0], 24], [[192, 0, 2, 0], 24],
+  [[192, 168, 0, 0], 16], [[198, 18, 0, 0], 15], [[198, 51, 100, 0], 24], [[203, 0, 113, 0], 24],
+  [[224, 0, 0, 0], 4], [[240, 0, 0, 0], 4],
+]
+function v6(text: string): number[] {
+  const ip = parseIp(text)
+  if (!ip) throw new Error('bad prefix ' + text)
+  return ip.bytes
+}
+const V6_GLOBAL: [number[], number] = [v6('2000::'), 3]
+const V6_BLOCKED: [number[], number][] = [[v6('2001::'), 23], [v6('2001:db8::'), 32], [v6('2002::'), 16], [v6('3fff::'), 20]]
+const V6_EMBEDS_V4: [number[], number][] = [[v6('::ffff:0:0'), 96], [v6('64:ff9b::'), 96]]
+
+function isPublicAddress(text: string): boolean {
+  const ip = parseIp(text)
+  if (!ip) return false
+  if (ip.family === 4) return !V4_BLOCKED.some(([p, b]) => inCidr(ip.bytes, p, b))
+  // 包著 IPv4 的，取出最後 4 個位元組用 IPv4 規則
+  if (V6_EMBEDS_V4.some(([p, b]) => inCidr(ip.bytes, p, b))) return isPublicAddress(ip.bytes.slice(12).join('.'))
+  // 預設拒絕：只有 2000::/3，再排除特殊範圍
+  if (!inCidr(ip.bytes, V6_GLOBAL[0], V6_GLOBAL[1])) return false
+  return !V6_BLOCKED.some(([p, b]) => inCidr(ip.bytes, p, b))
+}
+
+for (const ip of ['8.8.8.8', '172.31.255.255', '172.32.0.1', '::1', '[::ffff:7f00:1]', '2001:4860:4860::8888']) {
+  console.log(ip, isPublicAddress(ip))
+}
+</script>
+  <script type="types">
+type _1 = Expect<Equal<ReturnType<typeof isPublicAddress>, boolean>>  // isPublicAddress 回傳 boolean
+type _2 = Expect<Equal<Parameters<typeof inCidr>, [bytes: number[], prefix: number[], bits: number]>>  // inCidr(bytes, prefix, bits) 的參數不能改
+</script>
+  <script type="tests">
+assert.deepEqual(parseIp('::1'), { family: 6, bytes: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1] }, '::1 要展開成 15 個 0 位元組加上 1')
+assert.deepEqual(parseIp('[::ffff:127.0.0.1]'), { family: 6, bytes: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1] }, '方括號與結尾內嵌的 IPv4 都要能解析')
+assert.deepEqual(parseIp('2001:db8::'), { family: 6, bytes: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }, ':: 在結尾也要展開')
+assert.deepEqual(parseIp('1.2.3.4'), { family: 4, bytes: [1, 2, 3, 4] }, 'IPv4 解析成 4 個位元組')
+assert.equal(parseIp('1::2::3'), null, ':: 只能出現一次')
+assert.equal(parseIp('1:2:3:4::5:6:7:8'), null, '已經有 8 組時不能再有 ::')
+assert.equal(parseIp('127.1'), null, '只接受四段的 IPv4')
+assert.deepEqual(parseIp('::'), { family: 6, bytes: Array(16).fill(0) }, ':: 單獨出現代表 8 組全是 0')
+assert.deepEqual(parseIp('fe80::1:2'), { family: 6, bytes: [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 2] }, ':: 在中間要補上剛好缺的組數')
+
+assert.equal(inCidr([172, 31, 255, 255], [172, 16, 0, 0], 12), true, '172.31.255.255 在 172.16.0.0/12 裡')
+assert.equal(inCidr([172, 32, 0, 0], [172, 16, 0, 0], 12), false, '172.32.0.0 不在 172.16.0.0/12 裡：第二個位元組只比前 4 個位元')
+assert.equal(inCidr([172, 15, 255, 255], [172, 16, 0, 0], 12), false, '172.15.255.255 不在 172.16.0.0/12 裡')
+assert.equal(inCidr([100, 127, 255, 255], [100, 64, 0, 0], 10), true, '100.127.255.255 在 100.64.0.0/10 裡')
+assert.equal(inCidr([100, 128, 0, 0], [100, 64, 0, 0], 10), false, '100.128.0.0 不在 100.64.0.0/10 裡')
+assert.equal(inCidr([10, 1, 2, 3], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0), false, '長度不同（IPv4 對 IPv6 前綴）要回 false')
+
+const blocked = ['127.0.0.1', '10.1.2.3', '172.16.0.1', '172.31.0.9', '192.168.1.1', '169.254.169.254', '100.64.0.1', '0.0.0.0',
+  '255.255.255.255', '203.0.113.5', '198.19.0.1', '224.0.0.1', '192.0.0.8', '192.0.2.1', '198.51.100.7', '240.0.0.1', '239.255.255.250',
+  '::1', '::', 'fe80::1', 'fd00::1', 'ff02::1', '2001:db8::1',
+  '::ffff:7f00:1', '[::ffff:127.0.0.1]', '64:ff9b::7f00:1', '[::ffff:a9fe:a9fe]',
+  '2002:7f00:1::1', '3fff::1', '5f00::1', '100::1', '2001::1', '0:0:0:0:0:ffff:7f00:1', '127.1', 'abc', '']
+for (const ip of blocked) assert.equal(isPublicAddress(ip), false, `${ip} 不能連`)
+const allowed = ['8.8.8.8', '1.1.1.1', '172.32.0.1', '100.128.0.1', '198.20.0.1', '192.0.1.1', '223.255.255.255', '2001:200::1', '3ffe::1', '::ffff:8.8.8.8', '64:ff9b::808:808',
+  '2001:4860:4860::8888', '[2606:4700:4700::1111]']
+for (const ip of allowed) assert.equal(isPublicAddress(ip), true, `${ip} 是公開位址，應該可以連`)
+</script>
+  <script type="wrong">
+// 用字串開頭判斷
+type Ip = { family: 4; bytes: number[] } | { family: 6; bytes: number[] }
+function parseIPv4(text: string): number[] | null {
+  const parts = text.split('.')
+  if (parts.length !== 4) return null
+  if (!parts.every(p => /^(0|[1-9]\d{0,2})$/.test(p) && Number(p) <= 255)) return null
+  return parts.map(Number)
+}
+function parseIp(text: string): Ip | null {
+  const v4 = parseIPv4(text)
+  return v4 ? { family: 4, bytes: v4 } : null
+}
+function inCidr(bytes: number[], prefix: number[], bits: number): boolean {
+  return bytes.slice(0, Math.floor(bits / 8)).join('.') === prefix.slice(0, Math.floor(bits / 8)).join('.')
+}
+function isPublicAddress(text: string): boolean {
+  if (!parseIp(text) && !text.includes(':')) return false
+  return !['127.', '10.', '192.168.', '169.254.', '0.', '::1', 'fe80', 'fc', 'fd'].some(p => text.startsWith(p))
+}
+</script>
+  <script type="wrong">
+// inCidr 只比整個位元組，172.16.0.0/12 變成只比 172
+type Ip = { family: 4; bytes: number[] } | { family: 6; bytes: number[] }
+function parseIPv4(text: string): number[] | null {
+  const parts = text.split('.')
+  if (parts.length !== 4) return null
+  if (!parts.every(p => /^(0|[1-9]\d{0,2})$/.test(p) && Number(p) <= 255)) return null
+  return parts.map(Number)
+}
+function parseIp(text: string): Ip | null {
+  let s = text.startsWith('[') && text.endsWith(']') ? text.slice(1, -1) : text
+  if (!s.includes(':')) {
+    const v4 = parseIPv4(s)
+    return v4 ? { family: 4, bytes: v4 } : null
+  }
+  const lastColon = s.lastIndexOf(':')
+  const tail = s.slice(lastColon + 1)
+  if (tail.includes('.')) {
+    const v4 = parseIPv4(tail)
+    if (!v4) return null
+    s = s.slice(0, lastColon + 1) + ((v4[0] << 8) | v4[1]).toString(16) + ':' + ((v4[2] << 8) | v4[3]).toString(16)
+  }
+  const halves = s.split('::')
+  if (halves.length > 2) return null
+  const split = (part: string) => (part === '' ? [] : part.split(':'))
+  let groups = split(halves[0])
+  if (halves.length === 2) {
+    const right = split(halves[1])
+    const missing = 8 - groups.length - right.length
+    if (missing < 1) return null
+    groups = [...groups, ...Array.from({ length: missing }, () => '0'), ...right]
+  }
+  if (groups.length !== 8) return null
+  const bytes: number[] = []
+  for (const g of groups) {
+    if (!/^[0-9a-f]{1,4}$/i.test(g)) return null
+    const n = parseInt(g, 16)
+    bytes.push(n >> 8, n & 0xff)
+  }
+  return { family: 6, bytes }
+}
+function inCidr(bytes: number[], prefix: number[], bits: number): boolean {
+  if (bytes.length !== prefix.length) return false
+  for (let i = 0; i < Math.floor(bits / 8); i++) if (bytes[i] !== prefix[i]) return false
+  return true
+}
+const V4_BLOCKED: [number[], number][] = [
+  [[0, 0, 0, 0], 8], [[10, 0, 0, 0], 8], [[100, 64, 0, 0], 10], [[127, 0, 0, 0], 8],
+  [[169, 254, 0, 0], 16], [[172, 16, 0, 0], 12], [[192, 0, 0, 0], 24], [[192, 0, 2, 0], 24],
+  [[192, 168, 0, 0], 16], [[198, 18, 0, 0], 15], [[198, 51, 100, 0], 24], [[203, 0, 113, 0], 24],
+  [[224, 0, 0, 0], 4], [[240, 0, 0, 0], 4],
+]
+function v6(text: string): number[] {
+  const ip = parseIp(text)
+  if (!ip) throw new Error('bad prefix ' + text)
+  return ip.bytes
+}
+const V6_BLOCKED: [number[], number][] = [[v6('2001::'), 23], [v6('2001:db8::'), 32], [v6('2002::'), 16], [v6('3fff::'), 20]]
+const V6_EMBEDS_V4: [number[], number][] = [[v6('::ffff:0:0'), 96], [v6('64:ff9b::'), 96]]
+function isPublicAddress(text: string): boolean {
+  const ip = parseIp(text)
+  if (!ip) return false
+  if (ip.family === 4) return !V4_BLOCKED.some(([p, b]) => inCidr(ip.bytes, p, b))
+  if (V6_EMBEDS_V4.some(([p, b]) => inCidr(ip.bytes, p, b))) return isPublicAddress(ip.bytes.slice(12).join('.'))
+  if ((ip.bytes[0] & 0xe0) !== 0x20) return false
+  return !V6_BLOCKED.some(([p, b]) => inCidr(ip.bytes, p, b))
+}
+</script>
+  <script type="wrong">
+// IPv4 表只寫了私有、本機、metadata、multicast，漏掉協定保留、文件用與 240/4
+type Ip = { family: 4; bytes: number[] } | { family: 6; bytes: number[] }
+function parseIPv4(t: string): number[] | null {
+  const p = t.split('.')
+  return p.length === 4 && p.every(x => /^(0|[1-9]\d{0,2})$/.test(x) && Number(x) <= 255) ? p.map(Number) : null
+}
+function parseIp(text: string): Ip | null {
+  let s = text.startsWith('[') && text.endsWith(']') ? text.slice(1, -1) : text
+  if (!s.includes(':')) { const v4 = parseIPv4(s); return v4 ? { family: 4, bytes: v4 } : null }
+  const i = s.lastIndexOf(':')
+  if (s.slice(i + 1).includes('.')) {
+    const v4 = parseIPv4(s.slice(i + 1))
+    if (!v4) return null
+    s = s.slice(0, i + 1) + ((v4[0] << 8) | v4[1]).toString(16) + ':' + ((v4[2] << 8) | v4[3]).toString(16)
+  }
+  const halves = s.split('::')
+  if (halves.length > 2) return null
+  const split = (x: string) => (x === '' ? [] : x.split(':'))
+  let groups = split(halves[0])
+  if (halves.length === 2) {
+    const right = split(halves[1])
+    const missing = 8 - groups.length - right.length
+    if (missing < 1) return null
+    groups = [...groups, ...Array.from({ length: missing }, () => '0'), ...right]
+  }
+  if (groups.length !== 8 || !groups.every(g => /^[0-9a-f]{1,4}$/i.test(g))) return null
+  return { family: 6, bytes: groups.flatMap(g => [parseInt(g, 16) >> 8, parseInt(g, 16) & 0xff]) }
+}
+function inCidr(bytes: number[], prefix: number[], bits: number): boolean {
+  if (bytes.length !== prefix.length) return false
+  for (let i = 0; i < bytes.length && bits - i * 8 > 0; i++) {
+    const mask = (0xff << (8 - Math.min(8, bits - i * 8))) & 0xff
+    if ((bytes[i] & mask) !== (prefix[i] & mask)) return false
+  }
+  return true
+}
+const V4_BLOCKED: [string, number][] = [['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16],
+  ['172.16.0.0', 12], ['192.168.0.0', 16], ['224.0.0.0', 4]]
+const V6_BLOCKED: [string, number][] = [['2001::', 23], ['2001:db8::', 32], ['2002::', 16], ['3fff::', 20]]
+const inRange = (bytes: number[], [p, b]: [string, number]) => inCidr(bytes, parseIp(p)?.bytes ?? [], b)
+function isPublicAddress(text: string): boolean {
+  const ip = parseIp(text)
+  if (!ip) return false
+  if (ip.family === 4) return !V4_BLOCKED.some(r => inRange(ip.bytes, r))
+  if (inRange(ip.bytes, ['::ffff:0:0', 96]) || inRange(ip.bytes, ['64:ff9b::', 96])) return isPublicAddress(ip.bytes.slice(12).join('.'))
+  return inRange(ip.bytes, ['2000::', 3]) && !V6_BLOCKED.some(r => inRange(ip.bytes, r))
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：寫出安全的出站請求 <code>safeFetch(input, deps, policy)</code>。最上面是練習 1 的答案，直接用。<code>deps.resolve</code> 是 DNS 解析、<code>deps.fetch(ip, url)</code> 連到指定的 IP 發請求（不跟隨重導向、Host 與 SNI 用 <code>url</code> 的網域）。要求：</p>
+  <ul>
+    <li>網址解析失敗、不是 <code>https:</code>、有指定 port（<code>url.port</code> 不是空字串）、有 userinfo，回 <code>bad_url</code>，而且不呼叫 <code>resolve</code>。</li>
+    <li>hostname 是 IP 就直接檢查；否則呼叫 <code>resolve</code> <strong>一次</strong>，解析結果是空的、或任何一個不是公開位址，回 <code>blocked_address</code>。</li>
+    <li>用其中一個驗證過的 IP 呼叫 <code>deps.fetch</code>。</li>
+    <li>3xx 時把 <code>location</code> 標頭相對於目前網址解析，重複整個流程；最多跟隨 <code>policy.maxRedirects</code> 次，再收到 3xx 回 <code>too_many_redirects</code>。</li>
+    <li>body 超過 <code>policy.maxBytes</code> 位元組回 <code>too_large</code>；否則回 <code>{ ok: true, body }</code>。</li>
+  </ul>
+  <script type="start">
+// ---- 練習 1 的答案（不用改）----
+type Ip = { family: 4; bytes: number[] } | { family: 6; bytes: number[] }
+function parseIPv4(t: string): number[] | null {
+  const p = t.split('.')
+  return p.length === 4 && p.every(x => /^(0|[1-9]\d{0,2})$/.test(x) && Number(x) <= 255) ? p.map(Number) : null
+}
+function parseIp(text: string): Ip | null {
+  let s = text.startsWith('[') && text.endsWith(']') ? text.slice(1, -1) : text
+  if (!s.includes(':')) { const v4 = parseIPv4(s); return v4 ? { family: 4, bytes: v4 } : null }
+  const i = s.lastIndexOf(':')
+  if (s.slice(i + 1).includes('.')) {
+    const v4 = parseIPv4(s.slice(i + 1))
+    if (!v4) return null
+    s = s.slice(0, i + 1) + ((v4[0] << 8) | v4[1]).toString(16) + ':' + ((v4[2] << 8) | v4[3]).toString(16)
+  }
+  const halves = s.split('::')
+  if (halves.length > 2) return null
+  const split = (x: string) => (x === '' ? [] : x.split(':'))
+  let groups = split(halves[0])
+  if (halves.length === 2) {
+    const right = split(halves[1])
+    const missing = 8 - groups.length - right.length
+    if (missing < 1) return null
+    groups = [...groups, ...Array.from({ length: missing }, () => '0'), ...right]
+  }
+  if (groups.length !== 8 || !groups.every(g => /^[0-9a-f]{1,4}$/i.test(g))) return null
+  return { family: 6, bytes: groups.flatMap(g => [parseInt(g, 16) >> 8, parseInt(g, 16) & 0xff]) }
+}
+function inCidr(bytes: number[], prefix: number[], bits: number): boolean {
+  if (bytes.length !== prefix.length) return false
+  for (let i = 0; i < bytes.length && bits - i * 8 > 0; i++) {
+    const mask = (0xff << (8 - Math.min(8, bits - i * 8))) & 0xff
+    if ((bytes[i] & mask) !== (prefix[i] & mask)) return false
+  }
+  return true
+}
+const V4_BLOCKED: [string, number][] = [['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16],
+  ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.0.2.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['198.51.100.0', 24],
+  ['203.0.113.0', 24], ['224.0.0.0', 4], ['240.0.0.0', 4]]
+const V6_BLOCKED: [string, number][] = [['2001::', 23], ['2001:db8::', 32], ['2002::', 16], ['3fff::', 20]]
+const inRange = (bytes: number[], [p, b]: [string, number]) => inCidr(bytes, parseIp(p)?.bytes ?? [], b)
+function isPublicAddress(text: string): boolean {
+  const ip = parseIp(text)
+  if (!ip) return false
+  if (ip.family === 4) return !V4_BLOCKED.some(r => inRange(ip.bytes, r))
+  if (inRange(ip.bytes, ['::ffff:0:0', 96]) || inRange(ip.bytes, ['64:ff9b::', 96])) return isPublicAddress(ip.bytes.slice(12).join('.'))
+  return inRange(ip.bytes, ['2000::', 3]) && !V6_BLOCKED.some(r => inRange(ip.bytes, r))
+}
+// ---- 練習 1 的答案結束 ----
+
+type Res = { status: number; headers: Record<string, string>; body: Uint8Array }
+type Deps = {
+  resolve(host: string): Promise<string[]>
+  fetch(ip: string, url: URL): Promise<Res>
+}
+type Policy = { maxRedirects: number; maxBytes: number }
+type SafeFetchResult =
+  | { ok: true; body: Uint8Array }
+  | { ok: false; error: 'bad_url' | 'blocked_address' | 'too_many_redirects' | 'too_large' }
+
+async function safeFetch(input: string, deps: Deps, policy: Policy): Promise<SafeFetchResult> {
+  // 目前的寫法：只要網址解析得了就照抓
+  let url: URL
+  try { url = new URL(input) } catch { return { ok: false, error: 'bad_url' } }
+  const [ip] = await deps.resolve(url.hostname)
+  const res = await deps.fetch(ip, url)
+  return { ok: true, body: res.body }
+}
+
+const demoDeps: Deps = {
+  resolve: async host => (host === 'img.partner.example' ? ['93.184.215.14'] : ['10.0.0.5']),
+  fetch: async (ip, url) => ({ status: 200, headers: { 'content-type': 'image/png' }, body: new Uint8Array(3) }),
+}
+const policy = { maxRedirects: 3, maxBytes: 1024 }
+console.log(await safeFetch('https://img.partner.example/beans.png', demoDeps, policy))
+console.log(await safeFetch('https://internal.example/admin', demoDeps, policy))
+</script>
+  <script type="answer">
+// ---- 練習 1 的答案（不用改）----
+type Ip = { family: 4; bytes: number[] } | { family: 6; bytes: number[] }
+function parseIPv4(t: string): number[] | null {
+  const p = t.split('.')
+  return p.length === 4 && p.every(x => /^(0|[1-9]\d{0,2})$/.test(x) && Number(x) <= 255) ? p.map(Number) : null
+}
+function parseIp(text: string): Ip | null {
+  let s = text.startsWith('[') && text.endsWith(']') ? text.slice(1, -1) : text
+  if (!s.includes(':')) { const v4 = parseIPv4(s); return v4 ? { family: 4, bytes: v4 } : null }
+  const i = s.lastIndexOf(':')
+  if (s.slice(i + 1).includes('.')) {
+    const v4 = parseIPv4(s.slice(i + 1))
+    if (!v4) return null
+    s = s.slice(0, i + 1) + ((v4[0] << 8) | v4[1]).toString(16) + ':' + ((v4[2] << 8) | v4[3]).toString(16)
+  }
+  const halves = s.split('::')
+  if (halves.length > 2) return null
+  const split = (x: string) => (x === '' ? [] : x.split(':'))
+  let groups = split(halves[0])
+  if (halves.length === 2) {
+    const right = split(halves[1])
+    const missing = 8 - groups.length - right.length
+    if (missing < 1) return null
+    groups = [...groups, ...Array.from({ length: missing }, () => '0'), ...right]
+  }
+  if (groups.length !== 8 || !groups.every(g => /^[0-9a-f]{1,4}$/i.test(g))) return null
+  return { family: 6, bytes: groups.flatMap(g => [parseInt(g, 16) >> 8, parseInt(g, 16) & 0xff]) }
+}
+function inCidr(bytes: number[], prefix: number[], bits: number): boolean {
+  if (bytes.length !== prefix.length) return false
+  for (let i = 0; i < bytes.length && bits - i * 8 > 0; i++) {
+    const mask = (0xff << (8 - Math.min(8, bits - i * 8))) & 0xff
+    if ((bytes[i] & mask) !== (prefix[i] & mask)) return false
+  }
+  return true
+}
+const V4_BLOCKED: [string, number][] = [['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16],
+  ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.0.2.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['198.51.100.0', 24],
+  ['203.0.113.0', 24], ['224.0.0.0', 4], ['240.0.0.0', 4]]
+const V6_BLOCKED: [string, number][] = [['2001::', 23], ['2001:db8::', 32], ['2002::', 16], ['3fff::', 20]]
+const inRange = (bytes: number[], [p, b]: [string, number]) => inCidr(bytes, parseIp(p)?.bytes ?? [], b)
+function isPublicAddress(text: string): boolean {
+  const ip = parseIp(text)
+  if (!ip) return false
+  if (ip.family === 4) return !V4_BLOCKED.some(r => inRange(ip.bytes, r))
+  if (inRange(ip.bytes, ['::ffff:0:0', 96]) || inRange(ip.bytes, ['64:ff9b::', 96])) return isPublicAddress(ip.bytes.slice(12).join('.'))
+  return inRange(ip.bytes, ['2000::', 3]) && !V6_BLOCKED.some(r => inRange(ip.bytes, r))
+}
+// ---- 練習 1 的答案結束 ----
+
+type Res = { status: number; headers: Record<string, string>; body: Uint8Array }
+type Deps = {
+  resolve(host: string): Promise<string[]>
+  fetch(ip: string, url: URL): Promise<Res>
+}
+type Policy = { maxRedirects: number; maxBytes: number }
+type SafeFetchResult =
+  | { ok: true; body: Uint8Array }
+  | { ok: false; error: 'bad_url' | 'blocked_address' | 'too_many_redirects' | 'too_large' }
+
+async function safeFetch(input: string, deps: Deps, policy: Policy): Promise<SafeFetchResult> {
+  let url: URL
+  try { url = new URL(input) } catch { return { ok: false, error: 'bad_url' } }
+  for (let redirects = 0; ; redirects++) {
+    // 1. 網址本身：只允許 https、預設 port、沒有 userinfo
+    if (url.protocol !== 'https:' || url.port !== '' || url.username !== '' || url.password !== '') {
+      return { ok: false, error: 'bad_url' }
+    }
+    // 2. 實際要連的位址：IP 字面值直接檢查，網域只解析一次、每一筆都檢查
+    const addresses = parseIp(url.hostname) ? [url.hostname] : await deps.resolve(url.hostname)
+    if (addresses.length === 0 || !addresses.every(isPublicAddress)) return { ok: false, error: 'blocked_address' }
+    // 3. 用驗證過的 IP 連線
+    const res = await deps.fetch(addresses[0], url)
+    // 4. 重導向：每一跳重新走一次整個流程
+    if (res.status >= 300 && res.status < 400) {
+      if (redirects >= policy.maxRedirects) return { ok: false, error: 'too_many_redirects' }
+      try { url = new URL(res.headers['location'] ?? '', url) } catch { return { ok: false, error: 'bad_url' } }
+      continue
+    }
+    // 5. 大小
+    if (res.body.byteLength > policy.maxBytes) return { ok: false, error: 'too_large' }
+    return { ok: true, body: res.body }
+  }
+}
+
+const demoDeps: Deps = {
+  resolve: async host => (host === 'img.partner.example' ? ['93.184.215.14'] : ['10.0.0.5']),
+  fetch: async (ip, url) => ({ status: 200, headers: { 'content-type': 'image/png' }, body: new Uint8Array(3) }),
+}
+const policy = { maxRedirects: 3, maxBytes: 1024 }
+console.log(await safeFetch('https://img.partner.example/beans.png', demoDeps, policy))
+console.log(await safeFetch('https://internal.example/admin', demoDeps, policy))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<ReturnType<typeof safeFetch>, Promise<SafeFetchResult>>>  // safeFetch 回傳 Promise<SafeFetchResult>
+</script>
+  <script type="tests">
+// 假的網路：dns 表、每個 IP 上的網頁
+function world(dns: Record<string, string[] | (() => string[])>, pages: Record<string, Res>) {
+  const log = { resolves: [] as string[], fetches: [] as string[] }
+  const deps: Deps = {
+    resolve: async host => {
+      log.resolves.push(host)
+      const r = dns[host]
+      return typeof r === 'function' ? r() : (r ?? [])
+    },
+    fetch: async (ip, url) => {
+      // 傳進來的不是 IP 的話，模擬 HTTP client 自己再解析一次
+      let target = ip
+      if (!parseIp(ip)) { log.resolves.push(ip); const r = dns[ip]; target = (typeof r === 'function' ? r() : r ?? [])[0] ?? '' }
+      log.fetches.push(`${target} ${url.href}`)
+      return pages[`${target} ${url.href}`] ?? { status: 404, headers: {}, body: new Uint8Array(0) }
+    },
+  }
+  return { deps, log }
+}
+const ok = (n: number): Res => ({ status: 200, headers: {}, body: new Uint8Array(n) })
+const redirect = (to: string): Res => ({ status: 302, headers: { location: to }, body: new Uint8Array(0) })
+const P = { maxRedirects: 3, maxBytes: 1000 }
+const PUB = '93.184.215.14'
+
+{
+  const w = world({ 'img.partner.example': [PUB] }, { [`${PUB} https://img.partner.example/a.png`]: ok(10) })
+  const r = await safeFetch('https://img.partner.example/a.png', w.deps, P)
+  assert.deepEqual(r, { ok: true, body: new Uint8Array(10) }, '公開位址的 https 網址要能抓到')
+  assert.deepEqual(w.log.fetches, [`${PUB} https://img.partner.example/a.png`], 'deps.fetch 要收到驗證過的 IP')
+}
+{
+  const w = world({ 'internal.example': ['10.0.0.5'] }, {})
+  assert.deepEqual(await safeFetch('https://internal.example/', w.deps, P), { ok: false, error: 'blocked_address' }, '網域解析成 10.0.0.5 要擋下')
+  assert.equal(w.log.fetches.length, 0, '被擋下的位址不能發出請求')
+}
+{
+  const w = world({ 'mixed.example': [PUB, '127.0.0.1'] }, {})
+  assert.deepEqual(await safeFetch('https://mixed.example/', w.deps, P), { ok: false, error: 'blocked_address' }, '解析結果有任何一筆是內網位址就要擋下，不能只看第一筆')
+}
+{
+  const w = world({ 'empty.example': [] }, {})
+  assert.deepEqual(await safeFetch('https://empty.example/', w.deps, P), { ok: false, error: 'blocked_address' }, '解析不到任何位址要回 blocked_address')
+}
+{
+  let n = 0
+  const w = world({ 'rebind.example': () => (n++ === 0 ? [PUB] : ['127.0.0.1']) }, { [`${PUB} https://rebind.example/x`]: ok(5) })
+  const r = await safeFetch('https://rebind.example/x', w.deps, P)
+  assert.deepEqual(w.log.resolves, ['rebind.example'], 'DNS rebinding：每一跳只能解析一次，連線要用驗證過的 IP，不能讓 fetch 再解析')
+  assert.deepEqual(w.log.fetches, [`${PUB} https://rebind.example/x`], 'DNS rebinding：deps.fetch 收到的必須是驗證過的 IP')
+  assert.deepEqual(r, { ok: true, body: new Uint8Array(5) }, 'DNS rebinding 的情境下，用驗證過的 IP 應該正常拿到內容')
+}
+for (const bad of ['http://img.partner.example/', 'https://user@127.0.0.1/', 'https://a:b@img.partner.example/', 'https://img.partner.example:8443/', 'file:///etc/passwd', 'not a url']) {
+  const w = world({ 'img.partner.example': [PUB] }, {})
+  assert.deepEqual(await safeFetch(bad, w.deps, P), { ok: false, error: 'bad_url' }, `${bad} 要回 bad_url（只允許 https、預設 port、沒有帳號密碼）`)
+  assert.equal(w.log.resolves.length, 0, `${bad} 在解析 DNS 前就要擋下`)
+}
+{
+  const w = world({}, {})
+  assert.deepEqual(await safeFetch('https://169.254.169.254/latest/meta-data/', w.deps, P), { ok: false, error: 'blocked_address' }, 'hostname 是內網 IP 要直接擋下')
+  assert.deepEqual(await safeFetch('https://[::ffff:7f00:1]/', w.deps, P), { ok: false, error: 'blocked_address' }, 'IPv6 寫法的 127.0.0.1 也要擋下')
+  assert.equal(w.log.resolves.length, 0, 'hostname 是 IP 時不需要解析 DNS')
+}
+{
+  const w = world({ 'img.partner.example': [PUB] }, { [`${PUB} https://img.partner.example/a`]: redirect('http://169.254.169.254/latest/meta-data/') })
+  assert.deepEqual(await safeFetch('https://img.partner.example/a', w.deps, P), { ok: false, error: 'bad_url' }, '重導向到 http 的 metadata 要回 bad_url')
+  assert.equal(w.log.fetches.length, 1, '重導向的目標沒通過檢查，不能發出請求')
+}
+{
+  const w = world({ 'img.partner.example': [PUB] }, { [`${PUB} https://img.partner.example/a`]: redirect('https://img.partner.example:6379/') })
+  assert.deepEqual(await safeFetch('https://img.partner.example/a', w.deps, P), { ok: false, error: 'bad_url' }, '重導向到別的 port 要回 bad_url：每一跳都要重新檢查 https、port、userinfo')
+  assert.equal(w.log.fetches.length, 1, '重導向的目標沒通過檢查，不能發出請求')
+}
+{
+  const w = world({ 'img.partner.example': [PUB] }, { [`${PUB} https://img.partner.example/a`]: redirect('https://10.0.0.1/admin') })
+  assert.deepEqual(await safeFetch('https://img.partner.example/a', w.deps, P), { ok: false, error: 'blocked_address' }, '重導向到 https://10.0.0.1/ 要擋下：每一跳都要重新檢查位址')
+}
+{
+  const w = world({ 'img.partner.example': [PUB], 'cdn.partner.example': ['8.8.4.4'] }, {
+    [`${PUB} https://img.partner.example/a`]: redirect('/b'),
+    [`${PUB} https://img.partner.example/b`]: redirect('https://cdn.partner.example/c'),
+    ['8.8.4.4 https://cdn.partner.example/c']: ok(7),
+  })
+  assert.deepEqual(await safeFetch('https://img.partner.example/a', w.deps, P), { ok: true, body: new Uint8Array(7) }, '合法的重導向（包括相對網址）要跟到底')
+  assert.deepEqual(w.log.resolves, ['img.partner.example', 'img.partner.example', 'cdn.partner.example'], '每一跳都要重新解析並檢查')
+}
+{
+  const pages: Record<string, Res> = {}
+  for (let i = 0; i < 5; i++) pages[`${PUB} https://loop.example/${i}`] = redirect(`/${i + 1}`)
+  pages[`${PUB} https://loop.example/3`] = ok(1)
+  const w3 = world({ 'loop.example': [PUB] }, pages)
+  assert.deepEqual(await safeFetch('https://loop.example/0', w3.deps, P), { ok: true, body: new Uint8Array(1) }, '剛好 3 次重導向要允許')
+  delete pages[`${PUB} https://loop.example/3`]
+  pages[`${PUB} https://loop.example/3`] = redirect('/4')
+  const w4 = world({ 'loop.example': [PUB] }, pages)
+  assert.deepEqual(await safeFetch('https://loop.example/0', w4.deps, P), { ok: false, error: 'too_many_redirects' }, '第 4 次重導向要回 too_many_redirects')
+}
+{
+  const w = world({ 'big.example': [PUB] }, { [`${PUB} https://big.example/`]: ok(1001) })
+  assert.deepEqual(await safeFetch('https://big.example/', w.deps, P), { ok: false, error: 'too_large' }, '超過 maxBytes 要回 too_large')
+  const w2 = world({ 'big.example': [PUB] }, { [`${PUB} https://big.example/`]: ok(1000) })
+  assert.deepEqual(await safeFetch('https://big.example/', w2.deps, P), { ok: true, body: new Uint8Array(1000) }, '剛好 maxBytes 要允許')
+}
+</script>
+  <script type="wrong">
+// 只檢查 hostname 字串、不解析 DNS
+type Ip = { family: 4; bytes: number[] } | { family: 6; bytes: number[] }
+function parseIPv4(t: string): number[] | null {
+  const p = t.split('.')
+  return p.length === 4 && p.every(x => /^(0|[1-9]\d{0,2})$/.test(x) && Number(x) <= 255) ? p.map(Number) : null
+}
+function parseIp(text: string): Ip | null {
+  let s = text.startsWith('[') && text.endsWith(']') ? text.slice(1, -1) : text
+  if (!s.includes(':')) { const v4 = parseIPv4(s); return v4 ? { family: 4, bytes: v4 } : null }
+  const i = s.lastIndexOf(':')
+  if (s.slice(i + 1).includes('.')) {
+    const v4 = parseIPv4(s.slice(i + 1))
+    if (!v4) return null
+    s = s.slice(0, i + 1) + ((v4[0] << 8) | v4[1]).toString(16) + ':' + ((v4[2] << 8) | v4[3]).toString(16)
+  }
+  const halves = s.split('::')
+  if (halves.length > 2) return null
+  const split = (x: string) => (x === '' ? [] : x.split(':'))
+  let groups = split(halves[0])
+  if (halves.length === 2) {
+    const right = split(halves[1])
+    const missing = 8 - groups.length - right.length
+    if (missing < 1) return null
+    groups = [...groups, ...Array.from({ length: missing }, () => '0'), ...right]
+  }
+  if (groups.length !== 8 || !groups.every(g => /^[0-9a-f]{1,4}$/i.test(g))) return null
+  return { family: 6, bytes: groups.flatMap(g => [parseInt(g, 16) >> 8, parseInt(g, 16) & 0xff]) }
+}
+function inCidr(bytes: number[], prefix: number[], bits: number): boolean {
+  if (bytes.length !== prefix.length) return false
+  for (let i = 0; i < bytes.length && bits - i * 8 > 0; i++) {
+    const mask = (0xff << (8 - Math.min(8, bits - i * 8))) & 0xff
+    if ((bytes[i] & mask) !== (prefix[i] & mask)) return false
+  }
+  return true
+}
+const V4_BLOCKED: [string, number][] = [['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16],
+  ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.0.2.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['198.51.100.0', 24],
+  ['203.0.113.0', 24], ['224.0.0.0', 4], ['240.0.0.0', 4]]
+const V6_BLOCKED: [string, number][] = [['2001::', 23], ['2001:db8::', 32], ['2002::', 16], ['3fff::', 20]]
+const inRange = (bytes: number[], [p, b]: [string, number]) => inCidr(bytes, parseIp(p)?.bytes ?? [], b)
+function isPublicAddress(text: string): boolean {
+  const ip = parseIp(text)
+  if (!ip) return false
+  if (ip.family === 4) return !V4_BLOCKED.some(r => inRange(ip.bytes, r))
+  if (inRange(ip.bytes, ['::ffff:0:0', 96]) || inRange(ip.bytes, ['64:ff9b::', 96])) return isPublicAddress(ip.bytes.slice(12).join('.'))
+  return inRange(ip.bytes, ['2000::', 3]) && !V6_BLOCKED.some(r => inRange(ip.bytes, r))
+}
+type Res = { status: number; headers: Record<string, string>; body: Uint8Array }
+type Deps = { resolve(host: string): Promise<string[]>; fetch(ip: string, url: URL): Promise<Res> }
+type Policy = { maxRedirects: number; maxBytes: number }
+type SafeFetchResult = { ok: true; body: Uint8Array } | { ok: false; error: 'bad_url' | 'blocked_address' | 'too_many_redirects' | 'too_large' }
+async function safeFetch(input: string, deps: Deps, policy: Policy): Promise<SafeFetchResult> {
+  let url: URL
+  try { url = new URL(input) } catch { return { ok: false, error: 'bad_url' } }
+  for (let redirects = 0; ; redirects++) {
+    if (url.protocol !== 'https:' || url.port !== '' || url.username !== '' || url.password !== '') return { ok: false, error: 'bad_url' }
+    if (parseIp(url.hostname) && !isPublicAddress(url.hostname)) return { ok: false, error: 'blocked_address' }
+    const res = await deps.fetch(url.hostname, url)
+    if (res.status >= 300 && res.status < 400) {
+      if (redirects >= policy.maxRedirects) return { ok: false, error: 'too_many_redirects' }
+      try { url = new URL(res.headers['location'] ?? '', url) } catch { return { ok: false, error: 'bad_url' } }
+      continue
+    }
+    if (res.body.byteLength > policy.maxBytes) return { ok: false, error: 'too_large' }
+    return { ok: true, body: res.body }
+  }
+}
+</script>
+  <script type="wrong">
+// 驗證完讓 fetch 再解析一次（傳 hostname 而不是 IP）
+type Ip = { family: 4; bytes: number[] } | { family: 6; bytes: number[] }
+function parseIPv4(t: string): number[] | null {
+  const p = t.split('.')
+  return p.length === 4 && p.every(x => /^(0|[1-9]\d{0,2})$/.test(x) && Number(x) <= 255) ? p.map(Number) : null
+}
+function parseIp(text: string): Ip | null {
+  let s = text.startsWith('[') && text.endsWith(']') ? text.slice(1, -1) : text
+  if (!s.includes(':')) { const v4 = parseIPv4(s); return v4 ? { family: 4, bytes: v4 } : null }
+  const i = s.lastIndexOf(':')
+  if (s.slice(i + 1).includes('.')) {
+    const v4 = parseIPv4(s.slice(i + 1))
+    if (!v4) return null
+    s = s.slice(0, i + 1) + ((v4[0] << 8) | v4[1]).toString(16) + ':' + ((v4[2] << 8) | v4[3]).toString(16)
+  }
+  const halves = s.split('::')
+  if (halves.length > 2) return null
+  const split = (x: string) => (x === '' ? [] : x.split(':'))
+  let groups = split(halves[0])
+  if (halves.length === 2) {
+    const right = split(halves[1])
+    const missing = 8 - groups.length - right.length
+    if (missing < 1) return null
+    groups = [...groups, ...Array.from({ length: missing }, () => '0'), ...right]
+  }
+  if (groups.length !== 8 || !groups.every(g => /^[0-9a-f]{1,4}$/i.test(g))) return null
+  return { family: 6, bytes: groups.flatMap(g => [parseInt(g, 16) >> 8, parseInt(g, 16) & 0xff]) }
+}
+function inCidr(bytes: number[], prefix: number[], bits: number): boolean {
+  if (bytes.length !== prefix.length) return false
+  for (let i = 0; i < bytes.length && bits - i * 8 > 0; i++) {
+    const mask = (0xff << (8 - Math.min(8, bits - i * 8))) & 0xff
+    if ((bytes[i] & mask) !== (prefix[i] & mask)) return false
+  }
+  return true
+}
+const V4_BLOCKED: [string, number][] = [['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16],
+  ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.0.2.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['198.51.100.0', 24],
+  ['203.0.113.0', 24], ['224.0.0.0', 4], ['240.0.0.0', 4]]
+const V6_BLOCKED: [string, number][] = [['2001::', 23], ['2001:db8::', 32], ['2002::', 16], ['3fff::', 20]]
+const inRange = (bytes: number[], [p, b]: [string, number]) => inCidr(bytes, parseIp(p)?.bytes ?? [], b)
+function isPublicAddress(text: string): boolean {
+  const ip = parseIp(text)
+  if (!ip) return false
+  if (ip.family === 4) return !V4_BLOCKED.some(r => inRange(ip.bytes, r))
+  if (inRange(ip.bytes, ['::ffff:0:0', 96]) || inRange(ip.bytes, ['64:ff9b::', 96])) return isPublicAddress(ip.bytes.slice(12).join('.'))
+  return inRange(ip.bytes, ['2000::', 3]) && !V6_BLOCKED.some(r => inRange(ip.bytes, r))
+}
+type Res = { status: number; headers: Record<string, string>; body: Uint8Array }
+type Deps = { resolve(host: string): Promise<string[]>; fetch(ip: string, url: URL): Promise<Res> }
+type Policy = { maxRedirects: number; maxBytes: number }
+type SafeFetchResult = { ok: true; body: Uint8Array } | { ok: false; error: 'bad_url' | 'blocked_address' | 'too_many_redirects' | 'too_large' }
+async function safeFetch(input: string, deps: Deps, policy: Policy): Promise<SafeFetchResult> {
+  let url: URL
+  try { url = new URL(input) } catch { return { ok: false, error: 'bad_url' } }
+  for (let redirects = 0; ; redirects++) {
+    if (url.protocol !== 'https:' || url.port !== '' || url.username !== '' || url.password !== '') return { ok: false, error: 'bad_url' }
+    const addresses = parseIp(url.hostname) ? [url.hostname] : await deps.resolve(url.hostname)
+    if (addresses.length === 0 || !addresses.every(isPublicAddress)) return { ok: false, error: 'blocked_address' }
+    const res = await deps.fetch(url.hostname, url)
+    if (res.status >= 300 && res.status < 400) {
+      if (redirects >= policy.maxRedirects) return { ok: false, error: 'too_many_redirects' }
+      try { url = new URL(res.headers['location'] ?? '', url) } catch { return { ok: false, error: 'bad_url' } }
+      continue
+    }
+    if (res.body.byteLength > policy.maxBytes) return { ok: false, error: 'too_large' }
+    return { ok: true, body: res.body }
+  }
+}
+</script>
+  <script type="wrong">
+// 自動跟隨重導向、沒有重新驗證
+type Ip = { family: 4; bytes: number[] } | { family: 6; bytes: number[] }
+function parseIPv4(t: string): number[] | null {
+  const p = t.split('.')
+  return p.length === 4 && p.every(x => /^(0|[1-9]\d{0,2})$/.test(x) && Number(x) <= 255) ? p.map(Number) : null
+}
+function parseIp(text: string): Ip | null {
+  let s = text.startsWith('[') && text.endsWith(']') ? text.slice(1, -1) : text
+  if (!s.includes(':')) { const v4 = parseIPv4(s); return v4 ? { family: 4, bytes: v4 } : null }
+  const i = s.lastIndexOf(':')
+  if (s.slice(i + 1).includes('.')) {
+    const v4 = parseIPv4(s.slice(i + 1))
+    if (!v4) return null
+    s = s.slice(0, i + 1) + ((v4[0] << 8) | v4[1]).toString(16) + ':' + ((v4[2] << 8) | v4[3]).toString(16)
+  }
+  const halves = s.split('::')
+  if (halves.length > 2) return null
+  const split = (x: string) => (x === '' ? [] : x.split(':'))
+  let groups = split(halves[0])
+  if (halves.length === 2) {
+    const right = split(halves[1])
+    const missing = 8 - groups.length - right.length
+    if (missing < 1) return null
+    groups = [...groups, ...Array.from({ length: missing }, () => '0'), ...right]
+  }
+  if (groups.length !== 8 || !groups.every(g => /^[0-9a-f]{1,4}$/i.test(g))) return null
+  return { family: 6, bytes: groups.flatMap(g => [parseInt(g, 16) >> 8, parseInt(g, 16) & 0xff]) }
+}
+function inCidr(bytes: number[], prefix: number[], bits: number): boolean {
+  if (bytes.length !== prefix.length) return false
+  for (let i = 0; i < bytes.length && bits - i * 8 > 0; i++) {
+    const mask = (0xff << (8 - Math.min(8, bits - i * 8))) & 0xff
+    if ((bytes[i] & mask) !== (prefix[i] & mask)) return false
+  }
+  return true
+}
+const V4_BLOCKED: [string, number][] = [['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16],
+  ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.0.2.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['198.51.100.0', 24],
+  ['203.0.113.0', 24], ['224.0.0.0', 4], ['240.0.0.0', 4]]
+const V6_BLOCKED: [string, number][] = [['2001::', 23], ['2001:db8::', 32], ['2002::', 16], ['3fff::', 20]]
+const inRange = (bytes: number[], [p, b]: [string, number]) => inCidr(bytes, parseIp(p)?.bytes ?? [], b)
+function isPublicAddress(text: string): boolean {
+  const ip = parseIp(text)
+  if (!ip) return false
+  if (ip.family === 4) return !V4_BLOCKED.some(r => inRange(ip.bytes, r))
+  if (inRange(ip.bytes, ['::ffff:0:0', 96]) || inRange(ip.bytes, ['64:ff9b::', 96])) return isPublicAddress(ip.bytes.slice(12).join('.'))
+  return inRange(ip.bytes, ['2000::', 3]) && !V6_BLOCKED.some(r => inRange(ip.bytes, r))
+}
+type Res = { status: number; headers: Record<string, string>; body: Uint8Array }
+type Deps = { resolve(host: string): Promise<string[]>; fetch(ip: string, url: URL): Promise<Res> }
+type Policy = { maxRedirects: number; maxBytes: number }
+type SafeFetchResult = { ok: true; body: Uint8Array } | { ok: false; error: 'bad_url' | 'blocked_address' | 'too_many_redirects' | 'too_large' }
+async function safeFetch(input: string, deps: Deps, policy: Policy): Promise<SafeFetchResult> {
+  let url: URL
+  try { url = new URL(input) } catch { return { ok: false, error: 'bad_url' } }
+  if (url.protocol !== 'https:' || url.port !== '' || url.username !== '' || url.password !== '') return { ok: false, error: 'bad_url' }
+  const addresses = parseIp(url.hostname) ? [url.hostname] : await deps.resolve(url.hostname)
+  if (addresses.length === 0 || !addresses.every(isPublicAddress)) return { ok: false, error: 'blocked_address' }
+  let res = await deps.fetch(addresses[0], url)
+  for (let redirects = 0; res.status >= 300 && res.status < 400; redirects++) {
+    if (redirects >= policy.maxRedirects) return { ok: false, error: 'too_many_redirects' }
+    url = new URL(res.headers['location'] ?? '', url)
+    const next = parseIp(url.hostname) ? [url.hostname] : await deps.resolve(url.hostname)
+    res = await deps.fetch(next[0] ?? '', url)
+  }
+  if (res.body.byteLength > policy.maxBytes) return { ok: false, error: 'too_large' }
+  return { ok: true, body: res.body }
+}
+</script>
+  <script type="wrong">
+// 只檢查第一個解析結果
+type Ip = { family: 4; bytes: number[] } | { family: 6; bytes: number[] }
+function parseIPv4(t: string): number[] | null {
+  const p = t.split('.')
+  return p.length === 4 && p.every(x => /^(0|[1-9]\d{0,2})$/.test(x) && Number(x) <= 255) ? p.map(Number) : null
+}
+function parseIp(text: string): Ip | null {
+  let s = text.startsWith('[') && text.endsWith(']') ? text.slice(1, -1) : text
+  if (!s.includes(':')) { const v4 = parseIPv4(s); return v4 ? { family: 4, bytes: v4 } : null }
+  const i = s.lastIndexOf(':')
+  if (s.slice(i + 1).includes('.')) {
+    const v4 = parseIPv4(s.slice(i + 1))
+    if (!v4) return null
+    s = s.slice(0, i + 1) + ((v4[0] << 8) | v4[1]).toString(16) + ':' + ((v4[2] << 8) | v4[3]).toString(16)
+  }
+  const halves = s.split('::')
+  if (halves.length > 2) return null
+  const split = (x: string) => (x === '' ? [] : x.split(':'))
+  let groups = split(halves[0])
+  if (halves.length === 2) {
+    const right = split(halves[1])
+    const missing = 8 - groups.length - right.length
+    if (missing < 1) return null
+    groups = [...groups, ...Array.from({ length: missing }, () => '0'), ...right]
+  }
+  if (groups.length !== 8 || !groups.every(g => /^[0-9a-f]{1,4}$/i.test(g))) return null
+  return { family: 6, bytes: groups.flatMap(g => [parseInt(g, 16) >> 8, parseInt(g, 16) & 0xff]) }
+}
+function inCidr(bytes: number[], prefix: number[], bits: number): boolean {
+  if (bytes.length !== prefix.length) return false
+  for (let i = 0; i < bytes.length && bits - i * 8 > 0; i++) {
+    const mask = (0xff << (8 - Math.min(8, bits - i * 8))) & 0xff
+    if ((bytes[i] & mask) !== (prefix[i] & mask)) return false
+  }
+  return true
+}
+const V4_BLOCKED: [string, number][] = [['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16],
+  ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.0.2.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['198.51.100.0', 24],
+  ['203.0.113.0', 24], ['224.0.0.0', 4], ['240.0.0.0', 4]]
+const V6_BLOCKED: [string, number][] = [['2001::', 23], ['2001:db8::', 32], ['2002::', 16], ['3fff::', 20]]
+const inRange = (bytes: number[], [p, b]: [string, number]) => inCidr(bytes, parseIp(p)?.bytes ?? [], b)
+function isPublicAddress(text: string): boolean {
+  const ip = parseIp(text)
+  if (!ip) return false
+  if (ip.family === 4) return !V4_BLOCKED.some(r => inRange(ip.bytes, r))
+  if (inRange(ip.bytes, ['::ffff:0:0', 96]) || inRange(ip.bytes, ['64:ff9b::', 96])) return isPublicAddress(ip.bytes.slice(12).join('.'))
+  return inRange(ip.bytes, ['2000::', 3]) && !V6_BLOCKED.some(r => inRange(ip.bytes, r))
+}
+type Res = { status: number; headers: Record<string, string>; body: Uint8Array }
+type Deps = { resolve(host: string): Promise<string[]>; fetch(ip: string, url: URL): Promise<Res> }
+type Policy = { maxRedirects: number; maxBytes: number }
+type SafeFetchResult = { ok: true; body: Uint8Array } | { ok: false; error: 'bad_url' | 'blocked_address' | 'too_many_redirects' | 'too_large' }
+async function safeFetch(input: string, deps: Deps, policy: Policy): Promise<SafeFetchResult> {
+  let url: URL
+  try { url = new URL(input) } catch { return { ok: false, error: 'bad_url' } }
+  for (let redirects = 0; ; redirects++) {
+    if (url.protocol !== 'https:' || url.port !== '' || url.username !== '' || url.password !== '') return { ok: false, error: 'bad_url' }
+    const addresses = parseIp(url.hostname) ? [url.hostname] : await deps.resolve(url.hostname)
+    const ip = addresses[0]
+    if (ip === undefined || !isPublicAddress(ip)) return { ok: false, error: 'blocked_address' }
+    const res = await deps.fetch(ip, url)
+    if (res.status >= 300 && res.status < 400) {
+      if (redirects >= policy.maxRedirects) return { ok: false, error: 'too_many_redirects' }
+      try { url = new URL(res.headers['location'] ?? '', url) } catch { return { ok: false, error: 'bad_url' } }
+      continue
+    }
+    if (res.body.byteLength > policy.maxBytes) return { ok: false, error: 'too_large' }
+    return { ok: true, body: res.body }
+  }
+}
+</script>
+  <script type="wrong">
+// 重導向時只看網址格式、允許 http，結果 metadata 的位址只在位址檢查才擋下（錯誤種類不對、也解析了不該解析的 DNS）；也沒限制大小
+type Ip = { family: 4; bytes: number[] } | { family: 6; bytes: number[] }
+function parseIPv4(t: string): number[] | null {
+  const p = t.split('.')
+  return p.length === 4 && p.every(x => /^(0|[1-9]\d{0,2})$/.test(x) && Number(x) <= 255) ? p.map(Number) : null
+}
+function parseIp(text: string): Ip | null {
+  let s = text.startsWith('[') && text.endsWith(']') ? text.slice(1, -1) : text
+  if (!s.includes(':')) { const v4 = parseIPv4(s); return v4 ? { family: 4, bytes: v4 } : null }
+  const i = s.lastIndexOf(':')
+  if (s.slice(i + 1).includes('.')) {
+    const v4 = parseIPv4(s.slice(i + 1))
+    if (!v4) return null
+    s = s.slice(0, i + 1) + ((v4[0] << 8) | v4[1]).toString(16) + ':' + ((v4[2] << 8) | v4[3]).toString(16)
+  }
+  const halves = s.split('::')
+  if (halves.length > 2) return null
+  const split = (x: string) => (x === '' ? [] : x.split(':'))
+  let groups = split(halves[0])
+  if (halves.length === 2) {
+    const right = split(halves[1])
+    const missing = 8 - groups.length - right.length
+    if (missing < 1) return null
+    groups = [...groups, ...Array.from({ length: missing }, () => '0'), ...right]
+  }
+  if (groups.length !== 8 || !groups.every(g => /^[0-9a-f]{1,4}$/i.test(g))) return null
+  return { family: 6, bytes: groups.flatMap(g => [parseInt(g, 16) >> 8, parseInt(g, 16) & 0xff]) }
+}
+function inCidr(bytes: number[], prefix: number[], bits: number): boolean {
+  if (bytes.length !== prefix.length) return false
+  for (let i = 0; i < bytes.length && bits - i * 8 > 0; i++) {
+    const mask = (0xff << (8 - Math.min(8, bits - i * 8))) & 0xff
+    if ((bytes[i] & mask) !== (prefix[i] & mask)) return false
+  }
+  return true
+}
+const V4_BLOCKED: [string, number][] = [['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16],
+  ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.0.2.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['198.51.100.0', 24],
+  ['203.0.113.0', 24], ['224.0.0.0', 4], ['240.0.0.0', 4]]
+const V6_BLOCKED: [string, number][] = [['2001::', 23], ['2001:db8::', 32], ['2002::', 16], ['3fff::', 20]]
+const inRange = (bytes: number[], [p, b]: [string, number]) => inCidr(bytes, parseIp(p)?.bytes ?? [], b)
+function isPublicAddress(text: string): boolean {
+  const ip = parseIp(text)
+  if (!ip) return false
+  if (ip.family === 4) return !V4_BLOCKED.some(r => inRange(ip.bytes, r))
+  if (inRange(ip.bytes, ['::ffff:0:0', 96]) || inRange(ip.bytes, ['64:ff9b::', 96])) return isPublicAddress(ip.bytes.slice(12).join('.'))
+  return inRange(ip.bytes, ['2000::', 3]) && !V6_BLOCKED.some(r => inRange(ip.bytes, r))
+}
+type Res = { status: number; headers: Record<string, string>; body: Uint8Array }
+type Deps = { resolve(host: string): Promise<string[]>; fetch(ip: string, url: URL): Promise<Res> }
+type Policy = { maxRedirects: number; maxBytes: number }
+type SafeFetchResult = { ok: true; body: Uint8Array } | { ok: false; error: 'bad_url' | 'blocked_address' | 'too_many_redirects' | 'too_large' }
+async function safeFetch(input: string, deps: Deps, policy: Policy): Promise<SafeFetchResult> {
+  let url: URL
+  try { url = new URL(input) } catch { return { ok: false, error: 'bad_url' } }
+  for (let redirects = 0; ; redirects++) {
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return { ok: false, error: 'bad_url' }
+    const addresses = parseIp(url.hostname) ? [url.hostname] : await deps.resolve(url.hostname)
+    if (addresses.length === 0 || !addresses.every(isPublicAddress)) return { ok: false, error: 'blocked_address' }
+    const res = await deps.fetch(addresses[0], url)
+    if (res.status >= 300 && res.status < 400) {
+      if (redirects >= policy.maxRedirects) return { ok: false, error: 'too_many_redirects' }
+      try { url = new URL(res.headers['location'] ?? '', url) } catch { return { ok: false, error: 'bad_url' } }
+      continue
+    }
+    return { ok: true, body: res.body }
+  }
+}
+</script>
+  <script type="wrong">
+// https、port、userinfo 只在第一跳檢查，重導向後只檢查位址
+type Ip = { family: 4; bytes: number[] } | { family: 6; bytes: number[] }
+function parseIPv4(t: string): number[] | null {
+  const p = t.split('.')
+  return p.length === 4 && p.every(x => /^(0|[1-9]\d{0,2})$/.test(x) && Number(x) <= 255) ? p.map(Number) : null
+}
+function parseIp(text: string): Ip | null {
+  let s = text.startsWith('[') && text.endsWith(']') ? text.slice(1, -1) : text
+  if (!s.includes(':')) { const v4 = parseIPv4(s); return v4 ? { family: 4, bytes: v4 } : null }
+  const i = s.lastIndexOf(':')
+  if (s.slice(i + 1).includes('.')) {
+    const v4 = parseIPv4(s.slice(i + 1))
+    if (!v4) return null
+    s = s.slice(0, i + 1) + ((v4[0] << 8) | v4[1]).toString(16) + ':' + ((v4[2] << 8) | v4[3]).toString(16)
+  }
+  const halves = s.split('::')
+  if (halves.length > 2) return null
+  const split = (x: string) => (x === '' ? [] : x.split(':'))
+  let groups = split(halves[0])
+  if (halves.length === 2) {
+    const right = split(halves[1])
+    const missing = 8 - groups.length - right.length
+    if (missing < 1) return null
+    groups = [...groups, ...Array.from({ length: missing }, () => '0'), ...right]
+  }
+  if (groups.length !== 8 || !groups.every(g => /^[0-9a-f]{1,4}$/i.test(g))) return null
+  return { family: 6, bytes: groups.flatMap(g => [parseInt(g, 16) >> 8, parseInt(g, 16) & 0xff]) }
+}
+function inCidr(bytes: number[], prefix: number[], bits: number): boolean {
+  if (bytes.length !== prefix.length) return false
+  for (let i = 0; i < bytes.length && bits - i * 8 > 0; i++) {
+    const mask = (0xff << (8 - Math.min(8, bits - i * 8))) & 0xff
+    if ((bytes[i] & mask) !== (prefix[i] & mask)) return false
+  }
+  return true
+}
+const V4_BLOCKED: [string, number][] = [['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16],
+  ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.0.2.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['198.51.100.0', 24],
+  ['203.0.113.0', 24], ['224.0.0.0', 4], ['240.0.0.0', 4]]
+const V6_BLOCKED: [string, number][] = [['2001::', 23], ['2001:db8::', 32], ['2002::', 16], ['3fff::', 20]]
+const inRange = (bytes: number[], [p, b]: [string, number]) => inCidr(bytes, parseIp(p)?.bytes ?? [], b)
+function isPublicAddress(text: string): boolean {
+  const ip = parseIp(text)
+  if (!ip) return false
+  if (ip.family === 4) return !V4_BLOCKED.some(r => inRange(ip.bytes, r))
+  if (inRange(ip.bytes, ['::ffff:0:0', 96]) || inRange(ip.bytes, ['64:ff9b::', 96])) return isPublicAddress(ip.bytes.slice(12).join('.'))
+  return inRange(ip.bytes, ['2000::', 3]) && !V6_BLOCKED.some(r => inRange(ip.bytes, r))
+}
+type Res = { status: number; headers: Record<string, string>; body: Uint8Array }
+type Deps = { resolve(host: string): Promise<string[]>; fetch(ip: string, url: URL): Promise<Res> }
+type Policy = { maxRedirects: number; maxBytes: number }
+type SafeFetchResult = { ok: true; body: Uint8Array } | { ok: false; error: 'bad_url' | 'blocked_address' | 'too_many_redirects' | 'too_large' }
+async function safeFetch(input: string, deps: Deps, policy: Policy): Promise<SafeFetchResult> {
+  let url: URL
+  try { url = new URL(input) } catch { return { ok: false, error: 'bad_url' } }
+  if (url.port !== '' || url.username !== '' || url.password !== '') return { ok: false, error: 'bad_url' }
+  for (let redirects = 0; ; redirects++) {
+    if (url.protocol !== 'https:') return { ok: false, error: 'bad_url' }
+    const addresses = parseIp(url.hostname) ? [url.hostname] : await deps.resolve(url.hostname)
+    if (addresses.length === 0 || !addresses.every(isPublicAddress)) return { ok: false, error: 'blocked_address' }
+    const res = await deps.fetch(addresses[0], url)
+    if (res.status >= 300 && res.status < 400) {
+      if (redirects >= policy.maxRedirects) return { ok: false, error: 'too_many_redirects' }
+      try { url = new URL(res.headers['location'] ?? '', url) } catch { return { ok: false, error: 'bad_url' } }
+      continue
+    }
+    if (res.body.byteLength > policy.maxBytes) return { ok: false, error: 'too_large' }
+    return { ok: true, body: res.body }
+  }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：安全地使用第三方回應。物流商用 webhook 通知配送進度，你已經驗過簽章（<a href="17-api-keys-m2m.html">第 17 課</a>），現在要驗內容。完成 <code>parseDeliveryUpdate(body: unknown)</code>，不能用 <code>as</code> 把 <code>body</code> 轉型：</p>
+  <ul>
+    <li><code>orderId</code> 是正整數（<code>number</code>，不是字串）。</li>
+    <li><code>status</code> 是 <code>'picked_up'</code>、<code>'delivering'</code>、<code>'delivered'</code> 其中之一。</li>
+    <li><code>trackingUrl</code> 是字串，用 <code>new URL()</code> 解析得了，<code>protocol</code> 是 <code>https:</code>，而且 <code>hostname</code> 剛好是 <code>track.courier.example</code>。</li>
+    <li><code>note</code> 欄位存在時，必須是長度不超過 500 的字串；它不放進回傳值。</li>
+    <li>其他欄位忽略。通過時回 <code>{ ok: true, update: { orderId, status, trackingUrl } }</code>（只有這三個欄位，<code>trackingUrl</code> 是原本的字串），否則回 <code>{ ok: false, error: 'invalid' }</code>。</li>
+  </ul>
+  <script type="start">
+type DeliveryStatus = 'picked_up' | 'delivering' | 'delivered'
+type DeliveryUpdate = { orderId: number; status: DeliveryStatus; trackingUrl: string }
+type ParseResult = { ok: true; update: DeliveryUpdate } | { ok: false; error: 'invalid' }
+
+function parseDeliveryUpdate(body: unknown): ParseResult {
+  // 目前的寫法：相信物流商
+  const update = body as DeliveryUpdate
+  return { ok: true, update }
+}
+
+console.log(parseDeliveryUpdate({ orderId: 42, status: 'delivering', trackingUrl: 'https://track.courier.example/t/AB123', note: '已出車' }))
+console.log(parseDeliveryUpdate({ orderId: 42, status: 'delivering', trackingUrl: 'javascript:alert(document.cookie)' }))
+</script>
+  <script type="answer">
+type DeliveryStatus = 'picked_up' | 'delivering' | 'delivered'
+type DeliveryUpdate = { orderId: number; status: DeliveryStatus; trackingUrl: string }
+type ParseResult = { ok: true; update: DeliveryUpdate } | { ok: false; error: 'invalid' }
+
+const STATUSES: readonly DeliveryStatus[] = ['picked_up', 'delivering', 'delivered']
+const isStatus = (v: unknown): v is DeliveryStatus => STATUSES.some(s => s === v)
+
+function isTrackingUrl(v: unknown): v is string {
+  if (typeof v !== 'string') return false
+  let url: URL
+  try { url = new URL(v) } catch { return false }
+  return url.protocol === 'https:' && url.hostname === 'track.courier.example'
+}
+
+function parseDeliveryUpdate(body: unknown): ParseResult {
+  const invalid: ParseResult = { ok: false, error: 'invalid' }
+  if (typeof body !== 'object' || body === null) return invalid
+  if (!('orderId' in body) || !('status' in body) || !('trackingUrl' in body)) return invalid
+  const { orderId, status, trackingUrl } = body
+  if (typeof orderId !== 'number' || !Number.isSafeInteger(orderId) || orderId <= 0) return invalid
+  if (!isStatus(status)) return invalid
+  if (!isTrackingUrl(trackingUrl)) return invalid
+  if ('note' in body && (typeof body.note !== 'string' || body.note.length > 500)) return invalid
+  // 只取需要的欄位，不把整個 body 往下傳
+  return { ok: true, update: { orderId, status, trackingUrl } }
+}
+
+console.log(parseDeliveryUpdate({ orderId: 42, status: 'delivering', trackingUrl: 'https://track.courier.example/t/AB123', note: '已出車' }))
+console.log(parseDeliveryUpdate({ orderId: 42, status: 'delivering', trackingUrl: 'javascript:alert(document.cookie)' }))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<ReturnType<typeof parseDeliveryUpdate>, ParseResult>>  // parseDeliveryUpdate 回傳 ParseResult
+type _2 = Expect<Equal<Parameters<typeof parseDeliveryUpdate>, [body: unknown]>>  // 參數要維持 unknown
+</script>
+  <script type="tests">
+const good: DeliveryUpdate = { orderId: 42, status: 'delivered', trackingUrl: 'https://track.courier.example/t/AB123' }
+const INVALID: ParseResult = { ok: false, error: 'invalid' }
+const okWith = (update: DeliveryUpdate): ParseResult => ({ ok: true, update })
+assert.deepEqual(parseDeliveryUpdate(good), okWith(good), '正常的資料要通過')
+assert.deepEqual(parseDeliveryUpdate({ ...good, note: '放在警衛室', driver: { phone: '0900-000-000' }, extra: 1 }),
+  okWith(good), '回傳的 update 只能有 orderId、status、trackingUrl 三個欄位，note 和其他欄位都不能帶出去')
+for (const status of ['picked_up', 'delivering'] as const) {
+  assert.deepEqual(parseDeliveryUpdate({ ...good, status }), okWith({ ...good, status }), `status ${status} 要通過`)
+}
+const cases: [string, unknown][] = [
+  ['body 是 null', null],
+  ['body 是字串', 'hello'],
+  ['缺少 orderId', { status: 'delivered', trackingUrl: good.trackingUrl }],
+  ['orderId 是字串', { ...good, orderId: '42' }],
+  ['orderId 是負數', { ...good, orderId: -1 }],
+  ['orderId 是 0', { ...good, orderId: 0 }],
+  ['orderId 是小數', { ...good, orderId: 4.2 }],
+  ['orderId 是 NaN', { ...good, orderId: NaN }],
+  ['status 不在列舉裡', { ...good, status: 'lost' }],
+  ['缺少 trackingUrl', { orderId: 42, status: 'delivered' }],
+  ['trackingUrl 是 javascript:', { ...good, trackingUrl: 'javascript:alert(1)//track.courier.example' }],
+  ['trackingUrl 是 http:', { ...good, trackingUrl: 'http://track.courier.example/t/1' }],
+  ['trackingUrl 是別的網域的子網域', { ...good, trackingUrl: 'https://track.courier.example.evil.example/t/1' }],
+  ['trackingUrl 把網域放在路徑裡', { ...good, trackingUrl: 'https://evil.example/track.courier.example' }],
+  ['trackingUrl 是名字結尾相同的別的網域', { ...good, trackingUrl: 'https://eviltrack.courier.example/t/1' }],
+  ['status 是物件內建的屬性名稱', { ...good, status: 'constructor' }],
+  ['trackingUrl 用 userinfo 偽裝', { ...good, trackingUrl: 'https://track.courier.example@evil.example/' }],
+  ['trackingUrl 不是網址', { ...good, trackingUrl: 'track.courier.example' }],
+  ['trackingUrl 是數字', { ...good, trackingUrl: 123 }],
+  ['note 有 5000 字', { ...good, note: '咖'.repeat(5000) }],
+  ['note 是物件', { ...good, note: { text: 'hi' } }],
+]
+for (const [label, body] of cases) assert.deepEqual(parseDeliveryUpdate(body), INVALID, `${label}：要回 invalid`)
+assert.deepEqual(parseDeliveryUpdate({ ...good, note: '咖'.repeat(500) }), okWith(good), 'note 剛好 500 字要允許')
+{
+  const input = { ...good, note: '放在警衛室', extra: 1 }
+  parseDeliveryUpdate(input)
+  assert.deepEqual(input, { ...good, note: '放在警衛室', extra: 1 }, '不能修改傳進來的 body，要建立新的 update 物件')
+}
+</script>
+  <script type="wrong">
+// 起始程式的變形：用 as 轉型，只檢查欄位存在
+type DeliveryStatus = 'picked_up' | 'delivering' | 'delivered'
+type DeliveryUpdate = { orderId: number; status: DeliveryStatus; trackingUrl: string }
+type ParseResult = { ok: true; update: DeliveryUpdate } | { ok: false; error: 'invalid' }
+function parseDeliveryUpdate(body: unknown): ParseResult {
+  const u = body as DeliveryUpdate
+  if (!u || !u.orderId || !u.status || !u.trackingUrl) return { ok: false, error: 'invalid' }
+  return { ok: true, update: u }
+}
+</script>
+  <script type="wrong">
+// 網址用 includes 檢查
+type DeliveryStatus = 'picked_up' | 'delivering' | 'delivered'
+type DeliveryUpdate = { orderId: number; status: DeliveryStatus; trackingUrl: string }
+type ParseResult = { ok: true; update: DeliveryUpdate } | { ok: false; error: 'invalid' }
+const STATUSES: readonly DeliveryStatus[] = ['picked_up', 'delivering', 'delivered']
+const isStatus = (v: unknown): v is DeliveryStatus => STATUSES.some(s => s === v)
+function parseDeliveryUpdate(body: unknown): ParseResult {
+  const invalid: ParseResult = { ok: false, error: 'invalid' }
+  if (typeof body !== 'object' || body === null) return invalid
+  if (!('orderId' in body) || !('status' in body) || !('trackingUrl' in body)) return invalid
+  const { orderId, status, trackingUrl } = body
+  if (typeof orderId !== 'number' || !Number.isSafeInteger(orderId) || orderId <= 0) return invalid
+  if (!isStatus(status)) return invalid
+  if (typeof trackingUrl !== 'string' || !trackingUrl.startsWith('https://') || !trackingUrl.includes('track.courier.example')) return invalid
+  if ('note' in body && (typeof body.note !== 'string' || body.note.length > 500)) return invalid
+  return { ok: true, update: { orderId, status, trackingUrl } }
+}
+</script>
+  <script type="wrong">
+// 沒有限制 note 的長度與型別
+type DeliveryStatus = 'picked_up' | 'delivering' | 'delivered'
+type DeliveryUpdate = { orderId: number; status: DeliveryStatus; trackingUrl: string }
+type ParseResult = { ok: true; update: DeliveryUpdate } | { ok: false; error: 'invalid' }
+const STATUSES: readonly DeliveryStatus[] = ['picked_up', 'delivering', 'delivered']
+const isStatus = (v: unknown): v is DeliveryStatus => STATUSES.some(s => s === v)
+function parseDeliveryUpdate(body: unknown): ParseResult {
+  const invalid: ParseResult = { ok: false, error: 'invalid' }
+  if (typeof body !== 'object' || body === null) return invalid
+  if (!('orderId' in body) || !('status' in body) || !('trackingUrl' in body)) return invalid
+  const { orderId, status, trackingUrl } = body
+  if (typeof orderId !== 'number' || !Number.isSafeInteger(orderId) || orderId <= 0) return invalid
+  if (!isStatus(status)) return invalid
+  if (typeof trackingUrl !== 'string') return invalid
+  let url: URL
+  try { url = new URL(trackingUrl) } catch { return invalid }
+  if (url.protocol !== 'https:' || url.hostname !== 'track.courier.example') return invalid
+  return { ok: true, update: { orderId, status, trackingUrl } }
+}
+</script>
+  <script type="wrong">
+// 驗證都對，但把整個 body 帶出去
+type DeliveryStatus = 'picked_up' | 'delivering' | 'delivered'
+type DeliveryUpdate = { orderId: number; status: DeliveryStatus; trackingUrl: string }
+type ParseResult = { ok: true; update: DeliveryUpdate } | { ok: false; error: 'invalid' }
+const STATUSES: readonly DeliveryStatus[] = ['picked_up', 'delivering', 'delivered']
+const isStatus = (v: unknown): v is DeliveryStatus => STATUSES.some(s => s === v)
+function parseDeliveryUpdate(body: unknown): ParseResult {
+  const invalid: ParseResult = { ok: false, error: 'invalid' }
+  if (typeof body !== 'object' || body === null) return invalid
+  if (!('orderId' in body) || !('status' in body) || !('trackingUrl' in body)) return invalid
+  const { orderId, status, trackingUrl } = body
+  if (typeof orderId !== 'number' || !Number.isSafeInteger(orderId) || orderId <= 0) return invalid
+  if (!isStatus(status)) return invalid
+  if (typeof trackingUrl !== 'string') return invalid
+  let url: URL
+  try { url = new URL(trackingUrl) } catch { return invalid }
+  if (url.protocol !== 'https:' || url.hostname !== 'track.courier.example') return invalid
+  if ('note' in body && (typeof body.note !== 'string' || body.note.length > 500)) return invalid
+  return { ok: true, update: { ...body, orderId, status, trackingUrl } }
+}
+</script>
+  <script type="wrong">
+// hostname 用 endsWith 檢查
+type DeliveryStatus = 'picked_up' | 'delivering' | 'delivered'
+type DeliveryUpdate = { orderId: number; status: DeliveryStatus; trackingUrl: string }
+type ParseResult = { ok: true; update: DeliveryUpdate } | { ok: false; error: 'invalid' }
+const STATUSES: readonly DeliveryStatus[] = ['picked_up', 'delivering', 'delivered']
+const isStatus = (v: unknown): v is DeliveryStatus => STATUSES.some(s => s === v)
+function parseDeliveryUpdate(body: unknown): ParseResult {
+  const invalid: ParseResult = { ok: false, error: 'invalid' }
+  if (typeof body !== 'object' || body === null) return invalid
+  if (!('orderId' in body) || !('status' in body) || !('trackingUrl' in body)) return invalid
+  const { orderId, status, trackingUrl } = body
+  if (typeof orderId !== 'number' || !Number.isSafeInteger(orderId) || orderId <= 0) return invalid
+  if (!isStatus(status) || typeof trackingUrl !== 'string') return invalid
+  let url: URL
+  try { url = new URL(trackingUrl) } catch { return invalid }
+  if (url.protocol !== 'https:' || !url.hostname.endsWith('track.courier.example')) return invalid
+  if ('note' in body && (typeof body.note !== 'string' || body.note.length > 500)) return invalid
+  return { ok: true, update: { orderId, status, trackingUrl } }
+}
+</script>
+  <script type="wrong">
+// status 用物件查表：'constructor' 這類內建屬性也查得到
+type DeliveryStatus = 'picked_up' | 'delivering' | 'delivered'
+type DeliveryUpdate = { orderId: number; status: DeliveryStatus; trackingUrl: string }
+type ParseResult = { ok: true; update: DeliveryUpdate } | { ok: false; error: 'invalid' }
+const ALLOWED: Record<string, boolean> = { picked_up: true, delivering: true, delivered: true }
+const isStatus = (v: unknown): v is DeliveryStatus => typeof v === 'string' && Boolean(ALLOWED[v])
+function parseDeliveryUpdate(body: unknown): ParseResult {
+  const invalid: ParseResult = { ok: false, error: 'invalid' }
+  if (typeof body !== 'object' || body === null) return invalid
+  if (!('orderId' in body) || !('status' in body) || !('trackingUrl' in body)) return invalid
+  const { orderId, status, trackingUrl } = body
+  if (typeof orderId !== 'number' || !Number.isSafeInteger(orderId) || orderId <= 0) return invalid
+  if (!isStatus(status) || typeof trackingUrl !== 'string') return invalid
+  let url: URL
+  try { url = new URL(trackingUrl) } catch { return invalid }
+  if (url.protocol !== 'https:' || url.hostname !== 'track.courier.example') return invalid
+  if ('note' in body && (typeof body.note !== 'string' || body.note.length > 500)) return invalid
+  return { ok: true, update: { orderId, status, trackingUrl } }
+}
+</script>
+  <script type="wrong">
+// 驗證都對，但直接刪掉 body 的多餘欄位再回傳同一個物件
+type DeliveryStatus = 'picked_up' | 'delivering' | 'delivered'
+type DeliveryUpdate = { orderId: number; status: DeliveryStatus; trackingUrl: string }
+type ParseResult = { ok: true; update: DeliveryUpdate } | { ok: false; error: 'invalid' }
+const STATUSES: readonly DeliveryStatus[] = ['picked_up', 'delivering', 'delivered']
+const isStatus = (v: unknown): v is DeliveryStatus => STATUSES.some(s => s === v)
+function parseDeliveryUpdate(body: unknown): ParseResult {
+  const invalid: ParseResult = { ok: false, error: 'invalid' }
+  if (typeof body !== 'object' || body === null) return invalid
+  if (!('orderId' in body) || !('status' in body) || !('trackingUrl' in body)) return invalid
+  const { orderId, status, trackingUrl } = body
+  if (typeof orderId !== 'number' || !Number.isSafeInteger(orderId) || orderId <= 0) return invalid
+  if (!isStatus(status) || typeof trackingUrl !== 'string') return invalid
+  let url: URL
+  try { url = new URL(trackingUrl) } catch { return invalid }
+  if (url.protocol !== 'https:' || url.hostname !== 'track.courier.example') return invalid
+  if ('note' in body && (typeof body.note !== 'string' || body.note.length > 500)) return invalid
+  for (const key of Object.keys(body)) if (!['orderId', 'status', 'trackingUrl'].includes(key)) Reflect.deleteProperty(body, key)
+  return { ok: true, update: { orderId, status, trackingUrl } }
+}
+</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：「從網址匯入圖片」已經擋掉網址裡出現 <code>127.0.0.1</code> 和 <code>localhost</code> 的請求。攻擊者還能怎麼打到這台伺服器自己？</p>
+  <label data-key="a">沒辦法，本機只有這兩種寫法</label>
+  <label data-key="b">只能靠猜到管理介面的密碼</label>
+  <label data-key="c">用 <code>http://2130706433/</code>、<code>http://0x7f.1/</code>、<code>http://[::ffff:127.0.0.1]/</code>、<code>127.0.0.2</code>，或一個自己控制、解析成 127.0.0.1 的網域</label>
+  <p class="why">✓ 同一個位址有很多寫法，<code>new URL()</code> 會把它們全部轉成 127.0.0.1 再連；整個 <code>127.0.0.0/8</code> 都是本機；網域名稱可以解析成任何 IP。所以要解析網址、解析 DNS、對實際要連的每個 IP 做範圍判斷。a 是字串黑名單的迷思；b 錯在本機的管理介面常常根本不需要登入，SSRF 打的就是這種「只有本機連得到所以不設密碼」的服務。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 5：程式先用 <code>dns.lookup</code> 解析網域、確認是公開位址，接著呼叫 <code>fetch(url)</code>。為什麼這樣不夠？</p>
+  <label data-key="a"><code>fetch</code> 連線前會自己再解析一次；攻擊者的 DNS 把 TTL 設成 0，第二次回 127.0.0.1，檢查和連線用的不是同一個 IP（DNS rebinding）</label>
+  <label data-key="b">同一個網域每次解析的結果都一樣，所以這樣就夠了，只是多花一次 DNS 查詢</label>
+  <label data-key="c">問題只在效能：應該把 DNS 結果快取起來</label>
+  <p class="why">✓ 這是 TOCTOU：檢查的位址和連線的位址不一樣。解法是只解析一次、檢查所有 A／AAAA 紀錄、連線時直接用驗證過的 IP（保留 Host 與 SNI），在 Node 可以把檢查放進 undici <code>Agent</code> 的 <code>connect.lookup</code>。b 是迷思：DNS 的回答由網域擁有者決定，他想每次回不同的位址都可以。c 的快取不保證 <code>fetch</code> 會用到你的快取，而且沒有處理多筆紀錄的問題。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：主機已經改成「只接受 IMDSv2」。同事說：「metadata 拿不到了，應用程式的 SSRF 檢查可以拿掉。」怎麼回應？</p>
+  <label data-key="a">同意，IMDSv2 會擋下所有 SSRF</label>
+  <label data-key="b">不同意：IMDSv2 只保護 metadata 這個目標（要先 PUT 取得 token、hop limit 預設 1），內網服務、本機管理介面、內網掃描還是靠應用程式檢查和出站限制</label>
+  <label data-key="c">不同意，因為 IMDSv2 跟 v1 一樣只要 GET 就能拿到憑證</label>
+  <p class="why">✓ IMDSv2 讓「只能發 GET」的 SSRF 拿不到 token，是很有效的一層，但它只管 169.254.169.254。<code>127.0.0.1:9090</code> 的管理介面、<code>10.0.3.7</code> 的內部服務都不受影響。防線要疊加：應用程式檢查、出站防火牆或代理、IMDSv2、最小權限的 IAM 角色。c 錯在 IMDSv2 一定要先用 PUT 加自訂標頭取得 token；要小心的是 EC2 預設 v1 和 v2 都開著，要另外設定只接受 v2。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>用字串或正規表示式判斷內網位址</strong>：<code>2130706433</code>、<code>0x7f.1</code>、<code>[::ffff:7f00:1]</code>、userinfo 都會漏。先 <code>new URL()</code>，再把實際要連的 IP 解析成位元組，用 CIDR 比對。</li>
+  <li><strong>允許 http 與任意 port</strong>：變成敲內網 Redis、資料庫的工具。只允許 https 與 443，拒絕 userinfo。</li>
+  <li><strong>只檢查網址的 hostname，不解析 DNS</strong>：網域可以解析成任何位址。檢查的是 IP，不是名字。</li>
+  <li><strong>IPv6 用禁止清單</strong>：IANA 的清單會增加。只允許 <code>2000::/3</code> 再排除特殊範圍；IPv4-mapped 與 NAT64 取出內嵌的 IPv4 檢查。</li>
+  <li><strong>只檢查第一個 DNS 結果，或驗證完讓 HTTP client 再解析一次</strong>：多筆紀錄與 DNS rebinding 都能繞過。檢查每一筆，連線用驗證過的 IP。</li>
+  <li><strong>webhook 網址只在登記時檢查</strong>：DNS 之後可以改。每次送出都檢查。</li>
+  <li><strong>自動跟隨重導向</strong>：檢查過的網址一個 302 就換成 metadata。<code>redirect: 'manual'</code>，每一跳重新檢查、限制跳數。</li>
+  <li><strong>沒限制大小與時間</strong>：一個回應就能塞爆記憶體或卡住連線。邊讀邊算大小、<code>AbortSignal.timeout</code>、檢查 <code>Content-Type</code>。</li>
+  <li><strong>把連線錯誤的細節回給使用者</strong>：「連線被拒」「逾時」讓 API 變成內網掃描器。對外一律同一個訊息，細節寫 log。</li>
+  <li><strong>只靠應用程式檢查</strong>：沒有出站限制、IMDSv1 還開著、主機角色權限太大。網路層與雲端設定也要擋。</li>
+  <li><strong>盲目相信第三方 API</strong>：用 <code>as</code> 轉型就存、它給的網址直接放進 email。當成 <code>unknown</code> 驗證，網址檢查協定與完整的 hostname，只取需要的欄位。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>SSRF（OWASP API7）：伺服器照著使用者給的網址發請求，攻擊者就能借它打到 metadata、本機管理介面、內網服務，或拿來掃描內網。開場的匯入圖片 API 就是這樣讀到雲端臨時憑證。</li>
+  <li>修法寫成一個共用的 <code>safeFetch</code>，匯入圖片、webhook、連結預覽都走它：只允許 https、443、沒有 userinfo → 解析一次 DNS，每一筆都要是公開位址 → 用驗證過的 IP 連線（保留 Host 與 SNI）→ 不自動跟隨重導向，每一跳重新走一次、限制跳數 → 邊讀邊限制大小、限制時間、檢查 <code>Content-Type</code> → 錯誤訊息不透露細節。</li>
+  <li>判斷位址：先用 <code>new URL()</code> 正規化，再把 IP 解析成位元組，用 CIDR（前 N 個位元相同）比對；IPv4 照 IANA 特殊用途位址表拒絕，IPv6 只允許 <code>2000::/3</code> 再排除特殊範圍，內嵌 IPv4 的位址取出來檢查。已知目的地用網域允許清單。</li>
+  <li>網路層也要擋：出站防火牆或代理、高風險功能放在沒有權限的獨立服務、AWS 只接受 IMDSv2、IAM 最小權限。</li>
+  <li>第三方 API 的回應（OWASP API10）是不可信輸入：逐欄驗證、只取需要的欄位、網址檢查協定與完整 hostname、跨網域重導向不帶憑證、設逾時與斷路器。</li>
+</ul>
+<p>下一課：Secrets 管理與資料加密。這課的事故外洩的是雲端臨時憑證；下一課處理其他 secrets：資料庫密碼、API key、簽章金鑰要放在哪裡、怎麼輪替，以及哪些欄位要加密存放。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

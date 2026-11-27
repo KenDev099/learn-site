@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>12. 檔案上傳</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="12" data-practice="nestjs" data-task="pf12">
+<header>
+  <div class="eyebrow">階段 B2：平台功能 · 第 12 課</div>
+  <h1>檔案上傳</h1>
+</header>
+<main>
+<p>客戶要在 project 底下放附件：截圖、報價單 PDF。第一版很容易寫：收檔案、用原檔名存到 API 那台機器的磁碟、下載時把檔案和上傳時的型別原樣送回去。這一課假設這個第一版已經上線，看它接連出的四個事故：</p>
+<ul>
+  <li>兩個人都上傳 <code>report.pdf</code>，先傳的那份被蓋掉，找不回來。</li>
+  <li>租戶 B 把網址裡的檔案 id 換成別人的，下載到租戶 A 的合約。</li>
+  <li>有人傳了一個 2 GB 的檔案，API 的記憶體被吃光，所有人的請求一起失敗。</li>
+  <li>有人把一段 HTML 改名成 <code>.png</code> 上傳，同事點下載，那段 HTML 在你的網域上執行，讀走他的 token。</li>
+</ul>
+<p>這一課在你的 SaaS 加上 <code>files</code> 模組，一節修一個事故。四個都修好之後還剩一個藏在「每次都要寫兩個地方」裡的問題：檔案在物件儲存、描述它的資料在資料庫，上傳或刪除時任何一邊失敗都會留下殘局，最後一節處理。檔案大小也是方案的用量，第 14 課會接上。</p>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../nestjs/lessons/22-uploads-webhooks.html">NestJS 課第 22 課</a>的 <code>FileInterceptor</code>（multer 收 multipart）、<code>limits.fileSize</code>、看檔頭判斷型別。</li>
+  <li><a href="../../data-stores/lessons/12-object-storage.html">資料儲存課第 12 課</a>的物件儲存與 presigned URL（有時效、事先簽好權限的網址，拿著它就能直接對儲存服務上傳或下載）。</li>
+  <li><a href="../../auth/lessons/07-xss-csp.html">auth 課第 7 課</a>的 XSS 與 <code>X-Content-Type-Options: nosniff</code>（叫瀏覽器不要自己猜檔案型別）。</li>
+  <li><a href="11-audit-log.html">第 11 課</a>的 <code>audit.record(tx, …)</code>：上傳與刪除都要記。</li>
+</ul></div>
+
+<div class="callout">程式寫在你自己的 SaaS repo。判分時先啟動你的 API，在 learn 資料夾執行 <code>node check.mjs nestjs pf12</code>。測試會上傳一個 6 MB 的檔案，第一次跑時稍微慢一點是正常的。</div>
+
+<p>這課的路線：</p>
+<ul>
+  <li>修事故之前先決定檔案放哪、位元組要不要經過 API；作品的選擇寫成 ADR。</li>
+  <li>檔案存在哪個 key：修掉同名覆蓋；metadata 放進租戶隔離：修掉跨租戶下載。</li>
+  <li>2 GB 的檔案在讀完之前擋下；改名的 HTML 看內容認出來。</li>
+  <li>漏網的檔案在下載時也不能執行：一律 attachment＋nosniff。</li>
+  <li>儲存與資料庫不在同一個交易：決定失敗時留下哪種殘局。最後套到你的業務模組。</li>
+</ul>
+
+<h2>修事故之前：檔案放在哪，位元組要不要經過 API？</h2>
+<p>四個事故的修法都是「在某一步加一道檢查」，而這些檢查能放在哪一步，取決於檔案怎麼從瀏覽器走到它最後存放的地方。所以第一件事是決定這條路徑。</p>
+<p>第一版把檔案寫在 API 那台機器的磁碟上，這在正式環境撐不久。容器重新建立時，寫在容器裡的檔案會跟著消失；API 開成兩台時，檔案只存在收到上傳的那一台，另一台收到下載請求就找不到。所以檔案要存到一個所有 API 實例共用、獨立於 API 的地方：<strong>物件儲存</strong>。</p>
+<p>物件儲存是專門存檔案的服務，最常見的是 AWS S3，也有很多服務相容 S3 的 API。它不像電腦的檔案系統有資料夾階層，每個檔案叫一個「物件」，用一個字串 <strong>key</strong> 存取：用 key 放進去，用同一個 key 拿出來或刪掉。key 寫起來像路徑（<code>tenants/abc/files/123</code>），但它只是一個名字；開頭相同的那一段叫前綴，物件儲存可以照前綴列出一群物件、對它們設定權限或保存規則。</p>
+<p>檔案到物件儲存有兩條路，差在位元組有沒有經過你的 API：</p>
+<ul>
+  <li><strong>經過 API</strong>：前端用 <code>multipart/form-data</code> 上傳。這是瀏覽器送檔案的標準格式，把表單欄位和檔案內容分成好幾段放在同一個請求本文裡；NestJS 用 multer 把它拆開。API 手上有完整的位元組，檢查完才寫進儲存。</li>
+  <li><strong>presigned URL 直傳</strong>：API 用自己的儲存金鑰簽一個網址，網址裡寫明「可以對哪個 key 上傳、到什麼時候為止」並附上簽名。前端拿著這個網址直接 PUT 給物件儲存，物件儲存只驗簽名與時間就收下，不知道也不在乎你的使用者是誰。傳完之後前端再呼叫 API 一次「我傳好了」，API 這時才寫入檔案的紀錄。</li>
+</ul>
+<div class="table-wrap"><table>
+  <thead><tr><th></th><th>經過 API（multer 收、API 寫進儲存）</th><th>presigned URL 直傳</th></tr></thead>
+  <tbody>
+    <tr><td>流程</td><td>前端 multipart 上傳到 API → API 檢查 → 寫進儲存＋metadata</td><td>前端跟 API 要一個上傳網址 → 直接 PUT 到儲存 → 再呼叫 API 確認</td></tr>
+    <tr><td>API 的頻寬與記憶體</td><td>全部經過 API</td><td>不經過，只處理兩個小請求</td></tr>
+    <tr><td>型別、大小檢查</td><td>收到時就檢查，不合格的根本不會寫進儲存</td><td>確認時才讀物件的開頭檢查，不合格的要刪掉；大小靠簽名條件</td></tr>
+    <tr><td>用量計算</td><td>寫 metadata 時一起算</td><td>確認時才知道實際大小</td></tr>
+    <tr><td>適合</td><td>檔案小（幾 MB）、量不大</td><td>檔案大、量大、使用者在世界各地</td></tr>
+  </tbody>
+</table></div>
+<p>這張表的核心取捨是：檢查集中在一處，還是讓 API 不扛流量。直傳省下 API 的頻寬與記憶體，但檔案在 API 看到之前就已經進了儲存，每個檢查都要在「確認」那一步回頭補，不合格的還要刪掉；漏寫確認時的檢查，任何東西都進得了儲存。經過 API 則反過來：API 要扛住每個位元組，但不合格的檔案根本不會被寫進去。</p>
+<p>契約的上限是 5 MB，作品選<strong>經過 API</strong>：流程短、每個檢查都在同一個請求裡、測試好寫。這種有代價的決定照第 6 課開始的做法寫成 ADR，「後果」那段寫清楚代價與什麼時候要換。參考實作的 <code>docs/adr/0004-file-storage.md</code>：</p>
+<pre># 0004. 檔案經過 API 上傳，存在物件儲存
+
+## 決定
+經過 API（multer，記憶體上限 5 MB）上傳：先看 magic bytes 判斷型別，再寫進儲存。
+key 一律是 tenants/&lt;tenantId&gt;/files/&lt;隨機 id&gt;，不用使用者的檔名。下載一律 attachment＋nosniff。
+開發用本機磁碟，正式環境換 S3 相容儲存。
+
+## 後果
+- API 要多承擔上傳的頻寬與記憶體；檔案變大時改成 presigned URL＋上傳完成的確認端點（寫新的 ADR）。
+- 刪除先刪 metadata 再刪物件，失敗留下的孤兒物件由排程清理。</pre>
+<p>ADR 裡的其他句子（key 的格式、magic bytes、attachment、刪除順序）就是接下來各節要做的事，讀到那裡再回頭對照。</p>
+<p>「開發用本機磁碟，正式環境換 S3」要能做到，業務程式就不能直接呼叫 S3 的 SDK。參考實作把儲存包成一個只有三個方法的服務 <code>StorageService</code>：給 key 和位元組就存、給 key 就取、給 key 就刪。開發時的實作寫在本機磁碟（<code>src/files/storage.service.ts</code>），正式環境換成 S3 相容的實作，呼叫它的程式一行都不用改：</p>
+<pre>// src/files/storage.service.ts（節錄）
+private path(key: string) {
+  const p = resolve(this.root, key)
+  if (!p.startsWith(this.root + sep)) throw new Error(`不合法的 storage key：${key}`)   // 不會跑出根目錄
+  return p
+}
+async put(key: string, data: Buffer | string) { … }
+get(key: string) { … }
+async delete(key: string) { … }</pre>
+<p>本機磁碟版要把 key 接在根目錄後面變成真正的檔案路徑，<code>path()</code> 就是做這件事。<code>resolve</code> 會把 <code>../</code> 算掉，如果 key 是 <code>../../etc/passwd</code>，算出來的路徑就跑到根目錄外面了，所以接著檢查結果是不是還在根目錄底下，不是就拒絕。這是一道保險：下一節會讓 key 一律由程式產生，正常情況不會出現 <code>../</code>，但萬一哪天有人把使用者的字串放進 key，這裡還擋得住。</p>
+
+<div class="callout practice"><strong>💡 實務上：先選簡單的，把換掉的條件寫下來</strong><br>面試官看到「經過 API 上傳」不會扣分，看到「不知道為什麼這樣選」才會。ADR 裡寫清楚目前的上限（5 MB）、代價（API 頻寬與記憶體）、換成 presigned 的觸發條件（檔案超過幾十 MB、上傳讓 API 延遲變高），被問到「量變大怎麼辦」時就有現成的答案。工作上這也是跟 PM 對齊的方式：上限是產品決定，架構跟著它走。</div>
+
+<p>路徑定了：檔案經過 API，存進物件儲存，用 key 存取。下一個問題就是這個 key 要叫什麼，而第一個事故正是第一版用原檔名當 key 造成的。</p>
+
+<h2>同名覆蓋與跨租戶下載：key 和 metadata 怎麼設計？</h2>
+<p>第一版用使用者給的檔名當 key。兩個人都上傳 <code>report.pdf</code>，第二次的 <code>put</code> 用的是同一個 key，儲存照做，第一份就被取代了：對儲存來說，同一個 key 寫第二次就是「更新這個物件」，不會警告，也沒有東西可以還原。</p>
+<p>覆蓋只是第一個症狀，根本問題是讓<strong>使用者決定的字串變成儲存的位置</strong>。檔名裡可以有 <code>/</code>、<code>../</code>、控制字元，這些都會改變 key 的意思。所以 key 由程式產生：<code>tenants/&lt;tenantId&gt;/files/&lt;隨機 id&gt;</code>，每一段都有它的理由：</p>
+<ul>
+  <li><strong>隨機 id</strong>（UUID）：每次上傳都不一樣，兩個人上傳同名的 <code>report.pdf</code> 會變成兩個不同的物件，不會互相覆蓋（練習 1 的第二個測試就是這個）。</li>
+  <li><strong>沒有使用者的字串</strong>：檔名裡的 <code>../</code>、<code>/</code>、控制字元碰不到儲存路徑。</li>
+  <li><strong>租戶前綴</strong>：物件儲存的權限、生命週期規則（例如多久之後自動刪除）、刪除整個租戶的資料，都可以照 <code>tenants/&lt;tenantId&gt;/</code> 這個前綴一次做完。</li>
+</ul>
+<p>那使用者給的檔名去哪了？物件儲存只認 key，不知道這個物件原本叫什麼、是什麼型別、掛在哪個 project 下、屬於哪個租戶。這些描述檔案的資料叫 <strong>metadata</strong>，存在資料庫的一般資料表裡。原檔名只存在這裡，用來在列表上顯示、在下載時放進回應標頭，<strong>從來不出現在 key 裡</strong>。</p>
+<p>metadata 放進資料庫，也是修第二個事故的地方。第一版下載時直接拿網址裡的 id 去找檔案，沒有問「這是誰的檔案」，所以租戶 B 換一個 id 就拿到 A 的合約。修法不需要新東西，就是讓 <code>files</code> 表走跟 project 完全一樣的租戶隔離：有 <code>tenant_id</code>、加進 TenantDb 的自動條件清單、開 RLS。回顧一下這兩道：<a href="08-tenant-isolation-prisma.html">第 8 課</a>的 TenantDb 會替清單裡的資料表的每個查詢自動加上 <code>tenant_id</code> 條件；<a href="09-rls-defense-in-depth.html">第 9 課</a>的 RLS 是資料庫層的同一道條件，程式漏掉時由資料庫擋。這樣 B 用 A 的檔案 id 查，查詢會自動帶上 B 的租戶條件，結果是「沒有這筆」，API 回 404，跟這個 id 根本不存在一模一樣，B 也無從得知那個 id 是不是真的有檔案。</p>
+<p>反方向也要擋：B 拿 A 的 project id 上傳，不能讓檔案掛到 A 的 project 底下。<code>project</code> 的關聯用<a href="08-tenant-isolation-prisma.html">第 8 課</a>的複合外鍵 <code>(tenant_id, project_id)</code>：外鍵同時比對兩個欄位，B 的 <code>tenant_id</code> 配上 A 的 project id 這個組合在 project 表裡不存在，資料庫就拒絕寫入。service 在寫入前也會先用 TenantDb 查 project，B 查不到 A 的 project，先回 404（最後一節的程式裡看得到）；複合外鍵是程式漏查時的最後一道保證。</p>
+<pre>// prisma/schema.prisma
+model File {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @map("tenant_id") @db.Uuid
+  projectId   String   @map("project_id") @db.Uuid
+  project     Project  @relation(fields: [tenantId, projectId], references: [tenantId, id], onDelete: Cascade)
+  filename    String                         // 使用者給的，只用來顯示與下載
+  contentType String   @map("content_type")  // 偵測出來的，不是瀏覽器送的
+  size        Int
+  storageKey  String   @map("storage_key")   // 程式產生的
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  …
+}</pre>
+<p>注意 <code>filename</code> 與 <code>storageKey</code> 是兩個欄位：一個是給人看的名字，一個是程式產生的位置，彼此無關。<code>contentType</code> 的註解寫著「偵測出來的」，後面兩節會說明為什麼不能用瀏覽器送的那個。</p>
+<p>key 和 metadata 修掉了覆蓋與跨租戶下載。但到目前為止，API 還是什麼檔案都收：2 GB 的檔案、改名成 <code>.png</code> 的 HTML 都照樣進得來。接下來在收檔案的那一刻把它們擋下，先從大小開始。</p>
+
+<h2>2 GB 的檔案：怎麼在讀完之前就擋下？</h2>
+<p>先看第一版為什麼會被一個 2 GB 的檔案拖垮。multer 用 <code>memoryStorage()</code> 時，會把整個檔案讀進記憶體裡的一個 Buffer，處理請求的程式拿到的就是這個 Buffer。如果大小檢查寫在 controller 裡（「<code>file.size</code> 超過 5 MB 就拒絕」），這行程式執行的時候，2 GB 早就全部進了記憶體，檢查來得太晚。而 API 是一個程序服務所有人，記憶體被吃光，所有人的請求一起失敗。</p>
+<p>所以大小要在 multer <strong>讀資料的時候</strong>擋（<a href="../../nestjs/lessons/22-uploads-webhooks.html">NestJS 課第 22 課</a>）：設定 <code>limits.fileSize</code>，multer 一邊讀一邊數，讀到上限就停止，不會先把 2 GB 讀完再判斷。Nest 會把這個錯誤轉成 413（Payload Too Large，請求內容太大）。</p>
+<p>契約要求的不是單純的 413，而是錯誤碼 <code>FILE_TOO_LARGE</code>，所以參考實作繼承 <code>FileInterceptor(...)</code>、覆寫 <code>intercept</code>，只為了把這個 413 換成契約的錯誤（為什麼可以繼承它，見課末「補充與查表」）：</p>
+<pre>// src/files/files.controller.ts
+export const MAX_FILE_BYTES = 5 * 1024 * 1024
+
+// defParamCharset：檔名照 UTF-8 解（預設 latin1，中文檔名會變亂碼）
+class Upload extends FileInterceptor('file', { storage: memoryStorage(), limits: { fileSize: MAX_FILE_BYTES, files: 1 }, defParamCharset: 'utf8' }) {
+  override async intercept(context: ExecutionContext, next: CallHandler) {
+    try {
+      return await super.intercept(context, next)
+    } catch (e) {
+      if (e instanceof PayloadTooLargeException) throw new ApiError(413, 'FILE_TOO_LARGE', '檔案不能超過 5 MB')
+      throw e
+    }
+  }
+}</pre>
+<p>這一行設定裡有四個選項，各管一件事：</p>
+<ul>
+  <li><code>storage: memoryStorage()</code>：檔案放在記憶體，下一節要讀它的開頭判斷型別，接著整份寫進儲存。</li>
+  <li><code>limits.fileSize</code>：這一節的主角，讀到 5 MB 就停。</li>
+  <li><code>limits.files: 1</code>：一個請求只收一個檔案，不讓人一次塞一百個 5 MB 繞過單檔上限。</li>
+  <li><code>defParamCharset: 'utf8'</code>：跟中文檔名有關，下載那一節再講。</li>
+</ul>
+<p>有了上限，記憶體的用量就算得出來：每個上傳最多佔 5 MB，20 個人同時上傳就是 100 MB。這就是 ADR 裡「API 承擔記憶體」的意思。如果哪天產品要收 200 MB 的影片，正確的反應是改成直傳、寫新的 ADR，而不是把上限調大，讓 20 個同時上傳變成 4 GB。</p>
+<p>大小擋住了，但 5 MB 以內的檔案還是什麼都收，包括第四個事故那段改名成 <code>.png</code> 的 HTML。下一節要認出檔案到底是什麼。</p>
+
+<h2>改名成 .png 的 HTML：怎麼認出檔案真正的型別？</h2>
+<p>第一版判斷型別的方式有兩種，兩種都靠不住。一種是看副檔名，但副檔名就是檔名的一部分，改名就換了。另一種是看 multer 給的 <code>file.mimetype</code>，它來自請求裡那一段檔案宣稱的 <code>Content-Type</code>。瀏覽器通常照副檔名猜一個填上去，而用 curl 或自己寫的腳本上傳的人想填什麼就填什麼。兩者都是<strong>上傳的人決定的</strong>，拿來做安全判斷等於讓攻擊者自己說自己是好人。</p>
+<p>可靠的是看檔案內容。多數二進位檔案格式都規定檔案開頭要有固定的幾個 byte 當作簽名，叫 <strong>magic bytes</strong>：PNG 一定以 <code>89 50 4E 47 0D 0A 1A 0A</code> 開頭，PDF 一定以 <code>%PDF-</code>（<code>25 50 44 46 2D</code>）開頭。這幾個 byte 是內容的一部分，改檔名改不到。HTML 沒有這種簽名，它就是一般的文字，所以改名成 <code>.png</code> 的 HTML 開頭不會是 PNG 的簽名。</p>
+<pre>// src/files/file-type.ts
+const SIGNATURES: [string, number[]][] = [
+  ['image/png', [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]],
+  ['image/jpeg', [0xff, 0xd8, 0xff]],
+  ['image/gif', [0x47, 0x49, 0x46, 0x38]],
+  ['application/pdf', [0x25, 0x50, 0x44, 0x46, 0x2d]],
+]
+export const detectType = (buf: Buffer) =&gt; SIGNATURES.find(([, sig]) =&gt; sig.every((b, i) =&gt; buf[i] === b))?.[0] ?? null</pre>
+<p><code>detectType</code> 拿上一節留在記憶體裡的 Buffer，逐一比對四種簽名，第一個每個 byte 都對得上的就是它的型別；都對不上就回 <code>null</code>。</p>
+<p>這是一份<strong>白名單</strong>：只接受認得的四種，其他一律拒絕。反過來的黑名單（「HTML、SVG、JS 不收」）要列出所有危險的型別，漏一種就破功，而且每出現一種新格式就要記得補。白名單漏掉的代價只是「某種正常檔案傳不上來」，使用者會回報，你再加進去。偵測不出來就回 415（Unsupported Media Type，不支援的型別）<code>UNSUPPORTED_FILE_TYPE</code>。偵測出來的型別存進 metadata 的 <code>contentType</code>，下載時用它，不用上傳時宣稱的那個。</p>
+<p>反過來，一個沒有副檔名、瀏覽器送 <code>application/octet-stream</code>（「不知道是什麼的位元組」）的 PNG，開頭是 PNG 的簽名，就要接受，<code>contentType</code> 記成 <code>image/png</code>：判斷只看內容，名字和宣稱都不參考，兩個方向都一樣。</p>
+<p>但 magic bytes 也有它證明不了的事：它只檢查開頭，證明「開頭像 PNG」。一個開頭是 PNG 簽名、後面接著一段 HTML 的檔案一樣會通過。所以第四個事故還沒完全修好，下載的那一端要再守一次。</p>
+
+<h2>漏網的檔案：下載時怎麼不讓它在你的網域上執行？</h2>
+<p>先把第四個事故的機制看清楚。瀏覽器打開一個網址時，如果把回應當成 HTML 來顯示，裡面的 script 就以<strong>這個網址的網域</strong>的身分執行：讀得到這個網域的 localStorage、帶著這個網域的 cookie 發請求。下載網址在你的 API 網域上，被當成網頁打開的上傳檔案，就是在你的網域上執行別人的程式，這就是 <a href="../../auth/lessons/07-xss-csp.html">auth 課第 7 課</a>的 XSS。第一版怎麼讓它成真的？攻擊者把 HTML 檔名改成 <code>.png</code>，但不是用瀏覽器上傳，而是用 curl 上傳，把那一段的 <code>Content-Type</code> 填成 <code>text/html</code>：上一節說過，這個值上傳的人想填什麼就填什麼。第一版把這個宣稱的型別存下來，下載時原樣送回去，又沒有加 attachment，瀏覽器就在分頁裡把它當 HTML 渲染。</p>
+<p>所以下載的回應要讓瀏覽器「不管內容是什麼都不執行」，三個標頭一起用：</p>
+<ul>
+  <li><code>Content-Disposition: attachment</code>：告訴瀏覽器把回應存成檔案，不要在分頁裡顯示。沒有它，瀏覽器會嘗試直接顯示認得的型別，HTML 就會被渲染、執行。</li>
+  <li><code>Content-Type</code> 用偵測出來的：上一節存進 metadata 的值，所以上傳時宣稱的 <code>text/html</code> 永遠不會被送回去。</li>
+  <li><code>X-Content-Type-Options: nosniff</code>：瀏覽器有時不照 <code>Content-Type</code>，而是自己看內容猜型別，猜成 HTML 就可能執行。<code>nosniff</code> 叫它照標頭寫的型別處理，不要自己猜。</li>
+</ul>
+<p>三個標頭各擋一條路，所以一起用：attachment 決定「存檔，不顯示」，正確的 Content-Type 決定「這是什麼」，nosniff 保證瀏覽器照這個說法處理。參考實作的下載端點：</p>
+<pre>// src/files/files.controller.ts
+@Permissions('files:read')
+@Get('files/:id/content')
+async content(@Param('id', UUID) id: string, @Res({ passthrough: true }) res: Response) {
+  const { file, data } = await this.files.content(id)
+  res.set({ 'Content-Type': file.contentType, 'Content-Disposition': attachment(file.filename), 'X-Content-Type-Options': 'nosniff' })
+  return new StreamableFile(data)
+}
+
+// src/files/file-type.ts：ASCII 的備用檔名＋RFC 6266 的 filename*（UTF-8）
+export function attachment(filename: string) {
+  const ascii = filename.replace(/[^\x20-\x7e]|["\\]/g, '_')
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(filename)}`
+}</pre>
+<p>這個 handler 既要設標頭，又要回傳檔案內容。<code>@Res({ passthrough: true })</code> 讓你拿到回應物件來設定標頭，同時仍由 Nest 送出 return 的值（<a href="../../nestjs/lessons/02-controllers.html">NestJS 第 2 課</a>講過為什麼不用不加 passthrough 的 <code>@Res()</code>）；<code>StreamableFile</code> 把位元組包成 Nest 會原樣送出的回應本文，不會被轉成 JSON。</p>
+<p><code>this.files.content(id)</code> 走的是 TenantDb，所以「key 和 metadata」那一節修好的跨租戶隔離在這裡一樣有效：B 拿 A 的 id 下載，同樣是 404。</p>
+<p><code>attachment()</code> 處理的是另一件事：下載下來的檔案要叫原本的名字，而原檔名常常是中文。<code>filename="…"</code> 這種寫法只能放 ASCII。RFC 6266 規定了另一個參數 <code>filename*=UTF-8''…</code>，值是 UTF-8 的百分比編碼（<code>encodeURIComponent</code> 產生的那種），支援它的瀏覽器會優先用這個。兩個參數一起給：<code>filename*</code> 給新的客戶端正確的中文，<code>filename</code> 放一個把非 ASCII 換成 <code>_</code> 的備用值給舊的客戶端。備用值同時把 <code>"</code> 和 <code>\</code> 也換掉，因為 <code>"</code> 會提早結束引號裡的字串，讓檔名的後半段被當成標頭的其他內容。</p>
+<p>中文檔名在上傳那一端也要顧：前面 multer 設的 <code>defParamCharset: 'utf8'</code>，就是讓它把上傳請求裡的檔名照 UTF-8 解。預設是 latin1，中文檔名存進資料庫時就已經是亂碼，下載端寫得再對也救不回來。</p>
+<p>正式環境改用 S3 時，下載通常不再讓位元組經過 API，做法見課末「補充與查表」，練習 5 會用到。</p>
+
+<div class="callout practice"><strong>💡 實務上：檔案下載最好放在另一個網域</strong><br>大型服務會把使用者上傳的內容放在另一個網域（例如 GitHub 的 <code>githubusercontent.com</code>）：就算某個檔案真的被瀏覽器當網頁執行，它也讀不到主網域的 cookie 與 localStorage。作品不用做到這一步，但 attachment＋nosniff＋偵測型別是最低標準。資安審查會直接上傳一個改名的 HTML 試試看，你的作品要擋得住。</div>
+
+<p>到這裡四個事故都修掉了。但每一節都默默假設了一件事：寫進儲存和寫進資料庫兩步都會成功。下一節看其中一步失敗時會怎樣。</p>
+
+<h2>儲存和資料庫不在同一個交易：失敗時要留下哪種殘局？</h2>
+<p>一次上傳要寫兩個地方：位元組寫進物件儲存，metadata 寫進資料庫。資料庫的交易只管得到資料庫自己：交易失敗時，資料庫能把這次的寫入全部撤回，但物件儲存是另一個服務，<code>storage.put</code> 是一次對外的呼叫，寫進去就是寫進去了，資料庫的回滾碰不到它。兩個系統沒辦法放進同一個交易，所以總有一個時間點只成功了一半。能選的不是「不失敗」，而是<strong>失敗時留下哪一種殘局</strong>：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>失敗後的狀態</th><th>使用者看到什麼</th><th>怎麼收拾</th></tr></thead>
+  <tbody>
+    <tr><td>孤兒物件：儲存裡有、資料庫沒有</td><td>沒有影響</td><td>排程比對兩邊、刪掉沒有 metadata 的物件</td></tr>
+    <tr><td>壞連結：資料庫有、儲存沒有</td><td>列表看得到，下載 500</td><td>要人工判斷</td></tr>
+  </tbody>
+</table></div>
+<p>兩種殘局的差別在於使用者看不看得到，以及能不能自動收拾。孤兒物件只是多佔一點儲存空間，沒有人會點到它，排程照 <code>tenants/</code> 前綴列出物件、比對 metadata 表就能清掉。壞連結則出現在使用者的列表上，點下去就失敗；而且排程沒辦法判斷該怎麼修：檔案已經不在了，是要刪掉這筆紀錄，還是去找備份？只能人工處理。</p>
+<p>所以規則是：永遠讓失敗落在孤兒物件那一邊。上傳是<strong>先寫物件，再寫 metadata</strong>：物件寫好了，metadata 那一步才在交易裡檢查 project 存在、容量上限，任何一項失敗，就把剛寫的物件刪掉。萬一連這次刪除也失敗，留下的也只是一個孤兒物件。反過來先寫 metadata 再寫物件，物件寫入失敗時，資料庫裡已經有一筆指向不存在物件的紀錄，就是壞連結。</p>
+<p>看下面的程式時，注意 <code>storage.put</code> 在交易之前、<code>catch</code> 裡刪物件這兩處。交易裡的 <code>lockTenant</code>、<code>storageUsage</code> 是第 14 課的容量上限，現在先跳過：</p>
+<pre>// src/files/files.service.ts
+async upload(projectId: string, file: { originalname: string; buffer: Buffer; size: number }) {
+  const contentType = detectType(file.buffer)
+  if (!contentType) throw new ApiError(415, 'UNSUPPORTED_FILE_TYPE', '只接受 PNG、JPEG、GIF、PDF')
+  const tenantId = this.ctx.tenantId!
+  const id = randomUUID()
+  const storageKey = `tenants/${tenantId}/files/${id}`
+  await this.storage.put(storageKey, file.buffer)
+  try {
+    return await this.db.tx(async tx =&gt; {
+      const limits = await lockTenant(tx, tenantId)                                       // 第 14 課
+      if (!(await tx.project.findUnique({ where: { id: projectId } }))) throw notFound()   // 別的租戶的 project 也是 404
+      if ((await storageUsage(tx)) + file.size &gt; limits.storageBytes) throw planLimit('檔案總容量')
+      const f = await tx.file.create({ data: { id, tenantId, projectId, filename: file.originalname.slice(0, 255), contentType, size: file.size, storageKey } })
+      await this.audit.record(tx, 'file.uploaded', 'file', f.id)
+      return fileView(f)
+    })
+  } catch (e) {
+    await this.storage.delete(storageKey)
+    throw e
+  }
+}</pre>
+<p>這一段把前面每一節串在一起：先用 <code>detectType</code> 擋掉不認得的型別（還沒寫任何東西，直接回 415）；key 由程式用租戶與隨機 id 組出來；交易裡用 TenantDb 查 project，別的租戶的 project 查不到就 404；稽核跟 metadata 在同一個交易（第 11 課）。檔名截到 255 個字元，避免過長的字串進資料庫。</p>
+<p>刪除反過來：<strong>先刪 metadata（交易＋稽核），再刪物件</strong>。metadata 一刪，檔案就從使用者的列表消失；之後物件刪除失敗，留下的也是孤兒物件，只記 log，留給排程：</p>
+<pre>async remove(id: string) {
+  const f = await this.db.tx(async tx =&gt; {
+    const row = await tx.file.findUnique({ where: { id } })
+    if (!row) throw notFound()
+    await tx.file.delete({ where: { id } })
+    await this.audit.record(tx, 'file.deleted', 'file', id)
+    return row
+  })
+  await this.storage.delete(f.storageKey).catch(e =&gt; this.logger.warn(`刪除物件失敗 ${f.storageKey}：${e.message}`))
+}</pre>
+<p>為什麼容量檢查要先鎖租戶列（<code>lockTenant</code>）再加總（<code>storageUsage</code>），第 14 課解釋。孤兒清理的排程這一課不實作，寫在 ADR 的「後果」裡：這個殘局有人知道、有地方追蹤，之後補上排程時再更新 ADR。</p>
+<p><code>files</code> 模組到這裡完整了：檔案經過 API、key 由程式產生、大小與型別在收的時候擋、下載不執行、失敗只留孤兒物件。最後一步是把它接到你自己的業務模組上。</p>
+
+<h2>套到你的業務模組</h2>
+<p>檔案模組是平台功能，跟業務無關；你的業務模組直接掛上去（<code>POST /&lt;資源&gt;/:id/files</code>），或者沿用 project 的端點。同樣的模組放進不同的業務，要多想的地方不一樣。三個建議題目：</p>
+<ul>
+  <li><strong>客服工單</strong>：附件常是客人的截圖，裡面可能有個資。權限照工單走（看得到工單才下載得到），保存期限跟工單一起，刪工單時附件一起進孤兒清理。</li>
+  <li><strong>預約排程</strong>：附件不多，但可能有診斷證明這類敏感文件。考慮下載也寫稽核（<code>file.downloaded</code>），誰看過敏感文件是常見的稽核需求。</li>
+  <li><strong>進銷存</strong>：匯入用的 CSV／Excel 不是附件，是「上傳後要解析的資料」：大小限制更嚴、解析放背景工作（第 13 課），解析失敗回報哪一列錯，原檔留著方便重跑。</li>
+</ul>
+
+<h2>補充與查表</h2>
+<ul>
+  <li><strong>為什麼可以 <code>extends FileInterceptor(...)</code></strong>：<code>FileInterceptor(...)</code> 不是 interceptor 的實例，它回傳的是一個類別（依你給的參數產生），所以可以繼承它、覆寫 <code>intercept</code>，在 <code>super.intercept</code> 外面包一層 <code>try／catch</code> 換錯誤碼。</li>
+  <li><strong>正式環境的下載：302 轉到 presigned GET</strong>：正式環境用 S3 時，常見的做法是下載端點檢查權限後回 302，轉到一個短時效的 presigned GET 網址，並在簽名時指定回應的 <code>Content-Disposition</code>（S3 的 <code>ResponseContentDisposition</code>），位元組就不用經過 API。契約允許 200 或 302，測試會跟著轉址走。</li>
+  <li><strong>這課的錯誤回應</strong>（查表用）：
+    <div class="table-wrap"><table>
+      <thead><tr><th>情況</th><th>狀態碼</th><th>錯誤碼</th></tr></thead>
+      <tbody>
+        <tr><td>超過 5 MB</td><td>413</td><td><code>FILE_TOO_LARGE</code></td></tr>
+        <tr><td>magic bytes 不在白名單</td><td>415</td><td><code>UNSUPPORTED_FILE_TYPE</code></td></tr>
+        <tr><td>檔案或 project 不存在、屬於別的租戶</td><td>404</td><td><code>notFound()</code></td></tr>
+      </tbody>
+    </table></div>
+  </li>
+</ul>
+
+<h2>練習</h2>
+
+<div class="local" data-test="ex1" data-files="">
+  <p>練習 1：做出 <code>POST /api/v1/projects/:id/files</code>（multipart，欄位 <code>file</code>）、<code>GET /api/v1/files/:id</code>、<code>GET /api/v1/files/:id/content</code>。上傳 PNG 回 201 與正確的 metadata，下載的位元組跟原檔一樣；兩個同名的檔案各自保存、不互相覆蓋。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="">
+  <p>練習 2：超過 5 MB 回 413 <code>FILE_TOO_LARGE</code>；改名成 <code>.png</code> 的 HTML、改名成 <code>.pdf</code> 的純文字都回 415 <code>UNSUPPORTED_FILE_TYPE</code>；沒有副檔名、瀏覽器送 <code>application/octet-stream</code> 的 PNG 要接受，<code>contentType</code> 是偵測出來的 <code>image/png</code>。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="">
+  <p>練習 3：租戶 B 讀 A 的檔案 metadata、下載、刪除都 404（A 的檔案還在）；B 用 A 的 project ID 上傳也 404。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="">
+  <p>練習 4：下載回應有 <code>Content-Disposition: attachment</code>，中文檔名用 <code>filename*=UTF-8''…</code>，有 <code>X-Content-Type-Options: nosniff</code>，<code>Content-Type</code> 是偵測出來的型別（測試上傳時故意宣稱 <code>text/html</code>）。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 5：你改成正式環境的做法：下載端點檢查權限後回 302，轉到 S3 的 presigned GET 網址，有效時間設 24 小時「免得使用者下載到一半過期」。某位成員被移除後，他還能下載嗎？</p>
+  <label data-key="a">不能：API 已經不認他的 token，presigned 網址跟著失效</label>
+  <label data-key="b">不能：S3 每次下載都會回頭問 API 這個人還有沒有權限</label>
+  <label data-key="c">能，但只能下載被移除前打開過的那一個檔案，而且只能一次</label>
+  <label data-key="d">能：拿過的網址在 24 小時內都有效，誰拿到都能下載；網址的有效時間要短（幾分鐘），每次下載都回 API 重新檢查權限再簽</label>
+  <p class="why">✓ presigned 網址的權限在簽名那一刻就決定了，S3 只驗簽名與時間，不知道你的成員名單，網址也可以被轉傳。所以權限檢查發生在 API 簽發網址的時候，有效時間決定「撤銷要多久才生效」。a 是最常見的誤解：token 與 presigned 網址是兩套憑證。下載中途過期不是問題：S3 只在請求開始時檢查網址有沒有過期，已經開始的傳輸會繼續。（第 12 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：同事說：「key 用 <code>tenants/&lt;tenantId&gt;/&lt;原檔名&gt;</code> 就好，已經有租戶前綴，不會跨租戶，而且在儲存的主控台看得懂是哪個檔案。」還會出什麼事？</p>
+  <label data-key="a">不會出事，租戶前綴已經解決了所有問題</label>
+  <label data-key="b">同一個租戶兩個人上傳同名檔案，後面的蓋掉前面的；檔名裡的 <code>/</code>、<code>../</code> 還會改變物件的路徑</label>
+  <label data-key="c">只有效能問題：原檔名太長會讓 S3 變慢</label>
+  <label data-key="d">只要在 key 前面再加上傳時間就完全沒問題了</label>
+  <p class="why">✓ 使用者決定的字串不該變成儲存的位置：同名會覆蓋（資料遺失），特殊字元會改變路徑。key 用程式產生的隨機 id，原檔名存在 metadata、只在下載標頭用。d 加時間只是讓撞名機率變小，同一毫秒的兩個請求、檔名裡的 <code>../</code> 還是在。（第 12 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 7：刪除檔案時，同事把順序改成「先刪 S3 的物件，成功了才刪 metadata」，理由是「這樣不會留下孤兒物件、省儲存費」。S3 刪除成功、接著資料庫交易失敗時，使用者會看到什麼？</p>
+  <label data-key="a">檔案還在列表上，點下載卻失敗：資料庫說有、儲存說沒有，變成壞連結，而且沒有排程能自動修好</label>
+  <label data-key="b">什麼都看不到，因為兩個操作會一起回滾</label>
+  <label data-key="c">檔案從列表消失，跟成功刪除一樣</label>
+  <label data-key="d">S3 的刪除會等資料庫交易結束才真的執行</label>
+  <p class="why">✓ 物件儲存不在資料庫的交易裡，刪掉就回不來。先刪 metadata 再刪物件，失敗時留下的是使用者看不到的孤兒物件，排程比對前綴就能清掉；省一點儲存費換來壞連結不划算。b、d 都假設儲存與資料庫能一起回滾，這正是做不到的地方。（第 12 課）</p>
+</div>
+
+<h2>自評清單</h2>
+<p>測試判不出來、但作品裡看得出來的事。每一項自己確認：</p>
+<ul>
+  <li><strong>ADR 寫了架構選擇</strong>：為什麼經過 API、上限多少、什麼情況改成直傳。</li>
+  <li><strong>大的檔案沒有被整個讀進來</strong>：把上限暫時改成 1 KB，上傳一個 50 MB 的檔案，看 API 的記憶體沒有跳 50 MB（<code>process.memoryUsage().rss</code> 或活動監視器），而且很快就回 413。</li>
+  <li><strong>key 裡沒有使用者的字串</strong>：看一眼儲存的資料夾（或 bucket），每個 key 都是 <code>tenants/&lt;uuid&gt;/files/&lt;uuid&gt;</code>。</li>
+  <li><strong>上傳失敗不留物件</strong>：上傳到一個不存在的 project（404），儲存的資料夾裡沒有多出檔案。</li>
+  <li><strong>上傳與刪除都有稽核</strong>：<code>GET /audit-logs?action=file.uploaded</code> 看得到。</li>
+</ul>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>用原檔名當 key</strong>：同名覆蓋、路徑穿越。key 由程式產生，原檔名只存在 metadata。</li>
+  <li><strong>看副檔名或 <code>file.mimetype</code> 判斷型別</strong>：兩者都是上傳的人決定的。看內容的 magic bytes，用白名單。</li>
+  <li><strong>先整個收進來才檢查大小</strong>：大小限制設在 multer 的 <code>limits.fileSize</code>，讀到上限就停。</li>
+  <li><strong>下載用 <code>inline</code> 或沿用上傳時的 Content-Type</strong>：上傳的 HTML 會在你的網域執行。attachment＋偵測出的型別＋nosniff。</li>
+  <li><strong>中文檔名變亂碼</strong>：multer 預設用 latin1 解檔名，要設 <code>defParamCharset: 'utf8'</code>；下載用 <code>filename*=UTF-8''…</code>。</li>
+  <li><strong>先刪物件再刪 metadata</strong>：交易失敗時留下壞連結。先刪 metadata，物件留給排程。</li>
+  <li><strong>下載端點直接用 <code>PrismaService</code> 查</strong>：沒有租戶條件，換一個 id 就下載到別人的檔案。metadata 與下載都走 TenantDb。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>先決定路徑：經過 API（簡單、檢查集中，承擔頻寬與記憶體）或 presigned 直傳（省 API、檢查要在確認時補）；作品選前者，代價與換的條件寫在 ADR。儲存包成 put／get／delete 三個方法，開發與正式環境換實作不改業務程式。</li>
+  <li>同名覆蓋：key 是 <code>tenants/&lt;tenantId&gt;/files/&lt;隨機 id&gt;</code>，使用者的檔名只存在 metadata。跨租戶下載：metadata 有 tenant_id、走 TenantDb、開 RLS，project 用複合外鍵，別的租戶一律 404。</li>
+  <li>2 GB 吃光記憶體：大小在 multer 讀資料時擋（<code>limits.fileSize</code>），不是讀完再檢查。改名的 HTML：型別看 magic bytes 白名單，不信副檔名與瀏覽器送的型別。</li>
+  <li>magic bytes 只證明開頭，所以下載一律 <code>attachment</code>＋偵測出的 <code>Content-Type</code>＋<code>nosniff</code>；中文檔名上傳設 <code>defParamCharset: 'utf8'</code>、下載用 <code>filename*</code>。</li>
+  <li>儲存與資料庫不在同一個交易：上傳先寫物件、刪除先刪 metadata，失敗只留下使用者看不到的孤兒物件，交給排程。</li>
+</ul>
+<p>下一課做匯出：工作太久不能讓 HTTP 請求等，交給背景的 worker；worker 裡沒有請求，租戶上下文要自己重建。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

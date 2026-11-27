@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>19. 結構化 log 與 request context</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="19" data-practice="node">
+<header>
+  <div class="eyebrow">階段 5：上線前的準備 · 第 19 課</div>
+  <h1>結構化 log 與 request context</h1>
+</header>
+<main>
+
+<p>晚上九點，客服轉來一句話：「王小明說他 20:14 點的拿鐵一直沒出來。」你打開伺服器的 log，看到幾千行 <code>console.log</code> 印出來的字串，三台機器、上百個請求交錯在一起，分不出哪一行屬於王小明的那一筆。<a href="18-error-handling.html">上一課</a>的結論是「錯誤只在邊界記一次，用 errorId 對得上」，但那個做法有個前提：log 本身要找得到、看得懂。現在這個前提不成立。</p>
+<p>這一課從這個客訴出發，把咖啡店的 log 改到「客服給一個編號，五分鐘內就能找出那個請求的每一行 log，看到完整的錯誤原因，而且 log 裡沒有任何密碼」。一路自己做一個小 logger，最後你也會看得懂正式專案用的 pino 每個設定在做什麼。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>幾千行 log 裡為什麼找不到王小明？每一行要長什麼樣子、要有哪些欄位和等級，才搜得到、篩得出來。</li>
+  <li>找到那一行，錯誤卻印成 <code>{}</code>？Error 怎麼記才完整；log 裡又為什麼不能出現王小明的密碼。</li>
+  <li>怎麼把王小明那個請求的每一行 log 串起來？request id，以及為什麼要用 <code>AsyncLocalStorage</code> 而不是全域變數；還有 context 在哪些地方會悄悄遺失。</li>
+  <li>每個請求記一行能看出什麼？access log、log 量就是成本，以及正式專案怎麼直接用 pino。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="07-event-loop.html">第 7 課</a>的 event loop：一個請求在 <code>await</code> 等資料庫時，event loop 會去處理別的請求，所以多個請求的步驟會交錯執行。</li>
+  <li><a href="18-error-handling.html">第 18 課</a>的錯誤處理：錯誤類別帶 <code>code</code> 和 <code>cause</code>，在 HTTP 邊界統一轉成回應、配一個 errorId，而且只在邊界記一次 log。</li>
+</ul></div>
+
+<h2>幾千行 log 裡，為什麼找不到王小明？</h2>
+<p>開發時只有你一個人在打 API，<code>console.log('訂單成立', orderId)</code> 很夠用：畫面上就那幾行，一眼看得出誰是誰。上線後情況完全不同，有三件事同時改變：</p>
+<ul>
+  <li>同一時間有很多請求在處理，它們的 log 一行一行交錯，相鄰的兩行不一定屬於同一個請求。</li>
+  <li>服務跑在好幾台機器上，王小明的請求落在哪一台你事先不知道。</li>
+  <li>log 不再是你看著終端機讀，而是被收集平台（<a href="../../devops/lessons/21-logs.html">部署課第 21 課</a>）從每台機器集中起來，你在平台上下查詢條件。</li>
+</ul>
+<p>你真正要問的問題長這樣：「找出 20:10 到 20:20 之間、王小明的、等級是 error 的 log」，或「過去一小時 5xx 超過 50 次就通知我」。這種問題只能靠<strong>欄位</strong>回答：時間是一個欄位、顧客是一個欄位、等級是一個欄位，平台才能用條件篩選、分組、加總。給人讀的句子做不到這些，平台只能對整行做全文搜尋。</p>
+<p>所以要換一種寫法。<strong>結構化 log</strong>（structured logging）指的是每一筆 log 都用固定欄位的格式記錄，每個值都有自己的名字，最常見的格式是 JSON。再加上一條規則：一筆 log 只佔一行，一行就是一個完整的 JSON 物件。這種「一行一個 JSON」的格式叫 <strong>JSON Lines</strong>。為什麼要強調一行：收集工具是一行一行讀的，一筆 log 如果跨好幾行（例如把 JSON 排版印出來，或直接印出多行的 stack），平台會把它拆成好幾筆互不相關的紀錄，欄位也解析不了。</p>
+<p>同一件事的兩種寫法：</p>
+<pre>// 給人看的字串：要搜「拿鐵」「王小明」只能用全文搜尋，金額混在句子裡沒辦法加總
+訂單成立！王小明 點了 拿鐵 x2，共 220 元（req 7f3a…）
+
+// 結構化：每個值都有名字，可以用 customer = "王小明" AND level = "error" 篩選，total 可以加總
+{"time":"2026-10-31T12:14:03.512Z","level":"info","msg":"訂單成立","requestId":"7f3a…","customer":"王小明","drink":"拿鐵","qty":2,"total":220}</pre>
+<p>注意第二種寫法的 <code>msg</code> 是固定的「訂單成立」，變動的東西（誰、什麼飲料、多少錢）都放在欄位裡。這個區分很關鍵：<code>msg</code> 固定，平台才能統計「訂單成立」一天出現幾次、按小時畫成圖；如果把 id、金額塞進訊息字串，每一行的訊息都不一樣，平台就無法把它們歸成同一組。</p>
+<p>這樣就有了最小版本的答案：log 改成一行一個 JSON，王小明、時間、等級都是欄位，就能從幾千行裡篩出來。但「要有哪些欄位」「等級怎麼分」如果每個人各寫各的，篩選條件就對不上。下一節把這些定下來。</p>
+
+<h2>每一行要有哪些欄位？等級怎麼定？</h2>
+<p>要讓上一節的查詢條件在每一行都成立，每一行至少要有這幾個欄位：</p>
+<div class="table-wrap"><table>
+<tr><th>欄位</th><th>內容</th><th>為什麼</th></tr>
+<tr><td><code>time</code></td><td>ISO 8601 字串，例如 <code>2026-10-31T12:14:03.512Z</code></td><td>帶時區（<code>Z</code> 是 UTC），排序、跨機器比對都不會錯</td></tr>
+<tr><td><code>level</code></td><td>等級</td><td>過濾與告警</td></tr>
+<tr><td><code>msg</code></td><td>固定的一句話</td><td>分組、統計</td></tr>
+<tr><td><code>requestId</code> 等</td><td>這件事的相關資料</td><td>搜尋、把同一個請求串起來</td></tr>
+</table></div>
+<p><code>time</code> 要用帶時區的 ISO 字串，是因為三台機器的 log 要排在同一條時間軸上；只寫「20:14:03」的話，你不知道那是台灣時間還是 UTC，跨機器一比就亂。<code>requestId</code> 是串起同一個請求的編號，這一課後半會專門處理。</p>
+<p><code>level</code> 需要多解釋。<strong>log 等級</strong>（level）表示這件事有多嚴重。logger 會設一個門檻，低於門檻的 log 直接不輸出。這樣同一份程式碼，開發時可以印出很細的資訊，上線時只留重要的。咖啡店的等級這樣分：</p>
+<div class="table-wrap"><table>
+<tr><th>等級</th><th>意思</th><th>咖啡店的例子</th></tr>
+<tr><td><code>fatal</code></td><td>程序要結束了</td><td>啟動時連不上資料庫、<code>uncaughtException</code>（<a href="18-error-handling.html">第 18 課</a>）</td></tr>
+<tr><td><code>error</code></td><td>這個操作失敗，需要有人看</td><td>500：建立訂單時資料庫出錯</td></tr>
+<tr><td><code>warn</code></td><td>不正常但撐過去了</td><td>上游第一次逾時、重試後成功；連線池快滿了</td></tr>
+<tr><td><code>info</code></td><td>正常的重要事件</td><td>伺服器啟動、訂單成立、每個請求的 access log</td></tr>
+<tr><td><code>debug</code></td><td>開發時追問題用的細節</td><td>每一句 SQL、上游的完整回應</td></tr>
+</table></div>
+<p>正式環境的門檻通常是 <code>info</code>，開發時用 <code>debug</code>。門檻不要寫死在程式裡，放在環境變數（例如 <code>LOG_LEVEL</code>，<a href="02-process-config.html">第 2 課</a>的做法），這樣不用改程式、不用重新部署就能調整。</p>
+<p>等級最常被搞錯的是 4xx。客戶端送錯資料（缺欄位、找不到商品）是預期中會發生的事，屬於<a href="18-error-handling.html">第 18 課</a>說的「可預期的錯誤」，伺服器已經正確回應了，沒有東西壞掉。把它記成 error，告警就會因為使用者打錯字而響個不停，真正的 500 反而被淹沒。所以 4xx 通常不記成 error。</p>
+<p>欄位定好之後，下一個問題是「每次都要記得帶」。很多 log 都有共同的欄位，例如服務名稱、這個請求的 id，每一行都手動帶很容易漏掉一行，而漏掉的那行剛好就搜不到。所以 logger 都提供 <strong>child logger</strong>：從原本的 logger（父 logger）產生一個新的 logger，並綁定一組欄位；新 logger 輸出的每一行都會自動附上這些欄位，等級門檻沿用父 logger，父 logger 本身不受影響。</p>
+<pre>const logger = createLogger({ level: process.env.LOG_LEVEL ?? 'info' })
+const orderLog = logger.child({ service: 'orders' })
+orderLog.info('訂單成立', { orderId: 7 })
+// {"time":"…","level":"info","msg":"訂單成立","service":"orders","orderId":7}</pre>
+<p>最後是 log 要寫到哪裡。答案是 <strong>stdout</strong>（標準輸出）：程式只管往 stdout 寫，由執行它的平台（Docker、Kubernetes、雲端服務）收集、轉送、保存。程式不自己開檔案、不自己處理檔案太大時的輪替，因為容器可能隨時被換掉，寫在裡面的檔案也跟著消失。這裡要記得<a href="02-process-config.html">第 2 課</a>看過的一件事：stdout 接到管線時是<strong>非同步寫入</strong>，如果寫得比對方讀得快，資料就堆在記憶體裡；log 寫得太多，把物件轉成 JSON 本身也吃 CPU。log 不是免費的，這一課最後一節會回來談成本。</p>
+<div class="callout practice"><strong>💡 實務上：欄位名稱和等級是團隊的約定，不是個人習慣</strong><br>咖啡店後台拆成訂單、庫存兩個服務後，一個寫 <code>orderId</code>、一個寫 <code>order_id</code>，查王小明那筆單就要搜兩次，告警規則也要寫兩份。所以團隊通常在專案初期就定好共用欄位的名稱（<code>requestId</code>、<code>userId</code>、<code>orderId</code>），放進共用的 logger 模組或 README。等級則決定誰會被叫醒：維運通常把告警掛在 error 上，記成 error 就代表真的需要有人處理。資深在 code review 會問兩件事：這行的 <code>msg</code> 是固定的嗎？這個等級出現時，你希望誰去做什麼？</div>
+<p>現在你能篩出 20:14 那段時間的 error 了。但點開那一行，你最想看的錯誤內容，可能是一個空的 <code>{}</code>。</p>
+
+<h2>找到那一行，錯誤卻是 <code>{}</code>：Error 怎麼記？</h2>
+<p>上一節的 logger 做的事，就是把欄位放進一個物件、交給 <code>JSON.stringify</code>。最自然的寫法是 <code>log.error('出錯了', { err })</code>，把錯誤直接放進欄位。這正是最常見的翻車點。執行 <code>node examples/error-json.ts</code>（本機 Node 24.22.1）：</p>
+<pre>$ node examples/error-json.ts
+{"msg":"出錯了","err":{}}
+[] [ 'stack', 'message', 'cause' ]
+Error: 建立訂單失敗
+    at file:///…/work/19/examples/error-json.ts:5:13 …
+Converting circular structure to JSON
+Do not know how to serialize a BigInt</pre>
+<p>先看前兩行。第一行：<code>err</code> 變成 <code>{}</code>，你最需要的那筆資訊完全消失。原因在第二行：<code>JSON.stringify</code> 只輸出物件「自己的、可列舉的」屬性。前面的 <code>[]</code> 是 <code>Object.keys(err)</code>，它只列出可列舉的屬性，結果是空的；後面是 <code>Object.getOwnPropertyNames(err)</code>，它連不可列舉的也列，才看得到 <code>message</code>、<code>stack</code>、<code>cause</code>。也就是說，這三個屬性確實在 Error 身上，只是被標成<strong>不可列舉</strong>，<code>JSON.stringify</code> 就跳過它們。</p>
+<p>第三、四行解釋了為什麼開發時沒發現：<code>console.log(err)</code> 看得到完整的錯誤和 stack，因為 <code>console.log</code> 內部用的是 <code>util.inspect</code>，它會主動把 Error 的這些屬性印出來，跟 JSON 是兩回事。開發時用 <code>console.log</code> 一切正常，換成 JSON logger 上線後才變成 <code>{}</code>，而那時你正需要它。</p>
+<p>解法是 logger 自己把 Error 轉成普通物件，再交給 <code>JSON.stringify</code>。把物件轉成可以存或傳的文字，叫<strong>序列化</strong>（serialization）。Error 要留下這些欄位：</p>
+<ul>
+  <li><code>name</code>、<code>message</code>、<code>stack</code>：是什麼錯、發生在哪一行。</li>
+  <li><code>code</code>（有的話）：例如 <code>ECONNREFUSED</code>，第 18 課說過，別人的錯誤要靠它判斷。</li>
+  <li><code>cause</code>（有的話）：第 18 課往上丟錯誤時用 <code>cause</code> 包住原因。<code>cause</code> 本身可能又是一個 Error，所以要一路往下轉，就像 <a href="../../typescript/lessons/04-errors.html">TypeScript 課第 4 課</a>沿著 cause 走完錯誤鏈。只轉最外層，你會看到「建立訂單失敗」，卻看不到底下真正的「資料庫連不上」。</li>
+</ul>
+<p>回到輸出的最後兩行，這是另一類問題：<code>JSON.stringify</code> 不是輸出錯，而是直接<strong>丟錯</strong>。兩種情況會這樣：</p>
+<ul>
+  <li><strong>循環參照</strong>：物件沿著屬性往下走，又走回自己。例如資料庫套件回傳的物件、Node 的 <code>req</code> 和 <code>res</code> 互相指來指去。往下走永遠走不完，<code>JSON.stringify</code> 只好丟錯。</li>
+  <li><strong>BigInt</strong>：JSON 沒有對應的型別。<a href="20-postgres-pool-transactions.html">第 20 課</a>從資料庫拿到的 <code>bigint</code> 欄位就會碰到。</li>
+</ul>
+<p>為什麼這比 <code>{}</code> 更嚴重：logger 是在出事時幫你的工具。如果它自己因為某個欄位丟錯，原本要記的那個錯誤沒記到，還多了一個新的錯誤，而且多半發生在最需要 log 的時候。所以 logger 不能因為任何輸入丟錯：遇到循環就換成 <code>"[Circular]"</code>，BigInt 轉成字串。</p>
+<p>這幾件事可以在同一趟走訪裡完成，工具是 <code>JSON.stringify(value, replacer)</code> 的第二個參數。<code>replacer</code> 是一個函式，物件裡每個值在輸出前都會先經過它，參數是 <code>(key, value)</code>，<code>this</code> 是裝著這個值的那個物件，函式回傳什麼就輸出什麼。在 replacer 裡遇到 Error 就回傳轉好的普通物件，遇到 BigInt 就回傳字串，遇到循環就回傳 <code>"[Circular]"</code>。</p>
+<p>判斷循環時有一個細節要分清楚。「循環」是一個值出現在自己的<strong>祖先</strong>裡，也就是從它往下走，會走回它上面的某一層，永遠走不完；「同一個物件出現兩次」只是兩個欄位指向同一個物件，例如 <code>{ a: shared, b: shared }</code>，往下走會結束，兩邊都應該完整輸出。常見的寫法只用一個 <code>WeakSet</code> 記「看過的物件」，第二次看到就當成循環，會把後者也誤判成循環，該印的內容就被換成 <code>"[Circular]"</code>。正確的做法是只跟「目前這條路徑上的祖先」比。</p>
+<p>那要怎麼知道目前這條路徑？靠的就是 replacer 的 <code>this</code>。<code>JSON.stringify</code> 是深度優先走訪的：先把一個物件的第一個欄位整棵走完，才換下一個欄位；而每次呼叫 replacer 時，<code>this</code> 就是目前這個值的父物件。所以可以準備一個陣列當<strong>祖先堆疊</strong>：每次進到 replacer，先從堆疊頂端往下 pop，直到頂端就是 <code>this</code> 為止，這時堆疊裡剩下的正好是從根到父物件的那條路徑（從別的分支回來時，走完的那些物件就在這一步被移掉）。接著檢查 <code>value</code> 是否還在堆疊裡：在，就是循環，回傳 <code>"[Circular]"</code>；不在，而且是物件，就把它 push 進堆疊，再照常往下處理。前面特地提 <code>this</code>，就是為了這一步。</p>
+<p>到這裡，王小明那筆錯誤可以完整記下來了。但「完整」也帶來另一個風險：你把什麼東西都記進去，也包括不該記的。</p>
+
+<h2>log 裡會不會有王小明的密碼？</h2>
+<p>先想 log 去了哪裡。它會被複製到收集平台、保存好幾個月、可能有備份、給很多人看：後端、維運、客服，有時還有外包廠商。能看 log 的人通常比能直接查資料庫的人多得多。寫進 log 的密碼，等於寫進一個權限比資料庫寬鬆得多的地方。所以這些東西不能出現在 log：</p>
+<ul>
+  <li>密碼、token、API key、<code>Authorization</code> 標頭、<code>Cookie</code> 標頭：拿到就能冒充使用者登入。</li>
+  <li>信用卡號。</li>
+  <li><strong>個資</strong>：能識別出特定個人的資料，英文是 PII（personally identifiable information），例如完整手機號碼、身分證字號、地址。真的需要時只留末幾碼，例如 <code>0912***678</code>。</li>
+</ul>
+<p>沒有人會故意寫 <code>log.info({ password })</code>。真正的漏法是「把整個物件丟進去」：<code>log.info('登入', { body: req.body })</code>、<code>log.info('請求', { headers: req.headers })</code>。寫的人只是想留個紀錄方便查問題，但 <code>body</code> 裡有密碼，<code>headers</code> 裡有 <code>Authorization</code> 和 <code>Cookie</code>。上一節的 logger 會盡責地把它們完整寫出來。</p>
+<p>所以 logger 要有一道<strong>遮蔽</strong>（redaction）：欄位名稱是敏感名稱的，值就換成 <code>"[REDACTED]"</code>。因為你不知道別人會把物件包幾層，遮蔽要不管在第幾層、在不在陣列裡都生效；比對名稱時不分大小寫，因為標頭可能寫成 <code>Authorization</code> 也可能是 <code>authorization</code>。遮蔽也要在輸出時做，不能改到呼叫者傳進來的物件，否則程式後面拿到的 <code>body.password</code> 就變成了 <code>"[REDACTED]"</code>。上一節的 replacer 正好可以順便做這件事：</p>
+<pre>log.info('登入', { user: 'ming', body: { password: 'hunter2' }, headers: { Authorization: 'Bearer eyJ…' } })
+// {"time":"…","level":"info","msg":"登入","user":"ming","body":{"password":"[REDACTED]"},"headers":{"Authorization":"[REDACTED]"}}</pre>
+<p>但遮蔽是最後一道防線，不是主要防線。它只認得你列出的名稱：哪天上游回應裡多了一個叫 <code>secret</code> 的欄位，它就照樣寫出去。更可靠的習慣是只記你需要的欄位：記 <code>{ userId }</code>，不是 <code>{ user }</code>；永遠不要把整個 <code>req</code> 丟進 log。</p>
+<p>如果真的發現密碼已經進了 log，處理方式和資料外洩一樣，不是刪掉就好：通知受影響的使用者重設密碼、修正程式並加上遮蔽、檢查 log 保存了多久、被複製到哪些地方、有誰能存取（<a href="../../auth/lessons/23-secrets-encryption.html">Auth 課第 23 課</a>會再談 secrets 的管理）。</p>
+<div class="callout practice"><strong>💡 實務上：review 時把 log 當成「對外輸出」來看</strong><br>上線前，資深會特別看 PR 裡新增的 log：有沒有把整個 <code>body</code>、<code>user</code> 物件丟進去，debug 那行會不會順手印出上游回應裡的手機號碼。查客服案件時用 <code>userId</code>、訂單編號搜尋，不要為了好查而把手機號碼寫進 log。另一個常被忽略的漏洞是人：把正式環境的 log 整段貼到 Slack、issue 或 AI 工具，等於又多複製一份。log 存多久、誰能看，是資安和法務會關心的事，選收集平台時就要一起決定。</div>
+<p>現在每一行都是乾淨、完整的 JSON。回到客訴本身：王小明那個請求會留下好幾行 log，你要怎麼確定哪幾行是他的？</p>
+
+<h2>怎麼把王小明那個請求的每一行 log 串起來？</h2>
+<p>一個「點拿鐵」的請求會留下好幾行 log：收到訂單、查庫存、廚房做好。用時間和顧客名稱篩，只能找到其中帶有顧客名稱的那幾行；查庫存那一行可能根本沒記顧客是誰。要把它們全部串起來，每一行都要帶同一個 <strong>request id</strong>（也叫 correlation id）：請求一進來就決定一個編號，這個請求產生的每一行 log 都帶上它。回應標頭也帶上這個編號（<code>x-request-id</code>），前端可以把它顯示給使用者，客服拿到使用者畫面上的編號就能直接搜尋，不用再靠「20:14 左右、點拿鐵」去猜。</p>
+<p>編號從哪來？如果請求在到達咖啡店的服務之前，已經經過一個閘道（API gateway 或負載平衡器），它可能已經在 <code>x-request-id</code> 標頭給了一個編號，這時要沿用它，閘道的 log 和你的 log 才對得上。沒有的話就自己產生，用 <code>crypto.randomUUID()</code>（其他產生方式見課末「補充與查表」）。</p>
+<p>沿用外面送來的值時，有一件事不能省：外面送來的值<strong>不能直接信任</strong>。任何人都能在請求裡塞任意的 <code>x-request-id</code>，而這個值會被寫進這個請求的每一行 log，還可能被別的系統拿去當 key。塞一個 10 KB 的字串，每一行 log 就多 10 KB；如果 log 是純文字格式，塞一個帶換行的值，還能在 log 裡偽造出一整行假的紀錄，這叫 log injection。所以只接受短的、字元範圍很小的格式。這課的規則是：只由英數字、<code>-</code>、<code>_</code>、<code>.</code> 組成，長度 1 到 64，其他一律換成自己產生的。</p>
+<p>決定好編號之後，真正的問題才開始：怎麼讓「這個請求的每一行 log」都拿得到它？寫 log 的地方散在處理函式、查庫存的函式、廚房的事件監聽器裡。下面看三種做法。</p>
+
+<h3>做法一：全域變數（錯的）</h3>
+<p>最直覺的寫法是一個模組層級的變數 <code>currentRequestId</code>：請求進來時設定，寫 log 時讀它。在 Vue 前端這樣寫通常不會出事，因為瀏覽器裡一個頁面只服務一個使用者。伺服器不一樣。執行 <code>node examples/mixed-up.ts</code>，它模擬 A、B 兩個請求交錯（先看前兩行）：</p>
+<pre>$ node examples/mixed-up.ts
+全域變數 B 的 log 寫成 B
+全域變數 A 的 log 寫成 B
+AsyncLocalStorage B 的 log 寫成 B
+AsyncLocalStorage A 的 log 寫成 A
+run 外面： undefined</pre>
+<p>A 的 log 被寫成了 B。過程是這樣：A 先進來，把變數設成 A，開始 <code>await</code> 資料庫；等待的時候，event loop 去處理 B（<a href="07-event-loop.html">第 7 課</a>），B 把變數改成 B；A 等完回來寫 log，讀到的是 B。關鍵在於：Node 只有一條執行 JavaScript 的執行緒，同一瞬間只<strong>執行</strong>一段程式，但它同時<strong>處理</strong>很多請求，這些請求在每個 <code>await</code> 交錯。全域變數只有一格，所有請求共用，誰最後寫入誰就贏。</p>
+<p>這個錯誤特別危險的地方是它不會報錯。log 照樣輸出，只是掛在別人身上：你搜王小明的 request id，看到的是另一位客人的庫存紀錄，還以為找到了原因。</p>
+
+<h3>做法二：一路傳參數</h3>
+<p>既然共用一格會被覆蓋，那就讓每個請求各自帶著自己的編號：把 <code>requestId</code>（或已經綁好它的 child logger）當參數，從處理函式一路傳到每一個會寫 log 的函式。這是對的，而且最清楚，看函式簽名就知道 log 從哪來。代價是每一層函式都要多一個參數，包括那些根本不關心 log、只是負責往下傳的中間層。程式小的時候可以接受，函式一多就很煩，也容易有人在某一層漏傳。</p>
+
+<h3>做法三：AsyncLocalStorage</h3>
+<p>我們想要的是兩者的優點：像全域變數一樣隨處讀得到，又像傳參數一樣每個請求各有一份。<code>AsyncLocalStorage</code>（從 <code>node:async_hooks</code> import）就是做這件事的。</p>
+<p>先說清楚它依賴的概念。一個請求從進來到結束，會引發一連串的非同步工作：<code>await</code> 之後繼續執行的程式、它建立的 <code>setTimeout</code>、它產生的 Promise。這些工作在因果上都源自同一個請求。Node 會追蹤這條因果鏈，鏈上共有的上下文叫 <strong>async context</strong>。<code>AsyncLocalStorage</code> 讓你在一條 async context 上掛一份資料：</p>
+<ul>
+  <li><code>als.run(store, fn)</code>：執行 <code>fn</code>，並把 <code>store</code> 掛在這次執行開始的 async context 上。</li>
+  <li><code>als.getStore()</code>：在 <code>fn</code> 裡，以及 <code>fn</code> 引發的所有非同步工作裡，都會拿到這個 <code>store</code>；在 <code>run</code> 外面拿到 <code>undefined</code>。</li>
+</ul>
+<p>套在伺服器上：每個請求進來時，用 <code>als.run</code> 給它一份自己的 store，裡面放 request id；寫 log 的函式從 <code>getStore()</code> 讀。</p>
+<pre>import { AsyncLocalStorage } from 'node:async_hooks'
+const als = new AsyncLocalStorage&lt;{ requestId: string }&gt;()
+
+createServer((req, res) =&gt; {
+  const requestId = pickRequestId(req)          // 合法就沿用，否則 randomUUID()
+  res.setHeader('x-request-id', requestId)
+  als.run({ requestId }, () =&gt; handle(req, res))
+})
+
+// 任何地方：
+const log = (msg: string, fields = {}) =&gt;
+  write(JSON.stringify({ msg, requestId: als.getStore()?.requestId, ...fields }) + '\n')</pre>
+<p>回頭看 <code>mixed-up.ts</code> 輸出的後三行：用 <code>AsyncLocalStorage</code> 時 A 寫成 A、B 寫成 B，而在 <code>run</code> 外面讀到 <code>undefined</code>。A 和 B 一樣交錯，但它們各有一個 store，彼此看不到對方的，<code>await</code> 回來之後拿到的仍然是自己的：</p>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="兩個交錯的請求 A 和 B，各自在自己的 run 裡，await 前後 getStore 都拿到自己的 requestId；全域變數則被 B 覆蓋">
+    <defs><marker id="a19" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <text class="d-small" x="20" y="22">時間 →</text>
+    <line class="d-line" x1="70" y1="18" x2="680" y2="18" marker-end="url(#a19)"/>
+    <text class="d-text" x="20" y="72">A</text>
+    <rect class="d-soft" x="60" y="50" width="610" height="40" rx="6"/>
+    <rect class="d-box" x="70" y="56" width="150" height="28" rx="4"/><text class="d-small" x="80" y="75">log 收到訂單 → A</text>
+    <text class="d-small" x="235" y="75">await 查庫存 20 ms …</text>
+    <rect class="d-box" x="470" y="56" width="190" height="28" rx="4"/><text class="d-small" x="480" y="75">log 庫存確認 → A</text>
+    <text class="d-text" x="20" y="142">B</text>
+    <rect class="d-soft" x="160" y="120" width="380" height="40" rx="6"/>
+    <rect class="d-box" x="170" y="126" width="150" height="28" rx="4"/><text class="d-small" x="180" y="145">log 收到訂單 → B</text>
+    <rect class="d-box" x="340" y="126" width="190" height="28" rx="4"/><text class="d-small" x="350" y="145">log 庫存確認 → B</text>
+    <text class="d-accent" x="70" y="200">als.run 給 A、B 各一個 store：await 前後都拿到自己的</text>
+    <text class="d-small" x="70" y="225">全域變數只有一格：B 進來時被改成 B，A 回來讀到 B</text>
+  </svg>
+  <figcaption>兩個交錯的請求各有自己的 store，彼此看不到對方的。</figcaption>
+</figure>
+<p>這個機制不只用在 log。框架的 request scope、OpenTelemetry 的 trace、pino 的 mixin（最後一節會看到）都建立在它上面。它在 Node 24 的實作方式和相關 API 的細節，見課末「補充與查表」。</p>
+<p>到這裡，處理函式和查庫存那兩行都帶對了編號。但王小明那個請求還有第三行：「製作完成」是在廚房的事件監聽器裡寫的。如果你在這裡就停手，那一行會掛在別人的 request id 上。</p>
+
+<h2>為什麼廚房那一行 log 掛到別人身上？</h2>
+<p>上一節說 store 跟著「這個請求引發的非同步工作」走。要精確一點：context 跟著的是「<strong>建立</strong>非同步工作、或<strong>呼叫</strong>函式的那個地方」，不是「函式寫在哪裡」或「在哪裡註冊的」。所以只要你的 callback 被別人存起來，之後在另一個請求的 context 裡呼叫，它就拿到別人的 store，或者什麼都拿不到。執行 <code>node examples/context-loss.ts</code>，它示範了四種情況：</p>
+<pre>$ node examples/context-loss.ts
+1. callback 佇列： （沒有）
+2. 在 A 裡 on，在 B 裡 emit： B
+3. bind 之後： C
+4. await 之後： E</pre>
+<p>由上到下對應：</p>
+<ul>
+  <li><strong>1. 自己維護的 callback 佇列</strong>：舊式的連線池、批次處理，會把 callback 存在陣列裡，之後由另一個計時器一次取出呼叫。這時 callback 是在「清佇列的那個人」的 context 執行，不是放進佇列的那個請求，所以印出「沒有」。</li>
+  <li><strong>2. EventEmitter 監聽器</strong>：<a href="08-events-cancellation.html">第 8 課</a>說過 <code>emit</code> 是同步呼叫監聽器的，所以監聽器在 <strong>emit 那一刻</strong>的 context 執行，不是註冊（<code>on</code>）時的 context。在 A 裡 <code>on</code>、在 B 裡 <code>emit</code>，監聽器拿到的是 B。這是最容易踩到的一種：咖啡店的廚房是一個共用的事件來源，它把一段時間內的單湊成一批，由開這一批的請求觸發 emit。王小明的單如果被併進別人開的那一批，他的「製作完成」就掛到別人的 request id 上，而且不會報錯。</li>
+  <li><strong>3. 修正：bind</strong>：<code>AsyncLocalStorage.bind(fn)</code> 把函式綁在「現在」的 context，之後不管誰、在哪裡呼叫，它都在綁定時的 context 執行。在 C 裡把監聽器 bind 起來再註冊，emit 時拿到的就是 C。</li>
+  <li><strong>4. <code>await</code> 不會遺失</strong>：<code>await</code> 之後的程式在 <code>await</code> 當下的 context 繼續，所以一般的 async 函式不用擔心。</li>
+</ul>
+<p>第 1 種情況的修正方式，以及 <code>await</code> 遇到特殊物件時的例外，見課末「補充與查表」。</p>
+<p>遇到「log 掛錯人」時怎麼查：在懷疑的呼叫之後印出 <code>als.getStore()</code>，順著流程往下找，第一個印出 <code>undefined</code> 或別人 id 的地方，它前面那個 callback 就是讓 context 遺失的地方（這是官方文件建議的方法）。</p>
+<div class="callout practice"><strong>💡 實務上：request id 是客服、前端、後端之間的共同語言</strong><br>常見做法是前端出錯時，在錯誤提示裡顯示一段「錯誤代碼」，內容就是回應標頭的 <code>x-request-id</code>；客服請使用者截圖，後端拿去一搜就是那個請求的所有 log。前端和 API 不同網域時，瀏覽器預設讀不到這個自訂標頭，後端的 CORS 設定要加上 <code>Access-Control-Expose-Headers: x-request-id</code>，這是最常見的「前端拿不到 id」原因。前端如果有接錯誤追蹤服務（例如 Sentry），也把這個 id 一起送上去，兩邊才對得上。要不要自己用 <code>AsyncLocalStorage</code>：先看框架有沒有做好，例如 Node 的 Web 框架 Fastify 會給每個請求一個自動帶 request id 的 logger（<code>request.log</code>）；小專案一路傳 logger 參數也完全可以。真的自己用時，把共用的事件來源（佇列、廚房、WebSocket）列出來，逐一確認 context 有沒有掛對。</div>
+<p>現在客服給一個編號，你就能找出王小明那個請求的每一行。但在客訴發生之前，有沒有辦法先發現「拿鐵的請求最近變慢、或常常失敗」？</p>
+
+<h2>每個請求記一行，能看出什麼？log 量又怎麼控制？</h2>
+<p>到目前為止的 log 都是「發生了某件事」才記。還有一種 log 不管發生什麼都記：<strong>access log</strong>，每個請求一行，內容是方法、路徑、狀態碼、耗時、request id。它的價值在統計：「哪個 API 變慢了」「5xx 的比例多少」「哪個路徑最常被打」，都能直接從這些欄位算出來。王小明的單如果是因為 <code>/brew</code> 這幾分鐘耗時暴增才卡住，access log 會比客服更早告訴你。</p>
+<p>寫法是包住處理函式，在請求<strong>結束時</strong>記一行，因為要到那時才知道最後的狀態碼和花了多久。有三個地方要做對：</p>
+<ul>
+  <li><strong>什麼時候算結束</strong>：<a href="13-http-server.html">第 13 課</a>教過，<code>res</code> 的 <code>finish</code> 事件只在回應完整送出時觸發；客戶端在回應送完前離開時，不會有 <code>finish</code>，只有 <code>close</code>。<code>close</code> 在兩種情況都會觸發，而且只觸發一次，所以聽 <code>close</code>，再用 <code>res.writableFinished</code> 分辨是哪一種：<code>false</code> 代表沒送完，就多記 <code>aborted: true</code>。只聽 <code>finish</code>，中斷的請求就從 log 消失，偏偏使用者等太久而離開的，常常就是最慢的那些；兩個都聽又沒去重，一個請求會記兩行。</li>
+  <li><strong>耗時用 <code>performance.now()</code></strong>：它是單調遞增的時鐘，從程序啟動開始算，只會往前走。<code>Date.now()</code> 讀的是系統時間，系統時間會被 NTP（網路校時）校正而往前或往後跳，用它相減，量出負的耗時都有可能。</li>
+  <li><strong>路徑不含查詢字串</strong>：一來 <code>?phone=0912…</code> 這類查詢字串可能是個資，上一節說過不能進 log；二來查詢字串每次都不一樣，<code>/brew?drink=拿鐵</code> 和 <code>/brew?drink=可頌</code> 要算成同一個 API，統計時才分得了組。</li>
+</ul>
+<p>access log 每個請求都記，量很快就大起來，這就是前面一直說要回來談的成本。log 量就是錢：收集平台通常依寫入量和保存天數計費，每個請求多寫十行 debug，帳單就跟著變大；寫得太多時，序列化吃 CPU，stdout 寫不完堆在記憶體裡，還會拖慢服務本身。常見的控制方式：</p>
+<ul>
+  <li>正式環境的門檻用 <code>info</code>；debug 只在追問題時暫時打開，查完就關。</li>
+  <li>量很大的 log 做<strong>取樣</strong>（sampling）：只記其中一部分，例如成功的請求只記 1%，錯誤全部記。成功的請求大同小異，留一部分就足夠統計；錯誤每一筆都可能是你要找的那筆。</li>
+  <li>同一個錯誤只在邊界記一次（<a href="18-error-handling.html">第 18 課</a>），不要每一層各記一次：一次失敗出現五行 error，量變大，告警和統計也失真。</li>
+</ul>
+<p>到這裡，客訴需要的每一件事都做出來了：結構化的欄位、完整的 Error、遮蔽、request id、access log。最後一個問題是：正式專案也要這樣自己寫嗎？</p>
+
+<h2>正式專案也要自己寫 logger 嗎？</h2>
+<p>不要。正式專案用 <strong>pino</strong>：一個高效能的 JSON logger，這課做的每件事它都有對應的設定。自己做一次的目的，是讓你看得懂它的設定和輸出，知道每個選項在解決哪個問題，出事時知道去哪裡查。對照如下：</p>
+<div class="table-wrap"><table>
+<tr><th>這課自己做的</th><th>pino 的對應</th></tr>
+<tr><td>一行一個 JSON、<code>time</code>、<code>level</code>、<code>msg</code></td><td>預設輸出；level 是數字（info 是 30、error 是 50），time 預設是毫秒數</td></tr>
+<tr><td>等級門檻</td><td><code>pino({ level: 'info' })</code></td></tr>
+<tr><td><code>child(bindings)</code></td><td><code>logger.child({ requestId })</code></td></tr>
+<tr><td>Error 序列化</td><td>內建的 <code>err</code> serializer</td></tr>
+<tr><td>遮蔽</td><td><code>redact: ['password', 'req.headers.authorization', 'users[*].token']</code>：用路徑指定，<strong>區分大小寫</strong>，可以用 <code>*</code> 萬用字元，不會自動找任何深度的同名欄位</td></tr>
+<tr><td>從 AsyncLocalStorage 帶 requestId</td><td><code>mixin()</code>：每一行都會呼叫它，把回傳的欄位併進去</td></tr>
+<tr><td>寫到 stdout</td><td>預設；transport 可以在另一條 worker thread 處理輸出</td></tr>
+</table></div>
+<p>先看第一列。換成 pino 之後，<code>level</code> 和 <code>time</code> 的格式都和這課自己做的不同：<code>level</code> 是數字，<code>time</code> 是毫秒數。第一節說過，在收集平台上找 log 靠的是欄位查詢，所以原本寫成 <code>level = "error"</code> 的查詢和告警條件，換成 pino 後會什麼都查不到，也不會觸發。處理方式有兩種：一是把查詢和告警條件改成數字，例如 <code>level &gt;= 50</code>；二是讓 pino 輸出字串，用 <code>formatters: { level: (label) =&gt; ({ level: label }) }</code> 把等級改成 <code>"error"</code> 這類名稱，用 <code>timestamp: pino.stdTimeFunctions.isoTime</code> 把時間改成 ISO 8601 字串。哪一種都可以，重點是換 logger 時要一起檢查平台上的查詢和告警。</p>
+<p>表裡最需要留意的是遮蔽。這課的做法是「任何深度、只要名稱相同就遮」，pino 則是依你列出的路徑遮：比較精準、也比較快，代價是你要列出每一條路徑，漏列就漏遮，而且大小寫要寫對。兩種做法的取捨是效能與保險之間的選擇；用 pino 時，前面「只記需要的欄位」這個習慣更重要。</p>
+<p>還有一個邊界要知道：request id 只能串起<strong>一個服務</strong>裡的 log。請求從前端到咖啡店的 API，再到庫存服務、付款服務，要串起整條路徑，靠的是 <strong>OpenTelemetry</strong>：一套收集 log、指標與 trace 的開放標準，它的 trace id 會在服務之間用標頭傳遞，<a href="../../devops/lessons/23-tracing.html">部署課第 23 課</a>會實作。</p>
+<p>接下來的三題，就是把這課的 logger、request id 和 access log 各做一次。</p>
+
+<h2>練習</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs node 19</code> 建立 <code>work/19/</code>，裡面有內文的範例（<code>examples/</code>）和三題的起始檔。<code>kitchen.ts</code>（湊批次做飲料的廚房）和 <code>supplier.ts</code>（假的上游）不用改。三題互相獨立。</p>
+
+<div class="local" data-test="ex1" data-files="logger.ts">
+  <p>練習 1：完成 <code>logger.ts</code> 的 <code>createLogger({ level, write, now })</code>。回傳的 logger 有 <code>debug</code>、<code>info</code>、<code>warn</code>、<code>error</code>、<code>fatal</code>，都是 <code>(msg, fields?)</code>，以及 <code>child(bindings)</code>。每次呼叫 <code>write</code> 一次，內容是一行 JSON 加 <code>\n</code>，欄位依序是 <code>time</code>（<code>now().toISOString()</code>）、<code>level</code>、<code>msg</code>、child 綁定的欄位、這次的欄位。低於 <code>level</code>（預設 <code>info</code>）的不輸出。<code>child</code> 可以一層層疊加，不能改到父 logger。任何深度的 Error 轉成 <code>{ name, message, stack }</code>，有 <code>code</code>、<code>cause</code> 才加上（cause 是 Error 要繼續轉）。欄位名稱是 <code>password</code>、<code>token</code>、<code>authorization</code>、<code>cookie</code>、<code>cardNumber</code>（不分大小寫，任何深度，包括陣列裡的物件）的值在輸出裡換成 <code>"[REDACTED]"</code>，傳進來的物件不能被改到。參照到自己祖先的地方換成 <code>"[Circular]"</code>（同一個物件出現兩次不算），BigInt 轉成字串，logger 不能丟錯。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="app.ts">
+  <p>練習 2：<code>app.ts</code> 的 <code>createApp(write)</code> 處理 <code>GET /brew?drink=拿鐵&amp;ms=30</code>：記「收到訂單」→ 查庫存 → 記「庫存確認」→ 交給廚房 → 廚房 emit 時記「製作完成」並回應。現在用全域變數存 requestId，請求一交錯就錯亂。改用 <code>AsyncLocalStorage</code>，讓每一行 log 都帶上自己請求的 <code>requestId</code>，包括廚房事件監聽器裡的那一行（廚房把 15 ms 內的單湊一批，emit 發生在開這一批的那個請求的 context）。<code>x-request-id</code> 只由英數字、<code>-</code>、<code>_</code>、<code>.</code> 組成、長度 1 到 64 時沿用，否則（或沒帶）用 <code>randomUUID()</code> 產生；回應標頭 <code>x-request-id</code> 帶上最後用的值。測試會同時送出 20 個延遲交錯的請求。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="access-log.ts">
+  <p>練習 3：完成 <code>access-log.ts</code> 的 <code>accessLog(logger, handler)</code>，回傳包裝過的處理函式。每個請求結束時呼叫一次 <code>logger.info('request', { method, path, status, durationMs, requestId })</code>：<code>path</code> 不含查詢字串；<code>status</code> 是實際送出的狀態碼；<code>durationMs</code> 是從請求進來到結束的毫秒數，用 <code>performance.now()</code> 量；<code>requestId</code> 是回應標頭 <code>x-request-id</code> 的值（<code>res.getHeader</code>）。客戶端在回應送完前離開時，同樣記一行，再加上 <code>aborted: true</code>。每個請求剛好一行。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：<code>console.log(JSON.stringify({ err }))</code> 為什麼印出 <code>{"err":{}}</code>？</p>
+  <label data-key="a">這個 Error 沒有訊息，<code>new Error()</code> 時忘了傳字串</label>
+  <label data-key="b"><code>JSON.stringify</code> 遇到 class 的實例一律輸出 <code>{}</code></label>
+  <label data-key="c">Error 的 <code>message</code>、<code>stack</code>、<code>cause</code> 是不可列舉的屬性，<code>JSON.stringify</code> 只輸出可列舉的，要自己序列化</label>
+  <p class="why">✓ <code>Object.keys(err)</code> 是空陣列，<code>Object.getOwnPropertyNames(err)</code> 才看得到 <code>stack</code>、<code>message</code>、<code>cause</code>，因為它們不可列舉。有訊息也一樣是 <code>{}</code>，a 錯。一般 class 的實例，建構式裡指定的欄位是可列舉的，會照常輸出，b 錯。logger 要自己把 Error 轉成 <code>{ name, message, stack, code, cause }</code>。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：同事說：「Node 是單執行緒，一次只處理一個請求，所以用一個全域變數 <code>currentRequestId</code> 記住目前的請求就好。」問題在哪？</p>
+  <label data-key="a">沒有問題，單執行緒保證不會有兩個請求同時改它</label>
+  <label data-key="b">一次只<strong>執行</strong>一段 JavaScript，但很多請求的處理會在每個 <code>await</code> 交錯，A 在等資料庫時 B 把變數改掉，A 回來讀到 B 的 id</label>
+  <label data-key="c">要加鎖（mutex）保護這個變數才安全</label>
+  <p class="why">✓ 單執行緒只代表不會有兩段 JavaScript 在同一瞬間跑，不代表一次只處理一個請求：每個 <code>await</code> 都讓 event loop 去跑別的請求。加鎖等於讓請求排隊一個一個處理，吞吐量掉光，也沒有解決「每個請求要有自己的值」。正確做法是一路傳參數，或 <code>AsyncLocalStorage.run</code> 給每個請求一份自己的 store。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：你發現 log 裡有使用者登入時的明文密碼，已經存了兩個星期。除了刪掉那些 log，還要做什麼？</p>
+  <label data-key="a">當成外洩處理：通知受影響的使用者重設密碼、修正程式並加上遮蔽、檢查 log 保存在哪、保存多久、有誰能存取</label>
+  <label data-key="b">刪掉就沒事了，log 只有工程師看得到</label>
+  <label data-key="c">把正式環境的 log 等級調成 <code>error</code>，以後就不會記到</label>
+  <p class="why">✓ log 會被複製到收集平台、備份、轉給第三方服務，能看的人比資料庫多得多，刪掉一份不代表沒外流，b 錯。調高等級只是讓那一行剛好不輸出，等哪天有人在 error 裡帶上 body 又會出現，也沒處理已經外洩的部分，c 錯。修正要包括：只記需要的欄位、加上遮蔽、加測試防止再犯。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 7：線上有個問題重現不了，有人提議「先把正式環境的 log 等級開到 debug 放著」。代價是什麼？</p>
+  <label data-key="a">沒有代價，debug 只是多幾行字</label>
+  <label data-key="b">只有磁碟空間，買大一點就好</label>
+  <label data-key="c">log 量可能多好幾倍：收集平台的費用、序列化與寫 stdout 的 CPU 和延遲都上升，debug 常記完整的 SQL 與上游回應，帶出個資的機會也變大</label>
+  <p class="why">✓ log 不是免費的：平台依量計費，stdout 接管線時是非同步寫入，寫不完會堆在記憶體裡拖慢服務。debug 為了追問題，通常記得最細，最容易帶出敏感資料。比較好的做法是暫時、有範圍地打開（只開某個模組、某段時間），或用取樣，問題查完就關掉。</p>
+</div>
+
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>log 是多行或非 JSON 的字串</strong>：收集平台把一筆 log 拆成很多筆，無法用欄位搜尋。一行一個 JSON，變動的值放欄位，<code>msg</code> 固定。</li>
+  <li><strong>4xx 記成 error</strong>：客戶端送錯資料是可預期的，記成 error 會讓告警響個不停、淹沒真正的 500。</li>
+  <li><strong>Error 變成 <code>{}</code></strong>：直接 <code>JSON.stringify</code>。自己序列化 name、message、stack、code，沿著 cause 往下轉。</li>
+  <li><strong>logger 自己丟錯</strong>：循環參照、BigInt 讓 <code>JSON.stringify</code> 丟錯，原本要記的錯誤也沒記到。logger 要能處理任何輸入。</li>
+  <li><strong>把「同一個物件出現兩次」當成循環</strong>：只用一個 <code>WeakSet</code> 記看過的物件，會把共用的物件誤換成 <code>"[Circular]"</code>。只跟目前路徑上的祖先比。</li>
+  <li><strong>把整個 <code>req</code>、<code>req.body</code>、<code>req.headers</code> 丟進 log</strong>：帶出 Cookie、Authorization、密碼。只記需要的欄位，遮蔽當最後一道防線。</li>
+  <li><strong>直接信任外面送來的 <code>x-request-id</code></strong>：任意長度、任意字元會寫進每一行 log。限制格式與長度，不合格就自己產生。</li>
+  <li><strong>用全域變數存 request id</strong>：請求一交錯就掛錯。用 <code>AsyncLocalStorage.run</code> 或一路傳參數。</li>
+  <li><strong>EventEmitter 監聽器的 log 掛錯請求</strong>：監聽器在 emit 的 context 執行。用 <code>AsyncLocalStorage.bind</code> 綁定註冊時的 context。</li>
+  <li><strong>access log 只聽 <code>finish</code></strong>：客戶端中途離開的請求沒有紀錄，偏偏這些常是最慢的。聽 <code>close</code>，用 <code>writableFinished</code> 分辨。</li>
+  <li><strong>用 <code>Date.now()</code> 量耗時</strong>：系統時間會被校正而跳動。量耗時用 <code>performance.now()</code>。</li>
+  <li><strong>每一層都記同一個錯誤</strong>：一次失敗出現五行 error，告警與統計都失真。只在邊界記一次（<a href="18-error-handling.html">第 18 課</a>）。</li>
+  <li><strong>log 太多</strong>：拖慢服務、帳單變大。正式環境用 info，大量的成功紀錄做取樣。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>上線後要靠欄位找 log：一行一個 JSON，<code>time</code>（ISO）、<code>level</code>、固定的 <code>msg</code>，變動的值放欄位；寫到 stdout，由平台收集。</li>
+  <li>等級 fatal／error／warn／info／debug，正式環境預設 info，門檻放環境變數，4xx 不記成 error；child logger 綁定共同欄位。</li>
+  <li>Error 的 message、stack、cause 不可列舉，要自己序列化（含 code 與 cause 鏈）；循環參照、BigInt 不能讓 logger 丟錯。</li>
+  <li>密碼、token、Authorization、Cookie、卡號、個資不能進 log；只記需要的欄位，遮蔽處理任何深度與陣列當最後一道防線，log 外洩當成資料外洩處理。</li>
+  <li>request id：合法的 <code>x-request-id</code> 沿用，否則 <code>randomUUID()</code>，回應也帶上；全域變數會被交錯的請求覆蓋，<code>AsyncLocalStorage.run</code> 讓每個請求的整串非同步流程都拿到自己的 store。</li>
+  <li>callback 佇列和 EventEmitter 監聽器會在別人的 context 執行，用 <code>AsyncLocalStorage.bind</code> 修正；<code>await</code> 不會遺失。</li>
+  <li>access log 在 <code>close</code> 時記一行，<code>writableFinished</code> 為 false 就是 aborted；耗時用 <code>performance.now()</code>；log 量是成本，用等級與取樣控制。正式專案用 pino，跨服務串連用 OpenTelemetry。</li>
+</ul>
+<p>下一課連接真的 PostgreSQL：設定連線池、參數化查詢、在交易裡防止超賣，並把資料庫錯誤轉成正確的 HTTP 回應。</p>
+
+<h2>補充與查表</h2>
+<p>主線用不到、但工作上會查的細節集中在這裡。</p>
+
+<h3>AsyncLocalStorage 的其他 API 與 context 遺失的細節</h3>
+<ul>
+  <li><strong><code>AsyncLocalStorage.snapshot()</code></strong>：和 <code>bind</code> 是同一件事的另一種寫法，把「現在」的 context 存起來，之後在這個 context 裡執行函式。</li>
+  <li><strong>callback 佇列的修正</strong>：官方文件建議用 <code>util.promisify</code> 把 callback 介面改成 Promise，或用 <code>AsyncResource</code>（<code>node:async_hooks</code> 裡把 callback 綁定到某個 context 的類別）綁定。</li>
+  <li><strong><code>await</code> 與 thenable</strong>：thenable 是有 <code>then</code> 方法、可以被 <code>await</code> 的物件。本機 24.22.1 對自訂的 thenable，<code>await</code> 之後一樣在原本的 context 繼續。但如果你直接呼叫某個 thenable 的 <code>.then(cb)</code>，而它把 <code>cb</code> 存起來、由別處呼叫，就是 callback 佇列那種情況。</li>
+  <li><strong><code>enterWith</code></strong>：可以不包 callback 就設定 store，官方文件標為實驗性。用 <code>run</code>。</li>
+</ul>
+
+<h3>版本備註</h3>
+<ul>
+  <li>Node 24 起 <code>AsyncLocalStorage</code> 預設用 <code>AsyncContextFrame</code> 實作（v24.0.0 的變更，可以用 <code>--no-async-context-frame</code> 換回舊的 async_hooks 實作），效能比舊實作好。</li>
+  <li><code>AsyncLocalStorage.bind</code> 與 <code>snapshot</code> 在 v23.11.0／v22.15.0 起標為 stable。</li>
+  <li>Node v24.16.0 起有 <code>randomUUIDv7()</code>（從 <code>node:crypto</code> import），前段是時間，按產生順序排序，可以拿來產生 request id。</li>
+  <li>pino 在 npm 上的最新版是 10.4.0（撰寫時）。</li>
+</ul>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

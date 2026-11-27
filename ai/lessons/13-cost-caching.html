@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>13. 成本：token 預算、prompt caching、模型選擇與批次處理</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="13" data-practice="ai">
+<header>
+  <div class="eyebrow">階段 5：上線：評估、安全、成本、可靠性與可觀測性 · 第 13 課</div>
+  <h1>成本：token 預算、prompt caching、模型選擇與批次處理</h1>
+</header>
+<main>
+
+<p>客服助理上線一個月，帳單比預估多了好幾倍。拆開來看，錢大部分不是花在顧客的問題上，而是花在<strong>每一個請求都重送一次</strong>的東西：客服規則、工具定義、整份菜單與門市文件。顧客問「拿鐵多少錢」只有十幾個 token，前面那一大段卻有好幾千個。</p>
+<p>這一課教你看懂帳單，把錢省在不影響品質的地方。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>帳單怎麼來的、prompt caching：一個請求的錢花在哪幾種 token，每次重送的規則和菜單怎麼用快取變便宜（開場問題的最小答案）。</li>
+  <li>讓快取命中：請求的內容要怎麼排，快取才不會每次都落空。</li>
+  <li>選模型與 effort、count_tokens：什麼時候換便宜的模型或讓它少想一點，太長的輸入怎麼在送出前擋下。</li>
+  <li>Message Batches：每晚分類評論這種不急的工作，怎麼用批次打 5 折。</li>
+  <li>預算與告警：怎麼替每位顧客設每天的花費上限，避免一個人燒掉整月額度。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="01-what-is-llm.html">第 1 課</a>的費用算法：輸入 token × 輸入單價＋輸出 token × 輸出單價，單價以每百萬 token 計，輸出比輸入貴。</li>
+  <li><a href="02-first-api-call.html">第 2 課</a>的 <code>usage</code> 與對話歷史：每個回應都附這次的 token 數；API 沒有記憶，每一輪都重送整段歷史。</li>
+  <li><a href="04-prompt-design.html">第 4 課</a>的穩定請求：同樣的輸入要組出逐位元相同的請求，例如菜單一定排序、不在 system 放現在時間。</li>
+  <li><a href="../../system-design/lessons/05-caching.html">系統設計課第 5 課</a>的快取：重複的東西存起來直接拿，省下多少取決於命中率（拿得到的比例）。</li>
+</ul></div>
+
+<h2>帳單怎麼來的：一個請求的四種 token</h2>
+<p>第 1 課的公式是「輸入 token × 輸入單價＋輸出 token × 輸出單價」。用了快取之後，回應的 <code>usage</code> 會把輸入拆成三種，各有各的價錢：</p>
+<div class="table-wrap"><table>
+  <tr><th>usage 欄位</th><th>是什麼</th><th>Opus 5.5 單價（每百萬 token）</th></tr>
+  <tr><td><code>input_tokens</code></td><td>沒有用到快取的輸入：通常是最後一個快取斷點之後的部分</td><td>$4</td></tr>
+  <tr><td><code>cache_creation_input_tokens</code></td><td>這次<strong>寫入</strong>快取的輸入（cache write）</td><td>$5（5 分鐘 TTL，1.25 倍）／$8（1 小時 TTL，2 倍）</td></tr>
+  <tr><td><code>cache_read_input_tokens</code></td><td>這次從快取<strong>讀到</strong>的輸入（cache read）</td><td>$0.20（0.05 倍）</td></tr>
+  <tr><td><code>output_tokens</code></td><td>輸出，包含思考的 token</td><td>$20</td></tr>
+</table></div>
+<p>三種輸入<strong>互不重疊</strong>：<code>input_tokens</code> 不包含快取的部分，整個 prompt 的長度是三者相加。兩個快取欄位在 SDK 的型別裡是 <code>number | null</code>，計算時要用 <code>?? 0</code>。</p>
+<p>三個現行模型的價格（2026-11-01 查詢<a href="https://platform.claude.com/docs/en/about-claude/pricing">官方定價頁</a>；價格會變，程式裡集中放在一個檔案）：</p>
+<div class="table-wrap"><table>
+  <tr><th>模型</th><th>輸入</th><th>5 分鐘寫入</th><th>1 小時寫入</th><th>快取讀取</th><th>輸出</th></tr>
+  <tr><td><code>claude-opus-5-5</code></td><td>$4</td><td>$5</td><td>$8</td><td>$0.20</td><td>$20</td></tr>
+  <tr><td><code>claude-sonnet-5-5</code></td><td>$2</td><td>$2.50</td><td>$4</td><td>$0.10</td><td>$10</td></tr>
+  <tr><td><code>claude-haiku-5-5</code>（prompt ≤ 10 萬 token）</td><td>$0.10</td><td>$0.125</td><td>$0.20</td><td>$0.01</td><td>$0.50</td></tr>
+  <tr><td><code>claude-haiku-5-5</code>（prompt &gt; 10 萬 token）</td><td>$0.50</td><td>$0.625</td><td>$1</td><td>$0.05</td><td>$2.50</td></tr>
+</table></div>
+<p>快取讀取的倍率不是每個模型都一樣：一般是輸入價的 0.1 倍，Opus 5.5 與 Sonnet 5.5 是 0.05 倍。Haiku 5.5 依 prompt 長度分兩段價格，「prompt 長度」是 <code>input_tokens</code>＋<code>cache_creation_input_tokens</code>＋<code>cache_read_input_tokens</code>，超過 10 萬時<strong>整個請求</strong>（包括輸出）都用高的那組價格。</p>
+<p>算一個客服請求：tools＋system＋菜單文件 6,000 token、這次的問題與歷史 500 token、回答 300 token，用 Opus 5.5、沒有快取：</p>
+<pre>輸入 6,500 × $4  ÷ 1,000,000 = $0.026
+輸出   300 × $20 ÷ 1,000,000 = $0.006
+合計 $0.032／次；一天 1 萬次 = $320／天，其中 $240 花在每次都一樣的 6,000 token</pre>
+<p>同樣的請求，固定的 6,000 token 命中快取：</p>
+<pre>輸入（沒快取的部分） 500 × $4    = $0.0020
+快取讀取         6,000 × $0.20 = $0.0012
+輸出               300 × $20   = $0.0060
+合計 $0.0092／次；一天 1 萬次約 $92，少了七成，回答一個字都沒變</pre>
+<p>練習 1 要把這個算法寫成 <code>costOf(usage, model, opts)</code>：記 log、做成本報表、扣預算都靠它。</p>
+<div class="callout practice"><strong>💡 實務上：每個請求都記下 usage 與費用</strong><br>咖啡店後台的成本報表、月底對帳、PM 問「這個新功能每天多花多少錢」，答案都來自每個請求的 log：模型、四種 token、算出的費用，加上功能名稱（客服、評論分類）與顧客或租戶 id。沒有這些欄位，帳單只有一個總數，找不出是哪個功能、哪位顧客在花錢。資深工程師在功能上線前就把這幾個欄位放進 log（第 15 課），而不是等帳單來了才補。</div>
+
+<h2>prompt caching：重複的前綴只付一點點</h2>
+<p><strong>prompt caching</strong>（提示快取）是 API 把請求的開頭（前綴）存起來，下一個請求開頭一模一樣時，那一段用快取讀取的價格計費，處理也比較快。它跟系統設計課的快取一樣看<strong>命中率</strong>，但比對方式很嚴格：</p>
+<ul>
+  <li><strong>前綴比對，逐位元相同</strong>：請求依 <code>tools</code> → <code>system</code> → <code>messages</code> 的順序組成一長串，從頭開始比，第一個不同的位元組之後全部算沒命中。</li>
+  <li><strong>你決定存到哪裡</strong>：在某個 block 上加 <code>cache_control: { type: 'ephemeral' }</code>，就是一個<strong>快取斷點</strong>（breakpoint）：從開頭到這個 block 為止的前綴會被寫入快取。一個請求最多 4 個斷點。</li>
+  <li><strong>自動快取</strong>：在請求頂層寫 <code>cache_control: { type: 'ephemeral' }</code>，API 會自動把斷點放在最後一個可快取的 block，對話變長時跟著往後移。它也佔 4 個名額中的 1 個。</li>
+  <li><strong>TTL</strong>（time to live，存活時間）：預設 5 分鐘，每次命中會重新計時；可以設 <code>ttl: '1h'</code>。寫入價 5 分鐘是 1.25 倍、1 小時是 2 倍。</li>
+  <li><strong>太短不快取</strong>：Opus 5.5、Sonnet 5.5、Haiku 5.5 的前綴至少要 512 token（Haiku 4.5、Opus 4.6 是 4,096）。不夠長時不會報錯，只是 <code>cache_creation_input_tokens</code> 一直是 0。</li>
+  <li><strong>快取依模型分開</strong>：換模型、換 speed 都從零開始。</li>
+</ul>
+<figure>
+  <svg viewBox="0 0 700 220" role="img" aria-label="請求的組成順序：tools、system 規則、system 菜單（斷點 1），接著對話歷史與這次的問題（頂層自動快取的斷點在最後）。斷點 1 之前每次都一樣，之後每次會變">
+    <defs><marker id="ar13" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="var(--muted)"/></marker></defs>
+    <rect x="20" y="60" width="120" height="56" rx="6" class="d-soft"/><text x="80" y="84" text-anchor="middle" class="d-text">tools</text><text x="80" y="104" text-anchor="middle" class="d-small">依 name 排序</text>
+    <rect x="145" y="60" width="120" height="56" rx="6" class="d-soft"/><text x="205" y="84" text-anchor="middle" class="d-text">system：規則</text><text x="205" y="104" text-anchor="middle" class="d-small">固定文字</text>
+    <rect x="270" y="60" width="130" height="56" rx="6" class="d-soft"/><text x="335" y="84" text-anchor="middle" class="d-text">system：菜單</text><text x="335" y="104" text-anchor="middle" class="d-small">cache_control</text>
+    <rect x="410" y="60" width="140" height="56" rx="6" class="d-box"/><text x="480" y="84" text-anchor="middle" class="d-text">對話歷史</text><text x="480" y="104" text-anchor="middle" class="d-small">一輪一輪往後加</text>
+    <rect x="555" y="60" width="125" height="56" rx="6" class="d-box"/><text x="617" y="84" text-anchor="middle" class="d-text">日期＋問題</text><text x="617" y="104" text-anchor="middle" class="d-small">每次都不同</text>
+    <line x1="402" y1="40" x2="402" y2="140" class="d-line" stroke-dasharray="4 3"/>
+    <text x="402" y="32" text-anchor="middle" class="d-accent">斷點 1</text>
+    <line x1="682" y1="40" x2="682" y2="140" class="d-line" stroke-dasharray="4 3"/>
+    <text x="640" y="32" text-anchor="middle" class="d-accent">自動快取</text>
+    <line x1="20" y1="160" x2="398" y2="160" class="d-line" marker-end="url(#ar13)"/>
+    <text x="210" y="182" text-anchor="middle" class="d-small">每個請求都逐字相同：第 2 次起以 0.05 倍讀取</text>
+    <text x="545" y="182" text-anchor="middle" class="d-small">多輪對話時，上一輪的歷史也命中</text>
+    <text x="350" y="210" text-anchor="middle" class="d-small">順序固定是 tools → system → messages，任何一個位元組改變，它和後面的全部重算</text>
+  </svg>
+  <figcaption>穩定的放前面、會變的放後面；斷點放在穩定部分的最後一個 block。</figcaption>
+</figure>
+<p><strong>划不划算</strong>：5 分鐘 TTL 時，同樣的前綴用兩次就回本（Opus 5.5：1.25＋0.05 = 1.3 倍，不快取是 2 倍）；1 小時 TTL 要三次（2＋0.05＋0.05 = 2.1 倍，對 3 倍）。客服這種一直有人問的流量，用預設的 5 分鐘就好；一小時才來幾個請求、每次間隔超過 5 分鐘的工作，才考慮 1 小時。</p>
+
+<h2>讓快取命中：穩定的在前、會變的在後</h2>
+<p>第 4 課要求「同樣的輸入產生逐位元相同的請求」，這裡就是它省錢的地方。快取不命中的原因，幾乎都是前綴裡有東西在變：</p>
+<div class="table-wrap"><table>
+  <tr><th>會讓前綴改變的東西</th><th>改成</th></tr>
+  <tr><td>system 裡寫現在時間、日期、顧客名字</td><td>放到最後一則 user 訊息的開頭</td></tr>
+  <tr><td>工具清單的順序不固定（從 Map、物件、資料庫查出來）</td><td>依 <code>name</code> 排序；工具也不要依顧客動態增減</td></tr>
+  <tr><td>文件順序、JSON 的 key 順序不固定</td><td>排序後再組字串</td></tr>
+  <tr><td>對話中途要加營運方指令，改了 system</td><td>在 messages 後面加 <code>{ role: 'system' }</code> 訊息（<a href="12-llm-security.html">第 12 課</a>），前面的快取保留</td></tr>
+  <tr><td>重送歷史時改寫、刪除了前面的訊息</td><td>歷史只往後加，assistant 存完整 content（第 2 課）</td></tr>
+</table></div>
+<p>客服請求的組法：</p>
+<pre>return {
+  model: 'claude-opus-5-5',
+  max_tokens: 16000,
+  tools: [...tools].sort(byName),                       // 複製後排序，不改到呼叫者的陣列
+  system: [
+    { type: 'text', text: RULES },
+    { type: 'text', text: `&lt;menu&gt;\n${menuDoc}\n&lt;/menu&gt;`, cache_control: { type: 'ephemeral' } },  // 斷點 1
+  ],
+  messages: [...history, { role: 'user', content: `今天是 ${taipeiDate(now)}。\n\n${question}` }],
+  cache_control: { type: 'ephemeral' },                 // 自動快取：歷史越長越划算
+}</pre>
+<p>斷點放在菜單那個 block，快取存的是「tools＋規則＋菜單」：tools 排在 system 前面，所以斷點放在 system 的最後一個 block 就把 tools 一起包進去。放在第一個 block 的話，只有 tools＋規則被快取，最貴的菜單每次照價計費。頂層的自動快取負責對話：第 3 輪時，前兩輪的歷史已經在上一個請求寫入快取，這次就讀得到。代價是自動斷點落在最後一則訊息，每個請求都會把「這次的問題」用 1.25 倍寫入快取；多輪對話下一輪會讀回來，划算，但如果大多是只問一句就走的請求，那一小段寫了也沒人讀，這時只留菜單上的斷點就好。每個 block 都加 <code>cache_control</code> 不會更好：超過 4 個斷點直接 400。</p>
+
+<h3>用 usage 驗證，不要假設</h3>
+<p>加了 <code>cache_control</code> 不代表有省到錢。快取不命中時 API 不報錯，只會在 <code>usage</code> 看得出來：</p>
+<div class="table-wrap"><table>
+  <tr><th>你看到的</th><th>代表</th></tr>
+  <tr><td>第 1 個請求 <code>cache_creation</code> 有值，之後 <code>cache_read</code> 接近前綴長度</td><td>正常</td></tr>
+  <tr><td>每個請求都在 <code>cache_creation</code>，<code>cache_read</code> 一直是 0</td><td>前綴每次都不同：有東西在變</td></tr>
+  <tr><td><code>cache_creation</code> 與 <code>cache_read</code> 都是 0</td><td>前綴短於最小長度（512 token），或根本沒放 <code>cache_control</code></td></tr>
+</table></div>
+<p>上線後把<strong>快取命中率</strong>（cache_read 佔全部輸入的比例）放進監控（第 15 課），改了 prompt 之後命中率掉下來，就知道哪次部署出了問題。第 1 個請求本來就不會命中，判斷「沒命中」要從第 2 個請求看起。</p>
+
+<h2>選模型與 effort：看「每完成一個任務」的成本</h2>
+<p>快取和精簡 token 是免費的優化，回答不會變。換模型、降 effort 是<strong>取捨</strong>：便宜了，品質可能掉。所以順序是先做免費的，再用<a href="11-evals.html">第 11 課</a>的 eval 比較取捨。</p>
+<div class="table-wrap"><table>
+  <tr><th>任務</th><th>常見的選擇</th></tr>
+  <tr><td>分類（評論好壞、問題類型）、路由、擷取欄位</td><td>Haiku 5.5：比 Opus 5.5 便宜 40 倍，簡單任務常常一樣準</td></tr>
+  <tr><td>一般客服問答</td><td>Opus 5.5 較低的 effort，或 Sonnet 5.5</td></tr>
+  <tr><td>多步驟的 agent、困難的推理</td><td>Opus 5.5，effort medium 以上</td></tr>
+</table></div>
+<p><strong>effort</strong> 控制模型思考與輸出的投入程度，寫在 <code>output_config</code> 裡（不是請求頂層）：<code>output_config: { effort: 'low' }</code>，可選 <code>low</code>、<code>medium</code>、<code>high</code>、<code>xhigh</code>、<code>max</code>。Opus 5.5 預設 <code>medium</code>、Sonnet 5.5 預設 <code>high</code>。effort 越低，思考 token 越少，輸出 token（含思考）就越少，回應也越快。Opus 5.5 的思考不能關，effort 是唯一能調的地方。</p>
+<p>資深工程師會注意三件事：</p>
+<ul>
+  <li><strong>先試「最強的模型＋較低的 effort」</strong>，再考慮<strong>模型路由</strong>（model routing：先用小模型分類，再依難度交給不同模型）。路由多一次呼叫、多一個要維護的 prompt，而且快取依模型分開，兩個模型各寫一次快取。</li>
+  <li><strong>看每完成一個任務的成本</strong>，不是每個請求的單價。小模型答錯，顧客再問兩次、agent 多跑三輪、最後轉真人，總成本反而更高。</li>
+  <li><strong>用 eval 決定</strong>：同一組 eval 集跑兩種設定，比較通過率與平均成本（用練習 1 的 <code>costOf</code> 加總）。通過率沒掉才換。</li>
+</ul>
+<div class="callout practice"><strong>💡 實務上：換模型是一個要留紀錄的決定</strong><br>PM 說「客服太貴，換便宜的模型」時，先拿出 eval 結果：兩種設定的通過率、每個任務的平均成本、轉真人的比例。通過率掉了幾個百分點，要換算成多出來的轉真人次數，再跟省下的 API 費比，人工成本可能反而更高。決定換的話，在設定檔裡改模型與 effort（不要散落在程式各處），上線後一週內盯著快取命中率、轉真人比例與顧客回饋，有問題可以馬上改回來。</div>
+
+<h2>count_tokens：送出前先知道多長</h2>
+<p>顧客上傳一份 300 頁的合約、或是 RAG 一次撈回太多段落，送出去才從 <code>usage</code> 知道花了多少，已經來不及。<code>client.messages.countTokens()</code> 用跟真正請求一樣的參數（model、system、tools、messages）算出輸入 token 數：</p>
+<pre>const { input_tokens } = await client.messages.countTokens({ model, system, tools, messages })
+if (input_tokens &gt; 50_000) return '文件太長，請只貼要問的段落'          // 或先摘要、先切塊檢索
+
+// 最壞情況的估計：輸入全部照價＋輸出用滿 max_tokens
+const worst = (input_tokens * price.input + maxTokens * price.output) / 1_000_000</pre>
+<ul>
+  <li>它是 Claude 自己的 tokenizer 算的，第 1 課說過，其他家的 tokenizer（例如 tiktoken）算出來的數字對 Claude 是錯的。</li>
+  <li>免費，但有自己的每分鐘請求數上限（跟送訊息的上限分開算）；結果是估計值，跟實際可能差幾個 token。</li>
+  <li>每個請求都先數一次會多一次網路來回。適合用在長度不可控的輸入（上傳檔案、大量檢索結果）；一般短問題直接送，事後用 <code>usage</code> 記帳。</li>
+</ul>
+
+<h2>Message Batches：不急的工作打 5 折</h2>
+<p>有些工作不需要馬上有結果：每晚把當天的評論分類、跑第 11 課的 eval、重算所有商品的摘要。<strong>Message Batches API</strong> 讓你一次送出很多請求，Anthropic 在背景處理，所有 token 都打 5 折，而且跟快取的倍率疊加。限制（官方文件）：</p>
+<ul>
+  <li>一批最多 100,000 個請求或 256 MB；多數在 1 小時內完成，最長 24 小時，超過就過期（expired）。</li>
+  <li>結果保留 29 天。<strong>結果的順序跟送出的順序不一定一樣</strong>，每個請求要有 <code>custom_id</code>，用它對應。</li>
+  <li>每筆結果的 <code>result.type</code> 是 <code>succeeded</code>、<code>errored</code>、<code>canceled</code> 或 <code>expired</code>；後三種不收費。<code>errored</code> 裡如果是 <code>invalid_request_error</code>，要先修請求再重送，其他錯誤可以直接重送。</li>
+</ul>
+<pre>let batch = await client.messages.batches.create({
+  requests: reviews.map(r =&gt; ({ custom_id: r.id, params: reviewParams(r) })),   // params 就是 messages.create 的參數
+})
+while (batch.processing_status !== 'ended') {           // in_progress → ended（取消時會經過 canceling）
+  await sleep(60_000)
+  batch = await client.messages.batches.retrieve(batch.id)
+}
+for await (const row of await client.messages.batches.results(batch.id)) {   // 一行一筆的 JSONL 串流
+  if (row.result.type === 'succeeded') save(row.custom_id, row.result.message)
+  else retry.push(row.custom_id)
+}</pre>
+<p>正式環境不會讓一個程序睡 1 小時等批次：用 BullMQ（<a href="../../nestjs/lessons/20-queues-bullmq.html">NestJS 課第 20 課</a>）排一個每晚送出批次的工作，把 batch id 存進資料庫，另一個重複執行的工作每幾分鐘檢查一次狀態，ended 之後下載結果、把失敗的重新排入下一批。批次也不佔即時請求的處理量，白天的客服不會被晚上的大量工作拖慢（第 14 課）。很多請求共用同一段長前綴時，因為批次可能處理超過 5 分鐘，可以考慮用 1 小時 TTL 的快取，讓後面處理的請求還讀得到；官方文件也提醒，批次裡的快取命中是盡力而為（best-effort），不保證每個都命中。</p>
+
+<h2>預算與告警：一個人不能燒掉整月額度</h2>
+<p>有人寫個腳本對你的客服連續貼長文，或是 agent 被誘導繞圈（第 7 課），沒有上限的話，帳單會在你睡覺時暴增。成本控制要在三個層級都有：</p>
+<div class="table-wrap"><table>
+  <tr><th>層級</th><th>做法</th></tr>
+  <tr><td>單一請求</td><td><code>max_tokens</code> 限制輸出；輸入太長先用 <code>countTokens</code> 擋下</td></tr>
+  <tr><td>單一任務</td><td>agent 的輪數與 token 預算（第 7 課）</td></tr>
+  <tr><td>每位顧客／每個租戶每天</td><td>送出前檢查「今天已花＋這次估計 ≤ 上限」，收到回應後用 <code>usage</code> 算出的實際費用累加</td></tr>
+</table></div>
+<p>每日預算有幾個要注意的地方：</p>
+<ul>
+  <li><strong>送出前用估計、送出後用實際</strong>：估計用 <code>countTokens</code> 或平常的平均值；實際值用 <code>costOf(response.usage)</code>。只在事後檢查的話，最後一個請求會超出很多。</li>
+  <li><strong>「一天」用哪個時區</strong>：顧客在台灣，就用台北時間的日期當 key；直接用 <code>toISOString()</code> 的 UTC 日期，會在台灣早上 8 點才重置。</li>
+  <li><strong>存在哪裡</strong>：練習 5 存在記憶體的 <code>Map</code> 裡，只適用單一程序。多台伺服器要共用計數，用 Redis 的 <code>INCRBYFLOAT</code> 加上一天多一點的過期時間，key 像 <code>budget:2026-11-01:u42</code>。</li>
+  <li><strong>超過時降級，不是直接報錯</strong>：改用較短的回答、較便宜的模型，或回「今天的線上諮詢次數已用完，已幫你轉給店員」，並記 log、發告警。</li>
+  <li><strong>整個帳號也要有上限</strong>：在 Claude Console 為 workspace 設花費上限，並對每日總花費設告警，這是程式出錯時最後一道防線。</li>
+</ul>
+<div class="callout practice"><strong>💡 實務上：上限要先跟 PM、客服講好</strong><br>每日上限設多少、超過時顧客看到什麼，是產品決定，不只是技術決定：太低會讓正常的熟客被擋，太高擋不住濫用。常見做法是先看上線第一週每位顧客每天花費的分布，上限設在絕大多數正常顧客之上，再對碰到上限的帳號發告警，讓客服或維運看一下是真的熟客還是腳本。降級的文案也要客服知道，顧客打電話來時才答得出來。</div>
+
+<h2>練習</h2>
+<p>在 learn 資料夾執行 <code>node check.mjs ai 13</code>，會建立 <code>ai/practice/work/13/</code>。<code>prices.ts</code> 是價格表，已經寫好，不用改。五題互相獨立，可以照任何順序做。做完練習 1、2 後，有 API key 的話可以在 <code>ai/practice</code> 執行 <code>node --env-file-if-exists=.env work/13/live.ts</code>：它先用 <code>countTokens</code> 估計長度，再送兩個同樣前綴的請求，你會看到第 2 個請求的 <code>cache_read_input_tokens</code> 大於 0。</p>
+
+<div class="local" data-test="ex1" data-files="ex1.ts">
+  <p>練習 1：完成 <code>costOf(usage, model, opts)</code>，回傳美元、四捨五入到小數第 6 位。<code>input_tokens</code>、<code>output_tokens</code>、<code>cache_creation_input_tokens</code>、<code>cache_read_input_tokens</code> 各用 <code>PRICES</code> 裡自己的單價；寫入的單價依 <code>opts.cacheTtl</code>（預設 <code>'5m'</code>）；快取欄位是 <code>null</code> 時當成 0；Haiku 5.5 的 prompt（三種輸入相加）大於 10 萬時整個請求改用 <code>HAIKU_LONG</code>；<code>opts.batch</code> 時全部乘上 <code>BATCH_DISCOUNT</code>。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="ex2.ts">
+  <p>練習 2：完成 <code>buildCachedRequest(menuDoc, tools, history, question, now)</code>。tools 依 <code>name</code> 排序（不改到傳進來的陣列）；system 是兩個 text block：<code>RULES</code>，以及用 <code>&lt;menu&gt;</code> 包住的菜單（這個 block 加 <code>cache_control</code>）；messages 是 history 加上最後一則 user 訊息「今天是 &lt;台北日期&gt;。」空一行再接問題；請求頂層加 <code>cache_control</code> 開啟自動快取。日期與問題不同時，tools＋system 序列化後要逐字相同。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="ex3.ts">
+  <p>練習 3：完成 <code>checkCacheHealth(usages)</code>。<code>hitRate</code> 是全部 <code>cache_read_input_tokens</code> 除以全部輸入（三種相加），null 當成 0、沒有輸入時是 0。有兩個以上的請求、而且從第 2 個起 <code>cache_read_input_tokens</code> 全部是 0 或 null 時，<code>warning</code> 是「快取沒有命中，檢查前綴是否有變動的內容」，其他情況是 <code>null</code>。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="ex4.ts">
+  <p>練習 4：完成 <code>runNightlyBatch(client, reviews, sleep)</code>。用 <code>client.messages.batches.create</code> 送出，每則評論一個請求（<code>custom_id</code> 是評論 id、<code>params</code> 用寫好的 <code>reviewParams</code>）；<code>processing_status</code> 不是 <code>'ended'</code> 就用傳進來的 <code>sleep(POLL_MS)</code> 等待再 <code>retrieve</code>；結束後讀 <code>results</code>，<code>succeeded</code> 的用 <code>readLabel</code> 放進 <code>labels</code>（以 <code>custom_id</code> 為 key），其他結果的 <code>custom_id</code> 放進 <code>retry</code>，不要丟錯。</p>
+</div>
+
+<div class="local" data-test="ex5" data-files="ex5.ts">
+  <p>練習 5：完成 <code>DailyBudget</code>。<code>canSpend(userId, estimateUsd)</code> 在「這位顧客今天已花的＋這次估計」小於或等於上限時回傳 <code>true</code>；<code>record(userId, actualUsd)</code> 累加實際費用；<code>spent(userId)</code> 回傳今天已花多少。不同顧客分開算，「今天」用建構時傳入的 <code>now()</code> 與寫好的 <code>taipeiDay</code>，台北時間換日就重新計算。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：加了 <code>cache_control</code>，可是 <code>usage.cache_read_input_tokens</code> 一直是 0，也沒有錯誤。最可能的原因是？</p>
+  <label data-key="a">快取功能要另外申請才能用</label>
+  <label data-key="b">前綴每次都在變（例如 system 有時間、工具順序不固定），或可快取的前綴短於模型的最小長度</label>
+  <label data-key="c">快取只有 Message Batches 才有</label>
+  <label data-key="d">一定要設 1 小時 TTL 才會命中</label>
+  <p class="why">✓ 快取是逐位元的前綴比對，任何一個位元組改變，它和後面的全部重算；前綴短於 512 token（Opus 5.5 等）時不快取也不報錯。快取不用申請（a 錯），一般請求就能用（c 錯），5 分鐘 TTL 在請求頻繁時一樣命中（d 錯）。要用 usage 驗證，不要假設。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：每晚要把 5 萬則評論分類，隔天早上看結果。最省的做法是？</p>
+  <label data-key="a">用 Promise.all 同時送出 5 萬個請求</label>
+  <label data-key="b">用 Message Batches（5 折、可與快取疊加），模型用 Haiku 5.5，結果用 custom_id 對應</label>
+  <label data-key="c">用 Opus 5.5 的 fast mode</label>
+  <label data-key="d">一則一則送，每則間隔 1 秒</label>
+  <p class="why">✓ 不需要即時的工作適合批次：費用減半，也不佔即時客服的處理量。分類是簡單的任務，用 Haiku 5.5 再用 eval 確認品質。a 一次送 5 萬個很容易碰到 rate limit（429），而且照原價；c 的 fast mode 是更快但更貴（價格 2 倍），也不能用在批次；d 要跑將近 14 小時，照原價。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 8：想降低客服成本，第一個該試的是？</p>
+  <label data-key="a">立刻換成最便宜的模型</label>
+  <label data-key="b">先做不影響品質的：讓 prompt caching 命中、刪掉不必要的輸入與輸出；再用 eval 比較較低的 effort 或較小的模型</label>
+  <label data-key="c">把 max_tokens 設成 50</label>
+  <label data-key="d">關掉 RAG，不送菜單文件</label>
+  <p class="why">✓ 快取與精簡 token 不會讓回答變差。換模型、降 effort 是取捨，要用 eval 驗證，並且看每完成一個任務的成本（a）。max_tokens 太小會把回答（含思考）截斷，stop_reason 變成 max_tokens（c）。不送菜單，模型就只能猜價格（d）。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>沒驗證快取有命中就以為省到錢</strong>：快取不命中不會報錯。看 <code>cache_read_input_tokens</code>，把命中率放進監控。</li>
+  <li><strong>在 system 放時間、顧客名字或沒排序的資料</strong>：前綴每次都不同，快取永遠寫入、從不讀取，比不快取還貴 25%。會變的內容放在最後一則 user 訊息。</li>
+  <li><strong>快取讀取用 0.1 倍計算 Opus 5.5</strong>：Opus 5.5、Sonnet 5.5 是 0.05 倍。價格表集中在一個檔案，附上查詢日期。</li>
+  <li><strong>算費用時漏掉 cache_creation_input_tokens</strong>：寫入是另外計費的，而且比一般輸入貴。</li>
+  <li><strong>為了省錢換小模型卻沒跑 eval</strong>：品質掉了你不會馬上知道；顧客重問、轉真人的成本比省下的多。</li>
+  <li><strong>批次結果依順序對應</strong>：結果的順序跟送出的不一定一樣，一定用 <code>custom_id</code>。</li>
+  <li><strong>批次裡有失敗的請求就讓整個工作丟錯</strong>：errored、expired 是預期中會發生的，記下來重送就好，成功的結果要保留。</li>
+  <li><strong>沒有每位使用者的預算上限</strong>：一個濫用者就能燒掉整月額度。送出前檢查估計值，收到回應後扣實際值，超過時降級並告警。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>一個請求的費用 = input、cache_creation（1.25 倍或 2 倍）、cache_read（Opus 5.5／Sonnet 5.5 是 0.05 倍）、output 各乘自己的單價；Haiku 5.5 的 prompt 超過 10 萬 token 整個請求用高價；批次全部 5 折並與快取疊加。</li>
+  <li>prompt caching 是逐位元的前綴比對，順序 tools → system → messages；斷點放在穩定部分的最後一個 block，頂層 <code>cache_control</code> 自動快取對話；最多 4 個斷點，前綴至少 512 token。</li>
+  <li>穩定的在前、會變的在後：工具排序、日期放在最後一則 user 訊息、中途指令用 role: 'system' 訊息。用 usage 驗證命中。</li>
+  <li>先做免費的（快取、精簡 token），再用 eval 比較較低的 effort（<code>output_config.effort</code>）或較小的模型；看每完成一個任務的成本。</li>
+  <li><code>countTokens</code> 在送出前估計輸入長度（可能跟實際差幾個 token），用來擋下太長的輸入。</li>
+  <li>不急的工作用 Message Batches：5 折、用 custom_id 對應、輪詢到 ended、失敗的重送。</li>
+  <li>每位顧客每天設上限：送出前用估計檢查，收到回應後扣實際值，超過時降級並告警。</li>
+</ul>
+<p>下一課處理上線後的另一個現實：API 會逾時、會 429、會過載，學怎麼設定重試、fallback 與限流，讓客服在尖峰時段也撐得住。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

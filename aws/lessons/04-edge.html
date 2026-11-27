@@ -1,0 +1,711 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>4. 對外入口：Route 53、ACM、ALB 與 CloudFront</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="4" data-practice="aws">
+<header>
+  <div class="eyebrow">階段 2：網路與入口 · 第 4 課</div>
+  <h1>對外入口：Route 53、ACM、ALB 與 CloudFront</h1>
+</header>
+<main>
+
+<p>咖啡店的官網與 API 要用 <code>cafe.example.com</code> 與 <code>api.cafe.example.com</code> 對外。上線三個月後的某個早上，整站打不開，瀏覽器顯示憑證過期：當初有人清理 DNS 時，刪掉了一筆「看不懂用途」的 CNAME 記錄。同一週，海外的顧客反映菜單圖片要等好幾秒才出現；工程師切換新版 API 時改了 DNS，半小時後還有人連到舊的機器。</p>
+<p>上一課處理 VPC 裡面的路；這一課處理從顧客的瀏覽器到你的 VPC 這一段。它由四個服務組成：<strong>Route 53</strong>（DNS：把名稱查成位址）、<strong>ACM</strong>（AWS Certificate Manager：申請與續約 TLS 憑證）、<strong>ALB</strong>（Application Load Balancer：依規則把請求分給後面的程式）、<strong>CloudFront</strong>（CDN：在離顧客近的地方快取內容）。學完你能解釋上面三件事的原因，並寫出一個能重複執行的 DNS 切換程式。</p>
+<p>這課的路線：</p>
+<ul>
+  <li>一個請求從網址到程式：四個服務各自負責哪一段。</li>
+  <li>Route 53：記錄類型、alias 與 CNAME、TTL、routing policy（練習 1、3）。</li>
+  <li>ACM：DNS 驗證、自動續約的條件、CloudFront 為什麼要 <code>us-east-1</code>。</li>
+  <li>ALB：listener、規則、target group、健康檢查；什麼時候改用 NLB（練習 2）。</li>
+  <li>CloudFront：快取、cache key、invalidation 的代價。</li>
+</ul>
+
+<div class="callout"><strong>這課會用到：</strong>DNS 與記錄類型（<a href="../../devops/lessons/04-networking.html">devops 課第 4 課</a>：A 記錄把名稱對到 IPv4、CNAME 把名稱對到另一個名稱、TTL 是快取多久）；TLS 憑證與自動續期（<a href="../../devops/lessons/05-tls.html">devops 課第 5 課</a>）；反向代理（<a href="../../devops/lessons/12-nginx.html">devops 課第 12 課</a>：一個入口依網域與路徑轉給不同的後端）；第 3 課的公有子網路（ALB 放在那裡）。</div>
+
+<div class="callout warn"><strong>練習環境：</strong>模擬器的 Route 53 只存記錄，不會真的回應 DNS 查詢，也不會依權重挑記錄。DNS 怎麼解析、ALB 怎麼比對規則，在頁面練習裡依規則推論；本機練習檢查你送出的記錄設定。</div>
+
+<h2>一個請求從網址到程式</h2>
+<p>顧客打開 <code>https://api.cafe.example.com/v1/menu</code>，依序經過：</p>
+<ol>
+  <li><strong>DNS</strong>：瀏覽器問 <code>api.cafe.example.com</code> 在哪。查詢最後問到 Route 53，Route 53 回答 ALB 的 IP。</li>
+  <li><strong>TLS</strong>：瀏覽器連到 ALB 的 443，ALB 出示 ACM 簽發的憑證，瀏覽器確認憑證有效、網域相符，才繼續。</li>
+  <li><strong>規則</strong>：ALB 依 Host、路徑等條件決定這個請求交給哪一組後端（target group），轉給其中一個健康的 cafe-api task。</li>
+</ol>
+<p>菜單圖片則多一層：<code>img.cafe.example.com</code> 指到 CloudFront，CloudFront 在世界各地的節點快取圖片，快取裡沒有才回到來源（S3 或 ALB）拿。</p>
+<p>所以開場三件事的最小答案：憑證過期是第 2 步，ACM 自動續約需要的 DNS 驗證記錄被刪了；海外很慢是因為圖片沒有經過 CloudFront，每次都回到東京；切換後還連到舊機器是第 1 步，DNS 的答案被快取了 TTL 那麼久。接下來每一節展開一段。</p>
+
+<h2>Route 53：記錄、alias 與 TTL</h2>
+<p><strong>hosted zone</strong>（託管區域）是 Route 53 裡一個網域的所有記錄，例如 <code>cafe.example.com</code> 這個 zone。建立 public hosted zone 時，Route 53 會給你四台 name server（NS 記錄），你要到網域註冊商把網域的 NS 設成它們，網際網路上的查詢才會問到 Route 53。</p>
+<p>devops 課第 4 課的 A、AAAA、CNAME 在這裡都一樣。Route 53 多了一種 <strong>alias 記錄</strong>，用來指向 AWS 的資源（ALB、CloudFront、S3 網站、API Gateway，或同一個 zone 裡的另一筆記錄）：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>CNAME</th><th>alias（類型仍寫 A 或 AAAA）</th></tr>
+  <tr><td>回答什麼</td><td>另一個名稱，客戶端的 resolver 要再查一次</td><td>直接回答目標現在的 IP，客戶端看到的就是 A 記錄</td></tr>
+  <tr><td>能不能放在 zone 的頂端（apex，例如 <code>cafe.example.com</code> 本身）</td><td>不能：DNS 規定 apex 要有 SOA、NS 記錄，CNAME 不能和其他記錄共存</td><td>能</td></tr>
+  <tr><td>TTL</td><td>自己設</td><td>不能自己設，跟著目標</td></tr>
+  <tr><td>查詢費</td><td>一般計費</td><td>指向 ALB、CloudFront 等 AWS 資源時不收查詢費（<a href="https://aws.amazon.com/route53/pricing/">Route 53 定價頁</a>，2026-11-20 查證）</td></tr>
+</table></div>
+<p>ALB 的 IP 會變，所以不能把 ALB 的 IP 寫進 A 記錄；子網域可以 CNAME 到 ALB 的 DNS 名稱，apex 只能用 alias。實務上兩者都用 alias。</p>
+<p><strong>TTL</strong> 是 resolver 可以快取這個答案多久（秒）。改了記錄，已經快取舊答案的人要等 TTL 過完才會再問。開場第三件事就是這樣：記錄的 TTL 是 3600，改完之後最多一小時內還有人連到舊的。所以要換 IP 的記錄，<strong>提前</strong>（至少一個舊 TTL 的時間之前）把 TTL 調低到 60，切換、觀察穩定之後再調回來。</p>
+<div class="callout practice"><strong>💡 實務上：DNS 切換前一天先把 TTL 調低</strong><br>搬機房、換 ALB、換 CDN，都是改 DNS。資深工程師的步驟是：前一天把相關記錄的 TTL 從 3600 調到 60（要等舊的 3600 秒過完才全面生效）；切換當天先改一小部分流量（下面的 weighted），看錯誤率與延遲；確定沒問題再全部切過去，舊環境留著一段時間方便回滾；最後把 TTL 調回較長的值，減少查詢量。也要知道有些 resolver 與應用程式（例如 JVM 的 DNS 快取設定）不完全照 TTL，舊環境不要切完馬上關。</div>
+
+<h2>Route 53：routing policy 與健康檢查</h2>
+<p>同一個名稱可以有好幾筆記錄，由 <strong>routing policy</strong>（路由政策）決定回答哪一筆：</p>
+<div class="table-wrap"><table>
+  <tr><th>policy</th><th>怎麼選</th><th>用在哪</th></tr>
+  <tr><td>simple</td><td>只有一筆，照回</td><td>大多數記錄</td></tr>
+  <tr><td>weighted</td><td>每筆有權重（0～255），依「自己的權重 ÷ 全部的權重」的比例回答；權重 0 的不回答，除非整組都是 0</td><td>新版 API 先切 10%、藍綠部署</td></tr>
+  <tr><td>failover</td><td>PRIMARY 健康就回它，不健康改回 SECONDARY</td><td>主站掛了切到維護頁或備援 region</td></tr>
+  <tr><td>latency</td><td>回答對查詢者延遲最低的那個 region 的記錄</td><td>多 region 部署</td></tr>
+</table></div>
+<p>同名、同類型的多筆記錄靠 <strong><code>SetIdentifier</code></strong> 區分，同一組裡不能重複。failover 要搭配 <strong>Route 53 健康檢查</strong>：Route 53 從多個地點定期打你的端點，連續失敗就標成不健康。weighted 也可以掛健康檢查，不健康的記錄不會被回答。</p>
+<p>改記錄用 <code>ChangeResourceRecordSets</code>，一次送一個 <strong>change batch</strong>：裡面的每一筆是 <code>CREATE</code>（已存在就失敗）、<code>DELETE</code>，或 <code>UPSERT</code>（不存在就建、存在就改）。同一個 batch 裡的變更一起生效，所以「blue 改成 90、green 改成 10」要放在同一個 batch；分兩次送，中間會有一段時間權重比例不是你要的。練習 3 就是這樣一支切換程式。</p>
+<p>練習 1 會把這一節與上一節寫成一個簡化的解析器。先看 weighted 怎麼用一個 0～1 的亂數挑記錄：</p>
+<div class="lab"><script type="code">
+// weighted：把權重排成一條線，亂數落在哪一段就回答哪一筆
+const records = [{ id: 'blue', weight: 90 }, { id: 'green', weight: 10 }]
+const pick = (r: number) => {
+  const total = records.reduce((s, x) => s + x.weight, 0)
+  let point = r * total
+  for (const rec of records) {
+    if (point < rec.weight) return rec.id
+    point -= rec.weight
+  }
+  return records[records.length - 1].id
+}
+for (const r of [0, 0.5, 0.899, 0.9, 0.99]) console.log(`亂數 ${r} → ${pick(r)}`)
+// 模擬一萬次查詢
+const counts: Record<string, number> = { blue: 0, green: 0 }
+for (let i = 0; i < 10000; i++) counts[pick(i / 10000)]++
+console.log(counts)
+</script></div>
+<p>注意這是「每一次 DNS 查詢」的比例，不是每個請求：resolver 快取了答案，同一個辦公室的人在 TTL 內都會拿到同一個。流量小或 TTL 長時，實際比例會跟權重差很多。</p>
+
+<h2>ACM：憑證怎麼來、為什麼會過期</h2>
+<p>DNS 讓瀏覽器找到 ALB，接下來是 TLS（devops 課第 5 課）。<strong>ACM</strong> 替你申請公開憑證，用在 ALB、CloudFront 這些整合的服務時不收費（<a href="https://aws.amazon.com/certificate-manager/pricing/">ACM 定價頁</a>，2026-11-20 查證；可以匯出私鑰的憑證另外計費）。私鑰留在 AWS 裡，你拿不到，也就不會外洩。</p>
+<p>申請時要證明你擁有這個網域，建議用 <strong>DNS 驗證</strong>：ACM 給你一筆 CNAME 記錄（名稱與值都是一串亂碼），你把它加到 zone 裡，ACM 查得到就簽發。這筆記錄<strong>要一直留著</strong>，因為續約時 ACM 會再查一次。依官方「Renewal for domains validated by DNS」（2026-11-20 查證）：</p>
+<ul>
+  <li>目前的憑證有效期 198 天，到期前 45 天 ACM 檢查續約條件（較早簽發、有效期 395 天的憑證是到期前 60 天）。</li>
+  <li>條件有兩個：憑證<strong>正被 AWS 服務使用中</strong>（例如掛在 ALB 上），而且每個網域的驗證 CNAME <strong>還在、公開 DNS 查得到</strong>。</li>
+  <li>條件不符時，ACM 會在到期前 30、15、7、3、1 天發 AWS Health 與 EventBridge 事件通知你，不會自己修好。</li>
+</ul>
+<p>開場的事故就是第二個條件：那筆「看不懂用途」的 CNAME 就是驗證記錄。另外，你自己匯入 ACM 的憑證（從別的 CA 買的）ACM 不會續約，要自己在到期前重新匯入。</p>
+<p>還有一個 region 的規則：<strong>CloudFront 用的 ACM 憑證必須在 <code>us-east-1</code> 申請</strong>（官方「Requirements for using SSL/TLS certificates with CloudFront」），因為 CloudFront 是全球服務。ALB 用的憑證則要在 ALB 所在的 region。所以一個同時有 CloudFront 與東京 ALB 的網站，常常要申請兩張憑證。</p>
+<div class="callout practice"><strong>💡 實務上：憑證續約失敗，多半是驗證記錄被刪了</strong><br>DNS 驗證的 CNAME 名稱長得像 <code>_3f9a….cafe.example.com</code>，清理 DNS 的人很容易當成垃圾刪掉。資深工程師會用 IaC 管理這些記錄（和憑證放在同一個模組，刪不掉也不會被忘記），並訂閱 ACM 的到期事件送到團隊的告警頻道。收到「無法自動續約」的通知時，先查兩件事：驗證記錄還在不在、憑證是不是還掛在服務上。</div>
+
+<h2>ALB：listener、規則與 target group</h2>
+<p>TLS 在 ALB 結束之後，ALB 要決定把請求交給誰。它的角色跟 devops 課第 12 課的 nginx 反向代理一樣，只是由 AWS 代管、跨 AZ。ALB 放在公有子網路（第 3 課），由這幾個部分組成：</p>
+<ul>
+  <li><strong>listener</strong>：聽一個 port 與協定，例如 HTTPS:443（掛 ACM 憑證）、HTTP:80。</li>
+  <li><strong>規則</strong>（rule）：listener 底下的一組「條件 → 動作」，每條有一個 <strong>priority</strong>（1～50000），<strong>數字小的先比對</strong>，第一條符合的生效；都不符合時用 listener 的預設動作。</li>
+  <li><strong>target group</strong>：一組後端（Fargate task 的 IP、EC2 執行個體、Lambda），ALB 對它們做健康檢查，只把請求送給健康的。</li>
+</ul>
+<p>規則的條件常用的有四種，同一條規則裡的不同條件要<strong>全部</strong>符合，同一個條件給多個值時<strong>任一個</strong>符合即可（官方「Condition types for listener rules」，2026-11-20 查證）：</p>
+<div class="table-wrap"><table>
+  <tr><th>條件</th><th>比對什麼</th><th>大小寫</th><th>萬用字元</th></tr>
+  <tr><td><code>host-header</code></td><td>Host，例如 <code>*.cafe.example.com</code>（不含 <code>cafe.example.com</code> 本身）</td><td>不分</td><td><code>*</code> 任意多個字元、<code>?</code> 一個字元</td></tr>
+  <tr><td><code>path-pattern</code></td><td>路徑，不含 query string</td><td>分</td><td><code>*</code>、<code>?</code></td></tr>
+  <tr><td><code>http-request-method</code></td><td><code>GET</code>、<code>POST</code>……</td><td>分</td><td>不支援</td></tr>
+  <tr><td><code>source-ip</code></td><td>來源 IP 的 CIDR</td><td>—</td><td>不支援</td></tr>
+</table></div>
+<p>萬用字元不是正規表示式：<code>/v1/*</code> 的 <code>*</code> 是「任意字元」，<code>.</code> 就是一個點。ALB 另外也支援正規表示式的比對（設定欄位是 <code>RegexValues</code>，跟萬用字元的 <code>Values</code> 分開），練習 2 只處理萬用字元。動作常用的是 <code>forward</code>（轉給 target group）、<code>redirect</code>（例如 HTTP:80 的預設動作轉址到 HTTPS）、<code>fixed-response</code>（直接回固定的狀態碼與內容，例如維護中）。</p>
+<p>target group 的健康檢查與 deregistration delay 在 devops 課第 18 課看過：預設每 30 秒打一次健康檢查路徑，連續失敗 2 次標成不健康、連續成功 5 次才恢復；部署移除 task 時，ALB 會等 deregistration delay（預設 300 秒）讓進行中的請求做完。ALB 的 idle timeout 預設 60 秒：連線上 60 秒沒有資料往來就關掉，長時間的 SSE、WebSocket 或慢的報表 API 會被切斷，要調高它或讓伺服器定期送資料。</p>
+<p>什麼時候不用 ALB，改用 <strong>NLB</strong>（Network Load Balancer）？NLB 在 L4 工作，只看 TCP／UDP 的 IP 與 port，不解析 HTTP：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>ALB</th><th>NLB</th></tr>
+  <tr><td>層級</td><td>L7（HTTP、HTTPS、gRPC）</td><td>L4（TCP、UDP、TLS）</td></tr>
+  <tr><td>能依什麼分流</td><td>Host、路徑、標頭、方法</td><td>只有 port</td></tr>
+  <tr><td>IP</td><td>會變，要用 DNS 名稱</td><td>每個 AZ 一個固定 IP，可以指定自己的 Elastic IP</td></tr>
+  <tr><td>適合</td><td>一般的 Web、API</td><td>對方防火牆只允許固定 IP、非 HTTP 的協定（例如 MQTT、遊戲伺服器）、極高的連線數</td></tr>
+</table></div>
+<div class="callout practice"><strong>💡 實務上：ALB 的 idle timeout 與長連線</strong><br>咖啡店的廚房看板用 SSE 推新訂單，上線後每隔一分鐘斷一次，就是 ALB 60 秒的 idle timeout。做法有兩個：伺服器每 20～30 秒送一個註解行當心跳，或把 ALB 的 idle timeout 調高。後端（Node 的 HTTP server）的 keep-alive timeout 也要比 ALB 的 idle timeout 長，否則後端先關連線，ALB 會偶發 502。這類設定寫進部署文件，換 ALB 時才不會遺失。</div>
+
+<h2>CloudFront：把內容放到顧客附近</h2>
+<p>ALB 在東京，海外的顧客每張圖片都要跨洋。<strong>CloudFront</strong> 是 AWS 的 CDN：在世界各地有節點（edge location），顧客連到最近的節點，節點有快取就直接回，沒有才回到你設定的<strong>來源</strong>（origin，例如 S3 bucket 或 ALB）拿，拿到後依規則快取。</p>
+<ul>
+  <li><strong>cache key</strong>：決定「哪些請求算同一份內容」。預設只看路徑；把 query string、cookie、標頭加進 cache key，快取會被切得很碎、命中率下降。只放真的會改變內容的部分。</li>
+  <li><strong>TTL</strong>：快取多久，由來源回應的 <code>Cache-Control</code> 與 CloudFront 的 cache policy（最小、預設、最大 TTL）一起決定。檔名帶版本雜湊的靜態檔（Vite 的 build 產物）可以快取很久。</li>
+  <li><strong>invalidation</strong>（失效）：要求節點丟掉某些路徑的快取。它不是即時的，要一段時間才會在所有節點完成；而且每個帳號每月前 1,000 個路徑免費，之後每個路徑計費，<code>/*</code> 這種萬用字元算一個路徑（官方「Pay for file invalidation」，2026-11-20 查證）。日常部署靠檔名帶版本，不要靠 invalidation。</li>
+</ul>
+<p>來源是 S3 時，bucket 不必公開：CloudFront 用 OAC（Origin Access Control）以自己的身分讀私有 bucket，第 7 課部署 Vue 網站時會完整做一次。</p>
+
+<h2>這課的練習怎麼對應真的 AWS</h2>
+<p>DNS 解析、ALB 比對規則、CloudFront 快取都是真的 AWS 在跑的行為，模擬器只存設定：</p>
+<ul>
+  <li><strong>頁面上的練習</strong>（1、2）：把 Route 53 的解析規則與 ALB 的規則比對寫成程式。</li>
+  <li><strong>本機練習</strong>（3）：用 SDK 在模擬器建 hosted zone、改 weighted 記錄，測試讀回記錄，並記下你送出的 change batch。模擬器有些檢查比真的 Route 53 寬鬆（例如同一批裡重複的 <code>SetIdentifier</code>），所以測試直接檢查送出的內容。模擬器也允許同名的 hosted zone 建很多個，這一點跟真的 Route 53 一樣，所以「先找再建」要你自己寫。</li>
+</ul>
+
+<h2>在真的 AWS 帳號上做一次（選做）</h2>
+<p>這一節不判分，也不影響進度。用第 2 課建立的 <code>learn-sandbox</code> profile。建一個 hosted zone、放 weighted 記錄，用 Route 53 的 <code>test-dns-answer</code> 直接問 Route 53 會怎麼回答（不需要真的擁有這個網域，也不用改註冊商的 NS），做完馬上刪掉。網域名稱換成一個你自己的、不容易撞名的名字。</p>
+<div class="callout warn"><strong>費用：</strong>hosted zone 每個月計費，但<strong>建立後 12 小時內刪除不收費</strong>；DNS 查詢依次數計費（<a href="https://aws.amazon.com/route53/pricing/">Route 53 定價頁</a>，2026-11-20 查證）。這一節在 12 小時內清除就不會產生 hosted zone 的費用。不建 ALB（每小時計費）、不建 CloudFront。</div>
+<pre># 1. 建 hosted zone，記下 Id（/hostedzone/Z…）
+aws route53 create-hosted-zone --name cafe-learn-04-&lt;你的名字&gt;.com --caller-reference "$(date +%s)" \
+  --profile learn-sandbox --query HostedZone.Id --output text
+
+# 2. 準備一個 change batch：blue 90、green 10，TTL 60（192.0.2.x 是文件專用的位址）
+cat &gt; weighted.json &lt;&lt;'EOF'
+{ "Changes": [
+  { "Action": "UPSERT", "ResourceRecordSet": { "Name": "api.cafe-learn-04-&lt;你的名字&gt;.com", "Type": "A",
+    "SetIdentifier": "blue", "Weight": 90, "TTL": 60, "ResourceRecords": [{ "Value": "192.0.2.10" }] } },
+  { "Action": "UPSERT", "ResourceRecordSet": { "Name": "api.cafe-learn-04-&lt;你的名字&gt;.com", "Type": "A",
+    "SetIdentifier": "green", "Weight": 10, "TTL": 60, "ResourceRecords": [{ "Value": "192.0.2.20" }] } }
+] }
+EOF
+
+# 3. 一次送出兩筆變更；回傳的 ChangeInfo.Status 從 PENDING 變成 INSYNC 就生效了
+aws route53 change-resource-record-sets --hosted-zone-id &lt;Id&gt; --change-batch file://weighted.json --profile learn-sandbox
+
+# 4. 看 zone 裡的記錄：NS、SOA 是 Route 53 自動建的，加上剛才的 blue、green
+aws route53 list-resource-record-sets --hosted-zone-id &lt;Id&gt; --profile learn-sandbox \
+  --query 'ResourceRecordSets[].[Name,Type,SetIdentifier,Weight]' --output table
+
+# 5. 問 Route 53 會怎麼回答，看 RecordData；多執行幾次觀察
+aws route53 test-dns-answer --hosted-zone-id &lt;Id&gt; --record-name api.cafe-learn-04-&lt;你的名字&gt;.com --record-type A \
+  --profile learn-sandbox --query RecordData</pre>
+<h3>清除</h3>
+<pre># 刪記錄：DELETE 的內容要跟現有記錄完全一樣，所以用同一份檔案把 UPSERT 換成 DELETE
+sed 's/"UPSERT"/"DELETE"/' weighted.json &gt; delete.json
+aws route53 change-resource-record-sets --hosted-zone-id &lt;Id&gt; --change-batch file://delete.json --profile learn-sandbox
+aws route53 delete-hosted-zone --id &lt;Id&gt; --profile learn-sandbox
+aws route53 list-hosted-zones-by-name --dns-name cafe-learn-04-&lt;你的名字&gt;.com --profile learn-sandbox \
+  --query "HostedZones[?Name=='cafe-learn-04-&lt;你的名字&gt;.com.'].Id"   # 確認：回傳 []</pre>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：寫 <code>resolve(zone, name, random)</code>，模擬 Route 53 怎麼回答 A 記錄的查詢，回傳 <code>{ ips, cnames }</code>。<code>zone.aws</code> 是 AWS 資源（ALB、CloudFront）的 DNS 名稱與它們目前的 IP。規則：</p>
+  <ul>
+    <li>先檢查：zone 的頂端（名稱等於 <code>zone.apex</code>）有 CNAME 記錄時，丟出錯誤。</li>
+    <li>查一個名稱：名稱在 <code>zone.aws</code> 裡就回答那些 IP。否則找同名的記錄，沒有就回答空的 <code>ips</code>。</li>
+    <li>是 CNAME：把目標名稱加進 <code>cnames</code>，繼續查目標名稱。</li>
+    <li>是 A 記錄：有 <code>weight</code> 的是 weighted，依權重用 <code>random()</code> 挑一筆（權重 0 不選，除非全部是 0，那就平均挑）；有 <code>failover</code> 的，PRIMARY 的 <code>healthy</code> 不是 <code>false</code> 就用它，否則用 SECONDARY；其他只有一筆。挑到的記錄有 <code>alias</code> 就繼續查 alias 的目標（<strong>不</strong>加進 <code>cnames</code>），否則回答它的 <code>values</code>。</li>
+    <li>連續查了超過 8 次就丟錯（避免記錄互相指向造成無限迴圈）。</li>
+  </ul>
+  <script type="start">
+type Rec = { name: string, type: 'A' | 'CNAME', values?: string[], alias?: string, setId?: string, weight?: number, failover?: 'PRIMARY' | 'SECONDARY', healthy?: boolean }
+type Zone = { apex: string, records: Rec[], aws: Record<string, string[]> }
+type Answer = { ips: string[], cnames: string[] }
+
+function resolve(zone: Zone, name: string, random: () => number): Answer {
+  // 1. apex 有 CNAME 就丟錯
+  // 2. 用迴圈一次查一個名稱：aws 資源、CNAME、weighted、failover、simple
+  return { ips: [], cnames: [] }
+}
+
+const zone: Zone = {
+  apex: 'cafe.example.com',
+  aws: { 'cafe-alb-123.ap-northeast-1.elb.amazonaws.com': ['203.0.113.10', '203.0.113.11'] },
+  records: [
+    { name: 'cafe.example.com', type: 'A', alias: 'cafe-alb-123.ap-northeast-1.elb.amazonaws.com' },
+    { name: 'www.cafe.example.com', type: 'CNAME', values: ['cafe.example.com'] },
+  ],
+}
+console.log(resolve(zone, 'www.cafe.example.com', Math.random))
+</script>
+  <script type="answer">
+type Rec = { name: string, type: 'A' | 'CNAME', values?: string[], alias?: string, setId?: string, weight?: number, failover?: 'PRIMARY' | 'SECONDARY', healthy?: boolean }
+type Zone = { apex: string, records: Rec[], aws: Record<string, string[]> }
+type Answer = { ips: string[], cnames: string[] }
+
+function pickWeighted(recs: Rec[], random: () => number): Rec {
+  const live = recs.filter(r => (r.weight ?? 0) > 0)
+  if (!live.length) return recs[Math.floor(random() * recs.length)]
+  let point = random() * live.reduce((s, r) => s + r.weight!, 0)
+  for (const r of live) {
+    if (point < r.weight!) return r
+    point -= r.weight!
+  }
+  return live[live.length - 1]
+}
+
+function resolve(zone: Zone, name: string, random: () => number): Answer {
+  if (zone.records.some(r => r.name === zone.apex && r.type === 'CNAME')) throw new Error(`${zone.apex} 是 zone 的頂端，不能用 CNAME`)
+  const cnames: string[] = []
+  let current = name
+  for (let step = 0; step < 8; step++) {
+    if (zone.aws[current]) return { ips: zone.aws[current], cnames }
+    const recs = zone.records.filter(r => r.name === current)
+    if (!recs.length) return { ips: [], cnames }
+    const cname = recs.find(r => r.type === 'CNAME')
+    if (cname) { current = cname.values![0]; cnames.push(current); continue }
+    const chosen = recs.some(r => r.weight !== undefined) ? pickWeighted(recs, random)
+      : recs.some(r => r.failover) ? (recs.find(r => r.failover === 'PRIMARY' && r.healthy !== false) ?? recs.find(r => r.failover === 'SECONDARY')!)
+      : recs[0]
+    if (!chosen.alias) return { ips: chosen.values ?? [], cnames }
+    current = chosen.alias
+  }
+  throw new Error(`${name} 查了超過 8 次，記錄可能互相指向`)
+}
+
+const zone: Zone = {
+  apex: 'cafe.example.com',
+  aws: { 'cafe-alb-123.ap-northeast-1.elb.amazonaws.com': ['203.0.113.10', '203.0.113.11'] },
+  records: [
+    { name: 'cafe.example.com', type: 'A', alias: 'cafe-alb-123.ap-northeast-1.elb.amazonaws.com' },
+    { name: 'www.cafe.example.com', type: 'CNAME', values: ['cafe.example.com'] },
+  ],
+}
+console.log(resolve(zone, 'www.cafe.example.com', Math.random))
+</script>
+  <script type="tests">
+const ALB = 'cafe-alb-123.ap-northeast-1.elb.amazonaws.com'
+const BLUE = 'cafe-blue-1.ap-northeast-1.elb.amazonaws.com', GREEN = 'cafe-green-2.ap-northeast-1.elb.amazonaws.com'
+const CF = 'd111111abcdef8.cloudfront.net'
+const z: Zone = {
+  apex: 'cafe.example.com',
+  aws: { [ALB]: ['203.0.113.10', '203.0.113.11'], [BLUE]: ['203.0.113.21'], [GREEN]: ['203.0.113.31'], [CF]: ['198.51.100.80'] },
+  records: [
+    { name: 'cafe.example.com', type: 'A', alias: ALB },
+    { name: 'www.cafe.example.com', type: 'CNAME', values: ['cafe.example.com'] },
+    { name: 'img.cafe.example.com', type: 'CNAME', values: [CF] },
+    { name: 'api.cafe.example.com', type: 'A', setId: 'blue', weight: 90, alias: BLUE },
+    { name: 'api.cafe.example.com', type: 'A', setId: 'green', weight: 10, alias: GREEN },
+    { name: 'canary.cafe.example.com', type: 'A', setId: 'old', weight: 0, values: ['192.0.2.1'] },
+    { name: 'canary.cafe.example.com', type: 'A', setId: 'new', weight: 5, values: ['192.0.2.2'] },
+    { name: 'beta.cafe.example.com', type: 'A', setId: 'a', weight: 0, values: ['192.0.2.11'] },
+    { name: 'beta.cafe.example.com', type: 'A', setId: 'b', weight: 0, values: ['192.0.2.12'] },
+    { name: 'pay.cafe.example.com', type: 'A', setId: 'main', failover: 'PRIMARY', healthy: false, values: ['192.0.2.50'] },
+    { name: 'pay.cafe.example.com', type: 'A', setId: 'sorry', failover: 'SECONDARY', values: ['192.0.2.99'] },
+    { name: 'loop-a.cafe.example.com', type: 'CNAME', values: ['loop-b.cafe.example.com'] },
+    { name: 'loop-b.cafe.example.com', type: 'CNAME', values: ['loop-a.cafe.example.com'] },
+  ],
+}
+const r = (n: number) => () => n
+assert.deepEqual(resolve(z, 'cafe.example.com', r(0)), { ips: ['203.0.113.10', '203.0.113.11'], cnames: [] }, 'apex 用 alias 指向 ALB：直接回答 ALB 的 IP，不會出現在 cnames')
+assert.deepEqual(resolve(z, 'www.cafe.example.com', r(0)), { ips: ['203.0.113.10', '203.0.113.11'], cnames: ['cafe.example.com'] }, 'www 是 CNAME：cnames 記下目標，再查 cafe.example.com')
+assert.deepEqual(resolve(z, 'img.cafe.example.com', r(0)), { ips: ['198.51.100.80'], cnames: [CF] }, 'CNAME 指向 CloudFront 的名稱')
+assert.deepEqual(resolve(z, 'api.cafe.example.com', r(0.5)), { ips: ['203.0.113.21'], cnames: [] }, '權重 90／10，亂數 0.5 落在 blue')
+assert.deepEqual(resolve(z, 'api.cafe.example.com', r(0.899)), { ips: ['203.0.113.21'], cnames: [] }, '亂數 0.899 × 100 = 89.9，還在 blue 的 0～90')
+assert.deepEqual(resolve(z, 'api.cafe.example.com', r(0.95)), { ips: ['203.0.113.31'], cnames: [] }, '亂數 0.95 落在 green')
+assert.deepEqual(resolve(z, 'canary.cafe.example.com', r(0)), { ips: ['192.0.2.2'], cnames: [] }, '權重 0 的記錄不會被回答，就算它排在前面、亂數是 0')
+assert.deepEqual(resolve(z, 'beta.cafe.example.com', r(0.7)), { ips: ['192.0.2.12'], cnames: [] }, '整組都是 0 時平均挑：0.7 × 2 落在第二筆')
+assert.deepEqual(resolve(z, 'pay.cafe.example.com', r(0)), { ips: ['192.0.2.99'], cnames: [] }, 'PRIMARY 不健康：回答 SECONDARY')
+const healthy: Zone = { ...z, records: z.records.map(x => x.setId === 'main' ? { ...x, healthy: true } : x) }
+assert.deepEqual(resolve(healthy, 'pay.cafe.example.com', r(0)), { ips: ['192.0.2.50'], cnames: [] }, 'PRIMARY 健康：回答 PRIMARY')
+assert.deepEqual(resolve(z, 'nope.cafe.example.com', r(0)), { ips: [], cnames: [] }, '沒有記錄：ips 是空的')
+let loopErr = ''
+try { resolve(z, 'loop-a.cafe.example.com', r(0)) } catch (e) { loopErr = String(e) }
+assert(loopErr !== '', 'loop-a、loop-b 互相指向：查超過 8 次要丟錯，不能無限迴圈')
+let apexErr = ''
+try { resolve({ ...z, records: [...z.records.filter(x => x.name !== 'cafe.example.com'), { name: 'cafe.example.com', type: 'CNAME', values: [ALB] }] }, 'www.cafe.example.com', r(0)) } catch (e) { apexErr = String(e) }
+assert(apexErr !== '', 'zone 頂端（cafe.example.com）放 CNAME 是不合法的設定：要丟錯，請改用 alias')
+</script>
+  <script type="wrong">
+type Rec = { name: string, type: 'A' | 'CNAME', values?: string[], alias?: string, setId?: string, weight?: number, failover?: 'PRIMARY' | 'SECONDARY', healthy?: boolean }
+type Zone = { apex: string, records: Rec[], aws: Record<string, string[]> }
+type Answer = { ips: string[], cnames: string[] }
+function pickWeighted(recs: Rec[], random: () => number): Rec {
+  const live = recs.filter(r => (r.weight ?? 0) > 0)
+  if (!live.length) return recs[Math.floor(random() * recs.length)]
+  let point = random() * live.reduce((s, r) => s + r.weight!, 0)
+  for (const r of live) { if (point < r.weight!) return r; point -= r.weight! }
+  return live[live.length - 1]
+}
+// 沒有檢查 apex 的 CNAME
+function resolve(zone: Zone, name: string, random: () => number): Answer {
+  const cnames: string[] = []
+  let current = name
+  for (let step = 0; step < 8; step++) {
+    if (zone.aws[current]) return { ips: zone.aws[current], cnames }
+    const recs = zone.records.filter(r => r.name === current)
+    if (!recs.length) return { ips: [], cnames }
+    const cname = recs.find(r => r.type === 'CNAME')
+    if (cname) { current = cname.values![0]; cnames.push(current); continue }
+    const chosen = recs.some(r => r.weight !== undefined) ? pickWeighted(recs, random)
+      : recs.some(r => r.failover) ? (recs.find(r => r.failover === 'PRIMARY' && r.healthy !== false) ?? recs.find(r => r.failover === 'SECONDARY')!)
+      : recs[0]
+    if (!chosen.alias) return { ips: chosen.values ?? [], cnames }
+    current = chosen.alias
+  }
+  throw new Error('查太多次')
+}
+</script>
+  <script type="wrong">
+type Rec = { name: string, type: 'A' | 'CNAME', values?: string[], alias?: string, setId?: string, weight?: number, failover?: 'PRIMARY' | 'SECONDARY', healthy?: boolean }
+type Zone = { apex: string, records: Rec[], aws: Record<string, string[]> }
+type Answer = { ips: string[], cnames: string[] }
+// 權重 0 的記錄也排進那條線：用 <= 比較，亂數 0 時會選到它
+function pickWeighted(recs: Rec[], random: () => number): Rec {
+  const total = recs.reduce((s, r) => s + (r.weight ?? 0), 0)
+  if (!total) return recs[Math.floor(random() * recs.length)]
+  let point = random() * total
+  for (const r of recs) { if (point <= r.weight!) return r; point -= r.weight! }
+  return recs[recs.length - 1]
+}
+function resolve(zone: Zone, name: string, random: () => number): Answer {
+  if (zone.records.some(r => r.name === zone.apex && r.type === 'CNAME')) throw new Error('apex 不能用 CNAME')
+  const cnames: string[] = []
+  let current = name
+  for (let step = 0; step < 8; step++) {
+    if (zone.aws[current]) return { ips: zone.aws[current], cnames }
+    const recs = zone.records.filter(r => r.name === current)
+    if (!recs.length) return { ips: [], cnames }
+    const cname = recs.find(r => r.type === 'CNAME')
+    if (cname) { current = cname.values![0]; cnames.push(current); continue }
+    const chosen = recs.some(r => r.weight !== undefined) ? pickWeighted(recs, random)
+      : recs.some(r => r.failover) ? (recs.find(r => r.failover === 'PRIMARY' && r.healthy !== false) ?? recs.find(r => r.failover === 'SECONDARY')!)
+      : recs[0]
+    if (!chosen.alias) return { ips: chosen.values ?? [], cnames }
+    current = chosen.alias
+  }
+  throw new Error('查太多次')
+}
+</script>
+  <script type="wrong">
+type Rec = { name: string, type: 'A' | 'CNAME', values?: string[], alias?: string, setId?: string, weight?: number, failover?: 'PRIMARY' | 'SECONDARY', healthy?: boolean }
+type Zone = { apex: string, records: Rec[], aws: Record<string, string[]> }
+type Answer = { ips: string[], cnames: string[] }
+function pickWeighted(recs: Rec[], random: () => number): Rec {
+  const live = recs.filter(r => (r.weight ?? 0) > 0)
+  if (!live.length) return recs[Math.floor(random() * recs.length)]
+  let point = random() * live.reduce((s, r) => s + r.weight!, 0)
+  for (const r of live) { if (point < r.weight!) return r; point -= r.weight! }
+  return live[live.length - 1]
+}
+// failover 不看健康狀態，永遠回答 PRIMARY
+function resolve(zone: Zone, name: string, random: () => number): Answer {
+  if (zone.records.some(r => r.name === zone.apex && r.type === 'CNAME')) throw new Error('apex 不能用 CNAME')
+  const cnames: string[] = []
+  let current = name
+  for (let step = 0; step < 8; step++) {
+    if (zone.aws[current]) return { ips: zone.aws[current], cnames }
+    const recs = zone.records.filter(r => r.name === current)
+    if (!recs.length) return { ips: [], cnames }
+    const cname = recs.find(r => r.type === 'CNAME')
+    if (cname) { current = cname.values![0]; cnames.push(current); continue }
+    const chosen = recs.some(r => r.weight !== undefined) ? pickWeighted(recs, random)
+      : recs.find(r => r.failover === 'PRIMARY') ?? recs[0]
+    if (!chosen.alias) return { ips: chosen.values ?? [], cnames }
+    current = chosen.alias
+  }
+  throw new Error('查太多次')
+}
+</script>
+  <script type="wrong">
+type Rec = { name: string, type: 'A' | 'CNAME', values?: string[], alias?: string, setId?: string, weight?: number, failover?: 'PRIMARY' | 'SECONDARY', healthy?: boolean }
+type Zone = { apex: string, records: Rec[], aws: Record<string, string[]> }
+type Answer = { ips: string[], cnames: string[] }
+function pickWeighted(recs: Rec[], random: () => number): Rec {
+  const live = recs.filter(r => (r.weight ?? 0) > 0)
+  if (!live.length) return recs[Math.floor(random() * recs.length)]
+  let point = random() * live.reduce((s, r) => s + r.weight!, 0)
+  for (const r of live) { if (point < r.weight!) return r; point -= r.weight! }
+  return live[live.length - 1]
+}
+// 把 alias 當成 CNAME：目標也記進 cnames
+function resolve(zone: Zone, name: string, random: () => number): Answer {
+  if (zone.records.some(r => r.name === zone.apex && r.type === 'CNAME')) throw new Error('apex 不能用 CNAME')
+  const cnames: string[] = []
+  let current = name
+  for (let step = 0; step < 8; step++) {
+    if (zone.aws[current]) return { ips: zone.aws[current], cnames }
+    const recs = zone.records.filter(r => r.name === current)
+    if (!recs.length) return { ips: [], cnames }
+    const cname = recs.find(r => r.type === 'CNAME')
+    if (cname) { current = cname.values![0]; cnames.push(current); continue }
+    const chosen = recs.some(r => r.weight !== undefined) ? pickWeighted(recs, random)
+      : recs.some(r => r.failover) ? (recs.find(r => r.failover === 'PRIMARY' && r.healthy !== false) ?? recs.find(r => r.failover === 'SECONDARY')!)
+      : recs[0]
+    if (!chosen.alias) return { ips: chosen.values ?? [], cnames }
+    current = chosen.alias
+    cnames.push(current)
+  }
+  throw new Error('查太多次')
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：寫 <code>wildcard(pattern, value, ignoreCase)</code> 與 <code>matchListener(rules, fallback, req)</code>，模擬 ALB 的 listener 規則。<code>wildcard</code>：<code>*</code> 是任意多個字元、<code>?</code> 是一個字元，其他字元都照字面比對（包括 <code>.</code>），要整個字串相符。<code>matchListener</code>：規則依 <code>priority</code> 由小到大比對，第一條符合的回傳它的 <code>then</code>，都不符合回傳 <code>fallback</code>。一條規則符合的條件是 <code>if</code> 裡每一種有寫的條件都符合，同一種條件的多個值任一個符合即可：</p>
+  <ul>
+    <li><code>host</code>：比對 <code>req.host</code>，不分大小寫。</li>
+    <li><code>path</code>：比對路徑，<code>req.path</code> 裡 <code>?</code> 之後的 query string 不算，分大小寫。</li>
+    <li><code>method</code>：跟 <code>req.method</code> 完全相同（分大小寫，不支援萬用字元）。</li>
+  </ul>
+  <script type="start">
+type Cond = { host?: string[], path?: string[], method?: string[] }
+type Action = { type: 'forward', target: string } | { type: 'redirect', to: string } | { type: 'fixed', status: number }
+type Rule = { priority: number, if: Cond, then: Action }
+type Req = { host: string, path: string, method: string }
+
+function wildcard(pattern: string, value: string, ignoreCase: boolean): boolean {
+  return false
+}
+
+function matchListener(rules: Rule[], fallback: Action, req: Req): Action {
+  return fallback
+}
+
+const rules: Rule[] = [
+  { priority: 20, if: { host: ['*.cafe.example.com'] }, then: { type: 'forward', target: 'tg-web' } },
+  { priority: 10, if: { host: ['api.cafe.example.com'], path: ['/v1/*'] }, then: { type: 'forward', target: 'tg-api' } },
+]
+console.log(matchListener(rules, { type: 'fixed', status: 404 }, { host: 'api.cafe.example.com', path: '/v1/menu', method: 'GET' }))
+</script>
+  <script type="answer">
+type Cond = { host?: string[], path?: string[], method?: string[] }
+type Action = { type: 'forward', target: string } | { type: 'redirect', to: string } | { type: 'fixed', status: number }
+type Rule = { priority: number, if: Cond, then: Action }
+type Req = { host: string, path: string, method: string }
+
+function wildcard(pattern: string, value: string, ignoreCase: boolean): boolean {
+  const source = [...pattern].map(c => c === '*' ? '.*' : c === '?' ? '.' : c.replace(/[.+^${}()|[\]\\/]/g, '\\$&')).join('')
+  return new RegExp(`^${source}$`, ignoreCase ? 'i' : '').test(value)
+}
+
+function matchListener(rules: Rule[], fallback: Action, req: Req): Action {
+  const path = req.path.split('?')[0]
+  const hit = (rule: Rule) =>
+    (!rule.if.host || rule.if.host.some(h => wildcard(h, req.host, true)))
+    && (!rule.if.path || rule.if.path.some(p => wildcard(p, path, false)))
+    && (!rule.if.method || rule.if.method.includes(req.method))
+  return [...rules].sort((a, b) => a.priority - b.priority).find(hit)?.then ?? fallback
+}
+
+const rules: Rule[] = [
+  { priority: 20, if: { host: ['*.cafe.example.com'] }, then: { type: 'forward', target: 'tg-web' } },
+  { priority: 10, if: { host: ['api.cafe.example.com'], path: ['/v1/*'] }, then: { type: 'forward', target: 'tg-api' } },
+]
+console.log(matchListener(rules, { type: 'fixed', status: 404 }, { host: 'api.cafe.example.com', path: '/v1/menu', method: 'GET' }))
+</script>
+  <script type="tests">
+const fwd = (target: string): Action => ({ type: 'forward', target })
+const notFound: Action = { type: 'fixed', status: 404 }
+const rs: Rule[] = [
+  { priority: 20, if: { host: ['*.cafe.example.com'] }, then: fwd('tg-web') },
+  { priority: 10, if: { host: ['api.cafe.example.com'], path: ['/v1/*'] }, then: fwd('tg-api-v1') },
+  { priority: 5, if: { path: ['/health'] }, then: { type: 'fixed', status: 200 } },
+  { priority: 1, if: { host: ['old.cafe.example.com', 'legacy.cafe.example.com'] }, then: { type: 'redirect', to: 'https://cafe.example.com/' } },
+  { priority: 8, if: { host: ['api.cafe.example.com'], path: ['/orders'], method: ['POST'] }, then: fwd('tg-orders-write') },
+  { priority: 12, if: { path: ['/img/?.png'] }, then: fwd('tg-img') },
+]
+const req = (host: string, path: string, method = 'GET'): Req => ({ host, path, method })
+assert.deepEqual(matchListener(rs, notFound, req('api.cafe.example.com', '/v1/menu')), fwd('tg-api-v1'),
+  'priority 10 與 20 都符合，數字小的先：陣列順序不算')
+assert.deepEqual(matchListener(rs, notFound, req('API.Cafe.Example.com', '/v1/menu')), fwd('tg-api-v1'), 'host 不分大小寫')
+assert.deepEqual(matchListener(rs, notFound, req('api.cafe.example.com', '/V1/menu')), fwd('tg-web'), 'path 分大小寫：/V1/menu 不符合 /v1/*，落到 priority 20')
+assert.deepEqual(matchListener(rs, notFound, req('api.cafe.example.com', '/v1/menu?lang=en')), fwd('tg-api-v1'), 'path 不含 query string')
+assert.deepEqual(matchListener(rs, notFound, req('cafe.example.com', '/health?from=alb')), { type: 'fixed', status: 200 }, 'path 不含 query string：/health?from=alb 的路徑是 /health')
+assert.deepEqual(matchListener(rs, notFound, req('legacy.cafe.example.com', '/v1/menu')), { type: 'redirect', to: 'https://cafe.example.com/' }, '同一個條件的多個值任一個符合即可')
+assert.deepEqual(matchListener(rs, notFound, req('shop.cafe.example.com', '/health')), { type: 'fixed', status: 200 }, 'priority 5 的 /health 沒有 host 條件，任何 host 都符合')
+assert.deepEqual(matchListener(rs, notFound, req('cafe.example.com', '/')), notFound, '*.cafe.example.com 不符合 cafe.example.com 本身：用預設動作')
+assert.deepEqual(matchListener(rs, notFound, req('api.cafe.example.com', '/orders', 'POST')), fwd('tg-orders-write'), 'host、path、method 三個條件都符合')
+assert.deepEqual(matchListener(rs, notFound, req('api.cafe.example.com', '/orders', 'GET')), fwd('tg-web'), 'method 不符合：同一條規則的條件要全部符合')
+assert.deepEqual(matchListener(rs, notFound, req('api.cafe.example.com', '/orders', 'post')), fwd('tg-web'), 'method 分大小寫')
+assert.deepEqual(matchListener(rs, notFound, req('cafe.example.com', '/img/a.png')), fwd('tg-img'), '? 是剛好一個字元')
+assert.deepEqual(matchListener(rs, notFound, req('cafe.example.com', '/img/ab.png')), notFound, '? 只能一個字元')
+assert.deepEqual(matchListener(rs, notFound, req('cafe.example.com', '/img/a-png')), notFound, '. 是字面上的點，不是正規表示式的任意字元')
+assert.equal(wildcard('/v1/*', '/v1/', false), true, '* 可以是零個字元')
+</script>
+  <script type="wrong">
+type Cond = { host?: string[], path?: string[], method?: string[] }
+type Action = { type: 'forward', target: string } | { type: 'redirect', to: string } | { type: 'fixed', status: number }
+type Rule = { priority: number, if: Cond, then: Action }
+type Req = { host: string, path: string, method: string }
+function wildcard(pattern: string, value: string, ignoreCase: boolean): boolean {
+  const source = [...pattern].map(c => c === '*' ? '.*' : c === '?' ? '.' : c.replace(/[.+^${}()|[\]\\/]/g, '\\$&')).join('')
+  return new RegExp(`^${source}$`, ignoreCase ? 'i' : '').test(value)
+}
+// 依陣列順序比對，沒有排 priority
+function matchListener(rules: Rule[], fallback: Action, req: Req): Action {
+  const path = req.path.split('?')[0]
+  const hit = (rule: Rule) =>
+    (!rule.if.host || rule.if.host.some(h => wildcard(h, req.host, true)))
+    && (!rule.if.path || rule.if.path.some(p => wildcard(p, path, false)))
+    && (!rule.if.method || rule.if.method.includes(req.method))
+  return rules.find(hit)?.then ?? fallback
+}
+</script>
+  <script type="wrong">
+type Cond = { host?: string[], path?: string[], method?: string[] }
+type Action = { type: 'forward', target: string } | { type: 'redirect', to: string } | { type: 'fixed', status: number }
+type Rule = { priority: number, if: Cond, then: Action }
+type Req = { host: string, path: string, method: string }
+// 把 pattern 直接當正規表示式
+function wildcard(pattern: string, value: string, ignoreCase: boolean): boolean {
+  return new RegExp(`^${pattern}$`, ignoreCase ? 'i' : '').test(value)
+}
+function matchListener(rules: Rule[], fallback: Action, req: Req): Action {
+  const path = req.path.split('?')[0]
+  const hit = (rule: Rule) =>
+    (!rule.if.host || rule.if.host.some(h => wildcard(h, req.host, true)))
+    && (!rule.if.path || rule.if.path.some(p => wildcard(p, path, false)))
+    && (!rule.if.method || rule.if.method.includes(req.method))
+  return [...rules].sort((a, b) => a.priority - b.priority).find(hit)?.then ?? fallback
+}
+</script>
+  <script type="wrong">
+type Cond = { host?: string[], path?: string[], method?: string[] }
+type Action = { type: 'forward', target: string } | { type: 'redirect', to: string } | { type: 'fixed', status: number }
+type Rule = { priority: number, if: Cond, then: Action }
+type Req = { host: string, path: string, method: string }
+function wildcard(pattern: string, value: string, ignoreCase: boolean): boolean {
+  const source = [...pattern].map(c => c === '*' ? '.*' : c === '?' ? '.' : c.replace(/[.+^${}()|[\]\\/]/g, '\\$&')).join('')
+  return new RegExp(`^${source}$`, ignoreCase ? 'i' : '').test(value)
+}
+// host 分大小寫
+function matchListener(rules: Rule[], fallback: Action, req: Req): Action {
+  const path = req.path.split('?')[0]
+  const hit = (rule: Rule) =>
+    (!rule.if.host || rule.if.host.some(h => wildcard(h, req.host, false)))
+    && (!rule.if.path || rule.if.path.some(p => wildcard(p, path, false)))
+    && (!rule.if.method || rule.if.method.includes(req.method))
+  return [...rules].sort((a, b) => a.priority - b.priority).find(hit)?.then ?? fallback
+}
+</script>
+  <script type="wrong">
+type Cond = { host?: string[], path?: string[], method?: string[] }
+type Action = { type: 'forward', target: string } | { type: 'redirect', to: string } | { type: 'fixed', status: number }
+type Rule = { priority: number, if: Cond, then: Action }
+type Req = { host: string, path: string, method: string }
+function wildcard(pattern: string, value: string, ignoreCase: boolean): boolean {
+  const source = [...pattern].map(c => c === '*' ? '.*' : c === '?' ? '.' : c.replace(/[.+^${}()|[\]\\/]/g, '\\$&')).join('')
+  return new RegExp(`^${source}$`, ignoreCase ? 'i' : '').test(value)
+}
+// 沒有去掉 query string
+function matchListener(rules: Rule[], fallback: Action, req: Req): Action {
+  const hit = (rule: Rule) =>
+    (!rule.if.host || rule.if.host.some(h => wildcard(h, req.host, true)))
+    && (!rule.if.path || rule.if.path.some(p => wildcard(p, req.path, false)))
+    && (!rule.if.method || rule.if.method.includes(req.method))
+  return [...rules].sort((a, b) => a.priority - b.priority).find(hit)?.then ?? fallback
+}
+</script>
+</div>
+
+<div class="local" data-test="ex3" data-files="dns-cutover.ts">
+  <p>練習 3：完成 <code>dns-cutover.ts</code> 的兩個函式，把 <code>api.cafe-04.test</code> 的流量從 blue 慢慢切到 green。<code>ensureZone(r53, name)</code>：用 <code>ListHostedZonesByNameCommand({ DNSName: name })</code> 找名稱剛好是 <code>name + '.'</code> 的 hosted zone（Route 53 回傳的名稱結尾多一個點），有就回傳它的 <code>Id</code>，沒有才用 <code>CreateHostedZoneCommand</code> 建立（<code>CallerReference</code> 每次要不同）。<code>shiftTraffic(r53, zoneId, { name, blueIp, greenIp, greenWeight })</code>：只送<strong>一個</strong> <code>ChangeResourceRecordSetsCommand</code>，<code>ChangeBatch.Changes</code> 放兩筆 <code>UPSERT</code>：A 記錄、<code>SetIdentifier</code> 分別是 <code>'blue'</code> 與 <code>'green'</code>、權重分別是 <code>100 - greenWeight</code> 與 <code>greenWeight</code>、<code>TTL: 60</code>、<code>ResourceRecords: [{ Value: ip }]</code>。測試會呼叫 <code>ensureZone</code> 兩次確認沒有多建，切到 10%、再切到 100% 兩次，讀回記錄並檢查你送出的 change batch。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 4：咖啡店的 ALB 在東京，前面要加一個 CloudFront，網域都是 <code>cafe.example.com</code>。你在東京（<code>ap-northeast-1</code>）的 ACM 申請了憑證，掛到 ALB 沒問題，CloudFront 的設定畫面卻選不到它。為什麼？</p>
+  <label data-key="a">CloudFront 不支援 ACM 的憑證，要從別的 CA 買</label>
+  <label data-key="b">一張憑證只能掛在一個服務上，要先從 ALB 拿下來</label>
+  <label data-key="c">憑證還在等 DNS 驗證，驗證完才能掛到 CloudFront</label>
+  <label data-key="d">CloudFront 用的 ACM 憑證必須在 <code>us-east-1</code> 申請；東京的那張只給東京的 ALB 用</label>
+  <p class="why">✓ CloudFront 是全球服務，只讀 <code>us-east-1</code> 的 ACM 憑證；ALB 用的則要在 ALB 所在的 region。所以這個網站要申請兩張。c 錯在題目說憑證已經掛到 ALB，代表已經簽發；b 錯在一張 ACM 憑證可以給同一個 region 的多個服務使用。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：你把 <code>api.cafe.example.com</code> 的 A 記錄從舊 ALB 改到新 ALB，Route 53 顯示已經生效（INSYNC）。半小時後，仍有一部分顧客連到舊的。記錄原本的 TTL 是 3600。最可能的原因？</p>
+  <label data-key="a">Route 53 的變更要 24 小時才會傳到全世界</label>
+  <label data-key="b">那些顧客的 resolver 還在快取舊的答案，最多要等原本的 TTL（3600 秒）過完</label>
+  <label data-key="c">舊 ALB 還開著，DNS 會優先回答還活著的那個</label>
+  <label data-key="d">新 ALB 的健康檢查還沒通過，Route 53 暫時回答舊的</label>
+  <p class="why">✓ resolver 依 TTL 快取答案，改記錄之前已經查過的人，在 TTL 內不會再問。所以要切換的記錄要提前把 TTL 調低。a 是常見的說法，但 Route 53 本身的變更通常幾十秒內就同步到它所有的 name server，慢的是外面的快取。d 錯在一般的 simple 記錄沒有掛健康檢查。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：合作的金流商要求：「回呼你們的 webhook 時，我們的防火牆只能放行固定的 IP。」咖啡店的 API 目前在 ALB 後面。怎麼做？</p>
+  <label data-key="a">前面改用（或加一個）NLB，每個 AZ 掛一個 Elastic IP，把這些 IP 給對方</label>
+  <label data-key="b">查出 ALB 目前的 IP 給對方</label>
+  <label data-key="c">在 ALB 的規則加 <code>source-ip</code> 條件</label>
+  <label data-key="d">請對方改用 ALB 的 DNS 名稱設定防火牆</label>
+  <p class="why">✓ NLB 每個 AZ 有一個固定 IP，可以指定自己的 Elastic IP，適合對方只能用 IP 設定白名單的情況。b 是最危險的做法：ALB 的 IP 會隨擴展與維護改變，某天回呼就會失敗。c 管的是「誰能連進來」，題目要的是對方防火牆放行你的固定位址。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>apex 用 CNAME 指向 ALB 或 CloudFront</strong>：不合法。用 alias。</li>
+  <li><strong>把 ALB 的 IP 寫進 A 記錄</strong>：ALB 的 IP 會變。用 alias 指向 ALB。</li>
+  <li><strong>要切換時才調低 TTL</strong>：舊的 TTL 要先過完，調低要提前做。</li>
+  <li><strong>weighted 切換分兩次請求、或用 CREATE</strong>：中間比例不對；CREATE 在記錄已存在時失敗。同一個 change batch、用 UPSERT。</li>
+  <li><strong>同名的 hosted zone 建了兩個</strong>：只有註冊商指向的那個會生效，改另一個沒有用。建之前先找。</li>
+  <li><strong>刪掉 ACM 的驗證 CNAME</strong>：下次續約失敗，憑證過期。驗證記錄要一直留著，用 IaC 管。</li>
+  <li><strong>CloudFront 的憑證申請在 ALB 的 region</strong>：CloudFront 只看 <code>us-east-1</code>。</li>
+  <li><strong>ALB 規則以為照建立順序比對</strong>：依 priority，數字小的先；比較廣的規則（<code>/api*</code>）的 priority 要比特定的規則大。</li>
+  <li><strong>把 path-pattern 當正規表示式</strong>：它是萬用字元，<code>.</code> 是字面上的點；要正規表示式用另外的 <code>RegexValues</code>。</li>
+  <li><strong>SSE、WebSocket 每分鐘斷一次</strong>：ALB idle timeout 預設 60 秒，送心跳或調高。</li>
+  <li><strong>每次部署都 invalidate <code>/*</code></strong>：不即時，超過免費額度要錢。靜態檔名帶版本雜湊。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>請求的路：Route 53 回答位址 → ALB 用 ACM 憑證做 TLS → 依規則轉給 target group；靜態內容經過 CloudFront。</li>
+  <li>Route 53：hosted zone 的 NS 要設到註冊商；alias 指向 AWS 資源、可以放在 apex、不收查詢費；CNAME 不能放 apex。TTL 是快取時間，切換前提前調低。</li>
+  <li>routing policy：weighted（權重比例，0 不回答，除非全部是 0）、failover（搭配健康檢查）、latency。改記錄用 change batch，同一批一起生效，UPSERT 可以重複執行。</li>
+  <li>ACM：DNS 驗證，驗證記錄要一直留著；自動續約要「使用中」且驗證記錄查得到；匯入的憑證不會自動續約；CloudFront 的憑證要在 <code>us-east-1</code>。</li>
+  <li>ALB：listener → 依 priority（小的先）比對規則 → target group 健康檢查。host 不分大小寫、path 分大小寫且不含 query，萬用字元 <code>*</code>、<code>?</code>。要固定 IP 或非 HTTP 協定用 NLB。</li>
+  <li>CloudFront：cache key 越少命中率越高；invalidation 不即時、超過免費額度計費，部署靠檔名版本。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 7 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 7：cafe-api 在私有子網路，呼叫外部 API 逾時。你查了它的 route table，<code>0.0.0.0/0</code> 確實指向 <code>nat-0abc</code>，安全群組的出站也全開。下一步查什麼？</p>
+  <label data-key="a">cafe-api 的安全群組進站規則有沒有開回應的 port</label>
+  <label data-key="b">NAT gateway 的安全群組有沒有放行</label>
+  <label data-key="c">NAT 所在子網路的 route table 有沒有 <code>0.0.0.0/0 → internet gateway</code></label>
+  <label data-key="d">換一個 AZ 重新部署 cafe-api</label>
+  <p class="why">✓ NAT 只是第一層，它自己也要有路出去：NAT 必須在公有子網路，那裡的路由指向 internet gateway。NAT 被放進私有子網路時，第一層看起來完全正常。a 是最常見的錯誤：安全群組有狀態，回應自動放行。b 錯在 NAT gateway 本身不掛安全群組。（第 3 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 8：cafe-api 連 RDS 時 log 立刻出現 <code>ECONNREFUSED 10.20.20.5:5433</code>，不是等很久才失敗。這告訴你什麼？</p>
+  <label data-key="a">封包有到達對方主機，但那個 port 沒有程式在聽：先檢查連線設定的 port（PostgreSQL 預設 5432）</label>
+  <label data-key="b">db 的安全群組擋了 5433，要加一條進站規則</label>
+  <label data-key="c">NACL 擋住了回程，要開臨時 port</label>
+  <label data-key="d">RDS 正在切換 Multi-AZ，等一下就好</label>
+  <p class="why">✓ 被拒絕代表對方主機回了 RST：網路是通的，問題在目的地沒有程式聽那個 port。這裡多半是設定檔把 port 寫成 5433。b、c 是最多人會選的：安全群組與 NACL 擋下時是直接丟掉封包，你看到的會是逾時，不是被拒絕。（第 3 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 9：資安要求 db 的子網路改用自訂的 NACL：進站只允許來自 app 子網路的 5432、出站只允許到 app 子網路的 5432。套用後 cafe-api 連資料庫全部逾時。為什麼？</p>
+  <label data-key="a">NACL 的規則編號要從 1 開始，否則不會生效</label>
+  <label data-key="b">NACL 要先刪掉安全群組才能生效</label>
+  <label data-key="c">NACL 只能寫拒絕，允許要寫在安全群組</label>
+  <label data-key="d">NACL 無狀態：資料庫的回應要送到 cafe-api 的臨時 port，出站只開 5432 就把回應擋了</label>
+  <p class="why">✓ 回應封包的目的 port 是客戶端的臨時 port，不是 5432。NACL 不會記得「這是剛才那條連線的回應」，所以出站要開到 app 子網路的 1024–65535。c 剛好說反：NACL 可以寫允許與拒絕，安全群組才只能寫允許。（第 3 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 10：上個月替 S3 建了 gateway endpoint，這個月的 NAT 處理費只降了一半。cafe-api 跑在兩個 AZ。最可能的原因？</p>
+  <label data-key="a">gateway endpoint 只處理下載，上傳還是走 NAT</label>
+  <label data-key="b">endpoint 只掛到其中一個 AZ 的私有 route table，另一個 AZ 的 S3 流量還是走 NAT</label>
+  <label data-key="c">gateway endpoint 也有處理費，跟 NAT 差不多</label>
+  <label data-key="d">要再建一個 S3 的 interface endpoint 才會全部生效</label>
+  <p class="why">✓ gateway endpoint 是 route table 裡的一條路由，只有掛到的 route table 所屬的子網路會用它。兩個 AZ 各有一張私有 route table，就兩張都要掛。c 錯在 gateway endpoint 不收費；d 是多花錢的做法，從 VPC 內存取不需要 interface endpoint。（第 3 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 11：要讓 <code>cafe.example.com</code>（沒有 www）指向 ALB。哪個做法正確？</p>
+  <label data-key="a">建一筆 CNAME，值是 ALB 的 DNS 名稱</label>
+  <label data-key="b">查出 ALB 現在的兩個 IP，建一筆 A 記錄</label>
+  <label data-key="c">建一筆 A 類型的 alias 記錄，目標選這個 ALB</label>
+  <label data-key="d">在註冊商把網域的 NS 改成 ALB 的 DNS 名稱</label>
+  <p class="why">✓ zone 的頂端不能放 CNAME，alias 可以，而且直接回答 ALB 目前的 IP，指向 AWS 資源也不收查詢費。b 是最多人會做的：今天能用，ALB 的 IP 一變就整站掛掉。a 在 apex 不合法。（第 4 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 12：ACM 寄來通知：<code>api.cafe.example.com</code> 的憑證無法自動續約，30 天後到期。憑證是半年前用 DNS 驗證申請的，正掛在 ALB 上。先查什麼？</p>
+  <label data-key="a">ALB 的 listener 是不是還用 HTTPS:443</label>
+  <label data-key="b">zone 裡那筆 ACM 給的驗證 CNAME 還在不在</label>
+  <label data-key="c">信用卡是不是過期了，ACM 續約要付費</label>
+  <label data-key="d">憑證是不是在 us-east-1，其他 region 不會自動續約</label>
+  <p class="why">✓ 自動續約的條件是憑證使用中、而且每個網域的驗證 CNAME 在公開 DNS 查得到；題目說憑證掛在 ALB 上，剩下就是驗證記錄。這筆記錄名稱像亂碼，常被清理 DNS 的人刪掉。d 錯在 us-east-1 是 CloudFront 的要求，跟續約無關；c 錯在給 ALB 用的 ACM 公開憑證不收費。（第 4 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 13：ALB 的 HTTPS listener 有這兩條規則。上線後，所有 <code>/api/admin</code> 的請求都進到一般的 API，管理後台的 target group 一個請求都沒收到。哪裡錯了？</p>
+<pre>priority 100   path-pattern /api/*         → forward tg-api
+priority 200   path-pattern /api/admin/*   → forward tg-admin</pre>
+  <label data-key="a">priority 小的先比對：<code>/api/*</code> 已經涵蓋 <code>/api/admin/…</code>，比較特定的規則要給比較小的 priority</label>
+  <label data-key="b">path-pattern 不支援兩層路徑，要改用正規表示式</label>
+  <label data-key="c">同一個 listener 只能有一條 path-pattern 規則</label>
+  <label data-key="d">ALB 會挑最長相符的路徑，這兩條規則應該能正常運作，是 target group 的健康檢查沒過</label>
+  <p class="why">✓ ALB 依 priority 由小到大比對，第一條符合就停，不會挑「最具體」的。把 admin 那條改成比 100 小的 priority。d 是最多人會選的：最長相符是 route table 的規則（第 3 課），ALB 規則不是這樣算。（第 4 課）</p>
+</div>
+
+<p>這個階段的重點整理成<a href="../sheets/stage-2.html">一頁圖解</a>。</p>
+<p>下一課進入運算：把 cafe-api 的容器放上 ECS Fargate，分清楚 task role 與 execution role，並處理 task 一直停掉的常見原因。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

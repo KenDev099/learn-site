@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>9. gRPC 服務：unary、串流、deadline 與狀態碼</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="9" data-practice="api-styles">
+<header>
+  <div class="eyebrow">階段 4：gRPC 與 Protobuf · 第 9 課</div>
+  <h1>gRPC 服務：unary、串流、deadline 與狀態碼</h1>
+</header>
+<main>
+
+<p>上一課用 protobuf 定義了庫存的訊息。這一課讓它真的跑起來：訂單服務下單前要問庫存服務「拿鐵還有幾杯」「幫我保留 2 杯」，店內看板要即時看到庫存變化。這些是服務之間的同步呼叫，咖啡店選了 gRPC（第 1 課的決策表）。</p>
+<p>寫出能回應的伺服器不難，難的是出事時的行為：庫存服務卡住時，訂單服務要等多久？使用者已經放棄了，庫存服務還在查資料庫嗎？錯誤要回什麼，呼叫端才知道該不該重試？</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>定義服務與 Connect-ES：四種 RPC 各適合什麼情境，寫出庫存服務的伺服器與 client（開場問題的最小答案）。</li>
+  <li>狀態碼：庫存不足、服務重啟各回哪個碼，呼叫端的重試機制靠它決定要不要重試。</li>
+  <li>deadline 與取消傳遞：訂單服務最多等多久，使用者放棄後怎麼讓庫存服務的查詢也停下來。</li>
+  <li>串流：店內看板即時看到庫存變化，client 斷線時怎麼把監聽清乾淨。</li>
+  <li>metadata、interceptor 與互通：request id、憑證這種每個呼叫都要帶的資訊放哪，出問題時怎麼用 buf curl、grpc-js 除錯。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="08-protobuf-codegen.html">第 8 課</a>的 protobuf：在 <code>.proto</code> 寫訊息，<code>buf generate</code> 產生 TypeScript 程式碼；proto3 不送等於預設值的欄位。</li>
+  <li><a href="../../system-design/lessons/08-timeouts-retries-backoff.html">系統設計課第 8 課</a>的逾時與重試：每個呼叫都要有逾時，重試要退避加隨機；deadline 是整條呼叫鏈共用的時間預算。</li>
+  <li><a href="../../typescript/lessons/11-timeouts-cancellation.html">TypeScript 課第 11 課</a>的 <code>AbortSignal</code>：<code>AbortController</code> 發出取消，把 <code>signal</code> 交給 <code>fetch</code> 這類函式，它們收到 abort 就停下並丟錯。</li>
+  <li><a href="../../typescript/lessons/10-iterators-generators.html">TypeScript 課第 10 課</a>的 async generator：<code>async function*</code> 每 <code>yield</code> 一次交出一個值，呼叫端用 <code>for await</code> 一個一個拿。</li>
+</ul></div>
+
+<h2>定義服務：四種 RPC</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs api-styles 09</code>，會建立 <code>api-styles/practice/work/09/</code>（還沒安裝套件的話，先照<a href="02-graphql-schema-queries.html">第 2 課</a>開頭的步驟 <code>npm install</code>），並先執行 <code>buf generate</code> 產生 <code>gen/</code>（每次跑測試前都會重產，改了 .proto 不用自己記得）。這一課的契約在 <code>proto/coffee/inventory/v1/inventory.proto</code>。上一課只有 message，這一課多了 <code>service</code>：</p>
+<pre>service InventoryService {
+  rpc GetStock(GetStockRequest) returns (GetStockResponse);          // unary
+  rpc Reserve(ReserveRequest) returns (ReserveResponse);             // unary
+  rpc WatchStock(WatchStockRequest) returns (stream WatchStockResponse);  // server streaming
+  rpc Restock(stream RestockRequest) returns (RestockResponse);      // client streaming
+}</pre>
+<p><strong>service</strong> 是一組方法，每個方法叫一個 <strong>RPC</strong>（remote procedure call，遠端程序呼叫）：呼叫端寫起來像呼叫本機函式，實際上請求經過網路送到另一個程序。<code>stream</code> 寫在哪一邊，決定了 RPC 的種類：</p>
+<div class="table-wrap"><table>
+  <tr><th>種類</th><th>寫法</th><th>意思</th><th>咖啡店的例子</th></tr>
+  <tr><td>unary</td><td><code>(A) returns (B)</code></td><td>一個請求、一個回應，最常見</td><td>查庫存、保留庫存</td></tr>
+  <tr><td>server streaming</td><td><code>(A) returns (stream B)</code></td><td>一個請求，伺服器陸續送多個回應</td><td>店內看板訂閱拿鐵的庫存變化</td></tr>
+  <tr><td>client streaming</td><td><code>(stream A) returns (B)</code></td><td>客戶端陸續送多個請求，伺服器最後回一個</td><td>倉庫掃描進貨，一箱送一筆，最後回總數</td></tr>
+  <tr><td>bidirectional streaming</td><td><code>(stream A) returns (stream B)</code></td><td>雙方同時陸續送，互不等待</td><td>POS 與庫存服務即時同步（少用）</td></tr>
+</table></div>
+<p>預設用 unary。串流適合「資料本來就是陸續產生的」情況；用串流傳一個大清單，通常不如分頁的 unary 好維護。另外注意命名：<code>buf lint</code> 的 STANDARD 規則要求每個 RPC 有自己的 <code>XxxRequest</code>／<code>XxxResponse</code>，所以串流回的是 <code>WatchStockResponse</code>，不是直接回 <code>StockLevel</code>。這樣之後要在串流訊息加欄位（例如變動原因），不會影響別的 RPC。</p>
+<p><code>buf generate</code> 除了 message，還會在 <code>gen/coffee/inventory/v1/inventory_pb.js</code> 產生 <code>InventoryService</code>：一個描述物件（descriptor），列出每個方法的名稱、種類、請求與回應的 schema。伺服器和 client 都拿它當輸入，型別也從它推出來。</p>
+
+<h2>伺服器與 client：Connect-ES</h2>
+<p>本課用 <strong>Connect</strong>（Buf 公司的 RPC 框架，JS 版叫 Connect-ES，本課用 <code>@connectrpc/connect</code> 與 <code>@connectrpc/connect-node</code> 2.3.0）。同一個 Connect 伺服器同時接受三種協定：gRPC、gRPC-Web 和 Connect 自己的協定（第 11 課會用到後兩種）。這一課只用 gRPC。</p>
+<pre>// server.ts（練習 1 的骨架）
+import { Code, ConnectError, type ConnectRouter } from '@connectrpc/connect'
+import { InventoryService } from './gen/coffee/inventory/v1/inventory_pb.js'
+
+export function inventoryRoutes(stock: Map&lt;string, number&gt;) {
+  return (router: ConnectRouter) =&gt; {
+    router.service(InventoryService, {
+      async getStock(req, ctx) {
+        // req.productIds 是 string[]；回傳的物件形狀要符合 GetStockResponse
+        return { levels: { '2': { productId: '2', available: stock.get('2') ?? 0 } } }
+      },
+      async reserve(req) { … },
+    })
+  }
+}
+
+// 開伺服器
+import http2 from 'node:http2'
+import { connectNodeAdapter } from '@connectrpc/connect-node'
+http2.createServer(connectNodeAdapter({ routes: inventoryRoutes(stock) })).listen(4000)</pre>
+<ul>
+  <li><code>router.service(描述, 實作)</code>：實作是一個物件，方法名稱是 proto 的 RPC 名稱改成小寫開頭（<code>GetStock</code> → <code>getStock</code>）。沒實作的方法，呼叫時會收到 <code>UNIMPLEMENTED</code>。</li>
+  <li>每個方法收到 <code>req</code>（已解碼的請求訊息，欄位名是 lowerCamelCase）和 <code>ctx</code>（這次呼叫的資訊，後面會用到 <code>signal</code>、<code>timeoutMs()</code>、<code>requestHeader</code>）。回傳普通物件就好，Connect 會依 schema 編碼。</li>
+  <li><code>connectNodeAdapter</code> 把路由變成 Node 的請求處理函式。用 <code>http2.createServer</code> 是因為 gRPC 規定跑在 <strong>HTTP/2</strong> 上：一條 TCP 連線可以同時跑很多個請求（多工，multiplexing），串流也靠它。gRPC 的結果狀態放在回應最後的 trailers（標頭的一種，在 body 之後才送），這也是瀏覽器不能直接呼叫原生 gRPC 的原因（第 11 課）。</li>
+</ul>
+<p>client 端：</p>
+<pre>import { createClient } from '@connectrpc/connect'
+import { createGrpcTransport } from '@connectrpc/connect-node'
+
+const transport = createGrpcTransport({ baseUrl: 'http://localhost:4000' })   // http:// = 不加密的 HTTP/2
+const client = createClient(InventoryService, transport)
+const res = await client.getStock({ productIds: ['1', '2'] })                  // 有型別：res.levels['1'].available</pre>
+<p><strong>transport</strong> 決定用哪個協定、怎麼連線；<code>createGrpcTransport</code> 用 gRPC 協定，一律走 HTTP/2（Connect v2 移除了 <code>httpVersion</code> 選項）。換成 <code>createConnectTransport</code>，同一個 client 就改用 Connect 協定，呼叫的程式不用改。在 <code>work/09</code> 執行 <code>node examples/tour.ts</code>，它在同一個程序裡開伺服器和 client，依序示範這一課的每一種呼叫。前兩段：</p>
+<pre>1. unary
+  [伺服器] getStock 協定=grpc x-request-id=tour-1 剩餘=998
+   1:12 2:5
+2. 錯誤是 ConnectError，帶狀態碼
+  [伺服器] getStock 協定=grpc x-request-id=tour-2 剩餘=沒有 deadline
+   code=5（NotFound） message=找不到商品 99</pre>
+<p>開場的三個問題，最小的答案在這裡：訂單服務要等多久，由它呼叫時設的 deadline 決定，gRPC 預設不設就會一直等；deadline 到了，取消會傳到庫存服務，它要把 signal 交給資料庫查詢，查詢才會停；錯誤用 gRPC 狀態碼表示，呼叫端依碼決定要不要重試。細節在後面的〈狀態碼〉與〈deadline 與取消傳遞〉。</p>
+
+<h2>狀態碼：選對碼，呼叫端才知道要不要重試</h2>
+<p>gRPC 不用 HTTP 狀態碼表示結果。成功或失敗都是 HTTP 200，真正的結果是 trailers 裡的 <strong>gRPC 狀態碼</strong>：一共 17 個，從 <code>OK = 0</code> 到 <code>UNAUTHENTICATED = 16</code>（grpc.io 的 Status codes 文件）。在 Connect 裡丟 <code>new ConnectError(訊息, Code.X)</code>，client 收到的也是 <code>ConnectError</code>，讀 <code>err.code</code>。handler 丟出不是 <code>ConnectError</code> 的錯誤（一般的 <code>Error</code>、<code>TypeError</code>），呼叫端會收到 <code>INTERNAL</code> 或 <code>UNKNOWN</code>，它沒辦法判斷該怎麼處理。</p>
+<div class="table-wrap"><table>
+  <tr><th>狀態碼（數字）</th><th>什麼時候用</th><th>呼叫端可以重試嗎</th></tr>
+  <tr><td><code>INVALID_ARGUMENT</code>（3）</td><td>請求本身不對，跟系統狀態無關：空的 id 清單、數量 0</td><td>不行，改請求才有用</td></tr>
+  <tr><td><code>NOT_FOUND</code>（5）</td><td>要的東西不存在：商品 99</td><td>不行</td></tr>
+  <tr><td><code>FAILED_PRECONDITION</code>（9）</td><td>系統目前的狀態不允許：庫存不夠</td><td>狀態改變前不行</td></tr>
+  <tr><td><code>ABORTED</code>（10）</td><td>併發衝突，例如交易被中止</td><td>從更高一層重做（重新讀、再寫）</td></tr>
+  <tr><td><code>RESOURCE_EXHAUSTED</code>（8）</td><td>配額用完、被限流</td><td>等一段時間再試</td></tr>
+  <tr><td><code>UNAVAILABLE</code>（14）</td><td>服務暫時連不上、正在重啟</td><td>可以，退避後重試（非冪等操作仍要小心）</td></tr>
+  <tr><td><code>DEADLINE_EXCEEDED</code>（4）</td><td>期限到了還沒完成</td><td>要看操作是否冪等，下一節說明</td></tr>
+  <tr><td><code>PERMISSION_DENIED</code>（7）／<code>UNAUTHENTICATED</code>（16）</td><td>沒有權限／沒有或無效的憑證</td><td>不行</td></tr>
+  <tr><td><code>INTERNAL</code>（13）</td><td>伺服器的 bug、違反了不該違反的條件</td><td>通常不行，要有人去查</td></tr>
+</table></div>
+<p>grpc.io 文件給的分法：呼叫端可以只重試這一個呼叫 → <code>UNAVAILABLE</code>；要從更高一層重做 → <code>ABORTED</code>；系統狀態被修正之前都不該重試 → <code>FAILED_PRECONDITION</code>。所以庫存不足不能回 <code>UNAVAILABLE</code>：呼叫端的重試機制會不停重送。</p>
+<p>「庫存不足」也可以不當錯誤，改在回應裡放一個欄位（例如 <code>ReserveResponse</code> 加 <code>oneof result</code>）。取捨跟<a href="03-resolvers-mutations.html">第 3 課</a> GraphQL 的 union 一樣：呼叫端<strong>一定要處理</strong>的業務結果，放回應裡比較不會被漏掉；呼叫端通常只是失敗的，用狀態碼。這一課用狀態碼。</p>
+<div class="callout practice"><strong>💡 實務上：每個 RPC 會回哪些狀態碼，要寫進契約</strong><br>訂單服務的工程師要寫重試與錯誤畫面，得先知道 <code>Reserve</code> 可能回什麼。常見做法是在 .proto 的 RPC 上方用註解列出「哪種情況回哪個碼」，這份註解會跟著 <code>buf generate</code> 出現在產生的程式碼裡，呼叫端在編輯器就看得到。監控也依狀態碼分開看：gRPC 失敗時 HTTP 仍是 200，只看 HTTP 5xx 的儀表板會漏掉；<code>INTERNAL</code>、<code>UNKNOWN</code> 拿來告警（代表有 bug），<code>NOT_FOUND</code>、<code>FAILED_PRECONDITION</code> 是正常業務結果，只看趨勢。之後把某個情況改回別的狀態碼，對呼叫端來說就是破壞性變更，要跟改欄位一樣先通知。</div>
+<p>保留庫存要先檢查、再扣，失敗時庫存不能變。在單一個 Node 程序裡，只要檢查和扣之間沒有 <code>await</code>，別的請求就插不進來。換成資料庫時，兩個請求會同時通過檢查，要改成一句有條件的 UPDATE（<code>… SET available = available - $1 WHERE id = $2 AND available &gt;= $1</code>）或交易（<a href="../../postgresql/lessons/18-transactions.html">PostgreSQL 課第 18 課</a>）。</p>
+
+<h2>deadline 與取消傳遞</h2>
+<p><strong>deadline</strong> 是「這次呼叫最晚必須完成的時間點」。gRPC 預設<strong>沒有</strong> deadline（grpc.io 的 Deadlines 文件）：沒設的話，下游卡住時，呼叫端就一直等。在 Connect 的 client 用 <code>timeoutMs</code> 設：</p>
+<pre>await client.getStock({ productIds: ['2'] }, { timeoutMs: 300 })   // 300 ms 內沒完成就丟 DEADLINE_EXCEEDED</pre>
+<p>client 會把它放進請求的 <code>grpc-timeout</code> 標頭（例如 <code>300m</code>，m 是毫秒）。送的是相對的「還剩多久」而不是絕對時間，兩台機器的時鐘不準也沒關係。伺服器這邊：</p>
+<ul>
+  <li><code>ctx.timeoutMs()</code>：還剩幾毫秒；client 沒設 deadline 時是 <code>undefined</code>。</li>
+  <li><code>ctx.signal</code>：一個 <code>AbortSignal</code>。deadline 到、client 取消、或這次 RPC 結束時都會 abort。</li>
+</ul>
+<p>只設 deadline 還不夠。client 時間到就放棄了，但伺服器如果沒有把 <code>ctx.signal</code> 交給資料庫查詢和下游呼叫，那些工作會繼續跑完，結果沒人要。這就是<strong>取消傳遞</strong>（cancellation propagation）：上游放棄後，下游的工作也跟著停。尖峰時最需要它，沒人要的查詢還佔著資料庫連線，會讓更多請求逾時。</p>
+<pre>async getStock(req, ctx) {
+  const left = ctx.timeoutMs()
+  if (left !== undefined &amp;&amp; left &lt; 20) {                          // 剩這麼一點，開始查也來不及
+    throw new ConnectError(`剩 ${left} ms`, Code.DeadlineExceeded)
+  }
+  const rows = await repo.fetchLevels(req.productIds, ctx.signal)  // 把 signal 交給下游
+  …
+}</pre>
+<p>下游收到 signal abort 時應該以 <code>signal.reason</code> 失敗。讓這個錯誤原樣往外丟，不要 <code>catch</code> 之後包成 <code>INTERNAL</code>：伺服器回給呼叫端的狀態碼，就是 handler 最後丟出的錯誤。tour 的第 5 段，client 只等 200 ms，伺服器的假下游一直等到 signal abort：</p>
+<pre>5. deadline：client 只等 200 ms
+  [伺服器] getStock 協定=grpc x-request-id=tour-5 剩餘=199
+   DeadlineExceeded，等了約 200 ms
+  [伺服器] signal abort 了，原因：ConnectError: [deadline_exceeded] the operation timed out</pre>
+<p>多跑幾次，最後一行有時會是 <code>http/2 stream closed with error code INTERNAL_ERROR</code>：client 和伺服器各有一個計時器，client 先放棄時會關掉這個 HTTP/2 stream，伺服器就以「連線被關」為原因 abort。兩種情況 <code>ctx.signal</code> 都會 abort，這正是要用它而不是自己計時的原因。</p>
+
+<figure>
+  <svg viewBox="0 0 700 230" role="img" aria-label="deadline 預算：App 給 BFF 300 毫秒，BFF 用掉 120 毫秒，呼叫庫存服務時只剩 180 毫秒">
+    <defs><marker id="a9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="20" y="20" width="660" height="40" rx="6"/>
+    <text class="d-text" x="350" y="45" text-anchor="middle">App → 訂單服務：整個請求的預算 300 ms</text>
+    <rect class="d-box" x="20" y="90" width="264" height="40" rx="6"/>
+    <text class="d-text" x="152" y="115" text-anchor="middle">訂單服務自己用掉 120 ms</text>
+    <rect class="d-box" x="284" y="90" width="396" height="40" rx="6"/>
+    <text class="d-text" x="482" y="115" text-anchor="middle">呼叫庫存服務：timeoutMs = 剩下的 180 ms</text>
+    <line class="d-line" x1="482" y1="130" x2="482" y2="168" marker-end="url(#a9)"/>
+    <rect class="d-box" x="284" y="170" width="396" height="40" rx="6"/>
+    <text class="d-text" x="482" y="195" text-anchor="middle">庫存服務：ctx.timeoutMs() ≈ 180，ctx.signal 交給資料庫</text>
+    <text class="d-small" x="20" y="165">每一層各自給固定 300 ms：</text>
+    <text class="d-small" x="20" y="183">App 早就放棄，下游還在做白工</text>
+    <text class="d-accent" x="20" y="205">deadline 是整條呼叫鏈共用的預算</text>
+  </svg>
+  <figcaption>deadline 往下傳的是「剩多少」，每多一層就少一點（系統設計課第 8 課的預算觀念）。</figcaption>
+</figure>
+<p>從上游收到請求的服務，呼叫下游時用<strong>剩下的時間</strong>當 deadline：<code>ctx.timeoutMs()</code> 減掉自己處理回應需要的時間，不是每層各訂一個固定值。剩下太少就直接回 <code>DEADLINE_EXCEEDED</code>，不浪費下游的資源。</p>
+<div class="callout practice"><strong>💡 實務上：deadline 從使用者願意等多久往回推，並設一個上限保底</strong><br>先問 PM：App 按下「結帳」後，最多讓使用者等多久就該顯示錯誤？那就是最外層的預算，每一層往下傳剩下的。怕有人忘了設，Connect 2.3.0 的 transport 可以設 <code>defaultTimeoutMs</code>，呼叫沒帶 <code>timeoutMs</code> 時就用它；伺服器端的 <code>connectNodeAdapter</code> 可以設 <code>maxTimeoutMs</code>，呼叫端要求的時間比它長就拒絕（回 <code>INVALID_ARGUMENT</code>）。數字不要憑感覺訂：看下游正常時的回應時間分佈（例如 p99），留一點餘裕。一個服務的 <code>DEADLINE_EXCEEDED</code> 突然變多，通常是它的下游變慢了，沿著呼叫鏈一層層看下游的回應時間（下面 metadata 一節的 request id 能把同一個請求在各服務的 log 串起來）。</div>
+<div class="callout warn"><code>DEADLINE_EXCEEDED</code> 只代表呼叫端沒在期限內拿到結果，<strong>不代表伺服器沒做</strong>。<code>Reserve</code> 可能已經扣完庫存，只是回應來不及送達。盲目重試會扣兩次。要能重試，<code>Reserve</code> 要帶 <code>idempotency_key</code>，伺服器對同一個 key 只扣一次（<a href="../../system-design/lessons/09-idempotency.html">系統設計課第 9 課</a>；第 12 課實作）。<code>GetStock</code> 這種只讀的呼叫，重試沒有副作用。</div>
+
+<h2>串流：async generator 與取消</h2>
+<p>server streaming 的 handler 寫成 <strong>async generator</strong>（<code>async *方法名</code>）：每 <code>yield</code> 一次，Connect 就送出一筆回應；generator 結束，串流就結束；丟錯，串流就以那個狀態碼結束。client 用 <code>for await</code> 一筆一筆收，中途 <code>break</code> 就是取消串流，伺服器的 <code>ctx.signal</code> 會 abort。tour 的第 3 段：</p>
+<pre>3. server streaming：收到 3 筆後 break
+   收到 available=12
+   收到 available=11
+   收到 available=10
+  [伺服器] watchStock 結束，signal.aborted=true</pre>
+<p>練習 3 的 <code>watchStock</code> 要在庫存變動時送出，變動來自一個 EventEmitter（<a href="../../node/lessons/08-events-cancellation.html">Node 課第 8 課</a>）的 <code>'change'</code> 事件。最常見的錯是用 <code>changes.on(…)</code> 加了監聽卻沒有移除：每個斷線的 client 都留下一個監聽，記憶體慢慢漲，Node 最後印出 MaxListenersExceededWarning。Node 內建的 <code>events.on</code> 正好解決這件事（Node 課第 8 課）：</p>
+<pre>import { on } from 'node:events'
+
+const events = on(changes, 'change', { signal: ctx.signal })   // 呼叫的當下就開始監聽
+yield { productId, available: current }                         // 先開始監聽，再送目前的值
+for await (const [change] of events) {                          // 每次 emit 得到一個參數陣列
+  …
+  yield change
+}</pre>
+<ul>
+  <li><code>on()</code> 回傳一個 async iterator，事件會先排進它自己的佇列，不會因為 client 還沒讀而漏掉。</li>
+  <li>傳入 <code>signal</code> 後，signal abort 時它會移除監聽，並讓 <code>for await</code> 丟出 <code>AbortError</code>。這個錯誤不是 <code>ConnectError</code>，Connect 會把它當成 <code>INTERNAL</code> 送給呼叫端。所以要包一層 <code>try/catch</code>，在 signal 已經 abort 時改丟 <code>ctx.signal.reason</code>，deadline 到時 client 才會收到 <code>DEADLINE_EXCEEDED</code>。</li>
+  <li>順序很重要：先開始監聽、再送目前的值。反過來的話，送出目前值到開始監聽之間的變動會漏掉。</li>
+</ul>
+<p>串流不是無限的。長時間開著的串流會被中間的負載平衡器、代理伺服器因為閒置而切斷，所以要設 deadline 讓 client 定期重新訂閱，或定期送一筆心跳（heartbeat）訊息。串流的 deadline 涵蓋整個串流，不是每一筆。</p>
+<div class="callout practice"><strong>💡 實務上：每次部署，所有串流都會斷一次</strong><br>店內看板訂閱著庫存，庫存服務一重新部署，舊程序上的串流全部中斷，看板收到 <code>UNAVAILABLE</code> 或連線錯誤。所以訂閱端一定要寫「斷線後等一下再重新訂閱」，而且等待時間要退避加隨機（<a href="../../system-design/lessons/08-timeouts-retries-backoff.html">系統設計課第 8 課</a>），不然幾十台看板會在同一秒一起重連。重新訂閱後伺服器先送目前的值（練習 3 的設計），看板就不會停在斷線前的舊數字。上線前跟維運確認：部署時舊程序會等多久才強制關閉、中間的代理對閒置連線的逾時是多少，心跳間隔要比它短。</div>
+<p>client streaming 反過來：handler 收到的 <code>req</code> 是 async iterable，用 <code>for await</code> 讀完再回一個回應；client 傳一個 async generator 進去。tour 的第 4 段就是 <code>Restock</code>：</p>
+<pre>// 伺服器
+async restock(requests) {
+  let receivedItems = 0, totalQuantity = 0
+  for await (const r of requests) { … receivedItems++; totalQuantity += r.quantity }
+  return { receivedItems, totalQuantity }
+}
+// client
+async function* deliveries() {
+  yield { productId: '2', quantity: 10 }
+  yield { productId: '6', quantity: 4 }
+}
+await client.restock(deliveries())</pre>
+<p>bidirectional streaming 的 handler 同時拿到 async iterable 也回傳 async generator。Connect 的 gRPC transport 在 Node 支援它，但需要雙方都用 HTTP/2，經過某些代理會不通，實務上少用。</p>
+
+<h2>metadata 與 interceptor</h2>
+<p><strong>metadata</strong> 是 gRPC 的標頭：跟商業資料無關、但每個呼叫都需要的資訊，例如 <code>authorization</code>（誰在呼叫）和 <code>x-request-id</code>（把同一個請求在不同服務的 log 串起來）。Connect 用標準的 <code>Headers</code>：client 呼叫時傳 <code>{ headers: { 'x-request-id': id } }</code>，伺服器讀 <code>ctx.requestHeader.get('x-request-id')</code>。</p>
+<p>每個呼叫都要加的東西，不要在每個呼叫的地方各寫一次，用 <strong>interceptor</strong>（攔截器）統一處理。它包住每一次呼叫，可以改請求、看回應、量時間：</p>
+<pre>const requestId: Interceptor = next =&gt; async req =&gt; {
+  req.header.set('x-request-id', crypto.randomUUID())
+  return next(req)
+}
+createGrpcTransport({ baseUrl, interceptors: [requestId] })</pre>
+<p>tour 第 1 段印出的 <code>x-request-id=tour-1</code> 就是這樣來的。伺服器端也可以在 <code>connectNodeAdapter({ routes, interceptors })</code> 加 interceptor，統一做驗證或記錄 log。</p>
+<div class="callout practice"><strong>💡 實務上：interceptor 放橫切的事，不放商業邏輯</strong><br>「橫切」指每個 RPC 都要做、跟哪個功能無關的事。咖啡店的各個服務通常共用同一組 interceptor：產生或沿用 <code>x-request-id</code>、驗證 <code>authorization</code>、記錄每個 RPC 的方法名、耗時和狀態碼。「拿鐵庫存不足就拒絕」這種規則不要放進去，它屬於 handler，放在 interceptor 裡別人讀程式時找不到。記 log 時不要整包印出 metadata 或請求內容，<code>authorization</code> 的 token 和顧客個資會跟著進 log 系統，資安會找上門。資深工程師會把這組 interceptor 做成各服務共用的套件，確保標頭名稱一致，request id 才串得起來。</div>
+
+<h2>互通與除錯：grpc-js、buf curl</h2>
+<p>Connect 實作的是真正的 gRPC 協定，任何 gRPC client 都能呼叫它。Node 官方的 gRPC 實作是 <code>@grpc/grpc-js</code>（本課 1.14.6），NestJS 的 gRPC microservice 用的也是它。它可以不產生程式碼，用 <code>@grpc/proto-loader</code>（0.8.1）在執行時讀 .proto：</p>
+<pre>import * as grpc from '@grpc/grpc-js'
+import * as protoLoader from '@grpc/proto-loader'
+
+const definition = protoLoader.loadSync(PROTO, { defaults: true })   // 預設 keepCase: false，欄位名轉成 productIds
+const loaded = grpc.loadPackageDefinition(definition)                // 依 package 變成巢狀物件：loaded.coffee.inventory.v1.InventoryService
+const client = new InventoryService('127.0.0.1:4000', grpc.credentials.createInsecure())   // 不加密
+
+client.getStock({ productIds: ['2'] }, { deadline: Date.now() + 300 }, (err, res) =&gt; {
+  client.close()                                     // 用完關掉連線
+  if (err) console.log(grpc.status[err.code], err.details)   // err.code 是數字，grpc.status[5] 是 'NOT_FOUND'
+  else console.log(res.levels)
+})</pre>
+<ul>
+  <li>grpc-js 的 <code>deadline</code> 是<strong>絕對時間點</strong>（<code>Date</code> 或毫秒時間戳），不是毫秒數。寫 <code>{ deadline: 300 }</code> 等於「1970 年過 300 ms」，每個呼叫都立刻 <code>DEADLINE_EXCEEDED</code>。它送出前會換算成相對的 <code>grpc-timeout</code>。</li>
+  <li><code>defaults: true</code>：proto3 不送預設值，庫存 0 在線上根本沒有那個欄位（第 8 課）。不設的話 proto-loader 讀出 <code>undefined</code>；Connect 產生的程式碼則一律補上 0。</li>
+  <li>grpc-js 是 callback 風格，自己包成 Promise。proto-loader 載入的 client 在 TypeScript 裡沒有型別，<code>interop.ts</code> 已經幫你寫好用得到的部分。</li>
+</ul>
+<p>除錯時用 <code>buf curl</code>（像 curl，但懂 protobuf）。先 <code>node examples/serve.ts</code> 用你的 <code>server.ts</code> 開在 4000 port，另一個終端機在 <code>work/09</code>：</p>
+<pre>npx buf curl --protocol grpc --http2-prior-knowledge --schema proto \
+  -d '{"productIds":["2","5"]}' \
+  http://localhost:4000/coffee.inventory.v1.InventoryService/GetStock
+{
+  "levels": {
+    "2": { "productId": "2", "available": 5 },
+    "5": { "productId": "5" }
+  }
+}</pre>
+<p><code>--schema proto</code> 讓它讀本機的 .proto 才知道怎麼把 JSON 轉成 protobuf；<code>--http2-prior-knowledge</code> 表示直接用不加密的 HTTP/2。商品 5 的庫存是 0，所以 JSON 裡沒有 <code>available</code>：又是「預設值不送」。失敗時它印出狀態碼（例如 <code>"code": "not_found"</code>）並以非 0 結束。另一個常見工具是 grpcurl。兩者都能改用伺服器反射（reflection）：伺服器多開一個服務，回答「我有哪些方法、訊息長什麼樣」，就不用帶 .proto。方便，但等於公開整份 API 的結構，正式環境通常只在內網或除錯時開。</p>
+
+<h2>練習</h2>
+<p>四題都在 <code>api-styles/practice/work/09/</code>，執行 <code>node check.mjs api-styles 09</code>。proto、<code>gen/</code>、<code>examples/</code> 不用改。測試自己開伺服器（listen 0）、每次用不同的隨機庫存，四題互不相依，可以不按順序做。</p>
+
+<div class="local" data-test="ex1" data-files="server.ts">
+  <p>練習 1：在 <code>server.ts</code> 完成 <code>getStock</code> 與 <code>reserve</code>，庫存在傳入的 <code>stock</code> Map。<code>getStock</code> 回傳 <code>{ levels: { [id]: { productId, available } } }</code>；<code>productIds</code> 是空陣列回 <code>INVALID_ARGUMENT</code>，任何一個商品不存在回 <code>NOT_FOUND</code>（不要回 available 0）。<code>reserve</code> 扣掉 <code>quantity</code> 並回 <code>{ productId, remaining }</code>；<code>quantity</code> 小於 1 回 <code>INVALID_ARGUMENT</code>，商品不存在回 <code>NOT_FOUND</code>，庫存不夠回 <code>FAILED_PRECONDITION</code>，而且失敗時庫存不能變。測試還會同時送 20 個 reserve 搶最後 5 份拿鐵，要剛好 5 個成功。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="deadline.ts">
+  <p>練習 2：在 <code>deadline.ts</code> 讓 deadline 與取消傳下去。伺服器的 <code>getStock</code>：<code>ctx.timeoutMs()</code> 有值且小於 <code>MIN_BUDGET_MS</code>（20）時直接丟 <code>DEADLINE_EXCEEDED</code>，不呼叫 repo；其他情況把這次 RPC 的 signal 傳給 <code>repo.fetchLevels</code>，repo 的錯誤原樣往外丟。client 的 <code>getStockWithin(client, ids, budgetMs)</code> 以 <code>budgetMs</code> 當這次呼叫的 deadline。測試的假 repo 永遠不會自己完成，只在收到的 signal abort 時失敗，所以結果跟電腦快慢無關。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="watch.ts">
+  <p>練習 3：在 <code>watch.ts</code> 實作 server streaming 的 <code>watchStock</code>：商品不存在回 <code>NOT_FOUND</code>；先送目前庫存，之後每次 <code>changes</code> 發出 <code>'change'</code> 事件（參數是 <code>{ productId, available }</code>）且是這個商品、數字跟上一筆送出的不同時，送一筆。client 取消或 deadline 到時要移除監聽，deadline 到時串流要以 <code>DEADLINE_EXCEEDED</code> 結束（不是 <code>INTERNAL</code>）。測試收到 3 筆後 break，再檢查 <code>changes.listenerCount('change')</code> 回到 0。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="interop.ts">
+  <p>練習 4：在 <code>interop.ts</code> 用 <code>@grpc/grpc-js</code> 與 <code>@grpc/proto-loader</code> 載入 <code>PROTO</code>，完成 <code>callWithGrpcJs(address, ids, ms)</code>：以 <code>ms</code> 為預算設 deadline 呼叫 <code>GetStock</code>，成功回 <code>{ ok: true, levels: { [id]: 庫存數字 } }</code>（庫存 0 也要是 0），失敗回 <code>{ ok: false, code, message }</code>，<code>code</code> 是狀態碼的名稱（<code>'NOT_FOUND'</code>、<code>'DEADLINE_EXCEEDED'</code>），<code>message</code> 是伺服器給的訊息（<code>err.details</code>）。用完關掉 client。測試的目標是一個 Connect 伺服器。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：訂單服務收到 App 的請求時，預算是 300 ms；呼叫庫存服務之前已經用了 120 ms。呼叫庫存服務時的 deadline 應該是？</p>
+  <label data-key="a">固定 300 ms，跟上游一樣</label>
+  <label data-key="b">剩下的 180 ms，再扣掉自己處理回應需要的時間</label>
+  <label data-key="c">不設 deadline，等到好為止</label>
+  <label data-key="d">1 秒，留一點餘裕</label>
+  <p class="why">✓ deadline 是整條呼叫鏈共用的預算。每一層各給固定逾時（a、d），總時間會超過使用者願意等的時間，上游早就放棄了，下游還在做白工。不設（c）時，一個卡住的下游會讓請求永遠等。Connect 的 <code>ctx.timeoutMs()</code> 就是剩餘預算。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：<code>Reserve</code>（扣庫存）回 <code>DEADLINE_EXCEEDED</code>，可以直接重試嗎？</p>
+  <label data-key="a">可以，逾時代表伺服器一定沒執行</label>
+  <label data-key="b">不一定：伺服器可能已經扣完，只是回應來不及送達；要重試就讓 Reserve 帶 idempotency key，伺服器對同一個 key 只扣一次</label>
+  <label data-key="c">不行，DEADLINE_EXCEEDED 永遠不能重試</label>
+  <label data-key="d">讓伺服器改回 UNAVAILABLE 就可以安全重試</label>
+  <p class="why">✓ 逾時只代表呼叫端沒在期限內拿到結果。非冪等的操作要先有冪等設計才能重試（系統設計課第 9 課）。只讀的 GetStock 重試沒有副作用，所以 c 太絕對。改狀態碼（d）不會改變「可能已經扣過」的事實，只是把問題藏起來。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：伺服器沒有把 <code>ctx.signal</code> 傳給資料庫查詢。client 的 deadline 到了之後會怎樣？</p>
+  <label data-key="a">查詢自動停止</label>
+  <label data-key="b">client 收到 DEADLINE_EXCEEDED，但伺服器的查詢繼續跑完；流量大時這些沒人要的查詢佔著連線，讓更多請求逾時</label>
+  <label data-key="c">伺服器程序當掉</label>
+  <label data-key="d">client 會一直等到查詢結束</label>
+  <p class="why">✓ client 有自己的計時器，時間到就放棄（d 錯）。伺服器那邊只有 <code>ctx.signal</code> 會 abort，沒交給查詢的話，查詢不知道已經沒人要（a 錯），也不會出錯（c 錯）。取消要一路傳下去才有效。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 8：顧客要買 3 杯拿鐵，庫存只剩 2 杯。<code>Reserve</code> 回哪個狀態碼最合適？</p>
+  <label data-key="a"><code>INTERNAL</code></label>
+  <label data-key="b"><code>UNAVAILABLE</code></label>
+  <label data-key="c"><code>FAILED_PRECONDITION</code></label>
+  <label data-key="d"><code>NOT_FOUND</code></label>
+  <p class="why">✓ 系統目前的狀態不允許這個操作，狀態改變（補貨）前重試也沒用。INTERNAL 代表伺服器有 bug，會觸發錯誤告警；UNAVAILABLE 會讓呼叫端的重試機制不停重送；NOT_FOUND 是商品不存在。也可以把「庫存不足」設計成回應欄位，取捨跟第 3 課相同。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>沒設 deadline</strong>：gRPC 預設沒有逾時，一個卡住的下游會讓呼叫永遠等。每個呼叫都設 <code>timeoutMs</code>（grpc-js 是 <code>deadline: Date.now() + ms</code>）。</li>
+  <li><strong>每一層各自訂固定逾時</strong>：總時間超過上游願意等的時間。往下傳剩餘預算（<code>ctx.timeoutMs()</code>）。</li>
+  <li><strong>伺服器不傳遞取消</strong>：逾時後還在查資料庫。把 <code>ctx.signal</code> 交給每個下游；不要自己用 <code>AbortSignal.timeout</code> 另訂一個時間。</li>
+  <li><strong>所有錯誤都回 INTERNAL 或 UNKNOWN</strong>：呼叫端無法判斷要不要重試。丟 <code>ConnectError</code> 並選對狀態碼；deadline 造成的錯誤原樣往外丟，不要包成 INTERNAL。</li>
+  <li><strong>找不到時回傳空值或 0</strong>：「沒有這個商品」和「賣完了」是兩件事，前者回 <code>NOT_FOUND</code>。</li>
+  <li><strong>DEADLINE_EXCEEDED 後盲目重試非冪等操作</strong>：伺服器可能已經做完。先加 idempotency key。</li>
+  <li><strong>串流沒有處理取消</strong>：<code>emitter.on</code> 之後沒有移除，每個斷線的 client 留下一個監聽。用 <code>events.on(…, { signal: ctx.signal })</code>。</li>
+  <li><strong>grpc-js 的 deadline 傳毫秒數</strong>：它要的是絕對時間點，傳 300 等於 1970 年，每個呼叫都立刻逾時。</li>
+  <li><strong>把 gRPC 狀態碼當 HTTP 狀態碼</strong>：gRPC 的回應幾乎都是 HTTP 200，結果看 trailers 裡的 gRPC 狀態碼；5 是 NOT_FOUND，不是 404。</li>
+  <li><strong>以為前端可以直接呼叫這個 gRPC 伺服器</strong>：瀏覽器的 <code>fetch</code> 讀不到 HTTP/2 trailers，原生 gRPC 只適合服務之間。瀏覽器要改用 gRPC-Web 或 Connect 協定（第 11 課）。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>service 裡的 RPC 依 <code>stream</code> 的位置分成 unary、server streaming、client streaming、bidirectional；預設用 unary。</li>
+  <li>Connect-ES：<code>router.service(描述, 實作)</code> 加 <code>http2.createServer(connectNodeAdapter(…))</code> 是伺服器；<code>createClient(描述, createGrpcTransport({ baseUrl }))</code> 是 client。gRPC 跑在 HTTP/2 上。</li>
+  <li>錯誤用 <code>ConnectError(訊息, Code.X)</code>：參數錯 INVALID_ARGUMENT、不存在 NOT_FOUND、狀態不允許 FAILED_PRECONDITION、暫時不可用 UNAVAILABLE。狀態碼決定呼叫端會不會重試。</li>
+  <li>deadline 是整條呼叫鏈的剩餘預算：client 設 <code>timeoutMs</code>，伺服器用 <code>ctx.timeoutMs()</code> 看剩多少、把 <code>ctx.signal</code> 交給下游。逾時後重試非冪等操作要有 idempotency key。</li>
+  <li>server streaming 用 async generator；用 <code>events.on</code> 加 signal 監聽事件，先監聽再送目前值，取消時監聽會被移除。</li>
+  <li>metadata 放 request id、authorization，用 interceptor 統一加。grpc-js 能呼叫 Connect 伺服器（deadline 是絕對時間）；除錯用 <code>buf curl</code>。</li>
+</ul>
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 6 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 9：庫存服務要改 <code>inventory.proto</code>，訂單服務下週才更新，兩邊用二進位通訊。下面哪個改動，部署後舊的訂單服務仍然讀得對？</p>
+  <label data-key="a">依名稱重新排序欄位並重新編號，名稱都沒變</label>
+  <label data-key="b"><code>price_twd</code> 從含稅改成未稅，編號與型別都沒變</label>
+  <label data-key="c">新增 <code>string warehouse_id = 5;</code>，既有的編號都沒變</label>
+  <label data-key="d">刪掉 <code>price_twd</code>，空出的 4 給新的 <code>string note</code></label>
+  <p class="why">✓ 線上只有欄位編號沒有名稱，舊程式遇到不認得的編號 5 就依 wire type 跳過。a 改了每個欄位的身分，d 讓舊資料被當成 note 解讀。b 最容易漏：buf breaking 也會放行，但每個呼叫端都算錯錢，改語意要新增一個名稱說清楚的欄位。（第 8 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 10：後台的 <code>UpdateProduct</code> 收整個 <code>Product</code> 訊息，伺服器照收到的值整筆更新。店長只改了美式咖啡的價格，商品名稱卻變成空的，為什麼？</p>
+  <label data-key="a">空字串等於預設值不會送出，沒給的 name 跟「改成空的」讀起來一樣</label>
+  <label data-key="b">沒填的 string 欄位解碼成 undefined，存進資料庫變成 NULL</label>
+  <label data-key="c">伺服器用舊版產生的程式碼解碼，不認得 name 就把它跳過</label>
+  <p class="why">✓ proto3 不送等於預設值的欄位，接收端補預設值，所以伺服器分不出「沒給」和「改成空字串」。修法是請求帶 <code>update_mask</code> 列出這次要改的欄位，或把可部分更新的欄位標成 <code>optional</code>。b 錯在沒有存在性的 string 欄位讀出來是空字串，不是 undefined。（第 8 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 11：訂單服務用 <code>createGrpcTransport</code> 呼叫庫存服務，今天 <code>Reserve</code> 有三成失敗。監控只看 HTTP 5xx 的儀表板卻一直是 0，為什麼？</p>
+  <label data-key="a">Connect 把錯誤轉成 HTTP 4xx，只看 5xx 當然看不到</label>
+  <label data-key="b">負載平衡器自動重試了失敗的請求，最後都成功了</label>
+  <label data-key="c">handler 丟的是一般 Error，Connect 吞掉它並回了空回應</label>
+  <label data-key="d">gRPC 失敗也回 HTTP 200，結果在 trailers 的狀態碼裡</label>
+  <p class="why">✓ gRPC 不用 HTTP 狀態碼表示結果，成功失敗都是 200，真正的結果是 trailers 裡的 gRPC 狀態碼。監控要依 gRPC 狀態碼分開看：<code>INTERNAL</code>、<code>UNKNOWN</code> 告警，<code>NOT_FOUND</code>、<code>FAILED_PRECONDITION</code> 看趨勢。c 錯在一般 Error 不會被吞掉，呼叫端會收到 <code>INTERNAL</code> 或 <code>UNKNOWN</code>。（第 9 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 12：訂單服務呼叫 <code>GetStock</code> 時設 <code>timeoutMs: 200</code>，庫存服務的 handler 這樣寫。尖峰時會出什麼事？</p>
+<pre>async getStock(req, ctx) {
+  const signal = AbortSignal.timeout(500)
+  const rows = await repo.fetchLevels(req.productIds, signal)
+  …
+}</pre>
+  <label data-key="a">訂單服務要等到 500 ms 才收到 <code>DEADLINE_EXCEEDED</code></label>
+  <label data-key="b">訂單服務 200 ms 就放棄，查詢卻跑到 500 ms，白做的查詢佔著連線</label>
+  <label data-key="c">沒有影響，Connect 在 200 ms 時會 abort handler 裡所有的 signal</label>
+  <label data-key="d">client 斷線時查詢會立刻停，500 ms 只影響沒設 deadline 的 client</label>
+  <p class="why">✓ client 有自己的計時器，200 ms 就放棄；伺服器只有 <code>ctx.signal</code> 會在 deadline 到或 client 取消時 abort，自己訂的 signal 不知道已經沒人要了。改成把 <code>ctx.signal</code> 交給 repo，剩太少時直接回 <code>DEADLINE_EXCEEDED</code>。c 錯在 Connect 只 abort <code>ctx.signal</code>，管不到你另外建的 signal。（第 9 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 13：訂單服務的共用重試 interceptor 遇到 <code>UNAVAILABLE</code> 和 <code>DEADLINE_EXCEEDED</code> 都重試 3 次。庫存服務變慢那天，同一筆訂單的拿鐵被扣了兩三次，該怎麼修？</p>
+  <label data-key="a">讓 <code>Reserve</code> 帶 idempotency key，伺服器對同一個 key 只扣一次</label>
+  <label data-key="b">把 <code>timeoutMs</code> 拉長，請求就不會在扣完之後才逾時</label>
+  <label data-key="c">檢查和扣庫存之間不要有 <code>await</code>，避免兩個請求同時通過檢查</label>
+  <label data-key="d">只重試 <code>UNAVAILABLE</code>，它代表伺服器確定沒有執行</label>
+  <p class="why">✓ <code>DEADLINE_EXCEEDED</code> 只代表呼叫端沒在期限內拿到結果，<code>Reserve</code> 可能已經扣完，盲目重試就扣兩次。非冪等操作要重試，先加 idempotency key。b 只是讓它少發生，下游再慢一點又會重複扣。（第 9 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 14：店內看板的庫存串流上線一週，庫存服務的記憶體一直漲，log 出現 MaxListenersExceededWarning。<code>changes.listenerCount('change')</code> 是在線看板數的好幾倍，最可能的原因？</p>
+  <label data-key="a">看板沒設 deadline，伺服器把每條串流的連線永遠留著</label>
+  <label data-key="b">generator yield 得比看板讀得快，回應都堆在伺服器的記憶體</label>
+  <label data-key="c">EventEmitter 超過 10 個監聽者後，新加的監聽不會被移除</label>
+  <label data-key="d">handler 用 <code>changes.on</code> 加監聽，看板斷線後沒有移除</label>
+  <p class="why">✓ 每個斷線的看板都留下一個監聽，數字才會超過在線的看板數。改用 <code>events.on(changes, 'change', { signal: ctx.signal })</code>，取消或 deadline 到時監聽會被移除。a 錯在還連著的串流各只有一個監聽，數量會等於在線看板數，不會是好幾倍。（第 9 課）</p>
+</div>
+
+<p>這個階段的重點整理成<a href="../sheets/stage-4.html">一頁圖解</a>。</p>
+<p>下一課處理 API 改版：GraphQL schema 與 proto 改了之後，怎麼在合併前就知道會不會弄壞前端或別的服務。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

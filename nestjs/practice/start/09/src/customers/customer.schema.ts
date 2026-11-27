@@ -1,0 +1,3 @@
+// 練習 3：用 zod 寫顧客的回應 schema（允許清單：只列要送出的欄位）
+//   export const customerResponseSchema = …
+export {}

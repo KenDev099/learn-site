@@ -1,0 +1,1868 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>11. 斷路器、隔艙與負載卸除：不被依賴拖垮</title>
+<link rel="stylesheet" href="../../style.css">
+<style>
+.tl { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin: 1.2em 0; }
+.tl table { width: 100%; }
+.tl td { vertical-align: top; }
+.tl tr.now td { background: var(--accent-soft); }
+.tl tr.later { visibility: hidden; }
+.tl .note { margin: 10px 0 0; min-height: 3.5em; }
+.tl .wait { color: var(--fail); font-weight: 600; }
+</style>
+</head>
+<body data-lesson="11">
+<header>
+  <div class="eyebrow">階段 3：可靠性：失敗是常態 · 第 11 課</div>
+  <h1>斷路器、隔艙與負載卸除：不被依賴拖垮</h1>
+</header>
+<main>
+<p>早上 8 點，金流閘道的資料庫出了問題，付款 API 從 200ms 變成 10 秒才回應。金流沒有掛，只是變慢。十分鐘後，咖啡店的 App 連菜單都打不開，可是菜單跟金流一點關係都沒有。一個外部依賴變慢，就把整個系統拖垮，這是正式環境最常見的大型事故之一。</p>
+<p>這一課的任務是重建這個早上：先弄清楚金流變慢是怎麼一步步拖垮菜單的，再替「呼叫金流」這一行程式一層一層加上防護，最後做到下一次金流再慢 10 秒時，付款雖然不能用，菜單照常打開、使用者看到清楚的訊息、金流恢復後系統自己回到正常。<a href="08-timeouts-retries-backoff.html">第 8 課</a>的逾時與重試處理「一次呼叫失敗之後怎麼辦」，<a href="10-rate-limiting.html">第 10 課</a>的限流處理「某個客戶送太多」；這一課處理的是「依賴整個變慢或變差時，怎麼不被拖下水」。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>金流只是變慢，為什麼十分鐘後連菜單都打不開：用 Little's Law 重播事故，找出每一步該補的防線。</li>
+  <li>明知會失敗就不要等：斷路器；斷路器還沒打開之前也要保住菜單：隔艙。</li>
+  <li>請求多到做不完時，伺服器怎麼早點拒絕、先丟不重要的（負載卸除），客戶端怎麼在本機先少送（自適應節流）。</li>
+  <li>擋下來之後使用者看到什麼：降級與備援。</li>
+  <li>這些防護要照什麼順序包在金流呼叫外面，上線後怎麼確認它們真的會動。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="03-latency-percentiles.html">第 3 課</a>的 Little's Law 與排隊：同時卡在系統裡的請求數 = 每秒請求數 × 每個請求停留的秒數；使用率越高，排隊越久。</li>
+  <li><a href="08-timeouts-retries-backoff.html">第 8 課</a>的逾時與重試：每個呼叫都要有逾時，剩餘時間往下傳；每層都重試會讓流量放大好幾倍，要用重試預算限制。</li>
+  <li><a href="10-rate-limiting.html">第 10 課</a>的限流與並行數限制：限流管「一段時間內幾個」，並行數限制管「同時進行中幾個」。</li>
+</ul></div>
+
+<h2>金流只是變慢，為什麼十分鐘後連菜單都打不開？</h2>
+<p>要回答這個問題，先看一台 API 伺服器「同時」能處理多少請求。請求進來之後，到回應送出之前，它一直佔著一些東西：一塊記憶體、可能一條資料庫連線，還有一個 <strong>worker</strong>。worker 是伺服器裡實際負責處理請求的執行緒或程序，數量是固定的。這些資源都有上限，所以每台伺服器同時進行中的請求數也有上限。這一課把「一個進行中的請求佔掉的那一份資源」叫做<strong>格子</strong>：咖啡店有 3 台 API，每台 100 格，全部 300 格。</p>
+<p>格子會不會不夠，取決於每個請求佔著格子多久。<a href="03-latency-percentiles.html">第 3 課</a>的 Little's Law 正好算這個：同時卡在系統裡的請求數 L = 每秒進來的請求數 λ × 每個請求停留的時間 W。下單 API 尖峰每秒 50 個請求，每個都要呼叫金流，所以下單佔的格子數就是 50 × 金流的回應時間。看菜單每秒 450 個，不碰金流，50ms 就回應。執行後看每一列最後的「共幾格 / 300」：</p>
+<div class="lab"><script type="code">
+// 3 台 API，每台最多同時處理 100 個請求（受限於記憶體、資料庫連線池、worker 數）
+const slots = 3 * 100
+const checkoutPerSec = 50     // 下單：每個都要呼叫金流
+const menuPerSec = 450        // 看菜單：不碰金流，50ms 就回應
+
+for (const paymentMs of [200, 2000, 10000]) {
+  const checkoutInFlight = checkoutPerSec * (paymentMs + 30) / 1000   // L = λW，W 換成秒
+  const menuInFlight = menuPerSec * 50 / 1000
+  const used = checkoutInFlight + menuInFlight
+  console.log(`金流 ${paymentMs}ms：下單佔 ${checkoutInFlight.toFixed(1)} 格、菜單佔 ${menuInFlight.toFixed(1)} 格，` +
+    `共 ${used.toFixed(1)} / ${slots}${used > slots ? '  ← 超過上限，所有請求都在排隊' : ''}`)
+}
+</script></div>
+<p>金流 200ms 時，下單和菜單加起來只用了 1/10 的容量；金流變成 10 秒，光是下單就要 501.5 格，超過全部的 300 格。注意 λ 完全沒變，客人沒有變多，是 W 變大了 50 倍。超過的請求只能排隊，而<strong>菜單請求也排在同一條隊伍裡</strong>：菜單自己 50ms 就能做完，卻拿不到格子，跟著逾時。這就是開場問題的答案。</p>
+<p>這也說明了為什麼「變慢」比「掛掉」危險。金流如果直接掛掉，每次呼叫立刻收到連線錯誤，W 反而變小，格子很快就還回來，你的程式也馬上知道出事了。變慢的金流不回錯，呼叫端只能一直等，每個請求都佔著格子不放。接下來的十分鐘會一步一步變糟，按「下一步」看：</p>
+<div class="tl">
+  <div class="table-wrap"><table>
+    <tr><th>時間</th><th>金流</th><th>咖啡店 API</th><th>使用者看到</th></tr>
+    <tr data-note="金流變慢：p99 從 200ms 變成 10 秒。它沒有回錯，所以呼叫端的程式不知道出事了，只是一直等。"><td>08:00</td><td>p99 10 秒</td><td>下單請求開始卡住</td><td>付款轉圈圈</td></tr>
+    <tr data-note="L = λW：每秒 50 個下單 × 10 秒 = 500 個請求同時卡著，佔用記憶體、資料庫連線、worker。3 台加起來只有 300 格。"><td>08:01</td><td>p99 10 秒</td><td>300 格全被下單佔滿</td><td>付款逾時</td></tr>
+    <tr data-note="菜單請求跟下單共用同一批 worker 和連線池，拿不到格子只能排隊。菜單本身沒有問題，卻跟著逾時。"><td>08:02</td><td>p99 10 秒</td><td>菜單也在排隊<br><span class="wait">健康的功能被拖累</span></td><td>菜單打不開</td></tr>
+    <tr data-note="健康檢查 /health 也排在同一條隊伍裡，逾時。負載平衡器判定這台機器死了，把它移出輪替（第 4 課）。"><td>08:03</td><td>p99 10 秒</td><td>健康檢查逾時，1 號機被踢掉</td><td>錯誤變多</td></tr>
+    <tr data-note="剩下兩台要分擔原本三台的流量，更快被塞滿，接著也被踢掉。這就是第 4 課說的「剩下的機器過載」。"><td>08:04</td><td>p99 10 秒</td><td>2、3 號機也被踢掉</td><td>全站 502</td></tr>
+    <tr data-note="App 自動重試、使用者狂按重新整理、閘道也重試：流量變成平常的好幾倍（第 8 課的重試放大）。金流也收到更多請求，恢復得更慢。"><td>08:05</td><td>收到更多請求，更慢</td><td>重試讓流量變 3 倍</td><td>全站 502</td></tr>
+    <tr data-note="就算金流 08:30 恢復了，咖啡店這邊積壓的排隊與重試還會讓系統維持過載一段時間。修好根因不代表系統會自己好，往往要手動擋流量才救得回來。"><td>08:30</td><td>恢復正常</td><td>仍在重試風暴中</td><td>還是打不開</td></tr>
+  </table></div>
+  <div class="bar"><button data-prev>◀ 上一步</button><button class="primary" data-next>下一步 ▶</button><span class="kbd" data-count></span></div>
+  <p class="note"></p>
+</div>
+<p>這種「一個元件的故障或變慢，透過依賴關係和重試擴散，最後變成整個系統的故障」的事故，叫<strong>連鎖故障（cascading failure）</strong>。回頭看時間軸，它不是一個錯誤造成的，而是好幾個環節接力：每個請求等太久、慢的功能佔走所有人的格子、排隊越來越長、健康檢查被擋、重試把流量放大、使用者最後什麼都做不了。</p>
+<p>第一個直覺是把逾時縮短，這是第 8 課教過的，一定要做。但只靠逾時擋不住：逾時設 2 秒，下單還是要佔 50 × 2 = 100 格，是全部容量的三分之一，而且每一張訂單都要白等 2 秒才知道失敗；App 或閘道再各重試幾次，佔用的格子和金流收到的請求又跟著乘上去。逾時只是讓 W 有上限，沒有讓「明知會失敗的呼叫」停下來，也沒有把金流跟菜單隔開。所以時間軸上每個環節都需要自己的防線，這一課依序補上：</p>
+<div class="table-wrap"><table>
+  <tr><th>出事的環節</th><th>防線</th></tr>
+  <tr><td>每個請求等 10 秒才放棄</td><td>逾時（第 8 課）；確定會失敗時根本不要呼叫：<strong>斷路器</strong></td></tr>
+  <tr><td>下單佔滿所有格子，菜單跟著排隊</td><td><strong>隔艙</strong>：每個依賴只能用自己那一份</td></tr>
+  <tr><td>排隊越來越長，做完的請求早就逾時</td><td><strong>伺服器端負載卸除</strong>：佇列有上限、丟掉過期的、先丟不重要的</td></tr>
+  <tr><td>健康檢查被擋，機器被踢掉</td><td>卸除時健康檢查最優先</td></tr>
+  <tr><td>重試讓流量變好幾倍</td><td>重試預算（第 8 課）、<strong>客戶端自適應節流</strong></td></tr>
+  <tr><td>使用者什麼都做不了</td><td><strong>降級</strong>：付款不能用，至少菜單看得到</td></tr>
+</table></div>
+<p>從第一列開始。金流已經連續失敗好一陣子了，下一個呼叫多半也會失敗，為什麼還要讓它再佔一個格子、再等一次？</p>
+
+<h2>明知金流會失敗，為什麼還要每次等 10 秒？</h2>
+<p>家裡的電箱有一個開關叫斷路器：電流過大時它會跳開，切斷電路，保護電線不燒起來。軟體借用了這個名字。<strong>斷路器（circuit breaker）</strong>，也有人叫熔斷器，是包在「呼叫外部依賴」外面的一層程式：它記錄最近每一次呼叫的成敗，失敗太多時就「跳開」，接下來一段時間不再呼叫依賴，直接回錯給呼叫端。</p>
+<p>這樣做有兩個好處，剛好對應上一節的問題。第一，呼叫端<strong>快速失敗（fail fast）</strong>：明知道會失敗就立刻回錯，不再為每張訂單白等 10 秒、佔一個格子。下單的 W 從 10 秒變成幾毫秒，套回 L = λW，佔用的格子幾乎歸零，菜單就拿得到格子了。第二，金流少收到請求。它正在出問題，咖啡店還每秒送 50 個（加上重試更多）過去，只會讓它更難恢復；斷路器讓它有機會喘口氣。</p>
+<p>斷路器靠三個狀態運作，下面這張圖先看整體，再逐一說明每個狀態為什麼這樣設計：</p>
+<figure>
+  <svg viewBox="0 0 700 260" role="img" aria-label="斷路器的三個狀態：closed 在失敗率超過門檻時轉為 open；open 經過開啟時間後轉為 half-open；half-open 試探成功轉回 closed，試探失敗轉回 open">
+    <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="20" y="90" width="170" height="70" rx="10"/>
+    <text class="d-text" x="105" y="120" text-anchor="middle">closed（關閉）</text>
+    <text class="d-small" x="105" y="142" text-anchor="middle">正常放行、記錄結果</text>
+    <rect class="d-box" x="510" y="90" width="170" height="70" rx="10"/>
+    <text class="d-text" x="595" y="120" text-anchor="middle">open（開啟）</text>
+    <text class="d-small" x="595" y="142" text-anchor="middle">全部擋下、快速失敗</text>
+    <rect class="d-soft" x="265" y="185" width="170" height="65" rx="10"/>
+    <text class="d-text" x="350" y="212" text-anchor="middle">half-open（半開）</text>
+    <text class="d-small" x="350" y="234" text-anchor="middle">放少數幾個試探</text>
+    <path class="d-line" d="M190,105 L510,105" marker-end="url(#arr)"/>
+    <text class="d-accent" x="350" y="80" text-anchor="middle">呼叫數 ≥ 最少呼叫數 且 失敗率 ≥ 門檻</text>
+    <path class="d-line" d="M600,160 L600,215 L435,215" marker-end="url(#arr)"/>
+    <text class="d-small" x="610" y="195">經過開啟時間</text>
+    <path class="d-line" d="M265,215 L100,215 L100,160" marker-end="url(#arr)"/>
+    <text class="d-small" x="110" y="240">試探全部成功</text>
+    <path class="d-line" d="M400,185 L540,160" marker-end="url(#arr)"/>
+    <text class="d-small" x="430" y="165">任一試探失敗</text>
+  </svg>
+  <figcaption>斷路器的三個狀態。open 擋下的呼叫不會碰到下游；half-open 只放少數幾個試探，避免剛恢復的服務馬上又被打倒</figcaption>
+</figure>
+<p><strong>closed（關閉）</strong>是平常的狀態，名字沿用電路的說法：電路「關閉」代表電流通得過，所以 closed 是「放行」。這時每個呼叫照常送到金流，斷路器記下結果。它只看最近一段時間的結果，例如最近 10 秒，這叫<strong>滑動時間視窗</strong>：視窗跟著時間往前移，太舊的紀錄自動不算。只看最近的，是因為斷路器要回答的是「金流<strong>現在</strong>健不健康」，一小時前的失敗跟現在無關。</p>
+<p>從 closed 轉成 <strong>open</strong> 要同時滿足兩個條件。第一個是視窗內的呼叫數至少達到<strong>最少呼叫數（minimum calls，有的函式庫叫 volume threshold）</strong>；第二個是失敗率達到門檻，例如 50%。為什麼要第一個條件？想像深夜只有 1 個付款請求，剛好逾時，失敗率就是 1/1 = 100%。只看失敗率的話，斷路器會因為一次偶發的失敗就跳開，接下來一段時間所有人都不能付款。樣本太少時算出來的比例沒有意義，最少呼叫數就是「樣本夠多才下判斷」。</p>
+<p><strong>open（開啟）</strong>時，斷路器完全不呼叫金流，直接丟出一個專門的錯誤，例如 <code>BreakerOpenError</code>。用專門的錯誤，是為了讓呼叫端分得出「金流回錯」和「斷路器沒讓你呼叫」，兩者的處理方式不一樣，下面會講。open 會維持一段<strong>開啟時間</strong>，例如 30 秒，時間到了轉成 half-open。</p>
+<p><strong>half-open（半開）</strong>是試探期：斷路器不知道金流好了沒，所以只放少數幾個請求過去，其他的照樣擋下。試探都成功，就回到 closed 並清掉舊紀錄；任何一個試探失敗，就立刻回到 open、重新計時。為什麼不在開啟時間到了就直接全部放行？因為 open 期間被擋下的使用者會一起重新嘗試，剛恢復的金流馬上收到一大波請求，很可能又被打倒，斷路器再度打開，反覆來回。少數試探就是先問一句「你好了嗎」，再把流量交回去。</p>
+
+<h3>哪些錯誤算「失敗」？</h3>
+<p>斷路器要判斷的是「金流健不健康」，所以只有代表金流有問題的錯誤才算失敗：逾時、連線失敗、5xx，以及 408（Request Timeout）和 429（Too Many Requests）這兩個例外的 4xx。<strong>其他 4xx（400、404、422）是呼叫端自己的問題</strong>：使用者輸入錯誤的卡號，金流回 422，這代表金流好好的，有正常在檢查卡號。如果 4xx 也算失敗，尖峰時段一群人輸錯卡號，失敗率就衝過門檻，斷路器打開，所有人都不能付款。</p>
+<p>函式庫都有對應的設定。以 opossum 為例，它的 <code>errorFilter</code> 是一個函式：對某個錯誤回傳 true，這個錯誤照樣丟給呼叫端，但不算進失敗率。咖啡店就在這裡寫「4xx 除了 408、429 以外都回傳 true」。</p>
+
+<h3>用 opossum 包住金流呼叫，要設哪些值？</h3>
+<p>Node 常用 opossum 這類函式庫實作斷路器。上面講的每個概念，在 opossum 裡都有一個選項，括號是 opossum 10.0.0 的預設值：失敗率門檻是 <code>errorThresholdPercentage</code>（50，失敗率超過 50% 才打開）；滑動視窗是 <code>rollingCountTimeout</code>（10 秒，內部分成 10 個桶）；最少呼叫數是 <code>volumeThreshold</code>（<strong>0</strong>）；開啟時間是 <code>resetTimeout</code>（30 秒）。cockatiel 和 .NET 的對應名稱與預設值不同，對照表在課末「補充與查表」。</p>
+<div class="callout warn"><strong>opossum 的 <code>volumeThreshold</code> 預設是 0。</strong>服務剛啟動、第一個呼叫剛好失敗，失敗率 100%，斷路器馬上打開，之後 30 秒所有付款都直接失敗。用 opossum 一定要自己設最少呼叫數，或開 <code>allowWarmUp</code>（啟動後第一個統計視窗內的失敗不會打開斷路器）。</div>
+<p>設定之外，還有兩條用法上的規則。第一，<strong>每個依賴一個斷路器</strong>。如果整個服務只用一個斷路器包住所有外部呼叫，簡訊服務壞掉時失敗率衝高，斷路器打開，金流的呼叫也一起被擋住，等於自己製造了一次連鎖故障。斷路器的單位要跟「會一起壞的東西」一致：咖啡店的金流、簡訊、物流各一個。</p>
+<p>第二，<strong>斷路器丟出的錯誤不能被重試</strong>。第 8 課說暫時性錯誤可以重試，<code>BreakerOpenError</code> 看起來也很「暫時」，但它代表的是「金流現在需要休息」。重試它只會在本機空轉、讓請求繼續佔著格子，或在斷路器轉成 half-open 的瞬間一起湧上去。第 8 課的重試邏輯要把 <code>BreakerOpenError</code> 當成永久錯誤，改走降級（後面「降級」那一節）。</p>
+<p>練習 1 會實作完整的斷路器。斷路器跟<a href="04-redundancy-load-balancing.html">第 4 課</a>負載平衡器的異常剔除很像，差別見課末「補充與查表」。</p>
+<div class="callout practice"><strong>💡 實務上：斷路器多半是「設定」出來的，重點在打開之後怎麼辦</strong><br>工作中很少自己從頭寫斷路器，而是用 opossum、cockatiel 這類函式庫，包在呼叫金流、簡訊、物流這些外部 API 的那一層。真正要花時間的是三個問題：打開時使用者看到什麼（接到哪個降級畫面）、誰會收到告警、門檻是根據平常的失敗率和流量設的，還是照抄預設值。呼叫量很低的地方（一天跑幾次的批次工作）幾乎到不了最少呼叫數，斷路器形同虛設，用逾時加重試就夠了。Code review 看到新加的外部呼叫，資深工程師會先問：「這個依賴變慢 10 秒時，我們會怎樣？」</div>
+<p>但斷路器有一個空窗。它只看成敗，要等失敗累積到門檻才會打開；而且金流如果是變慢但還沒超過逾時，例如每次 5 秒才成功，對斷路器來說每一次都是成功，它永遠不會打開。這段時間裡，下單照樣一格一格佔走菜單的位置。斷路器打開之前，誰來保護菜單？</p>
+
+<h2>斷路器還沒打開之前，誰來保護菜單？</h2>
+<p>回到上一節的空窗：金流每次 5 秒才成功，斷路器不會打開，下單照樣佔掉 50 × 5 = 250 格，每秒 450 個菜單請求只剩 50 格可用，任何一點突發或重試就會把剩下的也塞滿。問題的根源是下單和菜單共用同一批格子，誰佔得久，誰就把別人擠出去。所以要換個角度：不管金流多慢，<strong>規定它最多只能用幾格</strong>。</p>
+<p>這個做法叫<strong>隔艙（bulkhead）</strong>，名字來自船：船身分成好幾個密封的艙，一個艙進水，水不會流到其他艙，船不會沉。軟體的隔艙把共用的資源（worker、連線、記憶體）切開，<strong>每個依賴只能用自己那一份</strong>。金流變慢時，最多只有分給金流的格子被佔滿，菜單、會員、集點照常。它跟斷路器互補：斷路器要等失敗累積才有反應，隔艙從第一秒就生效，不管金流是慢、是錯，還是慢到剛好不算錯。</p>
+<p>隔艙的實作是一個<strong>信號量（semaphore）</strong>。信號量就是一個「同時最多幾個」的計數器，裡面有固定數量的名額：</p>
+<ul>
+  <li>要呼叫金流，先拿一個名額，拿到了才呼叫。</li>
+  <li>名額用完時，新的請求排進一條等待佇列；佇列也滿了，就立刻失敗，不呼叫金流。</li>
+  <li>呼叫結束，不管成功或失敗，都要歸還名額，讓佇列最前面的請求開始。</li>
+</ul>
+<p>最後一點最容易寫錯：只在成功時歸還，金流每失敗一次就漏掉一個名額，幾次錯誤之後名額全部漏光，所有呼叫永遠在排隊。所以歸還一定寫在 <code>finally</code> 裡。用函式庫時，opossum 的 <code>capacity</code> 選項就是這個信號量，滿了丟 <code>ESEMLOCKED</code>；cockatiel 是 <code>bulkhead(limit, queue)</code>，滿了丟 <code>BulkheadRejectedError</code>。</p>
+<p>剩下的問題是名額要給多少。給太少，平常的尖峰就在拒絕付款；給太多，金流變慢時又擠掉菜單。用 Little's Law 算平常需要多少，再留餘裕吸收突發。執行後看兩件事：隔艙的大小，以及金流 10 秒時其他功能還剩幾格：</p>
+<div class="lab"><script type="code">
+// 金流平常 200ms、尖峰每秒 50 個下單
+const normalInFlight = 50 * 0.2                  // L = λW
+const limit = Math.ceil(normalInFlight * 3)      // 留 3 倍餘裕吸收突發
+const queue = Math.floor(limit * 0.5)            // 佇列不超過並行上限的一半
+console.log('平常同時呼叫金流：', normalInFlight)
+console.log('隔艙：並行上限', limit, '、佇列上限', queue)
+
+// 金流變成 10 秒時，這個隔艙最多讓多少請求成功？
+const maxPerSec = limit / 10
+console.log(`金流 10 秒時，每秒最多完成 ${maxPerSec} 個下單，其餘 ${50 - maxPerSec} 個立刻失敗`)
+console.log('其他功能能用的格子：', 300 - limit - queue, '/ 300')
+</script></div>
+<p>金流平常只需要 10 格，給 30 格的並行上限和 15 格的佇列。金流變成 10 秒時，這 30 格每秒只能完成 3 個下單，其餘 47 個立刻失敗；但失敗得很快，而且其他功能還有 255 格可以用，菜單打得開。這正是我們要的取捨：已經壞掉的功能壞得快一點，換健康的功能完全不受影響。</p>
+<p>為什麼佇列只給並行上限的一半，而不是給大一點、讓更多下單「等等看」？因為<strong>滿了立刻拒絕比排隊好</strong>。排隊的請求一樣佔著記憶體和連線；金流慢到 10 秒時，排在後面的請求輪到它時，客戶端多半早已放棄。佇列只用來吸收很短的突發，上限要設小；Google SRE 書建議佇列長度不超過執行緒數的 50%，上面的程式就是照這個比例算的。</p>
+<p>隔艙跟<a href="10-rate-limiting.html">第 10 課</a>的並行數限制是同一個工具，用途不同：限流保護<strong>你自己</strong>不被某個客戶打爆；隔艙保護<strong>你的其他功能</strong>不被某個依賴拖垮。練習 2 會實作有佇列上限、可以取消的隔艙。</p>
+<div class="callout practice"><strong>💡 實務上：隔艙常常就是「把連線池分開」</strong><br>最常見的版本不是寫信號量，而是把共用的池子拆開：每個外部服務用自己的 HTTP 連線上限，後台報表的大查詢用另一組資料庫連線（甚至另一台唯讀副本），不跟線上下單搶。咖啡店月底跑營收報表把連線池佔滿、顧客結帳卡住，就是少了這道隔艙。坑在切太細：每份都太小，平常尖峰就在拒絕請求，所以上限要先用 Little's Law 估、再看監控的飽和度調整。只有一兩個依賴、流量也不大的小服務，先把逾時設好，通常比切隔艙更划算。</div>
+<p>斷路器和隔艙都是咖啡店 API 在「呼叫金流」時保護自己。可是回頭看時間軸 08:05：下單快速失敗之後，使用者狂按重新整理、App 自動重試，打進咖啡店 API 的請求變成平常的好幾倍。這時被塞爆的不是金流，是咖啡店 API 自己。請求多到做不完時，伺服器該怎麼辦？</p>
+
+<h2>請求多到做不完時，伺服器該全部收下嗎？</h2>
+<p>前兩節站在呼叫端，這一節換到被呼叫的那一端。請求多到處理不完時，伺服器主動拒絕一部分，叫<strong>負載卸除（load shedding）</strong>。<a href="10-rate-limiting.html">第 10 課</a>提過它跟限流的差別：限流看的是「某個客戶送了多少」，卸除看的是「我自己還撐不撐得住」，不管請求是誰送的。這裡講怎麼做。</p>
+<p>直覺上「全部收下、慢慢做」比較好，至少不會拒絕任何人。其實相反。要看出為什麼，先分清兩個數字：<strong>吞吐量（throughput）</strong>是每秒做完幾個請求；<strong>goodput</strong> 是其中真正有用的部分，也就是在客戶端放棄之前就完成、結果有人收到的請求。平常兩者幾乎一樣，過載時會分開：伺服器可能每秒還是做完 100 個，但如果每個都排了 5 秒，而客戶端 2 秒就放棄，goodput 就是 0。機器全速運轉，做的都是白工。</p>
+<figure>
+  <svg viewBox="0 0 700 270" role="img" aria-label="橫軸是送進來的負載，縱軸是成功的請求數。理想情況在容量處持平；沒有卸除時超過容量後 goodput 急速下降；有卸除時維持在接近容量">
+    <defs><marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <path class="d-line" d="M70,230 L670,230" marker-end="url(#arr2)"/>
+    <path class="d-line" d="M70,230 L70,20" marker-end="url(#arr2)"/>
+    <text class="d-small" x="560" y="255">送進來的負載 →</text>
+    <text class="d-small" x="80" y="25">goodput</text>
+    <path class="d-line" d="M330,40 L330,230" stroke-dasharray="4 4"/>
+    <text class="d-small" x="335" y="225">容量</text>
+    <path class="d-line" d="M70,230 L330,70 L650,70" stroke-width="2"/>
+    <text class="d-text" x="480" y="60">有卸除：維持在容量附近</text>
+    <path class="d-line" d="M330,70 C380,80 410,150 450,200 S560,226 650,228" stroke-dasharray="7 4" stroke-width="2"/>
+    <text class="d-accent" x="460" y="170">沒有卸除：排隊超過逾時，</text>
+    <text class="d-accent" x="460" y="190">goodput 掉到接近 0</text>
+  </svg>
+  <figcaption>AWS Builders' Library〈Using load shedding to avoid overload〉的概念圖：超過容量後，有卸除的伺服器把多的請求很便宜地拒絕掉，剩下的都在期限內完成</figcaption>
+</figure>
+<p>用一個每秒為單位的模擬看看：容量每秒 100 個、每秒進來 150 個、客戶端等 2 秒就放棄。執行後比較三種做法的「goodput 每秒幾個」：</p>
+<div class="lab"><script type="code">
+const CAPACITY = 100        // 每秒做得完幾個
+const ARRIVALS = 150        // 每秒進來幾個
+const CLIENT_TIMEOUT = 2    // 客戶端等幾秒就放棄
+const SECONDS = 30
+
+function simulate(maxQueue: number, dropExpired: boolean) {
+  const queue: number[] = []          // 每個元素是請求到達的秒數，先進先出
+  let good = 0, wasted = 0, rejected = 0, dropped = 0
+  for (let t = 0; t < SECONDS; t++) {
+    for (let i = 0; i < ARRIVALS; i++) {
+      if (queue.length < maxQueue) queue.push(t)
+      else rejected++                 // 佇列滿：立刻回 503，幾乎不花成本
+    }
+    let budget = CAPACITY
+    while (budget > 0 && queue.length > 0) {
+      const arrived = queue.shift()!
+      if (dropExpired && t - arrived >= CLIENT_TIMEOUT) { dropped++; continue }  // 沒人在等了，不做
+      budget--
+      if (t + 1 - arrived <= CLIENT_TIMEOUT) good++
+      else wasted++                   // 做完了，但客戶端早就放棄
+    }
+  }
+  const done = good + wasted
+  console.log(`做完 ${done}（每秒 ${done / SECONDS}）、goodput ${good}（每秒 ${good / SECONDS}）、白工 ${wasted}、立刻拒絕 ${rejected}、丟掉過期 ${dropped}`)
+}
+
+console.log('佇列沒有上限：'); simulate(Infinity, false)
+console.log('佇列上限 100（約 1 秒的量）：'); simulate(100, false)
+console.log('佇列沒有上限，但丟掉過期的：'); simulate(Infinity, true)
+</script></div>
+<p>三種做法的吞吐量都是每秒 100 個，但佇列沒有上限時，goodput 只有每秒 15 個：只有前幾秒的請求趕上期限，之後做的全是白工，而且佇列還留著 1,500 個沒人要的請求。佇列有上限，或在開始處理前檢查「還來不來得及」，goodput 就回到每秒 100 個。多出來的 50 個請求反正做不完，差別只在於是「馬上告訴客戶端不行」，還是「讓所有人都等到逾時」。</p>
+<p>模擬裡的兩個修正，就是卸除的前兩條規則。<strong>佇列要有上限</strong>，排太久的直接丟。<strong>開始處理前先看 deadline</strong>：第 8 課的 deadline 傳遞讓伺服器知道「呼叫端最晚等到什麼時候」，剩下的時間連做完都不夠，就直接拒絕，不要開始。</p>
+<p>決定要丟之後，下一個問題是先丟誰。過載時不是每個請求都一樣重要，所以要<strong>依重要性（criticality）卸除</strong>：先丟最不重要的。咖啡店的順序是結帳 &gt; 看菜單 &gt; 推薦商品，推薦區塊少了沒人會發現，結帳失敗就是少一筆營收。重要性要跟著請求往下游傳，下游才知道該先丟哪些；Google 內部的分級做法見課末「補充與查表」。其中有一個請求永遠最優先：<strong>健康檢查</strong>。時間軸 08:03 就是反例：<code>/health</code> 排在隊伍裡逾時，負載平衡器以為機器死了、把它踢掉，剩下的機器負擔更重。卸除時如果連 <code>/health</code> 也丟，就是自己重演那一步。</p>
+<p>拒絕的方式也有講究。<strong>拒絕要便宜</strong>：在做任何昂貴的事之前（查資料庫、解析大 body）就判斷，否則拒絕本身就把伺服器拖垮。拒絕時回 503 加 <code>Retry-After</code>，讓客戶端照第 8 課退避。429 和 503 別混用：429 是「你送太多」，針對某個客戶；503 是「我撐不住」，跟是誰送的無關。</p>
+<p>最後，<strong>監控要分開算</strong>。快速拒絕的請求延遲很短，混進延遲指標會讓 p99 看起來變好，其實是大量請求被丟掉。被卸除的請求要另外計數、另外告警。練習 3 會寫一個依優先順序和 deadline 決定收不收的函式。</p>
+<div class="callout practice"><strong>💡 實務上：「哪些請求可以先丟」是產品決策，前端也要配合</strong><br>重要性的排序不是工程師自己決定的，要跟 PM 一起列出來：結帳和登入不能丟，推薦、瀏覽統計、通知數字可以先丟。後端通常在閘道或中介層依路由或標頭判斷重要性，所以 API 設計時就要讓請求帶得出這個資訊。前端收到 503 時要照 <code>Retry-After</code> 等待、顯示「目前人潮較多，請稍後再試」，不要立刻自動重試，也不要讓按鈕可以連點：過載時每個重試都會把流量再放大，後端更難恢復。</div>
+<p>卸除讓咖啡店 API 在過載時還能完成做得完的那部分。但拒絕本身也要成本：收封包、解析標頭、回 503。如果 App 或閘道不管被拒絕多少次都照樣送，咖啡店 API 光是拒絕就忙不過來。能不能讓送請求的那一端自己少送一點？</p>
+
+<h2>後端一直回 503，客戶端為什麼還要照送？</h2>
+<p>這一節的「客戶端」是送請求的那一端：可能是呼叫咖啡店 API 的閘道或 App 後端，也可能是呼叫金流的咖啡店 API。客戶端其實看得到後端的狀況：它送出去的請求有多少被接受、多少被 503 打回來，都在它手上。<strong>自適應節流（adaptive throttling）</strong>就是利用這份資訊：客戶端自己看「後端最近接受了多少比例」，接受得越少，就在本機先丟掉越多請求，根本不送出去。</p>
+<p>Google SRE 書〈Handling Overload〉的做法是讓每個客戶端記錄最近一段時間（例如 2 分鐘）的兩個數字：</p>
+<ul>
+  <li><code>requests</code>：應用程式想送的請求數，包括被本機丟掉的。</li>
+  <li><code>accepts</code>：後端接受的請求數。</li>
+</ul>
+<p>每個新請求在本機被丟掉的機率是：</p>
+<pre>p = max(0, (requests − K × accepts) ÷ (requests + 1))</pre>
+<p>分母的 +1 讓剛開始、還沒有資料時機率不會跳到很高。先用現有的紀錄算 p，再把這次請求記進 <code>requests</code>，不管它最後有沒有被丟掉：requests 量的是「應用程式想送多少」，accepts 量的是「後端接住多少」，兩者相比才看得出差距。公式寫法的出處見課末「補充與查表」。</p>
+<p>K 是倍數，決定客戶端多寬容。K = 2 的意思是：只要後端接受的比例還在一半以上，requests − 2 × accepts ≤ 0，p = 0，客戶端一個都不丟；後端拒絕超過一半，客戶端才開始丟。K 越小越積極，書中偏好 2。執行後看不同的接受比例對應多大的本機丟棄機率：</p>
+<div class="lab"><script type="code">
+const k = 2
+const requests = 1000
+console.log('後端接受比例 → 本機丟掉的機率')
+for (const acceptRatio of [1, 0.6, 0.5, 0.4, 0.25, 0.1, 0]) {
+  const accepts = requests * acceptRatio
+  const p = Math.max(0, (requests - k * accepts) / (requests + 1))
+  console.log(`${(acceptRatio * 100).toFixed(0).padStart(3)}% → ${(p * 100).toFixed(1)}%`)
+}
+</script></div>
+<p>後端只接受 25% 時，客戶端自己丟掉約一半；後端完全拒絕時，客戶端幾乎全部丟掉，但還是會放極少數出去試探。後端恢復後 accepts 增加，p 就自動降回 0，不需要像斷路器那樣切換狀態。</p>
+<p>它跟<a href="08-timeouts-retries-backoff.html">第 8 課</a>的重試預算解決不同的問題：重試預算限制<strong>重試</strong>佔多少比例，避免「一個請求變三個」；自適應節流限制的是<strong>所有請求</strong>，讓客戶端整體的送出量跟後端實際接得住的量對齊。兩個可以一起用。練習 4 會實作它。</p>
+<p>到這裡，咖啡店有斷路器、隔艙、卸除和節流四道防線，金流變慢時系統不會再整個塌掉。可是每一道防線最後做的事都一樣：回一個錯誤。使用者手上拿到的是一堆錯誤訊息，這樣算成功嗎？</p>
+
+<h2>擋下來之後，使用者看到什麼？</h2>
+<p>斷路器打開、隔艙滿了、請求被卸除之後，如果只回一個錯誤頁面，保護機制只是讓系統「掛得比較快」。防線的目的是讓還健康的部分繼續服務，所以要決定每個依賴壞掉時，畫面上剩下什麼。這叫<strong>降級（graceful degradation）</strong>：依賴失敗時，做少一點但還能用。降級時拿來頂替的那個結果，叫<strong>備援（fallback）</strong>，例如快取裡的舊資料、預設值。有些降級要靠 ops 旗標切換：ops 旗標是不用改程式、不用部署，在設定裡就能切換的開關（<a href="19-evolution-compatibility.html">第 19 課</a>細談）。咖啡店的每個依賴壞掉時：</p>
+<div class="table-wrap"><table>
+  <tr><th>依賴壞掉</th><th>降級的做法</th><th>使用者看到</th></tr>
+  <tr><td>推薦服務</td><td>不顯示推薦區塊；用 ops 旗標一鍵關掉</td><td>少了「你可能也喜歡」，其他正常</td></tr>
+  <tr><td>菜單的資料庫查詢</td><td>回快取裡過期的菜單（第 5 課：重新載入失敗時保留舊值）</td><td>菜單是 10 分鐘前的版本</td></tr>
+  <tr><td>集點服務</td><td>下單照常成功，集點放進佇列晚點入帳（<a href="12-queues-outbox.html">第 12 課</a>）</td><td>「點數將於稍後入帳」</td></tr>
+  <tr><td>金流</td><td>不能假裝付款成功。改成「到店付款」，或明確告訴使用者稍後再試</td><td>清楚的錯誤訊息，不是轉圈圈 30 秒</td></tr>
+</table></div>
+<p>表格最後一列是這個早上的主角，也是最不能隨便降級的一列。<strong>不能用備援掩蓋錢和權限的錯誤</strong>：付款、庫存、權限檢查失敗時，回「成功」或「有權限」比回錯誤更糟，前者讓店家少收錢，後者讓不該看的人看到資料。這類依賴只能快速失敗，把「付款暫時不能用」清楚地告訴使用者；這一課前面所有的防線，就是為了讓這個錯誤訊息在 1 秒內出現，而不是轉 30 秒圈圈。</p>
+<p>其他依賴的備援，本身也要可靠。<strong>備援要便宜</strong>：回本機的快取、預設值、空陣列。備援如果是去呼叫另一個服務，就多了一條新的故障路徑，而且主要路徑壞掉的時候，往往正是大家都在呼叫備援的時候，備援服務也會被灌爆。</p>
+<p>備援還有一個特性：它平常不會跑到。程式改了好幾版，備援路徑悄悄壞掉也沒人發現，出事那天才第一次執行，常常發現它根本不能用。所以<strong>備援要定期演練</strong>，最後一節會講怎麼做。最後，<strong>要讓人知道現在是降級中</strong>：記指標、記 log，降級狀態持續太久要告警。降級是爭取時間，不是新的常態。</p>
+<div class="callout practice"><strong>💡 實務上：降級畫面要在設計階段就畫出來</strong><br>規劃新頁面時，資深工程師會把頁面上每個區塊依賴哪個服務列出來，逐一問「這個壞了，畫面長怎樣」，再跟 PM、設計師一起決定：隱藏、顯示舊資料加提示，還是整頁擋下。前端常見的做法是讓每個區塊各自處理錯誤（例如 React 的 error boundary、Vue 的 onErrorCaptured，或各區塊獨立的載入與錯誤狀態），推薦區塊失敗不會讓整頁白掉。金流改成「到店付款」這種降級牽涉營運流程和對帳，一定要先跟店家、財務確認，不能由工程師在出事當下臨時決定。</div>
+<p>現在呼叫金流的那一行程式外面，已經要包上逾時、重試、斷路器、隔艙，失敗時再接到降級。四層東西包在一起，誰包誰有差嗎？</p>
+
+<h2>這些防護要照什麼順序包在金流呼叫外面？</h2>
+<p>有差，而且<strong>包的順序會改變行為</strong>。原因是每一層只看得到它裡面那一層的結果：外層拿到的是內層處理過的結果，內層做了什麼它不知道。把這些機制依序包起來的結構叫<strong>韌性管線（resilience pipeline）</strong>。.NET 的標準韌性處理器（Microsoft.Extensions.Http.Resilience）是一個現成的參考，它由外到內是這樣排的，圖上的數字是它的預設值：</p>
+<figure>
+  <svg viewBox="0 0 700 230" role="img" aria-label="韌性管線由外到內：並行上限、總逾時、重試、斷路器、單次嘗試逾時，最裡面是實際呼叫">
+    <rect class="d-soft" x="10" y="10" width="680" height="210" rx="10"/>
+    <text class="d-text" x="25" y="32">1. 並行上限（隔艙）：1,000 個、佇列 0</text>
+    <rect class="d-box" x="30" y="45" width="640" height="165" rx="9"/>
+    <text class="d-text" x="45" y="67">2. 總逾時 30 秒：包含所有重試</text>
+    <rect class="d-soft" x="50" y="80" width="600" height="120" rx="8"/>
+    <text class="d-text" x="65" y="102">3. 重試：最多 3 次、指數退避加 jitter</text>
+    <rect class="d-box" x="70" y="115" width="560" height="75" rx="7"/>
+    <text class="d-text" x="85" y="137">4. 斷路器：每一次嘗試都記錄</text>
+    <rect class="d-soft" x="90" y="148" width="520" height="34" rx="6"/>
+    <text class="d-text" x="105" y="170">5. 單次嘗試逾時 10 秒 → 實際呼叫金流</text>
+  </svg>
+  <figcaption>由外到內的順序。每一層只看得到它裡面那一層的結果</figcaption>
+</figure>
+<p>逐層看為什麼這樣排。<strong>隔艙在最外面</strong>：一個請求（包括它所有的重試）只佔一個名額；名額滿了，連重試都不用開始，直接快速失敗。如果隔艙放在重試裡面，一個請求重試三次就要搶三次名額。</p>
+<p>接著是兩個逾時。<strong>總逾時包住重試</strong>：使用者最多等 30 秒，重試再多次也不能超過。<strong>單次逾時在最裡面</strong>：每次嘗試各自計時，一次卡住不會吃掉全部的時間。只有單次逾時沒有總逾時的話，第一次加上 3 次重試共 4 次嘗試，每次 10 秒再加退避，使用者可能要等 40 秒以上。</p>
+<p>最關鍵的是<strong>重試在斷路器外面</strong>。這樣斷路器才看得到每一次嘗試的結果。反過來放，斷路器只看到「重試三次後的最終結果」：金流 67% 的嘗試都失敗了，只要第三次成功，斷路器看到的就是一次成功，以為一切正常。正確的順序下，斷路器打開後，重試收到 <code>BreakerOpenError</code>，必須停止，這就是上面「斷路器丟出的錯誤不能被重試」那條規則在管線裡的位置。</p>
+<p>Node 的 cockatiel 也用同樣的概念組合：<code>wrap(retry, breaker, timeout)</code> 是第一個包住第二個、第二個包住第三個，等於 <code>retry.execute(() =&gt; breaker.execute(() =&gt; timeout.execute(…)))</code>。下面用一個前兩次都失敗、第三次才成功的金流，執行後比較兩種順序下「斷路器看到」的那一串結果：</p>
+<div class="lab"><script type="code">
+type Call = () => Promise<string>
+
+// 極簡的「斷路器」：只記錄看到的結果
+function recorder(seen: string[]) {
+  return async (fn: Call) => {
+    try { const v = await fn(); seen.push('成功'); return v }
+    catch (e) { seen.push('失敗'); throw e }
+  }
+}
+// 極簡的重試：最多 3 次
+async function retry3(fn: Call) {
+  let last: unknown
+  for (let i = 0; i < 3; i++) {
+    try { return await fn() } catch (e) { last = e }
+  }
+  throw last
+}
+function flakyPayment() {
+  let calls = 0
+  return async () => { calls++; if (calls <= 2) throw new Error('502'); return '付款成功' }
+}
+
+{
+  const seen: string[] = []
+  const breaker = recorder(seen)
+  const pay = flakyPayment()
+  console.log('重試包斷路器：', await retry3(() => breaker(pay)), '，斷路器看到', seen)
+}
+{
+  const seen: string[] = []
+  const breaker = recorder(seen)
+  const pay = flakyPayment()
+  console.log('斷路器包重試：', await breaker(() => retry3(pay)), '，斷路器看到', seen)
+}
+</script></div>
+<p>兩種順序付款都成功了，但第二種的斷路器完全不知道金流前兩次都失敗了。金流變得更糟時，它會晚很多才打開，而那段時間裡每個請求都打了 3 次，金流收到的流量是平常的好幾倍。</p>
+<p>管線排好了，但這五層在正常的日子裡一次都不會觸發。門檻設錯、名額沒歸還，都要等到下一個早上 8 點才會發現。怎麼在出事之前就確認它們會動？</p>
+
+<h3>上線之後，怎麼確認這些防護真的會動？</h3>
+<p>這些機制有一個共同的麻煩：平常完全不會觸發。斷路器門檻設錯、隔艙忘了歸還名額、降級畫面壞了，在正常的日子裡都看不出來。所以上線後要做兩件事：讓它們的狀態看得到，以及主動製造故障確認它們會動。</p>
+<p>要看的指標有四組：</p>
+<ul>
+  <li><strong>斷路器的狀態變化</strong>：每次轉成 open、half-open、closed 都記一筆並發告警（指標與告警怎麼設，見<a href="../../devops/lessons/22-metrics-slo.html">部署課第 22 課</a>）；被擋下的呼叫數。斷路器一天開關好幾次，代表門檻太敏感或下游真的不穩。</li>
+  <li><strong>隔艙的飽和度</strong>：進行中的數量 ÷ 上限、佇列長度、被拒絕的次數。常常接近滿，代表上限太小或依賴變慢了。</li>
+  <li><strong>卸除的數量</strong>：依原因（過載、過期）和重要性分開算。結帳開始被卸除是最高等級的告警。</li>
+  <li><strong>降級的時間</strong>：現在有幾個功能在降級、持續多久。</li>
+</ul>
+<p>指標只能告訴你出事時發生了什麼，要事先確認，就得在 staging 主動製造故障：用代理或測試開關讓金流延遲 10 秒、回 503、斷線，這叫<strong>故障注入（fault injection）</strong>；團隊排時間一起做、觀察系統和告警的反應，叫<strong>故障演練（game day）</strong>。咖啡店的演練就是在 staging 重播這個早上，逐項確認：斷路器真的打開、隔艙真的擋下、菜單不受影響、降級畫面真的出現、告警真的響、值班的人知道怎麼處理。全部打勾，下一次金流在早上 8 點變慢時，使用者看到的會是「付款暫時無法使用」和一份照常打得開的菜單。</p>
+
+<h2>補充與查表</h2>
+<p>主線省略的對照、出處與版本，查表用，不用背。</p>
+<h3>三個函式庫的斷路器預設值</h3>
+<div class="table-wrap"><table>
+  <tr><th></th><th>opossum 10.0.0（Node）</th><th>cockatiel 4.0.0（Node）</th><th>.NET 標準韌性處理器</th></tr>
+  <tr><td>失敗率門檻</td><td><code>errorThresholdPercentage</code> 50（失敗率超過 50% 才打開）</td><td><code>SamplingBreaker</code> 的 <code>threshold</code>（0～1，必填）；或 <code>ConsecutiveBreaker(n)</code> 連續 n 次失敗</td><td>10%</td></tr>
+  <tr><td>統計視窗</td><td><code>rollingCountTimeout</code> 10 秒，分 10 個桶</td><td><code>duration</code>（必填）</td><td>30 秒</td></tr>
+  <tr><td>最少呼叫數</td><td><code>volumeThreshold</code> <strong>0</strong></td><td><code>minimumRps</code>（每秒請求數）</td><td>100 次</td></tr>
+  <tr><td>開啟多久</td><td><code>resetTimeout</code> 30 秒</td><td><code>halfOpenAfter</code></td><td>5 秒</td></tr>
+  <tr><td>並行上限</td><td><code>capacity</code>（預設 <code>Number.MAX_SAFE_INTEGER</code>）</td><td>另外用 <code>bulkhead(limit, queue)</code></td><td>限流器：1,000 個、佇列 0</td></tr>
+</table></div>
+<p>資料來源：opossum 10.0.0 的設定文件、cockatiel 4.0.0 的 README、Microsoft Learn〈Build resilient HTTP apps〉（2026-02-24 版）。.NET 標準處理器預設也是把逾時、連線失敗、5xx、408、429 算成失敗。</p>
+<h3>斷路器與第 4 課的異常剔除</h3>
+<p>兩者不一樣。<a href="04-redundancy-load-balancing.html">第 4 課</a>的異常剔除在負載平衡器裡，把「某一台」壞掉的主機移出輪替，其他台繼續服務；斷路器在呼叫端，判斷的是「整個依賴」。依賴是多台主機時兩者都要有：剔除處理一台壞，斷路器處理全部壞。</p>
+<h3>每個端點各一個斷路器</h3>
+<p>依賴有多個獨立的端點或主機時，斷路器可以再細分。.NET 的標準 hedging 處理器會對多個端點送 hedged request（慢了就再送一份給另一個端點，<a href="03-latency-percentiles.html">第 3 課</a>的選讀），它就替每個端點各配一個斷路器。</p>
+<h3>更大尺度的隔艙</h3>
+<p>隔艙也可以用在機器層級：VIP 企業客戶的請求走獨立的一組機器，一個客戶的流量暴增不會影響其他客戶。</p>
+<h3>負載卸除的出處</h3>
+<ul>
+  <li>goodput 的概念圖出自 AWS Builders' Library〈Using load shedding to avoid overload〉。</li>
+  <li>Google 內部把請求的重要性分成 <code>CRITICAL_PLUS</code>、<code>CRITICAL</code>、<code>SHEDDABLE_PLUS</code>、<code>SHEDDABLE</code> 四級，重要性會跟著請求往下游傳。</li>
+  <li>RFC 9110 §15.6.4 允許 503 附 <code>Retry-After</code>。</li>
+</ul>
+<h3>自適應節流公式的寫法</h3>
+<p>Google SRE 書〈Handling Overload〉裡的公式是一張圖。本課的寫法取自 Apache Beam 的 <code>AdaptiveThrottler</code> 實作，它的註解指向同一章；「先用現有紀錄算 p，再把這次請求記進 <code>requests</code>」的順序也是照 Beam 的實作。</p>
+
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：完成 <code>CircuitBreaker</code>。<code>state()</code> 回傳目前狀態，<code>execute(fn)</code> 依狀態決定要不要呼叫 <code>fn</code>。規則：</p>
+  <ul>
+    <li><strong>closed</strong>：呼叫 <code>fn</code>，在它結束時用 <code>now()</code> 記下時間和成敗。只算距離現在不到 <code>windowMs</code> 的紀錄（剛好 <code>windowMs</code> 以前的不算）。記完之後，如果視窗內的呼叫數 ≥ <code>minimumCalls</code> 而且失敗率 ≥ <code>failureRateThreshold</code>，轉成 open。</li>
+    <li><strong>open</strong>：不呼叫 <code>fn</code>，丟出 <code>BreakerOpenError</code>。轉成 open 之後經過 <code>openMs</code>（含），<code>state()</code> 和 <code>execute</code> 都把它當成 half-open。</li>
+    <li><strong>half-open</strong>：同時最多放 <code>halfOpenMaxCalls</code> 個試探，多的丟 <code>BreakerOpenError</code>。累積 <code>halfOpenMaxCalls</code> 次成功就轉回 closed，並清空紀錄；任何一次試探失敗立刻轉回 open，重新計時。</li>
+    <li><code>fn</code> 的錯誤一律原樣丟給呼叫端。<code>isFailure(err)</code> 回傳 false 的錯誤當成成功計算（沒給 <code>isFailure</code> 時所有錯誤都算失敗）。</li>
+    <li>狀態改變之前開始、改變之後才結束的呼叫，結果一律忽略（例如某個試探失敗、斷路器回到 open 之後，另一個試探才成功，不能因此轉回 closed）。時間只能用傳進來的 <code>now</code>。</li>
+  </ul>
+  <script type="start">
+class BreakerOpenError extends Error {
+  name = 'BreakerOpenError'
+  constructor() { super('斷路器開啟中，暫停呼叫') }
+}
+
+type BreakerState = 'closed' | 'open' | 'half-open'
+type BreakerOptions = {
+  failureRateThreshold: number   // 0～1，例如 0.5
+  minimumCalls: number
+  windowMs: number
+  openMs: number
+  halfOpenMaxCalls: number
+  now: () => number
+  isFailure?: (err: unknown) => boolean
+}
+
+class CircuitBreaker {
+  private readonly opts: BreakerOptions
+
+  constructor(opts: BreakerOptions) {
+    this.opts = opts
+  }
+
+  state(): BreakerState {
+    throw new Error('TODO')
+  }
+
+  async execute<T>(fn: () => Promise<T>): Promise<T> {
+    throw new Error('TODO')
+  }
+}
+</script>
+  <script type="answer">
+class BreakerOpenError extends Error {
+  name = 'BreakerOpenError'
+  constructor() { super('斷路器開啟中，暫停呼叫') }
+}
+
+type BreakerState = 'closed' | 'open' | 'half-open'
+type BreakerOptions = {
+  failureRateThreshold: number   // 0～1，例如 0.5
+  minimumCalls: number
+  windowMs: number
+  openMs: number
+  halfOpenMaxCalls: number
+  now: () => number
+  isFailure?: (err: unknown) => boolean
+}
+
+class CircuitBreaker {
+  private readonly opts: BreakerOptions
+  private mode: BreakerState = 'closed'
+  private epoch = 0                                  // 每次換狀態加 1，用來忽略舊的結果
+  private records: { at: number; failed: boolean }[] = []
+  private openedAt = 0
+  private probesInFlight = 0
+  private probeSuccesses = 0
+
+  constructor(opts: BreakerOptions) {
+    this.opts = opts
+  }
+
+  state(): BreakerState {
+    if (this.mode === 'open' && this.opts.now() - this.openedAt >= this.opts.openMs) {
+      this.moveTo('half-open')
+    }
+    return this.mode
+  }
+
+  async execute<T>(fn: () => Promise<T>): Promise<T> {
+    const state = this.state()
+    if (state === 'open') throw new BreakerOpenError()
+    if (state === 'half-open') {
+      if (this.probesInFlight >= this.opts.halfOpenMaxCalls) throw new BreakerOpenError()
+      this.probesInFlight++
+    }
+    const epoch = this.epoch
+    try {
+      const value = await fn()
+      this.record(epoch, false)
+      return value
+    } catch (err) {
+      const isFailure = this.opts.isFailure ?? (() => true)
+      this.record(epoch, isFailure(err))
+      throw err
+    }
+  }
+
+  private record(epoch: number, failed: boolean) {
+    if (epoch !== this.epoch) return
+    if (this.mode === 'half-open') {
+      this.probesInFlight--
+      if (failed) this.moveTo('open')
+      else if (++this.probeSuccesses >= this.opts.halfOpenMaxCalls) this.moveTo('closed')
+      return
+    }
+    const now = this.opts.now()
+    this.records.push({ at: now, failed })
+    this.records = this.records.filter(r => now - r.at < this.opts.windowMs)
+    const failures = this.records.filter(r => r.failed).length
+    if (this.records.length >= this.opts.minimumCalls &&
+        failures / this.records.length >= this.opts.failureRateThreshold) {
+      this.moveTo('open')
+    }
+  }
+
+  private moveTo(mode: BreakerState) {
+    this.mode = mode
+    this.epoch++
+    this.records = []
+    this.probesInFlight = 0
+    this.probeSuccesses = 0
+    if (mode === 'open') this.openedAt = this.opts.now()
+  }
+}
+</script>
+  <script type="tests">
+const flush = () => new Promise<void>(r => setTimeout(r, 0))
+const settle = async (p: Promise<unknown>) => { try { return { ok: true, value: await p, error: undefined as unknown } } catch (e) { return { ok: false, value: undefined, error: e } } }
+const createClock = (t = 0) => ({ now: () => t, advance: (ms: number) => { t += ms } })
+const poison = () => {
+  const saved = { now: Date.now, random: Math.random }
+  const boom = (): never => { throw new Error('不能用 Date.now／Math.random：時間要用傳進來的 now()') }
+  Date.now = boom
+  Math.random = boom
+  return () => { Date.now = saved.now; Math.random = saved.random }
+}
+const make = (clock: { now: () => number }, extra: Partial<BreakerOptions> = {}) => new CircuitBreaker({
+  failureRateThreshold: 0.5, minimumCalls: 5, windowMs: 10000, openMs: 5000, halfOpenMaxCalls: 2, now: clock.now, ...extra,
+})
+let calls = 0
+const ok = () => { calls++; return Promise.resolve('ok') }
+const fail = () => { calls++; return Promise.reject(new Error('金流 502')) }
+const run = async (b: CircuitBreaker, seq: string) => {
+  for (const c of seq) await settle(b.execute(c === 'S' ? ok : fail))
+}
+
+{
+  const clock = createClock()
+  const b = make(clock)
+  const restore = poison()
+  try {
+    assert.equal(b.state(), 'closed', '一開始是 closed')
+    const r = await settle(b.execute(fail))
+    assert(!r.ok && r.error instanceof Error && r.error.message === '金流 502', 'fn 的錯誤要原樣丟給呼叫端')
+    assert.equal(b.state(), 'closed', 'minimumCalls 是 5，第 1 次失敗不能打開斷路器')
+    await run(b, 'SFS')
+    assert.equal(b.state(), 'closed', '4 次呼叫還沒到 minimumCalls，失敗率 50% 也不能打開')
+    await run(b, 'F')
+    assert.equal(b.state(), 'open', '5 次中 3 次失敗（60% ≥ 50%）要轉成 open')
+  } finally { restore() }
+  calls = 0
+  const r = await settle(b.execute(ok))
+  assert.equal(calls, 0, 'open 時不能呼叫 fn')
+  assert(!r.ok && r.error instanceof BreakerOpenError, 'open 時要丟 BreakerOpenError')
+  assert.equal((r.error as Error).name, 'BreakerOpenError', 'BreakerOpenError 的 name 要是 BreakerOpenError')
+  clock.advance(4999)
+  assert.equal(b.state(), 'open', '還沒經過 openMs，要維持 open')
+  clock.advance(1)
+  assert.equal(b.state(), 'half-open', '經過 openMs 之後要轉成 half-open')
+}
+{
+  const clock = createClock()
+  const b = make(clock, { minimumCalls: 4 })
+  await run(b, 'SFSF')
+  assert.equal(b.state(), 'open', '失敗率剛好等於門檻（4 次中 2 次失敗）也要打開：用 ≥')
+}
+{
+  const clock = createClock()
+  const b = make(clock)
+  await run(b, 'FFFF')
+  clock.advance(10000)
+  await run(b, 'FSSSS')
+  assert.equal(b.state(), 'closed', '10 秒前的 4 次失敗已經在視窗外，不能算進失敗率（視窗內只有 5 次中 1 次失敗）')
+}
+{
+  const clock = createClock()
+  const b = make(clock)
+  await run(b, 'FFFFF')
+  clock.advance(5000)
+  const ds = [Promise.withResolvers<string>(), Promise.withResolvers<string>()]
+  let started = 0
+  const probes = ds.map(d => settle(b.execute(() => { started++; return d.promise })))
+  await flush()
+  assert.equal(started, 2, 'half-open 時要放 halfOpenMaxCalls（2）個試探')
+  calls = 0
+  const third = await settle(b.execute(ok))
+  assert.equal(calls, 0, '試探還在進行、名額已滿時，第 3 個呼叫不能執行 fn')
+  assert(!third.ok && third.error instanceof BreakerOpenError, 'half-open 名額已滿時要丟 BreakerOpenError')
+  ds[0].resolve('ok')
+  await flush()
+  assert.equal(b.state(), 'half-open', '只成功 1 次，還沒累積 halfOpenMaxCalls 次成功，維持 half-open')
+  ds[1].resolve('ok')
+  await Promise.all(probes)
+  assert.equal(b.state(), 'closed', '試探全部成功要轉回 closed')
+  await run(b, 'F')
+  assert.equal(b.state(), 'closed', '轉回 closed 之後重新計數：1 次失敗不能打開')
+}
+{
+  const clock = createClock()
+  const b = make(clock)
+  await run(b, 'FFFFF')
+  clock.advance(5000)
+  const d1 = Promise.withResolvers<string>()
+  const d2 = Promise.withResolvers<string>()
+  const p1 = settle(b.execute(() => d1.promise))
+  const p2 = settle(b.execute(() => d2.promise))
+  await flush()
+  d1.reject(new Error('還是 502'))
+  await p1
+  assert.equal(b.state(), 'open', '任何一次試探失敗要立刻轉回 open')
+  d2.resolve('ok')
+  await p2
+  assert.equal(b.state(), 'open', '回到 open 之後才結束的試探，結果要忽略，不能轉回 closed')
+  clock.advance(4999)
+  assert.equal(b.state(), 'open', '回到 open 要重新計時 openMs')
+}
+{
+  const clock = createClock()
+  const b = make(clock, { isFailure: e => !(typeof e === 'object' && e !== null && 'status' in e && typeof e.status === 'number' && e.status < 500) })
+  const badCard = Object.assign(new Error('卡號錯誤'), { status: 422 })
+  for (let i = 0; i < 6; i++) {
+    assert.equal(b.state(), 'closed', `已經有 ${i} 次 422 還要是 closed：422 是呼叫端的錯，isFailure 回傳 false 時不能算失敗`)
+    const r = await settle(b.execute(() => Promise.reject(badCard)))
+    assert(!r.ok && r.error === badCard, 'isFailure 回傳 false 的錯誤也要原樣丟給呼叫端')
+  }
+  assert.equal(b.state(), 'closed', '422 是呼叫端的錯，isFailure 回傳 false，不能算失敗')
+  const down = () => Promise.reject(Object.assign(new Error('壞了'), { status: 503 }))
+  for (let i = 0; i < 5; i++) await settle(b.execute(down))
+  assert.equal(b.state(), 'closed', '視窗內 11 次中 5 次失敗，不到 50%，維持 closed')
+  await settle(b.execute(down))
+  assert.equal(b.state(), 'open', '503 算失敗：視窗內 12 次中 6 次失敗（50%）要打開')
+}
+{
+  const clock = createClock()
+  const b = make(clock, { failureRateThreshold: 0.8, minimumCalls: 3, windowMs: 3000, openMs: 1000, halfOpenMaxCalls: 1 })
+  await run(b, 'FFSF')
+  assert.equal(b.state(), 'closed', '門檻改成 0.8：4 次中 3 次失敗（75%）不能打開，要用傳進來的 failureRateThreshold')
+  await run(b, 'F')
+  assert.equal(b.state(), 'open', '門檻 0.8：5 次中 4 次失敗（剛好 80%）要打開')
+  clock.advance(999)
+  assert.equal(b.state(), 'open', 'openMs 是 1000，經過 999ms 還要是 open')
+  clock.advance(1)
+  assert.equal(b.state(), 'half-open', 'openMs 是 1000，經過 1000ms 要轉 half-open：要用傳進來的 openMs')
+  const d = Promise.withResolvers<string>()
+  const probe = settle(b.execute(() => d.promise))
+  calls = 0
+  const second = await settle(b.execute(ok))
+  assert(calls === 0 && !second.ok && second.error instanceof BreakerOpenError, 'halfOpenMaxCalls 是 1：已經有 1 個試探時，第 2 個要被擋下')
+  d.resolve('ok')
+  await probe
+  assert.equal(b.state(), 'closed', 'halfOpenMaxCalls 是 1：1 次試探成功就要轉回 closed')
+  await run(b, 'FF')
+  clock.advance(3000)
+  await run(b, 'F')
+  assert.equal(b.state(), 'closed', 'windowMs 是 3000：3 秒前的 2 次失敗在視窗外，只剩 1 次呼叫，不到 minimumCalls')
+}
+</script>
+  <script type="wrong">
+class BreakerOpenError extends Error {
+  name = 'BreakerOpenError'
+  constructor() { super('斷路器開啟中，暫停呼叫') }
+}
+type BreakerState = 'closed' | 'open' | 'half-open'
+type BreakerOptions = { failureRateThreshold: number; minimumCalls: number; windowMs: number; openMs: number; halfOpenMaxCalls: number; now: () => number; isFailure?: (err: unknown) => boolean }
+// 錯誤：沒有最少呼叫數，第一次失敗就打開
+class CircuitBreaker {
+  private readonly opts: BreakerOptions
+  private mode: BreakerState = 'closed'
+  private epoch = 0
+  private records: { at: number; failed: boolean }[] = []
+  private openedAt = 0
+  private probesInFlight = 0
+  private probeSuccesses = 0
+  constructor(opts: BreakerOptions) { this.opts = opts }
+  state(): BreakerState {
+    if (this.mode === 'open' && this.opts.now() - this.openedAt >= this.opts.openMs) this.moveTo('half-open')
+    return this.mode
+  }
+  async execute<T>(fn: () => Promise<T>): Promise<T> {
+    const state = this.state()
+    if (state === 'open') throw new BreakerOpenError()
+    if (state === 'half-open') {
+      if (this.probesInFlight >= this.opts.halfOpenMaxCalls) throw new BreakerOpenError()
+      this.probesInFlight++
+    }
+    const epoch = this.epoch
+    try { const v = await fn(); this.record(epoch, false); return v }
+    catch (err) { this.record(epoch, (this.opts.isFailure ?? (() => true))(err)); throw err }
+  }
+  private record(epoch: number, failed: boolean) {
+    if (epoch !== this.epoch) return
+    if (this.mode === 'half-open') {
+      this.probesInFlight--
+      if (failed) this.moveTo('open')
+      else if (++this.probeSuccesses >= this.opts.halfOpenMaxCalls) this.moveTo('closed')
+      return
+    }
+    const now = this.opts.now()
+    this.records.push({ at: now, failed })
+    this.records = this.records.filter(r => now - r.at < this.opts.windowMs)
+    const failures = this.records.filter(r => r.failed).length
+    if (failures / this.records.length >= this.opts.failureRateThreshold) this.moveTo('open')
+  }
+  private moveTo(mode: BreakerState) {
+    this.mode = mode; this.epoch++; this.records = []; this.probesInFlight = 0; this.probeSuccesses = 0
+    if (mode === 'open') this.openedAt = this.opts.now()
+  }
+}
+</script>
+  <script type="wrong">
+class BreakerOpenError extends Error {
+  name = 'BreakerOpenError'
+  constructor() { super('斷路器開啟中，暫停呼叫') }
+}
+type BreakerState = 'closed' | 'open' | 'half-open'
+type BreakerOptions = { failureRateThreshold: number; minimumCalls: number; windowMs: number; openMs: number; halfOpenMaxCalls: number; now: () => number; isFailure?: (err: unknown) => boolean }
+// 錯誤：open 之後永遠不轉 half-open
+class CircuitBreaker {
+  private readonly opts: BreakerOptions
+  private mode: BreakerState = 'closed'
+  private records: { at: number; failed: boolean }[] = []
+  constructor(opts: BreakerOptions) { this.opts = opts }
+  state(): BreakerState { return this.mode }
+  async execute<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.mode === 'open') throw new BreakerOpenError()
+    try { const v = await fn(); this.record(false); return v }
+    catch (err) { this.record((this.opts.isFailure ?? (() => true))(err)); throw err }
+  }
+  private record(failed: boolean) {
+    if (this.mode !== 'closed') return
+    const now = this.opts.now()
+    this.records.push({ at: now, failed })
+    this.records = this.records.filter(r => now - r.at < this.opts.windowMs)
+    const failures = this.records.filter(r => r.failed).length
+    if (this.records.length >= this.opts.minimumCalls && failures / this.records.length >= this.opts.failureRateThreshold) {
+      this.mode = 'open'
+      this.records = []
+    }
+  }
+}
+</script>
+  <script type="wrong">
+class BreakerOpenError extends Error {
+  name = 'BreakerOpenError'
+  constructor() { super('斷路器開啟中，暫停呼叫') }
+}
+type BreakerState = 'closed' | 'open' | 'half-open'
+type BreakerOptions = { failureRateThreshold: number; minimumCalls: number; windowMs: number; openMs: number; halfOpenMaxCalls: number; now: () => number; isFailure?: (err: unknown) => boolean }
+// 錯誤：half-open 時全部放行
+class CircuitBreaker {
+  private readonly opts: BreakerOptions
+  private mode: BreakerState = 'closed'
+  private epoch = 0
+  private records: { at: number; failed: boolean }[] = []
+  private openedAt = 0
+  private probeSuccesses = 0
+  constructor(opts: BreakerOptions) { this.opts = opts }
+  state(): BreakerState {
+    if (this.mode === 'open' && this.opts.now() - this.openedAt >= this.opts.openMs) this.moveTo('half-open')
+    return this.mode
+  }
+  async execute<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.state() === 'open') throw new BreakerOpenError()
+    const epoch = this.epoch
+    try { const v = await fn(); this.record(epoch, false); return v }
+    catch (err) { this.record(epoch, (this.opts.isFailure ?? (() => true))(err)); throw err }
+  }
+  private record(epoch: number, failed: boolean) {
+    if (epoch !== this.epoch) return
+    if (this.mode === 'half-open') {
+      if (failed) this.moveTo('open')
+      else if (++this.probeSuccesses >= this.opts.halfOpenMaxCalls) this.moveTo('closed')
+      return
+    }
+    const now = this.opts.now()
+    this.records.push({ at: now, failed })
+    this.records = this.records.filter(r => now - r.at < this.opts.windowMs)
+    const failures = this.records.filter(r => r.failed).length
+    if (this.records.length >= this.opts.minimumCalls && failures / this.records.length >= this.opts.failureRateThreshold) this.moveTo('open')
+  }
+  private moveTo(mode: BreakerState) {
+    this.mode = mode; this.epoch++; this.records = []; this.probeSuccesses = 0
+    if (mode === 'open') this.openedAt = this.opts.now()
+  }
+}
+</script>
+  <script type="wrong">
+class BreakerOpenError extends Error {
+  name = 'BreakerOpenError'
+  constructor() { super('斷路器開啟中，暫停呼叫') }
+}
+type BreakerState = 'closed' | 'open' | 'half-open'
+type BreakerOptions = { failureRateThreshold: number; minimumCalls: number; windowMs: number; openMs: number; halfOpenMaxCalls: number; now: () => number; isFailure?: (err: unknown) => boolean }
+// 錯誤：沒有用 isFailure，4xx 也算失敗
+class CircuitBreaker {
+  private readonly opts: BreakerOptions
+  private mode: BreakerState = 'closed'
+  private epoch = 0
+  private records: { at: number; failed: boolean }[] = []
+  private openedAt = 0
+  private probesInFlight = 0
+  private probeSuccesses = 0
+  constructor(opts: BreakerOptions) { this.opts = opts }
+  state(): BreakerState {
+    if (this.mode === 'open' && this.opts.now() - this.openedAt >= this.opts.openMs) this.moveTo('half-open')
+    return this.mode
+  }
+  async execute<T>(fn: () => Promise<T>): Promise<T> {
+    const state = this.state()
+    if (state === 'open') throw new BreakerOpenError()
+    if (state === 'half-open') {
+      if (this.probesInFlight >= this.opts.halfOpenMaxCalls) throw new BreakerOpenError()
+      this.probesInFlight++
+    }
+    const epoch = this.epoch
+    try { const v = await fn(); this.record(epoch, false); return v }
+    catch (err) { this.record(epoch, true); throw err }
+  }
+  private record(epoch: number, failed: boolean) {
+    if (epoch !== this.epoch) return
+    if (this.mode === 'half-open') {
+      this.probesInFlight--
+      if (failed) this.moveTo('open')
+      else if (++this.probeSuccesses >= this.opts.halfOpenMaxCalls) this.moveTo('closed')
+      return
+    }
+    const now = this.opts.now()
+    this.records.push({ at: now, failed })
+    this.records = this.records.filter(r => now - r.at < this.opts.windowMs)
+    const failures = this.records.filter(r => r.failed).length
+    if (this.records.length >= this.opts.minimumCalls && failures / this.records.length >= this.opts.failureRateThreshold) this.moveTo('open')
+  }
+  private moveTo(mode: BreakerState) {
+    this.mode = mode; this.epoch++; this.records = []; this.probesInFlight = 0; this.probeSuccesses = 0
+    if (mode === 'open') this.openedAt = this.opts.now()
+  }
+}
+</script>
+  <script type="wrong">
+class BreakerOpenError extends Error {
+  name = 'BreakerOpenError'
+  constructor() { super('斷路器開啟中，暫停呼叫') }
+}
+type BreakerState = 'closed' | 'open' | 'half-open'
+type BreakerOptions = { failureRateThreshold: number; minimumCalls: number; windowMs: number; openMs: number; halfOpenMaxCalls: number; now: () => number; isFailure?: (err: unknown) => boolean }
+// 錯誤：沒有時間視窗，舊的失敗一直算
+class CircuitBreaker {
+  private readonly opts: BreakerOptions
+  private mode: BreakerState = 'closed'
+  private epoch = 0
+  private records: { at: number; failed: boolean }[] = []
+  private openedAt = 0
+  private probesInFlight = 0
+  private probeSuccesses = 0
+  constructor(opts: BreakerOptions) { this.opts = opts }
+  state(): BreakerState {
+    if (this.mode === 'open' && this.opts.now() - this.openedAt >= this.opts.openMs) this.moveTo('half-open')
+    return this.mode
+  }
+  async execute<T>(fn: () => Promise<T>): Promise<T> {
+    const state = this.state()
+    if (state === 'open') throw new BreakerOpenError()
+    if (state === 'half-open') {
+      if (this.probesInFlight >= this.opts.halfOpenMaxCalls) throw new BreakerOpenError()
+      this.probesInFlight++
+    }
+    const epoch = this.epoch
+    try { const v = await fn(); this.record(epoch, false); return v }
+    catch (err) { this.record(epoch, (this.opts.isFailure ?? (() => true))(err)); throw err }
+  }
+  private record(epoch: number, failed: boolean) {
+    if (epoch !== this.epoch) return
+    if (this.mode === 'half-open') {
+      this.probesInFlight--
+      if (failed) this.moveTo('open')
+      else if (++this.probeSuccesses >= this.opts.halfOpenMaxCalls) this.moveTo('closed')
+      return
+    }
+    this.records.push({ at: this.opts.now(), failed })
+    const failures = this.records.filter(r => r.failed).length
+    if (this.records.length >= this.opts.minimumCalls && failures / this.records.length >= this.opts.failureRateThreshold) this.moveTo('open')
+  }
+  private moveTo(mode: BreakerState) {
+    this.mode = mode; this.epoch++; this.records = []; this.probesInFlight = 0; this.probeSuccesses = 0
+    if (mode === 'open') this.openedAt = this.opts.now()
+  }
+}
+</script>
+  <script type="wrong">
+class BreakerOpenError extends Error {
+  name = 'BreakerOpenError'
+  constructor() { super('斷路器開啟中，暫停呼叫') }
+}
+
+type BreakerState = 'closed' | 'open' | 'half-open'
+type BreakerOptions = {
+  failureRateThreshold: number   // 0～1，例如 0.5
+  minimumCalls: number
+  windowMs: number
+  openMs: number
+  halfOpenMaxCalls: number
+  now: () => number
+  isFailure?: (err: unknown) => boolean
+}
+
+// 錯誤：門檻寫死 0.5，沒有用 failureRateThreshold
+class CircuitBreaker {
+  private readonly opts: BreakerOptions
+  private mode: BreakerState = 'closed'
+  private epoch = 0                                  // 每次換狀態加 1，用來忽略舊的結果
+  private records: { at: number; failed: boolean }[] = []
+  private openedAt = 0
+  private probesInFlight = 0
+  private probeSuccesses = 0
+
+  constructor(opts: BreakerOptions) {
+    this.opts = opts
+  }
+
+  state(): BreakerState {
+    if (this.mode === 'open' && this.opts.now() - this.openedAt >= this.opts.openMs) {
+      this.moveTo('half-open')
+    }
+    return this.mode
+  }
+
+  async execute<T>(fn: () => Promise<T>): Promise<T> {
+    const state = this.state()
+    if (state === 'open') throw new BreakerOpenError()
+    if (state === 'half-open') {
+      if (this.probesInFlight >= this.opts.halfOpenMaxCalls) throw new BreakerOpenError()
+      this.probesInFlight++
+    }
+    const epoch = this.epoch
+    try {
+      const value = await fn()
+      this.record(epoch, false)
+      return value
+    } catch (err) {
+      const isFailure = this.opts.isFailure ?? (() => true)
+      this.record(epoch, isFailure(err))
+      throw err
+    }
+  }
+
+  private record(epoch: number, failed: boolean) {
+    if (epoch !== this.epoch) return
+    if (this.mode === 'half-open') {
+      this.probesInFlight--
+      if (failed) this.moveTo('open')
+      else if (++this.probeSuccesses >= this.opts.halfOpenMaxCalls) this.moveTo('closed')
+      return
+    }
+    const now = this.opts.now()
+    this.records.push({ at: now, failed })
+    this.records = this.records.filter(r => now - r.at < this.opts.windowMs)
+    const failures = this.records.filter(r => r.failed).length
+    if (this.records.length >= this.opts.minimumCalls &&
+        failures / this.records.length >= 0.5) {
+      this.moveTo('open')
+    }
+  }
+
+  private moveTo(mode: BreakerState) {
+    this.mode = mode
+    this.epoch++
+    this.records = []
+    this.probesInFlight = 0
+    this.probeSuccesses = 0
+    if (mode === 'open') this.openedAt = this.opts.now()
+  }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：完成 <code>Bulkhead</code>。<code>run(fn, signal)</code> 的規則：</p>
+  <ul>
+    <li>同時最多 <code>maxConcurrent</code> 個 <code>fn</code> 在執行。名額滿時，依先來先到排隊；佇列已經有 <code>maxQueue</code> 個在等時，立刻以 <code>BulkheadFullError</code> reject，不呼叫 <code>fn</code>。</li>
+    <li>任何一個 <code>fn</code> 結束（成功或失敗）就讓佇列最前面的開始執行；佇列空了才歸還名額。<code>run</code> 的結果就是 <code>fn</code> 的結果（失敗就原樣 reject）。</li>
+    <li>排隊中的請求被 <code>signal</code> 取消時，從佇列移除、以 <code>signal.reason</code> reject，之後也不會執行。呼叫 <code>run</code> 時 <code>signal</code> 已經取消，就直接以 <code>signal.reason</code> reject。已經開始執行的 <code>fn</code> 不受影響（要不要中止是 <code>fn</code> 自己的事）。</li>
+  </ul>
+  <script type="start">
+class BulkheadFullError extends Error {
+  name = 'BulkheadFullError'
+  constructor() { super('隔艙已滿，請稍後再試') }
+}
+
+class Bulkhead {
+  private readonly maxConcurrent: number
+  private readonly maxQueue: number
+
+  constructor(maxConcurrent: number, maxQueue: number) {
+    this.maxConcurrent = maxConcurrent
+    this.maxQueue = maxQueue
+  }
+
+  async run<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    throw new Error('TODO')
+  }
+}
+</script>
+  <script type="answer">
+class BulkheadFullError extends Error {
+  name = 'BulkheadFullError'
+  constructor() { super('隔艙已滿，請稍後再試') }
+}
+
+class Bulkhead {
+  private readonly maxConcurrent: number
+  private readonly maxQueue: number
+  private active = 0
+  private readonly queue: Array<() => void> = []
+
+  constructor(maxConcurrent: number, maxQueue: number) {
+    this.maxConcurrent = maxConcurrent
+    this.maxQueue = maxQueue
+  }
+
+  async run<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (signal?.aborted) throw signal.reason
+    if (this.active < this.maxConcurrent) {
+      this.active++
+    } else {
+      if (this.queue.length >= this.maxQueue) throw new BulkheadFullError()
+      // 等前面的人把名額直接交給我（active 不變），避免被後來的人插隊
+      await new Promise<void>((resolve, reject) => {
+        const start = () => {
+          signal?.removeEventListener('abort', onAbort)
+          resolve()
+        }
+        const onAbort = () => {
+          this.queue.splice(this.queue.indexOf(start), 1)
+          reject(signal!.reason)
+        }
+        this.queue.push(start)
+        signal?.addEventListener('abort', onAbort, { once: true })
+      })
+    }
+    try {
+      return await fn()
+    } finally {
+      const next = this.queue.shift()
+      if (next) next()
+      else this.active--
+    }
+  }
+}
+</script>
+  <script type="tests">
+const flush = () => new Promise<void>(r => setTimeout(r, 0))
+const settle = async (p: Promise<unknown>) => { try { return { ok: true, value: await p, error: undefined as unknown } } catch (e) { return { ok: false, value: undefined, error: e } } }
+let running = 0
+let peak = 0
+const task = (label: string) => {
+  const d = Promise.withResolvers<string>()
+  const t = {
+    label, d, started: false,
+    fn: () => {
+      t.started = true
+      running++
+      peak = Math.max(peak, running)
+      return d.promise.finally(() => { running-- })
+    },
+  }
+  return t
+}
+const pendingOrDone = (p: Promise<unknown>) => Promise.race([p.then(() => 'done'), flush().then(() => 'pending')])
+
+{
+  const b = new Bulkhead(2, 2)
+  const ts = [1, 2, 3, 4, 5].map(i => task('t' + i))
+  const rs = ts.map(t => settle(b.run(t.fn)))
+  assert.equal(await pendingOrDone(rs[4]), 'done', '名額 2 個、佇列 2 個都滿了，第 5 個要立刻 reject，不能排隊等')
+  const r5 = await rs[4]
+  assert(!r5.ok && r5.error instanceof BulkheadFullError, '佇列滿時要丟 BulkheadFullError')
+  assert.equal((r5.error as Error).name, 'BulkheadFullError', 'BulkheadFullError 的 name 要是 BulkheadFullError')
+  assert(!ts[4].started, '被拒絕的請求不能執行 fn')
+  assert.deepEqual(ts.map(t => t.started), [true, true, false, false, false], '前 2 個要立刻開始，第 3、4 個排隊')
+  ts[0].d.resolve('t1 完成')
+  await flush()
+  assert.deepEqual(ts.map(t => t.started), [true, true, true, false, false], 't1 結束後要換佇列最前面的 t3（先進先出）')
+  ts[1].d.reject(new Error('金流 502'))
+  await flush()
+  assert(ts[3].started, 't2 失敗也要釋放名額，t4 要開始執行')
+  const r2 = await rs[1]
+  assert(!r2.ok && (r2.error as Error).message === '金流 502', 'fn 失敗時 run 要原樣 reject 同一個錯誤')
+  ts[2].d.resolve('t3 完成')
+  ts[3].d.resolve('t4 完成')
+  const all = await Promise.all(rs.slice(0, 4))
+  assert.deepEqual(all.map(r => r.value), ['t1 完成', undefined, 't3 完成', 't4 完成'], 'run 要回傳 fn 的結果')
+  assert(peak <= 2, `同時執行的數量不能超過 2，實際最多 ${peak}`)
+  const later = task('t6')
+  const r6 = settle(b.run(later.fn))
+  await flush()
+  assert(later.started, '全部結束後名額要歸還，新的請求可以馬上執行')
+  later.d.resolve('t6 完成')
+  await r6
+}
+{
+  running = 0; peak = 0
+  const b = new Bulkhead(1, 2)
+  const t1 = task('t1'), t2 = task('t2'), t3 = task('t3'), t4 = task('t4'), t5 = task('t5')
+  const ac = new AbortController()
+  const r1 = settle(b.run(t1.fn))
+  const r2 = settle(b.run(t2.fn, ac.signal))
+  const r3 = settle(b.run(t3.fn))
+  await flush()
+  const reason = new Error('使用者離開頁面')
+  ac.abort(reason)
+  assert.equal(await pendingOrDone(r2), 'done', '排隊中被取消要立刻 reject')
+  const res2 = await r2
+  assert(!res2.ok && res2.error === reason, '取消時要以 signal.reason reject')
+  const r4 = settle(b.run(t4.fn))
+  const r5 = settle(b.run(t5.fn))
+  const res5 = await Promise.race([r5, flush().then(() => null)])
+  assert(res5 !== null && !res5.ok && res5.error instanceof BulkheadFullError, '被取消的請求要從佇列移除：佇列剩 t3、t4，第 5 個才會因為滿了被拒絕')
+  t1.d.resolve('t1')
+  await flush()
+  assert(!t2.started, '被取消的請求不能被執行')
+  assert(t3.started, 't1 結束後要輪到 t3')
+  t3.d.resolve('t3')
+  await flush()
+  assert(t4.started, 't3 結束後要輪到 t4')
+  t4.d.resolve('t4')
+  await Promise.all([r1, r3, r4])
+}
+{
+  const b = new Bulkhead(1, 0)
+  const t = task('t')
+  const ac = new AbortController()
+  const r = settle(b.run(t.fn, ac.signal))
+  await flush()
+  ac.abort(new Error('太晚了'))
+  t.d.resolve('照樣完成')
+  const res = await r
+  assert(res.ok && res.value === '照樣完成', '已經開始執行的 fn 不受取消影響，要回傳它的結果')
+  const ac2 = new AbortController()
+  const reason = new Error('早就取消了')
+  ac2.abort(reason)
+  const t2 = task('t2')
+  const res2 = await settle(b.run(t2.fn, ac2.signal))
+  assert(!res2.ok && res2.error === reason && !t2.started, 'signal 已經取消時要直接以 signal.reason reject，不執行 fn')
+}
+{
+  const b = new Bulkhead(1, 2)
+  const t1 = task('t1'), t2 = task('t2'), t3 = task('t3')
+  const ac = new AbortController()
+  const r1 = settle(b.run(t1.fn))
+  const r2 = settle(b.run(t2.fn, ac.signal))
+  const r3 = settle(b.run(t3.fn))
+  t1.d.resolve('t1')
+  await flush()
+  assert(t2.started && !t3.started, 't1 結束後輪到 t2，t3 繼續排隊')
+  ac.abort(new Error('t2 已經在執行才取消'))
+  t2.d.resolve('t2')
+  await flush()
+  assert(t3.started, 't2 開始執行之後的取消不能動到佇列：開始執行時要移除 abort 監聽，t3 還要能輪到')
+  t3.d.resolve('t3')
+  const res = await Promise.all([r1, r2, r3])
+  assert.deepEqual(res.map(r => r.value), ['t1', 't2', 't3'], '三個請求都要拿到自己 fn 的結果')
+}
+</script>
+  <script type="wrong">
+class BulkheadFullError extends Error {
+  name = 'BulkheadFullError'
+  constructor() { super('隔艙已滿，請稍後再試') }
+}
+// 錯誤：佇列沒有上限
+class Bulkhead {
+  private readonly maxConcurrent: number
+  private readonly maxQueue: number
+  private active = 0
+  private readonly queue: Array<() => void> = []
+  constructor(maxConcurrent: number, maxQueue: number) { this.maxConcurrent = maxConcurrent; this.maxQueue = maxQueue }
+  async run<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (signal?.aborted) throw signal.reason
+    if (this.active < this.maxConcurrent) this.active++
+    else {
+      await new Promise<void>((resolve, reject) => {
+        const start = () => { signal?.removeEventListener('abort', onAbort); resolve() }
+        const onAbort = () => { this.queue.splice(this.queue.indexOf(start), 1); reject(signal!.reason) }
+        this.queue.push(start)
+        signal?.addEventListener('abort', onAbort, { once: true })
+      })
+    }
+    try { return await fn() } finally {
+      const next = this.queue.shift()
+      if (next) next(); else this.active--
+    }
+  }
+}
+</script>
+  <script type="wrong">
+class BulkheadFullError extends Error {
+  name = 'BulkheadFullError'
+  constructor() { super('隔艙已滿，請稍後再試') }
+}
+// 錯誤：沒有用 finally，fn 失敗時不會釋放名額
+class Bulkhead {
+  private readonly maxConcurrent: number
+  private readonly maxQueue: number
+  private active = 0
+  private readonly queue: Array<() => void> = []
+  constructor(maxConcurrent: number, maxQueue: number) { this.maxConcurrent = maxConcurrent; this.maxQueue = maxQueue }
+  async run<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (signal?.aborted) throw signal.reason
+    if (this.active < this.maxConcurrent) this.active++
+    else {
+      if (this.queue.length >= this.maxQueue) throw new BulkheadFullError()
+      await new Promise<void>((resolve, reject) => {
+        const start = () => { signal?.removeEventListener('abort', onAbort); resolve() }
+        const onAbort = () => { this.queue.splice(this.queue.indexOf(start), 1); reject(signal!.reason) }
+        this.queue.push(start)
+        signal?.addEventListener('abort', onAbort, { once: true })
+      })
+    }
+    const value = await fn()
+    const next = this.queue.shift()
+    if (next) next(); else this.active--
+    return value
+  }
+}
+</script>
+  <script type="wrong">
+class BulkheadFullError extends Error {
+  name = 'BulkheadFullError'
+  constructor() { super('隔艙已滿，請稍後再試') }
+}
+// 錯誤：後進先出
+class Bulkhead {
+  private readonly maxConcurrent: number
+  private readonly maxQueue: number
+  private active = 0
+  private readonly queue: Array<() => void> = []
+  constructor(maxConcurrent: number, maxQueue: number) { this.maxConcurrent = maxConcurrent; this.maxQueue = maxQueue }
+  async run<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (signal?.aborted) throw signal.reason
+    if (this.active < this.maxConcurrent) this.active++
+    else {
+      if (this.queue.length >= this.maxQueue) throw new BulkheadFullError()
+      await new Promise<void>((resolve, reject) => {
+        const start = () => { signal?.removeEventListener('abort', onAbort); resolve() }
+        const onAbort = () => { this.queue.splice(this.queue.indexOf(start), 1); reject(signal!.reason) }
+        this.queue.push(start)
+        signal?.addEventListener('abort', onAbort, { once: true })
+      })
+    }
+    try { return await fn() } finally {
+      const next = this.queue.pop()
+      if (next) next(); else this.active--
+    }
+  }
+}
+</script>
+  <script type="wrong">
+class BulkheadFullError extends Error {
+  name = 'BulkheadFullError'
+  constructor() { super('隔艙已滿，請稍後再試') }
+}
+// 錯誤：取消時只有 reject，沒有從佇列移除
+class Bulkhead {
+  private readonly maxConcurrent: number
+  private readonly maxQueue: number
+  private active = 0
+  private readonly queue: Array<() => void> = []
+  constructor(maxConcurrent: number, maxQueue: number) { this.maxConcurrent = maxConcurrent; this.maxQueue = maxQueue }
+  async run<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (signal?.aborted) throw signal.reason
+    if (this.active < this.maxConcurrent) this.active++
+    else {
+      if (this.queue.length >= this.maxQueue) throw new BulkheadFullError()
+      await new Promise<void>((resolve, reject) => {
+        this.queue.push(resolve)
+        signal?.addEventListener('abort', () => reject(signal.reason), { once: true })
+      })
+    }
+    try { return await fn() } finally {
+      const next = this.queue.shift()
+      if (next) next(); else this.active--
+    }
+  }
+}
+</script>
+  <script type="wrong">
+class BulkheadFullError extends Error {
+  name = 'BulkheadFullError'
+  constructor() { super('隔艙已滿，請稍後再試') }
+}
+
+// 錯誤：開始執行時沒有移除 abort 監聽，之後取消會從佇列刪掉別人
+class Bulkhead {
+  private readonly maxConcurrent: number
+  private readonly maxQueue: number
+  private active = 0
+  private readonly queue: Array<() => void> = []
+
+  constructor(maxConcurrent: number, maxQueue: number) {
+    this.maxConcurrent = maxConcurrent
+    this.maxQueue = maxQueue
+  }
+
+  async run<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (signal?.aborted) throw signal.reason
+    if (this.active < this.maxConcurrent) {
+      this.active++
+    } else {
+      if (this.queue.length >= this.maxQueue) throw new BulkheadFullError()
+      // 等前面的人把名額直接交給我（active 不變），避免被後來的人插隊
+      await new Promise<void>((resolve, reject) => {
+        const start = () => resolve()
+        const onAbort = () => {
+          this.queue.splice(this.queue.indexOf(start), 1)
+          reject(signal!.reason)
+        }
+        this.queue.push(start)
+        signal?.addEventListener('abort', onAbort, { once: true })
+      })
+    }
+    try {
+      return await fn()
+    } finally {
+      const next = this.queue.shift()
+      if (next) next()
+      else this.active--
+    }
+  }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：寫 <code>admit</code>，在開始處理一個請求之前決定收不收。依序判斷：</p>
+  <ul>
+    <li>剩下的時間 <code>deadline − now</code> 小於 <code>minWorkMs</code>（做完都來不及，包括已經過期），或已經排隊超過 <code>maxQueueWaitMs</code>（<code>now − enqueuedAt &gt; maxQueueWaitMs</code>）→ <code>'reject-expired'</code>。不管多閒都一樣。</li>
+    <li>使用率 u = <code>inFlight ÷ capacity</code>。<code>sheddable</code> 在 u ≥ 0.7、<code>normal</code> 在 u ≥ 0.9、<code>critical</code> 在 u ≥ 1 時 → <code>'reject-overload'</code>。</li>
+    <li>其餘 → <code>'accept'</code>。</li>
+  </ul>
+  <script type="start">
+type Priority = 'critical' | 'normal' | 'sheddable'   // 結帳、看菜單、推薦
+type IncomingRequest = { priority: Priority; enqueuedAt: number; deadline: number }
+type ServerState = { inFlight: number; capacity: number; now: number; maxQueueWaitMs: number; minWorkMs: number }
+type Decision = 'accept' | 'reject-overload' | 'reject-expired'
+
+function admit(req: IncomingRequest, state: ServerState): Decision {
+  throw new Error('TODO')
+}
+</script>
+  <script type="answer">
+type Priority = 'critical' | 'normal' | 'sheddable'   // 結帳、看菜單、推薦
+type IncomingRequest = { priority: Priority; enqueuedAt: number; deadline: number }
+type ServerState = { inFlight: number; capacity: number; now: number; maxQueueWaitMs: number; minWorkMs: number }
+type Decision = 'accept' | 'reject-overload' | 'reject-expired'
+
+const SHED_AT: Record<Priority, number> = { sheddable: 0.7, normal: 0.9, critical: 1 }
+
+function admit(req: IncomingRequest, state: ServerState): Decision {
+  if (req.deadline - state.now < state.minWorkMs) return 'reject-expired'
+  if (state.now - req.enqueuedAt > state.maxQueueWaitMs) return 'reject-expired'
+  if (state.inFlight / state.capacity >= SHED_AT[req.priority]) return 'reject-overload'
+  return 'accept'
+}
+</script>
+  <script type="tests">
+const base = { capacity: 100, now: 10000, maxQueueWaitMs: 500, minWorkMs: 50 }
+const fresh = (priority: Priority) => ({ priority, enqueuedAt: 10000, deadline: 12000 })
+const cases: Array<[Priority, number, Decision, string]> = [
+  ['sheddable', 0, 'accept', '很閒時推薦也收'],
+  ['sheddable', 69, 'accept', '使用率 69% 推薦還收'],
+  ['sheddable', 70, 'reject-overload', '使用率剛好 70%，推薦要被卸除（≥）'],
+  ['normal', 70, 'accept', '使用率 70% 菜單還收'],
+  ['critical', 70, 'accept', '使用率 70% 結帳還收'],
+  ['normal', 89, 'accept', '使用率 89% 菜單還收'],
+  ['normal', 90, 'reject-overload', '使用率剛好 90%，菜單要被卸除（≥）'],
+  ['sheddable', 90, 'reject-overload', '使用率 90%，推薦當然也被卸除'],
+  ['critical', 90, 'accept', '使用率 90% 結帳還收'],
+  ['critical', 99, 'accept', '使用率 99% 結帳還收'],
+  ['critical', 100, 'reject-overload', '滿載時結帳也要拒絕'],
+  ['critical', 130, 'reject-overload', '超載時結帳也要拒絕'],
+  ['normal', 100, 'reject-overload', '滿載時菜單被拒絕'],
+]
+for (const [priority, inFlight, expected, msg] of cases) {
+  assert.equal(admit(fresh(priority), { ...base, inFlight }), expected, `${msg}（${priority}、inFlight ${inFlight}/100）`)
+}
+const expired: Array<[IncomingRequest, string]> = [
+  [{ priority: 'critical', enqueuedAt: 10000, deadline: 9000 }, 'deadline 已經過了'],
+  [{ priority: 'critical', enqueuedAt: 10000, deadline: 10000 }, 'deadline 就是現在'],
+  [{ priority: 'critical', enqueuedAt: 10000, deadline: 10049 }, '只剩 49ms，不夠 minWorkMs 50ms'],
+  [{ priority: 'critical', enqueuedAt: 9499, deadline: 12000 }, '排隊 501ms，超過 maxQueueWaitMs 500ms'],
+  [{ priority: 'sheddable', enqueuedAt: 5000, deadline: 20000 }, '排隊 5 秒'],
+]
+for (const [req, msg] of expired) {
+  assert.equal(admit(req, { ...base, inFlight: 0 }), 'reject-expired', `${msg}：即使伺服器很閒也要 reject-expired`)
+  assert.equal(admit(req, { ...base, inFlight: 100 }), 'reject-expired', `${msg}：過期的判斷要在過載之前`)
+}
+assert.equal(admit({ priority: 'critical', enqueuedAt: 10000, deadline: 10050 }, { ...base, inFlight: 0 }), 'accept', '剩下剛好 50ms（= minWorkMs）還來得及')
+assert.equal(admit({ priority: 'critical', enqueuedAt: 9500, deadline: 12000 }, { ...base, inFlight: 0 }), 'accept', '排隊剛好 500ms（= maxQueueWaitMs）還收')
+assert.equal(admit({ priority: 'normal', enqueuedAt: 0, deadline: 1000 }, { capacity: 10, inFlight: 7, now: 0, maxQueueWaitMs: 100, minWorkMs: 10 }), 'accept', 'capacity 10、inFlight 7（70%）菜單還收')
+assert.equal(admit({ priority: 'sheddable', enqueuedAt: 0, deadline: 1000 }, { capacity: 10, inFlight: 7, now: 0, maxQueueWaitMs: 100, minWorkMs: 10 }), 'reject-overload', 'capacity 10、inFlight 7（70%）推薦要卸除：用 inFlight ÷ capacity，不是寫死 100')
+const mulberry32 = (seed: number) => () => {
+  seed = (seed + 0x6d2b79f5) | 0
+  let t = Math.imul(seed ^ (seed >>> 15), 1 | seed)
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+}
+const ref = (req: IncomingRequest, s: ServerState): Decision => {
+  if (req.deadline - s.now < s.minWorkMs || s.now - req.enqueuedAt > s.maxQueueWaitMs) return 'reject-expired'
+  const limit = { sheddable: 0.7, normal: 0.9, critical: 1 }[req.priority]
+  return s.inFlight / s.capacity >= limit ? 'reject-overload' : 'accept'
+}
+const rand = mulberry32(11)
+const prios: Priority[] = ['critical', 'normal', 'sheddable']
+for (let i = 0; i < 500; i++) {
+  const capacity = 1 + Math.floor(rand() * 200)
+  const now = Math.floor(rand() * 100000)
+  const s: ServerState = { capacity, inFlight: Math.floor(rand() * capacity * 1.3), now, maxQueueWaitMs: Math.floor(rand() * 1000), minWorkMs: Math.floor(rand() * 200) }
+  const req: IncomingRequest = { priority: prios[Math.floor(rand() * 3)], enqueuedAt: now - Math.floor(rand() * 1500), deadline: now + Math.floor(rand() * 1000) - 300 }
+  assert.equal(admit(Object.freeze(req), Object.freeze(s)), ref(req, s), `隨機案例 ${JSON.stringify({ req, s })}`)
+}
+</script>
+  <script type="wrong">
+type Priority = 'critical' | 'normal' | 'sheddable'
+type IncomingRequest = { priority: Priority; enqueuedAt: number; deadline: number }
+type ServerState = { inFlight: number; capacity: number; now: number; maxQueueWaitMs: number; minWorkMs: number }
+type Decision = 'accept' | 'reject-overload' | 'reject-expired'
+// 錯誤：所有優先順序用同一個門檻
+function admit(req: IncomingRequest, state: ServerState): Decision {
+  if (req.deadline - state.now < state.minWorkMs) return 'reject-expired'
+  if (state.now - req.enqueuedAt > state.maxQueueWaitMs) return 'reject-expired'
+  if (state.inFlight / state.capacity >= 0.9) return 'reject-overload'
+  return 'accept'
+}
+</script>
+  <script type="wrong">
+type Priority = 'critical' | 'normal' | 'sheddable'
+type IncomingRequest = { priority: Priority; enqueuedAt: number; deadline: number }
+type ServerState = { inFlight: number; capacity: number; now: number; maxQueueWaitMs: number; minWorkMs: number }
+type Decision = 'accept' | 'reject-overload' | 'reject-expired'
+// 錯誤：先丟 critical
+const SHED_AT: Record<Priority, number> = { critical: 0.7, normal: 0.9, sheddable: 1 }
+function admit(req: IncomingRequest, state: ServerState): Decision {
+  if (req.deadline - state.now < state.minWorkMs) return 'reject-expired'
+  if (state.now - req.enqueuedAt > state.maxQueueWaitMs) return 'reject-expired'
+  if (state.inFlight / state.capacity >= SHED_AT[req.priority]) return 'reject-overload'
+  return 'accept'
+}
+</script>
+  <script type="wrong">
+type Priority = 'critical' | 'normal' | 'sheddable'
+type IncomingRequest = { priority: Priority; enqueuedAt: number; deadline: number }
+type ServerState = { inFlight: number; capacity: number; now: number; maxQueueWaitMs: number; minWorkMs: number }
+type Decision = 'accept' | 'reject-overload' | 'reject-expired'
+// 錯誤：不看 deadline，只看排隊多久
+const SHED_AT: Record<Priority, number> = { sheddable: 0.7, normal: 0.9, critical: 1 }
+function admit(req: IncomingRequest, state: ServerState): Decision {
+  if (state.now - req.enqueuedAt > state.maxQueueWaitMs) return 'reject-expired'
+  if (state.inFlight / state.capacity >= SHED_AT[req.priority]) return 'reject-overload'
+  return 'accept'
+}
+</script>
+  <script type="wrong">
+type Priority = 'critical' | 'normal' | 'sheddable'
+type IncomingRequest = { priority: Priority; enqueuedAt: number; deadline: number }
+type ServerState = { inFlight: number; capacity: number; now: number; maxQueueWaitMs: number; minWorkMs: number }
+type Decision = 'accept' | 'reject-overload' | 'reject-expired'
+// 錯誤：門檻用 > 而不是 ≥
+const SHED_AT: Record<Priority, number> = { sheddable: 0.7, normal: 0.9, critical: 1 }
+function admit(req: IncomingRequest, state: ServerState): Decision {
+  if (req.deadline - state.now < state.minWorkMs) return 'reject-expired'
+  if (state.now - req.enqueuedAt > state.maxQueueWaitMs) return 'reject-expired'
+  if (state.inFlight / state.capacity > SHED_AT[req.priority]) return 'reject-overload'
+  return 'accept'
+}
+</script>
+  <script type="wrong">
+type Priority = 'critical' | 'normal' | 'sheddable'
+type IncomingRequest = { priority: Priority; enqueuedAt: number; deadline: number }
+type ServerState = { inFlight: number; capacity: number; now: number; maxQueueWaitMs: number; minWorkMs: number }
+type Decision = 'accept' | 'reject-overload' | 'reject-expired'
+// 錯誤：先判斷過載、再判斷過期
+const SHED_AT: Record<Priority, number> = { sheddable: 0.7, normal: 0.9, critical: 1 }
+function admit(req: IncomingRequest, state: ServerState): Decision {
+  if (state.inFlight / state.capacity >= SHED_AT[req.priority]) return 'reject-overload'
+  if (req.deadline - state.now < state.minWorkMs) return 'reject-expired'
+  if (state.now - req.enqueuedAt > state.maxQueueWaitMs) return 'reject-expired'
+  return 'accept'
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 4：完成 <code>AdaptiveThrottle</code>。</p>
+  <ul>
+    <li><code>shouldReject()</code>：先丟掉距離現在 <code>windowMs</code>（含）以上的紀錄，用剩下的 requests 和 accepts 算 p = max(0, (requests − k × accepts) ÷ (requests + 1))；<strong>算完之後</strong>把這次請求記進 requests（不管等一下有沒有被本機丟掉）；<code>random() &lt; p</code> 時回傳 true，代表本機直接丟掉、不送出。</li>
+    <li><code>recordAccepted()</code>：後端接受了請求時呼叫，記一筆 accept。</li>
+    <li>時間只能用 <code>now</code>，亂數只能用 <code>random</code>。</li>
+  </ul>
+  <script type="start">
+type ThrottleOptions = {
+  k: number
+  windowMs: number
+  now: () => number
+  random: () => number
+}
+
+class AdaptiveThrottle {
+  private readonly opts: ThrottleOptions
+
+  constructor(opts: ThrottleOptions) {
+    this.opts = opts
+  }
+
+  shouldReject(): boolean {
+    throw new Error('TODO')
+  }
+
+  recordAccepted(): void {
+    throw new Error('TODO')
+  }
+}
+</script>
+  <script type="answer">
+type ThrottleOptions = {
+  k: number
+  windowMs: number
+  now: () => number
+  random: () => number
+}
+
+class AdaptiveThrottle {
+  private readonly opts: ThrottleOptions
+  private requests: number[] = []   // 每筆是時間
+  private accepts: number[] = []
+
+  constructor(opts: ThrottleOptions) {
+    this.opts = opts
+  }
+
+  shouldReject(): boolean {
+    const now = this.opts.now()
+    const recent = (t: number) => now - t < this.opts.windowMs
+    this.requests = this.requests.filter(recent)
+    this.accepts = this.accepts.filter(recent)
+    const r = this.requests.length
+    const p = Math.max(0, (r - this.opts.k * this.accepts.length) / (r + 1))
+    this.requests.push(now)
+    return this.opts.random() < p
+  }
+
+  recordAccepted(): void {
+    this.accepts.push(this.opts.now())
+  }
+}
+</script>
+  <script type="tests">
+const createClock = (t = 0) => ({ now: () => t, advance: (ms: number) => { t += ms } })
+const poison = () => {
+  const saved = { now: Date.now, random: Math.random }
+  const boom = (): never => { throw new Error('不能用 Date.now／Math.random：要用傳進來的 now()、random()') }
+  Date.now = boom
+  Math.random = boom
+  return () => { Date.now = saved.now; Math.random = saved.random }
+}
+const restore = poison()
+try {
+  {
+    const clock = createClock()
+    let r = 0
+    const th = new AdaptiveThrottle({ k: 2, windowMs: 120000, now: clock.now, random: () => r })
+    assert.equal(th.shouldReject(), false, '第一個請求還沒有任何紀錄，p 要是 0（先算 p，再記這次請求）')
+    th.recordAccepted()
+    for (let i = 0; i < 50; i++) {
+      clock.advance(100)
+      assert.equal(th.shouldReject(), false, '後端全部接受時永遠不能拒絕（random() 是 0 也一樣）')
+      th.recordAccepted()
+    }
+  }
+  {
+    const clock = createClock()
+    let r = 0.99
+    const th = new AdaptiveThrottle({ k: 2, windowMs: 10000, now: clock.now, random: () => r })
+    for (let i = 0; i < 8; i++) {
+      assert.equal(th.shouldReject(), false, `第 ${i + 1} 個請求：random() 是 0.99，不該被拒絕`)
+      if (i % 4 === 0) th.recordAccepted()
+    }
+    r = 0.444
+    assert.equal(th.shouldReject(), true, '8 個請求、2 個被接受、k = 2：p = (8 − 4) ÷ 9 ≈ 0.4444，random() 0.444 要拒絕')
+    r = 0.5
+    assert.equal(th.shouldReject(), false, '剛剛被本機拒絕的也要算進 requests：p = (9 − 4) ÷ 10 = 0.5，random() 0.5 不拒絕（要 < p）')
+    r = 0.545
+    assert.equal(th.shouldReject(), true, 'p = (10 − 4) ÷ 11 ≈ 0.5454，random() 0.545 要拒絕')
+    clock.advance(9999)
+    r = 0
+    assert.equal(th.shouldReject(), true, '還在視窗內，p > 0')
+    clock.advance(1)
+    r = 0.6
+    assert.equal(th.shouldReject(), false, '10 秒前的紀錄已經在視窗外（剛好 windowMs 也不算）：只剩 1 個 request、0 個 accept，p = 0.5')
+    clock.advance(10000)
+    r = 0
+    assert.equal(th.shouldReject(), false, '後端恢復、舊紀錄都過期之後，p 要回到 0')
+  }
+  {
+    const clock = createClock()
+    let r = 0.99
+    const th = new AdaptiveThrottle({ k: 2, windowMs: 10000, now: clock.now, random: () => r })
+    for (let i = 0; i < 5; i++) { th.shouldReject(); th.recordAccepted() }
+    clock.advance(10000)
+    th.shouldReject()
+    r = 0.49
+    assert.equal(th.shouldReject(), true, '10 秒前的 accepts 也要清掉：視窗內 1 個 request、0 個 accept，p = 0.5，random() 0.49 要拒絕')
+  }
+  {
+    const clock = createClock()
+    let r = 0.99
+    const th = new AdaptiveThrottle({ k: 1.5, windowMs: 10000, now: clock.now, random: () => r })
+    for (let i = 0; i < 10; i++) {
+      th.shouldReject()
+      if (i < 5) th.recordAccepted()
+    }
+    r = 0.22
+    assert.equal(th.shouldReject(), true, 'k = 1.5：10 個請求、5 個被接受，p = (10 − 7.5) ÷ 11 ≈ 0.227，random() 0.22 要拒絕（要用傳進來的 k）')
+  }
+} finally { restore() }
+</script>
+  <script type="wrong">
+type ThrottleOptions = { k: number; windowMs: number; now: () => number; random: () => number }
+// 錯誤：被本機拒絕的請求沒有算進 requests
+class AdaptiveThrottle {
+  private readonly opts: ThrottleOptions
+  private requests: number[] = []
+  private accepts: number[] = []
+  constructor(opts: ThrottleOptions) { this.opts = opts }
+  shouldReject(): boolean {
+    const now = this.opts.now()
+    const recent = (t: number) => now - t < this.opts.windowMs
+    this.requests = this.requests.filter(recent)
+    this.accepts = this.accepts.filter(recent)
+    const r = this.requests.length
+    const p = Math.max(0, (r - this.opts.k * this.accepts.length) / (r + 1))
+    if (this.opts.random() < p) return true
+    this.requests.push(now)
+    return false
+  }
+  recordAccepted(): void { this.accepts.push(this.opts.now()) }
+}
+</script>
+  <script type="wrong">
+type ThrottleOptions = { k: number; windowMs: number; now: () => number; random: () => number }
+// 錯誤：公式寫成 k × requests
+class AdaptiveThrottle {
+  private readonly opts: ThrottleOptions
+  private requests: number[] = []
+  private accepts: number[] = []
+  constructor(opts: ThrottleOptions) { this.opts = opts }
+  shouldReject(): boolean {
+    const now = this.opts.now()
+    const recent = (t: number) => now - t < this.opts.windowMs
+    this.requests = this.requests.filter(recent)
+    this.accepts = this.accepts.filter(recent)
+    const r = this.requests.length
+    const p = Math.max(0, (this.opts.k * r - this.accepts.length) / (r + 1))
+    this.requests.push(now)
+    return this.opts.random() < p
+  }
+  recordAccepted(): void { this.accepts.push(this.opts.now()) }
+}
+</script>
+  <script type="wrong">
+type ThrottleOptions = { k: number; windowMs: number; now: () => number; random: () => number }
+// 錯誤：沒有時間視窗，歷史永遠累積
+class AdaptiveThrottle {
+  private readonly opts: ThrottleOptions
+  private requests = 0
+  private accepts = 0
+  constructor(opts: ThrottleOptions) { this.opts = opts }
+  shouldReject(): boolean {
+    const p = Math.max(0, (this.requests - this.opts.k * this.accepts) / (this.requests + 1))
+    this.requests++
+    return this.opts.random() < p
+  }
+  recordAccepted(): void { this.accepts++ }
+}
+</script>
+  <script type="wrong">
+type ThrottleOptions = { k: number; windowMs: number; now: () => number; random: () => number }
+// 錯誤：用 Math.random
+class AdaptiveThrottle {
+  private readonly opts: ThrottleOptions
+  private requests: number[] = []
+  private accepts: number[] = []
+  constructor(opts: ThrottleOptions) { this.opts = opts }
+  shouldReject(): boolean {
+    const now = this.opts.now()
+    const recent = (t: number) => now - t < this.opts.windowMs
+    this.requests = this.requests.filter(recent)
+    this.accepts = this.accepts.filter(recent)
+    const r = this.requests.length
+    const p = Math.max(0, (r - this.opts.k * this.accepts.length) / (r + 1))
+    this.requests.push(now)
+    return Math.random() < p
+  }
+  recordAccepted(): void { this.accepts.push(this.opts.now()) }
+}
+</script>
+  <script type="wrong">
+type ThrottleOptions = { k: number; windowMs: number; now: () => number; random: () => number }
+// 錯誤：先記這次請求再算 p，第一個請求就有一半機率被丟掉
+class AdaptiveThrottle {
+  private readonly opts: ThrottleOptions
+  private requests: number[] = []
+  private accepts: number[] = []
+  constructor(opts: ThrottleOptions) { this.opts = opts }
+  shouldReject(): boolean {
+    const now = this.opts.now()
+    const recent = (t: number) => now - t < this.opts.windowMs
+    this.requests = this.requests.filter(recent)
+    this.accepts = this.accepts.filter(recent)
+    this.requests.push(now)
+    const r = this.requests.length
+    const p = Math.max(0, (r - this.opts.k * this.accepts.length) / (r + 1))
+    return this.opts.random() < p
+  }
+  recordAccepted(): void { this.accepts.push(this.opts.now()) }
+}
+</script>
+  <script type="wrong">
+type ThrottleOptions = {
+  k: number
+  windowMs: number
+  now: () => number
+  random: () => number
+}
+
+// 錯誤：只清掉舊的 requests，舊的 accepts 一直留著
+class AdaptiveThrottle {
+  private readonly opts: ThrottleOptions
+  private requests: number[] = []   // 每筆是時間
+  private accepts: number[] = []
+
+  constructor(opts: ThrottleOptions) {
+    this.opts = opts
+  }
+
+  shouldReject(): boolean {
+    const now = this.opts.now()
+    const recent = (t: number) => now - t < this.opts.windowMs
+    this.requests = this.requests.filter(recent)
+    const r = this.requests.length
+    const p = Math.max(0, (r - this.opts.k * this.accepts.length) / (r + 1))
+    this.requests.push(now)
+    return this.opts.random() < p
+  }
+
+  recordAccepted(): void {
+    this.accepts.push(this.opts.now())
+  }
+}
+</script>
+  <script type="wrong">
+type ThrottleOptions = {
+  k: number
+  windowMs: number
+  now: () => number
+  random: () => number
+}
+
+// 錯誤：k 寫死成 2
+class AdaptiveThrottle {
+  private readonly opts: ThrottleOptions
+  private requests: number[] = []   // 每筆是時間
+  private accepts: number[] = []
+
+  constructor(opts: ThrottleOptions) {
+    this.opts = opts
+  }
+
+  shouldReject(): boolean {
+    const now = this.opts.now()
+    const recent = (t: number) => now - t < this.opts.windowMs
+    this.requests = this.requests.filter(recent)
+    this.accepts = this.accepts.filter(recent)
+    const r = this.requests.length
+    const p = Math.max(0, (r - 2 * this.accepts.length) / (r + 1))
+    this.requests.push(now)
+    return this.opts.random() < p
+  }
+
+  recordAccepted(): void {
+    this.accepts.push(this.opts.now())
+  }
+}
+</script>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：呼叫金流時收到 <code>BreakerOpenError</code>。依照第 8 課「暫時性錯誤可以重試」的規則，呼叫端應該怎麼做？</p>
+  <label data-key="a">重試，這是暫時性錯誤，等一下斷路器就關了</label>
+  <label data-key="b">不重試，直接走降級或快速回錯</label>
+  <label data-key="c">立刻重試，反正斷路器擋下來不會打到金流，不花成本</label>
+  <p class="why">✓ 斷路器打開代表「下游現在需要休息」，重試只是在本機空轉、佔著請求不放，或在半開的瞬間一起湧上去把剛恢復的金流再打倒。a 的「等一下就好」是斷路器自己會處理的事；c 忽略了重試會讓呼叫端的請求繼續佔用名額與記憶體。<code>BreakerOpenError</code> 要當成不重試的錯誤，改走降級。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 6：用 opossum 10 的預設值（<code>errorThresholdPercentage</code> 50、<code>volumeThreshold</code> 0）包住金流。服務剛部署完，第一個付款請求剛好逾時。接下來會怎樣？</p>
+  <label data-key="a">沒事，一次失敗不會影響統計</label>
+  <label data-key="b">斷路器要等視窗（10 秒）結束才會計算失敗率</label>
+  <label data-key="c">失敗率 1/1 = 100%，斷路器立刻打開，接下來 30 秒的付款都直接失敗</label>
+  <p class="why">✓ <code>volumeThreshold</code> 是「視窗內至少幾次呼叫才可能打開」，預設 0 等於沒有下限，1 次失敗就是 100%。之後要經過 <code>resetTimeout</code>（預設 30 秒）才會半開。低流量的服務一定要設最少呼叫數，或開 <code>allowWarmUp</code>。opossum 每次呼叫結束就判斷，不是等視窗結束才算（b）。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 7：菜單和結帳共用同一個 HTTP 客戶端和連線池。金流變慢時，菜單也跟著變慢。同事提議「把連線池從 100 加到 1,000」。最好的做法是？</p>
+  <label data-key="a">用隔艙：每個依賴（金流、菜單的資料庫…）有自己的並行上限與佇列上限，滿了快速失敗</label>
+  <label data-key="b">照同事說的加大連線池，容量變大就不會卡</label>
+  <label data-key="c">把金流的逾時從 10 秒改成 60 秒，讓它有時間回應</label>
+  <p class="why">✓ Little's Law：每秒 50 個 × 10 秒 = 500 個卡著，加大池子只是讓更多請求卡在金流上，佔用更多記憶體，金流變得更慢時一樣會塞滿（b）。逾時拉長（c）讓 W 變大，卡住的更多。隔艙讓金流最多只能用自己那一份，菜單不受影響。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 8：過載時，同事讓佇列沒有上限，「這樣就不會拒絕任何請求，吞吐量也維持在最高」。監控上的吞吐量確實很高。問題在哪？</p>
+  <label data-key="a">沒有問題，吞吐量高代表系統很健康</label>
+  <label data-key="b">每個請求都排很久，做完時客戶端早就逾時放棄了，goodput 接近 0</label>
+  <label data-key="c">只會多用一點記憶體，其他沒影響</label>
+  <p class="why">✓ 吞吐量算的是做完幾個，goodput 才是有人收到的。排隊時間超過客戶端逾時之後，伺服器做的全是白工，客戶端還會重試，讓佇列更長。佇列要有上限，開始處理前先檢查 deadline，過期的直接丟。記憶體（c）也會一直長到程序被殺掉，但那不是唯一的問題。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 9：同事把韌性機制包成 <code>breaker.execute(() =&gt; retry(() =&gt; callPayment()))</code>：斷路器在外、重試在內。每次嘗試有 60% 會失敗，重試最多試 3 次，所以約 78% 的請求最後成功（1 − 0.6³）。會發生什麼事？</p>
+  <label data-key="a">一樣，包的順序不影響行為</label>
+  <label data-key="b">斷路器會更早打開，因為它看到更多失敗</label>
+  <label data-key="c">斷路器只看到重試後的最終結果，失敗率約 22% 而不是 60%，很晚才打開或根本不打開；金流收到的嘗試數約是請求數的 2 倍</label>
+  <p class="why">✓ 外層只看得到內層的最終結果。斷路器包在重試外面時，大部分失敗都被重試吸收掉了，斷路器看到的失敗率只有 0.6³ ≈ 22%，以為情況還好；金流卻平均每個請求收到 1 + 0.6 + 0.36 ≈ 2 次嘗試。正確的順序是重試在外、斷路器在內（.NET 標準處理器與 cockatiel 的 <code>wrap(retry, breaker, timeout)</code>），斷路器看得到每一次嘗試，打開後重試收到 <code>BreakerOpenError</code> 就停止。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>整個服務只有一個斷路器</strong>：簡訊服務壞掉，金流的呼叫也被擋住。每個依賴一個斷路器。</li>
+  <li><strong>4xx 或驗證錯誤也算失敗</strong>：一群人輸錯卡號就把斷路器打開。只算逾時、連線錯誤、5xx、408、429。</li>
+  <li><strong>沒有最少呼叫數</strong>：低流量時一兩次失敗就打開（opossum 的 <code>volumeThreshold</code> 預設 0）。設最少呼叫數。</li>
+  <li><strong>half-open 全部放行</strong>：剛恢復的服務馬上被積壓的流量打倒，斷路器又打開，反覆來回。只放少數試探。</li>
+  <li><strong>重試 <code>BreakerOpenError</code></strong>：讓斷路器失去意義。把它當成不重試的錯誤。</li>
+  <li><strong>重試包在斷路器裡面</strong>：斷路器看不到每一次嘗試，該打開時不打開。順序是隔艙 → 總逾時 → 重試 → 斷路器 → 單次逾時。</li>
+  <li><strong>隔艙沒有用 <code>finally</code> 歸還名額</strong>：幾次錯誤之後名額全部漏光，所有呼叫永遠在排隊。</li>
+  <li><strong>佇列沒有上限、不丟過期請求</strong>：延遲爆炸，做完的工作都沒人要。佇列設上限，開始前先看 deadline。</li>
+  <li><strong>卸除負載時連健康檢查也丟</strong>：負載平衡器把你判定為死掉，剩下的機器更忙。健康檢查永遠最優先。</li>
+  <li><strong>快速拒絕的請求混進延遲指標</strong>：p99 看起來變好，其實是大量請求被丟掉。卸除數另外計數、另外告警。</li>
+  <li><strong>備援去呼叫另一個也可能壞的服務</strong>：製造新的故障路徑。備援要便宜、本機、可靠。</li>
+  <li><strong>付款或權限失敗時用備援假裝成功</strong>：比回錯誤更糟。跟錢與權限有關的依賴只能快速失敗。</li>
+  <li><strong>從來沒演練過</strong>：真的出事時才發現斷路器沒打開、降級畫面是壞的。在 staging 做故障注入與演練。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>連鎖故障常常從依賴「變慢」開始：L = λW，客人沒變多、W 變大，卡住的請求就佔滿共用的格子，健康的功能和健康檢查一起被拖垮，重試再把流量放大好幾倍。只縮短逾時擋不住，每個環節都要有自己的防線。</li>
+  <li>斷路器讓明知會失敗的呼叫快速失敗：有 closed、open、half-open 三個狀態，滑動視窗內呼叫數達到最少呼叫數、失敗率達到門檻才打開；經過開啟時間後放少數試探。每個依賴一個，4xx 不算失敗，<code>BreakerOpenError</code> 不重試。</li>
+  <li>斷路器只看成敗、要等失敗累積，所以還要隔艙：每個依賴只能用自己的並行名額，滿了快速失敗；大小用 Little's Law 算，佇列上限設小，名額一定要在 <code>finally</code> 歸還。</li>
+  <li>伺服器過載時，吞吐量不等於 goodput。佇列要有上限、開始前檢查 deadline、依重要性卸除（結帳 &gt; 菜單 &gt; 推薦）、健康檢查最優先，拒絕要便宜並回 503 加 Retry-After。</li>
+  <li>拒絕也有成本，所以客戶端用自適應節流在本機先丟：p = max(0, (requests − K × accepts) ÷ (requests + 1))，K = 2 時後端拒絕超過一半才開始丟；被本機丟掉的也算 requests。</li>
+  <li>防線擋下之後要接到降級：做少一點但不要全掛；備援要便宜可靠，不能用來掩蓋錢和權限的錯誤。</li>
+  <li>組合順序由外到內：並行上限 → 總逾時 → 重試 → 斷路器 → 單次逾時，斷路器才看得到每一次嘗試。監控斷路器狀態、隔艙飽和度、卸除數量，並用故障注入在 staging 重播事故，確認它們真的會動。</li>
+</ul>
+<p>下一課把「不需要馬上做完的事」交給佇列：結帳只做必要的部分，寄收據、廚房出單、集點交給背景處理，並面對訊息遺失、重複送達與 outbox 的問題。</p>
+
+
+</main>
+<script>
+// 時間軸（.tl）：逐步顯示每一列 tr[data-note]，下方顯示目前步驟的說明（與 PostgreSQL 課相同）
+document.querySelectorAll('.tl').forEach(tl => {
+  const rows = [...tl.querySelectorAll('tr[data-note]')]
+  const note = tl.querySelector('.note')
+  const count = tl.querySelector('[data-count]')
+  const prev = tl.querySelector('[data-prev]')
+  const next = tl.querySelector('[data-next]')
+  let cur = 0
+  const show = () => {
+    rows.forEach((r, i) => {
+      r.classList.toggle('now', i === cur)
+      r.classList.toggle('later', i > cur)
+    })
+    note.textContent = rows[cur].dataset.note
+    count.textContent = `步驟 ${cur + 1} / ${rows.length}`
+    prev.disabled = cur === 0
+    next.textContent = cur === rows.length - 1 ? '↺ 重新播放' : '下一步 ▶'
+  }
+  prev.onclick = () => { cur--; show() }
+  next.onclick = () => { cur = cur === rows.length - 1 ? 0 : cur + 1; show() }
+  show()
+})
+</script>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

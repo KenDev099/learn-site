@@ -1,0 +1,3 @@
+yannh/kubernetes-json-schema@e0c72a1bc5f409d1685c0e1323460c8a98cd7459
+datreeio/CRDs-catalog@3eb90d47aba8d61919d4419dd38301536e32a94b
+由 bin/schemas.mjs 產生

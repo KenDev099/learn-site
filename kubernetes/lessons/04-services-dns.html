@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>4. Service 與叢集內 DNS：用名字找到會變動的 Pod</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="4" data-practice="kubernetes">
+<header>
+  <div class="eyebrow">階段 2：網路與設定 · 第 4 課</div>
+  <h1>Service 與叢集內 DNS：用名字找到會變動的 Pod</h1>
+</header>
+<main>
+
+<p>上一課的 cafe-api 已經有 3 個副本，壞了會自己補回來。可是還沒有人連得到它：點餐前端、收據 worker 要呼叫 API 時，網址該寫什麼？Pod 有 IP，但 Pod 隨時會被重建，IP 跟著變，而且一次有 3 個。</p>
+<p>這一課學 <strong>Service</strong>：給一群 Pod 一個固定的名字和固定的 IP，連線自動分給後面準備好的 Pod。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>Pod IP 為什麼不能直接用、Service：Pod 會重建、IP 會變，一次還有 3 個，網址該寫成 Service 的名字（開場問題的最小答案）。</li>
+  <li>port、targetPort 與叢集內 DNS：Service 的兩個 port 各是誰的，跨 namespace 呼叫別的服務時名字怎麼寫。</li>
+  <li>Service 的類型：只給叢集內用、從節點進來、還是請雲端開一台負載平衡器；本機怎麼從 Mac 連進叢集。</li>
+  <li>長連線與負載平衡：為什麼三個副本一個很忙、兩個很閒，用連線池和 gRPC 的服務都會遇到。</li>
+  <li>Service 沒有流量：照固定順序排查，值班時不用亂猜。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="03-deployments.html">第 3 課</a>的 Deployment 與 selector：Deployment 維持 N 個 Pod，用 selector 挑出帶有特定 label 的 Pod 認作自己的。</li>
+  <li><a href="../../devops/lessons/04-networking.html">devops 課第 4 課</a>的網路基礎：IP 加 port 找到一個程序，DNS 把名字查成 IP，TCP 連線建立後會一直用到關閉。</li>
+  <li><a href="01-why-kubernetes.html">第 1 課</a>的練習叢集：下面的指令都假設你已經在 learn 資料夾執行過 <code>export KUBECONFIG="$PWD/kubernetes/practice/.kube/config"</code>。</li>
+</ul></div>
+
+<h2>Pod IP 為什麼不能直接用</h2>
+<p>每個 Pod 都會分到一個叢集內的 IP（kind 裡是 <code>10.244.x.x</code>）。<code>-o wide</code> 會多印出 IP 和所在節點：</p>
+<pre>kubectl get pods -n demo -o wide
+NAME                       READY   STATUS    IP           NODE
+cafe-api-549b54d94-6ghn2   1/1     Running   10.244.1.9   learn-k8s-worker
+cafe-api-549b54d94-vncjq   1/1     Running   10.244.2.7   learn-k8s-worker2
+
+kubectl delete pod -n demo cafe-api-549b54d94-6ghn2
+kubectl get pods -n demo -o wide
+NAME                       READY   STATUS    IP            NODE
+cafe-api-549b54d94-qz8kd   1/1     Running   10.244.1.12   learn-k8s-worker     ← 補回來的新 Pod，IP 不一樣
+cafe-api-549b54d94-vncjq   1/1     Running   10.244.2.7    learn-k8s-worker2</pre>
+<p>把 <code>10.244.1.9</code> 寫進前端的設定會出三個問題：</p>
+<ul>
+  <li><strong>IP 會變</strong>：Pod 被刪、節點當機、部署新版本，新 Pod 都拿到新的 IP（第 3 課的自我修復就是建新 Pod，不是修舊的）。</li>
+  <li><strong>有好幾份</strong>：3 個副本要連哪一個？呼叫端得自己記住全部的 IP、自己輪流、自己避開壞掉的。</li>
+  <li><strong>不知道誰準備好了</strong>：剛啟動、還沒開始聽 port 的 Pod 也有 IP。</li>
+</ul>
+<p><a href="../../devops/lessons/12-nginx.html">devops 課第 12 課</a>用 nginx 的 <code>upstream</code> 解決過同樣的問題：呼叫端只認 nginx，nginx 知道後面有哪些副本。Kubernetes 把這件事做成內建的物件，叫 Service。</p>
+
+<h2>Service：固定的名字、固定的 IP</h2>
+<p><strong>Service</strong> 是「一群 Pod 的穩定入口」。它有三個部分：</p>
+<ul>
+  <li><strong>selector</strong>：用 label 挑出後面是哪些 Pod，跟第 3 課 Deployment 的 selector 是同一種寫法。</li>
+  <li><strong>ClusterIP</strong>：建立 Service 時分到的虛擬 IP（kind 裡是 <code>10.96.x.x</code>），Service 存在一天就不會變。只在叢集內連得到，這也是預設的 Service 類型名稱。</li>
+  <li><strong>名字</strong>：叢集的 DNS 伺服器會替每個 Service 建立一筆紀錄，<code>cafe-api</code> 這個名字查出來就是它的 ClusterIP。</li>
+</ul>
+<p>最小的 Service：</p>
+<pre>apiVersion: v1
+kind: Service
+metadata:
+  name: cafe-api            # 這就是 DNS 名稱
+spec:
+  selector:                 # 挑出 label 完全符合的 Pod
+    app.kubernetes.io/name: cafe-api
+    app.kubernetes.io/instance: main
+  ports:
+    - name: http
+      port: 80              # 呼叫端連的 port
+      targetPort: http      # 轉到 Pod 的哪個 port（下一節）</pre>
+<p>Service 本身不是一個程序，也沒有容器在「代理」流量。它背後是兩個元件合作：</p>
+<figure>
+  <svg viewBox="0 0 700 300" role="img" aria-label="EndpointSlice 控制器根據 selector 和 Pod 的 Ready 狀態更新 EndpointSlice；每個節點的 kube-proxy 讀 EndpointSlice 寫轉送規則。client Pod 先問 CoreDNS 得到 ClusterIP，再連 ClusterIP，被節點上的規則改寫成其中一個 Ready Pod 的 IP 和 port">
+    <defs><marker id="s1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="10" y="20" width="150" height="56" rx="8"/>
+    <text class="d-text" x="85" y="45" text-anchor="middle">前端的 Pod</text>
+    <text class="d-small" x="85" y="64" text-anchor="middle">GET http://cafe-api/</text>
+    <path class="d-line" d="M160,40 L245,40" marker-end="url(#s1)"/>
+    <text class="d-small" x="203" y="32" text-anchor="middle">① 查名字</text>
+    <rect class="d-box" x="250" y="15" width="150" height="50" rx="8"/>
+    <text class="d-text" x="325" y="38" text-anchor="middle">CoreDNS</text>
+    <text class="d-small" x="325" y="56" text-anchor="middle">cafe-api → 10.96.67.173</text>
+    <path class="d-line" d="M85,76 L85,150" marker-end="url(#s1)"/>
+    <text class="d-small" x="92" y="118">② 連 10.96.67.173:80</text>
+    <rect class="d-box" x="10" y="155" width="300" height="56" rx="8"/>
+    <text class="d-text" x="160" y="180" text-anchor="middle">節點上的轉送規則（kube-proxy 寫的）</text>
+    <text class="d-small" x="160" y="199" text-anchor="middle">③ 挑一個 Ready 的 Pod，改寫成它的 IP:3000</text>
+    <path class="d-line" d="M160,211 L62,250" marker-end="url(#s1)"/>
+    <path class="d-line" d="M160,211 L160,250" marker-end="url(#s1)"/>
+    <path class="d-line" d="M160,211 L258,250" marker-end="url(#s1)"/>
+    <rect class="d-soft" x="12" y="252" width="96" height="36" rx="6"/>
+    <text class="d-small" x="60" y="275" text-anchor="middle">Pod 10.244.1.9</text>
+    <rect class="d-soft" x="112" y="252" width="96" height="36" rx="6"/>
+    <text class="d-small" x="160" y="275" text-anchor="middle">Pod 10.244.2.7</text>
+    <rect class="d-soft" x="212" y="252" width="96" height="36" rx="6"/>
+    <text class="d-small" x="260" y="275" text-anchor="middle">Pod 10.244.1.12</text>
+    <rect class="d-box" x="440" y="100" width="250" height="60" rx="8"/>
+    <text class="d-text" x="565" y="125" text-anchor="middle">EndpointSlice</text>
+    <text class="d-small" x="565" y="145" text-anchor="middle">cafe-api：3 個 IP、port 3000、ready</text>
+    <path class="d-line" d="M565,160 L565,200" marker-start="url(#s1)"/>
+    <rect class="d-box" x="440" y="205" width="250" height="56" rx="8"/>
+    <text class="d-text" x="565" y="228" text-anchor="middle">控制器</text>
+    <text class="d-small" x="565" y="247" text-anchor="middle">看 selector 挑到哪些 Pod、是否 Ready</text>
+    <path class="d-line" d="M440,130 L315,175" marker-end="url(#s1)"/>
+    <text class="d-small" x="370" y="128" text-anchor="middle">kube-proxy 讀</text>
+  </svg>
+  <figcaption>DNS 只回答 ClusterIP；真正選 Pod 的是每個節點上的轉送規則，規則的內容來自 EndpointSlice。</figcaption>
+</figure>
+<ul>
+  <li><strong>EndpointSlice</strong>：記錄「這個 Service 現在後面有哪些 Pod IP、port、是否 Ready」的物件。控制平面裡的控制器一直盯著 Pod，Pod 增加、刪除、Ready 狀態改變，它就更新 EndpointSlice。這是第 1 課控制迴圈的又一個例子。</li>
+  <li><strong>kube-proxy</strong>：每個節點上都有一份（第 1 課的元件圖），它讀 EndpointSlice，把「連到 ClusterIP:80 的封包改送到某個 Pod IP:3000」寫成節點的 Linux 轉送規則（iptables 或 nftables；這門課的 kind 叢集用 iptables，<code>kubectl get configmap kube-proxy -n kube-system -o yaml</code> 裡的 <code>mode</code> 看得到）。</li>
+</ul>
+<p>所以 Service 只是一筆設定，壞不了也不會變慢；能不能連通取決於 EndpointSlice 裡有沒有東西、規則寫得對不對。後面排查的順序就是照這張圖走。</p>
+<div class="callout"><strong>EndpointSlice 只放 Ready 的 Pod 收流量</strong>：Pod 的容器起來了但還沒準備好，就不該收流量。「準備好」由 readiness probe 判斷，第 7 課教。這一課的 Pod 沒有寫 probe，容器一啟動就算 Ready。Service 本身不做健康檢查，它只看 Pod 的 Ready 狀態。</div>
+
+<h2>port、targetPort 與具名 port</h2>
+<p>一個 Service 的 port 有兩個數字，很多人第一次寫會搞混：</p>
+<div class="table-wrap"><table>
+  <tr><th>欄位</th><th>是誰的 port</th><th>cafe-api 的值</th></tr>
+  <tr><td><code>port</code></td><td>Service（ClusterIP）的 port，呼叫端連這個</td><td>80，所以網址寫 <code>http://cafe-api</code> 就好</td></tr>
+  <tr><td><code>targetPort</code></td><td>Pod 裡容器真正在聽的 port</td><td>3000（cafe-api 的程式聽 3000）</td></tr>
+  <tr><td><code>containerPort</code>（在 Deployment）</td><td>容器宣告自己聽哪個 port，可以取名字</td><td><code>name: http</code>、<code>containerPort: 3000</code></td></tr>
+</table></div>
+<p><code>targetPort</code> 可以寫數字，也可以寫容器 port 的<strong>名字</strong>。寫名字時，Deployment 要先替 port 取名：</p>
+<pre># Deployment 的容器
+containers:
+  - name: api
+    image: learn-k8s/cafe-api:v1
+    ports:
+      - name: http            # 名字最多 15 個字元，小寫英數與 -
+        containerPort: 3000
+
+# Service
+ports:
+  - port: 80
+    targetPort: http          # 找容器上叫 http 的 port</pre>
+<p>具名的好處：哪天 cafe-api 改聽 8080，只改 Deployment 的 <code>containerPort</code>，Service 不用動；滾動更新期間新舊 Pod 的 port 不同也照樣能轉。<code>containerPort</code> 本身不會開 port 也不會擋 port（程式聽哪個就是哪個），它是給人和 Service 看的說明，名字寫了才有 targetPort 可以參照。</p>
+<p>省略 <code>targetPort</code> 時，它預設等於 <code>port</code>。寫了 <code>port: 80</code> 卻沒寫 targetPort，流量就會送到 Pod 的 80，而 cafe-api 沒在聽 80，連線被拒。</p>
+
+<h2>叢集內 DNS：用名字連線</h2>
+<p>叢集裡有一個 DNS 伺服器 <strong>CoreDNS</strong>（在 kube-system，它自己的 Service 叫 kube-dns，ClusterIP 是 <code>10.96.0.10</code>）。每建一個 Service，它就能回答這個 Service 的名字。完整的名稱是：</p>
+<pre>&lt;service 名稱&gt;.&lt;namespace&gt;.svc.cluster.local
+cafe-api.k8s-04-ex1.svc.cluster.local</pre>
+<p>平常不用寫這麼長，因為 kubelet 替每個 Pod 寫好了 <code>/etc/resolv.conf</code>。看 k8s-tools 裡 probe Pod 的：</p>
+<pre>kubectl exec -n k8s-tools deploy/probe -- cat /etc/resolv.conf
+search k8s-tools.svc.cluster.local svc.cluster.local cluster.local
+nameserver 10.96.0.10
+options ndots:5</pre>
+<ul>
+  <li><code>search</code>：名字不完整時，依序在後面補上這些尾巴再查。第一個是 Pod <strong>自己的 namespace</strong>。</li>
+  <li><code>ndots:5</code>：名字裡的點少於 5 個，就先試 search 的尾巴，最後才把它當完整名稱查。</li>
+</ul>
+<p>於是同一個名字，在不同 namespace 的 Pod 裡查到的結果不同：</p>
+<div class="table-wrap"><table>
+  <tr><th>在 namespace <code>shop</code> 的 Pod 裡寫</th><th>補完後查到</th><th>結果</th></tr>
+  <tr><td><code>cafe-api</code></td><td><code>cafe-api.shop.svc.cluster.local</code></td><td>只找得到 shop 裡的 cafe-api</td></tr>
+  <tr><td><code>menu.catalog</code></td><td><code>menu.catalog.svc.cluster.local</code>（第二個尾巴）</td><td>namespace catalog 的 menu</td></tr>
+  <tr><td><code>menu.catalog.svc.cluster.local</code></td><td>同上</td><td>完整名稱，在哪裡查都一樣</td></tr>
+</table></div>
+<p>規則：<strong>同一個 namespace 寫短名稱，跨 namespace 一定要寫 <code>&lt;service&gt;.&lt;namespace&gt;</code></strong>。只寫 <code>menu</code> 在別的 namespace 會查不到，Node 的 fetch 會丟 <code>ENOTFOUND</code>。設定檔裡也絕不寫 ClusterIP 或 Pod IP：Service 刪掉重建，ClusterIP 就換了。</p>
+<p>自己查查看（第 3 課的 Deployment 加上一個 Service 之後）：</p>
+<pre>kubectl exec -n k8s-tools deploy/probe -- getent hosts cafe-api.demo
+10.96.67.173      cafe-api.demo.svc.cluster.local  cafe-api.demo
+kubectl exec -n k8s-tools deploy/probe -- curl -s http://cafe-api.demo/version
+{"version":"v1","instance":"cafe-api-549b54d94-vncjq"}</pre>
+<div class="callout warn"><strong>nslookup 不一定會用 search</strong>：probe 和 busybox 映像裡的 <code>nslookup</code> 是 BusyBox 的版本，它不套用 search 的尾巴，所以 <code>nslookup cafe-api.demo</code> 會回 NXDOMAIN，看起來像 DNS 壞了。用 <code>nslookup</code> 時給完整名稱 <code>cafe-api.demo.svc.cluster.local</code>，或改用 <code>getent hosts</code>，它跟你的程式一樣走系統的解析流程。</div>
+<p>ndots:5 的代價：程式呼叫外部網域 <code>api.stripe.com</code>（只有 2 個點）時，會先依序查 <code>api.stripe.com.shop.svc.cluster.local</code> 等三個不存在的名字，最後才查真正的網域，多了幾次 DNS 往返。在網域最後加一個點（<code>api.stripe.com.</code>）代表「這已經是完整名稱」，就不會先試 search。大部分服務不需要理會；DNS 查詢量大到 CoreDNS 吃緊時，平台團隊才會調這些設定。了解即可。</p>
+<div class="callout practice"><strong>💡 實務上：服務網址寫進設定，不寫死在程式裡</strong><br>呼叫別的服務的網址應該放在設定裡（<a href="06-config-secrets.html">第 6 課</a>的 ConfigMap），例如 <code>MENU_URL=http://menu.catalog</code>。常見的事故是：開發時兩個服務在同一個 namespace，程式裡寫短名稱 <code>menu</code> 一切正常；到了 staging，menu 由另一個團隊部署在 catalog namespace，上線就變成 <code>ENOTFOUND</code>。跨團隊呼叫一律寫 <code>&lt;service&gt;.&lt;namespace&gt;</code>，並且先跟對方確認這組名稱會不會變：對方改 Service 名稱或搬 namespace，對你來說就等於改了 API。</div>
+
+<h2>Service 的類型：誰連得到</h2>
+<p><code>spec.type</code> 決定 Service 從哪裡連得到：</p>
+<div class="table-wrap"><table>
+  <tr><th>類型</th><th>做了什麼</th><th>什麼時候用</th></tr>
+  <tr><td><code>ClusterIP</code>（預設）</td><td>只有叢集內部連得到的虛擬 IP＋DNS 名稱</td><td>服務之間互相呼叫。絕大多數 Service 都是這種</td></tr>
+  <tr><td><code>NodePort</code></td><td>ClusterIP 之外，在<strong>每個節點</strong>開同一個 port（預設範圍 30000–32767）轉進來</td><td>很少直接用：port 號不好記，要知道節點 IP；通常是給外部負載平衡器接的底層機制</td></tr>
+  <tr><td><code>LoadBalancer</code></td><td>NodePort 之外，再請雲端建立一台外部負載平衡器指進來，位址寫在 <code>EXTERNAL-IP</code></td><td>非 HTTP 的協定、或少數要直接對外的服務</td></tr>
+  <tr><td>headless（<code>clusterIP: None</code>）</td><td>沒有 ClusterIP；DNS 直接回傳每個 Ready Pod 的 IP</td><td>呼叫端要自己挑 Pod 的情況，例如資料庫叢集的成員（第 11 課的 StatefulSet）</td></tr>
+  <tr><td><code>ExternalName</code></td><td>沒有 selector 也沒有 IP；DNS 回一筆 CNAME 指到外部主機</td><td>讓程式用叢集內的固定名稱連外部服務，例如第 11 課用它指到 RDS</td></tr>
+</table></div>
+<p>三種主要類型是一層包一層：LoadBalancer 也有 NodePort，NodePort 也有 ClusterIP。<code>kubectl get svc</code> 的 PORT(S) 欄位會顯示 <code>80:30451/TCP</code>，冒號後面就是自動分配的 NodePort。</p>
+<p><strong>LoadBalancer 在本機怎麼運作</strong>：雲端上，建立 LoadBalancer Service 會由雲端的控制器建一台真的負載平衡器（在 EKS 上由 AWS Load Balancer Controller 建一台 NLB，按小時計費）。kind 沒有雲端，這門課用第 1 課裝的 cloud-provider-kind 代替：它看到 LoadBalancer Service，就啟動一個 <code>kindccm-…</code> 的 Envoy 容器當負載平衡器，填好 EXTERNAL-IP。Mac 連不到 kind 的 Docker 網路，所以它把 Envoy 的 80 port 對應到 Mac 上一個<strong>隨機的</strong> port。<code>bin/url.mjs</code> 幫你查出這個 port：</p>
+<pre>kubectl get svc -n demo cafe-api
+NAME       TYPE           CLUSTER-IP      EXTERNAL-IP   PORT(S)        AGE
+cafe-api   LoadBalancer   10.96.214.169   172.26.0.7    80:30451/TCP   36s
+
+node kubernetes/practice/bin/url.mjs demo cafe-api
+http://localhost:60629
+curl -s http://localhost:60629/version
+{"version":"v1","instance":"cafe-api-549b54d94-6ghn2"}</pre>
+<p>EXTERNAL-IP 剛出現時，Envoy 可能還要幾十秒才接上 Pod，這段時間 curl 會收到 <code>Empty reply from server</code>，等一下再試即可。Service 刪掉重建，Envoy 容器也重建，Mac 上的 port 會換一個，所以腳本裡絕不寫死 port。</p>
+<div class="callout practice"><strong>💡 實務上：對外的 HTTP 服務共用一個入口</strong><br>在雲端，每個 LoadBalancer Service 都是一台要付錢、要管安全群組的負載平衡器，服務一多，帳單和資安要審的對外入口都跟著變多。對外的 HTTP 服務正確的做法是共用一個入口，依網域和路徑分給各個 ClusterIP Service，這是第 5 課的 Gateway API。review 時看到新服務寫了 <code>type: LoadBalancer</code>，資深工程師會先問：它真的要直接對外嗎？走的是 HTTP 嗎？多半的答案是掛到 Gateway 上就好。<code>kubectl port-forward</code> 也能從 Mac 連進叢集，但它是開發時的臨時通道（關掉終端機就斷），不是對外服務的方式。</div>
+
+<h2>長連線與負載平衡</h2>
+<p>kube-proxy 的規則是在<strong>建立 TCP 連線時</strong>挑一個 Pod，之後這條連線上的所有請求都送到同一個 Pod。它看不懂 HTTP，所以叫 L4（傳輸層）負載平衡。用 cafe-api 回應的 <code>x-instance</code> 標頭（處理請求的 Pod 名稱）可以看到差別：</p>
+<pre># 一次 curl 送 4 個請求：curl 會重用同一條連線（keep-alive）
+kubectl exec -n k8s-tools deploy/probe -- sh -c \
+  'curl -s -o /dev/null -D - http://cafe-api.demo/version http://cafe-api.demo/version http://cafe-api.demo/version http://cafe-api.demo/version | grep x-instance'
+x-instance: cafe-api-549b54d94-vncjq
+x-instance: cafe-api-549b54d94-vncjq
+x-instance: cafe-api-549b54d94-vncjq
+x-instance: cafe-api-549b54d94-vncjq
+
+# 每次都開新連線
+kubectl exec -n k8s-tools deploy/probe -- sh -c \
+  'for i in 1 2 3 4; do curl -s -o /dev/null -D - http://cafe-api.demo/version | grep x-instance; done'
+x-instance: cafe-api-549b54d94-vncjq
+x-instance: cafe-api-549b54d94-6ghn2
+x-instance: cafe-api-549b54d94-6ghn2
+x-instance: cafe-api-549b54d94-vncjq</pre>
+<p>正式環境的影響：服務之間的呼叫通常是長連線。Node 的 <code>fetch</code> 預設 keep-alive、資料庫連線池、gRPC 都會讓一條連線用很久。結果是三個副本裡一個很忙、兩個很閒，剛擴出來的新 Pod 也分不到舊連線的流量。查的時候看每個 Pod 的請求數或 CPU（第 8 課的 <code>kubectl top</code>），不要只看總量。</p>
+<p>處理方式依需求選：</p>
+<ul>
+  <li>大部分 HTTP 服務：連線會因為閒置逾時、部署重啟自然換掉，不平均的程度通常可以接受。</li>
+  <li>需要每個請求都平均分配：在前面放 L7（應用層，看得懂 HTTP）的代理，例如第 5 課的 Gateway，或 service mesh（Istio、Linkerd 這類在每個 Pod 旁邊加代理的平台）。</li>
+  <li>gRPC 這類單一長連線：用客戶端負載平衡（搭配 headless Service 拿到每個 Pod 的 IP），或設定連線的最長壽命讓它定期重連。</li>
+</ul>
+
+<h2>Service 沒有流量：照順序排查</h2>
+<p>最常見的狀況：Service 建得起來（apply 沒報錯），可是呼叫一直失敗。照著上面那張圖，從 Pod 往外查，每一步都有明確的指令：</p>
+<ol>
+  <li><strong>EndpointSlice 有沒有東西</strong>：
+<pre>kubectl get endpointslice -n demo -l kubernetes.io/service-name=cafe-api
+NAME             ADDRESSTYPE   PORTS     ENDPOINTS   AGE
+cafe-api-79pvt   IPv4          &lt;unset&gt;   &lt;unset&gt;     3s</pre>
+  ENDPOINTS 是 <code>&lt;unset&gt;</code>：selector 一個 Pod 都沒挑到，或挑到的 Pod 都沒 Ready。下一步。</li>
+  <li><strong>selector 和 Pod 的 label 對不對得上</strong>：
+<pre>kubectl describe service cafe-api -n demo
+Selector:   app.kubernetes.io/instance=mian,app.kubernetes.io/name=cafe-api
+TargetPort: web/TCP
+Endpoints:
+kubectl get pods -n demo --show-labels</pre>
+  把 Selector 跟 Pod 的 LABELS 逐字比對（這裡 <code>mian</code> 拼錯）。label 都對，就看 Pod 的 READY 欄是不是 <code>1/1</code>。</li>
+  <li><strong>port／targetPort</strong>：ENDPOINTS 有 IP、PORTS 卻是 <code>&lt;unset&gt;</code>，代表 targetPort 寫的名字在容器上找不到：
+<pre>NAME            ADDRESSTYPE   PORTS     ENDPOINTS               AGE
+badport-pcv8g   IPv4          &lt;unset&gt;   10.244.1.9,10.244.2.7   20s</pre>
+  PORTS 有數字但連線被拒（<code>Could not connect to server</code>），就是數字不對：targetPort 要等於程式真正聽的 port。用 <code>kubectl get service cafe-api -n demo -o yaml</code> 和 Deployment 的 <code>containerPort</code> 對照。</li>
+  <li><strong>名字</strong>：錯誤是 <code>Could not resolve host</code> 或 <code>ENOTFOUND</code>：檢查呼叫端在哪個 namespace、名字有沒有帶上 Service 的 namespace（<code>getent hosts</code> 試一次）。</li>
+</ol>
+<p>你可能在舊文章看到 <code>kubectl get endpoints</code>。Endpoints 是 EndpointSlice 的前身，從 Kubernetes 1.33 起標為 deprecated，這個叢集執行時會印出 <code>Warning: v1 Endpoints is deprecated in v1.33+; use discovery.k8s.io/v1 EndpointSlice</code>。看的內容一樣，新的習慣用 EndpointSlice。</p>
+<div class="callout practice"><strong>💡 實務上：「API 連不到」先看 EndpointSlice</strong><br>很多人一連不上就先懷疑 DNS 或網路，花一小時查 CoreDNS，最後發現是 label 拼錯。資深的做法是照順序、不跳步：EndpointSlice 一行指令就能排除一半的可能，有 ready 的 endpoint 才往 port、名字查。在事故頻道回報時也照這個順序寫，例如「EndpointSlice 有 3 個 ready、port 3000、<code>getent hosts</code> 解析得到」，接手的人不用從頭再查一遍。第 14 課會把這個順序擴大成完整的除錯流程。</div>
+
+<h2>練習</h2>
+<p>四題都在 <code>kubernetes/practice/work/04/</code>，執行頁面上的指令跑測試。測試會把你的 manifest 套用到專屬的 namespace（<code>k8s-04-ex1</code>、<code>k8s-04-ex2</code>…），從 k8s-tools 裡的 Pod 用真的請求檢查，跑完刪掉 namespace。叢集很忙時一題要跑幾分鐘。想自己動手試，可以用 <code>kubectl apply -n k8s-04-ex1 -f kubernetes/practice/work/04/ex1/</code>（先 <code>kubectl create namespace k8s-04-ex1</code>），測試開始時會把同名的 namespace 清掉重建。</p>
+
+<div class="local" data-test="ex1" data-files="ex1/deployment.yaml ex1/service.yaml">
+  <p>練習 1：<code>deployment.yaml</code> 是第 3 課的 cafe-api（3 個副本）。替容器的 3000 port 取名 <code>http</code>，再在 <code>service.yaml</code> 寫 ClusterIP Service <code>cafe-api</code>：<code>port</code> 80，<code>targetPort</code> 用名字 <code>http</code>，selector 只挑這個 Deployment 的 Pod。測試會在同一個 namespace 另外放一個同名（<code>app.kubernetes.io/name: cafe-api</code>）、但 <code>instance</code> 是 <code>canary</code> 的 Deployment，然後從叢集裡用新連線呼叫 <code>http://cafe-api.k8s-04-ex1/health/live</code> 200 次：要全部成功、至少分到 2 個 Pod，而且一次都不能打到 canary。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="ex2/service.yaml ex2/diagnosis.md">
+  <p>練習 2：<code>ex2/</code> 的 Service 套用後沒有任何流量，裡面有兩個錯。先套用到自己建的 namespace，只用 kubectl 照「排查順序」找出原因（不要先看 YAML 猜），修好 <code>service.yaml</code>，再在 <code>diagnosis.md</code> 寫下你用了哪些指令、各看到什麼。不能把 Service 改成別的類型繞過。測試要求：EndpointSlice 有 3 個 ready 的 endpoint、port 是 3000，<code>http://cafe-api.k8s-04-ex2/version</code> 回 200；<code>diagnosis.md</code> 要提到看 EndpointSlice 的指令，以及 <code>describe</code>、<code>-o yaml</code> 或 <code>--show-labels</code> 其中之一。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="ex3/menu/service.yaml ex3/api/deployment.yaml">
+  <p>練習 3：菜單由另一個團隊負責，跑在 namespace <code>k8s-04-ex3-menu</code>（<code>ex3/menu/</code>，<code>GET /products</code> 回傳菜單）；點餐 API 在 <code>k8s-04-ex3-api</code>（<code>ex3/api/</code>），它的 <code>GET /menu-proxy</code> 會去抓環境變數 <code>MENU_URL</code> 的網址。測試把兩個資料夾分別套用到這兩個 namespace，manifest 裡不要寫 namespace。完成兩件事：寫 <code>menu/service.yaml</code> 的 Service <code>menu</code>（port 80），以及填好 <code>api/deployment.yaml</code> 的 <code>MENU_URL</code>，指到菜單服務的 <code>/products</code>。不能寫 IP；測試會把 menu 的 Service 刪掉重建（ClusterIP 改變），API 要照樣拿得到菜單。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="ex4/service-lb.yaml ex4/curl.sh">
+  <p>練習 4：把 cafe-api 開到 Mac。在 <code>service-lb.yaml</code> 寫 LoadBalancer Service <code>cafe-api</code>（port 80 → 容器的 <code>http</code>），在 <code>curl.sh</code> 用 <code>node kubernetes/practice/bin/url.mjs k8s-04-ex4 cafe-api</code> 取得網址，再 curl 它的 <code>/version</code>。腳本在 learn 資料夾執行（<code>bash kubernetes/practice/work/04/ex4/curl.sh</code>）。Envoy 剛建好時會有幾十秒連不上，可以用 curl 的 <code>--retry 10 --retry-all-errors --retry-delay 3</code> 重試。測試會跑一次，把 Service 刪掉重建讓 Mac 上的 port 改變，再跑一次；不能寫死 port，也不能用 <code>kubectl port-forward</code>。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：Service cafe-api 的 EndpointSlice 是空的（ENDPOINTS 是 &lt;unset&gt;），最先檢查什麼？</p>
+  <label data-key="a">CoreDNS 是否正常</label>
+  <label data-key="b">Service 的 selector 有沒有挑到 Pod，以及那些 Pod 是否 Ready</label>
+  <label data-key="c">節點的防火牆</label>
+  <label data-key="d">刪掉 Service 重建</label>
+  <p class="why">✓ EndpointSlice 只放 selector 挑到、而且 Ready 的 Pod。空的代表 selector 和 label 對不上，或 Pod 還沒 Ready（第 7 課的 readiness）。a：DNS 只負責把名字變成 ClusterIP，就算 DNS 正常，後面沒有 Pod 一樣連不到。c：EndpointSlice 是 API 裡的紀錄，跟防火牆無關。d：重建一模一樣的 Service，selector 還是錯的。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：訂單服務用 HTTP keep-alive 呼叫 cafe-api Service，三個副本裡只有一個 CPU 很高。最可能的原因是？</p>
+  <label data-key="a">Service 的負載平衡壞了，要重建 Service</label>
+  <label data-key="b">kube-proxy 在建立連線時才挑 Pod，長連線建立後所有請求都送到同一個 Pod</label>
+  <label data-key="c">另外兩個 Pod 沒有 Ready</label>
+  <label data-key="d">DNS 快取了某一個 Pod 的 IP</label>
+  <p class="why">✓ ClusterIP 是 L4 負載平衡，分配發生在建立連線時。要每個請求都平均，需要 L7 的代理（第 5 課的 Gateway、service mesh），或讓客戶端定期換連線。c：沒 Ready 的 Pod 確實收不到流量，但那樣另外兩個應該是完全沒有請求，而且 <code>kubectl get pods</code> 一眼就看得出來；三個都 Ready 卻不平均，是長連線。d：DNS 回的是 Service 的 ClusterIP，不是 Pod IP（headless Service 才回 Pod IP）。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：namespace <code>shop</code> 裡的 Pod 要呼叫 namespace <code>pay</code> 的 Service <code>gateway</code>，下面哪個名稱一定查得到？</p>
+  <label data-key="a"><code>gateway</code></label>
+  <label data-key="b"><code>gateway.pay</code></label>
+  <label data-key="c"><code>pay.gateway</code></label>
+  <label data-key="d"><code>gateway.shop.svc.cluster.local</code></label>
+  <p class="why">✓ <code>&lt;service&gt;.&lt;namespace&gt;</code> 會被 search 補成 <code>gateway.pay.svc.cluster.local</code>。a：短名稱先補上自己的 namespace，變成 <code>gateway.shop.svc.cluster.local</code>，shop 裡沒有就查不到。c：順序反了，Service 名稱在前。d：指到 shop，namespace 錯了。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 8：Service 寫了 <code>port: 80</code>、沒寫 <code>targetPort</code>，容器聽 3000。EndpointSlice 有 3 個 ready 的 IP，但呼叫都是連線被拒。為什麼？</p>
+  <label data-key="a">Pod 還沒 Ready</label>
+  <label data-key="b">ClusterIP Service 只能用 port 3000</label>
+  <label data-key="c">沒寫 targetPort 時它等於 port，流量被送到 Pod 的 80，沒有程式在聽</label>
+  <label data-key="d">CoreDNS 把名字解析到錯的 IP</label>
+  <p class="why">✓ targetPort 預設等於 port。EndpointSlice 的 PORTS 會顯示 80，這就是線索；改成 <code>targetPort: http</code>（容器 port 的名字）或 3000。a：EndpointSlice 裡是 ready，代表 Pod 已經 Ready。b：Service 的 port 可以是任何數字，跟容器的 port 無關。d：連線被拒代表已經連到 Pod 的 IP，只是那個 port 沒人聽；名字查不到的錯誤長得不一樣。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>在設定裡寫 Pod IP 或 ClusterIP</strong>：Pod 重建、Service 重建都會換 IP。一律用 DNS 名稱，跨 namespace 寫 <code>&lt;service&gt;.&lt;namespace&gt;</code>。</li>
+  <li><strong>跨 namespace 只寫短名稱</strong>：短名稱只會在呼叫端自己的 namespace 找，結果是 <code>ENOTFOUND</code>。</li>
+  <li><strong>targetPort 寫錯或沒寫</strong>：Service 建得起來，但連線被拒，或 EndpointSlice 的 PORTS 是 &lt;unset&gt;。替容器 port 取名，targetPort 用名字。</li>
+  <li><strong>selector 太寬</strong>：只寫 <code>app.kubernetes.io/name</code>，同 namespace 的 canary 或別的 Deployment 也會被挑進來收流量。selector 要能唯一指到這組 Pod（例如再加 <code>app.kubernetes.io/instance</code>）。</li>
+  <li><strong>以為 Service 會做健康檢查</strong>：Service 只看 Pod 的 Ready 狀態。程式卡死但容器還在，沒有 readiness probe 就會繼續收流量（第 7 課）。</li>
+  <li><strong>長連線造成負載不平均</strong>：kube-proxy 以連線為單位分配。看每個 Pod 的請求量或 CPU，需要逐請求分配時改用 L7。</li>
+  <li><strong>每個服務都開 LoadBalancer</strong>：雲端上每個都是一台要付錢的負載平衡器。服務之間用 ClusterIP，對外 HTTP 統一走第 5 課的 Gateway。</li>
+  <li><strong>用 BusyBox 的 nslookup 查短名稱就斷定 DNS 壞了</strong>：它不套用 search，給完整名稱或改用 <code>getent hosts</code>。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>Pod IP 會變、有好幾份、不知道誰準備好了，所以呼叫端不直接連 Pod。</li>
+  <li>Service 用 selector 挑 Pod，給它們固定的 ClusterIP 和 DNS 名稱；控制器把挑到而且 Ready 的 Pod 寫進 EndpointSlice，每個節點的 kube-proxy 依此寫轉送規則。Service 本身不是程序。</li>
+  <li><code>port</code> 是呼叫端連的，<code>targetPort</code> 是容器聽的；替容器 port 取名，targetPort 寫名字。</li>
+  <li>同 namespace 用 <code>cafe-api</code>，跨 namespace 用 <code>cafe-api.&lt;ns&gt;</code>，完整名稱是 <code>cafe-api.&lt;ns&gt;.svc.cluster.local</code>；靠的是 resolv.conf 的 search 和 ndots:5。</li>
+  <li>ClusterIP 給內部、LoadBalancer 給外部（本機由 cloud-provider-kind 開 Envoy 容器，用 <code>bin/url.mjs</code> 查 port）、headless 回 Pod IP、ExternalName 指外部主機，NodePort 很少直接用。</li>
+  <li>kube-proxy 是 L4、以連線為單位分配，長連線會讓負載不平均。</li>
+  <li>沒有流量時照順序查：EndpointSlice → selector 與 Ready → port／targetPort → DNS 名稱與 namespace。</li>
+</ul>
+<p>下一課把對外的 HTTP 流量收進同一個入口：用 Gateway API 依網域和路徑把請求分給各個 Service，並了解 Ingress 為什麼退場。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

@@ -1,0 +1,3 @@
+// 練習 2：用 Reflector.createDecorator 寫 @Timeout(ms)
+//   export const Timeout = …
+export {}

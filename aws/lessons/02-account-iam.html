@@ -1,0 +1,1049 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>2. 帳號與 IAM 延伸：SSO 設定檔、CloudTrail、跨帳號 role、permission boundary 與提權路徑</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="2" data-practice="aws">
+<header>
+  <div class="eyebrow">階段 1：帳號與身分 · 第 2 課</div>
+  <h1>帳號與 IAM 延伸：SSO 設定檔、CloudTrail、跨帳號 role、permission boundary 與提權路徑</h1>
+</header>
+<main>
+
+<p>咖啡店請外包做會員系統。店長為了省事，把 root 使用者的 access key 寫進 <code>.env</code> 交給外包；幾週後金鑰外洩，帳號一夜之間被開了幾十台機器。事後老闆問了三個問題：<strong>是誰、在什麼時候、做了哪些事？</strong>同一週，合作的會計事務所要讀咖啡店 bucket 裡的月報表，同事直接在 bucket policy 寫了對方帳號可以 <code>s3:*</code>、Resource <code>*</code>。</p>
+<p><a href="../../devops/lessons/19-aws-iam.html">devops 課第 19 課</a>已經把帳號的第一天、同一個帳號裡的權限評估、role 與 OIDC 做完。這一課接著往下：開發者電腦上的憑證怎麼放才安全、出事後怎麼用 CloudTrail 查、別的帳號要用你的資源時權限怎麼算、怎麼讓開發者自己建 role 又不會替自己升級成管理員。</p>
+<p>這課的路線：</p>
+<ul>
+  <li>開發者電腦上的憑證：讀懂 <code>~/.aws/config</code> 的 SSO profile，找出設定檔裡的風險（練習 1）。</li>
+  <li>CloudTrail：事情發生之後，怎麼查出誰做了什麼，哪些事查不到。</li>
+  <li>跨帳號的權限：為什麼兩邊都要允許，完整的評估順序（練習 2）。</li>
+  <li>把 role 交給另一個帳號：信任政策、ExternalId、session 的長度（練習 3）。</li>
+  <li>提權路徑與 permission boundary：哪些權限組合等於管理員，怎麼放權又不失控（練習 4）。</li>
+</ul>
+
+<div class="callout"><strong>這課會用到：</strong>devops 課第 19 課的 policy 評估（同一個帳號裡：明確拒絕優先，身分型與資源型政策取聯集）、role 與信任政策（誰可以 assume 這個 role）、IAM Identity Center（人員的單一登入）；第 1 課的<a href="01-aws-big-picture.html">憑證鏈與 profile</a>（SDK 依固定順序找憑證，<code>AWS_PROFILE</code> 指定用哪個 profile）。</div>
+
+<div class="callout warn"><strong>練習環境：</strong>模擬器不檢查權限，任何憑證都能做任何事。所以「允不允許」的判斷都在頁面上的練習做；本機練習只檢查你建出來的 role 與政策文件寫得對不對。</div>
+
+<h2>開發者電腦上的憑證：SSO profile</h2>
+<p>開場的事故，根源是一把<strong>長期金鑰</strong>（access key：一組不會自己過期的 ID 加 secret）被放在檔案裡傳來傳去。devops 課第 19 課說過人員應該走 IAM Identity Center 登入；這一節看它落到你電腦上長什麼樣子，以及怎麼檢查一台電腦的設定有沒有問題。</p>
+<p>執行 <code>aws configure sso</code>，照提示輸入公司的 SSO 入口網址（start URL）、選帳號與權限，CLI 會在 <code>~/.aws/config</code> 寫下兩種區段：</p>
+<pre>[profile cafe-dev]                 # 一個 profile：用哪個 SSO 登入、進哪個帳號、拿哪個權限
+sso_session = cafe
+sso_account_id = 111122223333
+sso_role_name = Developer          # Identity Center 的 permission set 名稱
+region = ap-northeast-1
+
+[sso-session cafe]                 # SSO 登入本身：入口網址與 Identity Center 所在的 region
+sso_start_url = https://cafe.awsapps.com/start
+sso_region = ap-northeast-1
+sso_registration_scopes = sso:account:access</pre>
+<ul>
+  <li><strong>profile 區段</strong>在 config 檔寫成 <code>[profile 名稱]</code>，只有 <code>[default]</code> 例外；同一個 profile 在 <code>~/.aws/credentials</code> 檔裡寫成 <code>[名稱]</code>，沒有 <code>profile</code> 前綴。CLI 會把兩個檔案裡同名的 profile 合在一起看。</li>
+  <li><strong>sso-session 區段</strong>可以被好幾個 profile 共用：同一個入口登入一次，就能用 dev、staging 兩個 profile。<code>sso_region</code> 是 Identity Center 所在的 region，跟 profile 自己的 <code>region</code>（資源在哪）是兩回事。</li>
+</ul>
+<p>每天開始工作時執行 <code>aws sso login --profile cafe-dev</code>，瀏覽器會打開讓你確認登入。成功後 CLI 把 SSO 的 token 快取在 <code>~/.aws/sso/cache/</code>，之後 CLI 與 SDK 用這個 token 換到的都是<strong>會過期的臨時憑證</strong>。電腦被偷、檔案外洩，攻擊者拿到的也只是短時間內有效的東西，而且公司在 Identity Center 停用你的帳號後就換不到新的。</p>
+<p>沒有 Identity Center 的個人帳號，AWS CLI 2.32.0 起還有 <code>aws login</code>：在瀏覽器用主控台的身分（root、IAM user 或聯合登入）登入，CLI 拿到臨時憑證並自動更新，最長 12 小時，config 裡會寫下一行 <code>login_session = …</code>（官方「Login for AWS local development using console credentials」，2026-11-20 查證；這門課的 CLI 是 2.36.37）。公司帳號有 Identity Center 時，官方建議用 <code>aws configure sso</code>。</p>
+<p>所以檢查一台電腦的設定，要找的是這幾件事，練習 1 會寫成程式：</p>
+<div class="table-wrap"><table>
+  <tr><th>看到什麼</th><th>為什麼是風險</th></tr>
+  <tr><td>某個 profile 有 <code>aws_access_key_id</code></td><td>長期金鑰，外洩就一直有效，要換成 SSO</td></tr>
+  <tr><td><code>[default]</code> 指向正式環境的帳號</td><td>忘了加 <code>--profile</code> 的指令全部打到正式環境（第 1 課的憑證鏈）</td></tr>
+  <tr><td><code>sso_session</code> 指到不存在的 <code>[sso-session]</code></td><td>這個 profile 登入不了，常見於複製別人的設定檔</td></tr>
+  <tr><td><code>[sso-session]</code> 沒有 <code>sso_region</code></td><td>CLI 不知道去哪個 region 的 Identity Center 登入</td></tr>
+  <tr><td>兩個 profile 名稱指向同一個帳號＋同一個權限</td><td>同一個身分有兩個名字，有人以為自己在用 staging，其實是同一個帳號</td></tr>
+</table></div>
+<div class="callout practice"><strong>💡 實務上：新人拿到的是 SSO 入口網址，不是金鑰</strong><br>成熟的團隊替新人開帳號時，給的是 Identity Center 的入口網址和一段 <code>~/.aws/config</code> 範本，權限依職務分成幾個 permission set（例如 Developer、ReadOnly）；離職時在 Identity Center 停用一個人，所有帳號的存取一起收回。接手舊專案時，先在團隊裡問「誰的電腦上還有 <code>aws_access_key_id</code>」，再搭配 devops 課第 19 課的 credential report 找出帳號裡的長期金鑰，逐一換掉。</div>
+
+<h2>CloudTrail：事情發生之後查得到什麼</h2>
+<p>上一節讓金鑰不容易外洩；這一節處理開場老闆的三個問題。<strong>CloudTrail</strong> 是 AWS 的操作紀錄服務：每一個 API 呼叫（不管來自主控台、CLI 還是 SDK）都會留下一筆事件（event），寫明誰、什麼時候、從哪個 IP、呼叫了什麼、成功或失敗。</p>
+<p>不用設定就有的是 <strong>Event history</strong>（事件歷史）。依官方文件（2026-11-20 查證）：</p>
+<ul>
+  <li>保留最近 <strong>90 天</strong>，看 Event history 不收費。</li>
+  <li>只有<strong>管理事件</strong>（management events）：對資源本身的操作，例如建立 bucket、刪除 bucket、改 security group、建 IAM role。<strong>資料事件</strong>（data events）不在裡面：讀寫 S3 物件（<code>GetObject</code>、<code>PutObject</code>）、呼叫 Lambda 函式這類「用資源」的操作。</li>
+  <li>一次只查一個 region、一個帳號，而且只能用一個條件篩選（例如事件名稱或資源名稱）加時間範圍。IAM 這類全球服務的事件，大多記在 <code>us-east-1</code>。</li>
+</ul>
+<p>要超過 90 天、要看資料事件、要集中多個帳號，就要自己建 <strong>trail</strong>（把事件持續寫進一個 S3 bucket）或 CloudTrail Lake 的 event data store。資料事件要在 trail 上另外開，依事件數計費（<a href="https://aws.amazon.com/cloudtrail/pricing/">CloudTrail 定價頁</a>）。「誰下載了收據」這種問題，事前沒開資料事件，事後就查不到。</p>
+<p>查「誰刪了 <code>cafe-menu</code> 這個 bucket」：</p>
+<pre>aws cloudtrail lookup-events \
+  --lookup-attributes AttributeKey=ResourceName,AttributeValue=cafe-menu \
+  --query 'Events[].CloudTrailEvent' --output text</pre>
+<p>每筆事件的本體是一段 JSON。下面是兩筆簡化過的事件，按執行，看程式怎麼從裡面找出刪除的人：</p>
+<div class="lab"><script type="code">
+// lookup-events 回傳的 CloudTrailEvent 是 JSON 字串（欄位簡化過）
+const events = [
+  { eventTime: '2026-11-02T18:04:11Z', eventName: 'ListObjectsV2', sourceIPAddress: '203.0.113.7',
+    userIdentity: { type: 'IAMUser', arn: 'arn:aws:iam::111122223333:user/vendor-deploy', accessKeyId: 'AKIAEXAMPLE1' },
+    requestParameters: { bucketName: 'cafe-menu' } },
+  { eventTime: '2026-11-02T18:05:40Z', eventName: 'DeleteBucket', sourceIPAddress: '203.0.113.7',
+    userIdentity: { type: 'IAMUser', arn: 'arn:aws:iam::111122223333:user/vendor-deploy', accessKeyId: 'AKIAEXAMPLE1' },
+    requestParameters: { bucketName: 'cafe-menu' } },
+].map(e => JSON.stringify(e))
+
+for (const raw of events) {
+  const e = JSON.parse(raw)
+  if (e.eventName !== 'DeleteBucket') continue
+  console.log(`${e.eventTime} ${e.userIdentity.arn} 從 ${e.sourceIPAddress} 刪除了 ${e.requestParameters.bucketName}`)
+  console.log(`用的金鑰：${e.userIdentity.accessKeyId}（${e.userIdentity.type}，長期金鑰）`)
+}
+</script></div>
+<p>從結果看三件事：<code>userIdentity.arn</code> 是誰；<code>accessKeyId</code> 是哪一把金鑰，拿去跟 credential report 對，就知道要停用哪一把；<code>sourceIPAddress</code> 是不是你們自己的 IP。同一把金鑰的其他事件，再用 <code>AttributeKey=AccessKeyId</code> 查一次，就是攻擊者做過的事。</p>
+<div class="callout practice"><strong>💡 實務上：事故調查第一步是 CloudTrail，第二步才是修</strong><br>發現金鑰外洩時，先把那把金鑰設成 Inactive 止血，接著用 CloudTrail 以金鑰 ID 查出它做過的事：建了哪些機器、開了哪些新的 user 或金鑰（攻擊者常留後門）、改了哪些權限，每一項都要清掉。公司帳號通常會在第一天就建一個組織層級的 trail，寫進一個專門的 log 帳號，一般開發者刪不掉，因為入侵者第一件事常常是關掉 trail。</div>
+
+<h2>跨帳號：兩邊都要允許</h2>
+<p>知道怎麼查之後，回到開場的第二件事：會計事務所的帳號要讀咖啡店的 bucket。這是<strong>跨帳號存取</strong>：發出請求的身分（principal）在一個帳號，資源在另一個帳號。</p>
+<p>devops 課第 19 課的規則是同一個帳號內的版本：身分型政策（掛在 user、role 上）和資源型政策（掛在資源上，例如 bucket policy）<strong>取聯集</strong>，任一邊允許、沒有明確拒絕就放行。跨帳號時不一樣，AWS 會在兩個帳號各評估一次，<strong>兩邊都要允許</strong>（官方「Cross-account policy evaluation logic」）：</p>
+<figure>
+  <svg viewBox="0 0 700 230" role="img" aria-label="跨帳號存取時，請求方帳號的身分型政策與資源所在帳號的 bucket policy 都要允許">
+    <defs><marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="20" y="30" width="280" height="150" rx="10"/>
+    <text class="d-text" x="40" y="58">會計事務所帳號 222222222222</text>
+    <rect class="d-box" x="40" y="75" width="240" height="44" rx="6"/>
+    <text class="d-text" x="56" y="102">role/analyst 的身分型政策</text>
+    <text class="d-small" x="40" y="145">要允許 s3:GetObject 咖啡店的 bucket</text>
+    <text class="d-small" x="40" y="164">還要過 boundary、SCP（若有）</text>
+    <rect class="d-soft" x="400" y="30" width="280" height="150" rx="10"/>
+    <text class="d-text" x="420" y="58">咖啡店帳號 111111111111</text>
+    <rect class="d-box" x="420" y="75" width="240" height="44" rx="6"/>
+    <text class="d-text" x="436" y="102">cafe-reports 的 bucket policy</text>
+    <text class="d-small" x="420" y="145">Principal 要包含對方的 role 或帳號</text>
+    <text class="d-small" x="420" y="164">Action、Resource 要涵蓋這個請求</text>
+    <line class="d-line" x1="280" y1="97" x2="418" y2="97" marker-end="url(#arr2)"/>
+    <text class="d-accent" x="296" y="88">GetObject</text>
+    <text class="d-text" x="190" y="215">兩邊各自評估，都是「允許」才放行；任一邊有明確拒絕就拒絕</text>
+  </svg>
+  <figcaption>跨帳號：不是聯集，是兩次評估都要通過。</figcaption>
+</figure>
+<p>所以同事的寫法錯在兩個地方：bucket policy 給了對方 <code>s3:*</code> 與 <code>*</code>，對方帳號的管理員又可以把這個權限轉給他們帳號裡的任何人。正確的做法是 bucket policy 只列對方指定的 role、只給 <code>s3:GetObject</code>、Resource 只到 <code>reports/*</code>；或是下一節的做法：在咖啡店帳號建一個 role 給對方 assume。</p>
+<p>把所有政策類型放在一起，官方「Policy evaluation logic」的評估順序是（2026-11-20 查證）：</p>
+<ol>
+  <li><strong>明確拒絕</strong>：所有相關政策裡只要有一條符合的 Deny，就拒絕。</li>
+  <li><strong>RCP</strong>（resource control policy）、<strong>SCP</strong>（service control policy）：AWS Organizations 對整個帳號設的上限，前者管帳號裡的資源、後者管帳號裡的身分。有設定時，它們沒允許的就拒絕。</li>
+  <li><strong>資源型政策</strong>：同一個帳號內，它直接允許某些身分時可以單獨放行；跨帳號時它只是兩個必要條件之一。</li>
+  <li><strong>身分型政策</strong>：沒有任何一條允許，就是隱含拒絕。</li>
+  <li><strong>permission boundary</strong>：掛在 user 或 role 上的「上限」，它沒允許的就拒絕。</li>
+  <li><strong>session policy</strong>：assume role 時另外傳入的政策，同樣只能再收窄。</li>
+</ol>
+<p>第 2、5、6 步都只能<strong>收窄</strong>，本身不給任何權限：boundary 寫了 <code>s3:*</code>，身分型政策沒寫，還是什麼都不能做。同一個帳號內，資源型政策直接列出某個 user 或 role session 時，boundary 的隱含拒絕擋不住它，細節在官方文件；練習 2 的同帳號情況不會出現 boundary。</p>
+<div class="lab"><script type="code">
+// 同一個請求，同帳號與跨帳號的結果不同（只看 Allow，沒有任何 Deny）
+const identityAllows = false   // 呼叫者自己的身分型政策沒有寫 s3:GetObject
+const bucketAllows = true      // bucket policy 列了呼叫者
+
+const sameAccount = identityAllows || bucketAllows
+const crossAccount = identityAllows && bucketAllows
+console.log('同帳號（聯集）：', sameAccount ? '允許' : '拒絕')
+console.log('跨帳號（兩邊都要）：', crossAccount ? '允許' : '拒絕')
+</script></div>
+
+<h2>把 role 交給另一個帳號：信任政策與 ExternalId</h2>
+<p>bucket policy 只適用 S3 這類有資源型政策的服務。更通用的跨帳號做法是：在咖啡店帳號建一個 role，讓對方 assume 進來。一個 role 由兩份政策組成：</p>
+<ul>
+  <li><strong>信任政策</strong>（trust policy）：誰可以 assume 我。它本身就是 role 的資源型政策，Principal 寫對方的帳號（<code>arn:aws:iam::222222222222:root</code>，代表「那個帳號，由它自己決定給誰」）或對方指定的 role。</li>
+  <li><strong>權限政策</strong>（permissions policy）：assume 進來之後能做什麼，就是一般的身分型政策。</li>
+</ul>
+<p>對方那邊還要有 <code>sts:AssumeRole</code> 這個 role 的權限，又是「兩邊都要允許」。assume 成功後拿到的是臨時憑證，身分變成 <code>arn:aws:sts::111111111111:assumed-role/角色名稱/session 名稱</code>，CloudTrail 裡會看到這個 session 名稱，所以要求對方用有意義的名字。</p>
+<p>如果對方是一家替很多客戶服務的公司（例如報表 SaaS），還有一個陷阱叫 <strong>confused deputy</strong>（被混淆的代理人）：SaaS 用自己的帳號替每個客戶 assume 客戶的 role。另一個客戶只要在 SaaS 的設定頁填上<em>你的</em> role ARN，SaaS 就會替他去讀你的資料，因為 SaaS 的帳號確實被你信任。解法是 <strong>ExternalId</strong>：SaaS 替每個客戶產生一個不重複的字串，你在信任政策加上條件，assume 時必須帶這個字串：</p>
+<pre>{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "AWS": "arn:aws:iam::222222222222:root" },
+    "Action": "sts:AssumeRole",
+    "Condition": { "StringEquals": { "sts:ExternalId": "cafe-reports-7f3a" } }
+  }]
+}</pre>
+<p>別的客戶填你的 role ARN 時，SaaS 帶的是那個客戶的 ExternalId，條件不成立。ExternalId 不是密碼，它的作用是讓 SaaS 分得清「這次是替誰做」，所以由 SaaS 產生、客戶不能自己改。</p>
+<p>對方的 CLI 設定長這樣，<code>source_profile</code> 是他們自己的身分，CLI 會自動帶 ExternalId 去 assume：</p>
+<pre>[profile cafe-reports]
+role_arn = arn:aws:iam::111111111111:role/cafe-reporting
+source_profile = accounting-sso
+external_id = cafe-reports-7f3a
+role_session_name = accounting-monthly-report</pre>
+<p>session 的長度：role 的 <code>MaxSessionDuration</code> 可以設 1 到 12 小時（預設 1 小時），assume 時用 <code>DurationSeconds</code> 要求不超過它的長度；從一個 role 的臨時憑證再 assume 另一個 role（role chaining）最長只有 1 小時。assume 時也可以傳一份 session policy，讓這一次拿到的權限比 role 本身更小。</p>
+<div class="callout practice"><strong>💡 實務上：跨帳號給 role，不給 IAM user</strong><br>合作廠商、外包、另一個部門要用你的資源，資深工程師的做法是建一個 role、信任政策只列對方的帳號（或對方指定的 role）、加 ExternalId（對方是多客戶的服務時一定要）、權限只開需要的動作與路徑，再把 role ARN 給對方。不要在自己帳號替對方開 IAM user 和金鑰：金鑰會被存在對方的系統裡，你看不到、也無法要求輪替。合作結束時刪掉 role，存取立刻結束。</div>
+
+<h2>提權路徑與 permission boundary</h2>
+<p>跨帳號處理的是「外面的人能做什麼」；最後一節看「裡面的人會不會替自己加權限」。<strong>提權</strong>（privilege escalation）是指一個身分利用手上的權限，間接拿到比原本更大的權限。devops 課第 19 課已經點出 <code>iam:PassRole</code> 給 <code>*</code> 的危險，這裡把常見的路徑列完整：</p>
+<div class="table-wrap"><table>
+  <tr><th>手上的權限</th><th>怎麼變成管理員</th></tr>
+  <tr><td><code>iam:PassRole</code>（Resource 涵蓋管理員 role）＋<code>ec2:RunInstances</code></td><td>開一台機器，instance profile 掛管理員 role，從機器上拿 role 的憑證</td></tr>
+  <tr><td><code>iam:PassRole</code>（同上）＋<code>lambda:CreateFunction</code></td><td>建一個用管理員 role 執行的函式，在函式裡做任何事</td></tr>
+  <tr><td><code>iam:CreatePolicyVersion</code></td><td>替自己身上的受管政策建一個新版本，內容改成 <code>"Action": "*"</code> 並設為預設版本</td></tr>
+  <tr><td><code>iam:AttachUserPolicy</code>（Resource 涵蓋自己）</td><td>把 <code>AdministratorAccess</code> 掛到自己身上</td></tr>
+</table></div>
+<p>要注意這些權限常常不是明寫出來的：<code>iam:*</code>、<code>iam:Pass*</code>、<code>"Action": "*"</code> 都包含它們；<code>"NotAction": "s3:*"</code> 搭配 Allow 的意思是「S3 以外全部允許」，也包含它們。只用字串比對找 <code>iam:PassRole</code> 的審查會漏掉，練習 4 就是處理這些寫法。</p>
+<p>可是平台團隊不可能每次都替開發者建 role：開發者做 Lambda 時，自己就需要建 role、把 role 交給 Lambda。<strong>permission boundary</strong> 解決這個矛盾。它是掛在 user 或 role 上的一份政策，代表「這個身分最多能有多少權限」；實際能做的是身分型政策與 boundary 的<strong>交集</strong>。做法是給開發者建 role 的權限，但加一個條件：建出來的 role 一定要掛上指定的 boundary。</p>
+<pre>{
+  "Effect": "Allow",
+  "Action": ["iam:CreateRole", "iam:PutRolePolicy", "iam:AttachRolePolicy"],
+  "Resource": "arn:aws:iam::111111111111:role/app-*",
+  "Condition": {
+    "StringEquals": { "iam:PermissionsBoundary": "arn:aws:iam::111111111111:policy/app-boundary" }
+  }
+}</pre>
+<p>這樣開發者建的 <code>app-*</code> role 就算掛了 <code>AdministratorAccess</code>，實際權限也不會超出 <code>app-boundary</code>。完整的設計還要用 Deny 擋住開發者修改、刪除 boundary 本身，以及移除 role 上的 boundary（<code>iam:DeleteRolePermissionsBoundary</code>）。</p>
+<p>這些組合靠人眼很難看全。IAM Access Analyzer 的政策驗證會在你存政策時提出安全警告（devops 課第 19 課介紹過），團隊裡也常在 CI 檢查 IAM 的變更。</p>
+<div class="callout practice"><strong>💡 實務上：審 IAM 的 PR 時，先問「這能不能變成管理員」</strong><br>IaC 的 PR 裡出現 IAM 變更，資深工程師會先找四樣東西：Action 有沒有萬用字元或 NotAction、<code>iam:PassRole</code> 的 Resource 是不是具體的 role、有沒有能改政策或掛政策的 <code>iam:</code> 動作、建 role 的權限有沒有綁 boundary。需要給開發者自建 role 的權限時，跟資安一起定一份 boundary，寫進團隊的平台文件。</div>
+
+<h2>這課的練習怎麼對應真的 AWS</h2>
+<p>前面的判斷規則都在 AWS 的權限評估裡發生，模擬器不做這件事：它不會因為信任政策沒列你就拒絕 assume，也不會因為缺 ExternalId 就擋下。所以這課分成兩種練習：</p>
+<ul>
+  <li><strong>頁面上的練習</strong>（1、2、4）：把規則寫成程式，判斷設定檔與政策有沒有問題、請求會不會被允許。</li>
+  <li><strong>本機練習</strong>（3）：用 SDK 在模擬器建 role，測試把 role 與政策讀回來檢查內容。IAM 回傳的政策文件是 URL 編碼的 JSON，要先 <code>decodeURIComponent</code> 再 <code>JSON.parse</code>。最後用另一個模擬帳號 assume 一次，確認 role 可以被使用，但這一步在模擬器一定成功，不能拿來證明信任政策是對的。</li>
+</ul>
+
+<h2>在真的 AWS 帳號上做一次（選做）</h2>
+<p>這一節不判分，也不影響進度。用第 1 課開的獨立練習帳號，不要用公司帳號。這一節替你建好之後每一課都會用的 <code>learn-sandbox</code> profile，再試一次 ExternalId 與 CloudTrail。</p>
+<div class="callout warn"><strong>費用：</strong>這一節不建立計費的資源。IAM Identity Center 與 IAM 不另外收費；CloudTrail 的 Event history 查詢不收費（<a href="https://docs.aws.amazon.com/awscloudtrail/latest/userguide/view-cloudtrail-events.html">CloudTrail 文件</a>，2026-11-20 查證）。</div>
+<p>先在主控台用 root 登入，搜尋「IAM Identity Center」並啟用（主控台會引導你一起啟用 AWS Organizations），建一個使用者給自己、建一個 permission set（練習帳號可以用 AdministratorAccess），把使用者與 permission set 指派到這個帳號。記下設定頁上的 AWS access portal URL（<code>https://…awsapps.com/start</code>）。之後全部用 CLI：</p>
+<pre># 1. 建立 profile：照提示輸入 SSO session 名稱、剛才的 portal URL、Identity Center 所在的 region，再選帳號與 permission set
+aws configure sso --profile learn-sandbox
+
+# 2. 看 ~/.aws/config 多了 [profile learn-sandbox] 與 [sso-session …] 兩個區段
+cat ~/.aws/config
+
+# 3. 之後每天開始前登入一次，再確認身分：Arn 應該是 assumed-role/AWSReservedSSO_…
+aws sso login --profile learn-sandbox
+aws sts get-caller-identity --profile learn-sandbox
+
+# 4. 建一個要求 ExternalId 的 role，這裡用自己的帳號扮演合作夥伴（&lt;帳號ID&gt; 換成你的 12 位數帳號）
+cat &gt; trust.json &lt;&lt;'EOF'
+{ "Version": "2012-10-17", "Statement": [{ "Effect": "Allow",
+  "Principal": { "AWS": "arn:aws:iam::&lt;帳號ID&gt;:root" }, "Action": "sts:AssumeRole",
+  "Condition": { "StringEquals": { "sts:ExternalId": "cafe-learn-demo" } } }] }
+EOF
+aws iam create-role --role-name cafe-learn-02-partner --assume-role-policy-document file://trust.json --profile learn-sandbox
+
+# 5. 不帶 ExternalId：應該回 AccessDenied
+aws sts assume-role --role-arn arn:aws:iam::&lt;帳號ID&gt;:role/cafe-learn-02-partner --role-session-name try --profile learn-sandbox
+
+# 6. 帶 ExternalId：拿到 assumed-role/cafe-learn-02-partner/try 的臨時憑證
+aws sts assume-role --role-arn arn:aws:iam::&lt;帳號ID&gt;:role/cafe-learn-02-partner --role-session-name try \
+  --external-id cafe-learn-demo --query 'AssumedRoleUser.Arn' --profile learn-sandbox
+
+# 7. 在 CloudTrail 查剛才的 CreateRole：IAM 的事件記在 us-east-1；事件不是即時出現，查不到就等幾分鐘
+aws cloudtrail lookup-events --region us-east-1 --profile learn-sandbox \
+  --lookup-attributes AttributeKey=EventName,AttributeValue=CreateRole \
+  --query 'Events[].[EventTime,Username,EventName]' --output table</pre>
+<h3>清除</h3>
+<pre>aws iam delete-role --role-name cafe-learn-02-partner --profile learn-sandbox
+aws iam list-roles --profile learn-sandbox --query "Roles[?starts_with(RoleName, 'cafe-learn')].RoleName"   # 確認：回傳 []</pre>
+<p>Identity Center 的使用者與 <code>learn-sandbox</code> profile 留著，之後每一課都會用。</p>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：寫 <code>auditConfig(configText, credentialsText, prodAccounts)</code>，讀 <code>~/.aws/config</code> 與 <code>~/.aws/credentials</code> 的內容，回傳排序過的風險清單。解析規則：一行一個設定，前後空白去掉；空行和 <code>#</code>、<code>;</code> 開頭的行是註解；<code>[…]</code> 是區段；<code>key = value</code> 在第一個 <code>=</code> 切開。config 的 <code>[default]</code> 與 <code>[profile X]</code> 都是 profile（名稱是 <code>default</code>、<code>X</code>），<code>[sso-session X]</code> 是 SSO 登入設定；credentials 的 <code>[X]</code> 是 profile X，跟 config 的 <code>[profile X]</code> 合在一起看。要回報的風險：</p>
+  <ul>
+    <li><code>static-key:X</code>：profile X 有 <code>aws_access_key_id</code>（兩個檔案都算）。</li>
+    <li><code>default-prod</code>：<code>default</code> profile 的帳號在 <code>prodAccounts</code> 裡。帳號看 <code>sso_account_id</code>，沒有時看 <code>role_arn</code> 裡的 12 位數帳號。</li>
+    <li><code>missing-sso-session:X</code>：profile X 的 <code>sso_session</code> 指到不存在的 <code>[sso-session]</code>。</li>
+    <li><code>missing-sso-region:S</code>：<code>[sso-session S]</code> 沒有 <code>sso_region</code>。</li>
+    <li><code>duplicate:A,B</code>：兩個以上的 profile 有相同的 <code>sso_account_id</code>＋<code>sso_role_name</code>，名稱排序後用逗號接起來。</li>
+  </ul>
+  <script type="start">
+type Section = Record<string, string>
+
+function auditConfig(configText: string, credentialsText: string, prodAccounts: string[]): string[] {
+  // 1. 寫一個解析 INI 的函式：區段名稱 → { key: value }，記得跳過註解
+  // 2. config 的 [default]、[profile X] → profile；[sso-session X] → session；credentials 的 [X] → profile
+  // 3. 逐一檢查五種風險，結果排序後回傳
+  return []
+}
+
+const config = `
+[default]
+sso_session = cafe
+sso_account_id = 222233334444
+sso_role_name = AdministratorAccess
+
+[profile dev]
+sso_session = cafe
+sso_account_id = 111122223333
+sso_role_name = Developer
+
+[sso-session cafe]
+sso_start_url = https://cafe.awsapps.com/start
+sso_region = ap-northeast-1
+`
+console.log(auditConfig(config, '', ['222233334444']))
+</script>
+  <script type="answer">
+type Section = Record<string, string>
+
+function parseIni(text: string): Record<string, Section> {
+  const out: Record<string, Section> = {}
+  let current: Section | null = null
+  for (const raw of text.split('\n')) {
+    const line = raw.trim()
+    if (!line || line.startsWith('#') || line.startsWith(';')) continue
+    const head = line.match(/^\[(.+)\]$/)
+    if (head) { current = out[head[1].trim()] ??= {}; continue }
+    const eq = line.indexOf('=')
+    if (current && eq > 0) current[line.slice(0, eq).trim()] = line.slice(eq + 1).trim()
+  }
+  return out
+}
+
+function auditConfig(configText: string, credentialsText: string, prodAccounts: string[]): string[] {
+  const profiles: Record<string, Section> = {}
+  const sessions: Record<string, Section> = {}
+  for (const [name, kv] of Object.entries(parseIni(configText))) {
+    if (name === 'default') profiles.default = { ...profiles.default, ...kv }
+    else if (name.startsWith('profile ')) { const p = name.slice(8).trim(); profiles[p] = { ...profiles[p], ...kv } }
+    else if (name.startsWith('sso-session ')) sessions[name.slice(12).trim()] = kv
+  }
+  for (const [name, kv] of Object.entries(parseIni(credentialsText))) profiles[name] = { ...profiles[name], ...kv }
+
+  const risks = new Set<string>()
+  const sameIdentity: Record<string, string[]> = {}
+  for (const [name, p] of Object.entries(profiles)) {
+    if (p.aws_access_key_id) risks.add(`static-key:${name}`)
+    if (p.sso_session && !sessions[p.sso_session]) risks.add(`missing-sso-session:${name}`)
+    const account = p.sso_account_id ?? p.role_arn?.match(/^arn:aws:iam::(\d{12}):/)?.[1]
+    if (name === 'default' && account && prodAccounts.includes(account)) risks.add('default-prod')
+    if (p.sso_account_id && p.sso_role_name) (sameIdentity[`${p.sso_account_id}/${p.sso_role_name}`] ??= []).push(name)
+  }
+  for (const [name, s] of Object.entries(sessions)) if (!s.sso_region) risks.add(`missing-sso-region:${name}`)
+  for (const names of Object.values(sameIdentity)) if (names.length > 1) risks.add(`duplicate:${names.sort().join(',')}`)
+  return [...risks].sort()
+}
+
+const config = `
+[default]
+sso_session = cafe
+sso_account_id = 222233334444
+sso_role_name = AdministratorAccess
+
+[profile dev]
+sso_session = cafe
+sso_account_id = 111122223333
+sso_role_name = Developer
+
+[sso-session cafe]
+sso_start_url = https://cafe.awsapps.com/start
+sso_region = ap-northeast-1
+`
+console.log(auditConfig(config, '', ['222233334444']))
+</script>
+  <script type="tests">
+const cfg = `
+[default]
+sso_session = cafe
+sso_account_id = 222233334444
+sso_role_name = AdministratorAccess
+region = ap-northeast-1
+
+[profile dev]
+sso_session = cafe
+sso_account_id = 111122223333
+sso_role_name = Developer
+
+[profile dev-old]
+sso_session = cafe
+sso_account_id = 111122223333
+sso_role_name = Developer
+
+[profile report]
+sso_session = partner
+sso_account_id = 555566667777
+sso_role_name = ReadOnly
+
+#[profile legacy]
+#aws_access_key_id = AKIAOLDOLDOLD
+[profile ci]
+region = ap-northeast-1
+;aws_access_key_id=AKIACOMMENTED
+
+[sso-session cafe]
+sso_start_url = https://cafe.awsapps.com/start
+sso_region = ap-northeast-1
+sso_registration_scopes = sso:account:access
+`
+const creds = `
+[ci]
+aws_access_key_id = AKIAEXAMPLEEXAMPLE
+aws_secret_access_key = secret
+`
+assert.deepEqual(auditConfig(cfg, creds, ['222233334444']),
+  ['default-prod', 'duplicate:dev,dev-old', 'missing-sso-session:report', 'static-key:ci'],
+  '完整的例子：default 指到正式帳號、dev 與 dev-old 是同一個身分、report 的 sso_session 不存在、ci 在 credentials 檔有金鑰；# 和 ; 開頭的行是註解，不算')
+assert.deepEqual(auditConfig(cfg, creds, []), ['duplicate:dev,dev-old', 'missing-sso-session:report', 'static-key:ci'], 'prodAccounts 是空的時不回報 default-prod')
+assert.deepEqual(auditConfig(cfg, '', ['222233334444']), ['default-prod', 'duplicate:dev,dev-old', 'missing-sso-session:report'], 'credentials 檔是空的時，ci 沒有金鑰')
+assert.deepEqual(auditConfig('', '[default]\naws_access_key_id = AKIAEXAMPLE\naws_secret_access_key = s\n', []), ['static-key:default'],
+  'credentials 檔的 [default] 也是 default profile')
+assert.deepEqual(auditConfig('[default]\nrole_arn = arn:aws:iam::999988887777:role/admin\nsource_profile = base\n', '[base]\naws_access_key_id = AKIA\n', ['999988887777']),
+  ['default-prod', 'static-key:base'], '沒有 sso_account_id 時，看 role_arn 裡的帳號')
+assert.deepEqual(auditConfig('[sso-session old]\nsso_start_url = https://old.awsapps.com/start\n\n[profile a]\nsso_session = old\nsso_account_id = 111122223333\nsso_role_name = ReadOnly\n', '', []),
+  ['missing-sso-region:old'], '[sso-session old] 沒有 sso_region；profile a 指到的 session 存在，不算 missing-sso-session')
+assert.deepEqual(auditConfig('[profile a]\nsso_session=x\nsso_account_id=1\nsso_role_name=R\n[profile b]\nsso_session=x\nsso_account_id=1\nsso_role_name=R\n[profile c]\nsso_session=x\nsso_account_id=1\nsso_role_name=R\n[sso-session x]\nsso_region=us-east-1\n', '', []),
+  ['duplicate:a,b,c'], '三個 profile 同一個身分時，名稱全部列在同一項；= 前後沒有空白也要能解析')
+assert.deepEqual(auditConfig('[profile p]\nsso_session = cafe\nsso_account_id = 111122223333\nsso_role_name = Developer\n[sso-session cafe]\nsso_region = ap-northeast-1\n', '', []), [], '沒有問題時回傳空陣列')
+</script>
+  <script type="wrong">
+type Section = Record<string, string>
+// 區段名稱照原樣保留：config 的 [profile dev] 被當成名叫「profile dev」的 profile
+function parseIni(text: string): Record<string, Section> {
+  const out: Record<string, Section> = {}
+  let current: Section | null = null
+  for (const raw of text.split('\n')) {
+    const line = raw.trim()
+    if (!line || line.startsWith('#') || line.startsWith(';')) continue
+    const head = line.match(/^\[(.+)\]$/)
+    if (head) { current = out[head[1].trim()] ??= {}; continue }
+    const eq = line.indexOf('=')
+    if (current && eq > 0) current[line.slice(0, eq).trim()] = line.slice(eq + 1).trim()
+  }
+  return out
+}
+function auditConfig(configText: string, credentialsText: string, prodAccounts: string[]): string[] {
+  const profiles: Record<string, Section> = {}
+  const sessions: Record<string, Section> = {}
+  for (const [name, kv] of Object.entries(parseIni(configText))) {
+    if (name.startsWith('sso-session ')) sessions[name.slice(12).trim()] = kv
+    else profiles[name] = { ...profiles[name], ...kv }
+  }
+  for (const [name, kv] of Object.entries(parseIni(credentialsText))) profiles[name] = { ...profiles[name], ...kv }
+  const risks = new Set<string>()
+  const same: Record<string, string[]> = {}
+  for (const [name, p] of Object.entries(profiles)) {
+    if (p.aws_access_key_id) risks.add(`static-key:${name}`)
+    if (p.sso_session && !sessions[p.sso_session]) risks.add(`missing-sso-session:${name}`)
+    const account = p.sso_account_id ?? p.role_arn?.match(/^arn:aws:iam::(\d{12}):/)?.[1]
+    if (name === 'default' && account && prodAccounts.includes(account)) risks.add('default-prod')
+    if (p.sso_account_id && p.sso_role_name) (same[`${p.sso_account_id}/${p.sso_role_name}`] ??= []).push(name)
+  }
+  for (const [name, s] of Object.entries(sessions)) if (!s.sso_region) risks.add(`missing-sso-region:${name}`)
+  for (const names of Object.values(same)) if (names.length > 1) risks.add(`duplicate:${names.sort().join(',')}`)
+  return [...risks].sort()
+}
+</script>
+  <script type="wrong">
+type Section = Record<string, string>
+// 沒有跳過註解：用沒有錨點的正規表示式找區段與 key，# 開頭的行也被讀進去
+function parseIni(text: string): Record<string, Section> {
+  const out: Record<string, Section> = {}
+  let current: Section | null = null
+  for (const line of text.split('\n')) {
+    const head = line.match(/\[(.+)\]/)
+    if (head) { current = out[head[1].trim()] ??= {}; continue }
+    const kv = line.match(/([\w-]+)\s*=\s*(.*)/)
+    if (current && kv) current[kv[1]] = kv[2].trim()
+  }
+  return out
+}
+function auditConfig(configText: string, credentialsText: string, prodAccounts: string[]): string[] {
+  const profiles: Record<string, Section> = {}
+  const sessions: Record<string, Section> = {}
+  for (const [name, kv] of Object.entries(parseIni(configText))) {
+    if (name === 'default') profiles.default = { ...profiles.default, ...kv }
+    else if (name.startsWith('profile ')) { const p = name.slice(8).trim(); profiles[p] = { ...profiles[p], ...kv } }
+    else if (name.startsWith('sso-session ')) sessions[name.slice(12).trim()] = kv
+  }
+  for (const [name, kv] of Object.entries(parseIni(credentialsText))) profiles[name] = { ...profiles[name], ...kv }
+  const risks = new Set<string>()
+  const same: Record<string, string[]> = {}
+  for (const [name, p] of Object.entries(profiles)) {
+    if (p.aws_access_key_id) risks.add(`static-key:${name}`)
+    if (p.sso_session && !sessions[p.sso_session]) risks.add(`missing-sso-session:${name}`)
+    const account = p.sso_account_id ?? p.role_arn?.match(/^arn:aws:iam::(\d{12}):/)?.[1]
+    if (name === 'default' && account && prodAccounts.includes(account)) risks.add('default-prod')
+    if (p.sso_account_id && p.sso_role_name) (same[`${p.sso_account_id}/${p.sso_role_name}`] ??= []).push(name)
+  }
+  for (const [name, s] of Object.entries(sessions)) if (!s.sso_region) risks.add(`missing-sso-region:${name}`)
+  for (const names of Object.values(same)) if (names.length > 1) risks.add(`duplicate:${names.sort().join(',')}`)
+  return [...risks].sort()
+}
+</script>
+  <script type="wrong">
+type Section = Record<string, string>
+// 只看 config，沒看 credentials 檔：放在 credentials 裡的金鑰全部漏掉
+function parseIni(text: string): Record<string, Section> {
+  const out: Record<string, Section> = {}
+  let current: Section | null = null
+  for (const raw of text.split('\n')) {
+    const line = raw.trim()
+    if (!line || line.startsWith('#') || line.startsWith(';')) continue
+    const head = line.match(/^\[(.+)\]$/)
+    if (head) { current = out[head[1].trim()] ??= {}; continue }
+    const eq = line.indexOf('=')
+    if (current && eq > 0) current[line.slice(0, eq).trim()] = line.slice(eq + 1).trim()
+  }
+  return out
+}
+function auditConfig(configText: string, credentialsText: string, prodAccounts: string[]): string[] {
+  const profiles: Record<string, Section> = {}
+  const sessions: Record<string, Section> = {}
+  for (const [name, kv] of Object.entries(parseIni(configText))) {
+    if (name === 'default') profiles.default = { ...profiles.default, ...kv }
+    else if (name.startsWith('profile ')) { const p = name.slice(8).trim(); profiles[p] = { ...profiles[p], ...kv } }
+    else if (name.startsWith('sso-session ')) sessions[name.slice(12).trim()] = kv
+  }
+  const risks = new Set<string>()
+  const same: Record<string, string[]> = {}
+  for (const [name, p] of Object.entries(profiles)) {
+    if (p.aws_access_key_id) risks.add(`static-key:${name}`)
+    if (p.sso_session && !sessions[p.sso_session]) risks.add(`missing-sso-session:${name}`)
+    const account = p.sso_account_id ?? p.role_arn?.match(/^arn:aws:iam::(\d{12}):/)?.[1]
+    if (name === 'default' && account && prodAccounts.includes(account)) risks.add('default-prod')
+    if (p.sso_account_id && p.sso_role_name) (same[`${p.sso_account_id}/${p.sso_role_name}`] ??= []).push(name)
+  }
+  for (const [name, s] of Object.entries(sessions)) if (!s.sso_region) risks.add(`missing-sso-region:${name}`)
+  for (const names of Object.values(same)) if (names.length > 1) risks.add(`duplicate:${names.sort().join(',')}`)
+  return [...risks].sort()
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：完成 <code>evaluate(input, req)</code>，判斷呼叫者能不能對 bucket 做這個請求，回傳 <code>'allowed'</code>、<code>'explicit-deny'</code> 或 <code>'implicit-deny'</code>。<code>covers(statement, req)</code>（Action、Resource 有沒有涵蓋這個請求）與 <code>names(statement, caller)</code>（bucket policy 的 Principal 有沒有包含呼叫者）已經寫好。規則照上面「跨帳號：兩邊都要允許」：</p>
+  <ul>
+    <li>身分型政策、boundary、bucket policy（只看 Principal 包含呼叫者的那幾條）裡，任何一條符合的 Deny → <code>'explicit-deny'</code>。</li>
+    <li>身分那一側通過＝身分型政策有符合的 Allow，而且沒有 boundary 或 boundary 也有符合的 Allow。資源那一側通過＝bucket policy 有包含呼叫者且符合的 Allow。</li>
+    <li>呼叫者的帳號等於 <code>bucketAccount</code>：任一側通過就允許（這種情況題目不會給 boundary）。不同帳號：兩側都要通過。都不符合 → <code>'implicit-deny'</code>。</li>
+  </ul>
+  <script type="start">
+type Statement = { Effect: 'Allow' | 'Deny', Action: string | string[], Resource: string | string[], Principal?: { AWS: string | string[] } }
+type Policy = { Statement: Statement[] }
+type Caller = { account: string, arn: string }
+type Input = { caller: Caller, identityPolicies: Policy[], boundary?: Policy, bucketAccount: string, bucketPolicy?: Policy }
+type Req = { action: string, resource: string }
+type Decision = 'allowed' | 'explicit-deny' | 'implicit-deny'
+
+const list = (v: string | string[] | undefined): string[] => v === undefined ? [] : Array.isArray(v) ? v : [v]
+// IAM 的 * 萬用字元；Action 不分大小寫、Resource 分大小寫
+const like = (pattern: string, value: string, ignoreCase = false) =>
+  new RegExp('^' + pattern.split('*').map(s => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$', ignoreCase ? 'i' : '').test(value)
+const covers = (s: Statement, req: Req) =>
+  list(s.Action).some(a => like(a, req.action, true)) && list(s.Resource).some(r => like(r, req.resource))
+const names = (s: Statement, caller: Caller) =>
+  list(s.Principal?.AWS).some(p => p === '*' || p === caller.arn || p === `arn:aws:iam::${caller.account}:root`)
+
+function evaluate(input: Input, req: Req): Decision {
+  const { caller, identityPolicies, boundary, bucketAccount, bucketPolicy } = input
+  // 1. 三種政策裡有沒有符合的 Deny
+  // 2. 身分那一側、資源那一側各自通過了沒
+  // 3. 同帳號取聯集，跨帳號兩側都要
+  return 'implicit-deny'
+}
+
+const analyst = { account: '222222222222', arn: 'arn:aws:iam::222222222222:role/analyst' }
+console.log(evaluate({
+  caller: analyst,
+  identityPolicies: [],
+  bucketAccount: '111111111111',
+  bucketPolicy: { Statement: [{ Effect: 'Allow', Principal: { AWS: analyst.arn }, Action: 's3:GetObject', Resource: 'arn:aws:s3:::cafe-reports/*' }] },
+}, { action: 's3:GetObject', resource: 'arn:aws:s3:::cafe-reports/2026-10.csv' }))
+</script>
+  <script type="answer">
+type Statement = { Effect: 'Allow' | 'Deny', Action: string | string[], Resource: string | string[], Principal?: { AWS: string | string[] } }
+type Policy = { Statement: Statement[] }
+type Caller = { account: string, arn: string }
+type Input = { caller: Caller, identityPolicies: Policy[], boundary?: Policy, bucketAccount: string, bucketPolicy?: Policy }
+type Req = { action: string, resource: string }
+type Decision = 'allowed' | 'explicit-deny' | 'implicit-deny'
+
+const list = (v: string | string[] | undefined): string[] => v === undefined ? [] : Array.isArray(v) ? v : [v]
+// IAM 的 * 萬用字元；Action 不分大小寫、Resource 分大小寫
+const like = (pattern: string, value: string, ignoreCase = false) =>
+  new RegExp('^' + pattern.split('*').map(s => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$', ignoreCase ? 'i' : '').test(value)
+const covers = (s: Statement, req: Req) =>
+  list(s.Action).some(a => like(a, req.action, true)) && list(s.Resource).some(r => like(r, req.resource))
+const names = (s: Statement, caller: Caller) =>
+  list(s.Principal?.AWS).some(p => p === '*' || p === caller.arn || p === `arn:aws:iam::${caller.account}:root`)
+
+function evaluate(input: Input, req: Req): Decision {
+  const { caller, identityPolicies, boundary, bucketAccount, bucketPolicy } = input
+  const identity = identityPolicies.flatMap(p => p.Statement)
+  const limit = boundary?.Statement ?? []
+  const resource = (bucketPolicy?.Statement ?? []).filter(s => names(s, caller))
+  const hit = (sts: Statement[], effect: 'Allow' | 'Deny') => sts.some(s => s.Effect === effect && covers(s, req))
+
+  if ([identity, limit, resource].some(sts => hit(sts, 'Deny'))) return 'explicit-deny'
+  const identitySide = hit(identity, 'Allow') && (!boundary || hit(limit, 'Allow'))
+  const resourceSide = hit(resource, 'Allow')
+  const ok = caller.account === bucketAccount ? identitySide || resourceSide : identitySide && resourceSide
+  return ok ? 'allowed' : 'implicit-deny'
+}
+
+const analyst = { account: '222222222222', arn: 'arn:aws:iam::222222222222:role/analyst' }
+console.log(evaluate({
+  caller: analyst,
+  identityPolicies: [],
+  bucketAccount: '111111111111',
+  bucketPolicy: { Statement: [{ Effect: 'Allow', Principal: { AWS: analyst.arn }, Action: 's3:GetObject', Resource: 'arn:aws:s3:::cafe-reports/*' }] },
+}, { action: 's3:GetObject', resource: 'arn:aws:s3:::cafe-reports/2026-10.csv' }))
+</script>
+  <script type="tests">
+const CAFE = '111111111111'
+const partner = { account: '222222222222', arn: 'arn:aws:iam::222222222222:role/analyst' }
+const clerk = { account: CAFE, arn: 'arn:aws:iam::111111111111:role/cafe-clerk' }
+const get = { action: 's3:GetObject', resource: 'arn:aws:s3:::cafe-reports/2026-10.csv' }
+const payroll = { action: 's3:GetObject', resource: 'arn:aws:s3:::cafe-reports/payroll/2026-10.csv' }
+const idRead: Policy = { Statement: [{ Effect: 'Allow', Action: 's3:GetObject', Resource: 'arn:aws:s3:::cafe-reports/*' }] }
+const bucketFor = (principal: string): Policy => ({ Statement: [{ Effect: 'Allow', Principal: { AWS: principal }, Action: 's3:GetObject', Resource: 'arn:aws:s3:::cafe-reports/*' }] })
+
+assert.equal(evaluate({ caller: partner, identityPolicies: [idRead], bucketAccount: CAFE, bucketPolicy: bucketFor(partner.arn) }, get), 'allowed',
+  '跨帳號：對方的身分型政策與咖啡店的 bucket policy 都允許，才放行')
+assert.equal(evaluate({ caller: partner, identityPolicies: [], bucketAccount: CAFE, bucketPolicy: bucketFor(partner.arn) }, get), 'implicit-deny',
+  '跨帳號：只有 bucket policy 允許不夠，對方自己的身分型政策也要允許（不是聯集）')
+assert.equal(evaluate({ caller: partner, identityPolicies: [idRead], bucketAccount: CAFE }, get), 'implicit-deny',
+  '跨帳號：對方的身分型政策寫了也沒用，咖啡店的 bucket policy 沒列他')
+assert.equal(evaluate({ caller: partner, identityPolicies: [idRead], bucketAccount: CAFE, bucketPolicy: bucketFor('arn:aws:iam::222222222222:root') }, get), 'allowed',
+  'Principal 寫對方帳號的 root，代表整個帳號，涵蓋 role/analyst')
+assert.equal(evaluate({ caller: partner, identityPolicies: [idRead], bucketAccount: CAFE, bucketPolicy: bucketFor('arn:aws:iam::333333333333:role/analyst') }, get), 'implicit-deny',
+  'bucket policy 列的是別的帳號的 role，不包含這個呼叫者')
+assert.equal(evaluate({ caller: clerk, identityPolicies: [], bucketAccount: CAFE, bucketPolicy: bucketFor(clerk.arn) }, get), 'allowed',
+  '同一個帳號：bucket policy 允許就夠了（聯集）')
+assert.equal(evaluate({ caller: clerk, identityPolicies: [idRead], bucketAccount: CAFE }, get), 'allowed', '同一個帳號：身分型政策允許也夠了')
+assert.equal(evaluate({ caller: clerk, identityPolicies: [], bucketAccount: CAFE }, get), 'implicit-deny', '同一個帳號：兩邊都沒有允許就是隱含拒絕')
+assert.equal(evaluate({ caller: partner, identityPolicies: [{ Statement: [{ Effect: 'Allow', Action: 'S3:getobject', Resource: 'arn:aws:s3:::cafe-reports/*' }] }], bucketAccount: CAFE, bucketPolicy: bucketFor(partner.arn) }, get), 'allowed',
+  'Action 不分大小寫')
+assert.equal(evaluate({ caller: partner, identityPolicies: [idRead], boundary: { Statement: [{ Effect: 'Allow', Action: 's3:ListBucket', Resource: '*' }] }, bucketAccount: CAFE, bucketPolicy: bucketFor(partner.arn) }, get), 'implicit-deny',
+  'boundary 只允許 ListBucket：身分型政策允許 GetObject 也超出上限')
+assert.equal(evaluate({ caller: partner, identityPolicies: [], boundary: { Statement: [{ Effect: 'Allow', Action: 's3:*', Resource: '*' }] }, bucketAccount: CAFE, bucketPolicy: bucketFor(partner.arn) }, get), 'implicit-deny',
+  'boundary 寫了 s3:* 不會給權限：身分型政策沒允許，身分那一側就沒通過')
+const withDenyBoundary: Policy = { Statement: [{ Effect: 'Allow', Action: 's3:*', Resource: '*' }, { Effect: 'Deny', Action: 's3:GetObject', Resource: 'arn:aws:s3:::cafe-reports/payroll/*' }] }
+assert.equal(evaluate({ caller: partner, identityPolicies: [idRead], boundary: withDenyBoundary, bucketAccount: CAFE, bucketPolicy: bucketFor(partner.arn) }, payroll), 'explicit-deny',
+  'boundary 裡的 Deny 也是明確拒絕')
+assert.equal(evaluate({ caller: partner, identityPolicies: [idRead], boundary: withDenyBoundary, bucketAccount: CAFE, bucketPolicy: bucketFor(partner.arn) }, get), 'allowed',
+  'boundary 的 Deny 只擋 payroll/，其他報表照樣可以讀')
+const bucketWithDeny: Policy = { Statement: [...bucketFor(partner.arn).Statement, { Effect: 'Deny', Principal: { AWS: '*' }, Action: 's3:*', Resource: 'arn:aws:s3:::cafe-reports/payroll/*' }] }
+assert.equal(evaluate({ caller: partner, identityPolicies: [idRead], bucketAccount: CAFE, bucketPolicy: bucketWithDeny }, payroll), 'explicit-deny', 'bucket policy 的 Deny（Principal *）擋下所有人')
+assert.equal(evaluate({ caller: partner, identityPolicies: [{ Statement: [...idRead.Statement, { Effect: 'Deny', Action: 's3:*', Resource: '*' }] }], bucketAccount: CAFE, bucketPolicy: bucketFor(partner.arn) }, get), 'explicit-deny',
+  '身分型政策裡的 Deny 優先於所有 Allow')
+</script>
+  <script type="wrong">
+type Statement = { Effect: 'Allow' | 'Deny', Action: string | string[], Resource: string | string[], Principal?: { AWS: string | string[] } }
+type Policy = { Statement: Statement[] }
+type Caller = { account: string, arn: string }
+type Input = { caller: Caller, identityPolicies: Policy[], boundary?: Policy, bucketAccount: string, bucketPolicy?: Policy }
+type Req = { action: string, resource: string }
+type Decision = 'allowed' | 'explicit-deny' | 'implicit-deny'
+const list = (v: string | string[] | undefined): string[] => v === undefined ? [] : Array.isArray(v) ? v : [v]
+const like = (pattern: string, value: string, ignoreCase = false) =>
+  new RegExp('^' + pattern.split('*').map(s => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$', ignoreCase ? 'i' : '').test(value)
+const covers = (s: Statement, req: Req) => list(s.Action).some(a => like(a, req.action, true)) && list(s.Resource).some(r => like(r, req.resource))
+const names = (s: Statement, caller: Caller) => list(s.Principal?.AWS).some(p => p === '*' || p === caller.arn || p === `arn:aws:iam::${caller.account}:root`)
+// 跨帳號也取聯集
+function evaluate(input: Input, req: Req): Decision {
+  const { caller, identityPolicies, boundary, bucketPolicy } = input
+  const identity = identityPolicies.flatMap(p => p.Statement)
+  const limit = boundary?.Statement ?? []
+  const resource = (bucketPolicy?.Statement ?? []).filter(s => names(s, caller))
+  const hit = (sts: Statement[], effect: 'Allow' | 'Deny') => sts.some(s => s.Effect === effect && covers(s, req))
+  if ([identity, limit, resource].some(sts => hit(sts, 'Deny'))) return 'explicit-deny'
+  const identitySide = hit(identity, 'Allow') && (!boundary || hit(limit, 'Allow'))
+  return identitySide || hit(resource, 'Allow') ? 'allowed' : 'implicit-deny'
+}
+</script>
+  <script type="wrong">
+type Statement = { Effect: 'Allow' | 'Deny', Action: string | string[], Resource: string | string[], Principal?: { AWS: string | string[] } }
+type Policy = { Statement: Statement[] }
+type Caller = { account: string, arn: string }
+type Input = { caller: Caller, identityPolicies: Policy[], boundary?: Policy, bucketAccount: string, bucketPolicy?: Policy }
+type Req = { action: string, resource: string }
+type Decision = 'allowed' | 'explicit-deny' | 'implicit-deny'
+const list = (v: string | string[] | undefined): string[] => v === undefined ? [] : Array.isArray(v) ? v : [v]
+const like = (pattern: string, value: string, ignoreCase = false) =>
+  new RegExp('^' + pattern.split('*').map(s => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$', ignoreCase ? 'i' : '').test(value)
+const covers = (s: Statement, req: Req) => list(s.Action).some(a => like(a, req.action, true)) && list(s.Resource).some(r => like(r, req.resource))
+const names = (s: Statement, caller: Caller) => list(s.Principal?.AWS).some(p => p === '*' || p === caller.arn || p === `arn:aws:iam::${caller.account}:root`)
+// 把 boundary 當成另一份會給權限的政策
+function evaluate(input: Input, req: Req): Decision {
+  const { caller, identityPolicies, boundary, bucketAccount, bucketPolicy } = input
+  const identity = identityPolicies.flatMap(p => p.Statement)
+  const limit = boundary?.Statement ?? []
+  const resource = (bucketPolicy?.Statement ?? []).filter(s => names(s, caller))
+  const hit = (sts: Statement[], effect: 'Allow' | 'Deny') => sts.some(s => s.Effect === effect && covers(s, req))
+  if ([identity, limit, resource].some(sts => hit(sts, 'Deny'))) return 'explicit-deny'
+  const identitySide = hit(identity, 'Allow') || hit(limit, 'Allow')
+  const resourceSide = hit(resource, 'Allow')
+  const ok = caller.account === bucketAccount ? identitySide || resourceSide : identitySide && resourceSide
+  return ok ? 'allowed' : 'implicit-deny'
+}
+</script>
+  <script type="wrong">
+type Statement = { Effect: 'Allow' | 'Deny', Action: string | string[], Resource: string | string[], Principal?: { AWS: string | string[] } }
+type Policy = { Statement: Statement[] }
+type Caller = { account: string, arn: string }
+type Input = { caller: Caller, identityPolicies: Policy[], boundary?: Policy, bucketAccount: string, bucketPolicy?: Policy }
+type Req = { action: string, resource: string }
+type Decision = 'allowed' | 'explicit-deny' | 'implicit-deny'
+const list = (v: string | string[] | undefined): string[] => v === undefined ? [] : Array.isArray(v) ? v : [v]
+const like = (pattern: string, value: string, ignoreCase = false) =>
+  new RegExp('^' + pattern.split('*').map(s => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$', ignoreCase ? 'i' : '').test(value)
+const covers = (s: Statement, req: Req) => list(s.Action).some(a => like(a, req.action, true)) && list(s.Resource).some(r => like(r, req.resource))
+const names = (s: Statement, caller: Caller) => list(s.Principal?.AWS).some(p => p === '*' || p === caller.arn || p === `arn:aws:iam::${caller.account}:root`)
+// boundary 只看 Allow，忽略它裡面的 Deny
+function evaluate(input: Input, req: Req): Decision {
+  const { caller, identityPolicies, boundary, bucketAccount, bucketPolicy } = input
+  const identity = identityPolicies.flatMap(p => p.Statement)
+  const limit = boundary?.Statement ?? []
+  const resource = (bucketPolicy?.Statement ?? []).filter(s => names(s, caller))
+  const hit = (sts: Statement[], effect: 'Allow' | 'Deny') => sts.some(s => s.Effect === effect && covers(s, req))
+  if ([identity, resource].some(sts => hit(sts, 'Deny'))) return 'explicit-deny'
+  const identitySide = hit(identity, 'Allow') && (!boundary || hit(limit, 'Allow'))
+  const resourceSide = hit(resource, 'Allow')
+  const ok = caller.account === bucketAccount ? identitySide || resourceSide : identitySide && resourceSide
+  return ok ? 'allowed' : 'implicit-deny'
+}
+</script>
+</div>
+
+<div class="local" data-test="ex3" data-files="setup-reporting.ts">
+  <p>練習 3：完成 <code>setup-reporting.ts</code> 的 <code>setupReporting(iam, { partnerAccount, externalId, bucket })</code>，讓會計事務所的帳號讀咖啡店的月報表。用 <code>CreateRoleCommand</code> 建立名為 <code>ROLE_NAME</code> 的 role，<code>AssumeRolePolicyDocument</code> 是信任政策的 JSON 字串：只有一條 Allow，Principal 是 <code>{ AWS: 'arn:aws:iam::&lt;partnerAccount&gt;:root' }</code>，Action 是 <code>sts:AssumeRole</code>，條件 <code>StringEquals</code> 的 <code>sts:ExternalId</code> 等於 <code>externalId</code>。再用 <code>PutRolePolicyCommand</code> 加一份 inline policy：只能 <code>s3:GetObject</code>，Resource 是 <code>arn:aws:s3:::&lt;bucket&gt;/reports/*</code>，不要掛其他政策。回傳 role 的 ARN。測試會把 role 與政策讀回來檢查（IAM 回傳的是 URL 編碼的 JSON），再用另一個模擬帳號帶 ExternalId assume 一次。模擬器不檢查信任政策，所以讀回來的內容才是判分依據。</p>
+</div>
+
+<div class="exercise">
+  <p>練習 4：審查一份要給開發者的政策。完成 <code>can(policy, action, resource)</code> 與 <code>escalationPaths(policy)</code>。<code>can</code>：有任何涵蓋這個請求的 Deny 就是 <code>false</code>；否則有涵蓋的 Allow 才是 <code>true</code>。一條 statement 涵蓋請求的條件是 Resource 符合，而且有 <code>Action</code> 時其中一個符合請求的動作，有 <code>NotAction</code> 時其中<em>沒有任何一個</em>符合。比對都用寫好的 <code>like</code>（Action 不分大小寫）。<code>escalationPaths</code> 回傳排序過的清單，可能的項目：</p>
+  <ul>
+    <li><code>'passrole-ec2'</code>：能 <code>iam:PassRole</code> <code>ADMIN_ROLE</code>，而且能 <code>ec2:RunInstances</code> <code>NEW_INSTANCE</code>。</li>
+    <li><code>'passrole-lambda'</code>：能 <code>iam:PassRole</code> <code>ADMIN_ROLE</code>，而且能 <code>lambda:CreateFunction</code> <code>NEW_FUNCTION</code>。</li>
+    <li><code>'create-policy-version'</code>：能 <code>iam:CreatePolicyVersion</code> <code>ANY_POLICY</code>。</li>
+    <li><code>'attach-user-policy'</code>：能 <code>iam:AttachUserPolicy</code> <code>SELF</code>。</li>
+  </ul>
+  <script type="start">
+type Statement = { Effect: 'Allow' | 'Deny', Action?: string | string[], NotAction?: string | string[], Resource: string | string[] }
+type Policy = { Statement: Statement[] }
+
+const ADMIN_ROLE = 'arn:aws:iam::123456789012:role/cafe-admin'
+const NEW_INSTANCE = 'arn:aws:ec2:ap-northeast-1:123456789012:instance/*'
+const NEW_FUNCTION = 'arn:aws:lambda:ap-northeast-1:123456789012:function:anything'
+const ANY_POLICY = 'arn:aws:iam::123456789012:policy/cafe-admin-policy'
+const SELF = 'arn:aws:iam::123456789012:user/intern'
+
+const list = (v: string | string[] | undefined): string[] => v === undefined ? [] : Array.isArray(v) ? v : [v]
+const like = (pattern: string, value: string, ignoreCase = false) =>
+  new RegExp('^' + pattern.split('*').map(s => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$', ignoreCase ? 'i' : '').test(value)
+
+function can(policy: Policy, action: string, resource: string): boolean {
+  return false
+}
+
+function escalationPaths(policy: Policy): string[] {
+  return []
+}
+
+console.log(escalationPaths({ Statement: [
+  { Effect: 'Allow', Action: ['iam:PassRole', 'ec2:RunInstances'], Resource: '*' },
+] }))
+</script>
+  <script type="answer">
+type Statement = { Effect: 'Allow' | 'Deny', Action?: string | string[], NotAction?: string | string[], Resource: string | string[] }
+type Policy = { Statement: Statement[] }
+
+const ADMIN_ROLE = 'arn:aws:iam::123456789012:role/cafe-admin'
+const NEW_INSTANCE = 'arn:aws:ec2:ap-northeast-1:123456789012:instance/*'
+const NEW_FUNCTION = 'arn:aws:lambda:ap-northeast-1:123456789012:function:anything'
+const ANY_POLICY = 'arn:aws:iam::123456789012:policy/cafe-admin-policy'
+const SELF = 'arn:aws:iam::123456789012:user/intern'
+
+const list = (v: string | string[] | undefined): string[] => v === undefined ? [] : Array.isArray(v) ? v : [v]
+const like = (pattern: string, value: string, ignoreCase = false) =>
+  new RegExp('^' + pattern.split('*').map(s => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$', ignoreCase ? 'i' : '').test(value)
+
+function can(policy: Policy, action: string, resource: string): boolean {
+  const covers = (s: Statement) => {
+    const actionOk = s.Action !== undefined
+      ? list(s.Action).some(a => like(a, action, true))
+      : !list(s.NotAction).some(a => like(a, action, true))
+    return actionOk && list(s.Resource).some(r => like(r, resource))
+  }
+  if (policy.Statement.some(s => s.Effect === 'Deny' && covers(s))) return false
+  return policy.Statement.some(s => s.Effect === 'Allow' && covers(s))
+}
+
+function escalationPaths(policy: Policy): string[] {
+  const paths: string[] = []
+  const passAdmin = can(policy, 'iam:PassRole', ADMIN_ROLE)
+  if (passAdmin && can(policy, 'ec2:RunInstances', NEW_INSTANCE)) paths.push('passrole-ec2')
+  if (passAdmin && can(policy, 'lambda:CreateFunction', NEW_FUNCTION)) paths.push('passrole-lambda')
+  if (can(policy, 'iam:CreatePolicyVersion', ANY_POLICY)) paths.push('create-policy-version')
+  if (can(policy, 'iam:AttachUserPolicy', SELF)) paths.push('attach-user-policy')
+  return paths.sort()
+}
+
+console.log(escalationPaths({ Statement: [
+  { Effect: 'Allow', Action: ['iam:PassRole', 'ec2:RunInstances'], Resource: '*' },
+] }))
+</script>
+  <script type="tests">
+const ALL = ['attach-user-policy', 'create-policy-version', 'passrole-ec2', 'passrole-lambda']
+assert.deepEqual(escalationPaths({ Statement: [{ Effect: 'Allow', Action: ['iam:PassRole', 'ec2:RunInstances'], Resource: '*' }] }), ['passrole-ec2'],
+  'PassRole 給 * 加上 RunInstances：可以開機器掛管理員 role')
+assert.deepEqual(escalationPaths({ Statement: [
+  { Effect: 'Allow', Action: 'iam:PassRole', Resource: 'arn:aws:iam::123456789012:role/cafe-lambda-receipt' },
+  { Effect: 'Allow', Action: 'lambda:CreateFunction', Resource: '*' },
+] }), [], 'PassRole 只限 cafe-lambda-receipt 這個 role：交不出管理員 role，不算提權')
+assert.deepEqual(escalationPaths({ Statement: [
+  { Effect: 'Allow', Action: 'iam:Pass*', Resource: 'arn:aws:iam::123456789012:role/*' },
+  { Effect: 'Allow', Action: 'lambda:Create*', Resource: '*' },
+] }), ['passrole-lambda'], 'iam:Pass*、lambda:Create* 這類萬用字元也要算；role/* 涵蓋管理員 role')
+assert.deepEqual(escalationPaths({ Statement: [{ Effect: 'Allow', Action: 'iam:*', Resource: '*' }] }), ['attach-user-policy', 'create-policy-version'],
+  'iam:* 包含 CreatePolicyVersion、AttachUserPolicy；沒有 ec2、lambda 的權限就沒有 PassRole 那兩條')
+assert.deepEqual(escalationPaths({ Statement: [{ Effect: 'Allow', Action: '*', Resource: '*' }] }), ALL, 'Action * 什麼都能做')
+assert.deepEqual(escalationPaths({ Statement: [{ Effect: 'Allow', NotAction: 's3:*', Resource: '*' }] }), ALL,
+  'Allow 搭 NotAction s3:*：S3 以外全部允許，四條路徑都有')
+assert.deepEqual(escalationPaths({ Statement: [{ Effect: 'Allow', NotAction: ['iam:*', 'organizations:*'], Resource: '*' }] }), [],
+  'NotAction 排除了 iam:*：PassRole 與兩個 iam 動作都不允許')
+assert.deepEqual(escalationPaths({ Statement: [{ Effect: 'Allow', Action: '*', Resource: '*' }, { Effect: 'Deny', Action: 'iam:*', Resource: '*' }] }),
+  [], 'Deny iam:* 擋掉所有 iam 動作，包含 PassRole')
+assert.deepEqual(escalationPaths({ Statement: [{ Effect: 'Allow', Action: ['IAM:passrole', 'EC2:RunInstances'], Resource: '*' }] }), ['passrole-ec2'], 'Action 不分大小寫')
+assert.deepEqual(escalationPaths({ Statement: [{ Effect: 'Allow', Action: 'iam:AttachUserPolicy', Resource: 'arn:aws:iam::123456789012:user/intern' }] }),
+  ['attach-user-policy'], '能替自己掛政策，就能掛上 AdministratorAccess')
+assert.deepEqual(escalationPaths({ Statement: [{ Effect: 'Allow', Action: 'iam:AttachUserPolicy', Resource: 'arn:aws:iam::123456789012:user/interns/*' }] }),
+  [], 'Resource 不涵蓋自己（user/intern）時不算')
+assert.deepEqual(escalationPaths({ Statement: [{ Effect: 'Allow', Action: ['s3:GetObject', 'logs:*'], Resource: '*' }] }), [], '一般的讀取權限沒有提權路徑')
+assert.equal(can({ Statement: [{ Effect: 'Allow', Action: 's3:GetObject', Resource: 'arn:aws:s3:::cafe-menu/*' }] }, 's3:GetObject', 'arn:aws:s3:::Cafe-Menu/latte.jpg'), false,
+  'Resource 分大小寫')
+</script>
+  <script type="wrong">
+type Statement = { Effect: 'Allow' | 'Deny', Action?: string | string[], NotAction?: string | string[], Resource: string | string[] }
+type Policy = { Statement: Statement[] }
+const ADMIN_ROLE = 'arn:aws:iam::123456789012:role/cafe-admin'
+const NEW_INSTANCE = 'arn:aws:ec2:ap-northeast-1:123456789012:instance/*'
+const NEW_FUNCTION = 'arn:aws:lambda:ap-northeast-1:123456789012:function:anything'
+const ANY_POLICY = 'arn:aws:iam::123456789012:policy/cafe-admin-policy'
+const SELF = 'arn:aws:iam::123456789012:user/intern'
+const list = (v: string | string[] | undefined): string[] => v === undefined ? [] : Array.isArray(v) ? v : [v]
+const like = (pattern: string, value: string, ignoreCase = false) =>
+  new RegExp('^' + pattern.split('*').map(s => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$', ignoreCase ? 'i' : '').test(value)
+// 動作用完整字串比對：iam:*、iam:Pass* 都漏掉
+function can(policy: Policy, action: string, resource: string): boolean {
+  const covers = (s: Statement) => {
+    const actionOk = s.Action !== undefined
+      ? list(s.Action).some(a => a.toLowerCase() === action.toLowerCase())
+      : !list(s.NotAction).some(a => a.toLowerCase() === action.toLowerCase())
+    return actionOk && list(s.Resource).some(r => like(r, resource))
+  }
+  if (policy.Statement.some(s => s.Effect === 'Deny' && covers(s))) return false
+  return policy.Statement.some(s => s.Effect === 'Allow' && covers(s))
+}
+function escalationPaths(policy: Policy): string[] {
+  const paths: string[] = []
+  const passAdmin = can(policy, 'iam:PassRole', ADMIN_ROLE)
+  if (passAdmin && can(policy, 'ec2:RunInstances', NEW_INSTANCE)) paths.push('passrole-ec2')
+  if (passAdmin && can(policy, 'lambda:CreateFunction', NEW_FUNCTION)) paths.push('passrole-lambda')
+  if (can(policy, 'iam:CreatePolicyVersion', ANY_POLICY)) paths.push('create-policy-version')
+  if (can(policy, 'iam:AttachUserPolicy', SELF)) paths.push('attach-user-policy')
+  return paths.sort()
+}
+</script>
+  <script type="wrong">
+type Statement = { Effect: 'Allow' | 'Deny', Action?: string | string[], NotAction?: string | string[], Resource: string | string[] }
+type Policy = { Statement: Statement[] }
+const ADMIN_ROLE = 'arn:aws:iam::123456789012:role/cafe-admin'
+const NEW_INSTANCE = 'arn:aws:ec2:ap-northeast-1:123456789012:instance/*'
+const NEW_FUNCTION = 'arn:aws:lambda:ap-northeast-1:123456789012:function:anything'
+const ANY_POLICY = 'arn:aws:iam::123456789012:policy/cafe-admin-policy'
+const SELF = 'arn:aws:iam::123456789012:user/intern'
+const list = (v: string | string[] | undefined): string[] => v === undefined ? [] : Array.isArray(v) ? v : [v]
+const like = (pattern: string, value: string, ignoreCase = false) =>
+  new RegExp('^' + pattern.split('*').map(s => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$', ignoreCase ? 'i' : '').test(value)
+// 只看 Action，沒有 Action 的 statement（NotAction）當成什麼都不允許
+function can(policy: Policy, action: string, resource: string): boolean {
+  const covers = (s: Statement) => list(s.Action).some(a => like(a, action, true)) && list(s.Resource).some(r => like(r, resource))
+  if (policy.Statement.some(s => s.Effect === 'Deny' && covers(s))) return false
+  return policy.Statement.some(s => s.Effect === 'Allow' && covers(s))
+}
+function escalationPaths(policy: Policy): string[] {
+  const paths: string[] = []
+  const passAdmin = can(policy, 'iam:PassRole', ADMIN_ROLE)
+  if (passAdmin && can(policy, 'ec2:RunInstances', NEW_INSTANCE)) paths.push('passrole-ec2')
+  if (passAdmin && can(policy, 'lambda:CreateFunction', NEW_FUNCTION)) paths.push('passrole-lambda')
+  if (can(policy, 'iam:CreatePolicyVersion', ANY_POLICY)) paths.push('create-policy-version')
+  if (can(policy, 'iam:AttachUserPolicy', SELF)) paths.push('attach-user-policy')
+  return paths.sort()
+}
+</script>
+  <script type="wrong">
+type Statement = { Effect: 'Allow' | 'Deny', Action?: string | string[], NotAction?: string | string[], Resource: string | string[] }
+type Policy = { Statement: Statement[] }
+const ADMIN_ROLE = 'arn:aws:iam::123456789012:role/cafe-admin'
+const NEW_INSTANCE = 'arn:aws:ec2:ap-northeast-1:123456789012:instance/*'
+const NEW_FUNCTION = 'arn:aws:lambda:ap-northeast-1:123456789012:function:anything'
+const ANY_POLICY = 'arn:aws:iam::123456789012:policy/cafe-admin-policy'
+const SELF = 'arn:aws:iam::123456789012:user/intern'
+const list = (v: string | string[] | undefined): string[] => v === undefined ? [] : Array.isArray(v) ? v : [v]
+const like = (pattern: string, value: string, ignoreCase = false) =>
+  new RegExp('^' + pattern.split('*').map(s => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$', ignoreCase ? 'i' : '').test(value)
+// 不看 Resource：PassRole 只限某個 role 也被當成能交出管理員 role
+function can(policy: Policy, action: string, resource: string): boolean {
+  const covers = (s: Statement) => s.Action !== undefined
+    ? list(s.Action).some(a => like(a, action, true))
+    : !list(s.NotAction).some(a => like(a, action, true))
+  if (policy.Statement.some(s => s.Effect === 'Deny' && covers(s))) return false
+  return policy.Statement.some(s => s.Effect === 'Allow' && covers(s))
+}
+function escalationPaths(policy: Policy): string[] {
+  const paths: string[] = []
+  const passAdmin = can(policy, 'iam:PassRole', ADMIN_ROLE)
+  if (passAdmin && can(policy, 'ec2:RunInstances', NEW_INSTANCE)) paths.push('passrole-ec2')
+  if (passAdmin && can(policy, 'lambda:CreateFunction', NEW_FUNCTION)) paths.push('passrole-lambda')
+  if (can(policy, 'iam:CreatePolicyVersion', ANY_POLICY)) paths.push('create-policy-version')
+  if (can(policy, 'iam:AttachUserPolicy', SELF)) paths.push('attach-user-policy')
+  return paths.sort()
+}
+</script>
+  <script type="wrong">
+type Statement = { Effect: 'Allow' | 'Deny', Action?: string | string[], NotAction?: string | string[], Resource: string | string[] }
+type Policy = { Statement: Statement[] }
+const ADMIN_ROLE = 'arn:aws:iam::123456789012:role/cafe-admin'
+const NEW_INSTANCE = 'arn:aws:ec2:ap-northeast-1:123456789012:instance/*'
+const NEW_FUNCTION = 'arn:aws:lambda:ap-northeast-1:123456789012:function:anything'
+const ANY_POLICY = 'arn:aws:iam::123456789012:policy/cafe-admin-policy'
+const SELF = 'arn:aws:iam::123456789012:user/intern'
+const list = (v: string | string[] | undefined): string[] => v === undefined ? [] : Array.isArray(v) ? v : [v]
+const like = (pattern: string, value: string, ignoreCase = false) =>
+  new RegExp('^' + pattern.split('*').map(s => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$', ignoreCase ? 'i' : '').test(value)
+// 沒有處理 Deny
+function can(policy: Policy, action: string, resource: string): boolean {
+  return policy.Statement.some(s => s.Effect === 'Allow'
+    && (s.Action !== undefined ? list(s.Action).some(a => like(a, action, true)) : !list(s.NotAction).some(a => like(a, action, true)))
+    && list(s.Resource).some(r => like(r, resource)))
+}
+function escalationPaths(policy: Policy): string[] {
+  const paths: string[] = []
+  const passAdmin = can(policy, 'iam:PassRole', ADMIN_ROLE)
+  if (passAdmin && can(policy, 'ec2:RunInstances', NEW_INSTANCE)) paths.push('passrole-ec2')
+  if (passAdmin && can(policy, 'lambda:CreateFunction', NEW_FUNCTION)) paths.push('passrole-lambda')
+  if (can(policy, 'iam:CreatePolicyVersion', ANY_POLICY)) paths.push('create-policy-version')
+  if (can(policy, 'iam:AttachUserPolicy', SELF)) paths.push('attach-user-policy')
+  return paths.sort()
+}
+</script>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：客服說有顧客的收據 PDF 出現在網路上。你到 CloudTrail 的 Event history 用 bucket 名稱查最近一週，只看到幾筆 <code>PutBucketPolicy</code>、<code>ListBuckets</code>，沒有任何下載紀錄。這代表什麼？</p>
+  <label data-key="a">這一週沒有人下載過收據，外流的檔案是更早以前拿到的</label>
+  <label data-key="b">Event history 只有管理事件，讀取物件（GetObject）是資料事件，要事先在 trail 開啟才會記錄</label>
+  <label data-key="c">下載是透過 presigned URL，CloudTrail 不記錄任何 presigned URL 的請求</label>
+  <label data-key="d">Event history 只保留 7 天，要改查 trail</label>
+  <p class="why">✓ Event history 保留 90 天的管理事件，<code>GetObject</code> 這類資料事件不在裡面，要事先在 trail 開資料事件（另外計費）才查得到。a 是最常見的誤判：查不到不代表沒發生。那幾筆 <code>PutBucketPolicy</code> 反而值得先看：是不是有人改了 bucket policy 讓物件變成公開。d 的天數錯了。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 6：平台團隊給 role <code>app-receipt</code> 掛了一個 permission boundary，內容是 Allow <code>s3:*</code> on <code>*</code>。這個 role 的身分型政策只有 <code>logs:PutLogEvents</code>。它能讀 <code>cafe-receipts</code> bucket 的物件嗎（同一個帳號，bucket policy 沒有列它）？</p>
+  <label data-key="a">能：boundary 允許了 s3:*</label>
+  <label data-key="b">能：身分型政策和 boundary 取聯集</label>
+  <label data-key="c">不能：boundary 只設上限，實際權限是身分型政策與 boundary 的交集，身分型政策沒有 S3</label>
+  <label data-key="d">不能：只要有 boundary，這個 role 就不能使用任何資源型政策</label>
+  <p class="why">✓ boundary 本身不給權限，只把身分型政策能給的範圍再收窄；這裡身分型政策沒有任何 S3 動作，交集是空的。a 把 boundary 當成另一份 Allow，是最常見的誤解。d 錯在 boundary 並不會讓資源型政策全部失效。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 7：會計事務所說：「你們的 bucket policy 已經允許我們的 role <code>analyst</code> 讀 <code>reports/*</code>，可是我們一直收到 AccessDenied。」咖啡店這邊的設定你檢查過是對的。最可能的原因是？</p>
+  <label data-key="a">對方帳號裡 <code>analyst</code> 的身分型政策沒有允許 <code>s3:GetObject</code> 咖啡店的 bucket</label>
+  <label data-key="b">跨帳號存取一定要用 role，bucket policy 對其他帳號無效</label>
+  <label data-key="c">bucket policy 要寫 Deny 其他所有人，Allow 才會生效</label>
+  <label data-key="d">S3 的跨帳號存取要先在咖啡店帳號建一個 IAM user 給對方</label>
+  <p class="why">✓ 跨帳號時兩邊各評估一次：資源所在帳號的 bucket policy 要允許，請求方帳號的身分型政策也要允許。請對方在自己的 role 加上 <code>s3:GetObject</code> 咖啡店 bucket 的 <code>reports/*</code>。b 錯在 bucket policy 本來就可以列其他帳號的 principal；d 是最不該做的做法。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>把長期金鑰給外包或寫進 <code>.env</code></strong>：外洩就一直有效。人員用 Identity Center 的 SSO，外部合作用跨帳號 role。</li>
+  <li><strong>以為 CloudTrail 什麼都記</strong>：Event history 只有 90 天的管理事件，S3 物件讀寫、Lambda 呼叫這類資料事件要事先在 trail 開。</li>
+  <li><strong>以為查不到就是沒發生</strong>：先確認查的 region 對不對（IAM 事件大多在 <code>us-east-1</code>）、事件類型有沒有被記錄。</li>
+  <li><strong>跨帳號只改一邊</strong>：bucket policy 允許了，對方的身分型政策也要允許；反過來也一樣。</li>
+  <li><strong>信任政策的 Principal 寫 <code>*</code></strong>：任何 AWS 帳號都能來 assume，只剩條件在擋。列出對方的帳號或 role。</li>
+  <li><strong>給多客戶的 SaaS 信任卻不要求 ExternalId</strong>：別的客戶可以借 SaaS 的手讀你的資料（confused deputy）。</li>
+  <li><strong>把 boundary 當成給權限</strong>：boundary 只設上限，實際權限是交集。</li>
+  <li><strong>審 IAM 只搜尋字串 <code>iam:PassRole</code></strong>：<code>iam:*</code>、<code>*</code>、<code>NotAction</code> 都包含它。用評估規則判斷，或交給 Access Analyzer。</li>
+  <li><strong>用模擬器的成功證明權限正確</strong>：模擬器不檢查信任政策與權限，要檢查政策文件本身。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>開發者電腦用 SSO profile：<code>[profile X]</code> 指向一個 <code>[sso-session]</code>，<code>aws sso login</code> 之後拿到的是會過期的臨時憑證；config 的 <code>[profile X]</code> 與 credentials 的 <code>[X]</code> 是同一個 profile。沒有 Identity Center 的個人帳號可以用 <code>aws login</code>（CLI 2.32.0 起）。</li>
+  <li>CloudTrail Event history 免費保留 90 天的管理事件、一次查一個 region；長期保存、資料事件、跨帳號集中要建 trail。事故調查用金鑰 ID 與身分 ARN 查出做過的所有事。</li>
+  <li>同一個帳號內身分型與資源型政策取聯集；跨帳號兩邊各評估一次，都要允許。評估順序：明確拒絕 → RCP／SCP → 資源型 → 身分型 → permission boundary → session policy，後面這些上限只能收窄。</li>
+  <li>role＝信任政策（誰能 assume）＋權限政策（能做什麼）。跨帳號給 role 不給 user；多客戶的服務要求 ExternalId；session 長度 1～12 小時，role chaining 最長 1 小時。</li>
+  <li>提權路徑：PassRole（能交出高權限 role）＋能建 EC2 或 Lambda、CreatePolicyVersion、替自己掛政策。萬用字元與 NotAction 都要算。讓開發者自建 role 時，用條件強制掛 permission boundary。</li>
+  <li>模擬器不做權限評估：允不允許用規則推論，本機題檢查政策文件本身。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 7 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 8：同事寫了一支清除舊 bucket 的維運腳本，昨天在他的電腦上把正式環境的 bucket 刪了。他說他明明在腳本裡寫了 <code>--region ap-northeast-1</code>。下一版腳本最該加什麼？</p>
+  <label data-key="a">把 region 改成從環境變數讀，不要寫死</label>
+  <label data-key="b">每個刪除指令前加 <code>read -p "確定嗎？"</code> 讓人確認</label>
+  <label data-key="c">開頭用 <code>aws sts get-caller-identity</code> 比對預期的帳號 ID，不符就停止</label>
+  <label data-key="d">改用 SDK 寫，SDK 不會讀到錯誤的 profile</label>
+  <p class="why">✓ 請求作用在憑證所屬的帳號，region 管不到帳號。腳本開頭查出目前的帳號並比對，不符就在動手前停下來，這不靠人記得切換。b 是最多人會選的：人在趕時間時一樣會按 y，而且畫面上也看不出是哪個帳號。d 錯在 SDK 一樣走憑證鏈。（第 1 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 9：CI 的環境變數裡設了測試帳號的 <code>AWS_ACCESS_KEY_ID</code>、<code>AWS_SECRET_ACCESS_KEY</code>，同一台 runner 的環境裡還留著 <code>AWS_PROFILE=prod</code>，runner 的設定檔也有 prod 這個 profile。部署程式用 SDK v3 的預設憑證鏈，會用哪一組？</p>
+  <label data-key="a">環境變數的金鑰：環境變數永遠排第一</label>
+  <label data-key="b">prod profile：只要指定了 profile，SDK 就跳過環境變數的金鑰</label>
+  <label data-key="c">兩組都會用，SDK 依服務輪流</label>
+  <label data-key="d">SDK 偵測到衝突會直接丟錯，不會送出請求</label>
+  <p class="why">✓ SDK v3 的憑證鏈第一步是環境變數，但指定了 profile（<code>AWS_PROFILE</code> 或程式裡的 profile 選項）時整步跳過，只印一行警告。a 是最常見的答案，也是這種事故的來源。修法是一個環境只放一種憑證來源，程式啟動時印出目前的帳號。（第 1 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 10：咖啡店開帳號第一天設了每月 50 美元的 Budgets 預算與通知。月中測試用的機器忘了關，月底帳單是 400 美元。為什麼預算沒擋住？</p>
+  <label data-key="a">預算的門檻要設「預測花費」才會生效</label>
+  <label data-key="b">Budgets 每個月第一天才會檢查上個月的花費</label>
+  <label data-key="c">測試機器屬於免費方案，不計入預算</label>
+  <label data-key="d">Budgets 只會通知，不會停掉任何資源；收到通知後要有人去處理</label>
+  <p class="why">✓ 預算只做監看與通知，不會自動停機器。通知寄出後沒人處理，按時間計費的資源會一直累積。a 是常見的誤解：預測門檻讓你更早收到信，但一樣只是信。防範方式是測試完立刻刪資源，並確認通知的收件人會看信。（第 1 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 11：會計事務所的工程師說：「我們自己的 role 已經允許 <code>s3:GetObject</code> 你們的 <code>cafe-reports/*</code>，為什麼還是 AccessDenied？」你最先要檢查咖啡店這邊的什麼？</p>
+  <label data-key="a"><code>cafe-reports</code> 的 bucket policy 有沒有列出對方的 role 或帳號</label>
+  <label data-key="b">咖啡店帳號的 SCP 有沒有允許對方的帳號</label>
+  <label data-key="c">咖啡店帳號有沒有對應的 IAM user 讓對方登入</label>
+  <label data-key="d">對方 role 的 permission boundary 有沒有允許 S3</label>
+  <p class="why">✓ 跨帳號存取是兩次評估：對方帳號的身分型政策允許之外，資源所在帳號也要允許，S3 就是 bucket policy 要列出對方。d 是對方那一側的事，不是咖啡店這邊要查的；b 錯在 SCP 管的是咖啡店自己帳號裡的身分，不是別人帳號的身分。（第 2 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 12：三個月前離職的工程師被懷疑在離職前刪掉了一個 bucket。你到 CloudTrail Event history 查那個 bucket 名稱，什麼都沒有。帳號裡沒有建過任何 trail。接下來怎麼做最實際？</p>
+  <label data-key="a">換到 us-east-1 再查一次，S3 的事件都記在那裡</label>
+  <label data-key="b">改用事件名稱 <code>DeleteBucket</code> 查，資源名稱的條件不準</label>
+  <label data-key="c">Event history 只保留 90 天，那時的紀錄已經不在了；這次先建 trail 長期保存，再從其他來源（例如 Git 歷史、IaC state、帳單明細）推敲</label>
+  <label data-key="d">聯絡 AWS 支援，他們可以調出帳號的完整操作紀錄</label>
+  <p class="why">✓ 沒有 trail 時只有 90 天的 Event history，超過就沒了。事件調查的能力要事前準備：建 trail 寫進別人刪不掉的地方。a、b 換 region 或換條件查，一樣受 90 天限制。（第 2 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 13：這段政策要掛給實習生，讓他部署 Lambda。哪裡會出事？</p>
+<pre>{ "Effect": "Allow",
+  "Action": ["lambda:CreateFunction", "lambda:UpdateFunctionCode", "iam:PassRole"],
+  "Resource": "*" }</pre>
+  <label data-key="a">沒有問題：PassRole 只是把 role 交給 Lambda，實習生自己拿不到 role 的權限</label>
+  <label data-key="b">PassRole 的 Resource 是 <code>*</code>：他可以建一個用管理員 role 執行的函式，透過函式做任何事</label>
+  <label data-key="c">缺了 <code>lambda:InvokeFunction</code>，函式建好也不能用</label>
+  <label data-key="d">Lambda 的 Resource 不能寫 <code>*</code>，政策存不進去</label>
+  <p class="why">✓ PassRole 加上能建 Lambda，就能讓函式以任何 role 的身分執行，等於間接拿到那個 role 的權限。修法是 PassRole 的 Resource 寫具體的 role ARN，並加 <code>iam:PassedToService</code> 條件只能交給 Lambda。a 是最常見的誤解：他雖然不直接拿到憑證，但函式裡的程式是他寫的。（第 2 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 14：咖啡店改用一家報表 SaaS，對方給了他們的 AWS 帳號 ID，請你建一個 role 讓他們 assume。你為什麼還要在信任政策加上 <code>sts:ExternalId</code> 條件？</p>
+  <label data-key="a">沒有 ExternalId，SaaS 拿到的臨時憑證不會過期</label>
+  <label data-key="b">ExternalId 是密碼，防止 SaaS 的員工直接登入</label>
+  <label data-key="c">沒有 ExternalId，跨帳號的 AssumeRole 不會被允許</label>
+  <label data-key="d">SaaS 用同一個帳號服務很多客戶；別的客戶填上你的 role ARN 時，因為 ExternalId 不同，SaaS 替他 assume 會失敗</label>
+  <p class="why">✓ 這是 confused deputy：被信任的是 SaaS 的整個帳號，ExternalId 讓 SaaS 分清楚「這次替哪個客戶做」。b 是最多人會選的錯誤：ExternalId 不是秘密，它的作用是區分客戶，不是驗證身分。c 錯在沒有條件的信任政策一樣能 assume。（第 2 課）</p>
+</div>
+
+<p>這個階段的重點整理成<a href="../sheets/stage-1.html">一頁圖解</a>。</p>
+<p>下一課進入網路：私有子網路裡的程式為什麼連不到外面、連不到資料庫，從 route table、NAT、安全群組、NACL 一層一層查，以及怎麼讓 S3 的流量不經過 NAT。</p>
+
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

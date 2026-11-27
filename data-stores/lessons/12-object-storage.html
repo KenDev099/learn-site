@@ -1,0 +1,457 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>12. 物件儲存：S3、presigned URL 與生命週期</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="12" data-practice="data-stores">
+<header>
+  <div class="eyebrow">階段 4：搜尋與檔案 · 第 12 課</div>
+  <h1>物件儲存：S3、presigned URL 與生命週期</h1>
+</header>
+<main>
+
+<p>咖啡店開始寄電子收據：每筆訂單產生一份 PDF，第一版直接存進 <code>orders</code> 表的 <code>bytea</code> 欄位（PostgreSQL 存二進位資料的型別）。一年後資料庫從 3 GB 長到 80 GB，其中 77 GB 是 PDF；每晚的備份從 5 分鐘變成 2 小時，開一台分擔查詢的副本資料庫（讀副本）要先複製 80 GB，連「查本月營收」都因為快取被 PDF 擠掉而變慢。</p>
+<p>這一課的任務是把收據搬出資料庫，並且做出一套上得了線的收據流程：店員在後台上傳 PDF、伺服器確認檔案合格、客人只下載得到自己的收據、沒用的檔案自動清掉、bucket 的權限在上線前檢查過。檔案會放在<strong>物件儲存</strong>（object storage），資料庫只記「哪個檔案、屬於誰、狀態如何」。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>收據 PDF 該放哪裡？資料庫存檔案的代價，以及檔案和紀錄怎麼分工（開場問題的最小答案）。物件儲存用 bucket 和 key 組織檔案，跟資料表有哪些根本差異。</li>
+  <li>程式怎麼存取？本機用 Garage 代替 AWS，用 AWS SDK v3 上傳、讀 metadata、下載。</li>
+  <li>店員的瀏覽器怎麼直接上傳又拿不到金鑰？presigned URL，以及它限得住和限不住的東西。</li>
+  <li>檔案和資料庫紀錄中途斷掉怎麼辦？pending → uploaded 的確認流程；沒走完的上傳和孤兒檔案由清理程式與生命週期規則收拾。</li>
+  <li>客人怎麼只下載到自己的收據？下載前的授權；最後是上線前的權限檢查與出問題時怎麼查。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../nestjs/lessons/22-uploads-webhooks.html">NestJS 課第 22 課</a>的檔案上傳：檔案經過 API 伺服器，大檔案會佔住伺服器的記憶體、頻寬與連線。</li>
+</ul></div>
+
+<h2>收據 PDF 該放哪裡？</h2>
+<p>先說清楚：PostgreSQL 可以正確存二進位，PDF 放進 <code>bytea</code> 不會壞，讀出來也一模一樣。開場的問題不是「存不了」，而是「存在這裡太貴」。貴在三個地方。</p>
+<p>第一，<strong>資料庫是最貴的儲存</strong>。它跑在高效能的磁碟上，而且一份資料不只存一次：PostgreSQL 每次寫入都會先記一筆交易紀錄，叫 WAL（write-ahead log），讀副本靠它同步，備份也要保留它（<a href="../../postgresql/lessons/37-backup-replication.html">PostgreSQL 課第 37 課</a>）。所以一份 2 MB 的 PDF 寫進資料庫，主資料庫、WAL、每台副本、每份備份各佔一份，實際佔的空間是好幾倍。</p>
+<p>第二，<strong>備份、還原、複寫跟著變慢</strong>。這些操作的時間大致跟資料庫的大小成正比。平常慢一點只是麻煩，真正痛的是出事要還原的時候：營運停擺，大家等的是 80 GB 而不是 3 GB，而這 80 GB 裡絕大部分是不需要查詢的 PDF。</p>
+<p>第三，<strong>檔案流量佔住資料庫連線與記憶體</strong>。客人下載一份 2 MB 的 PDF，資料庫要把它從磁碟讀出來、放進記憶體、經過連線送給 API，再由 API 送給瀏覽器。這段時間連線池裡少了一條連線，資料庫的快取也被 PDF 佔掉一塊，原本常用的訂單資料被擠出記憶體，這就是開場「查本月營收也變慢」的原因。</p>
+<p>那改存在 API 伺服器的硬碟上呢？<a href="../../nestjs/lessons/22-uploads-webhooks.html">NestJS 課第 22 課</a>說過，這也不行：API 有多台伺服器時，檔案只在其中一台，請求落到別台就找不到；容器重建時，硬碟上的檔案就跟著不見了。</p>
+<p>所以檔案需要第三個地方：<strong>物件儲存</strong>，一種專門存檔案的服務。它用 HTTP 存取，每個檔案有一個名稱，用名稱拿整份檔案；容量由服務提供者負責擴充，不用預先規劃磁碟大小。它跟資料庫擅長的事剛好互補：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>資料庫（PostgreSQL）</th><th>物件儲存（S3）</th></tr>
+  <tr><td>擅長</td><td>小筆資料、查詢、交易、約束</td><td>大檔案整份存取、容量不用預先規劃</td></tr>
+  <tr><td>存取方式</td><td>SQL，經過連線</td><td>HTTP，以 key 取整個檔案</td></tr>
+  <tr><td>能不能部分修改</td><td>可以更新某一欄</td><td>不行，只能整份覆蓋</td></tr>
+  <tr><td>咖啡店放什麼</td><td><code>receipts</code> 表：key、訂單、大小、狀態</td><td>PDF 本體</td></tr>
+</table></div>
+<p>表的最後一列就是開場問題的答案，分工的原則是：<strong>資料庫存 key 與中繼資料，檔案放物件儲存</strong>。中繼資料（metadata）是「描述資料的資料」，例如檔案大小、型別、屬於哪筆訂單。這些資料很小，而且需要查詢（「這筆訂單有沒有收據」「這位客人的收據有哪些」），所以留在資料庫；PDF 本體很大、從來不需要用 SQL 查裡面的內容，所以搬出去。資料庫回到 3 GB，備份、副本、快取的問題一起消失。</p>
+<div class="callout practice"><strong>💡 實務上：接手的專案常常已經把檔案塞在資料庫裡</strong><br>開頭咖啡店的狀況在真實專案很常見：早期為了快，頭像、合約、收據直接存進 PostgreSQL 的二進位欄位（<code>bytea</code>）或存成 base64 字串，等備份變慢、帳單變貴才有人注意。搬出去的常見做法是分三步：先讓新檔案改存 S3，再寫背景程式分批把舊資料上傳並回填 key，最後抽查確認都搬完了，才刪掉舊欄位。反過來說，不是每個專案一開始就要上 S3：內部工具、只有幾百個小檔案、沒有多台伺服器的情況，存資料庫最簡單，等量起來再搬也來得及。資深工程師評估時會先問：檔案總量多大、每月長多快、會不會被大量下載。</div>
+<p>接下來要決定的是：PDF 在物件儲存裡怎麼放、怎麼命名，才能讓資料庫裡的那個 key 永遠指得到它。</p>
+
+<h2>物件儲存怎麼組織檔案？bucket、key 與整份覆蓋</h2>
+<p>物件儲存的產品很多，最有名的是 Amazon S3（Simple Storage Service，在 AWS 架構裡的位置見<a href="../../devops/lessons/18-aws-architecture.html">DevOps 課第 18 課</a>）。S3 的 API 已經變成業界標準，很多產品實作了同一套 API，叫做 <strong>S3 相容</strong>（S3-compatible），例如 Cloudflare R2、Google Cloud Storage 的相容模式，以及這一課在本機用的 Garage。學會 S3 API，這些都能用，所以這一課的名詞都用 S3 的叫法。</p>
+<p>S3 的資料只有兩層。最外層是 <strong>bucket</strong>，放物件的容器，咖啡店開一個叫 <code>cafe-receipts</code> 的 bucket。bucket 是設定的單位：誰能存取、檔案多久自動刪除、哪些網站可以從瀏覽器呼叫，都設在 bucket 上，所以性質不同的檔案（私人收據、公開的菜單照片）通常分開放不同 bucket。</p>
+<p>bucket 裡放的是<strong>物件</strong>（object），一個物件就是一個檔案加上它的 metadata。每個物件用 <strong>key</strong> 定位，key 是物件在 bucket 裡的完整名稱，例如 <code>receipts/2026/11/9f1c….pdf</code>。資料庫的 <code>receipts</code> 表存的就是這個字串，有了 bucket 和 key，就能拿到那份 PDF。</p>
+<p>key 看起來像檔案路徑，但 S3 沒有真的資料夾。主控台把 key 用 <code>/</code> 切開，顯示成一層層的資料夾，實際上 <code>receipts/2026/11/9f1c….pdf</code> 只是一個剛好含有斜線的長字串。key 的開頭一段叫 <strong>prefix</strong>，例如 <code>receipts/2026/</code>。prefix 很重要，因為很多操作都只能用 prefix 篩選：列出物件時可以只列 <code>receipts/</code> 底下的，自動刪除的規則可以只套用在 <code>tmp/</code>，權限可以只開放 <code>receipts/*</code>。換句話說，key 的命名方式決定了之後能怎麼管理這些檔案，要在第一個檔案上傳前想好。咖啡店的規劃是：正式收據放 <code>receipts/</code>、匯出報表這類暫存檔放 <code>tmp/</code>，收據的 key 再帶上年月，之後依月份列出或清理都方便。</p>
+<p>物件的 <strong>metadata</strong> 是跟著物件存的標頭，最重要的兩個是 <code>Content-Type</code>（檔案是什麼型別，例如 <code>application/pdf</code>，瀏覽器下載時靠它決定怎麼顯示）和 <code>Content-Length</code>（大小，單位是 bytes）。後面確認上傳時，伺服器就是讀這兩個值來判斷檔案合不合格。</p>
+<p>從資料庫轉過來的人，最容易誤會的是物件能怎麼修改。物件只能<strong>整份覆蓋</strong>：不能「改 PDF 的第 3 頁」或「在檔案後面附加一行」，要改就上傳一份新的蓋掉舊的。資料庫的 <code>UPDATE</code> 有交易和鎖保護，S3 沒有：同一個 key 有兩個人同時上傳，後完成的那份會留下來，先完成的直接被蓋掉，不會報錯。這是後面「key 由伺服器產生、每次都不一樣」的原因之一。另一方面，S3 的讀寫是強一致的：PUT 成功之後馬上 GET、LIST 都看得到新內容，不會讀到舊版本（這個保證從什麼時候開始，見課末「補充與查表」）。</p>
+<p>最後是錢。S3 依三項收費：儲存量（每 GB 每月）、請求次數（PUT 比 GET 貴）、流出流量（從 S3 傳到網際網路的每 GB）。存檔案很便宜，所以「沒人用的檔案一直放著」平常不痛，但會默默累積；熱門檔案被大量下載時，流量費才是大頭。這兩件事後面都會處理：清理沒用的檔案是這一課的一節，降低公開檔案流量的 CDN 放在課末。</p>
+<p>模型清楚了，下一步是寫程式把 PDF 放進 bucket。練習的時候沒有 AWS 帳號，要先有一個本機的 S3。</p>
+
+<h2>程式怎麼存取？本機用 Garage，程式用 AWS SDK v3</h2>
+<p>課程的 Docker Compose 有一個 <strong>Garage</strong>（dxflrs/garage:v2.5.0），它是用 Rust 寫的 S3 相容儲存，映像只有二十多 MB。因為它實作了 S3 API，程式連它和連 AWS 的寫法一樣（為什麼不用以前常見的 MinIO，見課末）。啟動 Garage 與這課要用的 PostgreSQL：</p>
+<pre>cd learn/data-stores/practice
+docker compose --profile pg --profile s3 up -d --wait</pre>
+<p>Garage 用 <code>--single-node --default-access-key</code> 啟動，已經建好一把只在本機用的開發金鑰，金鑰寫在 <code>helpers/s3.ts</code> 的 <code>S3_CONFIG</code>。金鑰分成兩半：access key id 是識別用的名稱，secret access key 是密碼，用來證明請求真的是你發的。</p>
+<p>程式用 AWS 官方的 SDK（<code>@aws-sdk/client-s3</code> 3.1161.0）。先建立一個 client，告訴它連到哪裡、用什麼金鑰。連 Garage 和連 AWS 只差這段設定，每一行的註解寫了在 AWS 上該怎麼改：</p>
+<pre>import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3'
+
+const s3 = new S3Client({
+  endpoint: 'http://127.0.0.1:16490',   // 連 AWS 時不寫，SDK 依 region 自己算網址
+  region: 'garage',                      // Garage 設定檔裡的 s3_region；AWS 則是 ap-northeast-1 這類
+  forcePathStyle: true,                  // 網址寫成 http://host/bucket/key，Garage 需要
+  credentials: { accessKeyId: '…', secretAccessKey: '…' },   // AWS 上不寫，用 IAM 角色
+})
+
+// 上傳：Body 可以是字串、Buffer 或 stream
+await s3.send(new PutObjectCommand({ Bucket: 't12-receipts', Key: 'receipts/2026/11/a.pdf', Body: pdf, ContentType: 'application/pdf' }))
+// 只讀 metadata，不下載內容
+const head = await s3.send(new HeadObjectCommand({ Bucket: 't12-receipts', Key: 'receipts/2026/11/a.pdf' }))
+head.ContentLength   // 位元組數
+head.ContentType     // 'application/pdf'
+// 下載：Body 是 stream
+const obj = await s3.send(new GetObjectCommand({ Bucket: 't12-receipts', Key: 'receipts/2026/11/a.pdf' }))</pre>
+<p>SDK v3 的寫法都是同一個模式：建立一個 <code>XxxCommand</code> 物件描述要做什麼，交給 <code>s3.send()</code> 送出。上面三個 command 對應三個基本操作：<code>PutObjectCommand</code> 上傳，<code>ContentType</code> 會存成物件的 metadata；<code>HeadObjectCommand</code> 只讀 metadata、不下載內容，幾百 bytes 的回應就能知道一個 3 MB 的檔案有多大，後面確認上傳就靠它；<code>GetObjectCommand</code> 下載，回傳的 <code>Body</code> 是 stream，邊收邊處理，不用整份放進記憶體。物件不存在時，<code>HeadObjectCommand</code> 會丟出 <code>name</code> 為 <code>'NotFound'</code> 的錯誤，程式用這個判斷「檔案還沒傳上來」。</p>
+<p>金鑰的處理要特別小心。上面的 <code>credentials</code> 只在本機連 Garage 時寫；在 AWS 上，伺服器的程式不寫 <code>credentials</code>，改用 <strong>IAM 角色</strong>。IAM 角色是 AWS 上一組權限的身分，例如「可以讀寫 <code>cafe-receipts</code> 這個 bucket」，它可以掛在執行程式的機器（EC2）或容器（ECS task）上。程式在那台機器或容器裡執行時，SDK 發現設定裡沒有 <code>credentials</code>，會自動向 AWS 拿這個角色的短效金鑰（臨時憑證），快過期前再自己換新（<a href="../../devops/lessons/19-aws-iam.html">DevOps 課第 19 課</a>）。所以程式碼與設定檔裡沒有任何長期有效的金鑰可以外流。後面「上線前」那一節的最小權限，設的就是這個角色的權限。反過來，把金鑰寫在程式碼裡、推上 Git，或放進前端，就等於把整個 bucket 的權限送給拿到的人。</p>
+<p>收據只有幾百 KB，用上面的寫法就夠了。伺服器要上傳幾百 MB 以上的大檔時，寫法不太一樣，見課末「補充與查表」的大檔上傳。</p>
+<p>到這裡，API 伺服器自己已經能存取 S3。但收據 PDF 是店員在後台的瀏覽器裡選檔案上傳的，照這個寫法，檔案要先從瀏覽器傳到 API，API 再用 <code>PutObjectCommand</code> 傳給 S3。瀏覽器又不能直接拿這把金鑰去傳，因為前端的程式碼任何人都看得到。下一節解決這個矛盾。</p>
+
+<h2>店員的瀏覽器怎麼直接上傳，又拿不到金鑰？presigned URL</h2>
+<p>先看經過 API 的代價：同一份檔案走兩次網路，瀏覽器傳給 API、API 再傳給 S3。檔案在 API 上的這段時間，佔住了 API 的記憶體、頻寬和一個請求，上傳慢的話還會撞到請求逾時；同時上傳的人一多，API 處理一般請求的能力就跟著下降，這正是 <a href="../../nestjs/lessons/22-uploads-webhooks.html">NestJS 課第 22 課</a>說的問題。最好的做法是讓瀏覽器直接把檔案傳到 S3，API 完全不碰檔案內容。難處在於，S3 只接受帶有合法簽章的請求，而簽章要用金鑰算，金鑰又不能給瀏覽器。</p>
+<p>要理解解法，先看 S3 怎麼驗證請求。每個送到 S3 的請求都附有一個<strong>簽章</strong>：發請求的一方用 secret access key，對「哪個操作、哪個 bucket、哪個 key、什麼時間、哪些標頭」算出一串雜湊值。S3 也有同一把金鑰，收到請求時用同樣的內容重算一次，兩邊算出來一樣，才代表請求確實出自金鑰的主人，而且內容沒被改過。這套演算法叫 SigV4（Signature Version 4）。</p>
+<p>關鍵在於：簽章可以先算好，再交給別人用。<strong>presigned URL</strong>（預先簽章的網址）就是這樣：API 用自己的金鑰，替「這個 bucket、這個 key、PUT、5 分鐘內有效」先簽好一個章，把簽章和這些條件放在網址的查詢參數裡交給瀏覽器。拿到網址的人不需要帳號、也看不到金鑰，就能做<strong>那一個操作</strong>；想改成別的 key、別的操作，或過了有效時間，S3 重算出來的簽章都對不上，請求就被拒絕。網址長這樣（省略部分）：</p>
+<pre>http://127.0.0.1:16490/t12-receipts/receipts/2026/11/9f1c….pdf
+  ?X-Amz-Algorithm=AWS4-HMAC-SHA256
+  &amp;X-Amz-Credential=GK6c…/20261101/garage/s3/aws4_request
+  &amp;X-Amz-Date=20261101T080000Z        ← 簽章時間
+  &amp;X-Amz-Expires=300                  ← 300 秒後失效
+  &amp;X-Amz-SignedHeaders=content-type;host   ← 這些標頭也被簽進去，改了就對不上
+  &amp;X-Amz-Signature=3ef6…</pre>
+<p>有了 presigned URL，收據的上傳流程就變成下圖這樣。這一節先看 ①、③、④：瀏覽器向 API 申請、API 發網址、瀏覽器直接 PUT 到 S3。②、⑤、⑥、⑦ 是為了讓資料庫紀錄和 S3 上的檔案對得上，下一節再講。</p>
+
+<figure>
+  <svg viewBox="0 0 700 330" role="img" aria-label="上傳流程：瀏覽器向 API 申請，API 在資料庫寫 pending 紀錄並回傳 presigned URL，瀏覽器直接 PUT 到 S3，再通知 API，API 用 HeadObject 驗證後把紀錄改成 uploaded">
+    <defs><marker id="arr12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <text class="d-accent" x="70" y="22" text-anchor="middle">瀏覽器</text>
+    <text class="d-accent" x="290" y="22" text-anchor="middle">API</text>
+    <text class="d-accent" x="480" y="22" text-anchor="middle">PostgreSQL</text>
+    <text class="d-accent" x="630" y="22" text-anchor="middle">S3</text>
+    <line class="d-line" x1="70" y1="32" x2="70" y2="320"/>
+    <line class="d-line" x1="290" y1="32" x2="290" y2="320"/>
+    <line class="d-line" x1="480" y1="32" x2="480" y2="320"/>
+    <line class="d-line" x1="630" y1="32" x2="630" y2="320"/>
+    <line class="d-line" x1="70" y1="56" x2="282" y2="56" marker-end="url(#arr12)"/>
+    <text class="d-small" x="180" y="50" text-anchor="middle">① 申請上傳（型別、大小）</text>
+    <line class="d-line" x1="290" y1="84" x2="472" y2="84" marker-end="url(#arr12)"/>
+    <text class="d-small" x="385" y="78" text-anchor="middle">② INSERT pending</text>
+    <line class="d-line" x1="290" y1="112" x2="78" y2="112" marker-end="url(#arr12)"/>
+    <text class="d-small" x="180" y="106" text-anchor="middle">③ presigned URL（5 分鐘）</text>
+    <line class="d-line" x1="70" y1="150" x2="622" y2="150" marker-end="url(#arr12)"/>
+    <text class="d-small" x="350" y="144" text-anchor="middle">④ PUT 檔案（直接到 S3，不經過 API）</text>
+    <line class="d-line" x1="70" y1="188" x2="282" y2="188" marker-end="url(#arr12)"/>
+    <text class="d-small" x="180" y="182" text-anchor="middle">⑤ 傳好了</text>
+    <line class="d-line" x1="290" y1="222" x2="622" y2="222" marker-end="url(#arr12)"/>
+    <text class="d-small" x="460" y="216" text-anchor="middle">⑥ HeadObject：實際大小、型別</text>
+    <line class="d-line" x1="290" y1="258" x2="472" y2="258" marker-end="url(#arr12)"/>
+    <text class="d-small" x="385" y="252" text-anchor="middle">⑦ uploaded 或 rejected</text>
+    <rect class="d-soft" x="150" y="276" width="420" height="34" rx="4"/>
+    <text class="d-text" x="360" y="298" text-anchor="middle">之後沒有 ⑤ 的 pending，由排程清掉</text>
+  </svg>
+  <figcaption>檔案只走 ④ 一次；API 只處理幾百 bytes 的請求。先寫紀錄再發網址，最後由伺服器自己確認，不相信前端的說法。</figcaption>
+</figure>
+
+<p>③ 在 API 這邊產生網址，用 <code>@aws-sdk/s3-request-presigner</code> 的 <code>getSignedUrl</code>。它接收 client 和一個 command，但不送出請求，而是把這個請求的簽章算好、組成網址回傳：</p>
+<pre>import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
+
+const url = await getSignedUrl(s3, new PutObjectCommand({ Bucket, Key: key, ContentType: 'application/pdf' }), {
+  expiresIn: 300,                              // 秒；SigV4 最長 7 天（604800），超過會直接丟錯
+  signingDate: new Date(now),                  // 簽章時間，預設是現在；測試用它控制時間
+  signableHeaders: new Set(['content-type']),  // 把 Content-Type 簽進去（下一段說明）
+})</pre>
+<p>④ 前端（例如 Vue 的元件）拿到網址後，用 <code>fetch</code> 直接 PUT 檔案，<code>Content-Type</code> 標頭要跟簽的時候一樣；傳完再通知 API（圖中的 ⑤）：</p>
+<pre>const { receiptId, url } = await api.post('/receipts/uploads', { orderId: 15, contentType: file.type, size: file.size, fileName: file.name })
+const res = await fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/pdf' }, body: file })
+if (!res.ok) throw new Error('上傳失敗')
+await api.post(`/receipts/${receiptId}/confirm`)</pre>
+
+<h3>照官方範例寫，會先撞到兩個問題</h3>
+<p>上面的 <code>getSignedUrl</code> 多了一個 <code>signableHeaders</code>，發網址的 client 也要多一個設定。這兩處是照官方範例寫時，在這一版 SDK（3.1161.0）會遇到的問題，課程用 Garage 實際測過。</p>
+<p>第一個問題：<strong>上傳一定失敗，錯誤是 <code>InvalidDigest</code></strong>。SDK 預設會替 PutObject 算 checksum，也就是根據檔案內容算出的一個短值，S3 收到後用同樣的方法再算一次，兩邊一樣就代表內容沒傳壞。控制這件事的設定 <code>requestChecksumCalculation</code> 預設是 <code>'WHEN_SUPPORTED'</code>（API 支援就算）。直接 PUT 時這是好事，但簽網址的當下還沒有檔案內容，SDK 算的是「空內容」的 CRC32，並把它放進網址參數 <code>x-amz-checksum-crc32</code>。瀏覽器傳上來的是真正的 PDF，checksum 當然對不上，S3 就拒收。解法是發網址用的 client 設成 <code>requestChecksumCalculation: 'WHEN_REQUIRED'</code>，只在 API 規定一定要 checksum 時才算，PutObject 不在其中。這個設定寫在建立 client 的地方，也就是前面那段 <code>new S3Client({...})</code> 裡多加一行（練習 1 的 <code>createS3()</code> 就是寫在這裡）：</p>
+<pre>const s3 = new S3Client({
+  ...S3_CONFIG,                              // endpoint、region、forcePathStyle、credentials，同前面那段
+  requestChecksumCalculation: 'WHEN_REQUIRED', // 簽網址時不把「空內容的 checksum」放進網址
+})</pre>
+<p>它影響的是這個 client 發出、簽出的所有請求，所以只放在拿來發網址的 client。如果同一個服務也要由伺服器自己直接 PUT 檔案、又想保留預設的 checksum 檢查，就另外建一個不加這行的 client 給它用。</p>
+<p>第二個問題：<strong>Content-Type 預設沒有被簽進去</strong>。<code>s3-request-presigner</code> 的原始碼會把 <code>content-type</code> 加進「不簽的標頭」，所以就算 <code>PutObjectCommand</code> 寫了 <code>ContentType: 'application/pdf'</code>，網址的 <code>X-Amz-SignedHeaders</code> 只有 <code>host</code>。沒被簽進去的標頭，S3 驗簽章時不會檢查，拿到網址的人用 <code>text/html</code> 上傳照樣成功。加上 <code>signableHeaders: new Set(['content-type'])</code> 後，Content-Type 成為簽章的一部分，送不同的 Content-Type 會得到 403 簽章不符。</p>
+<div class="callout warn">為什麼要在意 Content-Type：有人把 <code>text/html</code> 的檔案傳上去，之後你的網域發出下載網址，瀏覽器會把它當網頁執行，裡面的 script 就以你的網站身分跑起來（XSS）。</div>
+
+<h3>瀏覽器還要過 CORS 這關</h3>
+<p>簽章與 checksum 都對了，用 curl 拿網址測試也上傳成功，但從後台網頁用 <code>fetch</code> 送出，還是會被瀏覽器擋下來，原因是跨網域。後台的網頁在 <code>https://cafe.example.tw</code>，S3 是另一個網域。瀏覽器規定，網頁用 <code>fetch</code> 呼叫別的網域時，要對方明確表示「允許這個網站呼叫我」才行，這套規則叫 <strong>CORS</strong>（Cross-Origin Resource Sharing）。所以 bucket 要先設定 CORS（<code>PutBucketCorsCommand</code>，Garage 也支援）：AllowedOrigins 只寫自己的網站，AllowedMethods 寫 PUT、GET，AllowedHeaders 寫 <code>content-type</code>。沒設定時，瀏覽器的 Console 會顯示 CORS 錯誤，但用 curl 測卻正常，因為 CORS 是瀏覽器的規則，curl 不檢查。這是最常見的上線問題之一。</p>
+
+<h3>presigned PUT 限得住什麼、限不住什麼</h3>
+<p>presigned URL 是「持有就能用」的憑證，所以要清楚它到底綁住了哪些條件。簽章只保證「簽進去的東西沒被改」，沒簽進去的就沒有保護：</p>
+<div class="table-wrap"><table>
+  <tr><th>條件</th><th>presigned PUT</th><th>怎麼處理</th></tr>
+  <tr><td>哪個 bucket、哪個 key、哪個操作</td><td>限得住</td><td>網址只能 PUT 到那個 key</td></tr>
+  <tr><td>有效時間</td><td>限得住（<code>X-Amz-Expires</code>）</td><td>上傳用 5–15 分鐘，下載用 1–5 分鐘</td></tr>
+  <tr><td>Content-Type</td><td>簽進去才限得住</td><td><code>signableHeaders</code></td></tr>
+  <tr><td>檔案大小範圍</td><td><strong>限不住</strong></td><td>事前用 presigned POST 的 <code>content-length-range</code>，事後用 HeadObject 檢查</td></tr>
+</table></div>
+<p>有效時間要短，是因為網址可能外流（貼錯地方、留在瀏覽器紀錄、被擴充套件讀到），有效時間就是它被濫用的時間窗。S3 是在請求開始時檢查網址有沒有過期，所以只要夠「開始上傳」就好，上傳得久不會被中途切斷。</p>
+<div class="callout practice"><strong>💡 實務上：會員頭像、商品圖、客服附件幾乎都走這個流程</strong><br>後台上傳商品圖、會員換頭像、客服單附上截圖、匯出報表給人下載，做法都是「API 發 presigned URL，檔案直接進出 S3」。資深工程師接到上傳需求會先問四件事：檔案多大、誰能看、要保存多久、要不要公開。答案決定用 PUT 還是 POST、放哪個 bucket 與 prefix、要不要生命週期規則、走不走 CDN。圖片類通常還要產生縮圖：確認上傳後丟一個背景工作去做，原圖與縮圖放不同 prefix。CORS 的 AllowedOrigins 要每個環境各設一份（本機、staging、正式站網域都不同），新環境漏設，就會出現「本機好好的、上線就壞」。</div>
+<p>最後一列是這一節留下的缺口：PUT 網址綁不住大小，店員（或拿到網址的任何人）可以傳一個 500 MB 的檔案上來。另一種形式 presigned POST 可以在 S3 收檔時就擋掉超過大小的檔案（見課末），但不管用哪一種，前端在 ①、⑤ 說的大小和型別都可以造假。最後一道關卡必須是伺服器自己去 S3 看實際的檔案，這就是下一節的確認流程。</p>
+
+<h2>檔案和資料庫紀錄中途斷掉怎麼辦？pending → uploaded</h2>
+<p>上一節留下的缺口是「伺服器要自己確認檔案」，但問題不只這個。收據的檔案在 S3、紀錄在 PostgreSQL，兩者不在同一個交易裡：資料庫的交易可以讓「寫紀錄」和「寫另一張表」一起成功或一起失敗，卻管不到 S3。上傳流程的任何一步都可能中斷：網址發了但店員關掉分頁、檔案傳了但前端當掉沒通知 API、通知了但檔案不合規定。設計的目標是：不管斷在哪一步，資料庫的紀錄都說得出那個檔案現在的狀況，而且只有確認過的檔案能被下載。</p>
+<p>做法是給每份收據一個<strong>狀態</strong>，用狀態記錄流程走到哪裡。<code>receipts</code> 表長這樣：</p>
+<pre>-- 收據表（練習用的版本）
+CREATE TABLE receipts (
+  id           integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  order_id     integer NOT NULL REFERENCES orders(id),
+  s3_key       text NOT NULL UNIQUE,
+  content_type text NOT NULL,
+  size         integer NOT NULL,          -- 申請時是前端申報的大小，確認後改成實際大小
+  status       text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'uploaded', 'rejected')),
+  created_at   timestamptz NOT NULL,
+  uploaded_at  timestamptz
+);</pre>
+<p><code>pending</code> 是「發了網址，還沒確認」，<code>uploaded</code> 是「伺服器確認過檔案合格」，<code>rejected</code> 是「檔案不合格，已刪除」。下面四條規則對應上傳流程圖的 ②、⑤、⑥、⑦。</p>
+<p><strong>規則一：先建紀錄，再發網址</strong>（圖中的 ②）。API 收到申請後，先在 <code>receipts</code> 新增一筆 <code>status = 'pending'</code>，記下 key、訂單、預期的型別，然後才簽網址。這樣 S3 上的每個檔案在資料庫裡都找得到來源。順序反過來（先讓瀏覽器上傳，再寫資料庫）的話，寫資料庫失敗時，S3 上就留下一個沒有任何紀錄指到的檔案，沒人知道它屬於誰、能不能刪。</p>
+<p><strong>規則二：key 由伺服器產生，用不可猜的 id</strong>：<code>receipts/2026/11/&lt;uuid&gt;.pdf</code>。不用使用者給的檔名當 key，原因有兩個。第一，檔名可以被改成 <code>../../orders/16/receipt.pdf</code> 這類路徑，企圖寫到別人檔案的位置，這種攻擊叫路徑穿越（path traversal）。第二，上一節說過同一個 key 後上傳的會蓋掉先上傳的，兩個店員各自上傳一份叫 <code>receipt.pdf</code> 的檔案，就會互相覆蓋。uuid 每次都不同，兩個問題一起消失。原始檔名要顯示的話另存一欄。年月放在 key 裡，就是上一節規劃的 prefix，之後依月份列出或清理都方便。</p>
+<p><strong>規則三：前端說「傳好了」之後，伺服器自己確認</strong>（圖中的 ⑤、⑥、⑦）。這一步補上上一節的缺口：伺服器用 HeadObject 讀 S3 上物件的實際大小與型別，不看前端申報的數字。符合規定就改成 <code>uploaded</code>，並把 <code>size</code> 改成實際大小；不符合就刪除物件、改成 <code>rejected</code>；物件不存在就回明確的錯誤，紀錄維持 <code>pending</code>，因為使用者可能還在傳。</p>
+<p><strong>規則四：確認要冪等</strong>。冪等（idempotent）的意思是同一個操作做一次和做很多次，結果都一樣（<a href="../../system-design/lessons/09-idempotency.html">系統設計課第 9 課</a>）。前端可能因為逾時而重送「傳好了」，兩個請求甚至可能同時到。所以已經是 <code>uploaded</code>、<code>rejected</code> 的收據直接回傳原本的結果，不再呼叫 S3；更新時加上 <code>WHERE status = 'pending'</code>，兩個請求同時進來，只有一個更新得到那一列，另一個什麼也沒改到。</p>
+<div class="callout practice"><strong>💡 實務上：客服說「收據下載不了」，先查 receipts 表的狀態</strong><br>狀態欄就是除錯的入口：一直 <code>pending</code> 代表前端沒呼叫確認、或上傳被 CORS 擋了；<code>rejected</code> 代表檔案不合規格；<code>uploaded</code> 但 S3 找不到，代表物件被誤刪（手動操作、清理程式或生命週期規則）。值得做的監控是「超過 1 小時的 pending 數量」與「rejected 的比例」，突然變多通常是前端改版或設定出錯。</div>
+<p>四條規則讓「走完的流程」都是對的：只有 <code>uploaded</code> 的收據對應到一個確認過的檔案。但沒走完的流程還留在那裡：店員關掉分頁留下的 <code>pending</code> 永遠不會被確認，有些 pending 的檔案其實已經傳上去了；S3 上也可能因為各種意外，出現資料庫裡沒有紀錄的檔案。這些都在佔空間、算錢，下一節處理。</p>
+
+<h2>沒走完的上傳和孤兒檔案，誰來清？</h2>
+<p>上一節留下的垃圾分成兩種，清法不同。一種是<strong>資料庫知道的</strong>：超過有效時間很久還是 <code>pending</code> 的紀錄，網址早就過期了，不會再有人確認它。另一種是<strong>資料庫不知道的</strong>：S3 上沒有任何紀錄指到的物件，叫<strong>孤兒檔案</strong>（orphan object），例如手動上傳的測試檔、某次程式錯誤留下的檔案。另外還有不屬於收據流程、但同樣會累積的暫存檔，例如 <code>tmp/</code> 底下的匯出報表。沒人清，S3 帳單會一個月一個月默默長大，因為儲存是按量收費的。</p>
+
+<h3>清理程式：比對資料庫和 S3</h3>
+<p>能判斷「這個檔案有沒有紀錄」的只有你自己的程式，因為只有它同時看得到資料庫和 S3。清理程式由排程定期執行，做兩件事：刪掉早於某個時間點的 pending 紀錄，連同它們可能已經上傳的物件；再列出 <code>receipts/</code> 底下所有的 key，跟資料庫比對，沒有紀錄的就是孤兒，刪掉。</p>
+<p>「列出所有的 key」要特別小心。<code>ListObjectsV2</code> 一次最多回傳 1,000 個 key，還有更多時回應的 <code>IsTruncated</code> 是 true，並附上 <code>NextContinuationToken</code>，下一次請求帶 <code>ContinuationToken</code> 繼續，直到沒有 token 為止：</p>
+<pre>let token: string | undefined
+do {
+  const page = await s3.send(new ListObjectsV2Command({ Bucket, Prefix: 'receipts/', ContinuationToken: token }))
+  const keys = (page.Contents ?? []).map(o =&gt; o.Key!)
+  // …用一句 SELECT … WHERE s3_key = ANY($1) 找出有紀錄的，其餘就是孤兒
+  token = page.NextContinuationToken
+} while (token)</pre>
+<p>每一頁的 key 用一句 <code>SELECT … WHERE s3_key = ANY($1)</code> 一次查完，不要一個 key 查一次資料庫。刪除很多物件時用 <code>DeleteObjectsCommand</code>，一次最多 1,000 個 key，比一個一個刪少很多請求。分頁最容易出錯的地方在於測試抓不到：測試時只放幾十個物件，只看第一頁的寫法也會通過；正式環境累積到幾萬個，它就只處理最前面那 1,000 個，後面的孤兒永遠不會被清到。</p>
+
+<h3>生命週期規則：讓 S3 自己刪</h3>
+<p>暫存檔不需要比對資料庫，規則很單純：「<code>tmp/</code> 底下超過 1 天的就刪」。這種只看 prefix 和時間的清理，不用自己寫程式，交給 S3 的<strong>生命週期規則</strong>（lifecycle rule）：設在 bucket 上、由儲存服務自己在背景執行的規則，可以依 prefix 與天數自動刪除物件，在 AWS 上還能把舊物件轉到比較便宜的儲存類別（見課末）。</p>
+<p>咖啡店需要的第二條規則跟<strong>分段上傳</strong>（multipart upload）有關。分段上傳是大檔案的上傳方式：把檔案切成多塊分別上傳，全部傳完後再呼叫「完成」，S3 才把它們組成一個物件（細節見課末）。如果上傳到一半程式當掉，既沒有完成也沒有取消，已經傳上去的那些塊會一直佔著空間、照樣收費，而且它們還不是物件，不會出現在 <code>ListObjectsV2</code> 的結果裡，上面的清理程式看不到。<code>AbortIncompleteMultipartUpload</code> 規則會清掉開始太久還沒完成的分段上傳，是最便宜的保險。兩條規則寫在一起：</p>
+<pre>await s3.send(new PutBucketLifecycleConfigurationCommand({
+  Bucket,
+  LifecycleConfiguration: { Rules: [
+    // 匯出報表的暫存檔：1 天後刪除。prefix 寫在 Filter 裡
+    { ID: 'tmp-1-day', Status: 'Enabled', Filter: { Prefix: 'tmp/' }, Expiration: { Days: 1 } },
+    // 中斷的分段上傳：開始 1 天後清掉。Filter 空的代表整個 bucket
+    { ID: 'abort-multipart-1-day', Status: 'Enabled', Filter: {}, AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 } },
+  ] },
+}))</pre>
+<p>注意兩條規則的 <code>Filter</code> 不一樣。<strong>刪除規則一定要限定 prefix</strong>：<code>Expiration</code> 配上空的 Filter，代表整個 bucket 的物件一天後都刪掉，<code>receipts/</code> 的正式收據也不例外。<code>AbortIncompleteMultipartUpload</code> 只清沒完成的上傳，不會碰到已經存在的物件，所以可以套用在整個 bucket。</p>
+<p>生命週期規則有兩個限制，也是它不能取代清理程式的原因。第一，它不是即時的：到期後由服務在背景處理，可能晚一段時間才真的刪掉。第二，它只看 prefix 和時間，不知道資料庫，「沒有紀錄的檔案」這種判斷做不到。所以兩者分工：生命週期規則清 <code>tmp/</code> 和中斷的分段上傳，清理程式清過期的 pending 和孤兒。Garage 的生命週期功能比 AWS 少，練習只用得到上面這兩種規則，差異見課末。</p>
+<div class="callout practice"><strong>💡 實務上：清理排程第一次上線，先不要真的刪</strong><br>清理程式第一次上線時，先只列出「會刪哪些、共幾個」不真的刪，確認數字合理再打開。刪除是不可逆的，清錯正式收據比留幾個孤兒檔嚴重得多：例如 prefix 寫錯、比對的 SQL 漏了某種狀態，都會讓正常的收據被當成孤兒。生命週期規則也一樣，套用前再看一次每條規則的 Filter。</div>
+<p>上傳、確認、清理都有了，bucket 裡留下的只剩確認過的收據。最後一段流程是客人來下載。</p>
+
+<h2>客人怎麼只下載到自己的收據？</h2>
+<p>bucket 保持私有，沒有任何人能不帶簽章直接讀檔案。客人要下載收據時，用的還是 presigned URL，只是換成 GET：API 先確認<strong>這張收據屬於他</strong>，再發一個短效的下載網址：</p>
+<pre>const { rows } = await pool.query(
+  `SELECT r.s3_key, r.status, r.order_id FROM receipts r JOIN orders o ON o.id = r.order_id
+    WHERE r.id = $1 AND o.customer_id = $2`, [receiptId, customerId])
+// 查不到：不存在、不是本人的，都回同一種錯（403 或 404），不讓人試出哪些 id 存在
+if (!rows[0]) throw new ForbiddenError('找不到這張收據')
+// 查到了、是本人的，但還沒確認：才告訴他「還沒準備好」
+if (rows[0].status !== 'uploaded') throw new ReceiptNotReadyError('收據還沒準備好')
+const url = await getSignedUrl(s3, new GetObjectCommand({
+  Bucket, Key: rows[0].s3_key,
+  ResponseContentDisposition: `attachment; filename="receipt-${rows[0].order_id}.pdf"`,
+}), { expiresIn: 60 })</pre>
+<p>這段程式最重要的是 SQL 裡的 <code>o.customer_id = $2</code>。如果只檢查「有登入」，客人把網址裡的 receiptId 改一個數字，就下載到別人的收據，上面有別人的姓名、消費紀錄。這種「有驗證身分、卻沒檢查這筆資料是不是他的」的漏洞叫 BOLA（Broken Object Level Authorization），<a href="../../auth/lessons/19-object-level-authz.html">Auth 課第 19 課</a>講過。在物件儲存的情境下它特別危險，因為 presigned URL 的權限等於簽它的伺服器的權限：伺服器的角色讀得到整個 bucket，它簽出來的網址就能讀任何一份收據，S3 不會再替你檢查。所以授權一定要在簽之前做。</p>
+<p>查不到的時候，「收據不存在」和「收據是別人的」要回同一種錯誤。如果兩者回不同的錯，攻擊者就能一個一個 id 試，從錯誤種類知道哪些 id 存在。</p>
+<p>狀態的檢查則放在查到之後。SQL 只用 id 與 <code>customer_id</code> 查，不把 <code>status</code> 放進 WHERE：查不到，一律回 ForbiddenError；查到了但狀態不是 <code>uploaded</code>，才回「還沒準備好」。分成兩種錯不會洩漏資訊，因為能走到第二個判斷的，只有這張收據的主人，他本來就知道這張收據存在；別人的收據不管是什麼狀態，都停在第一個判斷。反過來，如果把 <code>status = 'uploaded'</code> 也寫進 WHERE，店員剛上傳、還沒確認的收據就會讓本人收到「找不到」，客服很難分辨是真的沒有，還是還在處理。兩個判斷合起來，保證只有上一節確認過的檔案能被下載。</p>
+<p>有效時間設 60 秒，比上傳短得多。下載網址會留在瀏覽器歷史、可能被客人轉貼給別人，而客人拿到網址通常馬上就點，60 秒到幾分鐘就夠；過期了，再從 API 重新拿一個就好。</p>
+<p><code>ResponseContentDisposition</code> 讓 S3 在回應裡加上 <code>Content-Disposition</code> 標頭，它告訴瀏覽器怎麼處理這個回應：<code>attachment</code> 讓瀏覽器下載而不是在分頁裡開啟，<code>filename</code> 決定存檔的名字。不設的話，客人存到的檔名是 key 裡那串 uuid。檔名用英數字最省事，中文檔名的寫法見課末。</p>
+<p>收據是私人檔案，每次下載都要經過授權。菜單照片、商品圖這類公開、大家都會看的檔案則相反，適合放在 CDN 後面降低流量費，做法見課末。程式寫完了，上線前還要確認的是 bucket 和角色本身的權限：程式寫得再對，bucket 被設成公開，授權檢查就形同虛設。</p>
+
+<h2>上線前：權限怎麼設，出問題怎麼查？</h2>
+<p>物件儲存的權限原則跟資料庫帳號一樣：<strong>bucket 私有、權限最小</strong>。bucket 私有，靠的是 <strong>Block Public Access</strong>：在帳號或 bucket 層級禁止任何公開設定的開關，打開後，就算有人不小心把 bucket 或物件設成公開也不會生效。新 bucket 預設開啟，保持開啟；需要公開的檔案透過 CDN 提供。</p>
+<p>權限最小，指的是 API 用的 IAM 角色（<a href="../../devops/lessons/19-aws-iam.html">DevOps 課第 19 課</a>）只拿得到它真的需要的操作和範圍：上傳、下載、刪除收據，只需要 <code>s3:PutObject</code>、<code>s3:GetObject</code>、<code>s3:DeleteObject</code>，範圍限定在 <code>arn:aws:s3:::cafe-receipts/receipts/*</code>。清理排程要列出 key，才另外給它 <code>s3:ListBucket</code>。這樣 API 就算被攻破，攻擊者也只碰得到收據這個 prefix，列不出 bucket 裡有什麼。前端永遠只拿 presigned URL，不拿金鑰。加密、版本控制、Object Lock 這些 AWS 的安全與保護功能，依需求加上，整理在課末。</p>
+<p>上線後最常見的問題是上傳回 403。先看錯誤訊息是哪一種：<code>SignatureDoesNotMatch</code> 代表簽章重算對不上，多半是簽進去的標頭（例如 Content-Type）、region 或 endpoint 跟實際請求不一致；<code>AccessDenied</code> 代表簽章沒問題，但簽網址的角色沒有這個權限；Request has expired 代表網址過期，或伺服器的時間不準，簽出來的簽章時間就是錯的。瀏覽器才失敗、curl 正常，就是 CORS。帳單變大時，先看儲存量依 prefix 的分布、未完成的分段上傳數量、流出流量，對應的就是這一課的清理和 CDN。</p>
+<div class="callout practice"><strong>💡 實務上：新 bucket 上線前的檢查清單</strong><br>公開的 bucket 外洩客人資料是雲端常見的資安事故，資安與維運會在上線審查時問這幾項：Block Public Access 開著、bucket policy（掛在 bucket 上的權限政策）沒有對所有人（<code>"Principal": "*"</code>）開放、API 的 IAM 角色只限需要的 prefix 與動作、CORS 只列自己的網域、有 <code>AbortIncompleteMultipartUpload</code> 規則、暫存的 prefix 有到期刪除。另外設好帳單告警（AWS Budgets），流量或儲存量異常時早一點知道，不要等月底收到帳單。</div>
+
+<h2>練習</h2>
+<p>先啟動 PostgreSQL 與 Garage（在 <code>learn/data-stores/practice</code> 執行 <code>docker compose --profile pg --profile s3 up -d --wait</code>），每一題都在 <code>learn/</code> 執行 <code>node check.mjs data-stores 12</code> 判分。測試用 PostgreSQL 的 schema <code>t12</code>（表的定義在 <code>receipts.ts</code>）與 bucket <code>t12-receipts</code>，每個測試檔開始前都會清空重建。共用的常數（<code>MAX_SIZE</code>、<code>UPLOAD_TTL</code>、<code>DOWNLOAD_TTL</code>）與錯誤類別都在 <code>receipts.ts</code>，每個檔案最上面的註解寫了規則。</p>
+
+<div class="local" data-test="ex1" data-files="upload.ts">
+  <p>練習 1：在 <code>upload.ts</code> 先修好 <code>createS3()</code>（起始寫法簽出來的網址一定上傳失敗），再實作 <code>createUpload(pool, store, { orderId, fileName, contentType, size, now })</code>：只接受 <code>application/pdf</code> 與 1 byte～2 MB 的整數大小，否則丟 <code>UploadRejectedError</code> 而且不寫資料庫；key 是 <code>receipts/&lt;yyyy&gt;/&lt;mm&gt;/&lt;uuid&gt;.pdf</code>（年月取自 <code>now</code> 的 UTC 時間，不能含 <code>fileName</code>）；先寫一筆 pending 紀錄，再回傳 5 分鐘有效、簽章時間為 <code>now</code>、Content-Type 也簽進去的 PUT 網址。測試會用 <code>fetch</code> 真的 PUT 到你的網址，並試 6 分鐘前發的網址、改用 <code>text/html</code> 上傳，這兩種都要失敗。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="confirm.ts">
+  <p>練習 2：在 <code>confirm.ts</code> 實作 <code>confirmUpload(pool, store, receiptId)</code>：用 HeadObject 讀物件的實際大小與型別，符合規定就改成 <code>uploaded</code>（<code>size</code> 改成實際大小），不符合就刪除物件並改成 <code>rejected</code>；物件不存在丟 <code>ObjectMissingError</code>，紀錄不存在丟 <code>ReceiptNotFoundError</code>。已經處理過的收據再確認一次，要回傳同樣的結果而且不再呼叫 S3。測試的紀錄裡申報的大小都是 1000 bytes，但其中一個物件實際是 3 MB。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="download.ts">
+  <p>練習 3：在 <code>download.ts</code> 實作 <code>getReceiptUrl(pool, store, receiptId, customerId, now)</code>：收據的訂單屬於這位客人、狀態是 <code>uploaded</code>，才回傳 60 秒有效的 GET 網址，下載時的回應標頭要有 <code>Content-Disposition: attachment; filename="receipt-&lt;orderId&gt;.pdf"</code>。不是本人的或不存在的收據都丟 <code>ForbiddenError</code>（別人的收據不管什麼狀態都一樣），自己還沒確認的丟 <code>ReceiptNotReadyError</code>。測試會用客人 21 的身分去拿客人 22 的收據。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="lifecycle.ts">
+  <p>練習 4：在 <code>lifecycle.ts</code> 實作兩個函式。<code>applyLifecycle(store)</code> 設定 bucket 的生命週期：<code>tmp/</code> 的物件 1 天後刪除、整個 bucket 中斷的分段上傳 1 天後清除，<code>receipts/</code> 的正式收據不能被任何規則刪掉。<code>cleanupOrphans(pool, store, olderThan)</code> 刪除早於 <code>olderThan</code> 的 pending 紀錄與它們的物件，以及 <code>receipts/</code> 底下沒有紀錄的孤兒物件，回傳 <code>{ deletedObjects, deletedPending }</code>。測試會放 1,200 個物件（超過 ListObjectsV2 的一頁），孤兒分散在第一頁與第二頁，還有一筆 10 分鐘前、仍在有效期內的 pending。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：把 PDF 收據存在 PostgreSQL 的 <code>bytea</code> 欄位，最大的問題是什麼？</p>
+  <label data-key="a">PostgreSQL 不能存二進位資料</label>
+  <label data-key="b">資料庫變大，備份、還原、複寫都變慢變貴，檔案流量還佔用資料庫連線</label>
+  <label data-key="c">PDF 存進去會損壞</label>
+  <label data-key="d">bytea 欄位不能加密</label>
+  <p class="why">✓ <code>bytea</code> 可以正確存二進位（a、c 錯），加密也跟欄位型別無關（d 錯）。問題是代價：資料庫是最貴的儲存，每份檔案還跟著副本、備份、WAL 各存一次，還原時要等的時間也跟著變長。檔案放物件儲存，資料庫只放 key 與中繼資料。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：presigned PUT URL 的有效時間該怎麼設？</p>
+  <label data-key="a">越長越好，避免使用者上傳到一半失效</label>
+  <label data-key="b">夠完成一次上傳就好（例如 5–15 分鐘），因為拿到網址的任何人都能用</label>
+  <label data-key="c">設成永久，省得重發</label>
+  <label data-key="d">跟登入 session 一樣長</label>
+  <p class="why">✓ presigned URL 是「持有就能用」的憑證，網址外流時，有效時間就是被濫用的時間窗，所以要短，並且限定 key 與 Content-Type。SigV4 的簽章最長 7 天，不可能永久（c 錯）；跟 session 綁在一起只會讓它太長（a、d 錯）。只要在開始上傳前有效就夠：S3 是在請求開始時檢查網址，上傳得久不會被中途切斷。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：presigned PUT URL 簽了 <code>ContentType: application/pdf</code>（也用 <code>signableHeaders</code> 簽進去了），使用者能不能用它上傳 500 MB 的檔案？</p>
+  <label data-key="a">不能，簽章會限制檔案大小</label>
+  <label data-key="b">能：PUT 的簽章綁不住大小範圍；事前要擋用 presigned POST 的 content-length-range，事後由伺服器用 HeadObject 檢查並刪除</label>
+  <label data-key="c">不能，S3 單一檔案上限是 100 MB</label>
+  <label data-key="d">能，但只要把 Content-Type 改掉就會被擋</label>
+  <p class="why">✓ 簽章只保證簽進去的參數與標頭沒被改，大小範圍不在裡面（a 錯）。S3 單次 PUT 可以到 5 GB（c 錯）。d 說的是型別檢查，跟「能不能傳 500 MB」無關：送同樣的 Content-Type 就能傳。所以練習 2 的伺服器端確認不能省。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>把檔案存在資料庫或 API 伺服器的硬碟</strong>：資料庫因此變大、變慢；本機硬碟在多台伺服器或容器重建時會遺失檔案。檔案放物件儲存，資料庫存 key。</li>
+  <li><strong>bucket 設成公開</strong>：任何人猜到或拿到 key 就能下載，收據上有客人的資料。保持 Block Public Access，私人檔案用短效 presigned URL，公開資源用 CDN。</li>
+  <li><strong>用使用者給的檔名當 key</strong>：可以路徑穿越去蓋別人的檔案，同名檔案也會互相覆蓋。key 由伺服器用 uuid 產生。</li>
+  <li><strong>presigned URL 有效期限過長</strong>：外流的網址在有效期內都能用。上傳 5–15 分鐘、下載 1–5 分鐘。</li>
+  <li><strong>以為 ContentType 寫在 PutObjectCommand 裡就有限制</strong>：presigner 預設不簽 Content-Type，要加 <code>signableHeaders</code>。</li>
+  <li><strong>相信前端說的大小與型別</strong>：申報的數字可以隨便填，PUT 網址也限不住大小。上傳後用 HeadObject 檢查，不合格就刪掉。</li>
+  <li><strong>只確認不清理</strong>：中斷的上傳、沒確認的 pending、孤兒檔案都在收費。用生命週期規則清 <code>tmp/</code> 與未完成的分段上傳，排程清資料庫對不上的檔案，而且清理要走完所有分頁。</li>
+  <li><strong>生命週期刪除規則沒限定 prefix</strong>：整個 bucket 的物件到期都會被刪，包括正式資料。</li>
+  <li><strong>access key 放在前端程式或 Git 裡</strong>：等於公開整個 bucket。伺服器用 IAM 角色，前端只拿 presigned URL。</li>
+</ul>
+
+<h2 id="appendix">補充與查表</h2>
+<p>這一節收的是主線用不到、但選工具、處理大檔或設計其他檔案功能時會遇到的細節，查表用，不用背。</p>
+
+<h3>為什麼不用 MinIO</h3>
+<p>以前常見的教材用 MinIO 當本機的 S3，但 MinIO 社群版從 2025 年 10 月起不再發布映像與執行檔，所以這門課改用 Garage。</p>
+
+<h3>S3 的強一致</h3>
+<p>S3 從 2020 年 12 月起提供強一致的讀寫（strong read-after-write consistency），PUT 成功之後馬上 GET、LIST 都看得到新內容。比較舊的文章會說 S3 是「最終一致」，那是這之前的行為。</p>
+
+<h3>伺服器端上傳大檔：stream 與分段上傳</h3>
+<p>伺服器端自己要上傳大檔（例如匯出 500 MB 的報表）時，<code>Body</code> 傳 stream，不要整個讀進記憶體（<a href="../../node/lessons/16-streams-backpressure.html">Node 課第 16 課</a>）。單次 PUT 最大 5 GB；更大或網路不穩時用<strong>分段上傳</strong>（multipart upload）：把檔案切成多塊（除了最後一塊，每塊至少 5 MB），可以平行上傳、失敗只重傳那一塊，全部傳完再呼叫「完成」組成一個物件。沒完成也沒取消的分段上傳，要靠生命週期規則的 <code>AbortIncompleteMultipartUpload</code> 清掉。</p>
+
+<h3>presigned POST</h3>
+<p><strong>presigned POST</strong> 是 presigned URL 的另一種形式：API 簽一份 policy（條件清單），瀏覽器用 HTML 表單格式（multipart/form-data）把檔案 POST 到 bucket，policy 可以寫「大小在 1 到 2,097,152 bytes 之間」，S3 收檔時就擋掉超過的。SDK 對應的套件是 <code>@aws-sdk/s3-presigned-post</code>（這門課沒有安裝）。用了 presigned POST，伺服器端的 HeadObject 確認仍然不能省。</p>
+
+<h3>中文檔名</h3>
+<p><code>Content-Disposition</code> 的 <code>filename="…"</code> 只適合英數字，中文檔名要另外用 <code>filename*=UTF-8''…</code> 的編碼格式。</p>
+
+<h3>CDN</h3>
+<p><strong>CDN</strong>（Content Delivery Network，內容傳遞網路）是分散在各地的快取伺服器，例如 AWS CloudFront。菜單照片、商品圖這類<strong>公開</strong>、大家都會看的檔案，透過 CDN 提供：使用者從最近的節點拿，S3 的流出流量和請求數都大幅下降。bucket 本身仍然私有，只允許 CDN 讀取。收據這種私人檔案不放公開 CDN。</p>
+
+<h3>AWS S3 有、Garage 沒有或不在練習範圍的功能</h3>
+<p>Garage v2.5.0 的生命週期只支援 <code>Expiration</code> 與 <code>AbortIncompleteMultipartUpload</code>，而且 prefix 只能寫在 <code>Filter</code> 裡（不接受舊式直接寫在 Rule 上的 <code>Prefix</code>）。下面幾項是 AWS S3 有、Garage 沒有或不在練習範圍的功能，要知道它們解決什麼問題：</p>
+<div class="table-wrap"><table>
+  <tr><th>功能</th><th>解決什麼</th><th>什麼時候用</th></tr>
+  <tr><td>儲存類別（storage class）與轉移（transition）</td><td>Standard 最貴、隨時可讀；Standard-IA 存得便宜、讀取另外收費；Glacier 類最便宜、取回要時間與費用</td><td>收據放 90 天後很少有人看：生命週期規則把 <code>receipts/</code> 轉到較便宜的類別（Garage 不支援）</td></tr>
+  <tr><td>版本控制（versioning）</td><td>覆蓋或刪除時保留舊版本，誤刪可以救回</td><td>重要文件的 bucket；記得搭配生命週期刪除舊版本，不然每次覆蓋都多一份費用（Garage 不支援）</td></tr>
+  <tr><td>伺服器端加密（SSE）</td><td>磁碟上的資料是加密的</td><td>S3 從 2023 年起預設對新物件用 SSE-S3 加密；有稽核要求再改用 KMS 金鑰（SSE-KMS）</td></tr>
+  <tr><td>Block Public Access</td><td>帳號或 bucket 層級禁止任何公開設定</td><td>新 bucket 預設開啟，保持開啟；公開資源用 CDN 提供</td></tr>
+  <tr><td>Object Lock</td><td>一段時間內禁止刪改（WORM）</td><td>法規要求保存的紀錄（Garage 不支援）</td></tr>
+</table></div>
+
+<h2>小結</h2>
+<ul>
+  <li>收據 PDF 放物件儲存，資料庫只存 key 與中繼資料；資料庫存檔案的代價是每份檔案跟著 WAL、副本、備份多存好幾份，備份還原變慢，還佔用連線與快取。</li>
+  <li>物件以 bucket＋key 定位，只能整份覆蓋；prefix 不是真的資料夾，但列出、生命週期、權限都靠它篩選，key 的命名要先規劃。</li>
+  <li>AWS SDK v3 用 <code>s3.send(new XxxCommand(…))</code>；連 Garage 這類 S3 相容服務要設 <code>endpoint</code>、<code>forcePathStyle</code>、<code>region</code>；在 AWS 上用 IAM 角色，程式裡不放金鑰。</li>
+  <li>presigned URL 讓瀏覽器直接上傳、下載而拿不到金鑰：有效時間短、Content-Type 用 <code>signableHeaders</code> 簽進去；發網址的 client 設 <code>requestChecksumCalculation: 'WHEN_REQUIRED'</code>；bucket 要設 CORS。</li>
+  <li>PUT 網址限不住大小：先寫 pending 紀錄、key 由伺服器用 uuid 產生，上傳後由伺服器用 HeadObject 確認，冪等地改成 uploaded 或刪檔改成 rejected。</li>
+  <li>清理分兩種：排程程式清超時的 pending 與孤兒（ListObjectsV2 每頁 1,000 個要走完），生命週期規則清 <code>tmp/</code> 與中斷的分段上傳（刪除規則一定要限定 prefix）。</li>
+  <li>下載前做物件層級授權，查不到一律回同一種錯，再發 60 秒的 GET 網址並設定 Content-Disposition。</li>
+  <li>bucket 私有（Block Public Access 開著）、IAM 只給需要的 prefix 與動作；版本控制、儲存類別、加密、CDN 依需求加上。</li>
+</ul>
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 8 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="b">
+  <p>練習 8：客人搜「鮮奶茶」得到 0 筆，可是「鮮奶茶」上週就上架了。用 <code>GET 索引/_doc/id</code> 確認文件在索引裡、<code>available</code> 是 true，下一步查什麼？</p>
+  <label data-key="a">把 <code>name</code> 的加權從 <code>^3</code> 調高，讓名稱命中的商品排到前面</label>
+  <label data-key="b">用 <code>_analyze</code> 照 <code>name</code> 的分析器分別切商品名和搜尋字，看詞有沒有交集</label>
+  <label data-key="c">查詢改成 wildcard <code>*鮮奶茶*</code>，讓名稱裡含這三個字的都能命中</label>
+  <label data-key="d">文件還沒 refresh，用 <code>refresh: true</code> 把這個商品重新寫入一次</label>
+  <p class="why">✓ 文件在、篩選也沒擋，剩下的就是兩邊切出的詞對不上；修法多半是換分析器或加同義詞，不是改程式。c 錯在 wildcard 比對的是索引裡切好的單一個詞，中文欄位切出的詞（cjk 是兩字一組）不會含「鮮奶茶」三個字，而且又慢又沒有分數。a 只改排序，0 筆調加權還是 0 筆。（第 10 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 9：使用者勾了「只看有供應的」，後端組出下面的查詢，哪裡會出事？</p>
+<pre>query: { bool: {
+  must:   [{ multi_match: { query: q, fields: ['name^3', 'description'] } }],
+  should: [{ term: { available: true } }],
+  filter: [{ range: { price: { lte: 120 } } }],
+} }</pre>
+  <label data-key="a">價格條件放在 filter 不算分數，便宜的商品不會排到前面</label>
+  <label data-key="b"><code>available</code> 是 boolean，<code>term</code> 比對不到 true，要改用 <code>match</code></label>
+  <label data-key="c">已停售的商品還是會出現，只是分數低一點</label>
+  <label data-key="d">must 和 filter 同時出現時，filter 會讓每一筆的分數都變成 0</label>
+  <p class="why">✓ <code>should</code> 是「符合就加分」，有 must 時不符合的不會被排除，停售品照樣出現。只決定要不要的條件放 filter：<code>filter: [{ term: { available: true } }, …]</code>，不算分數還能被快取。a 錯在價格本來就只是篩選，排序看關鍵字的相關程度才對。（第 10 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 10：菜單索引的 <code>category</code> 設成 <code>{ type: 'text', analyzer: 'cjk' }</code>，想說分類名稱也能搜。後台新增分類「季節限定」後，搜尋頁點這個分類篩選、左邊的分類統計會怎樣？</p>
+  <label data-key="a">用 term 篩「季節限定」得到 0 筆，分類統計直接報錯；改成 keyword 要建新索引重新匯入</label>
+  <label data-key="b">篩選和統計都正常，只是 text 欄位會算分數，分類條件會影響結果的排序</label>
+  <label data-key="c">篩選正常，分類統計會把「季節」「限定」這些詞各自當成一個分類來計數</label>
+  <label data-key="d">兩個都會出錯，改 mapping 把 <code>category</code> 換成 keyword，重新整理頁面就好</label>
+  <p class="why">✓ text 欄位存的是分析器切出的詞，「季節限定」在索引裡是「季節、節限、限定」，term 拿整個值去比就對不到；text 欄位做 terms 聚合會直接報錯。精確篩選、聚合的欄位用 keyword，兩種都要就用 multi-field。d 錯在已有欄位的型別大多不能改，要建新索引重新匯入；c 錯在 text 欄位根本不能做 terms 聚合。（第 10 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 11：outbox worker 送出 bulk 之後這樣收尾，哪裡會出事？</p>
+<pre>const res = await es.bulk({ operations })
+await client.query(
+  'UPDATE outbox SET processed_at = now() WHERE id = ANY($1)', [ids])
+await client.query('COMMIT')</pre>
+  <label data-key="a">回 409 的事件也被標成完成，ES 上的新資料會被舊版本蓋掉</label>
+  <label data-key="b">bulk 是一個請求，其中一筆被拒絕，整批都不會寫入 ES</label>
+  <label data-key="c">標記完成應該在送 bulk 之前做，不然重送時會寫入兩次</label>
+  <label data-key="d">有幾筆被 mapping 拒絕時請求仍回 200，那幾筆也被標成完成，永遠進不了搜尋</label>
+  <p class="why">✓ bulk 只要請求送到就回 200，每筆的成敗在 <code>res.items[i]</code> 的 status。逐筆看：200、201、409、delete 的 404 標完成，其他 attempts 加 1 並記下 last_error。a 錯在 409 代表 ES 已經有一樣新或更新的版本、這筆沒寫進去，標完成正是對的處理。（第 11 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 12：兩個 worker 並發處理 outbox，bulk 結果裡有一筆 index 回了 409 <code>version_conflict_engine_exception</code>。這筆事件該怎麼處理？</p>
+  <label data-key="a">attempts 加 1 留到下一輪，重送到成功為止</label>
+  <label data-key="b">標記完成，ES 已經有一樣新或更新的版本</label>
+  <label data-key="c">拿掉 <code>version</code> 再送一次，讓這筆內容蓋上去</label>
+  <label data-key="d">ROLLBACK 整批，等下一輪整批重送</label>
+  <p class="why">✓ <code>version_type: 'external'</code> 只接受更大的版本，重送或晚到的舊事件都回 409，所以寫入冪等、只會往前。a 是最常見的錯：版本不會自己變大，這筆會永遠重試、卡成毒事件。c 會讓舊資料蓋過新資料，正是版本號要擋的事。（第 11 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 13：為了改分析器重建菜單索引：建新索引、從資料庫全量匯入、refresh、用一個 <code>_aliases</code> 請求切換。切換後搜尋都正常，只有匯入期間店長改過價格的 3 項商品還是舊價格，為什麼？</p>
+  <label data-key="a">匯入期間的變更由 worker 寫到別名指向的舊索引，新索引沒有重播這段 outbox 事件</label>
+  <label data-key="b">切換前新索引沒有 refresh 完，這 3 筆還沒變成搜得到的狀態</label>
+  <label data-key="c">新索引裡已經有這 3 筆，external 版本號把較新的價格擋成 409</label>
+  <p class="why">✓ 全量匯入讀的是某個時間點的資料，之後的變更只進了舊索引。切換前重播這段期間的 outbox 事件、切換後再重播一次，版本號會擋掉重複和舊的。c 錯在新價格的版本比匯入時更大，重播時會被接受；擋下來的只有舊的或一樣的。（第 11 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 14：前端用 presigned PUT 傳完收據後呼叫確認 API，後端這樣寫（上限 2 MB）。哪裡會出事？</p>
+<pre>// POST /receipts/:id/confirm，body 是 { size }
+if (body.size &gt; 2_000_000) throw new UploadRejectedError()
+await pool.query(
+  "UPDATE receipts SET status = 'uploaded', size = $2 WHERE id = $1",
+  [id, body.size])</pre>
+  <label data-key="a">沒有重新驗證 presigned URL 的簽章，上傳的內容可能被竄改過</label>
+  <label data-key="b">前端逾時重送確認時，<code>size</code> 會被累加成兩倍</label>
+  <label data-key="c">大小是前端說的，實際傳了 500 MB 也會通過；要用 HeadObject 讀實際大小與型別</label>
+  <label data-key="d">還要先用 CopyObject 從暫存區搬到正式位置，否則物件不算存在</label>
+  <p class="why">✓ PUT 網址綁不住大小，申報的數字也可以隨便填，伺服器要自己用 HeadObject 確認：符合改 uploaded，不符合刪物件改 rejected，更新時加 <code>WHERE status = 'pending'</code> 讓重送只處理一次。a 錯在簽章 S3 收檔時已經驗過，後端不必也沒辦法再驗。（第 12 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 15：收據下載 API 要登入才能呼叫，程式如下。哪裡會出事？</p>
+<pre>const { rows } = await pool.query(
+  "SELECT s3_key FROM receipts WHERE id = $1 AND status = 'uploaded'",
+  [receiptId])
+if (!rows[0]) throw new NotFoundError()
+return getSignedUrl(s3, new GetObjectCommand({ Bucket, Key: rows[0].s3_key }),
+  { expiresIn: 60 })</pre>
+  <label data-key="a">bucket 是私有的，瀏覽器沒有 AWS 金鑰，打不開這個網址</label>
+  <label data-key="b">60 秒太短，大檔案下載到一半網址就失效、連線被切斷</label>
+  <label data-key="c">沒設 Content-Disposition，瀏覽器會拒絕下載這個 PDF</label>
+  <label data-key="d">沒確認收據屬於這位客人，把 receiptId 改一個數字就拿到別人的收據</label>
+  <p class="why">✓ 這是 BOLA：只檢查有登入，沒做物件層級授權。presigned URL 的權限等於簽它的伺服器，所以授權要在簽之前做：JOIN orders 加上 <code>o.customer_id = $2</code>，查不到一律回同一種錯。b 錯在 S3 是在請求開始時檢查網址，下載得久不會中途被切斷。（第 12 課）</p>
+</div>
+
+<p>這個階段的重點整理成<a href="../sheets/stage-4.html">一頁圖解</a>。</p>
+<p>下一課換到報表：每月 1 號跑的全年營收報表把正式資料庫拖慢時，什麼時候該把分析工作搬到欄式資料庫。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

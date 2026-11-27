@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>11. 尖峰前的壓測與容量驗證</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="11" data-practice="delivery">
+<header>
+  <div class="eyebrow">階段 4：上線與維運 · 第 11 課</div>
+  <h1>尖峰前的壓測與容量驗證</h1>
+</header>
+<main>
+
+<p>店長開了一張單 CAFE-38：下週一 7:00–9:00 全品項半價，預估是平常尖峰的 5 倍流量。上次「買一送一」那天，吧台的平板一直轉圈圈、看不到新單，客人排到門口。店長的問題很直接：<strong>這次撐不撐得住？撐不住的話是哪裡？</strong></p>
+<p>「應該沒問題吧」不是答案。這一課照資深工程師在大活動前的做法做一次，答案要有數字、有證據。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>先把「撐得住」寫成數字：目標怎麼訂、每個端點的流量怎麼估，為什麼還要準備跟那天一樣多的資料（開場問題的最小答案）。</li>
+  <li>到達率與第一次壓測：腳本為什麼固定每秒送幾個請求，跑完怎麼讀摘要、找出最慢的端點。</li>
+  <li>找原因：數一個請求送了幾個查詢、用 EXPLAIN 看資料庫怎麼找資料，用證據而不是直覺決定修法。</li>
+  <li>在正式表上建索引：為什麼一般的 <code>CREATE INDEX</code> 會讓下單停擺，要改用 <code>CONCURRENTLY</code>。</li>
+  <li>再跑一次、寫結論：前後的數字怎麼比才算數，容量結論要寫成店長能拿來做決定的一句話。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../system-design/lessons/03-latency-percentiles.html">系統設計課第 3 課</a>的百分位數：p95 是 100 個請求裡有 95 個不超過的那個時間；看延遲要看 p95、p99，不看平均。</li>
+  <li><a href="../../devops/lessons/22-metrics-slo.html">DevOps 課第 22 課</a>的 k6 與 SLO：k6 用一支 JS 腳本描述要送的流量，跑完印出每個指標的摘要；SLO 是「p95 低於多少、錯誤率低於多少」這種寫成數字的目標。</li>
+  <li><a href="../../nestjs/lessons/16-query-performance.html">NestJS 課第 16 課</a>的 N+1 與索引：先查 1 次拿到 N 筆、再對每筆各查一次，查詢數跟著資料量變多；索引讓資料庫不用掃整張表。</li>
+</ul></div>
+
+<h2>先拿到這一課的程式</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs delivery 11</code>，會建立 <code>delivery/practice/work/11/</code>。它是第 10 課的標準答案，加上上個 sprint 合併的「廚房看板」（CAFE-37）和這一課的材料：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>檔案</th><th>是什麼</th></tr></thead>
+  <tbody>
+    <tr><td><code>tickets/CAFE-38.md</code></td><td>店長的需求單：活動時段、目標、平常尖峰的流量</td></tr>
+    <tr><td><code>api/src/kitchen/kitchen.module.ts</code></td><td>廚房看板：<code>GET /kitchen/board</code> 列出 <code>paid</code>、<code>preparing</code> 的訂單（最早下單的在最上面），<code>POST /orders/:id/start</code> 是吧台按「開始製作」。<strong>練習 1 在這裡</strong></td></tr>
+    <tr><td><code>loadtest/rush.js</code></td><td>寫好的 k6 腳本：四個端點，依 CAFE-38 的流量送請求</td></tr>
+    <tr><td><code>loadtest/run.mjs</code>（<code>npm run load -- &lt;名稱&gt;</code>）</td><td>用 Docker 跑 <code>grafana/k6:2.3.0</code>，摘要寫到 <code>loadtest/&lt;名稱&gt;.json</code></td></tr>
+    <tr><td><code>scripts/load-data.ts</code>（<code>npm run load:data</code>）</td><td>在開發資料庫放 20 萬張舊訂單＋ 200 張廚房正在做的訂單</td></tr>
+    <tr><td><code>api/src/common/prisma.service.ts</code></td><td>多了 <code>DEBUG_SQL=1</code>：每個查詢印一行</td></tr>
+    <tr><td><code>capacity.json</code></td><td>練習 3 要填的範本</td></tr>
+  </tbody>
+</table></div>
+
+<h2>先把「撐得住」寫成數字</h2>
+<p>「撐得住」要先變成可以量的句子，否則壓測完也不知道算不算過。CAFE-38 已經給了目標：<strong>每個 API 的 p95 &lt; 300 ms、錯誤率 &lt; 1%</strong>。p95 是把請求依花費的時間由快到慢排好，排在第 95% 位置的那個：100 個請求裡有 95 個不超過它（<a href="../../system-design/lessons/03-latency-percentiles.html">系統設計課第 3 課</a>）：平均值會被大量很快的請求拉低，p95 才看得到排隊的那群客人。</p>
+<p>接著估流量（<a href="../../system-design/lessons/02-estimation.html">系統設計課第 2 課</a>的方法）：從平常的尖峰乘上倍數，<strong>每個端點分開算</strong>，因為客人的行為不是平均分布的：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>端點</th><th>平常尖峰（每秒）</th><th>活動（每秒）</th><th>說明</th></tr></thead>
+  <tbody>
+    <tr><td><code>GET /products</code>（menu）</td><td>4</td><td>20</td><td>× 5</td></tr>
+    <tr><td><code>POST /orders</code>（create-order）</td><td>0.8</td><td>4</td><td>× 5</td></tr>
+    <tr><td><code>GET /orders/:id</code>（order-status）</td><td>2</td><td>10</td><td>× 5</td></tr>
+    <tr><td><code>GET /kitchen/board</code>（kitchen-board）</td><td>3</td><td>3</td><td>平板還是三台、每秒拉一次。<strong>但每次要列的單從 40 張變成 200 張</strong></td></tr>
+  </tbody>
+</table></div>
+<p>最後一列是這一課的重點：有些端點的<strong>請求數</strong>不變，但<strong>每個請求要處理的資料量</strong>跟著尖峰變大。只看「每秒幾個請求」會漏掉它。所以壓測前還要準備<strong>跟那天一樣多的資料</strong>：<code>npm run load:data</code> 放的 200 張進行中訂單就是活動當下廚房的樣子，20 萬張舊訂單是正式資料庫半年的量。用種子資料的 6 張訂單壓測，什麼問題都看不出來。</p>
+<p>用量測證明系統撐得住預期的尖峰，叫<strong>容量驗證（capacity validation）</strong>。它的產出不是一張圖，而是一句可以拿去做決定的話：「在 X 的流量、Y 的資料量下，每個端點的 p95 是多少、有沒有達標；沒達標的原因是什麼、修了之後變多少」。</p>
+<p>先講這一課量出來的答案：其他三個端點都在目標內，只有廚房看板超標（p95 343 ms）。原因是一次看板請求送了 401 個查詢，而且資料庫要掃整張訂單表；兩個都修好後降到 18 ms，撐得住。細節在後面的〈跟著做：跑第一次壓測〉和兩節〈找原因〉。</p>
+
+<h2>為什麼腳本用「到達率」送請求</h2>
+<p>打開 <code>loadtest/rush.js</code>，每個端點是一個 scenario：</p>
+<pre>const peak = (rate, exec) =&gt; ({
+  executor: 'ramping-arrival-rate',   // 依「每秒到達幾個請求」送
+  exec,                               // 這個 scenario 執行哪個函式
+  startRate: 0,
+  timeUnit: '1s',
+  stages: [{ target: rate, duration: '10s' }, { target: rate, duration: '40s' }],   // 10 秒爬到尖峰（暖機），再維持 40 秒
+  preAllocatedVUs: 20,
+  maxVUs: 200,
+})
+
+scenarios: {
+  menu: peak(20, 'menu'),
+  order: peak(4, 'order'),
+  status: peak(10, 'status'),
+  board: peak(3, 'board'),
+}</pre>
+<p><code>ramping-arrival-rate</code> 是<strong>開放模型（open model）</strong>：每秒送幾個請求是固定的，不管前面的請求回來了沒。另一種是<strong>封閉模型</strong>，例如 k6 的 <code>constant-vus</code>：固定 50 個虛擬使用者（VU），每個等上一個回應回來才送下一個。系統變慢時，封閉模型的每個 VU 都在等，<strong>送出的請求自動變少</strong>，量到的延遲看起來沒那麼糟，問題被藏起來了。真實的客人不會因為你慢就少來，所以尖峰要用開放模型（<a href="../../devops/lessons/22-metrics-slo.html">DevOps 課第 22 課</a>有完整的說明）。</p>
+<p>到達率模式下，k6 要有足夠的 VU 去送請求；VU 不夠時，送不出去的請求記在 <code>dropped_iterations</code>。它不是 0，代表要的流量沒送到，量到的數字不可信。</p>
+<p>每個請求帶一個 <code>name</code> 標籤（<code>tags: { name: 'kitchen-board' }</code>），門檻寫成 <code>http_req_duration{name:kitchen-board}</code>，摘要就會分別算出每個端點的 p95。四個端點混在一起算，慢的端點會被快的稀釋掉。</p>
+
+<h2>跟著做：跑第一次壓測</h2>
+<p>在 <code>work/11</code> 依序執行。第一步套用 migration 並放進資料：</p>
+<pre>$ docker compose up -d --wait
+$ npm run db:setup
+$ npm run load:data
+刪掉上一次的 0 張，放進 200000 張舊訂單＋ 200 張廚房進行中的訂單</pre>
+<p>另開一個終端機，在 <code>work/11</code> 執行 <code>npm run dev</code> 啟動 API（3100 port 被 NestJS 課的 API 占用時，先關掉它）。回到第一個終端機：</p>
+<pre>$ npm run load -- before</pre>
+<p>k6 會跑 50 秒左右，結束時印出每個端點的重點（這是作者的 Mac 上量到的數字）：</p>
+<pre>menu           p95     6ms   p99    11ms   錯誤率 0.00%
+create-order   p95    15ms   p99    19ms   錯誤率 0.00%
+order-status   p95     7ms   p99    11ms   錯誤率 0.00%
+kitchen-board  p95   343ms   p99   357ms   錯誤率 0.00%
+dropped_iterations 0
+
+完整摘要：loadtest/before.json
+… level=error msg="thresholds on metrics 'http_req_duration{name:kitchen-board}' have been crossed"
+有端點沒達到目標（k6 印出 thresholds … have been crossed）。這是要找出來的問題，不是壓測壞了。</pre>
+<p>怎麼讀：</p>
+<ul>
+  <li><strong>先看 <code>dropped_iterations</code></strong>：是 0，代表要的流量都送出去了，下面的數字可以信。</li>
+  <li><strong>再看每個端點的 p95 跟目標比</strong>：三個端點都在 20 ms 以內，<code>kitchen-board</code> 是 343 ms，超過 300。一秒才 3 個請求，它卻是最慢的，代表問題是「每個請求做了太多事」，不是「請求太多」。</li>
+  <li><strong>錯誤率</strong>：都是 0。慢但沒有錯，所以下一步是找「慢在哪」。</li>
+</ul>
+<p>你的電腦上數字會不一樣（看 CPU、同時開了什麼），沒關係：容量驗證比的是<strong>同一台機器、同一個腳本、改之前和改之後</strong>的差別，不是跟這頁的數字比。<code>loadtest/before.json</code> 是 k6 的完整摘要，練習 3 會用到，<strong>跑完不要刪</strong>。</p>
+
+<div class="callout practice"><strong>💡 實務上：壓測在哪裡跑、先跟誰說</strong><br>正式的容量驗證在跟正式環境同規格的 staging 跑，不要壓正式資料庫：會寫進假訂單、拖慢真的客人。筆電上的數字只能看相對的變化（這一版比上一版好多少），不能直接當成「正式環境撐得住每秒多少」。動手前先跟維運或 DBA 約好時段（壓測會讓共用的資料庫變慢），也把資料量對齊正式環境：資料表小的時候，缺索引、N+1 都不會現形。報告要寫清楚條件：流量、資料量、機器、版本。</div>
+
+<h2>找原因一：數一個請求送了幾個查詢</h2>
+<p>看板慢，第一個要回答的是「一次看板請求，API 對資料庫做了什麼」。<code>PrismaService</code> 多了一個開關：環境變數 <code>DEBUG_SQL=1</code> 時，每個送到資料庫的查詢印一行 <code>prisma:query …</code>。停掉 <code>npm run dev</code>，改成這樣啟動：</p>
+<pre>$ DEBUG_SQL=1 npm run dev 2&gt;&amp;1 | tee sql.log</pre>
+<p>（<code>tee</code> 把輸出同時印在畫面上和存到 <code>sql.log</code>。）在另一個終端機打一次看板，然後數 log 裡有幾個查詢：</p>
+<pre>$ curl -s -o /dev/null http://localhost:3100/kitchen/board
+$ grep -c "prisma:query" sql.log
+401</pre>
+<p>一個請求 401 個查詢。看前幾行就知道是怎麼來的（欄位很長，這裡省略）：</p>
+<pre>prisma:query SELECT … FROM "public"."orders" WHERE "public"."orders"."status" IN ($1,$2) ORDER BY … "ordered_at" ASC, … "id" ASC OFFSET $3
+prisma:query SELECT … FROM "public"."order_items" WHERE "public"."order_items"."order_id" = $1 ORDER BY … OFFSET $2
+prisma:query SELECT … FROM "public"."products" WHERE "public"."products"."id" IN ($1,$2) OFFSET $3
+prisma:query SELECT … FROM "public"."order_items" WHERE "public"."order_items"."order_id" = $1 ORDER BY … OFFSET $2
+prisma:query SELECT … FROM "public"."products" WHERE "public"."products"."id" IN ($1,$2) OFFSET $3
+…</pre>
+<p>1 個查訂單，接著每張單 2 個（品項、商品名稱）：1 + 200 × 2 ＝ 401。對照 <code>kitchen.module.ts</code>：</p>
+<pre>const orders = await this.prisma.order.findMany({ where: { status: { in: ['paid', 'preparing'] } }, … })
+for (const order of orders) {
+  const items = await this.prisma.orderItem.findMany({ where: { orderId: order.id }, include: { product: true }, … })
+  …
+}</pre>
+<p>這就是 <strong>N+1</strong>（<a href="../../nestjs/lessons/16-query-performance.html">NestJS 課第 16 課</a>）：先查 1 次拿到 N 筆，再對每一筆各查一次。每個查詢本身都很快（零點幾毫秒），但 401 個加起來，還要一個接一個排隊等資料庫回應，再加上這段時間一直占著連線池的連線。平常 40 張單是 81 個查詢，沒人發現；活動當天 200 張單，就是 401 個。<strong>查詢數跟著資料筆數成長</strong>，是 N+1 最明顯的特徵。</p>
+<p>修法是讓查詢數固定：品項和商品名稱跟訂單一起查。Prisma 的 <code>include</code> 可以一層一層往下帶：</p>
+<pre>const orders = await this.prisma.order.findMany({
+  where: { status: { in: ['paid', 'preparing'] } },
+  orderBy: [{ orderedAt: 'asc' }, { id: 'asc' }],
+  include: { items: { include: { product: true }, orderBy: { id: 'asc' } } },
+})</pre>
+<p>從上面的 log 也看得出 Prisma 7.10.1 處理 <code>include</code> 的方式（schema 沒開 <code>relationJoins</code> 預覽功能時的預設）：關聯的資料表另外送一個 <code>WHERE … IN (…)</code> 查詢（品項的商品就是這樣查的）。所以這個寫法是每張表一個查詢，不管有幾張單，查詢數都一樣（改完用 <code>DEBUG_SQL=1</code> 再數一次確認）。不用 ORM 的話，自己寫成「先查訂單、再用 <code>WHERE order_id IN (…)</code> 一次查完品項、在程式裡用 <code>Map</code> 依 order_id 分組」也是同樣的效果。</p>
+<p>回應的形狀要跟原本一模一樣：吧台的平板是照著 <code>{ id, status, orderedAt, pickupAt, items: [{ name, quantity }] }</code> 畫畫面的。效能修正最常見的事故，就是順手改了回應的順序或欄位。</p>
+
+<h2>找原因二：EXPLAIN 看資料庫怎麼找資料</h2>
+<p>N+1 修好之後還剩一個查詢：從 20 萬張訂單裡找出 200 張進行中的。資料庫怎麼找？用 <code>EXPLAIN ANALYZE</code> 問它（<a href="../../postgresql/lessons/21-explain.html">PostgreSQL 課第 21 課</a>）。連進開發資料庫：</p>
+<pre>$ docker compose exec postgres psql -U learn -d cafe
+cafe=# EXPLAIN ANALYZE SELECT * FROM orders WHERE status IN ('paid', 'preparing') ORDER BY ordered_at, id;</pre>
+<pre> Gather Merge  (cost=4352.91..4377.87 rows=219 width=46) (actual time=10.792..13.124 rows=200.00 loops=1)
+   Workers Planned: 1
+   -&gt;  Sort  (cost=3352.90..3353.22 rows=129 width=46) (actual time=9.175..9.182 rows=100.00 loops=2)
+         Sort Key: ordered_at, id
+         -&gt;  Parallel Seq Scan on orders  (cost=0.00..3348.38 rows=129 width=46) (actual time=9.070..9.090 rows=100.00 loops=2)
+               Filter: (status = ANY ('{paid,preparing}'::text[]))
+               Rows Removed by Filter: 100090
+ Execution Time: 13.170 ms</pre>
+<p>由下往上讀：<code>Seq Scan on orders</code> 是<strong>整張表掃描</strong>，<code>Rows Removed by Filter: 100090</code> 是每個 worker 平均丟掉的列數（<code>loops=2</code>：兩個 worker 分工），合計讀了 20 萬列、丟掉幾乎全部，只為了留下 200 列。13 ms 聽起來不多，但每個看板請求都要做一次，而且舊訂單每天都在增加：半年後是 40 萬列，這個數字跟著翻倍。<code>orders</code> 只有 <code>customer_id</code> 的索引，沒有能用在 <code>status</code> 上的。</p>
+<p>索引要怎麼建，看查詢怎麼用欄位：<code>status</code> 用 <code>IN</code> 篩選（等號類的條件），<code>ordered_at</code> 用來排序。複合索引（<a href="../../postgresql/lessons/27-index-design.html">PostgreSQL 課第 27 課</a>）的規則是<strong>等號篩選的欄位放前面，排序或範圍的欄位放後面</strong>：<code>(status, ordered_at)</code>。建好之後同一句 EXPLAIN：</p>
+<pre> Sort  (cost=393.26..393.81 rows=220 width=46) (actual time=0.156..0.168 rows=200.00 loops=1)
+   Sort Key: ordered_at, id
+   -&gt;  Index Scan using orders_status_ordered_at_idx on orders  (cost=0.42..384.70 rows=220 width=46) (actual time=0.039..0.081 rows=200.00 loops=1)
+         Index Cond: (status = ANY ('{paid,preparing}'::text[]))
+         Index Searches: 2
+ Execution Time: 0.200 ms</pre>
+<p>從 13 ms 到 0.2 ms：索引直接跳到 <code>paid</code> 和 <code>preparing</code> 兩段（<code>Index Searches: 2</code>），只讀 200 列。上面那層 <code>Sort</code> 只排 200 列，很便宜。</p>
+<p>欄位順序反過來的 <code>(ordered_at, status)</code> 呢？在同一份資料上實測，PostgreSQL 根本不用它，還是 <code>Parallel Seq Scan</code>：索引是先依 <code>ordered_at</code> 排好的，進行中的 200 張散在最新的那一端，要用它就得從最舊的訂單一路掃過去。所以「有建索引」不等於「查詢會用」，<strong>一定要用 EXPLAIN 確認</strong>。</p>
+
+<div class="callout practice"><strong>💡 實務上：先找證據，再決定修法</strong><br>看到 API 慢，常見的第一反應是加快取、加機器、把連線池調大。這些都可能讓情況更糟：連線池滿通常是<strong>症狀</strong>，原因是每個請求占著連線太久（N+1、慢查詢），池子調大只是讓更多慢查詢同時壓在資料庫上。資深的順序是：壓測找出最慢的端點 → 查詢 log 數查詢數 → EXPLAIN 看最慢的那句 → 正式環境用 <code>pg_stat_statements</code> 找出總耗時最多的查詢（<a href="../../postgresql/lessons/29-query-tuning.html">PostgreSQL 課第 29 課</a>）。修完要能說出「從幾個查詢變幾個、從幾 ms 變幾 ms」，PR 說明直接貼前後的數字。</div>
+
+<h2>在正式表上建索引：CREATE INDEX CONCURRENTLY</h2>
+<p>索引要寫成 migration 才會跟著部署。直覺的寫法是 <code>CREATE INDEX …</code>，但它在建索引的整段時間對資料表加上 SHARE 鎖：<strong>可以讀、不能寫</strong>。20 萬列要建幾百毫秒，正式環境幾千萬列可能要幾分鐘，這段時間所有的 <code>INSERT INTO orders</code> 都在排隊：等於下單停擺。</p>
+<p><code>CREATE INDEX CONCURRENTLY</code> 建索引時不擋寫入（<a href="../../postgresql/lessons/34-zero-downtime-migrations.html">PostgreSQL 課第 34 課</a>）。代價有三個：</p>
+<ul>
+  <li><strong>比較慢</strong>：要掃描資料表兩次，並等正在進行的交易結束。</li>
+  <li><strong>不能放在交易（<code>BEGIN … COMMIT</code>）裡</strong>，否則直接報錯。所以 migration 檔案裡只放這一句。Prisma 7.10.1 的 <code>prisma migrate deploy</code> 不會把 migration 檔包進一個交易，這一句可以照常執行（本課程在 PostgreSQL 18 上實測過）。</li>
+  <li><strong>失敗時會留下一個 INVALID 的索引</strong>：查詢不會用它，但寫入時還是要維護它。要先 <code>DROP INDEX CONCURRENTLY</code> 再重建。</li>
+</ul>
+<p>新增 migration 的步驟：</p>
+<ol>
+  <li>在 <code>api/prisma/schema.prisma</code> 的 <code>model Order</code> 加一行 <code>@@index([status, orderedAt])</code>。Prisma 會把它命名為 <code>orders_status_ordered_at_idx</code>（表名_欄位名_idx）。這一步讓 schema 和資料庫一致：只在 SQL 建索引、schema 沒寫，下次有人執行 <code>prisma migrate dev</code>，Prisma 會「好心」產生一個 <code>DROP INDEX</code>。</li>
+  <li>在 <code>api/prisma/migrations/</code> 新增資料夾，名稱用時間開頭、排在現有的之後，例如 <code>20261111000000_orders_status_index/</code>，裡面放 <code>migration.sql</code>：
+<pre>-- 廚房看板（WHERE status IN (…) ORDER BY ordered_at）用的索引；CONCURRENTLY：建的時候不擋下單
+CREATE INDEX CONCURRENTLY "orders_status_ordered_at_idx" ON "orders"("status", "ordered_at");</pre></li>
+  <li><strong>不要改已經存在的 migration</strong>：正式環境已經跑過它們，不會再跑一次；改了只會讓 Prisma 發現檔案的 checksum 不對。</li>
+  <li><code>npm run db:setup</code> 套用，再用 EXPLAIN 確認看板的查詢用到它。</li>
+</ol>
+
+<div class="callout warn">Prisma 依 schema 產生 migration 時寫的是一般的 <code>CREATE INDEX</code>（不會自己加 CONCURRENTLY）。可以先用 <code>prisma migrate dev --create-only</code> 產生檔案、手動改成 CONCURRENTLY 再套用；或像上面一樣自己寫。不管哪種，送 PR 前打開 <code>migration.sql</code> 看一眼，大表上的一般 <code>CREATE INDEX</code> 要擋下來。</div>
+
+<h2>用同一個腳本再跑一次，寫結論</h2>
+<p>修完 N+1、加好索引之後，<code>npm run db:setup</code> 套用新的 migration，重新啟動 <code>npm run dev</code>（不用 <code>DEBUG_SQL</code>，印 log 本身也會拖慢 API），然後：</p>
+<pre>$ npm run load -- after
+menu           p95     8ms   p99    13ms   錯誤率 0.00%
+create-order   p95    26ms   p99    41ms   錯誤率 0.00%
+order-status   p95    10ms   p99    15ms   錯誤率 0.00%
+kitchen-board  p95    18ms   p99    22ms   錯誤率 0.00%
+dropped_iterations 0
+
+完整摘要：loadtest/after.json</pre>
+<p>看板從 343 ms 降到 18 ms，四個端點都在目標內。<strong>一定要用同一個腳本、同樣的資料、同一台機器</strong>：換了任何一樣，前後的數字就不能比，你也說不出改善是修正帶來的還是條件變了。其他端點的數字有一點上下（例如 create-order 15 → 26 ms），這是同一台機器兩次量測的正常波動，都遠低於目標；要確認是不是真的變慢，就多跑幾次看趨勢。</p>
+<p>把結果寫進 <code>capacity.json</code>，數字直接從摘要抄（p95 在 <code>metrics["http_req_duration{name:kitchen-board}"].values["p(95)"]</code>，四捨五入成整數）：</p>
+<pre>{
+  "before": { "p95Ms": 343 },
+  "after": { "p95Ms": 18 },
+  "slowestEndpoint": "kitchen-board",
+  "cause": "both"
+}</pre>
+<p>回覆給店長的結論長這樣：「用活動當天的預估流量（每秒約 37 個請求、廚房同時 200 張單）測試，原本吧台看板會超過目標（p95 343 ms），原因是查詢方式和缺索引；修正後 p95 18 ms，四個 API 都在 300 ms 內、沒有錯誤。」有條件、有數字、有原因。</p>
+<p>這次只驗證了「預估的尖峰」。如果還想知道離極限有多遠，就把到達率一階一階往上加（例如 × 7、× 10），找出延遲突然暴增的位置，叫<strong>飽和點（saturation point）</strong>：過了這一點，多加一點流量延遲就急遽上升，因為某個資源（連線池、CPU、資料庫）已經滿了在排隊。預估的尖峰離飽和點越遠，對「店長估錯了」的容忍度越大。</p>
+
+<div class="callout practice"><strong>💡 實務上：容量驗證要排進上線前的時程</strong><br>大活動（節慶促銷、媒體曝光、新店開幕）前一到兩週就要做，留時間修和重測；活動前一天才壓測，發現問題也來不及了。結論會給 PM、店長、維運看：寫「在什麼條件下撐得住、離飽和點多遠、撐不住時的備案」（例如看板改成每 3 秒拉一次）。壓測腳本放在 repo 裡（像 <code>loadtest/rush.js</code>），下次改到相關的程式或要辦活動，同一個腳本再跑一次就能比較。</div>
+
+<h2>練習</h2>
+<p>三題都在 <code>delivery/practice/work/11</code> 裡做，寫完回到 <code>learn/</code> 執行 <code>node check.mjs delivery 11</code>。判分不跑 k6：練習 1、2 在判分資料庫裡數查詢、跑 EXPLAIN，練習 3 只檢查你填的數字來自你自己存下的摘要。<strong>先跑一次 <code>npm run load -- before</code> 再改程式</strong>：修好之後就量不到修正前的數字了。</p>
+
+<div class="local" data-test="ex1" data-files="api/src/kitchen/kitchen.module.ts">
+  <p>練習 1：修好廚房看板的 N+1。</p>
+  <ul>
+    <li><code>KitchenService.board()</code> 的查詢數固定，不隨訂單數增加：品項和商品名稱跟訂單一起查（<code>include</code>，或自己用 <code>IN</code> 一次查完再分組）。</li>
+    <li>回應跟原本一樣：只有 <code>paid</code>、<code>preparing</code>；依 <code>orderedAt</code> 由舊到新，相同時依 <code>id</code>；每張單 <code>{ id, status, orderedAt, pickupAt, items: [{ name, quantity }] }</code>。</li>
+    <li>判分：判分資料庫放 5 張和 200 張進行中的訂單，各打一次看板，查詢數要相同而且 ≤ 3；回應跟用 SQL 算出來的看板一致。</li>
+  </ul>
+</div>
+
+<div class="local" data-test="ex2" data-files="api/prisma/schema.prisma">
+  <p>練習 2：新增 migration，用 <code>CREATE INDEX CONCURRENTLY</code> 建 <code>orders(status, ordered_at)</code> 的索引。</p>
+  <ul>
+    <li>新增 <code>api/prisma/migrations/20261111000000_orders_status_index/migration.sql</code>（排在現有的之後），建立 <code>orders_status_ordered_at_idx</code>；既有的 migration 不要改。</li>
+    <li><code>schema.prisma</code> 的 <code>model Order</code> 加上 <code>@@index([status, orderedAt])</code>。</li>
+    <li>判分：migration 用了 CONCURRENTLY；索引的欄位是 <code>(status, ordered_at)</code> 而且有效；判分資料庫放進 20 萬張訂單後，<code>SELECT * FROM orders WHERE status IN ('paid', 'preparing') ORDER BY ordered_at, id</code> 的執行計畫用到這個索引、沒有 Seq Scan。</li>
+  </ul>
+</div>
+
+<div class="local" data-test="ex3" data-files="capacity.json">
+  <p>練習 3：用同一個腳本壓測修正後的版本，填容量結論。</p>
+  <ul>
+    <li>修正前跑過 <code>npm run load -- before</code>；練習 1、2 做完後 <code>npm run db:setup</code>、重新啟動 API，再跑 <code>npm run load -- after</code>。兩個摘要都留在 <code>loadtest/</code>。</li>
+    <li><code>capacity.json</code>：<code>before.p95Ms</code>、<code>after.p95Ms</code> 是 kitchen-board 的 p(95)（四捨五入成整數，數字不是字串）；<code>slowestEndpoint</code> 是修正前 p95 最高的端點（用摘要裡的 name）；<code>cause</code> 是 <code>n-plus-one</code>、<code>missing-index</code> 或 <code>both</code>。</li>
+    <li>判分：數字等於你的 <code>before.json</code>、<code>after.json</code>；after 比 before 快；slowestEndpoint 和 cause 正確。</li>
+  </ul>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 4：壓測用 <code>constant-vus</code>（固定 50 個虛擬使用者，每個等回應回來才送下一個）。系統變慢時會發生什麼事？</p>
+  <label data-key="a">送出的請求數不變，量到的延遲跟開放模型一樣</label>
+  <label data-key="b">錯誤率會上升</label>
+  <label data-key="c">沒有差別，只是寫法不同</label>
+  <label data-key="d">每個使用者等更久才送下一個，送出的請求變少，延遲看起來沒那麼糟，問題被藏起來</label>
+  <p class="why">✓ d。封閉模型的到達率會跟著回應變慢而下降；真實的客人不會因為你慢就少來，所以尖峰要用開放模型（arrival-rate），並確認 dropped_iterations 是 0。a 剛好說反了；b 不一定，慢不等於錯；c 兩種模型在系統變慢時的行為完全不同。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：廚房看板有 200 張單時，一個請求跑了 401 個查詢。最可能的原因是？</p>
+  <label data-key="a">資料庫的機器太小</label>
+  <label data-key="b">N+1：先查 200 張單，再對每張單各查品項和商品</label>
+  <label data-key="c">連線池太小</label>
+  <label data-key="d">API 和資料庫之間的網路延遲</label>
+  <p class="why">✓ b。查詢數跟著資料筆數成長（1 + 200 × 2）就是 N+1 的特徵；用 include 或 IN 一次查回來，查詢數就固定。a、c、d 只會讓每個查詢變慢，不會讓查詢的「個數」變多。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 6：壓測時 p95 很高，你看到資料庫連線池常常是滿的。最先該做什麼？</p>
+  <label data-key="a">把連線池調大</label>
+  <label data-key="b">加 API 的機器</label>
+  <label data-key="c">先找出是哪些查詢占著連線、為什麼慢（查詢 log 的查詢數、EXPLAIN、pg_stat_statements）</label>
+  <label data-key="d">把 SLO 放寬到 1 秒</label>
+  <p class="why">✓ c。連線池滿通常是症狀：N+1 或慢查詢讓每個請求占住連線更久。a 和 b 讓更多慢查詢同時壓在資料庫上，可能更慢；d 是改目標不是解決問題。找到原因、修好之後，才知道還需不需要調池子或加機器。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>用固定虛擬使用者數（封閉模型）壓測尖峰</strong>：系統一慢就少送請求，延遲被藏起來。用 arrival-rate，並確認 <code>dropped_iterations</code> 是 0。</li>
+  <li><strong>只看所有請求混在一起的 p95</strong>：慢的端點被快的稀釋。每個端點加 <code>name</code> 標籤和門檻，分開看。</li>
+  <li><strong>用很少的資料壓測</strong>：6 張訂單看不出缺索引和 N+1。資料量要對齊正式環境和活動當下的狀態。</li>
+  <li><strong>憑感覺修</strong>：先加快取、調大連線池。先用查詢數和 EXPLAIN 找到原因，再決定修法。</li>
+  <li><strong>效能修正順手改了回應</strong>：順序、欄位變了，前端就壞了。修之前先確定回應的形狀，修完比對。</li>
+  <li><strong>在正式表上用一般的 <code>CREATE INDEX</code></strong>：建索引的整段時間擋住寫入。用 <code>CREATE INDEX CONCURRENTLY</code>，單獨一個 migration；失敗時記得清掉 INVALID 的索引。</li>
+  <li><strong>只在 SQL 建索引、schema.prisma 沒寫</strong>：下次產生 migration 時 Prisma 會把它刪掉。兩邊都要有，名稱一致。</li>
+  <li><strong>建了索引沒確認會不會用</strong>：欄位順序錯了，PostgreSQL 根本不用它。用 EXPLAIN 確認。</li>
+  <li><strong>修完沒用同一個腳本重測</strong>：沒有「之後」的數字，就證明不了改善，也不知道還有沒有別的瓶頸。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>容量驗證先把目標寫成數字（每個端點的 p95、錯誤率），再依平常尖峰 × 倍數估出每個端點的流量；也要估每個請求要處理的資料量，並準備同樣多的資料。</li>
+  <li>尖峰用開放模型（k6 的 ramping-arrival-rate）壓測，每個端點分開算 p95，先確認 <code>dropped_iterations</code> 是 0 再讀數字。</li>
+  <li>找原因靠證據：查詢 log 數查詢數（跟著資料筆數成長就是 N+1），EXPLAIN 看有沒有整張表掃描。N+1 用 include 或 IN 一次查完；索引依「等號篩選在前、排序在後」決定欄位順序，再用 EXPLAIN 確認真的有用到。</li>
+  <li>正式表上建索引用 <code>CREATE INDEX CONCURRENTLY</code>，放在新的 migration，schema.prisma 同步宣告。</li>
+  <li>修完用同一個腳本、同樣的資料再跑一次，結論寫出條件、修正前後的數字和原因。</li>
+</ul>
+<p>下一課是線上事故演練：某天早上告警響了，要從 log 和部署紀錄找出是哪次變更拖慢了系統，先止血、再修根因，最後寫一份不究責的事後檢討。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

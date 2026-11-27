@@ -1,0 +1,1739 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>9. 冪等性：重試也不會重複扣款</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="9">
+<header>
+  <div class="eyebrow">階段 3：可靠性：失敗是常態 · 第 9 課</div>
+  <h1>冪等性：重試也不會重複扣款</h1>
+</header>
+<main>
+
+<p>早上 8 點，陳美華在捷運上用 App 點了一杯拿鐵。訂單服務向金流閘道扣了 110 元，扣款成功，可是回應在路上遺失了：列車進隧道，手機斷線。App 等到逾時就自動重試，正好踩中<a href="08-timeouts-retries-backoff.html">第 8 課</a>警告過的情況：扣款的 POST 逾時不代表對方沒收到。伺服器又建了一張訂單、又扣了 110 元。她收到兩封扣款通知，客服電話開始響。</p>
+<p>上一課學會「失敗之後重試」，這一課處理重試的代價：同一件事被做了兩次。整課只做一件事：修好這個事故，讓結帳用的 <code>POST /orders</code> 不管被送幾次，都只建一張訂單、只扣一次款。我們會從「重複從哪裡來」一路做到伺服器端的冪等鍵、做到一半當機的復原，最後回到 App 端，看它要怎麼配合。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>為什麼重試會扣兩次款、冪等保證什麼：逾時之後 App 為什麼分不出「沒做」和「做了但回應丟了」；冪等講的是效果而不是回應，POST 要怎樣才能安全重試（開場問題的最小答案）。</li>
+  <li>結帳裡哪些步驟自己就能冪等：集點、改訂單狀態用唯一約束和條件更新，為什麼「先查再寫」擋不住重複。</li>
+  <li>冪等鍵與請求指紋：建立訂單怎麼認出「同一次結帳」，同一把 key 帶了不同內容時怎麼擋。</li>
+  <li>扣款後當機：扣款成功、伺服器還沒記下來就當機，重試怎麼從中斷的地方接著做。</li>
+  <li>App 端與「只扣一次」：App 什麼時候沿用 key、什麼時候換新的，整套做完能不能說是「恰好一次」。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="08-timeouts-retries-backoff.html">第 8 課</a>的重試規則：只重試暫時性錯誤；POST 逾時不代表對方沒收到，直接重試可能扣兩次款。</li>
+  <li><a href="../../postgresql/lessons/18-transactions.html">PostgreSQL 課第 18 課</a>的交易：<code>BEGIN</code> 到 <code>COMMIT</code> 之間的修改一起生效，<code>ROLLBACK</code> 就一起取消。</li>
+  <li><a href="../../postgresql/lessons/31-isolation-upsert.html">PostgreSQL 課第 31 課</a>的 UPSERT：<code>INSERT … ON CONFLICT</code> 撞到唯一約束時改成更新或跳過，檢查和寫入一步完成。</li>
+</ul></div>
+
+<h2>為什麼 App 重試一次，顧客就被扣兩次款？</h2>
+<p>先站在 App 的位置看這件事。App 送出 <code>POST /orders</code> 之後，唯一能讓它知道結果的就是伺服器的回應。回應沒來，它只知道「等太久了」，不知道問題出在去程還是回程。所以逾時的那一刻，實際上可能是下面兩種情況之一：</p>
+<ul>
+  <li>請求根本沒到伺服器：沒有建單、沒有扣款。</li>
+  <li>請求到了、也做完了，只是回應在回程遺失：訂單已建立、錢已經扣了。</li>
+</ul>
+<p>這兩種情況在 App 看來一模一樣，都是「逾時」。陳美華遇到的是第二種，下面這張時間軸把它畫出來：</p>
+
+<figure>
+  <svg viewBox="0 0 700 330" role="img" aria-label="時間軸：App 送出下單，訂單服務向金流扣款成功，回應在回程遺失，App 逾時後重試，訂單服務再扣一次款">
+    <defs><marker id="ar9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="40" y="12" width="120" height="34" rx="6"/><text class="d-text" x="100" y="34" text-anchor="middle">App</text>
+    <rect class="d-soft" x="290" y="12" width="120" height="34" rx="6"/><text class="d-text" x="350" y="34" text-anchor="middle">訂單服務</text>
+    <rect class="d-soft" x="540" y="12" width="120" height="34" rx="6"/><text class="d-text" x="600" y="34" text-anchor="middle">金流閘道</text>
+    <line class="d-line" x1="100" y1="46" x2="100" y2="320" stroke-dasharray="4 4"/>
+    <line class="d-line" x1="350" y1="46" x2="350" y2="320" stroke-dasharray="4 4"/>
+    <line class="d-line" x1="600" y1="46" x2="600" y2="320" stroke-dasharray="4 4"/>
+    <line class="d-line" x1="100" y1="72" x2="346" y2="72" marker-end="url(#ar9)"/><text class="d-small" x="225" y="66" text-anchor="middle">POST /orders（拿鐵 110 元）</text>
+    <line class="d-line" x1="350" y1="100" x2="596" y2="100" marker-end="url(#ar9)"/><text class="d-small" x="475" y="94" text-anchor="middle">扣款 110 元</text>
+    <line class="d-line" x1="600" y1="128" x2="354" y2="128" marker-end="url(#ar9)"/><text class="d-small" x="475" y="122" text-anchor="middle">成功（第 1 筆扣款）</text>
+    <line class="d-line" x1="350" y1="156" x2="200" y2="156"/><text class="d-accent" x="185" y="161" text-anchor="middle">✕</text><text class="d-small" x="275" y="150" text-anchor="middle">201 在回程遺失</text>
+    <text class="d-small" x="108" y="196">逾時，App 以為失敗 → 重試</text>
+    <line class="d-line" x1="100" y1="222" x2="346" y2="222" marker-end="url(#ar9)"/><text class="d-small" x="225" y="216" text-anchor="middle">POST /orders（同樣內容）</text>
+    <line class="d-line" x1="350" y1="250" x2="596" y2="250" marker-end="url(#ar9)"/><text class="d-small" x="475" y="244" text-anchor="middle">扣款 110 元</text>
+    <line class="d-line" x1="600" y1="278" x2="354" y2="278" marker-end="url(#ar9)"/><text class="d-accent" x="475" y="272" text-anchor="middle">成功（第 2 筆扣款）</text>
+    <line class="d-line" x1="350" y1="306" x2="104" y2="306" marker-end="url(#ar9)"/><text class="d-small" x="225" y="300" text-anchor="middle">201：顧客有兩張訂單</text>
+  </svg>
+  <figcaption>客戶端分不出「沒做」和「做了但回應遺失」。重試救回第一種，卻讓第二種變成重複扣款。</figcaption>
+</figure>
+
+<p>App 只有兩個選擇，兩個都會出事。不重試，碰上第一種情況，顧客以為點好了，咖啡師卻從沒收到訂單；重試，碰上第二種情況，就是陳美華的重複扣款。因為 App 分辨不出是哪一種，「永遠不重試」和「永遠重試」都不對。</p>
+<p>就算把 App 的自動重試關掉，問題也不會消失，因為同一個請求被送兩次的來源不只一個：</p>
+<div class="table-wrap"><table>
+  <tr><th>來源</th><th>例子</th></tr>
+  <tr><td>使用者連點</td><td>「結帳」按了兩下，送出兩個請求</td></tr>
+  <tr><td>網路與代理</td><td>手機從 Wi-Fi 切到 4G，連線斷掉後 App 重送；負載平衡器在上游逾時後轉給另一台</td></tr>
+  <tr><td>佇列重送</td><td>消費者處理完、還沒回報「這則處理好了」（ack）就當機，訊息再送一次（<a href="12-queues-outbox.html">第 12 課</a>）</td></tr>
+  <tr><td>webhook 重送</td><td>金流通知「付款成功」，你回得太慢，對方再送一次（<a href="../../nestjs/lessons/22-uploads-webhooks.html">NestJS 課第 22 課</a>）</td></tr>
+  <tr><td>排程</td><td>兩台伺服器都在 03:00 跑同一個結算工作（<a href="14-distributed-locks-leases.html">第 14 課</a>）</td></tr>
+</table></div>
+<p>這張表的共同點是：送出的一方都有正當理由再送一次，因為它們都無法確定上一次有沒有成功。網路上的請求沒辦法保證「只送一次」。我們能控制的只有伺服器這一端：同一件事收到幾次，效果都只發生一次。這個性質叫做冪等。「做幾次都一樣」聽起來很直白，但「一樣」指的是什麼很容易誤解，下一節先把定義講精確。</p>
+
+<h2>「做幾次都一樣」到底保證什麼？</h2>
+<p>上一節說伺服器要做到「收到幾次，效果都只發生一次」，這就是<strong>冪等（idempotent）</strong>的定義：同一個請求執行一次或執行很多次，對伺服器狀態造成的效果相同。看兩個咖啡店的例子：「把訂單 42 設成已付款」做三次，訂單還是已付款，跟做一次一樣，所以冪等；「顧客點數加 10」做三次，就多了 30 點，跟做一次不一樣，所以不冪等。</p>
+<p>定義裡說的是<strong>伺服器狀態</strong>，不是回應。第一次 <code>DELETE /orders/42</code> 回 204（刪除成功），第二次回 404（找不到），兩次回應不同，但做完之後訂單都不在了，伺服器的狀態相同，所以仍然冪等。這個區分在實務上有用：客戶端重試 DELETE 收到 404，不代表出錯，可能只是上一次其實已經成功。反過來，判斷一個操作冪不冪等，要看它對資料做了什麼，不能只看回應長得一不一樣。</p>
+<p>HTTP 本身就有冪等的概念。規格 RFC 9110 替每個方法標了它在<strong>語意上</strong>是不是冪等，也就是規格要求伺服器照這個意思實作。客戶端和中間的程式就靠這個標記決定「這個請求失敗了能不能自動再送」：</p>
+<div class="table-wrap"><table>
+  <tr><th>方法</th><th>冪等</th><th>說明</th></tr>
+  <tr><td>GET、HEAD、OPTIONS、TRACE</td><td>是</td><td>安全方法（safe）：只讀不改，當然冪等</td></tr>
+  <tr><td>PUT</td><td>是</td><td>「把這個資源設成這個內容」，設幾次結果都一樣</td></tr>
+  <tr><td>DELETE</td><td>是</td><td>刪一次和刪兩次，資源都不在了</td></tr>
+  <tr><td>POST</td><td>否</td><td>「建立一張新訂單」，送兩次就兩張</td></tr>
+  <tr><td>PATCH</td><td>否（RFC 5789）</td><td>規格不保證冪等，但可以設計成冪等：「狀態改成 paid」重做沒差，「數量加 1」就不行</td></tr>
+</table></div>
+<p>夾在客戶端和伺服器中間、負責轉送請求的程式叫做<strong>代理（proxy）</strong>，像上一節表裡的負載平衡器就是一種。RFC 9110 對重試的規定是：客戶端不應（SHOULD NOT）自動重試非冪等的請求，除非知道這個請求實際上冪等，或能確認原本的請求沒有被套用；代理一定不能（MUST NOT）自動重試非冪等請求。陳美華的 App 自動重試了一個 POST，正好踩在這條規定上。</p>
+<p>反過來也要小心：方法標成冪等，不代表你的實作冪等。把 <code>PUT /orders/42/pay</code> 寫成「呼叫金流扣款」，用了 PUT 也不會讓重複扣款消失。規格說的是你<em>應該</em>做到的語意，做不做得到，看程式怎麼寫。</p>
+<p>所以開場事故的方向很清楚：下單一定要用 POST，那就要讓這個 POST「實際上冪等」，App 才能放心重試。最小版本的做法是<strong>冪等鍵</strong>：App 每次結帳時產生一個唯一的字串，放在請求裡一起送出，重試時沿用同一個；伺服器記住用過的字串，看到重複的就回傳第一次的結果，不再建單、不再扣款。這要多一張表來記住這些字串，還有清除它們的工作，第四節會完整實作。在那之前先看更便宜的做法：結帳流程裡有些步驟，只要寫法對了，本身就能重做也沒差，根本不需要冪等鍵。</p>
+
+<h2>結帳裡哪些步驟不用冪等鍵，自己就能重做？</h2>
+<p>陳美華的一次結帳，伺服器實際做了好幾件事：建立訂單、向金流扣款、把訂單改成已付款、替這張訂單集點。上一節的例子已經暗示，其中「改成已付款」和「集點」可以設計成重做也沒差。這種不靠額外的紀錄、靠操作本身的寫法就做到的冪等，叫做<strong>自然冪等</strong>。能這樣設計的地方，就不需要冪等鍵表。常用的手法有四種：</p>
+<div class="table-wrap"><table>
+  <tr><th>手法</th><th>不冪等的寫法</th><th>冪等的寫法</th></tr>
+  <tr><td>絕對值取代增量</td><td><code>SET points = points + 10</code></td><td><code>SET status = 'paid'</code>（設成某個值，而不是加減）</td></tr>
+  <tr><td>條件更新（conditional update，也叫 compare-and-set，<a href="../../nestjs/lessons/18-layering-domain.html">NestJS 課第 18 課</a>）</td><td>先 SELECT 狀態，程式判斷後再 UPDATE</td><td><code>UPDATE orders SET status = 'paid' WHERE id = $1 AND status = 'pending'</code>，看影響了幾列</td></tr>
+  <tr><td>唯一約束＋已存在就跳過</td><td>先查「這張訂單集過點了嗎」，沒有再 INSERT</td><td><code>INSERT INTO stamp_awards (order_id, …) VALUES (…) ON CONFLICT (order_id) DO NOTHING</code></td></tr>
+  <tr><td>自然鍵</td><td>付款表用自動遞增 id，同一張訂單可以有很多筆付款</td><td>付款表以 <code>order_id</code> 當唯一鍵：一張訂單只能有一筆付款</td></tr>
+</table></div>
+<p>逐列看它們怎麼擋住重做：</p>
+<ul>
+  <li><strong>絕對值取代增量</strong>：「設成 paid」不管做幾次，結果都是 paid；「加 10 點」每做一次就多 10 點。能用「設成某個值」表達的，就不要用「加減」。</li>
+  <li><strong>條件更新</strong>：把「現在是什麼狀態」寫進 <code>WHERE</code>。第一次執行時訂單是 pending，更新 1 列；重試時訂單已經是 paid，條件不成立，更新 0 列，什麼都沒變。程式看影響列數就知道這次有沒有真的改到。</li>
+  <li><strong>唯一約束＋已存在就跳過</strong>：集點沒辦法寫成「設成某個值」，因為點數本來就是累加的。改成先插入一筆「這張訂單集過點」的紀錄，<code>order_id</code> 設唯一約束；重試時插入撞到約束，<code>DO NOTHING</code> 跳過，後面的加點也就不做。</li>
+  <li><strong>自然鍵</strong>：用業務上本來就唯一的東西當鍵。一張訂單只該有一筆付款，那付款表就以 <code>order_id</code> 為唯一鍵，資料庫會擋掉第二筆。</li>
+</ul>
+<p>表裡「不冪等的寫法」那一欄，第二、三列有個共同的形狀：程式先查詢，再依查詢結果決定要不要寫，叫做「先讀再寫」。它在只有一個請求時看起來沒問題，問題出在兩個請求<strong>同時</strong>進來。陳美華的重試和第一個請求就可能同時在跑：兩個請求都去查「這張訂單集過點了嗎」，都讀到「還沒有」，於是兩個都去加點。查詢和寫入之間隔著一次網路往返，另一個請求就是在這個空檔插隊的。</p>
+<p>條件更新和 <code>ON CONFLICT DO NOTHING</code> 不會有這個問題，因為它們是<strong>原子</strong>的：「檢查」和「寫入」在資料庫裡一步完成，中間沒有空檔讓別人插隊。下面用一個每次存取都要等一次網路往返的假資料表重現兩種寫法，執行後比較兩行「陳美華的點數」：先讀再寫的那行多給了點數，原子操作那行剛好 3 點。</p>
+
+<div class="lab"><script type="code">
+const roundTrip = () => new Promise<void>(resolve => setTimeout(resolve, 0))   // 模擬一次資料庫往返
+
+// 先讀再寫：查詢和寫入是兩次往返，中間別的請求可以插隊
+const awarded = new Set<number>()
+const stamps = new Map<string, number>()
+async function awardNaive(orderId: number, customer: string, n: number) {
+  await roundTrip()
+  if (awarded.has(orderId)) return 'already'
+  await roundTrip()
+  awarded.add(orderId)
+  stamps.set(customer, (stamps.get(customer) ?? 0) + n)
+  return 'awarded'
+}
+console.log('先讀再寫：', await Promise.all([awardNaive(1, '陳美華', 3), awardNaive(1, '陳美華', 3)]))
+console.log('陳美華的點數：', stamps.get('陳美華'), '（應該是 3）')
+
+// 原子的「不存在才插入」：檢查和寫入在同一步，像 INSERT … ON CONFLICT DO NOTHING
+const awarded2 = new Set<number>()
+const stamps2 = new Map<string, number>()
+async function insertIfAbsent(set: Set<number>, id: number) {
+  await roundTrip()
+  if (set.has(id)) return false
+  set.add(id)
+  return true
+}
+async function awardAtomic(orderId: number, customer: string, n: number) {
+  if (!await insertIfAbsent(awarded2, orderId)) return 'already'
+  await roundTrip()
+  stamps2.set(customer, (stamps2.get(customer) ?? 0) + n)   // 真實資料庫用 UPDATE … SET stamps = stamps + $1，也是原子的
+  return 'awarded'
+}
+console.log('原子操作：', await Promise.all([awardAtomic(1, '陳美華', 3), awardAtomic(1, '陳美華', 3)]))
+console.log('陳美華的點數：', stamps2.get('陳美華'))
+</script></div>
+
+<p>注意第二段的點數仍是增量（加 3），但它被「這張訂單只能集一次」的唯一約束保護住了，所以整體冪等。真實系統裡，插入集點紀錄和加點數要放在同一個交易：如果插入成功、加點前當機，交易回滾，集點紀錄也跟著消失，重試時才會再做一次；如果兩者分開提交，集點紀錄留下了、點數卻沒加，重試時會被唯一約束擋住，這張訂單的點數就永遠少了。</p>
+<div class="callout practice"><strong>💡 實務上：先問「這段被呼叫兩次會怎樣」</strong><br>Code review 時看到 <code>SET stamps = stamps + 1</code>、「先 SELECT 查有沒有、再 INSERT」，就是該停下來問的地方，咖啡店的集點、發兌換券、改訂單狀態都是常見位置。能用唯一約束或條件更新解決的，就不要急著加冪等鍵表：少一張要維護、定期清除的表。條件更新記得檢查影響列數：0 列代表條件不成立，可能是別人已經做過，也可能訂單根本不在那個狀態（例如已取消），要再查一次狀態決定回傳什麼，不是直接丟 500。替既有的表補唯一約束時，舊資料裡可能已經有重複，migration 會失敗，要先查出來、跟 PM 確認怎麼處理再上線。</div>
+<p>改狀態和集點解決了，但結帳還剩兩步做不到自然冪等。第一步是建立訂單：陳美華可能真的想連買兩杯拿鐵，同樣內容的兩個請求不一定是重送，資料庫沒有任何唯一約束能分辨。第二步是扣款：它發生在金流的系統裡，不在你的資料庫，你的唯一約束擋不到，交易回滾也退不回錢。像扣款、寄簡訊這種發生在別人系統裡、無法用你的交易回滾的動作，叫做<strong>外部副作用（foreign state mutation）</strong>。這兩步都需要冪等鍵，而扣款這一步，還要把同一把 key 傳給金流。下一節從建立訂單開始。</p>
+
+<h2>建立訂單：伺服器怎麼認出「這是同一次結帳」？</h2>
+<p>上一節留下的問題是：兩個內容一模一樣的 <code>POST /orders</code>，伺服器分不出是「重送」還是「真的又買一杯」。光看內容永遠分不出來，因為差別不在內容，而在顧客的<strong>意圖</strong>：按下一次「結帳」是一個意圖，App 為了這個意圖送幾次請求都還是同一個意圖；顧客再按一次「結帳」，才是新的意圖。</p>
+<p>伺服器看不到意圖，只有 App 知道，所以要讓 App 把它說出來。做法是：每一個意圖產生一個唯一的字串，叫做<strong>冪等鍵（idempotency key）</strong>，下面簡稱 key。App 把它放在請求標頭裡；重試時沿用同一把，下一次結帳換新的。伺服器第一次看到某把 key 時，照常建單、扣款，並把回應存起來；之後再看到同一把 key，就不再做一次，直接回傳存下的那份回應。對陳美華的 App 來說，重試拿到的回應跟第一次完全相同，它不會知道、也不需要知道伺服器其實沒再做一次。</p>
+<pre>POST /orders
+Idempotency-Key: "8e03978e-40d5-43e8-bc93-6894a57f9324"
+Content-Type: application/json
+
+{"items":{"2":1},"storeId":1}</pre>
+<p><code>Idempotency-Key</code> 這個標頭有一份 IETF 正在制定的規格，目前是草案，<strong>還不是 RFC</strong>（版本見課末「補充與查表」）。草案把標頭的值定義成 Structured Field 的 String，也就是要用雙引號包起來，所以範例的 key 有引號。key 本身通常用 V4 UUID：隨機產生的 128 位元識別碼，像上面那串，幾乎不可能撞到。</p>
+<p><a href="../../node/lessons/14-rest-api-design.html">Node 課第 14 課</a>做過冪等鍵的基本規則。伺服器收到請求時會遇到的情況，加上草案建議的狀態碼，整理如下：</p>
+<div class="table-wrap"><table>
+  <tr><th>情況</th><th>伺服器怎麼做</th><th>草案建議</th></tr>
+  <tr><td>這個端點要求 key，請求沒帶</td><td>拒絕，回應裡連到冪等規則的文件</td><td>400</td></tr>
+  <tr><td>第一次看到這把 key</td><td>記下 key，執行，存下回應</td><td>依結果</td></tr>
+  <tr><td>同 key、同內容，第一次已經完成</td><td>不執行，回傳存下的回應</td><td>同第一次</td></tr>
+  <tr><td>同 key，第一次還在處理中</td><td>拒絕，請客戶端稍後再試</td><td>409 Conflict</td></tr>
+  <tr><td>同 key、不同內容</td><td>拒絕，這是 key 被誤用</td><td>422 Unprocessable Content</td></tr>
+</table></div>
+<p>後兩列要分開看。「還在處理中」發生在重試比第一個請求還快到：第一個請求還在扣款，重試就進來了。這時不能回放（還沒有回應可回放），也不能再做一次，只能請客戶端等一下再用同一把 key 來問。「同 key 不同內容」則是客戶端寫錯了，例如結帳成功後沒換 key，就拿去送下一張訂單；這種情況再試幾次都一樣，客戶端不該重試。兩者用不同的狀態碼，客戶端才能分辨「等一下再來」和「你的程式有 bug」。各家 API 在這裡的選擇不完全一樣，本課程照 IETF 草案（對照見課末）。</p>
+<p>伺服器要記住 key，就需要一張表。下面是 PostgreSQL 的版本，有幾個欄位要到後面兩節才用得到，先看懂主鍵就好：</p>
+<pre>CREATE TABLE idempotency_keys (
+  customer_id     bigint      NOT NULL,
+  idempotency_key text        NOT NULL CHECK (length(idempotency_key) BETWEEN 1 AND 255),
+  request_method  text        NOT NULL,
+  request_path    text        NOT NULL,
+  request_hash    text        NOT NULL,              -- 下一節的請求指紋
+  recovery_point  text        NOT NULL DEFAULT 'started',
+  locked_at       timestamptz,
+  response_code   int,
+  response_body   jsonb,
+  created_at      timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (customer_id, idempotency_key)
+);</pre>
+<p>主鍵是 <code>(customer_id, idempotency_key)</code>，不是只有 key。key 是客戶端產生的，伺服器不能假設不同使用者不會撞到同一把：有 bug 的 App 可能把它寫死成同一個值。只用 key 當主鍵時，王小明的請求可能拿到陳美華的訂單回應，或被當成「同 key 不同內容」而失敗。所以 key 要<strong>限定在使用者範圍</strong>內：同一把 key，對不同顧客是不同的紀錄。<code>request_method</code> 和 <code>request_path</code> 記下這把 key 用在哪個端點，<code>response_code</code>、<code>response_body</code> 就是要回放的那份回應。</p>
+<p>還有一個並發的問題：陳美華的重試可能在第一個請求還沒寫進 key 紀錄之前就到了，兩個請求都查「這把 key 有沒有紀錄」，都讀到沒有。這就是上一節的「先讀再寫」，解法也一樣，用原子操作 <code>INSERT … ON CONFLICT DO NOTHING</code> 判斷誰先到：插入成功的那個請求負責執行；插入失敗代表 key 已經存在，再讀出紀錄，依上面的表決定回放、409 或 422。另外，咖啡店的 API 跑在多台伺服器、多個程序上，同一把 key 的重試可能被負載平衡器送到另一台，所以 key 一定要存在大家共用的資料庫，不能放在某個程序的記憶體裡（<a href="../../node/lessons/24-scaling.html">Node 課第 24 課</a>）。</p>
+<p>這張表會一直長大，所以 key 不能永遠保存。草案允許 key 有保存期限，但有的話要把保存政策公開寫在 API 文件裡，客戶端才知道重試最晚要在什麼時候之前送出。實際的 API 保存多久、錯誤回應存不存，以 Stripe 為例整理在課末。</p>
+
+<div class="callout practice"><strong>💡 實務上：只替「重複會造成損失」的端點加冪等鍵</strong><br>咖啡店後台裡，結帳、付款、退款、儲值、發送兌換券是優先名單；改暱稱、更新營業時間這類 PUT 本來就重做沒差，不需要。設計 API 時可以先問：「這個請求被送兩次，誰會損失、損失多少？」會扣到錢或寄出東西的，才值得多一張表和一個清除程式。冪等鍵是前後端的約定，要寫進 API 文件：哪些端點要求 key、保存多久、409 和 422 代表什麼，App 和網頁的同事才會照同一套規則實作。</div>
+<p>規則表裡還有一列沒說怎麼做：「同 key、不同內容」要回 422，伺服器得先能比較兩次請求的內容。這比看起來難，下一節處理。</p>
+
+<h2>同一把 key 送來的，怎麼確認是同一份內容？</h2>
+<p>要偵測上一節的「同 key、不同內容」，伺服器得把這一次的請求內容跟第一次的比較。把整份 body 存起來逐欄比對很浪費空間，常見做法是只存<strong>請求指紋（request fingerprint）</strong>：把請求內容算成一個固定長度的雜湊值。內容一樣，指紋就一樣；內容差一個字，指紋就完全不同。前面那張表的 <code>request_hash</code> 欄位存的就是它。</p>
+<p>直覺的寫法是 <code>sha256(JSON.stringify(body))</code>。問題是同一份資料可以有不同的 JSON 字串：咖啡店的 iOS 和 Android App 各自組 JSON，欄位順序不一定一樣。下面這格執行後，先看「字串相同嗎？」那一行，再看最後兩行的順序：</p>
+
+<div class="lab"><script type="code">
+// 同一份購物車，只是欄位的順序不同（iOS 和 Android 的 App 各自組 JSON）
+const fromIos = { storeId: 1, items: { '2': 1, '5': 2 }, note: '少冰' }
+const fromAndroid = { note: '少冰', items: { '5': 2, '2': 1 }, storeId: 1 }
+console.log(JSON.stringify(fromIos))
+console.log(JSON.stringify(fromAndroid))
+console.log('字串相同嗎？', JSON.stringify(fromIos) === JSON.stringify(fromAndroid))
+
+// 想「排序後重建物件」再 stringify？整數形式的鍵永遠依數字大小排在最前面
+const rebuilt = Object.fromEntries([['10', 1], ['9', 2]])
+console.log('重建後的鍵順序：', Object.keys(rebuilt).join(', '))
+console.log('字串排序：', ['10', '9'].sort().join(', '))
+</script></div>
+
+<p>第一段：最上層的鍵順序不同，字串就不同，指紋也不同。伺服器會把一次正常的重試誤判成「同 key 不同內容」，回 422，陳美華的 App 就把一次本來會成功的結帳當成錯誤。注意 <code>items</code> 裡的 <code>'5'</code>、<code>'2'</code> 反而自動排好了：JavaScript 物件的整數鍵（像 <code>'2'</code>、<code>'10'</code>）永遠依數字大小排在其他鍵前面，跟插入順序無關。</p>
+<p>第二段說明為什麼不能「建一個依序插入鍵的新物件再 <code>JSON.stringify</code>」：你想要字串順序 <code>'10'</code>、<code>'9'</code>，JavaScript 卻給你 <code>'9'</code>、<code>'10'</code>。如果另一個用 Go、Python 寫的服務照字串順序算，兩邊的指紋就對不起來。</p>
+<p>解法是<strong>正規化 JSON（canonical JSON）</strong>：一套固定的輸出規則，讓同樣的資料一定得到同樣的字串。規則有三條：物件的鍵遞迴地依固定順序排列；沒有多餘空白；陣列保持原順序，因為陣列的順序有意義，<code>[拿鐵, 可頌]</code> 和 <code>[可頌, 拿鐵]</code> 可以是不同的請求。鍵的順序要選一個各語言都算得一樣的。RFC 8785（JSON Canonicalization Scheme）用的是 UTF-16 碼位，剛好就是 JavaScript 陣列 <code>sort()</code> 對字串的預設順序。上面第二段已經示範過，物件的鍵順序靠不住，所以輸出要自己一段一段串字串。</p>
+<p>正規化之後算 SHA-256（<a href="../../auth/lessons/02-crypto-toolbox.html">認證課第 2 課</a>）：<code>TextEncoder</code> 把字串轉成位元組，<code>crypto.subtle.digest('SHA-256', bytes)</code> 回傳 32 個位元組，轉成 64 個字元的小寫 hex 存進 <code>request_hash</code>。</p>
+<p>指紋的用途要分清楚：它只拿來<strong>比對</strong>同一把 key 的兩次請求，不是拿來去重。不能反過來用「內容相同就當成重複」：同一位顧客 10 分鐘內真的買了兩杯一模一樣的拿鐵，內容相同、意圖不同，這正是上一節要引入 key 的原因。認出重複靠 key，確認 key 沒被誤用才靠指紋。</p>
+<p>到這裡，伺服器能認出重送，也能擋住誤用的 key；第一次做完的請求，重試時回放存下的回應就好。但規則表默默假設了一件事：第一次的請求要嘛做完了，要嘛還在做。如果它做到一半，伺服器就當機了呢？</p>
+
+<h2>扣款成功後伺服器當機，重試要從哪裡接著做？</h2>
+<p>上一節留下的情況在正式環境並不少見：部署重啟、記憶體不足、機器被回收，都會讓程序在任意一行停下來。而下單不是一個動作，是一串：建立訂單（自己的資料庫）→ 扣款（金流，外部）→ 把訂單改成已付款、排入寄收據的工作（自己的資料庫）。假設伺服器在扣款成功之後、記下扣款之前當機，key 紀錄裡沒有存下的回應，陳美華的 App 用同一把 key 重試時，伺服器該重新扣款嗎？只有「存下最後的回應」不夠回答這個問題，伺服器還需要知道上次做到哪一步。</p>
+<p>直覺的做法是把整串包進一個資料庫交易：要嘛全做，要嘛全不做。這行不通，原因有兩個。第一，扣款不在你的資料庫裡：交易回滾只會撤銷你資料庫裡的修改，金流那邊的錢不會退回來。第二，呼叫金流要幾百毫秒到幾秒，這段時間交易一直開著、握著鎖，其他要動同一筆資料的請求都在等。結論是：<strong>呼叫外部服務不要放在交易裡。</strong></p>
+<p>Brandur Leach 仿照 Stripe 的設計提出了另一種做法。把整串工作切成幾個<strong>原子階段（atomic phase）</strong>，每個階段是一個資料庫交易，交易裡除了做這個階段的事，還同時更新這把 key 的<strong>復原點（recovery point）</strong>：一個記錄「做到哪一步」的欄位，就是 key 表裡的 <code>recovery_point</code>。因為更新復原點和這個階段的寫入在同一個交易，兩者一定一起成功或一起消失，復原點永遠不會跟實際資料對不上。外部呼叫放在兩個交易之間。重試時先讀出這把 key 的復原點，從那裡繼續，做過的階段不再做。</p>
+
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="復原點的流程：started 經過交易 1 到 order_created，呼叫金流後經過交易 2 到 payment_captured，經過交易 3 到 finished">
+    <defs><marker id="ar9b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="10" y="30" width="130" height="44" rx="8"/><text class="d-text" x="75" y="57" text-anchor="middle">started</text>
+    <rect class="d-box" x="190" y="30" width="140" height="44" rx="8"/><text class="d-text" x="260" y="57" text-anchor="middle">order_created</text>
+    <rect class="d-box" x="380" y="30" width="160" height="44" rx="8"/><text class="d-text" x="460" y="57" text-anchor="middle">payment_captured</text>
+    <rect class="d-box" x="580" y="30" width="110" height="44" rx="8"/><text class="d-text" x="635" y="57" text-anchor="middle">finished</text>
+    <line class="d-line" x1="140" y1="52" x2="186" y2="52" marker-end="url(#ar9b)"/>
+    <line class="d-line" x1="330" y1="52" x2="376" y2="52" marker-end="url(#ar9b)"/>
+    <line class="d-line" x1="540" y1="52" x2="576" y2="52" marker-end="url(#ar9b)"/>
+    <rect class="d-soft" x="10" y="100" width="210" height="96" rx="8"/>
+    <text class="d-accent" x="20" y="122">交易 1</text>
+    <text class="d-small" x="20" y="144">建立 pending 訂單</text>
+    <text class="d-small" x="20" y="164">復原點 → order_created</text>
+    <text class="d-small" x="20" y="184">（記下 orderId）</text>
+    <rect class="d-soft" x="240" y="100" width="220" height="96" rx="8"/>
+    <text class="d-accent" x="250" y="122">金流（交易外）＋ 交易 2</text>
+    <text class="d-small" x="250" y="144">扣款，冪等鍵 pay:&lt;key&gt;</text>
+    <text class="d-small" x="250" y="164">訂單 → paid、記下 chargeId</text>
+    <text class="d-small" x="250" y="184">復原點 → payment_captured</text>
+    <rect class="d-soft" x="480" y="100" width="210" height="96" rx="8"/>
+    <text class="d-accent" x="490" y="122">交易 3</text>
+    <text class="d-small" x="490" y="144">排入寄收據的工作</text>
+    <text class="d-small" x="490" y="164">存下回應 201</text>
+    <text class="d-small" x="490" y="184">復原點 → finished</text>
+    <text class="d-small" x="350" y="232" text-anchor="middle">每個交易裡的寫入和復原點一起提交，或一起回滾；重試時從復原點繼續</text>
+  </svg>
+  <figcaption>三個原子階段。外部的扣款夾在交易 1 和交易 2 之間，用由本地 key 衍生的冪等鍵保護。</figcaption>
+</figure>
+
+<p>這套設計對不對，要逐一檢查每個可能當機的位置，看重試時會發生什麼：</p>
+<div class="table-wrap"><table>
+  <tr><th>當機的位置</th><th>資料庫裡的狀態</th><th>重試時</th></tr>
+  <tr><td>交易 1 提交前</td><td>交易回滾，沒有訂單、沒有 key 紀錄</td><td>從頭開始，只會建一張訂單</td></tr>
+  <tr><td>交易 1 提交後、扣款前</td><td>復原點 order_created</td><td>沿用那張訂單，去扣款</td></tr>
+  <tr><td>扣款成功、交易 2 提交前</td><td>復原點仍是 order_created，但金流已經扣了錢</td><td>再呼叫一次金流，帶<strong>同一個</strong> <code>pay:&lt;key&gt;</code>，金流認出重複，回傳原本那筆扣款</td></tr>
+  <tr><td>交易 2 提交後</td><td>復原點 payment_captured</td><td>不再扣款，直接做交易 3</td></tr>
+  <tr><td>交易 3 提交後、回應送出前</td><td>復原點 finished，回應已存</td><td>直接回傳存下的回應</td></tr>
+</table></div>
+<p>第三列就是開場那種「扣款成功、還沒記下來」的情況，也是整個設計的關鍵。你的資料庫和金流之間沒有共同的交易，「扣款成功」和「記下扣款」之間一定有空隙，不管程式怎麼排都消不掉。補上空隙的是外部服務自己的冪等：金流也接受冪等鍵，你把由本地 key 衍生的 <code>pay:&lt;key&gt;</code> 傳過去，你的 key 跟金流的 key 一對一，重試幾次都是同一筆扣款。這正是第三節末尾說的「扣款這一步，還要把同一把 key 傳給金流」。所以挑金流、簡訊這類外部服務時，「支不支援冪等鍵」是要確認的條件。</p>
+<p>剩下三件事要處理，才能讓這套流程在正式環境跑得住。</p>
+<p>第一是交易 3 裡的寄收據。如果在交易外直接寄信，交易 3 提交前當機，重試時會再做一次交易 3，顧客就收到兩封收據；寄信也是外部副作用。做法是不直接寄，而是在交易 3 裡把「要寄這封信」寫進一張工作表，由背景程式讀出來送。這樣「排入寄信」和「復原點改成 finished」一起提交，要嘛都有、要嘛都沒有。這個做法叫 outbox，<a href="12-queues-outbox.html">第 12 課</a>會完整實作。</p>
+<p>第二是兩個同 key 的請求同時在跑。規則表說第二個要回 409，伺服器得知道第一個「還在處理中」。做法是處理開始時設 <code>locked_at = now()</code>，第二個同 key 的請求看到有鎖就回 409。但程序當機時，鎖不會自己解開：<code>locked_at</code> 留在那裡，之後的重試永遠拿到 409，這把 key 就卡死了。所以鎖要有逾時：超過一段時間沒完成，就視為上一個處理者已經不在，允許下一次重試接手，從復原點繼續。<a href="14-distributed-locks-leases.html">第 14 課</a>會把這種「有期限的鎖」正式叫做租約（lease）。</p>
+<p>第三是清除舊的 key。建立訂單那一節說過 key 表會一直長大，要有一個背景程式定期清掉夠舊的紀錄。保存期限一定要比客戶端最長的重試時間長，否則 key 被清掉之後才到的重試，會被當成新請求，重複扣款又回來了。各家建議的期限見課末。</p>
+
+<div class="callout practice"><strong>💡 實務上：復原點留給「跨外部服務、牽涉金額」的流程</strong><br>大部分端點只動自己的資料庫，一個交易加上唯一約束就夠了，不需要切階段。結帳、退款、跟物流或發票系統串接這類「中間夾著外部呼叫」的流程，才值得付出更多狀態與測試的成本。設計審查時，資深工程師常做的事就是畫出上面那張「當機的位置」表：每個外部呼叫前後各當機一次，重試會發生什麼。串接新的金流或簡訊廠商前，先確認它支援冪等鍵、保存多久；不支援的話，要另外想辦法查詢「上次到底成功了沒」，這會讓設計複雜很多。</div>
+<p>伺服器端到這裡完整了：認得出重送、擋得住誤用、做到一半也接得回來。但這一切都建立在一個前提上：App 送來的 key 是對的。如果陳美華的 App 每次重試都換一把新 key，伺服器做得再好也沒用。</p>
+
+<h2>App 端怎麼配合，才算真的「只扣一次」？</h2>
+<p>上一節的前提要靠 App 遵守，伺服器沒辦法替它做。App 端的規則都從同一句話推出來：<strong>一把 key 代表一個意圖</strong>。</p>
+<ul>
+  <li><strong>一個意圖一把 key。</strong>key 在使用者按下「結帳」那一刻產生，不是每次送出請求時產生。如果寫在送請求的函式裡，每次重試就會自動拿到新 key。</li>
+  <li><strong>重試沿用同一把。</strong>每次重試換新 key，伺服器會把重試當成新的意圖，等於沒有 key，陳美華還是會被扣兩次。</li>
+  <li><strong>成功或放棄之後，下一個意圖換新 key。</strong>拿舊 key 下第二張訂單，伺服器會回放第一張的回應，App 以為成功了，第二杯拿鐵卻沒被點到。</li>
+  <li><strong>連點共用同一個請求。</strong>第一個請求還在跑時使用者再按一次，回傳同一個進行中的 Promise（<a href="../../typescript/lessons/12-races-concurrency.html">TypeScript 課第 12 課</a>的單一飛行），不產生新 key，也不送第二個請求。</li>
+  <li><strong>收到 409 就等一下再用同一把 key 重試；收到 422 不要重試。</strong>409 代表第一個請求還在處理，等一下就會有結果；422 是程式的 bug（同一把 key 被拿去送不同內容），重試幾次都一樣。</li>
+</ul>
+<p>伺服器和 App 都照規則做之後，陳美華的事故就不會再發生：App 逾時重試，帶的是同一把 key，伺服器回放第一次的回應，她只被扣一次款。那可以說這套系統做到了「恰好一次」嗎？</p>
+<p>精確地說，不行。<strong>「恰好一次」（exactly-once）送達，在跨系統的網路上做不到。</strong>回想第一節：網路可能遺失訊息，所以要重送；重送就可能重複，而送出的一方永遠分不出是哪一種。訊息送達只有兩種保證可選，加上處理端的冪等，才得到我們要的結果：</p>
+<div class="table-wrap"><table>
+  <tr><th>送達語意</th><th>做法</th><th>結果</th></tr>
+  <tr><td>至多一次（at-most-once）</td><td>不重試</td><td>不會重複，但可能遺失</td></tr>
+  <tr><td>至少一次（at-least-once）</td><td>重試直到確認</td><td>不會遺失，但可能重複</td></tr>
+  <tr><td>效果上一次（effectively-once）</td><td>至少一次 ＋ 處理端冪等</td><td>訊息可能到很多次，效果只發生一次</td></tr>
+</table></div>
+<p>這一課做的就是第三列：App 至少送一次（逾時就重試），伺服器靠冪等鍵讓效果只發生一次。請求確實可能到了兩次，只是第二次沒有造成任何效果。</p>
+<p>會聽到有人說「某某系統支援 exactly-once」，要問清楚範圍。常見的訊息佇列系統 Kafka 也號稱支援 exactly-once，但它指的是 Kafka 內部：從 Kafka 讀、處理、再寫回 Kafka 這一段可以做到不重複（靠 Kafka 自己的交易）。消費者拿到訊息後去扣款、寄信，這些動作不在 Kafka 的交易裡，仍然要靠冪等鍵或去重，<a href="12-queues-outbox.html">第 12 課</a>會實作。</p>
+<div class="callout practice"><strong>💡 實務上：上線後用指標確認冪等真的在運作</strong><br>冪等鍵上線之後要看四個指標。每個端點的<strong>回放次數</strong>（同 key 回傳存下的回應），突然上升代表客戶端或網路在大量重試；<strong>409 與 422 的比例</strong>，422 不該出現，出現就是某個客戶端版本的 bug，要找 App 的同事查是哪一版；<strong>key 表的列數與清除進度</strong>，清除工作停了，表會一直長大；<strong>停在中間復原點太久的 key</strong>，代表有請求做到一半被放棄，可能有顧客被扣了款卻沒拿到訂單確認。</div>
+
+<h2>補充與查表</h2>
+<p>查表用，不用背。實作或串接時，以各自最新的官方文件為準。</p>
+<ul>
+  <li><strong>IETF 草案</strong>：<code>draft-ietf-httpapi-idempotency-key-header-08</code>（2026-10-22 更新），還不是 RFC。標頭值是 Structured Field 的 String（要加雙引號）。缺 key 回 400、同 key 處理中回 409、同 key 不同內容回 422。key 可以有保存期限，有的話要把保存政策公開寫在 API 文件裡。</li>
+  <li><strong>HTTP 方法的出處</strong>：方法的冪等語意定義在 RFC 9110 §9.2.2。PATCH 不在 RFC 9110 裡，定義在 RFC 5789。</li>
+  <li><strong>Stripe（API v1，依官方文件）</strong>：key 最長 255 字元，建議用 V4 UUID，不要放 email 等個資。key 存滿 24 小時之後才可能被清除；清除之後再用同一把 key，會被當成新請求。端點<strong>開始執行之後</strong>才保存第一次的狀態碼與 body，<strong>包含 500</strong>：同 key 重試會一直拿到那個 500。參數驗證失敗、或撞上同 key 正在執行的請求時不保存，可以再試。會比對參數，不同就回錯誤。只有 POST 接受冪等鍵（GET、DELETE 本來就冪等）。</li>
+  <li><strong>Stripe API v2</strong>：改成重試時把失敗或做一半的工作做完，再回傳更新後的結果。</li>
+  <li><strong>Brandur Leach〈Implementing Stripe-like Idempotency Keys in Postgres〉</strong>：參數不符時回 409；本課程照 IETF 草案用 422，讓 409 只代表「還在處理中」，客戶端比較好分辨。文章建議由另一個背景程式清掉約 72 小時前的 key。另外建議（列為進階目標）加一個背景程式（completer），主動把被放棄的請求做完，客戶端沒再重試也不會卡在半路。</li>
+</ul>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：寫三個函式，替冪等鍵表準備資料。</p>
+  <ul>
+    <li><code>canonicalJson(value)</code>：輸出跟 <code>JSON.stringify</code> 一樣（沒有空白），但物件的鍵遞迴地用陣列 <code>sort()</code> 的預設順序排列，陣列保持原順序。要自己串接字串，不能「建一個依序插入鍵的新物件再 <code>JSON.stringify</code>」（整數鍵會被重新排序）。字串、數字、<code>true</code>／<code>false</code>、<code>null</code> 的寫法可以交給 <code>JSON.stringify</code>（引號、換行的跳脫才會一樣）。遇到 <code>undefined</code>、函式、bigint、<code>NaN</code>、<code>Infinity</code>（不管在第幾層）丟 <code>TypeError</code>。</li>
+    <li><code>fingerprint(body)</code>：<code>canonicalJson</code> 之後用 <code>TextEncoder</code> 轉成位元組，算 <code>crypto.subtle.digest('SHA-256', …)</code>，回傳小寫 hex（起始程式附了 <code>toHex</code>）。</li>
+    <li><code>recordKey(customerId, method, path, key)</code>：回傳 <code>`${customerId}:${方法轉大寫}:${path}:${key}`</code>，當作 key 表的查詢鍵；<code>key</code> 是空字串或超過 255 字元時丟 <code>RangeError</code>。</li>
+  </ul>
+  <script type="start">
+function toHex(buf: ArrayBuffer): string {
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('')
+}
+
+function canonicalJson(value: unknown): string {
+  throw new Error('TODO')
+}
+
+async function fingerprint(body: unknown): Promise<string> {
+  throw new Error('TODO')
+}
+
+function recordKey(customerId: number, method: string, path: string, key: string): string {
+  throw new Error('TODO')
+}
+
+console.log(canonicalJson({ storeId: 1, items: { '10': 1, '9': 2 }, note: '少冰' }))   // {"items":{"10":1,"9":2},"note":"少冰","storeId":1}
+console.log(await fingerprint({ b: 1, a: 2 }) === await fingerprint({ a: 2, b: 1 }))   // true
+console.log(recordKey(2, 'post', '/orders', 'k-1'))   // 2:POST:/orders:k-1
+</script>
+  <script type="answer">
+function toHex(buf: ArrayBuffer): string {
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('')
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === 'boolean' || typeof value === 'string') return JSON.stringify(value)
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError(`JSON 不能表示 ${value}`)
+    return JSON.stringify(value)
+  }
+  if (Array.isArray(value)) return '[' + value.map(v => canonicalJson(v)).join(',') + ']'
+  if (typeof value === 'object') {
+    const obj = value as Record<string, unknown>
+    const parts = Object.keys(obj).sort().map(k => JSON.stringify(k) + ':' + canonicalJson(obj[k]))
+    return '{' + parts.join(',') + '}'
+  }
+  throw new TypeError(`不支援的值：${typeof value}`)
+}
+
+async function fingerprint(body: unknown): Promise<string> {
+  const bytes = new TextEncoder().encode(canonicalJson(body))
+  return toHex(await crypto.subtle.digest('SHA-256', bytes))
+}
+
+function recordKey(customerId: number, method: string, path: string, key: string): string {
+  if (key.length === 0 || key.length > 255) throw new RangeError('冪等鍵長度要在 1～255 字元之間')
+  return `${customerId}:${method.toUpperCase()}:${path}:${key}`
+}
+
+console.log(canonicalJson({ storeId: 1, items: { '10': 1, '9': 2 }, note: '少冰' }))   // {"items":{"10":1,"9":2},"note":"少冰","storeId":1}
+console.log(await fingerprint({ b: 1, a: 2 }) === await fingerprint({ a: 2, b: 1 }))   // true
+console.log(recordKey(2, 'post', '/orders', 'k-1'))   // 2:POST:/orders:k-1
+</script>
+  <script type="types">
+type _1 = Expect<Equal<ReturnType<typeof fingerprint>, Promise<string>>>  // fingerprint 要回傳 Promise<string>
+type _2 = Expect<Equal<ReturnType<typeof canonicalJson>, string>>  // canonicalJson 要回傳 string
+</script>
+  <script type="tests">
+const refCanon = (v: unknown): string => {
+  if (Array.isArray(v)) return '[' + v.map(x => refCanon(x)).join(',') + ']'
+  if (v !== null && typeof v === 'object') {
+    const o = v as Record<string, unknown>
+    return '{' + Object.keys(o).sort().map(k => JSON.stringify(k) + ':' + refCanon(o[k])).join(',') + '}'
+  }
+  return JSON.stringify(v)
+}
+const refHex = async (s: string) => [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s)))].map(b => b.toString(16).padStart(2, '0')).join('')
+const throwsType = (v: unknown, msg: string) => {
+  let err: unknown
+  try { canonicalJson(v) } catch (e) { err = e }
+  assert(err instanceof TypeError, `${msg}：要丟 TypeError`)
+}
+
+assert.equal(canonicalJson({ '10': 1, '9': 2 }), '{"10":1,"9":2}', "{ '10': 1, '9': 2 } 要依字串順序輸出（'10' 在 '9' 前面）；重建物件再 JSON.stringify 會變成 9 在前")
+assert.equal(canonicalJson({ b: { y: 1, x: 2 }, a: 1 }), '{"a":1,"b":{"x":2,"y":1}}', '巢狀物件的鍵也要排序')
+assert.equal(canonicalJson([3, 1, 2]), '[3,1,2]', '陣列要保持原順序')
+assert.equal(canonicalJson({ note: '他說"好"\n少冰', n: null, ok: true, x: -0, f: 1.5 }), '{"f":1.5,"n":null,"note":"他說\\"好\\"\\n少冰","ok":true,"x":0}', '字串跳脫、null、布林、數字要跟 JSON.stringify 相同')
+assert.equal(canonicalJson('拿鐵'), '"拿鐵"', '最上層是字串時也要能處理')
+assert.equal(canonicalJson({ a: 1, _: 2, Z: 3 }), '{"Z":3,"_":2,"a":1}', "鍵要用 sort() 的預設順序（UTF-16 碼位：'Z' < '_' < 'a'），不是 localeCompare")
+const frozen = Object.freeze({ b: Object.freeze({ y: 1, x: 2 }), a: 1 })
+let frozenOut = ''
+try { frozenOut = canonicalJson(frozen) } catch { assert(false, '不能修改傳進來的物件（正規化只讀不寫）') }
+assert.equal(frozenOut, '{"a":1,"b":{"x":2,"y":1}}', '凍結的物件也要能正規化')
+throwsType(undefined, 'undefined')
+throwsType([1, undefined], '陣列裡的 undefined')
+throwsType({ a: 1, b: undefined }, '物件裡的 undefined')
+throwsType([1, NaN], '陣列裡的 NaN')
+throwsType({ x: { y: Infinity } }, '巢狀的 Infinity')
+throwsType({ f() { return 1 } }, '函式')
+throwsType({ id: 1n }, 'bigint')
+
+let seed = 9
+const rnd = () => { seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296 }
+const names = ['a', 'b', 'items', 'note', '10', '9', '2', 'storeId', 'Z', 'é', '_x']
+const gen = (depth: number): unknown => {
+  const r = rnd()
+  if (depth > 2 || r < 0.35) return [Math.floor(rnd() * 200) - 50, 'x' + Math.floor(rnd() * 9), null, true, false][Math.floor(rnd() * 5)]
+  if (r < 0.55) return Array.from({ length: Math.floor(rnd() * 4) }, () => gen(depth + 1))
+  const o: Record<string, unknown> = {}
+  for (const k of names) if (rnd() < 0.4) o[k] = gen(depth + 1)
+  return o
+}
+const shuffle = (v: unknown): unknown => {
+  if (Array.isArray(v)) return v.map(x => shuffle(x))
+  if (v !== null && typeof v === 'object') {
+    const o = v as Record<string, unknown>
+    return Object.fromEntries(Object.keys(o).reverse().map(k => [k, shuffle(o[k])]))
+  }
+  return v
+}
+for (let i = 0; i < 200; i++) {
+  const v = gen(0)
+  assert.equal(canonicalJson(v), refCanon(v), `隨機資料 ${JSON.stringify(v)} 的正規化結果不對`)
+  assert.equal(canonicalJson(shuffle(v)), refCanon(v), '同一份資料、鍵的插入順序不同，結果要一樣')
+}
+
+const sample = { storeId: 1, items: { '2': 1, '5': 2 }, customer: { name: '陳美華', tags: ['vip'] } }
+const sampleShuffled = { customer: { tags: ['vip'], name: '陳美華' }, items: { '5': 2, '2': 1 }, storeId: 1 }
+const expected = await refHex(refCanon(sample))
+const orig = crypto.subtle.digest
+let calls = 0
+Object.defineProperty(crypto.subtle, 'digest', { configurable: true, writable: true, value: (...a: Parameters<SubtleCrypto['digest']>) => { calls++; return orig.apply(crypto.subtle, a) } })
+let fp1 = '', fp2 = '', fp3 = '', fp4 = ''
+try {
+  fp1 = await fingerprint(sample)
+  fp2 = await fingerprint(sampleShuffled)
+  fp3 = await fingerprint({ items: [1, 2] })
+  fp4 = await fingerprint({ items: [2, 1] })
+} finally {
+  delete (crypto.subtle as unknown as Record<string, unknown>).digest
+}
+assert(calls >= 4, 'fingerprint 要用 crypto.subtle.digest 算 SHA-256')
+assert(/^[0-9a-f]{64}$/.test(fp1), `指紋要是 64 個字元的小寫 hex，得到 ${fp1}`)
+assert.equal(fp1, expected, '指紋要是「正規化 JSON → TextEncoder → SHA-256 → hex」')
+assert.equal(fp2, fp1, '鍵的順序不同（包含巢狀）時，指紋要相同')
+assert(fp3 !== fp4, '陣列順序不同是不同的請求，指紋要不同')
+
+assert.equal(recordKey(2, 'post', '/orders', 'k-1'), '2:POST:/orders:k-1', 'recordKey 的格式')
+assert(recordKey(1, 'POST', '/orders', 'k-1') !== recordKey(2, 'POST', '/orders', 'k-1'), '不同顧客用同一把 key，查詢鍵要不同')
+assert.equal(recordKey(3, 'Post', '/orders', 'k'.repeat(255)).length, '3:POST:/orders:'.length + 255, '255 字元的 key 是合法的')
+for (const [k, msg] of [['', '空字串'], ['k'.repeat(256), '256 字元']]) {
+  let err: unknown
+  try { recordKey(1, 'POST', '/orders', k) } catch (e) { err = e }
+  assert(err instanceof RangeError, `key 是${msg}時要丟 RangeError`)
+}
+</script>
+  <script type="wrong">
+function toHex(buf: ArrayBuffer): string {
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('')
+}
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(value)
+}
+async function fingerprint(body: unknown): Promise<string> {
+  return toHex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonicalJson(body))))
+}
+function recordKey(customerId: number, method: string, path: string, key: string): string {
+  if (key.length === 0 || key.length > 255) throw new RangeError('長度')
+  return `${customerId}:${method.toUpperCase()}:${path}:${key}`
+}
+</script>
+  <script type="wrong">
+function toHex(buf: ArrayBuffer): string {
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('')
+}
+function check(v: unknown): void {
+  if (v === undefined || typeof v === 'function' || typeof v === 'bigint') throw new TypeError('不支援')
+  if (typeof v === 'number' && !Number.isFinite(v)) throw new TypeError('不支援')
+  if (v !== null && typeof v === 'object') for (const x of Object.values(v)) check(x)
+}
+function canonicalJson(value: unknown): string {
+  check(value)
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return JSON.stringify(value)
+  const obj = value as Record<string, unknown>
+  return '{' + Object.keys(obj).sort().map(k => JSON.stringify(k) + ':' + JSON.stringify(obj[k])).join(',') + '}'
+}
+async function fingerprint(body: unknown): Promise<string> {
+  return toHex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonicalJson(body))))
+}
+function recordKey(customerId: number, method: string, path: string, key: string): string {
+  if (key.length === 0 || key.length > 255) throw new RangeError('長度')
+  return `${customerId}:${method.toUpperCase()}:${path}:${key}`
+}
+</script>
+  <script type="wrong">
+function toHex(buf: ArrayBuffer): string {
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('')
+}
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === 'boolean' || typeof value === 'string') return JSON.stringify(value)
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError('不支援')
+    return JSON.stringify(value)
+  }
+  if (Array.isArray(value)) return '[' + value.map(v => canonicalJson(v)).join(',') + ']'
+  if (typeof value === 'object') {
+    const obj = value as Record<string, unknown>
+    return '{' + Object.keys(obj).sort().map(k => JSON.stringify(k) + ':' + canonicalJson(obj[k])).join(',') + '}'
+  }
+  throw new TypeError('不支援')
+}
+async function fingerprint(body: unknown): Promise<string> {
+  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonicalJson(body)))
+  return btoa(String.fromCharCode(...new Uint8Array(hash)))
+}
+function recordKey(customerId: number, method: string, path: string, key: string): string {
+  if (key.length === 0 || key.length > 255) throw new RangeError('長度')
+  return `${customerId}:${method.toUpperCase()}:${path}:${key}`
+}
+</script>
+  <script type="wrong">
+function toHex(buf: ArrayBuffer): string {
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('')
+}
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === 'boolean' || typeof value === 'string') return JSON.stringify(value)
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError('不支援')
+    return JSON.stringify(value)
+  }
+  if (Array.isArray(value)) return '[' + value.map(v => canonicalJson(v)).join(',') + ']'
+  if (typeof value === 'object') {
+    const obj = value as Record<string, unknown>
+    return '{' + Object.keys(obj).sort().map(k => JSON.stringify(k) + ':' + canonicalJson(obj[k])).join(',') + '}'
+  }
+  throw new TypeError('不支援')
+}
+async function fingerprint(body: unknown): Promise<string> {
+  return toHex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(body))))
+}
+function recordKey(customerId: number, method: string, path: string, key: string): string {
+  if (key.length === 0 || key.length > 255) throw new RangeError('長度')
+  return `${customerId}:${method.toUpperCase()}:${path}:${key}`
+}
+</script>
+  <script type="wrong">
+function toHex(buf: ArrayBuffer): string {
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('')
+}
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === 'boolean' || typeof value === 'string') return JSON.stringify(value)
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError('不支援')
+    return JSON.stringify(value)
+  }
+  if (Array.isArray(value)) return '[' + value.map(v => canonicalJson(v)).join(',') + ']'
+  if (typeof value === 'object') {
+    const obj = value as Record<string, unknown>
+    return '{' + Object.keys(obj).sort().map(k => JSON.stringify(k) + ':' + canonicalJson(obj[k])).join(',') + '}'
+  }
+  throw new TypeError('不支援')
+}
+async function fingerprint(body: unknown): Promise<string> {
+  return toHex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonicalJson(body))))
+}
+function recordKey(customerId: number, method: string, path: string, key: string): string {
+  if (key.length === 0 || key.length > 255) throw new RangeError('長度')
+  return `${method.toUpperCase()}:${path}:${key}`
+}
+</script>
+  <script type="wrong">
+function toHex(buf: ArrayBuffer): string {
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('')
+}
+function sortDeep(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(x => sortDeep(x))
+  if (v !== null && typeof v === 'object') {
+    const o = v as Record<string, unknown>
+    return Object.fromEntries(Object.keys(o).sort().map(k => [k, sortDeep(o[k])]))
+  }
+  if (v === undefined || typeof v === 'function' || typeof v === 'bigint') throw new TypeError('不支援')
+  if (typeof v === 'number' && !Number.isFinite(v)) throw new TypeError('不支援')
+  return v
+}
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(sortDeep(value))
+}
+async function fingerprint(body: unknown): Promise<string> {
+  return toHex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonicalJson(body))))
+}
+function recordKey(customerId: number, method: string, path: string, key: string): string {
+  if (key.length === 0 || key.length > 255) throw new RangeError('長度')
+  return `${customerId}:${method.toUpperCase()}:${path}:${key}`
+}
+</script>
+  <script type="wrong">
+// 用 localeCompare 排序（順序跟別的語言算的不同）
+function toHex(buf: ArrayBuffer): string {
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('')
+}
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === 'boolean' || typeof value === 'string') return JSON.stringify(value)
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError('不支援')
+    return JSON.stringify(value)
+  }
+  if (Array.isArray(value)) return '[' + value.map(v => canonicalJson(v)).join(',') + ']'
+  if (typeof value === 'object') {
+    const obj = value as Record<string, unknown>
+    return '{' + Object.keys(obj).sort((a, b) => a.localeCompare(b)).map(k => JSON.stringify(k) + ':' + canonicalJson(obj[k])).join(',') + '}'
+  }
+  throw new TypeError('不支援')
+}
+async function fingerprint(body: unknown): Promise<string> {
+  return toHex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonicalJson(body))))
+}
+function recordKey(customerId: number, method: string, path: string, key: string): string {
+  if (key.length === 0 || key.length > 255) throw new RangeError('長度')
+  return `${customerId}:${method.toUpperCase()}:${path}:${key}`
+}
+</script>
+  <script type="wrong">
+// 為了排序，把傳進來的物件的鍵刪掉再依序加回去（改到輸入）
+function toHex(buf: ArrayBuffer): string {
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('')
+}
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === 'boolean' || typeof value === 'string') return JSON.stringify(value)
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError('不支援')
+    return JSON.stringify(value)
+  }
+  if (Array.isArray(value)) return '[' + value.map(v => canonicalJson(v)).join(',') + ']'
+  if (typeof value === 'object') {
+    const obj = value as Record<string, unknown>
+    for (const k of Object.keys(obj).sort()) { const v = obj[k]; delete obj[k]; obj[k] = v }
+    return '{' + Object.keys(obj).sort().map(k => JSON.stringify(k) + ':' + canonicalJson(obj[k])).join(',') + '}'
+  }
+  throw new TypeError('不支援')
+}
+async function fingerprint(body: unknown): Promise<string> {
+  return toHex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonicalJson(body))))
+}
+function recordKey(customerId: number, method: string, path: string, key: string): string {
+  if (key.length === 0 || key.length > 255) throw new RangeError('長度')
+  return `${customerId}:${method.toUpperCase()}:${path}:${key}`
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：起始程式提供一個假資料庫 <code>createAsyncDb()</code>，每個操作都會先等一次往返，同時進行的請求可以在中間插隊。它有非原子的 <code>get</code>／<code>put</code>，以及三個原子操作：<code>insertIfAbsent</code>（像 <code>INSERT … ON CONFLICT DO NOTHING</code>）、<code>compareAndSet</code>（像 <code>UPDATE … WHERE 值 = 預期</code>）、<code>increment</code>（像 <code>SET v = v + n</code>）。寫兩個函式：</p>
+  <ul>
+    <li><code>awardStamps(db, orderId, customerId, stamps)</code>：同一張訂單只能集點一次，就算同時被呼叫很多次。第一次回 <code>'awarded'</code> 並把點數加到 <code>'stamps'</code> 表（鍵是 <code>String(customerId)</code>），之後回 <code>'already'</code>。用 <code>'stampAwards'</code> 表（鍵是 <code>String(orderId)</code>）記錄哪些訂單集過點。</li>
+    <li><code>markPaid(db, orderId)</code>：<code>'orderStatus'</code> 表（鍵是 <code>String(orderId)</code>，值是狀態字串）只有在 <code>'pending'</code> 時才改成 <code>'paid'</code>，回傳 <code>{ changed }</code> 表示這次有沒有改到。</li>
+  </ul>
+  <script type="start">
+// 假資料庫：每個操作先等一次往返（像網路來回），同時進行的請求可以在中間插隊
+function createAsyncDb() {
+  const tables = new Map<string, Map<string, unknown>>()
+  const table = (name: string) => {
+    let t = tables.get(name)
+    if (!t) { t = new Map(); tables.set(name, t) }
+    return t
+  }
+  const roundTrip = () => new Promise<void>(resolve => setTimeout(resolve, 0))
+  return {
+    // 非原子：讀和寫是兩次往返，中間別人可以改
+    async get(name: string, key: string): Promise<unknown> {
+      await roundTrip()
+      return structuredClone(table(name).get(key))
+    },
+    async put(name: string, key: string, value: unknown): Promise<void> {
+      await roundTrip()
+      table(name).set(key, structuredClone(value))
+    },
+    // 原子：不存在才插入，回傳有沒有插入（INSERT … ON CONFLICT DO NOTHING）
+    async insertIfAbsent(name: string, key: string, value: unknown): Promise<boolean> {
+      await roundTrip()
+      const t = table(name)
+      if (t.has(key)) return false
+      t.set(key, structuredClone(value))
+      return true
+    },
+    // 原子：目前的值 === expected 才改成 next，回傳有沒有改到（UPDATE … WHERE v = expected）
+    async compareAndSet(name: string, key: string, expected: unknown, next: unknown): Promise<boolean> {
+      await roundTrip()
+      const t = table(name)
+      if (!t.has(key) || t.get(key) !== expected) return false
+      t.set(key, next)
+      return true
+    },
+    // 原子：數字加上 by（不存在當成 0），回傳新的值（UPDATE … SET v = v + by）
+    async increment(name: string, key: string, by: number): Promise<number> {
+      await roundTrip()
+      const t = table(name)
+      const next = ((t.get(key) as number | undefined) ?? 0) + by
+      t.set(key, next)
+      return next
+    },
+  }
+}
+type AsyncDb = ReturnType<typeof createAsyncDb>
+
+async function awardStamps(db: AsyncDb, orderId: number, customerId: number, stamps: number): Promise<'awarded' | 'already'> {
+  throw new Error('TODO')
+}
+
+async function markPaid(db: AsyncDb, orderId: number): Promise<{ changed: boolean }> {
+  throw new Error('TODO')
+}
+
+const db = createAsyncDb()
+console.log(await Promise.all([awardStamps(db, 1, 2, 3), awardStamps(db, 1, 2, 3)]))   // 一個 awarded、一個 already
+console.log(await db.get('stamps', '2'))   // 3
+await db.put('orderStatus', '1', 'pending')
+console.log(await Promise.all([markPaid(db, 1), markPaid(db, 1)]))   // 只有一個 changed: true
+</script>
+  <script type="answer">
+// 假資料庫：每個操作先等一次往返（像網路來回），同時進行的請求可以在中間插隊
+function createAsyncDb() {
+  const tables = new Map<string, Map<string, unknown>>()
+  const table = (name: string) => {
+    let t = tables.get(name)
+    if (!t) { t = new Map(); tables.set(name, t) }
+    return t
+  }
+  const roundTrip = () => new Promise<void>(resolve => setTimeout(resolve, 0))
+  return {
+    async get(name: string, key: string): Promise<unknown> {
+      await roundTrip()
+      return structuredClone(table(name).get(key))
+    },
+    async put(name: string, key: string, value: unknown): Promise<void> {
+      await roundTrip()
+      table(name).set(key, structuredClone(value))
+    },
+    async insertIfAbsent(name: string, key: string, value: unknown): Promise<boolean> {
+      await roundTrip()
+      const t = table(name)
+      if (t.has(key)) return false
+      t.set(key, structuredClone(value))
+      return true
+    },
+    async compareAndSet(name: string, key: string, expected: unknown, next: unknown): Promise<boolean> {
+      await roundTrip()
+      const t = table(name)
+      if (!t.has(key) || t.get(key) !== expected) return false
+      t.set(key, next)
+      return true
+    },
+    async increment(name: string, key: string, by: number): Promise<number> {
+      await roundTrip()
+      const t = table(name)
+      const next = ((t.get(key) as number | undefined) ?? 0) + by
+      t.set(key, next)
+      return next
+    },
+  }
+}
+type AsyncDb = ReturnType<typeof createAsyncDb>
+
+async function awardStamps(db: AsyncDb, orderId: number, customerId: number, stamps: number): Promise<'awarded' | 'already'> {
+  // 唯一約束決定誰先到；真實資料庫裡這兩步要放在同一個交易
+  const first = await db.insertIfAbsent('stampAwards', String(orderId), { customerId, stamps })
+  if (!first) return 'already'
+  await db.increment('stamps', String(customerId), stamps)
+  return 'awarded'
+}
+
+async function markPaid(db: AsyncDb, orderId: number): Promise<{ changed: boolean }> {
+  const changed = await db.compareAndSet('orderStatus', String(orderId), 'pending', 'paid')
+  return { changed }
+}
+
+const db = createAsyncDb()
+console.log(await Promise.all([awardStamps(db, 1, 2, 3), awardStamps(db, 1, 2, 3)]))   // 一個 awarded、一個 already
+console.log(await db.get('stamps', '2'))   // 3
+await db.put('orderStatus', '1', 'pending')
+console.log(await Promise.all([markPaid(db, 1), markPaid(db, 1)]))   // 只有一個 changed: true
+</script>
+  <script type="tests">
+// 測試用自己的一份假資料庫（行為與起始程式相同），並可以直接看表的內容
+const makeDb = () => {
+  const tables = new Map<string, Map<string, unknown>>()
+  const table = (name: string) => {
+    let t = tables.get(name)
+    if (!t) { t = new Map(); tables.set(name, t) }
+    return t
+  }
+  const roundTrip = () => new Promise<void>(resolve => setTimeout(resolve, 0))
+  const db: AsyncDb = {
+    async get(name, key) { await roundTrip(); return structuredClone(table(name).get(key)) },
+    async put(name, key, value) { await roundTrip(); table(name).set(key, structuredClone(value)) },
+    async insertIfAbsent(name, key, value) { await roundTrip(); const t = table(name); if (t.has(key)) return false; t.set(key, structuredClone(value)); return true },
+    async compareAndSet(name, key, expected, next) { await roundTrip(); const t = table(name); if (!t.has(key) || t.get(key) !== expected) return false; t.set(key, next); return true },
+    async increment(name, key, by) { await roundTrip(); const t = table(name); const n = ((t.get(key) as number | undefined) ?? 0) + by; t.set(key, n); return n },
+  }
+  return { db, table }
+}
+
+{
+  const { db, table } = makeDb()
+  const results = await Promise.all(Array.from({ length: 10 }, () => awardStamps(db, 42, 1, 3)))
+  assert.equal(results.filter(r => r === 'awarded').length, 1, `同一張訂單同時集點 10 次，只能有 1 次 'awarded'，得到 ${JSON.stringify(results)}`)
+  assert.equal(results.filter(r => r === 'already').length, 9, "其餘 9 次要回 'already'")
+  assert.equal(table('stamps').get('1'), 3, `點數只能加一次（3 點），得到 ${table('stamps').get('1')}`)
+  assert.equal(await awardStamps(db, 42, 1, 3), 'already', "之後再呼叫要回 'already'")
+  assert.equal(table('stamps').get('1'), 3, '重複呼叫不能再加點')
+  assert(table('stampAwards').has('42'), "集過點的訂單要記在 'stampAwards' 表（鍵是 String(orderId)）")
+}
+{
+  // 「做過了沒」要記在資料庫，不能記在程序的記憶體：別台伺服器做過的要認得，換一個資料庫就是沒做過
+  const { db, table } = makeDb()
+  table('stampAwards').set('77', { customerId: 4, stamps: 5 })
+  table('stamps').set('4', 5)
+  assert.equal(await awardStamps(db, 77, 4, 5), 'already', "另一台伺服器已經替訂單 77 集過點（資料庫裡有紀錄），要回 'already'")
+  assert.equal(table('stamps').get('4'), 5, '別台伺服器集過點的訂單不能再加點')
+  const fresh = makeDb()
+  assert.equal(await awardStamps(fresh.db, 42, 1, 3), 'awarded', "全新的資料庫裡訂單 42 還沒集過點，要回 'awarded'：判斷要靠資料庫裡的紀錄，不是程序裡的變數")
+}
+{
+  const { db, table } = makeDb()
+  const results = await Promise.all([2, 3, 4, 5, 6].map(orderId => awardStamps(db, orderId, 7, 2)))
+  assert.deepEqual(results, ['awarded', 'awarded', 'awarded', 'awarded', 'awarded'], '不同訂單各自集點')
+  assert.equal(table('stamps').get('7'), 10, `同一位顧客 5 張不同訂單同時集點，要加滿 10 點，得到 ${table('stamps').get('7')}：點數也要用原子操作（先讀再寫會蓋掉別人的加點）`)
+}
+{
+  const { db, table } = makeDb()
+  table('orderStatus').set('7', 'pending')
+  table('orderStatus').set('8', 'cancelled')
+  const results = await Promise.all(Array.from({ length: 5 }, () => markPaid(db, 7)))
+  assert.equal(results.filter(r => r.changed === true).length, 1, `同時 markPaid 5 次，只能有 1 次 changed: true，得到 ${JSON.stringify(results)}`)
+  assert.equal(results.filter(r => r.changed === false).length, 4, '其餘要回 changed: false')
+  assert.equal(table('orderStatus').get('7'), 'paid', '訂單要變成 paid')
+  assert.deepEqual(await markPaid(db, 8), { changed: false }, "已取消的訂單不能改成 'paid'")
+  assert.equal(table('orderStatus').get('8'), 'cancelled', '已取消的訂單狀態要保持 cancelled')
+  assert.deepEqual(await markPaid(db, 9), { changed: false }, '不存在的訂單回 changed: false')
+  assert(!table('orderStatus').has('9'), '不存在的訂單不能被建立出來')
+}
+</script>
+  <script type="wrong">
+function createAsyncDb() {
+  const tables = new Map<string, Map<string, unknown>>()
+  const table = (name: string) => { let t = tables.get(name); if (!t) { t = new Map(); tables.set(name, t) } return t }
+  const roundTrip = () => new Promise<void>(resolve => setTimeout(resolve, 0))
+  return {
+    async get(name: string, key: string): Promise<unknown> { await roundTrip(); return structuredClone(table(name).get(key)) },
+    async put(name: string, key: string, value: unknown): Promise<void> { await roundTrip(); table(name).set(key, structuredClone(value)) },
+    async insertIfAbsent(name: string, key: string, value: unknown): Promise<boolean> { await roundTrip(); const t = table(name); if (t.has(key)) return false; t.set(key, value); return true },
+    async compareAndSet(name: string, key: string, expected: unknown, next: unknown): Promise<boolean> { await roundTrip(); const t = table(name); if (!t.has(key) || t.get(key) !== expected) return false; t.set(key, next); return true },
+    async increment(name: string, key: string, by: number): Promise<number> { await roundTrip(); const t = table(name); const n = ((t.get(key) as number | undefined) ?? 0) + by; t.set(key, n); return n },
+  }
+}
+type AsyncDb = ReturnType<typeof createAsyncDb>
+async function awardStamps(db: AsyncDb, orderId: number, customerId: number, stamps: number): Promise<'awarded' | 'already'> {
+  if (await db.get('stampAwards', String(orderId)) !== undefined) return 'already'
+  await db.put('stampAwards', String(orderId), { customerId, stamps })
+  await db.increment('stamps', String(customerId), stamps)
+  return 'awarded'
+}
+async function markPaid(db: AsyncDb, orderId: number): Promise<{ changed: boolean }> {
+  return { changed: await db.compareAndSet('orderStatus', String(orderId), 'pending', 'paid') }
+}
+</script>
+  <script type="wrong">
+function createAsyncDb() {
+  const tables = new Map<string, Map<string, unknown>>()
+  const table = (name: string) => { let t = tables.get(name); if (!t) { t = new Map(); tables.set(name, t) } return t }
+  const roundTrip = () => new Promise<void>(resolve => setTimeout(resolve, 0))
+  return {
+    async get(name: string, key: string): Promise<unknown> { await roundTrip(); return structuredClone(table(name).get(key)) },
+    async put(name: string, key: string, value: unknown): Promise<void> { await roundTrip(); table(name).set(key, structuredClone(value)) },
+    async insertIfAbsent(name: string, key: string, value: unknown): Promise<boolean> { await roundTrip(); const t = table(name); if (t.has(key)) return false; t.set(key, value); return true },
+    async compareAndSet(name: string, key: string, expected: unknown, next: unknown): Promise<boolean> { await roundTrip(); const t = table(name); if (!t.has(key) || t.get(key) !== expected) return false; t.set(key, next); return true },
+    async increment(name: string, key: string, by: number): Promise<number> { await roundTrip(); const t = table(name); const n = ((t.get(key) as number | undefined) ?? 0) + by; t.set(key, n); return n },
+  }
+}
+type AsyncDb = ReturnType<typeof createAsyncDb>
+async function awardStamps(db: AsyncDb, orderId: number, customerId: number, stamps: number): Promise<'awarded' | 'already'> {
+  await db.increment('stamps', String(customerId), stamps)
+  return 'awarded'
+}
+async function markPaid(db: AsyncDb, orderId: number): Promise<{ changed: boolean }> {
+  return { changed: await db.compareAndSet('orderStatus', String(orderId), 'pending', 'paid') }
+}
+</script>
+  <script type="wrong">
+function createAsyncDb() {
+  const tables = new Map<string, Map<string, unknown>>()
+  const table = (name: string) => { let t = tables.get(name); if (!t) { t = new Map(); tables.set(name, t) } return t }
+  const roundTrip = () => new Promise<void>(resolve => setTimeout(resolve, 0))
+  return {
+    async get(name: string, key: string): Promise<unknown> { await roundTrip(); return structuredClone(table(name).get(key)) },
+    async put(name: string, key: string, value: unknown): Promise<void> { await roundTrip(); table(name).set(key, structuredClone(value)) },
+    async insertIfAbsent(name: string, key: string, value: unknown): Promise<boolean> { await roundTrip(); const t = table(name); if (t.has(key)) return false; t.set(key, value); return true },
+    async compareAndSet(name: string, key: string, expected: unknown, next: unknown): Promise<boolean> { await roundTrip(); const t = table(name); if (!t.has(key) || t.get(key) !== expected) return false; t.set(key, next); return true },
+    async increment(name: string, key: string, by: number): Promise<number> { await roundTrip(); const t = table(name); const n = ((t.get(key) as number | undefined) ?? 0) + by; t.set(key, n); return n },
+  }
+}
+type AsyncDb = ReturnType<typeof createAsyncDb>
+async function awardStamps(db: AsyncDb, orderId: number, customerId: number, stamps: number): Promise<'awarded' | 'already'> {
+  if (!await db.insertIfAbsent('stampAwards', String(orderId), { customerId, stamps })) return 'already'
+  const current = ((await db.get('stamps', String(customerId))) as number | undefined) ?? 0
+  await db.put('stamps', String(customerId), current + stamps)
+  return 'awarded'
+}
+async function markPaid(db: AsyncDb, orderId: number): Promise<{ changed: boolean }> {
+  return { changed: await db.compareAndSet('orderStatus', String(orderId), 'pending', 'paid') }
+}
+</script>
+  <script type="wrong">
+function createAsyncDb() {
+  const tables = new Map<string, Map<string, unknown>>()
+  const table = (name: string) => { let t = tables.get(name); if (!t) { t = new Map(); tables.set(name, t) } return t }
+  const roundTrip = () => new Promise<void>(resolve => setTimeout(resolve, 0))
+  return {
+    async get(name: string, key: string): Promise<unknown> { await roundTrip(); return structuredClone(table(name).get(key)) },
+    async put(name: string, key: string, value: unknown): Promise<void> { await roundTrip(); table(name).set(key, structuredClone(value)) },
+    async insertIfAbsent(name: string, key: string, value: unknown): Promise<boolean> { await roundTrip(); const t = table(name); if (t.has(key)) return false; t.set(key, value); return true },
+    async compareAndSet(name: string, key: string, expected: unknown, next: unknown): Promise<boolean> { await roundTrip(); const t = table(name); if (!t.has(key) || t.get(key) !== expected) return false; t.set(key, next); return true },
+    async increment(name: string, key: string, by: number): Promise<number> { await roundTrip(); const t = table(name); const n = ((t.get(key) as number | undefined) ?? 0) + by; t.set(key, n); return n },
+  }
+}
+type AsyncDb = ReturnType<typeof createAsyncDb>
+async function awardStamps(db: AsyncDb, orderId: number, customerId: number, stamps: number): Promise<'awarded' | 'already'> {
+  if (!await db.insertIfAbsent('stampAwards', String(orderId), { customerId, stamps })) return 'already'
+  await db.increment('stamps', String(customerId), stamps)
+  return 'awarded'
+}
+async function markPaid(db: AsyncDb, orderId: number): Promise<{ changed: boolean }> {
+  const status = await db.get('orderStatus', String(orderId))
+  if (status !== 'pending') return { changed: false }
+  await db.put('orderStatus', String(orderId), 'paid')
+  return { changed: true }
+}
+</script>
+  <script type="wrong">
+function createAsyncDb() {
+  const tables = new Map<string, Map<string, unknown>>()
+  const table = (name: string) => { let t = tables.get(name); if (!t) { t = new Map(); tables.set(name, t) } return t }
+  const roundTrip = () => new Promise<void>(resolve => setTimeout(resolve, 0))
+  return {
+    async get(name: string, key: string): Promise<unknown> { await roundTrip(); return structuredClone(table(name).get(key)) },
+    async put(name: string, key: string, value: unknown): Promise<void> { await roundTrip(); table(name).set(key, structuredClone(value)) },
+    async insertIfAbsent(name: string, key: string, value: unknown): Promise<boolean> { await roundTrip(); const t = table(name); if (t.has(key)) return false; t.set(key, value); return true },
+    async compareAndSet(name: string, key: string, expected: unknown, next: unknown): Promise<boolean> { await roundTrip(); const t = table(name); if (!t.has(key) || t.get(key) !== expected) return false; t.set(key, next); return true },
+    async increment(name: string, key: string, by: number): Promise<number> { await roundTrip(); const t = table(name); const n = ((t.get(key) as number | undefined) ?? 0) + by; t.set(key, n); return n },
+  }
+}
+type AsyncDb = ReturnType<typeof createAsyncDb>
+async function awardStamps(db: AsyncDb, orderId: number, customerId: number, stamps: number): Promise<'awarded' | 'already'> {
+  if (!await db.insertIfAbsent('stampAwards', String(orderId), { customerId, stamps })) return 'already'
+  await db.increment('stamps', String(customerId), stamps)
+  return 'awarded'
+}
+async function markPaid(db: AsyncDb, orderId: number): Promise<{ changed: boolean }> {
+  const before = await db.get('orderStatus', String(orderId))
+  await db.put('orderStatus', String(orderId), 'paid')
+  return { changed: before !== 'paid' }
+}
+</script>
+  <script type="wrong">
+// 用程序記憶體裡的 Set 去重（同步的 has＋add 不會被插隊，但多台伺服器、重啟後就失效）
+function createAsyncDb() {
+  const tables = new Map<string, Map<string, unknown>>()
+  const table = (name: string) => { let t = tables.get(name); if (!t) { t = new Map(); tables.set(name, t) } return t }
+  const roundTrip = () => new Promise<void>(resolve => setTimeout(resolve, 0))
+  return {
+    async get(name: string, key: string): Promise<unknown> { await roundTrip(); return structuredClone(table(name).get(key)) },
+    async put(name: string, key: string, value: unknown): Promise<void> { await roundTrip(); table(name).set(key, structuredClone(value)) },
+    async insertIfAbsent(name: string, key: string, value: unknown): Promise<boolean> { await roundTrip(); const t = table(name); if (t.has(key)) return false; t.set(key, value); return true },
+    async compareAndSet(name: string, key: string, expected: unknown, next: unknown): Promise<boolean> { await roundTrip(); const t = table(name); if (!t.has(key) || t.get(key) !== expected) return false; t.set(key, next); return true },
+    async increment(name: string, key: string, by: number): Promise<number> { await roundTrip(); const t = table(name); const n = ((t.get(key) as number | undefined) ?? 0) + by; t.set(key, n); return n },
+  }
+}
+type AsyncDb = ReturnType<typeof createAsyncDb>
+const seen = new Set<number>()
+async function awardStamps(db: AsyncDb, orderId: number, customerId: number, stamps: number): Promise<'awarded' | 'already'> {
+  if (seen.has(orderId)) return 'already'
+  seen.add(orderId)
+  await db.put('stampAwards', String(orderId), { customerId, stamps })
+  await db.increment('stamps', String(customerId), stamps)
+  return 'awarded'
+}
+async function markPaid(db: AsyncDb, orderId: number): Promise<{ changed: boolean }> {
+  return { changed: await db.compareAndSet('orderStatus', String(orderId), 'pending', 'paid') }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：寫 <code>checkout(input, deps)</code>，用復原點完成三個原子階段（型別都在起始程式裡）：</p>
+  <ul>
+    <li>先用 <code>db.getKey(key)</code> 讀這把 key 的紀錄。沒有紀錄就是 started：在<strong>一個</strong>交易裡 <code>insertOrder</code> 建立 pending 訂單，並 <code>setKey</code> 成 <code>order_created</code>（記下 orderId）。</li>
+    <li><code>order_created</code>：呼叫 <code>pay</code>，冪等鍵固定是 <code>`pay:${key}`</code>、金額是 <code>cartTotal(cart)</code>；成功後在一個交易裡 <code>markOrderPaid</code> 並 <code>setKey</code> 成 <code>payment_captured</code>（記下 chargeId）。</li>
+    <li><code>payment_captured</code>：在一個交易裡 <code>enqueueJob({ type: 'receipt', orderId })</code>，並 <code>setKey</code> 成 <code>finished</code>，存下回應 <code>{ status: 201, body: { orderId, chargeId, total } }</code>。</li>
+    <li><code>finished</code>：直接回傳存下的回應。</li>
+  </ul>
+  <p>任何一步都可能丟錯（模擬當機），丟錯就讓它往外丟；呼叫端會用同一把 key 重試，你要從復原點繼續、做過的階段不重做。<code>transaction</code> 的 callback 不能是 async（不能在交易裡呼叫金流）。</p>
+  <script type="start">
+type Cart = Record<string, number>   // productId → 數量
+const PRICES: Record<string, number> = { '1': 80, '2': 110, '3': 110, '4': 90, '5': 70, '6': 120 }
+function cartTotal(cart: Cart): number {
+  return Object.entries(cart).reduce((sum, [id, qty]) => sum + PRICES[id] * qty, 0)
+}
+
+type CheckoutResponse = { status: number; body: { orderId: number; chargeId: string; total: number } }
+// 沒有紀錄 = started
+type KeyRecord =
+  | { key: string; phase: 'order_created'; orderId: number }
+  | { key: string; phase: 'payment_captured'; orderId: number; chargeId: string }
+  | { key: string; phase: 'finished'; orderId: number; chargeId: string; response: CheckoutResponse }
+
+interface Tx {
+  setKey(rec: KeyRecord): void
+  insertOrder(order: { customerId: number; total: number }): number   // 建立 pending 訂單，回傳 orderId
+  markOrderPaid(orderId: number, chargeId: string): void
+  enqueueJob(job: { type: 'receipt'; orderId: number }): void
+}
+interface CheckoutDb {
+  getKey(key: string): Promise<KeyRecord | undefined>
+  transaction<T>(fn: (tx: Tx) => T): Promise<T>   // fn 丟錯就全部回滾；fn 不能是 async
+}
+type Pay = (req: { idempotencyKey: string; amount: number }) => Promise<{ chargeId: string }>
+
+async function checkout(input: { key: string; customerId: number; cart: Cart }, deps: { db: CheckoutDb; pay: Pay }): Promise<CheckoutResponse> {
+  throw new Error('TODO')
+}
+
+// 示範用的記憶體資料庫與金流（不會當機）
+const keys = new Map<string, KeyRecord>()
+let nextOrderId = 1001
+const demoDb: CheckoutDb = {
+  async getKey(key) { return structuredClone(keys.get(key)) },
+  async transaction(fn) {
+    return fn({
+      setKey: rec => { keys.set(rec.key, structuredClone(rec)) },
+      insertOrder: () => nextOrderId++,
+      markOrderPaid: () => {},
+      enqueueJob: job => console.log('排入工作', job),
+    })
+  },
+}
+const demoPay: Pay = async req => ({ chargeId: 'ch_' + req.idempotencyKey })
+const input = { key: 'k-1', customerId: 2, cart: { '2': 1, '5': 1 } }
+console.log(await checkout(input, { db: demoDb, pay: demoPay }))
+console.log(await checkout(input, { db: demoDb, pay: demoPay }))   // 同一把 key：回放同一個回應
+</script>
+  <script type="answer">
+type Cart = Record<string, number>   // productId → 數量
+const PRICES: Record<string, number> = { '1': 80, '2': 110, '3': 110, '4': 90, '5': 70, '6': 120 }
+function cartTotal(cart: Cart): number {
+  return Object.entries(cart).reduce((sum, [id, qty]) => sum + PRICES[id] * qty, 0)
+}
+
+type CheckoutResponse = { status: number; body: { orderId: number; chargeId: string; total: number } }
+// 沒有紀錄 = started
+type KeyRecord =
+  | { key: string; phase: 'order_created'; orderId: number }
+  | { key: string; phase: 'payment_captured'; orderId: number; chargeId: string }
+  | { key: string; phase: 'finished'; orderId: number; chargeId: string; response: CheckoutResponse }
+
+interface Tx {
+  setKey(rec: KeyRecord): void
+  insertOrder(order: { customerId: number; total: number }): number   // 建立 pending 訂單，回傳 orderId
+  markOrderPaid(orderId: number, chargeId: string): void
+  enqueueJob(job: { type: 'receipt'; orderId: number }): void
+}
+interface CheckoutDb {
+  getKey(key: string): Promise<KeyRecord | undefined>
+  transaction<T>(fn: (tx: Tx) => T): Promise<T>   // fn 丟錯就全部回滾；fn 不能是 async
+}
+type Pay = (req: { idempotencyKey: string; amount: number }) => Promise<{ chargeId: string }>
+
+async function checkout(input: { key: string; customerId: number; cart: Cart }, deps: { db: CheckoutDb; pay: Pay }): Promise<CheckoutResponse> {
+  const { key, customerId, cart } = input
+  const { db, pay } = deps
+  const total = cartTotal(cart)
+  let rec = await db.getKey(key)
+
+  if (!rec) {
+    // 階段 1：訂單和復原點在同一個交易
+    rec = await db.transaction(tx => {
+      const orderId = tx.insertOrder({ customerId, total })
+      const next: KeyRecord = { key, phase: 'order_created', orderId }
+      tx.setKey(next)
+      return next
+    })
+  }
+  if (rec.phase === 'order_created') {
+    // 階段 2：扣款在交易外，用由本地 key 衍生、每次重試都相同的冪等鍵
+    const { orderId } = rec
+    const { chargeId } = await pay({ idempotencyKey: `pay:${key}`, amount: total })
+    rec = await db.transaction(tx => {
+      tx.markOrderPaid(orderId, chargeId)
+      const next: KeyRecord = { key, phase: 'payment_captured', orderId, chargeId }
+      tx.setKey(next)
+      return next
+    })
+  }
+  if (rec.phase === 'payment_captured') {
+    // 階段 3：收據工作和回應一起提交
+    const { orderId, chargeId } = rec
+    rec = await db.transaction(tx => {
+      tx.enqueueJob({ type: 'receipt', orderId })
+      const response: CheckoutResponse = { status: 201, body: { orderId, chargeId, total } }
+      const next: KeyRecord = { key, phase: 'finished', orderId, chargeId, response }
+      tx.setKey(next)
+      return next
+    })
+  }
+  return rec.response
+}
+
+// 示範用的記憶體資料庫與金流（不會當機）
+const keys = new Map<string, KeyRecord>()
+let nextOrderId = 1001
+const demoDb: CheckoutDb = {
+  async getKey(key) { return structuredClone(keys.get(key)) },
+  async transaction(fn) {
+    return fn({
+      setKey: rec => { keys.set(rec.key, structuredClone(rec)) },
+      insertOrder: () => nextOrderId++,
+      markOrderPaid: () => {},
+      enqueueJob: job => console.log('排入工作', job),
+    })
+  },
+}
+const demoPay: Pay = async req => ({ chargeId: 'ch_' + req.idempotencyKey })
+const input = { key: 'k-1', customerId: 2, cart: { '2': 1, '5': 1 } }
+console.log(await checkout(input, { db: demoDb, pay: demoPay }))
+console.log(await checkout(input, { db: demoDb, pay: demoPay }))   // 同一把 key：回放同一個回應
+</script>
+  <script type="types">
+type _1 = Expect<Equal<ReturnType<typeof checkout>, Promise<CheckoutResponse>>>  // checkout 要回傳 Promise<CheckoutResponse>
+</script>
+  <script type="tests">
+const tick = () => new Promise<void>(r => setTimeout(r, 0))
+type OrderRow = { customerId: number; total: number; status: 'pending' | 'paid'; chargeId?: string }
+// 可以在指定位置「當機」的世界：txN:before＝第 N 個交易提交前、txN:after＝提交後、pay:before／pay:after＝扣款前／扣款成功後
+const makeWorld = (crashes: string[]) => {
+  let state = { keys: new Map<string, KeyRecord>(), orders: new Map<number, OrderRow>(), jobs: [] as { type: 'receipt'; orderId: number }[], nextId: 5001 }
+  const pending = new Set(crashes)
+  const crash = (tag: string) => { if (pending.delete(tag)) throw new Error('模擬當機：' + tag) }
+  let txCount = 0
+  const charges = new Map<string, { chargeId: string; amount: number }>()
+  let payCalls = 0
+  const db: CheckoutDb = {
+    async getKey(key) { await tick(); return structuredClone(state.keys.get(key)) },
+    async transaction(fn) {
+      await tick()
+      txCount++
+      const draft = structuredClone(state)
+      const result = fn({
+        setKey: rec => { draft.keys.set(rec.key, structuredClone(rec)) },
+        insertOrder: o => { const id = draft.nextId++; draft.orders.set(id, { customerId: o.customerId, total: o.total, status: 'pending' }); return id },
+        markOrderPaid: (id, chargeId) => {
+          const o = draft.orders.get(id)
+          if (!o) throw new Error(`訂單 ${id} 不存在`)
+          o.status = 'paid'
+          o.chargeId = chargeId
+        },
+        enqueueJob: job => { draft.jobs.push({ type: job.type, orderId: job.orderId }) },
+      })
+      if (result instanceof Promise) throw new Error('交易的 callback 不能是 async：不要在交易裡等待外部呼叫')
+      crash(`tx${txCount}:before`)
+      state = draft
+      crash(`tx${txCount}:after`)
+      return result
+    },
+  }
+  const pay: Pay = async req => {
+    await tick()
+    payCalls++
+    crash('pay:before')
+    let c = charges.get(req.idempotencyKey)
+    if (!c) { c = { chargeId: 'ch_' + (charges.size + 1), amount: req.amount }; charges.set(req.idempotencyKey, c) }
+    crash('pay:after')
+    return { chargeId: c.chargeId }
+  }
+  return { db, pay, get state() { return state }, charges, get payCalls() { return payCalls }, get txCount() { return txCount } }
+}
+
+const cart = { '2': 2, '6': 1 }   // 拿鐵 × 2 ＋ 起司蛋糕 = 340
+const scenarios = [[], ['tx1:before'], ['tx1:after'], ['pay:before'], ['pay:after'], ['tx2:before'], ['tx2:after'], ['tx3:before'], ['tx3:after'], ['tx1:after', 'pay:after', 'tx3:before']]
+for (const crashes of scenarios) {
+  const label = crashes.length ? `在 ${crashes.join('、')} 當機後重試` : '正常路徑'
+  const w = makeWorld(crashes)
+  const input = { key: 'k-' + crashes.join('-'), customerId: 3, cart }
+  let res: CheckoutResponse | undefined
+  let tries = 0
+  while (!res && tries < 8) {
+    tries++
+    try { res = await checkout(input, { db: w.db, pay: w.pay }) } catch (e) {
+      assert(e instanceof Error && e.message.startsWith('模擬當機'), `${label}：出現非預期的錯誤 ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+  assert(res !== undefined, `${label}：重試 8 次還沒成功，可能卡在某個復原點`)
+  if (!res) break
+  assert.equal(tries, crashes.length + 1, `${label}：每次當機後重試一次就要能往下走，總共應該呼叫 ${crashes.length + 1} 次，實際 ${tries} 次`)
+  const orders = [...w.state.orders.entries()]
+  assert.equal(orders.length, 1, `${label}：只能有一張訂單，得到 ${orders.length} 張（重試時要從復原點繼續，不是從頭建立）`)
+  const [orderId, order] = orders[0]
+  assert.equal(order.total, 340, `${label}：訂單金額要是 cartTotal(cart)`)
+  assert.equal(order.customerId, 3, `${label}：訂單的 customerId`)
+  assert.equal(w.charges.size, 1, `${label}：金流只能有一筆有效扣款，得到 ${w.charges.size} 筆（扣款的冪等鍵每次都要相同）`)
+  assert(w.charges.has('pay:' + input.key), `${label}：扣款的冪等鍵要是 'pay:' + key，得到 ${[...w.charges.keys()].join(', ')}`)
+  const charge = w.charges.get('pay:' + input.key)
+  assert.equal(charge?.amount, 340, `${label}：扣款金額要是 340`)
+  assert.equal(order.status, 'paid', `${label}：訂單要變成 paid`)
+  assert.equal(order.chargeId, charge?.chargeId, `${label}：訂單要記下 chargeId`)
+  assert.equal(w.state.jobs.length, 1, `${label}：寄收據的工作只能排入 1 次，得到 ${w.state.jobs.length} 次`)
+  assert.equal(w.state.jobs[0].orderId, orderId, `${label}：收據工作要帶 orderId`)
+  assert.deepEqual(res, { status: 201, body: { orderId, chargeId: charge?.chargeId, total: 340 } }, `${label}：回應要是 { status: 201, body: { orderId, chargeId, total } }`)
+  const payBefore = w.payCalls
+  const txBefore = w.txCount
+  const again = await checkout(input, { db: w.db, pay: w.pay })
+  assert.deepEqual(again, res, `${label}：finished 之後再呼叫，要回傳存下的同一個回應`)
+  assert.equal(w.payCalls, payBefore, `${label}：finished 之後再呼叫不能再呼叫金流`)
+  assert.equal(w.txCount, txBefore, `${label}：finished 之後再呼叫不能再開交易`)
+}
+</script>
+  <script type="wrong">
+type Cart = Record<string, number>
+const PRICES: Record<string, number> = { '1': 80, '2': 110, '3': 110, '4': 90, '5': 70, '6': 120 }
+function cartTotal(cart: Cart): number { return Object.entries(cart).reduce((sum, [id, qty]) => sum + PRICES[id] * qty, 0) }
+type CheckoutResponse = { status: number; body: { orderId: number; chargeId: string; total: number } }
+type KeyRecord =
+  | { key: string; phase: 'order_created'; orderId: number }
+  | { key: string; phase: 'payment_captured'; orderId: number; chargeId: string }
+  | { key: string; phase: 'finished'; orderId: number; chargeId: string; response: CheckoutResponse }
+interface Tx { setKey(rec: KeyRecord): void; insertOrder(order: { customerId: number; total: number }): number; markOrderPaid(orderId: number, chargeId: string): void; enqueueJob(job: { type: 'receipt'; orderId: number }): void }
+interface CheckoutDb { getKey(key: string): Promise<KeyRecord | undefined>; transaction<T>(fn: (tx: Tx) => T): Promise<T> }
+type Pay = (req: { idempotencyKey: string; amount: number }) => Promise<{ chargeId: string }>
+// 每次都從頭做，不看復原點
+async function checkout(input: { key: string; customerId: number; cart: Cart }, deps: { db: CheckoutDb; pay: Pay }): Promise<CheckoutResponse> {
+  const { key, customerId, cart } = input
+  const total = cartTotal(cart)
+  const orderId = await deps.db.transaction(tx => {
+    const id = tx.insertOrder({ customerId, total })
+    tx.setKey({ key, phase: 'order_created', orderId: id })
+    return id
+  })
+  const { chargeId } = await deps.pay({ idempotencyKey: `pay:${key}`, amount: total })
+  await deps.db.transaction(tx => { tx.markOrderPaid(orderId, chargeId); tx.setKey({ key, phase: 'payment_captured', orderId, chargeId }) })
+  const response: CheckoutResponse = { status: 201, body: { orderId, chargeId, total } }
+  await deps.db.transaction(tx => { tx.enqueueJob({ type: 'receipt', orderId }); tx.setKey({ key, phase: 'finished', orderId, chargeId, response }) })
+  return response
+}
+</script>
+  <script type="wrong">
+type Cart = Record<string, number>
+const PRICES: Record<string, number> = { '1': 80, '2': 110, '3': 110, '4': 90, '5': 70, '6': 120 }
+function cartTotal(cart: Cart): number { return Object.entries(cart).reduce((sum, [id, qty]) => sum + PRICES[id] * qty, 0) }
+type CheckoutResponse = { status: number; body: { orderId: number; chargeId: string; total: number } }
+type KeyRecord =
+  | { key: string; phase: 'order_created'; orderId: number }
+  | { key: string; phase: 'payment_captured'; orderId: number; chargeId: string }
+  | { key: string; phase: 'finished'; orderId: number; chargeId: string; response: CheckoutResponse }
+interface Tx { setKey(rec: KeyRecord): void; insertOrder(order: { customerId: number; total: number }): number; markOrderPaid(orderId: number, chargeId: string): void; enqueueJob(job: { type: 'receipt'; orderId: number }): void }
+interface CheckoutDb { getKey(key: string): Promise<KeyRecord | undefined>; transaction<T>(fn: (tx: Tx) => T): Promise<T> }
+type Pay = (req: { idempotencyKey: string; amount: number }) => Promise<{ chargeId: string }>
+let attempt = 0
+// 扣款的冪等鍵加上嘗試次數
+async function checkout(input: { key: string; customerId: number; cart: Cart }, deps: { db: CheckoutDb; pay: Pay }): Promise<CheckoutResponse> {
+  const { key, customerId, cart } = input
+  const { db, pay } = deps
+  const total = cartTotal(cart)
+  let rec = await db.getKey(key)
+  if (!rec) rec = await db.transaction(tx => { const orderId = tx.insertOrder({ customerId, total }); const next: KeyRecord = { key, phase: 'order_created', orderId }; tx.setKey(next); return next })
+  if (rec.phase === 'order_created') {
+    const { orderId } = rec
+    attempt++
+    const { chargeId } = await pay({ idempotencyKey: `pay:${key}:${attempt}`, amount: total })
+    rec = await db.transaction(tx => { tx.markOrderPaid(orderId, chargeId); const next: KeyRecord = { key, phase: 'payment_captured', orderId, chargeId }; tx.setKey(next); return next })
+  }
+  if (rec.phase === 'payment_captured') {
+    const { orderId, chargeId } = rec
+    rec = await db.transaction(tx => { tx.enqueueJob({ type: 'receipt', orderId }); const next: KeyRecord = { key, phase: 'finished', orderId, chargeId, response: { status: 201, body: { orderId, chargeId, total } } }; tx.setKey(next); return next })
+  }
+  if (rec.phase !== 'finished') throw new Error('?')
+  return rec.response
+}
+</script>
+  <script type="wrong">
+type Cart = Record<string, number>
+const PRICES: Record<string, number> = { '1': 80, '2': 110, '3': 110, '4': 90, '5': 70, '6': 120 }
+function cartTotal(cart: Cart): number { return Object.entries(cart).reduce((sum, [id, qty]) => sum + PRICES[id] * qty, 0) }
+type CheckoutResponse = { status: number; body: { orderId: number; chargeId: string; total: number } }
+type KeyRecord =
+  | { key: string; phase: 'order_created'; orderId: number }
+  | { key: string; phase: 'payment_captured'; orderId: number; chargeId: string }
+  | { key: string; phase: 'finished'; orderId: number; chargeId: string; response: CheckoutResponse }
+interface Tx { setKey(rec: KeyRecord): void; insertOrder(order: { customerId: number; total: number }): number; markOrderPaid(orderId: number, chargeId: string): void; enqueueJob(job: { type: 'receipt'; orderId: number }): void }
+interface CheckoutDb { getKey(key: string): Promise<KeyRecord | undefined>; transaction<T>(fn: (tx: Tx) => T): Promise<T> }
+type Pay = (req: { idempotencyKey: string; amount: number }) => Promise<{ chargeId: string }>
+// 復原點寫在另一個交易（交易之外）
+async function checkout(input: { key: string; customerId: number; cart: Cart }, deps: { db: CheckoutDb; pay: Pay }): Promise<CheckoutResponse> {
+  const { key, customerId, cart } = input
+  const { db, pay } = deps
+  const total = cartTotal(cart)
+  let rec = await db.getKey(key)
+  if (!rec) {
+    const orderId = await db.transaction(tx => tx.insertOrder({ customerId, total }))
+    const next: KeyRecord = { key, phase: 'order_created', orderId }
+    await db.transaction(tx => tx.setKey(next))
+    rec = next
+  }
+  if (rec.phase === 'order_created') {
+    const { orderId } = rec
+    const { chargeId } = await pay({ idempotencyKey: `pay:${key}`, amount: total })
+    await db.transaction(tx => tx.markOrderPaid(orderId, chargeId))
+    const next: KeyRecord = { key, phase: 'payment_captured', orderId, chargeId }
+    await db.transaction(tx => tx.setKey(next))
+    rec = next
+  }
+  if (rec.phase === 'payment_captured') {
+    const { orderId, chargeId } = rec
+    rec = await db.transaction(tx => { tx.enqueueJob({ type: 'receipt', orderId }); const next: KeyRecord = { key, phase: 'finished', orderId, chargeId, response: { status: 201, body: { orderId, chargeId, total } } }; tx.setKey(next); return next })
+  }
+  if (rec.phase !== 'finished') throw new Error('?')
+  return rec.response
+}
+</script>
+  <script type="wrong">
+type Cart = Record<string, number>
+const PRICES: Record<string, number> = { '1': 80, '2': 110, '3': 110, '4': 90, '5': 70, '6': 120 }
+function cartTotal(cart: Cart): number { return Object.entries(cart).reduce((sum, [id, qty]) => sum + PRICES[id] * qty, 0) }
+type CheckoutResponse = { status: number; body: { orderId: number; chargeId: string; total: number } }
+type KeyRecord =
+  | { key: string; phase: 'order_created'; orderId: number }
+  | { key: string; phase: 'payment_captured'; orderId: number; chargeId: string }
+  | { key: string; phase: 'finished'; orderId: number; chargeId: string; response: CheckoutResponse }
+interface Tx { setKey(rec: KeyRecord): void; insertOrder(order: { customerId: number; total: number }): number; markOrderPaid(orderId: number, chargeId: string): void; enqueueJob(job: { type: 'receipt'; orderId: number }): void }
+interface CheckoutDb { getKey(key: string): Promise<KeyRecord | undefined>; transaction<T>(fn: (tx: Tx) => T): Promise<T> }
+type Pay = (req: { idempotencyKey: string; amount: number }) => Promise<{ chargeId: string }>
+// 寄收據的工作在另一個交易裡先送出，再存 finished
+async function checkout(input: { key: string; customerId: number; cart: Cart }, deps: { db: CheckoutDb; pay: Pay }): Promise<CheckoutResponse> {
+  const { key, customerId, cart } = input
+  const { db, pay } = deps
+  const total = cartTotal(cart)
+  let rec = await db.getKey(key)
+  if (!rec) rec = await db.transaction(tx => { const orderId = tx.insertOrder({ customerId, total }); const next: KeyRecord = { key, phase: 'order_created', orderId }; tx.setKey(next); return next })
+  if (rec.phase === 'order_created') {
+    const { orderId } = rec
+    const { chargeId } = await pay({ idempotencyKey: `pay:${key}`, amount: total })
+    rec = await db.transaction(tx => { tx.markOrderPaid(orderId, chargeId); const next: KeyRecord = { key, phase: 'payment_captured', orderId, chargeId }; tx.setKey(next); return next })
+  }
+  if (rec.phase === 'payment_captured') {
+    const { orderId, chargeId } = rec
+    await db.transaction(tx => tx.enqueueJob({ type: 'receipt', orderId }))
+    rec = await db.transaction(tx => { const next: KeyRecord = { key, phase: 'finished', orderId, chargeId, response: { status: 201, body: { orderId, chargeId, total } } }; tx.setKey(next); return next })
+  }
+  if (rec.phase !== 'finished') throw new Error('?')
+  return rec.response
+}
+</script>
+  <script type="wrong">
+type Cart = Record<string, number>
+const PRICES: Record<string, number> = { '1': 80, '2': 110, '3': 110, '4': 90, '5': 70, '6': 120 }
+function cartTotal(cart: Cart): number { return Object.entries(cart).reduce((sum, [id, qty]) => sum + PRICES[id] * qty, 0) }
+type CheckoutResponse = { status: number; body: { orderId: number; chargeId: string; total: number } }
+type KeyRecord =
+  | { key: string; phase: 'order_created'; orderId: number }
+  | { key: string; phase: 'payment_captured'; orderId: number; chargeId: string }
+  | { key: string; phase: 'finished'; orderId: number; chargeId: string; response: CheckoutResponse }
+interface Tx { setKey(rec: KeyRecord): void; insertOrder(order: { customerId: number; total: number }): number; markOrderPaid(orderId: number, chargeId: string): void; enqueueJob(job: { type: 'receipt'; orderId: number }): void }
+interface CheckoutDb { getKey(key: string): Promise<KeyRecord | undefined>; transaction<T>(fn: (tx: Tx) => T): Promise<T> }
+type Pay = (req: { idempotencyKey: string; amount: number }) => Promise<{ chargeId: string }>
+// finished 之後又從頭做一次
+async function checkout(input: { key: string; customerId: number; cart: Cart }, deps: { db: CheckoutDb; pay: Pay }): Promise<CheckoutResponse> {
+  const { key, customerId, cart } = input
+  const { db, pay } = deps
+  const total = cartTotal(cart)
+  let rec = await db.getKey(key)
+  if (!rec || rec.phase === 'finished') rec = await db.transaction(tx => { const orderId = tx.insertOrder({ customerId, total }); const next: KeyRecord = { key, phase: 'order_created', orderId }; tx.setKey(next); return next })
+  if (rec.phase === 'order_created') {
+    const { orderId } = rec
+    const { chargeId } = await pay({ idempotencyKey: `pay:${key}`, amount: total })
+    rec = await db.transaction(tx => { tx.markOrderPaid(orderId, chargeId); const next: KeyRecord = { key, phase: 'payment_captured', orderId, chargeId }; tx.setKey(next); return next })
+  }
+  if (rec.phase === 'payment_captured') {
+    const { orderId, chargeId } = rec
+    rec = await db.transaction(tx => { tx.enqueueJob({ type: 'receipt', orderId }); const next: KeyRecord = { key, phase: 'finished', orderId, chargeId, response: { status: 201, body: { orderId, chargeId, total } } }; tx.setKey(next); return next })
+  }
+  if (rec.phase !== 'finished') throw new Error('?')
+  return rec.response
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 4：寫 App 端的 <code>createCheckoutClient(api, newKey, isRetryable)</code>，回傳 <code>{ submit(cart) }</code>。規則：</p>
+  <ul>
+    <li>一次 <code>submit</code> 是一個意圖：只呼叫 <code>newKey()</code> 一次，每次呼叫 <code>api(cart, key)</code> 都帶這把 key。</li>
+    <li><code>isRetryable(err)</code> 為 true 的錯誤最多重試 2 次（總共 3 次嘗試），沿用同一把 key；不可重試的錯誤直接 reject。三次都失敗就 reject 最後一次的錯誤。這題不用等待（退避在<a href="08-timeouts-retries-backoff.html">第 8 課</a>做過）。</li>
+    <li>上一次 <code>submit</code> 還在進行時再呼叫（連點），回傳<strong>同一個</strong> Promise，不呼叫 <code>newKey</code>、不呼叫 <code>api</code>。</li>
+    <li>這次 <code>submit</code> 結束（成功或失敗）後，下一次 <code>submit</code> 是新的意圖，用新的 key。</li>
+  </ul>
+  <script type="start">
+type Cart = Record<string, number>
+type Api = (body: Cart, idempotencyKey: string) => Promise<{ orderId: string }>
+
+function createCheckoutClient(api: Api, newKey: () => string, isRetryable: (err: unknown) => boolean): { submit(cart: Cart): Promise<{ orderId: string }> } {
+  throw new Error('TODO')
+}
+
+let n = 0
+let failOnce = true
+const api: Api = async (cart, key) => {
+  console.log('送出', key)
+  if (failOnce) { failOnce = false; throw new Error('網路斷線') }
+  return { orderId: 'order-for-' + key }
+}
+const client = createCheckoutClient(api, () => 'key-' + ++n, err => err instanceof Error && err.message === '網路斷線')
+const first = client.submit({ '2': 1 })
+console.log(first === client.submit({ '2': 1 }))   // true：連點共用同一個請求
+console.log(await first)                            // 重試沿用 key-1
+console.log(await client.submit({ '2': 1 }))        // 新的意圖：key-2
+</script>
+  <script type="answer">
+type Cart = Record<string, number>
+type Api = (body: Cart, idempotencyKey: string) => Promise<{ orderId: string }>
+
+function createCheckoutClient(api: Api, newKey: () => string, isRetryable: (err: unknown) => boolean): { submit(cart: Cart): Promise<{ orderId: string }> } {
+  let inflight: Promise<{ orderId: string }> | undefined
+
+  async function send(cart: Cart, key: string): Promise<{ orderId: string }> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await api(cart, key)
+      } catch (err) {
+        if (attempt >= 3 || !isRetryable(err)) throw err
+      }
+    }
+  }
+
+  return {
+    submit(cart) {
+      if (inflight) return inflight
+      const p = send(cart, newKey())   // 一個意圖一把 key
+      inflight = p
+      const clear = () => { if (inflight === p) inflight = undefined }
+      p.then(clear, clear)             // 結束後清掉；這條鏈也處理了 rejection
+      return p
+    },
+  }
+}
+
+let n = 0
+let failOnce = true
+const api: Api = async (cart, key) => {
+  console.log('送出', key)
+  if (failOnce) { failOnce = false; throw new Error('網路斷線') }
+  return { orderId: 'order-for-' + key }
+}
+const client = createCheckoutClient(api, () => 'key-' + ++n, err => err instanceof Error && err.message === '網路斷線')
+const first = client.submit({ '2': 1 })
+console.log(first === client.submit({ '2': 1 }))   // true：連點共用同一個請求
+console.log(await first)                            // 重試沿用 key-1
+console.log(await client.submit({ '2': 1 }))        // 新的意圖：key-2
+</script>
+  <script type="tests">
+const tick = () => new Promise<void>(r => setTimeout(r, 0))
+class NetError extends Error { name = 'NetError' }
+const retryable = (e: unknown) => e instanceof NetError
+// 由測試逐一決定每次 api 呼叫的結果
+const harness = () => {
+  const calls: { key: string; d: PromiseWithResolvers<{ orderId: string }> }[] = []
+  let keys = 0
+  const api: Api = (_cart, key) => { const d = Promise.withResolvers<{ orderId: string }>(); calls.push({ key, d }); return d.promise }
+  const newKey = () => 'k' + ++keys
+  return { calls, api, newKey, get keys() { return keys } }
+}
+const settle = async () => { for (let i = 0; i < 5; i++) await tick() }
+
+{
+  const h = harness()
+  const c = createCheckoutClient(h.api, h.newKey, retryable)
+  const p = c.submit({ '2': 1 })
+  await settle()
+  assert.equal(h.calls.length, 1, '送出後要呼叫 api 一次')
+  h.calls[0].d.reject(new NetError('斷線'))
+  await settle()
+  assert.equal(h.calls.length, 2, '可重試的錯誤要重試')
+  assert.equal(h.calls[1].key, h.calls[0].key, `重試要沿用同一把 key，第一次 ${h.calls[0].key}、第二次 ${h.calls[1].key}`)
+  h.calls[1].d.resolve({ orderId: 'A' })
+  assert.deepEqual(await p, { orderId: 'A' }, '重試成功要 resolve api 的結果')
+  assert.equal(h.keys, 1, `一次 submit 只能呼叫 newKey 一次，實際 ${h.keys} 次`)
+}
+{
+  const h = harness()
+  const c = createCheckoutClient(h.api, h.newKey, retryable)
+  const p1 = c.submit({ '2': 1 })
+  const p2 = c.submit({ '2': 1 })
+  const p3 = c.submit({ '2': 1 })
+  await settle()
+  assert(p1 === p2 && p2 === p3, '進行中再呼叫 submit（連點），要回傳同一個 Promise')
+  assert.equal(h.calls.length, 1, `連點 3 下只能呼叫 api 一次，實際 ${h.calls.length} 次`)
+  assert.equal(h.keys, 1, '連點不能產生新的 key')
+  h.calls[0].d.resolve({ orderId: 'B' })
+  await p1
+  await settle()
+  const p4 = c.submit({ '6': 1 })
+  await settle()
+  assert(p4 !== p1, '上一次結束後，submit 要回傳新的 Promise')
+  assert.equal(h.calls.length, 2, '成功之後的下一張訂單要送出新的請求')
+  assert(h.calls[1].key !== h.calls[0].key, '成功之後的下一張訂單要用新的 key（沿用舊 key 會被伺服器回放上一張）')
+  h.calls[1].d.resolve({ orderId: 'C' })
+  assert.deepEqual(await p4, { orderId: 'C' }, '第二張訂單的結果')
+}
+{
+  const h = harness()
+  const c = createCheckoutClient(h.api, h.newKey, retryable)
+  const p = c.submit({ '2': 1 })
+  await settle()
+  const bad = new Error('400 購物車是空的')
+  h.calls[0].d.reject(bad)
+  let err: unknown
+  try { await p } catch (e) { err = e }
+  await settle()
+  assert.equal(err, bad, '不可重試的錯誤要直接 reject 那個錯誤')
+  assert.equal(h.calls.length, 1, '不可重試的錯誤不能重試')
+}
+{
+  const h = harness()
+  const c = createCheckoutClient(h.api, h.newKey, retryable)
+  const p = c.submit({ '2': 1 })
+  const caught = p.then(() => undefined, (e: unknown) => e)
+  const errs = [new NetError('1'), new NetError('2'), new NetError('3')]
+  for (let i = 0; i < 3; i++) {
+    await settle()
+    assert.equal(h.calls.length, i + 1, `第 ${i + 1} 次嘗試`)
+    h.calls[i].d.reject(errs[i])
+  }
+  await settle()
+  assert.equal(h.calls.length, 3, `最多 3 次嘗試（重試 2 次），實際 ${h.calls.length} 次`)
+  const err = await caught
+  assert.equal(err, errs[2], '三次都失敗要 reject 最後一次的錯誤')
+  assert(h.calls.every(x => x.key === h.calls[0].key), '三次嘗試要用同一把 key')
+  const p2 = c.submit({ '2': 1 })
+  await settle()
+  assert.equal(h.calls.length, 4, '失敗之後再 submit 要送出新的請求')
+  assert(h.calls[3].key !== h.calls[0].key, '失敗結束後的下一次 submit 是新的意圖，要用新的 key')
+  h.calls[3].d.resolve({ orderId: 'D' })
+  await p2
+}
+</script>
+  <script type="wrong">
+type Cart = Record<string, number>
+type Api = (body: Cart, idempotencyKey: string) => Promise<{ orderId: string }>
+function createCheckoutClient(api: Api, newKey: () => string, isRetryable: (err: unknown) => boolean): { submit(cart: Cart): Promise<{ orderId: string }> } {
+  let inflight: Promise<{ orderId: string }> | undefined
+  async function send(cart: Cart): Promise<{ orderId: string }> {
+    for (let attempt = 1; ; attempt++) {
+      try { return await api(cart, newKey()) } catch (err) { if (attempt >= 3 || !isRetryable(err)) throw err }
+    }
+  }
+  return {
+    submit(cart) {
+      if (inflight) return inflight
+      const p = send(cart)
+      inflight = p
+      const clear = () => { if (inflight === p) inflight = undefined }
+      p.then(clear, clear)
+      return p
+    },
+  }
+}
+</script>
+  <script type="wrong">
+type Cart = Record<string, number>
+type Api = (body: Cart, idempotencyKey: string) => Promise<{ orderId: string }>
+function createCheckoutClient(api: Api, newKey: () => string, isRetryable: (err: unknown) => boolean): { submit(cart: Cart): Promise<{ orderId: string }> } {
+  async function send(cart: Cart, key: string): Promise<{ orderId: string }> {
+    for (let attempt = 1; ; attempt++) {
+      try { return await api(cart, key) } catch (err) { if (attempt >= 3 || !isRetryable(err)) throw err }
+    }
+  }
+  return { submit: cart => send(cart, newKey()) }
+}
+</script>
+  <script type="wrong">
+type Cart = Record<string, number>
+type Api = (body: Cart, idempotencyKey: string) => Promise<{ orderId: string }>
+function createCheckoutClient(api: Api, newKey: () => string, isRetryable: (err: unknown) => boolean): { submit(cart: Cart): Promise<{ orderId: string }> } {
+  let inflight: Promise<{ orderId: string }> | undefined
+  const key = newKey()
+  async function send(cart: Cart): Promise<{ orderId: string }> {
+    for (let attempt = 1; ; attempt++) {
+      try { return await api(cart, key) } catch (err) { if (attempt >= 3 || !isRetryable(err)) throw err }
+    }
+  }
+  return {
+    submit(cart) {
+      if (inflight) return inflight
+      const p = send(cart)
+      inflight = p
+      const clear = () => { if (inflight === p) inflight = undefined }
+      p.then(clear, clear)
+      return p
+    },
+  }
+}
+</script>
+  <script type="wrong">
+type Cart = Record<string, number>
+type Api = (body: Cart, idempotencyKey: string) => Promise<{ orderId: string }>
+function createCheckoutClient(api: Api, newKey: () => string, isRetryable: (err: unknown) => boolean): { submit(cart: Cart): Promise<{ orderId: string }> } {
+  let inflight: Promise<{ orderId: string }> | undefined
+  async function send(cart: Cart, key: string): Promise<{ orderId: string }> {
+    for (let attempt = 1; ; attempt++) {
+      try { return await api(cart, key) } catch (err) { if (attempt >= 3) throw err }
+    }
+  }
+  return {
+    submit(cart) {
+      if (inflight) return inflight
+      const p = send(cart, newKey())
+      inflight = p
+      const clear = () => { if (inflight === p) inflight = undefined }
+      p.then(clear, clear)
+      return p
+    },
+  }
+}
+</script>
+  <script type="wrong">
+type Cart = Record<string, number>
+type Api = (body: Cart, idempotencyKey: string) => Promise<{ orderId: string }>
+function createCheckoutClient(api: Api, newKey: () => string, isRetryable: (err: unknown) => boolean): { submit(cart: Cart): Promise<{ orderId: string }> } {
+  let inflight: Promise<{ orderId: string }> | undefined
+  async function send(cart: Cart, key: string): Promise<{ orderId: string }> {
+    for (let attempt = 1; ; attempt++) {
+      try { return await api(cart, key) } catch (err) { if (attempt > 3 || !isRetryable(err)) throw err }
+    }
+  }
+  return {
+    submit(cart) {
+      if (inflight) return inflight
+      const p = send(cart, newKey())
+      inflight = p
+      const clear = () => { if (inflight === p) inflight = undefined }
+      p.then(clear, clear)
+      return p
+    },
+  }
+}
+</script>
+  <script type="wrong">
+// 只有成功才清掉進行中的 Promise：失敗之後再按結帳，永遠拿到那個失敗的 Promise
+type Cart = Record<string, number>
+type Api = (body: Cart, idempotencyKey: string) => Promise<{ orderId: string }>
+function createCheckoutClient(api: Api, newKey: () => string, isRetryable: (err: unknown) => boolean): { submit(cart: Cart): Promise<{ orderId: string }> } {
+  let inflight: Promise<{ orderId: string }> | undefined
+  async function send(cart: Cart, key: string): Promise<{ orderId: string }> {
+    for (let attempt = 1; ; attempt++) {
+      try { return await api(cart, key) } catch (err) { if (attempt >= 3 || !isRetryable(err)) throw err }
+    }
+  }
+  return {
+    submit(cart) {
+      if (inflight) return inflight
+      const p = send(cart, newKey())
+      inflight = p
+      p.then(() => { inflight = undefined }, () => {})
+      return p
+    },
+  }
+}
+</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：RFC 9110 說 PUT 和 DELETE 是冪等的。下單用的 <code>POST /orders</code> 逾時了，App 可以直接自動重試嗎？</p>
+  <label data-key="a">可以，HTTP 方法是不是冪等不影響重試</label>
+  <label data-key="b">可以，只要伺服器有用交易</label>
+  <label data-key="c">沒有冪等鍵就不行：POST 不冪等，重試可能建立第二張訂單</label>
+  <label data-key="d">不行，POST 永遠不能重試</label>
+  <p class="why">✓ c。RFC 9110 說客戶端不應自動重試非冪等的請求，除非知道它實際上冪等。帶冪等鍵、伺服器實作了去重，POST 就「實際上冪等」，可以重試；所以 d 說「永遠不能」太絕對。a 忽略了方法的語意。b 的交易只保證「一次請求」的原子性，擋不住第二次請求再做一遍。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：App 送出結帳後逾時，重試時用一把<strong>新產生</strong>的冪等鍵。伺服器會怎樣？</p>
+  <label data-key="a">伺服器比對內容發現一樣，回傳第一次的結果</label>
+  <label data-key="b">伺服器把它當成新的意圖，可能建立第二張訂單、扣第二次款</label>
+  <label data-key="c">伺服器回 422，因為內容相同但 key 不同</label>
+  <p class="why">✓ b。伺服器認重複只靠 key：key 不同就是不同的意圖（顧客本來就可能連買兩杯一樣的拿鐵），所以 a 不會發生。422 是「同 key、不同內容」，c 剛好相反。重試一定要沿用同一把 key。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 7：同一把冪等鍵送來第二次，但購物車從 1 杯拿鐵變成 2 杯。伺服器應該怎麼做？</p>
+  <label data-key="a">拒絕（IETF 草案建議 422）：同一把 key 被拿去送不同的請求，是客戶端的 bug</label>
+  <label data-key="b">回放第一次的結果（1 杯），反正 key 一樣</label>
+  <label data-key="c">照新的內容再建立一張 2 杯的訂單</label>
+  <p class="why">✓ a。key 代表一個意圖，內容不同代表客戶端誤用了 key。b 會讓顧客以為點了 2 杯、實際只有 1 杯，而且沒有任何錯誤訊號；c 等於忽略 key，重複扣款的問題又回來了。請求指紋就是用來偵測這種情況的。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 8：團隊打算用 Kafka 傳「付款請求」事件，消費者收到就呼叫金流扣款。有人說「Kafka 支援 exactly-once，所以只會扣一次」。對嗎？</p>
+  <label data-key="a">對，Kafka 的 exactly-once 涵蓋所有下游</label>
+  <label data-key="b">對，只要把 producer 設成交易式</label>
+  <label data-key="c">不對，exactly-once 只在 Kafka 內部成立；呼叫金流要靠冪等鍵或去重</label>
+  <p class="why">✓ c。Kafka 文件的 exactly-once 是指 Kafka 內部：讀 Kafka、寫回 Kafka 這一段靠 Kafka 自己的交易做到不重複。b 的交易式 producer 也只保證寫進 Kafka 的訊息不重複，管不到金流。消費者扣款成功、還沒回報 Kafka「這則處理好了」就當機，訊息會再被處理一次，金流不在 Kafka 的交易裡，a 也錯在這裡。能做到的是「至少一次＋冪等＝效果上一次」：扣款時帶由訊息 ID 衍生的冪等鍵。<a href="12-queues-outbox.html">第 12 課</a>會實作冪等消費者。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>以為只有 HTTP API 需要冪等</strong>：佇列消費者、webhook 處理、排程工作都會被重複觸發，都要冪等。</li>
+  <li><strong>先讀再寫判斷「做過了沒」</strong>：並發時兩個請求都讀到「還沒做」。用唯一約束、<code>ON CONFLICT DO NOTHING</code> 或條件更新，讓檢查和寫入在資料庫裡一步完成。</li>
+  <li><strong>冪等鍵沒有限定使用者</strong>：主鍵只用 key，別人送同一把 key 會拿到你的回應或互相衝突。主鍵用 <code>(customer_id, key)</code>。</li>
+  <li><strong>用 <code>JSON.stringify</code> 算指紋</strong>：鍵順序不同就被當成不同請求，正常的重試被誤判成 422。用正規化 JSON。</li>
+  <li><strong>用「排序後重建物件」做正規化</strong>：JavaScript 物件的整數鍵永遠依數字排在前面，<code>{ '10': 1, '9': 2 }</code> 重建後還是 9 在前。正規化要自己串字串。</li>
+  <li><strong>把呼叫金流放在資料庫交易裡</strong>：交易拉長、握著鎖，而且金流無法回滾。切成原子階段，外部呼叫放在交易之間，並傳由本地 key 衍生的冪等鍵。</li>
+  <li><strong>復原點和資料寫在不同的交易</strong>：一邊提交、一邊回滾，重試時依錯的復原點繼續。同一個階段的寫入和復原點一起提交。</li>
+  <li><strong>冪等鍵永遠不清除，或保存期限比客戶端重試的時間還短</strong>：前者讓表無限長大，後者讓遲來的重試被當成新請求。訂好期限並寫進 API 文件。</li>
+  <li><strong>每次重試產生新的冪等鍵</strong>：等於沒有 key。key 在使用者按下按鈕時產生一次，重試沿用。</li>
+  <li><strong>成功後沿用舊 key 下新訂單</strong>：伺服器回放上一張的回應，新訂單沒被建立。一個意圖結束後換新 key。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>逾時之後，客戶端分不出「沒做」和「做了但回應遺失」，所以重試必然帶來重複；連點、代理、佇列、webhook、排程也都會重送。能控制的是伺服器：收到幾次，效果只發生一次。</li>
+  <li>冪等讓同一件事做很多次，效果跟做一次相同；它講的是伺服器狀態，不是回應。HTTP 方法的冪等是語意，實作做不做得到看程式；POST 要「實際上冪等」才能自動重試。</li>
+  <li>先讓操作本身冪等：絕對值取代增量、條件更新、唯一約束與 <code>ON CONFLICT DO NOTHING</code>、自然鍵。並發下要用原子操作，不要先讀再寫。</li>
+  <li>天生不冪等的操作（建立訂單）和外部副作用（扣款）用冪等鍵：一個意圖一把 key，限定在使用者範圍，存在共用的資料庫。IETF 草案（還不是 RFC）建議缺 key 回 400、處理中回 409、同 key 不同內容回 422。</li>
+  <li>請求指紋用正規化 JSON 加 SHA-256，確認同一把 key 送的是同一份內容；認出重複靠 key，不靠指紋。</li>
+  <li>跨越外部服務的請求切成原子階段，每個交易同時更新復原點；外部呼叫放在交易之間，帶由本地 key 衍生的冪等鍵；後續工作用 outbox 在交易裡排入；處理中的鎖要有逾時，key 要定期清除。</li>
+  <li>App 端一個意圖一把 key、重試沿用、結束後換新。「恰好一次」跨系統做不到，能做到的是「至少一次＋冪等＝效果上一次」。</li>
+</ul>
+<p>下一課講限流：當某個客戶的程式寫錯、不停送請求時，怎麼保護服務，也保護其他客戶。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

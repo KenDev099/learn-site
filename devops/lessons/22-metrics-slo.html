@@ -1,0 +1,548 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>22. 指標與 SLO：用數字描述服務好不好</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="22" data-practice="devops">
+<header>
+  <div class="eyebrow">階段 6：可觀測性與可靠性 · 第 22 課</div>
+  <h1>指標與 SLO：用數字描述服務好不好</h1>
+</header>
+<main>
+
+<p>週一早上，店長問你：「上週末結帳是不是很慢？」你翻了 log，看到幾千行 200，也看到幾行耗時 3 秒的請求，可是說不出「慢」是多慢、多少客人受影響、跟平常比是好還是壞。上線新版本時也一樣：新版本到底有沒有讓服務變差，大家各說各話。</p>
+<p>這一課把「服務好不好」變成大家都認的數字，新版本有沒有讓服務變差，不必再各說各話。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>指標是什麼、平均值會騙人：指標跟 log、trace 怎麼分工，「慢不慢」為什麼要看 p95 而不是平均（開場問題的最小答案）。</li>
+  <li>在 Node 暴露 <code>/metrics</code> 與 Prometheus：在 API 裡記錄請求數和耗時，用 PromQL 算出請求量、錯誤率、p95。</li>
+  <li>RED 與 USE：儀表板該放哪些圖，出事時先看哪一張。</li>
+  <li>SLI、SLO 與錯誤預算：替咖啡店訂出「夠好」的標準，用剩下的額度決定這週能不能上新功能，PM 和工程師用同一把尺討論。</li>
+  <li>壓測：用 k6 回答「多少流量內做得到這個 SLO」，寫成上線門檻。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="21-logs.html">第 21 課</a>的請求 log：每個請求一行 JSON，記下路由、狀態碼與耗時。</li>
+  <li><a href="../../node/lessons/13-http-server.html">Node 課第 13 課</a>的 <code>node:http</code> 伺服器：每個請求進到同一個處理函式，用 <code>res.writeHead</code>、<code>res.end</code> 回應。</li>
+  <li><a href="13-scaling.html">第 13 課</a>的容量規劃：先量出單一副本撐得住多少流量，再決定要開幾份；Little's law 算出同時在處理的請求數。</li>
+</ul></div>
+
+<h2>指標是什麼：跟 log、trace 的分工</h2>
+<p><strong>指標</strong>是隨時間記錄的數值序列，例如「每秒幾個請求」「現在有幾個請求在處理」。程式不記錄每一件事，只維護幾個計數器，每隔一段時間被讀走一次。所以它很便宜：一天一百萬個請求，跟一天一千個請求，指標的資料量幾乎一樣。</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>log（第 21 課）</th><th>指標（這一課）</th><th>trace（第 23 課）</th></tr>
+  <tr><td>記錄什麼</td><td>每一件事的細節</td><td>彙總後的數字</td><td>一個請求經過的每一段</td></tr>
+  <tr><td>成本跟什麼成正比</td><td>流量</td><td>序列數（見下面的 label）</td><td>流量（通常要取樣）</td></tr>
+  <tr><td>擅長回答</td><td>這個請求發生了什麼事</td><td>服務現在好不好、趨勢、告警</td><td>慢在哪一個服務、哪一段</td></tr>
+  <tr><td>不擅長</td><td>長期趨勢、便宜地告警</td><td>單一請求的細節</td><td>整體的比例與趨勢</td></tr>
+</table></div>
+<p>實務上的順序是：指標告訴你「有問題」（錯誤率升高），trace 告訴你「在哪裡」，log 告訴你「為什麼」。</p>
+
+<p>Prometheus 的指標有四種<strong>型別</strong>：</p>
+<div class="table-wrap"><table>
+  <tr><th>型別</th><th>是什麼</th><th>咖啡店的例子</th></tr>
+  <tr><td><strong>counter</strong></td><td>只會增加的累計數；程式重啟會歸零</td><td><code>http_requests_total</code>、<code>orders_total</code></td></tr>
+  <tr><td><strong>gauge</strong></td><td>可升可降的當下值</td><td><code>http_requests_in_flight</code>（正在處理的請求數）、連線池閒置數</td></tr>
+  <tr><td><strong>histogram</strong></td><td>把觀察值分到事先定好的<strong>桶子</strong>（bucket）裡計數，可以估百分位數</td><td><code>http_request_duration_seconds</code></td></tr>
+  <tr><td><strong>summary</strong></td><td>在程式裡直接算好百分位數</td><td>（不建議，原因見下一節）</td></tr>
+</table></div>
+<p>counter 的數字本身沒有意義：「累計 1,283,004 個請求」說明不了什麼，重啟後還會變回 0。有意義的是它的<strong>變化速度</strong>，所以查詢時一定用 <code>rate()</code> 算每秒增加多少（後面會講）。想知道「現在」的值，例如連線池還剩幾條，才用 gauge。</p>
+
+<h2>平均值會騙人：百分位數與 histogram</h2>
+<p>假設上週末某一分鐘有 1000 個結帳請求：980 個在 200ms 內完成（平均 73ms），20 個卡在等資料庫鎖，花了 2.4 秒以上。平均耗時是 120ms，看起來很健康；可是每 50 個客人就有 1 個等了兩秒多，而且常常是購物車最滿的那幾位。</p>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="延遲分布圖：大部分請求集中在 200 毫秒以內，平均值 120 毫秒的線落在高峰附近，右邊有一小群 2.4 秒以上的慢請求，p99 的線落在那一群上">
+    <line class="d-line" x1="40" y1="200" x2="680" y2="200"/>
+    <rect class="d-soft" x="50" y="60" width="30" height="140"/>
+    <rect class="d-soft" x="85" y="40" width="30" height="160"/>
+    <rect class="d-soft" x="120" y="110" width="30" height="90"/>
+    <rect class="d-soft" x="155" y="165" width="30" height="35"/>
+    <rect class="d-soft" x="560" y="185" width="30" height="15"/>
+    <rect class="d-soft" x="595" y="190" width="30" height="10"/>
+    <line class="d-line" x1="140" y1="25" x2="140" y2="200" stroke-dasharray="4 4"/>
+    <text class="d-accent" x="148" y="38">平均 120ms</text>
+    <line class="d-line" x1="600" y1="25" x2="600" y2="200" stroke-dasharray="4 4"/>
+    <text class="d-accent" x="520" y="38">p99 ≈ 2.4 秒</text>
+    <text class="d-small" x="50" y="220">0</text>
+    <text class="d-small" x="160" y="220">200ms</text>
+    <text class="d-small" x="560" y="220">2.4s</text>
+    <text class="d-small" x="250" y="150">980 個在 200ms 內</text>
+    <text class="d-small" x="440" y="175">20 個在 2.4 秒以上</text>
+    <text class="d-small" x="40" y="242">耗時 →（中間省略）</text>
+  </svg>
+  <figcaption>平均值落在大多數請求附近，完全看不出右邊那群等了兩秒多的客人。</figcaption>
+</figure>
+<p><strong>百分位數</strong>（percentile）回答「最慢的那群人感受如何」：p95 是「95% 的請求比這個值快」，p99 是 99%。p50（中位數）代表一般客人，p95、p99 代表運氣不好的客人。一個頁面如果要呼叫 API 好幾次，客人碰到 p99 的機會遠大於 1%，所以資深工程師看延遲一律看 p95、p99，不看平均。</p>
+<p>要算百分位數，需要知道分布。<strong>histogram</strong> 不記每個值，只記「落在每個桶子以下的有幾個」：桶子的上限叫 <code>le</code>（less or equal），而且是<strong>累加</strong>的，<code>le="0.25"</code> 包含所有 ≤ 0.25 秒的請求，最後一個 <code>le="+Inf"</code> 等於總數。估百分位數時，先找出第 95% 個請求落在哪個桶子，再在桶子裡用線性內插。所以估出來的值有誤差，誤差取決於桶子的間距：桶子要密集地放在你在意的範圍（例如 SLO 的 300ms 附近）。</p>
+<p>histogram 和 summary 最大的差別在<strong>能不能合併</strong>。cafe-api 有 3 個副本，每個副本都只看到自己的請求。histogram 的桶子是計數，三個副本同一個 <code>le</code> 的數字加起來，就是整體的分布，再估 p95 就對了。summary 在每個副本裡算好 p95，三個 p95 沒有任何數學方法可以合併成整體的 p95，取平均更是錯的。按「執行」看差多少：</p>
+
+<div class="lab"><script type="code">
+// 3 個副本的耗時（毫秒）：A 很閒都很快，B、C 比較忙
+const replicas: Record<string, number[]> = {
+  A: Array.from({ length: 900 }, (_, i) => 20 + (i % 40)),
+  B: Array.from({ length: 80 }, (_, i) => 100 + i * 10),
+  C: Array.from({ length: 20 }, (_, i) => 2400 + i * 50),
+}
+// 最近排名法：排序後取第 ceil(p × n) 個
+const pct = (list: number[], p: number) => [...list].sort((a, b) => a - b)[Math.ceil(p * list.length) - 1]
+const avg = (list: number[]) => list.reduce((a, b) => a + b, 0) / list.length
+
+const all = Object.values(replicas).flat()
+console.log('整體平均', avg(all).toFixed(0), 'ms')
+console.log('整體 p50', pct(all, 0.5), 'p95', pct(all, 0.95), 'p99', pct(all, 0.99))
+
+const each = Object.entries(replicas).map(([name, list]) => [name, pct(list, 0.95)] as const)
+console.log('各副本的 p95', each.map(([n, v]) => `${n}=${v}`).join(' '))
+console.log('把三個 p95 取平均（錯的）', avg(each.map(([, v]) => v)).toFixed(0))
+
+// histogram：每個副本只記桶子的計數，桶子可以直接相加
+const les = [50, 100, 250, 500, 1000, 2500, 5000, Infinity]
+const bucketsOf = (list: number[]) => les.map(le => list.filter(v => v <= le).length)
+const merged = les.map((_, i) => Object.values(replicas).reduce((sum, list) => sum + bucketsOf(list)[i], 0))
+console.log('合併後的桶子', merged.join(' '))
+// 跟 histogram_quantile 一樣：找出第 95% 個落在哪個桶子，在桶子裡線性內插
+function quantile(q: number, buckets: number[]) {
+  const rank = q * buckets.at(-1)
+  const i = buckets.findIndex(c => c >= rank)
+  const lower = i === 0 ? 0 : les[i - 1], below = i === 0 ? 0 : buckets[i - 1]
+  return lower + (les[i] - lower) * (rank - below) / (buckets[i] - below)
+}
+console.log('從合併的桶子估 p95', quantile(0.95, merged).toFixed(0), 'ms（真正的 p95 是', pct(all, 0.95), '）')
+</script></div>
+<p>三個 p95 的平均跟真正的 p95 差很多；合併桶子後估出來的值落在同一個桶子裡，誤差只來自桶子的間距。<a href="../../system-design/lessons/03-latency-percentiles.html">系統設計課第 3 課</a>會更深入談百分位數與尾端延遲。</p>
+
+<h2>在 Node 暴露 /metrics</h2>
+<p>Prometheus 用 <strong>pull 模型</strong>：服務自己開一個 <code>GET /metrics</code>，Prometheus 每隔一段時間來讀，這個動作叫 <strong>scrape</strong>（抓取）。回應是純文字的 <strong>exposition format</strong>，每行一個「名稱{label} 數值」：</p>
+<pre># HELP http_requests_total HTTP 請求數
+# TYPE http_requests_total counter
+http_requests_total{method="GET",route="/orders/:id",status="200"} 1532
+http_requests_total{method="GET",route="/orders/:id",status="404"} 17
+# TYPE http_request_duration_seconds histogram
+http_request_duration_seconds_bucket{le="0.1",method="GET",route="/orders/:id"} 1490
+http_request_duration_seconds_bucket{le="0.25",method="GET",route="/orders/:id"} 1541
+http_request_duration_seconds_bucket{le="+Inf",method="GET",route="/orders/:id"} 1549
+http_request_duration_seconds_sum{method="GET",route="/orders/:id"} 61.7
+http_request_duration_seconds_count{method="GET",route="/orders/:id"} 1549
+# TYPE http_requests_in_flight gauge
+http_requests_in_flight 3</pre>
+<p>一個 histogram 會產生三種序列：每個桶子的 <code>_bucket</code>、全部耗時加總的 <code>_sum</code>、總數 <code>_count</code>（等於 <code>+Inf</code> 那個桶子）。</p>
+<p><strong>命名慣例</strong>：小寫加底線；counter 以 <code>_total</code> 結尾；名稱帶上單位，而且用<strong>基本單位</strong>：秒（<code>_seconds</code>）、位元組（<code>_bytes</code>），不用毫秒、MB。單位寫錯是很常見的事故：名稱寫 <code>_seconds</code>，程式卻記毫秒，200ms 的請求被記成 200 秒，告警規則和儀表板全都錯。</p>
+<p><strong>label</strong> 讓同一個指標可以依維度切開，例如 method、route、status。要知道的是：每一組不同的 label 值就是一條獨立的<strong>時間序列</strong>（time series），Prometheus 的記憶體與儲存跟序列數成正比。route 用原始網址 <code>/orders/1155</code>，每張訂單就多一條序列；放 user_id，每個客人一條。這叫<strong>基數爆炸</strong>（cardinality explosion），會拖垮 Prometheus。規則是：label 的值要是<strong>有限的、事先數得出來的</strong>集合，例如 HTTP 方法、路由樣板 <code>/orders/:id</code>、狀態碼；比對不到路由的請求（掃描器亂打的網址）一律記成 <code>unmatched</code>。想看單一訂單、單一客人，用 log 或 trace。</p>
+<div class="callout practice"><strong>💡 實務上：label 是在 code review 時擋下來的</strong><br>基數爆炸很少是一次寫壞，通常是某天有人「順手」在 label 加了 <code>user_id</code>、<code>tenant</code> 或錯誤訊息全文，幾天後 Prometheus 記憶體用完、整個監控一起掛。資深工程師在 review 新增指標的 PR 時會問：這個 label 最多會有幾種值？乘上其他 label 的組合後有多少條序列？出事時有人會用這個維度切圖嗎？用不到的維度不要加。雲端的託管監控（例如 Grafana Cloud、Datadog）多半依序列數收費，基數直接就是帳單。</div>
+<p>Node 用 <code>prom-client</code>（這門課用 15.1.3）。它的 histogram 有 <code>startTimer()</code>，結束時呼叫回傳的函式就會記下經過的<strong>秒數</strong>：</p>
+<pre>import { Counter, Histogram, Registry, collectDefaultMetrics } from 'prom-client'
+
+export const register = new Registry()
+collectDefaultMetrics({ register })   // CPU、heap、event loop 延遲、GC…
+
+const duration = new Histogram({
+  name: 'http_request_duration_seconds',
+  help: 'HTTP 請求耗時（秒）',
+  labelNames: ['method', 'route'],
+  buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5],
+  registers: [register],
+})
+
+const end = duration.startTimer({ method: 'GET', route: '/orders/:id' })
+// …處理請求…
+end()   // 記下經過的秒數
+
+// GET /metrics 的回應
+res.writeHead(200, { 'content-type': register.contentType }).end(await register.metrics())</pre>
+<p><code>collectDefaultMetrics</code> 送你一組程序層級的指標，像 <code>process_cpu_seconds_total</code>、<code>nodejs_heap_size_used_bytes</code>、<code>nodejs_eventloop_lag_seconds</code>（<a href="../../node/lessons/23-profiling-memory.html">Node 課第 23 課</a>的 event loop 延遲），這些在下面的 USE 方法會用到。<code>/metrics</code> 只給內部網路的 Prometheus 讀，不要經過對外的 nginx 公開。</p>
+<div class="callout warn">記錄請求有兩個容易漏的地方：處理函式丟出例外時，<code>await handle()</code> 後面的程式不會執行，in_flight 的 <code>dec()</code> 要放在 <code>finally</code>；而狀態碼可能在例外被外層接住後才變成 500，要等回應真的送出（<code>res</code> 的 <code>finish</code> 事件）才讀 <code>res.statusCode</code>。練習 1 會測這兩件事。</div>
+
+<h2>Prometheus：抓取與 PromQL</h2>
+<p><strong>Prometheus</strong> 是定期抓取、儲存指標，並用 <strong>PromQL</strong> 查詢的監控系統。這門課用 3.15.1。設定檔列出要抓哪些目標：</p>
+<pre># prometheus.yml
+global:
+  scrape_interval: 15s      # 每 15 秒抓一次
+scrape_configs:
+  - job_name: cafe-api
+    static_configs:
+      - targets: ['api-1:3000', 'api-2:3000', 'api-3:3000']
+rule_files:
+  - rules.yml</pre>
+<figure>
+  <svg viewBox="0 0 700 220" role="img" aria-label="pull 模型：Prometheus 每 15 秒向三個 api 副本的 /metrics 抓取，存進自己的時間序列資料庫，recording rule 預先算好常用的查詢，Grafana 查詢畫圖，告警規則送到 Alertmanager">
+    <defs><marker id="arr22a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="20" y="20" width="140" height="45" rx="8"/><text class="d-text" x="90" y="48" text-anchor="middle">api-1 /metrics</text>
+    <rect class="d-box" x="20" y="85" width="140" height="45" rx="8"/><text class="d-text" x="90" y="113" text-anchor="middle">api-2 /metrics</text>
+    <rect class="d-box" x="20" y="150" width="140" height="45" rx="8"/><text class="d-text" x="90" y="178" text-anchor="middle">api-3 /metrics</text>
+    <rect class="d-soft" x="250" y="40" width="200" height="140" rx="10"/>
+    <text class="d-text" x="350" y="68" text-anchor="middle">Prometheus</text>
+    <text class="d-small" x="350" y="95" text-anchor="middle">時間序列資料庫</text>
+    <text class="d-small" x="350" y="120" text-anchor="middle">recording rule</text>
+    <text class="d-small" x="350" y="145" text-anchor="middle">告警規則</text>
+    <line class="d-line" x1="250" y1="70" x2="162" y2="42" marker-end="url(#arr22a)"/>
+    <line class="d-line" x1="250" y1="108" x2="162" y2="108" marker-end="url(#arr22a)"/>
+    <line class="d-line" x1="250" y1="146" x2="162" y2="172" marker-end="url(#arr22a)"/>
+    <text class="d-small" x="205" y="30" text-anchor="middle">每 15 秒來抓</text>
+    <rect class="d-box" x="540" y="40" width="140" height="45" rx="8"/><text class="d-text" x="610" y="68" text-anchor="middle">Grafana</text>
+    <rect class="d-box" x="540" y="135" width="140" height="45" rx="8"/><text class="d-text" x="610" y="163" text-anchor="middle">Alertmanager</text>
+    <line class="d-line" x1="538" y1="62" x2="452" y2="80" marker-end="url(#arr22a)"/>
+    <text class="d-small" x="495" y="55" text-anchor="middle">PromQL</text>
+    <line class="d-line" x1="452" y1="150" x2="538" y2="157" marker-end="url(#arr22a)"/>
+  </svg>
+  <figcaption>Prometheus 主動去抓。抓不到時，它替每個目標記的 <code>up</code> 指標會變成 0，「服務掛了」本身也是一個可以告警的數字。</figcaption>
+</figure>
+<p>常用的 PromQL，一步只多一樣東西：</p>
+<div class="table-wrap"><table>
+  <tr><th>想知道</th><th>PromQL</th></tr>
+  <tr><td>每條序列每秒幾個請求（5 分鐘平均）</td><td><code>rate(http_requests_total[5m])</code></td></tr>
+  <tr><td>依路由加總（合併副本與狀態碼）</td><td><code>sum by (route) (rate(http_requests_total[5m]))</code></td></tr>
+  <tr><td>5xx 佔全部的比例</td><td><code>sum by (route) (rate(http_requests_total{status=~"5.."}[5m])) / sum by (route) (rate(http_requests_total[5m]))</code></td></tr>
+  <tr><td>p95 耗時</td><td><code>histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_bucket[5m])))</code></td></tr>
+</table></div>
+<ul>
+  <li><code>[5m]</code> 是<strong>範圍選擇器</strong>：取過去 5 分鐘的樣本。Prometheus 3 起範圍是左開右閉，剛好落在左邊界的樣本不算。</li>
+  <li><code>rate()</code> 算這段時間內平均每秒增加多少，而且會處理 counter 重設：看到數字變小，就當作程式重啟、從 0 重新數，不會算出負值。所以 counter 重啟不會讓圖表壞掉。</li>
+  <li><code>irate()</code> 只看最後兩個樣本，適合看瞬間的尖峰，不適合拿來告警或算 SLO（太跳）。<code>increase(x[5m])</code> 是 5 分鐘內增加的總數，等於 <code>rate(x[5m]) × 300</code>，要「每秒」就得自己除 300。</li>
+  <li>比例要<strong>先加總再相除</strong>。各副本流量不同時，把每個副本的錯誤率取平均，一個很閒卻偶爾出錯的副本會把整體拉得很難看（或反過來掩蓋問題）。</li>
+  <li><code>histogram_quantile</code> 之前一定要 <code>sum by (le, …)</code>：先把各副本同一個 <code>le</code> 的桶子加起來，<code>le</code> 一定要留著，它就是桶子的上限。</li>
+  <li>Prometheus 3 起 <code>le</code> 的值會正規化成浮點數字串：程式輸出 <code>le="1"</code>，存進去會變成 <code>le="1.0"</code>。查詢或規則裡寫死 <code>le="1"</code> 的會查不到。</li>
+</ul>
+<p>儀表板每次打開都要重算一次 histogram_quantile，序列一多就很慢。<strong>recording rule</strong> 讓 Prometheus 定期把查詢算好，存成新的指標，儀表板與告警直接讀結果。命名慣例是 <code>層級:指標:運算</code>：</p>
+<pre># rules.yml
+groups:
+  - name: cafe-api-red
+    rules:
+      - record: route:http_requests:rate5m
+        expr: sum by (route) (rate(http_requests_total[5m]))</pre>
+<p>規則寫錯不會報錯，只會算出錯的數字，所以規則也要測。<code>promtool test rules</code>（在 <code>prom/prometheus</code> 映像的 <code>/bin/promtool</code>）讓你餵假的時間序列（<code>'0+60x10'</code> 是「從 0 開始、每個間隔加 60、共 10 次」），在指定的時間點比對結果。練習 2 的測試就是這樣做的。</p>
+
+<h2>RED 與 USE：儀表板放什麼</h2>
+<p>儀表板放太多面板，出事時反而找不到重點。兩個方法幫你決定放什麼：</p>
+<ul>
+  <li><strong>RED</strong>，看<strong>服務</strong>（使用者感受得到的）：<strong>R</strong>ate 請求量、<strong>E</strong>rrors 錯誤比例、<strong>D</strong>uration 耗時的 p95／p99。每個路由一組，就是上一節的三個 recording rule。</li>
+  <li><strong>USE</strong>，看<strong>資源</strong>（找原因）：<strong>U</strong>tilization 使用率（忙碌的時間比例）、<strong>S</strong>aturation 飽和（有多少工作在排隊）、<strong>E</strong>rrors 資源本身的錯誤。</li>
+</ul>
+<div class="table-wrap"><table>
+  <tr><th>cafe-api 儀表板</th><th>面板</th><th>指標</th></tr>
+  <tr><td>RED（第一排）</td><td>每秒請求數、5xx 比例、p95／p99，依路由</td><td>三個 recording rule</td></tr>
+  <tr><td>USE：CPU</td><td>使用率；event loop 延遲（Node 的 CPU 排隊）</td><td><code>rate(process_cpu_seconds_total[5m])</code>、<code>nodejs_eventloop_lag_seconds</code></td></tr>
+  <tr><td>USE：記憶體</td><td>heap 使用量、容器記憶體上限</td><td><code>nodejs_heap_size_used_bytes</code></td></tr>
+  <tr><td>USE：資料庫連線池</td><td>使用中、閒置、<strong>排隊等連線</strong>的數量</td><td><code>db_pool_total</code>、<code>db_pool_idle</code>、<code>db_pool_waiting</code></td></tr>
+  <tr><td>USE：資料庫本身</td><td>連線數、鎖等待、慢查詢</td><td><a href="../../postgresql/lessons/36-connections-monitoring.html">PostgreSQL 課第 36 課</a>的 <code>pg_stat_activity</code></td></tr>
+</table></div>
+<p>順序很重要：先看 RED 確認使用者在痛（p95 升高），再看 USE 找哪個資源飽和。只看 CPU 會漏掉最常見的情況：CPU 只用了 20%，請求卻全卡在等資料庫連線，<code>db_pool_waiting</code> 一直往上爬。反過來，CPU 90% 但 RED 都正常，那就不是事故。</p>
+
+<h2>SLI、SLO 與錯誤預算</h2>
+<p>「服務好不好」要先定義清楚：</p>
+<ul>
+  <li><strong>SLI</strong>（service level indicator，服務水準指標）：量測服務好壞的數字，通常寫成「好的事件 ÷ 全部的事件」。cafe-api 的兩個 SLI：<strong>可用性</strong>＝非 5xx 的請求比例；<strong>延遲</strong>＝300ms 內完成的請求比例。最好在負載平衡器（nginx、ALB）量，因為它看得到 app 掛掉時連不上的請求，app 自己的指標看不到。</li>
+  <li><strong>SLO</strong>（service level objective，服務水準目標）：SLI 的目標，加上時間範圍。例如「30 天內 99.9% 的請求不是 5xx」。</li>
+  <li><strong>SLA</strong>（service level agreement，服務水準協議）：寫進合約、違反要賠錢的承諾。SLA 一定比內部的 SLO 寬鬆，例如 SLO 99.9%、SLA 99.5%，中間的差距讓你在賠錢之前就發現問題。</li>
+</ul>
+<p><strong>錯誤預算</strong>（error budget）是 1 − SLO，也就是「允許失敗的額度」。99.9% 的 SLO 在 30 天內：</p>
+<pre>30 天 × 24 小時 × 60 分鐘 = 43,200 分鐘
+43,200 × (1 − 0.999) = 43.2 分鐘
+用請求數算：這 30 天有 2,000,000 個請求 → 允許 2,000 個失敗</pre>
+<p>99.9% 不是「幾乎不能出錯」，而是每個月有 43 分鐘可以「花」：一次 10 分鐘的部署事故、幾次資料庫維護。這也是 SLO 不能訂 100% 的原因：100% 代表永遠不能部署、不能改東西，而且使用者的網路、手機本身就達不到 100%，你付出的成本使用者感受不到。</p>
+<p><strong>錯誤預算政策</strong>把數字變成決策，事先和產品端講好，出事時就不用吵：</p>
+<div class="table-wrap"><table>
+  <tr><th>剩餘預算</th><th>決策</th></tr>
+  <tr><td>充足（例如剩 25% 以上），燃燒率正常</td><td><strong>ship</strong>：照常上新功能</td></tr>
+  <tr><td>快用完，或正在快速燃燒</td><td><strong>ship-with-caution</strong>：上線要金絲雀（第 16 課）、避開尖峰、有人盯</td></tr>
+  <tr><td>用完了（剩 0 或透支）</td><td><strong>freeze</strong>：暫停新功能，工程時間先拿去修穩定性，直到預算回來</td></tr>
+</table></div>
+<div class="callout practice"><strong>💡 實務上：SLO 是工程和產品一起簽的約定</strong><br>SLO 的數字不是工程師自己定的：先拿過去 30 天的實際表現當起點，再問產品端「客人慢到什麼程度會放棄結帳」。錯誤預算政策要在沒出事的時候寫下來、讓 PM 和主管同意，例如「預算用完就凍結新功能，直到 7 天內的燃燒率回到 1 以下」；等到事故當下才談，只會變成誰嗓門大誰贏。剛開始只挑 1～2 個最重要的路由（結帳、登入）訂 SLO，每季回頭檢查目標是否太鬆或太緊。</div>
+<p><strong>燃燒率</strong>（burn rate）是消耗預算的速度：觀察視窗內的錯誤率 ÷ (1 − SLO)。燃燒率 1 代表照這個速度，預算剛好在 30 天結束時用完；燃燒率 10 代表 3 天就會用完。注意分母是「允許的錯誤率」，跟觀察視窗多長、整個週期多長無關：過去 1 小時有 3,600 個請求、36 個 5xx，錯誤率 1%，SLO 99.9% 的燃燒率就是 0.01 ÷ 0.001 = 10。第 25 課會用燃燒率設告警：比「錯誤率超過 1%」好，因為它直接回答「這樣下去預算撐得住嗎」。</p>
+
+<h2>壓測：SLO 在多少流量內做得到</h2>
+<p>SLO 說「要多快」，但沒說「在多少流量下」。週末流量是平常的三倍時還做得到嗎？<strong>壓力測試</strong>（load test）用產生出來的流量量測系統在某個負載下的表現，回答這個問題，也把第 13 課容量規劃要的「單副本能力」從猜測變成實測。</p>
+<p>這門課用 <strong>k6</strong>（Grafana 的開源壓測工具，用 JavaScript 寫情境），版本 2.3.0，用 <code>grafana/k6:2.3.0</code> 映像在 compose（<a href="10-compose.html">第 10 課</a>）網路的<strong>另一個容器</strong>裡跑。不要 <code>docker exec</code> 進 api 容器裡壓測：壓測工具和被測程式搶同一份 CPU，量到的是兩者的混合。</p>
+<h3>開放模型與協調遺漏</h3>
+<p>很多壓測工具（例如 autocannon 的預設用法、k6 的 <code>constant-vus</code>）是<strong>封閉模型</strong>（closed model）：固定 50 個連線（虛擬使用者，VU），每個等上一個回應回來才送下一個。問題是：系統卡住 2 秒的期間，50 個 VU 全在等，工具就停止送請求，只量到 50 個慢請求。真實的客人不會因為你變慢就不來，這 2 秒本該有幾百個請求在排隊，它們的等待時間全沒被量到，p99 看起來還不錯。這叫<strong>協調遺漏</strong>（coordinated omission）：工具跟被測系統「協調」好一起變慢。</p>
+<p><strong>開放模型</strong>（open model）依固定的<strong>到達率</strong>送請求：每秒 100 個就是 100 個，不管前面的回來了沒。k6 的 <code>constant-arrival-rate</code>（固定到達率）、<code>ramping-arrival-rate</code>（依 stages 改變到達率）就是開放模型。到達率模式下，k6 需要足夠的 VU 去送請求：大約是「到達率 × 回應秒數」，用 <code>preAllocatedVUs</code> 事先配好。VU 不夠時，送不出去的請求記在 <strong><code>dropped_iterations</code></strong>；它不是 0，就代表你要的到達率沒送到，量到的延遲不可信。</p>
+<pre>export const options = {
+  scenarios: {
+    gate: {
+      executor: 'constant-arrival-rate',
+      rate: 100, timeUnit: '1s',   // 每秒 100 次迭代
+      duration: '20s',
+      preAllocatedVUs: 100,        // 事先配好，不要在測試中途才建立 VU
+    },
+  },
+  thresholds: {
+    http_req_duration: ['p(95)&lt;300'],
+    http_req_failed: ['rate&lt;0.001'],
+    dropped_iterations: ['count==0'],
+  },
+}</pre>
+<p><strong>thresholds</strong>（門檻）讓 k6 在不達標時以結束碼 99 結束，CI 看到非 0 就可以擋下這一版。<code>http_req_failed</code> 是失敗請求（預設是狀態碼不在 200–399）的比例。</p>
+<h3>找出飽和點</h3>
+<p>做法是逐步加壓：先用低流量<strong>暖機</strong> 30 秒（JIT 還沒編譯、連線池還沒建好、快取還是空的，這段的慢請求不代表正常狀況，不計分），之後一階一階提高到達率，每一階看 p95、錯誤率、<code>dropped_iterations</code>。每一階寫成一個 scenario，用 <code>startTime</code> 排在前一階之後，摘要裡就能分開看每一階。k6 只替設了門檻的子指標（例如 <code>http_req_duration{scenario:rps_80}</code>）在 handleSummary 的資料裡算出數字，所以每一階都要設門檻；高的幾階沒過門檻、整次以 99 結束，是預期中的事。只想要一條平滑上升的曲線時，用一個 <code>ramping-arrival-rate</code> 搭配 stages 也可以，代價是摘要把所有階段混在一起。</p>
+<p>加壓到某一點，吞吐量就不再上升、延遲開始暴增，這叫<strong>飽和點</strong>（saturation point）。這時同時看 USE 面板，找出最先飽和的資源：</p>
+<ul>
+  <li><code>db_pool_waiting</code> 一直上升、CPU 卻很閒：瓶頸是<strong>連線池</strong>（或資料庫太慢，讓每條連線占用太久）。Little's law（<a href="13-scaling.html">第 13 課</a>）告訴你上限：練習 4 的 API 有 5 條連線，9 成請求占用連線 40ms、1 成占用 80ms，平均每個請求占用 0.9 × 0.04 + 0.1 × 0.08 ＝ 0.044 秒，所以每秒最多 5 ÷ 0.044 ≈ 113 個請求。</li>
+  <li>CPU 接近一核、event loop 延遲上升：瓶頸是 <strong>CPU</strong>，該加副本。</li>
+  <li>資料庫的 CPU、鎖等待上升：瓶頸是<strong>資料庫</strong>，加 app 副本只會更糟。</li>
+</ul>
+<p>把結果變成上線門檻：「符合 SLO（p95 &lt; 300ms、錯誤率 &lt; 0.1%）的最大到達率」乘上安全係數（例如 0.7，留餘裕給尖峰和量測誤差），寫成 gate.js 的固定到達率與 thresholds，每次上線前在類正式環境跑一次。筆電上的數字只能比較相對變化（這一版比上一版好還是差），正式門檻要在跟正式環境同規格的機器上量；機器很忙時（例如同時開著很多容器），量到的能力會明顯偏低。</p>
+<div class="callout practice"><strong>💡 實務上：壓測通常在上線前與大活動前做</strong><br>常見的時機是：新功能上線前、改了資料庫查詢或連線池設定之後、雙 11 或節慶促銷前。不要對正式環境的資料庫壓測（會寫進假訂單、拖慢真客人），用跟正式環境同規格的 staging，並先跟維運、DBA 說好時段。報告要寫清楚條件（到達率、請求組合、資料量、機器規格）和瓶頸是哪個資源，PM 拿到的結論應該是「每秒 X 個請求以內做得到 SLO，再多要先加什麼」，不是一張延遲曲線。</div>
+<div class="callout">k6 2.x 移除了舊的摘要模式（<code>--no-summary</code> 改成 <code>--summary-mode=disabled</code>），<code>--summary-export</code> 的格式也變了。這一課用 <code>handleSummary()</code> 自己把資料寫成 summary.json，不依賴摘要的格式。</div>
+
+<h2>練習</h2>
+<p>練習 1、2、4 在 <code>devops/practice</code> 做（在 learn/ 執行 <code>node check.mjs devops 22</code>）。練習 1 用本機的 Node 跑，不需要 Docker；練習 2、4 需要 Docker 在跑，第一次會下載 <code>prom/prometheus:v3.15.1</code> 與 <code>grafana/k6:2.3.0</code>。練習 4 的測試每次會重新啟動 <code>ld-22</code>、跑兩次 20 秒的壓測，大約要兩分鐘。</p>
+
+<div class="local" data-test="ex1" data-files="shop/metrics.ts">
+  <p>練習 1：<code>shop/server.ts</code> 是一個小型的咖啡店 API（不用改），每個請求都交給 <code>shop/metrics.ts</code> 的 <code>instrument(req, res, route, handle)</code>：<code>route</code> 是比對到的路由樣板（例如 <code>/orders/:id</code>），比對不到時是 <code>null</code>；<code>handle()</code> 會寫出回應，也可能丟出例外（由 server.ts 接住後回 500）。用 prom-client 在 <code>register</code> 上建立：<code>http_requests_total{method,route,status}</code>（counter）、<code>http_request_duration_seconds{method,route}</code>（histogram，單位秒，buckets 是 <code>[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5]</code>）、<code>http_requests_in_flight</code>（gauge），再加上預設指標。比對不到的路由一律記成 <code>unmatched</code>。測試用隨機的次數請求 <code>/orders/&lt;編號&gt;</code>、<code>/orders/abc</code>（404）、<code>/nope/…</code>、<code>/products</code>、會丟例外的 <code>/boom</code> 和 <code>/slow?ms=200</code>，再解析 <code>/metrics</code>：計數要精確、route 只能是樣板、200ms 的請求要落在 <code>le="0.25"</code>、<code>+Inf</code> 等於 <code>_count</code>、處理中的 in_flight 是 1、全部結束後回到 0。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="rules.yml">
+  <p>練習 2：在 <code>rules.yml</code> 寫三個 recording rule，結果都只留 <code>route</code> 一個 label：<code>route:http_requests:rate5m</code>（每秒請求數，合併副本與狀態碼）、<code>route:http_errors:ratio_rate5m</code>（5xx 佔全部請求的比例）、<code>route:http_request_duration_seconds:p95_5m</code>（p95 耗時，秒）。都用 5 分鐘的範圍。測試用 <code>promtool test rules</code> 餵兩個副本、兩個路由的假資料：一個副本流量是另一個的十倍、其中一個在第 11 分鐘重啟（counter 歸零）、另一個在第 10 分鐘流量變三倍，在第 12、13、15、25 分鐘比對你的規則跟正確算式的結果。自己檢查語法的指令寫在 <code>rules.yml</code> 開頭。</p>
+</div>
+
+<div class="exercise">
+  <p>練習 3：寫一個錯誤預算計算機。SLO 一律用小數表示（99.9% 寫成 <code>0.999</code>）。<code>budgetMinutes(slo, days)</code>：這段期間允許壞掉幾分鐘。<code>errorBudget({ slo, total, bad })</code>：<code>total</code> 是到目前為止的請求數、<code>bad</code> 是失敗數，回傳 <code>allowed</code>（允許的失敗數 ＝ (1 − slo) × total）、<code>remaining</code>（allowed − bad，透支時是負數，不要截成 0）、<code>remainingRatio</code>（remaining ÷ allowed；沒有任何流量時預算完全沒用，回傳 1）。<code>burnRate({ slo, total, bad })</code>：<code>total</code>、<code>bad</code> 是觀察視窗裡的數字，回傳燃燒率（視窗內錯誤率 ÷ (1 − slo)；沒有流量時是 0）。<code>decide(policy, state)</code>：剩餘比例 ≤ 0 回傳 <code>'freeze'</code>；剩餘比例低於 <code>policy.cautionBelow</code>，或燃燒率高於 <code>policy.maxBurnRate</code>，回傳 <code>'ship-with-caution'</code>；其他回傳 <code>'ship'</code>。小數的誤差容許 1e-9。</p>
+  <script type="start">
+type Window = { slo: number, total: number, bad: number }
+type Budget = { allowed: number, remaining: number, remainingRatio: number }
+type Policy = { cautionBelow: number, maxBurnRate: number }
+type Decision = 'ship' | 'ship-with-caution' | 'freeze'
+
+function budgetMinutes(slo: number, days: number): number {
+  return 0
+}
+
+function errorBudget({ slo, total, bad }: Window): Budget {
+  return { allowed: 0, remaining: 0, remainingRatio: 0 }
+}
+
+function burnRate({ slo, total, bad }: Window): number {
+  return 0
+}
+
+function decide(policy: Policy, state: { remainingRatio: number, burnRate: number }): Decision {
+  return 'ship'
+}
+
+console.log(budgetMinutes(0.999, 30))                                   // 43.2
+console.log(errorBudget({ slo: 0.999, total: 2_000_000, bad: 500 }))    // 允許 2000、剩 1500、剩 75%
+console.log(burnRate({ slo: 0.999, total: 3600, bad: 36 }))             // 10
+</script>
+  <script type="answer">
+type Window = { slo: number, total: number, bad: number }
+type Budget = { allowed: number, remaining: number, remainingRatio: number }
+type Policy = { cautionBelow: number, maxBurnRate: number }
+type Decision = 'ship' | 'ship-with-caution' | 'freeze'
+
+function budgetMinutes(slo: number, days: number): number {
+  return (1 - slo) * days * 24 * 60
+}
+
+function errorBudget({ slo, total, bad }: Window): Budget {
+  const allowed = (1 - slo) * total
+  const remaining = allowed - bad                       // 透支時是負數，不要藏起來
+  const remainingRatio = total === 0 ? 1 : remaining / allowed
+  return { allowed, remaining, remainingRatio }
+}
+
+function burnRate({ slo, total, bad }: Window): number {
+  if (total === 0) return 0
+  return (bad / total) / (1 - slo)                       // 跟視窗長短無關：錯誤率 ÷ 允許的錯誤率
+}
+
+function decide(policy: Policy, state: { remainingRatio: number, burnRate: number }): Decision {
+  if (state.remainingRatio <= 0) return 'freeze'
+  if (state.remainingRatio < policy.cautionBelow || state.burnRate > policy.maxBurnRate) return 'ship-with-caution'
+  return 'ship'
+}
+
+console.log(budgetMinutes(0.999, 30))                                   // 43.2
+console.log(errorBudget({ slo: 0.999, total: 2_000_000, bad: 500 }))    // 允許 2000、剩 1500、剩 75%
+console.log(burnRate({ slo: 0.999, total: 3600, bad: 36 }))             // 10
+</script>
+  <script type="tests">
+const near = (a: number, b: number, msg: string) => assert(Math.abs(a - b) < 1e-9, `${msg}：應該是 ${b}，實際是 ${a}`)
+near(budgetMinutes(0.999, 30), 43.2, '99.9%／30 天的預算是 43.2 分鐘')
+near(budgetMinutes(0.99, 7), 100.8, '99%／7 天的預算是 100.8 分鐘')
+near(budgetMinutes(0.9995, 28), 20.16, '99.95%／28 天的預算是 20.16 分鐘')
+const b = errorBudget({ slo: 0.999, total: 2_000_000, bad: 500 })
+near(b.allowed, 2000, 'allowed＝(1 − slo) × total')
+near(b.remaining, 1500, 'remaining＝allowed − bad')
+near(b.remainingRatio, 0.75, 'remainingRatio＝remaining ÷ allowed')
+const over = errorBudget({ slo: 0.99, total: 50_000, bad: 800 })
+near(over.remaining, -300, '預算透支時 remaining 要是負數，不要截成 0：透支多少決定要凍結多久')
+near(over.remainingRatio, -0.6, '透支時 remainingRatio 也是負數')
+const idle = errorBudget({ slo: 0.999, total: 0, bad: 0 })
+assert(Number.isFinite(idle.remainingRatio), '沒有流量時不能除以零（得到 NaN）')
+near(idle.allowed, 0, '沒有流量時 allowed 是 0')
+near(idle.remainingRatio, 1, '沒有流量時預算完全沒用，remainingRatio 是 1')
+near(burnRate({ slo: 0.999, total: 3600, bad: 36 }), 10, '1% 的錯誤率在 99.9% 的 SLO 下燃燒率是 10')
+near(burnRate({ slo: 0.99, total: 12_000, bad: 120 }), 1, '錯誤率剛好等於 1 − SLO 時燃燒率是 1')
+near(burnRate({ slo: 0.995, total: 800, bad: 0 }), 0, '沒有失敗時燃燒率是 0')
+near(burnRate({ slo: 0.999, total: 0, bad: 0 }), 0, '沒有流量時燃燒率是 0，不是 NaN')
+const policy = { cautionBelow: 0.25, maxBurnRate: 2 }
+assert.equal(decide(policy, { remainingRatio: 0.8, burnRate: 0.5 }), 'ship', '預算充足、燃燒率正常時 ship')
+assert.equal(decide(policy, { remainingRatio: 0.1, burnRate: 0.5 }), 'ship-with-caution', '剩不到 cautionBelow 時 ship-with-caution')
+assert.equal(decide(policy, { remainingRatio: 0.9, burnRate: 6 }), 'ship-with-caution', '預算還多但燃燒率太高時也要 ship-with-caution')
+assert.equal(decide(policy, { remainingRatio: 0, burnRate: 0 }), 'freeze', '預算剛好用完時 freeze')
+assert.equal(decide(policy, { remainingRatio: -0.6, burnRate: 0.2 }), 'freeze', '預算透支時 freeze')
+assert.equal(decide({ cautionBelow: 0.5, maxBurnRate: 1 }, { remainingRatio: 0.4, burnRate: 0.5 }), 'ship-with-caution', '門檻要讀 policy，不要寫死')
+</script>
+  <script type="wrong">
+type Window = { slo: number, total: number, bad: number }
+type Budget = { allowed: number, remaining: number, remainingRatio: number }
+type Policy = { cautionBelow: number, maxBurnRate: number }
+type Decision = 'ship' | 'ship-with-caution' | 'freeze'
+const allowedRate = (slo: number) => (100 - slo) / 100
+function budgetMinutes(slo: number, days: number): number { return allowedRate(slo) * days * 24 * 60 }
+function errorBudget({ slo, total, bad }: Window): Budget {
+  const allowed = allowedRate(slo) * total
+  return { allowed, remaining: allowed - bad, remainingRatio: total === 0 ? 1 : (allowed - bad) / allowed }
+}
+function burnRate({ slo, total, bad }: Window): number { return total === 0 ? 0 : (bad / total) / allowedRate(slo) }
+function decide(policy: Policy, state: { remainingRatio: number, burnRate: number }): Decision {
+  if (state.remainingRatio <= 0) return 'freeze'
+  if (state.remainingRatio < policy.cautionBelow || state.burnRate > policy.maxBurnRate) return 'ship-with-caution'
+  return 'ship'
+}
+</script>
+  <script type="wrong">
+type Window = { slo: number, total: number, bad: number }
+type Budget = { allowed: number, remaining: number, remainingRatio: number }
+type Policy = { cautionBelow: number, maxBurnRate: number }
+type Decision = 'ship' | 'ship-with-caution' | 'freeze'
+function budgetMinutes(slo: number, days: number): number { return (1 - slo) * days * 24 * 60 }
+function errorBudget({ slo, total, bad }: Window): Budget {
+  const allowed = (1 - slo) * total
+  return { allowed, remaining: allowed - bad, remainingRatio: total === 0 ? 1 : (allowed - bad) / allowed }
+}
+// 錯的：用「這個視窗用掉整個 30 天預算的幾成」當燃燒率
+function burnRate({ slo, total, bad }: Window): number { return total === 0 ? 0 : (bad / total) / (1 - slo) / 30 }
+function decide(policy: Policy, state: { remainingRatio: number, burnRate: number }): Decision {
+  if (state.remainingRatio <= 0) return 'freeze'
+  if (state.remainingRatio < policy.cautionBelow || state.burnRate > policy.maxBurnRate) return 'ship-with-caution'
+  return 'ship'
+}
+</script>
+  <script type="wrong">
+type Window = { slo: number, total: number, bad: number }
+type Budget = { allowed: number, remaining: number, remainingRatio: number }
+type Policy = { cautionBelow: number, maxBurnRate: number }
+type Decision = 'ship' | 'ship-with-caution' | 'freeze'
+function budgetMinutes(slo: number, days: number): number { return (1 - slo) * days * 24 * 60 }
+function errorBudget({ slo, total, bad }: Window): Budget {
+  const allowed = (1 - slo) * total
+  return { allowed, remaining: allowed - bad, remainingRatio: (allowed - bad) / allowed }
+}
+function burnRate({ slo, total, bad }: Window): number { return (bad / total) / (1 - slo) }
+function decide(policy: Policy, state: { remainingRatio: number, burnRate: number }): Decision {
+  if (state.remainingRatio <= 0) return 'freeze'
+  if (state.remainingRatio < policy.cautionBelow || state.burnRate > policy.maxBurnRate) return 'ship-with-caution'
+  return 'ship'
+}
+</script>
+  <script type="wrong">
+type Window = { slo: number, total: number, bad: number }
+type Budget = { allowed: number, remaining: number, remainingRatio: number }
+type Policy = { cautionBelow: number, maxBurnRate: number }
+type Decision = 'ship' | 'ship-with-caution' | 'freeze'
+function budgetMinutes(slo: number, days: number): number { return (1 - slo) * days * 24 * 60 }
+function errorBudget({ slo, total, bad }: Window): Budget {
+  const allowed = (1 - slo) * total
+  const remaining = Math.max(0, allowed - bad)
+  return { allowed, remaining, remainingRatio: total === 0 ? 1 : remaining / allowed }
+}
+function burnRate({ slo, total, bad }: Window): number { return total === 0 ? 0 : (bad / total) / (1 - slo) }
+function decide(policy: Policy, state: { remainingRatio: number, burnRate: number }): Decision {
+  if (state.remainingRatio <= 0) return 'freeze'
+  if (state.remainingRatio < policy.cautionBelow || state.burnRate > policy.maxBurnRate) return 'ship-with-caution'
+  return 'ship'
+}
+</script>
+  <script type="wrong">
+type Window = { slo: number, total: number, bad: number }
+type Budget = { allowed: number, remaining: number, remainingRatio: number }
+type Policy = { cautionBelow: number, maxBurnRate: number }
+type Decision = 'ship' | 'ship-with-caution' | 'freeze'
+function budgetMinutes(slo: number, days: number): number { return (1 - slo) * days * 24 * 60 }
+function errorBudget({ slo, total, bad }: Window): Budget {
+  const allowed = (1 - slo) * total
+  return { allowed, remaining: allowed - bad, remainingRatio: total === 0 ? 1 : (allowed - bad) / allowed }
+}
+function burnRate({ slo, total, bad }: Window): number { return total === 0 ? 0 : (bad / total) / (1 - slo) }
+function decide(policy: Policy, state: { remainingRatio: number, burnRate: number }): Decision {
+  if (state.remainingRatio <= 0) return 'freeze'
+  if (state.remainingRatio < 0.25) return 'ship-with-caution'
+  return 'ship'
+}
+</script>
+</div>
+
+<div class="local" data-test="ex4" data-files="loadtest.js capacity.json gate.js">
+  <p>練習 4：找出 cafe-api 的容量，寫成上線門檻。<code>api/server.ts</code> 模擬一個連線池 5 條的 API（<code>GET /products</code> 占用連線 40ms、<code>POST /orders</code> 占用 80ms），<code>/metrics</code> 有 <code>db_pool_total</code>、<code>db_pool_idle</code>、<code>db_pool_waiting</code>、<code>process_cpu_seconds_total</code>。步驟：</p>
+  <p>（1）在這一題的資料夾執行 <code>docker compose up -d --wait</code>。（2）在 <code>loadtest.js</code> 的 options 寫 scenarios：名為 <code>warmup</code> 的暖機（從 0 秒開始、至少 30 秒、到達率模式），之後至少 3 階遞增的到達率（例如每秒 40、60、80、100、120），每一階一個 <code>constant-arrival-rate</code> 或 <code>ramping-arrival-rate</code> 的 scenario，用 <code>startTime</code> 排在暖機之後；每一階設 <code>http_req_duration{scenario:名稱}</code>（p95 &lt; 300）、<code>http_req_failed{scenario:名稱}</code>（rate &lt; 0.001）、<code>dropped_iterations{scenario:名稱}</code>（count == 0）的門檻。（3）用 <code>docker run --rm --network ld-22_default -v "$PWD":/scripts -w /scripts grafana/k6:2.3.0 run loadtest.js</code> 執行，同時在另一個終端機每隔幾秒 <code>curl -s localhost:18220/metrics</code>，看飽和時哪個指標在漲。（4）從 summary.json 找出三個門檻都過的最高那一階，寫進 <code>capacity.json</code>：<code>maxRpsWithinSlo</code>（那一階的每秒請求數）、<code>p95Ms</code>、<code>p99Ms</code>、<code>errorRate</code>（那一階的數字）、<code>bottleneck</code>（<code>pool</code>、<code>cpu</code> 或 <code>db</code>）、<code>evidence</code>（<code>{ "metric": 指標名稱, "value": 飽和時讀到的數值 }</code>）。（5）在 <code>gate.js</code> 用 <code>constant-arrival-rate</code> 以 0.7 × maxRpsWithinSlo 跑 20 秒，門檻是 <code>http_req_duration</code> p(95)&lt;300、<code>http_req_failed</code> rate&lt;0.001、<code>dropped_iterations</code> count==0。</p>
+  <p>測試用 <code>k6 inspect</code> 檢查兩個腳本的設定、比對 capacity.json 與 summary.json，再把 api 的連線池改成 20 條跑你的 gate.js（必須 exit 0），改成 1 條再跑一次（必須因門檻沒過 exit 99），同時讀 <code>/metrics</code> 確認瓶頸。你量到的數字會依電腦忙不忙而不同，沒關係，capacity.json 只要跟你自己的 summary.json 一致。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：cafe-api 跑 3 個副本，同事的儀表板把三個副本各自的 p95 取平均，當作整體的 p95：「平均一下差不多。」這樣做的問題是？</p>
+  <label data-key="a">沒有問題，副本數一樣多時取平均就是整體的 p95</label>
+  <label data-key="b">應該取三個 p95 的最大值，才是整體的 p95</label>
+  <label data-key="c">百分位數不能平均也不能取最大值；要把各副本 histogram 同一個 le 的桶子加起來，再用 histogram_quantile 估</label>
+  <label data-key="d">改用 summary，讓每個副本直接算好 p95，就可以平均了</label>
+  <p class="why">✓ c。各副本的流量和分布都不同：一個很閒、全是快請求的副本，會把平均拉低，蓋掉另一個副本的慢請求。桶子是計數，加起來就是整體的分布：<code>histogram_quantile(0.95, sum by (le) (rate(…_bucket[5m])))</code>。a 即使副本數一樣，流量也不一樣；b 最大值通常高估，也不是 p95 的定義；d summary 算好的百分位數正是沒辦法合併的那一種。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：SLO 是「30 天內 99.9% 的請求不是 5xx」。產品經理說：「99.9%，也就是幾乎不能出錯，這個月誰都不准部署。」錯誤預算其實是多少？</p>
+  <label data-key="a">0，99.9% 代表一次都不能失敗</label>
+  <label data-key="b">43.2 分鐘（或 0.1% 的請求）；預算還有剩就可以照常部署，用完才凍結新功能</label>
+  <label data-key="c">4.32 小時</label>
+  <label data-key="d">每天 1.44 分鐘，當天沒用完就作廢</label>
+  <p class="why">✓ b。30 × 24 × 60 × 0.001 ＝ 43.2 分鐘；用請求數算是 0.1%。錯誤預算的用意就是讓團隊放心地「花」在部署和改變上，用完了才依政策凍結。a 把 SLO 當成 100%；c 4.32 小時是 259.2 分鐘，大約是 99.4% 的預算，比 43.2 分鐘多了 6 倍；d 預算是整個 30 天的視窗，不是每天重置。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 7：你用固定 50 個連線的壓測工具測 cafe-api。中間系統卡住 2 秒，工具只量到 50 個 2 秒的慢請求，其他都很快，p99 看起來還不錯。問題在哪？</p>
+  <label data-key="a">沒有問題，量到的請求大部分都很快，代表服務是健康的</label>
+  <label data-key="b">連線數太少，改成 500 個連線就準了</label>
+  <label data-key="c">應該看平均延遲，p99 對短暫的卡頓太敏感</label>
+  <label data-key="d">協調遺漏：卡住時工具自己也停止送請求，本該在那 2 秒抵達、排隊的請求都沒被量到；改用固定到達率（k6 的 arrival-rate），並確認 dropped_iterations 是 0</label>
+  <p class="why">✓ d。封閉模型的每個連線要等回應才送下一個，系統越慢送得越少，延遲被系統性地低估。真實的客人不會因為你慢就晚點來，開放模型照固定到達率送，卡住期間的請求會排隊，等待時間全部算進去。a 正是被低估的結果；b 連線再多仍是封閉模型，只是比較晚才露餡；c 平均值更會掩蓋卡頓。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>用平均延遲判斷服務健康</strong>：平均值會被大量的快請求拉低。看 p95、p99，而且用 histogram 記錄。</li>
+  <li><strong>label 放 ID 或原始網址</strong>：每個值一條序列，基數爆炸拖垮 Prometheus。label 用路由樣板、方法、狀態碼，比對不到的記成 <code>unmatched</code>；要看單一訂單用 log 或 trace。</li>
+  <li><strong>單位混用</strong>：名稱寫 <code>_seconds</code> 卻記毫秒，buckets 也跟著錯。一律用秒、位元組這些基本單位。</li>
+  <li><strong>拋例外時 in_flight 沒減回來</strong>：<code>dec()</code> 放在 <code>await</code> 後面，例外一來就跳過，gauge 永遠往上漲。放在 <code>finally</code>。</li>
+  <li><strong>用 summary 記耗時</strong>：每個副本算好的百分位數沒辦法合併。用 histogram。</li>
+  <li><strong>在 PromQL 裡平均百分位數或比例</strong>：先 <code>sum by (le, route)</code> 合併桶子再 histogram_quantile；比例先把分子、分母各自加總再相除。</li>
+  <li><strong>用 irate 算 SLO，或 increase 忘了除秒數</strong>：irate 只看最後兩個點；increase 是總數不是每秒。告警與 SLO 用 rate。</li>
+  <li><strong>規則寫死 <code>le="1"</code></strong>：Prometheus 3 會存成 <code>le="1.0"</code>，查不到。</li>
+  <li><strong>把 SLO 訂成 100%</strong>：沒有預算就不能部署，使用者也感受不到最後那 0.1%。從現在的實際表現和使用者能接受的程度訂起。</li>
+  <li><strong>只看 CPU</strong>：CPU 很閒，客人卻在等連線池。先看 RED 確認使用者在痛，再用 USE 找原因。</li>
+  <li><strong>用封閉模型量延遲</strong>：系統越慢送得越少，p99 被低估（協調遺漏）。用 arrival-rate，並把 <code>dropped_iterations</code> 當成門檻。</li>
+  <li><strong>壓測工具和被測服務跑在同一個容器或同一台機器</strong>：兩者搶 CPU，量到的是混合結果。k6 跑在另一個容器，正式門檻用另一台機器。</li>
+  <li><strong>沒有暖機就計分</strong>：JIT、連線池、快取還沒熱，前幾秒的慢請求混進結果。先暖機，計分的階段排在後面。</li>
+  <li><strong>上線門檻只設 p95</strong>：錯誤回得很快的版本反而會過關；VU 不夠時延遲也不可信。p95、錯誤率、dropped_iterations 三個都要。</li>
+  <li><strong>把 maxVUs 或平均延遲當成能力</strong>：能力是「符合 SLO 的最大到達率」，要從實測的那一階讀出來。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>指標是便宜的彙總數字，擅長回答「服務現在好不好」；log 回答發生了什麼，trace 回答慢在哪裡。</li>
+  <li>counter 只增不減（用 <code>rate()</code> 看）、gauge 是當下值、histogram 用累加的桶子估百分位數而且能跨副本合併；summary 不能合併。</li>
+  <li>看延遲看 p95、p99，不看平均。<code>/metrics</code> 用 prom-client 暴露，名稱帶基本單位，label 只用值有限的維度（路由樣板，不放 ID）。</li>
+  <li>Prometheus 定期 scrape；RED 的 PromQL：<code>sum by (route) (rate(…[5m]))</code>、先加總再相除的錯誤比例、<code>histogram_quantile(0.95, sum by (le, route) (…))</code>；常用的寫成 recording rule，並用 promtool 測試。</li>
+  <li>RED 看服務、USE 看資源；先確認使用者在痛，再找飽和的資源。</li>
+  <li>SLI 是好事件的比例、SLO 是目標、SLA 是合約；錯誤預算 ＝ 1 − SLO（99.9%／30 天 ＝ 43.2 分鐘），燃燒率 ＝ 錯誤率 ÷ (1 − SLO)，政策決定 ship、ship-with-caution 或 freeze。</li>
+  <li>壓測用開放模型（k6 arrival-rate）避免協調遺漏，先暖機再逐步加壓，同時看 USE 找出瓶頸；符合 SLO 的最大到達率 × 安全係數寫成 thresholds，當作上線門檻。</li>
+</ul>
+<p>指標告訴你「有問題」，但一個請求經過 api、kitchen、資料庫，慢在哪一段還是看不出來：下一課用 OpenTelemetry 做分散式追蹤。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

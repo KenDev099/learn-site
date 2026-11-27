@@ -1,0 +1,1761 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>15. Passkey：用公鑰取代密碼</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="15">
+<header>
+  <div class="eyebrow">階段 4：更多登入方式：第三方、多因素與機器 · 第 15 課</div>
+  <h1>Passkey：用公鑰取代密碼</h1>
+</header>
+<main>
+<p><a href="14-mfa-totp.html">第 14 課</a>的 TOTP 擋得住「只拿到密碼」的攻擊者，擋不住釣魚：王小明在假的咖啡店登入頁輸入密碼和 6 位數驗證碼，假網站立刻把兩樣東西轉送到真網站，30 秒內就登入成功。問題出在密碼和驗證碼都是「一串可以照抄的字」，使用者分不出網址，字串也不知道自己被送到哪裡。</p>
+<p>這課的任務是替咖啡店的會員系統加上 passkey 登入，讓同樣的釣魚對王小明無效。做法的核心是：王小明的裝置保管一把私鑰，登入時對「伺服器給的隨機值＋瀏覽器看到的網址」簽章，伺服器只存公鑰。整課一路推到最後一關：伺服器收到一個登入回應，要能判斷該不該讓這個人登入，練習 3 會讓你親手寫出這段驗證程式。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>為什麼密碼和 OTP 轉送得了、passkey 轉送了也沒用（第 1 節，開場問題的最小答案）。</li>
+  <li>註冊與登入兩個儀式：王小明的裝置、瀏覽器和咖啡店伺服器之間來回傳了什麼，伺服器要存什麼（第 2、3 節）。</li>
+  <li>讀懂登入回應並逐項檢查：authenticatorData 這串位元組怎麼拆、伺服器照什麼順序檢查、challenge 存在哪（第 4、5 節，對應練習 1–3）。</li>
+  <li>換手機、掉手機與上線順序：同步與裝置綁定的 passkey、帳號復原、既有會員怎麼逐步改用 passkey（第 6、7 節）。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+  <ul>
+    <li><a href="08-jwt-signatures.html">第 8 課</a>的 ECDSA P-256：私鑰簽、公鑰驗；Web Crypto 的簽章是 r、s 兩個數字各 32 bytes 接起來，共 64 bytes。</li>
+    <li><a href="02-crypto-toolbox.html">第 2 課</a>的 SHA-256 與 base64url：SHA-256 把任意資料變成 32 bytes 的雜湊；base64url 把位元組轉成能放進 JSON、網址的字串。</li>
+    <li><a href="04-cookies-sessions.html">第 4 課</a>的 session：登入狀態存在伺服器、用 cookie 裡的 ID 找回來；這課的 challenge 也存在 session 裡。</li>
+    <li><a href="../../node/lessons/11-buffer-encoding.html">Node 課第 11 課</a>的位元組操作：大端序（big-endian，高位的 byte 放前面）、<code>readUInt32BE</code> 讀 32-bit 無號整數。</li>
+  </ul>
+</div>
+
+<h2>為什麼密碼和 OTP 轉送得了，什麼東西轉送了也沒用？</h2>
+<p>先看密碼和 OTP 為什麼會輸。伺服器驗證它們時只問一件事：「送來的字串對不對？」字串本身不記得自己是在哪個網站被輸入的，誰拿到誰就能用。假網站只要站在中間，把王小明輸入的東西原封不動轉給真網站，真網站看到的就是正確的密碼加上正確的驗證碼，沒有理由拒絕。整套防線最後只剩王小明自己看出網址不對，而做得逼真的釣魚頁面，正好讓這件事很難做到。</p>
+<p>所以要擋釣魚，登入時送出的東西要同時滿足兩個條件：</p>
+<ol>
+  <li><strong>不是可以照抄重用的秘密</strong>。這靠第 8 課的公鑰密碼學：私鑰簽章、公鑰驗章，只拿到公鑰簽不出任何東西。每次登入都對伺服器新給的隨機值簽章，就算某一次的簽章被錄下來，下一次也用不上。</li>
+  <li><strong>帶著「這是在哪個網站產生的」，而且這個資訊不能由網頁自己說</strong>。網頁的 JavaScript 是假網站寫的，它想填什麼網址都可以；只有瀏覽器知道目前分頁真正的網址，所以要由瀏覽器把網址寫進要簽的資料。</li>
+</ol>
+<p>把這兩個條件做成各家瀏覽器、作業系統都支援的標準，就是 passkey。往下讀之前，先認識會一直出現的四個名詞。</p>
+<p><strong>認證器（authenticator）</strong>是產生並保管私鑰、替使用者簽章的東西。它可以是手機或筆電內建的安全晶片（解鎖方式是 Touch ID、Windows Hello 這類），可以是插在 USB 上的安全金鑰，也可以是密碼管理工具。私鑰在認證器裡產生，之後網頁和伺服器都碰不到它。</p>
+<p><strong>passkey</strong> 是認證器裡為某一個網站產生的一組金鑰對（中文也譯作「通行密鑰」，Google 的中文介面稱「密碼金鑰」）。王小明在咖啡店建立 passkey，意思是他的 iPhone 為咖啡店產生一組金鑰對，私鑰留在 iPhone，公鑰交給咖啡店。</p>
+<p><strong>WebAuthn（Web Authentication API）</strong>是網頁使用 passkey 的瀏覽器 API，由 W3C 制定規格。前端只會用到兩個函式：<code>navigator.credentials.create()</code> 建立 passkey，<code>navigator.credentials.get()</code> 用 passkey 登入。這課寫到「§7.2」這類章節編號，指的都是 WebAuthn 規格（版本見課末「補充與查表」）。</p>
+<p><strong>RP（Relying Party，依賴方）</strong>是讓使用者用 passkey 登入的網站，叫「依賴方」是因為它依賴認證器的簽章來判斷來的人是誰。這課的 RP 就是咖啡店。每把 passkey 建立時都會記下一個 <strong>RP ID</strong>：這把 passkey 屬於哪個網域，例如 <code>coffee.example</code>。</p>
+<p>有了這些名詞，passkey 怎麼滿足上面兩個條件，可以拆成三件事：</p>
+<ol>
+  <li><strong>認證器只替對應的 RP ID 簽章</strong>：每把 passkey 建立時就記下 RP ID。王小明在 <code>coffee-login.example</code> 上按登入，瀏覽器只會找 RP ID 是 <code>coffee-login.example</code>（或它的上層網域）的 passkey，咖啡店的那把根本不會出現在選單裡。<br>你可能會問：options 是假網站自己的 JavaScript 送出的，它不能直接把 <code>rp.id</code> 填成 <code>coffee.example</code>，把咖啡店那把 passkey 叫出來嗎？不行。RP ID 雖然由網頁在 options 裡指定，瀏覽器會先檢查它：必須等於目前網址的網域，或是它的上層網域（registrable domain suffix）。在 <code>coffee-login.example</code> 上指定 <code>coffee.example</code>，瀏覽器直接以 <code>SecurityError</code> 拒絕這次呼叫，根本不會去問認證器。所以這道關卡由瀏覽器守住，不靠網頁自律，和下一點「origin 由瀏覽器填」是同一個道理。</li>
+  <li><strong>來源由瀏覽器寫進簽章資料</strong>：要簽的資料裡有一段 <code>clientDataJSON</code>，其中的 <code>origin</code> 是瀏覽器自己填的網址，網頁的 JavaScript 改不了。就算假網站想辦法拿到一個簽章，上面寫的也是假網站的來源，真網站驗證時會拒絕。</li>
+  <li><strong>伺服器只存公鑰</strong>：公鑰只能驗章、不能簽章。資料庫外洩，攻擊者拿到的東西不能拿來登入，也沒有可以離線暴力破解的密碼雜湊。</li>
+</ol>
+
+<figure>
+  <svg viewBox="0 0 700 260" role="img" aria-label="釣魚網站可以轉送密碼和 OTP，但轉送 passkey 的簽章會因為 origin 與 RP ID 不符而被真網站拒絕">
+    <defs><marker id="a15" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="20" y="95" width="120" height="60" rx="8"/><text class="d-text" x="80" y="122" text-anchor="middle">王小明</text><text class="d-small" x="80" y="142" text-anchor="middle">瀏覽器＋認證器</text>
+    <rect class="d-soft" x="290" y="95" width="140" height="60" rx="8"/><text class="d-text" x="360" y="122" text-anchor="middle">假網站</text><text class="d-small" x="360" y="142" text-anchor="middle">coffee-login.example</text>
+    <rect class="d-box" x="560" y="95" width="120" height="60" rx="8"/><text class="d-text" x="620" y="122" text-anchor="middle">真網站</text><text class="d-small" x="620" y="142" text-anchor="middle">coffee.example</text>
+    <line class="d-line" x1="140" y1="110" x2="288" y2="110" marker-end="url(#a15)"/>
+    <line class="d-line" x1="430" y1="110" x2="558" y2="110" marker-end="url(#a15)"/>
+    <text class="d-small" x="214" y="100" text-anchor="middle">密碼＋OTP</text>
+    <text class="d-small" x="494" y="100" text-anchor="middle">原封不動轉送</text>
+    <text class="d-accent" x="620" y="80" text-anchor="middle">✓ 登入成功</text>
+    <line class="d-line" x1="140" y1="145" x2="288" y2="145" marker-end="url(#a15)"/>
+    <line class="d-line" x1="430" y1="145" x2="558" y2="145" marker-end="url(#a15)"/>
+    <text class="d-small" x="214" y="175" text-anchor="middle">passkey 簽章</text>
+    <text class="d-small" x="214" y="192" text-anchor="middle">origin = 假網站</text>
+    <text class="d-small" x="494" y="175" text-anchor="middle">轉送</text>
+    <text class="d-accent" x="620" y="185" text-anchor="middle">✗ origin、RP ID 不符</text>
+    <text class="d-small" x="350" y="235" text-anchor="middle">而且認證器根本找不到 RP ID 是 coffee-login.example 的咖啡店 passkey</text>
+  </svg>
+  <figcaption>密碼和 OTP 是可以照抄的字串；passkey 的簽章帶著瀏覽器看到的來源，換個網站就沒用。</figcaption>
+</figure>
+
+<p>這就是開場問題的最小答案：如果王小明用的是 passkey，假網站上根本叫不出咖啡店的那把；退一步說，就算假網站拿到一個簽章，裡面寫的網址也是它自己的，轉送到真網站只會被拒絕。整個過程不需要王小明看懂網址。</p>
+<div class="callout">passkey 也是一種多因素認證：裝置是「你擁有的東西」，解鎖裝置用的指紋或 PIN 是「你本人」或「你知道的東西」。<strong>指紋只在裝置上比對</strong>，伺服器只收到「使用者已驗證」這一個位元，收不到任何生物特徵（WebAuthn §14.3）。</div>
+<p>不過上面每一件事都還有「怎麼做到」：私鑰什麼時候產生、公鑰怎麼交到咖啡店手上、伺服器怎麼確定簽章是剛剛簽的而不是錄下來的。先從王小明第一次建立 passkey 開始看。</p>
+
+<h2>王小明第一次建立 passkey，發生了什麼？註冊儀式</h2>
+<p>王小明已經用密碼登入咖啡店，在帳號設定頁按下「新增 passkey」。從這一刻起，瀏覽器、認證器、伺服器三方會照固定的步驟一來一回，WebAuthn 把這種流程叫做<strong>儀式（ceremony）</strong>。儀式有兩種：<strong>註冊（registration）</strong>建立 passkey，<strong>驗證（authentication）</strong>用 passkey 登入。這一節講註冊，下一節講登入。</p>
+<p>兩種儀式都從伺服器產生的 <strong>challenge</strong> 開始。challenge 是伺服器每次新產生的一次性隨機值。為什麼需要它？簽章只證明「有私鑰的人簽過這段資料」，不證明「是剛剛簽的」。如果每次要簽的資料都一樣，攻擊者只要錄下某一次的回應，之後原封不動重送就能過關，這種攻擊叫<strong>重放（replay）</strong>。讓認證器把伺服器這次新給的隨機值一起簽進去，伺服器再比對「回應裡的 challenge 是不是我剛剛發出去的那個」，錄下來的舊回應就失效了。challenge 要存在哪、什麼時候作廢，第 5 節會講。</p>
+
+<figure>
+  <svg viewBox="0 0 700 330" role="img" aria-label="註冊儀式：伺服器產生 challenge，瀏覽器呼叫 navigator.credentials.create，認證器產生金鑰對並回傳公鑰，伺服器驗證後存 credential 紀錄">
+    <defs><marker id="b15" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="30" y="10" width="140" height="34" rx="6"/><text class="d-text" x="100" y="32" text-anchor="middle">認證器</text>
+    <rect class="d-soft" x="280" y="10" width="140" height="34" rx="6"/><text class="d-text" x="350" y="32" text-anchor="middle">瀏覽器</text>
+    <rect class="d-soft" x="530" y="10" width="140" height="34" rx="6"/><text class="d-text" x="600" y="32" text-anchor="middle">咖啡店伺服器</text>
+    <line class="d-line" x1="100" y1="44" x2="100" y2="320"/><line class="d-line" x1="350" y1="44" x2="350" y2="320"/><line class="d-line" x1="600" y1="44" x2="600" y2="320"/>
+    <line class="d-line" x1="598" y1="75" x2="352" y2="75" marker-end="url(#b15)"/><text class="d-small" x="475" y="68" text-anchor="middle">1. options（challenge 存進 session）</text>
+    <line class="d-line" x1="348" y1="115" x2="102" y2="115" marker-end="url(#b15)"/><text class="d-small" x="225" y="108" text-anchor="middle">2. credentials.create()</text>
+    <text class="d-small" x="110" y="150">3. 使用者解鎖（指紋／PIN）</text>
+    <text class="d-small" x="110" y="168">　 產生金鑰對，私鑰留在這裡</text>
+    <line class="d-line" x1="102" y1="200" x2="348" y2="200" marker-end="url(#b15)"/><text class="d-small" x="225" y="193" text-anchor="middle">4. 公鑰＋credential ID</text>
+    <line class="d-line" x1="352" y1="240" x2="598" y2="240" marker-end="url(#b15)"/><text class="d-small" x="475" y="233" text-anchor="middle">5. 回應＋clientDataJSON</text>
+    <text class="d-small" x="590" y="275" text-anchor="end">6. 驗證 challenge、origin、RP ID</text>
+    <text class="d-small" x="590" y="293" text-anchor="end">　 存 credential 紀錄</text>
+  </svg>
+  <figcaption>註冊：私鑰從頭到尾沒離開認證器，伺服器收到的是公鑰。</figcaption>
+</figure>
+
+<p>圖裡的第 1 步，伺服器產生 challenge 存進王小明的 session，再回給前端一份 options；前端（例如 Vue 元件）把它原樣交給 <code>navigator.credentials.create()</code>。下面是這份 options 的 JSON 版本，二進位欄位用 base64url：</p>
+<pre>{
+  "rp": { "id": "coffee.example", "name": "咖啡店" },
+  "user": { "id": "隨機產生的 user handle（base64url）", "name": "amy@example.com", "displayName": "王小明" },
+  "challenge": "32 bytes 隨機值（base64url）",
+  "pubKeyCredParams": [
+    { "type": "public-key", "alg": -7 },
+    { "type": "public-key", "alg": -257 }
+  ],
+  "authenticatorSelection": { "residentKey": "required", "userVerification": "preferred" },
+  "excludeCredentials": [{ "type": "public-key", "id": "這個人已經註冊過的 credential ID" }],
+  "attestation": "none",
+  "timeout": 300000
+}</pre>
+<p>每個欄位都在回答一個設計問題，依序看：</p>
+<ul>
+  <li><code>rp</code>：這把 passkey 屬於哪個網站。<code>id</code> 就是第 1 節的 RP ID，<code>name</code> 是顯示給使用者看的名稱。</li>
+  <li><code>user</code>：這把 passkey 屬於哪個帳號。<code>name</code>、<code>displayName</code> 是讓王小明在選單裡認得出自己的帳號；<code>user.id</code> 則叫 <strong>user handle</strong>，會存在認證器裡，登入時跟著回應送回來，讓伺服器找到是哪個帳號。它最多 64 bytes，規格規定不能放 email、帳號這類個資（§5.4.3），因為它存在認證器裡，伺服器管不到它被誰看見。所以用隨機值，再在資料庫裡記下它對應哪個使用者。</li>
+  <li><code>challenge</code>：上面講的一次性隨機值。</li>
+  <li><code>pubKeyCredParams</code>：伺服器接受哪些簽章演算法。WebAuthn 傳遞金鑰和簽章用的是二進位格式，不是 JSON：<strong>CBOR</strong> 是一種結構類似 JSON、但用位元組表示的格式；<strong>COSE</strong> 是建立在 CBOR 上的標準，規定金鑰、簽章演算法怎麼表示。這裡的數字就是 COSE 的演算法編號：<code>-7</code> 是 ES256，也就是第 8 課的 ECDSA P-256 配 SHA-256；<code>-257</code> 是 RS256。註冊時拿到的公鑰同樣是 COSE 格式，解析交給函式庫（第 5 節）。</li>
+  <li><code>authenticatorSelection.residentKey: "required"</code>：要求建立<strong>可探索憑證（discoverable credential）</strong>。一般的憑證要伺服器先知道使用者是誰、把他的 credential ID 列給瀏覽器，認證器才找得到對應的私鑰；可探索憑證則是認證器自己記得「這個網站有哪些帳號」，登入時使用者不用先輸入 email，直接從選單挑帳號。passkey 指的就是這種憑證。</li>
+  <li><code>excludeCredentials</code>：王小明已經註冊過的 credential ID。認證器如果已經有其中一把，就不會再建一把，避免同一台裝置重複註冊。</li>
+  <li><code>attestation</code>：認證器附上的<strong>出廠證明</strong>，用來證明自己是哪個廠牌、哪個型號。只有要限制「只能用公司發的安全金鑰」這類情況才需要；一般網站用預設的 <code>"none"</code>。</li>
+  <li><code>timeout</code>：300,000 毫秒（5 分鐘）是規格建議的預設值（§15.1），challenge 的有效期也照這個長度。</li>
+</ul>
+<p>第 3、4 步，王小明用指紋或 PIN 解鎖 iPhone，認證器產生金鑰對：私鑰留在 iPhone，公鑰和 <strong>credential ID</strong> 交給瀏覽器。credential ID 是認證器替這把 passkey 取的識別碼，之後每次登入都會一起送回來，伺服器靠它找到該用哪一把公鑰驗章。第 5、6 步，伺服器收到回應，確認 challenge、origin、RP ID 都對（跟登入時的檢查是同一套想法，第 5 節細講），通過後為這把 passkey 存一筆 <strong>credential 紀錄</strong>：</p>
+<pre>CREATE TABLE passkeys (
+  id              bytea PRIMARY KEY,      -- credential ID（認證器給的）
+  user_id         bigint NOT NULL REFERENCES users(id),
+  public_key      bytea NOT NULL,         -- COSE 格式的公鑰
+  sign_count      bigint NOT NULL,        -- 32-bit 無號整數，integer 裝不下
+  transports      text[],                 -- usb、internal（內建）、hybrid（用手機掃 QR code）…，下次登入給瀏覽器當提示
+  backup_eligible boolean NOT NULL,       -- 註冊當時的 BE，之後不會變
+  backup_state    boolean NOT NULL,       -- 最近一次的 BS
+  name            text,                   -- 讓使用者辨認：「iPhone」「辦公室的安全金鑰」
+  created_at      timestamptz NOT NULL DEFAULT now(),
+  last_used_at    timestamptz
+);</pre>
+<p>一個使用者可以有很多把 passkey（手機、筆電、安全金鑰各一把），所以 <code>users</code> 對 <code>passkeys</code> 是一對多。帳號設定頁要列出它們，讓使用者能改名、刪除。<code>sign_count</code>、<code>backup_eligible</code>、<code>backup_state</code> 這三欄存的是認證器每次登入都會報上來的狀態，現在先記住欄位名稱；第 4 節拆開 authenticatorData 時，會講每一欄是什麼、為什麼要存。</p>
+
+<div class="callout practice"><strong>💡 實務上：RP ID 一旦上線就很難改</strong><br>RP ID 在註冊時就跟每一把 passkey 綁在一起。之後網站換網域（例如品牌改名，從 <code>coffee.example</code> 搬到別的網域），舊的 passkey 全部不能用，使用者只能先用別的方式登入再重新註冊。所以 RP ID 通常設成主網域 <code>coffee.example</code>，不是 <code>login.coffee.example</code>，這樣 <code>app.</code>、<code>admin.</code> 這些子網域都能共用同一把 passkey。staging 這類測試環境用自己的網域和 RP ID，不跟正式環境混用；本機開發可以直接用 <code>localhost</code>。資深工程師會在設計階段就問 PM 和維運：「之後有沒有換網域或拆子網域的計畫？」</div>
+<p>公鑰存好了。下次王小明回來登入，伺服器手上只有這把公鑰，它要拿公鑰驗的到底是「什麼東西」？</p>
+
+<h2>下次登入，王小明的裝置簽了什麼？登入儀式</h2>
+<p>登入時伺服器再產生一個新的 challenge（註冊用的那個已經作廢），前端拿它呼叫 <code>navigator.credentials.get()</code>。瀏覽器列出 RP ID 符合目前網域的 passkey，王小明選了自己的帳號、用指紋解鎖（登入頁怎麼讓 passkey 直接出現在瀏覽器的自動填入選單，是前端的細節，見課末「補充與查表」）。接下來要簽的資料由瀏覽器和認證器各準備一半：</p>
+<ol>
+  <li><strong>瀏覽器準備 clientDataJSON</strong>：一段 JSON，內容是 <code>type</code>（登入時是 <code>"webauthn.get"</code>，註冊時是 <code>"webauthn.create"</code>）、<code>challenge</code>、<code>origin</code>。這段由瀏覽器自己填，網頁的 JavaScript 改不了，第 1 節說的「來源由瀏覽器寫進簽章資料」就是在這裡發生。</li>
+  <li><strong>認證器準備 authenticatorData</strong>：認證器自己產生的一串位元組，裡面有 RP ID 的 SHA-256、幾個旗標（例如使用者有沒有在場、有沒有驗證過本人）和一個簽章計數器。第 4 節會逐段拆開。</li>
+  <li><strong>認證器簽章</strong>：簽的是 <code>authenticatorData || SHA-256(clientDataJSON)</code>。<code>||</code> 是「把兩段位元組前後接起來」的寫法，所以要簽的是 authenticatorData 原文，後面接上 clientDataJSON 的雜湊，不是兩段原文直接接起來。</li>
+</ol>
+<p>瀏覽器把 <code>clientDataJSON</code>、<code>authenticatorData</code>、<code>signature</code> 和 credential ID 交給前端，前端送到伺服器。伺服器用 credential ID 找出註冊時存的公鑰，再自己把 <code>authenticatorData || SHA-256(clientDataJSON)</code> 接一次來驗章。</p>
+<p>現在可以回頭驗證第 1 節的說法：釣魚網站拿到的簽章，到了真網站到底會怎樣？練習區的程式跑在 Worker 裡，沒有 <code>navigator.credentials</code>，也沒有真的認證器，所以下面用 Web Crypto 模擬：產生金鑰對、組 clientDataJSON 與 authenticatorData、簽章，再讓伺服器端檢查四項。執行後比較兩行結果裡哪幾項是 <code>false</code>：</p>
+
+<div class="lab"><script type="code">
+const enc = new TextEncoder()
+const sha256 = async (b: Uint8Array<ArrayBuffer>) => new Uint8Array(await crypto.subtle.digest('SHA-256', b))
+const ECDSA = { name: 'ECDSA', hash: 'SHA-256' }
+
+// 註冊：認證器產生金鑰對，私鑰留在裝置，公鑰交給咖啡店
+const { privateKey, publicKey } = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign', 'verify'])
+
+// 登入：瀏覽器填 origin，認證器組 authenticatorData 並簽章
+async function authenticatorGet(origin: string, rpId: string, challenge: string) {
+  const clientDataJSON = enc.encode(JSON.stringify({ type: 'webauthn.get', challenge, origin, crossOrigin: false }))
+  const authData = new Uint8Array(37)
+  authData.set(await sha256(enc.encode(rpId)), 0)   // rpIdHash
+  authData[32] = 0b00000101                          // 旗標：UP + UV
+  new DataView(authData.buffer).setUint32(33, 0)     // signCount
+  const signed = new Uint8Array([...authData, ...await sha256(clientDataJSON)])
+  const signature = new Uint8Array(await crypto.subtle.sign(ECDSA, privateKey, signed))
+  return { clientDataJSON, authData, signature }
+}
+
+// 咖啡店伺服器的檢查（簡化版）
+async function serverCheck(r: { clientDataJSON: Uint8Array<ArrayBuffer>; authData: Uint8Array<ArrayBuffer>; signature: Uint8Array<ArrayBuffer> }, challenge: string) {
+  const c = JSON.parse(new TextDecoder().decode(r.clientDataJSON))
+  const expectedRpIdHash = await sha256(enc.encode('coffee.example'))
+  const signed = new Uint8Array([...r.authData, ...await sha256(r.clientDataJSON)])
+  return {
+    challenge: c.challenge === challenge,
+    origin: c.origin === 'https://coffee.example',
+    rpIdHash: expectedRpIdHash.every((b, i) => b === r.authData[i]),
+    signature: await crypto.subtle.verify(ECDSA, publicKey, r.signature, signed),
+  }
+}
+
+const challenge = 'k3v9X1aQ'   // 真的要用 32 bytes 隨機值，這裡為了好讀
+const real = await authenticatorGet('https://coffee.example', 'coffee.example', challenge)
+console.log('在真網站登入：', await serverCheck(real, challenge))
+
+// 假設認證器真的替釣魚網站簽了（現實中它找不到這把 passkey）
+const phished = await authenticatorGet('https://coffee-login.example', 'coffee-login.example', challenge)
+console.log('釣魚網站轉送：', await serverCheck(phished, challenge))
+console.log('簽了什麼：', 37, '+', 32, '=', 37 + 32, 'bytes；簽章', real.signature.length, 'bytes')
+</script></div>
+<p>真網站四項都是 <code>true</code>。釣魚網站那一行，<code>signature</code> 也是 <code>true</code>：簽章本身有效，用的確實是王小明那把私鑰；<code>challenge</code> 也對，因為假網站可以先向真網站要一個 challenge 再交給受害者。會露出破綻的只有 <code>origin</code> 和 <code>rpIdHash</code>。所以<strong>只驗簽章不夠</strong>，伺服器的工作不是「驗一個簽章」，而是逐項比對回應裡的每個欄位。</p>
+<p>其中 <code>origin</code>、<code>challenge</code> 在 clientDataJSON 裡，是 JSON，<code>JSON.parse</code> 就讀得到；rpIdHash 和旗標則在 authenticatorData 這串位元組裡，伺服器得先會拆它，才談得上檢查。</p>
+
+<h2>authenticatorData 這串位元組裡寫了什麼？</h2>
+<p>上一節模擬用的是最短的 authenticatorData：37 bytes，固定分成三段。伺服器要確認 RP ID、確認使用者在場、偵測金鑰被複製，資料都從這三段讀出來：</p>
+<figure>
+  <svg viewBox="0 0 700 200" role="img" aria-label="authenticatorData 版面：前 32 bytes 是 rpIdHash，第 33 byte 是 flags，接著 4 bytes 是大端序的 signCount；flags 的 bit0 UP、bit2 UV、bit3 BE、bit4 BS、bit6 AT、bit7 ED">
+    <rect class="d-soft" x="20" y="20" width="400" height="44" rx="4"/><text class="d-text" x="220" y="47" text-anchor="middle">rpIdHash（32 bytes）</text>
+    <rect class="d-box" x="420" y="20" width="90" height="44" rx="4"/><text class="d-text" x="465" y="47" text-anchor="middle">flags（1）</text>
+    <rect class="d-soft" x="510" y="20" width="170" height="44" rx="4"/><text class="d-text" x="595" y="47" text-anchor="middle">signCount（4）</text>
+    <text class="d-small" x="20" y="82">位置 0</text><text class="d-small" x="420" y="82">32</text><text class="d-small" x="510" y="82">33～36（大端序）</text>
+    <g class="d-small">
+      <rect class="d-box" x="100" y="110" width="60" height="34"/><text x="130" y="132" text-anchor="middle">ED</text>
+      <rect class="d-box" x="160" y="110" width="60" height="34"/><text x="190" y="132" text-anchor="middle">AT</text>
+      <rect class="d-box" x="220" y="110" width="60" height="34"/><text x="250" y="132" text-anchor="middle">—</text>
+      <rect class="d-box" x="280" y="110" width="60" height="34"/><text x="310" y="132" text-anchor="middle">BS</text>
+      <rect class="d-box" x="340" y="110" width="60" height="34"/><text x="370" y="132" text-anchor="middle">BE</text>
+      <rect class="d-box" x="400" y="110" width="60" height="34"/><text x="430" y="132" text-anchor="middle">UV</text>
+      <rect class="d-box" x="460" y="110" width="60" height="34"/><text x="490" y="132" text-anchor="middle">—</text>
+      <rect class="d-box" x="520" y="110" width="60" height="34"/><text x="550" y="132" text-anchor="middle">UP</text>
+      <text x="130" y="162" text-anchor="middle">bit 7</text><text x="190" y="162" text-anchor="middle">6</text><text x="250" y="162" text-anchor="middle">5</text><text x="310" y="162" text-anchor="middle">4</text>
+      <text x="370" y="162" text-anchor="middle">3</text><text x="430" y="162" text-anchor="middle">2</text><text x="490" y="162" text-anchor="middle">1</text><text x="550" y="162" text-anchor="middle">bit 0</text>
+    </g>
+    <text class="d-small" x="350" y="190" text-anchor="middle">bit 0 是最低位（數值 1），bit 1 和 bit 5 保留不用</text>
+  </svg>
+  <figcaption>authenticatorData 至少 37 bytes；註冊時 AT=1，後面還接著公鑰等資料。</figcaption>
+</figure>
+<p><strong>第一段 rpIdHash</strong>（位置 0～31）是 RP ID 的 SHA-256，記錄認證器是替哪個網站簽的。伺服器自己算一次 SHA-256(<code>'coffee.example'</code>) 來比對；上一節釣魚的例子，就是這一項對不上。</p>
+<p><strong>第二段 flags</strong>（位置 32）只有 1 個 byte，也就是 8 個 bit，每個 bit 回答一個是非題。登入時最常看的是 UP 和 UV；BE、BS 跟 passkey 能不能同步有關，第 6 節會用到；AT、ED 只在註冊或使用擴充功能時出現。下表查表用，不用背：</p>
+<div class="table-wrap"><table>
+  <tr><th>旗標</th><th>位元</th><th>意思</th></tr>
+  <tr><td><strong>UP</strong>（User Present）</td><td>bit 0（<code>0x01</code>）</td><td>使用者在場：有人碰了裝置或按了確認。登入時一定要是 1。</td></tr>
+  <tr><td><strong>UV</strong>（User Verified）</td><td>bit 2（<code>0x04</code>）</td><td>使用者驗證過身分：指紋、臉、PIN。要求 UV 時才檢查。</td></tr>
+  <tr><td><strong>BE</strong>（Backup Eligible）</td><td>bit 3（<code>0x08</code>）</td><td>這把金鑰<strong>能</strong>被同步備份（例如存在 iCloud 鑰匙圈）。註冊後不會變。</td></tr>
+  <tr><td><strong>BS</strong>（Backup State）</td><td>bit 4（<code>0x10</code>）</td><td>這把金鑰<strong>目前</strong>已經備份。BE 是 0 時 BS 不可能是 1。</td></tr>
+  <tr><td><strong>AT</strong>（Attested credential data）</td><td>bit 6（<code>0x40</code>）</td><td>後面接著新金鑰的資料（註冊時）。</td></tr>
+  <tr><td><strong>ED</strong>（Extension Data）</td><td>bit 7（<code>0x80</code>）</td><td>後面接著擴充功能的資料。</td></tr>
+</table></div>
+<p>UP 和 UV 的差別要分清楚：UP 只代表「有人在裝置前面碰了一下」，UV 才代表「認證器確認了這個人是裝置的主人」。註冊時 options 裡的 <code>userVerification</code> 是伺服器的要求，實際有沒有驗，要看這次回應的 UV。</p>
+<p><strong>第三段 signCount（簽章計數器）</strong>（位置 33～36）是認證器每簽一次就增加的 32-bit 無號整數，用大端序存。它的用途是偵測金鑰被複製：正常情況下私鑰只存在一個認證器裡，數字只會往上加；萬一私鑰被複製到第二個認證器，兩邊各自從自己的數字往上加，伺服器每次記下收到的最新值，遲早會收到一個沒有比上次大的數字。會同步的 passkey 通常不實作計數器，一直回 0（規格寫明「沒有實作計數器的認證器固定給 0」），第 5 節的檢查規則必須照顧到這種情況。</p>
+<p>讀這三段會用到兩個 JavaScript 細節：怎麼從 flags 取出某一個 bit，以及怎麼把 4 bytes 讀成一個數字。下面這格兩件事都做，執行後特別看最後兩行：同樣的 4 bytes，讀出兩個不同的數字。</p>
+<div class="lab"><script type="code">
+const flags = 0b00011101
+console.log('flags 二進位：', flags.toString(2).padStart(8, '0'))
+const bits = [['UP', 0], ['UV', 2], ['BE', 3], ['BS', 4], ['AT', 6], ['ED', 7]] as const
+for (const [name, bit] of bits) console.log(name, (flags & (1 << bit)) !== 0)
+
+// 4 bytes 的計數器：FF FF FF FF
+const counter = new Uint8Array([0xff, 0xff, 0xff, 0xff])
+console.log('用 << 和 | 組：', (counter[0] << 24) | (counter[1] << 16) | (counter[2] << 8) | counter[3])
+console.log('用 DataView 讀：', new DataView(counter.buffer).getUint32(0))
+</script></div>
+<p>前半段用到兩個位元運算子：<code>1 &lt;&lt; n</code>（左移）把 1 往左移 n 位，得到「只有第 n 位是 1」的數字，例如 <code>1 &lt;&lt; 2</code> 是 <code>0b100</code>（4）；<code>a &amp; b</code>（位元 AND）只留下兩邊都是 1 的位元。所以 <code>flags &amp; 0x04</code> 不是 0，就代表 bit 2 是 1。</p>
+<p>後半段的差異來自 JavaScript 的位元運算一律先轉成<strong>有號</strong> 32-bit 整數，最高位元是 1 時結果就變成負數，所以用 <code>&lt;&lt;</code> 和 <code>|</code> 組出來的計數器是負的。<code>DataView.getUint32</code> 讀的是無號整數，第二個參數不給就是大端序（第 14 課用過的 <code>setBigUint64</code> 也是）。計數器讀成負數，跟存的值比大小就全錯了。</p>
+<p>練習 1 還會遇到第三個陷阱：<code>Uint8Array</code> 只是底層記憶體（<code>buffer</code>，一個 <code>ArrayBuffer</code>）的一個「視窗」。<code>big.subarray(10, 47)</code> 不複製資料，回傳的陣列和 <code>big</code> 共用同一個 <code>buffer</code>，只是從第 10 個 byte 開始看，這個起點記在 <code>byteOffset</code>。<code>new DataView(bytes.buffer)</code> 會從整個 buffer 的第 0 個 byte 開始讀，位置就錯了；要寫 <code>new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)</code>。反過來，<code>slice()</code> 會複製出一份新的資料。</p>
+<p>能從 authenticatorData 拆出 rpIdHash、旗標和 signCount，伺服器需要的原料就齊了。下一步是決定：這些欄位要照什麼順序檢查、每一項沒過代表什麼。</p>
+
+<h2>伺服器收到登入回應，要依序檢查哪幾件事？</h2>
+<p>第 3 節的釣魚例子說明了只驗簽章不夠，第 4 節讓我們讀得出每個欄位。WebAuthn Level 3 §7.2 把伺服器驗證登入回應的步驟寫成清單；去掉跟擴充功能、iframe 有關的部分，核心是下面這張表，順序照規格。讀的時候重點放在「擋什麼」那欄：每一項都對應一種具體的攻擊或錯誤，正式環境出問題時，你要能從「哪一項沒過」反推發生了什麼。</p>
+<div class="table-wrap"><table>
+  <tr><th>#</th><th>檢查</th><th>擋什麼</th></tr>
+  <tr><td>1</td><td>credential ID 屬於這個帳號（可探索憑證：用回應裡的 user handle 找帳號，再確認那個帳號有這把 credential）</td><td>拿別人的 passkey 登入自己的帳號，或反過來</td></tr>
+  <tr><td>2</td><td><code>clientData.type === 'webauthn.get'</code></td><td>拿註冊時的回應（<code>webauthn.create</code>）來登入</td></tr>
+  <tr><td>3</td><td><code>clientData.challenge</code> 等於伺服器存的 challenge</td><td>重放錄下來的回應</td></tr>
+  <tr><td>4</td><td><code>clientData.origin</code> 完全等於預期的來源</td><td>釣魚網站、別的子網域</td></tr>
+  <tr><td>5</td><td>rpIdHash 等於 SHA-256(RP ID)</td><td>別的網站的 passkey 產生的回應</td></tr>
+  <tr><td>6</td><td>UP 是 1；要求 UV 時 UV 是 1</td><td>沒人在場的簽章；只有「碰一下」卻當成驗證過身分</td></tr>
+  <tr><td>7</td><td>BE 是 0 時 BS 也要是 0；有用備份狀態做判斷時，BE 要跟註冊時存的一樣</td><td>不一致的認證器資料</td></tr>
+  <tr><td>8</td><td>用存好的公鑰驗 <code>authenticatorData || SHA-256(clientDataJSON)</code> 的簽章</td><td>偽造、竄改</td></tr>
+  <tr><td>9</td><td>signCount：新值或舊值有一個不是 0，而且新值 ≤ 舊值 → 可能被複製</td><td>被複製的金鑰</td></tr>
+  <tr><td>10</td><td>全部通過後才更新存的 signCount、backup_state、last_used_at</td><td>失敗的嘗試改到狀態</td></tr>
+</table></div>
+<p>有兩項需要多說明。第 9 步接著第 4 節的計數器：規格只說倒退是「可能被複製的訊號，不是證明」，要拒絕、只記錄還是要求額外驗證，由網站自己的政策決定。<strong>新舊都是 0 時不比較</strong>，否則所有同步 passkey 都登不進來。本課的練習採嚴格政策：倒退就拒絕。</p>
+<p>第 8 步有一個格式差異：WebAuthn 的 ES256 簽章是 <strong>DER 編碼</strong>，這是一種「型別、長度、內容」層層包起來的二進位格式，整個簽章大約 70～72 bytes；而 Web Crypto 只收<a href="08-jwt-signatures.html">第 8 課</a>的 64 bytes r||s，所以驗章前要先轉換。第 3 節的模擬直接用 Web Crypto 簽，所以印出的是 64 bytes 的 r||s；真的認證器回傳的是 DER，伺服器收到後要先轉。忘記轉換的症狀是「每個人都登不進去」：直接拿 DER 去驗不會報錯，只會回 <code>false</code>。練習 3 會提供現成的 <code>derToRaw</code>；DER 長什麼樣、怎麼轉，見課末「補充與查表」。</p>
+<p>這張表就是練習 3 的 <code>verifyAssertion</code> 要照順序實作的內容。正式環境<strong>不要自己解析 CBOR、COSE 和 attestation</strong>：格式多、邊界情況多，用維護良好的函式庫，例如 <code>@simplewebauthn/server</code> 搭配前端的 <code>@simplewebauthn/browser</code>（版本見課末）。同一張表在函式庫裡變成幾個參數：</p>
+<pre>// 伺服器（Node）：@simplewebauthn/server 14.0.3
+const verification = await verifyAuthenticationResponse({
+  response: body,                          // 前端 startAuthentication() 的結果
+  expectedChallenge: session.challenge,    // 從 session 取出，用完就刪
+  expectedOrigin: 'https://coffee.example',
+  expectedRPID: 'coffee.example',
+  credential: { id: passkey.id, publicKey: passkey.publicKey, counter: passkey.signCount, transports: passkey.transports },
+  requireUserVerification: true,           // 預設就是 true
+})
+if (verification.verified) {
+  // 更新 signCount 與 backup_state 是你的工作，函式庫不會幫你存
+  await savePasskey(passkey.id, verification.authenticationInfo.newCounter, verification.authenticationInfo.credentialBackedUp)
+}</pre>
+<p>對照表格看：<code>expectedChallenge</code> 對第 3 項、<code>expectedOrigin</code> 對第 4 項、<code>expectedRPID</code> 對第 5 項、<code>requireUserVerification</code> 對第 6 項，<code>credential</code> 裡的公鑰和計數器對第 8、9 項；第 10 項的「通過後更新」則留在 <code>if</code> 裡由你來做。函式庫處理格式與密碼學；你要負責的是這課講的部分：challenge 存在哪、怎麼作廢，資料表存什麼、登入後更新什麼，origin 和 RP ID 設什麼，以及復原流程。練習 3 讓你親手寫一次整張表的檢查順序，以後讀函式庫的設定和錯誤訊息，才知道它在做什麼。</p>
+
+<h3>第 3 項的「伺服器存的 challenge」存在哪、什麼時候作廢？</h3>
+<p>這幾個參數裡，<code>expectedChallenge</code> 是最容易做錯的一個，因為函式庫只負責比對，challenge 從哪來、存在哪是你的事。規格要求伺服器自己記住發出去的 challenge，不能相信客戶端送回來的值（§13.4.3），並建議至少 16 bytes、有效期跟 timeout 差不多。落到實作是四條規則，每一條都對應一種漏洞：</p>
+<ul>
+  <li>用 CSPRNG 產生 32 bytes（第 2 課），讓人猜不到。存在<strong>這個 session</strong> 底下，不是全站共用的集合：如果只檢查「這個 challenge 是不是我發過的」，攻擊者可以拿別人 session 的 challenge 來用。</li>
+  <li>5 分鐘後失效，跟 options 裡的 <code>timeout</code> 一致。</li>
+  <li><strong>用一次就刪</strong>，不論驗證成功或失敗，錄下來的回應才不能再送一次。同一個 session 重新開始登入時，舊的 challenge 作廢。</li>
+  <li>多台伺服器時，challenge 跟 session 一樣放在共用的儲存（Redis、資料庫），不然發 challenge 的和收回應的可能是不同台。</li>
+</ul>
+<p>練習 2 的 <code>ChallengeStore</code> 就是把這四條寫成程式。</p>
+
+<div class="callout practice"><strong>💡 實務上：「大家都登不進去」先查設定</strong><br>passkey 上線後，很多「登不進去」的回報不是攻擊，而是設定錯：預期的 origin 少了 port 或寫成 <code>http</code>、伺服器在反向代理後面，用請求的 Host 拼出 origin，結果拼成內部位址、多台伺服器的 challenge 各自存在記憶體裡。做法是 origin 和 RP ID 從每個環境的設定讀，不從請求內容推算。驗證失敗時在伺服器 log 記下是哪一項沒過（challenge、origin、rpIdHash、簽章），回給前端的只要一句「登入失敗」。這樣客服轉來「iPhone 登不進去」時，查 log 就分得出是設定問題還是使用者裝置的問題。</div>
+<p>到這裡，王小明用同一支 iPhone 登入的流程已經完整。但表裡第 7、9 項都繞著一個還沒回答的問題：passkey 能不能跟著王小明換到新手機？</p>
+
+<h2>王小明換手機，passkey 會跟著走嗎？同步與裝置綁定</h2>
+<p>答案取決於私鑰能不能離開產生它的那台裝置。passkey 依這點分成兩種：</p>
+<ul>
+  <li><strong>同步 passkey</strong>：存在 iCloud 鑰匙圈、Google 密碼管理工具、1Password 這類服務，同一個雲端帳號的所有裝置都拿得到。BE 和 BS 都是 1，signCount 通常一直是 0。王小明換新 iPhone，登入同一個 Apple ID 後 passkey 就回來了。</li>
+  <li><strong>裝置綁定 passkey</strong>：私鑰鎖在那支安全金鑰或那台裝置的晶片裡，複製不出來。BE 是 0，通常有遞增的 signCount。裝置遺失，passkey 就沒了。</li>
+</ul>
+<p>這也解釋了第 4 節的兩個現象：同步 passkey 的私鑰本來就會被「複製」到使用者的每台裝置，計數器沒有意義，所以固定給 0；裝置綁定的才有遞增的計數器，第 9 項的複製偵測只對它有用。兩種的取捨：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>同步 passkey</th><th>裝置綁定 passkey</th></tr>
+  <tr><td>方便</td><td>新裝置自動可用</td><td>每台裝置要各自註冊</td></tr>
+  <tr><td>遺失裝置</td><td>從雲端帳號取回</td><td>要靠別的 passkey 或復原流程</td></tr>
+  <tr><td>風險集中在</td><td>雲端帳號（Apple ID、Google 帳號）被盜</td><td>實體裝置被偷且 PIN 被破</td></tr>
+  <tr><td>複製偵測</td><td>做不到（計數器是 0）</td><td>signCount 倒退可以發現</td></tr>
+  <tr><td>適合</td><td>一般顧客</td><td>店長後台、能退款、能改權限的高權限帳號</td></tr>
+</table></div>
+<p>BE、BS 可以拿來做政策，這就是資料表存 <code>backup_eligible</code>、<code>backup_state</code> 的原因。例如顧客只有一把 BS=0 的 passkey 時，提示他「再加一把，或開啟同步，以免換手機後登不進來」；高權限帳號要求 BE=0 的安全金鑰。一旦用備份狀態做判斷，認證器報上來的 BE 就必須可信，所以 §7.2 規定（表裡第 7 項）：每次登入的 BE 要和註冊時存的一樣。</p>
+
+<div class="callout practice"><strong>💡 實務上：顧客用同步 passkey，安全金鑰留給高權限帳號</strong><br>一般顧客用同步 passkey 就好：換手機不會掉帳號，客服負擔最小。要求實體安全金鑰（BE=0）通常只用在少數帳號，例如咖啡店的店長後台、工程師登入雲端主控台，而且要搭配發放、遺失補發的流程，每人至少兩支。決定之前先問：「這個帳號被盜，最壞會發生什麼事？」如果答案只是「看到自己的訂單紀錄」，強迫顧客買安全金鑰只會讓他們放棄註冊。</div>
+<p>同步解決了換手機的問題。但如果王小明唯一的那支手機掉了、passkey 也沒同步，他要怎麼回到帳號？而這條「回到帳號」的路，正是攻擊者接下來會盯上的地方。</p>
+
+<h2>passkey 全丟了怎麼辦？帳號復原與導入順序</h2>
+<p>passkey 擋住了釣魚，攻擊者就會改打<strong>帳號復原</strong>：如果「忘記 passkey？輸入 email 收連結」就能重設，整個帳號的強度就等於那個 email 連結，前面做的一切都被繞過。所以復原流程的設計原則是不能比登入弱：</p>
+<ul>
+  <li>鼓勵使用者註冊兩把以上的 passkey（例如手機加筆電），遺失一把還能用另一把登入。這是成本最低的復原方式，帳號設定頁的 passkey 列表就是為此存在。</li>
+  <li>提供第 14 課的復原碼，只存雜湊、用一次就刪。</li>
+  <li>復原後通知使用者，並讓其他 session 失效。復原流程本身的設計是<a href="16-account-flows.html">第 16 課</a>的主題。</li>
+</ul>
+<p>復原流程解決的是已經在用 passkey 的人掉了裝置。同樣的「別把人鎖在門外」也適用在還沒用 passkey 的人：咖啡店既有的密碼會員要怎麼逐步換過來？他們的裝置不一定都支援 passkey，所以導入順序是：先在帳號設定加「新增 passkey」，登入頁同時支援密碼與 passkey；使用者用 passkey 登入過一陣子、確定他的裝置用得順之後，再提示他可以移除密碼。一次全部改掉，沒有支援裝置的使用者會被鎖在門外。</p>
+
+<h2>補充與查表</h2>
+<h3>版本備註</h3>
+<ul>
+  <li>WebAuthn Level 3 在 2026-08-25 成為正式的 W3C 推薦標準（Recommendation）。本課的章節編號（§5.4.3、§6.5.5、§7.2、§13.4.3、§14.3、§15.1）都指這一版。</li>
+  <li><code>@simplewebauthn/server</code>：2026-10-31 的最新版是 14.0.3，本課的範例以這一版為準。</li>
+</ul>
+<h3>FIDO2 與 CTAP</h3>
+<p>看文件時常會遇到 <strong>FIDO2</strong> 這個詞：它是 WebAuthn 加上 CTAP 的總稱。CTAP 是「瀏覽器怎麼跟安全金鑰、手機溝通」的協定。寫伺服器的人只會直接碰到 WebAuthn 這一半。</p>
+<h3>登入頁的 passkey 自動填入</h3>
+<p>使用可探索憑證時，登入頁可以讓 passkey 出現在瀏覽器的自動填入選單：帳號輸入框寫 <code>autocomplete="username webauthn"</code>，頁面載入時就用 <code>mediation: 'conditional'</code> 呼叫 <code>navigator.credentials.get()</code>。使用者點帳號欄位就看得到「用 passkey 登入」，不用先輸入 email。</p>
+<h3>ES256 的簽章：DER 轉 r||s</h3>
+<p>正式環境由函式庫做這個轉換，練習 3 也直接提供 <code>derToRaw</code>。想知道 DER 長什麼樣、要自己處理二進位格式或讀懂函式庫原始碼時再看。</p>
+<p>ECDSA 的簽章是兩個數字 r 和 s。<a href="08-jwt-signatures.html">第 8 課</a>看過 Web Crypto 和 JWT 的格式：r、s 各補成 32 bytes 直接接起來，共 64 bytes。WebAuthn 不一樣：§6.5.5 規定 ES256 的簽章必須是 ASN.1 <strong>DER 編碼</strong>。ASN.1 是一套描述資料結構的標準（憑證、金鑰檔都用它），DER 是把它轉成位元組的規則之一。DER 是一種「型別、長度、內容」一層一層包起來的二進位格式：</p>
+<pre>30 &lt;總長度&gt;
+   02 &lt;r 的長度&gt; &lt;r 的位元組&gt;
+   02 &lt;s 的長度&gt; &lt;s 的位元組&gt;</pre>
+<p><code>30</code> 代表 SEQUENCE（一串東西），<code>02</code> 代表 INTEGER（整數）。DER 的整數是有號的：最高位元是 1 時要在前面補一個 <code>00</code>，不然會被當成負數；前面的 <code>00</code> 又要省略。所以 r、s 的長度不固定（通常是 32 或 33 bytes，數字前面剛好是 0 時更短），整個簽章大約 70～72 bytes。驗章前要轉回 64 bytes 的 r||s：</p>
+<div class="lab"><script type="code">
+const enc = new TextEncoder()
+const ECDSA = { name: 'ECDSA', hash: 'SHA-256' }
+const hex = (b: Uint8Array) => Array.from(b, x => x.toString(16).padStart(2, '0')).join(' ')
+
+// r||s（64 bytes）→ DER，模擬認證器的輸出
+function rawToDer(raw: Uint8Array<ArrayBuffer>): Uint8Array<ArrayBuffer> {
+  const integer = (x: Uint8Array<ArrayBuffer>) => {
+    let i = 0
+    while (i < x.length - 1 && x[i] === 0) i++          // 去掉前面多餘的 00
+    const v = Array.from(x.subarray(i))
+    if (v[0] & 0x80) v.unshift(0)                       // 最高位元是 1：補 00，避免變負數
+    return [0x02, v.length, ...v]
+  }
+  const body = [...integer(raw.subarray(0, 32)), ...integer(raw.subarray(32))]
+  return new Uint8Array([0x30, body.length, ...body])
+}
+
+const { privateKey, publicKey } = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign', 'verify'])
+const data = enc.encode('authenticatorData || SHA-256(clientDataJSON)')
+const raw = new Uint8Array(await crypto.subtle.sign(ECDSA, privateKey, data))
+const der = rawToDer(raw)
+console.log('r||s：', raw.length, 'bytes')
+console.log('DER ：', der.length, 'bytes，開頭', hex(der.subarray(0, 4)), '…')
+console.log('用 r||s 驗：', await crypto.subtle.verify(ECDSA, publicKey, raw, data))
+console.log('直接拿 DER 驗：', await crypto.subtle.verify(ECDSA, publicKey, der, data))
+</script></div>
+<p>最後一行印出 <code>false</code>：這就是第 5 節說的「每個人都登不進去」。反方向的錯誤（把 r||s 當 DER 解析）一樣會讓驗證失敗。</p>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：寫 <code>parseAuthenticatorData(bytes)</code>，把 authenticatorData 拆成三個欄位：</p>
+  <ul>
+    <li>長度小於 37 bytes 回傳 <code>null</code>。</li>
+    <li><code>rpIdHash</code>：前 32 bytes（複製一份）。</li>
+    <li><code>flags</code>：第 33 個 byte 的 UP（bit 0）、UV（bit 2）、BE（bit 3）、BS（bit 4）、AT（bit 6）、ED（bit 7），每個是 boolean。</li>
+    <li><code>signCount</code>：接下來 4 bytes，大端序、無號，結果不能是負數。</li>
+    <li>傳進來的可能是某個大陣列的一段（<code>subarray</code>），<code>byteOffset</code> 不一定是 0。</li>
+  </ul>
+  <script type="start">
+type AuthenticatorFlags = { up: boolean; uv: boolean; be: boolean; bs: boolean; at: boolean; ed: boolean }
+type ParsedAuthData = { rpIdHash: Uint8Array<ArrayBuffer>; flags: AuthenticatorFlags; signCount: number }
+
+function parseAuthenticatorData(bytes: Uint8Array<ArrayBuffer>): ParsedAuthData | null {
+  throw new Error('TODO')
+}
+
+const sample = new Uint8Array(37)
+sample[32] = 0b00000101
+sample.set([0, 0, 0, 7], 33)
+console.log(parseAuthenticatorData(sample))
+</script>
+  <script type="answer">
+type AuthenticatorFlags = { up: boolean; uv: boolean; be: boolean; bs: boolean; at: boolean; ed: boolean }
+type ParsedAuthData = { rpIdHash: Uint8Array<ArrayBuffer>; flags: AuthenticatorFlags; signCount: number }
+
+function parseAuthenticatorData(bytes: Uint8Array<ArrayBuffer>): ParsedAuthData | null {
+  if (bytes.length < 37) return null
+  const f = bytes[32]
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  return {
+    rpIdHash: bytes.slice(0, 32),
+    flags: {
+      up: (f & 0x01) !== 0,
+      uv: (f & 0x04) !== 0,
+      be: (f & 0x08) !== 0,
+      bs: (f & 0x10) !== 0,
+      at: (f & 0x40) !== 0,
+      ed: (f & 0x80) !== 0,
+    },
+    signCount: view.getUint32(33),   // 不給第二個參數就是大端序
+  }
+}
+
+const sample = new Uint8Array(37)
+sample[32] = 0b00000101
+sample.set([0, 0, 0, 7], 33)
+console.log(parseAuthenticatorData(sample))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<typeof parseAuthenticatorData, (bytes: Uint8Array<ArrayBuffer>) => ParsedAuthData | null>>  // parseAuthenticatorData 要接收 Uint8Array<ArrayBuffer>、回傳 ParsedAuthData | null
+</script>
+  <script type="tests">
+const make = (flags: number, count: number[]) => {
+  const b = new Uint8Array(37)
+  for (let i = 0; i < 32; i++) b[i] = i + 1
+  b[32] = flags
+  b.set(count, 33)
+  return b
+}
+const none = { up: false, uv: false, be: false, bs: false, at: false, ed: false }
+const p1 = parseAuthenticatorData(make(0b00011101, [0, 0, 0, 0]))
+assert(p1 !== null, '37 bytes 是合法的長度，不能回 null')
+assert.deepEqual(p1?.flags, { up: true, uv: true, be: true, bs: true, at: false, ed: false }, 'flags 0b00011101：bit 0、2、3、4 是 1')
+assert.deepEqual(Array.from(p1?.rpIdHash ?? []), Array.from({ length: 32 }, (_, i) => i + 1), 'rpIdHash 是前 32 bytes')
+assert(p1?.rpIdHash instanceof Uint8Array && p1.rpIdHash.length === 32, 'rpIdHash 要是 32 bytes 的 Uint8Array')
+const reused = make(0x01, [0, 0, 0, 0])
+const p3 = parseAuthenticatorData(reused)
+reused[0] = 0xee
+assert.equal(p3?.rpIdHash[0], 1, 'rpIdHash 要複製一份（slice）：之後傳入的陣列被改掉，解析結果不能跟著變')
+const single: [number, keyof AuthenticatorFlags][] = [[0x01, 'up'], [0x04, 'uv'], [0x08, 'be'], [0x10, 'bs'], [0x40, 'at'], [0x80, 'ed']]
+for (const [bit, name] of single) {
+  assert.deepEqual(parseAuthenticatorData(make(bit, [0, 0, 0, 0]))?.flags, { ...none, [name]: true }, `flags 是 0x${bit.toString(16).padStart(2, '0')} 時只有 ${name} 是 true`)
+}
+assert.deepEqual(parseAuthenticatorData(make(0x22, [0, 0, 0, 0]))?.flags, none, 'bit 1 和 bit 5 是保留位元，不對應任何旗標')
+assert.equal(parseAuthenticatorData(make(1, [1, 2, 3, 4]))?.signCount, 16909060, 'signCount 01 02 03 04 是大端序的 16909060')
+assert.equal(parseAuthenticatorData(make(1, [0xff, 0xff, 0xff, 0xff]))?.signCount, 4294967295, 'signCount FF FF FF FF 是 4294967295：無號整數，不能變成負數')
+assert.equal(parseAuthenticatorData(make(1, [0x80, 0, 0, 1]))?.signCount, 2147483649, 'signCount 80 00 00 01 是 2147483649')
+assert.equal(parseAuthenticatorData(new Uint8Array(36)), null, '36 bytes 不夠，要回傳 null')
+assert.equal(parseAuthenticatorData(new Uint8Array(0)), null, '空的要回傳 null')
+const big = new Uint8Array(50)
+big.set(make(0x05, [0, 0, 1, 0]), 10)
+const p2 = parseAuthenticatorData(big.subarray(10, 47))
+assert.equal(p2?.signCount, 256, '傳進來的是 subarray（byteOffset 是 10）時也要讀對：DataView 要帶 byteOffset')
+assert.deepEqual(p2?.flags, { ...none, up: true, uv: true }, 'subarray 的 flags 也要讀對')
+const longer = new Uint8Array(80)
+longer.set(make(0x45, [0, 0, 0, 9]))
+assert.equal(parseAuthenticatorData(longer)?.signCount, 9, '註冊時 authenticatorData 比 37 bytes 長（AT=1），一樣要讀出前面的欄位')
+</script>
+  <script type="wrong">
+type AuthenticatorFlags = { up: boolean; uv: boolean; be: boolean; bs: boolean; at: boolean; ed: boolean }
+type ParsedAuthData = { rpIdHash: Uint8Array<ArrayBuffer>; flags: AuthenticatorFlags; signCount: number }
+
+function parseAuthenticatorData(bytes: Uint8Array<ArrayBuffer>): ParsedAuthData | null {
+  if (bytes.length < 37) return null
+  const f = bytes[32]
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  return {
+    rpIdHash: bytes.slice(0, 32),
+    flags: { up: (f & 0x01) !== 0, uv: (f & 0x04) !== 0, be: (f & 0x08) !== 0, bs: (f & 0x10) !== 0, at: (f & 0x40) !== 0, ed: (f & 0x80) !== 0 },
+    signCount: view.getUint32(33, true),
+  }
+}
+</script>
+  <script type="wrong">
+type AuthenticatorFlags = { up: boolean; uv: boolean; be: boolean; bs: boolean; at: boolean; ed: boolean }
+type ParsedAuthData = { rpIdHash: Uint8Array<ArrayBuffer>; flags: AuthenticatorFlags; signCount: number }
+
+function parseAuthenticatorData(bytes: Uint8Array<ArrayBuffer>): ParsedAuthData | null {
+  if (bytes.length < 37) return null
+  const f = bytes[32]
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  return {
+    rpIdHash: bytes.slice(0, 32),
+    flags: { up: (f & 0x01) !== 0, uv: (f & 0x02) !== 0, be: (f & 0x04) !== 0, bs: (f & 0x08) !== 0, at: (f & 0x40) !== 0, ed: (f & 0x80) !== 0 },
+    signCount: view.getUint32(33),
+  }
+}
+</script>
+  <script type="wrong">
+type AuthenticatorFlags = { up: boolean; uv: boolean; be: boolean; bs: boolean; at: boolean; ed: boolean }
+type ParsedAuthData = { rpIdHash: Uint8Array<ArrayBuffer>; flags: AuthenticatorFlags; signCount: number }
+
+function parseAuthenticatorData(bytes: Uint8Array<ArrayBuffer>): ParsedAuthData | null {
+  if (bytes.length < 37) return null
+  const f = bytes[32]
+  return {
+    rpIdHash: bytes.slice(0, 32),
+    flags: { up: (f & 0x01) !== 0, uv: (f & 0x04) !== 0, be: (f & 0x08) !== 0, bs: (f & 0x10) !== 0, at: (f & 0x40) !== 0, ed: (f & 0x80) !== 0 },
+    signCount: (bytes[33] << 24) | (bytes[34] << 16) | (bytes[35] << 8) | bytes[36],
+  }
+}
+</script>
+  <script type="wrong">
+type AuthenticatorFlags = { up: boolean; uv: boolean; be: boolean; bs: boolean; at: boolean; ed: boolean }
+type ParsedAuthData = { rpIdHash: Uint8Array<ArrayBuffer>; flags: AuthenticatorFlags; signCount: number }
+
+function parseAuthenticatorData(bytes: Uint8Array<ArrayBuffer>): ParsedAuthData | null {
+  if (bytes.length < 37) return null
+  const f = bytes[32]
+  const view = new DataView(bytes.buffer)
+  return {
+    rpIdHash: bytes.slice(0, 32),
+    flags: { up: (f & 0x01) !== 0, uv: (f & 0x04) !== 0, be: (f & 0x08) !== 0, bs: (f & 0x10) !== 0, at: (f & 0x40) !== 0, ed: (f & 0x80) !== 0 },
+    signCount: view.getUint32(33),
+  }
+}
+</script>
+  <script type="wrong">
+type AuthenticatorFlags = { up: boolean; uv: boolean; be: boolean; bs: boolean; at: boolean; ed: boolean }
+type ParsedAuthData = { rpIdHash: Uint8Array<ArrayBuffer>; flags: AuthenticatorFlags; signCount: number }
+
+function parseAuthenticatorData(bytes: Uint8Array<ArrayBuffer>): ParsedAuthData | null {
+  if (bytes.length < 37) return null
+  const f = bytes[32]
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  return {
+    rpIdHash: bytes.subarray(0, 32),
+    flags: {
+      up: (f & 0x01) !== 0,
+      uv: (f & 0x04) !== 0,
+      be: (f & 0x08) !== 0,
+      bs: (f & 0x10) !== 0,
+      at: (f & 0x40) !== 0,
+      ed: (f & 0x80) !== 0,
+    },
+    signCount: view.getUint32(33),   // 不給第二個參數就是大端序
+  }
+}
+
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：寫 <code>ChallengeStore</code>，管理登入用的 challenge。時間由建構子傳入的 <code>now()</code> 決定（毫秒）。</p>
+  <ul>
+    <li><code>issue(sessionId)</code>：用 CSPRNG 產生 32 bytes，回傳 base64url（43 個字元），綁在這個 session 上，5 分鐘內有效。同一個 session 再呼叫一次，舊的 challenge 作廢。</li>
+    <li><code>consume(sessionId, challenge)</code>：challenge 必須是<strong>這個 session</strong> 目前的那一個、還沒過期、還沒用過，才回傳 <code>true</code>。用過就刪，不能用第二次；<strong>不論這次對不對</strong>都要刪，不然攻擊者可以一直猜。</li>
+    <li>不同 session 的 challenge 互不影響。</li>
+  </ul>
+  <script type="start">
+// 已經寫好（第 2 課的答案）
+function base64urlEncode(bytes: Uint8Array<ArrayBuffer>): string {
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+const CHALLENGE_TTL_MS = 5 * 60 * 1000
+
+class ChallengeStore {
+  private readonly now: () => number
+  // 自己決定要用什麼資料結構存
+
+  constructor(now: () => number) {
+    this.now = now
+  }
+
+  issue(sessionId: string): string {
+    throw new Error('TODO')
+  }
+
+  consume(sessionId: string, challenge: string): boolean {
+    throw new Error('TODO')
+  }
+}
+
+let t = 0
+const store = new ChallengeStore(() => t)
+const c = store.issue('sess-1')
+console.log(c, store.consume('sess-1', c), store.consume('sess-1', c))
+</script>
+  <script type="answer">
+// 已經寫好（第 2 課的答案）
+function base64urlEncode(bytes: Uint8Array<ArrayBuffer>): string {
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+const CHALLENGE_TTL_MS = 5 * 60 * 1000
+
+class ChallengeStore {
+  private readonly now: () => number
+  private readonly pending = new Map<string, { challenge: string; expiresAt: number }>()
+
+  constructor(now: () => number) {
+    this.now = now
+  }
+
+  issue(sessionId: string): string {
+    const challenge = base64urlEncode(crypto.getRandomValues(new Uint8Array(32)))
+    this.pending.set(sessionId, { challenge, expiresAt: this.now() + CHALLENGE_TTL_MS })   // 覆蓋 = 舊的作廢
+    return challenge
+  }
+
+  consume(sessionId: string, challenge: string): boolean {
+    const entry = this.pending.get(sessionId)
+    if (!entry) return false
+    this.pending.delete(sessionId)   // 不論成敗，這個 challenge 都只有一次機會
+    return entry.challenge === challenge && this.now() < entry.expiresAt
+  }
+}
+
+let t = 0
+const store = new ChallengeStore(() => t)
+const c = store.issue('sess-1')
+console.log(c, store.consume('sess-1', c), store.consume('sess-1', c))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<ChallengeStore['issue'], (sessionId: string) => string>>  // issue(sessionId: string): string
+type _2 = Expect<Equal<ChallengeStore['consume'], (sessionId: string, challenge: string) => boolean>>  // consume(sessionId: string, challenge: string): boolean
+</script>
+  <script type="tests">
+let clock = 1_000_000
+const s = new ChallengeStore(() => clock)
+const c1 = s.issue('sess-a')
+assert(/^[A-Za-z0-9_-]{43}$/.test(c1), 'challenge 要是 32 bytes 的 base64url（43 個字元，沒有 = + /）')
+assert.equal(s.consume('sess-a', c1), true, '剛發的 challenge 用在同一個 session 要成功')
+assert.equal(s.consume('sess-a', c1), false, '同一個 challenge 用第二次要失敗（防重放）')
+
+const c2 = s.issue('sess-a')
+assert.equal(s.consume('sess-b', c2), false, '別的 session 拿這個 challenge 來用要失敗：challenge 要綁在發出去的那個 session')
+
+const ca = s.issue('sess-c')
+const cb = s.issue('sess-d')
+assert.equal(s.consume('sess-d', cb), true, '兩個 session 同時在登入，各自的 challenge 都要能用')
+assert.equal(s.consume('sess-c', ca), true, '兩個 session 同時在登入，各自的 challenge 都要能用')
+
+const old = s.issue('sess-e')
+const fresh = s.issue('sess-e')
+assert(old !== fresh, '每次 issue 都要產生新的 challenge')
+assert.equal(s.consume('sess-e', fresh), true, '重新 issue 之後，新的 challenge 要能用')
+assert.equal(s.consume('sess-e', old), false, '同一個 session 重新 issue 之後，舊的 challenge 要作廢')
+
+const c5 = s.issue('sess-h')
+assert.equal(s.consume('sess-h', 'wrong-guess'), false, '送錯的 challenge 要失敗')
+assert.equal(s.consume('sess-h', c5), false, '送錯一次之後，這個 session 的 challenge 也要作廢：不論成敗，consume 一次就刪')
+
+const c3 = s.issue('sess-f')
+clock += 5 * 60 * 1000 - 1000
+assert.equal(s.consume('sess-f', c3), true, '4 分 59 秒還在有效期內')
+const c4 = s.issue('sess-g')
+clock += 5 * 60 * 1000 + 1
+assert.equal(s.consume('sess-g', c4), false, '超過 5 分鐘要失敗')
+
+const s2 = new ChallengeStore(() => clock)
+assert.equal(s2.consume('sess-x', ''), false, '沒發過 challenge 的 session 要失敗')
+
+const realRandom = Math.random
+Math.random = () => 0.5
+try {
+  const r1 = s2.issue('sess-y')
+  const r2 = s2.issue('sess-z')
+  assert(r1 !== r2, 'Math.random 被換成固定值後，challenge 還是要不同：用 crypto.getRandomValues，不要用 Math.random')
+} finally {
+  Math.random = realRandom
+}
+</script>
+  <script type="wrong">
+function base64urlEncode(bytes: Uint8Array<ArrayBuffer>): string {
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+const CHALLENGE_TTL_MS = 5 * 60 * 1000
+
+class ChallengeStore {
+  private readonly now: () => number
+  private readonly pending = new Map<string, { challenge: string; expiresAt: number }>()
+
+  constructor(now: () => number) {
+    this.now = now
+  }
+
+  issue(sessionId: string): string {
+    const challenge = base64urlEncode(crypto.getRandomValues(new Uint8Array(32)))
+    this.pending.set(sessionId, { challenge, expiresAt: this.now() + CHALLENGE_TTL_MS })
+    return challenge
+  }
+
+  consume(sessionId: string, challenge: string): boolean {
+    const entry = this.pending.get(sessionId)
+    return !!entry && entry.challenge === challenge && this.now() < entry.expiresAt
+  }
+}
+</script>
+  <script type="wrong">
+function base64urlEncode(bytes: Uint8Array<ArrayBuffer>): string {
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+const CHALLENGE_TTL_MS = 5 * 60 * 1000
+
+class ChallengeStore {
+  private readonly now: () => number
+  private readonly pending = new Map<string, number>()
+
+  constructor(now: () => number) {
+    this.now = now
+  }
+
+  issue(sessionId: string): string {
+    const challenge = base64urlEncode(crypto.getRandomValues(new Uint8Array(32)))
+    this.pending.set(challenge, this.now() + CHALLENGE_TTL_MS)
+    return challenge
+  }
+
+  consume(sessionId: string, challenge: string): boolean {
+    const expiresAt = this.pending.get(challenge)
+    if (expiresAt === undefined) return false
+    this.pending.delete(challenge)
+    return this.now() < expiresAt
+  }
+}
+</script>
+  <script type="wrong">
+function base64urlEncode(bytes: Uint8Array<ArrayBuffer>): string {
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+const CHALLENGE_TTL_MS = 5 * 60 * 1000
+
+class ChallengeStore {
+  private readonly now: () => number
+  private readonly pending = new Map<string, string>()
+
+  constructor(now: () => number) {
+    this.now = now
+  }
+
+  issue(sessionId: string): string {
+    const challenge = base64urlEncode(crypto.getRandomValues(new Uint8Array(32)))
+    this.pending.set(sessionId, challenge)
+    return challenge
+  }
+
+  consume(sessionId: string, challenge: string): boolean {
+    const expected = this.pending.get(sessionId)
+    this.pending.delete(sessionId)
+    return expected === challenge
+  }
+}
+</script>
+  <script type="wrong">
+function base64urlEncode(bytes: Uint8Array<ArrayBuffer>): string {
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+const CHALLENGE_TTL_MS = 5 * 60 * 1000
+
+class ChallengeStore {
+  private readonly now: () => number
+  private readonly pending = new Map<string, { challenge: string; expiresAt: number }>()
+
+  constructor(now: () => number) {
+    this.now = now
+  }
+
+  issue(sessionId: string): string {
+    const bytes = new Uint8Array(32)
+    for (let i = 0; i < 32; i++) bytes[i] = Math.floor(Math.random() * 256)
+    const challenge = base64urlEncode(bytes)
+    this.pending.set(sessionId, { challenge, expiresAt: this.now() + CHALLENGE_TTL_MS })
+    return challenge
+  }
+
+  consume(sessionId: string, challenge: string): boolean {
+    const entry = this.pending.get(sessionId)
+    if (!entry) return false
+    this.pending.delete(sessionId)
+    return entry.challenge === challenge && this.now() < entry.expiresAt
+  }
+}
+</script>
+  <script type="wrong">
+function base64urlEncode(bytes: Uint8Array<ArrayBuffer>): string {
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+const CHALLENGE_TTL_MS = 5 * 60 * 1000
+
+class ChallengeStore {
+  private readonly now: () => number
+  private readonly pending = new Map<string, { challenge: string; expiresAt: number }>()
+
+  constructor(now: () => number) {
+    this.now = now
+  }
+
+  issue(sessionId: string): string {
+    const challenge = base64urlEncode(crypto.getRandomValues(new Uint8Array(32)))
+    this.pending.set(sessionId, { challenge, expiresAt: this.now() + CHALLENGE_TTL_MS })   // 覆蓋 = 舊的作廢
+    return challenge
+  }
+
+  consume(sessionId: string, challenge: string): boolean {
+    const entry = this.pending.get(sessionId)
+    if (!entry || entry.challenge !== challenge || this.now() >= entry.expiresAt) return false
+    this.pending.delete(sessionId)   // 錯誤：只有成功才刪，送錯的不刪
+    return true
+  }
+}
+
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：寫 <code>verifyAssertion(response, ctx)</code>，照 §7.2 驗證一個 passkey 登入回應。<code>response</code> 的三個欄位都是 base64url，<code>signature</code> 是 DER 編碼的 ES256 簽章。依序檢查，第一個不符合的就回傳對應的錯誤：</p>
+  <ol>
+    <li>解碼失敗、clientDataJSON 讀不出 <code>type</code>／<code>challenge</code>／<code>origin</code>、authenticatorData 不到 37 bytes → <code>malformed</code></li>
+    <li><code>type</code> 不是 <code>'webauthn.get'</code> → <code>bad_type</code></li>
+    <li><code>challenge</code> 不等於 <code>ctx.expectedChallenge</code> → <code>bad_challenge</code></li>
+    <li><code>origin</code> 不<strong>完全等於</strong> <code>ctx.expectedOrigin</code> → <code>bad_origin</code></li>
+    <li>rpIdHash 不等於 SHA-256(<code>ctx.rpId</code>) → <code>bad_rp</code></li>
+    <li>UP 不是 1 → <code>user_not_present</code>；<code>ctx.requireUV</code> 而 UV 不是 1 → <code>uv_required</code></li>
+    <li>BE 是 0 但 BS 是 1，或這次的 BE 跟註冊時存的 <code>backupEligible</code> 不同 → <code>bad_backup_flags</code></li>
+    <li>DER 轉不成 r||s（用已經寫好的 <code>derToRaw</code>），或 <code>authenticatorData || SHA-256(clientDataJSON)</code> 的簽章驗不過 → <code>bad_signature</code></li>
+    <li>新舊 signCount 有一個不是 0，而且新值 ≤ 存的值 → <code>counter_regressed</code>（本課的政策：拒絕）</li>
+  </ol>
+  <p>全部通過回傳 <code>{ ok: true, newSignCount, backupState }</code>，呼叫端再拿去更新資料庫。不能丟出例外。</p>
+  <script type="start">
+// 已經寫好（第 2 課的答案、練習 1 的答案）
+function base64urlDecode(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('不是 base64url：' + text)
+  const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+
+type AuthenticatorFlags = { up: boolean; uv: boolean; be: boolean; bs: boolean; at: boolean; ed: boolean }
+type ParsedAuthData = { rpIdHash: Uint8Array<ArrayBuffer>; flags: AuthenticatorFlags; signCount: number }
+
+function parseAuthenticatorData(bytes: Uint8Array<ArrayBuffer>): ParsedAuthData | null {
+  if (bytes.length < 37) return null
+  const f = bytes[32]
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  return {
+    rpIdHash: bytes.slice(0, 32),
+    flags: { up: (f & 0x01) !== 0, uv: (f & 0x04) !== 0, be: (f & 0x08) !== 0, bs: (f & 0x10) !== 0, at: (f & 0x40) !== 0, ed: (f & 0x80) !== 0 },
+    signCount: view.getUint32(33),
+  }
+}
+
+// 已經寫好：clientDataJSON（位元組）→ 需要的三個欄位，格式不對回 null
+function readClientData(bytes: Uint8Array<ArrayBuffer>): { type: string; challenge: string; origin: string } | null {
+  try {
+    const v: unknown = JSON.parse(new TextDecoder().decode(bytes))
+    if (typeof v !== 'object' || v === null || !('type' in v) || !('challenge' in v) || !('origin' in v)) return null
+    const { type, challenge, origin } = v
+    if (typeof type !== 'string' || typeof challenge !== 'string' || typeof origin !== 'string') return null
+    return { type, challenge, origin }
+  } catch {
+    return null
+  }
+}
+
+// 已經寫好：DER（30 len 02 len r 02 len s）→ 64 bytes 的 r||s，格式不對回 null
+function derToRaw(der: Uint8Array<ArrayBuffer>): Uint8Array<ArrayBuffer> | null {
+  if (der.length < 8 || der[0] !== 0x30 || der[1] !== der.length - 2) return null
+  const raw = new Uint8Array(64)
+  let i = 2
+  for (const offset of [0, 32]) {
+    if (der[i] !== 0x02) return null
+    const len = der[i + 1]
+    let v = der.subarray(i + 2, i + 2 + len)
+    if (v.length !== len || len === 0) return null
+    i += 2 + len
+    if (v.length === 33 && v[0] === 0) v = v.subarray(1)   // DER 為了避免變負數補的 00
+    if (v.length > 32) return null
+    raw.set(v, offset + 32 - v.length)                      // 不足 32 bytes 的在前面補 0
+  }
+  return i === der.length ? raw : null
+}
+
+type AssertionResponse = { clientDataJSON: string; authenticatorData: string; signature: string }
+type StoredCredential = { publicKey: CryptoKey; signCount: number; backupEligible: boolean }
+type VerifyContext = { expectedChallenge: string; expectedOrigin: string; rpId: string; credential: StoredCredential; requireUV: boolean }
+type VerifyError = 'malformed' | 'bad_type' | 'bad_challenge' | 'bad_origin' | 'bad_rp' | 'user_not_present'
+  | 'uv_required' | 'bad_backup_flags' | 'bad_signature' | 'counter_regressed'
+type VerifyResult = { ok: true; newSignCount: number; backupState: boolean } | { ok: false; error: VerifyError }
+
+async function verifyAssertion(response: AssertionResponse, ctx: VerifyContext): Promise<VerifyResult> {
+  throw new Error('TODO')
+}
+</script>
+  <script type="answer">
+// 已經寫好（第 2 課的答案、練習 1 的答案）
+function base64urlDecode(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('不是 base64url：' + text)
+  const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+
+type AuthenticatorFlags = { up: boolean; uv: boolean; be: boolean; bs: boolean; at: boolean; ed: boolean }
+type ParsedAuthData = { rpIdHash: Uint8Array<ArrayBuffer>; flags: AuthenticatorFlags; signCount: number }
+
+function parseAuthenticatorData(bytes: Uint8Array<ArrayBuffer>): ParsedAuthData | null {
+  if (bytes.length < 37) return null
+  const f = bytes[32]
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  return {
+    rpIdHash: bytes.slice(0, 32),
+    flags: { up: (f & 0x01) !== 0, uv: (f & 0x04) !== 0, be: (f & 0x08) !== 0, bs: (f & 0x10) !== 0, at: (f & 0x40) !== 0, ed: (f & 0x80) !== 0 },
+    signCount: view.getUint32(33),
+  }
+}
+
+// 已經寫好：clientDataJSON（位元組）→ 需要的三個欄位，格式不對回 null
+function readClientData(bytes: Uint8Array<ArrayBuffer>): { type: string; challenge: string; origin: string } | null {
+  try {
+    const v: unknown = JSON.parse(new TextDecoder().decode(bytes))
+    if (typeof v !== 'object' || v === null || !('type' in v) || !('challenge' in v) || !('origin' in v)) return null
+    const { type, challenge, origin } = v
+    if (typeof type !== 'string' || typeof challenge !== 'string' || typeof origin !== 'string') return null
+    return { type, challenge, origin }
+  } catch {
+    return null
+  }
+}
+
+// 已經寫好：DER（30 len 02 len r 02 len s）→ 64 bytes 的 r||s，格式不對回 null
+function derToRaw(der: Uint8Array<ArrayBuffer>): Uint8Array<ArrayBuffer> | null {
+  if (der.length < 8 || der[0] !== 0x30 || der[1] !== der.length - 2) return null
+  const raw = new Uint8Array(64)
+  let i = 2
+  for (const offset of [0, 32]) {
+    if (der[i] !== 0x02) return null
+    const len = der[i + 1]
+    let v = der.subarray(i + 2, i + 2 + len)
+    if (v.length !== len || len === 0) return null
+    i += 2 + len
+    if (v.length === 33 && v[0] === 0) v = v.subarray(1)   // DER 為了避免變負數補的 00
+    if (v.length > 32) return null
+    raw.set(v, offset + 32 - v.length)                      // 不足 32 bytes 的在前面補 0
+  }
+  return i === der.length ? raw : null
+}
+
+type AssertionResponse = { clientDataJSON: string; authenticatorData: string; signature: string }
+type StoredCredential = { publicKey: CryptoKey; signCount: number; backupEligible: boolean }
+type VerifyContext = { expectedChallenge: string; expectedOrigin: string; rpId: string; credential: StoredCredential; requireUV: boolean }
+type VerifyError = 'malformed' | 'bad_type' | 'bad_challenge' | 'bad_origin' | 'bad_rp' | 'user_not_present'
+  | 'uv_required' | 'bad_backup_flags' | 'bad_signature' | 'counter_regressed'
+type VerifyResult = { ok: true; newSignCount: number; backupState: boolean } | { ok: false; error: VerifyError }
+
+async function verifyAssertion(response: AssertionResponse, ctx: VerifyContext): Promise<VerifyResult> {
+  const fail = (error: VerifyError): VerifyResult => ({ ok: false, error })
+  let cDataBytes: Uint8Array<ArrayBuffer>, authBytes: Uint8Array<ArrayBuffer>, sigBytes: Uint8Array<ArrayBuffer>
+  try {
+    cDataBytes = base64urlDecode(response.clientDataJSON)
+    authBytes = base64urlDecode(response.authenticatorData)
+    sigBytes = base64urlDecode(response.signature)
+  } catch {
+    return fail('malformed')
+  }
+  const clientData = readClientData(cDataBytes)
+  const authData = parseAuthenticatorData(authBytes)
+  if (!clientData || !authData) return fail('malformed')
+
+  if (clientData.type !== 'webauthn.get') return fail('bad_type')
+  if (clientData.challenge !== ctx.expectedChallenge) return fail('bad_challenge')
+  if (clientData.origin !== ctx.expectedOrigin) return fail('bad_origin')
+
+  const expectedRpIdHash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(ctx.rpId)))
+  if (!expectedRpIdHash.every((b, i) => b === authData.rpIdHash[i])) return fail('bad_rp')
+
+  const { flags } = authData
+  if (!flags.up) return fail('user_not_present')
+  if (ctx.requireUV && !flags.uv) return fail('uv_required')
+  if (!flags.be && flags.bs) return fail('bad_backup_flags')
+  if (flags.be !== ctx.credential.backupEligible) return fail('bad_backup_flags')
+
+  const raw = derToRaw(sigBytes)
+  if (!raw) return fail('bad_signature')
+  const clientDataHash = new Uint8Array(await crypto.subtle.digest('SHA-256', cDataBytes))
+  const signed = new Uint8Array(authBytes.length + clientDataHash.length)
+  signed.set(authBytes, 0)
+  signed.set(clientDataHash, authBytes.length)
+  const valid = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, ctx.credential.publicKey, raw, signed)
+  if (!valid) return fail('bad_signature')
+
+  const stored = ctx.credential.signCount
+  if ((authData.signCount !== 0 || stored !== 0) && authData.signCount <= stored) return fail('counter_regressed')
+
+  return { ok: true, newSignCount: authData.signCount, backupState: flags.bs }
+}
+</script>
+  <script type="types">
+type _1 = Expect<Equal<typeof verifyAssertion, (response: AssertionResponse, ctx: VerifyContext) => Promise<VerifyResult>>>  // verifyAssertion(response, ctx) 要回傳 Promise<VerifyResult>
+</script>
+  <script type="tests">
+const te = new TextEncoder()
+const b64 = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+const hash = async (b: Uint8Array<ArrayBuffer>) => new Uint8Array(await crypto.subtle.digest('SHA-256', b))
+const toDer = (raw: Uint8Array<ArrayBuffer>) => {
+  const integer = (x: Uint8Array<ArrayBuffer>) => {
+    let i = 0
+    while (i < x.length - 1 && x[i] === 0) i++
+    const v = Array.from(x.subarray(i))
+    if (v[0] & 0x80) v.unshift(0)
+    return [0x02, v.length, ...v]
+  }
+  const body = [...integer(raw.subarray(0, 32)), ...integer(raw.subarray(32))]
+  return new Uint8Array([0x30, body.length, ...body])
+}
+const P256 = { name: 'ECDSA', namedCurve: 'P-256' }
+const ES = { name: 'ECDSA', hash: 'SHA-256' }
+const keys = await crypto.subtle.generateKey(P256, false, ['sign', 'verify'])
+const otherKeys = await crypto.subtle.generateKey(P256, false, ['sign', 'verify'])
+const CH = 'Yk3v9X1aQ0pL7sT2uW5zA8cE4gI6kM9oR1tV3xZ5bD7'
+const ORIGIN = 'https://coffee.example'
+
+type Fake = { type?: string; challenge?: string; origin?: string; rpId?: string; flags?: number; count?: number; key?: CryptoKey; signOther?: boolean; rawSig?: boolean }
+const fake = async (o: Fake = {}): Promise<AssertionResponse> => {
+  const cData = te.encode(JSON.stringify({ type: o.type ?? 'webauthn.get', challenge: o.challenge ?? CH, origin: o.origin ?? ORIGIN, crossOrigin: false }))
+  const auth = new Uint8Array(37)
+  auth.set(await hash(te.encode(o.rpId ?? 'coffee.example')), 0)
+  auth[32] = o.flags ?? 0x05
+  new DataView(auth.buffer).setUint32(33, o.count ?? 0)
+  const signed = new Uint8Array([...auth, ...await hash(cData)])
+  const raw = new Uint8Array(await crypto.subtle.sign(ES, o.key ?? keys.privateKey, o.signOther ? te.encode('別的資料') : signed))
+  return { clientDataJSON: b64(cData), authenticatorData: b64(auth), signature: b64(o.rawSig ? raw : toDer(raw)) }
+}
+const ctx = (o: { signCount?: number; backupEligible?: boolean; requireUV?: boolean; origin?: string; rpId?: string } = {}): VerifyContext => ({
+  expectedChallenge: CH,
+  expectedOrigin: o.origin ?? ORIGIN,
+  rpId: o.rpId ?? 'coffee.example',
+  credential: { publicKey: keys.publicKey, signCount: o.signCount ?? 0, backupEligible: o.backupEligible ?? false },
+  requireUV: o.requireUV ?? false,
+})
+const run = async (r: AssertionResponse, c: VerifyContext): Promise<unknown> => { try { return await verifyAssertion(r, c) } catch (e) { return '丟出了例外：' + String(e) } }
+const err = (error: string) => ({ ok: false, error })
+
+assert.deepEqual(await run(await fake(), ctx()), { ok: true, newSignCount: 0, backupState: false }, '正常的登入要通過（DER 要先轉成 r||s，簽的是 authenticatorData || SHA-256(clientDataJSON)）')
+assert.deepEqual(await run(await fake({ flags: 0x01 }), ctx()), { ok: true, newSignCount: 0, backupState: false }, '沒要求 UV 時，只有 UP 也要通過')
+assert.deepEqual(await run(await fake({ count: 11 }), ctx({ signCount: 10 })), { ok: true, newSignCount: 11, backupState: false }, '計數器從 10 增加到 11 要通過，newSignCount 是 11')
+assert.deepEqual(await run(await fake({ count: 3 }), ctx({ signCount: 0 })), { ok: true, newSignCount: 3, backupState: false }, '存的是 0、這次是 3 要通過')
+assert.deepEqual(await run(await fake({ flags: 0x1d }), ctx({ backupEligible: true })), { ok: true, newSignCount: 0, backupState: true }, '同步 passkey（BE=1、BS=1、計數器一直是 0）要通過，backupState 是 true')
+assert.deepEqual(await run(await fake({ flags: 0x0d }), ctx({ backupEligible: true })), { ok: true, newSignCount: 0, backupState: false }, 'BE=1、BS=0 也合法，backupState 是 false')
+const tea = { origin: 'https://tea.example', rpId: 'tea.example' }
+assert.deepEqual(await run(await fake(tea), ctx(tea)), { ok: true, newSignCount: 0, backupState: false }, '另一個網站（tea.example）的正常登入也要通過：origin 和 RP ID 要用 ctx 傳進來的值，不能寫死')
+assert.deepEqual(await run(await fake({ origin: 'https://tea.example' }), ctx(tea)), err('bad_rp'), 'ctx.rpId 是 tea.example、rpIdHash 是 coffee.example 的雜湊要回 bad_rp：要算 SHA-256(ctx.rpId)')
+
+assert.deepEqual(await run(await fake({ type: 'webauthn.create' }), ctx()), err('bad_type'), 'type 是 webauthn.create（註冊時的回應）要回 bad_type')
+assert.deepEqual(await run(await fake({ challenge: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' }), ctx()), err('bad_challenge'), 'challenge 不同要回 bad_challenge')
+assert.deepEqual(await run(await fake({ origin: 'https://coffee.example.evil.example' }), ctx()), err('bad_origin'), 'origin 是 https://coffee.example.evil.example 要回 bad_origin：要完全相等，不能用 startsWith、includes')
+assert.deepEqual(await run(await fake({ origin: 'http://coffee.example' }), ctx()), err('bad_origin'), 'origin 是 http://coffee.example（不是 https）要回 bad_origin')
+assert.deepEqual(await run(await fake({ origin: 'https://coffee-login.example' }), ctx()), err('bad_origin'), '釣魚網站的 origin 要回 bad_origin')
+assert.deepEqual(await run(await fake({ rpId: 'evil.example' }), ctx()), err('bad_rp'), 'rpIdHash 是 evil.example 的雜湊要回 bad_rp')
+assert.deepEqual(await run(await fake({ flags: 0x00 }), ctx()), err('user_not_present'), 'UP=0 要回 user_not_present')
+assert.deepEqual(await run(await fake({ flags: 0x04 }), ctx()), err('user_not_present'), '只有 UV、沒有 UP 也要回 user_not_present')
+assert.deepEqual(await run(await fake({ flags: 0x01 }), ctx({ requireUV: true })), err('uv_required'), '要求 UV 而 UV=0 要回 uv_required')
+assert.deepEqual(await run(await fake({ flags: 0x05 }), ctx({ requireUV: true })), { ok: true, newSignCount: 0, backupState: false }, '要求 UV 而 UV=1 要通過')
+assert.deepEqual(await run(await fake({ flags: 0x15 }), ctx()), err('bad_backup_flags'), 'BE=0 但 BS=1 要回 bad_backup_flags')
+assert.deepEqual(await run(await fake({ flags: 0x0d }), ctx({ backupEligible: false })), err('bad_backup_flags'), '註冊時 BE=0、這次 BE=1 要回 bad_backup_flags')
+assert.deepEqual(await run(await fake({ flags: 0x05 }), ctx({ backupEligible: true })), err('bad_backup_flags'), '註冊時 BE=1、這次 BE=0 要回 bad_backup_flags')
+assert.deepEqual(await run(await fake({ signOther: true }), ctx()), err('bad_signature'), '簽章是別的資料的簽章要回 bad_signature')
+assert.deepEqual(await run(await fake({ key: otherKeys.privateKey }), ctx()), err('bad_signature'), '用別把私鑰簽的要回 bad_signature')
+assert.deepEqual(await run(await fake({ rawSig: true }), ctx()), err('bad_signature'), '簽章不是 DER（直接給 r||s）要回 bad_signature，不能丟出例外')
+assert.deepEqual(await run(await fake({ count: 5, signOther: true }), ctx({ signCount: 10 })), err('bad_signature'), '簽章不對時要回 bad_signature：計數器的檢查放在驗章之後，沒驗過的資料不能拿來判斷')
+assert.deepEqual(await run(await fake({ count: 5 }), ctx({ signCount: 10 })), err('counter_regressed'), '計數器從 10 變 5 要回 counter_regressed')
+assert.deepEqual(await run(await fake({ count: 10 }), ctx({ signCount: 10 })), err('counter_regressed'), '計數器沒有增加（10 → 10）也要回 counter_regressed')
+assert.deepEqual(await run(await fake({ count: 0 }), ctx({ signCount: 7 })), err('counter_regressed'), '存的是 7、這次是 0 要回 counter_regressed')
+
+const good = await fake()
+assert.deepEqual(await run({ ...good, authenticatorData: b64(new Uint8Array(36)) }, ctx()), err('malformed'), 'authenticatorData 只有 36 bytes 要回 malformed')
+assert.deepEqual(await run({ ...good, clientDataJSON: b64(te.encode('not json')) }, ctx()), err('malformed'), 'clientDataJSON 不是 JSON 要回 malformed')
+assert.deepEqual(await run({ ...good, clientDataJSON: b64(te.encode('{"type":"webauthn.get"}')) }, ctx()), err('malformed'), 'clientDataJSON 少了 challenge、origin 要回 malformed')
+assert.deepEqual(await run({ ...good, signature: 'ab+c/=' }, ctx()), err('malformed'), '不是 base64url 要回 malformed，不能丟出例外')
+</script>
+  <script type="wrong">
+function base64urlDecode(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('不是 base64url：' + text)
+  const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+type AuthenticatorFlags = { up: boolean; uv: boolean; be: boolean; bs: boolean; at: boolean; ed: boolean }
+type ParsedAuthData = { rpIdHash: Uint8Array<ArrayBuffer>; flags: AuthenticatorFlags; signCount: number }
+function parseAuthenticatorData(bytes: Uint8Array<ArrayBuffer>): ParsedAuthData | null {
+  if (bytes.length < 37) return null
+  const f = bytes[32]
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  return { rpIdHash: bytes.slice(0, 32), flags: { up: (f & 0x01) !== 0, uv: (f & 0x04) !== 0, be: (f & 0x08) !== 0, bs: (f & 0x10) !== 0, at: (f & 0x40) !== 0, ed: (f & 0x80) !== 0 }, signCount: view.getUint32(33) }
+}
+function readClientData(bytes: Uint8Array<ArrayBuffer>): { type: string; challenge: string; origin: string } | null {
+  try {
+    const v: unknown = JSON.parse(new TextDecoder().decode(bytes))
+    if (typeof v !== 'object' || v === null || !('type' in v) || !('challenge' in v) || !('origin' in v)) return null
+    const { type, challenge, origin } = v
+    if (typeof type !== 'string' || typeof challenge !== 'string' || typeof origin !== 'string') return null
+    return { type, challenge, origin }
+  } catch {
+    return null
+  }
+}
+type AssertionResponse = { clientDataJSON: string; authenticatorData: string; signature: string }
+type StoredCredential = { publicKey: CryptoKey; signCount: number; backupEligible: boolean }
+type VerifyContext = { expectedChallenge: string; expectedOrigin: string; rpId: string; credential: StoredCredential; requireUV: boolean }
+type VerifyError = 'malformed' | 'bad_type' | 'bad_challenge' | 'bad_origin' | 'bad_rp' | 'user_not_present'
+  | 'uv_required' | 'bad_backup_flags' | 'bad_signature' | 'counter_regressed'
+type VerifyResult = { ok: true; newSignCount: number; backupState: boolean } | { ok: false; error: VerifyError }
+
+// 錯誤：忘了把 DER 轉成 r||s
+async function verifyAssertion(response: AssertionResponse, ctx: VerifyContext): Promise<VerifyResult> {
+  const fail = (error: VerifyError): VerifyResult => ({ ok: false, error })
+  let cDataBytes: Uint8Array<ArrayBuffer>, authBytes: Uint8Array<ArrayBuffer>, sigBytes: Uint8Array<ArrayBuffer>
+  try {
+    cDataBytes = base64urlDecode(response.clientDataJSON)
+    authBytes = base64urlDecode(response.authenticatorData)
+    sigBytes = base64urlDecode(response.signature)
+  } catch {
+    return fail('malformed')
+  }
+  const clientData = readClientData(cDataBytes)
+  const authData = parseAuthenticatorData(authBytes)
+  if (!clientData || !authData) return fail('malformed')
+  if (clientData.type !== 'webauthn.get') return fail('bad_type')
+  if (clientData.challenge !== ctx.expectedChallenge) return fail('bad_challenge')
+  if (clientData.origin !== ctx.expectedOrigin) return fail('bad_origin')
+  const expectedRpIdHash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(ctx.rpId)))
+  if (!expectedRpIdHash.every((b, i) => b === authData.rpIdHash[i])) return fail('bad_rp')
+  const { flags } = authData
+  if (!flags.up) return fail('user_not_present')
+  if (ctx.requireUV && !flags.uv) return fail('uv_required')
+  if (!flags.be && flags.bs) return fail('bad_backup_flags')
+  if (flags.be !== ctx.credential.backupEligible) return fail('bad_backup_flags')
+  const clientDataHash = new Uint8Array(await crypto.subtle.digest('SHA-256', cDataBytes))
+  const signed = new Uint8Array([...authBytes, ...clientDataHash])
+  const valid = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, ctx.credential.publicKey, sigBytes, signed)
+  if (!valid) return fail('bad_signature')
+  const stored = ctx.credential.signCount
+  if ((authData.signCount !== 0 || stored !== 0) && authData.signCount <= stored) return fail('counter_regressed')
+  return { ok: true, newSignCount: authData.signCount, backupState: flags.bs }
+}
+</script>
+  <script type="wrong">
+function base64urlDecode(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('不是 base64url：' + text)
+  const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+type AuthenticatorFlags = { up: boolean; uv: boolean; be: boolean; bs: boolean; at: boolean; ed: boolean }
+type ParsedAuthData = { rpIdHash: Uint8Array<ArrayBuffer>; flags: AuthenticatorFlags; signCount: number }
+function parseAuthenticatorData(bytes: Uint8Array<ArrayBuffer>): ParsedAuthData | null {
+  if (bytes.length < 37) return null
+  const f = bytes[32]
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  return { rpIdHash: bytes.slice(0, 32), flags: { up: (f & 0x01) !== 0, uv: (f & 0x04) !== 0, be: (f & 0x08) !== 0, bs: (f & 0x10) !== 0, at: (f & 0x40) !== 0, ed: (f & 0x80) !== 0 }, signCount: view.getUint32(33) }
+}
+function readClientData(bytes: Uint8Array<ArrayBuffer>): { type: string; challenge: string; origin: string } | null {
+  try {
+    const v: unknown = JSON.parse(new TextDecoder().decode(bytes))
+    if (typeof v !== 'object' || v === null || !('type' in v) || !('challenge' in v) || !('origin' in v)) return null
+    const { type, challenge, origin } = v
+    if (typeof type !== 'string' || typeof challenge !== 'string' || typeof origin !== 'string') return null
+    return { type, challenge, origin }
+  } catch {
+    return null
+  }
+}
+function derToRaw(der: Uint8Array<ArrayBuffer>): Uint8Array<ArrayBuffer> | null {
+  if (der.length < 8 || der[0] !== 0x30 || der[1] !== der.length - 2) return null
+  const raw = new Uint8Array(64)
+  let i = 2
+  for (const offset of [0, 32]) {
+    if (der[i] !== 0x02) return null
+    const len = der[i + 1]
+    let v = der.subarray(i + 2, i + 2 + len)
+    if (v.length !== len || len === 0) return null
+    i += 2 + len
+    if (v.length === 33 && v[0] === 0) v = v.subarray(1)
+    if (v.length > 32) return null
+    raw.set(v, offset + 32 - v.length)
+  }
+  return i === der.length ? raw : null
+}
+type AssertionResponse = { clientDataJSON: string; authenticatorData: string; signature: string }
+type StoredCredential = { publicKey: CryptoKey; signCount: number; backupEligible: boolean }
+type VerifyContext = { expectedChallenge: string; expectedOrigin: string; rpId: string; credential: StoredCredential; requireUV: boolean }
+type VerifyError = 'malformed' | 'bad_type' | 'bad_challenge' | 'bad_origin' | 'bad_rp' | 'user_not_present'
+  | 'uv_required' | 'bad_backup_flags' | 'bad_signature' | 'counter_regressed'
+type VerifyResult = { ok: true; newSignCount: number; backupState: boolean } | { ok: false; error: VerifyError }
+
+// 錯誤：簽 authenticatorData || clientDataJSON，沒有先雜湊 clientDataJSON
+async function verifyAssertion(response: AssertionResponse, ctx: VerifyContext): Promise<VerifyResult> {
+  const fail = (error: VerifyError): VerifyResult => ({ ok: false, error })
+  let cDataBytes: Uint8Array<ArrayBuffer>, authBytes: Uint8Array<ArrayBuffer>, sigBytes: Uint8Array<ArrayBuffer>
+  try {
+    cDataBytes = base64urlDecode(response.clientDataJSON)
+    authBytes = base64urlDecode(response.authenticatorData)
+    sigBytes = base64urlDecode(response.signature)
+  } catch {
+    return fail('malformed')
+  }
+  const clientData = readClientData(cDataBytes)
+  const authData = parseAuthenticatorData(authBytes)
+  if (!clientData || !authData) return fail('malformed')
+  if (clientData.type !== 'webauthn.get') return fail('bad_type')
+  if (clientData.challenge !== ctx.expectedChallenge) return fail('bad_challenge')
+  if (clientData.origin !== ctx.expectedOrigin) return fail('bad_origin')
+  const expectedRpIdHash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(ctx.rpId)))
+  if (!expectedRpIdHash.every((b, i) => b === authData.rpIdHash[i])) return fail('bad_rp')
+  const { flags } = authData
+  if (!flags.up) return fail('user_not_present')
+  if (ctx.requireUV && !flags.uv) return fail('uv_required')
+  if (!flags.be && flags.bs) return fail('bad_backup_flags')
+  if (flags.be !== ctx.credential.backupEligible) return fail('bad_backup_flags')
+  const raw = derToRaw(sigBytes)
+  if (!raw) return fail('bad_signature')
+  const signed = new Uint8Array([...authBytes, ...cDataBytes])
+  const valid = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, ctx.credential.publicKey, raw, signed)
+  if (!valid) return fail('bad_signature')
+  const stored = ctx.credential.signCount
+  if ((authData.signCount !== 0 || stored !== 0) && authData.signCount <= stored) return fail('counter_regressed')
+  return { ok: true, newSignCount: authData.signCount, backupState: flags.bs }
+}
+</script>
+  <script type="wrong">
+function base64urlDecode(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('不是 base64url：' + text)
+  const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+type AuthenticatorFlags = { up: boolean; uv: boolean; be: boolean; bs: boolean; at: boolean; ed: boolean }
+type ParsedAuthData = { rpIdHash: Uint8Array<ArrayBuffer>; flags: AuthenticatorFlags; signCount: number }
+function parseAuthenticatorData(bytes: Uint8Array<ArrayBuffer>): ParsedAuthData | null {
+  if (bytes.length < 37) return null
+  const f = bytes[32]
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  return { rpIdHash: bytes.slice(0, 32), flags: { up: (f & 0x01) !== 0, uv: (f & 0x04) !== 0, be: (f & 0x08) !== 0, bs: (f & 0x10) !== 0, at: (f & 0x40) !== 0, ed: (f & 0x80) !== 0 }, signCount: view.getUint32(33) }
+}
+function readClientData(bytes: Uint8Array<ArrayBuffer>): { type: string; challenge: string; origin: string } | null {
+  try {
+    const v: unknown = JSON.parse(new TextDecoder().decode(bytes))
+    if (typeof v !== 'object' || v === null || !('type' in v) || !('challenge' in v) || !('origin' in v)) return null
+    const { type, challenge, origin } = v
+    if (typeof type !== 'string' || typeof challenge !== 'string' || typeof origin !== 'string') return null
+    return { type, challenge, origin }
+  } catch {
+    return null
+  }
+}
+function derToRaw(der: Uint8Array<ArrayBuffer>): Uint8Array<ArrayBuffer> | null {
+  if (der.length < 8 || der[0] !== 0x30 || der[1] !== der.length - 2) return null
+  const raw = new Uint8Array(64)
+  let i = 2
+  for (const offset of [0, 32]) {
+    if (der[i] !== 0x02) return null
+    const len = der[i + 1]
+    let v = der.subarray(i + 2, i + 2 + len)
+    if (v.length !== len || len === 0) return null
+    i += 2 + len
+    if (v.length === 33 && v[0] === 0) v = v.subarray(1)
+    if (v.length > 32) return null
+    raw.set(v, offset + 32 - v.length)
+  }
+  return i === der.length ? raw : null
+}
+type AssertionResponse = { clientDataJSON: string; authenticatorData: string; signature: string }
+type StoredCredential = { publicKey: CryptoKey; signCount: number; backupEligible: boolean }
+type VerifyContext = { expectedChallenge: string; expectedOrigin: string; rpId: string; credential: StoredCredential; requireUV: boolean }
+type VerifyError = 'malformed' | 'bad_type' | 'bad_challenge' | 'bad_origin' | 'bad_rp' | 'user_not_present'
+  | 'uv_required' | 'bad_backup_flags' | 'bad_signature' | 'counter_regressed'
+type VerifyResult = { ok: true; newSignCount: number; backupState: boolean } | { ok: false; error: VerifyError }
+
+// 錯誤：origin 用 startsWith 比對
+async function verifyAssertion(response: AssertionResponse, ctx: VerifyContext): Promise<VerifyResult> {
+  const fail = (error: VerifyError): VerifyResult => ({ ok: false, error })
+  let cDataBytes: Uint8Array<ArrayBuffer>, authBytes: Uint8Array<ArrayBuffer>, sigBytes: Uint8Array<ArrayBuffer>
+  try {
+    cDataBytes = base64urlDecode(response.clientDataJSON)
+    authBytes = base64urlDecode(response.authenticatorData)
+    sigBytes = base64urlDecode(response.signature)
+  } catch {
+    return fail('malformed')
+  }
+  const clientData = readClientData(cDataBytes)
+  const authData = parseAuthenticatorData(authBytes)
+  if (!clientData || !authData) return fail('malformed')
+  if (clientData.type !== 'webauthn.get') return fail('bad_type')
+  if (clientData.challenge !== ctx.expectedChallenge) return fail('bad_challenge')
+  if (!clientData.origin.startsWith(ctx.expectedOrigin)) return fail('bad_origin')
+  const expectedRpIdHash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(ctx.rpId)))
+  if (!expectedRpIdHash.every((b, i) => b === authData.rpIdHash[i])) return fail('bad_rp')
+  const { flags } = authData
+  if (!flags.up) return fail('user_not_present')
+  if (ctx.requireUV && !flags.uv) return fail('uv_required')
+  if (!flags.be && flags.bs) return fail('bad_backup_flags')
+  if (flags.be !== ctx.credential.backupEligible) return fail('bad_backup_flags')
+  const raw = derToRaw(sigBytes)
+  if (!raw) return fail('bad_signature')
+  const clientDataHash = new Uint8Array(await crypto.subtle.digest('SHA-256', cDataBytes))
+  const signed = new Uint8Array([...authBytes, ...clientDataHash])
+  const valid = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, ctx.credential.publicKey, raw, signed)
+  if (!valid) return fail('bad_signature')
+  const stored = ctx.credential.signCount
+  if ((authData.signCount !== 0 || stored !== 0) && authData.signCount <= stored) return fail('counter_regressed')
+  return { ok: true, newSignCount: authData.signCount, backupState: flags.bs }
+}
+</script>
+  <script type="wrong">
+function base64urlDecode(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('不是 base64url：' + text)
+  const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+type AuthenticatorFlags = { up: boolean; uv: boolean; be: boolean; bs: boolean; at: boolean; ed: boolean }
+type ParsedAuthData = { rpIdHash: Uint8Array<ArrayBuffer>; flags: AuthenticatorFlags; signCount: number }
+function parseAuthenticatorData(bytes: Uint8Array<ArrayBuffer>): ParsedAuthData | null {
+  if (bytes.length < 37) return null
+  const f = bytes[32]
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  return { rpIdHash: bytes.slice(0, 32), flags: { up: (f & 0x01) !== 0, uv: (f & 0x04) !== 0, be: (f & 0x08) !== 0, bs: (f & 0x10) !== 0, at: (f & 0x40) !== 0, ed: (f & 0x80) !== 0 }, signCount: view.getUint32(33) }
+}
+function readClientData(bytes: Uint8Array<ArrayBuffer>): { type: string; challenge: string; origin: string } | null {
+  try {
+    const v: unknown = JSON.parse(new TextDecoder().decode(bytes))
+    if (typeof v !== 'object' || v === null || !('type' in v) || !('challenge' in v) || !('origin' in v)) return null
+    const { type, challenge, origin } = v
+    if (typeof type !== 'string' || typeof challenge !== 'string' || typeof origin !== 'string') return null
+    return { type, challenge, origin }
+  } catch {
+    return null
+  }
+}
+function derToRaw(der: Uint8Array<ArrayBuffer>): Uint8Array<ArrayBuffer> | null {
+  if (der.length < 8 || der[0] !== 0x30 || der[1] !== der.length - 2) return null
+  const raw = new Uint8Array(64)
+  let i = 2
+  for (const offset of [0, 32]) {
+    if (der[i] !== 0x02) return null
+    const len = der[i + 1]
+    let v = der.subarray(i + 2, i + 2 + len)
+    if (v.length !== len || len === 0) return null
+    i += 2 + len
+    if (v.length === 33 && v[0] === 0) v = v.subarray(1)
+    if (v.length > 32) return null
+    raw.set(v, offset + 32 - v.length)
+  }
+  return i === der.length ? raw : null
+}
+type AssertionResponse = { clientDataJSON: string; authenticatorData: string; signature: string }
+type StoredCredential = { publicKey: CryptoKey; signCount: number; backupEligible: boolean }
+type VerifyContext = { expectedChallenge: string; expectedOrigin: string; rpId: string; credential: StoredCredential; requireUV: boolean }
+type VerifyError = 'malformed' | 'bad_type' | 'bad_challenge' | 'bad_origin' | 'bad_rp' | 'user_not_present'
+  | 'uv_required' | 'bad_backup_flags' | 'bad_signature' | 'counter_regressed'
+type VerifyResult = { ok: true; newSignCount: number; backupState: boolean } | { ok: false; error: VerifyError }
+
+// 錯誤：沒檢查 UP
+async function verifyAssertion(response: AssertionResponse, ctx: VerifyContext): Promise<VerifyResult> {
+  const fail = (error: VerifyError): VerifyResult => ({ ok: false, error })
+  let cDataBytes: Uint8Array<ArrayBuffer>, authBytes: Uint8Array<ArrayBuffer>, sigBytes: Uint8Array<ArrayBuffer>
+  try {
+    cDataBytes = base64urlDecode(response.clientDataJSON)
+    authBytes = base64urlDecode(response.authenticatorData)
+    sigBytes = base64urlDecode(response.signature)
+  } catch {
+    return fail('malformed')
+  }
+  const clientData = readClientData(cDataBytes)
+  const authData = parseAuthenticatorData(authBytes)
+  if (!clientData || !authData) return fail('malformed')
+  if (clientData.type !== 'webauthn.get') return fail('bad_type')
+  if (clientData.challenge !== ctx.expectedChallenge) return fail('bad_challenge')
+  if (clientData.origin !== ctx.expectedOrigin) return fail('bad_origin')
+  const expectedRpIdHash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(ctx.rpId)))
+  if (!expectedRpIdHash.every((b, i) => b === authData.rpIdHash[i])) return fail('bad_rp')
+  const { flags } = authData
+  if (ctx.requireUV && !flags.uv) return fail('uv_required')
+  if (!flags.be && flags.bs) return fail('bad_backup_flags')
+  if (flags.be !== ctx.credential.backupEligible) return fail('bad_backup_flags')
+  const raw = derToRaw(sigBytes)
+  if (!raw) return fail('bad_signature')
+  const clientDataHash = new Uint8Array(await crypto.subtle.digest('SHA-256', cDataBytes))
+  const signed = new Uint8Array([...authBytes, ...clientDataHash])
+  const valid = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, ctx.credential.publicKey, raw, signed)
+  if (!valid) return fail('bad_signature')
+  const stored = ctx.credential.signCount
+  if ((authData.signCount !== 0 || stored !== 0) && authData.signCount <= stored) return fail('counter_regressed')
+  return { ok: true, newSignCount: authData.signCount, backupState: flags.bs }
+}
+</script>
+  <script type="wrong">
+function base64urlDecode(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('不是 base64url：' + text)
+  const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+type AuthenticatorFlags = { up: boolean; uv: boolean; be: boolean; bs: boolean; at: boolean; ed: boolean }
+type ParsedAuthData = { rpIdHash: Uint8Array<ArrayBuffer>; flags: AuthenticatorFlags; signCount: number }
+function parseAuthenticatorData(bytes: Uint8Array<ArrayBuffer>): ParsedAuthData | null {
+  if (bytes.length < 37) return null
+  const f = bytes[32]
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  return { rpIdHash: bytes.slice(0, 32), flags: { up: (f & 0x01) !== 0, uv: (f & 0x04) !== 0, be: (f & 0x08) !== 0, bs: (f & 0x10) !== 0, at: (f & 0x40) !== 0, ed: (f & 0x80) !== 0 }, signCount: view.getUint32(33) }
+}
+function readClientData(bytes: Uint8Array<ArrayBuffer>): { type: string; challenge: string; origin: string } | null {
+  try {
+    const v: unknown = JSON.parse(new TextDecoder().decode(bytes))
+    if (typeof v !== 'object' || v === null || !('type' in v) || !('challenge' in v) || !('origin' in v)) return null
+    const { type, challenge, origin } = v
+    if (typeof type !== 'string' || typeof challenge !== 'string' || typeof origin !== 'string') return null
+    return { type, challenge, origin }
+  } catch {
+    return null
+  }
+}
+function derToRaw(der: Uint8Array<ArrayBuffer>): Uint8Array<ArrayBuffer> | null {
+  if (der.length < 8 || der[0] !== 0x30 || der[1] !== der.length - 2) return null
+  const raw = new Uint8Array(64)
+  let i = 2
+  for (const offset of [0, 32]) {
+    if (der[i] !== 0x02) return null
+    const len = der[i + 1]
+    let v = der.subarray(i + 2, i + 2 + len)
+    if (v.length !== len || len === 0) return null
+    i += 2 + len
+    if (v.length === 33 && v[0] === 0) v = v.subarray(1)
+    if (v.length > 32) return null
+    raw.set(v, offset + 32 - v.length)
+  }
+  return i === der.length ? raw : null
+}
+type AssertionResponse = { clientDataJSON: string; authenticatorData: string; signature: string }
+type StoredCredential = { publicKey: CryptoKey; signCount: number; backupEligible: boolean }
+type VerifyContext = { expectedChallenge: string; expectedOrigin: string; rpId: string; credential: StoredCredential; requireUV: boolean }
+type VerifyError = 'malformed' | 'bad_type' | 'bad_challenge' | 'bad_origin' | 'bad_rp' | 'user_not_present'
+  | 'uv_required' | 'bad_backup_flags' | 'bad_signature' | 'counter_regressed'
+type VerifyResult = { ok: true; newSignCount: number; backupState: boolean } | { ok: false; error: VerifyError }
+
+// 錯誤：沒檢查 rpIdHash
+async function verifyAssertion(response: AssertionResponse, ctx: VerifyContext): Promise<VerifyResult> {
+  const fail = (error: VerifyError): VerifyResult => ({ ok: false, error })
+  let cDataBytes: Uint8Array<ArrayBuffer>, authBytes: Uint8Array<ArrayBuffer>, sigBytes: Uint8Array<ArrayBuffer>
+  try {
+    cDataBytes = base64urlDecode(response.clientDataJSON)
+    authBytes = base64urlDecode(response.authenticatorData)
+    sigBytes = base64urlDecode(response.signature)
+  } catch {
+    return fail('malformed')
+  }
+  const clientData = readClientData(cDataBytes)
+  const authData = parseAuthenticatorData(authBytes)
+  if (!clientData || !authData) return fail('malformed')
+  if (clientData.type !== 'webauthn.get') return fail('bad_type')
+  if (clientData.challenge !== ctx.expectedChallenge) return fail('bad_challenge')
+  if (clientData.origin !== ctx.expectedOrigin) return fail('bad_origin')
+  const { flags } = authData
+  if (!flags.up) return fail('user_not_present')
+  if (ctx.requireUV && !flags.uv) return fail('uv_required')
+  if (!flags.be && flags.bs) return fail('bad_backup_flags')
+  if (flags.be !== ctx.credential.backupEligible) return fail('bad_backup_flags')
+  const raw = derToRaw(sigBytes)
+  if (!raw) return fail('bad_signature')
+  const clientDataHash = new Uint8Array(await crypto.subtle.digest('SHA-256', cDataBytes))
+  const signed = new Uint8Array([...authBytes, ...clientDataHash])
+  const valid = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, ctx.credential.publicKey, raw, signed)
+  if (!valid) return fail('bad_signature')
+  const stored = ctx.credential.signCount
+  if ((authData.signCount !== 0 || stored !== 0) && authData.signCount <= stored) return fail('counter_regressed')
+  return { ok: true, newSignCount: authData.signCount, backupState: flags.bs }
+}
+</script>
+  <script type="wrong">
+function base64urlDecode(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('不是 base64url：' + text)
+  const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+type AuthenticatorFlags = { up: boolean; uv: boolean; be: boolean; bs: boolean; at: boolean; ed: boolean }
+type ParsedAuthData = { rpIdHash: Uint8Array<ArrayBuffer>; flags: AuthenticatorFlags; signCount: number }
+function parseAuthenticatorData(bytes: Uint8Array<ArrayBuffer>): ParsedAuthData | null {
+  if (bytes.length < 37) return null
+  const f = bytes[32]
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  return { rpIdHash: bytes.slice(0, 32), flags: { up: (f & 0x01) !== 0, uv: (f & 0x04) !== 0, be: (f & 0x08) !== 0, bs: (f & 0x10) !== 0, at: (f & 0x40) !== 0, ed: (f & 0x80) !== 0 }, signCount: view.getUint32(33) }
+}
+function readClientData(bytes: Uint8Array<ArrayBuffer>): { type: string; challenge: string; origin: string } | null {
+  try {
+    const v: unknown = JSON.parse(new TextDecoder().decode(bytes))
+    if (typeof v !== 'object' || v === null || !('type' in v) || !('challenge' in v) || !('origin' in v)) return null
+    const { type, challenge, origin } = v
+    if (typeof type !== 'string' || typeof challenge !== 'string' || typeof origin !== 'string') return null
+    return { type, challenge, origin }
+  } catch {
+    return null
+  }
+}
+function derToRaw(der: Uint8Array<ArrayBuffer>): Uint8Array<ArrayBuffer> | null {
+  if (der.length < 8 || der[0] !== 0x30 || der[1] !== der.length - 2) return null
+  const raw = new Uint8Array(64)
+  let i = 2
+  for (const offset of [0, 32]) {
+    if (der[i] !== 0x02) return null
+    const len = der[i + 1]
+    let v = der.subarray(i + 2, i + 2 + len)
+    if (v.length !== len || len === 0) return null
+    i += 2 + len
+    if (v.length === 33 && v[0] === 0) v = v.subarray(1)
+    if (v.length > 32) return null
+    raw.set(v, offset + 32 - v.length)
+  }
+  return i === der.length ? raw : null
+}
+type AssertionResponse = { clientDataJSON: string; authenticatorData: string; signature: string }
+type StoredCredential = { publicKey: CryptoKey; signCount: number; backupEligible: boolean }
+type VerifyContext = { expectedChallenge: string; expectedOrigin: string; rpId: string; credential: StoredCredential; requireUV: boolean }
+type VerifyError = 'malformed' | 'bad_type' | 'bad_challenge' | 'bad_origin' | 'bad_rp' | 'user_not_present'
+  | 'uv_required' | 'bad_backup_flags' | 'bad_signature' | 'counter_regressed'
+type VerifyResult = { ok: true; newSignCount: number; backupState: boolean } | { ok: false; error: VerifyError }
+
+// 錯誤：計數器沒有增加就拒絕，連新舊都是 0（同步 passkey）也擋掉
+async function verifyAssertion(response: AssertionResponse, ctx: VerifyContext): Promise<VerifyResult> {
+  const fail = (error: VerifyError): VerifyResult => ({ ok: false, error })
+  let cDataBytes: Uint8Array<ArrayBuffer>, authBytes: Uint8Array<ArrayBuffer>, sigBytes: Uint8Array<ArrayBuffer>
+  try {
+    cDataBytes = base64urlDecode(response.clientDataJSON)
+    authBytes = base64urlDecode(response.authenticatorData)
+    sigBytes = base64urlDecode(response.signature)
+  } catch {
+    return fail('malformed')
+  }
+  const clientData = readClientData(cDataBytes)
+  const authData = parseAuthenticatorData(authBytes)
+  if (!clientData || !authData) return fail('malformed')
+  if (clientData.type !== 'webauthn.get') return fail('bad_type')
+  if (clientData.challenge !== ctx.expectedChallenge) return fail('bad_challenge')
+  if (clientData.origin !== ctx.expectedOrigin) return fail('bad_origin')
+  const expectedRpIdHash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(ctx.rpId)))
+  if (!expectedRpIdHash.every((b, i) => b === authData.rpIdHash[i])) return fail('bad_rp')
+  const { flags } = authData
+  if (!flags.up) return fail('user_not_present')
+  if (ctx.requireUV && !flags.uv) return fail('uv_required')
+  if (!flags.be && flags.bs) return fail('bad_backup_flags')
+  if (flags.be !== ctx.credential.backupEligible) return fail('bad_backup_flags')
+  const raw = derToRaw(sigBytes)
+  if (!raw) return fail('bad_signature')
+  const clientDataHash = new Uint8Array(await crypto.subtle.digest('SHA-256', cDataBytes))
+  const signed = new Uint8Array([...authBytes, ...clientDataHash])
+  const valid = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, ctx.credential.publicKey, raw, signed)
+  if (!valid) return fail('bad_signature')
+  if (authData.signCount <= ctx.credential.signCount) return fail('counter_regressed')
+  return { ok: true, newSignCount: authData.signCount, backupState: flags.bs }
+}
+</script>
+  <script type="wrong">
+function base64urlDecode(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('不是 base64url：' + text)
+  const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+
+type AuthenticatorFlags = { up: boolean; uv: boolean; be: boolean; bs: boolean; at: boolean; ed: boolean }
+type ParsedAuthData = { rpIdHash: Uint8Array<ArrayBuffer>; flags: AuthenticatorFlags; signCount: number }
+
+function parseAuthenticatorData(bytes: Uint8Array<ArrayBuffer>): ParsedAuthData | null {
+  if (bytes.length < 37) return null
+  const f = bytes[32]
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  return {
+    rpIdHash: bytes.slice(0, 32),
+    flags: { up: (f & 0x01) !== 0, uv: (f & 0x04) !== 0, be: (f & 0x08) !== 0, bs: (f & 0x10) !== 0, at: (f & 0x40) !== 0, ed: (f & 0x80) !== 0 },
+    signCount: view.getUint32(33),
+  }
+}
+
+// 已經寫好：clientDataJSON（位元組）→ 需要的三個欄位，格式不對回 null
+function readClientData(bytes: Uint8Array<ArrayBuffer>): { type: string; challenge: string; origin: string } | null {
+  try {
+    const v: unknown = JSON.parse(new TextDecoder().decode(bytes))
+    if (typeof v !== 'object' || v === null || !('type' in v) || !('challenge' in v) || !('origin' in v)) return null
+    const { type, challenge, origin } = v
+    if (typeof type !== 'string' || typeof challenge !== 'string' || typeof origin !== 'string') return null
+    return { type, challenge, origin }
+  } catch {
+    return null
+  }
+}
+
+// 已經寫好：DER（30 len 02 len r 02 len s）→ 64 bytes 的 r||s，格式不對回 null
+function derToRaw(der: Uint8Array<ArrayBuffer>): Uint8Array<ArrayBuffer> | null {
+  if (der.length < 8 || der[0] !== 0x30 || der[1] !== der.length - 2) return null
+  const raw = new Uint8Array(64)
+  let i = 2
+  for (const offset of [0, 32]) {
+    if (der[i] !== 0x02) return null
+    const len = der[i + 1]
+    let v = der.subarray(i + 2, i + 2 + len)
+    if (v.length !== len || len === 0) return null
+    i += 2 + len
+    if (v.length === 33 && v[0] === 0) v = v.subarray(1)   // DER 為了避免變負數補的 00
+    if (v.length > 32) return null
+    raw.set(v, offset + 32 - v.length)                      // 不足 32 bytes 的在前面補 0
+  }
+  return i === der.length ? raw : null
+}
+
+type AssertionResponse = { clientDataJSON: string; authenticatorData: string; signature: string }
+type StoredCredential = { publicKey: CryptoKey; signCount: number; backupEligible: boolean }
+type VerifyContext = { expectedChallenge: string; expectedOrigin: string; rpId: string; credential: StoredCredential; requireUV: boolean }
+type VerifyError = 'malformed' | 'bad_type' | 'bad_challenge' | 'bad_origin' | 'bad_rp' | 'user_not_present'
+  | 'uv_required' | 'bad_backup_flags' | 'bad_signature' | 'counter_regressed'
+type VerifyResult = { ok: true; newSignCount: number; backupState: boolean } | { ok: false; error: VerifyError }
+
+// 錯誤：RP ID 寫死成 coffee.example
+async function verifyAssertion(response: AssertionResponse, ctx: VerifyContext): Promise<VerifyResult> {
+  const fail = (error: VerifyError): VerifyResult => ({ ok: false, error })
+  let cDataBytes: Uint8Array<ArrayBuffer>, authBytes: Uint8Array<ArrayBuffer>, sigBytes: Uint8Array<ArrayBuffer>
+  try {
+    cDataBytes = base64urlDecode(response.clientDataJSON)
+    authBytes = base64urlDecode(response.authenticatorData)
+    sigBytes = base64urlDecode(response.signature)
+  } catch {
+    return fail('malformed')
+  }
+  const clientData = readClientData(cDataBytes)
+  const authData = parseAuthenticatorData(authBytes)
+  if (!clientData || !authData) return fail('malformed')
+
+  if (clientData.type !== 'webauthn.get') return fail('bad_type')
+  if (clientData.challenge !== ctx.expectedChallenge) return fail('bad_challenge')
+  if (clientData.origin !== ctx.expectedOrigin) return fail('bad_origin')
+
+  const expectedRpIdHash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode('coffee.example')))
+  if (!expectedRpIdHash.every((b, i) => b === authData.rpIdHash[i])) return fail('bad_rp')
+
+  const { flags } = authData
+  if (!flags.up) return fail('user_not_present')
+  if (ctx.requireUV && !flags.uv) return fail('uv_required')
+  if (!flags.be && flags.bs) return fail('bad_backup_flags')
+  if (flags.be !== ctx.credential.backupEligible) return fail('bad_backup_flags')
+
+  const raw = derToRaw(sigBytes)
+  if (!raw) return fail('bad_signature')
+  const clientDataHash = new Uint8Array(await crypto.subtle.digest('SHA-256', cDataBytes))
+  const signed = new Uint8Array(authBytes.length + clientDataHash.length)
+  signed.set(authBytes, 0)
+  signed.set(clientDataHash, authBytes.length)
+  const valid = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, ctx.credential.publicKey, raw, signed)
+  if (!valid) return fail('bad_signature')
+
+  const stored = ctx.credential.signCount
+  if ((authData.signCount !== 0 || stored !== 0) && authData.signCount <= stored) return fail('counter_regressed')
+
+  return { ok: true, newSignCount: authData.signCount, backupState: flags.bs }
+}
+</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：王小明點了簡訊裡的連結，打開釣魚網站 <code>coffee-login.example</code>，畫面跟咖啡店一模一樣。他按「用 passkey 登入」。會發生什麼事？</p>
+  <label data-key="a">認證器替假網站簽章，假網站把簽章轉送給真網站，攻擊者登入成功</label>
+  <label data-key="b">認證器會跳出警告，要王小明自己判斷網址對不對</label>
+  <label data-key="c">瀏覽器找不到 RP ID 是 <code>coffee-login.example</code> 的咖啡店 passkey；就算拿到簽章，裡面的 origin 和 rpIdHash 也對不上真網站</label>
+  <label data-key="d">要看咖啡店有沒有開 MFA，有開才擋得住</label>
+  <p class="why">✓ passkey 綁定 RP ID，瀏覽器只會列出符合目前網域的 passkey，咖啡店那把在假網站上根本不會出現；簽章裡的 clientDataJSON 帶著瀏覽器填的 origin，伺服器比對不符就拒絕。a 是密碼和 OTP 的情況，不是 passkey。b 錯，防釣魚不靠使用者判斷網址，這正是它比 OTP 強的地方。d 錯，passkey 本身就同時是「擁有的裝置」加上「解鎖裝置的指紋或 PIN」。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：咖啡店的資料庫外洩，攻擊者拿到 <code>passkeys</code> 表的所有資料（credential ID、公鑰、signCount）。他能用這些登入顧客的帳號嗎？</p>
+  <label data-key="a">能，公鑰就是登入用的憑證，跟密碼雜湊外洩一樣嚴重</label>
+  <label data-key="b">不能，公鑰只能驗章、不能簽章；登入要的是留在使用者裝置裡的私鑰</label>
+  <label data-key="c">能，只要離線暴力破解公鑰，就能算出私鑰</label>
+  <p class="why">✓ 這是公鑰密碼學的設計：從公鑰算出 P-256 私鑰在計算上不可行，所以 c 錯。a 錯在把公鑰當成秘密：密碼雜湊外洩後還能離線猜密碼，公鑰外洩沒有東西可猜。還是要處理外洩（其他欄位可能有個資、要查怎麼被入侵的），但不需要讓所有人重設 passkey。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：咖啡店發現大部分顧客的 passkey，signCount 每次登入都是 0。應該怎麼處理？</p>
+  <label data-key="a">正常：同步 passkey 通常不實作計數器，一直回 0；只有新舊值有一個不是 0 時，才把「沒有增加」當成可能被複製的訊號</label>
+  <label data-key="b">全部拒絕，計數器沒增加代表金鑰被複製了</label>
+  <label data-key="c">伺服器自己幫每把 passkey 加 1，存起來比對</label>
+  <p class="why">✓ WebAuthn 規格寫明，沒有實作計數器的認證器固定給 0，§7.2 也只在「新舊有一個不是 0」時才比較。b 會讓 iCloud 鑰匙圈、Google 密碼管理工具的使用者全部登不進來。c 沒有意義：計數器的用途是比對認證器報的數字，伺服器自己加 1 偵測不到任何複製。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 7：顧客問：「用指紋登入咖啡店，我的指紋資料會傳到你們的伺服器嗎？」正確答案是？</p>
+  <label data-key="a">會，伺服器要比對指紋才知道是不是本人</label>
+  <label data-key="b">會，但是有加密，所以安全</label>
+  <label data-key="c">只傳指紋的雜湊值</label>
+  <label data-key="d">不會，指紋只在裝置上用來解鎖私鑰；伺服器只收到簽章和「使用者已驗證（UV）」這個旗標</label>
+  <p class="why">✓ 生物辨識在認證器本機進行（WebAuthn §14.3），通過後認證器才用私鑰簽章，並把 UV 設成 1。伺服器收到的是 authenticatorData、clientDataJSON 和簽章，裡面沒有任何生物特徵，也沒有它的雜湊，所以 a、b、c 都錯。伺服器也無從知道使用者用的是指紋、臉還是 PIN。</p>
+</div>
+
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>只驗簽章</strong>：釣魚網站或別的網站的 passkey 產生的簽章也是有效簽章。type、challenge、origin、rpIdHash、UP 每一項都要檢查。</li>
+  <li><strong>origin 用 <code>startsWith</code>、<code>includes</code> 比對</strong>：<code>https://coffee.example.evil.example</code> 會通過。用完全相等，或在明確的允許清單裡查。</li>
+  <li><strong>challenge 可以重複使用、沒綁 session、沒有期限</strong>：錄下來的回應就能重放。challenge 存在 session 底下，5 分鐘內有效，用一次就刪。</li>
+  <li><strong>簽章資料沒雜湊 clientDataJSON</strong>：簽的是 <code>authenticatorData || SHA-256(clientDataJSON)</code>，不是兩段原文接起來。</li>
+  <li><strong>用 <code>&lt;&lt;</code> 組 32-bit 計數器</strong>：最高位元是 1 時會變負數。用 <code>DataView.getUint32</code>。</li>
+  <li><strong>signCount 是 0 就當成錯誤</strong>：擋掉所有同步 passkey。新舊都是 0 時不比較。</li>
+  <li><strong>驗證失敗也更新 signCount</strong>：全部檢查通過後才更新 sign_count 和 backup_state。</li>
+  <li><strong>忘了 DER 轉換，或把 r||s 當 DER</strong>：WebAuthn 的 ES256 簽章是 DER，Web Crypto 要 64 bytes 的 r||s。忘了轉的症狀是所有人都登不進來。</li>
+  <li><strong>user handle 放 email 或帳號</strong>：它會存在認證器裡，規格禁止放個資。用隨機值。</li>
+  <li><strong>自己解析 CBOR、COSE 和 attestation</strong>：格式多、邊界情況多。用 <code>@simplewebauthn/server</code> 這類維護良好的函式庫，自己負責 challenge、資料表和政策。</li>
+  <li><strong>復原流程只靠 email 重設</strong>：攻擊者改打最弱的入口。讓使用者註冊多把 passkey、提供復原碼，復原後通知並讓其他 session 失效。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>密碼和 OTP 是可以照抄的字串，釣魚網站轉送就能用。passkey 是存在認證器裡的金鑰對：私鑰不離開裝置，伺服器只存公鑰，資料庫外洩也沒有能拿來登入的東西。</li>
+  <li>防釣魚靠兩層：passkey 綁定 RP ID，瀏覽器只在對的網域列出它；簽章資料裡有瀏覽器填的 origin。</li>
+  <li>兩個儀式都從伺服器的 challenge 開始，用來擋重放。註冊時伺服器存 credential ID、公鑰、signCount、BE／BS；登入時認證器簽 <code>authenticatorData || SHA-256(clientDataJSON)</code>。</li>
+  <li>authenticatorData：rpIdHash（32 bytes）、flags（UP bit 0、UV bit 2、BE bit 3、BS bit 4、AT bit 6、ED bit 7）、signCount（32-bit 大端序，用 <code>DataView.getUint32</code> 讀）。</li>
+  <li>只驗簽章不夠。伺服器依 WebAuthn Level 3 §7.2 檢查：type、challenge、origin、rpIdHash、UP／UV、BE／BS、簽章（DER 轉 r||s）、signCount（新舊都是 0 不比較），全部通過才更新狀態。</li>
+  <li>challenge：32 bytes CSPRNG、綁 session、5 分鐘、用一次就刪。</li>
+  <li>正式環境用 <code>@simplewebauthn/server</code> 這類函式庫做格式解析與驗章；你負責 challenge 存哪、怎麼作廢，資料表存什麼、登入後更新什麼，origin 和 RP ID 的設定，以及復原流程。</li>
+  <li>同步 passkey 方便、不怕遺失，但風險在雲端帳號；裝置綁定的安全金鑰適合高權限帳號。復原流程不能比登入弱；導入時先讓密碼和 passkey 並存。</li>
+</ul>
+<p>下一課：帳號流程。passkey 讓登入變強了，接著要把驗證信、重設密碼、改 email 這些「旁門」也守好，並擋下暴力破解。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

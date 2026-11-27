@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>26. 期末專題：把咖啡店 API 安全地送上線並維運</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="26" data-practice="devops">
+<header>
+  <div class="eyebrow">階段 7：期末專題 · 第 26 課</div>
+  <h1>期末專題：把咖啡店 API 安全地送上線並維運</h1>
+</header>
+<main>
+
+<p>前面 25 課各自練了一塊：映像、Compose、設定與 secret、nginx、擴展、CI／CD、migration、log、指標、trace、備份、告警。真正上線時，這些東西要一起運作，而且常常在接縫處出事：映像的 HEALTHCHECK 打錯路徑，Compose 就一直等不到 healthy；nginx 的限流設太嚴，壓測先被自己擋掉；runbook 寫的腳本名稱跟 repo 裡的對不上，半夜照著做才發現。</p>
+<p>這一課是期末專題：在你的 Mac 上組出一套<strong>類正式環境</strong>（production-like：盡量和正式環境一樣的本機或 staging 環境）。每一步都有自動檢查，五題全部通過，就等於通過一次上線準備度檢查。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>從需求到數字、架構與決策紀錄：把老闆的「推播之後不能掛」換成可以檢查的數字，畫出架構，把「為什麼這樣選」寫成 ADR。</li>
+  <li>映像與類正式環境：建出查得到來源的映像，組出 TLS 反向代理、藍綠兩組 api、只能讀寫資料的資料庫帳號、Redis 的 <code>compose.prod.yaml</code>。</li>
+  <li>部署、回滾與失敗的時候：在持續的流量下部署和回滾，跑到一半失敗時線上什麼都沒壞。</li>
+  <li>壓測驗收：用壓測證明這套環境撐得住尖峰，沒過時從數字找出瓶頸。</li>
+  <li>文件、上線準備度檢查與還差什麼：寫出別人半夜照著做就能維運的 runbook，逐項確認可以上線，以及跟真正的正式環境還差哪些。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="10-compose.html">第 10 課</a>的 Compose：healthcheck 判斷容器是否真的能服務，<code>depends_on</code> 等前一個服務 healthy 才啟動，<code>--wait</code> 等全部就緒才回來。</li>
+  <li><a href="16-cd.html">第 16 課</a>的藍綠部署：新版在另一個顏色啟動、通過檢查才切 nginx 的 upstream，舊顏色留著，回滾就是切回去。</li>
+  <li><a href="17-deploy-migrations.html">第 17 課</a>的部署前 migration：一次性 job 用專門的帳號套用 migration，成功才換程式；app 帳號只能讀寫資料。</li>
+  <li><a href="22-metrics-slo.html">第 22 課</a>的 SLO 與壓測門檻：用 k6 打出尖峰流量，p95、錯誤率沒達到 SLO 就不能上線。</li>
+</ul></div>
+
+<h2>從需求到數字</h2>
+<p>老闆不會說「我要 99.9% 的可用性」，他會說「推播之後不能掛」。工程師的第一件事，是把這種句子換成可以量、可以檢查的數字。練習資料夾裡的 <code>NEEDS.md</code> 是開會的結論：</p>
+<div class="callout">
+  <strong>咖啡店的上線需求</strong>
+  <ol>
+    <li>會員與集點卡下個月上線，行銷會在週末早上推播，預估尖峰流量是現在的三倍。</li>
+    <li>不能為了部署停機，營業時間也要能上新版本。</li>
+    <li>訂單資料遺失不能超過 15 分鐘。</li>
+    <li>系統壞了，要在 5 分鐘內有人知道；1 小時內要恢復服務。</li>
+    <li>新來的工程師照著文件就能部署、回滾、還原。</li>
+  </ol>
+</div>
+<div class="table-wrap"><table>
+  <tr><th>需求</th><th>換成的數字或做法</th><th>哪一課</th></tr>
+  <tr><td>推播之後不能掛</td><td>現在尖峰每秒 12 個請求 × 3 = 每秒 36 個；壓測要在這個到達率下 p95 &lt; 300ms、錯誤率 &lt; 0.1%</td><td>第 13、22 課</td></tr>
+  <tr><td>不能停機部署</td><td>藍綠部署、排空、部署前跑向後相容的 migration</td><td>第 13、16、17 課</td></tr>
+  <tr><td>遺失不超過 15 分鐘</td><td>RPO 15 分鐘：每 15 分鐘備份一次</td><td><a href="24-backup-dr.html">第 24 課</a></td></tr>
+  <tr><td>5 分鐘內有人知道</td><td>SLO 99.9% 的燃燒率告警（14.4 倍那條，短視窗 5 分鐘）</td><td>第 22、25 課</td></tr>
+  <tr><td>1 小時內恢復</td><td>RTO 1 小時：還原演練量到的時間要遠小於它</td><td><a href="24-backup-dr.html">第 24 課</a></td></tr>
+  <tr><td>照著文件就能做</td><td>runbook 的每一段都有能直接執行的指令，而且指令引用的檔案都存在</td><td><a href="25-alerting-incidents.html">第 25 課</a></td></tr>
+</table></div>
+<p>容量也要先算過。<a href="13-scaling.html">第 13 課</a>的公式：同時在處理的請求數 ≈ 到達率 × 每個請求的耗時。每秒 36 個、每個大約 0.05 秒，同一時間只有 2 個左右在處理，2 個 api 副本、每個連線池 8 條綽綽有餘。<strong>資料庫的連線預算</strong>也要算：藍綠兩組各 2 個副本，4 × 8 = 32 條，加上 migrate、備份、你自己連進去查問題的，都要在 PostgreSQL 預設的 <code>max_connections</code> 100 以內。之後擴展副本數時，這個總數是第一個會撞到的上限。</p>
+<div class="callout warn">每 15 分鐘一次 <code>pg_dump</code> 在本機練習是 RPO 15 分鐘的近似：最壞會丟掉 15 分鐘的訂單，資料一大，pg_dump 本身也會跑很久。正式環境用 WAL 封存與 PITR，或 RDS 的自動備份（<a href="24-backup-dr.html">第 24 課</a>、<a href="../../postgresql/lessons/37-backup-replication.html">PostgreSQL 課第 37 課</a>）。</div>
+<div class="callout practice"><strong>💡 實務上：需求會議要帶著數字去，帶著數字回來</strong><br>上線前通常會跟 PM、老闆、客服開一次會。資深工程師會先從 log 與指標查出現在的尖峰、錯誤率、延遲，再問「推播大概幾點發、發給多少人」「掛掉 10 分鐘的損失是多少」，把「不能掛」變成 SLO、RPO、RTO。「三倍」是估計，會議紀錄要寫下這個假設，上線後第一個尖峰就拿實際數字對照。每多一個 9、每少一分鐘 RPO 都要花錢，把成本跟老闆講清楚，比自己默默做到最好更重要。</div>
+
+<h2>架構與決策紀錄</h2>
+<figure>
+  <svg viewBox="0 0 700 300" role="img" aria-label="使用者經過 HTTPS 連到 nginx。nginx 只把流量送給 api-blue 兩個副本，api-green 兩個副本待命。api 連到 db 與 redis。migrate 是一次性的容器，用另一個帳號連 db。systemd timer 每 15 分鐘把 db 備份到異地。">
+    <defs><marker id="a26" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="10" y="115" width="90" height="50" rx="6"/>
+    <text class="d-text" x="55" y="145" text-anchor="middle">使用者</text>
+    <line class="d-line" x1="100" y1="140" x2="140" y2="140" marker-end="url(#a26)"/>
+    <text class="d-small" x="120" y="130" text-anchor="middle">443</text>
+    <rect class="d-box" x="142" y="80" width="140" height="120" rx="6"/>
+    <text class="d-accent" x="212" y="104" text-anchor="middle">nginx</text>
+    <text class="d-small" x="212" y="126" text-anchor="middle">TLS、80→301</text>
+    <text class="d-small" x="212" y="144" text-anchor="middle">HSTS、限流 429</text>
+    <text class="d-small" x="212" y="162" text-anchor="middle">上傳 5MB、擋 /metrics</text>
+    <text class="d-small" x="212" y="180" text-anchor="middle">active.conf</text>
+    <line class="d-line" x1="282" y1="120" x2="330" y2="70" marker-end="url(#a26)"/>
+    <line class="d-line" x1="282" y1="160" x2="330" y2="210" stroke-dasharray="4 4"/>
+    <rect class="d-box" x="332" y="40" width="150" height="60" rx="6"/>
+    <text class="d-text" x="407" y="66" text-anchor="middle">api-blue × 2</text>
+    <text class="d-small" x="407" y="86" text-anchor="middle">接流量（1.0.0）</text>
+    <rect class="d-soft" x="332" y="180" width="150" height="60" rx="6"/>
+    <text class="d-text" x="407" y="206" text-anchor="middle">api-green × 2</text>
+    <text class="d-small" x="407" y="226" text-anchor="middle">待命（上一版或下一版）</text>
+    <line class="d-line" x1="482" y1="70" x2="548" y2="110" marker-end="url(#a26)"/>
+    <line class="d-line" x1="482" y1="210" x2="548" y2="170" marker-end="url(#a26)"/>
+    <rect class="d-box" x="550" y="90" width="140" height="44" rx="6"/>
+    <text class="d-text" x="620" y="110" text-anchor="middle">db</text>
+    <text class="d-small" x="620" y="126" text-anchor="middle">cafe_app 只能讀寫</text>
+    <rect class="d-box" x="550" y="150" width="140" height="40" rx="6"/>
+    <text class="d-text" x="620" y="175" text-anchor="middle">redis（購物車）</text>
+    <rect class="d-soft" x="550" y="20" width="140" height="44" rx="6"/>
+    <text class="d-text" x="620" y="40" text-anchor="middle">migrate</text>
+    <text class="d-small" x="620" y="56" text-anchor="middle">一次性，cafe_migrator</text>
+    <line class="d-line" x1="620" y1="64" x2="620" y2="88" marker-end="url(#a26)"/>
+    <rect class="d-soft" x="550" y="240" width="140" height="50" rx="6"/>
+    <text class="d-text" x="620" y="262" text-anchor="middle">備份 timer</text>
+    <text class="d-small" x="620" y="280" text-anchor="middle">每 15 分鐘 → 異地</text>
+    <line class="d-line" x1="540" y1="250" x2="540" y2="120" stroke-dasharray="4 4"/>
+    <line class="d-line" x1="540" y1="120" x2="548" y2="118" marker-end="url(#a26)"/>
+    <text class="d-small" x="20" y="270">db、redis 不發布 port；只有 nginx 開在 127.0.0.1:18260、18263</text>
+  </svg>
+  <figcaption>期末專題的類正式環境。虛線的 green 平常不接流量，部署時新版本先放進去，檢查過再切換。</figcaption>
+</figure>
+<p>畫完架構圖，要把「為什麼這樣選」寫下來。<strong>ADR</strong>（Architecture Decision Record，架構決策紀錄）是一份很短的文件，一個決策一份，固定三段：</p>
+<ul>
+  <li><strong>背景</strong>：當時的需求、限制、團隊狀況。半年後的人看不到當時的會議，只看得到這一段。</li>
+  <li><strong>決策</strong>：選了什麼，具體到看得出怎麼做。</li>
+  <li><strong>後果</strong>：好處，以及<strong>缺點與代價</strong>。只寫優點的 ADR 沒有用：沒寫出代價，之後的人不知道它在什麼情況下會出問題，也不知道什麼時候該換掉。最後加一句<strong>重新評估的時機</strong>，例如「服務超過三個時評估 Kubernetes」。</li>
+</ul>
+<p>這個專題至少有四個值得記錄的決策：單機 Compose 還是 ECS／Kubernetes（第 13 課）、藍綠還是滾動更新（第 16 課）、pg_dump 還是 PITR（第 24 課）、購物車放 Redis 還是放記憶體（第 13 課）。<code>DECISIONS.md</code> 已經寫好 ADR-1 當範例。設計文件與 ADR 的完整寫法在 <a href="../../system-design/lessons/18-design-docs-adr.html">系統設計課第 18 課</a>。</p>
+<p>資深工程師最常犯的錯不是選錯工具，而是<strong>每一項都做到最複雜</strong>。兩個人維護一個服務，Kubernetes 的叢集升級、網路外掛、權限設定，會吃掉比服務本身更多的時間。依需求選最簡單、能滿足 SLO 與 RPO 的做法，在 ADR 裡寫清楚什麼時候要升級。</p>
+<div class="callout practice"><strong>💡 實務上：ADR 放在 repo 裡，跟著 PR 審查</strong><br>常見的做法是放在 <code>docs/adr/0001-….md</code>，跟程式碼一起走 PR，讓同事在決定之前提出反對意見。決定改變時不改舊的 ADR，而是寫一份新的，在舊的標上「已被 ADR-7 取代」，半年後的人才看得到為什麼換、換之前遇到什麼問題。新人到職、事故檢討、有人問「為什麼不用 Kubernetes」時，直接貼 ADR 的連結，比每次重新解釋省事。</div>
+
+<h2>映像與類正式環境</h2>
+<p>第一步是一個可以重現、可以追溯的映像（練習 1；Dockerfile 用<a href="09-multi-stage-security.html">第 9 課</a>的多階段建置）。可以重現：同一個 commit 每次建出一樣的東西，<code>npm ci</code> 照 lockfile 裝、基底映像釘版本。可以追溯：從正在跑的容器反查是哪個 commit 建的，靠 <code>org.opencontainers.image.revision</code> label 與 <code>/version</code>。正式環境由 CI（<a href="15-ci.html">第 15 課</a>）建置、推到 registry，部署用 <code>registry/cafe-api@sha256:…</code> 這種 digest 參照（第 16 課）；這裡在本機建置，用 <code>learn-devops/cafe-api:26-&lt;版本&gt;</code> 代替。CI 的 workflow 在第 15、16 課寫過，這一課不再重寫。</p>
+<p>第二步是 <code>compose.prod.yaml</code>（練習 2）。每一行設定都對應一個前面學過的理由：</p>
+<div class="table-wrap"><table>
+  <tr><th>設定</th><th>沒有它會怎樣</th><th>哪一課</th></tr>
+  <tr><td>api 用 <code>cafe_app</code>、migrate 用 <code>cafe_migrator</code></td><td>api 被注入 SQL 時可以 <code>DROP TABLE</code></td><td><a href="17-deploy-migrations.html">第 17 課</a></td></tr>
+  <tr><td>密碼用 <code>secrets</code> 掛檔案、<code>DB_PASSWORD_FILE</code></td><td><code>docker inspect</code> 就看得到密碼</td><td><a href="11-config-secrets.html">第 11 課</a></td></tr>
+  <tr><td>db、redis 不寫 <code>ports</code></td><td>資料庫直接暴露在主機的網路上</td><td><a href="10-compose.html">第 10 課</a></td></tr>
+  <tr><td>每個服務都有 <code>healthcheck</code>，<code>depends_on</code> 用 <code>condition</code></td><td>db 還沒好 api 就啟動、migrate 還沒跑完 api 就接流量</td><td><a href="10-compose.html">第 10 課</a></td></tr>
+  <tr><td><code>deploy.resources.limits.memory</code></td><td>一個副本漏記憶體，整台機器的服務一起被 OOM killer 收掉</td><td><a href="13-scaling.html">第 13 課</a></td></tr>
+  <tr><td><code>logging</code> 的 <code>max-size</code>、<code>max-file</code></td><td>log 一直長到磁碟滿，資料庫跟著寫不進去</td><td><a href="21-logs.html">第 21 課</a></td></tr>
+  <tr><td><code>DRAIN_MS</code> 比 nginx resolver 的 <code>valid</code> 長、<code>stop_grace_period</code> 比排空長</td><td>縮減副本時，nginx 還在送請求給已經關門的容器</td><td><a href="13-scaling.html">第 13 課</a></td></tr>
+</table></div>
+<p>nginx 的設定（<code>nginx/default.conf</code>，<a href="12-nginx.html">第 12 課</a>）是流量入口：80 port 一律 <code>301</code> 轉到 HTTPS；HSTS 標頭只加在 HTTPS 的 server（瀏覽器會忽略 HTTP 回應裡的 HSTS，放錯地方表示設定位置沒想清楚）；<code>client_max_body_size 5m</code>（預設只有 1m，4MB 的上傳會被擋）；<code>limit_req</code> 限制同一個 IP 的速度，超過回 <code>429</code>（預設是 503，會被誤認成伺服器壞了）；<code>/metrics</code> 不對外，Prometheus 在內部網路直接抓 <code>api:3000/metrics</code>。</p>
+<p>upstream 寫在另一個檔 <code>nginx/active.conf</code>，裡面的 <code>server api-blue:3000 resolve</code> 讓 nginx 定期向 Docker 內建的 DNS（<code>127.0.0.11</code>）重新查詢，副本增減時自動更新名單。<code>resolve</code> 參數在 nginx 1.27.3 之前只有商業版有，這裡用的 1.30.6 開源版可以用；它要搭配 <code>zone</code>（名單放在共用記憶體）與 <code>resolver</code>。</p>
+<div class="callout warn">Docker 的 DNS 只要容器在跑就會回它的 IP，不管 healthcheck 過了沒有；開源版 nginx 也沒有主動健康檢查，只會在請求失敗後暫時跳過那個副本。所以直接擴充「正在接流量的那一組」時，新副本還在啟動就會收到請求。這套環境的擴容方式是：把新的副本數部署到待命的那一組，檢查過再切換。雲端的負載平衡器（例如 AWS ALB）會主動打健康檢查，新目標通過才加入，這是正式環境和本機的差距之一。</div>
+
+<h2>部署、回滾與失敗的時候</h2>
+<p><code>deploy.sh</code> 是第 16 課藍綠部署的延伸，多了 Compose 與 migration。步驟：</p>
+<ol>
+  <li>從 <code>nginx/active.conf</code> 判斷現在接流量的顏色（old）與要部署的顏色（new）。</li>
+  <li>用新映像跑一次 migrate：<code>MIGRATE_IMAGE="$image" docker compose -f compose.prod.yaml run --rm --no-deps migrate</code>。失敗就停，流量不動。migration 一定要向後相容（第 17 課的 expand），因為接下來有一段時間舊版本還在服務。</li>
+  <li>把新映像寫進 <code>.env</code> 的 <code>BLUE_IMAGE</code> 或 <code>GREEN_IMAGE</code>，<code>up -d --no-deps --force-recreate --wait api-&lt;new&gt;</code>。寫進 <code>.env</code> 是為了讓「現在跑的是哪個版本」只有一個答案，之後任何人執行 <code>docker compose</code> 都不會意外換掉它。</li>
+  <li>健康關卡：新顏色的每個副本 <code>/health/ready</code> 都回 200（暖機完成、資料庫與 Redis 連得上、這個版本需要的 migration 都在），再做一次煙霧測試 <code>GET /products</code>。容器 healthy 只代表 <code>/health/live</code> 通過、程序活著；這套 api 啟動後還要暖機幾秒（建立連線池、載入快取），這段時間它會回 503，只看 healthy 就切流量，使用者會先吃到一串錯誤。</li>
+  <li>改寫 <code>active.conf</code>，<code>nginx -t</code> 通過才 <code>nginx -s reload</code>；沒過就把檔案改回去。</li>
+  <li>舊顏色留著不動，<code>rollback.sh</code> 先確認另一個顏色的副本都在跑而且 ready，再把 <code>active.conf</code> 改回去、reload，幾秒內完成。另一個顏色不在時，它要拒絕切換，不能把流量送進空的名單。</li>
+</ol>
+<p>任何一步失敗都以非 0 結束，而且流量留在原本的顏色。部署腳本最重要的性質不是「成功時很順」，而是<strong>失敗時什麼都沒壞</strong>。練習 3 會用一個 migration 會失敗的 3.0.0 測這件事。</p>
+<p>出事時先回滾還是先修？先回滾。回滾是演練過、幾秒就完成的動作；hotfix 要寫程式、跑 CI、建映像、再部署，每一步都可能出新的錯，而使用者在這段時間一直受影響。回滾止血之後，白天再修、再走一次正常的部署（第 25 課的「先止血再找原因」）。例外是回滾本身有風險的時候，例如新版本已經寫入舊版本讀不懂的資料，這也是 migration 要向後相容的原因。</p>
+<div class="callout practice"><strong>💡 實務上：什麼時候部署、部署完看什麼</strong><br>多數團隊避開週五傍晚、尖峰時段與連假前部署，挑有人在線上、出事能馬上處理的時間。部署前在團隊頻道說一聲（版本、有沒有 migration、誰在看），部署後盯 10～15 分鐘的錯誤率與 p95，沒有異常再宣布完成。資深工程師會在部署前先問自己：這次能不能直接 rollback.sh？如果 migration 讓舊版本讀不懂新資料，就要先拆成兩次部署。</div>
+<p>輪替資料庫密碼也走部署流程：api 只在啟動時讀密碼檔，所以順序是「產生新密碼 → <code>ALTER ROLE cafe_app PASSWORD …</code> → 換掉密碼檔 → 用目前的映像部署，讓容器重新建立」。<code>ALTER ROLE</code> 之後舊密碼立刻失效，已經建立的連線不受影響，但舊容器不能再開新連線，所以這幾步要連續做完。要完全零風險，常見做法是準備兩個登入帳號輪流使用：先改沒在用的那個、部署切換過去、下次再換另一個；AWS Secrets Manager 的輪替也提供這種「交替使用者」（alternating users）策略。</p>
+
+<h2>壓測驗收</h2>
+<p>部署流程沒問題，還要證明這套環境撐得住尖峰。沿用第 22 課的 <code>gate.js</code>，改成打整套類正式環境：</p>
+<ul>
+  <li><strong>經過 nginx 與 TLS</strong>：k6 在 compose 網路裡的另一個容器執行，網址是 <code>https://nginx</code>，憑證用 <code>SSL_CERT_FILE</code> 指定的私有 CA 驗證。直接打 <code>http://api-blue:3000</code> 會跳過 TLS 握手、限流、反向代理，驗收到的不是使用者走的路。</li>
+  <li><strong>真實的請求組成</strong>：照 <code>NEEDS.md</code> 的 8 成讀菜單、1 成加購物車、1 成下單。只打 <code>/health/live</code>，量到的是「程序活著」的速度，不是資料庫與 Redis 的速度。</li>
+  <li><strong>開放模型</strong>：<code>constant-arrival-rate</code>，每秒 36 個，不管系統多慢都照送。<code>constant-vus</code> 是封閉模型，系統變慢時送得也變少，數字會好看得不真實（第 22 課的協調遺漏）。</li>
+  <li><strong>三個門檻</strong>：<code>p(95)&lt;300</code>、<code>http_req_failed</code> 的 <code>rate&lt;0.001</code>、<code>dropped_iterations</code> 的 <code>count==0</code>。任何一個沒過，k6 以 99 結束，CI 就能擋下來。</li>
+</ul>
+<p>沒過的時候，回頭看第 13 課：p95 高、<code>db_pool_waiting</code> 大於 0 是連線池不夠；CPU 滿是副本不夠；429 是限流比尖峰還低。調整後把量到的數字寫進 <code>DECISIONS.md</code>，下次有人想改副本數，才知道現在的餘裕有多少。</p>
+<p>注意：在筆電上過了，只能證明腳本、門檻和設定寫對了，不是正式環境的容量保證。CPU、網路、資料量、其他程式搶資源的程度都不一樣。正式的門檻要在類正式的 staging 環境重量，並留安全係數（第 22 課用 0.7 倍）。</p>
+
+<h2>文件與上線準備度檢查</h2>
+<p><strong>上線準備度檢查</strong>（production readiness review，PRR）是上線前逐項確認「這個服務可以被安全地維運」。重點不是清單長，而是每一項都能被驗證。下表的每一項，都對應到一個自動檢查或一個可以執行的指令：</p>
+<div class="table-wrap"><table>
+  <tr><th>檢查</th><th>怎麼確認</th></tr>
+  <tr><td>映像非 root、沒有原始碼與 devDependencies、可追溯版本</td><td>練習 1</td></tr>
+  <tr><td>只有 HTTPS、HSTS、限流、上傳上限、指標不對外</td><td>練習 2</td></tr>
+  <tr><td>最小權限的資料庫帳號、密碼不在環境變數、資料庫不對外</td><td>練習 2</td></tr>
+  <tr><td>縮減副本不掉請求</td><td>練習 2</td></tr>
+  <tr><td>負載下部署、回滾零錯誤；失敗的部署不切流量</td><td>練習 3</td></tr>
+  <tr><td>尖峰三倍的流量下符合 SLO</td><td>練習 4</td></tr>
+  <tr><td>log 是 JSON、帶 request_id；<code>/metrics</code> 的 label 用路由樣板</td><td><code>docker compose -f compose.prod.yaml logs api-blue</code>、<code>docker compose -f compose.prod.yaml exec api-blue wget -qO- localhost:3000/metrics</code>（第 21、22 課）</td></tr>
+  <tr><td>燃燒率告警有測試、有 runbook_url</td><td>第 25 課的 promtool 測試</td></tr>
+  <tr><td>備份每 15 分鐘、還原演練通過</td><td><code>bash ops/backup.sh</code>、<code>bash ops/restore-drill.sh</code>、練習 5</td></tr>
+  <tr><td>部署、回滾、還原、輪替密碼、處理告警都有 runbook</td><td>練習 5</td></tr>
+</table></div>
+<p><strong>runbook</strong> 寫給半夜被叫醒、腦袋不清楚的人。每一段說明什麼時候用、要執行的指令（可以直接複製）、成功的樣子。文件最常見的問題是寫完就沒人更新，腳本改名了，runbook 還寫著舊的名字；所以練習 5 的測試會檢查 runbook 指令裡提到的每個腳本與設定檔是否存在。把這個檢查放進 CI，文件和程式就不會分開漂走。</p>
+<div class="callout practice"><strong>💡 實務上：PRR 是一場會議，也是一張待辦清單</strong><br>規模大一點的公司，新服務上線前要跟 SRE 或值班團隊做 PRR：逐項看檢查表，沒做到的不一定擋上線，但要變成有負責人、有期限的工單，並寫下「接受這個風險」。值班的人最在意的是：半夜被叫醒時有沒有 runbook、告警有沒有誤報、回滾要幾秒。第一次上線前，找一位沒參與開發的同事照 runbook 實際做一次部署與回滾，最容易找出文件漏掉的步驟。</div>
+<p>備份的排程用<a href="24-backup-dr.html">第 24 課</a>的 systemd timer（unit 檔見<a href="06-ssh-systemd.html">第 6 課</a>）：<code>OnCalendar=*:0/15</code> 是每小時的 0、15、30、45 分，<code>Persistent=true</code> 讓關機錯過的那一次在開機後補跑。用 cron 的話是 <code>*/15 * * * *</code>。間隔就是最壞情況下會遺失的資料量，所以一定要不超過 RPO。</p>
+
+<h2>跟真正的正式環境還差什麼</h2>
+<p>這套環境在一台機器上，刻意保持簡單。實際上線時，下面這些地方通常會換成雲端的託管服務，觀念不變、工具不同：</p>
+<div class="table-wrap"><table>
+  <tr><th>這一課</th><th>正式環境常見的做法</th><th>差別</th></tr>
+  <tr><td>容器裡的 PostgreSQL、pg_dump</td><td>RDS 等託管資料庫：自動備份與 PITR、Multi-AZ 自動切換</td><td>RPO 從 15 分鐘降到幾分鐘；不用自己升級、打補丁</td></tr>
+  <tr><td>nginx 在同一台機器</td><td>ALB 這類負載平衡器 + 憑證管理服務自動續期</td><td>主動健康檢查；憑證不會忘記續期</td></tr>
+  <tr><td><code>secrets/*.txt</code></td><td>Secrets Manager、SSM Parameter Store，搭配 IAM 角色（<a href="19-aws-iam.html">第 19 課</a>）</td><td>存取有稽核紀錄、可以自動輪替</td></tr>
+  <tr><td>本機建置、tag</td><td>CI 建置、推到 registry、部署用 digest（第 15、16 課）</td><td>部署的東西就是測過的那一份</td></tr>
+  <tr><td>單機 Compose</td><td>ECS、Kubernetes，跨多個可用區域</td><td>機器壞掉自動移走；代價是維運複雜度</td></tr>
+  <tr><td>log、指標在容器裡</td><td>集中的 log 與指標平台（第 21～23 課）</td><td>機器不見了，log 還在</td></tr>
+</table></div>
+<p>還有一件只有實際上線才學得到的事：每次事故、每次差點出事，都要回頭更新 runbook、ADR 和這張檢查表。上線準備度不是做一次的考試，是跟著服務一起長大的東西。</p>
+
+<h2>練習</h2>
+<p>五題都在 <code>devops/practice/work/26/</code> 裡做，需要 Docker Desktop 在執行。<code>app/</code> 是完整的 cafe-api，除了練習 1 的 <code>Dockerfile</code>、<code>.dockerignore</code> 之外不用改。<code>up.sh</code>、<code>release.sh</code>、<code>make-certs.sh</code>、<code>lib.ts</code>、<code>db/</code>、<code>ops/</code> 都已經寫好：<code>sh up.sh</code> 會產生私有 CA 與憑證（<code>certs/</code>）、三組隨機密碼（<code>secrets/</code>）、建置 1.0.0 的映像，然後 <code>docker compose -f compose.prod.yaml up -d --wait</code>，再等 api 暖機完成（api 啟動後要暖機 5 秒，這段時間 <code>/health/ready</code> 與業務路由都回 503，<code>/health/live</code> 與 <code>/version</code> 照常回應）。nginx 開在 <code>127.0.0.1:18260</code>（HTTP）與 <code>18263</code>（HTTPS），試的時候用 <code>curl --cacert certs/ca.crt https://localhost:18263/products</code>。練習 2～4 的測試每次都會先收掉整套環境、刪掉 <code>.env</code> 與 <code>secrets/</code>，從頭啟動，跑完也會收掉，所以每題要幾分鐘。第一次會下載 <code>node:24.22.2-alpine3.24</code>、<code>postgres:18.6-alpine3.24</code>、<code>nginx:1.30.6-alpine</code>、<code>redis:8.10.3-alpine</code>、<code>grafana/k6:2.3.0</code>。做之前先讀 <code>NEEDS.md</code>。</p>
+
+<div class="local" data-test="ex1" data-files="app/Dockerfile app/.dockerignore">
+  <p>練習 1：完成 <code>app/Dockerfile</code> 與 <code>app/.dockerignore</code>。基底映像 <code>node:24.22.2-alpine3.24</code>，多階段：建置階段 <code>npm ci</code>、<code>npm run build</code>；最終階段只有 <code>package.json</code>、正式依賴（<code>npm ci --omit=dev</code>）、<code>dist/</code>、<code>migrations/</code>，工作目錄 <code>/app</code>。<code>ARG APP_VERSION</code>、<code>GIT_SHA</code> 轉成同名的 <code>ENV</code>（<code>/version</code> 讀它們），<code>GIT_SHA</code> 也寫進 label <code>org.opencontainers.image.revision</code>。以 <code>node</code> 使用者執行，<code>HEALTHCHECK</code> 打 <code>http://127.0.0.1:3000/health/live</code>（映像裡沒有 curl，有 busybox 的 <code>wget</code>；程式沒在跑時這個指令要失敗，<code>|| exit 0</code> 這類永遠成功的寫法不算），<code>CMD ["node", "dist/server.js"]</code>。<code>.dockerignore</code> 至少擋掉 <code>node_modules</code>、<code>dist</code>、<code>.env</code>。測試用隨機的 <code>GIT_SHA</code> 建置，檢查 <code>docker build --check</code> 沒有警告、映像裡沒有 typescript 與 <code>src/</code>、label 與 <code>/version</code> 的值、容器會變成 healthy。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="compose.prod.yaml nginx/default.conf">
+  <p>練習 2：完成 <code>compose.prod.yaml</code> 與 <code>nginx/default.conf</code>。db 已經寫好；補上：<code>redis</code>（有 healthcheck）；<code>migrate</code>（image 是 <code>${MIGRATE_IMAGE:-${BLUE_IMAGE}}</code>、command <code>["node", "dist/migrate.js"]</code>、用 <code>cafe_migrator</code> 與 <code>migrator_password</code>）；<code>api-blue</code>、<code>api-green</code>（image 分別是 <code>${BLUE_IMAGE}</code>、<code>${GREEN_IMAGE}</code>，各 2 個副本，環境變數 <code>DB_HOST</code>、<code>DB_NAME</code>、<code>DB_USER=cafe_app</code>、<code>DB_PASSWORD_FILE=/run/secrets/app_password</code>、<code>REDIS_URL</code>、<code>DRAIN_MS</code>，等 migrate 成功、redis healthy 才啟動，有記憶體上限與 log 輪替）；<code>nginx</code>（<code>127.0.0.1:18260:80</code>、<code>127.0.0.1:18263:443</code>，把 <code>./nginx</code> 掛到 <code>/etc/nginx/conf.d</code>、<code>./certs</code> 掛到 <code>/etc/nginx/certs</code>，有 healthcheck）。nginx：HTTP 一律 301 到 <code>https://$host:18263$request_uri</code>；HTTPS 用 <code>/etc/nginx/certs/server.crt</code>、<code>server.key</code>，只在這裡加 HSTS；上傳上限 5MB；每個 IP 限流（每秒約 50 個，正常的每秒 36 個不能被擋），超過回 429；<code>/metrics</code> 回 404；其他路徑 <code>proxy_pass http://api</code>。測試會檢查：up 成功、HTTPS 用 CA 驗證、301 與 HSTS、413、429、db 與 redis 沒有發布 port、連進資料庫的只有 <code>cafe_app</code> 而且它不能建表、密碼不在環境變數、資源限制與 log 輪替、購物車跨副本一致，以及負載下把 api-blue 從 2 個縮到 1 個沒有失敗的請求。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="deploy.sh rollback.sh">
+  <p>練習 3：完成 <code>deploy.sh &lt;映像&gt;</code> 與 <code>rollback.sh</code>，照課文的六個步驟做藍綠部署：先用新映像跑 migrate、新顏色以 <code>--force-recreate --wait</code> 啟動、每個副本的 <code>/health/ready</code> 都 200 才切（最多等 <code>READY_TIMEOUT</code> 秒，預設 60）、改 <code>active.conf</code> 後 <code>nginx -t</code> 再 reload、舊顏色留著。任何一步失敗就以非 0 結束，<code>active.conf</code> 不變。<code>rollback.sh</code> 確認另一個顏色的副本都在跑而且 ready，才切回去。測試在每秒 20 個請求（GET 與 POST 輪流，經過 HTTPS）的持續負載下依序：部署 2.0.0（多一個 migration，blue → green）、再部署 2.1.0（這次要從 green 換到 blue，顏色不能寫死）、回滾到 2.0.0、部署 migration 會失敗的 3.0.0，每一步都不能有失敗的請求；最後把待命的顏色停掉，<code>rollback.sh</code> 要拒絕切換並以非 0 結束。自己試：<code>sh up.sh</code>，另開一個終端機 <code>while true; do curl -s --cacert certs/ca.crt https://localhost:18263/version; echo; sleep 0.2; done</code>，再 <code>sh deploy.sh "$(sh release.sh 2.0.0)"</code>。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="loadtest/gate.js">
+  <p>練習 4：<code>loadtest/gate.js</code> 是同事寫的第一版，找出問題並改好：以 <code>NEEDS.md</code> 換算出的尖峰到達率（固定到達率）打 <code>https://nginx</code> 至少 30 秒，請求組成照 <code>NEEDS.md</code>，門檻是 p95 &lt; 300ms、錯誤率 &lt; 0.1%、<code>dropped_iterations</code> 為 0，<code>preAllocatedVUs</code> 要夠。測試先用 <code>k6 inspect</code> 檢查設定，再在 compose 網路裡跑你的 gate.js，k6 要以 0 結束，並從 nginx 的 access log 確認請求真的經過 nginx、組成正確、4xx 與 5xx 不超過 0.1%（用 <code>setResponseCallback</code> 把錯誤算成成功、或用 <code>insecureSkipTLSVerify</code> 關掉憑證驗證，都會被判錯）。檔案開頭的註解是自己跑的指令。</p>
+</div>
+
+<div class="local" data-test="ex5" data-files="RUNBOOK.md DECISIONS.md">
+  <p>練習 5：完成 <code>RUNBOOK.md</code> 與 <code>DECISIONS.md</code>。RUNBOOK 要有「部署」（已寫好）「回滾」「還原」「輪替資料庫密碼」「收到燃燒率告警」「備份排程」六個 <code>## </code> 章節，每章至少一個程式碼區塊（「回滾」要執行 <code>rollback.sh</code>，「還原」要有把備份還原回正式資料庫的 <code>pg_restore</code>），區塊裡提到的腳本與設定檔（<code>.sh</code>、<code>.yaml</code>、帶路徑的 <code>.timer</code>、<code>.service</code>、<code>.conf</code>）都要存在。輪替密碼要更新 <code>secrets/app_password.txt</code>、<code>ALTER ROLE cafe_app … PASSWORD</code>，並讓 api 用新密碼重新建立。備份排程用 cron 或 systemd timer 執行 <code>ops/backup.sh</code>，設定寫在這一章或它提到的 <code>ops/</code> 裡的 .timer 檔，間隔不超過 15 分鐘。DECISIONS 至少 3 個 ADR（<code>## </code>），各記錄一個不同的決策，每個都有 <code>### 背景</code>、<code>### 決策</code>、<code>### 後果</code>，後果要有「缺點：」或「代價：」開頭的一項，並寫出什麼時候要重新評估。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：部署 2.0.0 之後，燃燒率告警響了，下單的錯誤率從 0.02% 升到 4%。你看了 log，大概知道是哪一行寫錯，五分鐘就能改好。第一步該做什麼？</p>
+  <label data-key="a">直接改好、跑 CI、部署 2.0.1，比回滾再部署少一次切換</label>
+  <label data-key="b">先執行 rollback.sh 止血，確認錯誤率恢復，再修好、走正常的部署流程</label>
+  <label data-key="c">先把 api 擴充到 4 個副本，分散錯誤</label>
+  <label data-key="d">先找出根本原因並寫事後檢討，避免改錯</label>
+  <p class="why">✓ b。回滾是演練過、幾秒就完成的動作；「五分鐘就能改好」通常不只五分鐘，CI、建置、部署每一步都可能出新問題，使用者這段時間一直在失敗。a 把恢復時間賭在估計上；c 程式錯誤不會因為副本變多而消失；d 根因與檢討在止血之後做。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 7：兩位工程師、單一 API 服務、流量穩定的團隊，正在決定正式環境要不要用 Kubernetes。哪一個說法最合理？</p>
+  <label data-key="a">一定要用，正式環境不用 Kubernetes 就不專業</label>
+  <label data-key="b">一定不要用：Kubernetes 只適合有專職平台團隊的大公司，小團隊永遠不該碰</label>
+  <label data-key="c">多半不需要：單機 Compose 或 ECS 這類託管服務的維運負擔小得多；在 ADR 寫下代價，等服務數量、團隊規模或可用性要求到了再換</label>
+  <label data-key="d">先用 Kubernetes：以後流量變大不用搬家，現在多花的維運時間算是預先投資</label>
+  <p class="why">✓ c。工具要依需求選，並寫下什麼時候重新評估。兩個人要同時維護叢集升級、網路、權限與服務本身，負擔很重。a 把工具當成目的；b 太絕對，服務多、團隊大時它的自動調度很有價值；d 為了可能不會來的需求，現在每天付維運成本，而且之後真的要換時，從 Compose 搬上去也不難。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 8：這套系統每 15 分鐘做一次 pg_dump，一年來從沒還原過。下一個衝刺只能做一件事：加一個漂亮的指標儀表板，或是每週自動還原演練並記錄 RTO。哪一個對可靠性幫助比較大？</p>
+  <label data-key="a">每週還原演練：沒還原過的備份不知道能不能用，也不知道要花多久；它直接驗證 RPO、RTO 這兩個承諾</label>
+  <label data-key="b">儀表板：看得到才管得到，備份有沒有成功也能放在儀表板上一起看</label>
+  <label data-key="c">兩個一樣，都屬於可觀測性</label>
+  <label data-key="d">都不用，備份腳本 exit 0 就代表成功</label>
+  <p class="why">✓ a。備份的價值只在還原那一刻，沒演練過的備份可能是空的、少了角色、或還原要好幾個小時（第 24 課）。b 儀表板有用，備份腳本成功也只代表檔案產生了，不會告訴你資料救不救得回來；c 還原演練驗證的是復原能力，不是觀察；d 正是第 24 課開場的事故。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 9：練習 4 的壓測在你的筆電上通過了：每秒 36 個請求、p95 120ms。主管問：「所以正式環境的容量沒問題了？」怎麼回答最正確？</p>
+  <label data-key="a">沒問題，筆電比雲端主機還快</label>
+  <label data-key="b">沒問題：用的是開放模型，系統變慢也照送，量到的數字不會被協調遺漏美化</label>
+  <label data-key="c">有問題，筆電上的壓測沒有意義</label>
+  <label data-key="d">它證明了壓測腳本、門檻和設定是對的；正式的容量要在硬體、資料量、網路都接近正式環境的 staging 重量，並留安全係數</label>
+  <p class="why">✓ d。CPU、網路延遲、資料量、跟其他程式搶資源的程度都不同，筆電的數字不能直接搬到正式環境。a 只看了一個因素；b 開放模型讓數字誠實，但量的還是筆電的硬體與資料量；c 太極端，本機壓測能抓出設定錯誤（例如限流太嚴、連線池太小），也讓同一套腳本可以直接拿去 staging 跑。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>每一項都做到最複雜</strong>：兩個人的團隊上 Kubernetes、自建 Prometheus 叢集，維運負擔比服務本身還重。依需求選最簡單能滿足 SLO 與 RPO 的做法，在 ADR 裡寫下何時升級。</li>
+  <li><strong>只在最後才整合</strong>：各部分分開時都能跑，放在一起才發現 port、名稱、健康檢查路徑對不上。從第一天就用同一個 compose 檔、同一套命名。</li>
+  <li><strong>api 用有建表權限的帳號連線</strong>：migration 方便了，被注入 SQL 時也能刪表。api 用 <code>cafe_app</code>，建表、改表只給一次性的 migrate。</li>
+  <li><strong>HSTS 加在 HTTP 的回應</strong>：瀏覽器會忽略它。加在 HTTPS 的 server，HTTP 只做 301。</li>
+  <li><strong>忘了 nginx 的預設上傳上限</strong>：<code>client_max_body_size</code> 預設 1m，app 允許 5MB 也沒用。</li>
+  <li><strong>部署先停舊版再起新版</strong>：中間的空檔全部是錯誤。新版本起來、檢查過，才切流量，舊版本留著當回滾。</li>
+  <li><strong>容器起來就切流量</strong>：程序在跑不等於能服務。等 <code>/health/ready</code>（資料庫、Redis、migration 都好了）再切。</li>
+  <li><strong>migration 失敗還繼續部署</strong>：<code>set -e</code> 加上每一步檢查結束碼，失敗就停、流量不動。</li>
+  <li><strong>壓測繞過 nginx 或只打健康檢查</strong>：驗收不到 TLS、限流、資料庫寫入，數字好看但沒有意義。</li>
+  <li><strong>runbook 跟腳本對不上</strong>：改了腳本名稱沒改文件，事故時照著做才失敗。在 CI 檢查 runbook 引用的檔案。</li>
+  <li><strong>決策只寫結論</strong>：沒寫代價與重新評估的時機，之後的人不知道它在什麼時候會出問題。</li>
+  <li><strong>把本機壓測當容量保證</strong>：只能證明設定與門檻寫對了，正式容量在 staging 重量並留餘裕。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>先把需求換成數字：尖峰到達率、SLO、RPO、RTO、資料庫連線預算，每一個數字都對應一個檢查。</li>
+  <li>用 ADR 記錄決策：背景、決策、後果（含缺點與代價）、何時重新評估；依需求選最簡單的做法。</li>
+  <li>映像要可重現、可追溯：多階段、非 root、只有執行需要的東西、revision label、HEALTHCHECK。</li>
+  <li>類正式環境：TLS 與 301、HSTS 只在 HTTPS、限流 429、上傳上限、指標不對外；最小權限的資料庫帳號、密碼用檔案、資料庫不發布 port；資源限制、log 輪替、排空時間比 resolver 的快取長。</li>
+  <li>部署：先 migration（向後相容）→ 新顏色啟動 → ready 與煙霧測試 → <code>nginx -t</code> → reload → 舊顏色留著；失敗就停、流量不動。出事先回滾止血。</li>
+  <li>壓測驗收要走使用者的路（nginx、TLS）、用真實的請求組成與開放模型；筆電上的結果只證明設定正確。</li>
+  <li>runbook 給半夜被叫醒的人看：什麼時候用、可以直接複製的指令、成功的樣子；用自動檢查讓它跟腳本保持一致。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段就是整門課的總結，所以這裡是總檢核：部署與維運面試最常問的 8 件事，全部放進這套咖啡店的類正式環境。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 10：部署紀錄寫著上週上線的是 <code>cafe-api:2.0.0</code>。之後有人修了一個小 bug，重新建置又推成 <code>2.0.0</code>。今天要回滾到上週那一版，會發生什麼事？</p>
+  <label data-key="a">拿到上週那一版：registry 不允許重推已經存在的版本號，第二次 push 會被拒絕</label>
+  <label data-key="b">拿到重建的那一版，但沒關係：版本號一樣代表行為一樣，回滾的目的有達到</label>
+  <label data-key="c">拿到重建的那一版：tag 可以改掛到別的映像，部署紀錄要記 digest，回滾也用 digest</label>
+  <label data-key="d">拿到上週那一版：部署前加上 <code>--pull always</code>，就會從 registry 重新抓舊的內容</label>
+  <p class="why">✓ c。tag 只是名牌，誰都能改掛；digest 是內容的雜湊，內容不同就不同，所以部署與回滾都寫 <code>cafe-api@sha256:…</code>，跑的一定是 staging 測過的那一個。回滾到的是一個沒人測過的映像，正好在最需要確定的時候不確定。a 錯在 registry 預設允許覆蓋 tag。（第 7、16 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 11：同事想省掉 Redis，提議把購物車存在 api 程序的記憶體裡，nginx 再開黏性 session，讓同一位顧客固定打到同一個副本。在這套藍綠環境裡會怎樣？</p>
+  <label data-key="a">每次部署切換顏色，購物車都留在舊顏色的程序裡，顧客的購物車全部清空；副本重啟或縮減時也一樣</label>
+  <label data-key="b">沒問題：黏性 session 讓顧客一直回到同一個副本，購物車永遠找得到，還少了一次 Redis 的網路往返</label>
+  <label data-key="c">只會多用記憶體：每個副本各自存一份所有顧客的購物車，副本越多記憶體用得越多</label>
+  <label data-key="d">只有 nginx reload 那一刻會出事：reload 清掉黏性對應表，切換完成之後就恢復正常</label>
+  <p class="why">✓ a。狀態在程序的記憶體裡，副本就不能隨時加、隨時換；藍綠切換本身就是把流量整批換到另一組程序。購物車放 Redis 並設 TTL，副本才是無狀態的。b 最常見：黏性 session 只是把狀態問題藏起來，副本一重啟、被縮減或換顏色就消失。（第 13 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 12：api 有 <code>/health/live</code> 和 <code>/health/ready</code> 兩個端點，容器的 healthcheck 用前者，<code>deploy.sh</code> 切流量前看後者。兩個端點該怎麼分工？</p>
+  <label data-key="a">兩個都檢查資料庫、Redis 與 migration，檢查得越完整，壞掉的副本越早被發現</label>
+  <label data-key="b">live 檢查資料庫與 Redis 連得上，ready 只確認程序有回應，切換才不會被依賴拖慢</label>
+  <label data-key="c">live 只確認程序有回應；ready 暖機期間也先回 200，免得部署卡在等待</label>
+  <label data-key="d">live 只確認程序有回應；ready 等暖機完成、資料庫與 Redis 連得上、migration 都在才回 200</label>
+  <p class="why">✓ d。liveness 回答「要不要重啟這個程序」，readiness 回答「能不能送流量給它」。依賴出事時重啟 api 沒有用，放進 liveness 會讓資料庫維護 30 秒變成所有副本被連環重啟。a 最多人選，錯就錯在把依賴放進 liveness；c 讓使用者在暖機時先吃到一串 503。（第 13 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 13：2.1.0 把訂單的備註欄位改名，程式也一起改成讀寫 <code>remark</code>，migration 只有下面一行。用 <code>deploy.sh</code> 部署時，哪裡會出事？</p>
+<pre>-- migrations/005_rename_note.sql
+ALTER TABLE orders RENAME COLUMN note TO remark;</pre>
+  <label data-key="a">不會出事：<code>deploy.sh</code> 等新顏色每個副本都 ready 才切，切換前新舊版本不會同時服務</label>
+  <label data-key="b">migrate 一跑完，還在接流量的舊顏色讀寫 <code>note</code> 就開始失敗，之後也回滾不了；要拆成 expand、雙寫、回填、contract</label>
+  <label data-key="c">只有回滾會出事：切到新顏色後一切正常，要切回舊顏色時，舊程式才會因為找不到 <code>note</code> 失敗</label>
+  <p class="why">✓ b。migration 在切換之前跑，接下來新舊兩版都在新 schema 上，回滾時也是，所以每個 migration 都要讓上一版還能用（N-1 相容）。改名要先加新欄位、部署雙寫版、回填，等舊版完全不在了才刪舊欄位。a 錯在只看程式的切換點，資料庫在 migrate 那一刻就已經換了。（第 17 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 14：同事的 Dockerfile 用 <code>COPY . .</code>，把含資料庫密碼的 <code>.env</code> 也複製進去，後面一步再 <code>RUN rm -f .env</code>。映像推到 registry 之後，密碼安全嗎？</p>
+  <label data-key="a">不安全：COPY 那一層還留著 <code>.env</code>，拉得到映像的人都能取出；用 <code>.dockerignore</code> 擋掉並輪替密碼</label>
+  <label data-key="b">安全：rm 之後最終的檔案系統裡沒有這個檔，<code>docker exec</code> 進容器也找不到</label>
+  <label data-key="c">安全：registry 只保存映像最後的檔案系統，推上去時中間刪掉的檔案不會一起上傳</label>
+  <label data-key="d">不安全，但不用處理：執行時是 <code>USER node</code>，只有 root 讀得到那一層的檔案</label>
+  <p class="why">✓ a。映像是一層一層疊起來的，後面刪檔只是加一個「已刪除」的標記，前面那層照樣下載、照樣能從 <code>docker save</code> 解開。推出去就當作外洩：先輪替，再修 Dockerfile；機密在執行時用 secrets 掛成檔案。b 最多人選，它只看了最上面那一層。（第 9、11 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 15：同事覺得兩個資料庫帳號很麻煩，提議 api 也改用 <code>cafe_migrator</code> 連線，理由是「密碼已經用 secrets 掛成檔案，db 也沒有發布 port」。這樣做的問題是？</p>
+  <label data-key="a">沒問題：密碼不在環境變數、資料庫也不對外，攻擊者拿不到這個帳號</label>
+  <label data-key="b">沒問題：cafe_migrator 的建表權限只在跑 migration 時有效，平常只能讀寫</label>
+  <label data-key="c">api 被注入 SQL 時，攻擊者能用這個帳號刪表、改 schema，不只是讀寫資料</label>
+  <p class="why">✓ c。api 是對外的，被 SQL injection 時，攻擊者能做的就是 api 帳號能做的事；只有資料權限的 <code>cafe_app</code> 刪不了表、改不了 schema。建表、改表只給一次性的 migrate。a 最多人選，但它防的是密碼外洩，注入的 SQL 走的是 api 自己的連線，用不著密碼。（第 17 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 16：在 staging 演練部署，切到 green 之後，nginx 開始回大量 502，error log 是 <code>connect() failed (111: Connection refused)</code>，<code>$upstream_response_time</code> 幾乎都是 0。先查什麼？</p>
+  <label data-key="a">資料庫的慢查詢：新版本多了查詢，api 處理不完，nginx 等不到回應</label>
+  <label data-key="b">green 的副本有沒有在跑、是不是一直重啟、聽的 port 跟 <code>active.conf</code> 寫的對不對</label>
+  <label data-key="c">把 <code>proxy_read_timeout</code> 調大，讓剛啟動的新版本有多一點時間回應</label>
+  <label data-key="d">限流設得太嚴：切換時同一個 IP 的請求集中，被 <code>limit_req</code> 擋下來</label>
+  <p class="why">✓ b。502 是 nginx 連不上後端或拿到無效回應，Connection refused 加上幾乎 0 的耗時代表根本沒人在聽；用 <code>docker compose ps</code>、<code>logs</code> 看容器狀態與 port。a、c 是 504（後端太慢、upstream timed out）的查法；d 限流回的是 429。（第 12 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 17：要讓 <code>NEEDS.md</code> 的「壞了 5 分鐘內有人知道」成立，又不要讓值班者半夜被叫醒卻沒事可做。哪一條該設成 page？</p>
+  <label data-key="a">任何一個 api 副本重啟就 page：重啟代表出過事，值班者越早知道越好</label>
+  <label data-key="b">資料庫 CPU 超過 80% 持續 5 分鐘就 page：資料庫是單點，要在它撐不住之前處理</label>
+  <label data-key="c">5 分鐘內出現任何一個 5xx 就 page：SLO 是 99.9%，錯誤一出現就該有人看</label>
+  <label data-key="d">錯誤比例的燃燒率在 1 小時與 5 分鐘兩個視窗都超過 14.4 倍時 page</label>
+  <p class="why">✓ d。page 只給影響使用者、緊急、可行動的狀況，所以對症狀（錯誤預算燒得多快）告警；兩個視窗都要超過，才不會被短暫尖峰叫醒，恢復後也很快解除。a、b 是原因：副本重啟時另一個副本照常服務，CPU 高可能只是報表在跑。c 忽略了錯誤預算，99.9% 本來就允許 0.1% 的失敗。（第 22、25 課）</p>
+</div>
+<p>這個階段的重點整理成<a href="../sheets/stage-7.html">一頁圖解</a>。</p>
+<p>接下來可以學什麼：想把單機換成能自動調度、跨機器的平台，接著學 <a href="../../kubernetes/lessons/01-why-kubernetes.html">Kubernetes 課</a>；想練習在更大的規模下做取捨、寫設計文件，接著學 <a href="../../system-design/lessons/01-what-is-system-design.html">系統設計課</a>。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

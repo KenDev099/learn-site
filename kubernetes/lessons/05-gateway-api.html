@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>5. 對外流量：Gateway API（以及 Ingress 為什麼退場）</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="5" data-practice="kubernetes">
+<header>
+  <div class="eyebrow">階段 2：網路與設定 · 第 5 課</div>
+  <h1>對外流量：Gateway API（以及 Ingress 為什麼退場）</h1>
+</header>
+<main>
+
+<p>上一課的 Service 讓叢集裡的程式用名字找到 cafe-api。但顧客在叢集外面：手機 App 打 <code>https://cafe.test/products</code>，網站打 <code>https://cafe.test/</code>，這些請求要有一個入口接住，依網域和路徑分給不同的服務，還要處理 HTTPS。在 devops 課，這個入口是 nginx；在 Kubernetes，入口是一組 API 物件，由控制器替你設定真正的代理伺服器。</p>
+<p>這一課學 Kubernetes 官方的新一代入口 API：<strong>Gateway API</strong>，最後也會教你看懂舊專案的 Ingress、把它搬過來。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>入口要做什麼：nginx.conf 裡的網域、路徑、HTTPS、轉發，在 Kubernetes 變成哪些物件。</li>
+  <li>Ingress 與 Gateway API、三種物件兩種角色：舊的 Ingress 卡在哪裡，平台團隊管入口、應用團隊管自己的路由，權限怎麼分開。</li>
+  <li>第一條 HTTPRoute 與比對規則：路由沒生效時怎麼讀 status，一個請求符合好幾條規則時送去哪裡，怎麼用權重做 90:10 的金絲雀上線。</li>
+  <li>HTTPS：在入口解密，憑證只放一個地方，cafe-api 不用處理 TLS。</li>
+  <li>舊的 Ingress 怎麼搬：接手舊專案時讀懂它的 annotation，改寫成 HTTPRoute。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="04-services-dns.html">第 4 課</a>的 Service：給一群 Pod 固定的名字，<code>port</code> 是 Service 自己的、<code>targetPort</code> 是容器的；LoadBalancer 類型在本機由 cloud-provider-kind 給位址，用 <code>bin/url.mjs</code> 查。</li>
+  <li><a href="../../devops/lessons/12-nginx.html">devops 課第 12 課</a>的 nginx 反向代理：<code>server_name</code> 比對網域、<code>location</code> 比對路徑、<code>proxy_pass</code> 轉給後面的服務。</li>
+  <li><a href="../../devops/lessons/05-tls.html">devops 課第 5 課</a>的 TLS 憑證：憑證的 SAN 列出它對哪些網域有效，本機可以自己當 CA 簽一張。</li>
+</ul></div>
+
+<h2>入口要做什麼：從 nginx.conf 到 Kubernetes 物件</h2>
+<p>devops 課第 12 課的 nginx 設定，拆開來就是一個入口要做的四件事：</p>
+<pre>server {
+    listen 443 ssl;                                  # 1. 在哪個 port、用什麼協定接請求
+    server_name cafe.example.tw;                     # 2. 依網域（Host 標頭）分辨是哪個網站
+    ssl_certificate     /etc/nginx/certs/fullchain.pem;   # 3. 在入口解密 HTTPS
+    ssl_certificate_key /etc/nginx/certs/privkey.pem;
+    location /api/ { proxy_pass http://api:3000/; }  # 4. 依路徑決定轉給哪個後端
+    location /     { proxy_pass http://web:80; }
+}</pre>
+<p>在 Kubernetes 裡你不寫 nginx.conf。你把這四件事寫成 API 物件交給叢集，一個<strong>控制器</strong>（第 1 課的控制迴圈）讀這些物件，替你設定真正處理流量的代理程式。對照表：</p>
+<div class="table-wrap"><table>
+  <tr><th>nginx.conf</th><th>Gateway API</th><th>誰負責</th></tr>
+  <tr><td><code>listen 443 ssl</code></td><td>Gateway 的 <strong>listener</strong>：port、協定</td><td>平台團隊</td></tr>
+  <tr><td><code>ssl_certificate</code></td><td>listener 的 <code>tls.certificateRefs</code>，指到一個存憑證的 Secret</td><td>平台團隊</td></tr>
+  <tr><td><code>server_name</code></td><td>HTTPRoute 的 <code>hostnames</code></td><td>應用團隊</td></tr>
+  <tr><td><code>location</code></td><td>HTTPRoute 的 <code>rules[].matches</code></td><td>應用團隊</td></tr>
+  <tr><td><code>proxy_pass</code></td><td>HTTPRoute 的 <code>backendRefs</code>：Service 名稱與 port</td><td>應用團隊</td></tr>
+</table></div>
+<p>本機叢集的控制器是 cloud-provider-kind（第 4 課替 LoadBalancer Service 開 kindccm 容器的那個）。它看到一個 Gateway，就開一個跑 <strong>Envoy</strong> 的 kindccm 容器（Envoy 是一個跟 nginx 同類的代理伺服器），之後每次你改 HTTPRoute，它就把新的路由規則推給這個 Envoy。在 EKS 上，同樣的物件會由 AWS Load Balancer Controller 變成一台 ALB。</p>
+<figure>
+  <svg viewBox="0 0 700 230" role="img" aria-label="從 Mac 的 curl 經 localhost 的 port 進到 kindccm 容器裡的 Envoy，Envoy 依 HTTPRoute 的規則轉給 Service cafe-api 或 web，再到 Pod。cloud-provider-kind 讀 Gateway 與 HTTPRoute，設定 Envoy">
+    <defs><marker id="g1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="10" y="120" width="120" height="56" rx="8"/>
+    <text class="d-text" x="70" y="143" text-anchor="middle">Mac 的 curl</text>
+    <text class="d-small" x="70" y="163" text-anchor="middle">localhost:5xxxx</text>
+    <path class="d-line" d="M130,148 L188,148" marker-end="url(#g1)"/>
+    <rect class="d-box" x="190" y="110" width="150" height="76" rx="8"/>
+    <text class="d-text" x="265" y="137" text-anchor="middle">Envoy</text>
+    <text class="d-small" x="265" y="157" text-anchor="middle">kindccm 容器</text>
+    <text class="d-small" x="265" y="174" text-anchor="middle">（EKS 上是 ALB）</text>
+    <rect class="d-soft" x="160" y="10" width="210" height="60" rx="8"/>
+    <text class="d-text" x="265" y="35" text-anchor="middle">cloud-provider-kind</text>
+    <text class="d-small" x="265" y="55" text-anchor="middle">讀 Gateway、HTTPRoute</text>
+    <path class="d-line" d="M265,70 L265,108" marker-end="url(#g1)"/>
+    <text class="d-small" x="275" y="94">推設定</text>
+    <path class="d-line" d="M340,130 L418,95" marker-end="url(#g1)"/>
+    <path class="d-line" d="M340,166 L418,195" marker-end="url(#g1)"/>
+    <text class="d-small" x="350" y="100">/products</text>
+    <text class="d-small" x="372" y="205">/</text>
+    <rect class="d-box" x="420" y="70" width="130" height="46" rx="8"/>
+    <text class="d-text" x="485" y="98" text-anchor="middle">Service cafe-api</text>
+    <rect class="d-box" x="420" y="172" width="130" height="46" rx="8"/>
+    <text class="d-text" x="485" y="200" text-anchor="middle">Service web</text>
+    <path class="d-line" d="M550,93 L598,93" marker-end="url(#g1)"/>
+    <path class="d-line" d="M550,195 L598,195" marker-end="url(#g1)"/>
+    <rect class="d-soft" x="600" y="70" width="90" height="46" rx="8"/>
+    <text class="d-text" x="645" y="98" text-anchor="middle">Pod</text>
+    <rect class="d-soft" x="600" y="172" width="90" height="46" rx="8"/>
+    <text class="d-text" x="645" y="200" text-anchor="middle">Pod</text>
+  </svg>
+  <figcaption>本機叢集的請求路徑。你只寫 Gateway 與 HTTPRoute；Envoy 的設定由控制器產生。</figcaption>
+</figure>
+<p>為什麼不每個服務開一個第 4 課的 LoadBalancer Service 就好？LoadBalancer 是第 4 層（L4）的：它只看 IP 和 port，不看 HTTP 的網域和路徑，所以一個服務就要一個對外位址，在雲端就是一台要付錢的負載平衡器。入口是第 7 層（L7）的：看得懂 HTTP，一個位址就能依網域、路徑、標頭分給很多服務，還能逐個請求分配流量（第 4 課講過 kube-proxy 是以連線為單位）。</p>
+
+<h2>Ingress 與 Gateway API：為什麼換</h2>
+<p>Kubernetes 最早的入口 API 叫 <strong>Ingress</strong>。它只定義了兩件事：主機名稱與路徑。其他功能（改寫路徑、逾時、上傳大小、金絲雀、轉址）都沒有欄位，每一家實作 Ingress 的程式（叫 <strong>Ingress controller</strong>）各自用 annotation 擴充，寫法互不相容：</p>
+<pre>metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$2          # 只有 Ingress NGINX 看得懂
+    nginx.ingress.kubernetes.io/proxy-body-size: 8m
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "10"</pre>
+<p>annotation 是任意字串，API server 不檢查，打錯字不會報錯，只是沒效果；換一家 controller，整套 annotation 要重寫。更麻煩的是一個 Ingress 物件同時放了「入口設定」和「各服務的路由」，誰能改它，誰就能動整個入口。</p>
+<p>現況（2026 年 11 月）：</p>
+<ul>
+  <li><strong>Ingress NGINX 已退役</strong>：這是最多人用的 Ingress controller（<code>kubernetes/ingress-nginx</code>）。SIG Network 與安全回應委員會在 2025 年 11 月 11 日宣布退役，2026 年 3 月起不再發佈新版、不修 bug、<strong>不修安全漏洞</strong>，GitHub repo 已封存。已經裝的不會自己壞掉，但出了漏洞沒有人修。</li>
+  <li><strong>Ingress API 凍結</strong>：<code>networking.k8s.io/v1</code> 的 Ingress 沒有被移除，舊 manifest 照樣能 apply，但不會再加新功能。</li>
+  <li><strong>Gateway API</strong>（<code>gateway.networking.k8s.io/v1</code>）是官方的接班人：Gateway、GatewayClass、HTTPRoute 都已 GA（正式穩定）。最新版是 v1.7.0；本機的 cloud-provider-kind 0.12.0 內建的是 v1.6.1 的 standard channel，這課只用 v1 的 GA 欄位。</li>
+</ul>
+<p>Gateway API 本身只是規格（一組 CRD，也就是 Kubernetes 的自訂物件型別），要有實作才會動。常見的實作：</p>
+<div class="table-wrap"><table>
+  <tr><th>實作</th><th>在哪裡用</th></tr>
+  <tr><td>cloud-provider-kind</td><td>這門課的本機 kind 叢集（底層 Envoy）</td></tr>
+  <tr><td>AWS Load Balancer Controller</td><td>EKS：v3.0.0（2026 年 1 月）起 Gateway API 支援 GA，HTTPRoute 變成 ALB 的規則</td></tr>
+  <tr><td>Envoy Gateway、Traefik、Istio、Cilium</td><td>自己管理入口代理、或已經用這些網路／service mesh 元件的叢集</td></tr>
+</table></div>
+<p>規格把功能分成 <strong>Core</strong>（每個實作都必須支援，有一致性測試）和 <strong>Extended</strong>（選擇性支援）。實作支援哪些 Extended 功能，寫在 GatewayClass 的 <code>status.supportedFeatures</code>：</p>
+<pre>kubectl get gatewayclass cloud-provider-kind -o jsonpath='{range .status.supportedFeatures[*]}{.name}{"\n"}{end}'
+# Gateway、HTTPRoute、HTTPRoute303RedirectStatusCode、HTTPRouteQueryParamMatching、ReferenceGrant……
+# 沒有 HTTPRoutePathRewrite、HTTPRouteSchemeRedirect：這兩個功能本機用不了，後面會實際看到後果</pre>
+<p>選實作、或從 Ingress 搬家之前，先拿你需要的功能對這張清單。</p>
+
+<h2>三種物件、兩種角色</h2>
+<p>Gateway API 把 Ingress 那一個物件拆成三種，對應公司裡兩種角色：</p>
+<ul>
+  <li><strong>GatewayClass</strong>：用哪一種實作，例如 <code>cloud-provider-kind</code>。叢集層級，通常安裝實作時就建好了。</li>
+  <li><strong>Gateway</strong>：一個實際的入口，有一個或多個 <strong>listener</strong>（接收點：port、協定、主機名稱、TLS 憑證）。由平台團隊管理，常放在 <code>infra</code> 這類專用的 namespace。</li>
+  <li><strong>HTTPRoute</strong>：符合哪些條件的 HTTP 請求要送到哪些 Service。由應用團隊寫在自己服務的 namespace，用 <strong>parentRefs</strong> 指定掛在哪個 Gateway 上。</li>
+</ul>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="平台團隊在 infra namespace 管 GatewayClass 與 Gateway，Gateway 的 allowedRoutes 只允許有 shared-gateway 標籤的 namespace；orders 與 menu 兩個應用團隊在自己的 namespace 寫 HTTPRoute，用 parentRefs 掛上 Gateway，後端是自己 namespace 的 Service">
+    <defs><marker id="g2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="10" y="10" width="300" height="230" rx="10"/>
+    <text class="d-small" x="25" y="32">平台團隊・namespace infra</text>
+    <rect class="d-box" x="30" y="45" width="260" height="50" rx="8"/>
+    <text class="d-text" x="160" y="68" text-anchor="middle">GatewayClass</text>
+    <text class="d-small" x="160" y="86" text-anchor="middle">用哪種實作（叢集層級）</text>
+    <path class="d-line" d="M160,95 L160,123" marker-end="url(#g2)"/>
+    <rect class="d-box" x="30" y="125" width="260" height="100" rx="8"/>
+    <text class="d-text" x="160" y="148" text-anchor="middle">Gateway</text>
+    <text class="d-small" x="45" y="170">listener：HTTPS 443、*.cafe.test</text>
+    <text class="d-small" x="45" y="190">憑證：Secret cafe-tls</text>
+    <text class="d-small" x="45" y="210">allowedRoutes：誰可以掛上來</text>
+    <rect class="d-soft" x="390" y="10" width="300" height="105" rx="10"/>
+    <text class="d-small" x="405" y="32">orders 團隊・namespace orders</text>
+    <rect class="d-box" x="405" y="45" width="130" height="55" rx="8"/>
+    <text class="d-text" x="470" y="70" text-anchor="middle">HTTPRoute</text>
+    <text class="d-small" x="470" y="88" text-anchor="middle">api.cafe.test</text>
+    <rect class="d-box" x="550" y="45" width="125" height="55" rx="8"/>
+    <text class="d-text" x="612" y="78" text-anchor="middle">Service</text>
+    <path class="d-line" d="M535,72 L548,72" marker-end="url(#g2)"/>
+    <rect class="d-soft" x="390" y="135" width="300" height="105" rx="10"/>
+    <text class="d-small" x="405" y="157">menu 團隊・namespace menu</text>
+    <rect class="d-box" x="405" y="170" width="130" height="55" rx="8"/>
+    <text class="d-text" x="470" y="195" text-anchor="middle">HTTPRoute</text>
+    <text class="d-small" x="470" y="213" text-anchor="middle">www.cafe.test/menu</text>
+    <rect class="d-box" x="550" y="170" width="125" height="55" rx="8"/>
+    <text class="d-text" x="612" y="203" text-anchor="middle">Service</text>
+    <path class="d-line" d="M535,197 L548,197" marker-end="url(#g2)"/>
+    <path class="d-line" d="M405,72 L292,160" marker-end="url(#g2)"/>
+    <path class="d-line" d="M405,197 L292,185" marker-end="url(#g2)"/>
+    <text class="d-small" x="318" y="110">parentRefs</text>
+  </svg>
+  <figcaption>平台團隊決定入口、憑證、誰能用；應用團隊只管自己的路由。</figcaption>
+</figure>
+<p>這樣切開的好處是權限可以分開給（第 12 課的 RBAC）：應用團隊只要有自己 namespace 的 HTTPRoute 權限，不用碰得到入口的憑證或其他團隊的路由。Ingress 把兩者放在同一個物件，常常只好給應用團隊過大的權限。</p>
+<p>Gateway 用 listener 的 <strong>allowedRoutes</strong> 決定哪些 namespace 的 Route 可以掛上來：</p>
+<div class="table-wrap"><table>
+  <tr><th><code>allowedRoutes.namespaces.from</code></th><th>意思</th><th>什麼時候用</th></tr>
+  <tr><td><code>Same</code>（預設）</td><td>只有跟 Gateway 同一個 namespace 的 Route</td><td>一個團隊自己的入口；這課的練習</td></tr>
+  <tr><td><code>Selector</code></td><td>namespace 的標籤符合 selector 的才行</td><td>共用入口：平台團隊替可以上線的 namespace 加標籤</td></tr>
+  <tr><td><code>All</code></td><td>任何 namespace</td><td>幾乎不要用：任何人寫一條 <code>hostnames: [cafe.test]</code> 的 Route 就能分走你的流量</td></tr>
+</table></div>
+<p>反方向也有管制：HTTPRoute 的 backendRefs 指到<strong>別的 namespace</strong> 的 Service 時，那個 namespace 要建一個 <strong>ReferenceGrant</strong>，明確說「允許某 namespace 的 HTTPRoute 參照我的 Service」，否則參照無效。這樣別人不能隨便把流量導進你的服務：</p>
+<pre>apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-infra-routes
+  namespace: orders           # 被參照的一方建立
+spec:
+  from:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    namespace: infra          # 允許 infra 的 HTTPRoute
+  to:
+  - group: ""
+    kind: Service             # 參照這個 namespace 的 Service</pre>
+<div class="callout practice"><strong>💡 實務上：新服務要對外，開發初期就跟平台團隊確認入口</strong><br>在有平台團隊的公司，應用團隊通常不自己建 Gateway，而是把 HTTPRoute 掛到共用的 Gateway 上。要掛得上去，有幾件事是平台團隊的設定：自己的 namespace 有沒有被 allowedRoutes 允許、要用的網域歸誰管、listener 的憑證有沒有涵蓋這個網域。臨上線才發現 Route 掛不上去，就得等別人排時間。資深工程師會在開發初期就開單確認，順便問清楚入口的逾時、上傳大小這些限制是多少。</div>
+
+<h2>第一條 HTTPRoute，以及怎麼讀 status</h2>
+<p>先建入口。listener 的名字之後可以用來指定「只掛在這個 listener」：</p>
+<pre>apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: cafe-gw
+spec:
+  gatewayClassName: cloud-provider-kind   # 用哪種實作
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+    allowedRoutes:
+      namespaces:
+        from: Same                         # 預設就是 Same，寫出來讓讀的人一眼看懂</pre>
+<p>再寫路由。cafe-api 自己的路由是 <code>/products</code>、<code>/orders</code>，其他路徑交給網站 web：</p>
+<pre>apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: cafe
+spec:
+  parentRefs:
+  - name: cafe-gw              # 掛在哪個 Gateway（同 namespace 時只寫名字）
+  hostnames:
+  - cafe.test                  # 只接 Host: cafe.test 的請求
+  rules:
+  - matches:                   # 兩個 match 之間是「或」
+    - path: { type: PathPrefix, value: /products }
+    - path: { type: PathPrefix, value: /orders }
+    backendRefs:
+    - name: cafe-api           # Service 名稱
+      port: 80                 # Service 的 port（不是容器的 3000）
+  - matches:
+    - path: { type: PathPrefix, value: / }
+    backendRefs:
+    - name: web
+      port: 80</pre>
+<p>套用之後，從 Mac 打打看。<code>cafe.test</code> 不是真的網域，所以用 <code>-H 'Host: …'</code> 自己帶 Host 標頭，效果跟瀏覽器打 <code>http://cafe.test</code> 一樣：</p>
+<pre>kubectl apply -n k8s-05-ex1 -f kubernetes/practice/work/05/ex1/
+URL=$(node kubernetes/practice/bin/url.mjs k8s-05-ex1 gateway/cafe-gw)    # http://localhost:5xxxx
+curl -i -H 'Host: cafe.test' $URL/products     # 200，x-instance: cafe-api-…
+curl -i -H 'Host: cafe.test' $URL/about        # 200，{"name":"web",…}
+curl -i -H 'Host: other.test' $URL/products    # 404，server: envoy，沒有 x-instance：Gateway 自己回的</pre>
+<p>沒有通的時候，第一件事是看 status。<code>kubectl apply</code> 只檢查格式，路由能不能生效是控制器之後才決定的，結果只寫在物件的 <code>status.conditions</code>，apply 永遠顯示成功：</p>
+<pre>kubectl get gateway -n k8s-05-ex1          # PROGRAMMED 要是 True
+kubectl describe httproute cafe -n k8s-05-ex1
+# Status:
+#   Parents:
+#     Conditions:
+#       Type: Accepted      Status: True    Reason: Accepted        ← Gateway 接受了這條 Route
+#       Type: ResolvedRefs  Status: True    Reason: ResolvedRefs    ← backendRefs 都找得到</pre>
+<div class="table-wrap"><table>
+  <tr><th>你看到的</th><th>原因</th><th>怎麼查、怎麼修</th></tr>
+  <tr><td>Route 的 status 是空的</td><td>parentRefs 指的 Gateway 名稱不對，或 Gateway 的 class 沒有控制器</td><td><code>kubectl get gateway</code> 對名稱；<code>kubectl get gatewayclass</code> 看 ACCEPTED</td></tr>
+  <tr><td>Accepted=False，NotAllowedByListeners</td><td>listener 的 allowedRoutes 不允許這個 namespace</td><td>請平台團隊加標籤或調 allowedRoutes</td></tr>
+  <tr><td>Accepted=False，UnsupportedValue</td><td>用了這個實作不支援的功能</td><td>看 message 和 GatewayClass 的 supportedFeatures</td></tr>
+  <tr><td>ResolvedRefs=False，BackendNotFound</td><td>backendRefs 的 Service 名稱打錯或不存在</td><td><code>kubectl get svc</code> 對名稱</td></tr>
+  <tr><td>ResolvedRefs=False，RefNotPermitted</td><td>跨 namespace 參照，對方沒有 ReferenceGrant</td><td>請對方建 ReferenceGrant</td></tr>
+  <tr><td>status 都正常，但請求 404</td><td>Host 或路徑沒有任何規則符合</td><td>對 hostnames 與 matches</td></tr>
+  <tr><td>status 都正常，但請求 503 或逾時</td><td>Service 沒有 Ready 的 Pod，或 backendRefs 的 port 寫錯</td><td>第 4 課的排查順序：EndpointSlice、targetPort</td></tr>
+</table></div>
+<div class="callout warn">本機實測（cloud-provider-kind 0.12.0）：backendRefs 的 port 寫成容器的 3000（Service 只有 80）時，它<strong>不會</strong>把 ResolvedRefs 設成 False，status 全部正常，請求卻卡住直到逾時。只有名稱錯才會變 BackendNotFound。不同實作檢查的嚴格程度不一樣，所以 status 正常之後還要真的打一個請求。</div>
+
+<h2>比對規則：路徑、標頭、優先順序</h2>
+<p>路徑有兩種常用的比對方式：</p>
+<div class="table-wrap"><table>
+  <tr><th>type</th><th><code>value: /orders</code> 符合</th><th>不符合</th></tr>
+  <tr><td><code>PathPrefix</code></td><td><code>/orders</code>、<code>/orders/</code>、<code>/orders/42</code></td><td><code>/ordersx</code>：前綴以「/ 分隔的一段」為單位比，不是字串開頭</td></tr>
+  <tr><td><code>Exact</code></td><td>只有 <code>/orders</code></td><td><code>/orders/</code>、<code>/orders/42</code></td></tr>
+</table></div>
+<p>一個請求可能同時符合好幾條規則（例如 <code>/orders/42</code> 符合 <code>/orders</code> 也符合 <code>/</code>），但只會送到一條。規格定的優先順序，依序比：</p>
+<ol>
+  <li>Exact 比 PathPrefix 優先。</li>
+  <li>PathPrefix 之間，字元多（越長）的優先。</li>
+  <li>有 method 條件的優先。</li>
+  <li>標頭條件越多的優先。</li>
+  <li>查詢參數條件越多的優先。</li>
+  <li>還是平手：建立時間早的 Route 優先，再來是「namespace/名稱」的字母順序；同一個 Route 裡才看 rule 列出的順序。</li>
+</ol>
+<p>跟 nginx 的 location 一樣，前面幾項分得出高下時跟你寫的順序無關，所以 <code>/</code> 放第一條也不會搶走 <code>/orders</code>。</p>
+<p><strong>標頭比對</strong>寫在 match 裡。同一個 match 裡的條件是「而且」，同一個 rule 的多個 match 之間是「或」：</p>
+<pre>matches:
+- path: { type: PathPrefix, value: /orders }
+  headers:                      # 同一個 match：路徑是 /orders 而且 X-Canary 是 1
+  - name: X-Canary
+    value: "1"                  # 值一定是字串，1 要加引號
+- path: { type: Exact, value: /healthz }    # 另一個 match：或者路徑剛好是 /healthz</pre>
+<p><strong>權重分流</strong>（weighted routing）：一個 rule 的 backendRefs 列好幾個後端，各給一個 <code>weight</code>，流量依<strong>比例</strong>分配（90 和 10、9 和 1 都是 9:1；沒寫 weight 時是 1，寫 0 就不送）。Envoy 是逐個請求抽籤，所以實際比例會在 10% 附近上下跳。這就是 <a href="../../devops/lessons/16-cd.html">devops 課第 16 課</a>的金絲雀：新版 v2 先拿 10% 的真實流量，觀察錯誤率和延遲，沒問題再調成 50、100；有問題就把 v2 的 weight 改回 0，不用重新部署。</p>
+<p>另一種常見需求是「公司內部的人先試新版，顧客不受影響」：用標頭當開關，帶 <code>X-Canary: 1</code> 的一律到 v2。兩者的取捨：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>權重</th><th>標頭</th></tr>
+  <tr><td>誰會用到新版</td><td>隨機一部分真實顧客</td><td>只有知道要帶標頭的人（QA、內部 App 版本）</td></tr>
+  <tr><td>適合</td><td>驗證新版在真實流量下的錯誤率、延遲</td><td>上線前在正式環境做功能測試</td></tr>
+  <tr><td>要注意</td><td>同一個使用者連續兩個請求可能一個 v1 一個 v2，兩版的 API 與資料格式要相容</td><td>不能測到真實流量的壓力</td></tr>
+</table></div>
+<p>練習 2 會把兩種組在同一條 HTTPRoute 裡：標頭那條規則的條件比較多，所以比權重那條優先。</p>
+<div class="callout practice"><strong>💡 實務上：金絲雀要先講好看哪些指標、誰決定往下推</strong><br>把 v2 的 weight 調成 10 只是開始，真正的工作是觀察：v2 的錯誤率、p95 延遲跟 v1 比有沒有變差（<a href="../../devops/lessons/22-metrics-slo.html">devops 課第 22 課</a>的指標）。上線前先跟團隊講好「看哪幾個數字、觀察多久、超過多少就把 weight 改回 0」，出事時才不用臨時開會。資深工程師還會先問：v2 有沒有改資料庫 schema 或 API 的回應格式？同一個使用者可能前後打到兩版，不相容的改動要拆成幾次上線，讓兩版能同時存在。</div>
+
+<h2>HTTPS：在 Gateway 終結 TLS</h2>
+<p><strong>TLS 終結</strong>（TLS termination）是在入口把 HTTPS 解密，後面到 Service 用 HTTP。這跟 devops 課 nginx 的做法一樣：憑證只放在入口，cafe-api 不用處理 TLS。步驟：</p>
+<p>步驟一：產生憑證。本機用 devops 課第 5 課的方法自己當 CA，簽一張 SAN 是 <code>DNS:cafe.test</code> 的憑證（<code>openssl req -x509 …</code> 做 CA、<code>openssl req -newkey …</code> 產生金鑰和 CSR、<code>openssl x509 -req … -extfile</code> 簽發）。</p>
+<p>步驟二：把憑證和金鑰放進叢集。<strong>Secret</strong> 是 Kubernetes 存機密資料的物件（第 6 課會詳細講），<code>type: kubernetes.io/tls</code> 的 Secret 有固定的兩個欄位 <code>tls.crt</code>、<code>tls.key</code>。直接從檔案建立，不要寫成 YAML 檔：</p>
+<pre>kubectl create secret tls cafe-tls -n k8s-05-ex3 --cert=server.crt --key=server.key \
+  --dry-run=client -o yaml | kubectl apply -f -
+# --dry-run=client -o yaml 只產生 YAML 不送出，交給 apply：Secret 已存在時會更新，腳本可以重複執行</pre>
+<div class="callout warn">Secret 的 YAML 裡金鑰只是 <strong>base64</strong>，不是加密，任何人 <code>base64 -d</code> 就還原了。把它寫進 manifest 檔再 commit，等於把金鑰公開在 git 歷史裡。正式環境用 cert-manager 自動簽發並寫進 Secret，或在 EKS 上用 AWS Certificate Manager（ACM）管理憑證、掛在 ALB 上，金鑰根本不進叢集。</div>
+<p>步驟三：Gateway 加一個 HTTPS listener：</p>
+<pre>listeners:
+- name: http
+  protocol: HTTP
+  port: 80
+  allowedRoutes: { namespaces: { from: Same } }
+- name: https
+  protocol: HTTPS
+  port: 443
+  hostname: cafe.test             # 這個 listener 只接 cafe.test（要跟憑證的 SAN 一致）
+  tls:
+    mode: Terminate               # 在 Gateway 解密
+    certificateRefs:
+    - name: cafe-tls              # 同 namespace 的 tls Secret
+  allowedRoutes: { namespaces: { from: Same } }</pre>
+<p>步驟四：HTTP 的請求不要直接送到後端，一律轉址到 HTTPS。路由用 <code>sectionName</code> 指定只掛在某個 listener：</p>
+<pre>apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: web
+spec:
+  parentRefs:
+  - name: cafe-gw
+    sectionName: https            # 只掛在 HTTPS listener
+  hostnames: [cafe.test]
+  rules:
+  - backendRefs: [{ name: web, port: 80 }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: to-https
+spec:
+  parentRefs:
+  - name: cafe-gw
+    sectionName: http             # 只掛在 HTTP listener
+  hostnames: [cafe.test]
+  rules:
+  - filters:                      # filter：對請求做額外處理
+    - type: RequestRedirect       # 直接回轉址，不送到任何後端
+      requestRedirect:
+        scheme: https
+        statusCode: 301           # 不寫是 302（暫時轉址）</pre>
+<p>沒寫 sectionName 的話，<code>web</code> 這條會同時掛在兩個 listener 上，HTTP 也直接送到 web，等於沒有強制 HTTPS。</p>
+<p>驗證。<code>--resolve</code> 讓 curl 把 <code>cafe.test</code> 解析到 127.0.0.1，同時送正確的 SNI 和 Host，<code>--cacert</code> 只信任你自己的 CA：</p>
+<pre>URL=$(node kubernetes/practice/bin/url.mjs k8s-05-ex3 gateway/cafe-gw 443); PORT=${URL##*:}
+curl -i --cacert kubernetes/practice/work/05/ex3/ca.crt --resolve cafe.test:$PORT:127.0.0.1 https://cafe.test:$PORT/menu
+HTTP=$(node kubernetes/practice/bin/url.mjs k8s-05-ex3 gateway/cafe-gw 80)
+curl -i -H 'Host: cafe.test' $HTTP/menu      # 301 Moved Permanently</pre>
+<div class="callout warn">本機實測：cloud-provider-kind 0.12.0 回了 301，但 <code>Location</code> 仍是 <code>http://cafe.test/menu</code>。轉址的 scheme 屬於 Extended 功能 HTTPRouteSchemeRedirect，它的 supportedFeatures 裡沒有，產生 Envoy 設定時只用了 hostname 和 statusCode，scheme 被略過了，status 還是顯示 Accepted。Envoy Gateway、AWS Load Balancer Controller 這類支援這項功能的實作，Location 會是 <code>https://…</code>。這是「先看 supportedFeatures」的實際例子：規格寫得到，不代表你用的實作做得到。練習 3 的測試因此只檢查 301 與 YAML 裡的 <code>scheme: https</code>。</div>
+
+<h2>舊的 Ingress 怎麼搬</h2>
+<p>接手舊專案時，常看到這種 Ingress（練習 4 的檔案）。先讀懂它：</p>
+<pre>apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cafe-menu
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx                   # 交給 Ingress NGINX 處理
+  rules:
+  - host: www.cafe.test                     # = hostnames
+    http:
+      paths:
+      - path: /menu(/|$)(.*)                # 正規表示式，(.*) 抓到的是 $2
+        pathType: ImplementationSpecific    # 比對方式由 controller 決定
+        backend:
+          service: { name: menu, port: { number: 80 } }   # = backendRefs</pre>
+<p>這條規則的意思：<code>/menu/items</code> 轉給 menu 時改成 <code>/items</code>，<code>/menu</code> 改成 <code>/</code>。就是 devops 課 <code>proxy_pass http://api:3000/;</code> 結尾斜線那個效果。對應的 Gateway API 寫法是 <strong>URLRewrite</strong> filter：</p>
+<pre>rules:
+- matches:
+  - path: { type: PathPrefix, value: /menu }
+  filters:
+  - type: URLRewrite
+    urlRewrite:
+      path:
+        type: ReplacePrefixMatch    # 把比對到的前綴 /menu 換掉
+        replacePrefixMatch: /       # 換成 /：/menu/items → /items
+  backendRefs: [{ name: menu, port: 80 }]</pre>
+<p>其他欄位的對應：Ingress 的 <code>pathType: Prefix</code> 就是 <code>PathPrefix</code>（兩者都以 <code>/</code> 分隔的段落比對）、<code>Exact</code> 就是 <code>Exact</code>，<code>host</code> 變成 <code>hostnames</code>，<code>backend.service</code> 變成 <code>backendRefs</code>。</p>
+<p>可是 URLRewrite 是 Extended 功能（HTTPRoutePathRewrite），本機的 cloud-provider-kind 0.12.0 不支援。實際套用的結果：</p>
+<pre>kubectl get httproute www -o jsonpath='{.status.parents[0].conditions}'
+# Accepted=True
+# PartiallyInvalid=True  Dropped Rule(s): rule[0] has unsupported filter type "URLRewrite"
+curl -H 'Host: www.cafe.test' $URL/menu/items
+# {"name":"web","path":"/menu/items"}     ← /menu 那條被丟掉，請求落到 / 的 web</pre>
+<p>這是遷移最危險的情況：沒有錯誤、Route 也是 Accepted，只是有一條規則沒生效，流量默默送錯地方。只有讀 status 的 <code>PartiallyInvalid</code> 或實際打請求才發現得到。</p>
+<p>官方有轉換工具 <strong>ingress2gateway</strong>（目前 v1.2.0，<code>brew install ingress2gateway</code>），讀 Ingress 和 Ingress NGINX 的 annotation，印出對應的 Gateway API 物件，翻不了的會列出警告：</p>
+<pre>ingress2gateway print --providers=ingress-nginx --input-file ingress.yaml</pre>
+<p>工具只是起點，產出要逐項檢查。annotation 是遷移時最容易漏的，常見的幾個：</p>
+<div class="table-wrap"><table>
+  <tr><th>Ingress NGINX annotation</th><th>Gateway API</th><th>要確認的事</th></tr>
+  <tr><td><code>rewrite-target</code></td><td>URLRewrite filter</td><td>實作是否支援 HTTPRoutePathRewrite；不支援就換實作，或讓服務直接用對外的路徑</td></tr>
+  <tr><td><code>ssl-redirect</code></td><td>RequestRedirect filter</td><td>Ingress 有設 TLS 時，Ingress NGINX 預設就會把 HTTP 用 308 轉到 HTTPS；搬過來要自己寫轉址路由，否則 HTTP 會直接送到後端</td></tr>
+  <tr><td><code>proxy-read-timeout</code></td><td>rule 的 <code>timeouts</code>（Extended：HTTPRouteRequestTimeout）</td><td>預設值各家不同，SSE、長輪詢的路徑特別注意</td></tr>
+  <tr><td><code>proxy-body-size</code></td><td>沒有標準欄位</td><td>用實作自己的擴充設定；上傳功能要實際測大檔案</td></tr>
+  <tr><td><code>canary-weight</code></td><td>backendRefs 的 <code>weight</code></td><td>Core 功能，各實作都支援</td></tr>
+</table></div>
+<div class="callout practice"><strong>💡 實務上：從 Ingress NGINX 搬家，先盤點再切換</strong><br>Ingress NGINX 不再修安全漏洞之後，很多團隊的待辦清單上都有這一項。第一步是盤點：列出所有 Ingress 和用到的 annotation，對照目標實作的 supportedFeatures，先找出翻不過去的功能。切換時，新的 Gateway 跟舊的 Ingress 先並存（不同的對外位址），用同一組請求表打兩邊、比對回應，全部一致再切 DNS，舊的留到確定不用回滾再刪；練習 4 的測試就是這個做法的縮小版。上傳大小、逾時這類沒有標準欄位的設定最容易漏，要找負責上傳、匯出功能的人一起確認。</div>
+
+<h2>練習</h2>
+<p>四題都在 <code>kubernetes/practice/work/05/</code>，每題一個資料夾。<code>backends.yaml</code> 是測試提供的後端（cafe-api，或設了 <code>ECHO_NAME</code>、會回傳收到的主機與路徑的版本），不用改。測試會把整個資料夾套用到 <code>k8s-05-exN</code> 這個 namespace；自己試的時候也用同一個名字：</p>
+<pre>export KUBECONFIG="$PWD/kubernetes/practice/.kube/config"
+kubectl create namespace k8s-05-ex1
+kubectl apply -n k8s-05-ex1 -f kubernetes/practice/work/05/ex1/
+kubectl get gateway,httproute -n k8s-05-ex1</pre>
+<p>每個 Gateway 會多開一個 kindccm 容器，做完一題就 <code>kubectl delete namespace k8s-05-exN</code>（測試結束時也會自己刪）。</p>
+
+<div class="local" data-test="ex1" data-files="ex1/gateway.yaml ex1/route.yaml">
+  <p>練習 1：完成兩個檔案。<code>gateway.yaml</code>：Gateway <code>cafe-gw</code>，class <code>cloud-provider-kind</code>，一個 HTTP 80 的 listener，明確寫出只允許同 namespace 的 Route。<code>route.yaml</code>：HTTPRoute <code>cafe</code> 掛在 cafe-gw，只接 <code>cafe.test</code>；<code>/products</code> 與 <code>/orders</code> 開頭的路徑送到 Service <code>cafe-api</code>，其他路徑送到 <code>web</code>。測試會跑 kubeconform，套用後檢查 Gateway Programmed、Route 的 Accepted 與 ResolvedRefs，再從 Mac 經 <code>bin/url.mjs</code> 的網址打 <code>/products</code>、<code>/orders/42</code>、<code>/about</code>，以及 Host 是 <code>other.test</code> 的請求（要 404）。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="ex2/route.yaml">
+  <p>練習 2：金絲雀。<code>ex2/</code> 有 cafe-api-v1、cafe-api-v2 兩個 Service 和現成的 Gateway <code>cafe-gw</code>。改 <code>route.yaml</code>：帶 <code>X-Canary: 1</code> 標頭的請求一律到 v2；其他請求 v1:v2 依 9:1 分流。只改路由，不要再建 Gateway。測試從叢集裡經 Gateway 送 30 個帶標頭的請求（要全部到 v2）和 300 個不帶標頭的請求（v2 的比例要在 4%～18% 之間，留了機率波動的餘裕），並檢查 YAML 的權重比例。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="ex3/setup.sh ex3/gateway.yaml ex3/routes.yaml">
+  <p>練習 3：HTTPS。完成 <code>setup.sh</code>：在 <code>ex3/</code> 產生 CA（<code>ca.key</code>、<code>ca.crt</code>）與 cafe.test 的憑證（<code>server.key</code>、<code>server.crt</code>，SAN 是 <code>DNS:cafe.test</code>），再建立 tls Secret <code>cafe-tls</code>；namespace 從第一個參數拿，重複執行也要成功。<code>gateway.yaml</code> 加一個 HTTPS 443 listener（hostname cafe.test，用 cafe-tls 終結 TLS）；<code>routes.yaml</code> 改成 HTTPS 送到 web、HTTP 一律 301 轉到 https。任何 YAML 檔都不能有 Secret 或金鑰（<code>.gitignore</code> 已經排除金鑰與憑證檔）。測試會執行兩次 <code>bash setup.sh k8s-05-ex3</code>，套用後用 <code>ca.crt</code> 驗證 <code>https://cafe.test</code>，再確認 HTTP 回 301 而且沒有送到 web。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="ex4/route.yaml">
+  <p>練習 4：把 <code>ex4/ingress.yaml.txt</code>（舊專案的兩個 Ingress：兩個主機、四條路徑、一個 rewrite-target）改寫成 <code>route.yaml</code> 裡的 HTTPRoute，掛在現成的 cafe-gw 上，rewrite 用 URLRewrite filter。測試先比對兩邊的每一條規則（主機、比對方式、路徑、後端、rewrite），再對 Gateway 打一組請求，確認送到的後端和後端收到的路徑都跟 Ingress 時一樣。本機實作不支援 URLRewrite，<code>/menu</code> 那條規則會被丟掉（status 會出現 PartiallyInvalid），所以 rewrite 只做靜態檢查，請求表不含 <code>/menu</code>；套用後自己用 <code>kubectl describe httproute</code> 看看那個條件。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：新專案要對外提供 HTTP API，入口應該選哪個？</p>
+  <label data-key="a">Ingress＋Ingress NGINX，因為網路上的範例最多</label>
+  <label data-key="b">Gateway API：Ingress API 已凍結、Ingress NGINX 已退役不再修安全漏洞，新功能都在 Gateway API</label>
+  <label data-key="c">每個服務各開一個 LoadBalancer Service</label>
+  <label data-key="d">NodePort 加上自己維護的 nginx</label>
+  <p class="why">✓ 入口直接面對網際網路，選一個不再有安全修補的元件風險最高。a 範例雖多，但控制器已退役；c 是 L4，看不懂網域和路徑，在雲端每個服務都是一台要付錢的負載平衡器；d 等於自己維護入口的設定、高可用和更新，Kubernetes 的好處都沒用到。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：HTTPRoute 的 status 顯示 <code>ResolvedRefs=False</code>、reason <code>BackendNotFound</code>。最可能的原因是？</p>
+  <label data-key="a">Gateway 沒有設定 TLS</label>
+  <label data-key="b">backendRefs 指到的 Service 不存在或名稱打錯</label>
+  <label data-key="c">後端的 Pod 還沒 Ready</label>
+  <label data-key="d">hostnames 寫錯</label>
+  <p class="why">✓ ResolvedRefs 檢查的是 Route 參照的物件找不找得到（跨 namespace 沒有 ReferenceGrant 時則是 RefNotPermitted）。c 的參照本身有效，status 正常，但請求會 503；d 是請求比對不到規則，Gateway 回 404；a 跟這條 Route 的參照無關。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：為什麼 Gateway API 把 Gateway 和 HTTPRoute 分成兩個物件？</p>
+  <label data-key="a">為了相容舊版的 Ingress</label>
+  <label data-key="b">平台團隊管入口（位址、憑證、哪些 namespace 能用），應用團隊只管自己服務的路由，不必拿到整個入口的權限</label>
+  <label data-key="c">HTTPRoute 處理請求比 Gateway 快</label>
+  <label data-key="d">一個 Gateway 只能掛一條 HTTPRoute</label>
+  <p class="why">✓ 角色分離是 Gateway API 的設計重點，配合 RBAC 與 allowedRoutes 控制誰能掛什麼。Ingress 把兩者混在一個物件，常常要給應用團隊過大的權限。c 不對：兩者都只是設定，真正處理請求的是 Envoy、ALB 這類代理；d 不對：一個 Gateway 可以掛很多 Route。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 8：你把舊的 Ingress 搬成 HTTPRoute，<code>kubectl apply</code> 成功，Route 也是 <code>Accepted=True</code>，但 <code>/menu/items</code> 的請求跑到了網站首頁的服務。第一步該看什麼？</p>
+  <label data-key="a">重新 apply 一次，可能是控制器還沒更新</label>
+  <label data-key="b">把 Route 刪掉重建</label>
+  <label data-key="c">看 Route 的其他 status 條件（例如 PartiallyInvalid）和 GatewayClass 的 supportedFeatures，確認那條規則用的功能這個實作有沒有支援</label>
+  <label data-key="d">改用 Ingress，因為 Ingress 比較穩定</label>
+  <p class="why">✓ 實作遇到不支援的 Extended 功能時，可能只丟掉那一條規則，Route 仍然 Accepted，流量落到下一條符合的規則（這裡是 <code>/</code>）。status 的 PartiallyInvalid 會寫出被丟掉的規則和原因。a、b 不會改變結果；d 是回到已經退役的元件。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>apply 成功就以為生效了</strong>：Route 被拒絕、後端找不到、規則被丟掉，都只寫在 status 的條件裡。apply 之後看 <code>kubectl describe httproute</code> 的 Accepted、ResolvedRefs、PartiallyInvalid，再真的打一個請求。</li>
+  <li><strong>HTTPRoute 沒寫 hostnames</strong>：它會接下這個 listener 上所有網域的請求，可能搶走別的服務的流量。每條 Route 都寫 hostnames。</li>
+  <li><strong>Gateway 的 allowedRoutes 設成 All</strong>：任何 namespace 的人都能寫一條 Route 掛上你的網域。用 Same 或 Selector 限制。</li>
+  <li><strong>backendRefs 的 port 寫成容器的 port</strong>：backendRefs 指的是 Service，要寫 Service 的 port（第 4 課的 80），不是 containerPort 3000。</li>
+  <li><strong>用 Exact 比對一整組 API 路徑</strong>：<code>Exact /orders</code> 不包含 <code>/orders/42</code>。一組 API 用 PathPrefix，只有單一端點（例如 <code>/healthz</code>）才用 Exact。</li>
+  <li><strong>標頭條件和權重放在同一個 rule</strong>：同一個 rule 的 matches 是「或」，帶標頭的請求也照權重分流。要「帶標頭一律到 v2」，標頭條件自己一個 rule。</li>
+  <li><strong>把憑證金鑰寫進 YAML</strong>：base64 不是加密，進了 git 就外流。用 <code>kubectl create secret tls</code> 從檔案建立；正式環境用 cert-manager 或 ACM。</li>
+  <li><strong>以為所有實作功能都一樣</strong>：Core 功能有一致性測試，Extended 功能各家不同。選實作、搬 Ingress 之前先對 GatewayClass 的 supportedFeatures。</li>
+  <li><strong>繼續用 Ingress NGINX</strong>：已退役，不再有安全修補。用 <code>kubectl get pods -A -l app.kubernetes.io/name=ingress-nginx</code> 檢查叢集有沒有在用，盡快規劃遷移。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>入口做四件事：依 port 接請求、依網域分辨、終結 TLS、依路徑轉給後端。Kubernetes 用 API 物件描述這些事，由控制器設定真正的代理（本機是 Envoy，EKS 上是 ALB）。</li>
+  <li>Ingress 只有主機與路徑，其他靠各家 annotation；Ingress API 已凍結，Ingress NGINX 已退役。新專案用 Gateway API（<code>gateway.networking.k8s.io/v1</code>）。</li>
+  <li>GatewayClass 選實作；Gateway 是平台團隊的入口（listener、憑證、allowedRoutes）；HTTPRoute 是應用團隊的路由（parentRefs、hostnames、matches、backendRefs）。跨 namespace 參照要 ReferenceGrant。</li>
+  <li>比對優先順序看規則本身（Exact、較長的前綴、較多的標頭），不看寫的順序；同一個 match 裡是「而且」，同一個 rule 的 matches 之間是「或」。weight 是相對比例，用來做金絲雀。</li>
+  <li>HTTPS：憑證放 tls Secret（從檔案建立，不進 git），listener 用 <code>tls.mode: Terminate</code>；HTTP listener 掛 RequestRedirect 轉到 https，用 sectionName 讓路由只掛在對的 listener。</li>
+  <li>apply 成功不等於生效：讀 status 的 Accepted、ResolvedRefs、PartiallyInvalid，再實際打請求。Extended 功能先查 supportedFeatures。</li>
+  <li>搬舊 Ingress：ingress2gateway 當起點，逐項確認 annotation 在新實作的對應，兩邊並存、用同一組請求比對後再切換。</li>
+</ul>
+<p>下一課處理設定與機密：用 ConfigMap 和 Secret 把 LOG_LEVEL、資料庫密碼這類設定跟映像分開，並看清楚 Secret 到底保護了什麼、沒保護什麼。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

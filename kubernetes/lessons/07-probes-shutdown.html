@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>7. 健康檢查與優雅關機：流量只送給準備好的 Pod</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="7" data-practice="kubernetes">
+<header>
+  <div class="eyebrow">階段 3：穩定上線 · 第 7 課</div>
+  <h1>健康檢查與優雅關機：流量只送給準備好的 Pod</h1>
+</header>
+<main>
+
+<p>到目前為止，Kubernetes 只知道「容器的程序有沒有在跑」。程序在跑，不代表它已經開始聽 port、連得上資料庫，也不代表它沒有卡死。結果是：滾動更新時，新 Pod 還在啟動就收到請求；舊 Pod 被關掉時，手上的請求被切斷；程序卡住了卻沒人發現。使用者看到的是部署時零星的 502 和連線錯誤。</p>
+<p>學完你能替一個服務寫出正確的 probe 與關機設定，並在持續負載下做到滾動重啟 0 個錯誤。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>沒有 probe 會怎樣：部署時零星的 502 從哪裡來，因為 Kubernetes 只知道程序有沒有在跑。</li>
+  <li>三種 probe、liveness 的陷阱：什麼時候送流量、什麼時候重啟；liveness 為什麼不能檢查資料庫，否則 30 秒的資料庫維護會變成全站中斷。</li>
+  <li>慢啟動：啟動要 45 秒的服務，怎麼不被誤判成卡死而一直重啟。</li>
+  <li>Pod 終止的時間軸、做到不掉請求：Pod 被刪除時哪幾件事同時發生，preStop、寬限期、應用程式的排空各負責哪一段。</li>
+  <li>和 NestJS 的接法：把健康檢查和優雅關機接上 Kubernetes，寄信的 worker 要設多長的寬限期。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../devops/lessons/03-processes-signals.html">devops 課第 3 課</a>的訊號：SIGTERM 是「請收尾後結束」，程式可以處理；SIGKILL 直接殺掉，程式沒機會收尾；訊號送給容器裡的 PID 1，PID 1 如果是 shell，不會轉給你的程式。</li>
+  <li><a href="../../node/lessons/21-graceful-shutdown.html">node 課第 21 課</a>的優雅關機：收到 SIGTERM 後停止接新請求、做完手上的再結束；<code>/health/live</code> 回答「程序活著嗎」，<code>/health/ready</code> 回答「現在能接流量嗎」。</li>
+  <li><a href="03-deployments.html">第 3 課</a>的滾動更新：換版時先建新 Pod、再關舊 Pod，一份一份換。</li>
+  <li><a href="04-services-dns.html">第 4 課</a>的 EndpointSlice：Service 只把流量送給 EndpointSlice 裡 Ready 的 Pod。</li>
+</ul></div>
+
+<h2>沒有 probe 會怎樣</h2>
+<p>課程映像 cafe-api 有個環境變數 <code>STARTUP_DELAY_MS</code>：程序啟動後先等這麼久才開始聽 port，模擬「載入設定、暖快取、檢查 migration」這些啟動工作。設成 8000，再做一次第 3 課的滾動重啟：</p>
+<pre>kubectl create namespace try-07
+kubectl apply -n try-07 -f kubernetes/practice/work/07/ex1/      # 練習 1 的起始檔：8 秒才聽 port、沒有 probe
+kubectl rollout restart deployment/cafe-api -n try-07
+kubectl get pods -n try-07 -w</pre>
+<p>新 Pod 幾乎一建立就顯示 <code>1/1 READY</code>。沒有 readinessProbe 時，Kubernetes 對「Ready」的定義是「容器的程序啟動了」。於是：</p>
+<ol>
+  <li>EndpointSlice 控制器把新 Pod 加進 Service 的端點（第 4 課），各節點的 kube-proxy 開始把流量轉過去。</li>
+  <li>Deployment 也認為新 Pod 可用，開始關掉舊 Pod。</li>
+  <li>但新 Pod 裡的程序還要 7、8 秒才聽 port，送過去的連線全部被拒絕（<code>ECONNREFUSED</code>）。</li>
+</ol>
+<p>重啟的同時，用 k8s-tools 裡的 loadgen（課程準備好的壓測程式，每秒 10 個請求、共 30 秒）持續打這個 Service：</p>
+<pre>kubectl exec -n k8s-tools deploy/loadgen -- node /loadgen/loadgen.mjs \
+  '{"urls":["http://cafe-api.try-07.svc.cluster.local/version"],"requests":300,"rps":10}'</pre>
+<p>印出的統計裡 <code>errors</code> 不是 0，<code>errorSamples</code> 是一串 <code>ECONNREFUSED</code>：每個新 Pod 開始收流量到真的聽 port 之間，送過去的請求都失敗。<strong>Kubernetes 不知道你的程式什麼時候準備好，你要告訴它</strong>，這就是 probe 的工作。</p>
+
+<h2>三種 probe</h2>
+<p><strong>probe（探針）</strong>是每個節點上的 kubelet 定期對容器做的檢查。kubelet 直接打 Pod 的 IP，不經過 Service。檢查方式有四種：<code>httpGet</code>（回應碼 200～399 算成功）、<code>tcpSocket</code>（連得上 port 就算成功）、<code>exec</code>（在容器裡執行指令，結束碼 0 算成功）、<code>grpc</code>。有 HTTP 端點的服務一律用 httpGet，本課程也只用它。</p>
+<p>同樣的檢查方式，掛在三個不同的欄位上，失敗的後果完全不同：</p>
+<div class="table-wrap"><table>
+  <tr><th>probe</th><th>回答的問題</th><th>失敗的後果</th><th>該檢查</th><th>不該檢查</th></tr>
+  <tr><td><code>startupProbe</code></td><td>啟動完了沒？</td><td>超過允許的次數就重啟容器；成功一次之後就不再執行</td><td>程序開始回應了（<code>/health/live</code>）</td><td>外部依賴</td></tr>
+  <tr><td><code>readinessProbe</code></td><td>現在能接流量嗎？</td><td>把 Pod 從 Service 的端點拿掉，<strong>不重啟</strong>；恢復後自動加回來</td><td>啟動完成、沒在排空、必要的依賴連得上（<code>/health/ready</code>）</td><td>非必要的依賴（推薦功能壞了，點餐還是能用）</td></tr>
+  <tr><td><code>livenessProbe</code></td><td>卡死了嗎？要不要重啟？</td><td>連續失敗就<strong>重啟容器</strong></td><td>程序本身還能回應（<code>/health/live</code>）</td><td>資料庫、Redis、其他服務</td></tr>
+</table></div>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="容器啟動後先只跑 startupProbe；成功一次後 readinessProbe 與 livenessProbe 才開始。readiness 失敗會把 Pod 從 EndpointSlice 拿掉，liveness 失敗會由 kubelet 重啟容器">
+    <defs><marker id="p7a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="10" y="95" width="120" height="50" rx="6"/>
+    <text class="d-text" x="70" y="125" text-anchor="middle">容器啟動</text>
+    <path class="d-line" d="M130,120 L180,120" marker-end="url(#p7a)"/>
+    <rect class="d-box" x="180" y="90" width="150" height="60" rx="6"/>
+    <text class="d-text" x="255" y="115" text-anchor="middle">startupProbe</text>
+    <text class="d-small" x="255" y="135" text-anchor="middle">只有它在跑</text>
+    <text class="d-small" x="255" y="175" text-anchor="middle">次數用完 → 重啟容器</text>
+    <path class="d-line" d="M330,110 L400,55" marker-end="url(#p7a)"/>
+    <path class="d-line" d="M330,130 L400,185" marker-end="url(#p7a)"/>
+    <text class="d-small" x="350" y="122">成功一次</text>
+    <rect class="d-box" x="400" y="25" width="150" height="55" rx="6"/>
+    <text class="d-text" x="475" y="50" text-anchor="middle">readinessProbe</text>
+    <text class="d-small" x="475" y="68" text-anchor="middle">一直檢查</text>
+    <rect class="d-box" x="400" y="160" width="150" height="55" rx="6"/>
+    <text class="d-text" x="475" y="185" text-anchor="middle">livenessProbe</text>
+    <text class="d-small" x="475" y="203" text-anchor="middle">一直檢查</text>
+    <path class="d-line" d="M550,52 L580,52" marker-end="url(#p7a)"/>
+    <text class="d-accent" x="585" y="45">失敗：移出端點</text>
+    <text class="d-small" x="585" y="64">不收新流量，不重啟</text>
+    <path class="d-line" d="M550,187 L580,187" marker-end="url(#p7a)"/>
+    <text class="d-accent" x="585" y="180">失敗：重啟容器</text>
+    <text class="d-small" x="585" y="199">RESTARTS ＋1</text>
+  </svg>
+  <figcaption>startupProbe 成功之前，另外兩個不會開始；沒有寫 startupProbe 時，另外兩個從容器啟動就開始。</figcaption>
+</figure>
+<p>每個 probe 都用同一組欄位控制時間。下面是 Kubernetes 1.37 的預設值：</p>
+<div class="table-wrap"><table>
+  <tr><th>欄位</th><th>意思</th><th>預設</th></tr>
+  <tr><td><code>initialDelaySeconds</code></td><td>容器啟動後（有 startupProbe 時是它成功後）等幾秒才開始檢查</td><td>0</td></tr>
+  <tr><td><code>periodSeconds</code></td><td>多久檢查一次</td><td>10</td></tr>
+  <tr><td><code>timeoutSeconds</code></td><td>一次檢查等多久沒回應就算失敗</td><td>1</td></tr>
+  <tr><td><code>failureThreshold</code></td><td>連續失敗幾次才算失敗</td><td>3</td></tr>
+  <tr><td><code>successThreshold</code></td><td>失敗後連續成功幾次才算恢復（liveness、startup 只能是 1）</td><td>1</td></tr>
+</table></div>
+<p>最常用的換算：<strong>periodSeconds × failureThreshold ≈ 多久才發現出事</strong>。liveness 用預設值，程序卡住大約 30 秒才被重啟；readiness 用預設值，資料庫斷了大約 30 秒才停止收流量。</p>
+<p><code>timeoutSeconds</code> 的預設 1 秒很短。cafe-api 的 <code>/health/ready</code> 連資料庫最多等 2 秒，timeout 只有 1 秒的話，資料庫稍微慢一點 probe 就先逾時。規則是：<strong>timeoutSeconds 要比健康檢查端點自己最長的等待時間長</strong>。節點很忙時回應也會變慢，liveness 的 timeout 太短會造成誤殺。</p>
+<p>把練習 1 的問題修好，只要加幾行：</p>
+<pre>containers:
+  - name: api
+    image: learn-k8s/cafe-api:v1
+    ports:
+      - containerPort: 3000
+    readinessProbe:
+      httpGet:
+        path: /health/ready      # 問「能接流量嗎」
+        port: 3000
+      periodSeconds: 2           # 啟動完最多 2 秒就開始收流量
+      timeoutSeconds: 2</pre>
+<p>現在新 Pod 會停在 <code>0/1</code>，直到 <code>/health/ready</code> 回 200 才變成 <code>1/1</code>。滾動更新也跟著等：maxUnavailable 是 0 時，新 Pod 沒 Ready 之前舊的不會關。readinessProbe 同時保護了 Service 的流量和 Deployment 的換版節奏。</p>
+<div class="callout">為什麼不直接打 <code>/health/live</code> 當 readiness？cafe-api 的 <code>/health/live</code> 只要程序在跑就回 200，排空中、資料庫斷了也一樣。readiness 要問的是「現在送請求過來會不會成功」，這要由應用程式自己判斷，所以 node 課第 21 課把兩個端點分開。</div>
+<div class="callout practice"><strong>💡 實務上：readiness 檢查哪些依賴，先想「所有 Pod 同時不 Ready」會怎樣</strong><br>readiness 失敗不會重啟，但所有 Pod 共用同一個依賴：依賴一斷，所有 Pod 同時被移出 Service，呼叫端看到的不是「部分功能壞了」，而是整個 API 沒有後端。所以只放「少了它，這個 Pod 什麼請求都處理不了」的依賴，例如 cafe-api 的資料庫；Redis 只拿來當快取的話，斷了應該降級成直接查資料庫，而不是讓 Pod 變成不 Ready。設計健康檢查前，資深工程師會跟 PM 一起列出「哪個依賴壞了，哪些功能還要能用」，再照這張表決定 <code>/health/ready</code> 要檢查什麼。</div>
+
+<h2>liveness 的陷阱：不要檢查依賴</h2>
+<p>一個真實常見的事故：團隊覺得「資料庫連不上，服務也等於壞了」，於是 livenessProbe 打 <code>/health/ready</code>（裡面會檢查資料庫）。某天 RDS 做計畫性的 failover，資料庫 30 秒連不上：</p>
+<ol>
+  <li>所有 cafe-api Pod 的 liveness 同時失敗，kubelet 把所有容器同時重啟。</li>
+  <li>重啟期間沒有任何 Pod 能服務，連「顯示菜單」這種不需要資料庫的請求也失敗。</li>
+  <li>資料庫回來了，幾十個剛重啟的 Pod 同時建立連線池，連線數瞬間衝高，資料庫又被打慢，liveness 又失敗，再重啟一輪。</li>
+</ol>
+<p>30 秒的資料庫維護，變成十幾分鐘的全站中斷。問題在於<strong>重啟不會修好依賴</strong>。資料庫壞了，重啟 cafe-api 一點幫助都沒有，只會讓情況更糟。</p>
+<p>規則：</p>
+<ul>
+  <li><strong>liveness 只檢查程序本身</strong>：event loop 還轉得動、能回應 HTTP。卡死、死鎖、無限迴圈這種「重啟就會好」的問題才交給它。</li>
+  <li><strong>依賴的狀態交給 readiness</strong>：資料庫斷了就停止收流量，資料庫回來就自動恢復，容器不動。</li>
+  <li><strong>很多服務不需要 liveness</strong>：程序崩潰會自己結束，kubelet 本來就會重啟結束的容器。只有「會卡住但不會結束」的程式才需要 liveness。不確定的時候，寧可不設，也不要設錯。</li>
+</ul>
+<p>Pod 一直被重啟會進入 <strong>CrashLoopBackOff</strong>：容器一直結束又被重啟，kubelet 在每次重啟之間等待越來越久（10 秒、20 秒、40 秒…最長 5 分鐘，正常跑滿 10 分鐘後重新計算）。<code>kubectl get pods</code> 的 RESTARTS 欄位在增加，就用 <code>kubectl describe pod</code> 看 Events 裡的 <code>Liveness probe failed</code> 或 <code>Startup probe failed</code>，再用 <code>kubectl logs --previous</code> 看被重啟前的那個容器印了什麼。</p>
+<div class="callout practice"><strong>💡 實務上：review liveness 設定時只問一句「重啟能修好嗎？」</strong><br>新服務的 manifest 送來 review，看 livenessProbe 時資深工程師只問：這個檢查失敗時，重啟容器能讓它恢復嗎？檢查資料庫、Redis、其他服務的 liveness 一律擋下，改成 readiness。沒把握的服務先不設 liveness，上線後真的觀察到「程序還在、卻不再回應」再加。值班時看到 RESTARTS 一直增加，也不要急著刪 Pod 或拿掉 probe：先把 <code>describe</code> 的 Events 和 <code>logs --previous</code> 存下來，確定是 probe 設錯還是程式真的卡住，再決定怎麼改。</div>
+
+<h2>慢啟動：用 startupProbe，不要拉長 initialDelaySeconds</h2>
+<p>有些服務啟動很慢：大型 Node 應用要載入很多模組、Java 服務要暖 JIT、有些服務啟動時要檢查 migration。課程映像 <code>learn-k8s/cafe-api:slow-start</code> 要 45 秒才聽 port。如果只有預設時間的 livenessProbe，它在第 30 秒左右就判定失敗、重啟容器，下一次還是一樣，永遠起不來。</p>
+<p>直覺的修法是把 liveness 的 <code>initialDelaySeconds</code> 設成 60。能跑，但有兩個代價：每次容器重啟都要白等 60 秒才開始檢查；啟動後如果很快卡住，也要等 60 秒之後才發現。而且啟動時間會變，資料變多、節點變忙，60 秒某天就不夠了。</p>
+<p>正確的做法是 startupProbe：</p>
+<pre>startupProbe:
+  httpGet:
+    path: /health/live
+    port: 3000
+  periodSeconds: 5
+  failureThreshold: 24      # 5 × 24 = 最多等 120 秒；一回應就算啟動完成
+livenessProbe:
+  httpGet:
+    path: /health/live
+    port: 3000
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3       # 啟動之後卡住，15 秒左右就判定失敗</pre>
+<p>liveness 判定失敗後，kubelet 重啟容器的方式跟刪除 Pod 一樣：先送 SIGTERM，等寬限期（下一節的 terminationGracePeriodSeconds，預設 30 秒）結束才送 SIGKILL。event loop 卡死的程序處理不了 SIGTERM，所以從卡住到重啟，實際是「偵測時間＋寬限期」，大約 45 秒。想縮短，可以在 livenessProbe 裡另外寫 <code>terminationGracePeriodSeconds</code>（只用在 probe 失敗的重啟，1.28 起穩定），不影響正常關機用的寬限期。</p>
+<p>startupProbe 的 <code>periodSeconds × failureThreshold</code> 是「最長能容忍的啟動時間」，給實際啟動時間兩倍左右的餘裕；間隔短一點，啟動完就能早點開始服務。它一成功，liveness 就用自己嚴格的設定接手。慢啟動和快速偵測卡死，兩件事各自用最適合的參數。</p>
+
+<h2>Pod 終止的時間軸</h2>
+<p>probe 處理了「還沒準備好」；接下來是另一半：「要關掉了」。滾動更新、縮減副本、節點維護，Pod 都會被刪除。刪除時發生的事情，依官方文件是這樣：</p>
+<figure>
+  <svg viewBox="0 0 700 300" role="img" aria-label="Pod 被刪除後同時發生兩件事：上方是 EndpointSlice 移除這個 Pod，各節點的 kube-proxy 與 Gateway 花幾秒更新規則；下方是 kubelet 執行 preStop，結束後送 SIGTERM，應用排空後結束；寬限期從一開始就在倒數，時間到送 SIGKILL">
+    <defs><marker id="p7b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="10" y="115" width="110" height="60" rx="6"/>
+    <text class="d-text" x="65" y="140" text-anchor="middle">Pod 被刪除</text>
+    <text class="d-small" x="65" y="160" text-anchor="middle">Terminating</text>
+    <path class="d-line" d="M120,135 L150,70" marker-end="url(#p7b)"/>
+    <path class="d-line" d="M120,155 L150,215" marker-end="url(#p7b)"/>
+    <text class="d-small" x="155" y="30">控制平面與各節點</text>
+    <rect class="d-box" x="155" y="40" width="210" height="50" rx="6"/>
+    <text class="d-text" x="260" y="62" text-anchor="middle">從 EndpointSlice 移除</text>
+    <text class="d-small" x="260" y="80" text-anchor="middle">標成 ready: false、terminating</text>
+    <path class="d-line" d="M365,65 L395,65" marker-end="url(#p7b)"/>
+    <rect class="d-box" x="395" y="40" width="290" height="50" rx="6"/>
+    <text class="d-text" x="540" y="62" text-anchor="middle">kube-proxy、Gateway 更新規則</text>
+    <text class="d-accent" x="540" y="80" text-anchor="middle">需要幾秒；這段期間新請求還會進來</text>
+    <text class="d-small" x="155" y="190">這個 Pod 所在節點的 kubelet</text>
+    <rect class="d-box" x="155" y="200" width="150" height="50" rx="6"/>
+    <text class="d-text" x="230" y="222" text-anchor="middle">執行 preStop</text>
+    <text class="d-small" x="230" y="240" text-anchor="middle">例如 sleep 5 秒</text>
+    <path class="d-line" d="M305,225 L335,225" marker-end="url(#p7b)"/>
+    <rect class="d-box" x="335" y="200" width="200" height="50" rx="6"/>
+    <text class="d-text" x="435" y="222" text-anchor="middle">送 SIGTERM 給 PID 1</text>
+    <text class="d-small" x="435" y="240" text-anchor="middle">應用排空、關連線池、結束</text>
+    <path class="d-line" d="M535,225 L565,225" marker-end="url(#p7b)"/>
+    <rect class="d-soft" x="565" y="200" width="120" height="50" rx="6"/>
+    <text class="d-text" x="625" y="222" text-anchor="middle">寬限期到了</text>
+    <text class="d-small" x="625" y="240" text-anchor="middle">SIGKILL</text>
+    <path class="d-line" d="M155,280 L685,280" marker-end="url(#p7b)"/>
+    <text class="d-small" x="420" y="296" text-anchor="middle">terminationGracePeriodSeconds（預設 30 秒）從 preStop 開始就在倒數</text>
+  </svg>
+  <figcaption>上下兩條線同時開始，彼此沒有先後保證。</figcaption>
+</figure>
+<ol>
+  <li>Pod 被標記為 Terminating，並記下寬限期。</li>
+  <li><strong>同時</strong>：EndpointSlice 控制器把這個 Pod 標成不再 ready；各節點的 kube-proxy、Gateway 的代理程式看到變化後更新自己的轉送規則。叢集越大、越忙，這一步越慢，通常要幾秒。</li>
+  <li><strong>同時</strong>：kubelet 執行容器的 <strong>preStop hook</strong>（容器收到 SIGTERM 之前先執行的動作）。preStop 結束後，送 SIGTERM 給容器的 PID 1。</li>
+  <li>程序結束，Pod 消失。<strong>terminationGracePeriodSeconds</strong>（寬限期，預設 30 秒）到了還沒結束，就送 SIGKILL 強制結束。寬限期<strong>從 preStop 開始就在倒數</strong>；preStop 本身超過寬限期時，kubelet 只會再多給一次 2 秒。</li>
+</ol>
+<p>問題出在第 2、3 步是平行的。如果沒有 preStop，應用收到 SIGTERM 就立刻停止接新連線，但這時其他節點的 kube-proxy 可能還沒更新規則，仍然把新連線送過來，這些連線就被拒絕。練習 4 的 cafe-api 設了 <code>DRAIN_MS=0</code>，就是模擬這種「收到 SIGTERM 立刻關門」的應用程式。</p>
+
+<h2>做到不掉請求</h2>
+<p>修法分三層，各自負責一段時間：</p>
+<ol>
+  <li><strong>preStop 先等幾秒</strong>：讓轉送規則先更新完，再讓應用程式開始關門。
+<pre>lifecycle:
+  preStop:
+    sleep:
+      seconds: 5</pre>
+  <code>sleep</code> 動作在 Kubernetes 1.34 正式穩定（PodLifecycleSleepAction），由 kubelet 自己等，不需要容器裡有 <code>sleep</code> 指令。舊的寫法 <code>exec: { command: ["sleep", "5"] }</code> 在 distroless 這種沒有 shell 的映像裡會失敗。</li>
+  <li><strong>應用程式收到 SIGTERM 後排空</strong>：<strong>排空</strong>（draining）是停止接新請求、把手上的請求做完。readiness 改回 503、停止接新連線、等進行中的請求、關資料庫連線池，最後結束（<a href="../../devops/lessons/13-scaling.html">devops 課第 13 課</a>講過排空，node 課第 21 課寫過這段程式）。</li>
+  <li><strong>寬限期要容得下全部</strong>：
+<pre>terminationGracePeriodSeconds ≥ preStop 秒數 ＋ 最長的請求 ＋ 關閉連線池等收尾時間</pre>
+  練習 4 是 5＋4＋2＝11 秒，再留點餘裕設 20。寬限期設太短，長請求做到一半就被 SIGKILL，使用者收到連線重置。設很長也沒有壞處（程序結束得早，Pod 就早消失），只是節點維護、縮容時最多要等這麼久。</li>
+</ol>
+<p>還有一個前提：<strong>SIGTERM 要送得到你的程式</strong>。容器的 CMD 寫成 <code>sh -c "node server.ts"</code> 時，PID 1 是 shell，shell 不會把 SIGTERM 轉給 node，node 一直跑到寬限期結束被 SIGKILL，排空的程式碼完全沒機會執行（devops 課第 3 課）。用 exec 形式 <code>CMD ["node", "server.ts"]</code>。課程的 <code>learn-k8s/cafe-api:no-sigterm</code> 映像會忽略 SIGTERM，就是模擬這種情況：每個 Pod 都要等滿寬限期才消失，滾動更新變得很慢。</p>
+<div class="callout">應用程式裡的等待（cafe-api 的 <code>DRAIN_MS</code>、Terminus 的 <code>gracefulShutdownTimeoutMs</code>）和 preStop sleep 做的是類似的事：都是在「還能接請求」的狀態下多撐幾秒。差別是 preStop 寫在 manifest 裡，每個服務一致、不用改程式，也能用在你改不到的第三方映像。兩者都有的時候，寬限期要把兩段都算進去。</div>
+<div class="callout practice"><strong>💡 實務上：「每次部署都有零星 502」的排查順序</strong><br>這是監控和客服最常回報的部署問題，也常被當成「部署本來就會這樣」放著不管。照這一課的順序查：新 Pod 有沒有 readinessProbe、Pod 被刪時有沒有 preStop、容器的 PID 1 是不是你的程式（CMD 用 exec 形式）、寬限期容不容得下最長的請求。修完用練習 4 的方式驗證：一邊用 loadgen 持續打、一邊 <code>rollout restart</code>，錯誤數要是 0。把這個測試放進新服務上線前的檢查清單，比上線後追 502 省事得多。</div>
+
+<h2>和 NestJS 的接法</h2>
+<p><a href="../../nestjs/lessons/24-observability-shutdown.html">NestJS 課第 24 課</a>已經把應用程式這一半做好了，接上 Kubernetes 只要對好名字：</p>
+<div class="table-wrap"><table>
+  <tr><th>NestJS（第 24 課）</th><th>Kubernetes</th></tr>
+  <tr><td><code>GET /health/live</code>：只回答程序活著</td><td><code>livenessProbe</code>、<code>startupProbe</code></td></tr>
+  <tr><td><code>GET /health/ready</code>：Terminus 檢查 Prisma、Redis，關機時回 503</td><td><code>readinessProbe</code></td></tr>
+  <tr><td><code>app.enableShutdownHooks()</code>：收到 SIGTERM 才會跑關機的 hook</td><td>kubelet 在 preStop 之後送 SIGTERM</td></tr>
+  <tr><td><code>beforeApplicationShutdown</code>：worker 先停止拿新 job、等手上的 job 做完</td><td>worker 的 terminationGracePeriodSeconds 要大於最長的 job</td></tr>
+</table></div>
+<p>寄收據的 BullMQ worker 沒有 HTTP 流量，不需要 preStop，也通常不需要 readinessProbe（沒有 Service 會把流量送給它）。它需要的是夠長的寬限期：最長的 job 要 50 秒，寬限期就設 60 秒以上，不然縮容時 job 做到一半被 SIGKILL，只能靠重試補救。</p>
+
+<h2>練習</h2>
+<p>在 <code>learn</code> 資料夾執行頁面上的指令，起始檔會複製到 <code>kubernetes/practice/work/07/</code>。每一題都先做靜態檢查（幾秒），通過了才套用到叢集的專屬 namespace（<code>k8s-07-ex1</code> 這種名字），用真的流量與 kubectl 檢查，最後刪掉。叢集的部分每題要幾分鐘。自己想先試的話，用前面的 <code>try-07</code> namespace，用完 <code>kubectl delete namespace try-07</code>。</p>
+
+<div class="local" data-test="ex1" data-files="ex1/deployment.yaml">
+  <p>練習 1：<code>ex1/deployment.yaml</code> 是 8 秒才聽 port 的 cafe-api（<code>STARTUP_DELAY_MS=8000</code>），沒有任何 probe。替容器 <code>api</code> 加上 readinessProbe，讓 Pod 真的能回應之後才收流量；其他欄位不要改，<code>ex1/service.yaml</code> 不用改。測試會用 loadgen 持續打 Service，同時執行 <code>kubectl rollout restart</code>，要 0 個錯誤。readinessProbe 要用 HTTP，路徑要選對（想想啟動期間哪個端點已經回 200 了），periodSeconds 不超過 5。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="ex2/deployment.yaml">
+  <p>練習 2：<code>ex2/deployment.yaml</code> 用 <code>learn-k8s/cafe-api:slow-start</code>，要 45 秒才聽 port，現在會被 livenessProbe 一直重啟。修好它：加上 startupProbe，最長容忍的啟動時間（initialDelaySeconds＋periodSeconds × failureThreshold）至少 60 秒、periodSeconds 不超過 10；保留打 <code>/health/live</code> 的 livenessProbe，initialDelaySeconds 不超過 10，卡住後 20 秒內（periodSeconds × failureThreshold）就判定失敗。測試等 Pod 不重啟就 Ready，接著呼叫 <code>POST /debug/hang</code> 讓 event loop 永遠卡住，liveness 必須把容器重啟。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="ex3/deployment.yaml">
+  <p>練習 3：<code>ex3/deployment.yaml</code> 的 cafe-api 連 namespace 裡的 postgres（測試會建立），但兩個 probe 都打 <code>/health/ready</code>。修正 probe 設定：資料庫中斷時，Pod 要停止收流量但不能被重啟；資料庫回來後自動恢復。測試會把 postgres 縮成 0 個副本 40 秒再恢復，期間所有 cafe-api Pod 都要變成 NotReady、重啟次數維持 0，恢復後全部回到 Ready。映像與環境變數不要改；readinessProbe 的 timeoutSeconds 要比 <code>/health/ready</code> 連資料庫的 2 秒長。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="ex4/deployment.yaml">
+  <p>練習 4：<code>ex4/deployment.yaml</code> 的 cafe-api 設了 <code>DRAIN_MS=0</code>：收到 SIGTERM 立刻停止接新連線，只把手上的請求做完；流量裡有要 4 秒的 <code>/slow?ms=4000</code>。加上 readinessProbe（<code>/health/ready</code>）、用 sleep 動作的 preStop（至少 3 秒），並寫出 Pod 層級的 <code>terminationGracePeriodSeconds</code>，至少是 preStop 秒數＋4（最長請求）＋2（關閉時間）。<code>DRAIN_MS</code> 維持 0、映像維持 v1。測試以每秒 20 個請求（四分之一是長請求）連續滾動重啟兩次，要 0 個錯誤、0 個連線重置。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：資料庫做 30 秒的維護，結果所有 API Pod 一起重啟，恢復後連線尖峰又把資料庫打慢。最可能的設定錯誤是？</p>
+  <label data-key="a">沒有 readinessProbe</label>
+  <label data-key="b">livenessProbe 檢查了資料庫連線</label>
+  <label data-key="c">replicas 太少</label>
+  <label data-key="d">terminationGracePeriodSeconds 太長</label>
+  <p class="why">✓ liveness 失敗會重啟容器，而依賴的問題不會因為重啟變好；所有副本同時重啟，再同時重建連線池，把小事放大成事故。依賴放 readiness（只停止收流量），liveness 只看程序本身。a 只會讓請求送到連不上資料庫的 Pod 而失敗，不會重啟；c 不會造成重啟；d 只影響關機時最多等多久。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 6：readinessProbe 連續失敗時，Kubernetes 會做什麼？</p>
+  <label data-key="a">重啟容器</label>
+  <label data-key="b">刪掉 Pod，由 ReplicaSet 再建一個</label>
+  <label data-key="c">把 Pod 從 Service 的端點拿掉，不再送新流量；之後檢查成功就自動加回來</label>
+  <label data-key="d">什麼都不做，只記在 Events</label>
+  <p class="why">✓ readiness 只決定收不收流量，容器完全不動，所以適合表達「暫時不能服務」（依賴斷了、正在排空）。a 是 liveness 與 startup 的行為；b 沒有任何 probe 會這樣做；d 錯在它會實際改變 EndpointSlice，<code>kubectl get pods</code> 也會顯示 <code>0/1</code>。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：應用程式收到 SIGTERM 就立刻停止接新連線。為什麼滾動更新時仍會有零星的連線錯誤？</p>
+  <label data-key="a">SIGTERM 要等 EndpointSlice 更新完很久之後才會送，所以中間沒有 Pod 可以服務</label>
+  <label data-key="b">從端點移除和送 SIGTERM（preStop 結束後）是同時開始的；各節點的 kube-proxy 與 Gateway 更新規則需要幾秒，這段期間新連線仍會送到這個 Pod</label>
+  <label data-key="c">Kubernetes 先送 SIGKILL，再送 SIGTERM</label>
+  <label data-key="d">因為 readinessProbe 在關機期間仍然回 200</label>
+  <p class="why">✓ 兩件事平行發生、沒有先後保證，所以用 preStop sleep 幾秒，等規則更新完再開始關門。a 把順序講反了，問題正是 SIGTERM 太早；c 錯，SIGKILL 只在寬限期結束後才送；d 錯，Pod 一進入 Terminating 就會從端點標成不 ready，跟 probe 的結果無關。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 8：preStop sleep 10 秒、應用程式排空最多要 25 秒，terminationGracePeriodSeconds 沒有寫。會發生什麼？</p>
+  <label data-key="a">沒問題：寬限期從 preStop 結束、送出 SIGTERM 時才開始算</label>
+  <label data-key="b">寬限期預設 30 秒，而且從 preStop 開始就在倒數；10＋25 超過 30，排空到一半就被 SIGKILL。要把寬限期設到 35 秒以上，再留點餘裕</label>
+  <label data-key="c">preStop 會被跳過，直接送 SIGTERM</label>
+  <label data-key="d">Kubernetes 會自動延長寬限期，等排空完成</label>
+  <p class="why">✓ 官方文件寫明寬限期涵蓋 preStop 和之後的關機時間；只有 preStop 本身超時，kubelet 才會再給一次 2 秒。a 是最常見的誤解；c 錯，preStop 會照常執行；d 錯，Kubernetes 不會等應用程式，時間到就是 SIGKILL。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>liveness 檢查依賴</strong>：資料庫或其他服務一抖，所有 Pod 一起重啟，事故被放大。liveness 只檢查程序本身，依賴交給 readiness。</li>
+  <li><strong>readiness 與 liveness 打同一個端點</strong>：兩者回答不同的問題。<code>/health/live</code> 給 liveness 與 startup，<code>/health/ready</code> 給 readiness。</li>
+  <li><strong>用很長的 initialDelaySeconds 處理慢啟動</strong>：每次重啟都要白等，啟動後卡住也很晚才發現。改用 startupProbe。</li>
+  <li><strong>timeoutSeconds 用預設的 1 秒</strong>：健康檢查端點本身會等依賴、節點忙碌時會變慢，probe 就誤判失敗。timeout 要比端點最長的等待時間長。</li>
+  <li><strong>沒有 preStop</strong>：滾動更新時零星的 502、連線被拒。加幾秒 sleep，讓轉送規則先更新。</li>
+  <li><strong>寬限期小於 preStop＋排空時間</strong>：請求做到一半被 SIGKILL。寬限期從 preStop 開始算；worker 的寬限期要大於最長的 job。</li>
+  <li><strong>容器用 <code>sh -c</code> 啟動</strong>：SIGTERM 送給 shell，不會轉給 node，排空的程式碼不會執行，每次都等到 SIGKILL（devops 課第 3 課）。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>沒有 readinessProbe 時，容器一啟動 Pod 就算 Ready，流量會送進還沒準備好的程序。</li>
+  <li>startupProbe 問「啟動完了沒」，成功前另外兩個不跑；readinessProbe 問「能接流量嗎」，失敗只移出端點；livenessProbe 問「卡死了嗎」，失敗就重啟容器。</li>
+  <li>periodSeconds × failureThreshold 決定多久發現問題；timeoutSeconds 要比健康檢查端點自己的等待長。</li>
+  <li>liveness 只看程序本身，依賴交給 readiness；不確定要不要 liveness 時，寧可不設。慢啟動用 startupProbe。</li>
+  <li>Pod 終止時，移出端點和 preStop→SIGTERM 同時開始。用 preStop sleep 等轉送規則更新、應用程式排空、寬限期 ≥ preStop＋最長請求＋收尾時間，而且 SIGTERM 要送得到 PID 1。</li>
+</ul>
+<p>下一課處理另一種「Pod 被殺」：容器用了太多記憶體被 OOMKilled、CPU 被節流變慢，以及用 requests、limits 和 HPA 讓服務依流量自動擴展。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

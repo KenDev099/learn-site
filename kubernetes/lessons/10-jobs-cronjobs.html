@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>10. Job 與 CronJob：資料庫 migration、批次與排程</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="10" data-practice="kubernetes">
+<header>
+  <div class="eyebrow">階段 3：穩定上線 · 第 10 課</div>
+  <h1>Job 與 CronJob：資料庫 migration、批次與排程</h1>
+</header>
+<main>
+
+<p>到目前為止，我們部署的都是「一直跑著」的服務：cafe-api 掛了，Deployment 就把它拉起來。但咖啡店還有另一種工作：部署新版前要跑一次資料庫 migration、每天打烊後算當天營收、把寄送失敗的收據重寄一遍。這些工作做完就該結束；如果放進 Deployment，程式正常結束後會被當成「掛了」，一直被重啟。</p>
+<p>這一課用 Job 和 CronJob 跑這些「做完就結束」的工作，並寫成重跑也不會出錯的樣子。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>Job、失敗與重試：做完就結束的工作為什麼不能放進 Deployment，失敗時重試幾次、最多跑多久。</li>
+  <li>migration 放在哪裡、migration Job 的細節：部署新版前的資料庫 migration 做成 Job、排在更新應用之前，部署腳本怎麼等它成功或失敗。</li>
+  <li>podFailurePolicy：「設定錯了」這種重試一百次都一樣的失敗，怎麼讓 Job 立刻停下。</li>
+  <li>CronJob：每天打烊後的營收報表怎麼排程，跟寫在應用程式裡的排程差在哪。</li>
+  <li>至少一次：同一件工作可能跑兩次，報表、寄信、migration 怎麼寫成重跑也不會出錯。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../devops/lessons/17-deploy-migrations.html">devops 課第 17 課</a>的部署時 migration：新版上線前先跑 migration，用專門的 migrator 帳號；不相容的變更拆成 expand（先加）和 contract（舊版下線後再刪）。</li>
+  <li><a href="09-rollouts-pdb.html">第 9 課</a>的新舊版本同時在線：滾動更新期間 v1、v2 同時處理請求，資料庫要讓兩版都能用。</li>
+</ul></div>
+
+<h2>做完就結束的工作：Job</h2>
+<p>先看 Deployment 為什麼不行。Deployment 的 Pod 範本只允許 <code>restartPolicy: Always</code>：容器結束了（不管結束碼是 0 還是 1），kubelet 都會重啟它。一個印完報表就 <code>exit 0</code> 的程式，在 Deployment 裡會不斷重跑，<code>kubectl get pods</code> 看到的是 <code>Completed</code> 和 <code>CrashLoopBackOff</code> 交替出現。</p>
+<p><strong>Job</strong> 是另一種控制器，它的期望狀態是「這個工作成功完成 N 次」：建立 Pod，Pod 成功結束（結束碼 0）就記一次成功；失敗就換一個新的 Pod 重試，直到成功或用完重試次數。完成之後 Job 和它的 Pod 留在叢集裡，讓你看狀態和 log。</p>
+<pre>apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hello
+spec:
+  template:
+    spec:
+      restartPolicy: Never            # Job 只能用 Never 或 OnFailure
+      containers:
+        - name: hello
+          image: busybox:1.38.0
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "echo 今天的營收報表算好了"]
+          resources:
+            requests: { cpu: 10m, memory: 8Mi }
+            limits: { memory: 16Mi }</pre>
+<p>在 <code>learn</code> 資料夾，先照第 1 課設定好 <code>KUBECONFIG</code>，把上面存成 <code>/tmp/hello-job.yaml</code> 試試：</p>
+<pre>kubectl create namespace try-10
+kubectl apply -n try-10 -f /tmp/hello-job.yaml
+kubectl get jobs -n try-10 -w          # STATUS 從 Running 變成 Complete，COMPLETIONS 1/1
+kubectl get pods -n try-10             # Pod 狀態是 Completed，沒有被重啟
+kubectl logs job/hello -n try-10       # 用 job/ 名稱讀 log，不用先查 Pod 的名字</pre>
+<p><code>restartPolicy</code> 的兩個選擇：</p>
+<ul>
+  <li><strong><code>Never</code></strong>：容器失敗，這個 Pod 就結束在 <code>Error</code> 狀態，Job 另建一個新 Pod 重試。失敗的 Pod 留著，log 看得到。</li>
+  <li><strong><code>OnFailure</code></strong>：在同一個 Pod 裡原地重啟容器。比較省（不用重新排程），但上一次的 log 會被蓋掉，只剩 <code>kubectl logs --previous</code> 看得到最近一次。</li>
+</ul>
+<p>沒寫 <code>restartPolicy</code> 時 Pod 預設是 <code>Always</code>，Job 不接受，API server 會直接拒絕。這一課的 Job 都用 <code>Never</code>：除錯時看得到每一次失敗，後面的 podFailurePolicy 也規定要 Never。</p>
+<div class="callout">Job 還有兩個欄位：<strong>completions</strong>（總共要成功幾次，預設 1）和 <strong>parallelism</strong>（同時跑幾個 Pod，預設 1）。例如把 1000 張收據分 10 批，<code>completions: 10</code>、<code>parallelism: 3</code>，同時處理 3 批。咖啡店的工作量用預設的 1／1 就夠，這一課不再展開。</div>
+
+<h2>失敗、重試與時間上限</h2>
+<p>把剛才的指令改成一定失敗，看 Job 怎麼重試：</p>
+<pre>kubectl create job always-fail -n try-10 --image=busybox:1.38.0 -- sh -c 'echo 連不上資料庫; exit 1'
+kubectl get pods -n try-10 -l batch.kubernetes.io/job-name=always-fail -w
+kubectl describe job always-fail -n try-10      # 最後的 Events 寫著 BackoffLimitExceeded</pre>
+<p>你會看到失敗的 Pod 一個接一個出現，而且間隔越來越長。三個欄位控制這件事：</p>
+<div class="table-wrap"><table>
+  <tr><th>欄位</th><th>意思</th><th>沒寫時</th></tr>
+  <tr><td><code>backoffLimit</code></td><td>失敗幾次後放棄，Job 變成 <code>Failed</code>（reason <code>BackoffLimitExceeded</code>）。重試的等待時間 10 秒、20 秒、40 秒⋯⋯逐次加倍，有上限</td><td>6</td></tr>
+  <tr><td><code>activeDeadlineSeconds</code></td><td>整個 Job 從開始算起最多跑幾秒，不管重試了幾次。時間到就終止所有 Pod，Job <code>Failed</code>（reason <code>DeadlineExceeded</code>）；它比 backoffLimit 優先</td><td>沒有上限</td></tr>
+  <tr><td><code>ttlSecondsAfterFinished</code></td><td>Job 結束（成功或失敗）幾秒後，連同 Pod 自動刪除</td><td>永遠留著</td></tr>
+</table></div>
+<p>怎麼選：</p>
+<ul>
+  <li><strong>backoffLimit</strong> 看「重試會不會好」。網路抖動、對方暫時忙線值得重試；SQL 寫錯、設定錯誤，重試 6 次只是讓失敗晚好幾分鐘才被發現。預設的 6 次，光是等待就要好幾分鐘。</li>
+  <li><strong>activeDeadlineSeconds</strong> 防止「卡住」：程式沒有失敗，只是一直在等（等鎖、等一個永遠不回應的連線）。沒有它，Job 可以永遠是 Running。</li>
+  <li><strong>ttlSecondsAfterFinished</strong> 防止「越積越多」：每次部署都建立一個 Job，一年後 namespace 裡有上百個結束的 Job 與 Pod。留一段讓人看 log 的時間（例如 10 分鐘到 1 天），之後自動清掉；log 要長期保存靠集中 log（devops 課第 21 課）。</li>
+</ul>
+<p>Job 失敗時的查法：<code>kubectl get job</code> 看狀態，<code>kubectl describe job</code> 看 Events 和失敗原因，<code>kubectl logs job/名稱</code> 看程式印了什麼（有多個 Pod 時它挑其中一個；要看特定一次，先 <code>kubectl get pods -l batch.kubernetes.io/job-name=名稱</code> 找到 Pod）。</p>
+
+<h2>migration 放在哪裡</h2>
+<p>新版 cafe-api 需要 orders 表多一個 <code>note</code> 欄位。這個 <code>ALTER TABLE</code> 要在新版程式開始處理請求之前做完。在 Kubernetes 上常見三種放法：</p>
+<div class="table-wrap"><table>
+  <tr><th>放法</th><th>會發生什麼</th></tr>
+  <tr><td>應用程式啟動時自己跑</td><td>每個副本啟動都會跑：4 個副本同時搶著改 schema；啟動時間被拉長，startupProbe 要放寬；應用的資料庫帳號需要 DDL 權限，被入侵時能 <code>DROP TABLE</code>；migration 失敗時 Pod CrashLoop，但滾動更新已經開始了</td></tr>
+  <tr><td>initContainer（Pod 裡先跑完才啟動主容器的容器）</td><td>還是每個 Pod 跑一次，擴展、節點維護時也會再跑；滾動更新期間新 Pod 的 migration 跟線上的舊版搶鎖；失敗時 Pod 卡在 <code>Init:Error</code>，部署流程不容易判斷</td></tr>
+  <tr><td><strong>獨立的 Job，排在更新應用之前</strong>（推薦）</td><td>每個版本只跑一次；用專門的 migrator 帳號，應用的帳號沒有 DDL 權限；失敗就停止部署，線上還是舊版，什麼都沒動</td></tr>
+</table></div>
+<figure>
+  <svg viewBox="0 0 700 230" role="img" aria-label="部署流程：建立 migrate-v2 Job，等它的狀態；Complete 就更新 Deployment 並等滾動更新完成；Failed 就停止部署並以 exit 1 結束，線上維持 v1">
+    <defs><marker id="a10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="10" y="85" width="140" height="56" rx="8"/>
+    <text class="d-text" x="80" y="110" text-anchor="middle">建立 Job</text>
+    <text class="d-small" x="80" y="128" text-anchor="middle">migrate-v2</text>
+    <line class="d-line" x1="150" y1="113" x2="200" y2="113" marker-end="url(#a10)"/>
+    <rect class="d-soft" x="200" y="85" width="140" height="56" rx="8"/>
+    <text class="d-text" x="270" y="110" text-anchor="middle">等它結束</text>
+    <text class="d-small" x="270" y="128" text-anchor="middle">同時看兩種結果</text>
+    <line class="d-line" x1="340" y1="105" x2="420" y2="50" marker-end="url(#a10)"/>
+    <line class="d-line" x1="340" y1="121" x2="420" y2="176" marker-end="url(#a10)"/>
+    <text class="d-accent" x="365" y="66">Complete</text>
+    <text class="d-accent" x="365" y="172">Failed</text>
+    <rect class="d-box" x="420" y="22" width="270" height="56" rx="8"/>
+    <text class="d-text" x="555" y="46" text-anchor="middle">更新 Deployment 的映像</text>
+    <text class="d-small" x="555" y="64" text-anchor="middle">rollout status 等新版全部 Ready</text>
+    <rect class="d-box" x="420" y="148" width="270" height="56" rx="8"/>
+    <text class="d-text" x="555" y="172" text-anchor="middle">停止部署，exit 1</text>
+    <text class="d-small" x="555" y="190" text-anchor="middle">印出 Job 的 log，線上維持 v1</text>
+  </svg>
+  <figcaption>migration Job 排在滾動更新之前：成功才動應用，失敗就什麼都不動</figcaption>
+</figure>
+<p>注意滾動更新期間 v1 和 v2 同時在線（<a href="09-rollouts-pdb.html">第 9 課</a>）：v2 的 migration 跑完之後，舊版 v1 還在處理請求，所以 migration 只能做「舊版也能接受」的改變，例如加一個可以是 NULL 的欄位（expand）；刪欄位、改名要等舊版完全下線後的下一次部署（contract）。這就是 devops 課第 17 課的 expand／contract，在 Kubernetes 上一樣適用。</p>
+
+<h2>migration Job 的細節</h2>
+<p>這一課的練習用課程映像 <code>learn-k8s/cafe-migrate</code>：每個版本一個 tag，裡面是「到這一版為止」的所有 SQL 檔，啟動後依序執行還沒跑過的檔案，並記在 <code>schema_migrations</code> 表（原始碼在 <code>kubernetes/practice/work/10/migrate/</code>）。Prisma 的 <code>migrate deploy</code>（<a href="../../nestjs/lessons/13-prisma-setup.html">NestJS 課第 13 課</a>）、node-pg-migrate 做的是同一件事，只是記錄的表名不同。幾個要注意的地方：</p>
+<ul>
+  <li><strong>Job 的 Pod 範本建立後不能改</strong>，名稱也不能重複。所以每個版本用新的名稱，例如 <code>migrate-v2</code>；要重跑同一版就先刪掉舊的 Job，或換個名字。好處是 <code>kubectl get jobs</code> 一眼看得出哪一版的 migration 跑過、成功了沒。</li>
+  <li><strong>backoffLimit 設小</strong>（0 或 1）。migration 失敗多半是 SQL 或資料的問題，重試不會好，越快讓部署停下來越好。</li>
+  <li><strong>設 <code>lock_timeout</code></strong>。<code>ALTER TABLE</code> 要拿表的鎖，如果有長交易擋著，它會排隊等，而排在它後面的所有查詢也跟著卡住（<a href="../../postgresql/lessons/34-zero-downtime-migrations.html">PostgreSQL 課第 34 課</a>）。拿不到鎖就放棄、稍後重跑，比卡住整個正式資料庫好。課程映像用 <code>PGOPTIONS="-c lock_timeout=5s"</code>。</li>
+  <li><strong>一個檔案一個交易</strong>。失敗就整個回滾，紀錄也不會寫入，下次從同一個檔案重跑。Prisma 在執行前還會拿 PostgreSQL 的 advisory lock，避免兩個 migrate 同時跑；知道有這層保護就好。</li>
+</ul>
+<p>部署腳本要等 Job 結束，而且要同時看「成功」和「失敗」。<code>kubectl wait --for=condition=Complete</code> 只認得成功：Job 早就 Failed 了，它還是會等到 <code>--timeout</code> 才結束，部署平白卡住好幾分鐘。直接讀 Job 的 conditions：</p>
+<pre>state=$(kubectl get job migrate-v2 -n cafe -o jsonpath='{.status.conditions[?(@.status=="True")].type}')
+echo "$state"     # 還在跑：空字串；成功：SuccessCriteriaMet Complete；失敗：FailureTarget Failed</pre>
+<p>1.31 起，Job 會先加上 <code>SuccessCriteriaMet</code>／<code>FailureTarget</code>（已經判定結果），等所有 Pod 都結束後才加上最終的 <code>Complete</code>／<code>Failed</code>。等 <code>Complete</code> 或 <code>Failed</code> 比較保險：那時已經沒有 Pod 還在動資料庫。用迴圈每 2 秒讀一次，遇到哪一種就照哪一種處理，加上總時間上限，就是練習 2 的 deploy.sh。</p>
+<div class="callout">第 13 課會用 Helm 打包。Helm 有 <strong>hook</strong>：標了 <code>helm.sh/hook: pre-upgrade</code> 的 Job 會在升級前執行，失敗就中止升級。概念和這裡的 deploy.sh 一樣，只是交給 Helm 去等。</div>
+
+<div class="callout practice"><strong>💡 實務上：大量資料回填不要塞進部署前的 migration</strong><br>expand 常伴隨回填，例如替 200 萬筆舊訂單算出新欄位的值。寫成一句 <code>UPDATE orders SET …</code> 放進 migration Job，它可能跑二十分鐘、鎖住大量的列，部署跟著卡住，activeDeadlineSeconds 一到還會整個交易回滾、白跑一趟。常見的做法是 migration 只放幾秒內完成的 schema 變更，回填另外寫成一個 Job：分批（例如每次 1000 筆）、中斷後能接著跑、在離峰時段執行。review migration PR 時，資深會先問「這段 SQL 在正式環境的資料量下要跑多久、會鎖什麼」，答不出來就先在正式資料的副本上量一次。</div>
+
+<h2>不要白白重試：podFailurePolicy</h2>
+<p>重寄收據的程式有兩種失敗：郵件伺服器暫時忙線（結束碼 1，等一下再試會好）、沒設定 <code>SMTP_HOST</code>（結束碼 2，重試一百次都一樣）。預設的處理不分種類，一律計入 backoffLimit；設定錯了，Job 要重試完所有次數、等完所有 backoff 才失敗。</p>
+<p><strong>podFailurePolicy</strong>（1.31 起 Stable）讓你依失敗的原因決定怎麼處理：</p>
+<pre>spec:
+  backoffLimit: 4
+  podFailurePolicy:
+    rules:
+      - action: FailJob             # 結束碼 2：整個 Job 立刻失敗
+        onExitCodes:
+          containerName: resend
+          operator: In
+          values: [2]
+      - action: Ignore              # Pod 被驅逐：不算重試次數，直接換一個
+        onPodConditions:
+          - type: DisruptionTarget
+  template:
+    spec:
+      restartPolicy: Never          # 用 podFailurePolicy 時一定要 Never</pre>
+<ul>
+  <li><strong>action</strong>：<code>FailJob</code>（整個 Job 失敗，還在跑的 Pod 全部終止）、<code>Ignore</code>（不計入 backoffLimit，換一個 Pod）、<code>Count</code>（照預設計入次數）。</li>
+  <li><strong>規則依序比對</strong>，第一條符合的生效；都不符合就照預設處理。</li>
+  <li><code>operator: In</code> 是「結束碼在清單裡」，<code>NotIn</code> 是「不在清單裡」。寫成 <code>NotIn [2]</code>，意思就反過來變成「除了 2 以外都立刻失敗」，暫時性的錯誤反而不重試了。</li>
+  <li><strong>DisruptionTarget</strong> 是 Pod 因為外力被終止時加上的狀況：節點 drain、被優先權高的 Pod 搶占（preemption）。這不是程式的錯，不該用掉重試次數。</li>
+</ul>
+<p>結果可以在 Job 的 status 看到：<code>status.failed</code> 是 1，<code>Failed</code> condition 的 reason 是 <code>PodFailurePolicy</code>，message 寫著是哪個容器、哪個結束碼符合了第幾條規則。這也提醒你：程式要用不同的結束碼表達不同的失敗，Kubernetes 才有東西可以判斷。</p>
+
+<h2>CronJob：依排程建立 Job</h2>
+<p><strong>CronJob</strong> 的工作很單純：到了排程的時間，用 <code>jobTemplate</code> 建立一個 Job，之後的事都交給 Job。每日營收報表：</p>
+<pre>apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: daily-report
+spec:
+  schedule: "30 23 * * *"           # 分 時 日 月 星期：每天 23:30
+  timeZone: Asia/Taipei
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template: …                   # 跟 Job 的 template 一樣</pre>
+<p><code>schedule</code> 是 cron 格式的五個欄位：分、時、日、月、星期。<code>"0 * * * *"</code> 是每小時整點，<code>"*/15 * * * *"</code> 是每 15 分鐘，<code>"0 9 * * 1"</code> 是每週一 9 點。不確定時把字串貼到 crontab.guru 這類網站確認。其餘欄位：</p>
+<div class="table-wrap"><table>
+  <tr><th>欄位</th><th>意思</th><th>沒寫時</th></tr>
+  <tr><td><code>timeZone</code>（1.27 起 Stable）</td><td>schedule 用哪個時區解讀，例如 <code>Asia/Taipei</code></td><td>kube-controller-manager 程序的時區；雲端與 kind 上通常是 UTC，23:30 會變成台北早上 7:30</td></tr>
+  <tr><td><code>concurrencyPolicy</code></td><td>上一個 Job 還沒結束時：<code>Allow</code> 照樣開始、<code>Forbid</code> 跳過這一次、<code>Replace</code> 終止舊的換新的</td><td>Allow</td></tr>
+  <tr><td><code>startingDeadlineSeconds</code></td><td>錯過排程時間（控制器重啟、Forbid 時上一個還在跑）多久以內仍然補建；超過就跳過這一次</td><td>沒有期限</td></tr>
+  <tr><td><code>successfulJobsHistoryLimit</code>／<code>failedJobsHistoryLimit</code></td><td>保留幾個結束的 Job（和它們的 Pod、log）</td><td>3／1</td></tr>
+</table></div>
+<p>報表選 <code>Forbid</code>：兩份同時寫同一天的資料沒有意義，還會互相覆蓋。<code>Replace</code> 適合「只有最新的一次有用」的工作，例如同步快取。<code>timeZone</code> 一定寫出來，不要把台北時間換算成 UTC 寫進 schedule：讀的人看不出是幾點，有夏令時間的地區還會每年錯兩次。也不要寫成 <code>CRON_TZ=Asia/Taipei 30 23 * * *</code>，官方文件說這種寫法從來不支援，API server 會拒絕。</p>
+<p>報表昨晚失敗了，現在想補跑一次，不用等到今晚，也不用另外寫一份 Job：</p>
+<pre>kubectl create job daily-report-manual-20261101 --from=cronjob/daily-report -n cafe</pre>
+<p><code>--from=cronjob/…</code> 直接用 CronJob 現在的 jobTemplate 建立 Job，加上 annotation <code>cronjob.kubernetes.io/instantiate: manual</code>，事後看得出是手動跑的。另外複製一份 Job YAML 的話，哪天 CronJob 改了映像或環境變數，補跑用的還是舊的。暫停排程用 <code>kubectl patch cronjob daily-report -p '{"spec":{"suspend":true}}'</code>，正在跑的不受影響。</p>
+<p>跟 <a href="../../nestjs/lessons/21-scheduling-events.html">NestJS 課第 21 課</a>的應用程式內排程（<code>@Cron</code>）比：排程寫在應用程式裡，部署成 3 個副本就會每個副本各跑一次，要自己加分散式鎖；應用重啟、滾動更新剛好碰上排程時間就會漏跑。CronJob 由叢集的控制器負責觸發，跟 API 有幾個副本無關，失敗有重試、有歷史紀錄。代價是每次都要啟動一個新的 Pod（幾秒），所以「每 10 秒一次」這種高頻工作還是適合放在常駐的 worker 裡。</p>
+
+<div class="callout practice"><strong>💡 實務上：排程工作壞了，通常沒有人知道</strong><br>API 掛了，使用者幾分鐘內就會回報；每日報表的 CronJob 失敗，可能要等到月底對帳才有人發現少了一週的資料。所以排程工作上線時要一起決定：失敗時誰會收到通知，以及「太久沒有成功」時誰會收到通知。後者特別重要：CronJob 被 suspend 後忘了恢復、一直被 startingDeadlineSeconds 跳過時，根本不會產生 Job，也就沒有「失敗」可以告警。常見的做法是用叢集監控的 Job／CronJob 指標設告警，或讓工作成功時去打一個外部的心跳服務，超過時間沒收到就通知值班。</div>
+
+<h2>至少一次：工作要能重跑</h2>
+<p>Job 保證的是「至少成功一次」，不是「剛好一次」。這些情況都會讓同一件工作跑第二次：</p>
+<ul>
+  <li>節點當機，Pod 已經寫完資料、還沒回報成功，Job 在別的節點重跑。</li>
+  <li>官方文件寫明：CronJob 在某些情況下可能建立兩個 Job，也可能一個都沒建立，所以工作應該是冪等的。</li>
+  <li>有人看報表數字怪怪的，用 <code>--from=cronjob</code> 手動補跑。</li>
+</ul>
+<p>冪等（idempotent）是「做一次和做很多次，結果一樣」（<a href="../../system-design/lessons/09-idempotency.html">系統設計課第 9 課</a>）。報表用日期當主鍵，重跑時用 <code>ON CONFLICT</code>（<a href="../../postgresql/lessons/31-isolation-upsert.html">PostgreSQL 課第 31 課</a>：主鍵已經存在時改做更新）更新那一列，而不是再插入一列：</p>
+<pre>INSERT INTO daily_revenue (day, total)
+SELECT (now() AT TIME ZONE 'Asia/Taipei')::date, coalesce(sum(total), 0)
+FROM orders
+WHERE (ordered_at AT TIME ZONE 'Asia/Taipei')::date = (now() AT TIME ZONE 'Asia/Taipei')::date
+ON CONFLICT (day) DO UPDATE SET total = EXCLUDED.total, generated_at = now();</pre>
+<p><code>DO NOTHING</code> 也不會報錯，但第二次跑時不會更新，如果第一次之後又有新訂單，報表就停在舊的數字。寄信這種「做了就收不回」的工作，要先記錄「這張收據寄過了」，寄之前查一下；migration 靠 <code>schema_migrations</code> 跳過已經跑過的檔案，也是同一個道理。</p>
+
+<h2>練習</h2>
+<p>在 <code>learn</code> 資料夾執行頁面上的指令，起始檔會複製到 <code>kubernetes/practice/work/10/</code>。每一題先做靜態檢查，通過了才在叢集的專屬 namespace（<code>k8s-10-ex1</code> 這種名字）建立測試用的 postgres、跑你的 Job，最後刪掉。第一次執行練習 1 或 2 時，測試會建置 migration 映像並載入叢集，要多等幾分鐘。想自己先試的話用前面的 <code>try-10</code>，用完 <code>kubectl delete namespace try-10</code>。</p>
+
+<div class="local" data-test="ex1" data-files="ex1/migrate-job.yaml">
+  <p>練習 1：完成 <code>ex1/migrate-job.yaml</code>，把 v1 的資料庫 migration 做成 Job：映像 <code>learn-k8s/cafe-migrate:v1</code>，失敗只重試 1 次（<code>backoffLimit: 1</code>）、整個 Job 最多 120 秒、結束 600 秒後自動刪除、Pod 用 <code>restartPolicy: Never</code>；環境變數 <code>DATABASE_URL</code> 從 Secret <code>db-migrator</code> 的 key <code>DATABASE_URL</code> 讀（密碼由測試隨機產生，不能寫死）。測試套用後要在 120 秒內 Complete、資料庫有 orders 表；再用新名稱跑一次同一版，也要成功而且 schema 不變。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="ex2/deploy.sh">
+  <p>練習 2：寫 <code>ex2/deploy.sh &lt;版本&gt;</code>：把 <code>migrate-job.yaml</code> 裡的 <code>__VERSION__</code> 換成版本號後套用（例如用 <code>sed</code>）→ 等 Job <code>migrate-&lt;版本&gt;</code> 結束，Complete 才繼續、Failed 就印出 log 並 <code>exit 1</code>、最多等 120 秒 → 用 <code>kubectl set image</code> 把 <code>deployment/cafe-api</code> 的容器 <code>api</code> 換成 <code>learn-k8s/cafe-api:&lt;版本&gt;</code>，等滾動更新完成。測試先部署 v1，執行 <code>deploy.sh v2</code>，要看到 orders 多了 <code>note</code> 欄位、API 回 v2；再執行 <code>deploy.sh v3-broken</code>（migration 一定失敗），要在 150 秒內以非 0 結束，而且 Deployment 完全沒被動過、API 仍是 v2。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="ex3/resend-job.yaml">
+  <p>練習 3：<code>ex3/resend-job.yaml</code> 是重寄收據的 Job：沒設 <code>SMTP_HOST</code> 時以結束碼 2 結束（設定錯誤），其他情況以 1 結束（暫時錯誤）。加上 podFailurePolicy：結束碼 2 立刻讓 Job 失敗、被驅逐（<code>DisruptionTarget</code>）不計入次數，<code>backoffLimit: 4</code>；容器的設定不要改，注意現在的 <code>restartPolicy</code>。測試會用你的 Job 建兩份：<code>SMTP_HOST</code> 是空字串的那份要失敗 1 次就 Failed、reason 是 <code>PodFailurePolicy</code>；有 <code>SMTP_HOST</code> 的那份要看到它重試。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="ex4/cronjob.yaml ex4/report.sql ex4/run-now.sh">
+  <p>練習 4：每日營收報表。<code>ex4/cronjob.yaml</code>：每天台北時間 23:30 執行、上一次還沒跑完就跳過這一次、錯過排程 10 分鐘內補跑、保留 3 個成功與 3 個失敗的 Job（jobTemplate 不要改）。<code>ex4/report.sql</code>：改成重跑時更新今天那一列。<code>ex4/run-now.sh</code>：用這個 CronJob 立刻手動跑一次，Job 名稱每次不同。測試會建好 orders 與 <code>daily_revenue</code> 表，執行 run-now.sh 兩次（中間多一筆訂單），每次的 Job 都要是從 CronJob 建立的並且 Complete，最後 <code>daily_revenue</code> 只有今天一列、金額是第二次算的。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：為什麼不建議讓應用程式在啟動時自動執行 migration？</p>
+  <label data-key="a">因為 Prisma 不支援在程式裡執行 migration</label>
+  <label data-key="b">每個副本都會跑、可能同時搶著改 schema；啟動時間被拉長；應用的帳號需要 DDL 權限；而且滾動更新開始後才發現失敗</label>
+  <label data-key="c">因為 Kubernetes 不允許容器在啟動時連資料庫</label>
+  <label data-key="d">因為 migration 只能在開發者的電腦上跑</label>
+  <p class="why">✓ 獨立的 Job 在更新應用之前跑一次，用 migrator 帳號，失敗就停止部署，線上什麼都沒動。a 錯，技術上做得到，問題在副本數與權限；c、d 都不是事實，Job 本身就是在叢集裡連資料庫。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：CronJob 每小時跑一次報表，某一次跑了 90 分鐘。<code>concurrencyPolicy</code> 沒有寫，會怎樣？</p>
+  <label data-key="a">下一次會被跳過，等這一次跑完</label>
+  <label data-key="b">預設是 Allow：下一次照常開始，兩個報表同時在跑</label>
+  <label data-key="c">舊的那一次會被終止，換成新的</label>
+  <label data-key="d">CronJob 會被自動停用</label>
+  <p class="why">✓ 預設 Allow 不管上一次有沒有結束。a 是 Forbid 的行為，c 是 Replace 的行為，都要明確寫出來；d 不會發生，CronJob 只有你設 <code>suspend: true</code> 才會停。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：Job 的程式因為設定錯誤以結束碼 2 失敗，<code>backoffLimit</code> 沒寫，也沒有 podFailurePolicy。會怎樣？</p>
+  <label data-key="a">Kubernetes 看得出這是設定錯誤，立刻讓 Job 失敗</label>
+  <label data-key="b">照預設重試，backoffLimit 是 6，每次等得更久，好幾分鐘後才失敗</label>
+  <label data-key="c">永遠重試，直到有人刪掉 Job</label>
+  <label data-key="d">結束碼不是 1 就算成功</label>
+  <p class="why">✓ 沒有 podFailurePolicy 時，所有失敗都計入重試，而且 backoff 逐次加倍。a 錯，Kubernetes 只看到「非 0」，要你用 podFailurePolicy 告訴它結束碼 2 的意思；c 錯，有 backoffLimit 上限；d 錯，只有 0 算成功。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 8：CronJob 沒寫 <code>timeZone</code>，schedule 是 <code>"0 9 * * *"</code>，叢集在 AWS 上。報表會在什麼時候跑？</p>
+  <label data-key="a">台北時間早上 9 點，因為公司在台北</label>
+  <label data-key="b">kube-controller-manager 程序所在時區的 9 點，雲端上通常是 UTC，也就是台北下午 5 點</label>
+  <label data-key="c">建立 CronJob 的人電腦上的時區</label>
+  <label data-key="d">每次隨機</label>
+  <p class="why">✓ 官方 API 文件：沒寫 timeZone 就用 kube-controller-manager 的時區。寫 <code>timeZone: Asia/Taipei</code>，讀 YAML 的人也一眼看懂。a、c 錯，叢集不知道公司或你的電腦在哪裡；d 錯，排程是固定的。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>migration 和應用一起啟動</strong>（寫在啟動程式或 initContainer）：多個副本同時跑、應用帳號權限過大、失敗時滾動更新已經開始。用獨立的 Job，排在更新應用之前。</li>
+  <li><strong>部署腳本只等 Complete</strong>：migration 早就 Failed，腳本還在等到逾時。同時檢查 Complete 和 Failed。</li>
+  <li><strong>migration 失敗還繼續部署</strong>：新版程式碰到舊 schema，所有請求一起失敗。失敗就 <code>exit 1</code>，什麼都不動。</li>
+  <li><strong>backoffLimit 用預設的 6</strong>：重試不會好的錯誤要等好幾分鐘才失敗。migration 設 0 或 1；依結束碼分類用 podFailurePolicy。</li>
+  <li><strong>沒有 activeDeadlineSeconds</strong>：卡住的 Job 永遠是 Running，部署跟著卡住。</li>
+  <li><strong>完成的 Job 越積越多</strong>：設 <code>ttlSecondsAfterFinished</code>；CronJob 用兩個 history limit 控制。</li>
+  <li><strong>沒寫 timeZone</strong>：排程差 8 小時。也不要自己換算成 UTC 或寫 <code>CRON_TZ=</code>。</li>
+  <li><strong>以為 CronJob 剛好執行一次</strong>：重跑、補跑、偶爾建立兩次都會發生。報表用 UPSERT，寄信先記錄已寄。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>Deployment 給「一直跑」的服務，Job 給「做完就結束」的工作；Job 的 Pod 用 <code>restartPolicy: Never</code>（或 OnFailure），不能用 Always。</li>
+  <li><code>backoffLimit</code> 控制重試次數（預設 6，等待逐次加倍），<code>activeDeadlineSeconds</code> 防止卡住，<code>ttlSecondsAfterFinished</code> 自動清理。</li>
+  <li>migration 做成每個版本一個 Job（新名稱、backoffLimit 小、lock_timeout），部署時先等它 Complete 再更新應用，Failed 就停；migration 只做舊版也相容的 expand。</li>
+  <li>podFailurePolicy 依結束碼或 Pod 狀況決定 FailJob、Ignore 或 Count，讓設定錯誤立刻失敗、被驅逐不算次數；需要 <code>restartPolicy: Never</code>。</li>
+  <li>CronJob 依 schedule 建立 Job：寫明 <code>timeZone</code>、依工作性質選 <code>concurrencyPolicy</code>、設 <code>startingDeadlineSeconds</code> 與 history limit；補跑用 <code>kubectl create job --from=cronjob/…</code>。</li>
+  <li>Job 是「至少一次」，工作要冪等：報表 UPSERT、寄信先查紀錄、migration 記錄跑過的檔案。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 8 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 9：cafe-api 的 <code>/health/ready</code> 會檢查 Redis 與資料庫。同事想把 livenessProbe 也改打 <code>/health/ready</code>，理由是「依賴斷了就重啟比較保險」。Redis 斷線 1 分鐘時會怎樣？</p>
+  <label data-key="a">斷線的 Pod 被重啟、重新建立 Redis 連線，比只移出端點恢復得更快</label>
+  <label data-key="b">兩個 probe 打同一個端點時，Kubernetes 只採用 readiness 的結果</label>
+  <label data-key="c">所有副本一起被重啟，重啟修不好 Redis，恢復時又同時重連多一波尖峰</label>
+  <p class="why">✓ liveness 失敗就重啟容器，而所有副本看的是同一個 Redis，會一起重啟，一分鐘的小事變成整個服務中斷。依賴交給 readiness（只停止收流量），liveness 只看程序本身，打 <code>/health/live</code>。a 錯在 Redis 恢復之前，重啟後的 Pod 一樣連不上，只是多了啟動時間和一次重連尖峰。（第 7 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 10：cafe-api 設了 preStop sleep 5 秒、<code>terminationGracePeriodSeconds: 40</code>，程式收到 SIGTERM 會排空。結果滾動更新時每個舊 Pod 都整整 40 秒才消失，長請求還是被切斷。Dockerfile 最後一行如下，問題在哪？</p>
+<pre>CMD ["sh", "-c", "node dist/main.js"]</pre>
+  <label data-key="a">PID 1 是 shell，SIGTERM 沒有轉給 node，排空沒執行，寬限期一到就被 SIGKILL</label>
+  <label data-key="b">preStop 只有 5 秒，轉送規則還沒更新完，SIGTERM 就已經送出去了</label>
+  <label data-key="c">寬限期設成 40 秒，Kubernetes 要等寬限期快結束時才送出 SIGTERM</label>
+  <label data-key="d">readinessProbe 在關機期間還回 200，Pod 一直留在端點裡繼續收請求</label>
+  <p class="why">✓ 每個 Pod 都剛好拖滿寬限期，代表程式沒有在 SIGTERM 時結束：shell 不會把訊號轉給 node，最後是 SIGKILL 連同手上的請求一起切斷。改成 exec 形式 <code>CMD ["node", "dist/main.js"]</code>。b 錯在 preStop 太短造成的是零星的連線被拒，不會讓每個 Pod 都等滿 40 秒。（第 7 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 11：新的 Pod 一直 Pending，事件寫 <code>Insufficient cpu</code>；但 <code>kubectl top node</code> 顯示每個節點的 CPU 只用了 20%。為什麼？</p>
+  <label data-key="a">metrics-server 的數字有延遲，節點實際上已經忙到放不下新 Pod</label>
+  <label data-key="b">其他 Pod 的 CPU limits 加起來超過節點容量，超賣後就不能再排</label>
+  <label data-key="c">新 Pod 沒有寫 requests，排程器不知道它要多少，只好先停在 Pending</label>
+  <label data-key="d">排程器只拿 requests 的加總跟 Allocatable 比，保留量已經被訂滿了</label>
+  <p class="why">✓ 排程看的是保留量，不是實際用量；四個很閒但 requests 很大的 Pod，一樣把節點佔滿。依量測結果調低過大的 requests，或靠 Cluster Autoscaler／Karpenter 加節點。b 錯在排程完全不看 limits，limits 加總超過節點容量照樣排得上。（第 8 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 12：匯出報表時 cafe-api 的 RESTARTS 一直增加，lastState 是 <code>OOMKilled</code>、exit code 137，<code>kubectl logs --previous</code> 沒有任何錯誤。記憶體 limit 256Mi，沒有設 <code>--max-old-space-size</code>。該怎麼處理？</p>
+  <label data-key="a">拿掉記憶體 limit，讓容器需要多少就用多少，就不會再被殺掉</label>
+  <label data-key="b">量測後調整 limit，並把 heap 上限設在 limit 的 70～75%</label>
+  <label data-key="c">調高 CPU limit，讓 GC 跑得夠快，記憶體就不會超過 limit</label>
+  <label data-key="d">讓 HPA 依記憶體使用率擴容，把匯出的負載分給更多 Pod</label>
+  <p class="why">✓ V8 自己的 heap 上限比 256Mi 還大，它還沒急著 GC，容器就被核心殺掉，所以 log 是空的。用 <code>NODE_OPTIONS=--max-old-space-size</code> 設好 heap 上限，不夠時會印出 heap out of memory，有線索可查；一次載入大量資料的匯出也先考慮改成串流。a 錯在沒有 limit，一個洩漏的 Pod 能吃光節點記憶體，拖垮同節點的所有服務。（第 8 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 13：HPA 的目標是 CPU 使用率 70%。同事把 CPU requests 從 100m 調成 500m，實際用量沒變，尖峰時每個 Pod 約 120m。之後尖峰時副本數都沒有增加，為什麼？</p>
+  <label data-key="a">requests 變大後新 Pod 排不上節點，HPA 判斷擴了也沒用就不擴</label>
+  <label data-key="b">HPA 看的是 limits 不是 requests，問題出在 limit 被調得太高</label>
+  <label data-key="c">使用率以 requests 為分母：120m ÷ 500m 只有 24%，HPA 認為很閒</label>
+  <label data-key="d">擴容預設回看 300 秒，尖峰不到 5 分鐘就結束，來不及擴</label>
+  <p class="why">✓ 以前 120m ÷ 100m 是 120%，現在只有 24%，同樣的負載在 HPA 眼裡變得很閒。requests 要照實際用量設，目標使用率才有意義。d 錯在 300 秒的穩定視窗是縮容用的，擴容預設不回看，一需要就擴。（第 8 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 14：部署腳本如下。某次部署了啟動就崩潰的版本，腳本結束時線上是什麼狀態？</p>
+<pre>set -euo pipefail
+kubectl set image deployment/cafe-api api=learn-k8s/cafe-api:"$1"
+kubectl rollout status deployment/cafe-api --timeout=120s
+if [ $? -ne 0 ]; then
+  kubectl rollout undo deployment/cafe-api
+  exit 1
+fi</pre>
+  <label data-key="a">壞版本留著：rollout status 失敗時 set -e 就結束腳本，undo 沒執行</label>
+  <label data-key="b">回到上一版：progressDeadlineSeconds 到了會自動回滾，undo 只是再做一次</label>
+  <label data-key="c">回到上一版：rollout status 回非 0，if 接到之後執行 undo 再 exit 1</label>
+  <label data-key="d">服務全部中斷：新版建立時舊 Pod 已經全部被刪掉，沒有 Pod 可以服務</label>
+  <p class="why">✓ <code>set -e</code> 下指令一失敗腳本就結束，走不到下一行的 if。改成 <code>if ! kubectl rollout status …; then</code> 接住，undo 之後再等回滾完成、exit 1。b 錯在 Kubernetes 不會自動回滾，progressDeadlineSeconds 到了只標成 ProgressDeadlineExceeded。（第 9 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 15：cafe-api 3 個副本、PDB <code>maxUnavailable: 1</code>。上週節點升級時一次只少一個 Pod，很順；昨天一台節點當機，服務卻整個中斷了好幾分鐘。最可能的原因是？</p>
+  <label data-key="a">PDB 的 selector 選不到 Pod，實際上沒有保護任何一個副本</label>
+  <label data-key="b">maxUnavailable 1 太寬鬆，要改成 minAvailable 3 才擋得住</label>
+  <label data-key="c">節點當機時驅逐 API 一直回 429，Pod 沒辦法搬到別的節點</label>
+  <label data-key="d">3 個副本都在那台節點上，當機不走驅逐 API，PDB 不參與</label>
+  <p class="why">✓ PDB 只管走驅逐 API 的自願中斷（drain、升級）；節點當機時沒有人呼叫驅逐 API。撐住非自願中斷的是多副本、用 topologySpreadConstraints 分散到不同節點（正式環境不同可用區）、readiness。a 錯在升級時一次只少一個，代表 PDB 有選到 Pod、有在作用。（第 9 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 16：部署腳本如下，沒有 <code>set -e</code>。v3 的 migration Job（<code>backoffLimit: 0</code>）在第 5 秒就 Failed，接下來會怎樣？</p>
+<pre>kubectl apply -f migrate-v3.yaml
+kubectl wait --for=condition=Complete job/migrate-v3 --timeout=120s
+kubectl set image deployment/cafe-api api=learn-k8s/cafe-api:v3
+kubectl rollout status deployment/cafe-api --timeout=120s</pre>
+  <label data-key="a">wait 看到 Job Failed 立刻回非 0，腳本停在第 2 行，線上維持 v2</label>
+  <label data-key="b">wait 等滿 120 秒逾時，腳本接著換成 v3，新版碰到舊 schema 開始出錯</label>
+  <label data-key="c">migration Job 失敗後，Kubernetes 會擋住同一個 namespace 的部署</label>
+  <label data-key="d">v3 的 Pod 會等 migration 成功才變 Ready，滾動更新停住，線上維持 v2</label>
+  <p class="why">✓ <code>kubectl wait --for=condition=Complete</code> 只認得成功，Job 早就 Failed 也要等到逾時；沒有 <code>set -e</code>，它的失敗也擋不住下一行。部署腳本要同時看 Complete 和 Failed，Failed 就印 log、exit 1，線上什麼都不動。a 錯在 wait 不會因為 Failed 提早結束，就算加了 set -e 也要白等 120 秒。（第 10 課）</p>
+</div>
+<p>這個階段的重點整理成<a href="../sheets/stage-3.html">一頁圖解</a>。</p>
+<p>下一課處理資料：容器裡寫的檔案為什麼重啟就不見、PVC 與 StatefulSet 怎麼保存資料，以及咖啡店的資料庫為什麼放在 RDS 而不是叢集裡。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

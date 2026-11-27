@@ -1,0 +1,1552 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>8. 逾時、重試與退避：失敗之後怎麼辦</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="8">
+<header>
+  <div class="eyebrow">階段 3：可靠性：失敗是常態 · 第 8 課</div>
+  <h1>逾時、重試與退避：失敗之後怎麼辦</h1>
+</header>
+<main>
+
+<p>週年慶早上 8 點，咖啡店的下單 API 每秒收到約 50 筆訂單，每筆都要呼叫金流閘道扣款。某天金流那邊出了狀況，回應從 200ms 變成 30 秒才回來。下單 API 的程式一行都沒改，卻開始大量逾時、記憶體上升、連菜單都打不開。接著值班同事發現：App 和 API 都在「失敗就馬上再試一次」，金流剛恢復一點又被重試的流量壓垮。</p>
+<p>前幾課把系統變大、變多台。從這一階段開始，我們假設<strong>失敗是常態</strong>：網路會掉、下游會慢、機器會重開。這一課從頭到尾只處理一件事：把訂單服務裡「呼叫金流扣款」的那一段改好，讓下次金流再出狀況時，壞掉的只有扣款，咖啡店的其他功能照常運作，金流恢復時也不會被我們自己的重試壓垮。要改好它，得依序回答三個問題：要等多久（逾時）、要不要再試（重試）、隔多久再試（退避）。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>金流變慢為什麼連菜單都打不開：一個沒有逾時的呼叫怎麼把整台伺服器拖垮。</li>
+  <li>逾時要訂幾秒：照下游延遲的百分位數訂，再照呼叫端剩下的時間往下傳（deadline），這節結束時先給三個問題的最小答案。</li>
+  <li>金流逾時了，可以再送一次嗎：哪些錯誤值得再試，為什麼扣款的 POST 逾時不能直接重送。</li>
+  <li>隔多久再試、伺服器叫你等時怎麼辦：指數退避、jitter 與 Retry-After。</li>
+  <li>每一層都重試會怎樣、整套怎麼收尾：重試放大與重試預算，重試和其他工具的分工，上線後看哪些指標。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../node/lessons/17-calling-external-apis.html">Node 課第 17 課</a>的呼叫外部 API：<code>fetch</code> 會遇到哪幾種錯誤、用 <code>AbortSignal.timeout</code> 設逾時、基本的 <code>withRetry</code>。</li>
+  <li><a href="../../typescript/lessons/11-timeouts-cancellation.html">TypeScript 課第 11 課</a>的取消：<code>AbortController</code> 發出取消訊號，<code>AbortSignal.any</code> 把多個訊號合成一個，任一個觸發就取消。</li>
+  <li><a href="03-latency-percentiles.html">第 3 課</a>的 Little's Law 與百分位數：同時在系統裡的請求數 = 每秒請求數 × 每個請求停留的秒數；p99 是 100 個請求裡只有 1 個比它慢的那個延遲。</li>
+</ul></div>
+
+<h2>金流變慢，為什麼連菜單都打不開？</h2>
+<p>先看開場事故的第一個怪現象：出問題的是金流，看菜單根本不呼叫金流，為什麼也打不開？原因是<strong>一個還在等回應的請求，會一直佔著資源</strong>。訂單服務呼叫金流之後，這個請求在等待期間仍然佔著一塊記憶體（請求內容、還沒做完的程式狀態）、一條連到金流的連線，如果它在交易裡呼叫金流，還佔著一條資料庫連線。這些資源都有上限：資料庫連線池是事先開好、數量固定的一組連線（<a href="../../node/lessons/20-postgres-pool-transactions.html">Node 課第 20 課</a>），借光了，後面的請求只能排隊。</p>
+<p>同時有多少請求在等，可以用<a href="03-latency-percentiles.html">第 3 課</a>的 Little's Law（L = λW）算：每秒進來的請求數乘上每個請求停留的秒數。執行下面的程式，看三種情況下「同時卡著」的數字差多少：</p>
+<div class="lab"><script type="code">
+// 下單 API：每秒 50 筆，每筆都要等金流回應
+const ordersPerSec = 50
+
+for (const [label, waitSec] of [['金流正常 0.2 秒', 0.2], ['金流卡住、沒有逾時 30 秒', 30], ['金流卡住、逾時 2 秒', 2]] as const) {
+  const inFlight = ordersPerSec * waitSec          // L = λ × W
+  console.log(`${label.padEnd(16, '　')} → 同時卡著 ${inFlight} 個請求`)
+}
+</script></div>
+<p>金流正常時，同時只有 10 個請求在等；金流卡住 30 秒、而我們又願意一直等，就變成 1,500 個。每秒進來的訂單數沒變，變的只有每個請求停留多久。這 1,500 個請求把連線池、記憶體佔滿之後，<strong>不相干的請求</strong>（看菜單、查訂單）也借不到資源，只能排隊，於是整個咖啡店一起變慢。</p>
+<p>這也說明為什麼<strong>慢比掛掉更危險</strong>。金流如果直接掛掉，連線馬上被拒絕，請求立刻失敗，資源也立刻釋放，影響只限於扣款。金流變慢時，每個請求都還「有希望」，所以沒有人放手，資源被一點一點吃光，最後連不相干的功能一起倒。</p>
+<p>要讓請求放手，就要設<strong>逾時（timeout）</strong>：等超過這個時間就放棄，回報失敗，把資源還回去。上面程式的第三行就是答案：同樣是金流卡住，設了 2 秒逾時，同時卡著的只有 100 個，因為每個請求最多停留 2 秒。逾時沒辦法讓金流變快，它做的是<strong>替等待設上限</strong>，把損害限制在扣款這一個功能裡。</p>
+<p>設逾時時要知道，一個網路呼叫的「等待」分成好幾段，對應不同的逾時：</p>
+<ul>
+  <li><strong>連線逾時（connect timeout）</strong>：連不上對方多久就放棄。只管「建立連線」這一段，連上之後就不管了。</li>
+  <li><strong>讀取逾時（read timeout）</strong>：連上之後，兩次收到資料之間最多等多久。只要對方每隔一段時間送一點資料，它就不會觸發，所以整個回應可以拖得很久。</li>
+  <li><strong>整體逾時</strong>：從送出請求到收完整個回應的上限。</li>
+</ul>
+<p>保護資源要靠的是整體逾時，因為只有它限制了「這個請求最多佔著資源多久」。<a href="../../node/lessons/17-calling-external-apis.html">Node 課第 17 課</a>講過，Node 的 <code>fetch</code> 沒有整體逾時，要自己傳 <code>AbortSignal.timeout(ms)</code>。規則只有一條：<strong>每個網路呼叫都要有逾時</strong>，包含資料庫查詢、Redis、內部服務，不只是呼叫第三方。所以修好金流呼叫的第一步，是在 <code>fetch</code> 加上 <code>AbortSignal.timeout</code>。問題是這個數字要填多少，下一節回答。</p>
+<div class="callout practice"><strong>💡 實務上：接手專案時先盤點「哪些呼叫沒有逾時」</strong><br>除了上面的 <code>fetch</code>，很多套件預設也不逾時，例如 axios 的 <code>timeout</code> 預設是 0（不限制），PostgreSQL 的 <code>statement_timeout</code> 預設也是 0，要自己設定。資深工程師 code review 時會問：「這個呼叫最久會等多久？逾時的時候使用者看到什麼？」咖啡店後台常見的事故是報表頁的慢查詢卡住連線池，結果收銀機下單也跟著失敗，跟開場的金流事故是同一種病。逾時的數字最好集中寫在設定裡、附上依據（看了哪個監控），之後才知道要不要調。</div>
+
+<h2>逾時要訂幾秒？先看下游延遲，再看呼叫端還剩多少時間</h2>
+<p>上一節決定了金流呼叫一定要有逾時，接著是數字。這個數字兩頭都會出事：訂太短，金流其實正常、只是這一次稍微慢一點的請求也被當成失敗，使用者明明付得了錢卻看到錯誤；訂太長，又回到上一節的問題，金流一變慢，資源就被卡住。</p>
+<p>AWS Builders' Library 的〈Timeouts, retries, and backoff with jitter〉給的做法，是先決定<strong>能接受多少誤判</strong>，再拿下游延遲對應的百分位數當逾時。誤判指的是「下游其實會成功，只是我們等不及」。如果逾時訂在金流的 p99.9，代表正常情況下 1,000 個請求只有 1 個會比它慢，也就是只有 0.1% 的正常請求被誤判成逾時。能接受 0.1% 誤判，就用 p99.9；能接受 1%，就用 p99。咖啡店從監控看到金流的 p99.9 是 1.2 秒，扣款的逾時就訂 1.2 秒左右，而不是拍腦袋寫 30 秒或 100ms。下游的延遲會隨著版本、流量改變，所以這個數字要定期依監控重新檢查。</p>
+<p>只看單一呼叫還不夠，因為扣款不是使用者直接呼叫的。使用者按下「送出訂單」，App 最多等 1 秒；請求先經過 API 閘道，再到訂單服務，訂單服務才呼叫金流。如果每一層各自訂 1 秒逾時：訂單服務自己花了 900ms 才呼叫金流，金流又可以用滿 1 秒，總共 1.9 秒。App 在 1 秒時就放棄了，後面那 900ms 不管成功失敗都沒人收，全是白工，而且還佔著資源。</p>
+<p>問題出在每一層都以為自己有完整的 1 秒。解法是 <strong>deadline</strong>：不再說「我最多等多久」，而是說「這個請求<strong>最晚</strong>要在哪個時間點完成」。最外層定下 deadline 之後，每一層往下傳的是「還剩多少時間」，這叫 <strong>deadline 傳遞（deadline propagation）</strong>。Google SRE 書〈Addressing Cascading Failures〉的作法是：每一層拿到剩下的時間，減掉自己已經用掉的，再扣一點<strong>餘裕（margin）</strong>，留給回應從下游傳回來、自己再處理一下的時間；剩下的時間太少就<strong>直接不做</strong>，因為做完也沒人收。下圖是咖啡店的例子：</p>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="閘道給 1000 毫秒的期限，訂單服務用掉 300 毫秒，扣掉 50 毫秒餘裕後，呼叫金流時只剩 650 毫秒">
+    <defs><marker id="arr8a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <text class="d-small" x="20" y="28">時間 →（0 = 使用者送出）</text>
+    <path class="d-line" d="M60,50 L670,50"/>
+    <text class="d-small" x="60" y="44" text-anchor="middle">0</text>
+    <text class="d-small" x="243" y="44" text-anchor="middle">300</text>
+    <text class="d-small" x="640" y="44" text-anchor="middle">1000</text>
+    <path class="d-line" d="M640,50 L640,230" stroke-dasharray="4 4"/>
+    <text class="d-accent" x="636" y="240" text-anchor="end">deadline</text>
+    <rect class="d-soft" x="60" y="65" width="580" height="40" rx="6"/>
+    <text class="d-text" x="75" y="90">API 閘道：期限 1,000ms</text>
+    <rect class="d-soft" x="60" y="120" width="183" height="40" rx="6"/>
+    <text class="d-text" x="75" y="145">訂單服務工作 300ms</text>
+    <rect class="d-box" x="243" y="175" width="366" height="40" rx="6"/>
+    <text class="d-text" x="258" y="200">呼叫金流：逾時 = 650ms</text>
+    <rect class="d-soft" x="609" y="175" width="31" height="40"/>
+    <text class="d-small" x="600" y="230" text-anchor="end">餘裕 50ms</text>
+    <path class="d-line" d="M243,160 L243,175" marker-end="url(#arr8a)"/>
+  </svg>
+  <figcaption>每一層傳下去的是剩餘時間：1,000 − 300 − 50 = 650ms，而不是另一個完整的 1 秒</figcaption>
+</figure>
+<p>下面的程式把這條規則寫成函式。執行後比較兩行：訂單服務在 300ms 時還有時間，就把剩下的 650ms 當成呼叫金流的逾時；在 880ms 時只剩 70ms，不夠做一次有意義的呼叫，就乾脆不呼叫。</p>
+<div class="lab"><script type="code">
+// 每一層：剩餘 = deadline − 現在 − 餘裕；太少就不做
+function budgetFor(deadline: number, now: number, marginMs: number, minUsefulMs: number) {
+  const remaining = deadline - now - marginMs
+  return remaining < minUsefulMs ? `剩 ${remaining}ms，不呼叫` : `呼叫，逾時 ${remaining}ms`
+}
+
+const deadline = 1000          // 使用者送出後 1,000ms
+console.log('訂單服務在 300ms 時：', budgetFor(deadline, 300, 50, 100))
+console.log('訂單服務在 880ms 時：', budgetFor(deadline, 880, 50, 100))
+</script></div>
+<p>到目前為止講的逾時都是「一次呼叫」。後面要加上重試，一個請求可能會呼叫金流好幾次，所以要先分清楚兩種限制：<strong>單次逾時（per-attempt timeout）</strong>限制一次嘗試，例如前面依 p99.9 訂的 1.2 秒；<strong>總期限</strong>就是 deadline，限制「所有嘗試加上中間的等待」。每次嘗試的逾時取兩者的較小值：剩下 650ms 時，這一次最多等 650ms，不會因為單次逾時是 1.2 秒就等到 1.2 秒。</p>
+<p>到這裡，開場的三個問題可以先有一版最小的答案：</p>
+<ul>
+  <li><strong>要等多久</strong>：逾時照下游延遲的百分位數訂（例如 p99.9），而且不超過呼叫端剩下的時間。</li>
+  <li><strong>要不要再試</strong>：只重試暫時性錯誤；非冪等的請求沒有冪等鍵就不自動重試。</li>
+  <li><strong>隔多久再試</strong>：每次重試前等的時間加倍，再加上隨機。</li>
+</ul>
+<div class="callout practice"><strong>💡 實務上：deadline 怎麼在服務之間傳</strong><br>gRPC 內建 deadline，客戶端設定的 deadline 會轉成 <code>grpc-timeout</code> 標頭送到伺服器端。HTTP 沒有標準標頭，團隊通常自訂一個（例如 <code>X-Request-Deadline</code>），裡面放剩餘毫秒數；放剩餘時間比放絕對時間好，因為不怕兩台機器的時鐘不一致。在 Node 裡，訂單服務收到剩餘時間後，用 <code>AbortSignal.timeout(剩餘)</code> 變成 signal，再用 <code>AbortSignal.any</code> 跟「客戶端斷線」的 signal 合併（<a href="../../typescript/lessons/11-timeouts-cancellation.html">TypeScript 課第 11 課</a>），往下傳給呼叫金流、查資料庫的每一個呼叫。這樣使用者關掉 App 或時間用完，整條鏈都會一起停下來。</div>
+<p>第一個答案這兩節已經講完。第二個答案裡的「暫時性錯誤」「冪等」還沒解釋，而扣款剛好是最需要想清楚的那種請求，下一節就從「金流逾時了，能不能再送一次」開始。</p>
+
+<h2>金流逾時了，可以再送一次嗎？</h2>
+<p>有了逾時，金流變慢時訂單服務會在時間內放棄。放棄之後，最自然的念頭是「再送一次」，這正是開場事故裡 App 和 API 做的事。要不要再送，得先看失敗的是哪一種。</p>
+<p>很多失敗是<strong>暫時性錯誤（transient fault）</strong>：問題出在當下的狀況，等一下再試就會好，例如逾時、連線被重設、503 Service Unavailable（伺服器暫時無法處理）。另一種是<strong>永久錯誤</strong>：問題出在請求本身，再試幾次結果都一樣，例如 400（請求格式錯）、404（找不到）、409（衝突）、422（內容不合規則）。重試永久錯誤不會成功，只會增加對方的負擔。</p>
+<p>暫時性錯誤為什麼值得重試？<a href="04-redundancy-load-balancing.html">第 4 課</a>算過，硬相依的可用性相乘：下單要經過三個 99.9% 的服務，整體只剩約 99.7%。但這些失敗大部分只持續一瞬間，例如某台機器剛好在重開、某條連線剛好被重設，再試一次多半就會打到正常的機器而成功。所以加上重試，使用者實際感受到的成功率會比 99.7% 高。代價是多送的請求，這一節和後面兩節都在處理這個代價。</p>
+<p>不過對扣款來說，比錯誤種類更重要的問題是：<strong>重試會不會造成重複的副作用</strong>。副作用指的是請求對外界造成的改變，例如扣了一筆錢、建了一張訂單。描述這件事的詞是<strong>冪等（idempotent）</strong>：同一個請求做一次跟做很多次，伺服器的最終狀態一樣。「把訂單 42 的狀態設成已取消」做幾次都一樣，是冪等的；「扣 110 元」做兩次就是扣 220 元，不是冪等的。</p>
+<p>HTTP 方法的規格 RFC 9110 §9.2.2 規定：PUT、DELETE 和安全方法（GET、HEAD、OPTIONS、TRACE）是冪等的，POST 和 PATCH 不是。RFC 9110 也規定：客戶端不應（SHOULD NOT）自動重試非冪等的請求，除非知道它實際上冪等，或能確認原本的請求沒被套用；代理（proxy）一定不能（MUST NOT）自動重試非冪等請求。</p>
+<p>扣款用的是 <code>POST</code>，所以它落在最危險的那一格。原因在於逾時能告訴你的事很少：</p>
+<div class="callout warn"><strong>逾時不代表對方沒收到。</strong><code>POST /orders</code> 逾時，可能是請求沒到，也可能是訂單已經建立、扣款也成功了，只是回應在路上遺失。直接重試就可能扣兩次款。POST 要能安全重試，得帶<strong>冪等鍵</strong>（Idempotency-Key，<a href="../../node/lessons/14-rest-api-design.html">Node 課第 14 課</a>介紹過，<a href="09-idempotency.html">下一課</a>深入做）。</div>
+<p>把錯誤種類和冪等合在一起，就是下面這張決策表。它是查表用的，不用背；判斷順序是：先看是不是呼叫端自己取消，再看方法冪不冪等（或有沒有冪等鍵），最後看錯誤種類。</p>
+<div class="table-wrap"><table>
+  <tr><th>失敗</th><th>重試？</th><th>理由</th></tr>
+  <tr><td>呼叫端自己取消（AbortError）</td><td>不重試</td><td>使用者離開頁面或上游已經放棄；也不該記成錯誤或告警</td></tr>
+  <tr><td>逾時、連線失敗</td><td>可以</td><td>暫時性；非冪等方法要有冪等鍵</td></tr>
+  <tr><td>408 Request Timeout</td><td>可以</td><td>伺服器等請求內容等太久</td></tr>
+  <tr><td>429 Too Many Requests</td><td>可以，照 Retry-After</td><td>被限流（RFC 6585，<a href="10-rate-limiting.html">第 10 課</a>）；不照它等只會一直被擋</td></tr>
+  <tr><td>500、502、503、504</td><td>可以</td><td>伺服器或閘道暫時出錯；503 常附 Retry-After</td></tr>
+  <tr><td>501 Not Implemented</td><td>不重試</td><td>伺服器不支援這個方法，再試也一樣</td></tr>
+  <tr><td>400、401、403、404、409、422</td><td>不重試</td><td>請求本身的問題；401 要先重新取得 token，那是另一條流程</td></tr>
+</table></div>
+<p>表裡最容易被忽略的是第一列。呼叫端取消，代表上游已經不要這個結果了，例如使用者關掉頁面、或上一節的 deadline 到了。這時重試是替沒人要的結果做白工，把它記成錯誤或觸發告警，也會讓值班的人以為系統壞了。取消是正常的結束。</p>
+<p>決定了「哪些可以重試」，還要決定「最多試幾次」。Google SRE 書〈Handling Overload〉建議每個請求最多 3 次嘗試（第一次加上最多 2 次重試）。另一個上限是上一節的總期限：次數還沒用完，但 deadline 到了，也要停。資料庫交易的重試有自己的規則，細節見課末。</p>
+<p>回到扣款：它是 POST，沒有冪等鍵之前，金流逾時了也不能自動重送，這一課先讓它「失敗就回報」，下一課再補上冪等鍵。查訂單狀態、查菜單這類 GET 則可以重試。接下來三節講退避、Retry-After、重試放大時，還是會拿扣款當例子，前提是它已經帶上冪等鍵（下一課實作），或者換成查詢扣款狀態的 GET；兩種都屬於可以安全重試的請求，所以能套用下面的規則。那可以重試的請求，失敗後應該馬上再送嗎？開場事故的後半段說明了答案是否定的，下一節處理。</p>
+<div class="callout practice"><strong>💡 實務上：加重試前先問「重複做一次會發生什麼事」</strong><br>查菜單、查訂單狀態重試幾次沒關係；扣款、寄簡訊、寄 Email、通知外送平台，重複一次就是客訴。加重試前先列出這支呼叫的副作用，再看第三方有沒有提供冪等鍵。也要確認你用的 SDK 是不是<strong>已經內建重試</strong>（例如 AWS SDK 預設就會重試），自己外面再包一層就變成兩層重試。前端也一樣：使用者狂按「送出」其實就是人工重試，按鈕送出後先停用、顯示處理中。</div>
+
+<h2>隔多久再試？指數退避與 jitter</h2>
+<p>開場事故裡，App 和 API 都是「失敗就馬上再試一次」。這樣做的問題是：失敗的原因通常還在。金流正在過載，你馬上再送，它還沒恢復，只是多收到一個請求，負擔更重。重試要有用，中間得給下游一點恢復的時間。</p>
+<p>最常見的做法是<strong>指數退避（exponential backoff）</strong>：每次重試前等的時間加倍，100ms、200ms、400ms、800ms……一路加倍到一個<strong>上限（cap）</strong>為止。加倍的道理是：第一次失敗可能只是一瞬間的問題，短短等一下就好；連續失敗好幾次，代表下游的問題比較嚴重，就等久一點，越來越少打擾它。上限是為了不要等到好幾分鐘：倍數一路翻下去，第 10 次重試就要等 51 秒，那時使用者早就離開了。</p>
+<p>只有退避還不夠。想像 1,000 支手機在同一刻遇到 503：它們用同一套程式，都在 100ms 後重試，又一起失敗，再一起在 300ms 重試……每一波都準時擠在同一刻，下游剛恢復一點，又被整整 1,000 個請求同時打倒。問題不在等多久，而在<strong>大家等得一樣久</strong>。</p>
+<p>解法是 <strong>jitter</strong>：在等待時間裡加入隨機，讓每個客戶端等的時間不一樣，回來的時間就錯開了。下面模擬 100 個客戶端在 0ms 同時失敗，之後每次重試都還是失敗，每 100ms 一格，數有幾個請求打到伺服器。比較的是兩種等待方式：不加 jitter，以及 full jitter，也就是把等待時間改成在 0 到退避時間之間隨機取一個值。程式用固定種子的亂數，所以每次執行的輸出都一樣。執行後比較兩張圖的形狀：</p>
+<div class="lab"><script type="code">
+// 可重現的亂數（mulberry32），範例每次輸出都一樣
+let seed = 42
+const random = () => { seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296 }
+
+const baseMs = 100, capMs = 1000, retries = 4
+const expo = (attempt: number) => Math.min(capMs, baseMs * 2 ** (attempt - 1))
+
+function simulate(delay: (attempt: number) => number) {
+  const slots = new Array(25).fill(0)               // 每格 100ms，共 2.5 秒
+  for (let c = 0; c < 100; c++) {
+    let t = 0
+    slots[0]++                                      // 第一次呼叫都在 0ms
+    for (let a = 1; a <= retries; a++) {
+      t += delay(a)
+      slots[Math.floor(t / 100)]++
+    }
+  }
+  return slots.map((n, i) => `${String(i * 100).padStart(5)}ms ${'#'.repeat(Math.ceil(n / 4))} ${n || ''}`).join('\n')
+}
+
+console.log('── 不加 jitter ──\n' + simulate(a => expo(a)))
+console.log('── full jitter ──\n' + simulate(a => random() * expo(a)))
+</script></div>
+<p>不加 jitter 時，100 個請求每一波都準時落在同一格（100、300、700、1500ms），每一波都是完整的 100 個，也就是下游每隔一段時間就被同時打一次。full jitter 沒有整齊的波：最高的是第一格（原本的 100 個請求，加上很快就重試的那些），之後逐格變少，最多也只有六十幾個。第一次重試只能在 0～100ms 之間隨機，能攤開的空間小；越後面的重試範圍越大，攤得越開。同樣的請求數，攤開之後下游每一刻承受的量就小得多。</p>
+<p>jitter 有好幾種加法。AWS 架構部落格 Marc Brooker 的〈Exponential Backoff And Jitter〉（2015）用模擬比較了幾種公式，結論是不加 jitter 最差，full jitter 和 decorrelated jitter 大幅減少總呼叫次數。下面四種公式照 AWS 的 <a href="https://github.com/aws-samples/aws-arch-backoff-simulator/blob/master/src/backoff_simulator.py">aws-arch-backoff-simulator</a> 整理，查表用，練習 1 會實作其中三種（指數部分的起算方式和 AWS 差一個 2 倍，見課末）：</p>
+<div class="table-wrap"><table>
+  <tr><th>名稱</th><th>第 n 次重試前等多久</th><th>特性</th></tr>
+  <tr><td>不加 jitter</td><td>exp = min(cap, base × 2<sup>n−1</sup>)</td><td>大家同步湧回，不要用</td></tr>
+  <tr><td>full jitter</td><td>random() × exp，範圍 [0, exp)</td><td>最分散；偶爾等得很短</td></tr>
+  <tr><td>equal jitter</td><td>exp ÷ 2 + random() × exp ÷ 2，範圍 [exp/2, exp)</td><td>保證至少等一半</td></tr>
+  <tr><td>decorrelated jitter</td><td>min(cap, base + random() × (上一次 × 3 − base))</td><td>依上一次的等待時間決定範圍，第一次以「上一次 = base」計算</td></tr>
+</table></div>
+<p>到這裡，可以重試的請求知道自己該等多久了。但有時候下游會直接告訴你該等多久，這時要聽誰的，下一節回答。</p>
+<div class="callout practice"><strong>💡 實務上：不只重試，所有定期執行的東西都要加 jitter</strong><br>「大家同一刻一起來」不只發生在重試：每分鐘的排程、快取到期時間、健康檢查、斷線後重新連線，全部都會。例如 200 家門市的 POS 機都設定在整點同步，伺服器就在每個整點被打一次；快取的到期時間都設成剛好 10 分鐘，同一批資料就會在同一刻一起失效、一起回資料庫查。看到「固定時間」「固定間隔」的設定，就問一句：幾百個客戶端會不會剛好對齊？會的話就加一點隨機。</div>
+
+<h2>金流說「等 30 秒再來」時怎麼辦？Retry-After</h2>
+<p>上一節的退避時間是客戶端自己猜的。下游其實比你更清楚自己什麼時候會恢復：它知道自己正在限流、還是正在重開。HTTP 讓伺服器把這個資訊告訴客戶端：429 或 503 回應可以附 <code>Retry-After</code> 標頭（RFC 9110 §10.2.3），值有兩種格式：</p>
+<pre>Retry-After: 120                              ← delay-seconds：非負整數秒，只能是數字
+Retry-After: Fri, 31 Dec 1999 23:59:59 GMT    ← HTTP 日期：要減掉現在的時間</pre>
+<p>收到 Retry-After 時要等的是 <strong>max(退避時間, Retry-After)</strong>：伺服器說的時間是下限，比它早回去只會再被拒絕；自己的退避時間如果比較長，也照樣遵守，因為退避還負責把大家錯開。</p>
+<p>這時要跟第二節的 deadline 一起看。如果 Retry-After 比剩餘的時間還長，例如金流說 120 秒後再來，但這張訂單的 deadline 只剩 2 秒，就<strong>直接放棄並回報</strong>：等完早就超過期限，結果沒人收，等待期間還佔著資源。快速失敗，讓上游決定要顯示什麼，例如「金流忙碌中，請稍後再試」。</p>
+<p>規則很單純，難的是把標頭的值正確讀出來。JavaScript 內建的轉換函式在這裡有兩個陷阱：第一，<code>parseInt</code> 與 <code>Number</code> 都太寬鬆；第二，<code>Date.parse</code> 在 V8（Chrome、Node）裡會把很多不是日期的字串猜成日期。執行下面的程式，看同一組值被三種函式解析成什麼：</p>
+<div class="lab"><script type="code">
+for (const v of ['120', '1.5', '-5', '', '12', 'Fri, 31 Dec 1999 23:59:59 GMT']) {
+  console.log(JSON.stringify(v).padEnd(33), 'parseInt:', parseInt(v), ' Number:', Number(v), ' Date.parse:', Date.parse(v))
+}
+</script></div>
+<p>輸出裡有三個會出事的結果：</p>
+<ul>
+  <li><code>parseInt('1.5')</code> 是 1：小數不是合法的 delay-seconds，卻被默默截成 1 秒。</li>
+  <li><code>Number('')</code> 是 0：伺服器送了空的標頭，你的程式卻解讀成「馬上重試」，正好是上一節要避免的事。</li>
+  <li><code>Date.parse('1.5')</code> 會是 2001 年的某一天：這是 V8 對非標準字串的猜測，別的引擎可能不同，總之不能拿來當 HTTP 日期。</li>
+</ul>
+<p>正確做法是<strong>先檢查格式，再轉換</strong>：去掉前後空白後全是數字，才當成秒數；日期先比對 RFC 9110 規定送出端要用的 IMF-fixdate 格式（<code>Sun, 06 Nov 1994 08:49:37 GMT</code>），符合了才交給 <code>Date.parse</code>。HTTP 日期一律是 GMT，不會有時區問題（<a href="../../typescript/lessons/06-dates-text.html">TypeScript 課第 6 課</a>）。兩種格式都不符合，就當成沒有 Retry-After，改用自己的退避。練習 2 會照這個規則寫 <code>parseRetryAfter</code>；RFC 9110 另外要求接收端能讀的兩種過時日期格式，見課末。</p>
+<p>到這裡，單一個呼叫端已經會逾時、會判斷能不能重試、會等對的時間。但開場事故裡重試的不只一個地方：App 會重試，API 也會重試。好幾層都照這套規則重試時，金流會收到多少請求，下一節來算。</p>
+
+<h2>每一層都重試，金流會收到幾倍的請求？</h2>
+<p>咖啡店的呼叫鏈是：App → API 閘道 → 訂單服務 → 金流客戶端。假設每一層都寫了「失敗就最多試 3 次」，而金流整個當掉了。閘道的每一次嘗試，都會讓訂單服務跑完自己的 3 次；訂單服務的每一次，又讓金流客戶端試 3 次。所以金流在最壞情況下收到的是 3 × 3 × 3 = <strong>27 倍</strong>的請求，是相乘，不是相加。這叫<strong>重試放大（retry amplification）</strong>。層數越多放大越快，Google SRE 書的例子是每層 4 次，資料庫收到 64 倍。</p>
+<figure>
+  <svg viewBox="0 0 700 170" role="img" aria-label="三層各試三次，最底層收到 27 倍的請求">
+    <defs><marker id="arr8b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="20" y="40" width="130" height="50" rx="6"/>
+    <text class="d-text" x="85" y="70" text-anchor="middle">App</text>
+    <rect class="d-box" x="200" y="40" width="130" height="50" rx="6"/>
+    <text class="d-text" x="265" y="70" text-anchor="middle">API 閘道</text>
+    <rect class="d-box" x="380" y="40" width="130" height="50" rx="6"/>
+    <text class="d-text" x="445" y="70" text-anchor="middle">訂單服務</text>
+    <rect class="d-soft" x="560" y="40" width="120" height="50" rx="6"/>
+    <text class="d-text" x="620" y="70" text-anchor="middle">金流</text>
+    <path class="d-line" d="M150,65 L198,65" marker-end="url(#arr8b)"/>
+    <path class="d-line" d="M330,65 L378,65" marker-end="url(#arr8b)"/>
+    <path class="d-line" d="M510,65 L558,65" marker-end="url(#arr8b)"/>
+    <text class="d-small" x="174" y="115" text-anchor="middle">× 3</text>
+    <text class="d-small" x="354" y="115" text-anchor="middle">× 3</text>
+    <text class="d-small" x="534" y="115" text-anchor="middle">× 3</text>
+    <text class="d-accent" x="620" y="115" text-anchor="middle">27 倍</text>
+    <text class="d-small" x="350" y="150" text-anchor="middle">1 次點擊 → 3 → 9 → 27 次扣款請求</text>
+  </svg>
+  <figcaption>各層嘗試次數相乘；只在一層重試，其他層把錯誤往上傳</figcaption>
+</figure>
+<p>更糟的是放大發生在最不該發生的時候。下游健康時幾乎不失敗，重試很少；下游一過載，失敗變多，重試就變多，流量變成好幾倍，下游更加過載，失敗又更多。這個惡性循環叫<strong>重試風暴（retry storm）</strong>，開場事故裡「金流剛恢復一點又被壓垮」就是它。對策有三層，從簡單到精細：</p>
+<ul>
+  <li><strong>只在一層重試</strong>：通常是最靠近失敗的那一層的上一層。以（帶冪等鍵的）扣款來說，就是金流客戶端那一層；閘道和 App 收到錯誤就往上傳，不再自己重試。這樣最壞情況從 27 倍降回 3 倍。</li>
+  <li><strong>限制重試的比例</strong>：只在一層重試，3 倍還是 3 倍。Google SRE 書建議每個客戶端的重試佔請求的比例低於 10% 才允許重試。這條規則會自動分辨兩種狀況：下游健康時，偶爾的失敗很少，比例遠低於 10%，照樣重試；大面積失敗時，比例一下就超過，重試自動停止，讓下游喘口氣。</li>
+  <li><strong>重試預算（retry budget）</strong>：把上一點做成具體的計數器。gRPC 提案 A6 的 retry throttling 是這樣做的：每個伺服器一個計數 <code>token_count</code>，從 <code>maxTokens</code> 開始；每次失敗減 1、每次成功加 <code>tokenRatio</code>；計數小於等於 <code>maxTokens</code> 的一半時停止重試，回到一半以上才恢復。<code>tokenRatio</code> 超過 3 位的小數會被忽略。</li>
+</ul>
+<p>重試預算的效果用程式看最清楚。下面的設定是 <code>maxTokens</code> 10、<code>tokenRatio</code> 0.1：失敗到第 5 次，計數掉到 5，就停止重試；之後要成功十次以上，計數才爬回 5 以上、恢復重試。失敗扣得快、成功加得慢，所以下游一出事，重試很快就停；下游要穩定好一陣子，重試才會恢復。執行後看每一行最後的「可以重試／停止重試」：</p>
+<div class="lab"><script type="code">
+// maxTokens 10、tokenRatio 0.1：健康時偶爾失敗沒關係，連續失敗就停止重試
+let tokens = 10
+const log = (event: string) => console.log(`${event.padEnd(6)} → token ${tokens}，${tokens > 5 ? '可以重試' : '停止重試'}`)
+for (let i = 0; i < 6; i++) { tokens = Math.max(0, tokens - 1); log('失敗') }
+for (let i = 0; i < 12; i++) { tokens = Math.min(10, tokens + 0.1); if (i % 4 === 3) log('成功×4') }
+</script></div>
+<p>再看成功之後的 token 數字：理論上是 4.4、4.8、5.2，印出來卻是 4.399999999999999 這類數字。原因是 0.1 在二進位浮點數裡不是精確值，一路累加就累積誤差。平常差這一點沒關係，但剛好在門檻邊緣時會讓判斷翻轉：例如 4 加 5 次 0.2，算出 5.000000000000001，被當成「大於 5」而恢復重試，實際上應該剛好等於 5、還不能重試。練習 3 會用整數記帳處理這件事。</p>
+<p>到這裡，扣款這條呼叫鏈需要的規則都有了：每次嘗試有逾時、整個請求有 deadline、只重試該重試的錯誤、退避加 jitter、聽從 Retry-After、只在一層重試、用預算在大面積失敗時煞車。最後一節把它們放回整套可靠性工具裡，並決定上線後怎麼確認它們有在作用。</p>
+<div class="callout practice"><strong>💡 實務上：在設計文件寫清楚「誰負責重試」</strong><br>重試常常藏在你沒注意的地方：前端的請求函式、API 閘道的設定、HTTP 客戶端套件、雲端 SDK。資深工程師在架構討論時會把呼叫鏈畫出來，逐層問「這層會不會重試？幾次？」，再決定只留哪一層。事故檢討時，如果下游流量在故障期間反而暴增好幾倍，第一個懷疑的就是重試放大，開場的事故就是這樣。這類設定要讓維運也看得到，例如寫在設計文件或 README，不要只藏在某個套件的預設值裡。</div>
+
+<h2>重試和其他工具怎麼分工？上線後要看什麼？</h2>
+<p>這一課的工具都在處理「下游出問題」，但各自只管一種情況。重試只是其中一種，其他工具有的前面講過，有的接下來幾課會加入，先把分工看清楚，才知道哪個問題該交給誰。表中的 hedged request 是<a href="03-latency-percentiles.html">第 3 課</a>選讀講過的做法：請求超過 p95 還沒回應，就再送一份給另一台副本，用先成功回來的結果。</p>
+<div class="table-wrap"><table>
+  <tr><th>工具</th><th>解決什麼</th><th>什麼時候觸發</th></tr>
+  <tr><td>逾時</td><td>不讓慢的依賴佔住資源</td><td>每一次呼叫</td></tr>
+  <tr><td>重試＋退避</td><td>暫時性錯誤</td><td>失敗之後</td></tr>
+  <tr><td>hedged request</td><td>尾延遲</td><td>還沒失敗、只是慢（超過 p95），只用在可重複執行的讀取</td></tr>
+  <tr><td>斷路器（<a href="11-circuit-breaker-bulkhead.html">第 11 課</a>）</td><td>下游明顯壞掉時根本不呼叫</td><td>失敗率超過門檻；斷路器擋下的錯誤不該再重試</td></tr>
+  <tr><td>冪等鍵（<a href="09-idempotency.html">第 9 課</a>）</td><td>讓有副作用的請求可以安全重試</td><td>寫入類的請求</td></tr>
+</table></div>
+<p>放回開場事故來看：逾時讓金流變慢時不再拖垮菜單；重試加退避處理金流一瞬間的失誤；重試預算在金流大面積失敗時讓重試停下來。斷路器更進一步，金流明顯壞掉時連第一次呼叫都不送（第 11 課）；冪等鍵則讓扣款這種 POST 也能安全重試（第 9 課）。</p>
+<p>正式環境不用自己從零寫重試迴圈，Node 有現成的套件（例如 p-retry、cockatiel，版本與其他語言的例子見課末）。用套件時要確認的就是這課的每一點：哪些錯誤重試、有沒有 jitter、有沒有總期限、取消時會不會停。練習 5 會把這些規則自己組成一次，之後看套件的設定時，就知道每個選項對應哪一條規則。</p>
+<p>最後是上線之後。這些規則有沒有在作用、數字訂得對不對，要靠指標確認：</p>
+<ul>
+  <li><strong>重試率</strong>（重試 ÷ 全部請求），依下游分開看。重試率突然上升，常常是下游開始出問題的第一個訊號，比錯誤率更早。下次金流變慢，你最先看到的就是它。</li>
+  <li><strong>每個請求的嘗試次數分布</strong>：大多數應該是 1 次。</li>
+  <li><strong>各依賴的逾時次數</strong>與延遲百分位數：逾時是不是還貼著 p99.9。</li>
+  <li><strong>重試預算用光的次數</strong>：用光代表下游在大面積失敗。</li>
+  <li><strong>被取消的請求</strong>要分開記，不要算進錯誤率，也不要觸發告警。</li>
+</ul>
+<p>這一課修好的扣款呼叫還留著一個缺口：它是 POST，沒有冪等鍵之前，逾時了也不能重試，使用者只能看到錯誤。補上這個缺口是下一課的事。</p>
+
+<h2>補充與查表</h2>
+<p>主線用不到、但讀別人的程式或調設定時會用到的細節。</p>
+
+<h3>退避公式的指數從哪裡算起</h3>
+<p>AWS 模擬器寫的是 min(cap, 2<sup>n</sup> × base)，第一次重試 n = 1 時就是 2 × base。這門課定義成「第一次重試等 base」（指數用 n − 1），兩者差一個 2 倍，看別人的程式時要注意它從哪裡算起。gRPC 的重試設計（提案 A6）也是指數退避，再乘上 0.8～1.2 的隨機係數當 jitter。</p>
+
+<h3>資料庫交易的重試</h3>
+<p>PostgreSQL 回 40001（序列化失敗）或 40P01（死結）時，要重試的是<strong>整個交易</strong>，不是失敗的那一句（<a href="../../postgresql/lessons/31-isolation-upsert.html">PostgreSQL 課第 31 課</a>）。</p>
+
+<h3>Retry-After 的過時日期格式</h3>
+<p>RFC 9110 另外要求接收端也要能讀兩種過時的日期格式（RFC 850 與 asctime），這課的練習只處理 IMF-fixdate；正式環境交給 HTTP 客戶端函式庫，或把解析不了的值當成「沒有 Retry-After」，改用自己的退避。</p>
+
+<h3>重試預算的其他實作</h3>
+<p>AWS SDK 在 2016 年也加入了類似 gRPC retry throttling 的本機 token bucket。</p>
+
+<h3>現成的重試套件</h3>
+<p>Node 可以用 p-retry 8.0.1 或 cockatiel 4.0.0 的 retry policy；.NET 的 Microsoft.Extensions.Http.Resilience 標準處理器預設重試 3 次（指數退避加 jitter），還提供 <code>DisableForUnsafeHttpMethods</code> 關掉 POST、PATCH、PUT、DELETE 的重試。</p>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：實作退避公式。<code>backoffDelay(attempt, opts)</code>：<code>attempt</code> 從 1 開始（第一次重試），不是正整數（0、負數、小數、NaN）就丟 <code>RangeError</code>。<code>exp = Math.min(capMs, baseMs × 2^(attempt − 1))</code>；<code>jitter</code> 是 <code>'none'</code> 回傳 exp、<code>'full'</code> 回傳 <code>random() × exp</code>、<code>'equal'</code> 回傳 <code>exp ÷ 2 + random() × exp ÷ 2</code>。再寫 <code>decorrelatedDelay(prevMs, opts)</code> = <code>Math.min(capMs, baseMs + random() × (prevMs × 3 − baseMs))</code>，第一次重試由呼叫端傳 <code>prevMs = baseMs</code>。亂數一律用參數的 <code>random</code>。</p>
+  <script type="start">
+type Jitter = 'none' | 'full' | 'equal'
+type BackoffOpts = { baseMs: number; capMs: number; jitter: Jitter; random: () => number }
+
+function backoffDelay(attempt: number, opts: BackoffOpts): number {
+  throw new Error('TODO')
+}
+
+function decorrelatedDelay(prevMs: number, opts: { baseMs: number; capMs: number; random: () => number }): number {
+  throw new Error('TODO')
+}
+
+const half = () => 0.5
+for (let a = 1; a <= 5; a++) console.log(a, backoffDelay(a, { baseMs: 100, capMs: 1000, jitter: 'equal', random: half }))
+</script>
+  <script type="answer">
+type Jitter = 'none' | 'full' | 'equal'
+type BackoffOpts = { baseMs: number; capMs: number; jitter: Jitter; random: () => number }
+
+function backoffDelay(attempt: number, opts: BackoffOpts): number {
+  if (!Number.isInteger(attempt) || attempt < 1) throw new RangeError(`attempt 要是正整數，收到 ${attempt}`)
+  const exp = Math.min(opts.capMs, opts.baseMs * 2 ** (attempt - 1))
+  if (opts.jitter === 'full') return opts.random() * exp
+  if (opts.jitter === 'equal') return exp / 2 + opts.random() * exp / 2
+  return exp
+}
+
+function decorrelatedDelay(prevMs: number, opts: { baseMs: number; capMs: number; random: () => number }): number {
+  return Math.min(opts.capMs, opts.baseMs + opts.random() * (prevMs * 3 - opts.baseMs))
+}
+
+const half = () => 0.5
+for (let a = 1; a <= 5; a++) console.log(a, backoffDelay(a, { baseMs: 100, capMs: 1000, jitter: 'equal', random: half }))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<ReturnType<typeof backoffDelay>, number>>  // backoffDelay 要回傳 number
+type _2 = Expect<Equal<Parameters<typeof backoffDelay>[1]['jitter'], 'none' | 'full' | 'equal'>>  // jitter 只接受三種
+</script>
+  <script type="tests">
+const realRandom = Math.random
+Math.random = () => { throw new Error('不能用 Math.random，請用 opts.random') }
+try {
+  const r = (v: number) => () => v
+  const o = (jitter: 'none' | 'full' | 'equal', v: number) => ({ baseMs: 100, capMs: 1000, jitter, random: r(v) })
+  assert.equal(backoffDelay(1, o('none', 0)), 100, '第一次重試（attempt 1）等 baseMs = 100，不是 200')
+  assert.equal(backoffDelay(2, o('none', 0)), 200, 'attempt 2 → 200')
+  assert.equal(backoffDelay(4, o('none', 0)), 800, 'attempt 4 → 800')
+  assert.equal(backoffDelay(5, o('none', 0)), 1000, 'attempt 5 的 1600 要被 capMs 1000 截掉')
+  assert.equal(backoffDelay(3, o('full', 0.25)), 100, 'full：random 0.25 × exp 400 = 100')
+  assert.equal(backoffDelay(3, o('full', 0)), 0, 'full：random 0 → 0')
+  assert.equal(backoffDelay(3, o('equal', 0)), 200, 'equal：至少等 exp 的一半（400 ÷ 2 = 200）')
+  assert.equal(backoffDelay(3, o('equal', 0.5)), 300, 'equal：200 + 0.5 × 200 = 300')
+  assert.equal(backoffDelay(6, o('equal', 0.5)), 750, 'equal：先截到 cap 1000 再算 500 + 250')
+  for (const a of [50, 2000]) {
+    for (const j of ['none', 'full', 'equal'] as const) {
+      const d = backoffDelay(a, o(j, 0.999))
+      assert(Number.isFinite(d) && d <= 1000, `attempt ${a}（${j}）不能超過 capMs，也不能是 NaN／Infinity，得到 ${d}`)
+    }
+  }
+  for (let i = 0; i < 200; i++) {
+    const v = (i * 0.618) % 1
+    const a = (i % 8) + 1
+    const exp = Math.min(1000, 100 * 2 ** (a - 1))
+    const f = backoffDelay(a, o('full', v)), e = backoffDelay(a, o('equal', v))
+    assert(f >= 0 && f < exp && Math.abs(f - v * exp) < 1e-9, `full 要在 [0, ${exp}) 之間且等於 random × exp，attempt ${a}、random ${v} 得到 ${f}`)
+    assert(e >= exp / 2 && e < exp && Math.abs(e - (exp / 2 + v * exp / 2)) < 1e-9, `equal 要在 [${exp / 2}, ${exp}) 之間，attempt ${a}、random ${v} 得到 ${e}`)
+  }
+  for (const bad of [0, -1, 1.5, NaN]) {
+    let threw: unknown = null
+    try { backoffDelay(bad, o('none', 0)) } catch (e) { threw = e }
+    assert(threw instanceof RangeError, `attempt = ${bad} 要丟 RangeError`)
+  }
+  const d = { baseMs: 100, capMs: 5000 }
+  assert.equal(decorrelatedDelay(100, { ...d, random: r(0) }), 100, 'decorrelated：random 0 → baseMs')
+  assert.equal(decorrelatedDelay(100, { ...d, random: r(0.5) }), 200, 'decorrelated：100 + 0.5 × (300 − 100) = 200')
+  assert.equal(decorrelatedDelay(1000, { ...d, random: r(0.5) }), 1550, 'decorrelated 依上一次的等待時間：100 + 0.5 × (3000 − 100) = 1550')
+  assert.equal(decorrelatedDelay(4000, { ...d, random: r(0.9) }), 5000, 'decorrelated 也要截到 capMs')
+  let prev = 100, seq: number[] = []
+  for (let i = 0; i < 4; i++) { prev = decorrelatedDelay(prev, { ...d, random: r(0.5) }); seq.push(prev) }
+  assert.deepEqual(seq, [200, 350, 575, 912.5], `連續呼叫（每次傳入上一次的結果）要是 200、350、575、912.5，得到 ${seq.join('、')}`)
+} finally {
+  Math.random = realRandom
+}
+</script>
+  <script type="wrong">
+type Jitter = 'none' | 'full' | 'equal'
+type BackoffOpts = { baseMs: number; capMs: number; jitter: Jitter; random: () => number }
+function backoffDelay(attempt: number, opts: BackoffOpts): number {
+  if (!Number.isInteger(attempt) || attempt < 1) throw new RangeError('attempt')
+  const exp = opts.baseMs * 2 ** (attempt - 1)
+  if (opts.jitter === 'full') return Math.min(opts.capMs, opts.random() * exp)
+  if (opts.jitter === 'equal') return Math.min(opts.capMs, exp / 2) + opts.random() * exp / 2
+  return Math.min(opts.capMs, exp)
+}
+function decorrelatedDelay(prevMs: number, opts: { baseMs: number; capMs: number; random: () => number }): number {
+  return Math.min(opts.capMs, opts.baseMs + opts.random() * (prevMs * 3 - opts.baseMs))
+}
+</script>
+  <script type="wrong">
+type Jitter = 'none' | 'full' | 'equal'
+type BackoffOpts = { baseMs: number; capMs: number; jitter: Jitter; random: () => number }
+function backoffDelay(attempt: number, opts: BackoffOpts): number {
+  if (!Number.isInteger(attempt) || attempt < 1) throw new RangeError('attempt')
+  const exp = Math.min(opts.capMs, opts.baseMs * 2 ** attempt)
+  if (opts.jitter === 'full') return opts.random() * exp
+  if (opts.jitter === 'equal') return exp / 2 + opts.random() * exp / 2
+  return exp
+}
+function decorrelatedDelay(prevMs: number, opts: { baseMs: number; capMs: number; random: () => number }): number {
+  return Math.min(opts.capMs, opts.baseMs + opts.random() * (prevMs * 3 - opts.baseMs))
+}
+</script>
+  <script type="wrong">
+type Jitter = 'none' | 'full' | 'equal'
+type BackoffOpts = { baseMs: number; capMs: number; jitter: Jitter; random: () => number }
+function backoffDelay(attempt: number, opts: BackoffOpts): number {
+  if (!Number.isInteger(attempt) || attempt < 1) throw new RangeError('attempt')
+  const exp = Math.min(opts.capMs, opts.baseMs * 2 ** (attempt - 1))
+  if (opts.jitter === 'none') return exp
+  return opts.random() * exp
+}
+function decorrelatedDelay(prevMs: number, opts: { baseMs: number; capMs: number; random: () => number }): number {
+  return Math.min(opts.capMs, opts.baseMs + opts.random() * (prevMs * 3 - opts.baseMs))
+}
+</script>
+  <script type="wrong">
+type Jitter = 'none' | 'full' | 'equal'
+type BackoffOpts = { baseMs: number; capMs: number; jitter: Jitter; random: () => number }
+function backoffDelay(attempt: number, opts: BackoffOpts): number {
+  if (!Number.isInteger(attempt) || attempt < 1) throw new RangeError('attempt')
+  const exp = Math.min(opts.capMs, opts.baseMs * 2 ** (attempt - 1))
+  if (opts.jitter === 'full') return opts.random() * exp
+  if (opts.jitter === 'equal') return exp / 2 + opts.random() * exp / 2
+  return exp
+}
+function decorrelatedDelay(prevMs: number, opts: { baseMs: number; capMs: number; random: () => number }): number {
+  return Math.min(opts.capMs, opts.baseMs + opts.random() * (opts.baseMs * 3 - opts.baseMs))
+}
+</script>
+  <script type="wrong">
+type Jitter = 'none' | 'full' | 'equal'
+type BackoffOpts = { baseMs: number; capMs: number; jitter: Jitter; random: () => number }
+function backoffDelay(attempt: number, opts: BackoffOpts): number {
+  if (!Number.isInteger(attempt) || attempt < 1) throw new RangeError('attempt')
+  const exp = Math.min(opts.capMs, opts.baseMs * 2 ** (attempt - 1))
+  if (opts.jitter === 'full') return Math.random() * exp
+  if (opts.jitter === 'equal') return exp / 2 + Math.random() * exp / 2
+  return exp
+}
+function decorrelatedDelay(prevMs: number, opts: { baseMs: number; capMs: number; random: () => number }): number {
+  return Math.min(opts.capMs, opts.baseMs + Math.random() * (prevMs * 3 - opts.baseMs))
+}
+</script>
+  <script type="wrong">
+type Jitter = 'none' | 'full' | 'equal'
+type BackoffOpts = { baseMs: number; capMs: number; jitter: Jitter; random: () => number }
+function backoffDelay(attempt: number, opts: BackoffOpts): number {
+  const exp = Math.min(opts.capMs, opts.baseMs * 2 ** (attempt - 1))
+  if (opts.jitter === 'full') return opts.random() * exp
+  if (opts.jitter === 'equal') return exp / 2 + opts.random() * exp / 2
+  return exp
+}
+function decorrelatedDelay(prevMs: number, opts: { baseMs: number; capMs: number; random: () => number }): number {
+  return Math.min(opts.capMs, opts.baseMs + opts.random() * (prevMs * 3 - opts.baseMs))
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：把「該不該重試」寫成規則。<code>shouldRetry(input)</code> 依序判斷：</p>
+  <ol>
+    <li><code>error</code> 是 <code>'aborted'</code>（呼叫端取消）→ 不重試。</li>
+    <li><code>attempt &gt;= maxAttempts</code>（<code>attempt</code> 是已經做過的次數）→ 不重試。</li>
+    <li>方法（不分大小寫）是 GET、HEAD、OPTIONS、TRACE、PUT、DELETE 才算冪等；其他方法（POST、PATCH……）要 <code>hasIdempotencyKey</code> 才能重試。</li>
+    <li>可以重試的失敗只有：<code>error</code> 是 <code>'timeout'</code> 或 <code>'network'</code>，或狀態碼是 408、429、500、502、503、504。</li>
+  </ol>
+  <p>再寫 <code>parseRetryAfter(value, nowMs)</code>，回傳要等的毫秒數：<code>null</code> 回傳 <code>null</code>；去掉前後空白後，全是數字（<code>/^\d+$/</code>）就是秒數 × 1000；符合已經寫好的 <code>IMF_FIXDATE</code> 就用 <code>Date.parse</code> 解析，回傳 <code>Math.max(0, 日期 − nowMs)</code>；其他（空字串、小數、負數、亂寫）都回傳 <code>null</code>。</p>
+  <script type="start">
+type RetryInput = {
+  method: string
+  status?: number
+  error?: 'timeout' | 'network' | 'aborted'
+  hasIdempotencyKey: boolean
+  attempt: number
+  maxAttempts: number
+}
+
+// RFC 9110 規定送出端用的 HTTP 日期格式，例：Sun, 06 Nov 1994 08:49:37 GMT
+const IMF_FIXDATE = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/
+
+function shouldRetry(input: RetryInput): boolean {
+  throw new Error('TODO')
+}
+
+function parseRetryAfter(value: string | null, nowMs: number): number | null {
+  throw new Error('TODO')
+}
+
+console.log(shouldRetry({ method: 'POST', error: 'timeout', hasIdempotencyKey: false, attempt: 1, maxAttempts: 3 }))
+console.log(parseRetryAfter('120', 0))
+</script>
+  <script type="answer">
+type RetryInput = {
+  method: string
+  status?: number
+  error?: 'timeout' | 'network' | 'aborted'
+  hasIdempotencyKey: boolean
+  attempt: number
+  maxAttempts: number
+}
+
+// RFC 9110 規定送出端用的 HTTP 日期格式，例：Sun, 06 Nov 1994 08:49:37 GMT
+const IMF_FIXDATE = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/
+
+const IDEMPOTENT = new Set(['GET', 'HEAD', 'OPTIONS', 'TRACE', 'PUT', 'DELETE'])
+const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504])
+
+function shouldRetry(input: RetryInput): boolean {
+  if (input.error === 'aborted') return false
+  if (input.attempt >= input.maxAttempts) return false
+  if (!IDEMPOTENT.has(input.method.toUpperCase()) && !input.hasIdempotencyKey) return false
+  if (input.error === 'timeout' || input.error === 'network') return true
+  return input.status !== undefined && RETRYABLE_STATUS.has(input.status)
+}
+
+function parseRetryAfter(value: string | null, nowMs: number): number | null {
+  if (value === null) return null
+  const v = value.trim()
+  if (/^\d+$/.test(v)) return Number(v) * 1000
+  if (IMF_FIXDATE.test(v)) {
+    const at = Date.parse(v)
+    if (!Number.isNaN(at)) return Math.max(0, at - nowMs)
+  }
+  return null
+}
+
+console.log(shouldRetry({ method: 'POST', error: 'timeout', hasIdempotencyKey: false, attempt: 1, maxAttempts: 3 }))
+console.log(parseRetryAfter('120', 0))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<ReturnType<typeof shouldRetry>, boolean>>  // shouldRetry 回傳 boolean
+type _2 = Expect<Equal<ReturnType<typeof parseRetryAfter>, number | null>>  // parseRetryAfter 回傳 number | null
+</script>
+  <script type="tests">
+type Case = [string, Partial<{ status: number; error: 'timeout' | 'network' | 'aborted' }>, boolean, number, boolean, string]
+const base = { attempt: 1, maxAttempts: 3 }
+const cases: Case[] = [
+  ['GET', { error: 'timeout' }, false, 1, true, 'GET 逾時可以重試'],
+  ['GET', { error: 'network' }, false, 1, true, 'GET 連線失敗可以重試'],
+  ['GET', { error: 'aborted' }, false, 1, false, '呼叫端取消（aborted）永遠不重試'],
+  ['POST', { error: 'aborted' }, true, 1, false, '有冪等鍵也一樣：aborted 不重試'],
+  ['GET', { status: 500 }, false, 1, true, '500 可以重試'],
+  ['GET', { status: 502 }, false, 1, true, '502 可以重試'],
+  ['GET', { status: 503 }, false, 1, true, '503 可以重試'],
+  ['GET', { status: 504 }, false, 1, true, '504 可以重試'],
+  ['GET', { status: 408 }, false, 1, true, '408 可以重試'],
+  ['GET', { status: 429 }, false, 1, true, '429 可以重試（照 Retry-After 等）'],
+  ['GET', { status: 501 }, false, 1, false, '501 Not Implemented 再試也一樣，不重試'],
+  ['GET', { status: 505 }, false, 1, false, '505 不在可重試的清單'],
+  ['GET', { status: 400 }, false, 1, false, '400 不重試'],
+  ['GET', { status: 401 }, false, 1, false, '401 不重試'],
+  ['GET', { status: 403 }, false, 1, false, '403 不重試'],
+  ['GET', { status: 404 }, false, 1, false, '404 不重試'],
+  ['PUT', { status: 409 }, false, 1, false, '409 衝突不重試'],
+  ['GET', { status: 422 }, false, 1, false, '422 不重試'],
+  ['GET', { status: 200 }, false, 1, false, '200 不是失敗'],
+  ['GET', {}, false, 1, false, '沒有錯誤也沒有狀態碼就不重試'],
+  ['POST', { error: 'timeout' }, false, 1, false, 'POST 逾時、沒有冪等鍵：伺服器可能已經建立訂單，不能重試'],
+  ['POST', { status: 503 }, false, 1, false, 'POST 503 沒有冪等鍵不重試'],
+  ['POST', { error: 'timeout' }, true, 1, true, 'POST 有冪等鍵就可以重試'],
+  ['POST', { status: 409 }, true, 1, false, '有冪等鍵也不重試 409'],
+  ['POST', { status: 422 }, true, 1, false, '有冪等鍵也不重試 422'],
+  ['PATCH', { status: 502 }, false, 1, false, 'PATCH 不是冪等的，沒有冪等鍵不重試'],
+  ['PATCH', { status: 502 }, true, 1, true, 'PATCH 有冪等鍵可以重試'],
+  ['PUT', { error: 'timeout' }, false, 1, true, 'PUT 是冪等的'],
+  ['DELETE', { error: 'timeout' }, false, 1, true, 'DELETE 逾時可以重試'],
+  ['HEAD', { status: 503 }, false, 1, true, 'HEAD 可以重試'],
+  ['OPTIONS', { status: 503 }, false, 1, true, 'OPTIONS 可以重試'],
+  ['TRACE', { status: 503 }, false, 1, true, 'TRACE 可以重試'],
+  ['get', { status: 503 }, false, 1, true, '方法不分大小寫：get 也是 GET'],
+  ['post', { status: 503 }, false, 1, false, '方法不分大小寫：post 也是 POST'],
+  ['CONNECT', { error: 'network' }, false, 1, false, '不在冪等清單的方法要有冪等鍵'],
+  ['GET', { error: 'timeout' }, false, 3, false, '已經做了 3 次、上限 3 次就不再重試'],
+  ['GET', { error: 'timeout' }, false, 4, false, '超過上限也不重試'],
+  ['GET', { error: 'timeout' }, false, 2, true, '做了 2 次、上限 3 次還可以再試'],
+  ['POST', { error: 'timeout' }, true, 3, false, '有冪等鍵也受次數上限'],
+  ['DELETE', { status: 500 }, false, 2, true, 'DELETE 500 第 2 次後還能再試'],
+]
+for (const [method, f, key, attempt, want, msg] of cases) {
+  const input = Object.freeze({ ...base, method, ...f, hasIdempotencyKey: key, attempt })
+  assert.equal(shouldRetry(input), want, `${method} ${JSON.stringify(f)} 冪等鍵 ${key} 第 ${attempt} 次：${msg}`)
+}
+const now = Date.parse('Sat, 31 Oct 2026 08:00:00 GMT')
+assert.equal(parseRetryAfter('120', now), 120000, "'120' 是 120 秒 = 120000ms")
+assert.equal(parseRetryAfter(' 5 ', now), 5000, "前後空白要去掉：' 5 ' → 5000")
+assert.equal(parseRetryAfter('0', now), 0, "'0' → 0")
+assert.equal(parseRetryAfter('Fri, 31 Dec 1999 23:59:59 GMT', now), 0, '已經過去的日期 → 0（不是負數）')
+assert.equal(parseRetryAfter('Sat, 31 Oct 2026 08:00:10 GMT', now), 10000, '10 秒後的日期 → 10000')
+assert.equal(parseRetryAfter('Sat, 31 Oct 2026 09:00:00 GMT', now), 3600000, '一小時後的日期 → 3600000')
+assert.equal(parseRetryAfter('1.5', now), null, "'1.5' 不是整數秒，要回傳 null（parseInt 會變成 1、Date.parse 會猜成 2001 年）")
+assert.equal(parseRetryAfter('-5', now), null, "'-5' 要回傳 null")
+assert.equal(parseRetryAfter('', now), null, "空字串要回傳 null（Number('') 是 0）")
+assert.equal(parseRetryAfter('   ', now), null, '只有空白要回傳 null')
+assert.equal(parseRetryAfter(null, now), null, 'null → null')
+assert.equal(parseRetryAfter('abc', now), null, "'abc' → null")
+assert.equal(parseRetryAfter('1e3', now), null, "'1e3' 不是 delay-seconds（Number 會變成 1000）")
+assert.equal(parseRetryAfter('12', now), 12000, "'12' 是 12 秒，不是日期")
+assert.equal(parseRetryAfter('2026-10-31T08:00:10Z', now), null, 'ISO 格式不是 HTTP 日期 → null')
+</script>
+  <script type="wrong">
+type RetryInput = { method: string; status?: number; error?: 'timeout' | 'network' | 'aborted'; hasIdempotencyKey: boolean; attempt: number; maxAttempts: number }
+const IMF_FIXDATE = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/
+function shouldRetry(input: RetryInput): boolean {
+  if (input.error === 'aborted') return false
+  if (input.attempt >= input.maxAttempts) return false
+  if (!['GET', 'HEAD', 'OPTIONS', 'TRACE', 'PUT', 'DELETE'].includes(input.method.toUpperCase()) && !input.hasIdempotencyKey) return false
+  if (input.error) return true
+  return input.status === 408 || input.status === 429 || (input.status !== undefined && input.status >= 500)
+}
+function parseRetryAfter(value: string | null, nowMs: number): number | null {
+  if (value === null) return null
+  const v = value.trim()
+  if (/^\d+$/.test(v)) return Number(v) * 1000
+  if (IMF_FIXDATE.test(v)) return Math.max(0, Date.parse(v) - nowMs)
+  return null
+}
+</script>
+  <script type="wrong">
+type RetryInput = { method: string; status?: number; error?: 'timeout' | 'network' | 'aborted'; hasIdempotencyKey: boolean; attempt: number; maxAttempts: number }
+const IMF_FIXDATE = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/
+function shouldRetry(input: RetryInput): boolean {
+  if (input.error === 'aborted') return false
+  if (input.attempt >= input.maxAttempts) return false
+  if (input.error) return true
+  return [408, 429, 500, 502, 503, 504].includes(input.status ?? 0)
+}
+function parseRetryAfter(value: string | null, nowMs: number): number | null {
+  if (value === null) return null
+  const v = value.trim()
+  if (/^\d+$/.test(v)) return Number(v) * 1000
+  if (IMF_FIXDATE.test(v)) return Math.max(0, Date.parse(v) - nowMs)
+  return null
+}
+</script>
+  <script type="wrong">
+type RetryInput = { method: string; status?: number; error?: 'timeout' | 'network' | 'aborted'; hasIdempotencyKey: boolean; attempt: number; maxAttempts: number }
+const IMF_FIXDATE = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/
+function shouldRetry(input: RetryInput): boolean {
+  if (input.error === 'aborted') return false
+  if (input.attempt >= input.maxAttempts) return false
+  if (!['GET', 'HEAD', 'OPTIONS', 'TRACE', 'PUT', 'DELETE'].includes(input.method.toUpperCase()) && !input.hasIdempotencyKey) return false
+  if (input.error) return true
+  return input.status !== undefined && input.status >= 400 && input.status !== 501
+}
+function parseRetryAfter(value: string | null, nowMs: number): number | null {
+  if (value === null) return null
+  const v = value.trim()
+  if (/^\d+$/.test(v)) return Number(v) * 1000
+  if (IMF_FIXDATE.test(v)) return Math.max(0, Date.parse(v) - nowMs)
+  return null
+}
+</script>
+  <script type="wrong">
+type RetryInput = { method: string; status?: number; error?: 'timeout' | 'network' | 'aborted'; hasIdempotencyKey: boolean; attempt: number; maxAttempts: number }
+const IMF_FIXDATE = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/
+function shouldRetry(input: RetryInput): boolean {
+  if (input.attempt >= input.maxAttempts) return false
+  if (!['GET', 'HEAD', 'OPTIONS', 'TRACE', 'PUT', 'DELETE'].includes(input.method.toUpperCase()) && !input.hasIdempotencyKey) return false
+  if (input.error) return true
+  return [408, 429, 500, 502, 503, 504].includes(input.status ?? 0)
+}
+function parseRetryAfter(value: string | null, nowMs: number): number | null {
+  if (value === null) return null
+  const v = value.trim()
+  if (/^\d+$/.test(v)) return Number(v) * 1000
+  if (IMF_FIXDATE.test(v)) return Math.max(0, Date.parse(v) - nowMs)
+  return null
+}
+</script>
+  <script type="wrong">
+type RetryInput = { method: string; status?: number; error?: 'timeout' | 'network' | 'aborted'; hasIdempotencyKey: boolean; attempt: number; maxAttempts: number }
+const IMF_FIXDATE = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/
+function shouldRetry(input: RetryInput): boolean {
+  if (input.error === 'aborted') return false
+  if (input.attempt >= input.maxAttempts) return false
+  if (!['GET', 'HEAD', 'OPTIONS', 'TRACE', 'PUT', 'DELETE'].includes(input.method.toUpperCase()) && !input.hasIdempotencyKey) return false
+  if (input.error) return true
+  return [408, 429, 500, 502, 503, 504].includes(input.status ?? 0)
+}
+function parseRetryAfter(value: string | null, nowMs: number): number | null {
+  if (value === null) return null
+  const n = parseInt(value, 10)
+  if (!Number.isNaN(n)) return n < 0 ? null : n * 1000
+  const at = Date.parse(value)
+  return Number.isNaN(at) ? null : Math.max(0, at - nowMs)
+}
+</script>
+  <script type="wrong">
+type RetryInput = { method: string; status?: number; error?: 'timeout' | 'network' | 'aborted'; hasIdempotencyKey: boolean; attempt: number; maxAttempts: number }
+const IMF_FIXDATE = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/
+function shouldRetry(input: RetryInput): boolean {
+  if (input.error === 'aborted') return false
+  if (input.attempt >= input.maxAttempts) return false
+  if (!['GET', 'HEAD', 'OPTIONS', 'TRACE', 'PUT', 'DELETE'].includes(input.method.toUpperCase()) && !input.hasIdempotencyKey) return false
+  if (input.error) return true
+  return [408, 429, 500, 502, 503, 504].includes(input.status ?? 0)
+}
+function parseRetryAfter(value: string | null, nowMs: number): number | null {
+  if (value === null) return null
+  const n = Number(value)
+  if (!Number.isNaN(n)) return n < 0 ? null : n * 1000
+  if (IMF_FIXDATE.test(value.trim())) return Math.max(0, Date.parse(value) - nowMs)
+  return null
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：完成 gRPC retry throttling 的 <code>RetryBudget</code>。token 從 <code>maxTokens</code> 開始，永遠介於 0 和 <code>maxTokens</code> 之間；<code>onFailure()</code> 減 1、<code>onSuccess()</code> 加 <code>tokenRatio</code>；<code>canRetry()</code> 在 token <strong>大於</strong> <code>maxTokens ÷ 2</code> 時為 true；<code>tokens</code> 回傳目前的 token 數。<code>tokenRatio</code> 最多 3 位小數，判斷門檻時不能被浮點誤差影響（提示：用整數的千分之一記帳）。再寫 <code>amplification(attemptsPerLayer)</code>：每一層最多嘗試幾次，回傳最底層最多收到幾倍的請求。</p>
+  <script type="start">
+class RetryBudget {
+  constructor(maxTokens: number, tokenRatio: number) {
+    throw new Error('TODO')
+  }
+  get tokens(): number {
+    throw new Error('TODO')
+  }
+  onFailure(): void {
+    throw new Error('TODO')
+  }
+  onSuccess(): void {
+    throw new Error('TODO')
+  }
+  canRetry(): boolean {
+    throw new Error('TODO')
+  }
+}
+
+function amplification(attemptsPerLayer: readonly number[]): number {
+  throw new Error('TODO')
+}
+
+const b = new RetryBudget(10, 0.1)
+for (let i = 0; i < 5; i++) b.onFailure()
+console.log(b.tokens, b.canRetry())
+console.log(amplification([3, 3, 3]))
+</script>
+  <script type="answer">
+class RetryBudget {
+  #milli: number
+  readonly #max: number
+  readonly #ratio: number
+  constructor(maxTokens: number, tokenRatio: number) {
+    this.#max = maxTokens * 1000
+    this.#ratio = Math.round(tokenRatio * 1000)     // 千分之一為單位的整數，沒有浮點誤差
+    this.#milli = this.#max
+  }
+  get tokens(): number {
+    return this.#milli / 1000
+  }
+  onFailure(): void {
+    this.#milli = Math.max(0, this.#milli - 1000)
+  }
+  onSuccess(): void {
+    this.#milli = Math.min(this.#max, this.#milli + this.#ratio)
+  }
+  canRetry(): boolean {
+    return this.#milli * 2 > this.#max
+  }
+}
+
+function amplification(attemptsPerLayer: readonly number[]): number {
+  return attemptsPerLayer.reduce((product, n) => product * n, 1)
+}
+
+const b = new RetryBudget(10, 0.1)
+for (let i = 0; i < 5; i++) b.onFailure()
+console.log(b.tokens, b.canRetry())
+console.log(amplification([3, 3, 3]))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<ReturnType<RetryBudget['canRetry']>, boolean>>  // canRetry 回傳 boolean
+type _2 = Expect<Equal<RetryBudget['tokens'], number>>  // tokens 是 number
+type _3 = Expect<Equal<ReturnType<typeof amplification>, number>>  // amplification 回傳 number
+</script>
+  <script type="tests">
+const near = (a: number, b: number) => Math.abs(a - b) < 1e-9
+const b1 = new RetryBudget(10, 0.1)
+assert(near(b1.tokens, 10), `一開始 token 要等於 maxTokens 10，得到 ${b1.tokens}`)
+assert.equal(b1.canRetry(), true, '一開始可以重試')
+for (let i = 0; i < 4; i++) b1.onFailure()
+assert.equal(b1.canRetry(), true, '失敗 4 次剩 6，大於 5，可以重試')
+b1.onFailure()
+assert(near(b1.tokens, 5), `失敗 5 次剩 5，得到 ${b1.tokens}`)
+assert.equal(b1.canRetry(), false, '剩 5 剛好等於一半：要「大於」一半才能重試')
+b1.onSuccess()
+assert(near(b1.tokens, 5.1), `成功一次加 0.1 → 5.1，得到 ${b1.tokens}`)
+assert.equal(b1.canRetry(), true, '5.1 大於 5，可以重試')
+
+const b2 = new RetryBudget(10, 0.1)
+for (let i = 0; i < 15; i++) b2.onFailure()
+assert(near(b2.tokens, 0), `token 不能小於 0，得到 ${b2.tokens}`)
+b2.onSuccess()
+assert(near(b2.tokens, 0.1), `從 0 開始加回去，得到 ${b2.tokens}`)
+
+const b3 = new RetryBudget(10, 0.5)
+b3.onSuccess()
+assert(near(b3.tokens, 10), `token 不能超過 maxTokens，得到 ${b3.tokens}`)
+b3.onFailure(); b3.onSuccess(); b3.onSuccess()
+assert(near(b3.tokens, 10), `失敗後連續成功也不能超過上限，得到 ${b3.tokens}`)
+
+const b4 = new RetryBudget(10, 0.1)
+for (let i = 0; i < 6; i++) b4.onFailure()
+b4.onSuccess()
+assert(near(b4.tokens, 4.1), `成功只加 tokenRatio，不是重設為滿：4 + 0.1 = 4.1，得到 ${b4.tokens}`)
+assert.equal(b4.canRetry(), false, '4.1 不到一半，不能重試')
+
+const b5 = new RetryBudget(10, 0.2)
+for (let i = 0; i < 6; i++) b5.onFailure()
+for (let i = 0; i < 5; i++) b5.onSuccess()
+assert.equal(b5.canRetry(), false, 'maxTokens 10、tokenRatio 0.2：剩 4 再成功 5 次剛好是 5，不能重試（浮點累加會變成 5.000000000000001）')
+b5.onSuccess()
+assert.equal(b5.canRetry(), true, '再成功一次是 5.2，可以重試')
+
+const b6 = new RetryBudget(4, 0.1)
+for (let i = 0; i < 3; i++) b6.onFailure()
+for (let i = 0; i < 10; i++) b6.onSuccess()
+assert.equal(b6.canRetry(), false, 'maxTokens 4、tokenRatio 0.1：剩 1 再成功 10 次剛好是 2，不能重試')
+
+const b7 = new RetryBudget(100, 0.003)
+for (let i = 0; i < 53; i++) b7.onFailure()
+for (let i = 0; i < 1000; i++) b7.onSuccess()
+assert.equal(b7.canRetry(), false, 'maxTokens 100、tokenRatio 0.003：47 + 1000 × 0.003 剛好是 50，不能重試')
+
+assert.equal(amplification([3, 3, 3]), 27, '三層各 3 次 → 27 倍')
+assert.equal(amplification([1, 1, 4]), 4, '只有一層重試 → 4 倍')
+assert.equal(amplification([4, 4, 4]), 64, 'Google SRE 的例子：每層 4 次 → 64 倍')
+assert.equal(amplification([2, 5]), 10, '[2, 5] → 10')
+assert.equal(amplification([]), 1, '沒有任何一層 → 1 倍')
+const frozen = Object.freeze([3, 2])
+assert.equal(amplification(frozen), 6, '不能修改傳入的陣列')
+</script>
+  <script type="wrong">
+class RetryBudget {
+  #milli: number
+  readonly #max: number
+  readonly #ratio: number
+  constructor(maxTokens: number, tokenRatio: number) { this.#max = maxTokens * 1000; this.#ratio = Math.round(tokenRatio * 1000); this.#milli = this.#max }
+  get tokens(): number { return this.#milli / 1000 }
+  onFailure(): void { this.#milli = Math.max(0, this.#milli - 1000) }
+  onSuccess(): void { this.#milli = Math.min(this.#max, this.#milli + this.#ratio) }
+  canRetry(): boolean { return this.#milli * 2 >= this.#max }
+}
+function amplification(attemptsPerLayer: readonly number[]): number { return attemptsPerLayer.reduce((p, n) => p * n, 1) }
+</script>
+  <script type="wrong">
+class RetryBudget {
+  #milli: number
+  readonly #max: number
+  readonly #ratio: number
+  constructor(maxTokens: number, tokenRatio: number) { this.#max = maxTokens * 1000; this.#ratio = Math.round(tokenRatio * 1000); this.#milli = this.#max }
+  get tokens(): number { return this.#milli / 1000 }
+  onFailure(): void { this.#milli = Math.max(0, this.#milli - 1000) }
+  onSuccess(): void { this.#milli = this.#milli + this.#ratio }
+  canRetry(): boolean { return this.#milli * 2 > this.#max }
+}
+function amplification(attemptsPerLayer: readonly number[]): number { return attemptsPerLayer.reduce((p, n) => p * n, 1) }
+</script>
+  <script type="wrong">
+class RetryBudget {
+  #milli: number
+  readonly #max: number
+  constructor(maxTokens: number, tokenRatio: number) { this.#max = maxTokens * 1000; this.#milli = this.#max }
+  get tokens(): number { return this.#milli / 1000 }
+  onFailure(): void { this.#milli = Math.max(0, this.#milli - 1000) }
+  onSuccess(): void { this.#milli = this.#max }
+  canRetry(): boolean { return this.#milli * 2 > this.#max }
+}
+function amplification(attemptsPerLayer: readonly number[]): number { return attemptsPerLayer.reduce((p, n) => p * n, 1) }
+</script>
+  <script type="wrong">
+class RetryBudget {
+  #tokens: number
+  readonly #max: number
+  readonly #ratio: number
+  constructor(maxTokens: number, tokenRatio: number) { this.#max = maxTokens; this.#ratio = tokenRatio; this.#tokens = maxTokens }
+  get tokens(): number { return this.#tokens }
+  onFailure(): void { this.#tokens = Math.max(0, this.#tokens - 1) }
+  onSuccess(): void { this.#tokens = Math.min(this.#max, this.#tokens + this.#ratio) }
+  canRetry(): boolean { return this.#tokens > this.#max / 2 }
+}
+function amplification(attemptsPerLayer: readonly number[]): number { return attemptsPerLayer.reduce((p, n) => p * n, 1) }
+</script>
+  <script type="wrong">
+class RetryBudget {
+  #milli: number
+  readonly #max: number
+  readonly #ratio: number
+  constructor(maxTokens: number, tokenRatio: number) { this.#max = maxTokens * 1000; this.#ratio = Math.round(tokenRatio * 1000); this.#milli = this.#max }
+  get tokens(): number { return this.#milli / 1000 }
+  onFailure(): void { this.#milli = Math.max(0, this.#milli - 1000) }
+  onSuccess(): void { this.#milli = Math.min(this.#max, this.#milli + this.#ratio) }
+  canRetry(): boolean { return this.#milli * 2 > this.#max }
+}
+function amplification(attemptsPerLayer: readonly number[]): number { return attemptsPerLayer.reduce((s, n) => s + n, 0) }
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 4：deadline 傳遞。<code>planCall(input)</code> 決定這一層要不要呼叫下游：<code>deadline &lt;= now</code> 回傳 <code>{ action: 'skip', reason: 'deadline-exceeded' }</code>；否則 <code>remaining = deadline − now − marginMs</code>，<code>remaining &lt; minUsefulMs</code> 回傳 <code>{ action: 'skip', reason: 'not-enough-time' }</code>；都不是就回傳 <code>{ action: 'call', timeoutMs }</code>，<code>timeoutMs</code> 取 <code>perAttemptTimeoutMs</code> 與 <code>remaining</code> 的<strong>較小值</strong>。</p>
+  <p>再寫 <code>propagate(hops, startDeadline, startNow, marginMs)</code>，模擬一個請求依序經過每一跳：第一跳拿到 <code>startDeadline</code>，在 <code>startNow</code> 開始；每一跳做完自己的 <code>workMs</code> 之後才呼叫下一跳，傳給下一跳的 deadline 是自己的 deadline 減 <code>marginMs</code>。每一跳記錄 <code>{ name, deadline, remainingMs }</code>（<code>remainingMs</code> = 自己的 deadline − 開始的時間）。某一跳開始時 <code>remainingMs &lt;= 0</code> 就不呼叫它，回傳到前一跳為止。</p>
+  <script type="start">
+type PlanInput = { deadline: number; now: number; marginMs: number; minUsefulMs: number; perAttemptTimeoutMs: number }
+type Plan =
+  | { action: 'call'; timeoutMs: number }
+  | { action: 'skip'; reason: 'deadline-exceeded' | 'not-enough-time' }
+type Hop = { name: string; workMs: number }
+type HopDeadline = { name: string; deadline: number; remainingMs: number }
+
+function planCall(input: PlanInput): Plan {
+  throw new Error('TODO')
+}
+
+function propagate(hops: readonly Hop[], startDeadline: number, startNow: number, marginMs: number): HopDeadline[] {
+  throw new Error('TODO')
+}
+
+console.log(planCall({ deadline: 1000, now: 300, marginMs: 50, minUsefulMs: 100, perAttemptTimeoutMs: 2000 }))
+console.log(propagate([{ name: '閘道', workMs: 20 }, { name: '訂單服務', workMs: 300 }, { name: '金流', workMs: 200 }], 1000, 0, 50))
+</script>
+  <script type="answer">
+type PlanInput = { deadline: number; now: number; marginMs: number; minUsefulMs: number; perAttemptTimeoutMs: number }
+type Plan =
+  | { action: 'call'; timeoutMs: number }
+  | { action: 'skip'; reason: 'deadline-exceeded' | 'not-enough-time' }
+type Hop = { name: string; workMs: number }
+type HopDeadline = { name: string; deadline: number; remainingMs: number }
+
+function planCall(input: PlanInput): Plan {
+  if (input.deadline <= input.now) return { action: 'skip', reason: 'deadline-exceeded' }
+  const remaining = input.deadline - input.now - input.marginMs
+  if (remaining < input.minUsefulMs) return { action: 'skip', reason: 'not-enough-time' }
+  return { action: 'call', timeoutMs: Math.min(input.perAttemptTimeoutMs, remaining) }
+}
+
+function propagate(hops: readonly Hop[], startDeadline: number, startNow: number, marginMs: number): HopDeadline[] {
+  const out: HopDeadline[] = []
+  let deadline = startDeadline
+  let now = startNow
+  for (const hop of hops) {
+    const remainingMs = deadline - now
+    if (remainingMs <= 0) break
+    out.push({ name: hop.name, deadline, remainingMs })
+    now += hop.workMs
+    deadline -= marginMs
+  }
+  return out
+}
+
+console.log(planCall({ deadline: 1000, now: 300, marginMs: 50, minUsefulMs: 100, perAttemptTimeoutMs: 2000 }))
+console.log(propagate([{ name: '閘道', workMs: 20 }, { name: '訂單服務', workMs: 300 }, { name: '金流', workMs: 200 }], 1000, 0, 50))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<ReturnType<typeof planCall>, Plan>>  // planCall 回傳 Plan
+type _2 = Expect<Equal<ReturnType<typeof propagate>, HopDeadline[]>>  // propagate 回傳 HopDeadline[]
+</script>
+  <script type="tests">
+const P = (deadline: number, now: number, marginMs: number, minUsefulMs: number, perAttemptTimeoutMs: number) =>
+  planCall(Object.freeze({ deadline, now, marginMs, minUsefulMs, perAttemptTimeoutMs }))
+assert.deepEqual(P(1000, 300, 50, 100, 2000), { action: 'call', timeoutMs: 650 }, '期限 1000、已用 300、餘裕 50 → 呼叫金流的逾時 650')
+assert.deepEqual(P(1000, 300, 50, 100, 400), { action: 'call', timeoutMs: 400 }, '單次逾時 400 比剩餘 650 短 → 取 400（較小值）')
+assert.deepEqual(P(1000, 920, 50, 100, 2000), { action: 'skip', reason: 'not-enough-time' }, '只剩 30ms、最少要 100ms → not-enough-time，不要送出')
+assert.deepEqual(P(1000, 960, 50, 1, 2000), { action: 'skip', reason: 'not-enough-time' }, '扣掉餘裕後是負數 → not-enough-time')
+assert.deepEqual(P(1000, 1000, 50, 100, 2000), { action: 'skip', reason: 'deadline-exceeded' }, 'now 等於 deadline → deadline-exceeded')
+assert.deepEqual(P(1000, 1500, 0, 1, 2000), { action: 'skip', reason: 'deadline-exceeded' }, 'deadline 已過 → deadline-exceeded')
+assert.deepEqual(P(1000, 800, 50, 150, 2000), { action: 'call', timeoutMs: 150 }, '剩餘剛好等於 minUsefulMs 可以呼叫')
+assert.deepEqual(P(5000, 0, 0, 10, 1200), { action: 'call', timeoutMs: 1200 }, '時間很多時用單次逾時')
+
+const hops = Object.freeze([
+  Object.freeze({ name: '閘道', workMs: 20 }),
+  Object.freeze({ name: '訂單服務', workMs: 300 }),
+  Object.freeze({ name: '金流', workMs: 200 }),
+])
+assert.deepEqual(propagate(hops, 1000, 0, 50), [
+  { name: '閘道', deadline: 1000, remainingMs: 1000 },
+  { name: '訂單服務', deadline: 950, remainingMs: 930 },
+  { name: '金流', deadline: 900, remainingMs: 580 },
+], '三跳：deadline 每跳扣 50，剩餘時間扣掉前面的工作')
+assert.deepEqual(propagate(hops, 1000, 600, 50), [
+  { name: '閘道', deadline: 1000, remainingMs: 400 },
+  { name: '訂單服務', deadline: 950, remainingMs: 330 },
+], '金流開始時（920ms）deadline 只到 900，已經沒時間 → 不呼叫，只回傳前兩跳')
+assert.deepEqual(propagate(hops, 1000, 1000, 50), [], '一開始就沒時間 → 空陣列')
+assert.deepEqual(propagate(hops, 1000, 0, 0), [
+  { name: '閘道', deadline: 1000, remainingMs: 1000 },
+  { name: '訂單服務', deadline: 1000, remainingMs: 980 },
+  { name: '金流', deadline: 1000, remainingMs: 680 },
+], '沒有餘裕時 deadline 不變，剩餘時間仍然遞減')
+assert.deepEqual(propagate([{ name: 'a', workMs: 100 }, { name: 'b', workMs: 0 }], 200, 0, 100), [
+  { name: 'a', deadline: 200, remainingMs: 200 },
+], 'b 開始時（100ms）deadline 是 100，剩 0 → 不呼叫')
+</script>
+  <script type="wrong">
+type PlanInput = { deadline: number; now: number; marginMs: number; minUsefulMs: number; perAttemptTimeoutMs: number }
+type Plan = { action: 'call'; timeoutMs: number } | { action: 'skip'; reason: 'deadline-exceeded' | 'not-enough-time' }
+type Hop = { name: string; workMs: number }
+type HopDeadline = { name: string; deadline: number; remainingMs: number }
+function planCall(input: PlanInput): Plan {
+  if (input.deadline <= input.now) return { action: 'skip', reason: 'deadline-exceeded' }
+  const remaining = input.deadline - input.now
+  if (remaining < input.minUsefulMs) return { action: 'skip', reason: 'not-enough-time' }
+  return { action: 'call', timeoutMs: Math.min(input.perAttemptTimeoutMs, remaining) }
+}
+function propagate(hops: readonly Hop[], startDeadline: number, startNow: number, marginMs: number): HopDeadline[] {
+  const out: HopDeadline[] = []
+  let deadline = startDeadline, now = startNow
+  for (const hop of hops) {
+    if (deadline - now <= 0) break
+    out.push({ name: hop.name, deadline, remainingMs: deadline - now })
+    now += hop.workMs
+  }
+  return out
+}
+</script>
+  <script type="wrong">
+type PlanInput = { deadline: number; now: number; marginMs: number; minUsefulMs: number; perAttemptTimeoutMs: number }
+type Plan = { action: 'call'; timeoutMs: number } | { action: 'skip'; reason: 'deadline-exceeded' | 'not-enough-time' }
+type Hop = { name: string; workMs: number }
+type HopDeadline = { name: string; deadline: number; remainingMs: number }
+function planCall(input: PlanInput): Plan {
+  if (input.deadline <= input.now) return { action: 'skip', reason: 'deadline-exceeded' }
+  const remaining = input.deadline - input.now - input.marginMs
+  return { action: 'call', timeoutMs: Math.min(input.perAttemptTimeoutMs, remaining) }
+}
+function propagate(hops: readonly Hop[], startDeadline: number, startNow: number, marginMs: number): HopDeadline[] {
+  const out: HopDeadline[] = []
+  let deadline = startDeadline, now = startNow
+  for (const hop of hops) {
+    out.push({ name: hop.name, deadline, remainingMs: deadline - now })
+    now += hop.workMs
+    deadline -= marginMs
+  }
+  return out
+}
+</script>
+  <script type="wrong">
+type PlanInput = { deadline: number; now: number; marginMs: number; minUsefulMs: number; perAttemptTimeoutMs: number }
+type Plan = { action: 'call'; timeoutMs: number } | { action: 'skip'; reason: 'deadline-exceeded' | 'not-enough-time' }
+type Hop = { name: string; workMs: number }
+type HopDeadline = { name: string; deadline: number; remainingMs: number }
+function planCall(input: PlanInput): Plan {
+  if (input.deadline <= input.now) return { action: 'skip', reason: 'deadline-exceeded' }
+  const remaining = input.deadline - input.now - input.marginMs
+  if (remaining < input.minUsefulMs) return { action: 'skip', reason: 'not-enough-time' }
+  return { action: 'call', timeoutMs: Math.min(input.perAttemptTimeoutMs, remaining) }
+}
+function propagate(hops: readonly Hop[], startDeadline: number, startNow: number, marginMs: number): HopDeadline[] {
+  const budget = startDeadline - startNow
+  const out: HopDeadline[] = []
+  let now = startNow
+  for (const hop of hops) {
+    out.push({ name: hop.name, deadline: now + budget, remainingMs: budget })
+    now += hop.workMs
+  }
+  return out
+}
+</script>
+  <script type="wrong">
+type PlanInput = { deadline: number; now: number; marginMs: number; minUsefulMs: number; perAttemptTimeoutMs: number }
+type Plan = { action: 'call'; timeoutMs: number } | { action: 'skip'; reason: 'deadline-exceeded' | 'not-enough-time' }
+type Hop = { name: string; workMs: number }
+type HopDeadline = { name: string; deadline: number; remainingMs: number }
+function planCall(input: PlanInput): Plan {
+  if (input.deadline <= input.now) return { action: 'skip', reason: 'deadline-exceeded' }
+  const remaining = input.deadline - input.now - input.marginMs
+  if (remaining < input.minUsefulMs) return { action: 'skip', reason: 'not-enough-time' }
+  return { action: 'call', timeoutMs: Math.max(input.perAttemptTimeoutMs, remaining) }
+}
+function propagate(hops: readonly Hop[], startDeadline: number, startNow: number, marginMs: number): HopDeadline[] {
+  const out: HopDeadline[] = []
+  let deadline = startDeadline, now = startNow
+  for (const hop of hops) {
+    if (deadline - now <= 0) break
+    out.push({ name: hop.name, deadline, remainingMs: deadline - now })
+    now += hop.workMs
+    deadline -= marginMs
+  }
+  return out
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 5：把前面的規則組成一個重試迴圈 <code>retryCall(call, o)</code>。<code>call(attempt, timeoutMs)</code> 做一次嘗試，回傳成功或失敗（失敗時告訴你能不能重試、伺服器的 Retry-After 換算成的毫秒數）。<code>attempt</code> 從 1 開始，每一輪：</p>
+  <ol>
+    <li><code>remaining = o.deadline − o.now()</code>，<code>remaining &lt;= 0</code> 就回傳 <code>reason: 'deadline'</code>。</li>
+    <li>呼叫 <code>call(attempt, Math.min(o.perAttemptTimeoutMs, remaining))</code>。</li>
+    <li>成功：<code>o.budget.onSuccess()</code>，回傳 <code>{ ok: true, value, attempts }</code>。</li>
+    <li>不能重試的失敗：回傳 <code>'not-retryable'</code>（不動預算）。</li>
+    <li>可以重試的失敗：先 <code>o.budget.onFailure()</code>；<code>attempt &gt;= o.maxAttempts</code> 回傳 <code>'attempts-exhausted'</code>；接著 <code>!o.budget.canRetry()</code> 回傳 <code>'budget'</code>。</li>
+    <li>等待時間 = <code>Math.max(backoff(attempt, …), retryAfterMs ?? 0)</code>；<code>o.now() + 等待 &gt;= o.deadline</code> 就<strong>不等</strong>，直接回傳 <code>'deadline'</code>；否則 <code>await o.sleep(等待)</code>，進入下一輪。</li>
+  </ol>
+  <p>失敗結果的 <code>attempts</code> 是實際呼叫了幾次，<code>error</code> 是最後一次失敗的 <code>error</code>（一次都沒呼叫時是 <code>'deadline-exceeded'</code>）。時間、等待、亂數都用 <code>o</code> 裡傳進來的。</p>
+  <script type="start">
+type Outcome<T> =
+  | { ok: true; value: T }
+  | { ok: false; retryable: boolean; retryAfterMs: number | null; error: string }
+type Budget = { canRetry(): boolean; onSuccess(): void; onFailure(): void }
+type RetryOpts = {
+  maxAttempts: number
+  baseMs: number
+  capMs: number
+  perAttemptTimeoutMs: number
+  deadline: number
+  now: () => number
+  sleep: (ms: number) => Promise<void>
+  random: () => number
+  budget: Budget
+}
+type RetryResult<T> =
+  | { ok: true; value: T; attempts: number }
+  | { ok: false; reason: 'not-retryable' | 'attempts-exhausted' | 'budget' | 'deadline'; attempts: number; error: string }
+
+// 已經寫好：full jitter 的指數退避
+const backoff = (attempt: number, baseMs: number, capMs: number, random: () => number) =>
+  random() * Math.min(capMs, baseMs * 2 ** (attempt - 1))
+
+async function retryCall<T>(call: (attempt: number, timeoutMs: number) => Promise<Outcome<T>>, o: RetryOpts): Promise<RetryResult<T>> {
+  throw new Error('TODO')
+}
+
+// 試跑：前兩次 503，第三次成功
+let t = 0
+const results: Outcome<string>[] = [
+  { ok: false, retryable: true, retryAfterMs: null, error: '503' },
+  { ok: false, retryable: true, retryAfterMs: null, error: '503' },
+  { ok: true, value: '訂單 #1001' },
+]
+const r = await retryCall(async (attempt, timeoutMs) => {
+  console.log(`第 ${attempt} 次，t = ${t}ms，逾時 ${timeoutMs}ms`)
+  return results[attempt - 1]
+}, {
+  maxAttempts: 3, baseMs: 100, capMs: 1000, perAttemptTimeoutMs: 500, deadline: 2000,
+  now: () => t, sleep: async ms => { t += ms }, random: () => 0.5,
+  budget: { canRetry: () => true, onSuccess() {}, onFailure() {} },
+})
+console.log(r)
+</script>
+  <script type="answer">
+type Outcome<T> =
+  | { ok: true; value: T }
+  | { ok: false; retryable: boolean; retryAfterMs: number | null; error: string }
+type Budget = { canRetry(): boolean; onSuccess(): void; onFailure(): void }
+type RetryOpts = {
+  maxAttempts: number
+  baseMs: number
+  capMs: number
+  perAttemptTimeoutMs: number
+  deadline: number
+  now: () => number
+  sleep: (ms: number) => Promise<void>
+  random: () => number
+  budget: Budget
+}
+type RetryResult<T> =
+  | { ok: true; value: T; attempts: number }
+  | { ok: false; reason: 'not-retryable' | 'attempts-exhausted' | 'budget' | 'deadline'; attempts: number; error: string }
+
+// 已經寫好：full jitter 的指數退避
+const backoff = (attempt: number, baseMs: number, capMs: number, random: () => number) =>
+  random() * Math.min(capMs, baseMs * 2 ** (attempt - 1))
+
+async function retryCall<T>(call: (attempt: number, timeoutMs: number) => Promise<Outcome<T>>, o: RetryOpts): Promise<RetryResult<T>> {
+  let lastError = 'deadline-exceeded'
+  for (let attempt = 1; ; attempt++) {
+    const remaining = o.deadline - o.now()
+    if (remaining <= 0) return { ok: false, reason: 'deadline', attempts: attempt - 1, error: lastError }
+    const r = await call(attempt, Math.min(o.perAttemptTimeoutMs, remaining))
+    if (r.ok) {
+      o.budget.onSuccess()
+      return { ok: true, value: r.value, attempts: attempt }
+    }
+    lastError = r.error
+    if (!r.retryable) return { ok: false, reason: 'not-retryable', attempts: attempt, error: r.error }
+    o.budget.onFailure()
+    if (attempt >= o.maxAttempts) return { ok: false, reason: 'attempts-exhausted', attempts: attempt, error: r.error }
+    if (!o.budget.canRetry()) return { ok: false, reason: 'budget', attempts: attempt, error: r.error }
+    const wait = Math.max(backoff(attempt, o.baseMs, o.capMs, o.random), r.retryAfterMs ?? 0)
+    if (o.now() + wait >= o.deadline) return { ok: false, reason: 'deadline', attempts: attempt, error: r.error }
+    await o.sleep(wait)
+  }
+}
+
+// 試跑：前兩次 503，第三次成功
+let t = 0
+const results: Outcome<string>[] = [
+  { ok: false, retryable: true, retryAfterMs: null, error: '503' },
+  { ok: false, retryable: true, retryAfterMs: null, error: '503' },
+  { ok: true, value: '訂單 #1001' },
+]
+const r = await retryCall(async (attempt, timeoutMs) => {
+  console.log(`第 ${attempt} 次，t = ${t}ms，逾時 ${timeoutMs}ms`)
+  return results[attempt - 1]
+}, {
+  maxAttempts: 3, baseMs: 100, capMs: 1000, perAttemptTimeoutMs: 500, deadline: 2000,
+  now: () => t, sleep: async ms => { t += ms }, random: () => 0.5,
+  budget: { canRetry: () => true, onSuccess() {}, onFailure() {} },
+})
+console.log(r)
+</script>
+  <script type="types">
+type _1 = Expect<Equal<Awaited<ReturnType<typeof retryCall<number>>>, RetryResult<number>>>  // retryCall 回傳 Promise<RetryResult<T>>
+</script>
+  <script type="tests">
+type Step = { out: Outcome<string>; costMs?: number }
+async function run(steps: Step[], over: Partial<RetryOpts> = {}, budgetOk: () => boolean = () => true) {
+  let clock = 0
+  const calls: Array<[number, number, number]> = []
+  const sleeps: number[] = []
+  const budgetLog: string[] = []
+  const o: RetryOpts = {
+    maxAttempts: 3, baseMs: 100, capMs: 1000, perAttemptTimeoutMs: 500, deadline: 2000,
+    now: () => clock,
+    sleep: async ms => { sleeps.push(ms); clock += ms },
+    random: () => 0.5,
+    budget: { canRetry: () => { budgetLog.push('can'); return budgetOk() }, onSuccess: () => { budgetLog.push('ok') }, onFailure: () => { budgetLog.push('fail') } },
+    ...over,
+  }
+  const realRandom = Math.random, realNow = Date.now
+  Math.random = () => { throw new Error('不能用 Math.random，請用 o.random') }
+  Date.now = () => { throw new Error('不能用 Date.now，請用 o.now') }
+  try {
+    const result = await retryCall<string>(async (attempt, timeoutMs) => {
+      calls.push([attempt, timeoutMs, clock])
+      const s = steps[attempt - 1]
+      if (!s) throw new Error(`不該有第 ${attempt} 次呼叫`)
+      clock += s.costMs ?? 0
+      return s.out
+    }, o)
+    return { result, calls, sleeps, budgetLog }
+  } finally {
+    Math.random = realRandom
+    Date.now = realNow
+  }
+}
+const fail = (error = '503', retryAfterMs: number | null = null, retryable = true): Step => ({ out: { ok: false, retryable, retryAfterMs, error } })
+const okStep: Step = { out: { ok: true, value: '訂單 #1001' } }
+
+{
+  const r = await run([fail(), fail(), okStep])
+  assert.deepEqual(r.result, { ok: true, value: '訂單 #1001', attempts: 3 }, '前兩次 503、第三次成功 → ok，attempts 3')
+  assert.deepEqual(r.sleeps, [50, 100], 'full jitter、random 0.5：第 1 次重試前等 50ms、第 2 次前等 100ms')
+  assert.deepEqual(r.calls.map(c => c[0]), [1, 2, 3], 'attempt 要從 1 依序遞增')
+  assert.deepEqual(r.budgetLog, ['fail', 'can', 'fail', 'can', 'ok'], '每次可重試的失敗要 onFailure，再問 canRetry；成功要 onSuccess')
+}
+{
+  const r = await run([fail(), fail(), fail()])
+  assert.deepEqual(r.result, { ok: false, reason: 'attempts-exhausted', attempts: 3, error: '503' }, '3 次都失敗 → attempts-exhausted')
+  assert.deepEqual(r.sleeps, [50, 100], '最後一次失敗之後不要再等（只等 2 次）')
+}
+{
+  const r = await run([fail('422', null, false)])
+  assert.deepEqual(r.result, { ok: false, reason: 'not-retryable', attempts: 1, error: '422' }, '不能重試的失敗要立刻停止')
+  assert.deepEqual(r.sleeps, [], '不能重試就不要等')
+  assert.deepEqual(r.budgetLog, [], '不能重試的失敗不扣重試預算')
+}
+{
+  const r = await run([fail('429', 700), okStep])
+  assert.deepEqual(r.sleeps, [700], 'Retry-After 700ms 比退避 50ms 長 → 等 700ms')
+  assert.equal(r.result.ok, true, '等完 Retry-After 後成功')
+}
+{
+  const r = await run([fail('503', 10), okStep])
+  assert.deepEqual(r.sleeps, [50], 'Retry-After 10ms 比退避 50ms 短 → 等 50ms（取較大值）')
+}
+{
+  const r = await run([fail('503', 120000)])
+  assert.deepEqual(r.result, { ok: false, reason: 'deadline', attempts: 1, error: '503' }, 'Retry-After 120 秒超過期限 → 直接放棄（reason deadline）')
+  assert.deepEqual(r.sleeps, [], '等了也來不及就不要等')
+}
+{
+  const r = await run([{ ...fail(), costMs: 1960 }])
+  assert.deepEqual(r.result, { ok: false, reason: 'deadline', attempts: 1, error: '503' }, '第一次花了 1960ms，再等 50ms 就超過期限 2000 → deadline')
+  assert.deepEqual(r.sleeps, [], '超過期限的等待不要執行')
+}
+{
+  const r = await run([{ ...fail(), costMs: 1950 }, okStep])
+  assert.deepEqual(r.result, { ok: false, reason: 'deadline', attempts: 1, error: '503' }, '第一次花了 1950ms，再等 50ms 剛好到期限 2000：醒來時已經沒時間，現在就放棄（用 >=）')
+  assert.deepEqual(r.sleeps, [], '等完剛好到期限的等待也不要執行')
+}
+{
+  const r = await run([{ ...fail(), costMs: 1800 }, okStep], { maxAttempts: 5 })
+  assert.deepEqual(r.calls.map(c => c[1]), [500, 150], '每次嘗試的逾時取 min(單次逾時 500, 剩餘)：第二次在 1850ms，只剩 150ms')
+}
+{
+  const r = await run([okStep], { deadline: 300 })
+  assert.deepEqual(r.calls[0].slice(0, 2), [1, 300], '剩 300ms、單次逾時 500 → 傳 300')
+}
+{
+  const r = await run([okStep], { deadline: 0 })
+  assert.deepEqual(r.result, { ok: false, reason: 'deadline', attempts: 0, error: 'deadline-exceeded' }, '一開始就過期 → 一次都不呼叫')
+  assert.equal(r.calls.length, 0, '過期就不要呼叫')
+}
+{
+  const r = await run([fail(), okStep], {}, () => false)
+  assert.deepEqual(r.result, { ok: false, reason: 'budget', attempts: 1, error: '503' }, '預算說不能重試 → budget')
+  assert.deepEqual(r.sleeps, [], '預算用光就不要等')
+}
+{
+  const r = await run([fail('503'), fail('504')], { maxAttempts: 2 })
+  assert.deepEqual(r.result, { ok: false, reason: 'attempts-exhausted', attempts: 2, error: '504' }, 'error 是最後一次失敗的錯誤')
+  assert.deepEqual(r.budgetLog, ['fail', 'can', 'fail'], '用完次數時不必再問 canRetry')
+}
+{
+  const r = await run([fail(), fail(), fail(), okStep], { maxAttempts: 4, random: () => 0.999, capMs: 300 })
+  assert(r.sleeps.every(ms => ms < 300), `等待要被 capMs 300 限制，得到 ${r.sleeps.join('、')}`)
+  assert.equal(r.result.ok, true, '第 4 次成功')
+}
+</script>
+  <script type="wrong">
+type Outcome<T> = { ok: true; value: T } | { ok: false; retryable: boolean; retryAfterMs: number | null; error: string }
+type Budget = { canRetry(): boolean; onSuccess(): void; onFailure(): void }
+type RetryOpts = { maxAttempts: number; baseMs: number; capMs: number; perAttemptTimeoutMs: number; deadline: number; now: () => number; sleep: (ms: number) => Promise<void>; random: () => number; budget: Budget }
+type RetryResult<T> = { ok: true; value: T; attempts: number } | { ok: false; reason: 'not-retryable' | 'attempts-exhausted' | 'budget' | 'deadline'; attempts: number; error: string }
+const backoff = (attempt: number, baseMs: number, capMs: number, random: () => number) => random() * Math.min(capMs, baseMs * 2 ** (attempt - 1))
+async function retryCall<T>(call: (attempt: number, timeoutMs: number) => Promise<Outcome<T>>, o: RetryOpts): Promise<RetryResult<T>> {
+  let lastError = 'deadline-exceeded'
+  for (let attempt = 1; ; attempt++) {
+    const remaining = o.deadline - o.now()
+    if (remaining <= 0) return { ok: false, reason: 'deadline', attempts: attempt - 1, error: lastError }
+    const r = await call(attempt, Math.min(o.perAttemptTimeoutMs, remaining))
+    if (r.ok) { o.budget.onSuccess(); return { ok: true, value: r.value, attempts: attempt } }
+    lastError = r.error
+    if (!r.retryable) return { ok: false, reason: 'not-retryable', attempts: attempt, error: r.error }
+    o.budget.onFailure()
+    if (!o.budget.canRetry()) return { ok: false, reason: 'budget', attempts: attempt, error: r.error }
+    const wait = Math.max(backoff(attempt, o.baseMs, o.capMs, o.random), r.retryAfterMs ?? 0)
+    if (o.now() + wait >= o.deadline) return { ok: false, reason: 'deadline', attempts: attempt, error: r.error }
+    await o.sleep(wait)
+    if (attempt >= o.maxAttempts) return { ok: false, reason: 'attempts-exhausted', attempts: attempt, error: r.error }
+  }
+}
+</script>
+  <script type="wrong">
+type Outcome<T> = { ok: true; value: T } | { ok: false; retryable: boolean; retryAfterMs: number | null; error: string }
+type Budget = { canRetry(): boolean; onSuccess(): void; onFailure(): void }
+type RetryOpts = { maxAttempts: number; baseMs: number; capMs: number; perAttemptTimeoutMs: number; deadline: number; now: () => number; sleep: (ms: number) => Promise<void>; random: () => number; budget: Budget }
+type RetryResult<T> = { ok: true; value: T; attempts: number } | { ok: false; reason: 'not-retryable' | 'attempts-exhausted' | 'budget' | 'deadline'; attempts: number; error: string }
+const backoff = (attempt: number, baseMs: number, capMs: number, random: () => number) => random() * Math.min(capMs, baseMs * 2 ** (attempt - 1))
+async function retryCall<T>(call: (attempt: number, timeoutMs: number) => Promise<Outcome<T>>, o: RetryOpts): Promise<RetryResult<T>> {
+  let lastError = 'deadline-exceeded'
+  for (let attempt = 1; ; attempt++) {
+    const remaining = o.deadline - o.now()
+    if (remaining <= 0) return { ok: false, reason: 'deadline', attempts: attempt - 1, error: lastError }
+    const r = await call(attempt, Math.min(o.perAttemptTimeoutMs, remaining))
+    if (r.ok) { o.budget.onSuccess(); return { ok: true, value: r.value, attempts: attempt } }
+    lastError = r.error
+    if (!r.retryable) return { ok: false, reason: 'not-retryable', attempts: attempt, error: r.error }
+    o.budget.onFailure()
+    if (attempt >= o.maxAttempts) return { ok: false, reason: 'attempts-exhausted', attempts: attempt, error: r.error }
+    if (!o.budget.canRetry()) return { ok: false, reason: 'budget', attempts: attempt, error: r.error }
+    const wait = backoff(attempt, o.baseMs, o.capMs, o.random)
+    if (o.now() + wait >= o.deadline) return { ok: false, reason: 'deadline', attempts: attempt, error: r.error }
+    await o.sleep(wait)
+  }
+}
+</script>
+  <script type="wrong">
+type Outcome<T> = { ok: true; value: T } | { ok: false; retryable: boolean; retryAfterMs: number | null; error: string }
+type Budget = { canRetry(): boolean; onSuccess(): void; onFailure(): void }
+type RetryOpts = { maxAttempts: number; baseMs: number; capMs: number; perAttemptTimeoutMs: number; deadline: number; now: () => number; sleep: (ms: number) => Promise<void>; random: () => number; budget: Budget }
+type RetryResult<T> = { ok: true; value: T; attempts: number } | { ok: false; reason: 'not-retryable' | 'attempts-exhausted' | 'budget' | 'deadline'; attempts: number; error: string }
+const backoff = (attempt: number, baseMs: number, capMs: number, random: () => number) => random() * Math.min(capMs, baseMs * 2 ** (attempt - 1))
+async function retryCall<T>(call: (attempt: number, timeoutMs: number) => Promise<Outcome<T>>, o: RetryOpts): Promise<RetryResult<T>> {
+  let lastError = 'deadline-exceeded'
+  for (let attempt = 1; ; attempt++) {
+    const remaining = o.deadline - o.now()
+    if (remaining <= 0) return { ok: false, reason: 'deadline', attempts: attempt - 1, error: lastError }
+    const r = await call(attempt, Math.min(o.perAttemptTimeoutMs, remaining))
+    if (r.ok) { o.budget.onSuccess(); return { ok: true, value: r.value, attempts: attempt } }
+    lastError = r.error
+    o.budget.onFailure()
+    if (attempt >= o.maxAttempts) return { ok: false, reason: 'attempts-exhausted', attempts: attempt, error: r.error }
+    if (!o.budget.canRetry()) return { ok: false, reason: 'budget', attempts: attempt, error: r.error }
+    const wait = Math.max(backoff(attempt, o.baseMs, o.capMs, o.random), r.retryAfterMs ?? 0)
+    if (o.now() + wait >= o.deadline) return { ok: false, reason: 'deadline', attempts: attempt, error: r.error }
+    await o.sleep(wait)
+  }
+}
+</script>
+  <script type="wrong">
+type Outcome<T> = { ok: true; value: T } | { ok: false; retryable: boolean; retryAfterMs: number | null; error: string }
+type Budget = { canRetry(): boolean; onSuccess(): void; onFailure(): void }
+type RetryOpts = { maxAttempts: number; baseMs: number; capMs: number; perAttemptTimeoutMs: number; deadline: number; now: () => number; sleep: (ms: number) => Promise<void>; random: () => number; budget: Budget }
+type RetryResult<T> = { ok: true; value: T; attempts: number } | { ok: false; reason: 'not-retryable' | 'attempts-exhausted' | 'budget' | 'deadline'; attempts: number; error: string }
+const backoff = (attempt: number, baseMs: number, capMs: number, random: () => number) => random() * Math.min(capMs, baseMs * 2 ** (attempt - 1))
+async function retryCall<T>(call: (attempt: number, timeoutMs: number) => Promise<Outcome<T>>, o: RetryOpts): Promise<RetryResult<T>> {
+  let lastError = 'deadline-exceeded'
+  for (let attempt = 1; ; attempt++) {
+    const remaining = o.deadline - o.now()
+    if (remaining <= 0) return { ok: false, reason: 'deadline', attempts: attempt - 1, error: lastError }
+    const r = await call(attempt, Math.min(o.perAttemptTimeoutMs, remaining))
+    if (r.ok) { o.budget.onSuccess(); return { ok: true, value: r.value, attempts: attempt } }
+    lastError = r.error
+    if (!r.retryable) return { ok: false, reason: 'not-retryable', attempts: attempt, error: r.error }
+    o.budget.onFailure()
+    if (attempt >= o.maxAttempts) return { ok: false, reason: 'attempts-exhausted', attempts: attempt, error: r.error }
+    if (!o.budget.canRetry()) return { ok: false, reason: 'budget', attempts: attempt, error: r.error }
+    await o.sleep(Math.max(backoff(attempt, o.baseMs, o.capMs, o.random), r.retryAfterMs ?? 0))
+  }
+}
+</script>
+  <script type="wrong">
+type Outcome<T> = { ok: true; value: T } | { ok: false; retryable: boolean; retryAfterMs: number | null; error: string }
+type Budget = { canRetry(): boolean; onSuccess(): void; onFailure(): void }
+type RetryOpts = { maxAttempts: number; baseMs: number; capMs: number; perAttemptTimeoutMs: number; deadline: number; now: () => number; sleep: (ms: number) => Promise<void>; random: () => number; budget: Budget }
+type RetryResult<T> = { ok: true; value: T; attempts: number } | { ok: false; reason: 'not-retryable' | 'attempts-exhausted' | 'budget' | 'deadline'; attempts: number; error: string }
+const backoff = (attempt: number, baseMs: number, capMs: number, random: () => number) => random() * Math.min(capMs, baseMs * 2 ** (attempt - 1))
+async function retryCall<T>(call: (attempt: number, timeoutMs: number) => Promise<Outcome<T>>, o: RetryOpts): Promise<RetryResult<T>> {
+  let lastError = 'deadline-exceeded'
+  for (let attempt = 1; ; attempt++) {
+    const remaining = o.deadline - o.now()
+    if (remaining <= 0) return { ok: false, reason: 'deadline', attempts: attempt - 1, error: lastError }
+    const r = await call(attempt, Math.min(o.perAttemptTimeoutMs, remaining))
+    if (r.ok) { o.budget.onSuccess(); return { ok: true, value: r.value, attempts: attempt } }
+    lastError = r.error
+    if (!r.retryable) return { ok: false, reason: 'not-retryable', attempts: attempt, error: r.error }
+    o.budget.onFailure()
+    if (attempt >= o.maxAttempts) return { ok: false, reason: 'attempts-exhausted', attempts: attempt, error: r.error }
+    const wait = Math.max(backoff(attempt, o.baseMs, o.capMs, o.random), r.retryAfterMs ?? 0)
+    if (o.now() + wait >= o.deadline) return { ok: false, reason: 'deadline', attempts: attempt, error: r.error }
+    await o.sleep(wait)
+  }
+}
+</script>
+  <script type="wrong">
+type Outcome<T> = { ok: true; value: T } | { ok: false; retryable: boolean; retryAfterMs: number | null; error: string }
+type Budget = { canRetry(): boolean; onSuccess(): void; onFailure(): void }
+type RetryOpts = { maxAttempts: number; baseMs: number; capMs: number; perAttemptTimeoutMs: number; deadline: number; now: () => number; sleep: (ms: number) => Promise<void>; random: () => number; budget: Budget }
+type RetryResult<T> = { ok: true; value: T; attempts: number } | { ok: false; reason: 'not-retryable' | 'attempts-exhausted' | 'budget' | 'deadline'; attempts: number; error: string }
+const backoff = (attempt: number, baseMs: number, capMs: number, random: () => number) => random() * Math.min(capMs, baseMs * 2 ** (attempt - 1))
+async function retryCall<T>(call: (attempt: number, timeoutMs: number) => Promise<Outcome<T>>, o: RetryOpts): Promise<RetryResult<T>> {
+  let lastError = 'deadline-exceeded'
+  for (let attempt = 1; ; attempt++) {
+    const remaining = o.deadline - o.now()
+    if (remaining <= 0) return { ok: false, reason: 'deadline', attempts: attempt - 1, error: lastError }
+    const r = await call(attempt, o.perAttemptTimeoutMs)
+    if (r.ok) { o.budget.onSuccess(); return { ok: true, value: r.value, attempts: attempt } }
+    lastError = r.error
+    if (!r.retryable) return { ok: false, reason: 'not-retryable', attempts: attempt, error: r.error }
+    o.budget.onFailure()
+    if (attempt >= o.maxAttempts) return { ok: false, reason: 'attempts-exhausted', attempts: attempt, error: r.error }
+    if (!o.budget.canRetry()) return { ok: false, reason: 'budget', attempts: attempt, error: r.error }
+    const wait = Math.max(backoff(attempt, o.baseMs, o.capMs, o.random), r.retryAfterMs ?? 0)
+    if (o.now() + wait >= o.deadline) return { ok: false, reason: 'deadline', attempts: attempt, error: r.error }
+    await o.sleep(wait)
+  }
+}
+</script>
+  <script type="wrong">
+type Outcome<T> = { ok: true; value: T } | { ok: false; retryable: boolean; retryAfterMs: number | null; error: string }
+type Budget = { canRetry(): boolean; onSuccess(): void; onFailure(): void }
+type RetryOpts = { maxAttempts: number; baseMs: number; capMs: number; perAttemptTimeoutMs: number; deadline: number; now: () => number; sleep: (ms: number) => Promise<void>; random: () => number; budget: Budget }
+type RetryResult<T> = { ok: true; value: T; attempts: number } | { ok: false; reason: 'not-retryable' | 'attempts-exhausted' | 'budget' | 'deadline'; attempts: number; error: string }
+async function retryCall<T>(call: (attempt: number, timeoutMs: number) => Promise<Outcome<T>>, o: RetryOpts): Promise<RetryResult<T>> {
+  let lastError = 'deadline-exceeded'
+  for (let attempt = 1; ; attempt++) {
+    const remaining = o.deadline - o.now()
+    if (remaining <= 0) return { ok: false, reason: 'deadline', attempts: attempt - 1, error: lastError }
+    const r = await call(attempt, Math.min(o.perAttemptTimeoutMs, remaining))
+    if (r.ok) { o.budget.onSuccess(); return { ok: true, value: r.value, attempts: attempt } }
+    lastError = r.error
+    if (!r.retryable) return { ok: false, reason: 'not-retryable', attempts: attempt, error: r.error }
+    o.budget.onFailure()
+    if (attempt >= o.maxAttempts) return { ok: false, reason: 'attempts-exhausted', attempts: attempt, error: r.error }
+    if (!o.budget.canRetry()) return { ok: false, reason: 'budget', attempts: attempt, error: r.error }
+    const wait = Math.max(Math.random() * Math.min(o.capMs, o.baseMs * 2 ** (attempt - 1)), r.retryAfterMs ?? 0)
+    if (o.now() + wait >= o.deadline) return { ok: false, reason: 'deadline', attempts: attempt, error: r.error }
+    await o.sleep(wait)
+  }
+}
+</script>
+  <script type="wrong">
+type Outcome<T> = { ok: true; value: T } | { ok: false; retryable: boolean; retryAfterMs: number | null; error: string }
+type Budget = { canRetry(): boolean; onSuccess(): void; onFailure(): void }
+type RetryOpts = { maxAttempts: number; baseMs: number; capMs: number; perAttemptTimeoutMs: number; deadline: number; now: () => number; sleep: (ms: number) => Promise<void>; random: () => number; budget: Budget }
+type RetryResult<T> = { ok: true; value: T; attempts: number } | { ok: false; reason: 'not-retryable' | 'attempts-exhausted' | 'budget' | 'deadline'; attempts: number; error: string }
+const backoff = (attempt: number, baseMs: number, capMs: number, random: () => number) => random() * Math.min(capMs, baseMs * 2 ** (attempt - 1))
+async function retryCall<T>(call: (attempt: number, timeoutMs: number) => Promise<Outcome<T>>, o: RetryOpts): Promise<RetryResult<T>> {
+  let lastError = 'deadline-exceeded'
+  for (let attempt = 1; ; attempt++) {
+    const remaining = o.deadline - o.now()
+    if (remaining <= 0) return { ok: false, reason: 'deadline', attempts: attempt - 1, error: lastError }
+    const r = await call(attempt, Math.min(o.perAttemptTimeoutMs, remaining))
+    if (r.ok) { o.budget.onSuccess(); return { ok: true, value: r.value, attempts: attempt } }
+    lastError = r.error
+    if (!r.retryable) return { ok: false, reason: 'not-retryable', attempts: attempt, error: r.error }
+    o.budget.onFailure()
+    if (attempt >= o.maxAttempts) return { ok: false, reason: 'attempts-exhausted', attempts: attempt, error: r.error }
+    if (!o.budget.canRetry()) return { ok: false, reason: 'budget', attempts: attempt, error: r.error }
+    const wait = Math.max(backoff(attempt, o.baseMs, o.capMs, o.random), r.retryAfterMs ?? 0)
+    if (o.now() + wait > o.deadline) return { ok: false, reason: 'deadline', attempts: attempt, error: r.error }
+    await o.sleep(wait)
+  }
+}
+</script>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：App 送出 <code>POST /orders</code>，等了 2 秒逾時。App 可以直接用同樣的內容重試嗎？</p>
+  <label data-key="a">可以，逾時代表伺服器沒收到請求，重試很安全</label>
+  <label data-key="b">沒有冪等鍵就不行：伺服器可能已經建立訂單、扣了款，只是回應在路上遺失，重試會重複下單</label>
+  <label data-key="c">可以，只要等久一點（例如 10 秒）再重試就不會重複</label>
+  <p class="why">✓ b。逾時只代表「沒在時間內收到回應」，請求可能根本沒到，也可能已經做完（a 錯）。等多久都一樣，伺服器不會因為你晚一點送就認出它是同一張訂單（c 錯）。RFC 9110 規定客戶端不應自動重試非冪等的請求；要安全重試 POST，得帶冪等鍵，讓伺服器認出重複（第 9 課）。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 7：API 閘道、訂單服務、金流客戶端三層，每一層都「失敗就最多試 3 次」。金流當機時，一次下單最多會對金流送出幾個請求？</p>
+  <label data-key="a">3 個，每一層的設定都一樣</label>
+  <label data-key="b">9 個，3 + 3 + 3</label>
+  <label data-key="c">27 個，3 × 3 × 3；應該只在一層重試</label>
+  <p class="why">✓ c。閘道的每一次嘗試都會讓訂單服務跑完自己的 3 次，訂單服務的每一次又讓金流客戶端試 3 次，所以是相乘不是相加（b 錯），也不會只有 3 次（a 錯）。下游已經壞掉時還被放大 27 倍，這就是重試風暴。只在一層重試，其他層把錯誤往上傳，再加上重試預算。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 8：1,000 支手機同時收到 503，程式都寫成「固定等 1 秒再試，最多 5 次」。會發生什麼？</p>
+  <label data-key="a">每一秒都有 1,000 個請求在同一刻湧回，下游剛恢復又被打倒；要改成指數退避加 jitter</label>
+  <label data-key="b">沒問題，等 1 秒足夠讓下游恢復</label>
+  <label data-key="c">只要把固定等待改成指數退避（1、2、4 秒）就解決了，不需要隨機</label>
+  <p class="why">✓ a。大家同時失敗、等一樣久，就會同時回來，每一波都是完整的 1,000 個（b 錯）。只改成指數退避，大家還是在 1、3、7 秒同步湧回，只是波與波之間隔得比較遠（c 錯）。加入 jitter 才會把請求攤開。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 9：金流回 503 並附上 <code>Retry-After: 120</code>，但這個下單請求的 deadline 只剩 2 秒。怎麼做？</p>
+  <label data-key="a">照 Retry-After 等 120 秒再試，這是伺服器的要求</label>
+  <label data-key="b">直接放棄並把錯誤回報給上游：等完早就超過期限，沒人會收這個結果</label>
+  <label data-key="c">忽略 Retry-After，用自己的退避在 2 秒內再試幾次</label>
+  <p class="why">✓ b。使用者 2 秒後就放棄了，等 120 秒只是佔著連線和記憶體（a 錯）。伺服器已經明說 120 秒內不要來，在 2 秒內硬試只會被拒絕、增加它的負擔（c 錯）。快速失敗，讓上游決定怎麼呈現（例如「金流忙碌中，請稍後再試」）。</p>
+</div>
+
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>沒有逾時或逾時太長</strong>：一個慢的依賴把連線、記憶體、進行中的請求全部卡住，連不相干的功能都受影響，就像開場金流變慢、菜單也打不開。依下游的 p99.9 訂逾時，並定期檢查。</li>
+  <li><strong>每一層各自設完整的逾時</strong>：下游還在做，上游早就放棄了，後面全是白工。deadline 要往下傳，每一層用剩餘時間減掉餘裕。</li>
+  <li><strong>不分錯誤種類全部重試</strong>：400、409、422、501 再試也一樣，只會增加負擔。照決策表分類。</li>
+  <li><strong>沒有冪等鍵就重試 POST</strong>：逾時不代表沒做，重試會重複下單、重複扣款（第 9 課）。</li>
+  <li><strong>把呼叫端取消（AbortError）當成失敗</strong>：重試它、記成錯誤或觸發告警都不對。取消是正常的結束。</li>
+  <li><strong>退避不加 jitter</strong>：大家同時回來，下游剛恢復又被打倒。定期工作和快取到期時間也要加 jitter。</li>
+  <li><strong>最後一次失敗後還 sleep</strong>：白白延遲回應。先判斷還能不能重試，再等。</li>
+  <li><strong>重試沒有總期限</strong>：使用者早就離開了還在重試。deadline 要往下傳，Retry-After 超過剩餘時間就放棄。</li>
+  <li><strong>用 <code>parseInt</code>、<code>Number</code> 或直接 <code>Date.parse</code> 解析 Retry-After</strong>：<code>'1.5'</code> 變 1 秒、空字串變 0、亂寫的字串被猜成日期。先檢查格式。</li>
+  <li><strong>每一層各自重試</strong>：放大倍數相乘。只在一層重試，其他層把錯誤往上傳。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>慢比掛掉更危險：等待中的請求佔著資源，Little's Law 算得出會卡住多少。每個網路呼叫都要有整體逾時。</li>
+  <li>逾時依可接受的誤判比例選下游延遲的百分位數（0.1% → p99.9）。</li>
+  <li>deadline 往下傳：每一層用剩餘時間減掉餘裕；時間不夠就不要開始。每次嘗試的逾時取單次逾時與剩餘時間的較小值。</li>
+  <li>重試的條件：暫時性錯誤（逾時、連線失敗、408、429、500、502、503、504）、方法冪等或有冪等鍵、不是呼叫端取消、還沒到次數上限與期限。扣款的 POST 沒有冪等鍵就不自動重試。</li>
+  <li>指數退避一定要加 jitter；full、equal、decorrelated 三種都能錯開，不加 jitter 的會同步湧回。</li>
+  <li>Retry-After 有秒數和 HTTP 日期兩種格式，要嚴格解析；等待取 max(退避, Retry-After)，超過期限就放棄。</li>
+  <li>多層重試會相乘放大；只在一層重試，並用重試預算（gRPC retry throttling）在大面積失敗時自動停止重試。</li>
+  <li>上線後看重試率、嘗試次數分布、逾時次數、預算用光次數；取消分開記。</li>
+</ul>
+<p>下一課處理重試留下的最大問題：同一個下單請求送了兩次，怎麼保證只扣一次款。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

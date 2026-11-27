@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>24. 權限與 Row Level Security</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="24">
+<header>
+  <div class="eyebrow">階段 7：實務 · 第 24 課</div>
+  <h1>權限與 Row Level Security</h1>
+</header>
+<main>
+
+<p>咖啡店要推出顧客 App：王小明登入之後，可以看自己的歷史訂單，也可以自己下單。同一週，後台來了新工讀生 <code>amy</code>，她要能查商品和顧客，但不該碰到訂單。到目前為止，你在這個頁面都用資料庫的最高管理員身分操作，想看什麼就看什麼、想刪什麼就刪什麼。上線之後不能這樣：顧客 App 送進資料庫的每一句查詢，都要有一個身分，而這個身分能做的事要剛好夠用。</p>
+<p>最讓人擔心的情境是這個：後端某支 API 查訂單時忘了寫 <code>WHERE customer_id = …</code>，王小明打開 App，看到的是全店每一位顧客的訂單。這一課的任務，是在資料庫這一端把權限設好，讓<strong>就算程式寫漏了，顧客也只看得到、只寫得進自己的訂單</strong>。用到兩層權限：<strong>表層級</strong>的 <code>GRANT</code>／<code>REVOKE</code> 決定一個身分能不能碰某張表；<strong>列層級</strong>的 Row Level Security 決定碰得到的那張表裡，它看得到哪幾列。最後你會看懂 Supabase 為什麼敢讓前端直接查資料庫。</p>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="01-what-is-db.html">第 1 課</a>的「前端不直接連資料庫」：資料庫的帳號密碼只放在後端，前端透過 API 拿資料。</li>
+  <li><a href="18-transactions.html">第 18 課</a>的交易：用 <code>BEGIN</code>…<code>COMMIT</code> 包起來的一組 SQL，中途出錯就整組取消。</li>
+  <li><a href="23-views-functions-triggers.html">第 23 課</a>的 <code>CREATE FUNCTION</code>：把一段 SQL 存成資料庫裡可以重複呼叫的函式。</li>
+</ul></div>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>顧客 App 用誰的身分查資料庫：PostgreSQL 的帳號叫 role，怎麼用 <code>SET ROLE</code> 模擬不同的人（開場問題的最小答案在這節）。</li>
+  <li>這個身分能碰哪些表：<code>GRANT</code>／<code>REVOKE</code> 讓 amy 只拿到工作需要的權限，也就是最小權限原則。</li>
+  <li>能查 <code>orders</code>，怎麼只看到自己的列：開啟 RLS、告訴資料庫「現在是哪位顧客」、寫第一條 policy。</li>
+  <li>顧客下單時怎麼擋住冒用別人的 <code>customer_id</code>：<code>WITH CHECK</code>；接著看誰會繞過 RLS，測試時要換成哪個身分。</li>
+  <li>連後端都省掉：Supabase 讓前端直接查資料庫，靠的就是前面這兩層。</li>
+</ol></div>
+
+<div class="callout warn"><strong>這一頁的執行框共用同一條連線，照你按的順序改資料。</strong>範例用 <code>SET ROLE</code> 切換身分，最後都會 <code>RESET ROLE</code> 切回來。看到莫名其妙的 permission denied，先單獨執行一次 <code>RESET ROLE;</code>，或按上方「重置資料庫」。</div>
+
+<h2>顧客 App 的查詢，該用誰的身分送進資料庫？</h2>
+<p>先看你現在是誰，以及這個資料庫裡有哪些帳號。執行後看兩個結果：第一個是目前的身分，第二個是帳號清單，注意「超級使用者」和「可登入」兩欄。</p>
+<div class="lab" data-sql="SELECT current_user;
+
+SELECT rolname, rolsuper AS 超級使用者, rolcanlogin AS 可登入
+FROM pg_roles
+WHERE rolname NOT LIKE 'pg\_%'
+ORDER BY rolname;"></div>
+<p>你現在是 <code>postgres</code>，它是<strong>超級使用者</strong>（superuser）。超級使用者的意思是：PostgreSQL 的所有權限檢查對它都不算數，任何表都能讀、能改、能刪，包括這課後面要設的每一道限制。安裝資料庫時預設就有這個帳號，用來管理資料庫本身。如果顧客 App 也用它連線，後端任何一個 bug 或漏洞，影響範圍就是整個資料庫。</p>
+<p>帳號清單裡的其他名字是這頁的 seed 建的。PostgreSQL 把「帳號」叫做 <strong>role</strong>，而且沒有把「使用者」和「群組」分成兩種東西，兩者都是 role，差別在設定：</p>
+<ul>
+  <li>有 <code>LOGIN</code> 屬性、可以拿來連線的 role，就是一般說的使用者。</li>
+  <li>沒有 <code>LOGIN</code>、不能連線，只拿來集中設定權限的 role，就是群組。</li>
+  <li>把 role A 加進 role B（寫成 <code>GRANT B TO A</code>），A 就繼承 B 的所有權限。</li>
+</ul>
+<p>這樣設計的好處是權限只要設一次。咖啡店的 seed 建了三個 role：<code>staff</code> 是店員群組，設定「店員可以看商品和顧客」；新來的工讀生只要加進 <code>staff</code> 就有一樣的權限，離職時把她移出群組就好，不用一張表一張表去改。<code>customer</code> 是顧客 App 查資料庫用的身分。<code>cafe_owner</code> 是 <code>orders</code> 這張表的擁有者，後面講「誰會繞過限制」時會用到。</p>
+<p>開場問題的最小答案也就在這裡：顧客 App 不用 <code>postgres</code>，而是用 <code>customer</code> 這個權限很少的 role 查資料庫。表層級用 <code>GRANT</code> 限制它只能碰哪些表、做哪些操作；列層級用 RLS 規定每位顧客只看得到自己的列。兩層都是資料庫自己檢查，不依賴後端程式有沒有寫對。Supabase 用的也是同一套做法，最後一節細講。</p>
+<p>要驗證這些限制有沒有效，得用不同的身分實際查查看。正式環境裡，不同的程式用不同的帳號密碼連線；這個頁面只有一條連線，所以改用 <code>SET ROLE 名稱</code>：超級使用者可以用它暫時「變成」另一個 role，之後的每一句都以那個 role 的權限執行，直到 <code>RESET ROLE</code> 變回原本的身分。這也是為什麼每格範例最後都有 <code>RESET ROLE</code>：忘了切回來，後面所有範例都會用那個權限很少的 role 執行，到處出現 permission denied。</p>
+<p>還有一個規則跟第 18 課的交易有關：在這個頁面按一次「執行」，整格的句子會被當成一組，只要其中一句出錯，整格都會被取消，包括裡面的 <code>SET ROLE</code> 和 <code>CREATE ROLE</code>。所以出錯的範例不會留下切換後的身分，但也不會留下它建的東西。下一節第一個範例就會遇到。</p>
+<p>身分有了，接下來的問題是：一個剛建好的 role，到底能做什麼？</p>
+
+<h2>新來的工讀生 amy，能碰哪些表？</h2>
+<p>新建的 role 什麼權限都沒有。建一個工讀生 <code>amy</code>，讓她去查訂單，執行後看錯誤訊息：</p>
+<div class="lab" data-sql="CREATE ROLE amy LOGIN;
+
+SET ROLE amy;
+SELECT * FROM orders;"></div>
+<p>permission denied。PostgreSQL 在讀任何一列之前，先檢查這個 role 有沒有這張表的 <code>SELECT</code> 權限；沒有，就直接拒絕整句查詢。這正是我們要的：amy 的工作用不到訂單，她就不該看得到。</p>
+<p>上一格出錯，依照上一節講的規則，<code>CREATE ROLE amy</code> 也一起被取消了，所以下一格要再建一次。這次把她加進 <code>staff</code> 群組。seed 已經讓 <code>staff</code> 能查 <code>customers</code> 和 <code>products</code>，執行後看 amy 能不能讀到商品：</p>
+<div class="lab" data-sql="CREATE ROLE amy LOGIN;
+GRANT staff TO amy;
+
+SET ROLE amy;
+SELECT name, price FROM products ORDER BY id;
+RESET ROLE;"></div>
+<p>查得到。amy 本身沒有被直接給過任何權限，她能查 <code>products</code>，是因為 <code>GRANT staff TO amy</code> 讓她繼承了 <code>staff</code> 的權限。之後店員要多一張表的權限，只要給 <code>staff</code>，每位店員都會一起拿到。</p>
+<p>權限的寫法只有三種形狀：</p>
+<pre>GRANT SELECT, INSERT, UPDATE, DELETE ON 表名 TO role;   -- 給
+REVOKE DELETE ON 表名 FROM role;                       -- 收回
+GRANT 群組 TO 使用者;                                  -- 加入群組</pre>
+<p><code>SELECT</code>、<code>INSERT</code>、<code>UPDATE</code>、<code>DELETE</code> 分開給，所以可以做到「能查、能改，不能刪」這種組合。給錯了用 <code>REVOKE</code> 收回。下面這格先給 <code>staff</code> 查詢和修改商品的權限，再把修改收回，最後查系統裡記錄的權限。執行後看結果剩下哪幾種權限：</p>
+<div class="lab" data-sql="GRANT SELECT, UPDATE ON products TO staff;
+REVOKE UPDATE ON products FROM staff;
+
+SELECT privilege_type
+FROM information_schema.role_table_grants
+WHERE grantee = 'staff' AND table_name = 'products';"></div>
+<p>只剩 <code>SELECT</code>，<code>UPDATE</code> 已經收回了。<code>information_schema.role_table_grants</code> 是 PostgreSQL 記錄「誰對哪張表有什麼權限」的地方，懷疑權限設錯時，第一步就是查它。</p>
+<p>為什麼要這樣一項一項給，而不是給 amy 全部權限省事？因為有一條資安的基本原則，叫<strong>最小權限原則</strong>（principle of least privilege）：每個帳號只給它完成工作所需的最少權限。理由很實際：帳號被濫用時，損害的上限就是這個帳號的權限。有一種常見攻擊叫 <strong>SQL injection</strong>：攻擊者在輸入欄位塞進一段 SQL，讓你的程式替他執行，<a href="25-backend.html">下一課</a>會細講。後端一旦被這樣攻擊，攻擊者能做的事，就是後端連線用的那個帳號能做的事；只有 <code>SELECT</code> 權限的帳號，至少刪不掉你的表。同樣的道理，報表系統只需要讀，就給一個唯讀帳號；只有跑 migration 時才用有 <code>ALTER</code> 權限的帳號。</p>
+<p>其中最重要的一條是：<strong>應用程式不要用超級使用者連線</strong>。前面說過超級使用者跳過所有權限檢查，這包括下一節要設的 RLS。後端用 <code>postgres</code> 連線，這課設的每一道限制都等於沒設。</p>
+<div class="callout practice"><strong>💡 實務上：正式環境通常會有好幾個資料庫帳號，各管各的事</strong><br>常見的分法：後端 API 用的帳號只有日常讀寫需要的權限；跑 migration 的帳號才能建表、改欄位；報表或資料分析工具用唯讀帳號；工程師查線上問題時用個人的唯讀帳號。不要整個團隊共用一組管理員密碼，出事時查不出是誰改的，有人離職也只能全部換密碼。新服務要接資料庫時，資深工程師會先問「它需要哪幾張表、哪幾種操作」，再照這個開權限，而不是先給全部、出問題再收。咖啡店的顧客 App 也一樣：它要看菜單、查訂單和訂位、下單，就只給 <code>products</code>、<code>orders</code>、<code>reservations</code> 的 <code>SELECT</code>，加上 <code>orders</code> 的 <code>INSERT</code>，其他表、其他操作一律不給。</div>
+<p>可是 <code>GRANT</code> 只能回答「能不能查 <code>orders</code> 這張表」，答案是整張表全部或完全沒有。顧客 App 需要查 <code>orders</code>，但每位顧客只能看到自己的那幾列，表層級的權限做不到這件事。</p>
+
+<h2>顧客可以查 orders，怎麼讓他只看到自己的那幾列？</h2>
+<p>先看問題有多嚴重。seed 已經 <code>GRANT SELECT ON orders TO customer</code>，也就是顧客 App 用的身分可以查訂單。切換成 <code>customer</code> 查，執行後看出現了哪些 <code>customer_id</code>：</p>
+<div class="lab" data-sql="SET ROLE customer;
+SELECT * FROM orders ORDER BY id;
+RESET ROLE;"></div>
+<p>每位顧客的訂單都看得到。這就是開場擔心的情境：表層級的權限一旦開了，整張表都開了。傳統的做法是靠後端在每一句查詢加上 <code>WHERE customer_id = 目前登入的人</code>，只要有一支 API 忘了加，資料就外洩。</p>
+<p>PostgreSQL 的 <strong>Row Level Security</strong>（列層級安全，簡稱 RLS）把這個 <code>WHERE</code> 從後端搬進資料庫。它的運作方式是：在一張表上開啟 RLS 之後，你可以為這張表寫好幾條<strong>政策</strong>（policy），每條政策規定「某個 role 做某種操作時，哪些列算數」。之後這個 role 對這張表下的每一句查詢，資料庫都會自動加上政策裡的條件，不管查詢本身有沒有寫 <code>WHERE</code>。</p>
+<figure>
+  <svg viewBox="0 0 720 250" role="img" aria-label="同一張 orders 表，在 RLS 的 policy 過濾之後，顧客 1 只看到自己的訂單，顧客 2 只看到自己的訂單">
+    <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <text class="d-accent" x="20" y="24">orders（全部）</text>
+    <rect class="d-soft" x="20" y="34" width="200" height="28"/><text class="d-text" x="30" y="53">id　customer_id　total</text>
+    <rect class="d-box" x="20" y="62" width="200" height="28"/><text class="d-text" x="30" y="81">1　　　1　　　190</text>
+    <rect class="d-box" x="20" y="90" width="200" height="28"/><text class="d-text" x="30" y="109">2　　　2　　　220</text>
+    <rect class="d-box" x="20" y="118" width="200" height="28"/><text class="d-text" x="30" y="137">3　　　1　　　150</text>
+    <rect class="d-box" x="20" y="146" width="200" height="28"/><text class="d-text" x="30" y="165">4　　　3　　　110</text>
+    <rect class="d-soft" x="270" y="80" width="170" height="70" rx="10"/>
+    <text class="d-accent" x="355" y="106" text-anchor="middle">policy</text>
+    <text class="d-small" x="355" y="128" text-anchor="middle">customer_id = 目前使用者</text>
+    <path class="d-line" d="M220,115 L266,115" marker-end="url(#arr)"/>
+    <path class="d-line" d="M440,100 L496,60" marker-end="url(#arr)"/>
+    <path class="d-line" d="M440,130 L496,170" marker-end="url(#arr)"/>
+    <text class="d-small" x="500" y="24">顧客 1 登入時看到</text>
+    <rect class="d-box" x="500" y="34" width="200" height="28"/><text class="d-text" x="510" y="53">1　　　1　　　190</text>
+    <rect class="d-box" x="500" y="62" width="200" height="28"/><text class="d-text" x="510" y="81">3　　　1　　　150</text>
+    <text class="d-small" x="500" y="150">顧客 2 登入時看到</text>
+    <rect class="d-box" x="500" y="160" width="200" height="28"/><text class="d-text" x="510" y="179">2　　　2　　　220</text>
+    <text class="d-small" x="360" y="232" text-anchor="middle">兩個人執行的都是同一句 SELECT * FROM orders，資料庫自動加上過濾條件</text>
+  </svg>
+</figure>
+<p>第一步是在 <code>orders</code> 上開啟 RLS。還沒寫任何政策，直接用 <code>customer</code> 查，執行後看剩幾列：</p>
+<div class="lab" data-sql="ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+
+SET ROLE customer;
+SELECT * FROM orders ORDER BY id;
+RESET ROLE;"></div>
+<p>一列都沒有。開啟 RLS 之後，<strong>預設是全部拒絕</strong>：沒有任何政策允許的列，一律看不到。這是刻意設計的安全預設值：忘了寫政策，後果頂多是「看不到」，有人會來回報 bug；如果預設是全部開放，忘了寫政策的後果就是全部外洩，而且沒有人會發現。</p>
+<p>接下來要寫一條政策，意思是「<code>customer_id</code> 等於目前登入的顧客」。但資料庫怎麼知道目前登入的是哪位顧客？顧客 App 的所有請求都用同一個 <code>customer</code> role 連線，role 只說明「這是顧客 App」，不說明「這是王小明」。不可能替每位顧客建一個 role，顧客有幾萬人，而且隨時有人註冊。</p>
+<p>所以要由後端在每次請求開始時告訴資料庫：這次是誰。PostgreSQL 允許你在連線上存自訂的設定值，名稱裡要有一個點，例如 <code>app.user_id</code>。用 <code>set_config(名稱, 值, 是否只在這個交易內有效)</code> 寫入，用 <code>current_setting(名稱)</code> 讀出。執行後看讀出來的值：</p>
+<div class="lab" data-sql="SELECT set_config('app.user_id', '1', false);
+
+SELECT current_setting('app.user_id') AS 目前使用者;"></div>
+<p>讀出 <code>1</code>。使用這個設定時要注意三件事：</p>
+<ul>
+  <li>第三個參數 <code>false</code> 表示設定在整個連線期間都有效；<code>true</code> 則只在目前的交易內有效，交易結束就消失。這頁用 <code>false</code> 是為了讓範例好操作，正式環境一定要用 <code>true</code>，原因跟連線池有關。<a href="19-concurrency.html">第 19 課</a>講過，後端會預先開好幾條連線放在池子裡，每個請求借一條來用、用完還回去，下一個請求可能借到同一條。<code>false</code> 設的 <code>app.user_id</code> 是黏在<strong>連線</strong>上的，請求結束、連線還回池子時它還在。如果下一個借到這條連線的請求因為某支 API 漏寫、或出錯提早跳過，沒有重新設定，它就會帶著上一位顧客的身分去查，RLS 會很盡責地把上一位顧客的訂單交給他。正式環境的寫法是：每個請求的查詢都包在 <code>BEGIN</code> … <code>COMMIT</code> 裡（<a href="18-transactions.html">第 18 課</a>），開頭先執行 <code>set_config('app.user_id', 目前顧客編號, true)</code>。交易一結束（不論 <code>COMMIT</code> 或 <code>ROLLBACK</code>），設定就自動消失，連線還回池子時是乾淨的，沒設定的請求只會落到預設的 <code>'0'</code>，什麼都查不到。也因為這樣，<code>true</code> 一定要在交易裡用：沒有 <code>BEGIN</code> 時，每一句自己就是一個交易，設定在那一句結束就消失了。</li>
+  <li>設定的值一律是文字，跟整數欄位比較前要轉型：<code>current_setting('app.user_id')::integer</code>。</li>
+  <li>seed 已經把它預設為 <code>'0'</code>，代表「沒有登入」。沒有顧客的編號是 0，所以沒登入的人符合不到任何一列。</li>
+</ul>
+<p>現在可以寫政策了。完整的語法長這樣：</p>
+<pre>CREATE POLICY 名稱 ON 表名
+  FOR SELECT | INSERT | UPDATE | DELETE | ALL
+  TO role
+  USING (條件)          -- 哪些「既有的列」可以被看到／修改／刪除
+  WITH CHECK (條件);    -- 新增或修改後的「新資料」必須符合</pre>
+<p><code>FOR</code> 指定這條政策管哪一種操作，<code>TO</code> 指定它套用在哪個 role，<code>USING</code> 是篩選既有列的條件。<code>WITH CHECK</code> 下一節才用到。顧客查訂單只需要 <code>FOR SELECT</code> 和 <code>USING</code>。下面這格建立政策、切換成 <code>customer</code>、設定目前是顧客 1，再查一次。執行後看剩下哪些訂單：</p>
+<div class="lab" data-sql="CREATE POLICY orders_select_own ON orders
+  FOR SELECT
+  TO customer
+  USING (customer_id = current_setting('app.user_id')::integer);
+
+SET ROLE customer;
+SELECT set_config('app.user_id', '1', false);
+SELECT * FROM orders ORDER BY id;
+RESET ROLE;"></div>
+<p>只剩王小明（顧客 1）的訂單。把 <code>'1'</code> 改成 <code>'2'</code> 再執行，就變成陳美華的訂單。查詢本身完全沒變，還是 <code>SELECT * FROM orders</code>，是資料庫自動幫這句加上了 <code>USING</code> 裡的條件。就算後端寫漏了 <code>WHERE</code>，顧客也只看得到自己的訂單，開場的擔心在查詢這一側解決了。</p>
+<p>不過這條政策寫的是 <code>FOR SELECT</code>，只管查詢。顧客 App 還要讓顧客自己下單，而新增訂單的時候，資料庫要檢查的是另一件事。</p>
+
+<h2>顧客自己下單時，怎麼擋住「幫別人下單」？</h2>
+<p>查詢時，資料庫是從既有的列裡挑出符合條件的；新增時，還沒有任何既有的列可以挑，要檢查的是「即將寫進去的這一列」。所以政策有兩種條件：<code>USING</code> 管「能看到、能改、能刪哪些既有的列」，<code>WITH CHECK</code> 管「寫進去的新資料必須符合什麼」，不符合就整句拒絕。</p>
+<p>顧客下單要過兩層：先用 <code>GRANT INSERT</code> 讓 <code>customer</code> 能新增到 <code>orders</code>（表層級），再用 <code>FOR INSERT</code> 的政策規定新訂單的 <code>customer_id</code> 必須是自己（列層級）。每條政策只管 <code>FOR</code> 指定的那種操作，所以這條新政策不會影響上一節查詢用的那條。執行後看王小明能不能幫自己下單：</p>
+<div class="lab" data-sql="GRANT INSERT ON orders TO customer;
+
+CREATE POLICY orders_insert_own ON orders
+  FOR INSERT
+  TO customer
+  WITH CHECK (customer_id = current_setting('app.user_id')::integer);
+
+SET ROLE customer;
+SELECT set_config('app.user_id', '1', false);
+INSERT INTO orders (customer_id, ordered_at, total) VALUES (1, '2026-10-29 10:00+08', 80);
+RESET ROLE;"></div>
+<p>成功。再讓王小明試著冒充陳美華（顧客 2）下一筆 9999 元的單：</p>
+<div class="lab" data-sql="SET ROLE customer;
+SELECT set_config('app.user_id', '1', false);
+INSERT INTO orders (customer_id, ordered_at, total) VALUES (2, '2026-10-29 10:00+08', 9999);
+RESET ROLE;"></div>
+<p>錯誤訊息是 new row violates row-level security policy，意思是新資料不符合 <code>WITH CHECK</code>，整句被擋下來，訂單沒有寫進去。後端就算有 bug，把前端傳來的 <code>customer_id</code> 原封不動寫進 SQL，資料庫也不會讓這筆訂單掛到別人名下。</p>
+<div class="callout practice"><strong>💡 實務上：RLS 是「後端忘了加 WHERE」時的最後一道防線</strong><br>假設咖啡店系統變成賣給很多家店用的 SaaS，每張表都有 <code>shop_id</code>。只要後端有一支 API 忘了寫 <code>WHERE shop_id = …</code>，A 店就看得到 B 店的營收；在表上加一條依 <code>shop_id</code> 過濾的 policy，就算程式寫漏了也不會外洩。代價是權限邏輯分散到資料庫，查「為什麼這筆資料查不到」時要記得看 policy，policy 用到的欄位也要有索引。設定目前使用者時，記得用前面講的交易內 <code>set_config(…, true)</code>。很多傳統後端專案不用 RLS、只靠後端程式和測試把關，這也是常見的選擇。</div>
+<p>政策寫好了，自然會想驗收一次：切回平常的 <code>postgres</code> 身分查 <code>orders</code>，看看是不是真的被過濾了。結果會出乎意料。</p>
+
+<h2>為什麼用 postgres 驗收，還是看得到全部訂單？</h2>
+<p>回到 <code>postgres</code> 身分，數一下看得到幾筆訂單：</p>
+<div class="lab" data-sql="SELECT count(*) AS 看到幾筆 FROM orders;"></div>
+<p>全部都看得到。政策沒有壞，是 <code>postgres</code> 根本不受 RLS 限制。有兩種身分預設會繞過 RLS：</p>
+<ul>
+  <li><strong>超級使用者</strong>，以及有 <code>BYPASSRLS</code> 屬性的 role：永遠繞過，沒有辦法改變。</li>
+  <li><strong>表的擁有者</strong>（owner，通常是建表的那個 role）：預設也繞過。理由是擁有者本來就能改表的結構、甚至關掉 RLS，限制它的讀取意義不大。</li>
+</ul>
+<p>seed 已經把 <code>orders</code> 的擁有者設為 <code>cafe_owner</code>。切換成它，執行後看數字：</p>
+<div class="lab" data-sql="SET ROLE cafe_owner;
+SELECT count(*) AS 擁有者看到幾筆 FROM orders;
+RESET ROLE;"></div>
+<p>一樣是全部。如果希望連擁有者也受 RLS 限制，例如後端程式剛好用建表的帳號連線，要再加 <code>FORCE</code>。這跟前面「限制擁有者意義不大」不衝突：<code>FORCE</code> 防的不是擁有者刻意關掉 RLS，那要明確下 <code>ALTER TABLE … DISABLE ROW LEVEL SECURITY</code>，是另一回事；它防的是後端剛好用建表帳號連線時，一般的查詢不知不覺就繞過了 policy。執行後看擁有者看到幾筆：</p>
+<div class="lab" data-sql="ALTER TABLE orders FORCE ROW LEVEL SECURITY;
+
+SET ROLE cafe_owner;
+SELECT count(*) AS 擁有者看到幾筆 FROM orders;
+RESET ROLE;"></div>
+<p>變成 0 筆，因為沒有任何政策是給 <code>cafe_owner</code> 的，而 RLS 預設全部拒絕。超級使用者則不受 <code>FORCE</code> 影響，仍然看得到全部。</p>
+<p>這解釋了為什麼<strong>測試 RLS 一定要切換成應用程式實際使用的那個 role</strong>：用超級使用者或擁有者測，永遠看到全部資料，會誤以為「policy 沒效」；反過來，如果只用管理員驗收、從沒用一般 role 跑過，政策寫錯了也不會發現。同樣的道理決定了正式環境的設定：後端連線用的帳號，既不能是超級使用者，最好也不是表的擁有者，否則 RLS 對它不起作用。</p>
+<p>到這裡，咖啡店的權限都是由資料庫把關，後端只負責告訴資料庫「現在是誰」。如果連這一步都交給別人處理，前端是不是就能直接查資料庫了？</p>
+
+<h2>如果連後端都省掉：Supabase 為什麼敢讓前端直接查資料庫？</h2>
+<p>第 1 課說過前端不直接連資料庫，因為帳號密碼放在前端，等於公開給所有人。Supabase 看起來是例外：前端用 <code>supabase.from('orders').select()</code> 就能查。它能這樣做，靠的正是這一課的兩層權限。</p>
+<p>先講一個要用到的名詞。使用者登入 Supabase 之後，前端會拿到一張 <strong>JWT</strong>：一段經過簽章的文字，裡面寫著使用者的 id 等資訊。簽章讓伺服器能確認這張 JWT 是自己發的、內容沒被改過，所以前端沒辦法自己偽造「我是別人」。JWT 的結構和簽章原理在<a href="../../auth/lessons/08-jwt-signatures.html">認證課第 8 課</a>。有了這個，Supabase 的流程是：</p>
+<ol>
+  <li>前端拿到的 anon key 不是資料庫密碼。請求先到 Supabase 的 API 伺服器，它看請求有沒有帶登入後的 JWT，用 <code>anon</code>（沒登入）或 <code>authenticated</code>（已登入）這兩個 role 去查資料庫。這兩個 role 跟我們的 <code>customer</code> 一樣，權限很少。</li>
+  <li>每次請求開始時，它把 JWT 裡的使用者資訊設定到連線上，跟我們用 <code>set_config</code> 設 <code>app.user_id</code> 是同樣的概念。<code>auth.uid()</code> 這個函式會讀出目前使用者的 id。</li>
+  <li>表都開啟 RLS，policy 寫成 <code>USING (auth.uid() = user_id)</code>。</li>
+</ol>
+<p>用這頁的資料庫模擬一遍。<code>orders</code> 上已經有我們前面加的政策和 <code>FORCE</code>，所以換一張乾淨的表 <code>reservations</code>（訂位），把整套設定放在同一格從頭做一次：建一個 <code>auth.uid()</code> 函式、建 <code>authenticated</code> role 並給它表層級權限、開啟 RLS、寫政策。執行後看林志豪（顧客 3）查得到哪些訂位：</p>
+<div class="lab" data-sql="CREATE SCHEMA auth;
+CREATE FUNCTION auth.uid() RETURNS integer
+LANGUAGE sql STABLE
+AS $$ SELECT current_setting('app.user_id')::integer $$;
+
+CREATE ROLE authenticated;
+GRANT USAGE ON SCHEMA auth TO authenticated;
+GRANT SELECT ON reservations TO authenticated;
+ALTER TABLE reservations ENABLE ROW LEVEL SECURITY;
+CREATE POLICY reservations_select_authenticated ON reservations
+  FOR SELECT TO authenticated
+  USING (auth.uid() = customer_id);
+
+SET ROLE authenticated;
+SELECT set_config('app.user_id', '3', false);
+SELECT * FROM reservations ORDER BY id;
+RESET ROLE;"></div>
+<p>只剩林志豪自己的那一筆訂位。這格的每一行都對應到前面學過的東西：<code>auth.uid()</code> 是用第 23 課的 <code>CREATE FUNCTION</code> 包起來的 <code>current_setting</code>，<code>GRANT</code> 是表層級，<code>ENABLE ROW LEVEL SECURITY</code> 和 <code>CREATE POLICY</code> 是列層級。</p>
+<p class="muted">真正的 Supabase 裡，<code>auth.uid()</code> 回傳的是 uuid，從 JWT 讀出來；這裡簡化成整數。概念完全相同：<strong>安全性不是靠「前端拿不到資料庫」，而是靠資料庫自己檢查每一列</strong>。所以在 Supabase 上，忘了開 RLS 的表等於對全世界公開。</p>
+<div class="callout practice"><strong>💡 實務上：用 Supabase 時，每張新表都要過一次 RLS 檢查</strong><br>建表的同一個 migration 就開啟 RLS，不要想著「之後再補」。查詢、新增、修改、刪除分開想：誰能做、條件是什麼；修改的 policy 只寫 <code>USING</code> 時，PostgreSQL 會拿同一個條件檢查改完的新資料，所以顧客沒辦法把自己的訂單改成別人的 <code>customer_id</code>；改完的資料要符合另一個條件時，才另外寫 <code>WITH CHECK</code>。上線前用兩個不同的測試帳號實際登入，確認彼此看不到對方的資料。會繞過 RLS 的 service_role key 只能放在後端或伺服器端函式，code review 時看到它出現在前端程式碼就要擋下來。</div>
+
+<h2>補充與查表</h2>
+<ul>
+  <li><strong>每種操作用哪個條件</strong>（查表用，不用背）：<code>FOR SELECT</code> 和 <code>FOR DELETE</code> 用 <code>USING</code> 挑出既有的列；<code>FOR INSERT</code> 用 <code>WITH CHECK</code> 檢查新資料；<code>FOR UPDATE</code> 兩個都用，<code>USING</code> 決定能改哪些列，<code>WITH CHECK</code> 檢查改完的資料，只寫 <code>USING</code> 時改完的資料也要符合同一個條件；<code>FOR ALL</code> 一次套用到全部操作。</li>
+  <li><strong>只開放部分欄位</strong>：<code>GRANT SELECT (id, name) ON customers TO 某role</code>，對方查得到編號和姓名，查不到電話。欄位權限是加上去的：如果這個 role 已經有整張表的 <code>SELECT</code>（例如這頁的 <code>staff</code>），它本來就看得到所有欄位，要先 <code>REVOKE SELECT ON customers FROM staff</code> 收回整張表的權限，再用欄位的寫法給。</li>
+  <li><strong>查權限</strong>：誰對哪張表有什麼權限，查 <code>information_schema.role_table_grants</code>；想直接問「某個 role 能不能做某件事」，用 <code>has_table_privilege('staff', 'orders', 'UPDATE')</code>，回傳 true 或 false。練習 1 的判分就是用它。</li>
+</ul>
+
+<h2>練習</h2>
+<p class="muted">判分時會在交易裡執行，結束後自動還原（包括 SET ROLE 和 set_config），不用擔心影響頁面上的資料。</p>
+
+<div class="exercise"
+  data-answer="GRANT SELECT, UPDATE ON orders TO staff;"
+  data-check="RESET ROLE;
+SELECT p, has_table_privilege('staff', 'orders', p)
+FROM unnest(ARRAY['SELECT', 'INSERT', 'UPDATE', 'DELETE']) AS p;">
+  <p>練習 1：店員需要查訂單，也需要修改訂單（例如改狀態），但不能新增或刪除訂單。給 <code>staff</code> 對 <code>orders</code> 剛好這兩種權限。</p>
+</div>
+
+<div class="exercise"
+  data-start="-- reservations（訂位）已經 GRANT SELECT, INSERT 給 customer
+-- 在這裡開啟 RLS 並建立 policy
+
+
+-- 自己測試：切換成顧客 2 看看
+SET ROLE customer;
+SELECT set_config('app.user_id', '2', false);
+SELECT * FROM reservations ORDER BY id;
+RESET ROLE;"
+  data-answer="ALTER TABLE reservations ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY reservations_select_own ON reservations
+  FOR SELECT
+  TO customer
+  USING (customer_id = current_setting('app.user_id')::integer);"
+  data-check="RESET ROLE;
+CREATE TEMP TABLE seen (as_user integer, id integer, customer_id integer);
+GRANT INSERT ON seen TO customer;
+SET ROLE customer;
+SELECT set_config('app.user_id', '2', false);
+INSERT INTO seen SELECT 2, id, customer_id FROM reservations;
+SELECT set_config('app.user_id', '3', false);
+INSERT INTO seen SELECT 3, id, customer_id FROM reservations;
+RESET ROLE;
+SELECT * FROM seen ORDER BY as_user, id;"
+  data-ordered>
+  <p>練習 2：讓 <code>customer</code> 查 <code>reservations</code>（訂位）時，只看得到 <code>customer_id</code> 等於 <code>current_setting('app.user_id')</code> 的訂位。判分會切換成 <code>customer</code>，分別以顧客 2 和顧客 3 的身分查詢。</p>
+</div>
+
+<div class="exercise"
+  data-answer="ALTER TABLE reservations ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY reservations_insert_own ON reservations
+  FOR INSERT
+  TO customer
+  WITH CHECK (customer_id = current_setting('app.user_id')::integer);"
+  data-check="RESET ROLE;
+CREATE TEMP TABLE tried (as_user integer, own boolean, other boolean);
+GRANT INSERT ON tried TO customer;
+SET ROLE customer;
+SELECT set_config('app.user_id', '3', false);
+INSERT INTO tried SELECT 3,
+  succeeds('INSERT INTO reservations (customer_id, reserved_at, seats) VALUES (3, ''2026-11-01 10:00+08'', 2)'),
+  succeeds('INSERT INTO reservations (customer_id, reserved_at, seats) VALUES (1, ''2026-11-01 10:00+08'', 2)');
+SELECT set_config('app.user_id', '1', false);
+INSERT INTO tried SELECT 1,
+  succeeds('INSERT INTO reservations (customer_id, reserved_at, seats) VALUES (1, ''2026-11-01 10:00+08'', 2)'),
+  succeeds('INSERT INTO reservations (customer_id, reserved_at, seats) VALUES (3, ''2026-11-01 10:00+08'', 2)');
+RESET ROLE;
+SELECT * FROM tried ORDER BY as_user;"
+  data-ordered>
+  <p>練習 3：讓 <code>customer</code> 可以新增自己的訂位，但不能用別人的 <code>customer_id</code> 新增。這題只需要處理 INSERT。判分會分別以顧客 3 和顧客 1 的身分，各試一次「幫自己訂位」和「幫對方訂位」，前者要成功、後者要被擋下。（判分用的 <code>succeeds('SQL')</code> 是 seed 準備的小工具，執行成功回傳 true、出錯回傳 false。）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 4：你幫 <code>orders</code> 開了 RLS、寫好 policy，用 <code>postgres</code> 身分查詢，卻還是看到全部的訂單。最可能的原因是？</p>
+  <label data-key="a">policy 寫錯了，要刪掉重寫</label>
+  <label data-key="b"><code>postgres</code> 是超級使用者，永遠會繞過 RLS；要切換成一般的 role 才能測試</label>
+  <label data-key="c">開啟 RLS 要重新啟動資料庫才會生效</label>
+  <p class="why">✓ 超級使用者和有 BYPASSRLS 的 role 一定會繞過 RLS；表的擁有者預設也會（除非 <code>FORCE ROW LEVEL SECURITY</code>）。測試 RLS 時，一定要用實際上應用程式會用的那個 role。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：同事說「Supabase 的 anon key 寫在前端程式碼裡，誰都看得到，所以資料一定不安全」。哪個說法最正確？</p>
+  <label data-key="a">沒錯，所以 Supabase 只適合放公開資料</label>
+  <label data-key="b">不會有問題，因為 anon key 有加密</label>
+  <label data-key="c">anon key 本來就是公開的，它只代表 <code>anon</code> 這個權限很少的 role；資料安不安全，取決於每張表有沒有開 RLS、policy 寫得對不對</label>
+  <p class="why">✓ 前端拿到的只是「以 anon 或 authenticated 身分發請求」的能力。真正把關的是資料庫的 GRANT 和 RLS policy。反過來說，忘了開 RLS 的表，任何人都查得到。絕對不能放到前端的是 service_role key，它會繞過 RLS。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>用超級使用者或表的擁有者測試 RLS</strong>：一定看到全部資料。用 SET ROLE 切換成一般 role 再測。</li>
+  <li><strong>開了 RLS 卻沒寫 policy</strong>：一般使用者什麼都看不到。這不是 bug，是安全的預設值。</li>
+  <li><strong>只寫了 <code>USING</code>，以為也擋住了寫入</strong>：<code>FOR SELECT</code> 的 policy 只管查詢；INSERT 要另外寫 <code>FOR INSERT … WITH CHECK</code>，或用 <code>FOR ALL</code>。</li>
+  <li><strong>有 RLS 就忘了 GRANT</strong>：RLS 是在「有表的權限」之後才進一步過濾。沒有 GRANT，連表都進不去（permission denied）。</li>
+  <li><strong>切了 SET ROLE 沒有 RESET</strong>：之後的操作都用那個 role 執行，到處 permission denied。</li>
+  <li><strong>應用程式用超級使用者連線</strong>：所有權限和 RLS 都失效，一個 SQL injection 就能拿走所有資料。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>使用者和群組都是 role；<code>GRANT 群組 TO 使用者</code> 讓使用者繼承權限。應用程式用權限很少的 role 連線，不用超級使用者。</li>
+  <li><code>GRANT</code>／<code>REVOKE</code> 管「能不能對這張表做某件事」，答案是整張表；遵守最小權限原則，帳號被濫用時損害才有上限。</li>
+  <li>RLS 管「能看到、能改哪些列」：<code>ENABLE ROW LEVEL SECURITY</code> 後預設全部拒絕，再用 <code>CREATE POLICY</code> 開放；<code>USING</code> 篩既有的列，<code>WITH CHECK</code> 檢查寫進去的新資料。</li>
+  <li>政策靠連線上的設定知道「現在是誰」：後端每次請求用 <code>set_config</code> 寫入，搭配連線池時用交易內有效的 <code>true</code>。</li>
+  <li>超級使用者永遠繞過 RLS；表的擁有者預設繞過，加 <code>FORCE</code> 才會受限。測試 RLS 要切換成應用程式實際用的 role。</li>
+  <li>Supabase 用 <code>anon</code>／<code>authenticated</code> role 加上 <code>auth.uid()</code> 和 RLS，讓前端直連也安全；忘了開 RLS 的表等於公開。</li>
+</ul>
+<p>下一課：權限設好了，接著從 Node 後端程式實際連上資料庫，並處理最常見的安全問題：SQL injection。</p>
+
+</main>
+
+<script type="text/sql" id="seed">
+CREATE TABLE customers (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL,
+  phone text
+);
+INSERT INTO customers (name, phone) VALUES
+  ('王小明', '0912-345-678'), ('陳美華', '0922-111-222'), ('林志豪', '0933-222-333'),
+  ('張雅婷', '0955-666-777'), ('李建國', '0966-777-888');
+
+CREATE TABLE products (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL,
+  price integer NOT NULL
+);
+INSERT INTO products (name, price) VALUES
+  ('美式咖啡', 80), ('拿鐵', 110), ('卡布奇諾', 110), ('伯爵紅茶', 90), ('可頌', 70);
+
+CREATE TABLE orders (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  customer_id integer NOT NULL REFERENCES customers(id),
+  ordered_at timestamptz NOT NULL,
+  total integer NOT NULL
+);
+INSERT INTO orders (customer_id, ordered_at, total) VALUES
+  (1, '2026-10-20 08:30+08', 190), (2, '2026-10-20 10:15+08', 220),
+  (1, '2026-10-21 09:00+08', 150), (3, '2026-10-21 14:20+08', 110),
+  (4, '2026-10-22 11:45+08', 360), (2, '2026-10-23 16:00+08', 200),
+  (5, '2026-10-25 13:30+08', 240);
+
+-- 訂位
+CREATE TABLE reservations (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  customer_id integer NOT NULL REFERENCES customers(id),
+  reserved_at timestamptz NOT NULL,
+  seats integer NOT NULL
+);
+INSERT INTO reservations (customer_id, reserved_at, seats) VALUES
+  (1, '2026-10-30 10:00+08', 2), (2, '2026-10-30 14:00+08', 4),
+  (3, '2026-10-31 09:30+08', 1), (2, '2026-11-01 15:00+08', 2),
+  (5, '2026-11-02 11:00+08', 3);
+
+-- 角色與權限
+CREATE ROLE staff;
+CREATE ROLE customer;
+CREATE ROLE cafe_owner;
+GRANT SELECT ON customers, products TO staff;
+GRANT SELECT ON products, orders, reservations TO customer;
+GRANT INSERT ON reservations TO customer;
+ALTER TABLE orders OWNER TO cafe_owner;
+
+-- 「目前登入的顧客」預設為 0（沒有登入）
+SELECT set_config('app.user_id', '0', false);
+
+-- 判分用的小工具：執行一句 SQL，成功回傳 true、出錯回傳 false
+CREATE FUNCTION succeeds(sql text) RETURNS boolean
+LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE sql;
+  RETURN true;
+EXCEPTION WHEN others THEN
+  RETURN false;
+END
+$$;
+</script>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

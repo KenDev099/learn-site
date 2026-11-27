@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>14. 方案、用量限制與限流</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="14" data-practice="nestjs" data-task="pf14">
+<header>
+  <div class="eyebrow">階段 B2：平台功能 · 第 14 課</div>
+  <h1>方案、用量限制與限流</h1>
+</header>
+<main>
+
+
+<p>你的 SaaS 有免費方案：3 個 project、5 位成員、20 MB 檔案。第一版的檢查是「先數有幾個，小於 3 才建立」，單元測試全過。上線後有個租戶用腳本同時送了 10 個建立請求，結果有了 12 個 project；另一個租戶的整合程式寫錯，每秒打 50 個請求，所有租戶的 API 都變慢。</p>
+<p>這兩件事是同一個問題的兩面：<strong>一個租戶不能超過它付錢買的量，也不能拖垮別的租戶</strong>。這一課在你的 SaaS 加上 <code>billing</code> 模組，從頭到尾處理這兩個事故：前半段找出 12 個 project 是怎麼來的、讓上限在併發下也算得對，後半段讓寫錯程式的租戶只擋到自己。這是階段 B2 的最後一課，最後有階段檢核。</p>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../nestjs/lessons/15-transactions-concurrency.html">NestJS 課第 15 課</a>的「讀、判斷、寫回會被插隊」與 <code>SELECT … FOR UPDATE</code>（鎖住選到的列，直到交易結束）。</li>
+  <li><a href="../../system-design/lessons/10-rate-limiting.html">系統設計課第 10 課</a>的固定視窗（每個時間區段從 0 開始計數）、限流的鍵（用什麼分別計數，例如 IP、使用者）、429 Too Many Requests 與 <code>Retry-After</code>（告訴客戶端幾秒後再試）。</li>
+  <li><a href="07-signup-login-refresh.html">第 7 課</a>的登入限流（以 email 計數），這一課的限流跟它分開。</li>
+  <li><a href="11-audit-log.html">第 11 課</a>的 <code>db.tx()</code>＋<code>audit.record</code>：改方案也要記。</li>
+</ul></div>
+
+<div class="callout">程式寫在你自己的 SaaS repo。判分時先啟動你的 API，在 learn 資料夾執行 <code>node check.mjs nestjs pf14</code>。練習 4 會對同一個租戶在幾秒內打 300 個請求；限流的視窗是一分鐘，連續重跑之間不用等（每次都用新註冊的租戶）。</div>
+
+<p>這課的路線：</p>
+<ul>
+  <li>「3 個 project」這個數字放在哪、超過時回什麼（ADR 0006）。</li>
+  <li>為什麼「先數再建」會建出 12 個；怎麼讓同一個租戶的「數、建」排隊：先鎖租戶列再數。</li>
+  <li>成員上限要數什麼（待接受的邀請也算）；降級時超出的資料怎麼辦；前端怎麼從 <code>GET /billing</code> 知道還剩多少。</li>
+  <li>每秒 50 個請求的租戶：tracker 用 tenantId、計數放 Redis、429 帶 <code>Retry-After</code>；跟登入限流的差別。</li>
+  <li>把同一個模式套到你的業務模組；階段檢核。</li>
+</ul>
+
+<h2>「免費方案 3 個 project」這個數字要放在哪？</h2>
+<p>要擋下第 4 個 project，程式得先知道「3」從哪裡來。這個決定看起來小，但它決定了以後誰能改數字、改了多久生效、改錯了有沒有人攔得住。常見的位置有三個：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>放哪</th><th>改數字要做什麼</th><th>適合</th></tr></thead>
+  <tbody>
+    <tr><td>程式常數＋<code>tenants.plan</code>（參考實作）</td><td>改程式、部署</td><td>方案少、很少改；數字跟程式邏輯一起 review</td></tr>
+    <tr><td>資料表 <code>plans</code></td><td>營運在後台改，立刻生效</td><td>方案多、常做促銷、有客製方案</td></tr>
+    <tr><td>設定檔、環境變數</td><td>改設定、重啟</td><td>不同環境要不同數字（例如 demo 環境放寬）</td></tr>
+  </tbody>
+</table></div>
+<p>三種都可行，差別在「誰來改數字」。放程式常數，改數字要開 PR、review、部署，跟改程式邏輯一樣慢，但也一樣留下紀錄、一樣有人審。放資料表，營運人員在後台一改就生效，代價是你要多做一個後台、多一張表，而且數字填錯時沒有 review 擋著。作品只有 free 和 pro 兩個方案、也沒有營運人員會來改，所以選最簡單的程式常數。這些數字也是契約的一部分：驗收測試會直接驗「免費方案的第 4 個 project 被擋下」，它跟程式一起被 review 是合理的。</p>
+<pre>// src/billing/plans.ts
+export const PLANS = {
+  free: { projects: 3, members: 5, storageBytes: 20 * 1024 * 1024 },
+  pro: { projects: 100, members: 50, storageBytes: 1024 * 1024 * 1024 },
+} as const
+export type Plan = keyof typeof PLANS</pre>
+<p>常數只回答「每個方案的上限是多少」。每個租戶現在是哪個方案，存在 <code>tenants.plan</code> 欄位（預設 <code>free</code>）。兩者合起來，從租戶就查得到它的上限：讀 <code>tenants.plan</code>，再拿去 <code>PLANS</code> 查。</p>
+<p>ADR 0006 寫下這個決定，也寫下換掉它的條件：「方案改成可以由營運調整時，把常數搬進資料表（寫新的 ADR）」。先把換掉的條件寫好，半年後有人覺得「數字怎麼寫死在程式裡」，就看得出這是當時的取捨，而不是疏忽。</p>
+<p>超過上限時回什麼也要先定，因為前端要靠它決定顯示什麼。契約定為一律 403 <code>PLAN_LIMIT_REACHED</code>：403 表示這個請求現在不被允許，<code>errorCode</code> 則說明原因是方案上限。前端看到這個 errorCode 就顯示升級的對話框，而不是一般的錯誤訊息。為什麼不選 429 或 402，練習 8 會問。</p>
+<p>數字和錯誤碼都有了，第一版的檢查就很直覺：建立之前數一下這個租戶有幾個 project，小於 3 才建立。開場的單元測試就是這樣寫的，也全過了。但上線後那個租戶有 12 個 project，下一節找出原因。</p>
+
+<h2>為什麼「先數、小於 3 才建立」會建出 12 個？</h2>
+<p>單元測試一次只送一個請求：第一個數到 0、第二個數到 1，每次都數得對。那個租戶的腳本不一樣，它同時送出 10 個請求，這 10 個請求在伺服器上是同時處理的。看其中兩個交錯時發生什麼（租戶原本已經有 2 個 project）：</p>
+<pre>請求 A：BEGIN; SELECT count(*) FROM projects → 2
+請求 B：BEGIN; SELECT count(*) FROM projects → 2      ← A 還沒 commit，B 看到的也是 2
+請求 A：2 &lt; 3，INSERT；COMMIT
+請求 B：2 &lt; 3，INSERT；COMMIT                          → 4 個</pre>
+<p>問題出在「數」和「建」之間有一段空檔。請求 A 數完、還沒 commit 新的 project，請求 B 就來數了；B 看不到 A 還沒 commit 的資料，所以也數到 2，也判斷「還可以建」。兩個請求各自的判斷都沒錯，錯在它們依據的是同一個已經過時的數字。10 個請求同時進來，最壞的情況是 10 個都數到 2、全部建立，就是開場的 12 個。</p>
+<p>結果取決於幾個請求誰先誰後，這種問題叫競態（race condition）。它跟 <a href="../../nestjs/lessons/15-transactions-concurrency.html">NestJS 課第 15 課</a>的超賣庫存是同一個模式：讀、判斷、寫回，中間被別的請求插隊。它有兩個麻煩的地方：一是在開發機上手動測永遠遇不到，因為你一次只按一下；二是它不會丟錯，資料就靜靜地變成錯的。所以練習 2 用 10 個同時的請求來測，這是抓得到它的方法。</p>
+<p>要修，就要讓同一個租戶的第二個請求，等第一個請求數完、建完、commit 之後才開始數。下一節比較幾種做法。</p>
+
+<h2>怎麼讓同一個租戶的「數、建」不被插隊？</h2>
+<p>要讓後到的請求一定看到先到的請求的結果，PostgreSQL 有三種做法：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>做法</th><th>怎麼做</th><th>代價</th></tr></thead>
+  <tbody>
+    <tr><td>先鎖租戶列再數（參考實作）</td><td>交易開頭 <code>SELECT … FROM tenants WHERE id = $1 FOR UPDATE</code>，再 count、再 insert</td><td>同一個租戶的建立操作排隊；別的租戶不受影響</td></tr>
+    <tr><td>條件式更新計數器</td><td><code>tenants</code> 加 <code>project_count</code>，<code>UPDATE … SET project_count = project_count + 1 WHERE id = $1 AND project_count &lt; 3</code>，影響 0 列就拒絕</td><td>一句 SQL、不用另外鎖；但每條會改數量的路徑（刪除、cascade、手動 SQL）都要維護計數器，否則會漂移</td></tr>
+    <tr><td>count＋SERIALIZABLE</td><td>交易隔離等級拉到最嚴格的 SERIALIZABLE，衝突時 PostgreSQL 讓其中一個失敗</td><td>失敗的交易要自己重試，沒重試就變成 500</td></tr>
+  </tbody>
+</table></div>
+<p>三種都正確，差別在代價落在哪裡。條件式計數器最省：一句 <code>UPDATE</code> 同時做了判斷和加一，資料庫保證這一句不會被插隊。但它多了一份「project 有幾個」的資料，跟實際的 <code>projects</code> 表是兩份；刪除 project、cascade 刪除、有人手動修資料時都要記得改計數器，漏一條路徑就會漂移，而且漂移不會報錯（練習 6）。SERIALIZABLE 要先知道「隔離等級」：它決定一個交易看得到別人多少資料。PostgreSQL 預設是 READ COMMITTED，交易裡的每一句 SQL 只看得到這句開始前已經 commit 的資料，上一節 B 數到 2 就是這個行為。SERIALIZABLE 則保證整批交易的結果，跟它們一個接一個依序執行的結果相同；PostgreSQL 偵測到排不出這種順序時，會讓其中一個交易以 serialization failure 失敗（細節見 <a href="../../nestjs/lessons/15-transactions-concurrency.html">NestJS 課第 15 課</a>）。它不用改資料結構，但這種保護方式是讓衝突的交易失敗，你得在程式裡接住失敗再重試；沒有重試，使用者看到的就是 500。</p>
+<p>參考實作選第一種，先鎖租戶那一列再數：每次數的都是實際的資料，不會漂移，也不用寫重試。它的運作方式是這樣：<code>SELECT … FOR UPDATE</code> 會鎖住選到的那一列，直到交易結束才放；另一個交易也要 <code>FOR UPDATE</code> 同一列時，會停在那裡等。只要所有「會用到上限」的操作（建立 project、上傳檔案、發邀請、改方案）都先拿這把鎖，同一個租戶的這些操作就會一個接一個做，第二個請求數到的已經包含第一個建立的 project。把上一節的時間軸換成這個做法，請求 B 會停在鎖那一步，等 A commit 之後才繼續，數到的是 3，於是被擋下。</p>
+<p>為什麼鎖的是<strong>租戶那一列</strong>，不是整張 <code>projects</code> 表？因為上限是每個租戶各自的。租戶 A 鎖 A 那一列、租戶 B 鎖 B 那一列，兩者互不等待；鎖整張表的話，一個租戶的尖峰會讓所有租戶的建立一起排隊（練習 14）。鎖租戶列的代價是同一個租戶的建立要排隊，但同一個租戶同時建很多 project 本來就少見，每次排隊等的也只是一次 count 加一次 insert。</p>
+<pre>// src/billing/plans.ts
+export async function lockTenant(tx: Tx, tenantId: string) {
+  const [row] = await tx.$queryRaw&lt;{ plan: string }[]&gt;`SELECT plan FROM tenants WHERE id = ${tenantId}::uuid FOR UPDATE`
+  if (!row || !isPlan(row.plan)) throw forbidden('租戶不存在')
+  return PLANS[row.plan]
+}
+
+// src/projects/projects.service.ts
+async create(dto: CreateProjectDto) {
+  return this.db.tx(async tx =&gt; {
+    const limits = await lockTenant(tx, this.ctx.tenantId!)   // 先鎖租戶再數：併發也不會超過上限
+    if (await tx.project.count() &gt;= limits.projects) throw planLimit('project 數量')
+    const p = await tx.project.create({ data: { tenantId: this.ctx.tenantId!, name: dto.name, description: dto.description ?? '' } })
+    await this.audit.record(tx, 'project.created', 'project', p.id)
+    return projectView(p)
+  })
+}</pre>
+<p><code>lockTenant</code> 鎖住的那一句同時讀出 <code>plan</code>，回傳對應的上限，所以「鎖」和「查方案」是同一句 SQL；鎖住之後，這個交易讀到的方案不會被別的交易改掉。</p>
+<p>這個寫法有兩個前提。第一，鎖、數、建都要在<strong>同一個互動式交易</strong>（<code>db.tx()</code>）裡。鎖到交易結束才放，所以 count 和 create 必須在同一個交易結束之前做完。改用 <code>db.client</code> 的話，每個操作各自成為一個交易，<code>lockTenant</code> 那句一執行完、交易就結束，鎖也跟著放了，後面的 count 又回到沒有保護的狀態。第二，鎖住的期間不要做外部呼叫，例如寄信、呼叫金流：外部服務慢 3 秒，同一個租戶的其他請求就一起等 3 秒。</p>
+<div class="callout practice"><strong>💡 實務上：併發的 bug 只在正式環境出現</strong><br>「同時」在開發機上幾乎不會發生，在正式環境卻天天發生：使用者連點兩下、前端重試、客戶的整合腳本平行送。超賣、超過上限、重複扣款都是同一類 bug。資深工程師看到「先查、再判斷、再寫」的程式就會問：兩個請求同時進來會怎樣？然後要求一個併發測試。你的作品有這種測試（練習 2），面試時是很具體的故事。</div>
+
+<p>project 的上限到這裡解決了。同一把鎖也要用在成員上限上，但成員多了一個 project 沒有的問題：要數的到底是什麼。</p>
+
+<h2>成員上限 5 位：待接受的邀請算不算？</h2>
+<p>成員的上限看起來跟 project 一樣：發邀請之前先 <code>lockTenant</code>，數一下成員，小於 5 才發。問題在「成員」數的是什麼。如果只數已經加入的人，免費方案的租戶可以一口氣發 100 封邀請：每一封發出時，已加入的只有 owner 一個人，都「沒有超過」。等 100 個人一個一個接受，租戶就有 101 位成員。</p>
+<p>關鍵在於邀請一發出去，就是一個已經承諾出去的名額：對方點連結就會加入，那時候不會再檢查一次上限。所以上限要在發邀請的當下，就把這些承諾算進去：已加入的成員，加上還有效的邀請。還有效，是指還沒接受、沒撤銷、沒過期；撤銷或過期的邀請不會再變成成員，就不佔名額，所以撤銷一封就空出一個（練習 3）。</p>
+<pre>// src/billing/plans.ts
+export async function memberUsage(tx: Pick&lt;Tx, 'membership' | 'invitation'&gt;, tenantId: string) {
+  const [members, pending] = await Promise.all([
+    tx.membership.count({ where: { tenantId } }),   // memberships 不在自動加租戶條件的清單裡（RLS 也允許看「自己在別的租戶的 membership」），所以要自己寫
+    // invitations 在清單裡：extension 與 RLS 都會自動限定在目前租戶
+    tx.invitation.count({ where: { acceptedAt: null, revokedAt: null, expiresAt: { gt: new Date() } } }),
+  ])
+  return members + pending
+}</pre>
+<p>注意兩個 count 的寫法不一樣。<code>invitations</code> 在<a href="08-tenant-isolation-prisma.html">第 8 課</a>自動加租戶條件的清單裡，Prisma extension 與 RLS 會自動限定在目前租戶，所以不用寫 <code>tenantId</code>。<code>memberships</code> 不在清單裡，RLS 也允許使用者看到「自己在別的租戶的 membership」，所以這裡要自己寫 <code>where: { tenantId }</code>，數到的才只有這個租戶的成員。</p>
+<p>發邀請（<code>src/members/invitations.service.ts</code>）跟建立 project 是同一個模式：在 <code>db.tx()</code> 裡先 <code>lockTenant</code>，再用 <code>memberUsage</code> 數，達到上限就丟 <code>PLAN_LIMIT_REACHED</code>。</p>
+<p>到這裡，所有「新增」都擋住了。但上限本身也會變：租戶從 pro 降回 free，已經有的資料比新的上限多，又該怎麼辦？</p>
+
+<h2>租戶降級時，超出上限的資料怎麼辦？</h2>
+<p>一個 pro 租戶有 10 個 project，降回 free 之後上限變成 3，多出 7 個。直覺的做法是刪掉超出的部分，但<strong>不刪</strong>：刪資料是無法回復的，而客戶降級可能只是暫時的，例如預算還沒批下來；下個月升回 pro 卻發現資料不見了，這個損失補不回來。</p>
+<p>做法是「已經有的都留著，之後不能再新增，直到用量低於上限」。這不用另外寫程式：前面的判斷是 <code>count &gt;= limits.projects</code>，10 大於 3，所以第 11 個本來就會被擋；客戶自己刪到剩 2 個，才能再建。判斷用 <code>&gt;=</code> 而不是「等於上限」，超出上限的狀態也一樣會被擋下。</p>
+<p>改方案本身也是會影響上限的操作，所以一樣先鎖租戶列：改方案就不會跟同一個租戶的建立 project 交錯，不會出現「數的時候用 pro 的上限、建完時租戶已經是 free」。改方案只有 owner 能做（權限矩陣的 <code>billing:write</code>），也要寫稽核（第 11 課），之後客戶問「誰把我們降級的」才查得到：</p>
+<pre>// src/billing/billing.module.ts
+async changePlan(plan: Plan) {
+  await this.db.tx(async tx =&gt; {
+    await lockTenant(tx, this.ctx.tenantId!)
+    await tx.tenant.update({ where: { id: this.ctx.tenantId! }, data: { plan } })
+    await this.audit.record(tx, 'billing.plan_changed', 'tenant', this.ctx.tenantId!)
+  })
+  return this.summary()
+}</pre>
+<p><code>changePlan</code> 最後回傳 <code>this.summary()</code>，也就是 <code>GET /billing</code> 的內容。前端要畫用量條（例如「project 2 / 3」）和「升級」按鈕，需要一個端點告訴它三件事：目前的方案、上限、用量。<code>GET /api/v1/billing</code> 回 <code>{ plan, limits, usage }</code>，usage 用跟檢查時同一組函式算：<code>tx.project.count()</code>、<code>memberUsage</code>、<a href="12-file-uploads.html">第 12 課</a>的 <code>storageUsage</code>。重點在「同一組函式」：畫面用一套算法、擋人用另一套的話（例如畫面忘了算待接受的邀請），就會出現「畫面說還有 1 個名額，按下去卻被擋」。</p>
+<p>這裡的 <code>POST /billing/plan</code> 是模擬升級，不接金流；真的接金流時流程怎麼改，見課末的補充。</p>
+<p>開場的第一件事到這裡處理完了：租戶不會超過它付錢買的量。但上限管的只是「存了多少」，開場的第二件事是另一個維度：那個每秒打 50 個請求的租戶，可能一筆資料都沒新增，卻讓所有租戶都變慢。</p>
+
+<h2>一個租戶每秒打 50 個請求：怎麼只擋它、不擋別人？</h2>
+<p>所有租戶共用同一組 API 伺服器和同一個資料庫。一個租戶的程式寫錯、每秒打 50 個請求，伺服器的 CPU 和資料庫的連線就被它佔去，其他租戶的請求只能排在後面。這叫吵鬧鄰居（noisy neighbor）：同一棟樓裡一戶太吵，整棟都受影響。用量上限擋不住它，因為它可能只是一直在讀。</p>
+<p>要的是限流：限制每個租戶在一段時間內能打幾個請求。契約定為：每個租戶每分鐘 300 個請求（登入後的請求都算），第 301 個回 429 <code>RATE_LIMITED</code> 並帶 <code>Retry-After</code>，<strong>別的租戶不受影響</strong>。300 是正常使用碰不到的數字，它要擋的只有寫錯的程式。</p>
+<p><a href="../../system-design/lessons/10-rate-limiting.html">系統設計課第 10 課</a>講過，限流要決定三件事：用什麼當計數的鍵、計數放在哪、超過時告訴客戶端什麼。參考實作用已經裝好的 @nestjs/throttler 6.7.1，它的 <code>ThrottlerGuard</code> 負責流程：每個請求呼叫 storage 把次數加一，再依 storage 回傳的結果決定放行或擋下，擋下時設好 <code>Retry-After</code>。真正算次數、判斷有沒有超過上限的是 storage，而 Redis 版的 storage（<code>RedisThrottlerStorage</code>）要自己實作。所以我們要動的是三個地方，正好對應那三件事：計數的鍵（tracker）、計數放哪（storage）、超過時丟什麼錯：</p>
+<pre>// src/billing/tenant-throttler.ts
+export const TENANT_LIMIT = { ttl: 60_000, limit: 300 }
+
+@Injectable()
+export class TenantThrottlerGuard extends ThrottlerGuard {
+  protected override async shouldSkip(context: ExecutionContext) {
+    return !context.switchToHttp().getRequest().auth          // 沒登入的路由沒有租戶，登入有自己的限流
+  }
+  protected override async getTracker(req: Record&lt;string, any&gt;) {
+    return `tenant:${req.auth.tenantId}`                       // 不是 IP
+  }
+  protected override async throwThrottlingException(): Promise&lt;void&gt; {
+    throw new ApiError(429, 'RATE_LIMITED', '請求太多，請稍後再試')
+  }
+}</pre>
+<p><strong>先看鍵：為什麼是 tenantId，不是常見的 IP？</strong>鍵決定「誰跟誰共用同一份額度」，而這一課要保護的是「別的租戶」，所以額度要以租戶為單位。用 IP 會在兩個方向出錯。一個方向是誤傷：公司網路通常用 NAT 讓多台電腦共用一個對外 IP，所以同一間公司的人在伺服器看來是同一個 IP，共用一個額度；兩個不同的租戶剛好在同一個網路裡，還會互相吃掉對方的額度。另一個方向是擋不住：一個租戶的腳本從很多台機器、很多個 IP 送，就繞過了限制。tenantId 沒有這兩個問題，而且它來自 <code>req.auth</code>，是 AccessGuard 驗證過 token 之後放進去的，客戶端改不了。沒登入的路由（註冊、登入）沒有 <code>req.auth</code>，也就沒有租戶，<code>shouldSkip</code> 讓它們跳過；它們的保護是第 7 課的登入限流。</p>
+<p><strong>再看計數放哪。</strong>正式環境的 API 通常會把同一份程式跑成好幾個程序，請求由負載平衡器分散過去，每一個程序叫一個副本。計數放在每個程序自己的記憶體裡，每個副本各算各的：3 個副本，一個租戶實際上能打 3 × 300 個請求才會被每個副本都擋下。所以計數放在所有副本共用的 Redis（<code>RedisThrottlerStorage</code>）。它用固定視窗計數：每個請求用 Redis 的 <code>INCR</code> 把這個鍵加一。<code>INCR</code> 是 Redis 的單一指令，「讀出、加一、寫回」在 Redis 裡一次做完（這就是「原子」的意思），不會像前半課先 count 再 insert 那樣被插隊；多個副本同時加，次數也不會少算。<code>increment</code> 拿到加完的次數，大於 300 就回傳 <code>isBlocked</code>。第一次加的時候設過期時間，視窗一到期，鍵消失，計數從 0 開始。</p>
+<p><strong>最後是超過時的回應。</strong>429 告訴客戶端「太多了」，<code>Retry-After</code> 告訴它「幾秒後再試」。少了 <code>Retry-After</code>，客戶端只能猜，最常見的猜法是立刻重試，正好又打進被擋的視窗。ThrottlerGuard 在擋下請求時，會用 storage 回傳的 <code>timeToBlockExpire</code>（秒）設好這個標頭，再呼叫 <code>throwThrottlingException</code>；我們覆寫的只是丟出的錯，讓它符合契約的錯誤格式。自己從頭寫限流的話，這個標頭最容易漏。</p>
+<p>還剩一件事：guard 什麼時候執行。限流要知道是哪個租戶，而租戶是 AccessGuard 驗證 token 之後才知道的，所以限流要排在 AccessGuard 之後。兩個都用 <code>APP_GUARD</code> 註冊時，執行順序就是註冊順序：</p>
+<pre>// src/app.module.ts
+providers: [
+  { provide: APP_FILTER, useClass: ErrorFilter },
+  { provide: APP_GUARD, useClass: AccessGuard },            // 先認證與權限
+  { provide: APP_GUARD, useClass: TenantThrottlerGuard },   // 再每租戶限流（要知道是哪個租戶）
+],</pre>
+<p>這一課的限流跟第 7 課的登入限流都叫限流，但防的東西不同，所以鍵、位置、門檻都不同，不能合併成同一個：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th></th><th>登入限流（第 7 課）</th><th>每租戶限流（這一課）</th></tr></thead>
+  <tbody>
+    <tr><td>防什麼</td><td>暴力猜密碼</td><td>一個租戶吃掉所有資源（吵鬧鄰居，noisy neighbor）</td></tr>
+    <tr><td>鍵</td><td>email（這時還沒有 token，不知道是哪個使用者）</td><td>tenantId（已經驗證過 token）</td></tr>
+    <tr><td>在哪裡</td><td>登入的 service 裡</td><td>全域 guard，AccessGuard 之後</td></tr>
+    <tr><td>門檻</td><td>很低（連續失敗幾次）</td><td>正常使用碰不到（每分鐘 300）</td></tr>
+  </tbody>
+</table></div>
+<div class="callout practice"><strong>💡 實務上：限流的數字要跟客戶溝通</strong><br>限流是產品規格：寫在 API 文件裡，最好在每個回應帶剩餘額度（<code>X-RateLimit-Remaining</code> 這類標頭），客戶的工程師才能調整自己的程式。上線前看一下現有客戶的實際流量，把門檻設在正常尖峰的幾倍；第一次上限流時先只記 log、不擋，觀察一週再開。被擋的租戶要能在監控上看到，客服才回答得了「為什麼我們一直收到 429」。</div>
+
+<p>固定視窗有一個已知的缺點，對這個目的夠用，細節與什麼時候該換見課末的補充。開場的兩個事故到這裡都處理完了；最後把同一套做法套到你自己的業務模組。</p>
+
+<h2>你的業務模組要加哪些上限？</h2>
+<p>前面的 project、成員、改方案都是同一個模式，你的業務模組加上限時照著做：會增加用量的操作在 <code>db.tx()</code> 裡先 <code>lockTenant</code>、再數、再寫；用量函式同時給檢查與 <code>GET /billing</code> 用。要先想清楚的是「該限什麼」，三種業務模組的答案不一樣：</p>
+<ul>
+  <li><strong>客服工單</strong>：上限通常不是工單數（客戶不會想被擋在「不能開新工單」），而是客服人員數（成員）與附件容量；工單量大的租戶靠限流保護其他人。</li>
+  <li><strong>預約排程</strong>：「每個資源每天最多 N 個預約」是業務規則，同樣是先鎖再數；時段重疊則交給 PostgreSQL 的排除約束（<a href="../../postgresql/lessons/38-modeling-patterns.html">PostgreSQL 課第 38 課</a>），不用自己數。</li>
+  <li><strong>進銷存</strong>：「庫存不能為負」跟方案上限是同一種競態：用條件式更新（<code>WHERE quantity &gt;= $n</code>）或鎖品項的那一列，月結報表的匯出量大時要考慮限制每個租戶同時跑幾個（第 13 課）。</li>
+</ul>
+<p>接下來的練習，把開場的兩個事故當成測試重現一次：10 個同時的建立請求、300 個以上的連續請求，確認你的 repo 都擋得住。</p>
+
+<h2>練習</h2>
+
+<div class="local" data-test="ex1" data-files="">
+  <p>練習 1：免費方案第 4 個 project 回 403 <code>PLAN_LIMIT_REACHED</code>；owner <code>POST /api/v1/billing/plan</code> 升級 pro 後可以建立（回應同 <code>GET /billing</code>）；降回 free 之後不能再新增，但已有的 4 個都還在。admin、member 改方案 403，不認得的 plan 400。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="">
+  <p>練習 2：已經有 2 個 project 時同時送 10 個建立請求，恰好 1 個 201、9 個 403 <code>PLAN_LIMIT_REACHED</code>（不能有 500），最後恰好 3 個。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="">
+  <p>練習 3：成員上限把待接受的邀請算進去：owner＋4 封邀請之後，第 5 封 403 <code>PLAN_LIMIT_REACHED</code>；撤銷一封之後可以再邀。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="">
+  <p>練習 4：同一個租戶一分鐘內的第 301 個請求回 429 <code>RATE_LIMITED</code>，<code>Retry-After</code> 是 1～60 的秒數；同時另一個租戶的請求照樣 200。測試只打輕量的 <code>GET /api/v1/me</code>。</p>
+</div>
+
+<div class="local" data-test="ex5" data-files="">
+  <p>練習 5：<code>GET /api/v1/billing</code> 回 <code>{ plan, limits, usage }</code>：limits 是免費方案的三個數字，usage 的 project 數、成員數（含待接受的邀請）、檔案總容量跟實際一致；刪掉檔案後容量跟著變。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 6：同事提議在 <code>tenants</code> 加 <code>project_count</code> 欄位，建立時 <code>UPDATE tenants SET project_count = project_count + 1 WHERE id = $1 AND project_count &lt; $2</code>，「一句 SQL 就擋住競態，不用鎖」。這個做法的主要代價是什麼？</p>
+  <label data-key="a">條件式 UPDATE 擋不住競態，兩個請求還是會同時通過</label>
+  <label data-key="b">每次建立都要更新租戶列，效能一定比 count 差很多</label>
+  <label data-key="c">計數器跟實際資料是兩份：刪除、cascade 刪除、手動修資料都要記得更新它，漏一條路徑就會漂移，上限從此算錯</label>
+  <label data-key="d">PostgreSQL 不允許在 WHERE 裡比較同一列的欄位與參數</label>
+  <p class="why">✓ 條件式更新本身是原子的，擋得住競態（a 錯）；代價在一致性：project 被 cascade 刪除時沒人減計數器，客戶就永遠「已滿」。「先鎖租戶列、再 count」每次都數實際資料，不會漂移，代價是同一個租戶的建立要排隊。兩者都是正確的做法，選哪個看你更怕哪一種代價。（第 14 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：你的 API 前面有一個 API gateway。同事說：「限流放在 gateway 就好，應用程式裡不用做。」比較好的分工是？</p>
+  <label data-key="a">全部放 gateway：gateway 比應用程式快，而且可以集中管理</label>
+  <label data-key="b">gateway 用 IP 擋明顯的濫用（還沒驗證身分也能擋）；每租戶的額度放在應用程式驗完 token 之後，因為只有那裡確定是哪個租戶</label>
+  <label data-key="c">全部放應用程式：gateway 的限流擋不了任何東西</label>
+  <label data-key="d">gateway 直接讀請求的 <code>x-tenant-id</code> 標頭來分租戶限流</label>
+  <p class="why">✓ 兩層的鍵不同：gateway 在驗證之前，只看得到 IP 與網址；租戶要等 token 驗證過才知道。d 是最危險的答案：標頭是客戶端自己填的，填別的租戶的 id 就能吃掉對方的額度（第 8 課：租戶只從 token 來）。gateway 若能驗證 JWT 也可以做租戶限流，但應用程式仍要保證自己的規則。（第 14 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 8：免費方案的租戶建立第 4 個 project。契約選 403 <code>PLAN_LIMIT_REACHED</code>，同事想改成 429 或 402。契約這樣選的理由是？</p>
+  <label data-key="a">429 表示「等一下再試就會成功」，客戶端會照 <code>Retry-After</code> 重試，但等多久都不會成功；402 在 HTTP 規範裡保留未定義，各家客戶端的處理不一致。403＋明確的 errorCode 讓前端知道要顯示升級</label>
+  <label data-key="b">403 比較安全，因為它不會透露租戶目前用了多少</label>
+  <label data-key="c">429 只能用在登入限流，其他地方都不能用</label>
+  <label data-key="d">402 會讓瀏覽器自動跳到付款頁面</label>
+  <p class="why">✓ 狀態碼決定客戶端的行為：429 會觸發重試與退避，用在「超過方案」只會製造無效的重試。402 Payment Required 在 RFC 9110 是保留給未來用的狀態碼。真正讓前端知道該做什麼的是 errorCode，這也是契約要每個錯誤都帶 errorCode 的原因。d 錯：瀏覽器對 402 沒有任何特別行為。（第 14 課）</p>
+</div>
+
+<h2>自評清單</h2>
+<p>測試判不出來、但作品裡看得出來的事。每一項自己確認：</p>
+<ul>
+  <li><strong>併發測試抓得到</strong>：把 <code>lockTenant</code> 那一行暫時拿掉，你自己 repo 的併發測試要失敗（記得先讓連線池暖機，見練習 2 的測試）。</li>
+  <li><strong>每個增加用量的路徑都鎖了租戶</strong>：建立 project、上傳檔案、發邀請、你的業務模組，搜尋 <code>lockTenant</code> 對一遍。</li>
+  <li><strong>限流跨副本有效</strong>：開兩個 API 程序（不同 port）、交替打同一個租戶，第 301 個一樣 429。</li>
+  <li><strong>ADR 0006 寫了取捨</strong>：方案放常數的理由、鎖租戶列的代價、固定視窗的缺點與什麼時候換。</li>
+  <li><strong>前端拿得到需要的資訊</strong>：429 有 <code>Retry-After</code>，403 有 <code>PLAN_LIMIT_REACHED</code>，<code>GET /billing</code> 夠畫用量條。</li>
+</ul>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>先 count、再 create，沒有鎖</strong>：同時的請求都數到同一個數字。在同一個 <code>db.tx()</code> 裡先 <code>lockTenant</code>。</li>
+  <li><strong>用 <code>db.client</code> 做「鎖、數、建」</strong>：每個操作各自一個交易，鎖拿到就放了。用互動式交易。</li>
+  <li><strong>用 SERIALIZABLE 卻不重試</strong>：衝突的請求變成 500。要嘛重試，要嘛換成鎖。</li>
+  <li><strong>成員數不算待接受的邀請</strong>：可以先發大量邀請再一個一個接受。</li>
+  <li><strong>降級時刪掉超出的資料</strong>：無法回復。只禁止新增。</li>
+  <li><strong>限流用 IP 或全域計數</strong>：同一個網路的租戶互相影響、一個租戶拖垮全部。登入後的請求用 tenantId。</li>
+  <li><strong>計數放在程序的記憶體</strong>：多個副本各算各的，額度變成副本數倍。放 Redis。</li>
+  <li><strong>429 沒有 <code>Retry-After</code></strong>：客戶端只能猜，常見的猜法是立刻重試。</li>
+</ul>
+
+
+<h2>補充與查表</h2>
+<ul>
+  <li><strong>固定視窗的已知缺點</strong>：視窗交界前後各打滿，短時間內可以通過兩倍的量。例如在一個視窗的最後一秒打 300 個、下一個視窗的第一秒再打 300 個，兩秒內就通過 600 個（<a href="../../system-design/lessons/10-rate-limiting.html">系統設計課第 10 課</a>）。對「保護別的租戶」這個目的夠用，ADR 0006 記下需要時換成滑動視窗。</li>
+  <li><strong>接真的金流</strong>：這課的 <code>POST /billing/plan</code> 直接改方案。接金流後，付款成功由金流的 webhook 通知你，你再改方案（<a href="../../nestjs/lessons/22-uploads-webhooks.html">NestJS 課第 22 課</a>的簽章驗證與冪等、<a href="../../delivery/lessons/08-payments.html">交付課第 8 課</a>），不在這門課做。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>方案用程式常數＋<code>tenants.plan</code>；超過上限一律 403 <code>PLAN_LIMIT_REACHED</code>，數字與換掉的條件寫在 ADR 0006。</li>
+  <li>用量檢查是「讀、判斷、寫」，同時進來的請求會數到同一個過時的數字：在同一個互動式交易裡先 <code>SELECT … FOR UPDATE</code> 鎖租戶列，再數、再新增；鎖租戶列而不是整張表，別的租戶不受影響。條件式計數器與 SERIALIZABLE＋重試也正確，各有代價。</li>
+  <li>成員上限算待接受的邀請；降級不刪資料，用 <code>&gt;=</code> 的判斷禁止新增；改方案只有 owner，一樣鎖租戶列、寫稽核。<code>GET /billing</code> 的用量跟檢查用同一組函式算。</li>
+  <li>每租戶限流：tracker 用 tenantId、計數放 Redis、guard 排在 AccessGuard 之後、429 帶 <code>Retry-After</code>；跟以 email 計數的登入限流分開。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 7 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="b">
+  <p>練習 9：移除成員的程式如下。哪裡會出事？</p>
+<pre>async remove(userId: string) {
+  await this.db.client.membership.deleteMany({ where: { tenantId: this.tenantId, userId } })
+  await this.db.tx(tx =&gt; this.audit.record(tx, 'member.removed', 'user', userId))
+}</pre>
+  <label data-key="a">不會出事：兩行都成功，稽核就會有紀錄</label>
+  <label data-key="b">刪除與稽核是兩個交易：第一個 commit 之後程序掛掉或第二個失敗，人被移除了卻沒有紀錄；而且使用者不存在時照樣記一筆。兩者要放在同一個 <code>db.tx()</code>，確認有刪到才記</label>
+  <label data-key="c">只是效能問題：開兩個交易比一個慢</label>
+  <label data-key="d"><code>deleteMany</code> 不會經過租戶條件，會刪到別的租戶</label>
+  <p class="why">✓ 稽核要跟業務一起 commit 或一起回滾，而且只記成功的事。這段程式兩個都違反：中間失敗會漏記，<code>deleteMany</code> 刪了 0 列也照樣記。d 錯：TenantDb 的自動條件涵蓋 <code>deleteMany</code>，而且這裡本來就明寫了 tenantId。（第 11 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 10：migration 裡已經 <code>REVOKE UPDATE, DELETE ON audit_logs FROM app_user</code>，用 app_user 連線檢查也確實沒有權限。但資安測試發現，透過一個有 SQL injection 的端點還是刪得掉稽核。最先要查什麼？</p>
+  <label data-key="a">REVOKE 有沒有寫錯表名</label>
+  <label data-key="b">PostgreSQL 的版本是否支援欄位層級的權限</label>
+  <label data-key="c">稽核表有沒有開 RLS</label>
+  <label data-key="d">API 實際是用哪個角色連線：如果 <code>PrismaService</code> 用的是擁有者的連線字串，GRANT／REVOKE 對它沒有作用</label>
+  <p class="why">✓ 權限檢查沒問題、資料卻刪得掉，代表執行的不是你檢查的那個角色。查 <code>pg_stat_activity</code> 的 <code>usename</code> 就知道。擁有者與 superuser 不受 GRANT 限制，RLS 也擋不到 superuser。a 已經被「檢查確實沒有權限」排除。（第 11 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 11：檔案上傳已經用 magic bytes 確認只收 PNG、JPEG、GIF、PDF。同事說：「型別都檢查過了，下載時就不用 <code>attachment</code> 和 <code>nosniff</code>，用 inline 讓圖片直接顯示比較方便。」為什麼還是要？</p>
+  <label data-key="a">magic bytes 只檢查開頭幾個 byte，檔案後面可以接任何內容；下載的標頭決定瀏覽器怎麼處理它，是另一道獨立的防線</label>
+  <label data-key="b">不需要，magic bytes 檢查已經保證檔案無害</label>
+  <label data-key="c">因為 attachment 會讓下載比較快</label>
+  <label data-key="d">因為 nosniff 會讓瀏覽器檢查病毒</label>
+  <p class="why">✓ 「開頭像 PNG」不等於「整個檔案只是一張圖」；瀏覽器若自己猜型別，或檔案被當成網頁打開，內容就在你的網域上執行。上傳檢查與下載標頭各擋一種情況，兩道都要。要在頁面上顯示圖片，可以用正確的 <code>image/*</code> Content-Type 加 nosniff，或放在另一個網域。（第 12 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 12：工單的 SLA 提醒是每 10 分鐘跑一次的排程，要處理所有租戶。哪個寫法符合這個作品的租戶隔離設計？</p>
+  <label data-key="a">排程用擁有者連線一次查出所有租戶快到期的工單，逐一寄信</label>
+  <label data-key="b">排程不需要租戶上下文，因為它不是使用者觸發的，沒有跨租戶的風險</label>
+  <label data-key="c">排程只列出有哪些租戶（明確的系統查詢），再為每個租戶放一個帶 tenantId 的 job；worker 用 <code>ctx.run</code> 開那個租戶的上下文，經過 TenantDb 查工單</label>
+  <label data-key="d">讓每個租戶的管理員自己按按鈕觸發提醒</label>
+  <p class="why">✓ 每個進入點都要回答「租戶從哪來」：排程的答案是「逐一處理每個租戶」。只有「列出租戶」那一步是系統層級的查詢，其餘都在租戶上下文裡，extension 與 RLS 照常擋。a 是系統身分的寫法，一個查詢寫錯就是跨租戶寄信。b 把「不是使用者觸發」誤當成「不會出錯」。（第 13 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 13：匯出的 worker 寫完 CSV 到儲存、還沒把狀態改成 <code>done</code>，程序就被重啟了。BullMQ 會再跑一次這個 job。下面哪個設計讓重跑的結果正確？</p>
+  <label data-key="a">每次把新產生的列<strong>附加</strong>到同一個檔案後面，最後再去重</label>
+  <label data-key="b">每次整份重新產生、覆蓋同一個 key，最後才把狀態改成 <code>done</code>；開頭看到 <code>done</code> 就跳過</label>
+  <label data-key="c">把 <code>attempts</code> 設成 1，job 就只會執行一次</label>
+  <label data-key="d">在 job 資料裡記一個 <code>alreadyWritten: true</code>，重跑時讀它</label>
+  <p class="why">✓ 佇列保證至少一次，所以工作要冪等：做兩次跟做一次結果一樣。整份覆蓋同一個 key 沒有「做到一半」的狀態要接續。c 錯：attempts 只管「丟錯後重試幾次」，程序被重啟時 job 仍會被重新處理。d 錯：job 資料是放進佇列時的快照，worker 改它不會讓重跑的那次看到。（第 13 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 14：為了讓用量檢查在併發下正確，同事提議在交易開頭 <code>LOCK TABLE projects IN EXCLUSIVE MODE</code>，「這樣絕對不會超過」。比起鎖 <code>tenants</code> 的那一列，問題是什麼？</p>
+  <label data-key="a">LOCK TABLE 擋不住併發的 INSERT</label>
+  <label data-key="b">LOCK TABLE 不能放在交易裡</label>
+  <label data-key="c">沒有問題，兩種做法效果一樣</label>
+  <label data-key="d">鎖整張表會讓所有租戶的建立都排成一列；鎖租戶列只讓同一個租戶排隊，別的租戶照常並行</label>
+  <p class="why">✓ 多租戶系統的鎖要跟隔離的範圍一致：上限是每個租戶各自的，鎖也只需要鎖那個租戶。鎖整張表是「一個租戶的尖峰拖慢所有人」，正好是這個階段要避免的吵鬧鄰居。a 錯：EXCLUSIVE 模式確實會擋住其他交易的寫入，問題是範圍太大。（第 14 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 15：每租戶限流的 tracker 用 <code>tenantId</code>。客戶抱怨：「我們公司有一個同事的腳本寫錯，整間公司的人都被 429 擋住。」這個設計的取捨是？</p>
+  <label data-key="a">以租戶為單位保護的是「別的租戶」，代價是同一個租戶裡的人共用額度；要避免同事互相影響，可以再加一層以 userId 為鍵、門檻較低的限流</label>
+  <label data-key="b">設計錯了，應該改成只用 userId，tenantId 沒有意義</label>
+  <label data-key="c">應該改用 IP，這樣只有寫錯腳本的那台電腦會被擋</label>
+  <label data-key="d">限流不應該影響付費客戶，pro 方案的租戶應該完全不限流</label>
+  <p class="why">✓ 限流的鍵決定「誰跟誰共用額度」。tenantId 讓一個租戶拖不垮其他租戶（這是平台的責任）；租戶內部的公平可以再疊一層 userId 的限流。b 只用 userId 的話，一個租戶開 100 個帳號就能拿到 100 倍的額度。c 讓同一個 NAT 後的整間公司（或別的租戶）共用額度，問題更大。（第 14 課）</p>
+</div>
+
+<p>這個階段的重點整理成<a href="../sheets/stage-3.html">一頁圖解</a>。</p>
+<p>下一個階段把作品推到線上：先用 OpenAPI 把契約交給前端，再做可觀測性、CI/CD 與部署、資安檢查，最後包裝成可以放上履歷的作品。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

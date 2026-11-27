@@ -1,0 +1,28 @@
+import { useEffect, useState } from 'react'
+
+type QuantityStepperProps = {
+  value?: number
+  defaultValue?: number
+  onChange?: (value: number) => void
+  min?: number
+  max?: number
+}
+
+export function QuantityStepper({ value, defaultValue = 1, onChange, min = 1, max = 20 }: QuantityStepperProps) {
+  const [inner, setInner] = useState(value ?? defaultValue)
+  useEffect(() => { if (value !== undefined) setInner(value) }, [value])
+  const current = inner
+
+  function change(next: number) {
+    setInner(next)
+    onChange?.(next)
+  }
+
+  return (
+    <div role="group" aria-label="數量">
+      <button type="button" aria-label="減少" disabled={current <= min} onClick={() => change(current - 1)}>−</button>
+      <output>{current}</output>
+      <button type="button" aria-label="增加" disabled={current >= max} onClick={() => change(current + 1)}>+</button>
+    </div>
+  )
+}

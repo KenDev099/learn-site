@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>9. 正式資料修復與回填：dry-run、批次、核對、可續跑與撤回</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="9" data-practice="delivery">
+<header>
+  <div class="eyebrow">階段 3：錢與資料 · 第 9 課</div>
+  <h1>正式資料修復與回填：dry-run、批次、核對、可續跑與撤回</h1>
+</header>
+<main>
+
+<p><a href="08-payments.html">第 8 課</a>修好了 webhook 重複加點數的 bug，但修好之前，正式環境已經這樣跑了兩週。程式改對了，資料庫裡多發出去的點數還在，而且有幾位顧客已經在櫃台把多的點數換成咖啡了。會計開了 <code>tickets/CAFE-33.md</code>：把重複的點數扣回來。</p>
+<p>這件事聽起來只是一句 <code>DELETE</code>，但它動的是正式環境的帳務資料：下錯一次，就是幾百位顧客的點數一起錯，而且沒有人說得出原本是多少。這一課照資深工程師處理正式資料的方式做一次。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>為什麼不能直接 DELETE：帳務資料錯了，為什麼用補償紀錄抵銷，而不是刪掉或改掉原本的紀錄。</li>
+  <li>在副本上找出重複、試跑：先在快照上看清楚資料，再算出會動到幾張單、幾位顧客、多少點，交給會計審核。</li>
+  <li>套用：分批執行、中斷了可以接著做、重跑也不會多扣一次。</li>
+  <li>核對與撤回：腳本說「完成」不代表資料對了，怎麼用一句查詢證明，出錯時怎麼把這次修復整個撤回。</li>
+  <li>回填新欄位的安全順序：新增欄位要替舊資料補值時，怎麼不鎖住整張表、不被還在跑的舊版程式寫壞。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../postgresql/lessons/18-transactions.html">PostgreSQL 課第 18 課</a>的交易：<code>BEGIN</code> 開始，<code>COMMIT</code> 或 <code>ROLLBACK</code> 結束，中間的修改一起生效或一起取消。</li>
+  <li><a href="../../postgresql/lessons/31-isolation-upsert.html">PostgreSQL 課第 31 課</a>的 <code>ON CONFLICT</code>：插入的列違反唯一約束時，<code>DO NOTHING</code> 不報錯、直接略過這一列。</li>
+</ul></div>
+
+<h2>先拿到這一課的程式</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs delivery 09</code>，會建立 <code>delivery/practice/work/09/</code>。它是第 8 課的標準答案，加上這些東西：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>檔案</th><th>是什麼</th></tr></thead>
+  <tbody>
+    <tr><td><code>tickets/CAFE-33.md</code></td><td>需求單：店長決定怎麼處理重複的點數，以及 <code>plan.json</code> 每個欄位的定義</td></tr>
+    <tr><td><code>data/prod-snapshot.sql</code></td><td>11/8 早上匯出的正式資料：150 位顧客、1500 張訂單、1909 筆點數紀錄（名稱已去識別化）</td></tr>
+    <tr><td>migration <code>20261109000000_point_repair</code></td><td><code>point_entries</code> 多兩個欄位 <code>reversal_of</code>（唯一）、<code>run_id</code>；新表 <code>data_repair_runs</code> 記錄每次修復的進度</td></tr>
+    <tr><td><code>scripts/repair-points.ts</code></td><td>修復腳本：<code>--dry-run</code> 試跑、<code>--apply</code> 套用。參數解析和連線已經寫好，<strong>練習 1、2 在這裡</strong></td></tr>
+    <tr><td><code>scripts/verify-points.sql</code>、<code>scripts/undo-repair.ts</code></td><td>核對查詢與撤回腳本的空殼，<strong>練習 3 在這裡</strong></td></tr>
+  </tbody>
+</table></div>
+<p>腳本是 <code>.ts</code>，用 <code>npm run repair-points -- --dry-run</code> 執行（<code>--</code> 後面的參數會傳給腳本）。它背後是 <code>node scripts/repair-points.ts</code>：這門課用的 Node 24 會直接執行只用到型別註記的 TypeScript 檔，把型別拿掉後執行（type stripping），不做型別檢查，所以不用先編譯。腳本用 <code>pg</code> 套件直接寫 SQL，不經過 Prisma：資料修復通常就是幾句精準的 SQL，直接寫最容易審查。</p>
+
+<h2>動正式資料之前：為什麼不能直接 DELETE</h2>
+<p>先看 <code>point_entries</code> 這張表的設計（第 8 課建的）：點數的每一次異動都是一筆紀錄，<strong>只新增、不修改</strong>，顧客的點數＝自己所有紀錄的 <code>points</code> 加總。付款成功加一筆 <code>order_paid</code>（每 10 元 1 點），店員手動補點加一筆 <code>manual</code>，在櫃台兌換時 POS 加一筆負數的 <code>redeem</code>。這種設計叫<strong>流水帳（ledger）</strong>，銀行存摺就是這樣：不會把舊的一行塗掉，只會往下加一行。</p>
+<p>修正重複的點數有三種做法：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>做法</th><th>點數對了嗎</th><th>之後查得到發生什麼事嗎</th><th>能撤回嗎</th></tr></thead>
+  <tbody>
+    <tr><td><code>DELETE</code> 重複的那幾筆</td><td>對</td><td>查不到：紀錄消失了，會計對不上兩週前的報表，也說不出刪了哪些</td><td>只能從備份撈回來</td></tr>
+    <tr><td>在顧客表加一個「點數」欄位直接改小</td><td>對</td><td>查不到，而且從此點數不等於紀錄的加總，兩邊永遠對不上</td><td>不能，不知道原本是多少</td></tr>
+    <tr><td>為每一筆重複新增一筆<strong>補償紀錄</strong></td><td>對（加總抵銷掉）</td><td>查得到：哪一筆被哪一次修復扣回</td><td>能：移除那一次修復寫入的補償紀錄</td></tr>
+  </tbody>
+</table></div>
+<p><strong>補償紀錄（compensating entry）</strong>是用一筆反向的紀錄抵銷錯誤，原本的紀錄留著。重複的那筆是 +30 點，就新增一筆 −30 點，<code>reason = 'dup_reversal'</code>，<code>reversal_of</code> 指向被抵銷的那一筆。會計做帳也是這樣：開錯的發票不撕掉，開一張折讓單沖銷。CAFE-33 第 4 點「不可以刪除或修改原本的紀錄」說的就是這個。</p>
+<p>其他的規矩，跟改程式時一樣是為了「錯了能發現、發現了能回頭」：</p>
+<ul>
+  <li><strong>先備份</strong>：執行前確認有一份能還原的備份（<a href="../../devops/lessons/24-backup-dr.html">DevOps 課第 24 課</a>）。補償紀錄能撤回，但腳本本身有 bug 時，備份是最後的保險。</li>
+  <li><strong>先在副本上做</strong>：把正式資料的快照載入一個獨立的資料庫，所有查詢、腳本先在那裡跑過。這一課的 <code>data/prod-snapshot.sql</code> 就是這份快照。</li>
+  <li><strong>先試跑（dry-run）</strong>：腳本先用「只計算、不寫入」的模式跑一次，算出會動到幾筆、幾位顧客、多少點，讓需要負責的人（這裡是店長和會計）看過數字再執行。</li>
+</ul>
+
+<div class="callout practice"><strong>💡 實務上：正式資料修復要走跟程式碼一樣的審查</strong><br>bug 修好之後，常常還要處理它留下的錯誤資料：重複扣款、算錯的金額、少寫的欄位。這類修復要當成一次部署：腳本放進 repo、開 PR 給人審查、附上試跑的數字，由要對結果負責的人（會計、PM、客服主管）確認後才執行。不要在正式資料庫的連線視窗裡手打 <code>UPDATE</code>：少一個 <code>WHERE</code> 就是整張表。資深工程師會先問：影響多少筆？誰會受影響、要不要通知？錯了怎麼退？執行時間會不會撞到尖峰？</div>
+
+<h2>跟著做：在副本上找出重複的點數</h2>
+<p>先建一個獨立的資料庫 <code>cafe_repair</code>，套用 migration 和種子資料，再載入快照（在 <code>work/09</code> 執行）：</p>
+<pre>docker compose up -d --wait
+docker compose exec postgres createdb -U learn cafe_repair
+DATABASE_URL=postgresql://learn:learn@127.0.0.1:5436/cafe_repair npm run db:setup
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U learn -d cafe_repair &lt; data/prod-snapshot.sql</pre>
+<p>第二行用容器裡的 <code>createdb</code> 建資料庫。第三行在指令前面設定 <code>DATABASE_URL</code>，只對這一個指令有效；<code>api/.env</code> 裡的設定不會蓋掉已經存在的環境變數，所以 migration 會套用到 <code>cafe_repair</code>。最後一行把快照餵給容器裡的 <code>psql</code>（<code>-T</code> 讓 stdin 可以導進去，<code>ON_ERROR_STOP=1</code> 讓它遇到錯誤就停）。最後會看到：</p>
+<pre>BEGIN
+INSERT 0 144
+INSERT 0 1500
+INSERT 0 1909
+…
+COMMIT</pre>
+<p>之後的 SQL 都在 <code>docker compose exec postgres psql -U learn -d cafe_repair</code> 開的 psql 裡執行。先看全貌：</p>
+<pre>SELECT reason, count(*), sum(points) FROM point_entries GROUP BY reason ORDER BY reason;
+
+ reason     | count |  sum
+------------+-------+--------
+ manual     |    40 |   1011
+ order_paid |  1799 |  52445
+ redeem     |    70 | -12320</pre>
+<p>一張訂單應該只有一筆 <code>order_paid</code>。找出有兩筆以上的訂單：</p>
+<pre>SELECT count(*) AS orders, sum(n - 1) AS duplicates
+FROM (SELECT order_id, count(*) AS n FROM point_entries
+      WHERE reason = 'order_paid' GROUP BY order_id HAVING count(*) &gt; 1) t;
+
+ orders | duplicates
+--------+------------
+    290 |        299</pre>
+<p>290 張訂單、299 筆重複：有些訂單不只多一筆。看其中一張（訂單 1385）：</p>
+<pre> id  | customer_id | order_id | points |   reason   |       created_at
+-----+-------------+----------+--------+------------+------------------------
+ 467 |          97 |     1385 |     30 | order_paid | 2026-10-22 14:04:25+00
+ 468 |          97 |     1385 |     30 | order_paid | 2026-10-22 14:05:07+00
+ 471 |          97 |     1385 |     30 | order_paid | 2026-10-22 14:31:08+00</pre>
+<p>同一個通知被 CafePay 重送了兩次，所以有三筆：第一筆（467）是正確的，468、471 兩筆是重複。<strong>只看「有沒有重複」會少算</strong>，要的是「第二筆以後的每一筆」。再看一張有 <code>manual</code> 的訂單（1087）：</p>
+<pre> id  | customer_id | order_id | points |   reason   |       created_at
+-----+-------------+----------+--------+------------+------------------------
+ 111 |          93 |     1087 |     35 | order_paid | 2026-10-19 19:20:56+00
+ 194 |          93 |     1087 |     35 | manual     | 2026-10-20 11:20:53+00</pre>
+<p>同一張訂單、同樣 35 點，看起來像重複，但它是店員隔天手動補的（例如客人以為沒拿到點數，店員補給他）。CAFE-33 第 2 點說了：<code>manual</code> 不算重複。只用「訂單和點數一樣」去比，就會誤扣這 30 筆。<strong>動手前先把資料長什麼樣子看清楚</strong>，規則要跟負責的人確認，不是自己猜。</p>
+
+<h3>用 row_number() 標出第幾筆</h3>
+<p>要「每張訂單依 id 排第二筆以後的」，用視窗函式（window function）<code>row_number()</code>：它不會把列合併（跟 <code>GROUP BY</code> 不同），而是在每一列旁邊加一個編號。<code>OVER (PARTITION BY order_id ORDER BY id)</code> 的意思是「同一張訂單的列分成一組，組內依 id 從 1 開始編號」：</p>
+<pre>SELECT id, customer_id, order_id, points FROM (
+  SELECT id, customer_id, order_id, points,
+         row_number() OVER (PARTITION BY order_id ORDER BY id) AS n
+  FROM point_entries
+  WHERE reason = 'order_paid'
+) t
+WHERE n &gt; 1
+ORDER BY id
+LIMIT 5;
+
+ id | customer_id | order_id | points
+----+-------------+----------+--------
+  2 |         147 |     1001 |     12
+  6 |         106 |     1004 |     30
+  9 |          73 |     1006 |     16
+ 14 |          31 |     1010 |     26
+ 17 |         122 |     1012 |     36</pre>
+<p>拿掉 <code>LIMIT</code> 會得到 299 列，正是要處理的重複。為什麼是「第二筆以後」而不是「最後一筆以外」？第一筆是 webhook 第一次送到時寫的，時間最接近付款；保留哪一筆點數都一樣，但規則要固定，重跑時才會選到同一批。</p>
+<p>最後是 CAFE-33 第 3 點：已經把多的點數換掉的顧客。以 23 號顧客為例，他現在的點數加總是 75 點，重複的點數有 84 點。全部扣回會變成 −9 點，所以這位顧客整個跳過，列進 <code>skipCustomers</code> 給店長聯繫。判斷式是：<strong>這位顧客所有紀錄的點數加總 − 他的重複點數 &lt; 0</strong>。</p>
+
+<h2>試跑（dry-run）：先算出會做什麼</h2>
+<p><strong>試跑（dry-run）</strong>是讓同一支腳本用「只計算、不寫入」的模式跑一次。它跟正式執行用同一套找資料的邏輯，所以試跑的數字就是正式執行會動到的範圍。CAFE-33 要求試跑輸出 <code>plan.json</code>：</p>
+<pre>DATABASE_URL=postgresql://learn:learn@127.0.0.1:5436/cafe_repair npm run repair-points -- --dry-run
+
+&gt; repair-points
+&gt; node scripts/repair-points.ts --dry-run
+
+{
+  duplicates: 299,
+  affectedCustomers: 118,
+  totalPoints: 8443,
+  skipCustomers: [
+    23, 41,  64,  72,
+    73, 85, 101, 137
+  ]
+}</pre>
+<p>（這是做完練習 1 之後的輸出；起始程式的 <code>plan()</code> 還沒寫，印出來的數字都是 0、<code>skipCustomers</code> 是空陣列。）同樣的內容寫進專案根目錄的 <code>plan.json</code>。</p>
+<p>這四個數字要貼到需求單上給店長和會計看：299 筆重複、118 位顧客、這次扣回 8443 點、8 位顧客不扣回。數字跟大家的預期差很多（例如有人以為「大概二三十筆」），就先停下來弄清楚，不要執行。</p>
+<p>寫試跑時的重點：</p>
+<ul>
+  <li><strong>真的不寫入</strong>：不能「先寫進去再回滾」來算數字，也不能順手建立執行紀錄。最好讓試跑和套用共用找資料的 SQL（例如放在同一個常數），只有套用那條路會呼叫 <code>INSERT</code>。</li>
+  <li><strong>數字從資料算出來</strong>：不要把在 psql 裡看到的 299 寫進程式。正式執行時資料可能已經變了（顧客又兌換了點數），腳本每次都要重新算。</li>
+  <li>計算可以用 SQL 也可以把資料讀出來用 TypeScript 算。點數紀錄只有幾千筆時兩者都行；幾百萬筆時讓資料庫算（<code>GROUP BY</code>、<code>sum</code>），不要全部搬到程式的記憶體裡。</li>
+</ul>
+
+<h2>套用：補償紀錄、分批、可以接著做</h2>
+<p>正式執行要同時做到三件事：寫對、不怕中斷、重跑不會重複。逐一來看。</p>
+
+<h3>寫對：一筆重複對應一筆補償紀錄</h3>
+<p>這一課的 migration 在 <code>point_entries</code> 加了兩個欄位：</p>
+<pre>ALTER TABLE "point_entries" ADD COLUMN "reversal_of" INTEGER, ADD COLUMN "run_id" TEXT;
+CREATE UNIQUE INDEX "point_entries_reversal_of_key" ON "point_entries"("reversal_of");</pre>
+<p>補償紀錄的內容：同一位顧客、同一張訂單、<code>points</code> 是原本的負數、<code>reason = 'dup_reversal'</code>、<code>reversal_of</code> 是被抵銷那一筆的 id、<code>run_id</code> 是這一次執行的名稱。可以用一句 <code>INSERT … SELECT</code> 從原本的紀錄算出來：</p>
+<pre>INSERT INTO point_entries (customer_id, order_id, points, reason, reversal_of, run_id)
+SELECT customer_id, order_id, -points, 'dup_reversal', id, $2
+FROM point_entries WHERE id = ANY($1::int[])
+ON CONFLICT (reversal_of) DO NOTHING</pre>
+<p><code>$1</code> 是這一批要扣回的 id 陣列（<code>pg</code> 會把 JavaScript 陣列轉成 PostgreSQL 陣列，<code>= ANY(…)</code> 的意思是「等於陣列裡任何一個」），<code>$2</code> 是 run 名稱。</p>
+
+<h3>重跑不重複：讓資料庫擋</h3>
+<p><code>reversal_of</code> 有唯一約束，所以<strong>一筆原始紀錄最多只能被抵銷一次</strong>。就算腳本因為 bug 或有人換了 run 名稱再跑一次，第二筆補償紀錄也寫不進去；<code>ON CONFLICT (reversal_of) DO NOTHING</code> 讓撞到的那筆直接略過，不讓整批失敗。這跟<a href="08-payments.html">第 8 課</a> <code>processed_events</code> 的去重是同一招：「做過沒有」交給唯一約束判斷，不靠程式先查再寫。</p>
+<p>找重複的 SQL 也要排除已經有補償紀錄的：</p>
+<pre>  WHERE n &gt; 1
+    AND NOT EXISTS (SELECT 1 FROM point_entries r WHERE r.reversal_of = t.id)</pre>
+<p>這樣修到一半時，找出來的只剩還沒處理的。這種「重複執行幾次，結果都跟執行一次一樣」的性質就是<a href="08-payments.html">第 8 課</a>講過的冪等（idempotent）。</p>
+
+<h3>不怕中斷：分批，每批一個交易，進度跟著提交</h3>
+<p>為什麼不把 299 筆放在一個交易裡一次做完？這裡只有 299 筆可以，但修復腳本常常要處理幾十萬筆，一個大交易會：一直握著它改過的列的鎖，正常的請求（例如顧客正在兌換點數）卡在後面等；做到 90% 失敗時全部回滾，從頭再來；交易越大，資料庫要保留的舊版本列越多。</p>
+<p><strong>分批（batching）</strong>是每次只拿一小批（這裡預設 200 筆），每批一個交易，做完就提交。中斷時，已經提交的批次留著，沒提交的那一批整批回滾，不會有「寫了一半的一批」。要做到<strong>可續跑（resumable）</strong>，還要記住做到哪裡：<code>data_repair_runs</code> 每次執行一列，<code>last_id</code> 是<strong>游標</strong>，記錄「已經處理到哪一筆原始紀錄的 id」。下一批就從 <code>id &gt; last_id</code> 開始拿：</p>
+<pre>SELECT id FROM (…找重複的 SQL…) d
+WHERE id &gt; $1 AND NOT (customer_id = ANY($2::int[]))   -- $1 游標、$2 不扣回的顧客
+ORDER BY id LIMIT $3                                    -- $3 每批幾筆</pre>
+<p>這種「用上一批最後一個 id 當起點」的分頁叫 keyset 分頁。不用 <code>OFFSET</code>：一邊寫入一邊用 <code>OFFSET</code> 翻頁，資料變動會讓頁面錯位，而且越後面的頁越慢。</p>
+
+<figure>
+  <svg viewBox="0 0 700 260" role="img" aria-label="分批執行：每一批在一個交易裡寫入補償紀錄並更新游標；第 3 批執行時中斷，只有第 3 批回滾；用同一個 run-id 再執行時，從游標接著做第 3 批">
+    <defs><marker id="ar9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <text class="d-text" x="20" y="30">第一次執行 --run-id cafe33-1</text>
+    <rect class="d-box" x="20" y="45" width="150" height="56" rx="8"/>
+    <text class="d-text" x="95" y="70" text-anchor="middle">第 1 批：提交</text>
+    <text class="d-small" x="95" y="90" text-anchor="middle">游標 → 這批最後的 id</text>
+    <rect class="d-box" x="190" y="45" width="150" height="56" rx="8"/>
+    <text class="d-text" x="265" y="70" text-anchor="middle">第 2 批：提交</text>
+    <text class="d-small" x="265" y="90" text-anchor="middle">游標 → 這批最後的 id</text>
+    <rect class="d-soft" x="360" y="45" width="150" height="56" rx="8"/>
+    <text class="d-accent" x="435" y="70" text-anchor="middle">第 3 批：中斷</text>
+    <text class="d-small" x="435" y="90" text-anchor="middle">整批回滾，游標不動</text>
+    <text class="d-text" x="20" y="160">再執行一次 --run-id cafe33-1</text>
+    <rect class="d-box" x="360" y="175" width="150" height="56" rx="8"/>
+    <text class="d-text" x="435" y="200" text-anchor="middle">第 3 批：提交</text>
+    <text class="d-small" x="435" y="220" text-anchor="middle">從 id &gt; 游標開始</text>
+    <rect class="d-box" x="530" y="175" width="150" height="56" rx="8"/>
+    <text class="d-text" x="605" y="200" text-anchor="middle">沒有下一批</text>
+    <text class="d-small" x="605" y="220" text-anchor="middle">status → done</text>
+    <line class="d-line" x1="170" y1="73" x2="188" y2="73" marker-end="url(#ar9)"/>
+    <line class="d-line" x1="340" y1="73" x2="358" y2="73" marker-end="url(#ar9)"/>
+    <line class="d-line" x1="510" y1="203" x2="528" y2="203" marker-end="url(#ar9)"/>
+    <line class="d-line" x1="265" y1="103" x2="400" y2="173" marker-end="url(#ar9)"/>
+    <text class="d-small" x="190" y="150">讀 data_repair_runs.last_id</text>
+  </svg>
+  <figcaption>每一批的補償紀錄和游標在同一個交易裡提交，所以游標永遠跟已經寫入的資料一致。</figcaption>
+</figure>
+
+<p>關鍵是<strong>更新游標和寫入這一批放在同一個交易</strong>。如果先提交補償紀錄、再另外更新游標，兩者之間中斷，游標就落後於資料；靠唯一約束還不會出錯，但游標已經不可信了。用 <code>pg</code> 的 client 手動寫交易：</p>
+<pre>await db.query('BEGIN')
+try {
+  // 1. 拿下一批 id（id &gt; 游標）；拿不到就把 status 改成 done，COMMIT，結束
+  // 2. INSERT 補償紀錄 … ON CONFLICT (reversal_of) DO NOTHING
+  // 3. UPDATE data_repair_runs SET last_id = 這批最後一個 id, reversed = reversed + 寫入筆數
+  await db.query('COMMIT')
+} catch (e) {
+  await db.query('ROLLBACK')
+  throw e
+}</pre>
+<p><code>INSERT</code> 的回傳值有 <code>rowCount</code>（實際寫入幾列，撞到唯一約束被略過的不算），拿來累加 <code>reversed</code>。腳本的 <code>--max-batches</code> 讓你跑幾批就停，用來分段執行（例如每晚只做一部分），也用來演練中斷。</p>
+<p>還有兩個細節：</p>
+<ul>
+  <li><strong>run 的狀態</strong>：第一次用某個 <code>--run-id</code> 執行時建立一列（<code>status = 'running'</code>），之後用同一個名稱執行就讀它的游標接著做；已經是 <code>done</code> 的直接結束；已經撤回（<code>undone</code>）的拒絕執行，要重做就換一個名稱。<code>INSERT … ON CONFLICT (run_id) DO NOTHING</code> 再 <code>SELECT</code> 就能同時處理「第一次」和「接著做」。</li>
+  <li><strong>不扣回的顧客</strong>在開始時算一次。續跑時重算，結果會一樣：已經扣回的點數和已經處理的重複，同時從「點數加總」和「還沒扣回的重複」兩邊減掉。</li>
+</ul>
+<p>做完練習 2 之後，在副本上試試看（先只跑一批，模擬做到一半被中斷）：</p>
+<pre>DATABASE_URL=postgresql://learn:learn@127.0.0.1:5436/cafe_repair npm run repair-points -- --apply --run-id cafe33-1 --max-batches 1
+
+&gt; repair-points
+&gt; node scripts/repair-points.ts --apply --run-id cafe33-1 --max-batches 1
+
+第 1 批：扣回 200 筆，游標 1301
+跑完 1 批先停在游標 1301；用同一個 --run-id 再執行會接著做
+
+DATABASE_URL=postgresql://learn:learn@127.0.0.1:5436/cafe_repair npm run repair-points -- --apply --run-id cafe33-1
+
+&gt; repair-points
+&gt; node scripts/repair-points.ts --apply --run-id cafe33-1
+
+第 1 批：扣回 78 筆，游標 1892
+cafe33-1 完成</pre>
+<p>第二次執行的「第 1 批」是這次執行的第 1 批，它從游標 1301 之後接著拿。200＋78＝278 筆，就是 299 筆重複扣掉 8 位不扣回顧客的 21 筆。訂單 1385 現在長這樣：</p>
+<pre>  id  | customer_id | order_id | points |    reason    | reversal_of |  run_id
+------+-------------+----------+--------+--------------+-------------+----------
+  467 |          97 |     1385 |     30 | order_paid   |             |
+  468 |          97 |     1385 |     30 | order_paid   |             |
+  471 |          97 |     1385 |     30 | order_paid   |             |
+ 1980 |          97 |     1385 |    -30 | dup_reversal |         468 | cafe33-1
+ 1981 |          97 |     1385 |    -30 | dup_reversal |         471 | cafe33-1</pre>
+<p>三筆原始紀錄都在，加總是 30 點，而且看得出哪兩筆被哪一次修復抵銷。</p>
+
+<div class="callout practice"><strong>💡 實務上：批次大小與執行時間</strong><br>批次太大，每個交易握鎖的時間長，線上請求會變慢；太小，交易次數多，整體跑很久。常見的做法是先用幾百筆試，看每批花多久（腳本印出每批的時間與筆數），讓一批在一秒內完成，批次之間可以停一下讓線上請求喘口氣。大量的修復排在離峰時段，執行時有人盯著資料庫的負載和錯誤率，隨時能 Ctrl-C：設計成可續跑之後，中斷就只是「暫停」，不是事故。執行的人、時間、run 名稱、每一步的輸出都貼回需求單，這就是之後查帳的依據。</div>
+
+<h2>核對與撤回</h2>
+<p>腳本說「完成」不代表資料對了：腳本本身可能有 bug。<strong>核對查詢（verification query）</strong>是另外寫一句 SQL，直接檢查修好之後應該成立的規則，每一列代表一個還沒解決的問題，修好之後要回傳 0 列。這裡的規則是：除了店長要聯繫的顧客，<strong>每張訂單最多只剩一筆有效的 <code>order_paid</code></strong>（被補償紀錄抵銷的不算）。核對查詢有兩個要求：</p>
+<ul>
+  <li><strong>修復前要找得到問題</strong>：修復前執行，要回傳每一張需要扣回的訂單（270 張）。一句永遠回傳 0 列的查詢，修復後也是 0 列，什麼都沒檢查到。先確認它在「壞的資料」上會叫，才相信它在「好的資料」上不叫。這跟<a href="05-bug-without-repro.html">第 5 課</a>「先寫一個會失敗的測試」是同一個道理。</li>
+  <li><strong>以「訂單」為單位</strong>：一張訂單有兩筆重複也只是一個問題，回報給人看的是「哪幾張訂單還有問題」。</li>
+</ul>
+<p>可以順便多查一種問題，例如「點數變成負的顧客」（扣過頭），用 <code>UNION ALL</code>（把兩個查詢的結果列直接接在一起）接在同一個查詢後面，第一欄寫問題的種類。執行方式：</p>
+<pre>docker compose exec -T postgres psql -U learn -d cafe_repair &lt; scripts/verify-points.sql
+ problem | customer_id | order_id | detail
+---------+-------------+----------+--------
+(0 rows)</pre>
+
+<h3>撤回：只撤回這一次</h3>
+<p>正式執行之後才發現規則錯了（例如會計說「11/1 以後的重複不用扣」），要能退回執行前的狀態。補償紀錄都帶著 <code>run_id</code>，所以撤回就是<strong>只刪除這一次執行寫入的補償紀錄</strong>：</p>
+<pre>DELETE FROM point_entries WHERE run_id = $1 AND reason = 'dup_reversal'</pre>
+<p>刪除帳務紀錄不是不行嗎？規則是「不改動原始的業務紀錄」。補償紀錄是我們這次修復自己寫的，撤回它就是把這次修復整個拿掉，原始紀錄一筆都沒動。<code>data_repair_runs</code> 那一列標成 <code>undone</code>，留下「這次修復被撤回了」的紀錄。如果撤回時距離修復已經很久、顧客可能已經看過修正後的點數，比較穩的做法是再寫一筆反向的補償紀錄（抵銷補償紀錄），這一課的情境是剛執行完就發現，用刪除。</p>
+<p>兩個容易出錯的地方：<code>WHERE</code> 只寫 <code>reason = 'dup_reversal'</code>，會把別次執行的補償紀錄一起刪掉；打錯 run 名稱時什麼都沒刪，腳本卻說成功，執行的人以為撤回了。找不到這個 run 就要失敗（exit code 不是 0）並說明原因。撤回後再跑一次核對查詢，又會找出那 270 張訂單，代表真的回到修復前。</p>
+
+<div class="callout practice"><strong>💡 實務上：把整個過程寫成操作手冊</strong><br><strong>操作手冊（runbook）</strong>是一份照著做就能完成某件操作的說明（寫法見<a href="../../engineering/lessons/07-technical-writing.html">工程實務課第 7 課</a>），寫給執行的人，可能是半夜的你、也可能是維運同事（<a href="../../engineering/lessons/07-technical-writing.html">工程實務課第 7 課</a>）。資料修復的手冊通常包含：前置條件（備份時間、已在副本驗證、需求單上的審核）、每一步的完整指令和預期輸出（試跑的四個數字、每批筆數）、怎麼判斷成功（核對查詢回傳 0 列）、出問題時怎麼停與怎麼撤回（<code>npm run undo-repair -- --run-id …</code>）、做完要通知誰（店長要聯繫 8 位顧客）。指令要能直接複製貼上，不要寫「把重複的刪掉」這種要執行的人自己判斷的句子。</div>
+
+<h2>回填新欄位的安全順序</h2>
+<p>另一種常見的正式資料作業是<strong>回填（backfill）</strong>：新增一個欄位後，替既有的資料補上值。例如之後要在 <code>orders</code> 加 <code>channel</code>（訂單來源：web 或櫃台），舊訂單都要補成 <code>web</code>，最後讓它不能是 NULL。上面的技巧（分批、可續跑、核對）全部用得上，另外還有一個<strong>順序</strong>問題：</p>
+
+<figure>
+  <svg viewBox="0 0 700 220" role="img" aria-label="回填新欄位的五個步驟：加可為 NULL 的欄位、部署雙寫、分批回填舊資料、核對沒有 NULL、加 NOT NULL">
+    <defs><marker id="ar9b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="10" y="40" width="120" height="70" rx="8"/>
+    <text class="d-text" x="70" y="70" text-anchor="middle">1. 加欄位</text>
+    <text class="d-small" x="70" y="92" text-anchor="middle">可為 NULL</text>
+    <rect class="d-box" x="148" y="40" width="120" height="70" rx="8"/>
+    <text class="d-text" x="208" y="70" text-anchor="middle">2. 部署雙寫</text>
+    <text class="d-small" x="208" y="92" text-anchor="middle">新資料都有值</text>
+    <rect class="d-box" x="286" y="40" width="120" height="70" rx="8"/>
+    <text class="d-text" x="346" y="70" text-anchor="middle">3. 分批回填</text>
+    <text class="d-small" x="346" y="92" text-anchor="middle">只補舊資料</text>
+    <rect class="d-box" x="424" y="40" width="120" height="70" rx="8"/>
+    <text class="d-text" x="484" y="70" text-anchor="middle">4. 核對</text>
+    <text class="d-small" x="484" y="92" text-anchor="middle">NULL 剩 0 筆</text>
+    <rect class="d-soft" x="562" y="40" width="128" height="70" rx="8"/>
+    <text class="d-accent" x="626" y="70" text-anchor="middle">5. 加 NOT NULL</text>
+    <text class="d-small" x="626" y="92" text-anchor="middle">之後不會再有 NULL</text>
+    <line class="d-line" x1="130" y1="75" x2="146" y2="75" marker-end="url(#ar9b)"/>
+    <line class="d-line" x1="268" y1="75" x2="284" y2="75" marker-end="url(#ar9b)"/>
+    <line class="d-line" x1="406" y1="75" x2="422" y2="75" marker-end="url(#ar9b)"/>
+    <line class="d-line" x1="544" y1="75" x2="560" y2="75" marker-end="url(#ar9b)"/>
+    <text class="d-small" x="10" y="150">先 3 後 2：回填完到雙寫上線之間的新訂單又是 NULL，第 5 步會失敗</text>
+    <text class="d-small" x="10" y="175">先 5 後 3：舊資料都是 NULL，NOT NULL 加不上去；就算加上，舊版程式寫入也會失敗</text>
+    <text class="d-small" x="10" y="200">每一步之間都可以停下來觀察，有問題只退那一步</text>
+  </svg>
+  <figcaption>回填新欄位的五個步驟：資料庫版的擴充—遷移—收斂（expand／migrate／contract，<a href="04-contracts-releases.html">第 4 課</a>、<a href="../../postgresql/lessons/34-zero-downtime-migrations.html">PostgreSQL 課第 34 課</a>）。</figcaption>
+</figure>
+
+<ol>
+  <li><strong>加可為 NULL、沒有預設值的欄位</strong>：PostgreSQL 18 文件寫明，<code>ADD COLUMN</code> 沒有預設值（或是不會變的預設值）時不需要重寫整張表，只改表的定義，大表上也是瞬間完成。這時舊版程式完全不知道這個欄位，照常運作。</li>
+  <li><strong>部署雙寫（dual write）</strong>：新版程式寫入訂單時同時填 <code>channel</code>。從這一刻起，新資料都有值，回填只要處理「這個時間點以前」的舊資料，而且回填結束後不會再冒出新的 NULL。</li>
+  <li><strong>分批回填</strong>：<code>UPDATE orders SET channel = 'web' WHERE id IN (下一批 channel IS NULL 的 id)</code>，跟這一課的修復一樣每批一個交易、可以中斷再接著做。<code>WHERE channel IS NULL</code> 本身就讓重跑不會重複做。</li>
+  <li><strong>核對</strong>：<code>SELECT count(*) FROM orders WHERE channel IS NULL</code> 要是 0。</li>
+  <li><strong>加 NOT NULL</strong>：直接 <code>SET NOT NULL</code> 會拿最強的 <code>ACCESS EXCLUSIVE</code> 鎖（連讀取都擋）掃整張表，大表上整段時間訂單都讀寫不了。PostgreSQL 18 可以先 <code>ALTER TABLE orders ADD CONSTRAINT orders_channel_not_null NOT NULL channel NOT VALID</code>（不掃表，但之後的寫入就要遵守），再 <code>ALTER TABLE orders VALIDATE CONSTRAINT orders_channel_not_null</code>（掃表檢查，只拿 <code>SHARE UPDATE EXCLUSIVE</code> 鎖，不擋一般的讀寫）。細節在 <a href="../../postgresql/lessons/34-zero-downtime-migrations.html">PostgreSQL 課第 34 課</a>。</li>
+</ol>
+<p>為什麼順序不能反，圖下方列了兩種情況。重點是：部署不是瞬間的（<a href="04-contracts-releases.html">第 4 課</a>看過舊版前端、舊版 API 會跟新版同時在線上），回填也要時間，每一步都要假設「前一個版本還在跑」。這也是為什麼回填跟加約束不放在同一個 migration 裡：migration 會在部署時自動執行（<a href="../../devops/lessons/17-deploy-migrations.html">DevOps 課第 17 課</a>），大量的 <code>UPDATE</code> 放在裡面會拖慢部署、失敗時卡住後面所有 migration；回填用獨立的腳本，像這一課一樣可以觀察、暫停、接著做。</p>
+
+<h2>練習</h2>
+<p>三題都在 <code>delivery/practice/work/09/scripts/</code> 裡做，寫完回到 <code>learn/</code> 執行 <code>node check.mjs delivery 09</code>。判分會在自己的資料庫載入 <code>data/prod-snapshot.sql</code>，執行你的腳本，再直接查資料庫；判分用的資料庫跟你的 <code>cafe_repair</code> 無關。三題各自獨立：練習 3 的判分不需要練習 2 完成。</p>
+
+<div class="local" data-test="ex1" data-files="scripts/repair-points.ts">
+  <p>練習 1：完成 <code>plan()</code>，讓 <code>npm run repair-points -- --dry-run</code> 把計畫寫到 <code>plan.json</code>。</p>
+  <ul>
+    <li>四個欄位的定義在 <code>tickets/CAFE-33.md</code> 的最後：<code>duplicates</code>、<code>affectedCustomers</code>、<code>totalPoints</code>、<code>skipCustomers</code>（由小到大）。</li>
+    <li>重複＝同一張訂單的 <code>order_paid</code> 依 id 排第二筆以後的；<code>manual</code> 不算。不扣回的顧客＝所有紀錄的點數加總 − 他的重複點數 &lt; 0。</li>
+    <li>只能讀資料：不能寫補償紀錄，也不能建立 <code>data_repair_runs</code>。</li>
+    <li>判分：數字和判分程式自己照 CAFE-33 算的一樣；執行前後 <code>point_entries</code> 的筆數、總和、id 序號與 <code>data_repair_runs</code> 都沒變（先寫再 <code>ROLLBACK</code> 也會被發現：序號不會退回）；再加一份三筆的重複、一筆像重複的 manual、一位把點數兌換光的顧客之後重跑，數字也要跟著對。</li>
+  </ul>
+</div>
+
+<div class="local" data-test="ex2" data-files="scripts/repair-points.ts">
+  <p>練習 2：完成 <code>apply()</code>，讓 <code>npm run repair-points -- --apply --run-id &lt;名稱&gt;</code> 分批寫入補償紀錄。</p>
+  <ul>
+    <li>每筆要扣回的重複寫一筆補償紀錄：同一位顧客、同一張訂單、<code>points</code> 是原本的負數、<code>reason = 'dup_reversal'</code>、<code>reversal_of</code>、<code>run_id</code>。<code>skipCustomers</code> 的不扣回；原始紀錄不能刪、不能改。</li>
+    <li>依原始紀錄的 id 由小到大，每批 <code>--batch-size</code> 筆、每批一個交易；進度記在 <code>data_repair_runs</code>（<code>kind = 'points-dedupe'</code>；<code>status</code> 做到一半是 running、做完是 done；<code>last_id</code> 是這一批最後一筆原始紀錄的 id；<code>reversed</code> 是累計寫入的筆數）。</li>
+    <li>用同一個 run 名稱再執行，從 <code>last_id</code> 接著做；做完的再執行、或換一個名稱執行，都不能多寫任何紀錄。</li>
+    <li>判分：先 <code>--batch-size 50 --max-batches 2</code>，要剛好寫了最前面的 100 筆、<code>status</code> running、<code>last_id</code> 是第 100 筆的 id；再執行一次要全部做完，每一筆重複剛好一筆正確的補償紀錄、沒有顧客變負數；第三次與換名稱的執行都不新增紀錄。判分資料會比快照多幾筆重複和一位不扣回的顧客，把試跑看到的名單寫死會過不了。</li>
+  </ul>
+</div>
+
+<div class="local" data-test="ex3" data-files="scripts/verify-points.sql scripts/undo-repair.ts">
+  <p>練習 3：寫核對查詢 <code>scripts/verify-points.sql</code> 與撤回腳本 <code>scripts/undo-repair.ts</code>。</p>
+  <ul>
+    <li><code>verify-points.sql</code>：一個 SQL 敘述（可以用 <code>WITH</code>、<code>UNION ALL</code>），每一張「還有重複點數沒扣回、而且應該扣回」的訂單回傳一列；不扣回的顧客不算問題。</li>
+    <li><code>npm run undo-repair -- --run-id &lt;名稱&gt;</code>：只移除這個 run 寫入的補償紀錄，<code>data_repair_runs</code> 的 status 改成 <code>undone</code>。找不到這個 run 時失敗（exit code 不是 0），什麼都不改。</li>
+    <li>判分：修復前回傳的列數等於需要扣回的訂單數；扣回一半時等於剩下的訂單數；全部扣回後 0 列。撤回 <code>v-a</code> 後，<code>point_entries</code> 的筆數與總和回到 <code>v-a</code> 執行前，另一次執行 <code>v-b</code> 的補償紀錄還在，核對查詢又找出那些訂單。判分直接用 SQL 模擬修復，不會執行你的練習 2；資料也會比快照多幾筆，不扣回的顧客要用查詢算出來，不能寫死。</li>
+  </ul>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：要修正兩週來重複發放的點數，最好的做法是？</p>
+  <label data-key="a">DELETE 重複的紀錄</label>
+  <label data-key="b">在顧客表存一個點數欄位，直接改成正確的數字</label>
+  <label data-key="c">為每一筆重複新增帶有 reversal_of 與 run_id 的補償紀錄</label>
+  <label data-key="d">在系統公告，請顧客自己回報多出來的點數</label>
+  <p class="why">✓ c。補償紀錄讓帳務能追溯（哪一筆被哪次修復扣回）、能撤回（移除那次 run 的紀錄）、重跑也不會重複（reversal_of 唯一）。a 和 b 點數會對，但紀錄消失了，會計對不上舊報表，出錯時也說不出原本是多少；b 還讓點數從此不等於紀錄的加總。d 把工程的問題丟給顧客，多數人不會回報。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 5：修復腳本跑到一半被中斷（部署重啟、網路斷線）。理想的設計是？</p>
+  <label data-key="a">全部放在一個交易，中斷就全部回滾，再從頭跑</label>
+  <label data-key="b">中斷後連進資料庫，手動刪掉寫到一半的資料再重跑</label>
+  <label data-key="c">從修復前的備份還原整個資料庫，再重跑</label>
+  <label data-key="d">分批、每批一個交易，進度跟著那一批提交，加上唯一約束；用同一個 run 再執行就從斷點接著做，不會重複</label>
+  <p class="why">✓ d。分批讓中斷只影響正在做的那一批（整批回滾），游標記住做到哪，唯一約束保證就算重做也不會多寫。a 的大交易會長時間握鎖、拖慢線上請求，失敗就前功盡棄；b 要人在壓力下手動判斷「哪些是寫到一半的」，很容易刪錯；c 還原會把修復期間顧客的新交易一起蓋掉。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：要替 orders 加一個新欄位並補齊舊資料，最後加上 NOT NULL。為什麼要先部署「寫入時同時填新欄位」的程式（雙寫），再回填舊資料？</p>
+  <label data-key="a">不然回填期間、以及回填完到雙寫上線之前的新訂單，新欄位還是 NULL，回填完就已經落後，NOT NULL 加不上去</label>
+  <label data-key="b">先部署雙寫，回填的 UPDATE 會跑得比較快</label>
+  <label data-key="c">PostgreSQL 規定有程式在寫入的欄位才能 UPDATE</label>
+  <label data-key="d">這樣就不用寫 migration 了</label>
+  <p class="why">✓ a。先雙寫，所有新資料都有值，回填只要處理固定的一批舊資料，做完就是完整的。反過來，回填和部署之間的空檔一直有新的 NULL 冒出來。b：速度跟順序無關；c：PostgreSQL 沒有這種規定；d：加欄位和 NOT NULL 仍然要 migration。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>直接在正式資料庫手打 UPDATE／DELETE</strong>：沒有試跑、沒有審核，少一個條件就是整張表。先在副本上跑腳本，試跑的數字給負責的人確認。</li>
+  <li><strong>用刪除或直接改值修正帳務資料</strong>：失去追溯和撤回的能力。新增補償紀錄，原始紀錄不動。</li>
+  <li><strong>只看「長得像」就當成重複</strong>：<code>manual</code> 跟 <code>order_paid</code> 金額一樣，卻不是重複。先看資料、跟負責的人確認規則。</li>
+  <li><strong>只算「有重複的訂單」</strong>：一張訂單三筆時會少扣一筆。要的是第二筆以後的每一筆（<code>row_number()</code>）。</li>
+  <li><strong>試跑會寫入資料</strong>：試跑只能讀；跟套用共用找資料的邏輯，只有套用會 INSERT。</li>
+  <li><strong>一個大交易處理所有資料</strong>：長時間握鎖、失敗就全部重來。分批、每批一個交易。</li>
+  <li><strong>重跑會重複修正</strong>：靠唯一約束（<code>reversal_of</code>）和「排除已處理的」查詢讓重跑冪等，不靠執行的人記得跑過沒有。</li>
+  <li><strong>游標和資料分開提交</strong>：中斷時兩者不一致。更新進度和寫入那一批放在同一個交易。</li>
+  <li><strong>核對查詢在修復前也回傳 0 列</strong>：它什麼都沒檢查到。先確認它在壞的資料上找得到問題。</li>
+  <li><strong>撤回刪掉所有修復紀錄</strong>：別次執行的也被刪掉。用 <code>run_id</code> 限定，找不到 run 要失敗。</li>
+  <li><strong>回填順序反了</strong>：先回填再雙寫會留下缺口，先加 NOT NULL 會失敗。加欄位 → 雙寫 → 分批回填 → 核對 → NOT NULL。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>修正正式資料前：先備份、在副本上找出問題並看清楚資料、用試跑算出影響（筆數、人數、金額）給負責的人審核。</li>
+  <li>帳務資料用補償紀錄修正：反向的一筆抵銷錯誤，<code>reversal_of</code> 指向原紀錄、<code>run_id</code> 記錄是哪次修復；原始紀錄不刪不改。</li>
+  <li>可續跑的修復：依 id 分批（keyset），每批一個交易，游標和那一批一起提交；唯一約束加上「排除已處理的」查詢，讓重跑不會重複。</li>
+  <li>做完用獨立的核對查詢確認（先確認它在修復前找得到問題），撤回只移除這一次 run 寫入的紀錄。</li>
+  <li>回填新欄位的順序：加可為 NULL 的欄位 → 部署雙寫 → 分批回填 → 核對 → 加 NOT NULL；每一步都假設上一版程式還在線上。</li>
+</ul>
+<p>下一課回到程式碼：CafePay 的 SDK 要停止支援 1.x，讀 changelog、處理破壞性變更，再用功能旗標分批切換到新版。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

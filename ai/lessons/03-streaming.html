@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>3. 串流：邊產生邊顯示、中斷與首字延遲</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="3" data-practice="ai">
+<header>
+  <div class="eyebrow">階段 1：LLM 基礎與第一個 API 呼叫 · 第 3 課</div>
+  <h1>串流：邊產生邊顯示、中斷與首字延遲</h1>
+</header>
+<main>
+
+<p>咖啡店的「問店員」視窗接好了第 2 課的 <code>ask()</code>，測試都過了。上線後顧客的回饋卻是「按了送出就沒反應，以為壞了」：問一個要解釋三種咖啡差別的問題，畫面要空白十幾秒，整段回答才一次跳出來。有人等不及關掉視窗，但後端還在等 Claude 把回答寫完，那些 token 照樣算錢。</p>
+<p>這一課改用<strong>串流（streaming）</strong>：模型產生一點就送一點，畫面邊收邊顯示。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>為什麼要串流：同一個回答，為什麼一次回傳讓顧客以為壞了，串流讓第一個字一兩秒就出現（開場問題的最小答案）。</li>
+  <li>串流長什麼樣、用 SDK 收串流：SSE 事件依什麼順序來，SDK 怎麼替你組回完整的回答。</li>
+  <li>量 TTFT：顧客等到第一個字要多久，怎麼量才不會量錯。</li>
+  <li>中斷、串流中途出錯：顧客關掉視窗時怎麼讓上游停下、不再花錢，回答到一半出錯時畫面怎麼處理。</li>
+  <li>資深視角：串流的代價：串流讓什麼事變難，上線後要記錄哪些指標。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="02-first-api-call.html">第 2 課</a>的回應：<code>content</code> 是 block 陣列，<code>usage</code> 記 token 數，<code>stop_reason</code> 說明回答能不能用。</li>
+  <li><a href="../../typescript/lessons/10-iterators-generators.html">TypeScript 課第 10 課</a>的 <code>for await</code>：一筆一筆讀非同步產生的資料，讀完一筆才拿下一筆。</li>
+  <li><a href="../../typescript/lessons/11-timeouts-cancellation.html">TypeScript 課第 11 課</a>的 <code>AbortController</code>：呼叫 <code>abort()</code> 時，它的 <code>signal</code> 會通知正在進行的工作停下。</li>
+  <li><a href="../../system-design/lessons/03-latency-percentiles.html">系統設計課第 3 課</a>的百分位數：p95 是 95% 的請求都不超過的延遲，延遲看分佈，不看平均。</li>
+</ul></div>
+
+<h2>為什麼要串流</h2>
+<p>模型是一次產生一個 token（<a href="01-what-is-llm.html">第 1 課</a>），所以回答本來就是一段一段「長」出來的。非串流的請求（第 2 課的 <code>messages.create</code>）要等全部產生完，API 才把整個 Message 一次回傳。同一個回答，兩種做法的總時間差不多，使用者的感受差很多：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>非串流</th><th>串流</th></tr>
+  <tr><td>畫面第一次出現文字</td><td>12 秒後（全部產生完）</td><td>約 1 秒後</td></tr>
+  <tr><td>全部顯示完</td><td>12 秒</td><td>12 秒</td></tr>
+  <tr><td>使用者看到的</td><td>空白、轉圈，不知道有沒有在動</td><td>文字一直在長，知道系統有在工作</td></tr>
+</table></div>
+<p>從送出請求到收到第一段文字的時間叫 <strong>TTFT（time to first token，首字延遲）</strong>。聊天介面最看重它：使用者能忍受一段長回答慢慢出現，很難忍受十秒的空白。</p>
+<p>第二個理由是逾時。一個很長的回答可能要產生好幾分鐘，一個 HTTP 回應這麼久沒有任何資料，中間的代理伺服器、負載平衡器常常會先把連線切掉。串流的連線一直有資料在流動，不會有這個問題。SDK 也替你擋了：用 SDK 1.3.0 實測，client 沒有自己設 <code>timeout</code> 時，非串流的 <code>messages.create</code> 只要 <code>max_tokens</code> 超過 21,333，還沒送出就丟出 <code>AnthropicError</code>：「Streaming is required for operations that may take longer than 10 minutes」。要更大的 <code>max_tokens</code>（最多 128K）就要用串流。</p>
+<div class="callout practice"><strong>💡 實務上：串流是給「有人在等著看」的畫面用的</strong><br>不是每個地方都要串流。從顧客訊息擷取訂單（第 5 課）、背景批次處理，要的是完整、驗證過的結果，沒有人在看文字一個字一個字出現，用 <code>messages.create</code> 比較簡單；<code>max_tokens</code> 很大時，用下面的 <code>stream()</code> 加 <code>finalMessage()</code> 一樣能拿到完整的 Message。決定前先問一句：這段文字會不會即時出現在某個人眼前？咖啡店的「問店員」視窗會，夜間把評論分類的排程不會。</div>
+
+<h2>串流長什麼樣：SSE 事件</h2>
+<p>請求多帶一個 <code>stream: true</code>，API 就改用 <strong>SSE（Server-Sent Events）</strong>回應：HTTP 回應保持連線，用文字一段一段送出事件，每個事件是一行 <code>event:</code> 加一行 <code>data:</code>（JSON），中間空一行。<a href="../../system-design/lessons/17-realtime-push.html">系統設計課第 17 課</a>是伺服器「送」SSE 給瀏覽器；這裡你的後端是「收」SSE 的那一方，第 15 課再把它轉送給前端。問「拿鐵多少錢？」，原始的回應大概是這樣（省略部分欄位）：</p>
+<pre>event: message_start
+data: {"type":"message_start","message":{"id":"msg_01…","role":"assistant","content":[],"stop_reason":null,"usage":{"input_tokens":41,"output_tokens":1,…}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"EqQB…"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
+
+event: ping
+data: {"type":"ping"}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"拿鐵一杯"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":" 110 元。"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn",…},"usage":{"output_tokens":186,…}}
+
+event: message_stop
+data: {"type":"message_stop"}</pre>
+<figure>
+  <svg viewBox="0 0 700 230" role="img" aria-label="串流事件的順序：message_start，接著每個 content block 有 start、delta、stop，然後 message_delta 與 message_stop；TTFT 算到第一個 text delta">
+    <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="var(--muted)"/></marker></defs>
+    <line x1="20" y1="120" x2="680" y2="120" class="d-line" marker-end="url(#ar)"/>
+    <text x="640" y="145" class="d-small">時間</text>
+    <rect x="20" y="80" width="100" height="30" rx="4" class="d-box"/><text x="70" y="100" text-anchor="middle" class="d-small">message_start</text>
+    <rect x="130" y="80" width="170" height="30" rx="4" class="d-soft"/><text x="215" y="100" text-anchor="middle" class="d-small">thinking block（看不到字）</text>
+    <rect x="310" y="80" width="230" height="30" rx="4" class="d-box"/><text x="425" y="100" text-anchor="middle" class="d-small">text block：text_delta × N</text>
+    <rect x="550" y="80" width="120" height="30" rx="4" class="d-soft"/><text x="610" y="100" text-anchor="middle" class="d-small">message_delta／stop</text>
+    <line x1="20" y1="45" x2="315" y2="45" class="d-line" marker-end="url(#ar)"/>
+    <text x="20" y="35" class="d-accent">TTFT：送出請求 → 第一個 text_delta</text>
+    <text x="20" y="175" class="d-small">usage.input_tokens 在 message_start 就有；output_tokens 最終值在 message_delta</text>
+    <text x="20" y="200" class="d-small">stop_reason 在 message_delta 才知道（message_start 裡是 null）</text>
+  </svg>
+  <figcaption>事件的順序。thinking 和 text 是不同的 block，用 index 區分。</figcaption>
+</figure>
+<div class="table-wrap"><table>
+  <tr><th>事件</th><th>內容</th></tr>
+  <tr><td><code>message_start</code></td><td>一個 <code>content</code> 是空陣列的 Message：id、model、輸入 token 數。<code>stop_reason</code> 是 <code>null</code>，<code>output_tokens</code> 只是開頭的數字。</td></tr>
+  <tr><td><code>content_block_start</code></td><td>一個 block 開始，<code>index</code> 就是它在最後 <code>content</code> 陣列的位置。Opus 5.5 第一個 block 通常是 thinking。</td></tr>
+  <tr><td><code>content_block_delta</code></td><td>block 的一小段新內容。<code>text_delta</code> 是要顯示的文字（叫 <strong>text delta</strong>）；thinking block 是 <code>thinking_delta</code>、<code>signature_delta</code>，不是給使用者看的。</td></tr>
+  <tr><td><code>content_block_stop</code></td><td>這個 block 結束。</td></tr>
+  <tr><td><code>message_delta</code></td><td>整個 Message 的最後變化：<code>stop_reason</code> 和 <code>usage</code>。官方文件提醒這裡的 token 數是<strong>累計值</strong>，不是增加的量。</td></tr>
+  <tr><td><code>message_stop</code></td><td>串流結束。</td></tr>
+  <tr><td><code>ping</code></td><td>沒有內容，讓連線保持活著，可能出現在任何位置，可以忽略。</td></tr>
+  <tr><td><code>error</code></td><td>串流途中出錯，例如 <code>overloaded_error</code>。後面會專門處理。</td></tr>
+</table></div>
+<p>Opus 5.5 的思考內容預設不顯示（第 2 課），所以 thinking block 只有一個 <code>signature_delta</code>，沒有文字。設 <code>thinking: { type: 'adaptive', display: 'summarized' }</code> 時才會出現 <code>thinking_delta</code> 的摘要文字，這一課不需要。官方文件也說之後可能新增事件類型，程式要能忽略不認得的事件。</p>
+<p>這些事件可以自己解析，但不需要：SDK 已經把切行、解析 JSON、把 delta 累積成完整 Message 都做好了。</p>
+
+<h2>用 SDK 收串流</h2>
+<p>把 <code>messages.create</code> 換成 <code>messages.stream</code>，參數一樣，SDK 會自動加上 <code>stream: true</code>：</p>
+<pre>const stream = client.messages.stream({
+  model: 'claude-opus-5-5',
+  max_tokens: 16000,
+  messages: [{ role: 'user', content: '拿鐵和卡布奇諾差在哪？' }],
+})
+
+stream.on('text', delta =&gt; {
+  process.stdout.write(delta)        // 每收到一段 text delta 就呼叫一次；thinking 不會進來
+})
+
+const message = await stream.finalMessage()   // 等串流結束，拿到跟 create 一樣的完整 Message
+console.log(message.stop_reason, message.usage.output_tokens)</pre>
+<p><code>stream()</code> 不用 <code>await</code>：它立刻回傳一個 <code>MessageStream</code> 物件，請求在背景送出。在同一段同步程式裡掛上 <code>.on('text', …)</code> 就不會漏掉任何事件。<code>finalMessage()</code> 回傳的 Message 跟第 2 課 <code>create</code> 的一樣：<code>content</code> 有 thinking 和 text block、<code>stop_reason</code>、最終的 <code>usage</code>，所以第 2 課的 <code>readAnswer</code> 那套檢查可以照用。</p>
+<p>常用的事件：</p>
+<div class="table-wrap"><table>
+  <tr><th>寫法</th><th>什麼時候呼叫</th></tr>
+  <tr><td><code>stream.on('text', (delta, snapshot) =&gt; …)</code></td><td>每個 text delta；<code>snapshot</code> 是這個 text block 到目前為止的全文</td></tr>
+  <tr><td><code>stream.on('streamEvent', (event, snapshot) =&gt; …)</code></td><td>每個原始事件（上一節那張表），<code>snapshot</code> 是累積中的 Message</td></tr>
+  <tr><td><code>await stream.finalMessage()</code></td><td>串流正常結束時回傳完整 Message；出錯或被中斷時 reject</td></tr>
+  <tr><td><code>stream.abort()</code></td><td>中斷這個串流（下面會講）</td></tr>
+</table></div>
+<p>也可以用 <code>for await</code> 一個一個讀原始事件，適合要依事件類型做不同處理的時候：</p>
+<pre>for await (const event of stream) {
+  if (event.type === 'content_block_delta' &amp;&amp; event.delta.type === 'text_delta') {
+    send(event.delta.text)
+  }
+}</pre>
+<p>兩個要避開的寫法：</p>
+<ul>
+  <li><strong>自己把 <code>.on()</code> 包成 <code>new Promise</code>、自己接字串組回答</strong>：要處理 end、error、abort 三種結束方式，很容易漏一種讓 Promise 永遠不 resolve。要完整結果就 <code>await stream.finalMessage()</code>，它已經處理好這些情況。</li>
+  <li><strong>用 <code>stream.finalText()</code> 拿文字</strong>：看 SDK 1.3.0 的原始碼，它把多個 text block 用<strong>空白</strong>接起來（<code>join(' ')</code>），一個 text 都沒有時還會丟錯。中文回答中間會多出空格。跟第 2 課一樣，自己從 <code>finalMessage()</code> 過濾 <code>type === 'text'</code> 再 <code>join('')</code>。</li>
+</ul>
+
+<h2>量 TTFT</h2>
+<p>TTFT 要算到<strong>第一個 text delta</strong>，因為那是使用者第一次看到字的時候。容易量錯的兩個點：</p>
+<ul>
+  <li><code>message_start</code>：請求一被接受就送來，通常很快，可是畫面上什麼都沒有。</li>
+  <li>thinking block 開始：Opus 5.5 一定會先思考，思考期間一樣沒有可以顯示的文字。</li>
+</ul>
+<p>所以 Opus 5.5 的 TTFT 包含思考的時間。想縮短它，可以把 <code>output_config: { effort: 'low' }</code>（SDK 1.3.0 的值有 <code>low</code>、<code>medium</code>、<code>high</code>、<code>xhigh</code>、<code>max</code>，Opus 5.5 預設 <code>medium</code>）用在簡單的問答上：思考少，第一個字來得早，也比較便宜，代價是困難的問題答得比較草率。也可以換成比較快的模型（第 13 課）。</p>
+<p>計時用參數傳進來的 <code>now()</code>，不要在函式裡直接呼叫 <code>Date.now()</code>，測試才能用假的時鐘得到固定的結果：</p>
+<pre>const start = now()
+let ttftMs: number | null = null
+const stream = client.messages.stream(params)
+stream.on('text', () =&gt; { ttftMs ??= now() - start })   // ??= 只在第一次（還是 null 時）賦值
+const message = await stream.finalMessage()
+const totalMs = now() - start</pre>
+<p>正式環境用 <code>performance.now()</code>：它不受系統時間校正影響，適合量經過的時間。整個回應都沒有文字（例如模型拒答，或第 6 課的只呼叫工具）時，TTFT 不存在，記成 <code>null</code>，不要用總時間代替，否則統計會被扭曲。</p>
+<p>TTFT 跟其他延遲一樣要看分佈，不是平均（系統設計課第 3 課）：p50 是 0.8 秒、p95 是 6 秒，代表每 20 個顧客就有一個要等 6 秒以上才看到字。第 15 課會把每個請求的 TTFT、總時間、token 數記進 log。</p>
+
+<div class="callout practice"><strong>💡 實務上：顧客說「助理好慢」，先分清楚是哪一種慢</strong><br>客服或 PM 轉來「好慢」的回報時，先看 TTFT 和總時間哪一個變長。TTFT 長是「按下送出後一直空白」，常見原因是思考太多（effort 太高）、prompt 太長或 API 那端排隊；總時間長但 TTFT 正常，是回答太長，該在 prompt 要求精簡。兩者的修法完全不同，所以 log 要分開記，不能只記一個「延遲」。</div>
+
+<h2>中斷：使用者走了就停</h2>
+<p>使用者關掉視窗或按了「停止」，你的後端如果繼續讀，模型就會一路產生到結束，這些 token 照樣算錢，連線也一直占著。API 不知道你的前端已經斷線，要由你的程式把請求中斷。</p>
+<p><strong>AbortSignal</strong> 是 JavaScript 標準的取消訊號（TypeScript 課第 11 課）：<code>AbortController</code> 呼叫 <code>abort()</code> 時，它的 <code>signal</code> 會觸發。把 signal 放在 <code>stream()</code> 的<strong>第二個參數</strong>（請求選項），SDK 會在它觸發時關掉連線：</p>
+<pre>const stream = client.messages.stream(params, { signal })   // 第一個參數是 API 的內容，第二個是這次請求的選項
+stream.on('text', delta =&gt; { partial += delta; onDelta(delta) })
+try {
+  await stream.finalMessage()
+  return { status: 'done', partial }
+} catch (err) {
+  if (err instanceof Anthropic.APIUserAbortError) return { status: 'aborted', partial }
+  throw err      // 其他錯誤不是使用者造成的，照樣往外丟
+}</pre>
+<ul>
+  <li>中斷後 <code>finalMessage()</code> 會丟出 <code>APIUserAbortError</code>（SDK 1.3.0 實測）。這是預期中的結束方式，不是錯誤，接住它，回傳「已中斷」和中斷前收到的文字。</li>
+  <li>只接 <code>APIUserAbortError</code>。用空的 <code>catch {}</code> 把所有錯誤都當成「使用者中斷」，API 過載、key 失效都會被藏起來。</li>
+  <li>手上有 stream 物件時，也可以直接呼叫 <code>stream.abort()</code>，效果一樣。用 signal 的好處是同一個 signal 可以一路往下傳：Express 或 NestJS 收到前端斷線時觸發它，資料庫查詢、API 呼叫一起停（第 15 課實作）。</li>
+  <li>中斷前產生的部分沒有完成，不要存成正式的對話紀錄。要保留就明確標示「已中斷」。</li>
+</ul>
+<div class="callout warn"><strong>signal 要傳給 SDK，只在自己的程式裡檢查是沒用的。</strong>常見的錯法是 <code>if (signal.aborted) return</code> 寫在讀取之後：程式不再處理新的文字，但連線沒關，模型繼續產生、繼續算錢。檢查方法：中斷後，SDK 送出的請求所帶的 signal 也要是 aborted（練習 2 的測試就是這樣檢查的）。</div>
+
+<div class="callout practice"><strong>💡 實務上：「停止」按鈕要真的讓上游停下來</strong><br>聊天介面幾乎都有「停止」按鈕，前端工程師很容易只做到「畫面不再更新」。整條線要一路斷到底：前端用 <code>AbortController</code> 取消 <code>fetch</code>，後端偵測到連線關掉就觸發 signal，SDK 再關掉跟 API 的連線。上線前在「問店員」視窗按一次停止，再去後端 log 確認這次請求記成「已中斷」，而不是一路跑到完成。code review 看到串流的 API 沒有接收 signal，就要問：使用者走了之後，這個請求停得下來嗎？</div>
+
+<h2>串流中途出錯</h2>
+<p>非串流的請求，出錯時直接是 HTTP 錯誤，例如 529 <code>overloaded_error</code>（API 暫時過載）。串流多了一種情況：HTTP 已經回 200、文字已經送出幾段了，接著才收到一個 <code>error</code> 事件：</p>
+<pre>event: error
+data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}</pre>
+<p>用 SDK 1.3.0 實測：收到 error 事件時，<code>finalMessage()</code> 和 <code>for await</code> 都會丟出 <code>Anthropic.APIError</code>，<code>err.type</code> 是 <code>'overloaded_error'</code>，<code>err.status</code> 是 <code>undefined</code>（因為 HTTP 狀態碼是 200，錯誤是後來才來的）。一開始就 529 的話，丟出的是 <code>InternalServerError</code>（<code>APIError</code> 的子類別），<code>status</code> 529、<code>type</code> 一樣是 <code>'overloaded_error'</code>。所以兩種情況都用 <code>err instanceof Anthropic.APIError</code> 接住、讀 <code>err.type</code>，不要比對錯誤訊息字串。</p>
+<p>這時候畫面上已經有半截回答了。處理原則：</p>
+<ul>
+  <li><strong>不能當成功</strong>：半截的退款規則可能剛好少了「需持收據」這個條件。回傳明確的失敗，帶著已收到的文字和錯誤類型，讓介面顯示「回答中斷了」和重試按鈕。</li>
+  <li><strong>不要存成正式紀錄</strong>：不能把它當成 assistant 的回答放進對話歷史（第 2 課的 <code>Conversation</code> 只在成功時加入歷史）。</li>
+  <li><strong>已經顯示的收不回來</strong>：所以不要偷偷從頭重試再接在後面，使用者會看到兩段開頭不一樣的回答。</li>
+</ul>
+<div class="callout">SDK 的自動重試（<code>maxRetries</code> 預設 2，第 2 課）只對「還沒開始串流」的錯誤有效，例如一開始就 429、529、連線失敗。串流開始之後才收到的 error 事件，SDK 不會替你重試，因為它也收不回已經給你的文字。這就是資深的取捨：<strong>重試只在第一個字之前做</strong>；第一個字之後出錯，交給使用者決定。想接著寫下去，官方文件建議 Claude 4.6 之後的模型把已收到的文字放進一則新的 user 訊息、請模型從斷掉的地方繼續，但思考與工具呼叫的 block 沒辦法接續，多數客服情境直接讓使用者重問比較單純。</div>
+
+<h2>資深視角：串流的代價</h2>
+<ul>
+  <li><strong>串流讓驗證變晚</strong>：文字邊產生邊送給使用者，你沒有機會在顯示前檢查整段內容。第 5 課的結構化輸出要完整結果才能驗證，通常不串流；第 12 課的輸出過濾也要考慮「已經送出去的收不回來」。</li>
+  <li><strong>stop_reason 還是要看</strong>：串流結束時 <code>finalMessage().stop_reason</code> 如果是 <code>max_tokens</code> 或 <code>refusal</code>，畫面上的文字一樣不完整，要補一個提示，不能只靠「串流沒出錯」。</li>
+  <li><strong>連線占得更久</strong>：一個串流可能開好幾十秒，伺服器同時開著的連線數變多。設好 client 的 <code>timeout</code>（第 2 課），使用者離開就中斷，第 14 課再加上限流。</li>
+  <li><strong>要記錄的指標</strong>：TTFT、總時間、輸出 token 數、結束方式（完成、中斷、中途出錯）。中斷率突然上升，常代表 TTFT 變長了，使用者等不下去。</li>
+</ul>
+
+<h2>練習</h2>
+<p>在 learn 資料夾執行 <code>node check.mjs ai 03</code>，會建立 <code>ai/practice/work/03/</code>。四題各自獨立，可以照任何順序做。測試用假的 fetch 回放事先寫好的 SSE 事件：fixture 會在事件之間停住，檢查你是不是真的邊收邊處理，也會插入 thinking block、error 事件、時間點。做完後如果有 API key，可以在 <code>ai/practice</code> 執行 <code>node --env-file-if-exists=.env work/03/live.ts</code>，看真實模型的 TTFT 和中斷效果。</p>
+
+<div class="local" data-test="ex1" data-files="ex1.ts">
+  <p>練習 1：完成 <code>streamAnswer(client, question, onDelta)</code>：用 <code>client.messages.stream</code> 送出一則 user 訊息（<code>max_tokens</code> 16000），每收到一段 text delta 就依序呼叫 <code>onDelta</code>，不能等串流結束才一次呼叫，也不能把 thinking 的內容送進去。結束後回傳 <code>{ text, usage }</code>：<code>text</code> 是所有 text block 直接接起來的文字（回答可能有兩個 text block），<code>usage</code> 是最終的 usage（<code>output_tokens</code> 要是 message_delta 帶來的值）。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="ex2.ts">
+  <p>練習 2：完成 <code>streamWithAbort(client, question, signal, onDelta)</code>。跟練習 1 一樣串流並呼叫 <code>onDelta</code>；<code>signal</code> 觸發時上游請求要跟著中斷，回傳 <code>{ status: 'aborted', partial }</code>（中斷前收到的文字），不丟錯；正常結束回傳 <code>{ status: 'done', partial: 完整文字 }</code>；不是中斷造成的錯誤（例如 HTTP 529）要照樣往外丟。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="ex3.ts">
+  <p>練習 3：完成 <code>safeStream(client, question, onDelta)</code>。正常結束回傳 <code>{ ok: true, text }</code>；任何 API 錯誤，不論是一開始的 HTTP 529 還是串流中途的 error 事件，都回傳 <code>{ ok: false, partial, errorType }</code>：<code>partial</code> 是出錯前收到的所有文字，<code>errorType</code> 是錯誤物件的 <code>type</code>（例如 <code>'overloaded_error'</code>）。只把 <code>Anthropic.APIError</code> 轉成失敗結果，其他例外（例如 <code>onDelta</code> 自己出錯）照樣往外丟。不要自己重試。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="ex4.ts">
+  <p>練習 4：完成 <code>measure(client, question, now)</code>，回傳 <code>{ ttftMs, totalMs, outputTokens }</code>。時間一律用參數 <code>now()</code>，起點是送出請求前；<code>ttftMs</code> 算到第一個 text delta（不是 message_start，也不是 thinking 開始），整個回應沒有文字時是 <code>null</code>；<code>totalMs</code> 算到 <code>finalMessage()</code> 完成；<code>outputTokens</code> 用最終的 usage。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：使用者在回答產生到一半時關掉了聊天視窗，你的後端沒有中斷對 Claude 的請求。後果是？</p>
+  <label data-key="a">沒關係，API 會自動偵測到前端斷線並停止</label>
+  <label data-key="b">模型繼續產生到結束，這些 token 照樣計費，連線也一直被占著</label>
+  <label data-key="c">沒有人讀的部分不計費</label>
+  <label data-key="d">API 會回 499 錯誤</label>
+  <p class="why">✓ API 只知道你的後端還連著，不知道你的前端已經斷線，所以 a、d 都不會發生；產生出來的 token 都算在 usage 裡，跟有沒有人看無關（c 錯）。要把前端的斷線轉成 AbortSignal 傳給 SDK，上游連線才會關掉（第 15 課實作）。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：串流已經送出 200 個字給顧客，然後收到 <code>overloaded_error</code>。最合理的處理是？</p>
+  <label data-key="a">自動從頭重試，把新的回答接在後面</label>
+  <label data-key="b">告訴顧客回答中斷了、提供重試按鈕；不把半截內容當正式紀錄</label>
+  <label data-key="c">當作沒發生，直接結束</label>
+  <label data-key="d">換成非串流再送一次，不提示就把畫面覆蓋掉</label>
+  <p class="why">✓ 串流開始後已經顯示的內容收不回來。a 會讓顧客看到兩段開頭不一樣的回答；c 讓半截內容（可能少了重要條件）被當成完整答案；d 讓畫面上的字突然被換掉，顧客不知道發生什麼事。自動重試只在第一個字之前做，之後交給使用者決定。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 7：Opus 5.5 的串流，TTFT 應該從哪裡算到哪裡？</p>
+  <label data-key="a">送出請求到收到 HTTP 200</label>
+  <label data-key="b">送出請求到 <code>message_start</code> 事件</label>
+  <label data-key="c">送出請求到第一個 text delta</label>
+  <label data-key="d">送出請求到 <code>message_stop</code></label>
+  <p class="why">✓ 使用者感受到的是第一個看得到的字。HTTP 200 和 <code>message_start</code> 很早就到，之後還有一段思考時間沒有任何可顯示的文字，用它們會讓 TTFT 看起來比實際好很多；<code>message_stop</code> 是總時間，不是首字延遲。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>等 <code>finalMessage()</code> 才把文字送出去</strong>：用了串流卻沒有邊收邊顯示，TTFT 跟非串流一樣。在 <code>on('text')</code> 裡處理每一段。</li>
+  <li><strong>把 SDK 的事件包成 <code>new Promise</code> 自己組文字</strong>：容易漏掉 error 或 abort，Promise 永遠不結束。要完整結果用 <code>finalMessage()</code>。</li>
+  <li><strong>用 <code>finalText()</code></strong>：多個 text block 之間會被加上空白。從 <code>finalMessage()</code> 過濾 text block 再 <code>join('')</code>。</li>
+  <li><strong>usage 讀 <code>message_start</code> 的</strong>：那時 <code>output_tokens</code> 還只是開頭的數字，費用會算錯。用 <code>finalMessage().usage</code>。</li>
+  <li><strong>前端斷線沒有中斷上游</strong>：白白付錢。把 signal 傳給 <code>stream()</code> 的第二個參數。</li>
+  <li><strong>用空的 catch 吞掉所有錯誤</strong>：API 錯誤被當成「使用者中斷」藏起來。只接 <code>APIUserAbortError</code>。</li>
+  <li><strong>串流途中出錯還把半截內容存成正式回答</strong>：回傳明確的失敗，不寫進對話歷史。</li>
+  <li><strong>TTFT 量到 message_start 或 thinking</strong>：要量到第一個 text delta；沒有文字時記 <code>null</code>。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>串流讓第一個字在一兩秒內出現；TTFT 是送出請求到第一個 text delta 的時間，要看 p95。SDK 1.3.0 在 <code>max_tokens</code> 很大（超過 21,333）又沒設 timeout 時，要求改用串流。</li>
+  <li>Claude 的串流是 SSE：<code>message_start</code> → 每個 block 的 <code>content_block_start／delta／stop</code> → <code>message_delta</code>（stop_reason、累計的 usage）→ <code>message_stop</code>，中間可能有 <code>ping</code> 和 <code>error</code>。thinking 和 text 是不同的 block。</li>
+  <li>SDK：<code>client.messages.stream(params, { signal })</code>，<code>on('text')</code> 邊收邊處理，<code>await finalMessage()</code> 拿完整 Message；文字自己過濾 text block 再接。</li>
+  <li>使用者離開時用 AbortSignal 中斷上游，接住 <code>APIUserAbortError</code>，其他錯誤照樣往外丟。</li>
+  <li>串流中途的 error 事件會變成 <code>APIError</code>（<code>type</code> 有值、<code>status</code> 是 undefined）；回傳明確的失敗與已收到的文字，不當成功、不存成紀錄。</li>
+  <li>已經送出的文字收不回來：自動重試只在第一個字之前做。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 8 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 8：「問店員」上線後，同一位顧客聊到第 20 輪時，每次請求的費用是第 1 輪的好幾倍，回答長度卻差不多。為什麼？</p>
+  <label data-key="a">API 在伺服器端保存對話，聊得越久，保存的費用越高</label>
+  <label data-key="b">對話變長時，API 會自動改用比較貴的模型維持品質</label>
+  <label data-key="c">每一輪都把前面的整段歷史當輸入重送，輸入一輪比一輪多</label>
+  <p class="why">✓ API 無狀態，記憶是你的程式每次重送的歷史：第 20 輪會把前 19 輪全部再送一次。估費用要算進去；太長就修剪最舊的問答，或開新對話。a 錯在 API 根本不保存對話，貴的是重送的輸入 token。（第 1、2 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 9：「問店員」很肯定地回答「我們有抹茶拿鐵，95 元」，但菜單上從來沒有這個品項。這是怎麼發生的？</p>
+  <label data-key="a">知識截止日的問題：換訓練資料比較新的模型，就不會再編出品項</label>
+  <label data-key="b">模型依機率接出「像菜單回答」的 token，接得順不代表是真的</label>
+  <label data-key="c">模型查菜單時連到了別家咖啡店的資料，把兩家搞混了</label>
+  <p class="why">✓ 模型不查資料庫，它產生的是機率上合理的文字，所以講錯時語氣一樣肯定。修法是把這家店真正的菜單放進這次請求、要求附上來源，並用 eval 持續量錯誤率。a 錯在新模型一樣會幻覺，而且它從來就不知道你店裡的菜單，這些資料要由你的程式放進請求。（第 1 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 10：顧客在 LINE 傳「兩杯熱拿鐵、一杯美式少冰」，要回覆總金額。哪種分工最合適？</p>
+  <label data-key="a">模型把訊息轉成品項與數量，程式查資料庫的價格算總額</label>
+  <label data-key="b">把價目表放進 system，請模型算好總額直接回覆顧客</label>
+  <label data-key="c">換最強的模型，要求它一步步列出算式再給出總額</label>
+  <p class="why">✓ 金額有明確規則、答案只有一個，錯了代價高又不容易被發現，交給程式；模型負責看懂亂七八糟的自然語言。c 錯在列出算式只讓答案看起來可信，數字仍是取樣產生的，不保證每次都對。（第 1 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 11：一位常客跟「問店員」聊了很久，之後的回答開始停在句子中間，log 裡沒有任何錯誤。先查什麼？</p>
+  <label data-key="a">API 是不是過載了：等一下再用同樣的請求重送</label>
+  <label data-key="b">模型是不是抽到結束的 token 提早說完：多送幾次就會完整</label>
+  <label data-key="c">這次的停止原因和輸入 token 數：歷史越長，留給回答的空間越少</label>
+  <label data-key="d">輸入是不是超過了 context window：SDK 把那個錯誤吞掉了</label>
+  <p class="why">✓ context window 包含輸入和輸出，歷史塞滿後請求照樣被接受，產生到上限就被切斷，停止原因會寫明是截斷。修法是修剪最舊的一問一答（這次的問題一定留），程式也要先看停止原因，截斷就不當成功。d 錯在輸入本身超過會直接被拒絕、一個字都不產生，不會有半截回答。（第 1、2 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 12：多輪對話的 <code>send()</code> 這樣寫。哪裡會出事？</p>
+<pre>async send(text) {
+  this.history.push({ role: 'user', content: text })
+  const res = await client.messages.create({ model, max_tokens, system, messages: this.history })
+  const answer = readAnswer(res)   // 截斷或拒答時丟錯
+  this.history.push({ role: 'assistant', content: res.content })
+  return answer
+}</pre>
+  <label data-key="a">assistant 存了完整的 content，應該只存文字，下一次請求才不會出錯</label>
+  <label data-key="b">每次都送整段歷史太浪費，只送這一句就好，模型會記得前面聊過什麼</label>
+  <label data-key="c">readAnswer 丟錯時沒有存 assistant，模型下一輪會忘記自己說到哪裡</label>
+  <label data-key="d">失敗時剛加的 user 沒有拿掉，下一次請求會出現兩則連續的 user</label>
+  <p class="why">✓ API 錯誤、截斷、拒答都會丟錯，剛加的 user 卻留在歷史裡；下一次 API 不報錯，把兩則併成同一輪，模型看到一個沒被回答的舊問題，可能答非所問。修法是失敗時拿掉最後一則 user，或成功後才一起加。a 錯在完整的 content 本來就該原樣送回，thinking 和之後的工具呼叫都靠它。（第 2 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 13：顧客按了「停止」之後，前端確實不再收到文字。這段後端程式哪裡會出事？</p>
+<pre>const stream = client.messages.stream(params)
+stream.on('text', delta =&gt; {
+  if (!signal.aborted) onDelta(delta)   // 按了停止就不再推給前端
+})
+await stream.finalMessage()</pre>
+  <label data-key="a">中斷時 finalMessage() 會丟出中斷錯誤，這裡沒接住，伺服器會崩潰</label>
+  <label data-key="b">signal 沒交給 SDK，連線沒關，模型繼續產生、照樣算錢</label>
+  <label data-key="c">沒推給前端的文字不計費，只是連線會一直占著直到逾時</label>
+  <p class="why">✓ 只在自己的程式裡檢查，畫面停了，上游還在跑；API 不知道你的前端已經走了。把 signal 傳進 <code>stream()</code> 的請求選項，SDK 才會關掉跟 API 的連線，再只接住使用者中斷的那一種錯誤。a 錯在 signal 根本沒交給 SDK，這裡不會有中斷錯誤，請求會一路跑到完成。（第 3 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 14：同事要替「問店員」的串流加上「出錯自動重試」。重試的界線該放在哪裡？</p>
+  <label data-key="a">任何錯誤都重試：過載是暫時的，重送一次通常就成功</label>
+  <label data-key="b">只重試第一個字之後的錯誤，之前的錯誤直接回報顧客</label>
+  <label data-key="c">第一個字之前才自動重試，之後出錯就回報失敗讓顧客決定</label>
+  <p class="why">✓ 已經顯示的文字收不回來，從頭重送會讓顧客看到兩段開頭不一樣的回答。第一個字之後出錯，回傳明確的失敗和已收到的文字，顯示「回答中斷了」和重試按鈕，半截內容不存成正式紀錄。a 錯在問題不是重送會不會成功，而是前面那一段已經送出去了。（第 3 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 15：客服轉來「助理變慢了」。log 裡首字延遲（TTFT）和平常一樣，總時間卻長了很多。先往哪個方向修？</p>
+  <label data-key="a">回答變長了：在 prompt 裡要求回答精簡</label>
+  <label data-key="b">模型想太多了：調低這類問題的思考強度</label>
+  <label data-key="c">API 那端在排隊：加上更多次的自動重試</label>
+  <label data-key="d">prompt 太長了：修剪更多舊的對話歷史</label>
+  <p class="why">✓ TTFT 已經包含排隊、讀 prompt 和思考的時間，它正常代表這些都沒變；多出來的時間花在產生文字，就是回答太長。b 錯在思考發生在第一個字之前，想太多會先讓 TTFT 變長。所以 TTFT 和總時間要分開記。（第 3 課）</p>
+</div>
+<p>這個階段的重點整理成<a href="../sheets/stage-1.html">一頁圖解</a>。</p>
+<p>下一課回到 prompt 本身：怎麼寫 system prompt、把資料和指令分開、給範例和指定輸出格式，讓回答更穩定。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

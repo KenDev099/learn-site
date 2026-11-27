@@ -1,0 +1,4 @@
+-- 錯誤：圖方便直接給 ALL
+GRANT ALL ON SCHEMA public TO cafe_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE cafe_migrator IN SCHEMA public GRANT ALL ON TABLES TO cafe_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE cafe_migrator IN SCHEMA public GRANT ALL ON SEQUENCES TO cafe_app;

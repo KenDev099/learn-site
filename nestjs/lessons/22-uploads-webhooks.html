@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>22. 檔案上傳與 webhook</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="22" data-practice="nestjs">
+<header>
+  <div class="eyebrow">階段 4：快取、背景工作與外部整合 · 第 22 課</div>
+  <h1>檔案上傳與 webhook</h1>
+</header>
+<main>
+<p>咖啡店下週要開放線上點餐，上線前資安同事看過程式，退回了兩支 API。第一支是 <code>POST /products/:id/image</code>，店長用它替商品上傳照片：它什麼檔案都收，而且直接用使用者給的檔名存檔，資安同事傳了一個取名 <code>photo.png</code> 的 shell script，伺服器照單全收。第二支是 <code>POST /webhooks/payments</code>，客人付款成功後，金流公司會呼叫它通知我們：資安同事自己用 curl 送了一筆 <code>{ data: { orderId: 1 } }</code>，訂單就變成已付款了；同一個通知送三次，付款流程也跑了三次。</p>
+<p>這兩支 API 看起來不相關，被退回的原因卻是同一個。到目前為止，咖啡店 API 收到的都是我們自己的 Vue 前台送來的 JSON，欄位長什麼樣子由我們決定。這兩支不一樣：檔案的名稱、類型、大小全由上傳的人決定；webhook 的請求根本不是我們的前台送的，任何知道網址的人都能送。請求跨過了<strong>信任邊界</strong>：邊界外面送進來的東西，每一個欄位都可能是假的，伺服器要自己確認。這一課把這兩支 API 修到能上線，修完之後，你遇到任何「外面送進來的東西」，都知道該問哪幾個問題。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>店長按下「上傳照片」，請求裡裝了什麼、Nest 怎麼把它變成一個檔案物件：哪些欄位是客戶端說了算的。</li>
+  <li>有人傳 500MB 上來要在哪裡擋、取名 <code>photo.png</code> 的文字檔怎麼認出來：大小在 multer 擋，類型看檔頭。</li>
+  <li>存檔時為什麼不能用使用者給的檔名：路徑穿越、撞名、副檔名欺騙一次解決。</li>
+  <li>客人付完款我們怎麼知道、怎麼確認通知真的是金流公司送的：webhook 與 HMAC 簽章。</li>
+  <li>同一個付款通知到了三次，怎麼只處理一次：用唯一約束做冪等。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="06-middleware-guards.html">第 6 課</a>的 guard 與 <code>timingSafeEqual</code>：guard 在 controller 之前決定請求能不能進來；比對密鑰用固定時間比較，回應時間才不會洩漏猜對了幾個字。</li>
+  <li><a href="../../auth/lessons/02-crypto-toolbox.html">認證課第 2 課</a>的 HMAC：用雙方共有的密鑰對內容算出一段簽章，內容被改過或沒有密鑰，就算不出相同的簽章。</li>
+  <li><a href="../../node/lessons/11-buffer-encoding.html">Node 課第 11 課</a>的 Buffer：Node 裡裝原始位元組的容器，檔案內容和 HTTP body 未解析前都是 Buffer。</li>
+  <li><a href="15-transactions-concurrency.html">第 15 課</a>的互動式交易與條件更新：交易裡的寫入一起 commit 或一起回滾；把判斷寫進 <code>updateMany</code> 的 <code>where</code>，看 <code>count</code> 知道有沒有改到。</li>
+</ul></div>
+
+<h2>店長按下「上傳照片」，請求裡裝了什麼？</h2>
+<p>要修上傳 API，得先知道它收到的是什麼。前面每一課的請求 body 都是 JSON，但 JSON 是文字格式，裝不下圖片這種任意位元組的二進位資料；硬要放進去，得先把位元組轉成 base64 字串，體積會變大，伺服器還要再轉回來。所以瀏覽器上傳檔案時用的是另一種格式：<strong>multipart/form-data</strong>。</p>
+<p>multipart 的意思是「一個 body 分成好幾段」。每一段叫一個 part，對應表單裡的一個欄位；段與段之間用一行 <strong>boundary</strong>（分隔字串）隔開。每個 part 先有自己的標頭，說明這個欄位叫什麼、檔名是什麼、內容是什麼類型，空一行之後才是內容本身。因為內容是原始位元組，不用轉碼，圖片原封不動地放在裡面。</p>
+<p>在 Vue 裡，你不用自己組這種格式。把檔案放進 <code>FormData</code> 交給 <code>fetch</code>，瀏覽器就會產生 multipart 請求：</p>
+<pre>const form = new FormData()
+form.append('image', fileInput.files[0])      // 欄位名稱 image，第二個參數是 File
+await fetch('/products/1/image', { method: 'POST', body: form })   // 不要自己設 Content-Type，瀏覽器會補上 boundary</pre>
+<p>註解裡那句「不要自己設 Content-Type」值得多看一眼：boundary 是瀏覽器隨機產生的，寫在 <code>Content-Type</code> 標頭裡告訴伺服器「用這串字切開 body」。你自己寫 <code>Content-Type: multipart/form-data</code> 會蓋掉瀏覽器的版本，少了 boundary，伺服器就切不開了。送出去的請求長這樣：</p>
+<pre>POST /products/1/image HTTP/1.1
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxk
+
+------WebKitFormBoundary7MA4YWxk
+Content-Disposition: form-data; name="image"; filename="latte.png"
+Content-Type: image/png
+
+‰PNG␍␊␚␊…（檔案的位元組）
+------WebKitFormBoundary7MA4YWxk--</pre>
+<p>從上往下看這個 part：<code>Content-Disposition</code> 說欄位名稱是 <code>image</code>、檔名是 <code>latte.png</code>；下一行的 <code>Content-Type: image/png</code> 說這段內容是 PNG 圖片；空一行之後是檔案的位元組；最後一行 boundary 後面多兩個 <code>--</code>，代表整個 body 結束。</p>
+<p>這三樣東西：<code>filename</code>、part 的 <code>Content-Type</code>、內容本身，<strong>全部是客戶端填的</strong>。瀏覽器會依使用者選的檔案填入合理的值，但請求不一定是從瀏覽器來的：用 curl 或任何程式都能自己組一個 multipart 請求，三樣東西愛填什麼就填什麼，而且可以互相矛盾。資安同事就是這樣做的：內容是 shell script，檔名寫 <code>photo.png</code>，類型寫 <code>image/png</code>。伺服器如果相信前兩樣，就會把 script 當成圖片存起來。</p>
+
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="一個 multipart 請求裡 filename、Content-Type 與內容三者都由客戶端填寫；伺服器只信內容的檔頭，檔名自己產生">
+    <defs><marker id="a22a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="20" y="30" width="300" height="190" rx="10"/>
+    <text class="d-text" x="170" y="58" text-anchor="middle">客戶端送來的 part</text>
+    <rect class="d-box" x="40" y="75" width="260" height="36" rx="6"/>
+    <text class="d-small" x="170" y="98" text-anchor="middle">filename="photo.png"　← 可以亂寫</text>
+    <rect class="d-box" x="40" y="120" width="260" height="36" rx="6"/>
+    <text class="d-small" x="170" y="143" text-anchor="middle">Content-Type: image/png　← 可以亂寫</text>
+    <rect class="d-box" x="40" y="165" width="260" height="36" rx="6"/>
+    <text class="d-small" x="170" y="188" text-anchor="middle">#!/bin/sh …　← 真正的內容</text>
+    <rect class="d-soft" x="400" y="30" width="280" height="190" rx="10"/>
+    <text class="d-text" x="540" y="58" text-anchor="middle">伺服器的決定</text>
+    <text class="d-small" x="420" y="98">檔名：randomUUID()，不看 filename</text>
+    <text class="d-small" x="420" y="143">類型：看內容開頭的位元組（檔頭）</text>
+    <text class="d-small" x="420" y="188">副檔名：依偵測到的類型</text>
+    <line class="d-line" x1="300" y1="183" x2="396" y2="143" marker-end="url(#a22a)"/>
+    <text class="d-accent" x="350" y="240" text-anchor="middle">三個欄位只有「內容」值得看，而且要看的是檔頭</text>
+  </svg>
+  <figcaption>客戶端給的檔名與 Content-Type 只是參考；類型由檔頭決定，檔名由伺服器產生。這張圖就是這課上傳部分的結論，接下來三節把右邊三行逐一做出來。</figcaption>
+</figure>
+<p>這就是開場問題的最小答案：上傳 API 只能相信檔案內容，而且要自己看內容判斷類型；檔名一律由伺服器產生。在動手之前，還要知道這個 multipart 請求進到 Nest 之後，會變成什麼樣子。</p>
+
+<h2>Nest 怎麼把這個請求變成一個檔案物件？</h2>
+<p>上一節的 body 是一大串混著文字標頭和二進位內容的位元組，要按 boundary 切開、解析每段的標頭，才拿得到檔案。Nest 預設的 JSON body parser 不處理這種格式，NestJS 在 Express 平台上交給一個專門解析 multipart 的套件：<strong>multer</strong>。</p>
+<p><code>@nestjs/platform-express</code> 把 multer 包成一個 interceptor：<code>FileInterceptor(欄位名稱, 選項)</code>。<a href="09-interceptors-rxjs.html">第 9 課</a>講過 interceptor 包在 controller 方法外面，在方法執行前後都能做事；<code>FileInterceptor</code> 做的是在方法執行前讓 multer 解析請求，把名為 <code>image</code> 的欄位取出來。controller 方法再用 <code>@UploadedFile()</code> 拿到解析好的檔案：</p>
+<pre>import { FileInterceptor } from '@nestjs/platform-express'
+
+@Post(':id/image')
+@UseInterceptors(FileInterceptor('image'))
+uploadImage(@Param('id', ParseIntPipe) id: number, @UploadedFile() file: Express.Multer.File) {
+  return this.products.saveImage(id, file)
+}</pre>
+<p><code>FileInterceptor('image')</code> 的 <code>'image'</code> 要跟 Vue 那邊 <code>form.append('image', …)</code> 的欄位名稱一致。<code>file</code> 的型別 <code>Express.Multer.File</code> 來自 <code>@types/multer</code> 套件，裡面有很多欄位，修這支 API 會用到的是這四個。注意「來源」那一欄：前兩個就是上一節那兩個可以亂寫的東西，換了個名字而已。</p>
+<div class="table-wrap"><table>
+  <tr><th>欄位</th><th>來源</th><th>能不能信</th></tr>
+  <tr><td><code>originalname</code></td><td>part 標頭的 <code>filename</code></td><td>不能：可能有 <code>../</code>、可能跟內容無關、兩個人可能上傳同名檔</td></tr>
+  <tr><td><code>mimetype</code></td><td>part 標頭的 <code>Content-Type</code></td><td>不能：客戶端自己填的</td></tr>
+  <tr><td><code>size</code></td><td>multer 數的位元組數</td><td>可以</td></tr>
+  <tr><td><code>buffer</code></td><td>檔案內容（沒設 storage 時 multer 用記憶體儲存）</td><td>這是唯一值得檢查的東西</td></tr>
+</table></div>
+<p>最後一列的「記憶體儲存」決定了接下來的問題。multer 可以設定把檔案存到哪裡：沒有設定 <code>storage</code> 或 <code>dest</code> 時，它把整個檔案讀進記憶體，放在 <code>file.buffer</code> 這個 Buffer 裡。對 2MB 以內的商品照片，這是最簡單的做法：內容就在手上，要檢查、要寫檔都直接用（更大的檔案怎麼辦見課末）。但「整個檔案讀進記憶體」也表示，對方傳多大，伺服器就要先拿出多少記憶體來裝。現在這支 API 沒有任何限制，有人傳 500MB 上來會怎樣？</p>
+
+<h2>有人傳 500MB 上來，要在哪裡擋？</h2>
+<p>上一節說到，multer 會把整個檔案收進記憶體。如果有人故意傳 500MB，或者同時傳十個，伺服器的記憶體可能在處理到 controller 之前就被吃光，整個程序當掉，所有客人的請求一起失敗。所以大小限制不只是「圖片別太大」的產品規則，也是保護伺服器的防線，重點是它<strong>在什麼時候</strong>生效。</p>
+<p>先回顧兩個位置。<a href="07-pipes-validation.html">第 7 課</a>的 pipe 負責在參數交給 controller 方法之前做轉換與驗證，例如把字串轉成數字、檢查 DTO；它拿到的是「已經準備好的參數」。<a href="09-interceptors-rxjs.html">第 9 課</a>的請求生命週期則規定了執行順序：guard → interceptor（前半）→ pipe → controller。記住這個順序，下面的問題就看得出來。</p>
+<p>直覺的寫法是用 pipe：NestJS 有 <code>MaxFileSizeValidator</code>，放在 <code>@UploadedFile()</code> 的 pipe 裡檢查 <code>file.size</code>，超過就拒絕。測試送 3MB 的檔案，也確實會被拒絕。問題在順序。<a href="09-interceptors-rxjs.html">第 9 課</a>的請求生命週期裡，interceptor 在 pipe 之前執行；<code>FileInterceptor</code> 是 interceptor，所以順序是：</p>
+<ol>
+  <li><code>FileInterceptor</code> 讓 multer 解析 multipart，把整個檔案收進 <code>file.buffer</code>。</li>
+  <li>pipe 執行，這時才看得到 <code>file.size</code>。</li>
+  <li>controller 方法執行。</li>
+</ol>
+<p>pipe 看到的 <code>size</code> 是已經收完的大小。500MB 的檔案會先在第 1 步吃下 500MB 的記憶體，第 2 步才告訴對方「太大」，防線來得太晚。要讓限制在第 1 步就生效，得交給 multer 自己：它在收資料的過程中就在數位元組，超過上限就停止接收。限制寫在 <code>FileInterceptor</code> 的第二個參數：</p>
+<pre>const MAX_IMAGE_BYTES = 2 * 1024 * 1024
+
+@UseInterceptors(FileInterceptor('image', { limits: { fileSize: MAX_IMAGE_BYTES, files: 1 } }))</pre>
+<p><code>fileSize</code> 是單一檔案的位元組上限，這裡是 2MB；<code>files: 1</code> 限制一個請求只能帶一個檔案欄位。兩個限制都在解析階段生效，不用等到 controller：</p>
+<ul>
+  <li>超過 <code>fileSize</code> 時 multer 丟 <code>LIMIT_FILE_SIZE</code>，<code>@nestjs/platform-express</code> 把它轉成 <code>PayloadTooLargeException</code>，客戶端收到 <strong>413</strong>。</li>
+  <li>多送檔案會回 400。</li>
+</ul>
+<p>這裡出現了兩種失敗的狀態碼，要分清楚。<strong>413 Payload Too Large</strong> 的意思是「請求本身太大」，伺服器連收都不收；<strong>422 Unprocessable Entity</strong> 的意思是「收下來了，但內容不符合規則」，<a href="07-pipes-validation.html">第 7 課</a>的驗證錯誤用的就是 422。大小在 multer 擋，回 413；下一節的類型檢查在 pipe 做，回 422。練習的判分會分別檢查這兩個狀態碼。</p>
+<p>大小擋住了。但 1.5MB 的 shell script 取名 <code>photo.png</code>，大小完全合格，照樣會被收下來。下一個問題是：怎麼知道它不是圖片？</p>
+
+<h2>取名 photo.png 的文字檔，怎麼認出來？</h2>
+<p>前兩節已經確認，<code>originalname</code> 的副檔名和 <code>mimetype</code> 都是客戶端填的，不能拿來判斷類型。能信的只剩 <code>file.buffer</code>，也就是內容本身。問題變成：光看一串位元組，怎麼知道它是 PNG？</p>
+<p>答案在檔案的開頭。大多數檔案格式規定，檔案的頭幾個位元組必須是一段固定的值，讀取程式看到這段值才知道該用哪種格式解析。這段固定的開頭叫<strong>檔頭</strong>，也常被叫做 magic number：</p>
+<ul>
+  <li>PNG 開頭永遠是 <code>89 50 4E 47 0D 0A 1A 0A</code>（<code>‰PNG</code> 加換行），上一節請求範例裡那串 <code>‰PNG␍␊␚␊</code> 就是它。</li>
+  <li>JPEG 開頭是 <code>FF D8 FF</code>。</li>
+  <li>GIF 是 <code>GIF87a</code> 或 <code>GIF89a</code>。</li>
+</ul>
+<p>檔頭和副檔名、Content-Type 最大的差別是：副檔名與 Content-Type 隨便改，檔案內容都不會變；檔頭改了，檔案就不是那個格式了，看圖軟體打不開。所以判斷類型要看檔頭。資安同事那個 shell script 開頭是 <code>#!/bin/sh</code>，不是任何圖片格式的檔頭，看檔頭就認得出來。</p>
+<p>這件事不用自己寫。<code>@nestjs/common</code> 的 <code>FileTypeValidator</code> 預設就是看檔頭（它用 <code>file-type</code> 套件偵測內容的類型）。把它用 <code>ParseFilePipeBuilder</code> 組成一個 pipe，放在 <code>@UploadedFile()</code> 裡：</p>
+<pre>@UploadedFile(
+  new ParseFilePipeBuilder()
+    .addFileTypeValidator({ fileType: /^image\/(png|jpeg)$/, overrideMimeType: true })
+    .build({ errorHttpStatusCode: HttpStatus.UNPROCESSABLE_ENTITY }),
+) file: Express.Multer.File</pre>
+<p>這幾行的每個選項都影響安全，看 <code>FileTypeValidatorOptions</code> 的定義逐一決定。下表後兩個選項是「關掉檢查」的開關，列出來是為了知道不能開：</p>
+<div class="table-wrap"><table>
+  <tr><th>選項</th><th>意思</th><th>這課的用法</th></tr>
+  <tr><td><code>fileType</code></td><td>允許的 MIME 類型，字串或正規表示式。字串是「包含到名稱結尾」的比對：<code>'png'</code> 符合 <code>image/png</code></td><td>用正規表示式 <code>/^image\/(png|jpeg)$/</code> 寫清楚只收兩種；GIF 是真的圖片也要擋</td></tr>
+  <tr><td><code>overrideMimeType</code></td><td>偵測成功後，把 <code>file.mimetype</code> 換成偵測到的類型</td><td>要開：後面決定副檔名用的就是 <code>file.mimetype</code>，不開它還是客戶端填的值</td></tr>
+  <tr><td><code>skipMagicNumbersValidation</code></td><td>不看檔頭，只比對客戶端給的 mimetype</td><td>不要開：等於沒驗</td></tr>
+  <tr><td><code>fallbackToMimetype</code></td><td>檔頭認不出來時改信客戶端的 mimetype</td><td>不要開：文字檔沒有檔頭，認不出來就會放行</td></tr>
+  <tr><td><code>errorHttpStatusCode</code>（<code>build</code> 的選項）</td><td>驗證失敗回哪個狀態碼，預設 400</td><td>設 422，跟<a href="07-pipes-validation.html">第 7 課</a>的驗證錯誤一致</td></tr>
+</table></div>
+<p><code>overrideMimeType</code> 最容易漏。驗證只回答「能不能收」，不會自動改掉 <code>file.mimetype</code>；不開它，驗證雖然通過，<code>file.mimetype</code> 仍是客戶端寫的字串。下一節要靠 <code>file.mimetype</code> 決定副檔名，到時候用的就是一個沒驗過的值。</p>
+<p>驗證失敗時 pipe 丟出例外，controller 方法不會執行，所以檔案也不會被存下來。這一點判分會查：422 之後 <code>UPLOAD_DIR</code> 裡必須是空的。到這裡，收進來的檔案大小合格、確定是 PNG 或 JPEG。剩下最後一步：存到硬碟上，要叫什麼名字？</p>
+
+<h2>存檔時，檔名為什麼不能用使用者給的？</h2>
+<p>起始程式的 <code>saveImage</code> 直接用 <code>originalname</code> 存檔。上一節已經確認內容是真的圖片了，檔名用使用者取的似乎沒差，但 <code>originalname</code> 本身就能出事，跟內容是什麼無關。三個理由，每一個都是真實發生過的事故：</p>
+<ul>
+  <li><strong>路徑穿越</strong>（path traversal）：檔名 <code>../../etc/cron.d/evil</code> 經過 <code>join(dir, filename)</code>（<a href="../../node/lessons/10-file-system.html">Node 課第 10 課</a>的路徑組合）會跑出上傳資料夾，寫到系統的其他地方。用 <code>basename()</code> 去掉路徑只擋得住這一種，下面兩種照樣中。</li>
+  <li><strong>撞名覆蓋</strong>：兩位店長都傳 <code>photo.png</code>，第二張蓋掉第一張，而且第一個商品的 <code>imageUrl</code> 現在指向別人的圖。</li>
+  <li><strong>副檔名欺騙</strong>：真的 PNG 取名 <code>latte.html</code>，存下來之後用 <code>/uploads/latte.html</code> 存取，瀏覽器會把它當網頁。反過來，拿 <code>extname(originalname)</code> 當副檔名，<code>cake</code>（沒有副檔名）會存成沒有副檔名的檔。這會出問題，是因為 <code>express.static</code> 這類靜態檔案伺服器依副檔名決定回應的 <code>Content-Type</code>，查不到副檔名就回 <code>application/octet-stream</code>（「一串不明的位元組」）；使用者直接打開圖片網址時，瀏覽器會把它當成檔案下載，而不是顯示成圖片。</li>
+</ul>
+<p>三個問題的根源都是「檔名由客戶端決定」，所以解法是把檔名的兩個部分都收回伺服器手上：主檔名用 <code>randomUUID()</code> 產生，不可能有 <code>../</code>，也不會撞名；副檔名查表，表的 key 是上一節偵測到的類型，PNG 一定存成 <code>.png</code>，客戶端取什麼名字都影響不到：</p>
+<pre>import { randomUUID } from 'node:crypto'
+
+const EXT: Record&lt;string, string&gt; = { 'image/png': '.png', 'image/jpeg': '.jpg' }
+
+const dir = this.config.get('UPLOAD_DIR', { infer: true })
+await mkdir(dir, { recursive: true })
+const filename = randomUUID() + EXT[file.mimetype]   // overrideMimeType 之後，mimetype 是偵測到的
+await writeFile(join(dir, filename), file.buffer)
+await this.prisma.product.update({ where: { id }, data: { imageUrl: `/uploads/${filename}` } })</pre>
+<p>這段程式從上往下：從設定讀出上傳資料夾、確保資料夾存在、組出檔名、寫入 <code>file.buffer</code>，最後把網址存到商品上。注意 <code>EXT[file.mimetype]</code> 這一行和上一節的連動：沒開 <code>overrideMimeType</code> 時，<code>file.mimetype</code> 是客戶端寫的，例如 <code>application/octet-stream</code>，查表拿到 <code>undefined</code>，檔名就變成沒有副檔名。</p>
+<p>資料夾路徑 <code>UPLOAD_DIR</code> 從設定讀，不寫死在程式碼。<a href="11-configuration.html">第 11 課</a>的 <code>Env</code> schema 已經有它，預設 <code>uploads</code>：開發時放在專案裡，正式環境可能是掛載的磁碟或暫存區，換地方只改設定，程式碼不用改。原始檔名如果對使用者有意義（例如下載時要顯示），另外存到資料庫欄位，不要拿它當路徑。這裡的做法只適合單一台伺服器，多台時要怎麼改見課末。</p>
+<p>上傳 API 修好了：大小在 multer 擋（413）、類型看檔頭（422）、檔名由伺服器產生。</p>
+<div class="callout practice"><strong>💡 實務上：上傳功能要先問清楚「誰傳、傳什麼、存多久」</strong><br>商品照片、會員頭像、退款要附的收據照片，幾乎每個後台都有上傳。動手前資深工程師會先問：誰能上傳（一定要過登入與權限的 guard，不能是公開端點）、允許哪些類型和多大、換新圖時舊檔要不要刪（不刪的話硬碟只會越來越滿）。手機拍的照片常常是好幾 MB，還可能帶有拍攝地點的 EXIF 資訊，公開顯示前通常會縮圖並去掉這些資訊；這種比較慢的處理適合丟給第 20 課的佇列，不要卡在上傳請求裡。收據、身分證件這類敏感檔案不能放在任何人都能用網址打開的地方，要經過有權限檢查的 API 才能下載。</div>
+
+<h2>客人付完款，我們怎麼知道？</h2>
+<p>上傳的問題是「內容可能是假的」；資安同事退回的第二支 API 問題更大：連「是誰送的」都可能是假的。要理解為什麼，先看這支 API 存在的原因。</p>
+<p>客人線上付款時，是在金流公司的頁面輸入卡號，付款結果在金流公司那邊產生，我們的伺服器不在這個流程裡。要知道某張訂單付款成功了沒有，有兩種方法：</p>
+<ul>
+  <li><strong>輪詢</strong>（polling）：我們每隔幾秒去問金流公司「訂單 1 付了沒」。結果出來之前的每一次詢問都是浪費，而且間隔多長，客人就要多等多久才看到「付款成功」。</li>
+  <li>反過來，我們事先在金流公司後台登記一個網址，付款結果一出來，<strong>金流公司主動呼叫這個網址</strong>告訴我們。</li>
+</ul>
+<p>第二種叫 <strong>webhook</strong>。它跟我們寫過的所有 API 方向相反：平常是我們的前台當客戶端、呼叫我們的伺服器；webhook 是金流公司當客戶端，呼叫我們的伺服器，請求什麼時候來、帶什麼內容，都由對方決定。我們只能提供一個網址，等它被呼叫。</p>
+<p>問題就出在「網址」：<code>POST /webhooks/payments</code> 必須公開在網路上，金流公司才打得到。公開的網址任何人都打得到，任何人都能 <code>POST /webhooks/payments</code> 送一筆 <code>{ data: { orderId: 1 } }</code> 把訂單改成已付款，這正是資安同事做的事。這支 API 不能像前台的 API 那樣靠登入判斷是誰，因為呼叫的不是使用者。</p>
+<p>金流公司的解法是<strong>簽章</strong>。開通 webhook 時，金流後台會給我們一把<strong>密鑰</strong>，只有雙方知道。之後每送一個請求，金流公司都用這把密鑰對請求內容算出一段簽章，放在標頭裡一起送來；我們收到後用同一把密鑰再算一次，算出來一樣，才代表請求是持有密鑰的金流公司送的。這一課假設金流公司的格式是：</p>
+<pre>X-Signature: t=1767225600,v1=5f1a…（64 個 hex 字元）
+
+簽的內容：`${t}.${原始 body}`
+演算法：HMAC-SHA256，密鑰是後台給的 PAYMENT_WEBHOOK_SECRET</pre>
+<p>這個 <code>t=…,v1=…</code> 的結構和簽 <code>${t}.${body}</code> 的方式取自 Stripe（Stripe 的標頭叫 <code>Stripe-Signature</code>，不是 <code>X-Signature</code>）：<code>t</code> 是簽章時的 Unix 秒數，<code>v1</code> 是 HMAC 的結果。<a href="../../auth/lessons/02-crypto-toolbox.html">認證課第 2 課</a>說過 HMAC 證明兩件事：內容沒被改過，而且是持有密鑰的人算出來的。偽造者沒有密鑰，算不出正確的 <code>v1</code>；他把別人的請求內容改掉，原本的 <code>v1</code> 也就對不上了。所以密鑰是整個機制的根本：它只存在金流公司和我們的伺服器設定裡，不進 git、不寫在程式碼。</p>
+<p>原理很短，實作卻有好幾個地方容易錯，錯了不是全部 401 就是形同沒驗。下一節一步一步寫出這個驗證。</p>
+
+<h2>怎麼確認這個通知真的是金流公司送的？</h2>
+<p>上一節的格式說明了「要算什麼」，這一節決定「在哪裡算、怎麼算才不會錯」。位置是 guard：<a href="06-middleware-guards.html">第 6 課</a>的 guard 在 controller 之前執行，簽章不對的請求到不了 controller，訂單也就不會被改。練習的起始專案已經在 controller 掛好 <code>@UseGuards(WebhookSignatureGuard)</code>，要寫的是 guard 的內容，分四個步驟，每一步都有常見的錯法。</p>
+<p><strong>1. 拿到原始的 body。</strong>HMAC 是算在位元組上的，差一個空白，算出來的值就完全不同。金流公司簽的是它送出的那串位元組，我們也要對同一串位元組算。問題是 Nest 的 body parser 會先把 JSON 解析成物件放在 <code>req.body</code>，原本的位元組就丟了。能不能用 <code>JSON.stringify(req.body)</code> 組回去？不行：<code>{"a":1, "b":2}</code> 和 <code>{"b":2,"a":1}</code> 解析成同一個物件，位元組卻不同，空白、換行、key 的順序在解析時都消失了，組回去的字串不一定跟原本一樣。所以要用解析前的位元組。NestJS 要在建立應用時開 <code>rawBody</code>，body parser 就會把原始位元組留在 <code>req.rawBody</code>：</p>
+<pre>// main.ts
+const app = await NestFactory.create(AppModule, { rawBody: true })
+
+// guard 裡
+const req = context.switchToHttp().getRequest&lt;RawBodyRequest&lt;Request&gt;&gt;()
+req.rawBody   // Buffer；沒開 rawBody 時是 undefined</pre>
+<p>這個設定有一個陷阱：它要開在<strong>每一個</strong>建立應用的地方。測試裡 <code>createTestApp</code> 可以用 <code>options: { rawBody: true }</code> 開，但正式啟動走的是 <code>main.ts</code>，兩邊都要有。只在測試開，測試全綠，上線後 <code>req.rawBody</code> 是 <code>undefined</code>，每一筆都 401。練習的判分會 <code>nest build</code> 後真的啟動一次，漏了 main.ts 就會在那裡失敗。</p>
+<p><strong>2. 解析標頭並檢查時間。</strong>拿到 body 之後，從 <code>X-Signature</code> 取出 <code>t</code> 和 <code>v1</code>。<code>t=…,v1=…</code> 這個格式把逗號換成 <code>&amp;</code> 就能交給 <code>URLSearchParams</code> 解析。這一步要處理所有「格式不對」的情況：沒有標頭、<code>t</code> 不是數字、沒有 rawBody，一律 401；不能讓這些情況丟出其他錯誤變成 500。對方送來壞掉的請求是對方的問題，不是我們的伺服器壞了。</p>
+<p>格式對了，還要檢查時間。為什麼簽章對了還不夠？想像有人在中途攔截到一個金流公司送來的合法請求，他不用改任何內容，原封不動地再送一次，簽章當然還是對的。這叫<strong>重放攻擊</strong>（replay）。擋重放靠的是 <code>t</code>：它被簽在內容裡，改了簽章就對不上；我們只接受 300 秒內簽出來的請求，錄下來的舊請求過了時間就沒用了：</p>
+<pre>const TOLERANCE_SECONDS = 300
+if (Math.abs(Date.now() / 1000 - Number(t)) &gt; TOLERANCE_SECONDS) throw new UnauthorizedException('簽章已過期')</pre>
+<p><code>Date.now()</code> 是毫秒，除以 1000 換成秒才能和 <code>t</code> 比。用絕對值是因為對方的時鐘可能比我們快，未來的時間一樣要拒絕。300 秒是常見的容忍值，涵蓋網路延遲與雙方時鐘誤差。</p>
+<p><strong>3. 算出預期的簽章。</strong>用同一把密鑰、同一個演算法，對 <code>`${t}.`</code> 加上原始 body 算 HMAC。<code>update</code> 可以呼叫多次，內容會接在一起，所以先餵 <code>`${t}.`</code> 再餵 Buffer，不用把 Buffer 轉成字串：</p>
+<pre>const secret = this.config.get('PAYMENT_WEBHOOK_SECRET', { infer: true })
+const expected = createHmac('sha256', secret).update(`${t}.`).update(req.rawBody).digest()   // Buffer，32 bytes
+const given = Buffer.from(v1, 'hex')</pre>
+<p>密鑰從 <code>ConfigService</code> 讀，和 <code>UPLOAD_DIR</code> 一樣放在設定裡。<code>digest()</code> 不帶參數回傳 32 bytes 的 Buffer；對方送來的 <code>v1</code> 是 hex 字串，用 <code>Buffer.from(v1, 'hex')</code> 也轉成 Buffer，兩邊才能逐位元組比較。</p>
+<p><strong>4. 固定時間比較。</strong>最後比較 <code>given</code> 和 <code>expected</code>。<a href="06-middleware-guards.html">第 6 課</a>講過 <code>===</code> 比到第一個不同的字就停，回應時間會洩漏猜對了幾個字，攻擊者可以一個字一個字地試出正確的簽章。所以用 <code>timingSafeEqual</code>，它不管哪裡不同，都花一樣的時間比完。但它遇到長度不同會丟 <code>RangeError</code>，所以先比長度：</p>
+<pre>if (given.length !== expected.length || !timingSafeEqual(given, expected)) throw new UnauthorizedException('簽章不符')
+return true</pre>
+<p>長度不同本來就代表簽章錯了，直接 401；沒有這一行，送一個 <code>v1=abc</code> 就能讓伺服器回 500，log 裡全是 RangeError。四個步驟走完，偽造的請求、被改過的請求、錄下來重放的請求都進不了 controller。</p>
+<div class="callout practice"><strong>💡 實務上：每家金流的簽章格式都不一樣，照對方文件做</strong><br>台灣常見的綠界、藍新，和國外的 Stripe，各有自己的簽章或檢查碼規則；原理都是「用雙方約好的密鑰算出一個值來比對」，但要簽哪些欄位、怎麼排序、怎麼編碼全看對方文件。對方有提供官方 SDK 的驗證函式時優先用它，自己照文件實作就要拿文件裡的範例值寫測試對過。開發時金流打不到你電腦上的 localhost，通常用金流的測試環境，再用 ngrok 這類轉發工具（Stripe 則有自己的 Stripe CLI）把請求轉到本機。驗簽失敗要記 log 方便追查，但不要把密鑰或完整簽章印出來；密鑰外洩時要能在金流後台換一組新的，只改設定、重新部署就生效。</div>
+<p>偽造的問題解決了，但資安同事回報的第二個現象還在：同一個通知送三次，付款流程跑了三次。這三次請求都是金流公司真的送的，簽章完全正確，guard 擋不住，也不該擋。</p>
+
+<h2>同一個付款通知到了三次，怎麼只處理一次？</h2>
+<p>上一節的 guard 只回答「是不是金流公司送的」，不回答「是不是送過了」。而金流公司確實會重複送：它送 webhook 的規則通常是「沒收到 2xx 就重送」，間隔拉長，持續一天甚至更久。重送是功能不是 bug：我們的伺服器剛好在重啟、網路剛好斷，重送讓通知不會漏。代價是同一個事件會到好幾次，有時還是同時到：第一次回應太慢，對方逾時後重送，兩個請求一起在處理。</p>
+<p>所以處理 webhook 要<strong>冪等</strong>（idempotent）：同一個事件處理一次和處理十次，結果一樣，訂單只付款一次、<code>paidAt</code> 不會被改掉。<a href="../../system-design/lessons/09-idempotency.html">系統設計課第 9 課</a>講過冪等的概念，這裡要把它做出來。要判斷「是不是同一個事件」，需要一個重送時不變的識別：金流公司送的每個事件都有 <code>id</code>（例如 <code>evt_1</code>），重送時不變，就拿它當依據。</p>
+<p>最直覺的寫法是「先查有沒有處理過，沒有才處理」，這也是最常見的錯誤寫法：</p>
+<pre>// 錯：兩個同時進來的請求都查到「沒有」，兩個都處理
+if (await tx.webhookEvent.findFirst({ where: { eventId: event.id } })) return
+await tx.order.updateMany(…)
+await tx.webhookEvent.create(…)</pre>
+<p>一次一個請求時它是對的；問題出在剛才說的「同時到」。第 15 課講過，查詢和寫入之間別人可以插進來：請求 A 查到「沒有」，還沒寫入之前，請求 B 也查到「沒有」，兩個都往下處理。應用程式層的檢查擋不住並發。正確的做法是把判斷交給資料庫：<code>event_id</code> 加<strong>唯一約束</strong>，資料庫保證同一個值只能存在一筆，兩個同時寫入的交易只有一個會成功，另一個收到 P2002（<a href="14-prisma-crud-relations.html">第 14 課</a>的違反唯一約束錯誤）：</p>
+<pre>// schema.prisma
+eventId String @unique @map("event_id")
+// 然後 npx prisma migrate dev --name webhook-event-unique</pre>
+<p>有了唯一約束，handler 不用先查，直接寫；撞到 P2002 就代表這個事件已經處理過了：</p>
+<pre>async handle(event: PaymentEvent) {
+  try {
+    await this.prisma.$transaction(async tx =&gt; {
+      const { count } = await tx.order.updateMany({
+        where: { id: event.data.orderId, status: 'pending' },     // 條件更新：已付款的不再改
+        data: { status: 'paid', paidAt: new Date() },
+      })
+      await tx.webhookEvent.create({
+        data: { eventId: event.id, type: event.type, status: count === 1 ? 'processed' : 'ignored' },
+      })
+    })
+  } catch (e) {
+    if (e instanceof Prisma.PrismaClientKnownRequestError &amp;&amp; e.code === 'P2002') return   // 已處理過：成功
+    throw e
+  }
+}</pre>
+<p>這段程式有四個設計決定，每一個都對應一種會出事的情境：</p>
+<ul>
+  <li><strong>改訂單和記事件在同一個交易。</strong>先記事件、再改訂單，改訂單那一步失敗（資料庫瞬斷）時，事件已經記成處理過，重送時會被當成重複而跳過，這張訂單永遠付不了款。放在同一個交易，改訂單失敗整筆回滾，事件沒有留下，重送就會重做。</li>
+  <li><strong>P2002 當成成功，回 200。</strong>回 409 或任何非 2xx，金流公司會繼續重送，但重送也不會變好。「已經處理過」對對方來說就是成功。</li>
+  <li><strong>條件更新 <code>status: 'pending'</code>。</strong>金流公司可能替同一張訂單送兩個不同 id 的事件（例如系統重試造成）。第二個事件的 id 是新的，唯一約束擋不住它；靠 <code>where</code> 裡的 <code>status: 'pending'</code>，已付款的訂單 <code>count</code> 是 0，<code>paidAt</code> 不會被改掉。</li>
+  <li><strong>找不到訂單記成 <code>ignored</code>，也回 200。</strong>訂單不存在不是對方能修的問題，回錯誤只會換來一天的重送。留一筆 <code>ignored</code>，之後對帳時查得到「收過這個事件但沒有處理」。</li>
+</ul>
+<p>只有一種情況該回 5xx：真的處理失敗、重送有機會成功，例如資料庫瞬斷。<code>catch</code> 裡其他錯誤照樣 <code>throw e</code>，就是把這種情況交給對方的重送。</p>
+<p>這裡的「同一個交易」只包住資料庫。付款成功後要做的其他事（寄收據、通知廚房）不要塞進 webhook 的交易裡，照第 20 課的 outbox 與第 21 課的事件處理。webhook handler 的工作只有：驗簽、改狀態、記事件、回 200。到這裡，資安同事退回的兩支 API 都修好了。</p>
+<div class="callout practice"><strong>💡 實務上：webhook 會遲到也會漏，要有對帳當後盾</strong><br>客服最常接到的付款問題是「我付款了，訂單還顯示未付款」，原因通常是 webhook 晚到、被防火牆擋掉，或我們當時剛好在部署。所以實務上不會只靠 webhook：會有一個排程（第 21 課）定期找出卡在 <code>pending</code> 太久的訂單，主動呼叫金流的查詢 API 確認結果，再用和 webhook 相同的條件更新（只改還是 <code>pending</code> 的訂單），兩邊同時到也不會重複處理。這一課的 <code>webhook_events</code> 表在這時很好用，客服或工程師可以直接查到「這張訂單收過哪些事件、處理結果是什麼」。上線前也要確認 handler 回應夠快，對方的逾時通常不長，慢了就會觸發不必要的重送。</div>
+
+<h2>練習</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs nestjs 22</code> 建立 <code>work/22/</code>。這一題用 PostgreSQL，先確認容器在跑（在 <code>learn/nestjs/practice</code> 執行 <code>docker compose up -d --wait</code>，第 12 課）。專案已經有：</p>
+<ul>
+  <li>資料表 <code>products</code>（有 <code>image_url</code>）、<code>orders</code>（<code>status</code>、<code>paid_at</code>）、<code>webhook_events</code>（<code>event_id</code>、<code>type</code>、<code>status</code>、<code>received_at</code>），migration 寫好了；<code>event_id</code> 還沒有唯一約束（練習 3 要加）。</li>
+  <li><code>Env</code> schema 已經有 <code>UPLOAD_DIR</code>（預設 <code>uploads</code>）與 <code>PAYMENT_WEBHOOK_SECRET</code>（至少 16 個字），<code>.env.example</code> 裡有開發用的值。</li>
+  <li><code>POST /products/:id/image</code>：<code>FileInterceptor('image')</code> 什麼都收，<code>ProductsService.saveImage</code> 用 <code>originalname</code> 存檔。</li>
+  <li><code>POST /webhooks/payments</code>：controller 已經掛上 <code>@UseGuards(WebhookSignatureGuard)</code> 並回 200，guard 的 <code>canActivate</code> 還沒寫；<code>WebhooksService.handle</code> 目前直接把訂單改成 paid。</li>
+  <li><code>PaymentEvent</code> 型別（<code>src/webhooks/payment-event.ts</code>）：<code>{ id, type, data: { orderId } }</code>。</li>
+</ul>
+<p>想親手試：在 <code>work/22</code> 執行 <code>npx prisma migrate dev</code>、<code>npm run start:dev</code>，另開終端機用 curl 上傳：<code>curl -F image=@某張圖.png localhost:3100/products/1/image</code>（<code>-F</code> 就是 multipart）。webhook 可以用 Node 算簽章：<code>node -e "const c=require('crypto');const t=Math.floor(Date.now()/1000);const raw=JSON.stringify({id:'evt_1',type:'payment.succeeded',data:{orderId:1}});console.log(raw);console.log('t='+t+',v1='+c.createHmac('sha256',process.env.S).update(t+'.'+raw).digest('hex'))"</code>，把印出來的 body 與標頭餵給 curl。</p>
+
+<div class="local" data-test="ex1" data-files="src/products/products.controller.ts src/products/products.service.ts">
+  <p>練習 1：把 <code>POST /products/:id/image</code> 改成安全的上傳：</p>
+  <ul>
+    <li><code>FileInterceptor</code> 的 <code>limits</code>：<code>fileSize</code> 2MB、<code>files</code> 1。超過 2MB 要回 413（1.5MB 要收）。</li>
+    <li><code>@UploadedFile()</code> 裡用 <code>ParseFilePipeBuilder</code> 加 <code>FileTypeValidator</code>：只收 <code>image/png</code> 與 <code>image/jpeg</code>，看檔頭、開 <code>overrideMimeType</code>，失敗回 422。GIF 是真的圖片也要 422；取名 <code>photo.png</code> 的文字檔要 422 而且不能存檔。</li>
+    <li><code>saveImage</code>：檔名用 <code>randomUUID()</code> 加上依<strong>偵測到的類型</strong>查表得到的副檔名（<code>.png</code>／<code>.jpg</code>），存到 <code>UPLOAD_DIR</code>；回應 <code>{ imageUrl: '/uploads/&lt;檔名&gt;' }</code> 並更新商品的 <code>imageUrl</code>。</li>
+  </ul>
+  <p>判分用 supertest 上傳：真的 PNG 取名 <code>latte.html</code>、Content-Type 寫 <code>text/html</code>，要 201 而且存成 <code>.png</code>；JPEG 的 Content-Type 是 <code>application/octet-stream</code>，要存成 <code>.jpg</code>；同名檔上傳兩次要有兩個檔案；檔名帶 <code>../</code> 不能寫到上傳資料夾以外；3MB 回 413 且沒有存檔。只用 <code>basename</code>、只用 <code>MaxFileSizeValidator</code>、開 <code>fallbackToMimetype</code> 或 <code>skipMagicNumbersValidation</code>，都過不了。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="src/webhooks/webhook-signature.guard.ts src/main.ts">
+  <p>練習 2：寫 <code>WebhookSignatureGuard.canActivate</code>，並在 <code>main.ts</code> 開 <code>rawBody</code>：</p>
+  <ul>
+    <li>解析 <code>X-Signature: t=&lt;秒&gt;,v1=&lt;hex&gt;</code>。沒有標頭、格式錯、<code>t</code> 不是數字、沒有 <code>req.rawBody</code>：丟 <code>UnauthorizedException</code>（401），不能是 500。</li>
+    <li><code>t</code> 與現在相差超過 300 秒（過去或未來）：401。</li>
+    <li>用 <code>PAYMENT_WEBHOOK_SECRET</code>（從 <code>ConfigService</code> 讀，不能寫死）對 <code>`${t}.` + rawBody</code> 算 HMAC-SHA256，和 <code>v1</code> 用 <code>timingSafeEqual</code> 比較，先比長度。</li>
+    <li><code>main.ts</code>：<code>NestFactory.create(AppModule, { rawBody: true })</code>。</li>
+  </ul>
+  <p>判分每次用隨機密鑰啟動；body 有多餘空白、key 順序不同時簽章要通過（算在原始位元組上）；改過內容、別的密鑰、<code>v1=abc</code>、400 秒前或後都要 401，200 秒內要 200；原始碼要出現 <code>timingSafeEqual(</code>；最後會 <code>nest build</code> 真的啟動一次送合法請求，漏了 <code>rawBody</code> 會在這裡失敗。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="prisma/schema.prisma src/webhooks/webhooks.service.ts">
+  <p>練習 3：讓同一個事件只處理一次。</p>
+  <ul>
+    <li><code>schema.prisma</code>：<code>WebhookEvent.eventId</code> 加 <code>@unique</code>，執行 <code>npx prisma migrate dev --name webhook-event-unique</code> 產生 migration（判分會檢查資料庫裡真的有唯一索引）。</li>
+    <li><code>WebhooksService.handle</code>：在一個 <code>$transaction</code> 裡，用 <code>updateMany</code>（<code>where</code> 含 <code>status: 'pending'</code>）改訂單，再 <code>create</code> 一筆 <code>webhookEvent</code>，<code>status</code> 依 <code>count</code> 是 <code>'processed'</code> 或 <code>'ignored'</code>。撞到 P2002 當成已處理，正常回傳（200）；其他錯誤照樣丟出。</li>
+  </ul>
+  <p>判分把簽章 guard 換成一律放行，只看冪等：同一個事件同時送 5 次都要 200，只記一筆、只付款一次（先查再寫擋不住）；重送要 200 且 <code>paidAt</code> 不變；另一個事件 id 付同一張已付款的訂單要記成 <code>ignored</code>；訂單不存在要 200 並記 <code>ignored</code>；用 trigger 讓第一次更新訂單失敗，第一次要回 5xx，重送之後訂單要真的變成 paid（事件和訂單不在同一個交易就會過不了）。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：同事把上傳的大小限制寫成 <code>ParseFilePipeBuilder().addMaxSizeValidator({ maxSize: 2MB })</code>，測試送 3MB 的檔案也確實被拒絕了。這樣有什麼問題？</p>
+  <label data-key="a">沒有問題，pipe 和 multer 的 limits 效果一樣</label>
+  <label data-key="b">有問題：pipe 只能檢查類型，不能檢查大小</label>
+  <label data-key="c">有問題：pipe 在 multer 把整個檔案收進記憶體之後才執行，500MB 的檔案會先吃掉 500MB 記憶體才被拒絕；限制要寫在 FileInterceptor 的 limits.fileSize，multer 收到超過就停下來回 413</label>
+  <label data-key="d">有問題：這樣會回 413，應該回 422 才對</label>
+  <p class="why">✓ c。順序是 multer 先解析整個 multipart、把檔案放進 <code>file.buffer</code>，然後才輪到 pipe；pipe 看到的 <code>size</code> 是已經收完的大小。a 錯在時機不同。b 錯：<code>MaxFileSizeValidator</code> 就是檢查大小，只是太晚。d 把狀態碼說反了：limits 擋下的是 413，pipe 擋下的才是 422（依 <code>errorHttpStatusCode</code>）。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：金流公司重送了一個已經處理過的 webhook，我們的程式發現 <code>event_id</code> 已經存在。應該回什麼？</p>
+  <label data-key="a">409 Conflict：告訴對方這個事件重複了</label>
+  <label data-key="b">200：對方要的是「你收到了」，已處理過就是收到了；回非 2xx 對方會繼續重送，重送也不會變好</label>
+  <label data-key="c">400：事件格式沒問題，但內容重複是客戶端的錯</label>
+  <label data-key="d">500：讓對方知道我們這邊有狀況</label>
+  <p class="why">✓ b。webhook 的契約通常是「2xx 代表收到，其他都重送」。重複的事件回 409、400 或 500 都會讓對方排進重送佇列，持續打一天；a、c、d 都是把 HTTP 語意套在不適用的地方。只有真的處理失敗、重送有機會成功的情況（例如資料庫瞬斷）才回 5xx。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 6：驗證簽章時，同事用 <code>JSON.stringify(req.body)</code> 重組 body 再算 HMAC，說這樣就不用開 <code>rawBody</code>。在測試裡送 <code>JSON.stringify(event)</code> 產生的 body 時通過了，上線後卻幾乎每一筆都 401。為什麼？</p>
+  <label data-key="a">正式環境的密鑰不一樣</label>
+  <label data-key="b">金流公司用的是 SHA-1，不是 SHA-256</label>
+  <label data-key="c">正式環境沒有設定時區，時間戳記對不上</label>
+  <label data-key="d">HMAC 算在位元組上。金流公司送的 JSON 有自己的空白、換行與 key 順序，解析再 stringify 之後位元組變了，算出來的簽章當然不同；要用解析前的 req.rawBody</label>
+  <p class="why">✓ d。測試會過是因為測試的 body 本來就是 <code>JSON.stringify</code> 的輸出，重組後一模一樣；真實的請求不是。a、b 會讓測試環境也全錯，不會只有正式環境錯。c 跟簽章內容無關，時間窗檢查的是 <code>t</code> 與現在的差距，和時區無關（Unix 秒數沒有時區）。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>用 <code>originalname</code> 當檔名</strong>：路徑穿越、撞名覆蓋、副檔名欺騙三個問題同時存在。<code>basename()</code> 只擋第一個。檔名用 <code>randomUUID()</code>，副檔名依偵測到的類型查表。</li>
+  <li><strong>信任 <code>file.mimetype</code> 或副檔名</strong>：兩者都是客戶端填的。用 <code>FileTypeValidator</code> 看檔頭，不開 <code>skipMagicNumbersValidation</code>、<code>fallbackToMimetype</code>。</li>
+  <li><strong>忘了 <code>overrideMimeType</code></strong>：驗證過了，但 <code>file.mimetype</code> 還是客戶端給的值，查表拿到 <code>undefined</code>，檔名變成沒有副檔名。</li>
+  <li><strong>大小限制寫在 pipe</strong>：整個檔案先進記憶體才被拒絕。寫在 <code>FileInterceptor</code> 的 <code>limits.fileSize</code>。</li>
+  <li><strong>用 <code>JSON.stringify(req.body)</code> 算簽章</strong>：空白、換行、key 順序一變就不符。開 <code>rawBody: true</code>，用 <code>req.rawBody</code>。</li>
+  <li><strong>只在測試裡開 <code>rawBody</code></strong>：<code>createTestApp</code> 的 options 不會影響 <code>main.ts</code>，正式啟動後 <code>req.rawBody</code> 是 <code>undefined</code>，每一筆都 401。</li>
+  <li><strong><code>===</code> 比簽章、或 <code>timingSafeEqual</code> 前不比長度</strong>：前者洩漏時間資訊，後者長度不同就丟 <code>RangeError</code> 變成 500。先比長度再 <code>timingSafeEqual</code>。</li>
+  <li><strong>沒有時間窗</strong>：錄下來的合法請求可以無限次重放。只接受 ±300 秒內的 <code>t</code>。</li>
+  <li><strong>密鑰寫死在程式碼</strong>：進了 git 就等於公開，換密鑰還要重新部署。從 <code>ConfigService</code> 讀。</li>
+  <li><strong>先查再寫做冪等</strong>：並發的請求都查到「沒有」。用唯一約束，撞到 P2002 當成已處理。</li>
+  <li><strong>記事件與改訂單分開兩個交易</strong>：改訂單失敗時事件已記成處理過，重送被跳過，訂單永遠 pending。放同一個 <code>$transaction</code>。</li>
+  <li><strong>重複或找不到訂單時回 4xx／5xx</strong>：對方會重送一整天。回 200，必要時記成 <code>ignored</code>。</li>
+  <li><strong>更新訂單不帶 <code>status: 'pending'</code></strong>：另一個事件 id 會把已付款的訂單再付一次，<code>paidAt</code> 被改掉。</li>
+</ul>
+
+<h2 id="appendix">補充與查表</h2>
+<h3>版本備註</h3>
+<p>這課的寫法對照練習安裝的版本：Express 平台的 NestJS 用 <strong>multer</strong>（練習裝的是 2.5.0）解析 multipart，<code>@nestjs/platform-express</code> 12.3.2 把它包成 <code>FileInterceptor</code>；<code>Express.Multer.File</code> 型別來自 <code>@types/multer</code>（2.3.0）；<code>@nestjs/common</code> 12 的 <code>FileTypeValidator</code> 預設看檔頭（用 <code>file-type</code> 套件偵測）。</p>
+<h3>幾百 MB 的檔案怎麼收？</h3>
+<p>這課用 multer 的記憶體儲存，整個檔案放在 <code>file.buffer</code>，對 2MB 以內的商品圖最簡單。幾百 MB 的影片就要改用磁碟儲存或串流，不在這課範圍。</p>
+<h3>伺服器變成多台時，檔案存哪裡？</h3>
+<p>存在伺服器硬碟只適合單一台伺服器。第 21 課提到上線時會部署成三台；變成多台之後，上傳到 A 台的檔案 B 台看不到，那時要改存物件儲存（S3 這類服務），controller 與驗證的寫法不變，只有 <code>saveImage</code> 裡「寫到哪」會換。</p>
+
+<h2>小結</h2>
+<ul>
+  <li>從信任邊界外送進來的東西（上傳的檔案、別人呼叫的 webhook），每個欄位都可能是假的，伺服器要自己確認。</li>
+  <li>multipart 的 <code>filename</code>、<code>Content-Type</code> 與內容都是客戶端填的；只有內容值得檢查，而且要看檔頭。</li>
+  <li><code>FileInterceptor(欄位, { limits: { fileSize, files } })</code> 在 multer 這層擋大小（413），interceptor 比 pipe 先執行，pipe 擋就太晚；<code>ParseFilePipeBuilder().addFileTypeValidator({ fileType, overrideMimeType: true }).build({ errorHttpStatusCode: 422 })</code> 看檔頭擋類型，失敗時不會存檔。</li>
+  <li>檔名用 <code>randomUUID()</code>，副檔名依偵測到的類型查表，存到設定的 <code>UPLOAD_DIR</code>。</li>
+  <li>webhook 是對方主動呼叫我們；用 HMAC 簽章驗來源與完整性：<code>rawBody: true</code> 拿原始位元組、±300 秒時間窗擋重放、先比長度再 <code>timingSafeEqual</code>、密鑰從設定讀，所有失敗都是 401。</li>
+  <li>webhook 會重送，處理要冪等：<code>event_id</code> 唯一約束，改訂單（條件更新）與記事件在同一個交易，P2002 與找不到訂單都回 200。</li>
+</ul>
+<p>下一課把這些 API 寫成文件：用 <code>@nestjs/swagger</code> 產生 OpenAPI，讓前端與金流公司不用問你就知道怎麼呼叫，並學會在不弄壞現有客戶端的前提下演進 API。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

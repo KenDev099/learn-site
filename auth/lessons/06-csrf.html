@@ -1,0 +1,1152 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>6. CSRF：借你的 Cookie 發請求</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="6">
+<header>
+  <div class="eyebrow">階段 2：瀏覽器裡的登入狀態：Cookie、Session 與跨站攻擊 · 第 6 課</div>
+  <h1>CSRF：借你的 Cookie 發請求</h1>
+</header>
+<main>
+
+<p>王小明登入咖啡店網站後，沒登出就去逛別的網站。其中一個標榜「免費拿鐵抽獎」的頁面藏了一個看不見的表單，頁面一載入就自動送出 <code>POST https://api.coffee.example/orders/42/cancel</code>。瀏覽器替這個請求附上咖啡店的 session cookie，API 看到合法的 session，就把王小明的訂單 #42 取消了。王小明什麼都沒點，惡意網站也從頭到尾沒碰到他的 cookie。</p>
+<p>這叫<strong>跨站請求偽造（Cross-Site Request Forgery，CSRF）</strong>：惡意網站讓你的瀏覽器帶著你的 cookie，對你已登入的網站送出你沒打算送的請求。<a href="05-same-origin-cors.html">第 5 課</a>說過，同源政策擋的是別的網站「讀」回應，不擋它「送」請求；CSRF 只需要「送」。</p>
+<p>這一課從頭到尾處理同一件事：讓咖啡店的 <code>POST /orders/42/cancel</code> 只接受王小明在咖啡店網站上自己按下的取消，拒絕別的網站替他送出的請求。學完你能替一個用 cookie 登入的網站選出 CSRF 防線，並說得出每一層擋什麼、漏什麼。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>王小明什麼都沒點，訂單怎麼被取消的：重現攻擊，找出 CSRF 成立的三個條件，之後每一種防法各打破其中一個。</li>
+  <li>能不能叫瀏覽器跨站時別帶 cookie：SameSite。明寫 <code>Lax</code> 就擋得住開頭的表單，但它還有四個洞。</li>
+  <li>伺服器怎麼知道請求從哪個網站來：瀏覽器自己填、網頁改不掉的 Fetch Metadata 與 <code>Origin</code> 標頭，照 Go 1.25 的規則寫成伺服器端檢查。</li>
+  <li>能不能在請求裡放一個攻擊者拿不到的值：CSRF token，以及它為什麼一定要用 HMAC 綁到 session。</li>
+  <li>Vue 前台只打 JSON API 時有沒有更省事的防法，防線畫好之後還有哪些地方會漏。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="04-cookies-sessions.html">第 4 課</a>的 session cookie 與 <code>SameSite</code>：瀏覽器會自動替請求附上目標網站的 cookie，<code>SameSite</code> 決定跨站時帶不帶。</li>
+  <li><a href="05-same-origin-cors.html">第 5 課</a>的同源、同站與預檢：來源看 scheme＋host＋port，站看 scheme＋可註冊網域；表單這類簡單請求直接送出，帶自訂標頭的跨來源請求要先通過預檢。</li>
+  <li><a href="02-crypto-toolbox.html">第 2 課</a>的安全亂數與 HMAC：<code>crypto.getRandomValues</code> 產生猜不到的值；HMAC 用伺服器的金鑰算出標籤，用 <code>crypto.subtle.verify</code> 驗證。</li>
+</ul></div>
+
+<h2>王小明什麼都沒點，訂單怎麼被取消的？</h2>
+<p>先重現攻擊。攻擊者在 <code>https://evil.example/win-a-free-latte</code> 放了這段 HTML：</p>
+<pre>&lt;form action="https://api.coffee.example/orders/42/cancel" method="POST"&gt;
+  &lt;input type="hidden" name="reason" value="不想要了"&gt;
+&lt;/form&gt;
+&lt;script&gt;document.forms[0].submit()&lt;/script&gt;</pre>
+<p>前三行是一個指向咖啡店 API 的表單，裡面只有一個隱藏欄位；最後一行在頁面載入時替使用者按下送出。使用者畫面上看到的，可能只是一張抽獎圖。</p>
+<p>這段 HTML 能成功，靠的是瀏覽器兩個很老的行為。第一，任何網站都能對任何網址送出表單。表單送出是瀏覽器最古老的功能，跨網站送表單不需要 CORS 許可，也不會先預檢（第 5 課：表單屬於簡單請求）。第二，瀏覽器送請求時，附上的是「目標網站」的 cookie，不管這個請求是哪個網頁發起的。請求要送去 <code>api.coffee.example</code>，瀏覽器就附上 <code>api.coffee.example</code> 的 cookie，即使按下送出的是 evil.example 的頁面。</p>
+<p>下面用幾個函式模擬這兩個行為。<code>api</code> 是咖啡店的 API，只看 cookie 裡的 session 判斷是誰；<code>browserSend</code> 是瀏覽器，依目標網址從 cookie 罐裡拿 cookie。執行後看最後一行訂單 #42 的狀態：</p>
+<div class="lab"><script type="code">
+// 咖啡店 API：只看 cookie 判斷是誰
+const sessions = new Map([['sid-8f3k', '王小明']])
+const orders = new Map([[42, { owner: '王小明', status: '已付款' }]])
+
+function api(method: string, path: string, cookies: Record<string, string>) {
+  const user = sessions.get(cookies.sid)
+  if (!user) return 401
+  const m = /^\/orders\/(\d+)\/cancel$/.exec(path)
+  const order = m ? orders.get(Number(m[1])) : undefined
+  if (method !== 'POST' || !order || order.owner !== user) return 404
+  order.status = '已取消'
+  return 200
+}
+
+// 瀏覽器：依「目標網址」從 cookie 罐裡拿 cookie，不看是誰發起的
+const jar: Record<string, Record<string, string>> = { 'api.coffee.example': { sid: 'sid-8f3k' } }
+function browserSend(fromPage: string, method: string, url: string) {
+  const u = new URL(url)
+  const status = api(method, u.pathname, jar[u.hostname] ?? {})
+  console.log(`${new URL(fromPage).host} 的頁面 → ${method} ${u.host}${u.pathname} → ${status}`)
+}
+
+browserSend('https://evil.example/win-a-free-latte', 'POST', 'https://api.coffee.example/orders/42/cancel')
+console.log('訂單 #42：', orders.get(42)?.status)
+</script></div>
+<p>API 回 200，訂單變成「已取消」。從 API 的角度看，這個請求跟王小明自己在咖啡店網站按下「取消訂單」一模一樣：同一個網址、同一個方法、同一個 session cookie。下圖是整個過程：</p>
+<figure>
+  <svg viewBox="0 0 700 270" role="img" aria-label="CSRF 序列圖：王小明登入咖啡店取得 cookie，接著打開惡意網站，惡意網站的表單讓瀏覽器帶著 cookie 對咖啡店 API 送出取消訂單的請求">
+    <defs><marker id="arr-csrf" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="20" y="15" width="170" height="40" rx="8"/>
+    <text class="d-text" x="105" y="40" text-anchor="middle">王小明的瀏覽器</text>
+    <rect class="d-soft" x="265" y="15" width="170" height="40" rx="8"/>
+    <text class="d-text" x="350" y="40" text-anchor="middle">evil.example</text>
+    <rect class="d-box" x="510" y="15" width="170" height="40" rx="8"/>
+    <text class="d-text" x="595" y="40" text-anchor="middle">api.coffee.example</text>
+    <line class="d-line" x1="105" y1="55" x2="105" y2="255" stroke-dasharray="4 4"/>
+    <line class="d-line" x1="350" y1="55" x2="350" y2="255" stroke-dasharray="4 4"/>
+    <line class="d-line" x1="595" y1="55" x2="595" y2="255" stroke-dasharray="4 4"/>
+    <path class="d-line" d="M105,80 L590,80" marker-end="url(#arr-csrf)"/>
+    <text class="d-small" x="115" y="74">① 登入，收到 Set-Cookie: sid=…</text>
+    <path class="d-line" d="M105,120 L345,120" marker-end="url(#arr-csrf)"/>
+    <text class="d-small" x="115" y="114">② 打開抽獎頁</text>
+    <path class="d-line" d="M350,150 L110,150" marker-end="url(#arr-csrf)"/>
+    <text class="d-small" x="140" y="144">③ 回傳自動送出的表單</text>
+    <path class="d-line" d="M105,195 L590,195" marker-end="url(#arr-csrf)"/>
+    <text class="d-accent" x="115" y="189">④ POST /orders/42/cancel ＋ Cookie: sid=…（自動附上）</text>
+    <path class="d-line" d="M595,230 L110,230" marker-end="url(#arr-csrf)"/>
+    <text class="d-small" x="300" y="224">⑤ 200：訂單已取消</text>
+  </svg>
+  <figcaption>惡意網站沒有讀到 cookie，只是讓瀏覽器自己帶上它</figcaption>
+</figure>
+<p>注意攻擊者從頭到尾<strong>讀不到</strong>任何東西：cookie 的值它不知道，⑤ 的回應受同源政策保護，evil.example 的程式也看不到。但它不需要讀，請求在 ④ 抵達伺服器時，取消訂單這件事已經發生了。所以 CSRF 傷害的是「會改變狀態」的請求：取消訂單、改 email、兌換集點、轉讓會員點數。只回傳資料的請求，攻擊者讀不到回應，沒有收穫。</p>
+<p>把這次攻擊拆開，它要成立需要三個條件，缺一不可：</p>
+<ol>
+  <li><strong>瀏覽器會自動帶憑證</strong>：cookie 會在請求裡自動附上，攻擊者不用知道它的值。HTTP Basic 認證、客戶端憑證也是瀏覽器自動帶的憑證，一樣適用。</li>
+  <li><strong>伺服器只靠這個憑證判斷身分</strong>：API 看到合法的 session 就照做，不管請求從哪個網頁來。</li>
+  <li><strong>請求裡沒有攻擊者猜不到的東西</strong>：取消訂單只需要訂單編號，攻擊者知道或猜得到所有參數。</li>
+</ol>
+<p>這三個條件就是防禦的方向：打破任何一個，攻擊就不成立。接下來每一種防法，都是在打破其中一個。先從最外層的第一個條件開始：cookie 是瀏覽器自動帶的，那能不能叫瀏覽器在跨站的時候別帶？</p>
+
+<h2>能不能叫瀏覽器跨站時別帶 cookie？SameSite</h2>
+<p>可以，這就是 cookie 的 <code>SameSite</code> 屬性。第 4 課設 session cookie 時寫了 <code>SameSite=Lax</code>，當時只說它決定跨站時帶不帶；這一節看它怎麼決定。</p>
+<p>瀏覽器先判斷請求是不是<strong>跨站</strong>。「站」是第 5 課的 site：scheme 加上可註冊網域。發起請求的頁面跟目標網址同站，SameSite 不管，cookie 照帶；不同站，才看 SameSite 的值。evil.example 跟 api.coffee.example 不同站，所以開頭的表單是跨站請求。</p>
+<p>SameSite 的規則用到兩個名詞，先講清楚。<strong>安全方法（safe method）</strong>是 GET、HEAD、OPTIONS。依 HTTP 的語意，它們只讀不改（<a href="../../node/lessons/14-rest-api-design.html">Node 課第 14 課</a>），伺服器收到它們不應該改任何資料，所以放行它們被認為沒有風險。<strong>頂層導覽（top-level navigation）</strong>是整個分頁跳到另一個網址、網址列會跟著變的請求：點連結、送出表單、<code>location.href = …</code>。<code>fetch</code>、<code>&lt;img&gt;</code>、<code>&lt;script&gt;</code>、iframe 裡的跳轉都不是頂層導覽，它們是頁面在背景載入東西。送出表單算頂層導覽，因為送出後整個分頁會跳到回應的頁面。</p>
+<p>有了這兩個名詞，SameSite 的三個值是：</p>
+<ul>
+  <li><strong><code>SameSite=Strict</code></strong>：任何跨站請求都不帶。</li>
+  <li><strong><code>SameSite=Lax</code></strong>：跨站時只有「頂層導覽，而且是安全方法」才帶。</li>
+  <li><strong><code>SameSite=None</code></strong>：跨站也帶，必須同時有 <code>Secure</code>，否則瀏覽器整個拒收這個 cookie。</li>
+</ul>
+<p>Lax 為什麼偏偏放行「頂層導覽的安全方法」？因為那正是使用者從別的網站點連結過來的情況。王小明在 Gmail 的信裡點了咖啡店的訂單連結，他期待看到自己已登入的訂單頁；這個請求是 GET、不改資料，帶 cookie 沒有風險。開頭的攻擊是跨站的 POST，不是安全方法，Lax 就不帶。各種情境對照如下：</p>
+<div class="table-wrap">
+<table>
+  <tr><th>情境（目標都是 api.coffee.example）</th><th>Strict</th><th>Lax</th><th>None; Secure</th></tr>
+  <tr><td>evil.example 自動送出的表單 POST（頂層導覽）</td><td>不帶</td><td>不帶</td><td>帶</td></tr>
+  <tr><td>evil.example 用 <code>fetch</code> 送 POST（帶 credentials）</td><td>不帶</td><td>不帶</td><td>帶</td></tr>
+  <tr><td>evil.example 的 <code>&lt;img src&gt;</code>、iframe</td><td>不帶</td><td>不帶</td><td>帶</td></tr>
+  <tr><td>從 Gmail 網頁版的信裡點連結進來（GET 頂層導覽）</td><td>不帶</td><td>帶</td><td>帶</td></tr>
+  <tr><td>marketing.coffee.example（同站的子網域）送出的 POST</td><td>帶</td><td>帶</td><td>帶</td></tr>
+  <tr><td>shop.coffee.example 前台呼叫 API（同站）</td><td>帶</td><td>帶</td><td>帶</td></tr>
+</table>
+</div>
+<p>表的第一列就是開場問題的最小答案：session cookie 明寫 <code>SameSite=Lax</code>，evil.example 自動送出的表單就不帶 cookie，API 看不到 session，回 401，訂單保住了。練習 1 會把這張表的判斷寫成函式。</p>
+<p>那為什麼不直接用最嚴的 Strict？看表的第四列：Strict 連從別的網站點連結進來都不帶 cookie。王小明從 Gmail 點訂單連結，會看到「沒登入」，要在站內再點一次或重新整理才正常。為了避開這個體驗問題，session cookie 通常用 Lax。</p>
+<p>但 Lax 只擋住了「跨站送 POST」這一種情況，它還有四個洞：</p>
+<ol>
+  <li><strong>會改狀態的 GET</strong>：如果咖啡店有 <code>GET /orders/42/cancel</code>、<code>GET /logout</code>、<code>GET /rewards/redeem?item=latte</code> 這類 API，攻擊者只要讓你點一個連結，或在頁面裡寫 <code>location.href = …</code>，就是頂層 GET 導覽，Lax 照帶。有些框架支援「方法覆寫」：GET 請求帶一個參數（例如 <code>GET …?_method=POST</code>），伺服器就當成 POST 處理。開著它，效果一樣。</li>
+  <li><strong>同站的子網域</strong>：SameSite 只看 site，<code>marketing.coffee.example</code> 跟 <code>api.coffee.example</code> 同站。這個子網域一旦被攻擊者掌控，它發出的請求連 Strict cookie 都會帶。常見的掌控方式有兩種。一種是外包的活動頁有 XSS 漏洞：攻擊者的程式碼跑進了那個網頁（<a href="07-xss-csp.html">第 7 課</a>）。另一種叫子網域接管（subdomain takeover）：某個子網域的 DNS 還指向已經刪掉的雲端資源，別人把那個資源申請下來，就接管了這個子網域。</li>
+  <li><strong>沒寫 SameSite 時，各家瀏覽器不一樣</strong>：只有 Chromium（Chrome 80+、Edge 86+）把沒寫的當成 Lax，Firefox 預設沒開，Safari 沒有這個預設，當成 None 處理。第 4 課說過：一定要明寫。</li>
+  <li><strong>Chrome 的 2 分鐘例外</strong>：Lax 是「預設套用」（cookie 沒寫 SameSite）時，瀏覽器用比較寬鬆的版本：cookie 設定後 2 分鐘內，跨站的頂層 POST 也會帶。這是為了不弄壞舊的單一登入流程。明寫 <code>SameSite=Lax</code> 就沒有這個例外。規格出處見課末「補充與查表」。</li>
+</ol>
+<p>四個洞有同一個根源：SameSite 是瀏覽器端的規則。伺服器只能希望使用者的瀏覽器照做、每個 cookie 的設定都沒寫錯、所有同站的子網域都可信。所以要疊好幾層各自獨立的防護，一層失守還有下一層，這種做法叫<strong>縱深防禦（defense in depth）</strong>。OWASP CSRF Prevention Cheat Sheet 的結論也是：<strong>SameSite 是縱深防禦，不是唯一防線</strong>。咖啡店的 session cookie 明寫 <code>SameSite=Lax</code>（或 Strict），伺服器端還要自己檢查。另外，Safari、Firefox 對第三方 cookie 的限制也不能當成 CSRF 防護，原因見課末。</p>
+<div class="callout practice"><strong>💡 實務上：有人要把 cookie 改成 SameSite=None 時，先問為什麼</strong><br>最常見的理由是「要嵌進別人的網站」：例如咖啡店的訂位小工具用 iframe 放在合作商場的頁面上，iframe 裡要維持登入，Lax 就不帶了；而且就算改成 None，Safari、Firefox 會封鎖第三方 cookie（見課末），這種登入本來就不可靠。改成 None 之後，evil.example 的表單、fetch 都會帶這個 cookie，開頭的攻擊又能成立，伺服器端的 CSRF 檢查就從「多一層保險」變成唯一防線。資深工程師會先問能不能不用 cookie（例如小工具改用短效 token），真的要改，就只讓那個用途用一個獨立的 cookie，主站的 session cookie 維持 Lax。上線前在 DevTools 的 Application → Cookies 確認每個 cookie 的 SameSite、Secure 都是明寫的。</div>
+<p>伺服器端要檢查什麼？四個洞的共通點是：伺服器看到 cookie 就照做，不知道請求是從哪個網站發起的。下一節就讓伺服器自己看出來。</p>
+
+<h2>伺服器怎麼知道請求是從哪個網站發起的？</h2>
+<p>上一節的洞，都出在第二個條件：伺服器只靠 cookie 判斷身分。如果伺服器能自己看出請求從哪個網站來，就能直接拒絕 evil.example 和不可信的子網域，不用指望 cookie 的設定。問題是：請求裡有什麼東西是攻擊者偽造不了的？</p>
+<p>大部分的請求標頭，網頁的 JavaScript 都能用 <code>fetch</code> 自己設定，攻擊者的頁面也能，拿來判斷來源沒有意義。但有一群標頭不一樣：瀏覽器規定網頁的 JavaScript 不能設定或修改它們，只有瀏覽器自己會填，這群標頭叫<strong>禁止的請求標頭（forbidden request header）</strong>。名稱以 <code>Sec-</code> 開頭的標頭就屬於這一類。攻擊者的頁面改不了它們，伺服器才能相信它們的內容。</p>
+<p>現代瀏覽器會在每個請求加上一組這樣的標頭，說明這個請求的來歷，叫 <strong>Fetch Metadata</strong>。防 CSRF 只需要其中的 <code>Sec-Fetch-Site</code>：發起請求的頁面跟目標網址是什麼關係。它有四個值：</p>
+<ul>
+  <li><code>same-origin</code>：同源，例如 api.coffee.example 自己的頁面。</li>
+  <li><code>same-site</code>：同站不同源，例如 shop.coffee.example 或 marketing.coffee.example 的頁面呼叫 api.coffee.example。</li>
+  <li><code>cross-site</code>：跨站，例如 evil.example。</li>
+  <li><code>none</code>：不是由網頁發起，而是使用者自己在網址列打網址、開書籤。</li>
+</ul>
+<p>所以 evil.example 不管用表單還是 fetch，送到咖啡店 API 的請求都帶著 <code>Sec-Fetch-Site: cross-site</code>，它改不掉。curl 當然可以隨便填這個標頭，但 curl 沒有受害者的 cookie，發出的請求用的是攻擊者自己的身分，不是 CSRF。另外兩個 Fetch Metadata 標頭（<code>Sec-Fetch-Mode</code>、<code>Sec-Fetch-Dest</code>）這課用不到，列在課末查表。</p>
+<p>另一個訊號是 <strong><code>Origin</code> 標頭</strong>：瀏覽器在跨來源請求與 POST 上註明請求來自哪個來源，例如 <code>Origin: https://evil.example</code>。它也是禁止的請求標頭。有一個值要特別小心：沙箱 iframe、<code>file:</code> 頁面、某些跳轉後的請求會送 <code>Origin: null</code>。<code>null</code> 不是「同源」，而是「來源不明」，要當成不可信。</p>
+<p>伺服器端的規則就是把這兩個訊號組起來。Go 1.25 的標準函式庫內建了一個這樣的檢查，叫 <code>net/http.CrossOriginProtection</code>，這課照它的規則走。一共四條，由上往下判斷：</p>
+<ol>
+  <li><strong>GET、HEAD、OPTIONS 一律放行</strong>：安全方法依語意不改資料，不需要防。前提是你的 GET 真的不改狀態；這條規則把「GET 不能改狀態」從建議變成安全要求，上一節的第一個洞在這裡一樣存在。</li>
+  <li><strong>有 <code>Sec-Fetch-Site</code></strong>：<code>same-origin</code> 或 <code>none</code> 放行，其他值拒絕。<code>same-site</code> 也拒絕：子網域不一定可信（外包活動頁、被接管的子網域），這正好補上 SameSite 的第二個洞。</li>
+  <li><strong>沒有 <code>Sec-Fetch-Site</code> 時退回比對 Origin</strong>：<code>Origin</code> 的 host 等於請求的 <code>Host</code> 標頭才放行，<code>null</code> 或不相等就拒絕。</li>
+  <li><strong>兩個都沒有就放行</strong>：瀏覽器送 POST 一定帶 Origin，兩個都沒有代表不是瀏覽器，例如手機 App、curl。它們不會自動帶受害者的 cookie，沒有 CSRF 的問題；這裡拒絕的話，手機 App 會全部壞掉。</li>
+</ol>
+<figure>
+  <svg viewBox="0 0 700 330" role="img" aria-label="Go 1.25 CrossOriginProtection 的判斷流程：安全方法放行；Sec-Fetch-Site 是 same-origin 或 none 放行，其他值拒絕；沒有 Sec-Fetch-Site 時比對 Origin 與 Host；兩個都沒有視為非瀏覽器請求放行">
+    <defs><marker id="arr-fm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="20" y="20" width="250" height="44" rx="8"/>
+    <text class="d-text" x="145" y="47" text-anchor="middle">方法是 GET／HEAD／OPTIONS？</text>
+    <path class="d-line" d="M270,42 L485,42" marker-end="url(#arr-fm)"/>
+    <text class="d-small" x="285" y="36">是</text>
+    <rect class="d-soft" x="490" y="20" width="190" height="44" rx="8"/>
+    <text class="d-text" x="585" y="47" text-anchor="middle">放行</text>
+    <path class="d-line" d="M145,64 L145,95" marker-end="url(#arr-fm)"/>
+    <rect class="d-box" x="20" y="100" width="250" height="44" rx="8"/>
+    <text class="d-text" x="145" y="127" text-anchor="middle">有 Sec-Fetch-Site？</text>
+    <path class="d-line" d="M270,122 L300,122" marker-end="url(#arr-fm)"/>
+    <text class="d-small" x="272" y="114">有</text>
+    <rect class="d-box" x="305" y="100" width="175" height="44" rx="8"/>
+    <text class="d-text" x="392" y="121" text-anchor="middle">same-origin／none？</text>
+    <text class="d-small" x="392" y="137" text-anchor="middle">或 Origin 在信任清單</text>
+    <path class="d-line" d="M480,110 L540,70" marker-end="url(#arr-fm)"/>
+    <text class="d-small" x="495" y="100">是</text>
+    <path class="d-line" d="M480,135 L485,180" marker-end="url(#arr-fm)"/>
+    <rect class="d-soft" x="490" y="160" width="190" height="44" rx="8"/>
+    <text class="d-accent" x="585" y="180" text-anchor="middle">拒絕 403</text>
+    <text class="d-small" x="585" y="196" text-anchor="middle">same-site、cross-site</text>
+    <path class="d-line" d="M145,144 L145,175" marker-end="url(#arr-fm)"/>
+    <text class="d-small" x="152" y="165">沒有</text>
+    <rect class="d-box" x="20" y="180" width="250" height="44" rx="8"/>
+    <text class="d-text" x="145" y="207" text-anchor="middle">有 Origin？</text>
+    <path class="d-line" d="M145,224 L145,255" marker-end="url(#arr-fm)"/>
+    <text class="d-small" x="152" y="245">沒有：curl、手機 App、舊瀏覽器 → 放行</text>
+    <path class="d-line" d="M270,202 L300,250" marker-end="url(#arr-fm)"/>
+    <text class="d-small" x="278" y="222">有</text>
+    <rect class="d-box" x="305" y="255" width="175" height="50" rx="8"/>
+    <text class="d-text" x="392" y="276" text-anchor="middle">Origin 的 host</text>
+    <text class="d-text" x="392" y="295" text-anchor="middle">等於 Host 標頭？</text>
+    <path class="d-line" d="M480,265 L540,210" marker-end="url(#arr-fm)"/>
+    <text class="d-small" x="520" y="250">不同（含 null）</text>
+    <text class="d-small" x="490" y="300">相同或在信任清單 → 放行</text>
+  </svg>
+  <figcaption>Go 1.25 <code>CrossOriginProtection.Check</code> 的流程</figcaption>
+</figure>
+<p>回到咖啡店。前台在 <code>https://shop.coffee.example</code>，API 在 <code>https://api.coffee.example</code>：同站但不同源，前台呼叫 API 帶的是 <code>Sec-Fetch-Site: same-site</code>，照第 2 條會被拒絕。做法是把前台的來源加進信任清單（Go 的 <code>AddTrustedOrigin</code>，比對完整的 Origin 字串），只放行這一個子網域，marketing 子網域照樣擋下。信任清單在第 2、3 條都會查，Origin 完全等於清單裡的某一個就放行。練習 2 會實作這套規則；Go 原始碼裡的邊界情況（什麼時候沒有 <code>Sec-Fetch-Site</code>、比對 Origin 的盲點）整理在課末。</p>
+<div class="callout practice"><strong>💡 實務上：加上檢查後前台突然全部 403，先看 Network 面板</strong><br>打開 DevTools 的 Network 面板，看被擋的請求的 Request Headers：<code>Sec-Fetch-Site</code> 是什麼、<code>Origin</code> 是什麼，再對照伺服器的信任清單。常見原因是新增了一個前台網域（例如 <code>https://www.coffee.example</code>）卻忘了加進清單，或清單寫了結尾的 <code>/</code>、寫錯 port。信任清單要逐字比對完整的 Origin，加網域的人要知道有這份清單，新前台上線的檢查清單裡就該有這一項。</div>
+<p>現在開頭的表單會被擋兩次：瀏覽器不帶 Lax cookie，就算帶了，伺服器也看到 <code>cross-site</code> 而拒絕。不過這兩層都靠瀏覽器提供的資訊。第三個條件還沒動過：請求裡的參數攻擊者全都知道。下一節從這裡下手。</p>
+
+<h2>能不能在請求裡放一個攻擊者拿不到的值？CSRF token</h2>
+<p>前兩節打破的是第一、第二個條件。第三個條件是：開頭的請求裡，訂單編號、取消原因這些參數攻擊者全都知道。如果每個會改狀態的請求都必須附上一個攻擊者拿不到的值，攻擊者的表單就湊不出合法的請求。這個值叫 <strong>CSRF token</strong>。伺服器渲染的表單（例如店長後台用傳統表單）、要支援不送 Fetch Metadata 的環境時，常用這個做法。</p>
+<p>最傳統的版本叫<strong>同步器 token（synchronizer token）</strong>，運作分三步：登入時產生一個 32 bytes 的安全亂數，存在 session 裡；伺服器產生頁面時，把它放在表單的隱藏欄位，或讓前端放進 <code>X-CSRF-Token</code> 標頭；伺服器收到請求時，拿請求裡的值跟 session 裡的比對，不一樣就拒絕。</p>
+<p>攻擊者為什麼拿不到這個值？token 寫在咖啡店的頁面裡，要拿到它就得讀咖啡店頁面的內容。evil.example 可以叫瀏覽器去載入咖啡店的頁面，卻讀不到回應，這是第 5 課的同源政策。「能送不能讀」讓 CSRF 有機可乘，在這裡反過來幫了防守方。</p>
+<p>同步器 token 的缺點是每個 session 要在伺服器多存一個值。session 存在 Redis 這類共用儲存時，每次發 token、驗 token 都要讀寫它；有些框架的 session 結構也不方便加欄位。能不能不存？</p>
+
+<h3>不存在伺服器：天真的 double submit 為什麼會被繞過</h3>
+<p>常見的偷懶版本叫「天真的 double submit」：產生一個亂數，同時放進 cookie 和表單欄位，伺服器不存任何東西，只檢查兩個值一樣。它的假設是「攻擊者讀不到 cookie，就不知道表單該填什麼」。</p>
+<p>這個假設不成立，因為攻擊者不需要讀 cookie，只要能<strong>寫</strong>。把攻擊者選的值寫進受害者瀏覽器的 cookie，叫 <strong>cookie 注入（cookie tossing）</strong>，常見的途徑有兩種：子網域可以寫 <code>Domain=coffee.example</code> 的 cookie，這種 cookie 會跟著送往所有 coffee.example 子網域的請求；網站還有 http（沒加密）的頁面時，網路上的攻擊者（例如同一個公共 Wi-Fi 上的人，這叫中間人攻擊）可以竄改這個頁面的回應，替它寫入同名 cookie。攻擊者寫進一個自己知道的值，再在表單裡填同一個值。下面模擬被接管的 marketing 子網域這麼做，執行後比較兩行的結果：</p>
+<div class="lab"><script type="code">
+// 天真的 double submit：只比 cookie 跟表單欄位一不一樣
+function naiveCheck(cookies: Record<string, string>, form: Record<string, string>) {
+  return cookies.csrf !== undefined && cookies.csrf === form._csrf
+}
+
+// 受害者正常使用時
+console.log('正常的表單：', naiveCheck({ sid: 'sid-8f3k', csrf: 'Qx7…' }, { _csrf: 'Qx7…' }))
+
+// 被接管的 marketing.coffee.example 先寫一個 cookie：
+//   Set-Cookie: csrf=attacker-chosen; Domain=coffee.example; Path=/
+// 送往 api.coffee.example 的請求就會帶著它，再配上攻擊者自己填的表單欄位
+const victimCookies = { sid: 'sid-8f3k', csrf: 'attacker-chosen' }
+console.log('cookie 注入之後：', naiveCheck(victimCookies, { _csrf: 'attacker-chosen' }))
+</script></div>
+<p>兩行都是 <code>true</code>：伺服器分不出哪一個是王小明自己的表單。問題在於這個檢查只問「兩個值一樣嗎」，沒問「這個值是不是伺服器為這個 session 發的」。</p>
+
+<h3>用 HMAC 把 token 綁到 session：簽章雙重提交</h3>
+<p>要回答「是不是伺服器為這個 session 發的」，又不想在伺服器存東西，可以用第 2 課的 HMAC：伺服器用只有自己知道的 secret，對「session ID 加上一個亂數」算出標籤，亂數和標籤一起當作 token。驗證時用同一個 secret 重算一次，對得上，就代表這個 token 是伺服器為這個 session 發的。這個做法叫<strong>簽章雙重提交 cookie（signed double-submit cookie）</strong>，格式如下：</p>
+<pre>random = base64url(32 bytes 安全亂數)
+token  = random + '.' + base64url(HMAC-SHA256(secret, `${sessionId.length}!${sessionId}!${random}`))</pre>
+<p>回到 cookie 注入。攻擊者寫進去的 token 必須是「為受害者的 session ID 算出的 HMAC」，沒有 secret 就算不出來；拿自己帳號的合法 token 也沒用，因為 session ID 不同。綁了 session 之後，攻擊者剩下的路是連 session cookie 一起蓋掉，換成自己帳號的 session，再配上自己帳號的合法 token。所以 session cookie 要用第 4 課的 <code>__Host-</code> 前綴（不能設 Domain），子網域就蓋不掉它。OWASP 建議 CSRF cookie 也用 <code>__Host-</code> 前綴，但綁 session 才是根本的解法。</p>
+<p>token 放在哪裡、從哪裡讀，要分清楚。token 本身可以放在一個一般的 cookie（不設 HttpOnly，讓前端讀出來）或直接寫進頁面；前端送請求時，把它放進 <code>X-CSRF-Token</code> 標頭或表單欄位。伺服器檢查的是<strong>標頭或欄位裡</strong>的 token，絕對不能從 cookie 讀 token 再跟 cookie 比：cookie 是自動帶的，攻擊者的請求也會帶，等於沒檢查。</p>
+<p>格式裡還有一個細節：HMAC 的訊息為什麼寫成 <code>${sessionId.length}!${sessionId}!${random}</code>，不直接把 sessionId 和 random 接起來？因為直接接起來，不同的組合可能得到同一個字串。執行後比較每一行的 <code>true</code>／<code>false</code>：</p>
+<div class="lab"><script type="code">
+const naive = (sessionId: string, random: string) => sessionId + random
+const framed = (sessionId: string, random: string) => `${sessionId.length}!${sessionId}!${random}`
+
+console.log(naive('ab', 'c'), naive('a', 'bc'), naive('ab', 'c') === naive('a', 'bc'))
+console.log(framed('ab', 'c'), framed('a', 'bc'), framed('ab', 'c') === framed('a', 'bc'))
+
+// 只加分隔不夠：sessionId 裡也可能有 !
+console.log(('a!b' + '!' + 'c') === ('a' + '!' + 'b!c'))
+console.log(framed('a!b', 'c'), framed('a', 'b!c'))
+</script></div>
+<p>簽章簽的是位元組，兩個訊息位元組一樣，簽章就一樣。<code>'ab' + 'c'</code> 和 <code>'a' + 'bc'</code> 都是 <code>abc</code>，簽章相同，伺服器就分不出這個 token 是發給哪個 session 的。訊息由多個欄位組成時，要讓每種組合都只對應一個字串：先寫長度再寫內容，或用固定長度的欄位。只加分隔符號不夠，因為欄位本身也可能含有分隔符號。這個原則在 JWT（<a href="08-jwt-signatures.html">第 8 課</a>用 <code>.</code> 分隔 base64url，base64url 本身不含 <code>.</code>）、webhook 簽章（<a href="17-api-keys-m2m.html">第 17 課</a>）都會再出現。</p>
+<p>最後是驗證。用 <code>crypto.subtle.verify</code>，它是常數時間比較（<a href="02-crypto-toolbox.html">第 2 課</a>）；不要 sign 一次再用 <code>===</code> 比。token 格式不對（沒有 <code>.</code>、多了 <code>.</code>、不是 base64url）一律回 false，不要讓例外變成 500。練習 3 會把簽發和驗證都寫出來。</p>
+<div class="callout practice"><strong>💡 實務上：多半是框架幫你做，你要做的是「不要關掉它」</strong><br>Django、Rails、Laravel 這類伺服器渲染的框架都內建 CSRF 檢查，在表單樣板加一個標籤（Django 的 <code>{% csrf_token %}</code>、Laravel 的 <code>@csrf</code>）或用 Rails 的表單 helper，就會放好隱藏欄位，平常你幾乎感覺不到它。真正會出事的時刻，是有人為了讓某個 403 消失，把整個中介軟體關掉，或把一整組路由加進排除清單，取消訂單的 API 就又能被開頭那個表單打到。code review 看到「停用 CSRF」的改動，要問清楚是哪個路由、為什麼、改用什麼方式驗證請求。自己用 HMAC 做 token，通常只發生在框架沒提供、或前後端分離要自己接的情況，這時本節的長度與分隔、常數時間比較就是檢查清單。</div>
+<p>簽章雙重提交適合伺服器渲染的表單，也適合前後端分離時自己接。但咖啡店的前台是 Vue SPA，只打 JSON API，每個請求都要自己帶 token。這種架構有沒有更省事的做法？</p>
+
+<h2>Vue 前台只打 JSON API，有更省事的防法嗎？</h2>
+<p>有。咖啡店的前台是 Vue SPA，API 只收 JSON，這種架構可以要求每個會改狀態的請求帶 <code>Content-Type: application/json</code> 或一個自訂標頭（例如 <code>X-Requested-With: coffee-shop</code>）。不用 token，也不用在伺服器存東西。</p>
+<p>為什麼這樣就擋得住？回想開頭的攻擊為什麼能送出：表單是簡單請求，不用預檢。但表單能做的事有限，它只能送三種 Content-Type（<code>application/x-www-form-urlencoded</code>、<code>multipart/form-data</code>、<code>text/plain</code>），而且不能加自訂標頭。攻擊者想送出帶 <code>application/json</code> 或自訂標頭的請求，只能改用 fetch；跨來源的 fetch 一旦帶了這些，就不是簡單請求，瀏覽器會先送預檢（第 5 課）。你的 CORS 設定沒有允許 evil.example，預檢失敗，真正的請求根本不會送出。結果是：表單送不出合格的請求，fetch 送得出合格的請求卻過不了預檢。它打破的是第三個條件的變形：合格的請求必須帶一個攻擊者的表單做不出來、fetch 又會被預檢擋下的東西（JSON 格式或自訂標頭）。</p>
+<p>這個防法有三個前提，少一個就破：</p>
+<ul>
+  <li><strong>CORS 沒有亂開</strong>：反射任意 Origin、允許 <code>null</code>、允許所有子網域（第 5 課的錯誤設定），等於替攻擊者通過預檢。</li>
+  <li><strong>伺服器真的拒絕其他格式</strong>：如果為了方便，body parser 也接受 <code>text/plain</code> 並當成 JSON 解析，攻擊者就能用 <code>&lt;form enctype="text/plain"&gt;</code> 湊出一個合法的 JSON body，不用預檢就送到。Content-Type 不是 <code>application/json</code> 的請求，回 415（Unsupported Media Type，不支援的格式）。</li>
+  <li><strong>允許清單裡的來源都可信</strong>：CORS 允許的來源本來就能讀寫你的 API。</li>
+</ul>
+<p>這個做法也有標準文件背書。BFF（Backend for Frontend）是一種架構：前端只拿 session cookie，OAuth 登入拿到的 access token 留在後端，<a href="11-revocation-tradeoffs.html">第 11 課</a>會講。RFC 10017（OAuth 2.0 for Browser-Based Applications，BCP 212，2026 年 8 月）對 BFF 架構的建議就是用自訂標頭加 CORS 防 CSRF，並提醒子網域被接管時 SameSite 擋不住。</p>
+<p>到這裡，咖啡店取消訂單的 API 有三層：<strong>cookie 明寫 SameSite、伺服器做 Fetch Metadata 檢查、API 只收 JSON</strong>。這是實務上最穩的組合，三層各擋不同的洞：SameSite 讓瀏覽器不帶 cookie，Fetch Metadata 讓伺服器拒絕別的網站，只收 JSON 讓表單送不出合格的請求。防線畫好了，剩下兩個問題：哪些情況其實不用防，哪些地方最容易漏掉？</p>
+
+<h2>哪些情況不用擔心，哪些地方最容易漏？</h2>
+<p>先看不用擔心的情況。<strong>token 放在 <code>Authorization</code> 標頭時不受 CSRF 影響</strong>。這打破的是第一個條件：瀏覽器不會自動帶這個標頭，前端要自己寫 <code>headers: { Authorization: `Bearer ${token}` }</code>，惡意網站沒有 token 就送不出。代價是 token 必須放在 JavaScript 讀得到的地方（記憶體、localStorage），一旦有 XSS，攻擊者直接把 token 偷走，拿到別的地方用到過期。CSRF 換成了 XSS 的風險，這個取捨在<a href="07-xss-csp.html">第 7 課</a>和<a href="11-revocation-tradeoffs.html">第 11 課</a>詳談。</p>
+<p>反過來，用 cookie 登入時，下面這些地方容易被忽略，都要防：</p>
+<ul>
+  <li><strong>登入表單（登入 CSRF，login CSRF）</strong>：攻擊者讓受害者的瀏覽器用<strong>攻擊者的帳密</strong>登入。受害者以為在用自己的帳號，之後加的信用卡、填的地址、搜尋紀錄全進了攻擊者的帳號。登入前還沒有 session，所以 CSRF token 要綁在登入前的匿名 session 上，或靠 Fetch Metadata 檢查（它不需要 session）。</li>
+  <li><strong>登出</strong>：<code>GET /logout</code> 讓任何網站一個 <code>&lt;a&gt;</code> 就能登出你。登出用 POST，也受同樣的檢查。</li>
+  <li><strong>OAuth 的 callback</strong>：<a href="12-oauth-pkce.html">第 12 課</a>的 <code>state</code> 與 PKCE 就是在防 OAuth 流程裡的 CSRF。</li>
+</ul>
+<div class="callout practice"><strong>💡 實務上：金流導回來的請求本來就是跨站的</strong><br>有些金流（例如綠界的付款結果頁）在付款完成後，讓使用者的瀏覽器用表單 POST 把人帶回你的網站。這是跨站的頂層 POST，跟開頭的攻擊長得一樣：Lax cookie 不會帶，Fetch Metadata 檢查會回 403，常見症狀是「付款成功了，回到網站卻顯示沒登入或錯誤頁」。正確的做法是讓這個端點不依賴 session，也不做任何改狀態的事，只用 303 轉到你站內的 GET 結果頁（頂層 GET 導覽，Lax cookie 會帶）；訂單狀態由金流的伺服器對伺服器通知更新，而且要驗金流的簽章。把這種端點從 CSRF 檢查排除時，要寫在文件裡，並確認它真的不靠 cookie 判斷身分。</div>
+<div class="callout warn"><strong>XSS 會打敗所有 CSRF 防護。</strong>上面這些防護都有一個共同前提：攻擊者的程式碼跑在別的網站。同源的惡意腳本送出的請求是 <code>Sec-Fetch-Site: same-origin</code>，Origin 正確，可以讀頁面上的 CSRF token，也可以帶自訂標頭。程式碼一旦跑進你的網站，這個前提就沒了。所以下一課是 XSS。</div>
+
+<h2>補充與查表</h2>
+<p>主線用不到、但查問題或審查別人的實作時會用到的細節。</p>
+
+<h3>Fetch Metadata 的三個標頭（查表用，不用背）</h3>
+<div class="table-wrap">
+<table>
+  <tr><th>標頭</th><th>意思</th><th>值</th></tr>
+  <tr><td><code>Sec-Fetch-Site</code></td><td>發起請求的頁面和目標的關係</td><td><code>same-origin</code>（同源）、<code>same-site</code>（同站不同源）、<code>cross-site</code>（跨站）、<code>none</code>（使用者自己打網址、開書籤）</td></tr>
+  <tr><td><code>Sec-Fetch-Mode</code></td><td>請求的模式</td><td><code>navigate</code>、<code>cors</code>、<code>no-cors</code>、<code>same-origin</code>、<code>websocket</code></td></tr>
+  <tr><td><code>Sec-Fetch-Dest</code></td><td>回應要拿去做什麼</td><td><code>document</code>、<code>image</code>、<code>script</code>、<code>empty</code>（fetch）…</td></tr>
+</table>
+</div>
+
+<h3>Chrome 2 分鐘例外的出處</h3>
+<p>cookie 規格的草案（rfc6265bis-22，還沒成為正式 RFC）叫它 Lax-allowing-unsafe，MDN 說明只有在 Lax 是預設值時才有；明寫 <code>SameSite=Lax</code> 就沒有這個例外。</p>
+
+<h3>第三方 cookie 的封鎖不是 CSRF 防護</h3>
+<p>Safari、Firefox 另外會封鎖或分隔<strong>第三方 cookie</strong>（嵌在別人網站裡的 iframe、圖片拿不到你的 cookie），Chrome 則維持讓使用者自己選（Google 2025 年 10 月宣布）。這是隱私機制，規則跟各家的設定、使用者的選擇有關，而且頂層導覽通常不在封鎖範圍。不能把它當成 CSRF 防護。</p>
+
+<h3>Go 1.25 CrossOriginProtection 的邊界情況</h3>
+<p>以下照 release-branch.go1.25 的 <code>src/net/http/csrf.go</code> 原始碼整理，要自己實作或審查這類 middleware 時再看：</p>
+<ul>
+  <li><strong>什麼時候沒有 <code>Sec-Fetch-Site</code></strong>：瀏覽器只在送往 <strong>potentially trustworthy</strong> 的網址（https、localhost）時才加 Fetch Metadata，另外很舊的瀏覽器也不送。Go 原始碼的註解說所有主流瀏覽器自 2023 年起都支援 <code>Sec-Fetch-Site</code>。</li>
+  <li><strong>比對 Origin 的盲點</strong>：Host 標頭不含 scheme，所以這一步分不出 <code>http://</code> 頁面打 <code>https://</code> API 的情況；Go 選擇放行，建議用 HSTS 補上。HSTS 是一個回應標頭，要求瀏覽器之後只用 https 連線到這個網站。</li>
+  <li><strong>信任清單在兩條路上都會查</strong>：<code>Sec-Fetch-Site</code> 不是 same-origin／none，或 Origin 跟 Host 不同時，Origin 完全等於清單裡的某一個就放行（咖啡店同站的前台就是靠這個）。</li>
+</ul>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：寫 <code>cookieWouldBeSent(cookie, req, browser, publicSuffixes)</code>，判斷瀏覽器送出請求時帶不帶這個 cookie。時間單位都是毫秒。依序檢查：</p>
+  <ol>
+    <li><code>cookie.secure</code> 是 true，目標網址不是 <code>https:</code> → 不帶（真實瀏覽器對 localhost 另有例外，這題不處理）。</li>
+    <li><code>sameSite</code> 是 <code>'None'</code> 卻沒有 <code>secure</code> → 瀏覽器根本沒存，不帶。</li>
+    <li>頁面與目標同站（用已經寫好的 <code>sameSite()</code>，有比 scheme）→ 帶。</li>
+    <li>跨站：<code>Strict</code> 不帶；<code>None</code> 帶；<code>Lax</code> 只在頂層導覽（<code>kind</code> 是 <code>'navigation'</code>）而且方法是 <code>GET</code> 或 <code>HEAD</code> 時帶。</li>
+    <li>沒寫 SameSite（<code>sameSite</code> 是 <code>undefined</code>）：<code>browser.laxByDefault</code> 是 true 就照 Lax，另外頂層導覽在 cookie 設定後 2 分鐘內（<code>now - createdAt &lt;= 120000</code>）任何方法都帶；<code>laxByDefault</code> 是 false 就照 None（這時不要求 Secure）。</li>
+  </ol>
+  <script type="start">
+type CookieInfo = { sameSite?: 'Strict' | 'Lax' | 'None'; secure: boolean; createdAt: number }
+type CookieRequest = { pageUrl: string; targetUrl: string; method: string; kind: 'navigation' | 'subresource'; now: number }
+
+// 第 5 課練習 1 的 siteOf 與 sameSite（已經寫好）
+function siteOf(url: string, publicSuffixes: string[]): string {
+  const u = new URL(url)
+  const host = u.hostname
+  if (host.startsWith('[') || /^\d+\.\d+\.\d+\.\d+$/.test(host)) return `${u.protocol}//${host}`
+  const labels = host.split('.')
+  // 從左往右找，第一個在清單裡的就是最長的公共字尾
+  let i = labels.findIndex((_, k) => publicSuffixes.includes(labels.slice(k).join('.')))
+  if (i === -1) i = labels.length - 1
+  return `${u.protocol}//${i === 0 ? host : labels.slice(i - 1).join('.')}`
+}
+
+function sameSite(a: string, b: string, publicSuffixes: string[]): boolean {
+  return siteOf(a, publicSuffixes) === siteOf(b, publicSuffixes)
+}
+
+function cookieWouldBeSent(cookie: CookieInfo, req: CookieRequest, browser: { laxByDefault: boolean }, publicSuffixes: string[]): boolean {
+  throw new Error('TODO')
+}
+
+const ps = ['example', 'com', 'com.tw', 'github.io']
+const lax: CookieInfo = { sameSite: 'Lax', secure: true, createdAt: 0 }
+console.log('跨站表單 POST：', cookieWouldBeSent(lax, { pageUrl: 'https://evil.example/', targetUrl: 'https://api.coffee.example/orders/42/cancel', method: 'POST', kind: 'navigation', now: 1000 }, { laxByDefault: true }, ps))
+console.log('從 Gmail 點連結：', cookieWouldBeSent(lax, { pageUrl: 'https://mail.google.com/', targetUrl: 'https://api.coffee.example/orders', method: 'GET', kind: 'navigation', now: 1000 }, { laxByDefault: true }, ps))
+</script>
+  <script type="answer">
+type CookieInfo = { sameSite?: 'Strict' | 'Lax' | 'None'; secure: boolean; createdAt: number }
+type CookieRequest = { pageUrl: string; targetUrl: string; method: string; kind: 'navigation' | 'subresource'; now: number }
+
+// 第 5 課練習 1 的 siteOf 與 sameSite（已經寫好）
+function siteOf(url: string, publicSuffixes: string[]): string {
+  const u = new URL(url)
+  const host = u.hostname
+  if (host.startsWith('[') || /^\d+\.\d+\.\d+\.\d+$/.test(host)) return `${u.protocol}//${host}`
+  const labels = host.split('.')
+  // 從左往右找，第一個在清單裡的就是最長的公共字尾
+  let i = labels.findIndex((_, k) => publicSuffixes.includes(labels.slice(k).join('.')))
+  if (i === -1) i = labels.length - 1
+  return `${u.protocol}//${i === 0 ? host : labels.slice(i - 1).join('.')}`
+}
+
+function sameSite(a: string, b: string, publicSuffixes: string[]): boolean {
+  return siteOf(a, publicSuffixes) === siteOf(b, publicSuffixes)
+}
+
+function cookieWouldBeSent(cookie: CookieInfo, req: CookieRequest, browser: { laxByDefault: boolean }, publicSuffixes: string[]): boolean {
+  if (cookie.secure && new URL(req.targetUrl).protocol !== 'https:') return false
+  if (cookie.sameSite === 'None' && !cookie.secure) return false
+  if (sameSite(req.pageUrl, req.targetUrl, publicSuffixes)) return true
+
+  const mode = cookie.sameSite ?? (browser.laxByDefault ? 'Lax' : 'None')
+  if (mode === 'Strict') return false
+  if (mode === 'None') return true
+
+  const navigation = req.kind === 'navigation'
+  if (navigation && (req.method === 'GET' || req.method === 'HEAD')) return true
+  // 只有「預設套用」的 Lax 才有 2 分鐘例外
+  return cookie.sameSite === undefined && navigation && req.now - cookie.createdAt <= 120000
+}
+
+const ps = ['example', 'com', 'com.tw', 'github.io']
+const lax: CookieInfo = { sameSite: 'Lax', secure: true, createdAt: 0 }
+console.log('跨站表單 POST：', cookieWouldBeSent(lax, { pageUrl: 'https://evil.example/', targetUrl: 'https://api.coffee.example/orders/42/cancel', method: 'POST', kind: 'navigation', now: 1000 }, { laxByDefault: true }, ps))
+console.log('從 Gmail 點連結：', cookieWouldBeSent(lax, { pageUrl: 'https://mail.google.com/', targetUrl: 'https://api.coffee.example/orders', method: 'GET', kind: 'navigation', now: 1000 }, { laxByDefault: true }, ps))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<Parameters<typeof cookieWouldBeSent>, [cookie: CookieInfo, req: CookieRequest, browser: { laxByDefault: boolean }, publicSuffixes: string[]]>>  // 參數要跟題目一樣
+type _2 = Expect<Equal<ReturnType<typeof cookieWouldBeSent>, boolean>>  // 回傳 boolean
+</script>
+  <script type="tests">
+const PS = ['example', 'com', 'com.tw', 'github.io']
+const chrome = { laxByDefault: true }
+const firefox = { laxByDefault: false }
+const API = 'https://api.coffee.example/orders/42/cancel'
+const req = (over: Partial<CookieRequest>): CookieRequest => ({ pageUrl: 'https://evil.example/', targetUrl: API, method: 'POST', kind: 'navigation', now: 1000, ...over })
+const ck = (over: Partial<CookieInfo>): CookieInfo => ({ secure: true, createdAt: 0, ...over })
+const send = (c: CookieInfo, r: CookieRequest, b = chrome) => cookieWouldBeSent(c, r, b, PS)
+
+assert.equal(send(ck({ sameSite: 'Lax' }), req({ method: 'GET', kind: 'subresource' })), false, '跨站的 fetch／img（subresource）就算是 GET，Lax 也不帶')
+assert.equal(send(ck({ sameSite: 'Lax' }), req({})), false, '跨站表單 POST（頂層導覽），Lax 不帶')
+assert.equal(send(ck({ sameSite: 'Lax' }), req({ pageUrl: 'https://mail.google.com/', method: 'GET' })), true, '從 Gmail 點連結進來（GET 頂層導覽），Lax 要帶')
+assert.equal(send(ck({ sameSite: 'Lax' }), req({ method: 'HEAD' })), true, 'HEAD 也是安全方法，頂層導覽時 Lax 要帶')
+assert.equal(send(ck({ sameSite: 'Strict' }), req({ pageUrl: 'https://mail.google.com/', method: 'GET' })), false, 'Strict 連從別的網站點連結進來都不帶')
+assert.equal(send(ck({ sameSite: 'Strict' }), req({ pageUrl: 'https://marketing.coffee.example/promo', kind: 'subresource' })), true, 'marketing.coffee.example 與 api.coffee.example 同站，連 Strict 都會帶')
+assert.equal(send(ck({ sameSite: 'Strict' }), req({ pageUrl: 'http://shop.coffee.example/', kind: 'subresource' })), false, 'http 頁面打 https 目標是跨站（scheme 不同），Strict 不帶')
+assert.equal(send(ck({ sameSite: 'Lax', secure: false }), req({ pageUrl: 'http://shop.coffee.example/', method: 'GET', kind: 'subresource' })), false, 'scheme 不同就是跨站，subresource 的 Lax cookie 不帶')
+assert.equal(send(ck({ createdAt: 0 }), req({ now: 60000 })), true, '沒寫 SameSite、Chrome、設定後 60 秒的跨站 POST 頂層導覽：2 分鐘例外，要帶')
+assert.equal(send(ck({ createdAt: 0 }), req({ now: 180000 })), false, '沒寫 SameSite、設定後 180 秒：超過 2 分鐘，照 Lax 不帶')
+assert.equal(send(ck({ createdAt: 0 }), req({ now: 60000, kind: 'subresource' })), false, '2 分鐘例外只適用頂層導覽，跨站 fetch POST 不帶')
+assert.equal(send(ck({ sameSite: 'Lax', createdAt: 0 }), req({ now: 60000 })), false, '明寫 Lax 的 cookie 沒有 2 分鐘例外')
+assert.equal(send(ck({ secure: false }), req({ kind: 'subresource' }), firefox), true, 'laxByDefault 為 false 時，沒寫 SameSite 照 None：跨站 fetch 也帶（不要求 Secure）')
+assert.equal(send(ck({ sameSite: 'None', secure: false }), req({ pageUrl: 'https://shop.coffee.example/', kind: 'subresource' })), false, 'SameSite=None 沒有 Secure，瀏覽器根本沒存，同站也不帶')
+assert.equal(send(ck({ sameSite: 'None' }), req({ kind: 'subresource' })), true, 'SameSite=None; Secure 跨站 fetch 也帶')
+assert.equal(send(ck({ sameSite: 'Lax' }), req({ pageUrl: 'http://shop.coffee.example/', targetUrl: 'http://api.coffee.example/orders', kind: 'subresource' })), false, 'Secure cookie 不送到 http 的目標')
+assert.equal(send(ck({ sameSite: 'Lax', secure: false }), req({ pageUrl: 'http://shop.coffee.example/', targetUrl: 'http://api.coffee.example/orders', kind: 'subresource' })), true, '不是 Secure 的 cookie 同站 http 照帶')
+assert.equal(send(ck({ sameSite: 'None' }), req({ pageUrl: 'http://shop.coffee.example/', kind: 'subresource' })), true, 'Secure 看的是目標網址：http 頁面打 https 目標，SameSite=None; Secure 照帶')
+assert.equal(send(ck({ sameSite: 'Strict' }), req({ pageUrl: 'https://shop.coffee.com.tw/', targetUrl: 'https://evil.com.tw/', kind: 'subresource' })), false, 'com.tw 是公共字尾，shop.coffee.com.tw 與 evil.com.tw 不同站')
+</script>
+  <script type="wrong">
+type CookieInfo = { sameSite?: 'Strict' | 'Lax' | 'None'; secure: boolean; createdAt: number }
+type CookieRequest = { pageUrl: string; targetUrl: string; method: string; kind: 'navigation' | 'subresource'; now: number }
+function siteOf(url: string, publicSuffixes: string[]): string {
+  const u = new URL(url)
+  const host = u.hostname
+  if (host.startsWith('[') || /^\d+\.\d+\.\d+\.\d+$/.test(host)) return `${u.protocol}//${host}`
+  const labels = host.split('.')
+  // 從左往右找，第一個在清單裡的就是最長的公共字尾
+  let i = labels.findIndex((_, k) => publicSuffixes.includes(labels.slice(k).join('.')))
+  if (i === -1) i = labels.length - 1
+  return `${u.protocol}//${i === 0 ? host : labels.slice(i - 1).join('.')}`
+}
+function sameSite(a: string, b: string, publicSuffixes: string[]): boolean {
+  return siteOf(a, publicSuffixes) === siteOf(b, publicSuffixes)
+}
+// 錯：Lax 放行跨站的 subresource（只看方法，沒看是不是頂層導覽）
+function cookieWouldBeSent(cookie: CookieInfo, req: CookieRequest, browser: { laxByDefault: boolean }, publicSuffixes: string[]): boolean {
+  if (cookie.secure && new URL(req.targetUrl).protocol !== 'https:') return false
+  if (cookie.sameSite === 'None' && !cookie.secure) return false
+  if (sameSite(req.pageUrl, req.targetUrl, publicSuffixes)) return true
+  const mode = cookie.sameSite ?? (browser.laxByDefault ? 'Lax' : 'None')
+  if (mode === 'Strict') return false
+  if (mode === 'None') return true
+  if (req.method === 'GET' || req.method === 'HEAD') return true
+  return cookie.sameSite === undefined && req.kind === 'navigation' && req.now - cookie.createdAt <= 120000
+}
+</script>
+  <script type="wrong">
+type CookieInfo = { sameSite?: 'Strict' | 'Lax' | 'None'; secure: boolean; createdAt: number }
+type CookieRequest = { pageUrl: string; targetUrl: string; method: string; kind: 'navigation' | 'subresource'; now: number }
+function siteOf(url: string, publicSuffixes: string[]): string {
+  const u = new URL(url)
+  const host = u.hostname
+  if (host.startsWith('[') || /^\d+\.\d+\.\d+\.\d+$/.test(host)) return `${u.protocol}//${host}`
+  const labels = host.split('.')
+  // 從左往右找，第一個在清單裡的就是最長的公共字尾
+  let i = labels.findIndex((_, k) => publicSuffixes.includes(labels.slice(k).join('.')))
+  if (i === -1) i = labels.length - 1
+  return `${u.protocol}//${i === 0 ? host : labels.slice(i - 1).join('.')}`
+}
+// 錯：只比網域，忽略 scheme
+function sameSite(a: string, b: string, publicSuffixes: string[]): boolean {
+  return siteOf(a, publicSuffixes).split('//')[1] === siteOf(b, publicSuffixes).split('//')[1]
+}
+function cookieWouldBeSent(cookie: CookieInfo, req: CookieRequest, browser: { laxByDefault: boolean }, publicSuffixes: string[]): boolean {
+  if (cookie.secure && new URL(req.targetUrl).protocol !== 'https:') return false
+  if (cookie.sameSite === 'None' && !cookie.secure) return false
+  if (sameSite(req.pageUrl, req.targetUrl, publicSuffixes)) return true
+  const mode = cookie.sameSite ?? (browser.laxByDefault ? 'Lax' : 'None')
+  if (mode === 'Strict') return false
+  if (mode === 'None') return true
+  const navigation = req.kind === 'navigation'
+  if (navigation && (req.method === 'GET' || req.method === 'HEAD')) return true
+  return cookie.sameSite === undefined && navigation && req.now - cookie.createdAt <= 120000
+}
+</script>
+  <script type="wrong">
+type CookieInfo = { sameSite?: 'Strict' | 'Lax' | 'None'; secure: boolean; createdAt: number }
+type CookieRequest = { pageUrl: string; targetUrl: string; method: string; kind: 'navigation' | 'subresource'; now: number }
+function siteOf(url: string, publicSuffixes: string[]): string {
+  const u = new URL(url)
+  const host = u.hostname
+  if (host.startsWith('[') || /^\d+\.\d+\.\d+\.\d+$/.test(host)) return `${u.protocol}//${host}`
+  const labels = host.split('.')
+  // 從左往右找，第一個在清單裡的就是最長的公共字尾
+  let i = labels.findIndex((_, k) => publicSuffixes.includes(labels.slice(k).join('.')))
+  if (i === -1) i = labels.length - 1
+  return `${u.protocol}//${i === 0 ? host : labels.slice(i - 1).join('.')}`
+}
+function sameSite(a: string, b: string, publicSuffixes: string[]): boolean {
+  return siteOf(a, publicSuffixes) === siteOf(b, publicSuffixes)
+}
+// 錯：2 分鐘例外也套用到明寫 Lax 的 cookie
+function cookieWouldBeSent(cookie: CookieInfo, req: CookieRequest, browser: { laxByDefault: boolean }, publicSuffixes: string[]): boolean {
+  if (cookie.secure && new URL(req.targetUrl).protocol !== 'https:') return false
+  if (cookie.sameSite === 'None' && !cookie.secure) return false
+  if (sameSite(req.pageUrl, req.targetUrl, publicSuffixes)) return true
+  const mode = cookie.sameSite ?? (browser.laxByDefault ? 'Lax' : 'None')
+  if (mode === 'Strict') return false
+  if (mode === 'None') return true
+  const navigation = req.kind === 'navigation'
+  if (navigation && (req.method === 'GET' || req.method === 'HEAD')) return true
+  return navigation && req.now - cookie.createdAt <= 120000
+}
+</script>
+  <script type="wrong">
+type CookieInfo = { sameSite?: 'Strict' | 'Lax' | 'None'; secure: boolean; createdAt: number }
+type CookieRequest = { pageUrl: string; targetUrl: string; method: string; kind: 'navigation' | 'subresource'; now: number }
+function siteOf(url: string, publicSuffixes: string[]): string {
+  const u = new URL(url)
+  const host = u.hostname
+  if (host.startsWith('[') || /^\d+\.\d+\.\d+\.\d+$/.test(host)) return `${u.protocol}//${host}`
+  const labels = host.split('.')
+  // 從左往右找，第一個在清單裡的就是最長的公共字尾
+  let i = labels.findIndex((_, k) => publicSuffixes.includes(labels.slice(k).join('.')))
+  if (i === -1) i = labels.length - 1
+  return `${u.protocol}//${i === 0 ? host : labels.slice(i - 1).join('.')}`
+}
+function sameSite(a: string, b: string, publicSuffixes: string[]): boolean {
+  return siteOf(a, publicSuffixes) === siteOf(b, publicSuffixes)
+}
+// 錯：SameSite=None 沒有 Secure 也送
+function cookieWouldBeSent(cookie: CookieInfo, req: CookieRequest, browser: { laxByDefault: boolean }, publicSuffixes: string[]): boolean {
+  if (cookie.secure && new URL(req.targetUrl).protocol !== 'https:') return false
+  if (sameSite(req.pageUrl, req.targetUrl, publicSuffixes)) return true
+  const mode = cookie.sameSite ?? (browser.laxByDefault ? 'Lax' : 'None')
+  if (mode === 'Strict') return false
+  if (mode === 'None') return true
+  const navigation = req.kind === 'navigation'
+  if (navigation && (req.method === 'GET' || req.method === 'HEAD')) return true
+  return cookie.sameSite === undefined && navigation && req.now - cookie.createdAt <= 120000
+}
+</script>
+  <script type="wrong">
+type CookieInfo = { sameSite?: 'Strict' | 'Lax' | 'None'; secure: boolean; createdAt: number }
+type CookieRequest = { pageUrl: string; targetUrl: string; method: string; kind: 'navigation' | 'subresource'; now: number }
+function siteOf(url: string, publicSuffixes: string[]): string {
+  const u = new URL(url)
+  const host = u.hostname
+  if (host.startsWith('[') || /^\d+\.\d+\.\d+\.\d+$/.test(host)) return `${u.protocol}//${host}`
+  const labels = host.split('.')
+  // 從左往右找，第一個在清單裡的就是最長的公共字尾
+  let i = labels.findIndex((_, k) => publicSuffixes.includes(labels.slice(k).join('.')))
+  if (i === -1) i = labels.length - 1
+  return `${u.protocol}//${i === 0 ? host : labels.slice(i - 1).join('.')}`
+}
+function sameSite(a: string, b: string, publicSuffixes: string[]): boolean {
+  return siteOf(a, publicSuffixes) === siteOf(b, publicSuffixes)
+}
+// 錯：Secure 看的是發起請求的頁面，不是目標網址
+function cookieWouldBeSent(cookie: CookieInfo, req: CookieRequest, browser: { laxByDefault: boolean }, publicSuffixes: string[]): boolean {
+  if (cookie.secure && new URL(req.pageUrl).protocol !== 'https:') return false
+  if (cookie.sameSite === 'None' && !cookie.secure) return false
+  if (sameSite(req.pageUrl, req.targetUrl, publicSuffixes)) return true
+  const mode = cookie.sameSite ?? (browser.laxByDefault ? 'Lax' : 'None')
+  if (mode === 'Strict') return false
+  if (mode === 'None') return true
+  const navigation = req.kind === 'navigation'
+  if (navigation && (req.method === 'GET' || req.method === 'HEAD')) return true
+  return cookie.sameSite === undefined && navigation && req.now - cookie.createdAt <= 120000
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：寫 <code>crossOriginCheck(req, trustedOrigins)</code>，照 Go 1.25 <code>CrossOriginProtection</code> 的規則判斷要不要放行。<code>headers</code> 的 key 一律小寫，沒有的標頭是 <code>undefined</code>：</p>
+  <ol>
+    <li>方法是 <code>GET</code>、<code>HEAD</code>、<code>OPTIONS</code> → 放行。</li>
+    <li>有 <code>sec-fetch-site</code>：值是 <code>same-origin</code> 或 <code>none</code> → 放行；其他值（包含 <code>same-site</code>）→ 除非 <code>origin</code> 完全等於 <code>trustedOrigins</code> 的某一個，否則回 <code>cross-site</code>。</li>
+    <li>沒有 <code>sec-fetch-site</code> 也沒有 <code>origin</code> → 放行（不是瀏覽器）。</li>
+    <li>只有 <code>origin</code>：用 <code>new URL()</code> 解析，<code>host</code>（含 port）等於 <code>req.host</code> → 放行；解析失敗（例如 <code>null</code>）或不相等 → 除非 origin 在信任清單，否則回 <code>origin-mismatch</code>。</li>
+  </ol>
+  <script type="start">
+type CheckRequest = { method: string; host: string; headers: Record<string, string | undefined> }
+type CheckResult = { ok: true } | { ok: false; reason: 'cross-site' | 'origin-mismatch' }
+
+function crossOriginCheck(req: CheckRequest, trustedOrigins: string[] = []): CheckResult {
+  throw new Error('TODO')
+}
+
+console.log(crossOriginCheck({ method: 'POST', host: 'api.coffee.example', headers: { 'sec-fetch-site': 'cross-site', origin: 'https://evil.example' } }))
+console.log(crossOriginCheck({ method: 'POST', host: 'api.coffee.example', headers: { 'sec-fetch-site': 'same-site', origin: 'https://shop.coffee.example' } }, ['https://shop.coffee.example']))
+console.log(crossOriginCheck({ method: 'POST', host: 'api.coffee.example', headers: {} }))
+</script>
+  <script type="answer">
+type CheckRequest = { method: string; host: string; headers: Record<string, string | undefined> }
+type CheckResult = { ok: true } | { ok: false; reason: 'cross-site' | 'origin-mismatch' }
+
+function crossOriginCheck(req: CheckRequest, trustedOrigins: string[] = []): CheckResult {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return { ok: true }
+
+  const origin = req.headers['origin']
+  const trusted = origin !== undefined && trustedOrigins.includes(origin)
+
+  const site = req.headers['sec-fetch-site']
+  if (site !== undefined) {
+    if (site === 'same-origin' || site === 'none' || trusted) return { ok: true }
+    return { ok: false, reason: 'cross-site' }
+  }
+
+  if (origin === undefined) return { ok: true }    // 不是瀏覽器：curl、手機 App
+
+  let host: string | null = null
+  try {
+    host = new URL(origin).host                    // 'null' 會解析失敗
+  } catch {}
+  if (host === req.host || trusted) return { ok: true }
+  return { ok: false, reason: 'origin-mismatch' }
+}
+
+console.log(crossOriginCheck({ method: 'POST', host: 'api.coffee.example', headers: { 'sec-fetch-site': 'cross-site', origin: 'https://evil.example' } }))
+console.log(crossOriginCheck({ method: 'POST', host: 'api.coffee.example', headers: { 'sec-fetch-site': 'same-site', origin: 'https://shop.coffee.example' } }, ['https://shop.coffee.example']))
+console.log(crossOriginCheck({ method: 'POST', host: 'api.coffee.example', headers: {} }))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<ReturnType<typeof crossOriginCheck>, { ok: true } | { ok: false; reason: 'cross-site' | 'origin-mismatch' }>>  // 回傳型別要跟題目的 CheckResult 一樣
+type _2 = Expect<Equal<Parameters<typeof crossOriginCheck>[0], CheckRequest>>  // 第一個參數是 CheckRequest
+const _3 = crossOriginCheck({ method: 'GET', host: 'a', headers: {} })  // trustedOrigins 要是選填（預設空陣列）
+</script>
+  <script type="tests">
+const H = 'api.coffee.example'
+const r = (method: string, headers: Record<string, string | undefined>) => ({ method, host: H, headers })
+const OK = { ok: true } as const
+const CROSS = { ok: false, reason: 'cross-site' } as const
+const MISMATCH = { ok: false, reason: 'origin-mismatch' } as const
+
+assert.deepEqual(crossOriginCheck(r('GET', { 'sec-fetch-site': 'cross-site', origin: 'https://evil.example' })), OK, 'GET 是安全方法，cross-site 也放行')
+assert.deepEqual(crossOriginCheck(r('OPTIONS', { 'sec-fetch-site': 'cross-site' })), OK, 'OPTIONS 是安全方法，放行')
+assert.deepEqual(crossOriginCheck(r('POST', { 'sec-fetch-site': 'same-origin', origin: 'https://api.coffee.example' })), OK, 'same-origin 的 POST 放行')
+assert.deepEqual(crossOriginCheck(r('POST', { 'sec-fetch-site': 'none' })), OK, 'none（使用者自己打網址）放行')
+assert.deepEqual(crossOriginCheck(r('POST', { 'sec-fetch-site': 'cross-site', origin: 'https://evil.example' })), CROSS, 'cross-site 的 POST 要拒絕')
+assert.deepEqual(crossOriginCheck(r('DELETE', { 'sec-fetch-site': 'cross-site', origin: 'https://evil.example' })), CROSS, 'cross-site 的 DELETE 要拒絕')
+assert.deepEqual(crossOriginCheck(r('POST', { 'sec-fetch-site': 'same-site', origin: 'https://marketing.coffee.example' })), CROSS, 'same-site 也要拒絕：子網域不一定可信')
+assert.deepEqual(crossOriginCheck(r('POST', { 'sec-fetch-site': 'same-site', origin: 'https://shop.coffee.example' }), ['https://shop.coffee.example']), OK, 'Origin 在信任清單時放行')
+assert.deepEqual(crossOriginCheck(r('POST', { 'sec-fetch-site': 'same-site', origin: 'https://marketing.coffee.example' }), ['https://shop.coffee.example']), CROSS, '信任清單只放行列出的來源')
+assert.deepEqual(crossOriginCheck(r('POST', { 'sec-fetch-site': 'same-site', origin: 'https://shop.coffee.example.evil.example' }), ['https://shop.coffee.example']), CROSS, '信任清單要完全相等，不能用 startsWith')
+assert.deepEqual(crossOriginCheck(r('POST', { origin: 'https://api.coffee.example' })), OK, '沒有 Sec-Fetch-Site 時，Origin 的 host 等於 Host 就放行')
+assert.deepEqual(crossOriginCheck({ method: 'POST', host: 'localhost:3000', headers: { origin: 'http://localhost:3000' } }), OK, 'host 要含 port 一起比')
+assert.deepEqual(crossOriginCheck({ method: 'POST', host: 'localhost:3000', headers: { origin: 'http://localhost:5173' } }), MISMATCH, 'port 不同就是不同來源')
+assert.deepEqual(crossOriginCheck(r('POST', { origin: 'https://evil.example', referer: 'https://api.coffee.example/orders' })), MISMATCH, '要看 Origin，不是 Referer')
+assert.deepEqual(crossOriginCheck(r('POST', { origin: 'null' })), MISMATCH, 'Origin: null 是來源不明，不是同源')
+assert.deepEqual(crossOriginCheck(r('POST', {})), OK, '兩個標頭都沒有是非瀏覽器請求（curl、手機 App），放行')
+assert.deepEqual(crossOriginCheck(r('POST', { origin: 'https://shop.coffee.example' }), ['https://shop.coffee.example']), OK, '沒有 Sec-Fetch-Site、Origin 不同但在信任清單，放行')
+assert.deepEqual(crossOriginCheck(r('POST', { origin: 'https://evil.example' })), MISMATCH, 'Origin 不同要回 origin-mismatch')
+</script>
+  <script type="wrong">
+type CheckRequest = { method: string; host: string; headers: Record<string, string | undefined> }
+type CheckResult = { ok: true } | { ok: false; reason: 'cross-site' | 'origin-mismatch' }
+// 錯：same-site 也放行
+function crossOriginCheck(req: CheckRequest, trustedOrigins: string[] = []): CheckResult {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return { ok: true }
+  const origin = req.headers['origin']
+  const trusted = origin !== undefined && trustedOrigins.includes(origin)
+  const site = req.headers['sec-fetch-site']
+  if (site !== undefined) {
+    if (site === 'same-origin' || site === 'same-site' || site === 'none' || trusted) return { ok: true }
+    return { ok: false, reason: 'cross-site' }
+  }
+  if (origin === undefined) return { ok: true }
+  let host: string | null = null
+  try { host = new URL(origin).host } catch {}
+  if (host === req.host || trusted) return { ok: true }
+  return { ok: false, reason: 'origin-mismatch' }
+}
+</script>
+  <script type="wrong">
+type CheckRequest = { method: string; host: string; headers: Record<string, string | undefined> }
+type CheckResult = { ok: true } | { ok: false; reason: 'cross-site' | 'origin-mismatch' }
+// 錯：兩個標頭都沒有時拒絕，手機 App 與 curl 全部被擋
+function crossOriginCheck(req: CheckRequest, trustedOrigins: string[] = []): CheckResult {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return { ok: true }
+  const origin = req.headers['origin']
+  const trusted = origin !== undefined && trustedOrigins.includes(origin)
+  const site = req.headers['sec-fetch-site']
+  if (site !== undefined) {
+    if (site === 'same-origin' || site === 'none' || trusted) return { ok: true }
+    return { ok: false, reason: 'cross-site' }
+  }
+  let host: string | null = null
+  try { host = new URL(origin ?? '').host } catch {}
+  if (host === req.host || trusted) return { ok: true }
+  return { ok: false, reason: 'origin-mismatch' }
+}
+</script>
+  <script type="wrong">
+type CheckRequest = { method: string; host: string; headers: Record<string, string | undefined> }
+type CheckResult = { ok: true } | { ok: false; reason: 'cross-site' | 'origin-mismatch' }
+// 錯：沒有 Sec-Fetch-Site 時用 Referer 判斷
+function crossOriginCheck(req: CheckRequest, trustedOrigins: string[] = []): CheckResult {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return { ok: true }
+  const origin = req.headers['origin']
+  const trusted = origin !== undefined && trustedOrigins.includes(origin)
+  const site = req.headers['sec-fetch-site']
+  if (site !== undefined) {
+    if (site === 'same-origin' || site === 'none' || trusted) return { ok: true }
+    return { ok: false, reason: 'cross-site' }
+  }
+  const from = req.headers['referer'] ?? origin
+  if (from === undefined) return { ok: true }
+  let host: string | null = null
+  try { host = new URL(from).host } catch {}
+  if (host === req.host || trusted) return { ok: true }
+  return { ok: false, reason: 'origin-mismatch' }
+}
+</script>
+  <script type="wrong">
+type CheckRequest = { method: string; host: string; headers: Record<string, string | undefined> }
+type CheckResult = { ok: true } | { ok: false; reason: 'cross-site' | 'origin-mismatch' }
+// 錯：把 Origin: null 當成同源
+function crossOriginCheck(req: CheckRequest, trustedOrigins: string[] = []): CheckResult {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return { ok: true }
+  const origin = req.headers['origin']
+  const trusted = origin !== undefined && trustedOrigins.includes(origin)
+  const site = req.headers['sec-fetch-site']
+  if (site !== undefined) {
+    if (site === 'same-origin' || site === 'none' || trusted) return { ok: true }
+    return { ok: false, reason: 'cross-site' }
+  }
+  if (origin === undefined || origin === 'null') return { ok: true }
+  let host: string | null = null
+  try { host = new URL(origin).host } catch {}
+  if (host === req.host || trusted) return { ok: true }
+  return { ok: false, reason: 'origin-mismatch' }
+}
+</script>
+  <script type="wrong">
+type CheckRequest = { method: string; host: string; headers: Record<string, string | undefined> }
+type CheckResult = { ok: true } | { ok: false; reason: 'cross-site' | 'origin-mismatch' }
+// 錯：信任清單用 startsWith 比對
+function crossOriginCheck(req: CheckRequest, trustedOrigins: string[] = []): CheckResult {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return { ok: true }
+  const origin = req.headers['origin']
+  const trusted = origin !== undefined && trustedOrigins.some(t => origin.startsWith(t))
+  const site = req.headers['sec-fetch-site']
+  if (site !== undefined) {
+    if (site === 'same-origin' || site === 'none' || trusted) return { ok: true }
+    return { ok: false, reason: 'cross-site' }
+  }
+  if (origin === undefined) return { ok: true }
+  let host: string | null = null
+  try { host = new URL(origin).host } catch {}
+  if (host === req.host || trusted) return { ok: true }
+  return { ok: false, reason: 'origin-mismatch' }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：做出簽章雙重提交的 CSRF token。</p>
+  <ul>
+    <li><code>issueCsrfToken(sessionId, secret)</code>：<code>random</code> 是 32 bytes 安全亂數的 base64url；回傳 <code>random + '.' + base64url(HMAC-SHA256(secret, `${sessionId.length}!${sessionId}!${random}`))</code>。</li>
+    <li><code>verifyCsrfToken(sessionId, token, secret)</code>：用 <code>crypto.subtle.verify</code> 檢查。格式不對（不是剛好兩段、簽章不是 base64url）回 false，不能丟例外。</li>
+  </ul>
+  <script type="start">
+// 第 2 課的 base64url（已經寫好）
+function base64urlEncode(bytes: Uint8Array<ArrayBuffer>): string {
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+function base64urlDecode(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('不是 base64url：' + text)
+  const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+
+async function issueCsrfToken(sessionId: string, secret: Uint8Array<ArrayBuffer>): Promise<string> {
+  throw new Error('TODO')
+}
+
+async function verifyCsrfToken(sessionId: string, token: string, secret: Uint8Array<ArrayBuffer>): Promise<boolean> {
+  throw new Error('TODO')
+}
+
+const secret = crypto.getRandomValues(new Uint8Array(32))
+const token = await issueCsrfToken('sid-8f3k', secret)
+console.log(token)
+console.log('同一個 session：', await verifyCsrfToken('sid-8f3k', token, secret))
+console.log('別人的 session：', await verifyCsrfToken('sid-x9q2', token, secret))
+</script>
+  <script type="answer">
+// 第 2 課的 base64url（已經寫好）
+function base64urlEncode(bytes: Uint8Array<ArrayBuffer>): string {
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+function base64urlDecode(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('不是 base64url：' + text)
+  const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+
+function hmacKey(secret: Uint8Array<ArrayBuffer>) {
+  return crypto.subtle.importKey('raw', secret, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify'])
+}
+
+// 先寫長度：('ab', 'c') 與 ('a', 'bc') 得到不同的訊息
+function message(sessionId: string, random: string) {
+  return new TextEncoder().encode(`${sessionId.length}!${sessionId}!${random}`)
+}
+
+async function issueCsrfToken(sessionId: string, secret: Uint8Array<ArrayBuffer>): Promise<string> {
+  const random = base64urlEncode(crypto.getRandomValues(new Uint8Array(32)))
+  const sig = await crypto.subtle.sign('HMAC', await hmacKey(secret), message(sessionId, random))
+  return random + '.' + base64urlEncode(new Uint8Array(sig))
+}
+
+async function verifyCsrfToken(sessionId: string, token: string, secret: Uint8Array<ArrayBuffer>): Promise<boolean> {
+  const parts = token.split('.')
+  if (parts.length !== 2) return false
+  const [random, sig] = parts
+  let sigBytes: Uint8Array<ArrayBuffer>
+  try {
+    sigBytes = base64urlDecode(sig)
+  } catch {
+    return false
+  }
+  return crypto.subtle.verify('HMAC', await hmacKey(secret), sigBytes, message(sessionId, random))
+}
+
+const secret = crypto.getRandomValues(new Uint8Array(32))
+const token = await issueCsrfToken('sid-8f3k', secret)
+console.log(token)
+console.log('同一個 session：', await verifyCsrfToken('sid-8f3k', token, secret))
+console.log('別人的 session：', await verifyCsrfToken('sid-x9q2', token, secret))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<typeof issueCsrfToken, (sessionId: string, secret: Uint8Array<ArrayBuffer>) => Promise<string>>>  // issueCsrfToken 的簽章要跟題目一樣
+type _2 = Expect<Equal<typeof verifyCsrfToken, (sessionId: string, token: string, secret: Uint8Array<ArrayBuffer>) => Promise<boolean>>>  // verifyCsrfToken 要回傳 Promise<boolean>
+</script>
+  <script type="tests">
+const enc = new TextEncoder()
+const key = new Uint8Array(32).map((_, i) => i * 7 + 1)
+const otherKey = new Uint8Array(32).map((_, i) => i * 5 + 3)
+const b64u = (buf: ArrayBuffer) => {
+  let s = ''
+  for (const b of new Uint8Array(buf)) s += String.fromCharCode(b)
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+const ref = async (sid: string, random: string) => {
+  const k = await crypto.subtle.importKey('raw', key, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+  return random + '.' + b64u(await crypto.subtle.sign('HMAC', k, enc.encode(`${sid.length}!${sid}!${random}`)))
+}
+
+assert.equal(await verifyCsrfToken('sid-A', await ref('sid-A', 'r4nd0m'), key), true, '簽的訊息要是 `${sessionId.length}!${sessionId}!${random}`')
+
+const realVerify = crypto.subtle.verify
+let calls = 0
+;(crypto.subtle as any).verify = (...a: any[]) => { calls++; return (realVerify as any).apply(crypto.subtle, a) }
+let t1 = ''
+try {
+  t1 = await issueCsrfToken('sid-A', key)
+  assert(/^[A-Za-z0-9_-]{43}\.[A-Za-z0-9_-]{43}$/.test(t1), 'token 要是「43 字元的 random . 43 字元的 HMAC」，random 用 32 bytes：' + t1)
+  assert.equal(await verifyCsrfToken('sid-A', t1, key), true, '同一個 session 發的 token 要通過')
+  assert(calls > 0, '要用 crypto.subtle.verify 驗證（常數時間），不要自己 sign 再用 === 比')
+} finally {
+  ;(crypto.subtle as any).verify = realVerify
+}
+assert.equal(await verifyCsrfToken('sid-B', t1, key), false, 'A session 的 token 不能拿到 B session 用')
+assert.equal(await verifyCsrfToken('sid-A', t1, otherKey), false, '換了 secret 就不能通過')
+assert.equal(await verifyCsrfToken('a', await ref('ab', 'c').then(t => 'bc.' + t.split('.')[1]), key), false, "為 ('ab', 'c') 算的 HMAC 不能讓 ('a', 'bc') 通過")
+assert.equal(await verifyCsrfToken('a', await ref('a!b', 'c').then(t => 'b!c.' + t.split('.')[1]), key), false, "為 ('a!b', 'c') 算的 HMAC 不能讓 ('a', 'b!c') 通過：要寫長度")
+const [rnd, sig] = t1.split('.')
+const flipped = (rnd[0] === 'A' ? 'B' : 'A') + rnd.slice(1)
+assert.equal(await verifyCsrfToken('sid-A', flipped + '.' + sig, key), false, '竄改 random 要失敗')
+assert.equal(await verifyCsrfToken('sid-A', t1 + '.x', key), false, '多一個 . 要回 false')
+assert.equal(await verifyCsrfToken('sid-A', rnd, key), false, '只有 random、沒有簽章要回 false')
+assert.equal(await verifyCsrfToken('sid-A', 'Qx7f9KZp2mW', key), false, '隨機字串（天真 double submit 的 token）要回 false')
+assert.equal(await verifyCsrfToken('sid-A', '', key), false, '空字串要回 false')
+assert.equal(await verifyCsrfToken('sid-A', rnd + '.+/==', key), false, '簽章不是 base64url 要回 false，不能丟例外')
+
+const realRandom = Math.random
+Math.random = () => 0.5
+try {
+  const a = await issueCsrfToken('sid-A', key)
+  const b = await issueCsrfToken('sid-A', key)
+  assert(a !== b, '每次發出的 token 都要不同：random 要用 crypto.getRandomValues，不能用 Math.random')
+} finally {
+  Math.random = realRandom
+}
+</script>
+  <script type="wrong">
+function base64urlEncode(bytes: Uint8Array<ArrayBuffer>): string {
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+function base64urlDecode(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('不是 base64url：' + text)
+  const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+function hmacKey(secret: Uint8Array<ArrayBuffer>) {
+  return crypto.subtle.importKey('raw', secret, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify'])
+}
+// 錯：HMAC 只簽 random，沒有綁 session
+async function issueCsrfToken(sessionId: string, secret: Uint8Array<ArrayBuffer>): Promise<string> {
+  const random = base64urlEncode(crypto.getRandomValues(new Uint8Array(32)))
+  const sig = await crypto.subtle.sign('HMAC', await hmacKey(secret), new TextEncoder().encode(random))
+  return random + '.' + base64urlEncode(new Uint8Array(sig))
+}
+async function verifyCsrfToken(sessionId: string, token: string, secret: Uint8Array<ArrayBuffer>): Promise<boolean> {
+  const parts = token.split('.')
+  if (parts.length !== 2) return false
+  const [random, sig] = parts
+  let sigBytes: Uint8Array<ArrayBuffer>
+  try { sigBytes = base64urlDecode(sig) } catch { return false }
+  return crypto.subtle.verify('HMAC', await hmacKey(secret), sigBytes, new TextEncoder().encode(random))
+}
+</script>
+  <script type="wrong">
+function base64urlEncode(bytes: Uint8Array<ArrayBuffer>): string {
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+function base64urlDecode(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('不是 base64url：' + text)
+  const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+function hmacKey(secret: Uint8Array<ArrayBuffer>) {
+  return crypto.subtle.importKey('raw', secret, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify'])
+}
+// 錯：sessionId 與 random 直接相接，沒有長度也沒有分隔
+const message = (sessionId: string, random: string) => new TextEncoder().encode(sessionId + random)
+async function issueCsrfToken(sessionId: string, secret: Uint8Array<ArrayBuffer>): Promise<string> {
+  const random = base64urlEncode(crypto.getRandomValues(new Uint8Array(32)))
+  const sig = await crypto.subtle.sign('HMAC', await hmacKey(secret), message(sessionId, random))
+  return random + '.' + base64urlEncode(new Uint8Array(sig))
+}
+async function verifyCsrfToken(sessionId: string, token: string, secret: Uint8Array<ArrayBuffer>): Promise<boolean> {
+  const parts = token.split('.')
+  if (parts.length !== 2) return false
+  const [random, sig] = parts
+  let sigBytes: Uint8Array<ArrayBuffer>
+  try { sigBytes = base64urlDecode(sig) } catch { return false }
+  return crypto.subtle.verify('HMAC', await hmacKey(secret), sigBytes, message(sessionId, random))
+}
+</script>
+  <script type="wrong">
+function base64urlEncode(bytes: Uint8Array<ArrayBuffer>): string {
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+function hmacKey(secret: Uint8Array<ArrayBuffer>) {
+  return crypto.subtle.importKey('raw', secret, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify'])
+}
+const message = (sessionId: string, random: string) => new TextEncoder().encode(`${sessionId.length}!${sessionId}!${random}`)
+async function issueCsrfToken(sessionId: string, secret: Uint8Array<ArrayBuffer>): Promise<string> {
+  const random = base64urlEncode(crypto.getRandomValues(new Uint8Array(32)))
+  const sig = await crypto.subtle.sign('HMAC', await hmacKey(secret), message(sessionId, random))
+  return random + '.' + base64urlEncode(new Uint8Array(sig))
+}
+// 錯：重算 HMAC 之後用 === 比對（不是常數時間）
+async function verifyCsrfToken(sessionId: string, token: string, secret: Uint8Array<ArrayBuffer>): Promise<boolean> {
+  const parts = token.split('.')
+  if (parts.length !== 2) return false
+  const [random, sig] = parts
+  const expected = await crypto.subtle.sign('HMAC', await hmacKey(secret), message(sessionId, random))
+  return base64urlEncode(new Uint8Array(expected)) === sig
+}
+</script>
+  <script type="wrong">
+function base64urlEncode(bytes: Uint8Array<ArrayBuffer>): string {
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+function base64urlDecode(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('不是 base64url：' + text)
+  const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+function hmacKey(secret: Uint8Array<ArrayBuffer>) {
+  return crypto.subtle.importKey('raw', secret, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify'])
+}
+const message = (sessionId: string, random: string) => new TextEncoder().encode(`${sessionId.length}!${sessionId}!${random}`)
+// 錯：random 用 Math.random 產生
+async function issueCsrfToken(sessionId: string, secret: Uint8Array<ArrayBuffer>): Promise<string> {
+  const random = base64urlEncode(new Uint8Array(32).map(() => Math.floor(Math.random() * 256)))
+  const sig = await crypto.subtle.sign('HMAC', await hmacKey(secret), message(sessionId, random))
+  return random + '.' + base64urlEncode(new Uint8Array(sig))
+}
+async function verifyCsrfToken(sessionId: string, token: string, secret: Uint8Array<ArrayBuffer>): Promise<boolean> {
+  const parts = token.split('.')
+  if (parts.length !== 2) return false
+  const [random, sig] = parts
+  let sigBytes: Uint8Array<ArrayBuffer>
+  try { sigBytes = base64urlDecode(sig) } catch { return false }
+  return crypto.subtle.verify('HMAC', await hmacKey(secret), sigBytes, message(sessionId, random))
+}
+</script>
+  <script type="wrong">
+function base64urlEncode(bytes: Uint8Array<ArrayBuffer>): string {
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+function base64urlDecode(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('不是 base64url：' + text)
+  const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+function hmacKey(secret: Uint8Array<ArrayBuffer>) {
+  return crypto.subtle.importKey('raw', secret, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify'])
+}
+// 錯：只用 ! 分隔、沒寫長度：('a!b', 'c') 與 ('a', 'b!c') 是同一個訊息
+const message = (sessionId: string, random: string) => new TextEncoder().encode(`${sessionId}!${random}`)
+async function issueCsrfToken(sessionId: string, secret: Uint8Array<ArrayBuffer>): Promise<string> {
+  const random = base64urlEncode(crypto.getRandomValues(new Uint8Array(32)))
+  const sig = await crypto.subtle.sign('HMAC', await hmacKey(secret), message(sessionId, random))
+  return random + '.' + base64urlEncode(new Uint8Array(sig))
+}
+async function verifyCsrfToken(sessionId: string, token: string, secret: Uint8Array<ArrayBuffer>): Promise<boolean> {
+  const parts = token.split('.')
+  if (parts.length !== 2) return false
+  const [random, sig] = parts
+  let sigBytes: Uint8Array<ArrayBuffer>
+  try { sigBytes = base64urlDecode(sig) } catch { return false }
+  return crypto.subtle.verify('HMAC', await hmacKey(secret), sigBytes, message(sessionId, random))
+}
+</script>
+  <script type="wrong">
+function base64urlEncode(bytes: Uint8Array<ArrayBuffer>): string {
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+function base64urlDecode(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('不是 base64url：' + text)
+  const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+function hmacKey(secret: Uint8Array<ArrayBuffer>) {
+  return crypto.subtle.importKey('raw', secret, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify'])
+}
+const message = (sessionId: string, random: string) => new TextEncoder().encode(`${sessionId.length}!${sessionId}!${random}`)
+async function issueCsrfToken(sessionId: string, secret: Uint8Array<ArrayBuffer>): Promise<string> {
+  const random = base64urlEncode(crypto.getRandomValues(new Uint8Array(32)))
+  const sig = await crypto.subtle.sign('HMAC', await hmacKey(secret), message(sessionId, random))
+  return random + '.' + base64urlEncode(new Uint8Array(sig))
+}
+async function verifyCsrfToken(sessionId: string, token: string, secret: Uint8Array<ArrayBuffer>): Promise<boolean> {
+  // 錯：沒檢查是不是剛好兩段
+  const [random, sig] = token.split('.')
+  let sigBytes: Uint8Array<ArrayBuffer>
+  try { sigBytes = base64urlDecode(sig) } catch { return false }
+  return crypto.subtle.verify('HMAC', await hmacKey(secret), sigBytes, message(sessionId, random))
+}
+</script>
+  <script type="wrong">
+function base64urlEncode(bytes: Uint8Array<ArrayBuffer>): string {
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+function base64urlDecode(text: string): Uint8Array<ArrayBuffer> {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) throw new Error('不是 base64url：' + text)
+  const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+function hmacKey(secret: Uint8Array<ArrayBuffer>) {
+  return crypto.subtle.importKey('raw', secret, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify'])
+}
+const message = (sessionId: string, random: string) => new TextEncoder().encode(`${sessionId.length}!${sessionId}!${random}`)
+async function issueCsrfToken(sessionId: string, secret: Uint8Array<ArrayBuffer>): Promise<string> {
+  const random = base64urlEncode(crypto.getRandomValues(new Uint8Array(32)))
+  const sig = await crypto.subtle.sign('HMAC', await hmacKey(secret), message(sessionId, random))
+  return random + '.' + base64urlEncode(new Uint8Array(sig))
+}
+async function verifyCsrfToken(sessionId: string, token: string, secret: Uint8Array<ArrayBuffer>): Promise<boolean> {
+  const parts = token.split('.')
+  if (parts.length !== 2) return false
+  const [random, sig] = parts
+  // 錯：簽章不是 base64url 時直接丟例外（伺服器變成 500）
+  const sigBytes = base64urlDecode(sig)
+  return crypto.subtle.verify('HMAC', await hmacKey(secret), sigBytes, message(sessionId, random))
+}
+</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：咖啡店 API 全部改成用 <code>Authorization: Bearer …</code> 標頭帶 token，不再用 cookie。還需要 CSRF 防護嗎？</p>
+  <label data-key="a">需要：瀏覽器會自動把 Authorization 標頭帶到同一個網站</label>
+  <label data-key="b">不需要，而且沒有任何新的風險：token 比 cookie 安全</label>
+  <label data-key="c">不需要 CSRF 防護，但 token 存在 JavaScript 讀得到的地方，一旦有 XSS 就會被直接偷走</label>
+  <label data-key="d">需要：攻擊者的表單可以自己加上 Authorization 標頭</label>
+  <p class="why">✓ CSRF 的第一個條件是「瀏覽器自動帶憑證」，Authorization 標頭要前端自己加，瀏覽器不會自動帶（a 錯）；表單也不能加自訂標頭，跨來源的 fetch 加了會先預檢（d 錯）。但風險沒有消失，只是換了一種：token 在 JavaScript 手上，XSS 可以把它讀走、拿到攻擊者的機器上一直用到過期（b 錯）。HttpOnly cookie 被 XSS 利用時，攻擊者至少要在受害者的瀏覽器裡操作。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：session cookie 設了 <code>SameSite=Lax</code>，取消訂單的 API 是 <code>GET /orders/42/cancel</code>。evil.example 能讓已登入的使用者取消訂單嗎？</p>
+  <label data-key="a">不能：Lax 會擋住所有從別的網站來的請求</label>
+  <label data-key="b">能：evil.example 只要讓分頁跳到這個網址（連結或 <code>location.href</code>），就是跨站的頂層 GET 導覽，Lax 會帶 cookie</label>
+  <label data-key="c">只有在 cookie 設定後 2 分鐘內能</label>
+  <label data-key="d">不能：GET 請求的回應 evil.example 讀不到，所以沒有傷害</label>
+  <p class="why">✓ Lax 只擋跨站的「非安全方法」和「非頂層導覽」，頂層 GET 導覽照帶 cookie（a 錯）。2 分鐘例外是讓 POST 也能過，而且只適用沒寫 SameSite 的 cookie，GET 本來就會過（c 錯）。讀不到回應無關緊要：取消已經在伺服器上執行了（d 錯）。修法是把會改狀態的操作改成 POST，並在伺服器做 Fetch Metadata 檢查。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：同事實作了「cookie 裡的 csrf 值等於表單欄位 <code>_csrf</code> 就放行」，理由是「攻擊者讀不到我們的 cookie」。為什麼不夠？</p>
+  <label data-key="a">攻擊者不需要讀 cookie，只要能寫：被接管的子網域可以寫 <code>Domain=coffee.example</code> 的同名 cookie，再在表單裡填同一個值</label>
+  <label data-key="b">攻擊者可以用 JavaScript 讀 <code>document.cookie</code> 拿到別的網站的 cookie</label>
+  <label data-key="c">沒有問題，只要 token 夠長、用 CSPRNG 產生就安全</label>
+  <label data-key="d">問題只在比對沒用常數時間</label>
+  <p class="why">✓ 天真的 double submit 只檢查「兩個值一樣」，不檢查「這個值是不是伺服器為這個 session 發的」。cookie 注入讓攻擊者自己決定 cookie 的值，兩邊都填同一個就通過，再長的亂數也沒用（c 錯）。同源政策讓別的網站讀不到你的 cookie（b 錯）。常數時間比較要做，但不是這裡的漏洞（d 錯）。修法是練習 3：用 HMAC 把 token 綁到 session。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>用 GET 改狀態</strong>（<code>/cancel</code>、<code>/logout</code>、<code>/redeem</code>）：SameSite=Lax 和 Fetch Metadata 檢查都會放行 GET。會改狀態的操作一律用 POST、PUT、PATCH、DELETE，也不要開方法覆寫。</li>
+  <li><strong>只靠 SameSite，甚至不寫 SameSite</strong>：子網域、會改狀態的 GET、各家瀏覽器預設不同、Chrome 的 2 分鐘例外，都是洞。明寫 SameSite，伺服器端另外檢查。</li>
+  <li><strong>天真的 double submit</strong>：沒有綁 session、沒有簽章，cookie 注入就能繞過。用 HMAC 把 token 綁到 session ID，訊息要寫長度或分隔。</li>
+  <li><strong>伺服器從 cookie 讀 CSRF token 再跟 cookie 比</strong>：cookie 會自動帶，攻擊者的請求也有，等於沒檢查。token 要從標頭或表單欄位讀。</li>
+  <li><strong>只看 Referer，或把 <code>Origin: null</code> 當同源</strong>：Referer 可能被 Referrer-Policy 拿掉，也不是為這個用途設計的；<code>null</code> 代表來源不明。用 Sec-Fetch-Site，退回比對 Origin。</li>
+  <li><strong>為了方便，<code>text/plain</code> 或表單格式的 body 也當成 JSON 解析</strong>：表單不用預檢就能送出這些格式，「只收 JSON」的防護就沒了。不是 <code>application/json</code> 回 415。</li>
+  <li><strong>以為登入頁、登出不需要 CSRF 防護</strong>：登入 CSRF 會讓受害者用攻擊者的帳號，之後的個資、付款資料都進了攻擊者的帳號。登入、登出都要檢查。</li>
+  <li><strong>信任清單用 <code>startsWith</code> 或 <code>endsWith</code> 比對</strong>：<code>https://shop.coffee.example.evil.example</code> 會通過。完整的 Origin 字串完全相等才放行。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>CSRF 要三個條件：瀏覽器自動帶 cookie、伺服器只靠 cookie 判斷身分、請求裡沒有攻擊者猜不到的東西。攻擊者讀不到任何回應，但會改狀態的請求一送到就已經生效。每種防法打破其中一個條件。</li>
+  <li>SameSite 打破第一個條件：Strict 跨站都不帶；Lax 跨站只有頂層導覽的 GET／HEAD 帶，明寫 Lax 就擋得住開頭的跨站表單；None 一定要 Secure。Lax 擋不住會改狀態的 GET、同站子網域、沒寫 SameSite 時的瀏覽器差異與 2 分鐘例外。它是縱深防禦，不是唯一防線。</li>
+  <li>Fetch Metadata 打破第二個條件，伺服器看瀏覽器自己填、網頁改不掉的標頭（Go 1.25 的規則）：安全方法放行；Sec-Fetch-Site 是 same-origin 或 none 放行，其他（含 same-site）拒絕；沒有就比 Origin 與 Host；兩個都沒有是非瀏覽器，放行。同站的前台用信任清單放行。</li>
+  <li>CSRF token 打破第三個條件，而且要綁 session：<code>random.HMAC(secret, 長度!sessionId!random)</code>，用 <code>crypto.subtle.verify</code> 驗證，從標頭或表單欄位讀。只比 cookie 和欄位一樣不一樣，會被 cookie 注入繞過。</li>
+  <li>JSON API 可以靠「只收 application/json 或自訂標頭」加上正確的 CORS，打破的是第三個條件的變形：合格的請求必須帶表單做不出來、fetch 又過不了預檢的東西。前提是伺服器拒絕其他格式。咖啡店的組合：cookie 明寫 SameSite、伺服器做 Fetch Metadata 檢查、API 只收 JSON。</li>
+  <li>Authorization 標頭不受 CSRF 影響，但換成 XSS 偷 token 的風險；登入、登出也要防；XSS 會打敗所有 CSRF 防護。</li>
+</ul>
+<p>CSRF 的攻擊者在別的網站；如果攻擊者的程式碼直接跑進你的網站呢？下一課講 XSS 與 CSP。</p>
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

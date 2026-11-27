@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>27. 期末專題：咖啡店訂單 API</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="27" data-practice="nestjs">
+<header>
+  <div class="eyebrow">階段 5：上線、維運與架構（資深） · 第 27 課</div>
+  <h1>期末專題：咖啡店訂單 API</h1>
+</header>
+<main>
+
+<p>星期六早上，王小明在咖啡店的 Vue 前台點了兩杯拿鐵，一共 220 元。他按下「下單」時捷運剛好進隧道，請求逾時，前端自動重送了一次。付款完成後，金流公司沒有及時收到我們的回應，同一個付款通知（webhook）送了三次。負責加點的 worker 寫完點數、回報之前連線逾時，工作被重試。那天下午部署新版本，Redis 也跟著重啟了一次。</p>
+<p>這些事單獨看都不稀奇，正式環境每天都在發生。麻煩的是它們全部落在同一張訂單上：任何一環沒接好，王小明就會多一張訂單、多扣一次庫存、拿到 4 點而不是 2 點、收到兩封收據，或是付了錢卻什麼都沒發生。這一課只有一個任務：<strong>不管途中重送幾次、哪個元件重啟，王小明最後剛好有一張已付款的訂單、2 點、一封收據</strong>；而且要用測試與上線檢查證明，下個月有人改了程式，這件事仍然成立。</p>
+<p>這課不教新語法。前面 26 課每課練一個零件：DI、驗證、交易、快取、佇列、排程、webhook、OpenAPI、健康檢查、關機、模組邊界。這裡把它們裝進同一條結帳流程，練資深工程師每天在做的三件事：盤點每一步會怎麼失敗、決定狀態存在哪裡、用測試和檢查清單證明它能上線。每一節都會標出用到的是哪一課。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>王小明的訂單經過哪些地方、每一步斷掉會怎樣：六個模組、兩條進來的路，以及為什麼每一個對策最後都落在 PostgreSQL 的交易與唯一約束。</li>
+  <li>下單送了兩次：Idempotency-Key 是什麼，怎麼讓重送拿回第一次的結果；兩個重送同時到、第一次就失敗時又怎麼辦。</li>
+  <li>付款通知送了三次、Redis 剛好重啟：為什麼交易裡只寫 PostgreSQL，送進佇列的事交給 outbox。</li>
+  <li>加點的工作被重試：worker 怎麼讓重試直接成功，而不是失敗三次把值班的人叫起來。</li>
+  <li>怎麼證明、能不能上線：用 e2e 測試保護這條流程，上線前逐項檢查請求以外的事。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="15-transactions-concurrency.html">第 15 課</a>的互動式交易與原子扣庫存：交易裡的寫入一起 commit 或一起回滾；扣庫存用帶條件的 <code>UPDATE</code>，不先讀再寫。</li>
+  <li><a href="20-queues-bullmq.html">第 20 課</a>的佇列與 outbox：佇列至少執行一次，所以 worker 要冪等；在同一個交易裡把要送的訊息寫進 outbox 表，再由 relay 送進佇列，就不會漏。</li>
+  <li><a href="22-uploads-webhooks.html">第 22 課</a>的 webhook：先驗簽章，再用 <code>webhook_events.event_id</code> 的唯一約束讓重送的同一個事件只處理一次。</li>
+  <li><a href="10-e2e-testing.html">第 10 課</a>的 e2e 測試：用 <code>configureApp</code> 建出跟正式環境一樣設定的應用，再用 supertest 送真的 HTTP 請求。</li>
+</ul></div>
+
+<h2>王小明的訂單會經過哪些地方？</h2>
+<p>要讓一張訂單不出錯，得先知道它從頭到尾經過哪些程式、每一份資料存在哪裡。專題的程式分成六個功能模組，資料歸屬在<a href="26-architecture.html">第 26 課</a>定下，每張表只有一個模組會讀寫它：</p>
+<ul>
+  <li><code>catalog</code>：商品與菜單。</li>
+  <li><code>orders</code>：顧客、訂單，以及這一課要用到的 <code>idempotency_keys</code>。</li>
+  <li><code>payments</code>：接收金流公司的 webhook，記錄處理過的 <code>webhook_events</code>。</li>
+  <li><code>loyalty</code>：集點卡與點數明細，規則是第 26 課的每滿 100 元 1 點，所以王小明的 220 元是 2 點。</li>
+  <li><code>notifications</code>：寄電子收據。</li>
+  <li><code>outbox</code>：把交易裡寫下的訊息送進 BullMQ 佇列。</li>
+</ul>
+<p>模組之間的依賴只往一個方向：<code>payments</code> 依賴 <code>orders</code>（要把訂單標成已付款）和 <code>outbox</code>（要寫下待送的訊息）；<code>loyalty</code> 與 <code>notifications</code> 只認得 <code>outbox/events.ts</code> 裡的事件型別，不知道是誰發的。這是第 26 課用事件解開循環 import 的結果：之後集點規則改了，只需要動 <code>loyalty</code>。</p>
+<p>王小明的訂單沿著下圖走三段路。第一段，前台送 <code>POST /api/v1/orders</code> 進 <code>orders</code>，在一個交易裡記下這次請求、扣庫存、建訂單、存回應。第二段，付款成功後金流公司送 webhook 進 <code>payments</code>，在一個交易裡把訂單改成已付款、記下這個事件、寫下兩則待送的訊息。第三段，<code>OutboxRelay</code> 每秒把還沒送出的訊息送進 <code>loyalty</code> 與 <code>notifications</code> 兩個佇列，各自的 worker 加點、寄收據。</p>
+
+<figure>
+  <svg viewBox="0 0 700 330" role="img" aria-label="下單走 orders 並寫 idempotency_keys；付款 webhook 走 payments，在同一個交易裡改訂單、記 webhook_events、寫 outbox_events；OutboxRelay 每秒把 outbox 送進 loyalty 與 notifications 兩個 BullMQ 佇列，各自的 worker 加點與寄收據">
+    <defs><marker id="a27" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="15" y="20" width="140" height="56" rx="10"/>
+    <text class="d-text" x="85" y="44" text-anchor="middle">Vue 前台</text>
+    <text class="d-small" x="85" y="64" text-anchor="middle">POST /api/v1/orders</text>
+    <rect class="d-box" x="15" y="130" width="140" height="56" rx="10"/>
+    <text class="d-text" x="85" y="154" text-anchor="middle">金流公司</text>
+    <text class="d-small" x="85" y="174" text-anchor="middle">POST …/webhooks/payments</text>
+    <rect class="d-soft" x="215" y="10" width="200" height="76" rx="10"/>
+    <text class="d-text" x="315" y="36" text-anchor="middle">orders</text>
+    <text class="d-small" x="315" y="56" text-anchor="middle">一個交易：寫 key → 扣庫存</text>
+    <text class="d-small" x="315" y="74" text-anchor="middle">→ 建訂單 → 存回應</text>
+    <rect class="d-soft" x="215" y="120" width="200" height="76" rx="10"/>
+    <text class="d-text" x="315" y="146" text-anchor="middle">payments</text>
+    <text class="d-small" x="315" y="166" text-anchor="middle">一個交易：markPaid</text>
+    <text class="d-small" x="315" y="184" text-anchor="middle">→ webhook_events → outbox_events</text>
+    <rect class="d-box" x="215" y="235" width="200" height="56" rx="10"/>
+    <text class="d-text" x="315" y="259" text-anchor="middle">PostgreSQL</text>
+    <text class="d-small" x="315" y="279" text-anchor="middle">十張表，唯一約束當最後一道防線</text>
+    <rect class="d-soft" x="470" y="120" width="215" height="56" rx="10"/>
+    <text class="d-text" x="577" y="144" text-anchor="middle">OutboxRelay（每秒）</text>
+    <text class="d-small" x="577" y="164" text-anchor="middle">SKIP LOCKED → queue.add(jobId)</text>
+    <rect class="d-box" x="470" y="215" width="100" height="56" rx="10"/>
+    <text class="d-text" x="520" y="239" text-anchor="middle">loyalty</text>
+    <text class="d-small" x="520" y="259" text-anchor="middle">worker 加點</text>
+    <rect class="d-box" x="585" y="215" width="100" height="56" rx="10"/>
+    <text class="d-text" x="635" y="239" text-anchor="middle">notifications</text>
+    <text class="d-small" x="635" y="259" text-anchor="middle">worker 寄收據</text>
+    <line class="d-line" x1="155" y1="48" x2="211" y2="48" marker-end="url(#a27)"/>
+    <line class="d-line" x1="155" y1="158" x2="211" y2="158" marker-end="url(#a27)"/>
+    <line class="d-line" x1="315" y1="86" x2="315" y2="116" marker-end="url(#a27)"/>
+    <line class="d-line" x1="315" y1="196" x2="315" y2="231" marker-end="url(#a27)"/>
+    <path class="d-line" d="M415,263 L440,263 L440,148 L466,148" fill="none" marker-end="url(#a27)"/>
+    <line class="d-line" x1="540" y1="176" x2="522" y2="211" marker-end="url(#a27)"/>
+    <line class="d-line" x1="615" y1="176" x2="633" y2="211" marker-end="url(#a27)"/>
+    <text class="d-small" x="440" y="225" text-anchor="middle">Redis</text>
+    <text class="d-accent" x="350" y="318" text-anchor="middle">左半邊只碰 PostgreSQL；Redis 掛了，下單與付款照樣成功</text>
+  </svg>
+  <figcaption>兩條進來的路徑都只在一個交易裡寫 PostgreSQL。送進佇列的事交給 relay，佇列暫時連不上也不會丟掉任何一筆。</figcaption>
+</figure>
+
+<p>圖下方那句話是這課設計的核心，後面會一再回到它：左半邊兩條進來的路只碰 PostgreSQL，所以 Redis 掛了，下單與付款照樣成功；需要 Redis 的工作交給 relay 稍後補送。為什麼要這樣切，下一節把失敗點列出來就會看到。</p>
+<p>起始專案已經能啟動，十張表的 migration 都寫好了，不用改 schema。這一課要你改的是五個地方：<code>OrdersService.create</code>、<code>PaymentsService.handle</code>、<code>LoyaltyService.earnForOrder</code>、<code>test/checkout.e2e-spec.ts</code>，以及練習 4 上線前檢查會點名的幾個檔案。</p>
+<p>圖上每一個箭頭都是一次網路呼叫或一次寫入，每一個都可能斷。動手改這五個地方之前，先把「斷在這裡會怎樣」逐一列出來。</p>
+
+<h2>每個箭頭斷掉會怎樣？先盤點，再寫程式</h2>
+<p>資深工程師接到「下單、付款、集點、收據」這種需求，第一件事不是寫程式，而是沿著上一節的圖一步一步問：這裡掛了會怎樣、客人會看到什麼。這個動作叫失敗點盤點。它把「上線後才會被客人發現的事」提前到設計階段，而且每一列都會直接變成一個要寫的對策、一個要寫的測試。</p>
+<p>下表是王小明那張訂單會經過的步驟。右欄是這一課的對策與對應的練習；現在看不懂對策沒關係，後面每一節會講其中一兩列：</p>
+<div class="table-wrap"><table>
+  <tr><th>步驟</th><th>可能出什麼事</th><th>沒處理的後果</th><th>對策（練習）</th></tr>
+  <tr><td>前端送出下單</td><td>網路逾時，前端重送</td><td>兩張訂單、扣兩次庫存</td><td>Idempotency-Key：同一個 key 只處理一次（練習 1）</td></tr>
+  <tr><td>同一個 key 同時送到</td><td>兩個請求都「先查沒有、再建立」</td><td>還是兩張訂單</td><td>key 當主鍵、在交易第一步寫入；撞 P2002 才去讀存下來的回應（練習 1）</td></tr>
+  <tr><td>下單失敗（庫存不足）</td><td>key 留在表裡</td><td>補貨後用同一個 key 重試永遠失敗</td><td>key 跟訂單同一個交易，失敗一起回滾（練習 1）</td></tr>
+  <tr><td>金流 webhook</td><td>金流公司重送同一個事件</td><td>加兩次點、寄兩封收據</td><td><code>webhook_events.event_id</code> 唯一，撞到當成已處理（第 22 課，已寫好）</td></tr>
+  <tr><td>付款後送進佇列</td><td>commit 與 <code>queue.add</code> 之間當機，或 Redis 連不上</td><td>訂單已 paid，點數與收據永遠不會補</td><td>同一個交易寫 outbox，relay 再送（練習 2）</td></tr>
+  <tr><td>worker 加點</td><td>寫完點數、回報前連線逾時，BullMQ 重試</td><td>加兩次點，或工作永遠 failed</td><td><code>point_transactions.order_id</code> 唯一＋<code>skipDuplicates</code>（練習 2）</td></tr>
+  <tr><td>改了一行程式</td><td>沒人注意到重送又會建立兩張訂單</td><td>上線後才發現</td><td>e2e 測試保護主流程（練習 3）</td></tr>
+  <tr><td>部署到平台</td><td>liveness 查資料庫；管理端點忘了 guard；DTO 多送欄位</td><td>資料庫一掛全部重啟；任何人改價；mass assignment</td><td>上線前檢查（練習 4）</td></tr>
+</table></div>
+<p>看完整張表，前六列的對策其實是同一句話：把「這件事做過了沒」這個狀態放進 PostgreSQL，用交易和唯一約束保證只發生一次。為什麼不用更直覺的做法？直覺的做法有兩種，都擋不住：</p>
+<ul>
+  <li><strong>記在程序的記憶體裡</strong>，例如用一個 <code>Set</code> 記住處理過的 key。正式環境通常同時跑好幾台伺服器，重送的請求可能被送到另一台，那一台的 <code>Set</code> 是空的；部署或重啟之後，所有台的 <code>Set</code> 也一起清空。</li>
+  <li><strong>先查資料庫，沒有才寫</strong>。查和寫是兩個動作，中間有空檔：兩個同時進來的請求可能都在對方寫入之前查詢，兩個都查到「沒有」，於是各寫一筆。</li>
+</ul>
+<p>唯一約束沒有這個空檔：「有沒有重複」的判斷和寫入，是資料庫在同一個動作裡完成的，不管請求從哪一台伺服器來、同時來幾個，同一個值最後只有一筆寫得進去。交易則保證相關的幾筆寫入一起成功或一起失敗，不會留下寫了一半的狀態。兩者合起來，就是這張表每一列的最後一道防線。</p>
+<div class="callout practice"><strong>💡 實務上：這張表就是技術設計文件的核心</strong><br>在團隊裡，這種盤點通常寫在開工前的技術設計文件（tech spec）或 PR 說明，讓 reviewer、PM、維運一起看。PM 關心客人會看到什麼（重複扣款、沒收到收據），維運關心出事時怎麼發現、怎麼補救。資深工程師會逐列追問：這種情況多常發生？發生了有沒有告警？能不能手動補？保護強度跟著後果走：收據漏寄一封，客服可以補寄；重複扣款就一定要在系統裡擋住。</div>
+
+<h2>下單送了兩次，怎麼只建一張訂單？</h2>
+<p>盤點表的第一列就是王小明早上遇到的事：前端送出下單後逾時，自動重送。從伺服器的角度看，難處在於它分不出兩件事：「這是同一次下單的重送」，還是「王小明真的想再點兩杯拿鐵」。兩個請求的內容一模一樣，只看內容是分不出來的。</p>
+<p>能分辨的只有前端，因為只有前端知道自己在重送。<strong>冪等鍵</strong>（Idempotency-Key）就是把這個資訊帶給伺服器的方法：前端在客人確定要下這一單時，產生一個隨機字串（例如用 <code>crypto.randomUUID()</code>），放在 <code>Idempotency-Key</code> 這個 HTTP header 送出；逾時重送時帶同一個字串。伺服器記住每一個處理過的 key，看到同一個 key 再來，就不再下單，而是把第一次的結果再送一次。這樣不管送幾次，效果都跟送一次一樣，這種性質就叫冪等（idempotent）。<a href="../../system-design/lessons/09-idempotency.html">系統設計課第 9 課</a>講過原理，這一節是 NestJS 加 Prisma 的實作。</p>
+<p>要把它做對，有三個設計決定要先想清楚，每一個都對應練習 1 的判分項目。</p>
+
+<h3>key 一定要帶，沒帶就拒絕</h3>
+<p>沒帶 key，或格式不對（只接受 1–64 個英數字、<code>-</code>、<code>_</code>），直接回 400 <code>IDEMPOTENCY_KEY_REQUIRED</code>。這看起來很嚴格，但另一種做法「沒帶就由伺服器自動產生一個」等於沒有保護：重送的請求一樣沒帶 key，伺服器又產生一個新的，對伺服器來說那是一個全新的請求，照樣多一張訂單。保護只有在前端真的帶 key 時才成立，所以伺服器要強制。</p>
+
+<h3>key 要綁定請求內容</h3>
+<p>伺服器除了記 key，也要記下請求內容的指紋。做法是把內容算成 SHA-256 雜湊：同樣的輸入一定得到同樣的一串值，內容差一點點，結果就完全不同。這個值存在 <code>requestHash</code> 欄位。</p>
+<p>同一個 key 配上不同的內容，代表前端把舊 key 用在新的一單上，多半是前端的 bug，例如購物車改了卻沒換 key。這時回 422 <code>IDEMPOTENCY_KEY_REUSED</code>，讓前端馬上知道。如果默默回傳舊訂單，王小明以為點了三杯，實際只有兩杯，bug 也被藏起來了。</p>
+<p>雜湊之前要自己挑欄位、固定順序，答案用的是 <code>customerId</code> 和每個品項的 <code>productId</code>、<code>quantity</code>。直接雜湊收到的原始 JSON 的話，<code>{"customerId":1,"items":…}</code> 和 <code>{"items":…,"customerId":1}</code> 意思一樣，雜湊值卻不同，會被誤判成換了內容；多一個空白、換行也一樣。所以自己挑欄位、固定順序再雜湊，key 順序與空白都不會影響結果。</p>
+
+<h3>存回應，不是重新查</h3>
+<p>重送時要送回的是「第一次那個請求的回應」：同樣的狀態碼（201）、一字不差的內容。所以第一次成功時，把狀態碼和回應字串存進 <code>responseStatus</code>、<code>responseBody</code>，重送時直接拿出來送。</p>
+<p>另一種做法是重送時依 key 找到訂單、再查一次送回去。聽起來一樣，其實不同：王小明付款之後，如果前端又重送了一次，重新查會拿到 <code>paid</code>；但前端在等的是「那一次下單」的結果，也就是當時的 <code>pending</code>。同一個請求兩次拿到不同的回應，前端的邏輯就可能走錯分支。</p>
+<p><code>responseBody</code> 用 text 欄位存原始字串，不用 PostgreSQL 的 jsonb。jsonb 會把 JSON 轉成內部格式儲存，取出來時 key 的順序會重排，就做不到一字不差。</p>
+<p>這三個決定處理的是「依序」的重送：第一次做完了，第二次才到。但王小明的重送不一定等第一次做完才到，第一次也不一定會成功。</p>
+
+<h2>兩個重送同時到、或第一次就失敗了呢？</h2>
+<p>先看同時到。前端逾時重送時，第一個請求其實可能還在伺服器裡跑：它正在扣庫存，第二個請求就進來了。如果程式寫成「先查 <code>idempotency_keys</code> 有沒有這個 key，沒有才下單」，就是上一節說的先查再寫：兩個請求都查到沒有，各下一張單。</p>
+<p>解法是讓資料庫來裁決誰先。key 是 <code>idempotency_keys</code> 表的主鍵，交易的第一步就 <code>create</code> 這一列。後到的交易插入同一個 key 時，會在資料庫裡等先到的交易提交；先到的提交之後，後到的插入違反主鍵、失敗。Prisma 把這種「違反唯一約束」的錯誤包成錯誤碼 <code>P2002</code> 丟出來。程式接住 <code>P2002</code>，就知道這個 key 有人處理過或正在處理，改去讀存下來的那一列，依序檢查：</p>
+<ul>
+  <li><code>requestHash</code> 跟這次不同：同一個 key 換了內容，丟 <code>IdempotencyKeyReusedError</code>，回 422。</li>
+  <li>存下來的回應還是 <code>null</code>：第一個還沒做完，丟 <code>IdempotencyKeyInProgressError</code>，回 409 <code>IDEMPOTENCY_KEY_IN_PROGRESS</code>。</li>
+  <li>都沒問題：回傳存下來的狀態碼與內容。</li>
+</ul>
+<p>再看第一次就失敗。假設拿鐵剛好只剩一杯，王小明的下單因為庫存不足失敗了。店員補貨後，前端用同一個 key、同樣的內容重試，應該要成功。因為 key 和訂單寫在同一個交易裡，庫存不足丟出錯誤時整個交易回滾，key 那一列也跟著消失，重試就跟第一次一樣。如果把寫 key 放在交易外面先提交，下單失敗只回滾交易裡的部分，key 留在表裡、回應是 <code>null</code>，之後每次重試撞 <code>P2002</code> 都被當成「處理中」，補貨後怎麼重試都是 409。</p>
+<p>把兩節的決定合起來，<code>OrdersService.create</code> 寫成程式是這樣：</p>
+<pre>// orders.service.ts
+if (!key || !KEY_FORMAT.test(key)) throw new IdempotencyKeyRequiredError()
+const requestHash = hashRequest(dto)
+try {
+  return await this.prisma.$transaction(async tx =&gt; {
+    await tx.idempotencyKey.create({ data: { key, requestHash } })   // 第一步：搶 key
+    const body = JSON.stringify(await this.placeOrder(tx, dto))      // 第 15 課的扣庫存、建訂單
+    await tx.idempotencyKey.update({ where: { key }, data: { responseStatus: 201, responseBody: body } })
+    return { status: 201, body }
+  })
+} catch (e) {
+  if (!(e instanceof Prisma.PrismaClientKnownRequestError &amp;&amp; e.code === 'P2002')) throw e
+}
+// 撞到主鍵：有人處理過（或正在處理）
+const saved = await this.prisma.idempotencyKey.findUniqueOrThrow({ where: { key } })
+if (saved.requestHash !== requestHash) throw new IdempotencyKeyReusedError(key)
+if (saved.responseStatus === null || saved.responseBody === null) throw new IdempotencyKeyInProgressError(key)
+return { status: saved.responseStatus, body: saved.responseBody }</pre>
+<p><code>catch</code> 只攔 <code>P2002</code>。庫存不足這類錯誤原樣丟出去：交易已經回滾，錯誤交給 exception filter 轉成對應的狀態碼。</p>
+<p>Controller 也要跟著改。平常 controller <code>return</code> 一個物件，Nest 會替你序列化成 JSON，用預設的狀態碼送出。這裡兩樣都不行：狀態碼要用存下來的那個，內容要送存下來的原始字串。所以用 <code>@Res()</code> 拿到回應物件，自己送出：</p>
+<pre>@Post()
+async create(@Headers('idempotency-key') key: string | undefined, @Body() dto: CreateOrderDto, @Res() res: Response) {
+  const saved = await this.orders.create(dto, key)
+  res.status(saved.status).type('application/json').send(saved.body)
+}</pre>
+<div class="callout warn">三個領域錯誤 <code>IdempotencyKeyRequiredError</code>、<code>IdempotencyKeyReusedError</code>、<code>IdempotencyKeyInProgressError</code> 已經在 <code>src/errors/domain-errors.ts</code>，<code>DomainExceptionFilter</code> 會轉成 400、422、409。service 只丟錯誤，不碰狀態碼（<a href="08-exception-filters.html">第 8 課</a>）。</div>
+<div class="callout practice"><strong>💡 實務上：前端在「購買意圖」產生 key，不是每次點擊</strong><br>身為前端，key 的另一半通常是你負責。結帳頁確定購物車內容時產生一次，逾時重試、客人連點按鈕都帶同一個；購物車內容改了就換新 key，否則會撞 422。收到 409 代表第一次還在處理，前端應該稍等再用同一個 key 重送，而不是顯示「下單失敗」讓客人重新下單。串接金流（例如 Stripe）時，你也會在對方的 API 文件看到同樣的 Idempotency-Key header，概念一模一樣。</div>
+
+<h2>付款通知送了三次、Redis 又剛好重啟，點數和收據會不會漏？</h2>
+<p>王小明的訂單只建了一張，接著他付款。金流公司付款成功後，會送一個 webhook 通知我們。同一個事件送三次這件事，<a href="22-uploads-webhooks.html">第 22 課</a>已經處理好了，起始專案也寫好了：先驗簽章，再用 <code>webhook_events.event_id</code> 的唯一約束讓同一個事件只處理一次。這一節要處理的是「處理」之後的事：付款成功要觸發加點與寄收據，這兩件事走 BullMQ 佇列，而佇列存在 Redis 裡。</p>
+<p>起始專案的 <code>PaymentsService.handle</code> 是這樣做的：在一個交易裡把訂單改成 paid、記下 webhook 事件；交易提交之後，再呼叫 <code>publisher.publish</code> 把工作送進佇列。這是兩次寫入，寫到兩個不同的地方，一次寫 PostgreSQL、一次寫 Redis。PostgreSQL 的交易管不到 Redis，兩次寫入沒辦法一起成功或一起失敗，中間任何一點出事，兩邊就不一致。這就是<a href="20-queues-bullmq.html">第 20 課</a>說的雙寫問題，第 20 課練習 7 問過這樣安不安全，答案是不安全。放到王小明身上，會出兩種事：</p>
+<ul>
+  <li><strong>提交之後、送進佇列之前，程序當機</strong>，例如剛好碰上部署。訂單已經是 paid，但工作沒進佇列，2 點和收據永遠不會出現，也沒有任何程式會再試。</li>
+  <li><strong>webhook 進來時 Redis 正在重啟</strong>。<code>publish</code> 丟錯，<code>handle</code> 回 5xx；金流公司看到失敗會重送，但 <code>event_id</code> 在剛才提交的交易裡已經記錄了，重送被當成重複。這次的點數與收據就真的遺失了，而且是被我們自己的防重複機制擋掉的。</li>
+</ul>
+<p>對策是第 20 課的 transactional outbox。它的想法是：既然 Redis 不能參與 PostgreSQL 的交易，交易裡就完全不碰 Redis，改成把「要送出的訊息」也當成資料，在同一個交易裡寫進 PostgreSQL 的 <code>outbox_events</code> 表。這樣「訂單變 paid」和「有訊息要送」一定一起提交、一起回滾。真正送進佇列的事交給 <code>OutboxRelay</code>：它用<a href="21-scheduling-events.html">第 21 課</a>的 <code>@Interval(1000)</code> 每秒撈出還沒送出的訊息，送進佇列、標記為已送，已經寫好了。Redis 這時連不上也沒關係，訊息還在表裡，下一秒再試。</p>
+<p><code>handle</code> 改成這樣：</p>
+<pre>await this.prisma.$transaction(async tx =&gt; {
+  const order = await this.orders.markPaid(tx, event.data.orderId)        // 第 18 課的條件更新，沒改到回 null
+  await tx.webhookEvent.create({ data: { eventId: event.id, type: event.type, status: order ? 'processed' : 'ignored' } })
+  if (!order) return
+  const payload = { orderId: order.id, customerId: order.customerId, total: order.total }
+  await this.outbox.add(tx, { type: 'order.paid', payload }, { type: 'receipt.requested', payload })
+})</pre>
+<p>三件事在同一個交易：訂單變 paid、記下事件、寫兩筆 outbox。要嘛全部發生，要嘛都沒發生。<code>OutboxService.add</code> 一定要傳交易的 <code>tx</code>；在 <code>$transaction</code> 外面用 <code>this.prisma.outboxEvent.create</code> 寫，就又變成兩次獨立的寫入，回到雙寫問題。<code>markPaid</code> 沒改到訂單（已經付過或取消了）時回傳 <code>null</code>，這時只記下事件、標成 <code>ignored</code>，不寫 outbox，同一張訂單就不會因為另一個事件 id 再加一次點。</p>
+<p>relay 自己也可能重複送：送到一半當機，下次會再送一次同一筆。它把 outbox 的 id 當成佇列工作的 <code>jobId</code>，佇列看到同一個 <code>jobId</code> 就不會再建一個工作；多台伺服器同時跑 relay 時，用 <code>FOR UPDATE SKIP LOCKED</code> 讓每一列只被一台拿走。這部分已經寫好，原理在第 20 課。</p>
+<p>payload 只放處理的人需要的事實：<code>{ orderId, customerId, total }</code>。loyalty 的 worker 拿到 <code>total: 220</code> 就能算出 2 點，不必回頭查訂單，也就不必認識 <code>orders</code> 模組（第 26 課）。</p>
+<p>另一個常見的誘惑：「加點在同一個交易裡直接做，最簡單、最原子」。做得到，但 <code>payments</code> 就要碰 <code>stamp_cards</code> 與 <code>point_transactions</code>，資料歸屬被打破；之後集點規則改成「生日加倍」，要改的是付款的程式。第 26 課用事件打破循環，這裡一樣：付款只宣告「訂單付款了」，誰要處理自己去接。</p>
+<p>到這裡，王小明的付款一定會變成兩個送進佇列的工作，一個都不會漏。但佇列為了不漏，給的保證是「至少執行一次」，同一個工作有可能被執行兩次。</p>
+
+<h2>加點的工作被重試了，怎麼不加兩次點、也不算失敗？</h2>
+<p>BullMQ 執行一個工作的流程是：worker 從 Redis 拿到工作、執行你的程式、做完之後回報 Redis「完成了」。點數已經寫進資料庫、卻沒有成功回報，有兩種情況，BullMQ 的處理方式不同：</p>
+<ul>
+  <li><strong>程式丟錯</strong>：worker 寫完點數，後面某一步（例如寫 log、呼叫別的服務）丟出錯誤。BullMQ 把這次記成失敗，照這個專案的工作設定重試：最多做 3 次，失敗後等 1 秒、2 秒再試（<code>attempts: 3</code>、<code>backoff</code> 指數 1000 毫秒）。</li>
+  <li><strong>worker 斷線</strong>：worker 寫完點數就當機，或跟 Redis 的連線斷了，什麼都沒回報。worker 處理工作時會持有一把有期限的鎖並定期續約；斷線後鎖過期，BullMQ 的 stalled 檢查把這個工作判定為卡住（stalled），放回等待區交給 worker 再跑一次。這條路跟 <code>attempts</code>、<code>backoff</code> 無關，即使設 <code>attempts: 1</code> 也會發生。</li>
+</ul>
+<p>兩種都會讓同一個工作再跑一次。這就是第 20 課說的至少一次：佇列寧可多做一次，也不會漏做，代價是 worker 必須承受同一個工作來兩次，也就是要冪等。</p>
+<p>資料這一層已經有保護：<code>point_transactions.order_id</code> 有唯一約束，同一張訂單第二次 <code>create</code> 會撞 <code>P2002</code>，王小明不會拿到 4 點。但工作本身丟了錯，BullMQ 就當它失敗，再試一次又撞，3 次用完後進 failed 清單。監控看到 failed 工作就發告警，值班的人半夜被叫起來，看到的是一個「其實沒事」的錯。這種假警報一多，大家就開始忽略 failed 清單，真正的問題混在裡面沒人看見。</p>
+<p>正確的做法是讓重試<strong>成功</strong>：發現這張訂單已經加過點，就當成這個工作已經完成。Prisma 的 <code>createMany</code> 加 <code>skipDuplicates: true</code> 會變成 <code>INSERT … ON CONFLICT DO NOTHING</code>，撞到唯一約束時什麼都不做、也不丟錯：</p>
+<pre>await this.prisma.$transaction(async tx =&gt; {
+  const card = await tx.stampCard.upsert({ where: { customerId }, create: { customerId }, update: {} })
+  await tx.pointTransaction.createMany({ data: [{ cardId: card.id, orderId, points, reason: '消費' }], skipDuplicates: true })
+})</pre>
+<p>第一行的 <code>upsert</code> 是「有就用、沒有就建立」：王小明第一次加點時還沒有集點卡，就建一張；之後 <code>update: {}</code> 什麼都不改，直接拿到現有的卡。這樣第一次和第 N 次都走同一段程式。另一種寫法是 <code>create</code> 照舊，在 <code>$transaction</code> 外面接住 <code>P2002</code> 當成成功。不能在交易裡面接：PostgreSQL 的交易只要有一個語句失敗就整個作廢，後面的查詢都會失敗。</p>
+<p>寄收據的 worker 已經寫好，它面對的是另一種情況：寄信是呼叫外部服務，我們資料庫的唯一約束管不到它。做法是把 <code>idempotencyKey: receipt-&lt;orderId&gt;</code> 傳給寄信服務，同一個 key 它只寄一次，重試也只寄一封。很多外部 API 都接受這樣的鍵，用它比自己記「寄過了」可靠：自己記的話，信寄出去之後、記下來之前當機，重試還是會再寄一封。</p>
+<p>到這裡，王小明的訂單不管被重送幾次，最後都是一張訂單、2 點、一封收據。但這只是「現在」的程式做得到。下個月有人改了 <code>OrdersService</code> 的一行，怎麼知道它還做得到？</p>
+
+<h2>下個月有人改了一行，怎麼知道重送不會又多一張？</h2>
+<p>前面每一節的保護有個共同的弱點：它們保護的是「平常不會發生的事」。少傳一個 <code>tx</code>、重送時多查一次訂單，程式看起來都對，平常操作也完全正常，只有重送、同時送、付款後再重送這些情境才會露餡。人工測試幾乎不會每次都重做這些情境，所以要寫成自動化測試，每次改程式都跑一遍。</p>
+<p>這裡用的是<a href="10-e2e-testing.html">第 10 課</a>的 e2e 測試，不只是測 service 的單元測試。原因是要保護的行為由好幾樣東西合起來決定：header 怎麼讀、controller 用哪個狀態碼送出、交易與唯一約束怎麼互動、outbox 怎麼被 relay 送進佇列。單元測試把其中任何一樣換成假的，就測不到它們之間的接縫。所以練習 3 有兩條限制：</p>
+<ul>
+  <li><strong>只透過 HTTP 操作與檢查</strong>：下單、查訂單、查點數都走 API，付款用 <code>sendPaymentWebhook</code> 模擬金流公司送 webhook，再用 <code>drain</code> 讓 relay 立刻送一次、等佇列的工作做完。測試看到的，就是前端與金流公司會看到的。</li>
+  <li><strong>不 mock Prisma</strong>：用真的 PostgreSQL 與 Redis，只是換成測試專用的資料庫與佇列前綴，不碰開發資料。mock 掉之後，交易、唯一約束、佇列全被假物件取代，測的是 mock 的行為。</li>
+</ul>
+<p>要測哪些情境，直接從盤點表來：表裡每一列「可能出什麼事」，都該有一個測試去重現它。把王小明這一天寫成測試，大致是：沒帶 key 下單要 400；帶 key 下單、同一個 key 重送，狀態碼和 <code>res.text</code> 都要跟第一次一樣，庫存只扣一次；付款之後再重送一次，還是第一次的內容；換內容重送要 422；付款後 <code>drain</code>，再檢查點數與收據各只有一份。</p>
+<p>怎麼知道測試真的有用？練習 3 的判分方式值得學起來：把正確的程式故意改壞，例如重送時重新查訂單、付款後沒寫 <code>receipt.requested</code>，看你的測試會不會失敗。改壞了測試還是全綠，就代表那種壞法沒被保護。這比看覆蓋率可靠：覆蓋率只說哪些行被執行過，不說結果有沒有被檢查。</p>
+<p>測試證明了結帳流程沒壞。但流程沒壞，不代表這個服務可以部署：它在正式環境能不能啟動、平台怎麼判斷它健康、是不是誰都能改價，這些都不在結帳流程裡。</p>
+
+<h2>功能都對了，可以部署了嗎？上線前逐項檢查</h2>
+<p>前面處理的問題都發生在「請求進來之後」。上線前還要檢查請求以外的事：服務在正式環境怎麼啟動、平台怎麼判斷它健康、管理功能有沒有權限、關機時進行中的請求會不會斷。這些平常開發時遇不到，一上線就會遇到。<a href="../../node/lessons/26-capstone.html">Node 課第 26 課</a>整理過一份上線檢查清單，下表是 NestJS 版，每一列都對應前面某一課；起始專案在其中幾列故意留了問題，練習 4 的測試會照它逐項檢查：</p>
+<div class="table-wrap"><table>
+  <tr><th>檢查</th><th>問自己</th><th>這個專案</th><th>課</th></tr>
+  <tr><td>啟動</td><td><code>nest build</code> 後 <code>node dist/main.js</code> 真的能啟動？</td><td>Vitest 會過、正式啟動卻 ReferenceError 的循環 import，<code>forwardRef</code> 只是蓋住</td><td><a href="25-debugging-performance.html">25</a>、<a href="26-architecture.html">26</a></td></tr>
+  <tr><td>探針</td><td>liveness 只看程序活著？readiness 才查依賴？</td><td>live 查資料庫的話，資料庫一掛每一台都被重啟，重啟也修不好</td><td><a href="24-observability-shutdown.html">24</a></td></tr>
+  <tr><td>權限</td><td>每個管理端點都有 guard？掛在 class 上？</td><td>金鑰比對寫在方法裡，新增一個路由就忘一個；<code>@UseGuards(AdminGuard)</code> 掛 class</td><td><a href="06-middleware-guards.html">6</a></td></tr>
+  <tr><td>輸入</td><td>DTO 沒宣告的欄位會被拒絕？</td><td><code>whitelist</code> 只是悄悄丟掉；加 <code>forbidNonWhitelisted</code> 回 400，前端馬上知道送錯，也擋下 mass assignment</td><td><a href="07-pipes-validation.html">7</a></td></tr>
+  <tr><td>快取</td><td>寫入之後快取會失效？</td><td>拆循環時不能把 <code>menu.invalidate()</code> 一起拿掉</td><td><a href="19-caching-redis.html">19</a></td></tr>
+  <tr><td>關機</td><td><code>enableShutdownHooks()</code>？worker 先關、資料庫最後斷？</td><td>已寫好：<code>beforeApplicationShutdown</code> 關 worker</td><td><a href="24-observability-shutdown.html">24</a></td></tr>
+  <tr><td>設定</td><td>缺少 secret 時不啟動？secret 不在 git？</td><td>已寫好：zod 驗證 <code>PAYMENT_WEBHOOK_SECRET</code>、<code>ADMIN_KEY</code> 至少 16 字</td><td><a href="11-configuration.html">11</a></td></tr>
+  <tr><td>測試</td><td>錯誤路徑、重送、並發都有測？測試會不會互相影響？</td><td>練習 3 的 e2e；<code>resetAll</code> 清表也清佇列</td><td><a href="10-e2e-testing.html">10</a>、<a href="17-db-integration-tests.html">17</a></td></tr>
+</table></div>
+<p>讀這張表的方式跟盤點表一樣：每一列都是「沒做會怎樣」。練習 4 要修的四列，各自的後果是：</p>
+<ul>
+  <li><strong>啟動</strong>：<code>catalog</code> 裡兩個 service 互相 import，Vitest 跑得過，<code>nest build</code> 之後正式啟動卻失敗。<code>node dist/main.js</code> 照 import 順序執行模組，兩個檔案互相 import 時，其中一方會在另一方的 class 還沒初始化完就讀它，丟出 <code>Cannot access … before initialization</code>（階段檢核練習 12）。Vitest 用 Vite 的模組執行器，載入 import 的方式和 Node 不同，所以測試通過不代表正式啟動沒問題，細節見第 25 課。第 25 課看過這種循環，<code>forwardRef</code> 只讓它啟動得起來，第 26 課的解法是讓依賴只往一個方向。</li>
+  <li><strong>探針</strong>：部署平台會定期打健康檢查端點。liveness 回答「這個程序要不要重啟」，readiness 回答「現在能不能把請求送給它」。判斷的問題是第 24 課那句：這種狀況，重啟程序修得好嗎？資料庫斷線重啟修不好，所以它只能放在 readiness；放進 liveness，資料庫一掛，每一台都被判定死掉、一起重啟。</li>
+  <li><strong>權限</strong>：改價的端點如果在方法裡自己比對金鑰，每新增一個路由就要記得寫一次，起始專案的 PATCH 就忘了，任何人都能改價。guard 掛在 class 上，新路由自動受保護。</li>
+  <li><strong>輸入</strong>：mass assignment 指的是請求多送了你沒打算讓它改的欄位，而程式照單全收，例如改價時多送 <code>stock: 999</code>，DTO 又直接當成 Prisma 的 <code>data</code>，庫存就被改了。<code>whitelist</code> 會把沒宣告的欄位悄悄丟掉，加上 <code>forbidNonWhitelisted</code> 則直接回 400，前端也馬上知道自己送錯了。</li>
+</ul>
+<p>清單的價值在「下次上線前一定會問」。出過一次事故，就加一列；改了哪個部分，就重看相關的幾列。</p>
+<div class="callout practice"><strong>💡 實務上：能自動化的交給 CI，要判斷的留給 code review</strong><br>團隊常把這份清單放進 PR 範本或發布流程。機器擋得住的（build 後真的能啟動、循環 import、e2e 測試）放進 CI，沒過就不能合併；需要判斷的（新端點有沒有 guard、寫入後快取有沒有失效）寫成 PR 範本裡的勾選題，讓 reviewer 逐項問。小心清單長到沒人看：每一列都要能用「是／否」回答，已經被 CI 自動檢查的就從人工清單拿掉。</div>
+
+<h2>練習</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs nestjs 27</code> 建立 <code>work/27/</code>。這一題同時用到 PostgreSQL 和 Redis，先確認容器在跑（在 <code>learn/nestjs/practice</code> 執行 <code>docker compose up -d --wait</code>，第 12 課）。專案已經有：</p>
+<ul>
+  <li>十張表的 schema 與 migration（<code>idempotency_keys</code>、<code>webhook_events</code>、<code>outbox_events</code>、<code>point_transactions.order_id</code> 唯一都建好了），<code>src/errors/domain-errors.ts</code> 的三個 Idempotency-Key 錯誤與對應的狀態碼。</li>
+  <li><code>OutboxService.add(tx, …messages)</code>、<code>OutboxRelay</code>（每秒 <code>publishPending</code>）、<code>QueuePublisher</code>、loyalty 與 notifications 兩個佇列的 processor、假的 <code>Mailer</code>、<code>WebhookSignatureGuard</code>、<code>AdminGuard</code>、健康檢查的 <code>RedisHealthIndicator</code>、request id 與 JSON log。</li>
+  <li><code>test/support/app.ts</code>：練習 3 用的 <code>createApp</code>、<code>resetAll</code>、<code>sendPaymentWebhook</code>、<code>drain</code>、<code>receipts</code>。</li>
+</ul>
+<p>照順序做：練習 2 建立在練習 1 的訂單上，練習 3 的測試會在標準答案上執行。想自己把服務跑起來：在 <code>work/27</code> 執行 <code>npx prisma migrate dev</code>、<code>npx prisma db seed</code>、<code>npm run start:dev</code>，用 curl 下單：</p>
+<pre>curl -X POST localhost:3100/api/v1/orders -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $(uuidgen)" -d '{"customerId":1,"items":[{"productId":2,"quantity":2}]}'</pre>
+<p>同一個 key 再送一次，看回應是不是一字不差；<code>/docs</code> 是 Swagger UI；<code>/health/ready</code> 列出 database 與 redis。</p>
+
+<div class="local" data-test="ex1" data-files="src/orders/orders.service.ts src/orders/orders.controller.ts">
+  <p>練習 1：<code>POST /api/v1/orders</code> 加上 Idempotency-Key。</p>
+  <ul>
+    <li><code>OrdersService.create(dto, key)</code>：key 沒帶或不符合 <code>^[A-Za-z0-9_-]{1,64}$</code> 丟 <code>IdempotencyKeyRequiredError</code>（400）。</li>
+    <li>在同一個互動式交易裡：第一步 <code>tx.idempotencyKey.create</code>（<code>key</code> 與請求內容的 SHA-256 <code>requestHash</code>）→ <code>placeOrder</code> → 把回應字串存進 <code>responseStatus</code>、<code>responseBody</code>。下單失敗整個交易回滾，key 不留下。</li>
+    <li>撞到主鍵（P2002）：讀出存下來的那筆。<code>requestHash</code> 不同丟 <code>IdempotencyKeyReusedError</code>（422）；回應還是 <code>null</code> 丟 <code>IdempotencyKeyInProgressError</code>（409）；否則回傳存下來的狀態碼與內容。</li>
+    <li>Controller 用 <code>@Headers('idempotency-key')</code> 讀 key，用 <code>@Res()</code> 以存下來的狀態碼送出原始字串，<code>Content-Type</code> 是 JSON。</li>
+  </ul>
+  <p>判分：沒帶 key、空字串、含空白、65 字都要 400 且不建立訂單；同一個 key 重送回 201 和一字不差的內容，只有一張訂單、庫存只扣一次；付款後重送仍回第一次的回應（<code>pending</code>）；同 key 不同內容 422；不同 key 同內容建兩張；同一個 key 同時送 5 次連跑 3 輪，每輪只建一張，其他是 201（同一內容）或 409；庫存不足失敗後補貨、同一個 key 重試要成功。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="src/payments/payments.service.ts src/loyalty/loyalty.service.ts">
+  <p>練習 2：付款 webhook 到集點、收據，一筆都不能漏、一筆都不能多。</p>
+  <ul>
+    <li><code>PaymentsService.handle</code>：在同一個 <code>$transaction</code> 裡 <code>markPaid</code>、寫 <code>webhookEvent</code>（<code>processed</code> 或 <code>ignored</code>）、<code>markPaid</code> 有改到時用 <code>this.outbox.add(tx, …)</code> 寫兩筆：<code>order.paid</code> 與 <code>receipt.requested</code>，payload 都是 <code>{ orderId, customerId, total }</code>。交易裡不碰 Redis；拿掉 <code>QueuePublisher</code> 的注入與 commit 之後的 <code>publish</code>。P2002 當成已處理（回 200）。</li>
+    <li><code>LoyaltyService.earnForOrder</code>：同一張訂單只加一次點，而且重試的工作要<strong>成功</strong>（completed），不是靠唯一約束丟錯。<code>upsert</code> 集點卡後用 <code>createMany</code> 加 <code>skipDuplicates: true</code>，或接住 P2002。</li>
+    <li>資料歸屬：只有 <code>src/loyalty</code> 碰 <code>stampCard</code>、<code>pointTransaction</code>；<code>src/payments</code>、<code>src/orders</code> 不 import <code>src/loyalty</code>。</li>
+  </ul>
+  <p>判分：付款後 outbox 有兩筆、relay 送出後加 2 點、寄一封收據；同一個事件重送三次都回 200，outbox 不多寫；不同事件 id 付同一張已付款的訂單不寫 outbox；<code>Queue.prototype.add</code> 被換成一直失敗時 webhook 仍回 200，恢復後 relay 補上點數與收據；<code>OutboxService.add</code> 第一次失敗時整個交易回滾，重送同一個事件要補上；<code>earnForOrder</code> 寫完點數後丟錯一次，重試後點數仍是 2、工作狀態是 completed；簽章錯 401 且沒有 outbox。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="test/checkout.e2e-spec.ts">
+  <p>練習 3：寫 e2e 測試保護結帳主流程。把 <code>test/checkout.e2e-spec.ts</code> 的四個 <code>it.todo</code> 寫成真的測試，在 <code>work/27</code> 執行 <code>npm test</code>（用 <code>nest_27_spec</code> 資料庫與 <code>nest-27-spec</code> 前綴，不碰開發資料）。只透過 HTTP 操作與檢查：<code>POST /api/v1/orders</code>、<code>GET /api/v1/orders/:id</code>、<code>GET /api/v1/customers/:id/points</code>、<code>sendPaymentWebhook</code>、<code>drain</code>、<code>receipts(app)</code>。<code>resetAll</code> 之後固定有顧客 1、2，商品 1 美式咖啡 80 元庫存 10、2 拿鐵 110 元庫存 10、3 起司蛋糕 120 元庫存 2。不要 <code>overrideProvider(PrismaService)</code> 或 <code>vi.mock</code>：要驗的就是交易、唯一約束與佇列放在一起的行為。</p>
+  <p>判分把你的測試套在標準答案上要全部通過，再套在八個故意改壞的版本上，每一個都至少要有一個測試失敗：沒看 key（重送多一張訂單）、沒扣庫存、重送回 200 而不是 201、重送時重新查訂單（付款後重送會回 paid）、同 key 換內容也回舊訂單、沒帶 key 也照樣下單、付款後沒寫 <code>receipt.requested</code>、沒寫 <code>order.paid</code>。所以：沒帶 key 要檢查 400；重送要比對狀態碼與 <code>res.text</code>，付款之後再重送一次，也換內容重送一次；付款後要 <code>drain</code> 再檢查點數與收據。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="src/app.setup.ts src/health/health.controller.ts src/catalog/products.controller.ts src/catalog/products.service.ts src/catalog/menu.service.ts">
+  <p>練習 4：上線前檢查。照上面的清單逐項修：</p>
+  <ul>
+    <li><strong>啟動</strong>：<code>catalog</code> 裡 <code>ProductsService ↔ MenuService</code> 互相 import，用 <code>forwardRef</code> 蓋著。讓依賴只往一個方向：<code>MenuService</code> 自己用 Prisma 查 products（同一個模組的表），<code>ProductsService</code> 寫入後呼叫 <code>menu.invalidate()</code>；拿掉 <code>forwardRef</code>。</li>
+    <li><strong>探針</strong>：<code>/health/live</code> 不檢查任何依賴（<code>this.health.check([])</code>）；<code>/health/ready</code> 維持 database 與 redis。</li>
+    <li><strong>權限</strong>：<code>ProductsController</code> 的每個路由都要 <code>AdminGuard</code>，掛在 class 上；拿掉方法裡自己比對金鑰的程式與 <code>ConfigService</code> 的注入。</li>
+    <li><strong>輸入</strong>：<code>configureApp</code> 的 <code>ValidationPipe</code> 加上 <code>whitelist: true, forbidNonWhitelisted: true</code>。</li>
+  </ul>
+  <p>判分：<code>src</code> 沒有循環 import，<code>nest build</code> 後 <code>node dist/main.js</code> 能啟動，<code>/health/live</code>、<code>/health/ready</code>、<code>/api/v1/menu</code> 都 200；資料庫查詢被換成失敗時 ready 503、live 200；<code>POST</code>、<code>PATCH /api/v1/products</code> 沒帶或帶錯 <code>X-Admin-Key</code> 都 401 且價格不變，每個路由都掛了 guard；PATCH 多送 <code>stock</code> 回 400 且庫存、價格都不變；菜單走快取，透過 API 改價後馬上看到新價格。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：同事提議把 Idempotency-Key 的處理搬到 interceptor，用 Redis 存「key → 回應」，service 完全不用改。哪個說法最準確？</p>
+  <label data-key="a">很好，Redis 比 PostgreSQL 快，而且 service 保持乾淨</label>
+  <label data-key="b">不行，interceptor 拿不到回應內容</label>
+  <label data-key="c">可以做，但保證變弱了：Redis 和訂單不在同一個交易，寫完訂單、存 key 之前當機就會漏；同時進來的請求要另外用 SET NX 搶鎖；Redis 重啟或淘汰 key，重送又會建立訂單。key 跟訂單同一個交易最可靠</label>
+  <label data-key="d">不行，Idempotency-Key 一定要存在資料庫，這是規範規定的</label>
+  <p class="why">✓ c。這條流程最強的保證來自「key 與訂單在同一個 PostgreSQL 交易」：同時進來的請求由主鍵裁決，失敗一起回滾，不會有空檔。搬到 Redis 不是不行，很多高流量服務這樣做，但每一個失敗點都要另外補：搶鎖、key 遺失、兩個儲存體之間的空檔。a 只看到速度；下單本來就要寫資料庫，多一筆 key 的成本很小。b 錯：interceptor 可以在 <code>tap</code> 裡拿到回應。d 錯：沒有這種規定，這是取捨。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：上線一週後，監控顯示 loyalty 佇列每天有十幾個 failed 工作，錯誤都是 P2002（<code>point_transactions.order_id</code> 唯一約束）。點數餘額都是對的。該怎麼處理？</p>
+  <label data-key="a">沒事，餘額對就好，把這個錯誤加進忽略清單</label>
+  <label data-key="b">worker 不夠冪等：撞到唯一約束代表這張訂單已經加過點，應該當成成功。改成 <code>skipDuplicates</code> 或接住 P2002，然後查為什麼每天有十幾次重試（連線逾時？worker 關機時機？）</label>
+  <label data-key="c">把 <code>attempts</code> 改成 1，就不會重試、不會失敗</label>
+  <label data-key="d">拿掉 <code>order_id</code> 的唯一約束，失敗就消失了</label>
+  <p class="why">✓ b。唯一約束擋住了重複加點，資料是對的，但工作失敗代表「worker 遇到它該處理的情況卻丟錯」，failed 清單裡的真問題會被這些假警報淹沒。先讓重試成功，再追重試的來源。a 把症狀藏起來，下次真的 P2002（例如別的 bug）也看不到。c 讓暫時性錯誤（資料庫連線中斷）也不重試，點數真的會漏。d 拿掉最後一道防線，餘額會開始錯。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 7：練習 3 的 e2e 測試全部通過。PM 問：「這樣是不是就不會再有重複訂單的 bug 了？」最誠實的回答是？</p>
+  <label data-key="a">是，測試通過就代表沒有 bug</label>
+  <label data-key="b">不是，e2e 測試沒有用，要靠人工測試</label>
+  <label data-key="c">是，只要測試覆蓋率到 100%</label>
+  <label data-key="d">測試保證的是「我們想到的那幾種壞法」再出現時會被抓到：重送、換內容、沒帶 key。沒想到的情況（例如兩台伺服器時鐘不同、資料庫 failover 時的交易）還是可能出事。所以上線後要監控重複訂單的數量，出了事故就把它變成新的測試</label>
+  <p class="why">✓ d。練習 3 的判分方式就是這個道理：把程式故意改壞八種，看測試抓不抓得到；抓得到的是那八種，不是所有的壞法。測試是回歸的保險，不是正確性的證明。a、c 把「通過」當成「沒有 bug」；覆蓋率只說哪些行被執行過，沒說結果對不對。b 走到另一個極端：人工測試更不可能每次都重做重送與並發的情境。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>先查 key 再建立訂單</strong>：兩個同時進來的請求都查到「沒有」，各建一張。key 當主鍵、交易第一步 <code>create</code>，由資料庫裁決誰先。</li>
+  <li><strong>在交易外先寫 key</strong>：下單失敗後 key 留著、回應是 <code>null</code>，客人之後怎麼重試都是 409。key 跟訂單同一個交易。</li>
+  <li><strong>重送時重新查訂單</strong>：付款後重送回 <code>paid</code>，客戶端拿到和第一次不一樣的內容。存回應字串，原封不動送回。</li>
+  <li><strong>沒存請求的雜湊</strong>：同一個 key 換了內容也回舊訂單，前端的 bug 被藏起來。</li>
+  <li><strong>沒帶 key 就自動產生一個</strong>：重送照樣多一張訂單，保護等於沒有。沒帶就 400。</li>
+  <li><strong>交易提交後才送進佇列</strong>：commit 與 add 之間當機、Redis 連不上，點數與收據永遠漏掉；而且 webhook 回 5xx 讓金流公司重送時，<code>event_id</code> 已經記錄，重送被當成重複。同一個交易寫 outbox。</li>
+  <li><strong>在交易外寫 outbox</strong>：<code>outbox.add</code> 沒傳 <code>tx</code>，又回到雙寫問題。</li>
+  <li><strong>付款的交易裡直接加點</strong>：原子，但 <code>payments</code> 碰了 <code>loyalty</code> 的表，之後改集點規則要改付款的程式。只寫事件。</li>
+  <li><strong>用 <code>@nestjs/event-emitter</code> 的程序內事件做加點</strong>：第 21 課比較過，程序內事件在程序當機時就丟了，也不會重試。要保證一定發生的工作走 outbox 與佇列。</li>
+  <li><strong>worker 靠唯一約束的錯誤擋重複</strong>：資料對，但工作進 failed，假警報淹沒真問題。<code>skipDuplicates</code> 或接住 P2002，讓重試成功。</li>
+  <li><strong>e2e 測試只測 happy path</strong>：改壞「重送回 200」或「付款後重送回現在的狀態」都抓不到。重送要比對狀態碼與 <code>res.text</code>，付款後再重送一次。</li>
+  <li><strong>e2e 測試 mock Prisma</strong>：交易、唯一約束、佇列全被假物件取代，測的是 mock 的行為。這一層用真的資料庫。</li>
+  <li><strong>liveness 順便查資料庫</strong>：資料庫一掛，每一台都被判定死掉、一起重啟，重啟也修不好資料庫。live 只看程序活著。</li>
+  <li><strong>金鑰比對寫在方法裡</strong>：新增一個路由就忘一個（起始專案的 PATCH 就忘了）。guard 掛在 class 上。</li>
+  <li><strong>只有 <code>whitelist</code> 沒有 <code>forbidNonWhitelisted</code></strong>：多送的欄位被悄悄丟掉，前端不知道送錯；沒有 <code>whitelist</code> 時 dto 直接當 Prisma 的 data，<code>stock: 999</code> 就寫進去了。</li>
+  <li><strong>拆循環時順手拿掉 <code>invalidate</code></strong>：改價後菜單一分鐘都是舊價。拆依賴方向，不拆功能。</li>
+</ul>
+
+
+<h2 id="appendix">補充與查表</h2>
+<p>查表用，不用背。</p>
+<div class="table-wrap"><table>
+  <tr><th>Idempotency-Key 的情況</th><th>service 丟的錯誤</th><th>回應</th></tr>
+  <tr><td>沒帶、空字串、含空白、超過 64 字</td><td><code>IdempotencyKeyRequiredError</code></td><td>400 <code>IDEMPOTENCY_KEY_REQUIRED</code></td></tr>
+  <tr><td>同一個 key、不同內容</td><td><code>IdempotencyKeyReusedError</code></td><td>422 <code>IDEMPOTENCY_KEY_REUSED</code></td></tr>
+  <tr><td>同一個 key、第一次還沒做完</td><td><code>IdempotencyKeyInProgressError</code></td><td>409 <code>IDEMPOTENCY_KEY_IN_PROGRESS</code></td></tr>
+  <tr><td>同一個 key、同樣內容、第一次已完成</td><td>不丟錯</td><td>存下來的狀態碼（201）與原始字串</td></tr>
+</table></div>
+<div class="table-wrap"><table>
+  <tr><th>這課用到的 Prisma 寫法</th><th>資料庫裡發生什麼</th><th>用在哪</th></tr>
+  <tr><td><code>create</code> 撞到主鍵或唯一約束</td><td>插入失敗，Prisma 丟 <code>P2002</code></td><td>搶 Idempotency-Key、webhook 的 <code>event_id</code></td></tr>
+  <tr><td><code>createMany</code> 加 <code>skipDuplicates: true</code></td><td><code>INSERT … ON CONFLICT DO NOTHING</code>，重複的列略過、不丟錯</td><td>worker 加點</td></tr>
+  <tr><td><code>updateMany</code> 帶狀態條件</td><td>只改到符合條件的列，回傳改了幾列</td><td><code>markPaid</code>（第 18 課）</td></tr>
+</table></div>
+
+<h2>小結</h2>
+<ul>
+  <li>王小明那一天的每一個失敗點，對策都是同一句：把「做過了沒」放進 PostgreSQL，用交易與唯一約束保證只發生一次。記憶體旗標在多台伺服器與重啟面前會失憶，先查再寫在同時進來的請求面前有空檔。</li>
+  <li>先盤點再寫程式：沿著流程逐步問「這裡掛了會怎樣、客人看到什麼」，每一列變成一個對策和一個測試，保護強度跟著後果走。</li>
+  <li>Idempotency-Key：必填、綁定請求雜湊、存回應字串不重新查、key 當主鍵在交易第一步寫入、失敗跟交易一起回滾。撞 P2002 才去讀存下來的回應，內容不同 422，回應是 <code>null</code> 就 409。</li>
+  <li>付款 webhook：<code>markPaid</code>、<code>webhook_events</code>、<code>outbox_events</code> 同一個交易，交易裡不碰 Redis，送進佇列交給 relay。payload 只放事實，<code>loyalty</code>、<code>notifications</code> 不認識 <code>payments</code>。</li>
+  <li>佇列至少執行一次，worker 要讓重試成功：<code>createMany</code> 加 <code>skipDuplicates</code>，或接住 P2002；外部服務用它的 idempotency key。</li>
+  <li>e2e 測試保護主流程：只透過 HTTP、用真的資料庫與佇列、照盤點表測錯誤路徑與重送，用「故意改壞」確認它抓得到。</li>
+  <li>上線前檢查請求以外的事：能正式啟動、live 不查依賴、guard 掛 class、<code>forbidNonWhitelisted</code>、寫入後快取失效、<code>enableShutdownHooks</code>、設定驗證。出過的事故變成新的一列。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 8 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 8：Redis 停機維護兩分鐘，PostgreSQL 正常，程序本身也沒問題。這段時間 <code>/health/live</code> 與 <code>/health/ready</code> 應該各回什麼？</p>
+  <label data-key="a">兩個都回 503，平台才知道服務出了問題，會自動重啟把它修好</label>
+  <label data-key="b">live 回 200，ready 一直等到 Redis 有回應為止，免得短暫斷線被誤判</label>
+  <label data-key="c">live 回 200，ready 在逾時內回 503，平台先停送流量但不重啟程序</label>
+  <p class="why">✓ live 只回答「程序要不要重啟」，重啟修不好 Redis；ready 回答「現在能不能接流量」，依賴掛了就 503。每個指標都要 <code>.withTimeout()</code>，Redis 卡住時 ready 約 1 秒就回 503，不能跟著卡住。a 錯在把依賴的問題算到程序頭上，每一台一起重啟，Redis 還是沒好。（第 24 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 9：本機一次打一個請求，log 的 requestId 都對；上線後同一個請求的 log 卻出現別人的 requestId。原因和修法是？</p>
+<pre>let currentRequestId = ''
+
+export function requestId(req: Request, res: Response, next: NextFunction) {
+  currentRequestId = randomUUID()
+  next()
+}
+// service 裡：this.logger.log('付款完成', { orderId, requestId: currentRequestId })</pre>
+  <label data-key="a">請求在 <code>await</code> 時會交錯，後到的請求蓋掉變數；改用 <code>AsyncLocalStorage</code>，把 <code>next</code> 交給 <code>run</code></label>
+  <label data-key="b">Node 用多條執行緒同時處理請求，模組變數在執行緒之間不同步；寫入前要先加鎖</label>
+  <label data-key="c">service 是 singleton，讀不到每個請求自己的值；把 logger 和 service 改成 <code>Scope.REQUEST</code></label>
+  <p class="why">✓ 單一執行緒不代表沒有並發：第一個請求 <code>await</code> 資料庫時，第二個請求的 middleware 已經把變數換掉了，一次一個時完全看不出來。<code>AsyncLocalStorage</code> 讓每個請求有自己的情境，provider 照樣是 singleton。c 能動但代價大：request scope 會冒泡到整條依賴鏈，每個請求重建實例，<code>app.get</code> 也拿不到。（第 24、25 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 10：每次部署都有幾筆付款請求斷在半路。關機 hook 都寫好了，但部署時 log 裡一行 hook 的輸出都沒有。最可能的原因與修法是？</p>
+  <label data-key="a">平台的關機時限太短，hook 還沒輪到就被殺掉；把時限從 30 秒拉長到 5 分鐘</label>
+  <label data-key="b"><code>main.ts</code> 沒有 <code>app.enableShutdownHooks()</code>，<code>SIGTERM</code> 來了 Nest 直接結束</label>
+  <label data-key="c">Prisma 在 <code>onModuleDestroy</code> 就斷線，後面的 hook 寫 log 失敗；把它移到最後</label>
+  <p class="why">✓ 沒有 <code>enableShutdownHooks</code>，<code>SIGTERM</code> 不會走 <code>app.close()</code>，三個關機 hook 一個都不會跑；本機 Ctrl+C 看起來正常，上線才出事。也不要自己監聽 <code>SIGTERM</code> 呼叫 <code>process.exit</code>，那一樣會切斷進行中的請求。c 的症狀不一樣：<code>$disconnect</code> 放太早時 hook 有跑，是程序結束不了、最後被 <code>SIGKILL</code>。（第 24 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 11：報表 API 一被呼叫，連什麼都不查的 <code>/health/live</code> 也要好幾秒才回應。最先該查什麼？</p>
+  <label data-key="a">資料庫連線池是不是被報表的大查詢佔滿，其他請求都在排隊等連線</label>
+  <label data-key="b">是不是有 provider 被設成 request scope，每個請求都在重建整條依賴鏈</label>
+  <label data-key="c">換成 Fastify 或 SWC 之後，整體回應時間能不能降到可以接受的範圍</label>
+  <label data-key="d">用 <code>monitorEventLoopDelay</code> 看事件迴圈延遲，是不是同步計算卡住主執行緒</label>
+  <p class="why">✓ live 不碰任何依賴也變慢，代表主執行緒根本沒空處理請求：報表的同步 CPU 工作卡住了事件迴圈。修法是非同步 API、切小塊、<code>worker_threads</code> 或佇列；包成 <code>async</code> 不會讓它不卡。a 錯在連線池滿了只有要查資料庫的請求會排隊，live 不查資料庫，不會跟著慢。（第 25 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 12：<code>orders</code> 付款後要呼叫 <code>LoyaltyService</code> 加點，<code>loyalty</code> 算點數又要 <code>OrdersService</code> 查訂單，兩個模組互相 import，build 後啟動就報 <code>Cannot access … before initialization</code>。哪個解法對？</p>
+  <label data-key="a">兩邊的注入都加上 <code>forwardRef(() =&gt; …)</code>，Nest 就是為這種情況設計的</label>
+  <label data-key="b">把加點的程式搬進 <code>orders</code>，<code>loyalty</code> 就不必再 import <code>orders</code></label>
+  <label data-key="c">兩個 service 都放進 <code>@Global()</code> 的 SharedModule，誰都能直接注入</label>
+  <label data-key="d"><code>orders</code> 發 <code>order.paid</code> 事件並帶上 total，<code>loyalty</code> 訂閱它、不回頭查</label>
+  <p class="why">✓ 根本解是讓依賴只往一個方向：<code>orders</code> 只宣布事實，<code>loyalty</code> 從事件裡拿需要的欄位，兩邊不再互相 import。a 最多人選，但它只讓程式啟動得起來，兩個模組還是綁在一起。b 循環沒了，卻變成 <code>orders</code> 寫 <code>loyalty</code> 的表；c 讓 provider 失去歸屬、依賴圖消失。（第 25、26 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 13：<code>notifications</code> 模組寄收據的程式如下，測試都通過。code review 時該指出什麼？</p>
+<pre>@Injectable()
+export class ReceiptsService {
+  constructor(private prisma: PrismaService, private mailer: Mailer) {}
+
+  async send(orderId: number) {
+    const order = await this.prisma.order.findUnique({ where: { id: orderId } })
+    await this.mailer.sendReceipt(order.customerId, order.total)
+  }
+}</pre>
+  <label data-key="a">直接查 <code>orders</code> 的表，違反資料歸屬；改從事件 payload 拿，或注入 <code>OrdersService</code></label>
+  <label data-key="b">沒有問題，<code>PrismaService</code> 是全域的，就是讓每個模組能直接查需要的資料</label>
+  <label data-key="c"><code>NotificationsModule</code> 沒有 import <code>PrismaModule</code>，上線時 DI 會解析失敗</label>
+  <p class="why">✓ 一張表只有一個模組碰：<code>orders</code> 之後改欄位或加軟刪除，沒人會想到 <code>notifications</code> 也要改。外面只透過 exports 的 service 或事件互動。b 是最常見的藉口：<code>@Global</code> 只是省掉 import，不代表誰都能碰每一張表。（第 26 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 14：付款 webhook 的處理寫成這樣。哪裡會出事？</p>
+<pre>await this.prisma.$transaction(async tx =&gt; {
+  await this.orders.markPaid(tx, orderId)
+  await tx.webhookEvent.create({ data: { eventId, type, status: 'processed' } })
+})
+await this.queue.add('order.paid', { orderId, customerId, total })</pre>
+  <label data-key="a"><code>queue.add</code> 放在交易外面，要移進 <code>$transaction</code> 裡才會跟著一起回滾</label>
+  <label data-key="b">提交後、送進佇列前當機或 Redis 連不上，點數與收據就再也不會補</label>
+  <label data-key="c">payload 不該帶 <code>customerId</code>、<code>total</code>，worker 只拿 id 回頭查訂單才一致</label>
+  <p class="why">✓ 提交與送進佇列是兩次寫入，中間任何失敗都會漏；而且金流公司重送時 <code>event_id</code> 已經記錄過，重送被當成重複。修法是同一個交易用 <code>tx</code> 寫 outbox，relay 再送進佇列。a 錯在 Redis 不參與 PostgreSQL 的交易，移進去也不會一起回滾，還讓付款跟著 Redis 失敗。（第 27 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 15：同事把搶 key 移到交易外面，撞 P2002 之後的處理照課文。拿鐵賣完、下單丟出庫存不足，客人等補貨後用同一個 key、同樣的內容重試，會怎樣？</p>
+<pre>await this.prisma.idempotencyKey.create({ data: { key, requestHash } })
+return this.prisma.$transaction(async tx =&gt; {
+  const body = JSON.stringify(await this.placeOrder(tx, dto))
+  await tx.idempotencyKey.update({ where: { key }, data: { responseStatus: 201, responseBody: body } })
+  return { status: 201, body }
+})</pre>
+  <label data-key="a">重試成功下單：上一次的交易整個回滾了，這次重新搶 key、重新下單</label>
+  <label data-key="b">回傳上一次的庫存不足：key 記住了第一次的結果，重送原封不動送回</label>
+  <label data-key="c">一直回 409：key 留在表裡、回應是 <code>null</code>，被當成第一次還在處理</label>
+  <label data-key="d">回 422：同一個 key 已經用過，伺服器把它當成前端重複使用了 key</label>
+  <p class="why">✓ 交易外的 <code>create</code> 已經自己提交，下單失敗只回滾交易裡的部分，key 留著、回應是 <code>null</code>；之後每次重試撞 P2002 都被當成「處理中」。key 要在同一個交易的第一步寫入，失敗時跟訂單一起回滾。a 是正確寫法才有的結果，這裡的 key 不會跟著回滾。（第 27 課）</p>
+</div>
+<p>這個階段的重點整理成<a href="../sheets/stage-5.html">一頁圖解</a>。</p>
+<p>接下來可以學什麼：這個 API 的登入、權限與 OWASP API Top 10 在<a href="../../auth/">認證、權限與資安</a>課；把它裝進容器、CI/CD、上 AWS、集中 log 與告警在<a href="../../devops/">部署與維運</a>課；流量變大之後的快取、限流、分片與事故處理在<a href="../../system-design/">系統設計與資深工程實踐</a>課。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

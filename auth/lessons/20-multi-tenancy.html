@@ -1,0 +1,1190 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>20. 多租戶隔離</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="20">
+<header>
+  <div class="eyebrow">階段 5：授權：能做什麼、能看哪些資料 · 第 20 課</div>
+  <h1>多租戶隔離</h1>
+</header>
+<main>
+
+<p>咖啡店的點餐系統做得不錯，別的咖啡品牌也想用。你把它改成一套系統賣給很多品牌：山丘咖啡、巷口咖啡各自有門市、店員、顧客、訂單，共用同一個 API、同一個資料庫。上線第一週，山丘咖啡的店長打電話來：信義店（門市 1）今天的營收報表是 310 元，收銀機的帳只有 190 元；點開明細，多出來的那一筆是<strong>巷口咖啡中山店的訂單</strong>，上面還有對方顧客的名字。反過來，巷口咖啡的店長也看得到山丘咖啡的營收。對一套賣給很多品牌的系統，這種事故一次就可能讓所有客戶一起離開。</p>
+<p>這一課的任務：找出這筆訂單為什麼會跑進別人的報表，然後把系統改成<strong>就算某個工程師忘了寫租戶條件，資料也不會漏到別的品牌</strong>。做完之後，你會知道每一層該擋哪一種錯：程式、資料庫、快取與背景工作，以及自家客服要跨品牌查資料時該怎麼留紀錄。</p>
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>為什麼山丘咖啡的報表多出巷口咖啡的訂單：每筆資料多了「屬於哪個租戶」這層歸屬，查詢沒用它就會漏（開場問題的最小答案）。接著決定資料要共用表、分 schema 還是分資料庫。</li>
+  <li>這個請求屬於哪個租戶：為什麼不能相信前端送的 <code>X-Tenant-Id</code>，租戶要從登入的身分決定。</li>
+  <li>幾百個查詢怎麼讓人忘不了加 <code>tenant_id</code>：repository 自動加條件、複合外鍵擋跨租戶參照、RLS 擋繞過程式的 SQL，以及連線池上的 <code>SET LOCAL</code>。</li>
+  <li>資料離開資料庫之後：快取 key、背景工作、檔案路徑這些 code review 常看不到的事故點。</li>
+  <li>跨租戶的合理需求與共用資源：客服怎麼查山丘咖啡的問題又留下紀錄，巷口咖啡跑大報表時怎麼不拖慢山丘咖啡。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="19-object-level-authz.html">第 19 課</a>的物件層級授權：在查詢時就加上條件（<code>WHERE id = $1 AND customer_id = $2</code>），查不到一律 404。租戶條件是同一個想法，只是範圍更大。</li>
+  <li><a href="../../postgresql/lessons/24-rls.html">PostgreSQL 課第 24 課</a>的 RLS：表開啟後，資料庫依政策自動過濾每一列；政策可以用 <code>current_setting</code> 讀這條連線上用 <code>set_config</code> 設好的值。</li>
+  <li><a href="../../node/lessons/19-structured-logging.html">Node 課第 19 課</a>的 <code>AsyncLocalStorage</code>：讓同一個請求裡的所有函式拿到同一份上下文。</li>
+</ul></div>
+
+<h2>為什麼山丘咖啡的報表多出巷口咖啡的訂單？</h2>
+<p>先把現在的處境說清楚。原本的系統只服務一家咖啡店；現在你經營一套系統，很多品牌付月費共用它，品牌不用自己架伺服器，也不用自己維護程式。這種賣法叫 <strong>SaaS</strong>（Software as a Service，軟體即服務）。</p>
+<p>共用這套系統、但資料必須跟別人分開的每一個客戶，叫做一個<strong>租戶</strong>（tenant）。在這裡，一個咖啡品牌就是一個租戶：山丘咖啡是租戶 1，巷口咖啡是租戶 2。一套系統同時服務多個租戶，叫<strong>多租戶</strong>（multi-tenancy）。多租戶系統對客戶最基本的承諾是<strong>租戶隔離</strong>（tenant isolation）：A 租戶永遠看不到、也改不到 B 租戶的資料。功能少一個、畫面醜一點，客戶都還能忍；隔離破一次，客戶失去的是營收數字和顧客名單，你失去的是所有客戶的信任。</p>
+<figure>
+  <svg viewBox="0 0 700 260" role="img" aria-label="平台底下有兩個租戶：山丘咖啡和巷口咖啡，各自有門市、店員、顧客、訂單；兩個租戶之間是隔離牆">
+    <rect class="d-soft" x="230" y="10" width="240" height="40" rx="8"/><text class="d-text" x="350" y="35" text-anchor="middle">咖啡店 POS 平台（你的公司）</text>
+    <line class="d-line" x1="300" y1="50" x2="175" y2="80"/><line class="d-line" x1="400" y1="50" x2="525" y2="80"/>
+    <rect class="d-box" x="40" y="80" width="270" height="165" rx="8"/>
+    <text class="d-accent" x="175" y="104" text-anchor="middle">租戶 1：山丘咖啡</text>
+    <rect class="d-soft" x="55" y="118" width="115" height="30" rx="5"/><text class="d-small" x="112" y="137" text-anchor="middle">門市 1 信義店</text>
+    <rect class="d-soft" x="180" y="118" width="115" height="30" rx="5"/><text class="d-small" x="237" y="137" text-anchor="middle">門市 2 大安店</text>
+    <text class="d-small" x="175" y="172" text-anchor="middle">店員、店長</text>
+    <text class="d-small" x="175" y="194" text-anchor="middle">顧客：王小明、陳美華…</text>
+    <text class="d-small" x="175" y="216" text-anchor="middle">商品、訂單、營收報表</text>
+    <rect class="d-box" x="390" y="80" width="270" height="165" rx="8"/>
+    <text class="d-accent" x="525" y="104" text-anchor="middle">租戶 2：巷口咖啡</text>
+    <rect class="d-soft" x="405" y="118" width="115" height="30" rx="5"/><text class="d-small" x="462" y="137" text-anchor="middle">門市 1 中山店</text>
+    <text class="d-small" x="525" y="172" text-anchor="middle">店員、店長</text>
+    <text class="d-small" x="525" y="194" text-anchor="middle">顧客：林志豪、張雅婷…</text>
+    <text class="d-small" x="525" y="216" text-anchor="middle">商品、訂單、營收報表</text>
+    <line class="d-line" x1="350" y1="70" x2="350" y2="255" stroke-dasharray="6 4"/>
+    <text class="d-small" x="350" y="252" text-anchor="middle">✕</text>
+  </svg>
+  <figcaption>兩個租戶都有「門市 1」。門市編號只在自己的租戶裡有意義，開場的事故就出在這裡，快取和背景工作也會再遇到它。</figcaption>
+</figure>
+<p>看圖裡的門市編號。單一品牌的時代，「門市 1」全公司只有一間，<code>storeId</code> 就足以指出是哪間店。多租戶之後，山丘咖啡的信義店是門市 1，巷口咖啡的中山店也是門市 1：門市編號只在<strong>自己的租戶裡</strong>唯一。下面是單一品牌時代寫的營收函式，原封不動搬到多租戶系統上。執行後看第一行印出的營收：</p>
+<div class="lab"><script type="code">
+type Order = { id: number; tenantId: number; storeId: number; total: number }
+const orders: Order[] = [
+  { id: 1, tenantId: 1, storeId: 1, total: 80 },
+  { id: 2, tenantId: 1, storeId: 1, total: 110 },
+  { id: 3, tenantId: 2, storeId: 1, total: 120 },   // 巷口咖啡的門市 1
+]
+
+// 店長看「門市 1 今天的營收」：單一品牌時代寫的，那時只有一個租戶
+function storeRevenue(storeId: number): number {
+  return orders.filter(o => o.storeId === storeId).reduce((sum, o) => sum + o.total, 0)
+}
+
+// 山丘咖啡的店長查門市 1
+console.log('山丘咖啡門市 1 的營收：', storeRevenue(1), '（正確應該是 190）')
+
+// 加上租戶條件
+function storeRevenueFor(tenantId: number, storeId: number): number {
+  return orders.filter(o => o.tenantId === tenantId && o.storeId === storeId).reduce((sum, o) => sum + o.total, 0)
+}
+console.log('加上租戶條件之後：', storeRevenueFor(1, 1))
+</script></div>
+<p>第一行印出 310，把巷口咖啡門市 1 的 120 元也算進去了，這就是店長看到的那個數字。<code>storeRevenue</code> 只問「是不是門市 1」，從來沒問「是不是山丘咖啡的門市 1」，因為寫它的時候根本沒有第二個品牌。加上 <code>tenantId</code> 條件後，第二行回到正確的 190。</p>
+<p>注意這個錯有多安靜：沒有例外、沒有錯誤訊息，數字只是「多了一點」。所以這類漏洞通常不是被測試或攻擊者發現，而是某天客戶打電話來問「為什麼報表上有我不認識的顧客」，那時資料已經漏出去了。</p>
+<p>這就是開場問題的最小答案：多租戶之後，每一筆資料都多了一層歸屬，<strong>它屬於哪個租戶</strong>；每一次讀寫都要用目前請求的租戶加上條件，而這個租戶要從登入的身分決定。這跟<a href="19-object-level-authz.html">第 19 課</a>的「這張訂單是不是這位顧客的」是同一個想法，只是範圍從一個人擴大到一整個品牌。</p>
+<p>加一個條件看起來很簡單。但在動手改幾百個查詢之前，要先決定一件更根本的事：所有品牌的資料，真的要放在同一張表裡嗎？</p>
+
+<h2>所有品牌的資料要放在同一張表嗎？</h2>
+<p>把租戶分開，有三種常見的做法，差別在「分開」發生在哪一層：同一張表裡用欄位分、同一個資料庫裡用 schema 分，或者乾脆每個租戶一個資料庫。</p>
+<p>中間那種要先認識 <strong>schema</strong>。在 PostgreSQL 裡，schema 是資料庫裡放表的命名空間，像資料夾一樣：同一個資料庫可以有 <code>tenant_hill.orders</code> 和 <code>tenant_alley.orders</code> 兩張同名的表，各在自己的 schema 底下。SQL 裡只寫 <code>orders</code> 沒寫 schema 時，PostgreSQL 依連線上的 <code>search_path</code> 設定決定去哪些 schema 找（<a href="../../postgresql/lessons/26-capstone.html">PostgreSQL 課第 26 課</a>）。所以「每個租戶一個 schema」的做法，是請求進來時把連線的 <code>search_path</code> 切到那個租戶的 schema。</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>共用表，每列帶 <code>tenant_id</code></th><th>每個租戶一個 schema</th><th>每個租戶一個資料庫</th></tr>
+  <tr><td>做法</td><td>所有租戶的訂單都在同一張 <code>orders</code>，用 <code>tenant_id</code> 欄位區分</td><td>同一個資料庫裡，每個租戶一個 schema：<code>tenant_hill.orders</code>、<code>tenant_alley.orders</code></td><td>每個租戶一個獨立的資料庫，甚至獨立的機器</td></tr>
+  <tr><td>隔離靠什麼</td><td>每個查詢都要加 <code>WHERE tenant_id = …</code>；再加 RLS 當保險</td><td>連線時切換 <code>search_path</code>；忘記切就會查到別人的</td><td>連到哪個資料庫；連錯才會出事</td></tr>
+  <tr><td>成本</td><td>最低：一套表、一套連線池</td><td>中等：表的數量 ＝ 租戶數 × 表數</td><td>最高：每個租戶一份資源、備份、監控</td></tr>
+  <tr><td>改 schema（migration）</td><td>跑一次</td><td>每個租戶跑一次，幾百個租戶時會有跑到一半失敗的問題</td><td>每個資料庫跑一次，同上</td></tr>
+  <tr><td>跨租戶統計（平台營收）</td><td>一個查詢</td><td>要合併每個 schema</td><td>要到每個資料庫拿再合併</td></tr>
+  <tr><td>適合</td><td>大多數 SaaS 的起點；租戶多、每個不大</td><td>租戶數量不多、需要比較強的隔離</td><td>大客戶、法規要求資料分開存放、需要獨立的效能保證</td></tr>
+</table></div>
+<p>從左到右，隔離越來越強，代價也越來越高。共用表最便宜，但隔離完全靠你的程式和資料庫設定，開場那種事故就是它的典型症狀。每租戶一個資料庫隔離最強，可是每多一個客戶就多一份要備份、監控、升級的資料庫；改一次表結構要對每個資料庫各跑一次 migration，幾百個租戶時，一定要處理「跑到一半某些租戶失敗」的情況。平台自己想算「全部品牌這個月的總營收」，也要到每個資料庫拿再合併。</p>
+<p>實務上常見的路線是<strong>從共用表開始</strong>，等某個大客戶要求獨立的資料庫（或付得起），再把它搬出去，變成混合模式。這課的程式碼都以共用表為主：它最便宜，也最容易出錯，開場的事故就發生在它身上，值得把防線一層一層講清楚。</p>
+<p>也不要以為選了分 schema、分資料庫就自動安全。程式裡的連線池、快取、背景工作一樣要知道「現在是哪個租戶」，只是忘記時的症狀不同：共用表是「多看到別人的幾列」，分開放是「整個連到別人那邊」。</p>
+<div class="callout practice"><strong>💡 實務上：選隔離方式前，先問清楚客戶是誰</strong><br>新的 B2B 產品（給店家、公司用的後台）幾乎都從共用表加 <code>tenant_id</code> 開始，第一天就把欄位放進每張表，比上線後再補容易太多。資深工程師會先問 PM 和業務：預計幾個租戶、有沒有大客戶在合約裡要求資料分開存放或指定機房、需不需要單獨還原某個租戶的資料。如果答案都是「沒有」，就不要一開始就做每租戶一個資料庫，維運成本會拖垮小團隊。反過來，只服務自己品牌的系統（像前幾課的單一咖啡店）根本不需要多租戶，有 <code>store_id</code> 就夠了。</div>
+<p>不管選哪一種，程式都要先回答同一個問題：共用表要用租戶加條件，分 schema 要用它切 <code>search_path</code>，分資料庫要用它選連線。這個「現在是哪個租戶」的答案，要從哪裡來？</p>
+
+<h2>這個請求屬於哪個租戶？</h2>
+<p>每個請求進來，後端都要先回答「這個請求屬於哪個租戶」。這個答案叫<strong>租戶上下文</strong>（tenant context），後面的查詢、快取、背景工作都靠它。它錯了，後面每一層都會很認真地幫你查出別人的資料。</p>
+<p>很多團隊第一個想到的做法是：Vue 前台本來就知道自己是哪個品牌，每個請求帶一個 <code>X-Tenant-Id</code> 標頭給後端。問題在<a href="01-authn-authz.html">第 1 課</a>說過的：<strong>請求裡的任何東西都可以被偽造</strong>。山丘咖啡的店員打開 DevTools，把標頭裡的 1 改成 2，就換成了巷口咖啡。登入只證明「你是山丘咖啡的店員」，不證明「你可以看你送來的那個租戶」。</p>
+<p>所以要逐一看每個候選來源，問同一個問題：這個值是伺服器自己確認過的，還是客戶端說了算？</p>
+<div class="table-wrap"><table>
+  <tr><th>來源</th><th>能不能當依據</th><th>原因</th></tr>
+  <tr><td>登入的主體（店員帳號屬於山丘咖啡）</td><td>可以，這是唯一的依據</td><td>伺服器自己查資料庫或驗過簽章得到的，客戶端改不了</td></tr>
+  <tr><td>子網域 <code>hill.coffeepos.example</code></td><td>只能當路由提示，要和主體一致</td><td>網址是使用者輸入的，任何人都能打 <code>alley.coffeepos.example</code></td></tr>
+  <tr><td><code>X-Tenant-Id</code> 標頭、body 或 query 裡的 <code>tenantId</code></td><td>不行</td><td>客戶端想送什麼就送什麼，打開 DevTools 改一個數字就換租戶</td></tr>
+</table></div>
+<p>子網域和標頭不是完全沒用：前端可以送它們當提示，例如讓 API 回「你在錯的網址」，或決定登入頁要顯示哪個品牌的 logo。但決定查哪個租戶的資料時，後端只用主體的租戶。下面的 <code>resolveTenant</code> 就是這個規則：主體的租戶是答案，子網域只拿來比對，標頭完全不看。執行後看三行結果的 <code>tenantId</code> 和 <code>status</code>：</p>
+<div class="lab"><script type="code">
+type Principal = { userId: number; tenantId: number; role: 'staff' | 'manager' }
+type Req = { host: string; headers: Record<string, string>; principal?: Principal }
+type TenantResult = { ok: true; tenantId: number } | { ok: false; status: 401 | 404 }
+
+const tenantsBySubdomain = new Map([['hill', 1], ['alley', 2]])
+
+function resolveTenant(req: Req): TenantResult {
+  if (!req.principal) return { ok: false, status: 401 }
+  const sub = req.host.split('.')[0]
+  const hinted = tenantsBySubdomain.get(sub)
+  // 子網域只是提示：跟主體的租戶不一致就當作找不到，不透露這個租戶存不存在
+  if (hinted !== undefined && hinted !== req.principal.tenantId) return { ok: false, status: 404 }
+  // X-Tenant-Id 完全不看
+  return { ok: true, tenantId: req.principal.tenantId }
+}
+
+const hillStaff: Principal = { userId: 7, tenantId: 1, role: 'staff' }
+console.log(resolveTenant({ host: 'hill.coffeepos.example', headers: {}, principal: hillStaff }))
+console.log(resolveTenant({ host: 'hill.coffeepos.example', headers: { 'x-tenant-id': '2' }, principal: hillStaff }))
+console.log(resolveTenant({ host: 'alley.coffeepos.example', headers: {}, principal: hillStaff }))
+</script></div>
+<p>三行結果依序是：</p>
+<ul>
+  <li>山丘咖啡的店員打山丘咖啡的網址：租戶 1，正常。</li>
+  <li>同一位店員多帶了 <code>x-tenant-id: 2</code>：結果還是租戶 1，標頭被忽略。</li>
+  <li>山丘咖啡的帳號打巷口咖啡的網址：404。回 404 而不是 403，是因為 403 等於告訴對方「這個租戶存在，只是你不能看」，跟<a href="19-object-level-authz.html">第 19 課</a>查不到別人的訂單一律回 404 是同一個理由。</li>
+</ul>
+<p>那主體身上的租戶又是從哪來的？要看你用哪一種登入方式：</p>
+<p>用 <strong>session</strong>（<a href="04-cookies-sessions.html">第 4 課</a>）時，登入成功就把 <code>tenantId</code> 存進伺服器端的 session，或每次請求用 <code>userId</code> 去資料庫查。這兩種都是伺服器自己保存的資料，客戶端碰不到。</p>
+<p>用 <strong>JWT</strong>（<a href="08-jwt-signatures.html">第 8</a>、<a href="09-jwt-verification.html">9 課</a>）時，可以把 <code>tenant_id</code> 放進 payload，簽章保證它沒被改過。但<a href="11-revocation-tradeoffs.html">第 11 課</a>說過 token 裡的資料可能過期：店員被調到別的品牌，舊 token 在到期前仍然帶著舊租戶。重要操作時用資料庫的最新狀態。</p>
+<p>還有一種情況要先想好：<strong>一個人屬於多個租戶</strong>，例如加盟顧問同時服務兩個品牌。這時登入後讓他選一個，伺服器檢查「他確實是這個租戶的成員」之後，把選擇存進 session，或發一個只帶這個租戶的 token。之後每次切換租戶，都等於再檢查一次成員資格，不能讓前端直接改。</p>
+<p>用子網域區分品牌時，session cookie 的設定也會影響隔離，細節見課末「補充與查表」。</p>
+<p>到這裡，租戶有了可靠的來源。回頭看開場的 <code>storeRevenue</code>：它的問題不是拿不到租戶，而是寫的人沒用它。系統有幾百個查詢，每個人寫新功能時都要記得加 <code>tenant_id</code>，總有一次會忘。怎麼讓「忘記」不再造成事故？</p>
+
+<h2>幾百個查詢，怎麼讓人忘不了加 tenant_id？</h2>
+<p>靠每個人記得，是把安全押在注意力上。資深的做法是改變結構，讓忘記變得很難，而且就算忘了也有別的東西擋住。這一節建立三道防線，每一道擋一種不同的錯：業務程式碼忘了加條件、資料指到別的租戶、有人繞過程式直接寫 SQL。最後再處理第三道防線在連線池上的一個陷阱。</p>
+
+<h3>第一道：業務程式碼忘了加條件，交給 repository 自動加</h3>
+<p>開場的 <code>storeRevenue</code> 自己寫了查詢邏輯，所以有機會漏掉條件。如果所有存取資料的程式都必須經過同一層，而那一層自己加條件，業務程式碼就根本沒機會忘記。這一層叫 <strong>repository</strong>：專門負責讀寫資料的那一層（<a href="../../nestjs/lessons/18-layering-domain.html">NestJS 課第 18 課</a>的分層）。業務程式碼呼叫 <code>orders.findById(id)</code>，repository 自己從上下文拿到目前的租戶，自己加上 <code>tenant_id</code> 條件。</p>
+<p>接著的問題是：repository 怎麼知道「目前的租戶」？最直接的做法是從 controller 一路把 <code>tenantId</code> 當參數傳下去，經過 service、經過每個輔助函式，最後到 repository。這很囉唆，而且中間只要有一個函式沒傳，就又回到「有人忘記」的老問題。</p>
+<p>Node 提供的解法是 <strong>AsyncLocalStorage</strong>（<a href="../../node/lessons/19-structured-logging.html">Node 課第 19 課</a>）。它像一個「跟著這個請求走」的盒子：請求進來時用 <code>run()</code> 放進一份資料，這個請求之後所有的 <code>await</code>、callback 裡呼叫 <code>getStore()</code> 都拿得到同一份，就算同時有好幾個請求在跑也不會拿錯。在 <code>run()</code> 之外呼叫 <code>getStore()</code> 會得到 <code>undefined</code>（Node 24 文件）。下面是把租戶放進盒子、再從 repository 取出的寫法：</p>
+<pre>// Node.js（這段在瀏覽器的練習區不能執行，Worker 裡沒有 node:async_hooks）
+import { AsyncLocalStorage } from 'node:async_hooks'
+
+const tenantContext = new AsyncLocalStorage&lt;{ tenantId: number }&gt;()
+
+// 認證之後的 middleware：租戶來自 principal，不是請求
+app.use((req, res, next) =&gt; {
+  tenantContext.run({ tenantId: req.principal.tenantId }, next)
+})
+
+// repository 拿租戶：沒有上下文就丟錯，絕不用預設值
+export function currentTenantId(): number {
+  const ctx = tenantContext.getStore()
+  if (!ctx) throw new Error('沒有租戶上下文：這段程式不是在請求或工作裡執行的')
+  return ctx.tenantId
+}</pre>
+<p>注意最後那個 <code>throw</code>。<code>getStore()</code> 拿不到上下文，代表這段程式不是在某個請求或工作裡執行的，例如有人在啟動程式裡直接呼叫了 repository。這時有兩種選擇：退回一個「預設租戶」或乾脆不加條件，讓程式繼續跑；或者直接丟錯。這裡選後者，叫<strong>失敗關閉</strong>（fail closed）：找不到租戶時寧可整個請求出錯，也不要猜一個。退回預設值的程式碼平常都正常，因為平常都有上下文；一旦出事，就是全部租戶的資料混在一起，而且沒有任何錯誤提醒你。AsyncLocalStorage 有一個跟預設值有關的建構子選項，課末「補充與查表」說明為什麼不要用它設預設租戶。</p>
+<p>讀取擋住了，寫入也一樣要擋。<a href="19-object-level-authz.html">第 19 課</a>的 mass assignment 是指把請求 body 整包寫進資料，讓客戶端有機會多塞一個不該由它決定的欄位。在多租戶系統裡它更危險：body 多塞一個 <code>"tenantId": 2</code>，資料就被寫進巷口咖啡。所以 <strong><code>tenantId</code> 一律由上下文填入，不從 body 來</strong>；更新時也不能讓 body 改掉既有資料的 <code>tenantId</code>。練習 1 會實作這樣的 repository。</p>
+<p>repository 管住了「查的是哪個租戶的資料」。但它管不住資料內容裡的參照：山丘咖啡的店員建立訂單時，送來的商品 id 如果是巷口咖啡的商品呢？</p>
+
+<h3>第二道：訂單指到別家的商品，交給複合外鍵擋</h3>
+<p>這種錯叫<strong>跨租戶參照</strong>（cross-tenant reference）：A 租戶的資料指到 B 租戶的資料。repository 會把訂單項目正確地存成租戶 1，可是項目裡的 <code>product_id</code> 指的是巷口咖啡的商品；之後報表一 join，山丘咖啡的訂單上就出現巷口咖啡的商品名稱和價格。</p>
+<p>一般的單一欄位外鍵 <code>product_id REFERENCES products(id)</code> 擋不住，因為它只檢查「這個商品存在」，不管它屬於誰。解法是<strong>複合外鍵</strong>（composite foreign key）：用 <code>(tenant_id, product_id)</code> 兩個欄位一起參照，資料庫要找到「同一個租戶底下的這個商品」才放行。<a href="../../postgresql/lessons/38-modeling-patterns.html">PostgreSQL 課第 38 課</a>用 <code>store_id</code> 做過同樣的事：</p>
+<pre>CREATE TABLE products (
+  tenant_id bigint NOT NULL,
+  id        bigint NOT NULL,
+  name      text   NOT NULL,
+  price     integer NOT NULL,
+  PRIMARY KEY (tenant_id, id)
+);
+
+CREATE TABLE order_items (
+  tenant_id  bigint NOT NULL,
+  order_id   bigint NOT NULL,
+  product_id bigint NOT NULL,
+  quantity   integer NOT NULL,
+  FOREIGN KEY (tenant_id, product_id) REFERENCES products (tenant_id, id)
+);
+
+INSERT INTO products VALUES (1, 10, '拿鐵', 110), (2, 20, '美式咖啡', 80);
+INSERT INTO order_items VALUES (1, 1, 10, 1);   -- 成功：租戶 1 的訂單、租戶 1 的商品
+INSERT INTO order_items VALUES (1, 2, 20, 1);   -- 失敗：租戶 1 的訂單指到租戶 2 的商品
+-- ERROR:  insert or update on table "order_items" violates foreign key constraint
+--         "order_items_tenant_id_product_id_fkey"（SQLSTATE 23503）</pre>
+<p>上面的錯誤訊息是用 PGlite 0.5.13（PostgreSQL 18.6）實際跑出來的。資料庫只認 <code>(1, 20)</code> 這個組合，租戶 1 沒有商品 20，所以擋下來。這一招不需要任何應用程式的配合：不管是 repository、手寫的匯入腳本還是直接連進資料庫的人，都寫不進跨租戶的參照。</p>
+<p>前兩道都有一個前提：讀資料的 SQL 是經過 repository 寫的。可是總有人會繞過它，例如為了趕報表直接寫一段 SQL。那段 SQL 忘了加 <code>tenant_id</code>，誰來擋？</p>
+
+<h3>第三道：有人繞過 repository，交給 RLS 擋</h3>
+<p>PostgreSQL 課第 24 課的 <strong>RLS</strong>（Row Level Security，列層級安全）在資料庫裡過濾：表開啟 RLS 之後，資料庫依你寫的政策自動過濾每一列。程式裡就算有一個查詢忘了加 <code>tenant_id</code>，資料庫也只回目前租戶的列。政策要知道「目前的租戶」，做法是讓應用程式在連線上設一個自訂變數 <code>app.tenant_id</code>，政策再用 <code>current_setting</code> 讀它：</p>
+<pre>ALTER TABLE products ENABLE ROW LEVEL SECURITY;
+ALTER TABLE products FORCE ROW LEVEL SECURITY;   -- 表的擁有者預設會繞過 RLS，FORCE 讓它也受限
+
+CREATE POLICY tenant_isolation ON products
+  USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::bigint);</pre>
+<p>這幾行有三個地方要看懂：</p>
+<ul>
+  <li><strong><code>FORCE</code></strong>：表的擁有者預設會繞過 RLS。很多團隊的應用程式就是用建表的那個帳號連線，不加 <code>FORCE</code>，政策對它等於不存在。</li>
+  <li><strong>只寫 <code>USING</code> 也擋寫入</strong>：只寫 <code>USING</code> 的政策，PostgreSQL 18 會把同一個條件也當成 <code>WITH CHECK</code>。所以不只看不到別人的列，也不能 <code>INSERT</code>、<code>UPDATE</code> 出別的租戶的列（會報 <code>new row violates row-level security policy</code>）。</li>
+  <li><strong><code>NULLIF(…, '')</code></strong>：<code>current_setting('app.tenant_id', true)</code> 的第二個參數 <code>true</code> 表示「沒有這個設定時回 NULL，不要報錯」。但實測在同一條連線上設定過一次、交易結束之後，它回的是<strong>空字串</strong>而不是 NULL，空字串轉 <code>bigint</code> 會報錯。所以用 <code>NULLIF</code> 把空字串也變成 NULL。NULL 跟任何值比較都不成立，<strong>沒設定租戶 ＝ 一列都看不到</strong>，這是資料庫層的失敗關閉。</li>
+</ul>
+<p>還有一個前提：應用程式連資料庫的帳號不能是超級使用者，也不能有 <code>BYPASSRLS</code> 屬性，這兩種永遠繞過 RLS（PostgreSQL 課第 24 課）。測試環境常用超級使用者連線，RLS 在那裡永遠不會生效，所以要用正式環境同樣的角色測。</p>
+<p>政策寫好了，但它讀的 <code>app.tenant_id</code> 是設在<strong>連線</strong>上的值。後端的連線會被很多請求輪流使用，上一個請求設的值，會不會留給下一個請求？</p>
+
+<h3>RLS 的變數會不會留給下一個請求？SET 和 SET LOCAL</h3>
+<p>後端不會每個請求都開一條新的資料庫連線，那樣太慢。它維護一個<strong>連線池</strong>（connection pool）：請求來了借一條、用完還回去，下一個請求很可能借到同一條（<a href="../../postgresql/lessons/36-connections-monitoring.html">PostgreSQL 課第 36 課</a>）。設在連線上的變數會跟著連線一起被下一個人借走，所以「設在哪一層、什麼時候消失」決定了會不會漏。</p>
+<p>PostgreSQL 有兩種設法。依 PostgreSQL 18 文件：<code>SET</code> 作用在整個 session（也就是這條連線）上，直到連線關閉或被改掉；<code>SET LOCAL</code> 只到目前交易結束（<code>COMMIT</code> 或 <code>ROLLBACK</code>）為止，在交易外執行只會警告、沒有效果。<code>set_config(name, value, true)</code> 等同 <code>SET LOCAL</code>。下面用一個模擬的連線池看差別，執行後對照每個請求查到的資料：</p>
+<div class="lab"><script type="code">
+// 模擬 PostgreSQL 連線上的設定：session 層和交易層
+class Conn {
+  session = new Map<string, string>()
+  local: Map<string, string> | null = null
+  begin() { this.local = new Map() }
+  commit() { this.local = null }                       // 交易結束，SET LOCAL 的值消失
+  set(key: string, value: string, isLocal: boolean) {
+    if (isLocal) {
+      if (!this.local) { console.log('  WARNING: SET LOCAL 在交易外，沒有效果'); return }
+      this.local.set(key, value)
+    } else this.session.set(key, value)
+  }
+  currentTenant(): string | null { return this.local?.get('app.tenant_id') ?? this.session.get('app.tenant_id') ?? null }
+}
+
+const rows = [{ tenant: '1', name: '山丘：拿鐵' }, { tenant: '2', name: '巷口：美式咖啡' }]
+const query = (c: Conn) => rows.filter(r => r.tenant === c.currentTenant()).map(r => r.name)   // RLS
+
+console.log('錯誤寫法：用 SET（session 層）')
+const pooled = new Conn()                                // 連線池只有一條連線，每個請求都借到它
+pooled.set('app.tenant_id', '1', false)
+console.log('請求 A（租戶 1）：', query(pooled))
+// 請求 B 是一個忘了設定租戶的背景工作，借到同一條連線
+console.log('請求 B（沒設定）：', query(pooled), '← 沿用了租戶 1')
+
+console.log('正確寫法：交易裡用 SET LOCAL（另一個全新的連線池）')
+const fresh = new Conn()
+fresh.begin(); fresh.set('app.tenant_id', '2', true)
+console.log('請求 C（租戶 2）：', query(fresh))
+fresh.commit()
+console.log('請求 D（沒設定）：', query(fresh), '← 一列都看不到')
+
+console.log('忘了 BEGIN 就用 SET LOCAL：')
+fresh.set('app.tenant_id', '2', true)
+console.log('請求 E：', query(fresh))
+</script></div>
+<p>三段輸出各說明一件事：</p>
+<ul>
+  <li><strong>用 <code>SET</code></strong>：請求 A 設了租戶 1，連線還回去之後值還在。請求 B 是一個忘了設定租戶的背景工作，借到同一條連線，就用租戶 1 的身分查到了山丘咖啡的資料。RLS 的失敗關閉在這裡失效了，因為對資料庫來說租戶「有設定」。</li>
+  <li><strong>交易裡用 <code>SET LOCAL</code></strong>：<code>COMMIT</code> 之後值就消失，請求 D 沒設定，一列都看不到，回到失敗關閉。</li>
+  <li><strong>忘了 <code>BEGIN</code> 就用 <code>SET LOCAL</code></strong>：只有一個警告，設定沒有生效，請求 E 查不到任何資料。這不會洩漏，但功能會壞，要在測試裡抓出來。</li>
+</ul>
+<p>所以每個請求的模式是：借連線 → <code>BEGIN</code> → <code>SELECT set_config('app.tenant_id', $1, true)</code> → 查詢 → <code>COMMIT</code> → 還連線。租戶值用參數（<code>$1</code>）傳，不要字串拼接，否則又多一個 SQL injection（<a href="../../postgresql/lessons/25-backend.html">PostgreSQL 課第 25 課</a>）的入口。如果前面還有 PgBouncer 這類 transaction 模式的連線池（PostgreSQL 課第 36 課），更要這樣做：同一個 session 的連續兩個交易可能跑在不同的伺服器連線上，session 層的設定根本不可靠。</p>
+<p>回頭看三道防線各管什麼錯：repository 擋「業務程式碼忘了加條件」，複合外鍵擋「參照到別的租戶的資料」，RLS 擋「有人繞過 repository 直接寫 SQL」。少了 repository，每個查詢都要自己記得；少了 RLS，一個手寫的報表查詢就能洩漏全部租戶。開場那個 <code>storeRevenue</code>，現在不管是走 repository 還是被人改成手寫 SQL，都查不到巷口咖啡的訂單了。</p>
+<p>可是這三道都只守在資料庫的路上。資料一旦被讀出來，存進快取、放進佇列、寫成檔案，就離開了 repository 和 RLS 的範圍。那些地方誰還記得租戶？</p>
+
+<h2>資料離開資料庫之後，誰還記得租戶？</h2>
+<p>資料庫查詢通常會被 code review 看到，真正的事故常發生在資料庫<strong>以外</strong>的地方。拿開場的門市 1 來說：菜單查詢很慢，有人加了快取，key 寫成 <code>menu:${storeId}</code>（快取見 <a href="../../nestjs/lessons/19-caching-redis.html">NestJS 課第 19 課</a>）。山丘咖啡的店員先開門市 1 的菜單，結果被存進 <code>menu:1</code>；巷口咖啡的店員接著開自己的門市 1，從快取拿到的是山丘咖啡的菜單。資料庫的每一道防線都正常運作，漏洞出在一個字串上。</p>
+<p>同樣的事會發生在每個「資料離開請求」的地方。下表檔案那一列會用到<strong>簽名網址</strong>（presigned URL）：後端用物件儲存（例如 S3）的存取金鑰簽出的下載連結，網址裡帶著有效期限和簽章，過期或被改動就失效，所以可以讓瀏覽器直接下載檔案，又不用把整個儲存空間公開。</p>
+<div class="table-wrap"><table>
+  <tr><th>地方</th><th>出事的樣子</th><th>做法</th></tr>
+  <tr><td>快取 key</td><td><code>menu:${storeId}</code>：兩個租戶都有門市 1，先查的那個租戶的菜單被另一個租戶讀到</td><td>key 一定包含租戶，每一段跳脫（練習 2）</td></tr>
+  <tr><td>背景工作（<a href="../../nestjs/lessons/20-queues-bullmq.html">NestJS 課第 20 課</a>）</td><td>job 只帶 <code>storeId</code>，worker 不知道租戶，就用「預設租戶」或乾脆不加條件</td><td>job 資料帶 <code>tenantId</code>，worker 用它重建上下文，並檢查 job 裡的每個 id 都屬於這個租戶（練習 3）</td></tr>
+  <tr><td>檔案、物件儲存（S3）</td><td><code>receipts/${orderId}.pdf</code>：改網址的數字就下載到別人的收據</td><td>路徑前綴 <code>tenants/${tenantId}/…</code>，下載前仍要做第 19 課的物件層級檢查，再發短期的簽名網址</td></tr>
+  <tr><td>搜尋索引</td><td>全文搜尋的索引沒有租戶欄位，搜「拿鐵」出現別的品牌的商品</td><td>每份文件帶 <code>tenantId</code>，查詢一律加過濾；或每個租戶一個索引</td></tr>
+  <tr><td>匯出、報表</td><td>「匯出 CSV」是另外寫的 SQL，沒經過 repository</td><td>一樣走 repository 或有 RLS 的連線；匯出檔放在租戶的路徑下</td></tr>
+  <tr><td>log、錯誤訊息</td><td>錯誤訊息印出「商品 20 屬於租戶 2」，等於告訴攻擊者那個 id 存在</td><td>對外一律 404（第 19 課）；log 記 <code>tenantId</code> 方便排查，但不記別的租戶的資料內容</td></tr>
+  <tr><td>webhook、email</td><td>寄信的範本、寄件名稱用錯租戶，或通知送到別的租戶設定的網址</td><td>發送時用 job 裡的 <code>tenantId</code> 讀設定，不用全域預設</td></tr>
+</table></div>
+<p>這張表的每一列都是同一個模式：<strong>只要資料離開了「有租戶上下文的請求」，就要把 <code>tenantId</code> 明確帶著走</strong>，到了另一邊再用它重建上下文。快取 key 是字串、job 是 JSON、檔案路徑是字串，這些地方都沒有 RLS 幫你擋，AsyncLocalStorage 的盒子也不會跟著 job 跑到另一台機器上的 worker。背景工作還要多做一步：job 是在請求當下建立的，到 worker 執行時，裡面的 <code>storeId</code> 仍要檢查確實屬於 job 的租戶，因為門市編號只在租戶裡唯一。</p>
+<p>練習 2 要修的就是菜單快取的 key。把租戶放進 key 之前，還有一個小陷阱要先看：用 <code>:</code> 串接不同的段，如果某一段本身就含有 <code>:</code>，兩組不同的值會組出同一個 key。執行後看第三行：</p>
+<div class="lab"><script type="code">
+const naive = (...parts: string[]) => parts.join(':')
+console.log(naive('menu', 'a:b', 'c'))
+console.log(naive('menu', 'a', 'b:c'))
+console.log('同一個 key？', naive('menu', 'a:b', 'c') === naive('menu', 'a', 'b:c'))
+
+// 每一段先跳脫，: 變成 %3A，就不會跟分隔符號混在一起
+const safe = (...parts: string[]) => parts.map(encodeURIComponent).join(':')
+console.log(safe('menu', 'a:b', 'c'), '≠', safe('menu', 'a', 'b:c'))
+</script></div>
+<p>兩組不同的參數組出了同一個 key，表示一個人的查詢結果可能被另一組條件讀到。每一段先用 <code>encodeURIComponent</code> 跳脫，<code>:</code> 變成 <code>%3A</code>，就不會跟分隔符號混在一起。門市編號是數字時不會碰到，但搜尋關鍵字、分類名稱、使用者輸入的篩選條件都可能含有 <code>:</code>。</p>
+<div class="callout practice"><strong>💡 實務上：用「兩個租戶」的測試資料抓漏洞</strong><br>只有一個租戶的測試資料永遠抓不到跨租戶漏洞，因為根本沒有別人的資料可以漏，開場的 <code>storeRevenue</code> 在單一品牌的測試裡永遠是對的。常見做法是測試資料固定建兩個租戶，而且故意讓它們有相同的門市編號、相同的商品名稱，再用租戶 B 的帳號去打每個 API、拿租戶 A 的 id，預期一律 404。code review 時看到新的快取 key、job 資料、檔案路徑、匯出功能，資深的人會直接問一句「這裡的 tenantId 從哪來？」。上線前也可以請 QA（測試人員）開兩個測試租戶，交叉操作一輪。</div>
+<p>到這裡防的都是「不小心」跨租戶。可是有一種跨租戶存取是公司自己需要的：山丘咖啡打電話來報案之後，你的客服得進去看山丘咖啡的資料，才查得出問題。</p>
+
+<h2>客服要查山丘咖啡的問題：怎麼跨租戶又不開後門？</h2>
+<p>你的公司經營這個平台，自己也需要跨租戶存取：客服要幫山丘咖啡查「為什麼這張訂單出現在我們的報表上」，工程師要排查只在某個租戶發生的錯誤。前面所有的防線都會擋住他們，因為客服帳號不屬於山丘咖啡。</p>
+<p>最省事的做法是給客服一個「超級使用者」帳號，所有租戶條件都跳過。這等於在隔離牆上開了一扇沒人看管的門：那個帳號被盜、客服出於好奇亂看、離職員工的帳號沒停用，任何一種都會洩漏所有租戶的資料，而且事後查不出誰看了什麼。</p>
+<p>比較好的做法是把跨租戶存取當成一個<strong>明確的、留下紀錄的動作</strong>。這裡的「紀錄」指<strong>稽核紀錄</strong>（audit log）：專門記錄「誰在什麼時候對什麼資料做了什麼」的紀錄，用來在事後回答責任問題，跟除錯用的一般 log 分開保存。整個設計包含這幾件事，每一件都對應一個超級帳號的風險：</p>
+<ul>
+  <li><strong>明確切換</strong>：客服帳號平常不屬於任何租戶，要看某個租戶時發起「進入租戶 1」，系統發一個只對租戶 1 有效的 session。它仍然經過同一套 repository 和 RLS，只是租戶上下文是切換來的，前面的三道防線一道都沒拆。</li>
+  <li><strong>填理由、關聯工單</strong>：例如「工單 #4821：報表多一筆別家的訂單」。沒有理由就不能進，事後也知道每一次存取是為了什麼。</li>
+  <li><strong>有時效</strong>：例如 1 小時後自動失效，不能永久掛著。忘了登出的 session 不會變成長期的後門。</li>
+  <li><strong>預設唯讀</strong>：查問題通常只需要看。要修改資料需要更高的權限，最好要第二個人核准。</li>
+  <li><strong>寫稽核紀錄</strong>：誰、什麼時候、進入哪個租戶、理由、看了哪些資料。稽核紀錄要跟一般 log 分開、不能被客服自己刪改（第 25 課會再談）。</li>
+  <li><strong>讓租戶知道</strong>：在租戶的管理頁面列出「平台人員的存取紀錄」，有些合約會要求事前同意。</li>
+</ul>
+<div class="callout practice"><strong>💡 實務上：「以客戶身分登入」常是客服最想要的功能</strong><br>很多 SaaS 後台都有「以這位使用者身分檢視」之類的按鈕，客服用它重現客戶看到的畫面，比叫客戶截圖快得多。PM 提這個需求時，要把它做成上面那種明確切換、會過期的租戶 session，而不是一個跳過所有檢查的後門。資安和法務通常會關心兩件事：客戶合約有沒有允許平台人員看資料、出事時能不能查出是誰看的。早期團隊可以先做最小版本（明確切換、唯讀、稽核紀錄），但稽核紀錄一定要從第一版就有，事後補不回已經發生的存取。</div>
+<p>資料的隔離到這裡完整了：誰都看不到別人的資料，自家客服要看也有範圍和紀錄。但租戶共用的不只是資料，還有同一台資料庫的 CPU、同一個 API 的處理能力。</p>
+
+<h2>巷口咖啡跑大報表，山丘咖啡結帳卡住：怎麼分資源？</h2>
+<p>巷口咖啡的店長在月底按下「匯出三年訂單」，這個查詢讓資料庫 CPU 滿載；同一時間，山丘咖啡的店員在櫃台結帳，畫面一直轉圈。巷口咖啡沒有看到山丘咖啡的任何資料，但山丘咖啡一樣受害了。一個租戶用太多共用資源、拖慢其他租戶，叫<strong>雜訊鄰居</strong>（noisy neighbor），就像住公寓時樓上整晚施工。</p>
+<p>它的成因跟資料隔離一樣：系統把所有租戶當成同一群使用者。解法也一樣，把「租戶」加進每個分配資源的地方：</p>
+<ul>
+  <li><strong>每個租戶各自的限流與配額</strong>：限流（rate limit）是規定一段時間內最多接受幾個請求，<a href="16-account-flows.html">第 16 課</a>用 IP 當 key 做過。這裡限流的 key 包含 <code>tenantId</code>（例如每租戶每分鐘 600 個請求），而不只是每 IP、每使用者：一個租戶有很多店員、很多 IP，只限每 IP 擋不住整個租戶的量。這是<a href="24-owasp-api-top10.html">第 24 課</a> OWASP API4（Unrestricted Resource Consumption）的一部分。</li>
+  <li><strong>重的工作進佇列，按租戶公平排程</strong>：匯出三年訂單這種工作不在請求裡直接跑，而是放進佇列。排程時不要讓一個租戶塞進去的一萬個 job 排在所有人前面。</li>
+  <li><strong>大租戶搬出去</strong>：回到第二節的三種隔離方式，用量大的租戶換成獨立的資料庫，這也是一個常見的付費方案。</li>
+  <li><strong>監控也要分租戶</strong>：延遲、錯誤率、資料量都依 <code>tenantId</code> 分組。否則幾百個租戶的平均值看起來很正常，某個租戶其實一直出錯，就像開場的事故，要等客戶打電話來才知道。</li>
+</ul>
+<p>回到這課的任務。開場那筆跑錯報表的訂單，現在要經過層層關卡才可能漏出去：租戶只從登入的主體來；repository 自動加條件，找不到租戶就失敗關閉；複合外鍵擋住跨租戶參照；RLS 擋住繞過程式的 SQL，變數用 <code>SET LOCAL</code> 不留給下一個請求；快取、背景工作、檔案都明確帶著租戶；客服跨租戶有範圍、有紀錄；資源也依租戶分配。接下來的練習 1–3 分別實作 repository、快取 key 和背景工作這三個最常出事的地方，練習 4–6 回頭檢查租戶來源、RLS 的必要性和客服存取的設計。</p>
+
+<h2>補充與查表</h2>
+<p>主線用不到、但實作上下文或設定子網域 cookie 時會查的細節。</p>
+
+<h3>AsyncLocalStorage 的 <code>defaultValue</code></h3>
+<p>Node 24 的 <code>AsyncLocalStorage</code> 建構子有一個 <code>defaultValue</code> 選項，設了之後 <code>run()</code> 之外呼叫 <code>getStore()</code> 會回這個值，而不是 <code>undefined</code>。所以<strong>不要用它設「預設租戶」</strong>：它會讓主線裡 <code>currentTenantId()</code> 的失敗關閉永遠不會觸發，沒有上下文的程式會靜靜地查預設租戶的資料。</p>
+
+<h3>子網域與 session cookie</h3>
+<p>所有租戶共用 <code>coffeepos.example</code> 底下的子網域時，session cookie 不要設 <code>Domain=coffeepos.example</code>，否則它會被送到每個租戶的子網域。用<a href="04-cookies-sessions.html">第 4 課</a>的 <code>__Host-</code> 前綴：它保證 cookie 是 host-only（只送回發出它的那個主機），別的子網域也沒辦法寫一個同名 cookie 蓋掉它；某個子網域有 <a href="07-xss-csp.html">XSS（第 7 課）</a>時，影響才不會擴散到其他租戶。</p>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：實作會自動加上租戶條件的 <code>TenantRepository&lt;T&gt;</code>（泛型見 <a href="../../typescript/lessons/19-generics.html">TypeScript 課第 19 課</a>）。建構子收到 <code>getTenantId</code>（回傳目前請求的租戶，正式環境裡它會讀 AsyncLocalStorage）和所有租戶共用的 <code>rows</code> 陣列（模擬共用的資料表）。</p>
+  <ul>
+    <li><code>findById(id)</code>：只找得到目前租戶的資料，別的租戶的回 <code>undefined</code>。</li>
+    <li><code>list()</code>：只回目前租戶的資料。</li>
+    <li><code>create(data)</code>：<code>tenantId</code> 一律用 <code>getTenantId()</code> 的值，就算 <code>data</code> 在執行時多帶了 <code>tenantId</code> 也一樣；<code>id</code> 是 <code>rows</code> 裡最大的 id 加 1；放進 <code>rows</code> 並回傳。</li>
+    <li><code>update(id, patch)</code>：別的租戶的資料找不到（回 <code>undefined</code>、不能改到）；<code>patch</code> 就算在執行時帶了 <code>id</code> 或 <code>tenantId</code> 也不能改掉它們。回傳更新後的資料。</li>
+    <li><code>delete(id)</code>：只能刪目前租戶的資料，有刪到回 <code>true</code>。</li>
+    <li>每次操作都重新呼叫 <code>getTenantId()</code>：同一個 repository 會被不同租戶的請求共用。</li>
+  </ul>
+  <p class="muted">提示：組出新物件時 TypeScript 無法證明它是 <code>T</code>，可以寫 <code>{ … } as T</code>；重點是 <code>tenantId</code> 放在哪裡。</p>
+  <script type="start">
+type Order = { id: number; tenantId: number; storeId: number; total: number }
+
+class TenantRepository<T extends { id: number; tenantId: number }> {
+  constructor(private getTenantId: () => number, private rows: T[]) {}
+
+  findById(id: number): T | undefined {
+    throw new Error('TODO')
+  }
+
+  list(): T[] {
+    throw new Error('TODO')
+  }
+
+  create(data: Omit<T, 'id' | 'tenantId'>): T {
+    throw new Error('TODO')
+  }
+
+  update(id: number, patch: Partial<Omit<T, 'id' | 'tenantId'>>): T | undefined {
+    throw new Error('TODO')
+  }
+
+  delete(id: number): boolean {
+    throw new Error('TODO')
+  }
+}
+
+const table: Order[] = [
+  { id: 1, tenantId: 1, storeId: 1, total: 80 },
+  { id: 2, tenantId: 2, storeId: 1, total: 120 },
+]
+const repo = new TenantRepository<Order>(() => 1, table)
+console.log(repo.list(), repo.findById(2))
+</script>
+  <script type="answer">
+type Order = { id: number; tenantId: number; storeId: number; total: number }
+
+class TenantRepository<T extends { id: number; tenantId: number }> {
+  constructor(private getTenantId: () => number, private rows: T[]) {}
+
+  findById(id: number): T | undefined {
+    const tenantId = this.getTenantId()
+    return this.rows.find(r => r.id === id && r.tenantId === tenantId)
+  }
+
+  list(): T[] {
+    const tenantId = this.getTenantId()
+    return this.rows.filter(r => r.tenantId === tenantId)
+  }
+
+  create(data: Omit<T, 'id' | 'tenantId'>): T {
+    const id = this.rows.reduce((max, r) => Math.max(max, r.id), 0) + 1
+    // tenantId 放在展開之後：data 裡就算有 tenantId 也會被蓋掉
+    const row = { ...data, id, tenantId: this.getTenantId() } as T
+    this.rows.push(row)
+    return row
+  }
+
+  update(id: number, patch: Partial<Omit<T, 'id' | 'tenantId'>>): T | undefined {
+    const row = this.findById(id)
+    if (!row) return undefined
+    // 最後再寫回原本的 id 和 tenantId，patch 改不掉它們
+    return Object.assign(row, patch, { id: row.id, tenantId: row.tenantId })
+  }
+
+  delete(id: number): boolean {
+    const tenantId = this.getTenantId()
+    const index = this.rows.findIndex(r => r.id === id && r.tenantId === tenantId)
+    if (index === -1) return false
+    this.rows.splice(index, 1)
+    return true
+  }
+}
+
+const table: Order[] = [
+  { id: 1, tenantId: 1, storeId: 1, total: 80 },
+  { id: 2, tenantId: 2, storeId: 1, total: 120 },
+]
+const repo = new TenantRepository<Order>(() => 1, table)
+console.log(repo.list(), repo.findById(2))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<ReturnType<TenantRepository<Order>['findById']>, Order | undefined>>  // findById 回傳 T | undefined，不要改簽章
+type _2 = Expect<Equal<Parameters<TenantRepository<Order>['create']>[0], Omit<Order, 'id' | 'tenantId'>>>  // create 的參數型別要是 Omit<T, 'id' | 'tenantId'>
+type _3 = Expect<Equal<ReturnType<TenantRepository<Order>['list']>, Order[]>>  // list 回傳 T[]，不要改成 any
+type _4 = Expect<Equal<ReturnType<TenantRepository<Order>['update']>, Order | undefined>>  // update 回傳 T | undefined
+const _typed = (r: TenantRepository<Order>) => {
+  // @ts-expect-error create 不能讓呼叫的人傳 tenantId
+  r.create({ storeId: 1, total: 80, tenantId: 2 })
+  // @ts-expect-error update 的 patch 不能有 tenantId
+  r.update(1, { tenantId: 2 })
+}
+</script>
+  <script type="tests">
+const data: Order[] = [
+  { id: 1, tenantId: 1, storeId: 1, total: 80 },
+  { id: 2, tenantId: 2, storeId: 1, total: 110 },
+  { id: 3, tenantId: 1, storeId: 2, total: 120 },
+]
+let current = 1
+const r = new TenantRepository<Order>(() => current, data)
+
+assert.equal(r.findById(2), undefined, '租戶 1 用 findById 查租戶 2 的 id 2，要回 undefined')
+assert.equal(r.findById(1)?.total, 80, '租戶 1 要找得到自己的 id 1')
+assert.deepEqual(r.list().map(o => o.id), [1, 3], 'list 只能回目前租戶（1）的資料')
+current = 2
+assert.deepEqual(r.list().map(o => o.id), [2], '切換到租戶 2 之後，list 要回租戶 2 的資料：每次操作都要重新呼叫 getTenantId()，不能在建構子裡存起來')
+assert.equal(r.findById(1), undefined, '租戶 2 不能用 findById 拿到租戶 1 的資料')
+current = 1
+
+const created = r.create({ storeId: 1, total: 90, tenantId: 2, id: 1 } as any)
+assert.equal(created.tenantId, 1, 'create 時 data 裡硬塞 tenantId: 2，也要存成目前的租戶 1')
+assert.equal(created.id, 4, '新資料的 id 是 rows 裡最大的 id 加 1，data 裡硬塞的 id 也不能用')
+assert.equal(data.length, 4, 'create 要把資料放進共用的 rows')
+assert.equal(data[3].tenantId, 1, 'rows 裡的新資料 tenantId 要是 1')
+
+assert.equal(r.update(2, { total: 1 }), undefined, 'update 別的租戶的資料要回 undefined')
+assert.equal(data[1].total, 110, 'update 別的租戶的資料，資料不能被改到')
+
+const updated = r.update(1, { total: 100, tenantId: 2, id: 99 } as any)
+assert.equal(updated?.total, 100, 'update 自己的資料要回傳改過的資料')
+assert.equal(data[0].total, 100, 'update 要改到 rows 裡那一筆，不能只回傳一份副本')
+assert.equal(data[0].tenantId, 1, 'patch 裡硬塞 tenantId 不能改掉資料的租戶')
+assert.equal(data[0].id, 1, 'patch 裡硬塞 id 不能改掉資料的 id')
+
+assert.equal(r.delete(2), false, 'delete 別的租戶的資料要回 false')
+assert.equal(data.some(o => o.id === 2), true, 'delete 別的租戶的資料，資料要還在')
+assert.equal(r.delete(3), true, 'delete 自己的資料要回 true')
+assert.equal(data.some(o => o.id === 3), false, 'delete 自己的資料要真的從 rows 移除')
+
+current = 2
+const next = r.create({ storeId: 1, total: 70 })
+assert.equal(next.id, 5, '租戶 2 新增時，id 也是「所有租戶」裡最大的 id 加 1（現在是 4 + 1），不能只看自己租戶，也不能用 rows.length + 1，否則會跟別人的 id 重複')
+assert.equal(next.tenantId, 2, '租戶 2 新增的資料 tenantId 要是 2')
+</script>
+  <script type="wrong">
+// 相信 data 裡的 tenantId：展開的順序錯了
+type Order = { id: number; tenantId: number; storeId: number; total: number }
+class TenantRepository<T extends { id: number; tenantId: number }> {
+  constructor(private getTenantId: () => number, private rows: T[]) {}
+  findById(id: number): T | undefined { const t = this.getTenantId(); return this.rows.find(r => r.id === id && r.tenantId === t) }
+  list(): T[] { const t = this.getTenantId(); return this.rows.filter(r => r.tenantId === t) }
+  create(data: Omit<T, 'id' | 'tenantId'>): T {
+    const id = this.rows.reduce((max, r) => Math.max(max, r.id), 0) + 1
+    const row = { tenantId: this.getTenantId(), id, ...data } as T
+    this.rows.push(row)
+    return row
+  }
+  update(id: number, patch: Partial<Omit<T, 'id' | 'tenantId'>>): T | undefined {
+    const row = this.findById(id)
+    if (!row) return undefined
+    return Object.assign(row, patch, { id: row.id, tenantId: row.tenantId })
+  }
+  delete(id: number): boolean {
+    const t = this.getTenantId()
+    const i = this.rows.findIndex(r => r.id === id && r.tenantId === t)
+    if (i === -1) return false
+    this.rows.splice(i, 1)
+    return true
+  }
+}
+</script>
+  <script type="wrong">
+// update 直接展開 patch：tenantId 被改掉
+type Order = { id: number; tenantId: number; storeId: number; total: number }
+class TenantRepository<T extends { id: number; tenantId: number }> {
+  constructor(private getTenantId: () => number, private rows: T[]) {}
+  findById(id: number): T | undefined { const t = this.getTenantId(); return this.rows.find(r => r.id === id && r.tenantId === t) }
+  list(): T[] { const t = this.getTenantId(); return this.rows.filter(r => r.tenantId === t) }
+  create(data: Omit<T, 'id' | 'tenantId'>): T {
+    const id = this.rows.reduce((max, r) => Math.max(max, r.id), 0) + 1
+    const row = { ...data, id, tenantId: this.getTenantId() } as T
+    this.rows.push(row)
+    return row
+  }
+  update(id: number, patch: Partial<Omit<T, 'id' | 'tenantId'>>): T | undefined {
+    const row = this.findById(id)
+    if (!row) return undefined
+    return Object.assign(row, patch)
+  }
+  delete(id: number): boolean {
+    const t = this.getTenantId()
+    const i = this.rows.findIndex(r => r.id === id && r.tenantId === t)
+    if (i === -1) return false
+    this.rows.splice(i, 1)
+    return true
+  }
+}
+</script>
+  <script type="wrong">
+// delete 沒加租戶條件
+type Order = { id: number; tenantId: number; storeId: number; total: number }
+class TenantRepository<T extends { id: number; tenantId: number }> {
+  constructor(private getTenantId: () => number, private rows: T[]) {}
+  findById(id: number): T | undefined { const t = this.getTenantId(); return this.rows.find(r => r.id === id && r.tenantId === t) }
+  list(): T[] { const t = this.getTenantId(); return this.rows.filter(r => r.tenantId === t) }
+  create(data: Omit<T, 'id' | 'tenantId'>): T {
+    const id = this.rows.reduce((max, r) => Math.max(max, r.id), 0) + 1
+    const row = { ...data, id, tenantId: this.getTenantId() } as T
+    this.rows.push(row)
+    return row
+  }
+  update(id: number, patch: Partial<Omit<T, 'id' | 'tenantId'>>): T | undefined {
+    const row = this.findById(id)
+    if (!row) return undefined
+    return Object.assign(row, patch, { id: row.id, tenantId: row.tenantId })
+  }
+  delete(id: number): boolean {
+    const i = this.rows.findIndex(r => r.id === id)
+    if (i === -1) return false
+    this.rows.splice(i, 1)
+    return true
+  }
+}
+</script>
+  <script type="wrong">
+// findById 只用 id 找
+type Order = { id: number; tenantId: number; storeId: number; total: number }
+class TenantRepository<T extends { id: number; tenantId: number }> {
+  constructor(private getTenantId: () => number, private rows: T[]) {}
+  findById(id: number): T | undefined { return this.rows.find(r => r.id === id) }
+  list(): T[] { const t = this.getTenantId(); return this.rows.filter(r => r.tenantId === t) }
+  create(data: Omit<T, 'id' | 'tenantId'>): T {
+    const id = this.rows.reduce((max, r) => Math.max(max, r.id), 0) + 1
+    const row = { ...data, id, tenantId: this.getTenantId() } as T
+    this.rows.push(row)
+    return row
+  }
+  update(id: number, patch: Partial<Omit<T, 'id' | 'tenantId'>>): T | undefined {
+    const t = this.getTenantId()
+    const row = this.rows.find(r => r.id === id && r.tenantId === t)
+    if (!row) return undefined
+    return Object.assign(row, patch, { id: row.id, tenantId: row.tenantId })
+  }
+  delete(id: number): boolean {
+    const t = this.getTenantId()
+    const i = this.rows.findIndex(r => r.id === id && r.tenantId === t)
+    if (i === -1) return false
+    this.rows.splice(i, 1)
+    return true
+  }
+}
+</script>
+  <script type="wrong">
+// id 只看自己租戶的最大值：會跟別的租戶的 id 撞在一起
+type Order = { id: number; tenantId: number; storeId: number; total: number }
+class TenantRepository<T extends { id: number; tenantId: number }> {
+  constructor(private getTenantId: () => number, private rows: T[]) {}
+  findById(id: number): T | undefined { const t = this.getTenantId(); return this.rows.find(r => r.id === id && r.tenantId === t) }
+  list(): T[] { const t = this.getTenantId(); return this.rows.filter(r => r.tenantId === t) }
+  create(data: Omit<T, 'id' | 'tenantId'>): T {
+    const id = this.list().reduce((max, r) => Math.max(max, r.id), 0) + 1
+    const row = { ...data, id, tenantId: this.getTenantId() } as T
+    this.rows.push(row)
+    return row
+  }
+  update(id: number, patch: Partial<Omit<T, 'id' | 'tenantId'>>): T | undefined {
+    const row = this.findById(id)
+    if (!row) return undefined
+    return Object.assign(row, patch, { id: row.id, tenantId: row.tenantId })
+  }
+  delete(id: number): boolean {
+    const t = this.getTenantId()
+    const i = this.rows.findIndex(r => r.id === id && r.tenantId === t)
+    if (i === -1) return false
+    this.rows.splice(i, 1)
+    return true
+  }
+}
+</script>
+  <script type="wrong">
+// update 回傳新物件，沒寫回 rows；create 讓 data 的 id 蓋掉
+type Order = { id: number; tenantId: number; storeId: number; total: number }
+class TenantRepository<T extends { id: number; tenantId: number }> {
+  constructor(private getTenantId: () => number, private rows: T[]) {}
+  findById(id: number): T | undefined { const t = this.getTenantId(); return this.rows.find(r => r.id === id && r.tenantId === t) }
+  list(): T[] { const t = this.getTenantId(); return this.rows.filter(r => r.tenantId === t) }
+  create(data: Omit<T, 'id' | 'tenantId'>): T {
+    const id = this.rows.reduce((max, r) => Math.max(max, r.id), 0) + 1
+    const row = { id, ...data, tenantId: this.getTenantId() } as T
+    this.rows.push(row)
+    return row
+  }
+  update(id: number, patch: Partial<Omit<T, 'id' | 'tenantId'>>): T | undefined {
+    const row = this.findById(id)
+    if (!row) return undefined
+    return { ...row, ...patch, id: row.id, tenantId: row.tenantId }
+  }
+  delete(id: number): boolean {
+    const t = this.getTenantId()
+    const i = this.rows.findIndex(r => r.id === id && r.tenantId === t)
+    if (i === -1) return false
+    this.rows.splice(i, 1)
+    return true
+  }
+}
+</script>
+  <script type="wrong">
+// 在建構子裡把租戶存起來：repository 被下一個租戶的請求共用時就錯了
+type Order = { id: number; tenantId: number; storeId: number; total: number }
+class TenantRepository<T extends { id: number; tenantId: number }> {
+  private tenantId: number
+  constructor(private getTenantId: () => number, private rows: T[]) { this.tenantId = getTenantId() }
+  findById(id: number): T | undefined { return this.rows.find(r => r.id === id && r.tenantId === this.tenantId) }
+  list(): T[] { return this.rows.filter(r => r.tenantId === this.tenantId) }
+  create(data: Omit<T, 'id' | 'tenantId'>): T {
+    const id = this.rows.reduce((max, r) => Math.max(max, r.id), 0) + 1
+    const row = { ...data, id, tenantId: this.tenantId } as T
+    this.rows.push(row)
+    return row
+  }
+  update(id: number, patch: Partial<Omit<T, 'id' | 'tenantId'>>): T | undefined {
+    const row = this.findById(id)
+    if (!row) return undefined
+    return Object.assign(row, patch, { id: row.id, tenantId: row.tenantId })
+  }
+  delete(id: number): boolean {
+    const i = this.rows.findIndex(r => r.id === id && r.tenantId === this.tenantId)
+    if (i === -1) return false
+    this.rows.splice(i, 1)
+    return true
+  }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：修好菜單快取。原本的 key 是 <code>menu:${storeId}</code>，兩個租戶都有門市 1，先查的那個租戶的菜單會被另一個租戶讀到。</p>
+  <ul>
+    <li>寫 <code>cacheKey(ctx, ...parts)</code>：回傳的 key 一定包含 <code>ctx.tenantId</code>，而且每一段（包括租戶）都先用 <code>encodeURIComponent</code> 跳脫再用 <code>:</code> 串起來，讓不同的組合不會組出同一個 key。</li>
+    <li>把 <code>getMenu</code> 改用 <code>cacheKey</code>：快取有就直接回傳，沒有才呼叫 <code>db.loadMenu</code> 並存進快取。</li>
+  </ul>
+  <script type="start">
+type Ctx = { tenantId: number }
+type Menu = { items: string[] }
+type MenuDeps = {
+  cache: Map<string, Menu>
+  db: { loadMenu(tenantId: number, storeId: number): Promise<Menu> }
+}
+
+function cacheKey(ctx: Ctx, ...parts: string[]): string {
+  throw new Error('TODO')
+}
+
+async function getMenu(ctx: Ctx, storeId: number, deps: MenuDeps): Promise<Menu> {
+  const key = `menu:${storeId}`
+  const hit = deps.cache.get(key)
+  if (hit) return hit
+  const menu = await deps.db.loadMenu(ctx.tenantId, storeId)
+  deps.cache.set(key, menu)
+  return menu
+}
+
+const menus: Record<string, Menu> = { '1:1': { items: ['拿鐵', '可頌'] }, '2:1': { items: ['美式咖啡', '起司蛋糕'] } }
+const deps: MenuDeps = { cache: new Map(), db: { loadMenu: async (t, s) => menus[`${t}:${s}`] } }
+console.log('山丘咖啡門市 1：', await getMenu({ tenantId: 1 }, 1, deps))
+console.log('巷口咖啡門市 1：', await getMenu({ tenantId: 2 }, 1, deps))
+</script>
+  <script type="answer">
+type Ctx = { tenantId: number }
+type Menu = { items: string[] }
+type MenuDeps = {
+  cache: Map<string, Menu>
+  db: { loadMenu(tenantId: number, storeId: number): Promise<Menu> }
+}
+
+function cacheKey(ctx: Ctx, ...parts: string[]): string {
+  return ['t', String(ctx.tenantId), ...parts].map(encodeURIComponent).join(':')
+}
+
+async function getMenu(ctx: Ctx, storeId: number, deps: MenuDeps): Promise<Menu> {
+  const key = cacheKey(ctx, 'menu', String(storeId))
+  const hit = deps.cache.get(key)
+  if (hit) return hit
+  const menu = await deps.db.loadMenu(ctx.tenantId, storeId)
+  deps.cache.set(key, menu)
+  return menu
+}
+
+const menus: Record<string, Menu> = { '1:1': { items: ['拿鐵', '可頌'] }, '2:1': { items: ['美式咖啡', '起司蛋糕'] } }
+const deps: MenuDeps = { cache: new Map(), db: { loadMenu: async (t, s) => menus[`${t}:${s}`] } }
+console.log('山丘咖啡門市 1：', await getMenu({ tenantId: 1 }, 1, deps))
+console.log('巷口咖啡門市 1：', await getMenu({ tenantId: 2 }, 1, deps))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<ReturnType<typeof cacheKey>, string>>  // cacheKey 回傳 string
+type _2 = Expect<Equal<ReturnType<typeof getMenu>, Promise<Menu>>>  // getMenu 回傳 Promise<Menu>
+</script>
+  <script type="tests">
+const a = { tenantId: 1 }, b = { tenantId: 2 }
+assert(cacheKey(a, 'menu', '1') !== cacheKey(b, 'menu', '1'), '不同租戶、相同的 parts，key 要不一樣：key 要包含 tenantId')
+assert(cacheKey(a, 'a:b', 'c') !== cacheKey(a, 'a', 'b:c'), 'cacheKey(ctx, "a:b", "c") 和 cacheKey(ctx, "a", "b:c") 不能一樣：每一段要先 encodeURIComponent')
+assert(cacheKey(a, 'a%3Ab') !== cacheKey(a, 'a:b'), '"a%3Ab" 和 "a:b" 不能組出同一個 key：用 encodeURIComponent，不要只替換冒號')
+assert(cacheKey({ tenantId: 1 }, '23') !== cacheKey({ tenantId: 12 }, '3'), '租戶 1＋"23" 和租戶 12＋"3" 不能一樣：租戶和其他段之間也要有分隔')
+const tricky = [['a:b', 'c'], ['a', 'b:c'], ['a%3Ab', 'c'], ['a\\', 'b'], ['a:b'], ['a\\:b'], ['a', ''], ['a'], ['', 'a'], ['a%', 'b'], ['a', '%b']]
+const seen = new Map<string, string>()
+for (const parts of tricky) {
+  const k = cacheKey(a, ...parts)
+  assert(!seen.has(k), `${JSON.stringify(parts)} 和 ${seen.get(k)} 組出同一個 key（${k}）：每一段都要用 encodeURIComponent 跳脫，自己發明的跳脫規則很容易漏掉 \\ 或 %`)
+  seen.set(k, JSON.stringify(parts))
+}
+assert.equal(cacheKey(a, 'menu', '1'), cacheKey({ tenantId: 1 }, 'menu', '1'), '相同的租戶和 parts 要得到相同的 key，快取才會命中')
+
+const stored: Record<string, Menu> = { '1:1': { items: ['拿鐵'] }, '2:1': { items: ['美式咖啡'] } }
+const loads: string[] = []
+const d: MenuDeps = { cache: new Map(), db: { loadMenu: async (t, s) => { loads.push(`${t}:${s}`); return stored[`${t}:${s}`] } } }
+assert.deepEqual(await getMenu(a, 1, d), { items: ['拿鐵'] }, '租戶 1 門市 1 要拿到自己的菜單')
+assert.deepEqual(await getMenu(b, 1, d), { items: ['美式咖啡'] }, '租戶 2 門市 1 要拿到自己的菜單，不能拿到租戶 1 快取裡的：getMenu 要改用 cacheKey')
+assert.deepEqual(await getMenu(a, 1, d), { items: ['拿鐵'] }, '租戶 1 再查一次仍然是自己的菜單')
+assert.deepEqual(loads, ['1:1', '2:1'], '第二次查租戶 1 門市 1 要用快取，不能再呼叫 loadMenu')
+</script>
+  <script type="wrong">
+// 起始程式的 key：沒有 tenantId
+type Ctx = { tenantId: number }
+type Menu = { items: string[] }
+type MenuDeps = { cache: Map<string, Menu>; db: { loadMenu(tenantId: number, storeId: number): Promise<Menu> } }
+function cacheKey(ctx: Ctx, ...parts: string[]): string {
+  return parts.map(encodeURIComponent).join(':')
+}
+async function getMenu(ctx: Ctx, storeId: number, deps: MenuDeps): Promise<Menu> {
+  const key = cacheKey(ctx, 'menu', String(storeId))
+  const hit = deps.cache.get(key)
+  if (hit) return hit
+  const menu = await deps.db.loadMenu(ctx.tenantId, storeId)
+  deps.cache.set(key, menu)
+  return menu
+}
+</script>
+  <script type="wrong">
+// 直接用 : 串接，沒有跳脫
+type Ctx = { tenantId: number }
+type Menu = { items: string[] }
+type MenuDeps = { cache: Map<string, Menu>; db: { loadMenu(tenantId: number, storeId: number): Promise<Menu> } }
+function cacheKey(ctx: Ctx, ...parts: string[]): string {
+  return [ctx.tenantId, ...parts].join(':')
+}
+async function getMenu(ctx: Ctx, storeId: number, deps: MenuDeps): Promise<Menu> {
+  const key = cacheKey(ctx, 'menu', String(storeId))
+  const hit = deps.cache.get(key)
+  if (hit) return hit
+  const menu = await deps.db.loadMenu(ctx.tenantId, storeId)
+  deps.cache.set(key, menu)
+  return menu
+}
+</script>
+  <script type="wrong">
+// 只把冒號換掉：% 本身沒跳脫
+type Ctx = { tenantId: number }
+type Menu = { items: string[] }
+type MenuDeps = { cache: Map<string, Menu>; db: { loadMenu(tenantId: number, storeId: number): Promise<Menu> } }
+function cacheKey(ctx: Ctx, ...parts: string[]): string {
+  return [String(ctx.tenantId), ...parts].map(p => p.replaceAll(':', '%3A')).join(':')
+}
+async function getMenu(ctx: Ctx, storeId: number, deps: MenuDeps): Promise<Menu> {
+  const key = cacheKey(ctx, 'menu', String(storeId))
+  const hit = deps.cache.get(key)
+  if (hit) return hit
+  const menu = await deps.db.loadMenu(ctx.tenantId, storeId)
+  deps.cache.set(key, menu)
+  return menu
+}
+</script>
+  <script type="wrong">
+// 自己用反斜線跳脫冒號：反斜線本身沒跳脫
+type Ctx = { tenantId: number }
+type Menu = { items: string[] }
+type MenuDeps = { cache: Map<string, Menu>; db: { loadMenu(tenantId: number, storeId: number): Promise<Menu> } }
+function cacheKey(ctx: Ctx, ...parts: string[]): string {
+  return [String(ctx.tenantId), ...parts].map(p => p.replaceAll(':', '\\:')).join(':')
+}
+async function getMenu(ctx: Ctx, storeId: number, deps: MenuDeps): Promise<Menu> {
+  const key = cacheKey(ctx, 'menu', String(storeId))
+  const hit = deps.cache.get(key)
+  if (hit) return hit
+  const menu = await deps.db.loadMenu(ctx.tenantId, storeId)
+  deps.cache.set(key, menu)
+  return menu
+}
+</script>
+  <script type="wrong">
+// 租戶直接黏在第一段前面，沒有分隔
+type Ctx = { tenantId: number }
+type Menu = { items: string[] }
+type MenuDeps = { cache: Map<string, Menu>; db: { loadMenu(tenantId: number, storeId: number): Promise<Menu> } }
+function cacheKey(ctx: Ctx, ...parts: string[]): string {
+  return ctx.tenantId + parts.map(encodeURIComponent).join(':')
+}
+async function getMenu(ctx: Ctx, storeId: number, deps: MenuDeps): Promise<Menu> {
+  const key = cacheKey(ctx, 'menu', String(storeId))
+  const hit = deps.cache.get(key)
+  if (hit) return hit
+  const menu = await deps.db.loadMenu(ctx.tenantId, storeId)
+  deps.cache.set(key, menu)
+  return menu
+}
+</script>
+  <script type="wrong">
+// cacheKey 寫對了，但 getMenu 還在用舊的 key
+type Ctx = { tenantId: number }
+type Menu = { items: string[] }
+type MenuDeps = { cache: Map<string, Menu>; db: { loadMenu(tenantId: number, storeId: number): Promise<Menu> } }
+function cacheKey(ctx: Ctx, ...parts: string[]): string {
+  return ['t', String(ctx.tenantId), ...parts].map(encodeURIComponent).join(':')
+}
+async function getMenu(ctx: Ctx, storeId: number, deps: MenuDeps): Promise<Menu> {
+  const key = `menu:${storeId}`
+  const hit = deps.cache.get(key)
+  if (hit) return hit
+  const menu = await deps.db.loadMenu(ctx.tenantId, storeId)
+  deps.cache.set(key, menu)
+  return menu
+}
+</script>
+  <script type="wrong">
+// 拿掉快取：結果對了，但每次都打資料庫
+type Ctx = { tenantId: number }
+type Menu = { items: string[] }
+type MenuDeps = { cache: Map<string, Menu>; db: { loadMenu(tenantId: number, storeId: number): Promise<Menu> } }
+function cacheKey(ctx: Ctx, ...parts: string[]): string {
+  return ['t', String(ctx.tenantId), ...parts].map(encodeURIComponent).join(':')
+}
+async function getMenu(ctx: Ctx, storeId: number, deps: MenuDeps): Promise<Menu> {
+  return deps.db.loadMenu(ctx.tenantId, storeId)
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：月報表是背景工作。店長按下「產生報表」時，API 呼叫 <code>enqueueReport</code> 把 job 放進佇列；之後 worker 從佇列拿出 job 呼叫 <code>runReportJob</code>。佇列存的是 JSON（像 Redis 裡的 BullMQ job），worker 那邊<strong>沒有</strong>請求的租戶上下文。</p>
+  <ul>
+    <li><code>enqueueReport(ctx, params, queue)</code>：job 一定帶 <code>tenantId</code>，而且取自 <code>ctx</code>；<code>params</code> 在執行時就算多帶了 <code>tenantId</code> 也不能用它。</li>
+    <li><code>runReportJob(job, deps)</code>：
+      <ul>
+        <li><code>job.tenantId</code> 不是正整數（沒有、字串、0）→ <code>{ ok: false, error: 'missing_tenant' }</code>，不能用任何預設租戶。</li>
+        <li>這個租戶沒有 <code>job.storeId</code> 這間門市 → <code>{ ok: false, error: 'store_not_in_tenant' }</code>。注意門市編號只在租戶裡唯一：兩個租戶都可能有門市 1。</li>
+        <li>否則回 <code>{ ok: true, report }</code>：只算<strong>這個租戶、這間門市</strong>、<code>orderedAt</code> 以 <code>job.month</code>（例如 <code>'2026-10'</code>）開頭的訂單，<code>orderCount</code> 是筆數、<code>revenue</code> 是 <code>total</code> 的總和。</li>
+      </ul>
+    </li>
+  </ul>
+  <script type="start">
+type Ctx = { tenantId: number }
+type ReportJob = { tenantId?: number; storeId: number; month: string }
+type Store = { tenantId: number; id: number; name: string }
+type Order = { tenantId: number; storeId: number; total: number; orderedAt: string }
+type Report = { tenantId: number; storeId: number; month: string; orderCount: number; revenue: number }
+type JobResult = { ok: true; report: Report } | { ok: false; error: 'missing_tenant' | 'store_not_in_tenant' }
+
+function enqueueReport(ctx: Ctx, params: { storeId: number; month: string }, queue: { add(job: ReportJob): void }): void {
+  throw new Error('TODO')
+}
+
+function runReportJob(job: ReportJob, deps: { stores: Store[]; orders: Order[] }): JobResult {
+  throw new Error('TODO')
+}
+
+const stores: Store[] = [
+  { tenantId: 1, id: 1, name: '山丘咖啡 信義店' },
+  { tenantId: 2, id: 1, name: '巷口咖啡 中山店' },
+]
+const orders: Order[] = [
+  { tenantId: 1, storeId: 1, total: 110, orderedAt: '2026-10-03T09:12:00+08:00' },
+  { tenantId: 2, storeId: 1, total: 80, orderedAt: '2026-10-03T10:40:00+08:00' },
+]
+const queue: ReportJob[] = []
+enqueueReport({ tenantId: 1 }, { storeId: 1, month: '2026-10' }, { add: job => queue.push(JSON.parse(JSON.stringify(job))) })
+console.log(queue[0], runReportJob(queue[0], { stores, orders }))
+</script>
+  <script type="answer">
+type Ctx = { tenantId: number }
+type ReportJob = { tenantId?: number; storeId: number; month: string }
+type Store = { tenantId: number; id: number; name: string }
+type Order = { tenantId: number; storeId: number; total: number; orderedAt: string }
+type Report = { tenantId: number; storeId: number; month: string; orderCount: number; revenue: number }
+type JobResult = { ok: true; report: Report } | { ok: false; error: 'missing_tenant' | 'store_not_in_tenant' }
+
+function enqueueReport(ctx: Ctx, params: { storeId: number; month: string }, queue: { add(job: ReportJob): void }): void {
+  // 只挑需要的欄位，tenantId 來自 ctx
+  queue.add({ tenantId: ctx.tenantId, storeId: params.storeId, month: params.month })
+}
+
+function runReportJob(job: ReportJob, deps: { stores: Store[]; orders: Order[] }): JobResult {
+  const tenantId = job.tenantId
+  if (tenantId === undefined || !Number.isInteger(tenantId) || tenantId <= 0) return { ok: false, error: 'missing_tenant' }
+  // 門市要用 (tenantId, id) 一起找
+  if (!deps.stores.some(s => s.tenantId === tenantId && s.id === job.storeId)) return { ok: false, error: 'store_not_in_tenant' }
+  const matched = deps.orders.filter(o => o.tenantId === tenantId && o.storeId === job.storeId && o.orderedAt.startsWith(job.month))
+  return {
+    ok: true,
+    report: {
+      tenantId,
+      storeId: job.storeId,
+      month: job.month,
+      orderCount: matched.length,
+      revenue: matched.reduce((sum, o) => sum + o.total, 0),
+    },
+  }
+}
+
+const stores: Store[] = [
+  { tenantId: 1, id: 1, name: '山丘咖啡 信義店' },
+  { tenantId: 2, id: 1, name: '巷口咖啡 中山店' },
+]
+const orders: Order[] = [
+  { tenantId: 1, storeId: 1, total: 110, orderedAt: '2026-10-03T09:12:00+08:00' },
+  { tenantId: 2, storeId: 1, total: 80, orderedAt: '2026-10-03T10:40:00+08:00' },
+]
+const queue: ReportJob[] = []
+enqueueReport({ tenantId: 1 }, { storeId: 1, month: '2026-10' }, { add: job => queue.push(JSON.parse(JSON.stringify(job))) })
+console.log(queue[0], runReportJob(queue[0], { stores, orders }))
+</script>
+  <script type="types">
+type _1 = Expect<Equal<ReturnType<typeof runReportJob>, JobResult>>  // runReportJob 回傳 JobResult，不要改
+type _2 = Expect<Equal<ReturnType<typeof enqueueReport>, void>>  // enqueueReport 回傳 void
+</script>
+  <script type="tests">
+const st: Store[] = [
+  { tenantId: 1, id: 1, name: '山丘咖啡 信義店' },
+  { tenantId: 1, id: 2, name: '山丘咖啡 大安店' },
+  { tenantId: 2, id: 1, name: '巷口咖啡 中山店' },
+]
+const od: Order[] = [
+  { tenantId: 1, storeId: 1, total: 80, orderedAt: '2026-10-01T08:30:00+08:00' },
+  { tenantId: 1, storeId: 1, total: 110, orderedAt: '2026-10-15T12:00:00+08:00' },
+  { tenantId: 1, storeId: 1, total: 120, orderedAt: '2026-09-30T18:00:00+08:00' },
+  { tenantId: 1, storeId: 2, total: 90, orderedAt: '2026-10-02T09:00:00+08:00' },
+  { tenantId: 2, storeId: 1, total: 70, orderedAt: '2026-10-05T07:45:00+08:00' },
+  { tenantId: 2, storeId: 1, total: 90, orderedAt: '2026-10-20T15:10:00+08:00' },
+]
+const deps2 = { stores: st, orders: od }
+const q: ReportJob[] = []
+const qq = { add: (job: ReportJob) => { q.push(JSON.parse(JSON.stringify(job))) } }
+
+enqueueReport({ tenantId: 1 }, { storeId: 1, month: '2026-10' }, qq)
+assert.equal(q.length, 1, 'enqueueReport 要呼叫 queue.add 一次')
+assert.equal(q[0].tenantId, 1, 'job 要帶 tenantId（取自 ctx），worker 才知道是哪個租戶')
+enqueueReport({ tenantId: 2 }, { storeId: 1, month: '2026-10', tenantId: 1 } as any, qq)
+assert.equal(q[1].tenantId, 2, 'params 裡硬塞 tenantId: 1 也不能用，job 的 tenantId 要取自 ctx（2）')
+
+assert.deepEqual(runReportJob(q[0], deps2), { ok: true, report: { tenantId: 1, storeId: 1, month: '2026-10', orderCount: 2, revenue: 190 } },
+  '租戶 1 門市 1 的 2026-10 報表：2 筆、190 元（不能算到租戶 2 的門市 1，也不能算到 9 月）')
+assert.deepEqual(runReportJob(q[1], deps2), { ok: true, report: { tenantId: 2, storeId: 1, month: '2026-10', orderCount: 2, revenue: 160 } },
+  '租戶 2 門市 1 的報表：2 筆、160 元，只能算租戶 2 的訂單')
+
+assert.deepEqual(runReportJob({ storeId: 1, month: '2026-10' }, deps2), { ok: false, error: 'missing_tenant' }, '沒有 tenantId 的 job 要回 missing_tenant，不能用預設租戶')
+assert.deepEqual(runReportJob({ tenantId: '1', storeId: 1, month: '2026-10' } as any, deps2), { ok: false, error: 'missing_tenant' }, 'tenantId 是字串時要回 missing_tenant')
+assert.deepEqual(runReportJob({ tenantId: 0, storeId: 1, month: '2026-10' }, deps2), { ok: false, error: 'missing_tenant' }, 'tenantId 是 0 時要回 missing_tenant')
+for (const bad of [-1, 1.5, NaN, null]) {
+  assert.deepEqual(runReportJob({ tenantId: bad, storeId: 1, month: '2026-10' } as any, deps2), { ok: false, error: 'missing_tenant' }, `tenantId 是 ${bad} 時要回 missing_tenant：只接受正整數`)
+}
+assert.deepEqual(runReportJob({ tenantId: 2, storeId: 2, month: '2026-10' }, deps2), { ok: false, error: 'store_not_in_tenant' },
+  '租戶 2 沒有門市 2（那是租戶 1 的大安店），要回 store_not_in_tenant')
+assert.deepEqual(runReportJob({ tenantId: 1, storeId: 2, month: '2026-10' }, deps2), { ok: true, report: { tenantId: 1, storeId: 2, month: '2026-10', orderCount: 1, revenue: 90 } },
+  '租戶 1 門市 2 的報表：1 筆、90 元')
+</script>
+  <script type="wrong">
+// job 沒帶 tenantId，worker 用全域的預設租戶
+type Ctx = { tenantId: number }
+type ReportJob = { tenantId?: number; storeId: number; month: string }
+type Store = { tenantId: number; id: number; name: string }
+type Order = { tenantId: number; storeId: number; total: number; orderedAt: string }
+type Report = { tenantId: number; storeId: number; month: string; orderCount: number; revenue: number }
+type JobResult = { ok: true; report: Report } | { ok: false; error: 'missing_tenant' | 'store_not_in_tenant' }
+const DEFAULT_TENANT = 1
+function enqueueReport(ctx: Ctx, params: { storeId: number; month: string }, queue: { add(job: ReportJob): void }): void {
+  queue.add({ storeId: params.storeId, month: params.month })
+}
+function runReportJob(job: ReportJob, deps: { stores: Store[]; orders: Order[] }): JobResult {
+  const tenantId = job.tenantId ?? DEFAULT_TENANT
+  if (!deps.stores.some(s => s.tenantId === tenantId && s.id === job.storeId)) return { ok: false, error: 'store_not_in_tenant' }
+  const m = deps.orders.filter(o => o.tenantId === tenantId && o.storeId === job.storeId && o.orderedAt.startsWith(job.month))
+  return { ok: true, report: { tenantId, storeId: job.storeId, month: job.month, orderCount: m.length, revenue: m.reduce((s, o) => s + o.total, 0) } }
+}
+</script>
+  <script type="wrong">
+// worker 有 tenantId，但缺少時退回預設租戶
+type Ctx = { tenantId: number }
+type ReportJob = { tenantId?: number; storeId: number; month: string }
+type Store = { tenantId: number; id: number; name: string }
+type Order = { tenantId: number; storeId: number; total: number; orderedAt: string }
+type Report = { tenantId: number; storeId: number; month: string; orderCount: number; revenue: number }
+type JobResult = { ok: true; report: Report } | { ok: false; error: 'missing_tenant' | 'store_not_in_tenant' }
+function enqueueReport(ctx: Ctx, params: { storeId: number; month: string }, queue: { add(job: ReportJob): void }): void {
+  queue.add({ tenantId: ctx.tenantId, storeId: params.storeId, month: params.month })
+}
+function runReportJob(job: ReportJob, deps: { stores: Store[]; orders: Order[] }): JobResult {
+  const tenantId = job.tenantId || 1
+  if (!deps.stores.some(s => s.tenantId === tenantId && s.id === job.storeId)) return { ok: false, error: 'store_not_in_tenant' }
+  const m = deps.orders.filter(o => o.tenantId === tenantId && o.storeId === job.storeId && o.orderedAt.startsWith(job.month))
+  return { ok: true, report: { tenantId, storeId: job.storeId, month: job.month, orderCount: m.length, revenue: m.reduce((s, o) => s + o.total, 0) } }
+}
+</script>
+  <script type="wrong">
+// 只看 storeId，不檢查門市屬於哪個租戶
+type Ctx = { tenantId: number }
+type ReportJob = { tenantId?: number; storeId: number; month: string }
+type Store = { tenantId: number; id: number; name: string }
+type Order = { tenantId: number; storeId: number; total: number; orderedAt: string }
+type Report = { tenantId: number; storeId: number; month: string; orderCount: number; revenue: number }
+type JobResult = { ok: true; report: Report } | { ok: false; error: 'missing_tenant' | 'store_not_in_tenant' }
+function enqueueReport(ctx: Ctx, params: { storeId: number; month: string }, queue: { add(job: ReportJob): void }): void {
+  queue.add({ tenantId: ctx.tenantId, storeId: params.storeId, month: params.month })
+}
+function runReportJob(job: ReportJob, deps: { stores: Store[]; orders: Order[] }): JobResult {
+  const tenantId = job.tenantId
+  if (tenantId === undefined || !Number.isInteger(tenantId) || tenantId <= 0) return { ok: false, error: 'missing_tenant' }
+  if (!deps.stores.some(s => s.id === job.storeId)) return { ok: false, error: 'store_not_in_tenant' }
+  const m = deps.orders.filter(o => o.tenantId === tenantId && o.storeId === job.storeId && o.orderedAt.startsWith(job.month))
+  return { ok: true, report: { tenantId, storeId: job.storeId, month: job.month, orderCount: m.length, revenue: m.reduce((s, o) => s + o.total, 0) } }
+}
+</script>
+  <script type="wrong">
+// 用 storeId 找到「第一間」門市再比租戶：兩個租戶都有門市 1 時找錯
+type Ctx = { tenantId: number }
+type ReportJob = { tenantId?: number; storeId: number; month: string }
+type Store = { tenantId: number; id: number; name: string }
+type Order = { tenantId: number; storeId: number; total: number; orderedAt: string }
+type Report = { tenantId: number; storeId: number; month: string; orderCount: number; revenue: number }
+type JobResult = { ok: true; report: Report } | { ok: false; error: 'missing_tenant' | 'store_not_in_tenant' }
+function enqueueReport(ctx: Ctx, params: { storeId: number; month: string }, queue: { add(job: ReportJob): void }): void {
+  queue.add({ tenantId: ctx.tenantId, storeId: params.storeId, month: params.month })
+}
+function runReportJob(job: ReportJob, deps: { stores: Store[]; orders: Order[] }): JobResult {
+  const tenantId = job.tenantId
+  if (tenantId === undefined || !Number.isInteger(tenantId) || tenantId <= 0) return { ok: false, error: 'missing_tenant' }
+  if (deps.stores.find(s => s.id === job.storeId)?.tenantId !== tenantId) return { ok: false, error: 'store_not_in_tenant' }
+  const m = deps.orders.filter(o => o.tenantId === tenantId && o.storeId === job.storeId && o.orderedAt.startsWith(job.month))
+  return { ok: true, report: { tenantId, storeId: job.storeId, month: job.month, orderCount: m.length, revenue: m.reduce((s, o) => s + o.total, 0) } }
+}
+</script>
+  <script type="wrong">
+// 只用 !tenantId 檢查：負數、小數會被當成合法租戶
+type Ctx = { tenantId: number }
+type ReportJob = { tenantId?: number; storeId: number; month: string }
+type Store = { tenantId: number; id: number; name: string }
+type Order = { tenantId: number; storeId: number; total: number; orderedAt: string }
+type Report = { tenantId: number; storeId: number; month: string; orderCount: number; revenue: number }
+type JobResult = { ok: true; report: Report } | { ok: false; error: 'missing_tenant' | 'store_not_in_tenant' }
+function enqueueReport(ctx: Ctx, params: { storeId: number; month: string }, queue: { add(job: ReportJob): void }): void {
+  queue.add({ tenantId: ctx.tenantId, storeId: params.storeId, month: params.month })
+}
+function runReportJob(job: ReportJob, deps: { stores: Store[]; orders: Order[] }): JobResult {
+  const tenantId = job.tenantId
+  if (!tenantId || typeof tenantId !== 'number') return { ok: false, error: 'missing_tenant' }
+  if (!deps.stores.some(s => s.tenantId === tenantId && s.id === job.storeId)) return { ok: false, error: 'store_not_in_tenant' }
+  const m = deps.orders.filter(o => o.tenantId === tenantId && o.storeId === job.storeId && o.orderedAt.startsWith(job.month))
+  return { ok: true, report: { tenantId, storeId: job.storeId, month: job.month, orderCount: m.length, revenue: m.reduce((s, o) => s + o.total, 0) } }
+}
+</script>
+  <script type="wrong">
+// 訂單只用 storeId 過濾：兩個租戶的門市 1 加在一起
+type Ctx = { tenantId: number }
+type ReportJob = { tenantId?: number; storeId: number; month: string }
+type Store = { tenantId: number; id: number; name: string }
+type Order = { tenantId: number; storeId: number; total: number; orderedAt: string }
+type Report = { tenantId: number; storeId: number; month: string; orderCount: number; revenue: number }
+type JobResult = { ok: true; report: Report } | { ok: false; error: 'missing_tenant' | 'store_not_in_tenant' }
+function enqueueReport(ctx: Ctx, params: { storeId: number; month: string }, queue: { add(job: ReportJob): void }): void {
+  queue.add({ tenantId: ctx.tenantId, storeId: params.storeId, month: params.month })
+}
+function runReportJob(job: ReportJob, deps: { stores: Store[]; orders: Order[] }): JobResult {
+  const tenantId = job.tenantId
+  if (tenantId === undefined || !Number.isInteger(tenantId) || tenantId <= 0) return { ok: false, error: 'missing_tenant' }
+  if (!deps.stores.some(s => s.tenantId === tenantId && s.id === job.storeId)) return { ok: false, error: 'store_not_in_tenant' }
+  const m = deps.orders.filter(o => o.storeId === job.storeId && o.orderedAt.startsWith(job.month))
+  return { ok: true, report: { tenantId, storeId: job.storeId, month: job.month, orderCount: m.length, revenue: m.reduce((s, o) => s + o.total, 0) } }
+}
+</script>
+  <script type="wrong">
+// enqueue 時讓 params 蓋掉 ctx 的租戶
+type Ctx = { tenantId: number }
+type ReportJob = { tenantId?: number; storeId: number; month: string }
+type Store = { tenantId: number; id: number; name: string }
+type Order = { tenantId: number; storeId: number; total: number; orderedAt: string }
+type Report = { tenantId: number; storeId: number; month: string; orderCount: number; revenue: number }
+type JobResult = { ok: true; report: Report } | { ok: false; error: 'missing_tenant' | 'store_not_in_tenant' }
+function enqueueReport(ctx: Ctx, params: { storeId: number; month: string }, queue: { add(job: ReportJob): void }): void {
+  queue.add({ tenantId: ctx.tenantId, ...params })
+}
+function runReportJob(job: ReportJob, deps: { stores: Store[]; orders: Order[] }): JobResult {
+  const tenantId = job.tenantId
+  if (tenantId === undefined || !Number.isInteger(tenantId) || tenantId <= 0) return { ok: false, error: 'missing_tenant' }
+  if (!deps.stores.some(s => s.tenantId === tenantId && s.id === job.storeId)) return { ok: false, error: 'store_not_in_tenant' }
+  const m = deps.orders.filter(o => o.tenantId === tenantId && o.storeId === job.storeId && o.orderedAt.startsWith(job.month))
+  return { ok: true, report: { tenantId, storeId: job.storeId, month: job.month, orderCount: m.length, revenue: m.reduce((s, o) => s + o.total, 0) } }
+}
+</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：前端工程師說：「Vue 前台本來就知道自己是哪個品牌，每個請求帶 <code>X-Tenant-Id</code> 標頭給 API，後端就用它查資料。登入也檢查過了，應該沒問題。」怎麼回應？</p>
+  <label data-key="a">可以：API 已經要求登入，標頭又是我們自己的前台程式送的，正常使用者不會去改它；真的有人改，查到的也只是他登入後本來就能用的系統</label>
+  <label data-key="b">標頭容易被改，改成用子網域（<code>hill.coffeepos.example</code>）決定租戶：網址是 DNS 和憑證保證的，比前端自己加的標頭可靠</label>
+  <label data-key="c">不行：租戶要從登入的主體來；標頭、子網域都是客戶端能控制的，頂多當提示，和主體不一致就拒絕</label>
+  <p class="why">✓ 登入只證明「你是山丘咖啡的店員」，不證明「你可以看你送來的那個租戶」。用 DevTools 或 curl 改一個標頭不需要任何技術。a 誤以為使用者只會用你的前台，而且「登入了」不等於「能看每個租戶」，山丘咖啡的店員把標頭改成 2 就查到巷口咖啡；b 換了一個一樣能被改的來源：DNS 和憑證只保證你連到的是真的伺服器，不保證你是那個租戶的人，任何人都能打 <code>alley.coffeepos.example</code>。子網域可以用來決定要顯示哪個品牌的登入頁，但 API 要比對主體的租戶。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：團隊已經寫好 <code>TenantRepository</code>，每個查詢都自動加 <code>tenant_id</code>，有人說「再加 RLS 只是重複，還要處理 <code>SET LOCAL</code> 很麻煩」。資深工程師最好的理由是？</p>
+  <label data-key="a">RLS 在資料庫裡過濾，資料不用先傳回應用程式再篩，加了之後查詢會比在 repository 裡過濾更快</label>
+  <label data-key="b">repository 只擋得住經過它的程式，手寫的報表 SQL、匯出腳本都可能繞過；RLS 在資料庫裡，沒設定租戶就一列都看不到</label>
+  <label data-key="c">應該反過來：加上 RLS 之後，就把 repository 裡的租戶條件全部拿掉，只留一層，程式比較乾淨，也不會兩邊條件不一致</label>
+  <p class="why">✓ 縱深防禦：兩層各自擋不同的錯。跨租戶洩漏的代價極高，多一層的成本（每個交易一次 <code>set_config</code>）很小。a 錯：repository 的 <code>WHERE tenant_id = …</code> 本來就在資料庫裡過濾，RLS 只是再加一個條件，不會讓查詢變快，條件寫不好反而會變慢；c 錯：拿掉應用層的條件後，RLS 的設定一出錯（例如用了有 <code>BYPASSRLS</code> 的帳號、表的擁有者沒加 <code>FORCE</code>）就沒有任何保護，而且程式在測試環境用超級使用者連線時根本看不出問題。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：平台客服常常要幫各品牌查問題，產品經理提議「給客服一個能看所有租戶的帳號，最方便」。比較好的設計是？</p>
+  <label data-key="a">客服平常不屬於任何租戶，要查時明確切換進一個租戶：填理由、限時、預設唯讀、寫稽核紀錄</label>
+  <label data-key="b">給一個能看所有租戶的超級帳號，但只開放給少數資深客服，帳號強制 MFA、只能從公司網路登入，降低被盜的機會</label>
+  <label data-key="c">客服不碰 API，直接用資料庫的超級使用者帳號連正式資料庫查詢，這樣不用為客服改任何程式，也不會影響租戶的權限設計</label>
+  <p class="why">✓ 跨租戶存取是合理的需求，重點是讓它變成「明確、有範圍、有紀錄」的動作，而不是隱形的後門。b 減少了帳號被盜的機會，但仍然是永久、無範圍、沒紀錄的全部存取，事後查不出誰看了什麼；c 最糟：超級使用者繞過 RLS，也繞過應用程式所有的檢查與稽核。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>從請求參數、標頭、子網域取得租戶</strong>：客戶端改一個值就換租戶。租戶從登入的主體來，其他來源只當提示，不一致就拒絕。</li>
+  <li><strong>每個查詢自己記得加 <code>tenant_id</code></strong>：總有一次會忘。集中在 repository，從上下文自動加。</li>
+  <li><strong>找不到租戶上下文時退回預設租戶</strong>：平常看不出來，出事時資料全部混在一起。失敗關閉：丟錯，或一列都不回。</li>
+  <li><strong>寫入時用 body 裡的 <code>tenantId</code></strong>，或展開 body 時順序錯了讓它蓋掉上下文的值：<code>tenantId</code> 一律最後由上下文填。</li>
+  <li><strong>快取 key、檔案路徑、搜尋索引、背景工作沒帶租戶</strong>：資料離開請求時，<code>tenantId</code> 要明確帶著走，另一邊再重建上下文並檢查每個 id 屬於這個租戶。</li>
+  <li><strong>連線池上用 <code>SET</code> 設定 RLS 變數</strong>：下一個借到這條連線的請求沿用上一個租戶。在交易裡用 <code>SET LOCAL</code> 或 <code>set_config(…, true)</code>。</li>
+  <li><strong>RLS 用 <code>current_setting('app.tenant_id')::bigint</code> 而沒處理空值</strong>：沒設定時會報錯或變成空字串。用 <code>NULLIF(current_setting('app.tenant_id', true), '')::bigint</code>。</li>
+  <li><strong>應用程式用超級使用者或表的擁有者連資料庫</strong>：RLS 被繞過。用一般角色，表加 <code>FORCE ROW LEVEL SECURITY</code>。</li>
+  <li><strong>單欄外鍵</strong>：訂單可以參照到別的租戶的商品。用 <code>(tenant_id, id)</code> 複合外鍵。</li>
+  <li><strong>平台管理員帳號沒有範圍、沒有稽核紀錄</strong>：改成明確切換、限時、唯讀、寫稽核紀錄、讓租戶看得到。</li>
+  <li><strong>限流只看 IP 或使用者</strong>：一個租戶的大量請求拖垮其他租戶。限流與配額的 key 加上 <code>tenantId</code>。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>多租戶系統最重要的保證是租戶隔離；漏掉時通常沒有錯誤訊息，只是「多看到一點別人的資料」，像開場報表多出的那 120 元。門市編號這類 id 只在租戶裡唯一。</li>
+  <li>三種隔離方式：共用表＋<code>tenant_id</code>（便宜、靠程式與 RLS）、每租戶一個 schema、每租戶一個資料庫（隔離最強、維運最重）；多數從共用表開始，大客戶再搬出去。</li>
+  <li>租戶上下文來自登入的主體；標頭、body、子網域都只是提示，不一致就回 404。</li>
+  <li>三道防線各擋一種錯：repository 從上下文（AsyncLocalStorage）自動加條件、寫入時由上下文填 <code>tenantId</code>；複合外鍵擋跨租戶參照；RLS 擋繞過 repository 的查詢，變數在交易裡用 <code>SET LOCAL</code>，不留給借到同一條連線的下一個請求。找不到租戶一律失敗關閉。</li>
+  <li>資料離開請求的地方（快取 key、背景工作、檔案路徑、搜尋、匯出、log）都要明確帶租戶，到另一邊再重建上下文。</li>
+  <li>平台人員跨租戶存取要明確切換、填理由、限時、唯讀、寫稽核紀錄；資源也要依租戶限流與配額，避免雜訊鄰居。</li>
+</ul>
+<p>下一課回到 NestJS 的練習專案，把登入、權限 guard 和物件層級授權做進真的 API，並用 E2E 測試攻擊它。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

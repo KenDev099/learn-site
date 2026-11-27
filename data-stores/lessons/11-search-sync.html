@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>11. 讓搜尋跟資料庫同步（資深）：outbox、重建索引與別名切換</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="11" data-practice="data-stores">
+<header>
+  <div class="eyebrow">階段 4：搜尋與檔案 · 第 11 課</div>
+  <h1>讓搜尋跟資料庫同步（資深）：outbox、重建索引與別名切換</h1>
+</header>
+<main>
+
+<p>老闆在後台把伯爵紅茶下架了。隔天有客人在 App 搜「紅茶」，伯爵紅茶還在結果裡，點進去卻是 404。查了紀錄：後台更新商品時，程式先改 PostgreSQL，再呼叫 Elasticsearch，那一刻 Elasticsearch 剛好在重啟，錯誤被 <code>catch</code> 吞掉了。資料庫說「已下架」，搜尋引擎說「還在賣」，而且沒有人知道兩邊不一樣。</p>
+<p>這一課從頭到尾處理這個事故。目標有兩個：一、資料庫改了，搜尋最後一定會跟上，不管中間 Elasticsearch 重啟、程式崩潰、還是兩個請求交錯；二、兩邊真的對不上時，你會比客人先知道，而且修得回來。只要資料存在兩個地方，就一定會遇到這個問題，所以這套做法在正式環境很常見。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>伯爵紅茶為什麼還搜得到：先改資料庫、再呼叫 Elasticsearch 這種寫法，到底在哪幾種情況下會漏；目標該怎麼重新定義。</li>
+  <li>outbox：把「搜尋要更新」寫進同一個資料庫交易，事故就不會再漏（開場問題的最小答案）。</li>
+  <li>worker 與版本號：誰把事件送到 Elasticsearch、怎麼逐筆確認成敗；重送或順序顛倒時，怎麼不讓舊資料蓋掉新資料。</li>
+  <li>改 mapping：同步的路通了之後，要換分析器時怎麼建新索引、用別名切換，而且這段期間的修改不會漏。</li>
+  <li>同步延遲與對帳：怎麼在客人抱怨之前知道搜尋落後了、哪幾筆不一樣，以及最糟時怎麼整份重建。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="10-search-engine.html">第 10 課</a>的菜單索引：mapping 決定每個欄位怎麼分析，已經存在的欄位不能改分析器。</li>
+  <li><a href="../../postgresql/lessons/18-transactions.html">PostgreSQL 課第 18 課</a>的交易：同一個交易裡的修改一起提交，或一起回滾。</li>
+</ul>
+版本：PostgreSQL 18.6、pg 8.23.1、Elasticsearch 9.5.5、@elastic/elasticsearch 9.5.1。</div>
+
+<h2>伯爵紅茶為什麼還搜得到？先寫資料庫再寫搜尋，哪裡會漏</h2>
+<p>先看出事的程式。後台的「更新商品」長這樣：</p>
+<pre>async function updateProduct(id: number, patch: Patch) {
+  await pool.query('UPDATE products SET available = $2 WHERE id = $1', [id, patch.available])  // 1. 寫資料庫
+  try {
+    await es.update({ index: 'menu', id: String(id), doc: patch })                              // 2. 寫搜尋引擎
+  } catch (e) {
+    console.error(e)        // 不想讓後台出錯，就吞掉
+  }
+}</pre>
+<p>同一段程式分別寫兩個系統，這種寫法叫<strong>雙寫</strong>（dual write）。它的根本問題是：PostgreSQL 和 Elasticsearch 是兩個獨立的系統，沒有一個「共同的交易」能讓兩邊一起成功或一起失敗。第 1 步提交之後，資料庫的修改就生效了，第 2 步不管發生什麼事都撤銷不了它。所以第 1 步和第 2 步之間發生的任何事，都會讓兩邊不一樣。把所有可能列出來：</p>
+<div class="table-wrap"><table>
+  <tr><th>失敗方式</th><th>結果</th></tr>
+  <tr><td>資料庫成功，ES 失敗（逾時、重啟、網路斷）</td><td>開頭的事故：搜得到已下架的商品。吞掉錯誤就沒人知道；改成回 500，資料庫其實已經改好了，使用者以為失敗又按一次</td></tr>
+  <tr><td>先寫 ES 再寫資料庫，資料庫回滾（違反約束、交易衝突）</td><td>搜尋裡出現資料庫根本沒有的內容</td></tr>
+  <tr><td>程式在兩步之間崩潰（部署重啟、OOM）</td><td>跟第一種一樣，而且連錯誤紀錄都沒有</td></tr>
+  <tr><td>兩個請求交錯</td><td>資料庫和 ES 的最終值不同，見下圖</td></tr>
+</table></div>
+<p>前三種至少有一邊「失敗」了，還算看得出來。第四種最麻煩，因為沒有任何一步出錯：店長和副店長幾乎同時改了同一個商品的價格，一個改 120 元、一個改 130 元。</p>
+<figure>
+  <svg viewBox="0 0 700 270" role="img" aria-label="兩個後台請求交錯：請求 A 把價格改成 120，請求 B 改成 130。資料庫依序得到 130，但 ES 先收到 B 再收到 A，最後是 120">
+    <defs><marker id="arr11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <text class="d-accent" x="90" y="24" text-anchor="middle">請求 A（120 元）</text>
+    <text class="d-accent" x="260" y="24" text-anchor="middle">請求 B（130 元）</text>
+    <text class="d-accent" x="450" y="24" text-anchor="middle">PostgreSQL</text>
+    <text class="d-accent" x="620" y="24" text-anchor="middle">Elasticsearch</text>
+    <line class="d-line" x1="90" y1="34" x2="90" y2="260"/>
+    <line class="d-line" x1="260" y1="34" x2="260" y2="260"/>
+    <line class="d-line" x1="450" y1="34" x2="450" y2="260"/>
+    <line class="d-line" x1="620" y1="34" x2="620" y2="260"/>
+    <line class="d-line" x1="90" y1="60" x2="440" y2="60" marker-end="url(#arr11)"/>
+    <text class="d-small" x="350" y="54" text-anchor="middle">UPDATE 120</text>
+    <line class="d-line" x1="260" y1="95" x2="440" y2="95" marker-end="url(#arr11)"/>
+    <text class="d-small" x="350" y="89" text-anchor="middle">UPDATE 130</text>
+    <line class="d-line" x1="260" y1="135" x2="610" y2="135" marker-end="url(#arr11)"/>
+    <text class="d-small" x="520" y="129" text-anchor="middle">寫入 130</text>
+    <line class="d-line" x1="90" y1="175" x2="610" y2="175" marker-end="url(#arr11)"/>
+    <text class="d-small" x="520" y="169" text-anchor="middle">寫入 120（A 比較慢）</text>
+    <rect class="d-box" x="395" y="205" width="110" height="34" rx="4"/>
+    <text class="d-text" x="450" y="227" text-anchor="middle">最後 130</text>
+    <rect class="d-soft" x="565" y="205" width="110" height="34" rx="4"/>
+    <text class="d-text" x="620" y="227" text-anchor="middle">最後 120</text>
+  </svg>
+  <figcaption>兩個請求在資料庫依序執行，送到 ES 的順序卻反了。沒有任何錯誤發生，兩邊就是不一樣，而且會一直不一樣到下次有人改這個商品。</figcaption>
+</figure>
+<p>看完這四種，可以得到一個結論：「讓兩邊同時成功」這個目標本身就做不到，再怎麼調整 try/catch 的位置都一樣。所以要換一個目標。</p>
+<p>換目標的依據來自<a href="01-choosing-a-store.html">第 1 課</a>的分工。PostgreSQL 是<strong>記錄系統</strong>：一筆資料「真正的值」以它為準，它說伯爵紅茶下架了，就是下架了。Elasticsearch 裡的菜單索引則是<strong>衍生資料</strong>：它的內容全部是從 PostgreSQL 抄過去、為了搜尋而換個形狀存的副本，就算整份刪掉，也能從資料庫重新產生。既然搜尋只是副本，它可以暫時落後，只要「之後一定會跟上」就好。這種「現在可能還不一樣，但沒有新的修改時，過一段時間一定會一樣」的保證，叫<strong>最終一致</strong>（eventual consistency）。</p>
+<p>所以這一課的目標改成四件事：</p>
+<ul>
+  <li>API 只負責把資料庫的交易做對。資料庫提交了，搜尋之後一定會跟上，通常在幾秒內。</li>
+  <li>送到搜尋引擎的過程可以失敗、重試、亂序，結果仍然正確。</li>
+  <li>不管搜尋索引壞成怎樣，都能從資料庫整份重建。</li>
+  <li>有指標看得出「現在落後多少」，有對帳找得出「哪幾筆不一樣」。</li>
+</ul>
+<p>第一件事馬上帶出一個問題：API 提交資料庫交易之後就回應店長了，那「Elasticsearch 還沒更新」這件事要記在哪裡？如果只記在 API 程式的記憶體裡，程式一崩潰就忘了，跟事故一模一樣。</p>
+
+<h2>「搜尋要更新」記在哪裡才不會忘？outbox</h2>
+<p>答案是記在資料庫裡，而且跟商品的修改放在同一個交易。做法叫 <strong>outbox</strong>（寄件匣）：建一張表，專門存放「等著送出去的事件」。下架伯爵紅茶時，API 在同一個交易裡做兩件事：把 <code>products</code> 的 <code>available</code> 改成 false，並且在 outbox 新增一筆「伯爵紅茶變了，內容是這樣」的事件。因為是同一個交易，這兩個寫入只有兩種結局：一起成功，或一起失敗，不可能出現「商品改了、事件沒寫」。</p>
+<p>交易提交後，API 的工作就結束了。另一個獨立的程式，叫 <strong>worker</strong>，會持續讀 outbox 裡還沒送的事件，把它們送到 Elasticsearch，送成功才標記完成。回到開場的事故：Elasticsearch 在重啟的那一刻，worker 送不出去，事件就留在 outbox 裡；等 Elasticsearch 恢復，worker 下一輪再送，伯爵紅茶就從搜尋結果消失了。差別在於「還沒送」這件事被寫進資料庫，不會因為錯誤被吞掉或程式崩潰而消失。</p>
+<p><a href="../../postgresql/lessons/33-job-queue.html">PostgreSQL 課第 33 課</a>和<a href="../../system-design/lessons/12-queues-outbox.html">系統設計課第 12 課</a>已經用 outbox 送過訊息；這一課把它用在搜尋同步，重點放在搜尋特有的問題。先看兩張表：</p>
+<pre>CREATE TABLE products (
+  id int PRIMARY KEY,
+  name text NOT NULL, category text NOT NULL, price int NOT NULL,
+  available boolean NOT NULL DEFAULT true,
+  version int NOT NULL DEFAULT 1          -- 每次修改加 1，等一下給 ES 當版本號
+);
+CREATE TABLE outbox (
+  id bigserial PRIMARY KEY,               -- 寫入順序
+  aggregate_id int NOT NULL,              -- 哪個商品
+  version int NOT NULL,                   -- 這次變更後的版本
+  op text NOT NULL CHECK (op IN ('upsert', 'delete')),
+  payload jsonb,                          -- 變更後的內容（delete 時是 null）
+  created_at timestamptz NOT NULL DEFAULT now(),
+  processed_at timestamptz,               -- 送成功才填
+  attempts int NOT NULL DEFAULT 0,        -- 失敗幾次
+  last_error text
+);
+CREATE INDEX outbox_pending ON outbox (id) WHERE processed_at IS NULL;   -- 只索引還沒送的</pre>
+<p>逐欄看。<code>aggregate_id</code> 記這個事件屬於哪一個東西；「aggregate」（聚合）是設計上的說法，指「一起被修改的一組資料」，這裡就是一個商品。<code>op</code> 分兩種：<code>upsert</code> 表示「搜尋裡這個商品要變成 payload 的內容」，不存在就新增；<code>delete</code> 表示「從搜尋移除」。<code>processed_at</code>、<code>attempts</code>、<code>last_error</code> 是給 worker 記錄送出結果用的，下一節會用到。</p>
+<p>最後一行是<strong>部分索引</strong>（partial index）：只替符合 <code>WHERE</code> 條件的列建索引。outbox 跑久了，絕大部分是已經送完的事件，worker 卻只查還沒送的那些；索引只放未處理的列，就能一直保持很小、很快。</p>
+<p><code>products.version</code> 現在看起來多餘，它是為了「worker 重送或亂序」準備的，後面「重送或晚到的舊事件」那一節會用它擋住舊資料。先記住一件事：每次修改商品，版本都要加 1，而且 outbox 事件要記下「這次修改後的版本」。</p>
+<p>接下來寫 API 的交易。用 pg 8.23.1 寫交易，要從 pool 借一條連線，在同一條連線上 BEGIN、執行、COMMIT：</p>
+<pre>const client = await pool.connect()      // 交易一定要在同一條連線上，pool.query 每次可能換連線
+try {
+  await client.query('BEGIN')
+  const { rows } = await client.query(
+    `UPDATE products SET price = COALESCE($2, price), version = version + 1
+      WHERE id = $1 RETURNING id, name, category, price, available, version`, [id, patch.price ?? null])
+  if (rows.length === 0) throw new NotFoundError()
+  const { version, ...payload } = rows[0]
+  await client.query(`INSERT INTO outbox (aggregate_id, version, op, payload) VALUES ($1, $2, 'upsert', $3)`,
+    [id, version, payload])                // pg 會把物件轉成 JSON 存進 jsonb
+  await client.query('COMMIT')
+  return version
+} catch (e) {
+  await client.query('ROLLBACK')
+  throw e
+} finally {
+  client.release()                         // 還給 pool，不還的話連線會被用光
+}</pre>
+<p>為什麼一定要 <code>pool.connect()</code>？pool 裡有好幾條連線，<code>pool.query</code> 每次呼叫可能拿到不同的那條。交易是綁在「一條連線」上的：如果 BEGIN 送在 A 連線、UPDATE 送在 B 連線，UPDATE 根本不在交易裡，outbox 寫入失敗時它也不會被回滾。所以借一條連線，整個交易都在它上面跑，最後在 <code>finally</code> 還回去。</p>
+<p>版本號用 <code>version = version + 1</code> 讓資料庫算，不在程式裡算。如果先 SELECT 出版本、在程式裡加 1 再寫回，店長和副店長的兩個並發請求會讀到同一個版本，寫出兩個「第 5 版」，之後就分不出誰比較新。<code>UPDATE</code> 會鎖住那一列，第二個請求要等第一個提交才能更新，所以讓資料庫加 1，版本一定連續；<code>RETURNING</code> 再把加完的版本和更新後的內容一次拿回來，直接放進 outbox 事件。</p>
+<p><code>COALESCE($2, price)</code> 的意思是「有給值就用新值，沒給（null）就維持原值」，讓同一個 SQL 能處理「只改部分欄位」。傳參數時用 <code>patch.price ?? null</code>，不要用 <code>||</code>：<code>??</code> 只把 undefined 和 null 換成 null，<code>||</code> 會把所有假值都換掉，而 <code>available: false</code>、<code>price: 0</code> 都是有意義的值。伯爵紅茶的下架就是 <code>available: false</code>，用 <code>||</code> 的話它會被當成「沒給」，商品根本不會下架。</p>
+<p>刪除商品也要寫事件，不然搜尋不知道要移除它。刪除事件的 <code>op</code> 是 <code>delete</code>、<code>payload</code> 是 null，版本是「刪除前的版本 + 1」；為什麼要加 1，後面講版本號時會看到。</p>
+<p>事件裡要不要帶完整內容，有兩種做法：本課的做法是帶 payload，worker 照著送就好；另一種是事件只帶 id，worker 送之前再讀一次最新的 <code>products</code>。商品這種小文件、修改不頻繁，帶內容最直接。兩者的比較，以及「用 trigger 自動寫 outbox」「用 CDC 讀資料庫的變更紀錄」這兩條替代路線，放在課末「補充與查表」。</p>
+<div class="callout practice"><strong>💡 實務上：最終一致要先講好：PM、畫面與不要強制 refresh</strong><br>改成 outbox 之後，店長在 Vue 後台存檔成功，切到前台搜尋可能還要等一兩秒才看到新價格，客服就會收到「改了沒反應」的回報，所以上線前要跟 PM 說清楚「改完多久內搜得到」，寫進需求。畫面也要配合：後台的商品列表直接查資料庫、不查搜尋，存檔的 API 回傳更新後的商品，Vue 用它更新畫面。前台的搜尋結果只是入口，商品頁、加入購物車、結帳一律再查一次資料庫，商品已下架就顯示「已停售」：就算搜尋還沒跟上，客人點進伯爵紅茶看到的也是「已停售」而不是 404。也不要為了「馬上搜得到」，讓 worker 每筆寫入都帶 <code>refresh: true</code>：每次強制 refresh 都會產生一個小區段（segment，<a href="10-search-engine.html">第 10 課</a>），拖慢寫入和搜尋，官方文件也建議維持預設的 <code>refresh=false</code>。</div>
+<p>到這裡，「伯爵紅茶下架了」這件事已經安全地躺在 outbox 裡，不會再被忘掉。但事件只是被記下來，還沒有任何東西把它送到 Elasticsearch。worker 要怎麼取事件、怎麼送、怎麼知道送成功了沒？</p>
+
+<h2>誰把事件送到 Elasticsearch？worker 取一批、bulk 送出、逐筆確認</h2>
+<p>worker 是一個獨立執行的程式，通常跟 API 分開部署，固定每隔一小段時間跑一輪。每一輪做這些事：</p>
+<pre>BEGIN;
+SELECT id, aggregate_id, version, op, payload FROM outbox
+ WHERE processed_at IS NULL
+ ORDER BY id
+ LIMIT 100
+ FOR UPDATE SKIP LOCKED;          -- 鎖住這批，別的 worker 跳過它們去拿下一批
+-- 用一個 bulk 請求送到 ES
+-- 成功的：UPDATE outbox SET processed_at = now() WHERE id = ANY(…)
+-- 失敗的：UPDATE outbox SET attempts = attempts + 1, last_error = … WHERE id = …
+COMMIT;</pre>
+<p>先看取事件這一步。正式環境常會開兩個以上的 worker，一個掛了另一個還在，事件多時也能一起分擔。這時就要回答：兩個 worker 同時查 outbox，怎麼不拿到同一批？<code>FOR UPDATE</code> 會鎖住取出的列，直到這個交易結束；<code>SKIP LOCKED</code> 讓另一個 worker 遇到被鎖的列時直接跳過，去拿後面還沒被鎖的。<a href="../../postgresql/lessons/33-job-queue.html">PostgreSQL 課第 33 課</a>示範過少了任一個會怎樣：只寫 <code>FOR UPDATE</code> 的話，第二個 worker 會卡在同一批列的鎖上等，兩個 worker 變成輪流做；什麼都不鎖，兩個 worker 會拿到同一批、各送一次。</p>
+<p>取到一批之後，送 ES 用 <strong>bulk API</strong>。一次一筆地送，100 個事件就是 100 個 HTTP 請求，大部分時間花在來回等待；bulk 把很多個動作放進一個請求。每個動作是一行描述（要做什麼、哪個索引、哪個 id），<code>index</code> 動作後面再接一行文件內容，<code>delete</code> 不用。下面每個動作裡的 <code>version</code> 和 <code>version_type</code> 是下一節的主角，先看整體結構：</p>
+<pre>const res = await es.bulk({
+  operations: [
+    { index: { _index: 't11-menu', _id: '12', version: 3, version_type: 'external' } },
+    { id: 12, name: '拿鐵', category: 'coffee', price: 125, available: true },
+    { delete: { _index: 't11-menu', _id: '16', version: 4, version_type: 'external' } },
+  ],
+})
+// res.errors：只要有任何一筆失敗就是 true
+// res.items：每個動作一個結果，順序跟送出去的一樣，例如
+// [{ index: { _id: '12', status: 201, result: 'created', _version: 3 } },
+//  { delete: { _id: '16', status: 404, result: 'not_found' } }]</pre>
+<p>bulk 的回應最容易讀錯。一個請求裝了很多動作，有的成功、有的失敗都很正常，所以 ES 不會因為其中一筆失敗就讓整個請求失敗：</p>
+<div class="callout warn"><strong>bulk 回 HTTP 200 不代表每筆都成功。</strong>只要請求本身送到了，ES 就回 200，每一筆的成敗寫在 <code>items[i].index.status</code>（或 <code>.delete.status</code>）和 <code>error</code> 裡。只看有沒有丟例外，就會把被拒絕的事件（例如 mapping 不符）標成完成，那筆資料永遠不會進搜尋。</div>
+<p>所以 worker 要拿 <code>items</code> 的第 i 筆對回送出去的第 i 個事件，逐筆決定要不要標記完成。最基本的兩種：status 是 200 或 201，表示寫入或刪除成功，標記完成；status 是 400 這類錯誤，表示文件被拒絕，例如 <code>price</code> 是字串、多了 mapping 沒有的欄位，這時不標記，<code>attempts + 1</code>、記下 <code>last_error</code>，讓之後查得到原因。還有 409 和 404 兩種結果要特別處理，它們跟版本號有關，下一節再補完這張規則。</p>
+<p>另一種失敗是整個 bulk 請求都沒送成，例如 ES 連不上、逾時，這正是開場事故的情況。這時 bulk 會丟例外，worker 要 ROLLBACK，把錯誤往外丟：ROLLBACK 放掉了鎖，事件都還是未完成，下一輪再送。錯誤要讓排程看得到（記 log、計數、告警），不能吞掉，否則又回到「沒人知道」。</p>
+<p>ES 在重啟或過載時，worker 不能每秒狂送，那只會拖慢它恢復。worker 連續失敗時要拉長每輪的間隔，例如 1、2、4、8 秒，最多 1 分鐘，這種「失敗越多次、等越久」的做法叫<strong>退避</strong>（backoff）。ES 恢復、送成功之後，再回到正常的間隔。</p>
+<p>還有一種事件，問題不在 ES，而在資料本身：某一筆因為內容有問題被 mapping 拒絕，重試幾次都一樣會失敗。這種事件叫<strong>毒事件</strong>（poison message）。如果不處理，它每一輪都會被取出來、佔掉批次的一個位置，也會讓告警一直響。<code>attempts</code> 超過門檻（例如 10 次）就不要再取它（<code>WHERE attempts &lt; 10</code>），並發告警讓人處理。</p>
+<p>上面的寫法在 ES 回應前一直開著交易；outbox 也只增不減，需要定期清理。這兩件正式環境的維運細節放在課末「補充與查表」。</p>
+<p>worker 的流程有了，但它有一個先天的性質：同一個事件可能被送不只一次，兩個 worker 送出的順序也不一定。開場那張「請求交錯」的圖，會不會換個形式在 worker 身上重演？</p>
+
+<h2>重送或晚到的舊事件，怎麼不蓋掉新資料？版本號</h2>
+<p>先說清楚為什麼會重送。worker 送完 bulk、ES 已經寫入了，但在 COMMIT 標記完成之前 worker 當機，資料庫裡這批事件仍然是「未完成」，下一輪會再送一次。這是刻意的取捨：寧可多送，也不能漏送。這種「每個事件保證送到，但可能送到不只一次」的保證叫<strong>至少一次</strong>（at-least-once）送達。</p>
+<p>再說為什麼會亂序。兩個 worker 並發時，worker A 拿到「拿鐵第 4 版」、worker B 拿到「拿鐵第 5 版」，兩個 bulk 請求誰先到 ES 沒有保證，B 可能先到。如果 ES 照收到的順序寫，最後留下的是第 4 版，跟雙寫那張圖一模一樣，而且沒有任何錯誤。</p>
+<p>要防的是同一件事：不能讓舊的資料蓋掉新的。worker 本身判斷不了「ES 現在是第幾版」，所以解法是讓 ES 自己判斷新舊，這就是 <code>products.version</code> 存在的原因。</p>
+<p>Elasticsearch 每份文件都有一個 <code>_version</code>。預設的模式叫 internal，由 ES 自己在每次寫入時加 1，它只知道「被寫了幾次」，不知道資料庫裡哪一版比較新。寫入時帶 <code>version</code> 和 <code>version_type: 'external'</code>，就改成用你給的版本，規則是（Elasticsearch 9.5 index API 文件）：</p>
+<ul>
+  <li>給的版本<strong>嚴格大於</strong>目前的版本（或文件不存在）才寫入，寫入後 <code>_version</code> 就是你給的值。</li>
+  <li>否則回 409 <code>version_conflict_engine_exception</code>，什麼都不改。版本一樣也是 409，所以同一個事件重送不會重複寫。</li>
+</ul>
+<p>在課程的 Elasticsearch 9.5.5 上實測：先送第 5 版、再送第 4 版，第 4 版得到 409，文件停在第 5 版。所以只要每個事件帶的是「資料庫裡那次變更後的版本」，送幾次、什麼順序都沒關係，ES 最後一定是最新版。重送不會改變結果，這叫寫入<strong>冪等</strong>（<a href="../../system-design/lessons/09-idempotency.html">系統設計課第 9 課</a>）；版本只會往上、不會倒退，這叫<strong>單調</strong>。</p>
+<p>這也決定了 worker 怎麼看 409：它要當成成功。409 的意思是「ES 已經有一樣新或更新的資料」，這筆事件要做的事已經有人做了。如果把 409 當失敗重試，版本永遠不會變大，這筆事件會永遠重試下去。</p>
+<p>刪除也要帶版本，否則會出現「刪掉的商品復活」。ES 刪除文件後，會暫時記住這份文件被刪時的版本，這個紀錄叫<strong>墓碑</strong>（tombstone）。在墓碑還在的期間，版本不比墓碑新的寫入一樣回 409。刪除事件的版本設成「刪除前 + 1」，墓碑記住的就是比所有舊事件都大的版本，晚到的舊事件會被擋住。下面比較刪除帶版本和不帶版本：</p>
+<div class="table-wrap"><table>
+  <tr><th>順序</th><th>delete 帶 version 6（external）</th><th>delete 沒帶版本</th></tr>
+  <tr><td>寫入第 3 版</td><td>_version 3</td><td>_version 3</td></tr>
+  <tr><td>刪除</td><td>墓碑記第 6 版</td><td>ES 自己加 1，墓碑記第 4 版</td></tr>
+  <tr><td>晚到的第 5 版</td><td>409，商品維持已刪除</td><td>5 &gt; 4，<strong>商品復活</strong></td></tr>
+</table></div>
+<p>墓碑不會永遠留著，課程的 9.5.5 預設保留 60 秒（設定名稱和查法見課末）。比這更晚到的舊事件仍可能讓刪掉的商品復活，這種少見的情況靠最後一節的對帳抓出來。</p>
+<p>現在可以補完 worker 對每一筆結果的規則。404 只會出現在 delete：文件本來就不在，「從搜尋移除」這個目的已經達成，所以也標記完成：</p>
+<div class="table-wrap"><table>
+  <tr><th>status</th><th>意思</th><th>事件怎麼辦</th></tr>
+  <tr><td>200、201</td><td>寫入或刪除成功</td><td>標記完成</td></tr>
+  <tr><td>409</td><td>版本衝突：ES 已經有一樣新或更新的版本</td><td>標記完成，這筆已經過時了</td></tr>
+  <tr><td>404（delete）</td><td>文件本來就不在</td><td>標記完成，想要的結果已經達成</td></tr>
+  <tr><td>400 等其他</td><td>文件被拒絕，例如 <code>price</code> 是字串、多了 mapping 沒有的欄位</td><td>不標記，<code>attempts + 1</code>、記下 <code>last_error</code></td></tr>
+</table></div>
+<p>版本號的做法有一個前提：一份 ES 文件由一個來源整份寫入。如果文件由好幾個來源各寫一部分，版本號就不能共用，這種情況的處理方式見課末。</p>
+<p>到這裡，日常的同步已經完整：API 寫 outbox，worker 送出，版本號讓重送和亂序都無害。接著團隊想改善搜尋本身，要把 <code>name</code> 換成另一個分析器。第 10 課說過已有欄位的分析器不能改，只能建新索引重新匯入；可是 worker 一刻不停地在寫，搜尋也一刻不能停，這要怎麼換？</p>
+
+<h2>要改 mapping 換分析器，怎麼重建索引而搜尋不中斷？別名切換</h2>
+<p>具體的需求是：把 <code>name</code> 從預設分析器改成 cjk，再加一個 <code>name.keyword</code>。<a href="10-search-engine.html">第 10 課</a>提過，已經存在的欄位不能改型別或分析器，因為舊文件已經照舊規則切好詞存進倒排索引了。唯一的辦法是建一個新索引、把資料重新寫進去。</p>
+<p>難處在「換過去」的那一刻。如果程式裡寫死 <code>index: 'menu-v1'</code>，換索引就要改程式、重新部署，而且部署的那段時間有的機器讀 v1、有的讀 v2。解法是讓程式永遠不知道真正的索引名稱，只用<strong>別名</strong>（alias）。別名是一個指向一或多個索引的名稱，查詢別名就等於查詢它指向的索引。程式讀寫 <code>menu</code>，<code>menu</code> 實際指向 <code>menu-20261001</code>，換索引只要改別名指向哪裡，程式完全不用動。別名只指向一個索引時，寫入也可以直接寫別名，所以 worker 一樣寫 <code>menu</code>。</p>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="零停機重建：程式只用別名 menu。建立新索引、從 PostgreSQL 全量匯入、補上匯入期間的 outbox 事件之後，用一個 _aliases 請求把 menu 從舊索引移到新索引，最後刪掉舊索引">
+    <defs><marker id="arr11b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="20" y="95" width="120" height="44" rx="6"/>
+    <text class="d-text" x="80" y="122" text-anchor="middle">API／worker</text>
+    <rect class="d-soft" x="210" y="95" width="120" height="44" rx="6"/>
+    <text class="d-text" x="270" y="116" text-anchor="middle">別名 menu</text>
+    <text class="d-small" x="270" y="132" text-anchor="middle">程式只認得它</text>
+    <line class="d-line" x1="140" y1="117" x2="205" y2="117" marker-end="url(#arr11b)"/>
+    <rect class="d-box" x="430" y="30" width="180" height="44" rx="6"/>
+    <text class="d-text" x="520" y="51" text-anchor="middle">menu-20261001</text>
+    <text class="d-small" x="520" y="67" text-anchor="middle">舊 mapping，切換後刪除</text>
+    <rect class="d-box" x="430" y="160" width="180" height="44" rx="6"/>
+    <text class="d-text" x="520" y="181" text-anchor="middle">menu-20261101</text>
+    <text class="d-small" x="520" y="197" text-anchor="middle">新 mapping，先匯入資料</text>
+    <line class="d-line" x1="330" y1="108" x2="425" y2="58" marker-end="url(#arr11b)" stroke-dasharray="5 4"/>
+    <text class="d-small" x="360" y="70" text-anchor="middle">切換前</text>
+    <line class="d-line" x1="330" y1="128" x2="425" y2="178" marker-end="url(#arr11b)"/>
+    <text class="d-small" x="360" y="172" text-anchor="middle">切換後</text>
+    <text class="d-small" x="350" y="236" text-anchor="middle">remove 和 add 放在同一個 _aliases 請求：別名不會有「沒有指向任何索引」的瞬間</text>
+  </svg>
+  <figcaption>別名讓「換索引」變成改一個指標：搜尋的程式不用改、不用重新部署。</figcaption>
+</figure>
+<p>別名解決了「怎麼換過去」，但還有「換過去之前，新索引的資料要怎麼齊」。新索引的資料從 PostgreSQL 全量匯入，因為資料庫是記錄系統；可是匯入要花時間，這段期間後台照常有人改商品，worker 照常把變更寫進別名，也就是<em>舊</em>索引。這些變更要想辦法補到新索引。前面幾節做好的 outbox 和版本號，在這裡剛好派上用場。完整步驟：</p>
+<ol>
+  <li><strong>查出別名目前指向哪個索引</strong>：<code>es.indices.getAlias({ name: 'menu' })</code> 回傳 <code>{ 'menu-20261001': { aliases: { menu: {} } } }</code>。不要假設舊索引叫 v1，上一次重建可能改過名字。</li>
+  <li><strong>記下 outbox 目前最大的 id</strong>。之後的變更都在它後面，第 5 步從這裡開始重播。（這個起點在正式環境要往前多拉一段，原因見課末。）</li>
+  <li><strong>建新索引</strong>：<code>es.indices.create({ index: 'menu-20261101', mappings })</code>。名稱常加日期或版本號，一看就知道是哪一次建的。</li>
+  <li><strong>從 PostgreSQL 全量匯入</strong>：讀出所有商品，bulk 寫進新索引，每筆帶 <code>version: products.version</code>、<code>version_type: 'external'</code>。資料來源是記錄系統，不是舊索引：舊索引可能本來就有錯。資料量大時分批讀：用 <code>WHERE id &gt; 上一批最後的 id ORDER BY id LIMIT n</code> 一批接一批往下讀，不用 <code>OFFSET</code>，越後面也不會越慢（這叫 keyset 分頁，詳見 <a href="../../postgresql/lessons/27-index-design.html">PostgreSQL 課第 27 課</a>）；bulk 每批幾百到幾千筆。</li>
+  <li><strong>補上匯入期間的變更</strong>：把 outbox 裡 id 大於第 2 步記錄的事件，全部重播到新索引。不用管它們有沒有被 worker 處理過，版本號會擋掉重複和舊的：同一個商品如果全量匯入時已經是第 7 版，重播第 6 版只會得到 409。</li>
+  <li><strong>refresh 新索引</strong>：ES 寫入的文件要等 refresh（預設每秒一次）後才搜得到。切換前先 <code>es.indices.refresh({ index })</code>，不然切換後的第一秒，使用者可能搜到 0 筆。</li>
+  <li><strong>原子切換</strong>：
+<pre>await es.indices.updateAliases({
+  actions: [
+    { remove: { index: 'menu-20261001', alias: 'menu' } },
+    { add: { index: 'menu-20261101', alias: 'menu' } },
+  ],
+})</pre>
+  官方文件說明同一個 <code>_aliases</code> 請求裡的動作是一個原子操作，別名不會同時指向兩個索引，也不會有指不到任何索引的空窗。分成 <code>deleteAlias</code> 再 <code>putAlias</code> 兩個請求，中間那幾毫秒的搜尋就會得到「索引不存在」的錯誤。</li>
+  <li><strong>再補一次第 5 步</strong>：第 5 步做完到切換之間，worker 可能又把幾筆變更寫進舊索引。切換後再重播一次，就不會漏。</li>
+  <li><strong>刪除舊索引</strong>。正式環境常先留一兩天，新索引有問題時把別名切回去就是回滾。</li>
+</ol>
+<div class="callout warn"><strong>不要先刪舊索引再建新的。</strong>從刪除到匯入完成這段時間，搜尋不是出錯就是 0 筆。新的一定先建好、資料補齊，才切換。</div>
+<p>Elasticsearch 也有內建的 <code>_reindex</code> API，可以直接從舊索引複製；它跟從資料庫匯入的差別與適用時機見課末。</p>
+<div class="callout practice"><strong>💡 實務上：重建索引當成一次上線來排</strong><br>會遇到的時機：搜尋要支援新的篩選欄位、改中文分詞、調整欄位型別。動手前先確認三件事：ES 的磁碟放得下新舊兩份索引；全量讀取會對 PostgreSQL 造成多少壓力（排在離峰時段，或從唯讀副本讀）；整個流程要跑多久。資料量大時，新索引匯入期間可以先把 <code>refresh_interval</code> 設成 <code>-1</code>、<code>number_of_replicas</code>（每份資料另外存幾份副本）設成 <code>0</code>，匯入完再改回原值並等副本建好，這是官方「提升寫入速度」建議的做法。切換前比對新舊索引的文件數，跑幾個常用查詢（例如「拿鐵」「紅茶」）看結果合不合理；舊索引留著，出問題時把別名切回去。這些步驟寫成操作手冊（runbook），跟維運約好時間再做。</div>
+<p>到這裡，日常同步和重建索引都不會漏資料了，至少在設計上是這樣。可是開場事故真正可怕的地方是「沒有人知道」。墓碑過期後才到的事件、有人直接下 SQL 改資料庫、某次部署帶進來的 bug，都可能繞過前面所有的機制。怎麼在客人抱怨之前發現？</p>
+
+<h2>怎麼比客人先知道搜尋沒跟上？同步延遲、對帳與全量重建</h2>
+<p>要回答兩個問題：一、現在搜尋落後資料庫多久？二、到底是哪幾筆不一樣？前者靠同步延遲的指標，後者靠對帳。</p>
+<p><strong>同步延遲</strong>（lag）是「資料庫改了之後多久才搜得到」。outbox 剛好提供了量它的方法：最舊的那一筆未處理事件，建立到現在經過的時間，就是目前最久的一筆變更已經等了多久。</p>
+<pre>SELECT coalesce(extract(epoch FROM now() - min(created_at)), 0) AS lag_seconds,
+       count(*) AS pending
+  FROM outbox WHERE processed_at IS NULL;</pre>
+<p>把 <code>lag_seconds</code> 定期送進監控（<a href="../../devops/lessons/22-metrics-slo.html">DevOps 課第 22 課</a>），設告警，例如「超過 60 秒持續 5 分鐘」。worker 當掉、ES 掛掉、有毒事件卡住，這個數字都會一直變大。只看 ES 的 CPU 或 API 回應時間看不出來：它們都很正常，但資料就是沒過去。另外也監控 <code>attempts</code> 超過門檻的事件數，那是被跳過的毒事件，不會反映在延遲上。如果開場的事故發生時已經有這個告警，Elasticsearch 重啟後事件卡住的那幾分鐘，值班的人就會收到通知。</p>
+<p>延遲指標只看得到「還在 outbox 裡等的事件」。根本沒寫進 outbox 的變更，或 ES 收到後又被覆蓋的錯誤，它都看不到。這時要靠<strong>對帳</strong>（reconciliation）：定期（例如每天半夜）把兩邊的資料拿出來比對，找出差異並修正。它是兜底的機制，專門抓前面所有機制都漏掉的情況：墓碑過期後才到的事件、有人直接改了資料庫卻沒寫 outbox、某次部署的 bug。</p>
+<p>比對不用比內容，比 <code>(id, version)</code> 就夠了：每次修改商品版本都會加 1，ES 的 <code>_version</code> 又是照資料庫的版本寫進去的，兩邊版本一樣，內容就一樣。差異分成三種：</p>
+<div class="table-wrap"><table>
+  <tr><th>差異</th><th>意思</th><th>修正</th></tr>
+  <tr><td>missing</td><td>資料庫有、ES 沒有</td><td>用資料庫的內容 index，帶資料庫的版本</td></tr>
+  <tr><td>stale</td><td>ES 的 <code>_version</code> 比資料庫舊</td><td>同上</td></tr>
+  <tr><td>orphaned</td><td>ES 有、資料庫沒有（刪掉的商品還搜得到）</td><td>delete，帶「ES 的版本 + 1」</td></tr>
+</table></div>
+<p>修正時一定要帶版本號：不帶的話 ES 用自己的 internal 版本（原本加 1），跟資料庫對不上，下次對帳又被判成 stale。</p>
+<p>對帳要讀出 ES 全部的 id 和版本，這裡有一個上限要注意。一般的分頁用 <code>from</code>（跳過幾筆）加 <code>size</code>（取幾筆），但兩者相加不能超過 <code>index.max_result_window</code>，預設 10,000，超過直接回錯誤（9.5.5 實測：「Result window is too large」）。要走訪全部文件，改用排序加 <code>search_after</code>：每頁依 <code>id</code> 排序，下一頁從上一頁最後一筆的排序值之後開始，不管走到第幾頁，每次都只取一頁，沒有上限：</p>
+<pre>let after: estypes.SortResults | undefined
+for (;;) {
+  const res = await es.search({
+    index: 'menu', size: 1000, sort: [{ id: 'asc' }], search_after: after,
+    version: true,           // 回傳 _version
+    _source: false,          // 只要 id 和版本，不要整份文件
+    query: { match_all: {} },
+  })
+  const hits = res.hits.hits
+  // 處理 hits：h._id、h._version
+  if (hits.length &lt; 1000) break
+  after = hits.at(-1)!.sort  // 這一頁最後一筆的排序值
+}</pre>
+<p>排序要用唯一而且穩定的欄位（這裡是文件裡的 <code>id</code>），不然同樣排序值的文件可能在換頁時被跳過或重複。走訪期間還有寫入時怎麼辦，見課末。</p>
+<p>最後一道防線是<strong>全量重建</strong>：當 ES 整個壞掉、或對帳發現大量差異，直接跑上一節的重建流程（新索引＋從資料庫匯入＋別名切換）。這是「搜尋是衍生資料」最大的好處：最糟的情況就是重建一次，不會掉資料。重建要定期演練、記下需要多久，事故時才知道「搜尋會不完整多久」。</p>
+<div class="callout practice"><strong>💡 實務上：同步延遲告警響了，照這個順序查</strong><br>半夜收到「搜尋同步延遲超過 60 秒」的告警，值班的人照順序查：一、<code>pending</code> 是一直增加，還是卡在固定幾筆？一直增加通常是 worker 沒在跑或 ES 連不上，看 worker 的 log，再用 <code>GET _cluster/health</code> 確認 ES 本身是否正常。二、卡在固定幾筆，就查 <code>attempts</code> 高的事件和它的 <code>last_error</code>，多半是 mapping 拒絕（欄位型別不符），修好資料或 mapping 後把這些事件的 <code>attempts</code> 歸零，讓 worker 重新取。三、ES 恢復後，<code>pending</code> 應該開始下降；不降就是 worker 自己有問題。這份清單寫進 runbook，新人值班也能處理。告警門檻跟 PM 約定的「多久內搜得到」對齊，不要設得比需求還嚴，不然值班的人會開始忽略它。</div>
+<p>回頭看開場的伯爵紅茶：outbox 讓「下架」不會被忘掉，worker 和版本號讓它最後一定送到、不會被舊資料蓋回去，延遲告警和對帳讓「兩邊不一樣」不再沒人知道，真的壞了還能整份重建。</p>
+
+<h2 id="appendix">補充與查表</h2>
+<p>這裡收主線提過、但做到這一步不需要記住的細節，查表用，不用背。</p>
+
+<p><strong>事件要帶內容，還是讓 worker 讀最新資料？</strong></p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>事件帶內容（payload，本課的做法）</th><th>事件只帶 id，worker 讀最新的 products</th></tr>
+  <tr><td>worker 的工作</td><td>照事件送，不用查資料庫</td><td>每批再查一次 products</td></tr>
+  <tr><td>outbox 大小</td><td>每筆都存一份內容，比較大</td><td>很小</td></tr>
+  <tr><td>同一個商品連改 10 次</td><td>送 10 次（版本號會擋掉舊的）</td><td>可以合併成 1 次，讀到的就是最新的</td></tr>
+  <tr><td>要注意</td><td>payload 的格式就是 ES 文件的格式，改 mapping 時兩邊要一起改</td><td>版本號要用讀到的那一列的 version，不能用事件的 version，不然內容和版本對不上</td></tr>
+</table></div>
+<p>兩種都常見。商品這種小文件、修改不頻繁，帶內容最直接；文件大或同一筆改得很頻繁（例如熱銷度每分鐘變），讀最新資料比較省。</p>
+
+<p><strong>用 trigger 寫 outbox。</strong>也可以用 trigger（<a href="../../postgresql/lessons/23-views-functions-triggers.html">PostgreSQL 課第 23 課</a>）在 <code>products</code> 改變時自動寫 outbox：好處是任何地方改資料（包括有人直接在資料庫下 SQL）都不會漏；代價是邏輯藏在資料庫裡，看應用程式碼看不出來，payload 的格式改起來也要寫 migration。團隊都透過同一個 API 改資料時，寫在程式裡比較好懂；常有批次腳本或多個服務直接改表時，trigger 比較保險。</p>
+
+<p><strong>CDC：不改應用程式的另一條路。</strong>CDC（change data capture，變更資料擷取）是讀資料庫自己的變更紀錄，把每一筆 INSERT／UPDATE／DELETE 送出去。PostgreSQL 的變更紀錄是 WAL，邏輯解碼把它轉成「哪張表、哪一列、改成什麼」（<a href="../../postgresql/lessons/37-backup-replication.html">PostgreSQL 課第 37 課</a>）；常用的工具是 Debezium，它佔用一個 replication slot，把變更送進 Kafka，再由另一個程式寫進 ES。</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>outbox＋worker</th><th>CDC（Debezium 等）</th></tr>
+  <tr><td>應用程式</td><td>每個改資料的地方都要寫 outbox（或用 trigger）</td><td>不用改，連直接下 SQL 的修改都會被捕捉</td></tr>
+  <tr><td>多出來的元件</td><td>一個 worker 程式</td><td>Debezium、通常還有 Kafka／Kafka Connect，各自要部署、監控、升級</td></tr>
+  <tr><td>事件格式</td><td>你決定（例如完整的搜尋文件）</td><td>資料表的一列，欄位改名、拆表會直接影響下游</td></tr>
+  <tr><td>出事時</td><td>outbox 表堆積，SQL 就查得到</td><td>CDC 停太久，replication slot 讓 WAL 一直堆，可能塞滿資料庫的磁碟</td></tr>
+</table></div>
+<p>CDC 也可以搭配 outbox：只讓 Debezium 讀 outbox 表（outbox event router），省掉 worker 的輪詢，事件格式仍由你決定。小團隊、一個資料庫、幾個需要同步的索引，outbox＋worker 就夠了；當很多服務都要訂閱資料變更、或已經在跑 Kafka，CDC 的成本才划算。</p>
+
+<p><strong>交易開著等 HTTP。</strong>worker 的寫法在 ES 回應前一直開著交易、鎖著這批列。批次小、ES 正常時沒問題；如果 ES 很慢，交易拖太久會擋住 VACUUM。另一種做法是 PostgreSQL 課第 33 課的租約（lease）：先用一個短交易把事件標成「處理中，到 X 時間為止」並提交，送完再用另一個交易標完成。</p>
+
+<p><strong>outbox 清理。</strong>outbox 只增不減，一年後會有幾千萬列。排程刪掉 <code>processed_at</code> 超過 7 天的事件（留幾天方便查問題）。</p>
+
+<p><strong>墓碑保留多久。</strong>由索引設定 <code>index.gc_deletes</code> 決定，課程的 9.5.5 預設 60 秒（<code>GET t11-menu/_settings?include_defaults=true</code> 可以查）。</p>
+
+<p><strong>一份文件由多個來源寫入。</strong>版本號只在「一份文件由一個來源整份寫入」時好用。如果 ES 文件由好幾個來源各寫一部分（商品資料來自 products、熱銷度來自訂單統計），它們的版本號不能共用，要嘛在送出前組成完整文件，要嘛用 <code>if_seq_no</code>／<code>if_primary_term</code> 這類樂觀並發控制，這是期末專題會處理的情況。</p>
+
+<p><strong>重播起點為什麼要往前拉。</strong>重建的第 2 步記下最大 id 時，可能有交易已經拿到比較小的 id、但還沒提交（bigserial 的值在 INSERT 時就決定，提交順序不一定跟 id 一樣）。這個變更不在全量匯入讀到的快照裡，id 又比記下的值小，重播時會漏掉。正式環境把重播的起點往前多拉一段（例如記下的 id 減去最近一分鐘的事件數，或改用 <code>created_at &gt;= 開始時間 - 1 分鐘</code>），反正版本號讓重播多少次都安全；漏網的情況還有對帳兜底。</p>
+
+<p><strong><code>_reindex</code> API。</strong>Elasticsearch 內建的 <code>_reindex</code> 可以把舊索引的文件直接複製到新索引。只是改分析器、文件內容不變時，它比從資料庫匯入快；但它的資料來源是舊索引，舊索引已經錯的東西會照抄過去。文件結構改了（新增欄位、改計算方式）時，還是從資料庫重建。</p>
+
+<p><strong>走訪期間有寫入。</strong>對帳走訪全部文件時如果還有寫入，官方建議搭配 point in time（<code>es.openPointInTime</code>）讓每一頁都看到同一個時間點；對帳本來就容許「剛好在改的那幾筆」下次再修，所以本課省略。</p>
+
+<h2>練習</h2>
+<p>先啟動 PostgreSQL 與 Elasticsearch（在 <code>learn/data-stores/practice</code> 執行 <code>docker compose --profile pg --profile search up -d --wait</code>，Elasticsearch 第一次啟動要一兩分鐘），每一題都在 <code>learn/</code> 執行 <code>node check.mjs data-stores 11</code> 判分。測試用 PostgreSQL 的 schema <code>t11</code> 與 <code>t11-</code> 開頭的索引，每個測試檔開始前會清空。表和 mapping 寫在 <code>schema.ts</code>（不用改），每個檔案最上面的註解寫了規則與要回傳什麼。</p>
+
+<div class="local" data-test="ex1" data-files="outbox.ts">
+  <p>練習 1：在 <code>outbox.ts</code> 實作 <code>updateProduct(pool, id, patch)</code> 與 <code>deleteProduct(pool, id)</code>：在同一個交易裡改 <code>products</code>（版本加 1）並寫一筆 outbox 事件，<code>upsert</code> 事件帶更新後的內容。測試會暫時加一個讓 outbox 寫入失敗的 CHECK 約束，確認商品也沒被改；並讓同一個商品並發更新 10 次，版本要剛好是 2～11。<code>BEGIN</code>／<code>COMMIT</code> 要送在 <code>pool.connect()</code> 借來的 client 上，直接用 <code>pool.query</code> 送會被判錯。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="sync-worker.ts">
+  <p>練習 2：在 <code>sync-worker.ts</code> 實作 <code>runOnce(pool, es, index, batchSize)</code>：用 <code>SKIP LOCKED</code> 取一批事件，用一個 bulk 請求寫進 ES（index 與 delete 都帶外部版本號），逐筆檢查結果，成功、409、delete 的 404 才標記完成，回傳完成的數量。測試會送亂序的版本、刪除後才到的舊事件、一筆會被 mapping 拒絕的事件，用一個連不上的 client 模擬 ES 當機，最後讓兩個 worker 並發處理 200 個事件，檢查每個事件只送一次、而且兩個 worker 真的同時在工作。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="reindex.ts">
+  <p>練習 3：在 <code>reindex.ts</code> 實作 <code>reindexWithAlias(pool, es, alias, newIndex, mappings)</code>，照「改 mapping」那一節的 9 個步驟零停機重建。測試會在你的全量讀取一回傳時，偷偷改 3 個商品、刪 1 個（其中 2 筆的事件 worker 已經處理過，<code>processed_at</code> 有值）；第一次重播讀完 outbox 時再改 1 個，要靠切換後的第二次重播補上。另一個迴圈在整個過程中不停搜尋別名，不能有任何一次出錯或得到 0 筆；測試建新索引時會關掉自動 refresh，切換前要自己 refresh。舊索引的名稱不是 v1，要從別名查出來。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="reconcile.ts">
+  <p>練習 4：在 <code>reconcile.ts</code> 實作 <code>reconcile(pool, es, alias)</code>：比對兩邊的 <code>(id, version)</code>，回傳 <code>{ missing, stale, orphaned }</code> 並修正。測試資料有 10,500 筆（超過 from + size 的上限），差異分散在前段和 10,000 之後；修正後再對帳一次，三種差異都要是空的。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：API 先更新 PostgreSQL，再呼叫 Elasticsearch，ES 失敗就回 500 給使用者。這樣有什麼問題？</p>
+  <label data-key="a">沒問題，使用者知道失敗了，會自己再試</label>
+  <label data-key="b">資料庫已經提交了，使用者卻以為失敗；兩邊仍然不一致，重試還可能重複操作</label>
+  <label data-key="c">ES 失敗時會自動讓 PostgreSQL 回滾</label>
+  <label data-key="d">只會讓 API 變慢，資料不受影響</label>
+  <p class="why">✓ b。兩個系統沒有共同的交易，回 500 不會撤銷已經提交的資料庫修改，ES 也沒更新。正確做法是 API 只做資料庫交易（同時寫 outbox），同步交給 worker。ES 不會、也沒辦法回滾 PostgreSQL；這也不只是變慢的問題。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 6：worker 把事件寫進 ES 時帶 <code>version</code> 與 <code>version_type: 'external'</code>，主要是為了什麼？</p>
+  <label data-key="a">讓 bulk 寫入變快</label>
+  <label data-key="b">Elasticsearch 規定每次寫入都要帶版本號</label>
+  <label data-key="c">至少一次送達加上並發處理，事件可能重送或亂序；版本號讓舊事件寫不進去</label>
+  <label data-key="d">讓 delete 可以刪除不存在的文件</label>
+  <p class="why">✓ c。external 版本只接受比目前更大的版本，重送的事件（版本相同）和晚到的舊事件（版本較小）都回 409，寫入因此冪等而且只會往前。它不會讓寫入變快，也不是必填（預設是 ES 自己管版本）；delete 不存在的文件本來就只回 404。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：要把菜單索引的 <code>name</code> 改成 cjk 分析器，哪個順序對？</p>
+  <label data-key="a">刪除舊索引 → 用新 mapping 建立同名索引 → 從資料庫匯入</label>
+  <label data-key="b">建新索引 → 從資料庫匯入並補上期間的變更 → 用一個 <code>_aliases</code> 請求切換別名 → 刪除舊索引</label>
+  <label data-key="c">用 PUT mapping 直接修改 <code>name</code> 欄位的分析器</label>
+  <label data-key="d">建新索引 → 匯入 → 先移除別名、再用另一個請求把別名加到新索引</label>
+  <p class="why">✓ b。新索引先準備好、資料補齊，再原子切換，使用者不會看到錯誤或空結果。a 在匯入完成前搜尋全部失效；c 做不到，已存在欄位的分析器不能改；d 的兩個請求之間別名不存在，那一瞬間的搜尋會出錯。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 8：要設一個告警，在「資料庫改了但搜尋一直沒跟上」時通知值班，該監控什麼？</p>
+  <label data-key="a">Elasticsearch 的 CPU 使用率</label>
+  <label data-key="b">outbox 中最舊一筆未處理事件的建立時間到現在的差距</label>
+  <label data-key="c">API 的平均回應時間</label>
+  <label data-key="d">PostgreSQL 的連線數</label>
+  <p class="why">✓ b。這個值就是「最久的一筆變更已經等了多久還沒進搜尋」，worker 停了、ES 掛了、毒事件卡住都會讓它持續上升。CPU、回應時間、連線數在同步停擺時可能都很正常。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>在 API 裡雙寫，再把 ES 的錯誤吞掉</strong>：兩邊不一致而且沒人知道。API 只寫資料庫（加 outbox），同步交給 worker。Code review 時搜尋一下 <code>es.index</code>、<code>es.update</code>：出現在 API 的存檔流程裡，就是雙寫。</li>
+  <li><strong>outbox 在另一個交易寫</strong>：先提交 products、再寫 outbox，中間失敗就漏事件。兩個寫入用同一個 client、同一個 BEGIN … COMMIT。</li>
+  <li><strong>版本號在程式裡算</strong>：先讀再加 1，並發時兩個請求寫出同一個版本。讓資料庫 <code>version = version + 1 … RETURNING version</code>。</li>
+  <li><strong>刪除沒有寫事件，或刪除沒帶版本</strong>：搜尋裡留著已刪除的商品，或被晚到的舊事件救活。刪除事件帶「刪除前 + 1」的版本，用 external 版本刪除。</li>
+  <li><strong>worker 沒有 SKIP LOCKED</strong>：沒鎖會重複處理，只有 FOR UPDATE 會互等，多開 worker 也不會變快。</li>
+  <li><strong>只看 bulk 有沒有丟例外</strong>：HTTP 200 也可能有其中幾筆失敗。逐筆看 <code>items</code> 的 status。</li>
+  <li><strong>把 409 當失敗重試</strong>：409 代表 ES 已經有更新的版本，這筆事件該標完成，不然它會永遠重試。</li>
+  <li><strong>ES 失敗也把事件標成完成</strong>：那批變更永遠不會進搜尋。整個請求失敗就 ROLLBACK 並丟錯，事件留到下一輪。</li>
+  <li><strong>程式寫死索引名稱</strong>：換索引要改程式、重新部署，不可能零停機。程式只用別名，舊索引名稱從別名查。</li>
+  <li><strong>重建時先刪舊索引、或切換別名分兩個請求、或切換前沒 refresh</strong>：搜尋會出錯或得到 0 筆。新索引補齊、refresh 之後，用一個 <code>_aliases</code> 請求切換。</li>
+  <li><strong>重建時只做全量匯入</strong>：匯入期間的變更寫到舊索引去了。重播這段期間的 outbox 事件，切換後再重播一次。</li>
+  <li><strong>沒有延遲指標、沒有對帳</strong>：出事時要等客人來抱怨才知道。監控最舊未處理事件的年齡，每天對帳一次。</li>
+  <li><strong>對帳用 from／size 一次讀完</strong>：超過 10,000 筆直接出錯，或只讀到前一萬筆。用 sort＋search_after 分頁。</li>
+  <li><strong>outbox 從不清理</strong>：表和索引無限長大，worker 的查詢越來越慢。排程刪掉處理完超過幾天的事件。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>雙寫沒有共同交易，失敗、崩潰、請求交錯都會讓資料庫和搜尋不一致，所以目標改成最終一致：資料庫是記錄系統，搜尋是可以重建的衍生資料，之後一定跟上，而且看得到落後多少。</li>
+  <li>outbox：改資料和寫事件在同一個交易、同一個 client；版本由資料庫 <code>version = version + 1</code> 遞增；刪除也要有事件。事件可以帶內容，也可以只帶 id 讓 worker 讀最新資料（比較見課末）。</li>
+  <li>worker 用 <code>FOR UPDATE SKIP LOCKED</code> 取一批、一個 bulk 送出、逐筆看 status：成功、409、delete 的 404 標完成，其他記 attempts；整個請求失敗就 ROLLBACK 並丟錯，連續失敗要退避，毒事件設上限。</li>
+  <li>送達是至少一次而且可能亂序；<code>version_type: 'external'</code> 只接受更大的版本，讓重送和亂序無害；delete 也帶版本，墓碑預設保留 60 秒（<code>index.gc_deletes</code>）。</li>
+  <li>改 mapping：建新索引 → 從資料庫全量匯入 → 重播期間的 outbox 事件 → refresh → 一個 <code>_aliases</code> 請求原子切換 → 再重播一次 → 刪舊索引。程式永遠只用別名。</li>
+  <li>上線要有：最舊未處理事件的年齡（同步延遲）告警、用 search_after 走訪的每日對帳、演練過的全量重建流程、outbox 清理。</li>
+  <li>CDC（Debezium、邏輯複寫）不用改應用程式，但多一套要維運的系統；需要的服務多了才划算（見課末）。</li>
+</ul>
+<p>下一課換到檔案：電子收據 PDF 不該放在資料庫裡，物件儲存、presigned URL 與生命週期規則怎麼用。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

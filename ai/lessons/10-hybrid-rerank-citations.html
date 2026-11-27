@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>10. 混合搜尋、重排與引用來源</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="10" data-practice="ai">
+<header>
+  <div class="eyebrow">階段 4：RAG：讓模型根據你的資料回答 · 第 10 課</div>
+  <h1>混合搜尋、重排與引用來源</h1>
+</header>
+<main>
+
+<p>第 9 課的助理已經能用 pgvector 找出跟問題「意思相近」的段落。上線第一天就有顧客問：「SKU-0042 還有貨嗎？」向量搜尋回來的是可頌、營業時間、退款規則，偏偏漏掉菜單上寫著「可改燕麥奶（SKU-0042）」的那一段。模型拿到一堆不相關的資料，不是說不知道，就是自己編一個答案。</p>
+<p>這一課把檢索補完整，並讓回答可以<strong>由程式驗證</strong>；資料不夠時，系統直接說「這個問題我需要請店員確認」。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>向量搜尋的盲點：顧客問「SKU-0042」時向量搜尋為什麼找不到，要再加哪一路搜尋來補（開場問題的最小答案）。</li>
+  <li>中文的關鍵字檢索：中文為什麼不能用 PostgreSQL 的全文檢索，pg_trgm 怎麼比對字面。</li>
+  <li>合併、重排：兩路的分數不能相加時怎麼合併名次，再怎麼從候選裡挑出真正相關的幾段。</li>
+  <li>組 context：挑出的段落怎麼編號、在 token 預算內放進 prompt。</li>
+  <li>引用與驗證、Claude 的 citations 功能：怎麼讓程式檢查回答有沒有根據，資料不夠時怎麼直接轉店員。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="09-pgvector.html">第 9 課</a>的向量搜尋：chunks 表的每一列是一塊，<code>ORDER BY embedding &lt;=&gt; $1 LIMIT k</code> 取最像的 k 塊，HNSW 索引讓它變快。</li>
+  <li><a href="08-chunking-embeddings.html">第 8 課</a>的切塊：每塊帶著 <code>headingPath</code>（它在手冊哪一章哪一節），embedding 找的是意思相近的塊。</li>
+  <li><a href="05-structured-output.html">第 5 課</a>的結構化輸出：<code>output_config.format</code> 加 <code>messages.parse</code> 拿到符合 schema 的 <code>parsed_output</code>，模型拒答時它是 <code>null</code>。</li>
+  <li><a href="../../postgresql/lessons/28-gin-search.html">PostgreSQL 課第 28 課</a>的文字搜尋：pg_trgm 把文字切成三個字一組來比對，GIN 索引讓這種比對不必掃整張表。</li>
+</ul></div>
+
+<h2>向量搜尋的盲點</h2>
+<p>embedding 模型把一段文字壓成一個向量，擅長的是<strong>意思</strong>：「植物奶還有嗎」和「燕麥奶賣完了」用字不同，向量卻很接近。代價是字面上的細節被磨掉了。下面這幾種問題，向量搜尋常常找不到：</p>
+<div class="table-wrap"><table>
+  <tr><th>問題</th><th>為什麼向量容易漏</th></tr>
+  <tr><td>SKU-0042 還有貨嗎</td><td>商品編號、訂單號碼沒有「意思」，模型訓練時也沒看過你的編號</td></tr>
+  <tr><td>伯爵</td><td>太短，向量幾乎只代表「一個詞」，跟整段描述的向量差很遠</td></tr>
+  <tr><td>桂花烏龍拿鐵（新品）</td><td>專有名詞、新詞，embedding 模型不認識，會被當成一般的「茶」「咖啡」</td></tr>
+</table></div>
+<p><strong>關鍵字搜尋</strong>（比對字面）剛好相反：編號、專有名詞一找就到，但「植物奶」找不到「燕麥奶」。兩邊的弱點互補，所以正式環境的 RAG 常用<strong>混合搜尋</strong>（hybrid search）：同一個問題同時跑語意（向量）和字面（關鍵字）兩路檢索，再把結果合併。</p>
+
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="混合搜尋的流程：問題同時送進向量檢索與關鍵字檢索，各取前 20 名，用 RRF 合併，重排挑出前 5 名，組成有編號的資料區塊交給模型，最後由程式驗證引用">
+    <defs><marker id="ar10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="var(--muted)"/></marker></defs>
+    <rect x="10" y="100" width="90" height="44" rx="6" class="d-box"/><text x="55" y="127" text-anchor="middle" class="d-text">問題</text>
+    <line x1="100" y1="115" x2="140" y2="65" class="d-line" marker-end="url(#ar10)"/>
+    <line x1="100" y1="130" x2="140" y2="180" class="d-line" marker-end="url(#ar10)"/>
+    <rect x="145" y="35" width="130" height="50" rx="6" class="d-soft"/><text x="210" y="57" text-anchor="middle" class="d-text">向量 &lt;=&gt;</text><text x="210" y="75" text-anchor="middle" class="d-small">前 20 名</text>
+    <rect x="145" y="160" width="130" height="50" rx="6" class="d-soft"/><text x="210" y="182" text-anchor="middle" class="d-text">pg_trgm &lt;%</text><text x="210" y="200" text-anchor="middle" class="d-small">前 20 名</text>
+    <line x1="275" y1="65" x2="310" y2="112" class="d-line" marker-end="url(#ar10)"/>
+    <line x1="275" y1="180" x2="310" y2="134" class="d-line" marker-end="url(#ar10)"/>
+    <rect x="315" y="100" width="80" height="44" rx="6" class="d-box"/><text x="355" y="127" text-anchor="middle" class="d-text">RRF</text>
+    <line x1="395" y1="122" x2="420" y2="122" class="d-line" marker-end="url(#ar10)"/>
+    <rect x="425" y="100" width="80" height="44" rx="6" class="d-box"/><text x="465" y="120" text-anchor="middle" class="d-text">重排</text><text x="465" y="136" text-anchor="middle" class="d-small">前 5 名</text>
+    <line x1="505" y1="122" x2="530" y2="122" class="d-line" marker-end="url(#ar10)"/>
+    <rect x="535" y="100" width="150" height="44" rx="6" class="d-box"/><text x="610" y="120" text-anchor="middle" class="d-text">[c1]…[c5]＋模型</text><text x="610" y="136" text-anchor="middle" class="d-small">回答＋sources</text>
+    <line x1="610" y1="144" x2="610" y2="180" class="d-line" marker-end="url(#ar10)"/>
+    <text x="610" y="200" text-anchor="middle" class="d-accent">程式驗證引用，不夠就拒答</text>
+    <text x="355" y="240" text-anchor="middle" class="d-small">資料庫裡跑兩句 SQL，合併、重排、驗證在程式裡做</text>
+  </svg>
+  <figcaption>這一課的完整檢索流程。練習 1～4 依序實作 RRF、兩路查詢、組資料區塊、引用驗證。</figcaption>
+</figure>
+
+<h2>中文的關鍵字檢索：用 pg_trgm，不用全文檢索</h2>
+<p>PostgreSQL 內建的全文檢索（<code>to_tsvector</code>）以「詞」為單位，但它不會把中文切成詞。在這門課的 PGlite 0.5.13（PostgreSQL 18.6）實測：</p>
+<pre>SELECT to_tsvector('simple', '拿鐵 110 元：濃縮咖啡加鮮奶，可改燕麥奶（SKU-0042），加價 10 元。');
+-- '-0042':7 '10':9 '110':2 'sku':6 '元':3,10 '加價':8 '可改燕麥奶':5 '拿鐵':1 '濃縮咖啡加鮮奶':4</pre>
+<p>「可改燕麥奶」整串是一個詞，所以搜「燕麥奶」比對不到。PostgreSQL 課第 28 課講過原因和中文斷詞的選項；這一課改用 <strong>pg_trgm</strong>：它把文字切成三個連續字元一組（trigram），比對兩段文字有多少組相同，不需要先斷詞。</p>
+<p>要用的是 <code>word_similarity(問題, 內容)</code>：它找出「內容」裡跟「問題」最像的那一段，回傳 0～1。這適合「短問題比長段落」。同一段菜單內容，換幾個問題實測：</p>
+<div class="table-wrap"><table>
+  <tr><th>問題</th><th>對「…可改燕麥奶（SKU-0042）…」</th><th>說明</th></tr>
+  <tr><td>SKU-0042 還有貨嗎</td><td>0.64</td><td>編號完全相同，分數高</td></tr>
+  <tr><td>燕麥奶</td><td>0.5</td><td>「燕麥奶」在「可改燕麥奶」的中間，只有部分 trigram 對得上</td></tr>
+  <tr><td>可以改燕麥奶嗎</td><td>0.3</td><td>問題越長、多出來的字越多，分數越低</td></tr>
+</table></div>
+<p>pg_trgm 以標點和空白分「字」，中文詞在一串文字的開頭時比較容易對上（「伯爵」對「伯爵紅茶 90 元」是 0.67），在中間時分數會打折。所以門檻要設低（這課用 0.1），也接受關鍵字這一路會混進一些雜訊：後面的 RRF 和重排會處理。</p>
+
+<p><strong>讓它用得到索引。</strong>chunks 有幾萬段時，每次都對每一段算 <code>word_similarity</code> 太慢，要建 trigram 的 GIN 索引，查詢也要寫成索引看得懂的形式：</p>
+<pre>CREATE INDEX chunks_content_trgm ON chunks USING gin (content gin_trgm_ops);
+
+SELECT id::text AS id FROM chunks
+WHERE $1 &lt;% content                               -- 用得到索引
+ORDER BY word_similarity($1, content) DESC, id
+LIMIT 20;</pre>
+<ul>
+  <li><code>$1 &lt;% content</code> 是 pg_trgm 的運算子，意思是「<code>word_similarity($1, content)</code> 大於門檻 <code>pg_trgm.word_similarity_threshold</code>」，GIN 索引支援它。</li>
+  <li>寫成 <code>WHERE word_similarity($1, content) &gt; 0.1</code> 結果一樣，但那是一般的函式呼叫，<strong>索引用不到</strong>，每次都掃整張表。用 <code>EXPLAIN</code> 檢查（<a href="../../postgresql/lessons/21-explain.html">PostgreSQL 課第 21 課</a>），要看到 <code>Bitmap Index Scan</code> 與 <code>Index Cond: (content %&gt; …)</code>。</li>
+  <li>門檻預設是 <strong>0.6</strong>（PostgreSQL 18 文件），「燕麥奶」的 0.5 會被擋掉，所以查詢前要改成 0.1。</li>
+</ul>
+<p>改門檻要小心範圍。<code>SET pg_trgm.word_similarity_threshold = 0.1</code> 會改到<strong>整條連線</strong>；正式環境用連線池（<a href="../../postgresql/lessons/36-connections-monitoring.html">PostgreSQL 課第 36 課</a>），這條連線下一次可能給別的請求用，設定就跟著過去了。要用 <code>SET LOCAL</code>，它只在目前的交易（<a href="../../postgresql/lessons/18-transactions.html">PostgreSQL 課第 18 課</a>）裡有效，交易結束（COMMIT 或 ROLLBACK）就恢復：</p>
+<pre>await db.transaction(async tx =&gt; {
+  await tx.exec('SET LOCAL pg_trgm.word_similarity_threshold = 0.1')
+  const vector = (await tx.query(VECTOR_SQL, [toSql(queryVector), 20])).rows
+  const keyword = (await tx.query(KEYWORD_SQL, [question, 20])).rows
+  // …
+})</pre>
+<p>兩路都在資料庫裡各跑一句 SQL，合併在程式裡做。也可以用 CTE（<a href="../../postgresql/lessons/16-subquery-cte.html">PostgreSQL 課第 16 課</a>）把兩路和 RRF 寫在同一句 SQL，少一次來回；程式裡合併比較好測試、好除錯，資料量不大時差異很小。</p>
+<div class="callout practice"><strong>💡 實務上：客服回報「明明有寫卻找不到」，先分開查兩路</strong><br>這類回報常見的是商品編號、新品名稱、活動代碼，向量那一路最容易漏掉。資深的做法是把那個問題分別丟進向量和關鍵字兩句 SQL，看正確段落在各自第幾名，再決定要調的是門檻、切塊還是索引。上線前用 <code>EXPLAIN</code> 確認關鍵字那一路真的走 GIN 索引，資料一多，掃全表會先拖慢整個 API。code review 看到沒加 <code>LOCAL</code> 的 <code>SET</code> 要直接提出來：本機只有一條連線測不出問題，上線後才會偶爾出現別的請求門檻被改掉的怪現象。</div>
+
+<h2>合併：RRF 用名次，不用分數</h2>
+<p>兩路的分數不能直接相加。向量那一路是 cosine 相似度，分布跟著 embedding 模型走（練習用的 <code>toyEmbed</code> 和 Voyage 的就不一樣）；<code>word_similarity</code> 是另一種量法，上一節的例子落在 0.3～0.67。相加的話，分數範圍大的那一路會主導排序，換一個 embedding 模型，結果就整個變了。</p>
+<p><strong>RRF</strong>（reciprocal rank fusion）只看名次：一段資料在每一路的名次是 <em>r</em>，就得到 1／(k＋r) 分，出現在幾路就加幾次。第 1 名的 <em>r</em> 是 1，<em>k</em> 常用 60。用剛才的問題試算：</p>
+<div class="table-wrap"><table>
+  <tr><th>段落</th><th>向量名次</th><th>關鍵字名次</th><th>RRF 分數</th></tr>
+  <tr><td>燕麥奶（SKU-0042）缺貨時，店員會告知</td><td>2</td><td>2</td><td>1/62 ＋ 1/62 ≈ 0.0323</td></tr>
+  <tr><td>植物奶每天早上補充</td><td>1</td><td>—</td><td>1/61 ≈ 0.0164</td></tr>
+  <tr><td>拿鐵…可改燕麥奶（SKU-0042）</td><td>—</td><td>1</td><td>1/61 ≈ 0.0164</td></tr>
+  <tr><td>可頌 70 元</td><td>3</td><td>—</td><td>1/63 ≈ 0.0159</td></tr>
+</table></div>
+<ul>
+  <li>兩路都找到的排最前面：兩個人都推薦的，比較可能真的相關。</li>
+  <li>只出現在一路的<strong>也會留下</strong>：SKU 那段向量完全找不到，只靠關鍵字那一路的第 1 名照樣進前 5。這正是混合搜尋要的。</li>
+  <li><em>k</em> 越大，第 1 名和第 10 名的差距越小。60 是原始論文的值，也是常見預設；需要調時用 eval（第 11 課）比較，不要憑感覺。</li>
+</ul>
+<div class="callout warn"><strong>RRF 分數不能拿來判斷「夠不夠相關」。</strong>不管檢索結果多爛，第 1 名在兩路都是第一的分數永遠是 2/61。它只能排序，不能當拒答門檻。門檻要用下一節重排模型的分數，它才代表「這段跟問題有多相關」。</div>
+
+<h2>重排：只對少量候選做精細判斷</h2>
+<p>向量和關鍵字都是「便宜的粗篩」：向量是問題和段落<strong>各自</strong>先算好的，比對時只算距離，看不到兩者的細節關係。<strong>重排</strong>（rerank）是把問題和候選段落<strong>一起</strong>交給一個模型，逐段判斷相關程度。準很多，但每段都要跑一次模型，又貴又慢，所以只用在 RRF 合併後的前 20 名左右，挑出最後要給 LLM 的 5 段。</p>
+<p>常見的兩種做法：</p>
+<div class="table-wrap"><table>
+  <tr><th>做法</th><th>怎麼用</th><th>取捨</th></tr>
+  <tr><td>專門的 reranker</td><td>Anthropic 文件推薦的 Voyage AI 有 <code>rerank-3</code>（準）與 <code>rerank-3-lite</code>（快、便宜）。送出 <code>query</code> 與 <code>documents</code>（字串陣列），回傳每段的 <code>index</code> 與 <code>relevance_score</code>，由高到低排好</td><td>專為這件事訓練；分數可以當門檻</td></tr>
+  <tr><td>請 LLM 打分</td><td>用結構化輸出要 <code>[{ id, score }]</code>，例如用 Haiku 5.5</td><td>不用多接一家服務，但較慢、較貴，分數也比較不穩定；要用 eval 驗證</td></tr>
+</table></div>
+<p>重排之後，每段候選都有一個 0～1 的相關分數，這課叫它 <code>Ranked</code>：</p>
+<pre>type Ranked = { id: string; headingPath: string[]; content: string; score: number }   // score：重排分數，由高到低</pre>
+<p>不加重排可不可以？資料只有幾百段、RRF 前 5 名就夠準時，可以先不加，少一次呼叫、少一家廠商。判斷方式一樣是用 eval 量：加了重排之後，正確段落進前 5 的比例（第 11 課的 recall@5）有沒有明顯提升，值不值得多出來的延遲與費用。練習裡的重排由測試直接給分數，專心在前後的步驟。</p>
+
+<h2>組 context：編號、預算、整段放或不放</h2>
+<p>要讓模型引用來源，每段資料都要有一個它能寫出來的 id。用資料庫的 id（「chunk 18342」）太長也沒意義，每次重新編短 id：<code>c1</code>、<code>c2</code>…，並帶上標題路徑，模型才知道這段在講什麼：</p>
+<pre>&lt;documents&gt;
+&lt;doc id="c1" title="門市手冊 › 庫存"&gt;燕麥奶（SKU-0042）缺貨時，店員會在點餐時告知。&lt;/doc&gt;
+&lt;doc id="c2" title="菜單 › 咖啡"&gt;拿鐵 110 元：濃縮咖啡加鮮奶，可改燕麥奶（SKU-0042），加價 10 元。&lt;/doc&gt;
+&lt;/documents&gt;</pre>
+<ul>
+  <li><strong>跳脫</strong>：資料可能來自顧客投稿（<code>helpers/coffee.ts</code> 的 <code>faq-community</code> 就夾帶了指令），內容用<a href="04-prompt-design.html">第 4 課</a>的 <code>escapeForTag</code>，放在屬性裡的標題再把 <code>"</code> 換成 <code>&amp;quot;</code>，資料裡的 <code>&lt;/doc&gt;</code> 才不會提早結束標籤。</li>
+  <li><strong>token 預算</strong>：context 越長越貴、越慢，模型找回細節的準確度也會下降（<a href="01-what-is-llm.html">第 1 課</a>的 context rot）。替資料區塊設一個上限，由高分往下放。</li>
+  <li><strong>放不下就整段不放</strong>：切一半的段落可能剛好切掉「但工廠同時處理堅果」這種關鍵的但書，比沒有更危險。跳過這段後，繼續看下一段，較短的可能還放得下。</li>
+  <li><strong>id 依放進去的順序編</strong>：跳過的不佔號，<code>c1</code>～<code>cN</code> 連續，程式要記住每個 id 對應哪一塊，之後才能把引用轉回原始文件、顯示連結。</li>
+</ul>
+<div class="callout practice"><strong>💡 實務上：context 預算是成本和品質一起調的旋鈕</strong><br>咖啡店助理每天可能有上千次提問，每次多放幾段資料，輸入 token 就跟著乘上去（第 13 課會算）。預算太小，正確段落被擠掉，模型只好拒答或亂補。資深的做法是記錄每次放了哪些段、跳過哪些段，回答出錯時先查「正確段落有沒有被放進去」，再查模型。這份紀錄也會用在第 15 課的觀測。</div>
+
+<h2>引用與驗證：程式檢查，資料不夠就拒答</h2>
+<p><strong>引用</strong>（citation）是在回答裡標出每個說法出自哪一段。它有兩個用處：顧客和店員可以點開來源確認；更重要的是，<strong>程式可以檢查</strong>。用第 5 課的結構化輸出要求固定的形狀：</p>
+<pre>const AnswerSchema = z.object({ answer: z.string(), sources: z.array(z.string()) })
+
+const response = await client.messages.parse({
+  model: 'claude-opus-5-5', max_tokens: 16000, system: SYSTEM,
+  messages: [{ role: 'user', content: `&lt;documents&gt;\n${ctx.text}\n&lt;/documents&gt;\n\n&lt;question&gt;${escapeForTag(question)}&lt;/question&gt;` }],
+  output_config: { format: zodOutputFormat(AnswerSchema) },
+})</pre>
+<p>SYSTEM 寫明「只根據 <code>&lt;documents&gt;</code> 回答、把用到的 id 放進 sources、找不到就說沒有」。但 prompt 只是要求，模型照樣可能引用一個不存在的 <code>c9</code>，或 sources 留空、用自己的知識回答。所以拿到回應後，程式要檢查：</p>
+<div class="table-wrap"><table>
+  <tr><th>情況</th><th>處理</th><th>原因</th></tr>
+  <tr><td>檢索的最高分（重排分數）低於門檻</td><td>不呼叫 API，直接拒答</td><td>沒有可靠資料，模型只能亂補；也省一次呼叫</td></tr>
+  <tr><td>一段都放不進 context</td><td>不呼叫 API，拒答</td><td>同上</td></tr>
+  <tr><td><code>parsed_output</code> 是 <code>null</code>（拒答、沒有 text）</td><td>拒答</td><td>第 5 課：<code>parse()</code> 遇到拒答不會丟錯</td></tr>
+  <tr><td>sources 是空的</td><td>拒答</td><td>沒有任何根據的回答</td></tr>
+  <tr><td>sources 裡有任何一個不是這次給的 id</td><td><strong>整個</strong>拒答</td><td>你不知道哪一句是根據那個不存在的來源說的，刪掉那個 id 不會讓回答變可信</td></tr>
+</table></div>
+<p>這裡的「拒答」指的是你的系統主動選擇不回答，叫<strong>拒答門檻</strong>（abstain threshold），跟第 2 課模型的 <code>refusal</code> 不同。拒答時回覆「這個問題我需要請店員確認」或轉真人客服，並且<strong>記錄下來</strong>：問題、檢索到的段落與分數、拒答原因。這份紀錄就是你的文件缺口清單，也會變成第 11 課 eval 集的題目。</p>
+<p>門檻值（例如重排分數 0.5）沒有標準答案，它在「答錯」和「太常說不知道」之間取捨。價格、過敏原、退款這類答錯代價高的問題，寧可門檻高一點。用 eval 集量兩個數字再決定：答錯率、拒答率。</p>
+<div class="callout practice"><strong>💡 實務上：拒答率是 PM 會盯的數字</strong><br>上線後 PM 常問「為什麼助理一直說要問店員」。拒答時記下的原因（分數太低、引用無效、模型拒答）能直接回答：分數太低多半是文件沒寫，交給負責內容的人補；引用無效多半是 prompt 或模型的問題，交給工程。門檻要調之前，先跟 PM、客服說清楚調高、調低各自會多出哪一種客訴，再用 eval 的結果一起決定。</div>
+<div class="callout">驗證引用只證明「回答有指向這次給的資料」，不證明回答真的符合那段資料的內容（模型可能引用 c1 卻把價格寫錯）。內容對不對要靠第 11 課的 eval；第 5 課的原則一樣成立：金額這類能用程式算的，就不要相信模型寫的數字。</div>
+
+<h2>另一種做法：Claude 的 citations 功能</h2>
+<p>Claude API 本身也有引用功能：把每段資料包成 <code>search_result</code> block（或 <code>document</code> block）放進 user 訊息，加上 <code>citations: { enabled: true }</code>，回答的 text block 會帶 <code>citations</code> 陣列，每筆有 <code>type: 'search_result_location'</code>、你給的 <code>source</code> 與 <code>title</code>、<code>cited_text</code>（被引用的原文），以及第幾個 search_result、第幾個 block。不需要 beta 標頭，Opus 5.5、Sonnet 5.5、Haiku 5.5 都支援（2026-11-01 官方文件）。</p>
+<pre>{
+  type: 'search_result',
+  source: 'chunk:18342',                 // 任何穩定的字串都可以，例如資料庫 id 或網址
+  title: '門市手冊 › 過敏原',
+  content: [{ type: 'text', text: '燕麥奶不含乳糖，但工廠同時處理堅果。' }],
+  citations: { enabled: true },          // 同一個請求裡所有 search_result 要用同樣的設定
+}</pre>
+<div class="table-wrap"><table>
+  <tr><th></th><th>自訂 sources 欄位（這課的練習）</th><th>citations 功能</th></tr>
+  <tr><td>引用的精細度</td><td>整段的 id</td><td>精確到 block，附上原文 <code>cited_text</code></td></tr>
+  <tr><td>能不能造假</td><td>可能寫出不存在的 id，要自己驗證</td><td>引用由 API 對應到你送的資料，位置是真的</td></tr>
+  <tr><td>輸出格式</td><td>結構化 JSON，好接程式、好評分</td><td>一般文字＋citations，<strong>不能跟 <code>output_config.format</code> 一起用（400）</strong></td></tr>
+  <tr><td>費用</td><td>sources 算輸出 token（很少）</td><td><code>cited_text</code> 不算輸出 token</td></tr>
+</table></div>
+<p>要把引用顯示給顧客看（例如回答下方列出原文），citations 功能比較省事也比較可靠；回答還要交給程式處理、需要其他結構化欄位時，用自訂欄位加驗證。兩種都不保證回答內容正確。</p>
+
+<h2>練習</h2>
+<p>在 learn 資料夾執行 <code>node check.mjs ai 10</code>，會建立 <code>ai/practice/work/10/</code>。四題<strong>照順序做</strong>：練習 2 用練習 1 的 <code>rrf</code>，練習 4 用練習 3 的 <code>buildContext</code>。練習 2 的測試會開一個 PGlite 資料庫（裡面有 pgvector 與 pg_trgm），第一次要等十幾秒。全部做完後，有 API key 的話可以在 <code>ai/practice</code> 執行 <code>node --env-file-if-exists=.env work/10/live.ts</code>，用咖啡店的文件跑一次完整流程。</p>
+
+<div class="local" data-test="ex1" data-files="ex1.ts">
+  <p>練習 1：完成 <code>rrf(rankings, k = 60)</code>。<code>rankings</code> 是好幾路的 id 排名（第一個是第 1 名）；每個 id 的分數是它出現的每一路 1／(k＋名次) 的加總；同一路裡重複的 id 只算第一次出現的名次；只出現在一路的也要留下。回傳 <code>{ id, score }[]</code>，分數由高到低，同分依 id 的字串順序。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="ex2.ts">
+  <p>練習 2：完成 <code>ex2.ts</code> 的三個地方。<code>TRGM_INDEX_SQL</code>：在 <code>chunks.content</code> 建 pg_trgm 的 GIN 索引。<code>KEYWORD_SQL</code>：用 <code>word_similarity($1, content)</code> 由高到低（同分依 id）取前 <code>$2</code> 筆的 <code>id::text</code>，篩選要寫成用得到索引的形式。<code>hybridSearch(db, query, queryVector, k)</code>：在一個交易裡用 <code>SET LOCAL</code> 把門檻設成 <code>KEYWORD_THRESHOLD</code>，兩路各取 <code>CANDIDATES</code> 筆，用 <code>rrf</code> 合併取前 k 筆，補上 <code>docId</code>、<code>headingPath</code>、<code>content</code> 與兩路的名次（沒出現是 <code>null</code>）。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="ex3.ts">
+  <p>練習 3：完成 <code>buildContext(chunks, budgetTokens, countTokens)</code>。依順序把每段組成 <code>&lt;doc id="c1" title="門市手冊 › 過敏原"&gt;內容&lt;/doc&gt;</code>（title 用 <code>escapeAttr</code>、內容用 <code>escapeForTag</code>，兩個都已經寫好），用 <code>countTokens</code> 量整段；加上去會超過預算就整段跳過、繼續看下一段。id 依放進去的順序連續編號。回傳 <code>{ text, ids, chunks }</code>：<code>text</code> 用 <code>\n</code> 連接，<code>chunks[i]</code> 對應 <code>ids[i]</code>。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="ex4.ts">
+  <p>練習 4：完成 <code>answerWithSources(client, question, retrieved, { minScore })</code>。沒有候選或最高分低於 <code>minScore</code>、或一段都放不進 context 時，不呼叫 API，回傳 <code>{ status: 'abstain', reason }</code>。否則用 <code>client.messages.parse</code> 與 <code>AnswerSchema</code> 送出（格式寫在 <code>ex4.ts</code> 的註解裡）。拒答（沒有 <code>parsed_output</code>）、<code>sources</code> 是空的、或有任何一個 source 不在這次 <code>buildContext</code> 的 <code>ids</code> 裡，都回傳 abstain；其他情況回傳 <code>{ status: 'answered', answer, sources }</code>。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：向量搜尋的分數是 0.82，pg_trgm 的分數是 0.35。把兩個分數相加來排序，有什麼問題？</p>
+  <label data-key="a">沒問題，兩個都是 0～1 的分數</label>
+  <label data-key="b">兩種分數的量法與分布不同，相加會讓範圍大的那一路主導，換模型結果就變；RRF 只看名次，避開這個問題</label>
+  <label data-key="c">應該相乘才對</label>
+  <label data-key="d">應該只用向量的分數，關鍵字只是輔助</label>
+  <p class="why">✓ 都在 0～1 之間不代表可以比較（a 錯）：cosine 和 word_similarity 量的是不同的東西，分布也不同。相乘（c）有一樣的問題，而且只出現在一路的段落會變成 0 分、被丟掉。只用向量（d）就回到「編號找不到」的問題。RRF 只看名次，簡單又穩，是混合搜尋常見的起點。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：這次只給了 c1～c5，模型的回答引用了 c7。應該怎麼處理？</p>
+  <label data-key="a">相信模型，可能是它記得的資料</label>
+  <label data-key="b">整個回答視為不可信：引用不在這次的資料裡，就無法證明出處；改成拒答（或重試），並記錄下來</label>
+  <label data-key="c">把 c7 從 sources 刪掉，其他照用</label>
+  <label data-key="d">回 HTTP 500 給前端</label>
+  <p class="why">✓ 模型「記得」的資料正是 RAG 要避免的（a 錯）：可能過期，也可能是編的。只刪掉 c7（c）不會讓回答變可信，你不知道哪一句是根據 c7 寫的。這不是伺服器故障（d 錯），是預期中會發生的情況，要給顧客合理的回覆。引用驗證是發現幻覺最便宜的方法，而且要由程式檢查，不能只靠 prompt。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：顧客問了一個文件沒寫的問題，檢索結果的最高分都很低。最好的做法是？</p>
+  <label data-key="a">照樣交給模型，讓它盡量回答</label>
+  <label data-key="b">不呼叫模型，回覆「這個問題我需要請店員確認」，並記錄問題與檢索結果，之後補文件</label>
+  <label data-key="c">把 k 加大到 100，總會找到相關的</label>
+  <label data-key="d">改用比較貴的模型</label>
+  <p class="why">✓ 沒有可靠資料時，模型很可能用自己的知識補一個看起來合理的答案（a、d 都一樣，貴的模型只是補得更像真的）。k 加大（c）只是塞進更多不相關的段落，更貴也更容易誤導。拒答加記錄能找出文件缺口，也省下一次呼叫。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 8：同事想用 RRF 的分數當拒答門檻：「最高分低於 0.02 就說不知道」。這樣可行嗎？</p>
+  <label data-key="a">可行，RRF 分數越高越相關</label>
+  <label data-key="b">可行，但門檻要改成 0.5</label>
+  <label data-key="c">不可行：RRF 只由名次決定，不管結果多不相關，兩路的第 1 名分數都一樣；門檻要用重排（或其他代表相關程度的）分數</label>
+  <label data-key="d">不可行，因為 RRF 分數可能是負的</label>
+  <p class="why">✓ RRF 的分數只跟名次有關：檢索結果再爛，總有一段是第 1 名，拿到 1/61 或 2/61（a、b 錯；而且 RRF 分數最高也只有 2/61 ≈ 0.033，0.5 永遠達不到）。1／(k＋名次) 一定是正的（d 錯）。RRF 用來排序，門檻要用重排模型的 <code>relevance_score</code> 這類「這段跟問題有多相關」的分數。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>只用向量搜尋</strong>：商品編號、專有名詞、很短的問題找不到。加上關鍵字那一路，用 RRF 合併。</li>
+  <li><strong>用 simple 全文檢索處理中文</strong>：<code>to_tsvector</code> 不會切中文，「燕麥奶」比對不到「可改燕麥奶」。改用 pg_trgm，或導入中文斷詞、搜尋引擎。</li>
+  <li><strong>pg_trgm 條件寫成函式</strong>：<code>word_similarity($1, content) &gt; 0.1</code> 用不到 GIN 索引。寫成 <code>$1 &lt;% content</code>，用 <code>EXPLAIN</code> 確認。</li>
+  <li><strong>用 <code>SET</code> 改門檻</strong>：設定會留在連線上，連線池會把它帶給下一個請求。在交易裡用 <code>SET LOCAL</code>。</li>
+  <li><strong>分數直接相加合併</strong>：尺度不同，某一路會主導。用 RRF。</li>
+  <li><strong>用 RRF 分數當拒答門檻</strong>：它只代表名次。門檻用重排分數。</li>
+  <li><strong>把半段文件塞進 context</strong>：可能剛好切掉但書。放不下就整段不放，繼續看下一段。</li>
+  <li><strong>相信模型的引用</strong>：不存在的 id、空的 sources 都要由程式擋下來，而且只要有一個不對就整個拒答。</li>
+  <li><strong>沒有拒答門檻</strong>：沒有資料時模型會自己補答案。分數太低就不呼叫模型，回覆「需要請店員確認」並記錄。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>向量搜尋抓意思，對編號、專有名詞、很短的詞很弱；關鍵字搜尋相反。混合搜尋兩路一起跑。</li>
+  <li>中文的關鍵字那一路用 pg_trgm：<code>gin_trgm_ops</code> 的 GIN 索引、<code>$1 &lt;% content</code> 篩選、<code>word_similarity</code> 排序；門檻預設 0.6，在交易裡 <code>SET LOCAL</code> 調低。</li>
+  <li>RRF：每一路給 1／(k＋名次)，加總後排序，k 常用 60；只出現在一路的也能被選上。它只能排序，不能當門檻。</li>
+  <li>重排把問題與候選一起交給模型精細判斷，只用在合併後的前 20 名左右；它的分數可以當拒答門檻。</li>
+  <li>組 context：短 id（c1、c2…）＋標題路徑，內容跳脫，在 token 預算內整段放或不放，id 依放入順序編號並記住對應。</li>
+  <li>引用：用結構化輸出要 <code>{ answer, sources }</code>，程式檢查每個 source 都在這次的 id 裡；分數太低、沒有來源、引用不存在，一律拒答並記錄。</li>
+  <li>Claude 的 citations 功能（<code>search_result</code> block）引用位置由 API 保證，但不能和 <code>output_config.format</code> 一起用。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 8 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 9：客服回報：顧客問「可頌有蛋嗎」，助理回「這個問題我需要請店員確認」，但門市手冊明明有寫。先查什麼？</p>
+  <label data-key="a">把 system prompt 改得更明確，要求模型盡量根據資料回答</label>
+  <label data-key="b">換成更強的模型，讓它更會從給的資料裡找出答案</label>
+  <label data-key="c">查這次的紀錄：正確段落有沒有被檢索到、排第幾、有沒有放進 context</label>
+  <label data-key="d">把重排的門檻調低，讓分數比較低的段落也能拿去回答</label>
+  <p class="why">✓ RAG 的回答上限就是找到的那幾段，所以先分清楚是檢索還是生成出錯。正確段落沒找到，查切塊、兩路各自的名次與索引；找到了卻沒放進 context，查預算與排序；都放進去了，才輪到 prompt 與模型。a 錯在正確段落根本沒送到模型面前時，prompt 寫得再好也答不出來。（第 8、10 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 10：紀錄顯示 c2（「拿鐵 110 元：濃縮咖啡加鮮奶…」）有放進 context，回答引用了 c2，引用驗證也通過，回答卻寫「拿鐵 100 元」。是哪一段出錯？</p>
+  <label data-key="a">生成：段落和引用都對，是模型寫錯；引用驗證不檢查內容是否一致</label>
+  <label data-key="b">檢索：c2 的塊切得太大，價格被其他內容稀釋，要切得更小</label>
+  <label data-key="c">引用驗證：回答既然是錯的，就表示驗證程式漏掉了不存在的 id</label>
+  <label data-key="d">組 context：c2 被預算截掉一半，模型只看到不完整的價格</label>
+  <p class="why">✓ 正確段落已經在 context、引用也指向它，檢索沒有錯，錯在生成。引用驗證只證明回答指向這次給的資料，不證明內容符合；內容對不對要靠 eval，金額這類能用程式取得的就不要相信模型寫的數字。c 錯在 c2 是這次給的 id，驗證本來就該通過，它沒有漏檢。（第 10 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 11：同事把手冊改成一句一塊，說「塊越小越精準」，於是「起司蛋糕含蛋、奶、小麥。它不含堅果。」被切成兩塊。顧客問「起司蛋糕含堅果嗎」，會怎樣？</p>
+  <label data-key="a">更準：「它不含堅果」這塊字少、主題單一，跟問題的相似度最高</label>
+  <label data-key="b">一樣：兩塊在文件裡相鄰，檢索時會一起被找回來交給模型</label>
+  <label data-key="c">只是比較貴：塊變多，embedding 的費用增加，檢索結果不變</label>
+  <label data-key="d">「它不含堅果」不知道「它」是誰，不容易被找到，找到了模型也無法確定</label>
+  <p class="why">✓ 塊太小會失去上下文：「起司蛋糕」留在前一塊，這一塊的向量裡沒有它，就算排進前幾名，模型也不能確定講的是哪個商品。起點是按標題切、太長才切在換行處、相鄰塊重疊，並把標題路徑接在內容前面算 embedding，再用 eval 比較切法。b 錯在每一塊各自算分數、各自排名，相鄰不代表會一起被找回來。（第 8 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 12：新品「桂花烏龍拿鐵」上架，菜單也重新匯入了。顧客問這個品名，只用向量搜尋回來的都是一般的茶和拿鐵段落，最該做的是？</p>
+  <label data-key="a">換一個維度更高的 embedding 模型，讓它分得出新品和舊品</label>
+  <label data-key="b">加一路關鍵字檢索（pg_trgm），和向量的結果用 RRF 合併</label>
+  <label data-key="c">把向量搜尋取的筆數加大，讓新品那一段也能擠進候選</label>
+  <label data-key="d">在 system prompt 列出新品名稱，提醒模型有這項商品</label>
+  <p class="why">✓ 向量抓的是意思，專有名詞、新詞、商品編號的字面細節會被磨掉，模型會把新品當成一般的茶或咖啡；比對字面的關鍵字檢索一找就到。兩路互補：關鍵字找不到「植物奶」對「燕麥奶」，向量找得到，所以兩路一起跑再合併。a 錯在換哪個模型都沒看過你家的新品名，問題出在向量本來就不看字面，不是維度不夠。（第 10 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 13：檢索流程是兩路各自檢索、RRF 合併、再重排。要決定「資料不夠，不回答」，該看哪一個分數？</p>
+  <label data-key="a">RRF 合併後的最高分：兩路都排在前面的段落，分數才會高</label>
+  <label data-key="b">兩路分數相加後的最高分：同時考慮了意思和字面</label>
+  <label data-key="c">重排的最高分：它是把問題和段落放在一起判斷的相關程度</label>
+  <label data-key="d">兩路是否都有找到：只出現在一路的段落就當作不夠相關</label>
+  <p class="why">✓ 重排分數代表「這段跟問題有多相關」，可以當拒答門檻；門檻值用 eval 在答錯率和拒答率之間取捨。RRF 只由名次決定，檢索結果再爛也總有第 1 名，拿到的分數一樣，所以只能排序、不能當門檻。a 是最常見的誤會：兩路都排前面只代表相對名次高，不代表真的相關。（第 10 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 14：重排為什麼比向量搜尋準，卻只用在合併後的少量候選？</p>
+  <label data-key="a">向量是兩邊各自先算好、只比距離；重排把問題和段落一起判斷，每段都要跑一次模型</label>
+  <label data-key="b">重排模型產生的向量維度比較高，細節比較多，但存進資料庫太佔空間</label>
+  <label data-key="c">重排同時比對字面和意思，等於再做一次混合搜尋，做太多次會重複</label>
+  <label data-key="d">重排看的是整份文件而不是單一塊，上下文完整，但送出的 token 太多</label>
+  <p class="why">✓ 向量搜尋是便宜的粗篩：段落的向量離線就算好，比對時只算距離，看不到問題和段落之間的細節關係。重排每段都要把問題和段落一起送進模型，準很多但又貴又慢，所以只對合併後的前 20 名左右做，挑出最後給 LLM 的幾段。b 錯在重排不產生要存的向量，它直接輸出每段的相關分數。（第 10 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 15：chunks 表變大後加了 HNSW 索引，查詢快了很多；eval 卻顯示有幾題原本找得到的段落，現在掉出前 k 名。先怎麼查？</p>
+  <label data-key="a">索引的資料損毀了，先重建索引再重跑一次 eval</label>
+  <label data-key="b">索引的運算子類別和查詢不一致，把距離算錯了</label>
+  <label data-key="c">把 HNSW 換成 B-tree 索引，讓搜尋結果變成精確的</label>
+  <label data-key="d">同一批問題各跑一次走索引、一次精確搜尋，比對前 k 名重疊多少</label>
+  <p class="why">✓ HNSW 是近似最近鄰索引，用一點召回率換速度，偶爾漏掉真正最近的段落是它的工作方式，不是壞掉。先量召回率：在交易裡關掉索引做精確搜尋，跟走索引的結果比；有過濾條件時再用 EXPLAIN 看是不是候選被過濾掉太多，然後才調設定。b 錯在運算子類別不一致時規劃器根本不用這個索引，退回全表掃描，結果反而是精確的。（第 9 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 16：要把 embedding 換成新模型，維度和舊的一樣。同事先把查詢改用新模型並上線，再讓背景工作慢慢重算舊的塊，重算完成前會怎樣？</p>
+  <label data-key="a">不受影響：維度一樣，新舊兩個模型的向量可以直接比較</label>
+  <label data-key="b">還沒重算的塊跟新模型的查詢向量比，分數沒有意義，搜尋悄悄變差</label>
+  <label data-key="c">pgvector 發現兩個向量來自不同的模型，查詢會直接報錯</label>
+  <label data-key="d">只有 cosine 距離受影響，這段期間先改用內積排序就好</label>
+  <p class="why">✓ 每個模型有自己的座標系，維度一樣只代表數字的個數相同。順序要反過來：新模型先寫進新欄位或新表，背景全部重算、用 eval 比較新舊兩組，確定比較好才把查詢切過去；每一塊記下 <code>embed_model</code>，才查得出哪些還是舊的。c 錯在資料庫只看得到數字，不知道是哪個模型算的，所以不會有任何錯誤訊息。（第 8、9 課）</p>
+</div>
+<p>這個階段的重點整理成<a href="../sheets/stage-4.html">一頁圖解</a>。</p>
+<p>下一課學怎麼證明這一切真的有效：建立 eval 集，用程式評分檢索與回答，並在 CI 擋下品質退步的修改。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

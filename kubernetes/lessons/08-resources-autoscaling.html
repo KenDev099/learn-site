@@ -1,0 +1,546 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>8. 資源與自動擴展：requests、limits、OOMKilled 與 HPA</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="8" data-practice="kubernetes">
+<header>
+  <div class="eyebrow">階段 3：穩定上線 · 第 8 課</div>
+  <h1>資源與自動擴展：requests、limits、OOMKilled 與 HPA</h1>
+</header>
+<main>
+
+<p>到目前為止，練習的 manifest 裡都有一段 <code>resources</code>，我們一直照抄沒解釋。這一段決定三件事：Pod 能不能被排上節點、容器用太多記憶體或 CPU 時會發生什麼事、自動擴展要依據什麼來算。設錯的代價很具體：Pod 一直 Pending、報表請求一打容器就被殺、尖峰時 API 慢到逾時但 Pod 看起來都很健康。</p>
+<p>學完這課，你能從 Pending、OOMKilled、延遲變高這三種症狀反推出是哪個資源設定有問題，並讓服務依流量自動擴縮。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>requests：Pod 為什麼一直 Pending，因為排程器只看保留量，不看實際用量。</li>
+  <li>limits、Node 應用的記憶體：記憶體超過會被殺（OOMKilled）、CPU 超過只會變慢；Node 的 heap 上限為什麼可能比容器的 limit 還大。</li>
+  <li>QoS 類別與 namespace 的防護：節點記憶體不夠時誰先被趕走，怎麼替整個 namespace 加上預設值和配額。</li>
+  <li>量測再設定：requests 與 limits 的數字從哪裡來，上線後多久檢討一次。</li>
+  <li>HPA 怎麼算、怎麼寫：依 CPU 自動擴縮，副本數是怎麼算出來的，什麼情況下它幫不上忙。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="03-deployments.html">第 3 課</a>的 Deployment：<code>replicas</code> 宣告要幾個 Pod，控制器負責補齊。</li>
+  <li><a href="../../devops/lessons/13-scaling.html">devops 課第 13 課</a>的容量規劃：先量出一個副本撐得住多少流量，不夠就水平擴展、加副本。</li>
+  <li><a href="../../devops/lessons/22-metrics-slo.html">devops 課第 22 課</a>的指標：p95 是「95% 的請求都不超過這個值」，看分布才知道尖峰時的樣子。</li>
+  <li><a href="../../node/lessons/23-profiling-memory.html">node 課第 23 課</a>的記憶體：<code>process.memoryUsage()</code> 分出 heap（JavaScript 物件）與 rss（整個程序佔用的實體記憶體）。</li>
+</ul></div>
+
+<h2>requests：排程器看的是「保留量」</h2>
+<p>容器的 <code>resources</code> 有兩組值：</p>
+<pre>resources:
+  requests:          # 保留量：排程器用它找放得下的節點
+    cpu: 100m
+    memory: 96Mi
+  limits:            # 上限：容器執行時最多能用多少
+    memory: 192Mi</pre>
+<p><strong>requests（請求量）</strong>是替容器保留的資源。排程器（scheduler）決定 Pod 放哪個節點時，只看 requests，不看實際用量：它把節點上所有 Pod 的 requests 加起來，跟節點的 <strong>Allocatable（可分配量）</strong>比，還放得下才放。Allocatable 是節點的總資源扣掉作業系統、kubelet 自己保留的部分。</p>
+<p>假設一個節點 Allocatable 是 2 顆 CPU，每個 Pod 的 CPU requests 是 500m：</p>
+<figure>
+  <svg viewBox="0 0 700 230" role="img" aria-label="節點可分配 2 CPU，四個各要求 500m 的 Pod 把它填滿，第五個 Pod 沒有節點放得下而 Pending">
+    <defs><marker id="r8a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="20" y="40" width="440" height="140" rx="8"/>
+    <text class="d-text" x="40" y="30">節點：Allocatable cpu 2（2000m）</text>
+    <rect class="d-soft" x="40" y="60" width="95" height="100" rx="6"/>
+    <rect class="d-soft" x="145" y="60" width="95" height="100" rx="6"/>
+    <rect class="d-soft" x="250" y="60" width="95" height="100" rx="6"/>
+    <rect class="d-soft" x="355" y="60" width="95" height="100" rx="6"/>
+    <text class="d-text" x="87" y="105" text-anchor="middle">Pod 1</text>
+    <text class="d-text" x="192" y="105" text-anchor="middle">Pod 2</text>
+    <text class="d-text" x="297" y="105" text-anchor="middle">Pod 3</text>
+    <text class="d-text" x="402" y="105" text-anchor="middle">Pod 4</text>
+    <text class="d-small" x="87" y="128" text-anchor="middle">500m</text>
+    <text class="d-small" x="192" y="128" text-anchor="middle">500m</text>
+    <text class="d-small" x="297" y="128" text-anchor="middle">500m</text>
+    <text class="d-small" x="402" y="128" text-anchor="middle">500m</text>
+    <text class="d-small" x="240" y="200" text-anchor="middle">requests 合計 2000m：滿了（就算實際只用了 300m）</text>
+    <rect class="d-box" x="560" y="70" width="110" height="80" rx="6"/>
+    <text class="d-text" x="615" y="105" text-anchor="middle">Pod 5</text>
+    <text class="d-accent" x="615" y="128" text-anchor="middle">Pending</text>
+    <path class="d-line" d="M555,110 L470,110" marker-end="url(#r8a)"/>
+    <text class="d-small" x="512" y="98" text-anchor="middle">放不下</text>
+  </svg>
+  <figcaption>排程只看 requests 的加總。四個 Pod 就算都很閒，第五個也排不上。</figcaption>
+</figure>
+<p>Pod 排不上時停在 <strong>Pending</strong>，原因寫在事件裡。練習 1 的起始檔要求每個 Pod 4 顆 CPU、8Gi 記憶體，套用之後：</p>
+<pre>kubectl create namespace try-08
+kubectl apply -n try-08 -f kubernetes/practice/work/08/ex1/
+kubectl get pods -n try-08                    # 3 個都是 Pending
+kubectl describe pod -n try-08 &lt;其中一個&gt;     # 看最後的 Events
+
+  Warning  FailedScheduling  default-scheduler  0/3 nodes are available:
+    1 node(s) had untolerated taint(s), 2 Insufficient memory. ...</pre>
+<p>讀法：3 個節點都不行；control-plane 有不讓一般 Pod 上去的污點（taint），兩個 worker 記憶體不夠（<code>Insufficient memory</code>）。再看節點能分多少：</p>
+<pre>kubectl describe node learn-k8s-worker | grep -A6 Allocatable
+Allocatable:
+  cpu:     8
+  memory:  8024556Ki     # 約 7.65Gi，比 8Gi 小：一個都放不下
+...
+kubectl describe node learn-k8s-worker | grep -A8 "Allocated resources"   # 已經被 requests 佔掉多少</pre>
+<div class="callout">kind 的每個節點都是同一台 Docker VM 裡的容器，所以三個節點都回報整台 VM 的 8 顆 CPU 與約 7.65Gi 記憶體，加起來其實是超賣的。正式環境每個節點是獨立的機器，Allocatable 才是真的。</div>
+<p>requests 設多少是取捨：</p>
+<ul>
+  <li><strong>太大</strong>：保留了用不到的資源，節點很快「排滿」，實際 CPU 卻很閒，要多花錢開節點。</li>
+  <li><strong>太小</strong>：太多 Pod 擠在同一個節點，大家同時忙的時候互相搶 CPU 與記憶體，節點記憶體不足時也最先被驅逐（後面會講）。</li>
+  <li><strong>不寫</strong>：排程器當它不用資源。下面會看到，這還會讓 HPA 算不出使用率。</li>
+</ul>
+<p>單位要寫對：</p>
+<div class="table-wrap"><table>
+  <tr><th>寫法</th><th>意思</th></tr>
+  <tr><td><code>cpu: 100m</code></td><td>100 <strong>millicore（毫核）</strong>＝0.1 顆 CPU。<code>0.1</code> 與 <code>100m</code> 相同，<code>1</code> 與 <code>1000m</code> 相同</td></tr>
+  <tr><td><code>memory: 96Mi</code></td><td>96 × 1024 × 1024 bytes（Mi、Gi 是 2 的次方單位）</td></tr>
+  <tr><td><code>memory: 96M</code></td><td>96 × 1000 × 1000 bytes，比 96Mi 少約 5%；<code>128M</code> 和 <code>128Mi</code> 是不同的值</td></tr>
+  <tr><td><code>memory: 128m</code></td><td>0.128 <strong>byte</strong>：小寫 m 是千分之一，記憶體寫成這樣是常見的手誤</td></tr>
+</table></div>
+<p>本課程的記憶體一律用 Mi、Gi，CPU 用 m。</p>
+
+<h2>limits：記憶體超過會被殺，CPU 超過會變慢</h2>
+<p><strong>limits（上限）</strong>是容器執行時能用的最大量，由節點的 Linux 核心強制執行。記憶體和 CPU 的處理方式完全不同，症狀也不同。</p>
+<p><strong>記憶體超過 limit：容器被殺掉。</strong>核心的 OOM killer（out of memory，記憶體不足時負責挑程序殺掉的機制）用 SIGKILL 直接結束程序，程序沒機會做任何收尾。cafe-api 有個 <code>POST /alloc?mb=N</code>，會暫時佔用 N MB 的記憶體，模擬產生大報表。練習 2 的起始檔 limit 是 128Mi，打一個 150MB 的請求：</p>
+<pre>kubectl apply -n try-08 -f kubernetes/practice/work/08/ex2/
+kubectl exec -n k8s-tools deploy/probe -- curl -sS -X POST \
+  'http://cafe-api.try-08.svc.cluster.local/alloc?mb=150'
+curl: (52) Empty reply from server         # 連線直接斷掉，沒有回應
+
+kubectl get pods -n try-08 -l app.kubernetes.io/name=cafe-api
+NAME                        READY   STATUS    RESTARTS     AGE
+cafe-api-6f9c7d5b8-k2x9p    1/1     Running   1 (8s ago)   1m</pre>
+<p>Pod 還是 Running，只是 RESTARTS 多了 1：被殺的是容器，kubelet 依 <code>restartPolicy: Always</code> 立刻把它重啟。要知道上一次為什麼結束，看 <strong>lastState</strong>：</p>
+<pre>kubectl describe pod -n try-08 cafe-api-6f9c7d5b8-k2x9p
+    Last State:     Terminated
+      Reason:       OOMKilled
+      Exit Code:    137
+
+# 或直接取欄位
+kubectl get pod -n try-08 cafe-api-6f9c7d5b8-k2x9p \
+  -o jsonpath='{.status.containerStatuses[0].lastState.terminated}'</pre>
+<p><strong>OOMKilled</strong> 是容器因為超過記憶體上限被殺。<strong>137</strong> 是 128＋9：程序被訊號結束時，結束碼是 128 加上訊號編號，SIGKILL 是 9（<a href="../../devops/lessons/03-processes-signals.html">devops 課第 3 課</a>）。同一個請求一直打，容器就一直被殺，重啟間隔越拉越長，最後進入第 7 課講過的 CrashLoopBackOff。注意 CrashLoopBackOff 是「正在等下一次重啟」的狀態，不是原因；原因要看 lastState。</p>
+<p><strong>CPU 超過 limit：不會被殺，而是被節流（throttling）。</strong>核心把時間切成很短的週期，CPU limit 200m 的意思是每個週期只能用 20% 的 CPU 時間；額度用完，容器的所有執行緒就被暫停到下一個週期。程式沒有錯誤、沒有重啟，只是每件事都變慢，請求在後面排隊。</p>
+<p>用 cafe-api 的 <code>GET /hash</code>（固定的計算量，做一次 pbkdf2）比較兩個 CPU limit：</p>
+<pre>               CPU limit 100m    CPU limit 1000m
+/hash 的 p50   約 1200 ms        約 230 ms</pre>
+<p>這是在本課程的 kind 叢集量到的數字，你的機器會不同，但差距的方向一樣。limit 太緊的 Pod，啟動也會變慢：Node 載入程式碼一樣要 CPU。</p>
+<p>所以三種症狀對應三種問題：</p>
+<div class="table-wrap"><table>
+  <tr><th>症狀</th><th>怎麼確認</th><th>通常的原因</th></tr>
+  <tr><td>Pod 一直 Pending</td><td><code>describe pod</code> 的 FailedScheduling：<code>Insufficient cpu／memory</code></td><td>requests 比任何節點剩下的可分配量都大，或叢集真的滿了</td></tr>
+  <tr><td>RESTARTS 增加、請求被斷線</td><td>lastState：<code>OOMKilled</code>、exit code <code>137</code></td><td>記憶體 limit 太小，或程式記憶體洩漏</td></tr>
+  <tr><td>延遲變高、Pod 都正常</td><td><code>kubectl top pod</code> 的 CPU 貼著 limit；監控的 <code>container_cpu_cfs_throttled_periods_total</code> 在增加</td><td>CPU limit 太緊</td></tr>
+</table></div>
+<div class="callout practice"><strong>💡 實務上：看到 OOMKilled，調大 limit 只是止血</strong><br>客服回報「匯出月報表一直失敗」，你查到 cafe-api 的 lastState 是 OOMKilled。先把被殺的時間點跟 log、監控對起來：是每次匯出報表就被殺，還是記憶體隨時間慢慢長大、隔幾小時被殺一次？前者是單一請求用太多記憶體，後者多半是洩漏，下一節會講 Node 應用怎麼分辨。可以先把 limit 調大讓功能恢復，但要開單追根本原因：調大 limit 會讓每個副本保留更多記憶體、多花錢，洩漏也只是被延後。</div>
+<p>CPU limit 要不要設，是資深工程師之間常見的爭論。很多團隊對 API 服務<strong>只設 CPU requests、不設 CPU limit</strong>：requests 已經保證了基本份額，節點有空閒 CPU 時讓它用，尖峰才不會被自己的 limit 節流。代價是一個失控的 Pod 可能吃掉節點上空閒的 CPU，影響同節點上沒有保留到的部分。<strong>記憶體則一定要設 limit</strong>：記憶體不像 CPU 可以「借用再還」，一個洩漏的 Pod 沒有上限，會把整個節點的記憶體用光，連累別人。本課程的練習都採用這個做法：CPU 只寫 requests，記憶體 requests 與 limits 都寫。</p>
+
+<h2>Node 應用的記憶體</h2>
+<p>容器的記憶體用量是整個程序的實體記憶體，不只是 JavaScript 物件。node 課第 23 課的 <code>process.memoryUsage()</code> 分得很清楚：</p>
+<ul>
+  <li><code>heapUsed</code>／<code>heapTotal</code>：V8 heap，放 JavaScript 物件、字串、閉包。</li>
+  <li><code>external</code>、<code>arrayBuffers</code>：heap 以外的記憶體，Buffer 就在這裡。<code>/alloc</code> 佔用的正是 Buffer。</li>
+  <li><code>rss</code>：整個程序實際佔用的記憶體，含 heap、Buffer、程式碼、原生函式庫。容器 limit 比的是它（嚴格說是整個容器的 cgroup 用量）。</li>
+</ul>
+<p>V8 有自己的 heap 上限，接近上限時才會努力做 GC（垃圾回收）。問題在於這個上限是 V8 自己決定的，不一定比容器 limit 小。在本課程用的 <code>node:24.22.2-alpine3.24</code> 實測：容器限制 128MB 或 256MB 時，heap 上限都是約 259MB，比 limit 還大。heap 在長大時，V8 覺得離上限還遠、不急著回收，容器就先被核心殺掉了。</p>
+<p>做法是用 <code>--max-old-space-size</code>（單位 MiB）明確設定 heap 上限，<strong>設在容器記憶體 limit 的 70～75%</strong>，剩下的留給 Buffer、程式碼與原生記憶體：</p>
+<pre>env:
+  - name: NODE_OPTIONS
+    value: --max-old-space-size=192     # limit 256Mi 的 75%
+resources:
+  limits:
+    memory: 256Mi</pre>
+<p>設了之後，heap 真的不夠時，你會看到 Node 自己印出 <code>JavaScript heap out of memory</code> 再結束，log 裡有線索；沒設時只看到 OOMKilled，log 什麼都沒有。另外兩個習慣：</p>
+<ul>
+  <li><code>kubectl top pod</code> 看到的記憶體是整個容器的用量，跟應用程式自己記錄的 <code>rss</code> 對照，就知道是 heap 長大（可能是洩漏，用 node 課第 23 課的 heap snapshot 查）還是 Buffer、原生記憶體。</li>
+  <li>會一次載入大量資料的請求（報表、匯出），先想能不能改成串流，而不是一直調大 limit。limit 調大，每個副本保留的記憶體也跟著變大。</li>
+</ul>
+
+<h2>QoS 類別、驅逐，以及 namespace 的防護</h2>
+<p>節點的記憶體被用光時，kubelet 不會等核心亂殺，而是主動挑 Pod 結束掉，這叫<strong>驅逐（eviction）</strong>。被驅逐的 Pod 會被刪除，由 Deployment 在別的節點重建。挑誰先走，看 Pod 的 <strong>QoS 類別（Quality of Service）</strong>，它在 Pod 建立時由 resources 的寫法決定：</p>
+<div class="table-wrap"><table>
+  <tr><th>QoS 類別</th><th>條件</th><th>節點記憶體不足時</th><th>適合</th></tr>
+  <tr><td><code>Guaranteed</code></td><td>每個容器都有 CPU 與記憶體的 requests 和 limits，而且 requests ＝ limits</td><td>最後才被驅逐</td><td>資料庫、絕對不能被擠掉的核心服務</td></tr>
+  <tr><td><code>Burstable</code></td><td>至少有一個容器寫了 requests 或 limits，但不符合 Guaranteed</td><td>BestEffort 之後；用量超過 requests 越多越先走</td><td>大多數 API 與 worker（本課程的寫法）</td></tr>
+  <tr><td><code>BestEffort</code></td><td>完全沒寫 requests 與 limits</td><td>第一個被驅逐</td><td>幾乎沒有適合的場景</td></tr>
+</table></div>
+<p>用 <code>kubectl get pod &lt;名稱&gt; -o jsonpath='{.status.qosClass}'</code> 可以看到。替服務選擇：</p>
+<ul>
+  <li><strong>API</strong>：Burstable，CPU requests 設在平常用量、不設 CPU limit，記憶體 requests 與 limits 都設。尖峰時可以借用節點空閒的 CPU。</li>
+  <li><strong>BullMQ worker</strong>（<a href="../../nestjs/lessons/20-queues-bullmq.html">NestJS 課第 20 課</a>）：一樣是 Burstable。它常把 CPU 用滿，如果跟 API 放在同一批節點，要確定 requests 反映真實用量，不然排程器會把太多 worker 塞在一起，拖慢同節點的 API。</li>
+  <li><strong>Guaranteed</strong> 的代價是 limit 等於 request，尖峰時沒有彈性，保留量也最大。真的需要穩定延遲的才用。</li>
+</ul>
+<p>多個團隊共用叢集時，靠每個人自律寫 resources 不夠。namespace 層級有兩個防護：</p>
+<ul>
+  <li><strong>LimitRange</strong>：替這個 namespace 裡沒寫 resources 的容器補上預設值（也可以規定每個容器的最小、最大值）。<code>defaultRequest</code> 補 requests，<code>default</code> 補 limits，兩個是分開的；只寫 <code>default</code> 時，requests 會跟著等於 limit。</li>
+  <li><strong>ResourceQuota</strong>：限制整個 namespace 的總量，例如所有 Pod 的 requests.cpu 加起來最多 1 顆、最多 10 個 Pod。超過時，建立 Pod 的請求直接被 API server 拒絕，訊息是 <code>exceeded quota</code>。</li>
+</ul>
+<pre>apiVersion: v1
+kind: LimitRange
+metadata:
+  name: defaults
+spec:
+  limits:
+    - type: Container
+      defaultRequest:       # 沒寫 requests 時
+        cpu: 100m
+      default:              # 沒寫 limits 時
+        memory: 256Mi</pre>
+<p>quota 用 Deployment 建 Pod 時有個陷阱：被拒絕的是 ReplicaSet 建 Pod 的請求，<code>kubectl apply</code> 本身是成功的。你只會看到副本數不夠，原因在 ReplicaSet 的事件裡：</p>
+<pre>kubectl get events -n team-a --field-selector reason=FailedCreate
+... Error creating: pods "api-7d9..." is forbidden: exceeded quota: team-quota,
+    requested: pods=1, used: pods=10, limited: pods=10</pre>
+<p>另外，quota 一旦限制了 <code>requests.cpu</code>，namespace 裡每個 Pod 都必須有 CPU requests，沒寫的會被拒絕。所以 ResourceQuota 幾乎都跟 LimitRange 一起用。</p>
+
+<h2>量測再設定</h2>
+<p>requests 與 limits 應該來自量測，不是猜測或照抄。量測工具是 <strong>metrics-server</strong>：它定期向每個節點的 kubelet 收集每個容器的 CPU 與記憶體用量，透過 Metrics API（<code>metrics.k8s.io</code>，1.37 起為 Stable）提供給 <code>kubectl top</code> 與 HPA。本課程的叢集已經裝好 metrics-server v0.9.1（kind 的 kubelet 憑證不是叢集 CA 簽的，所以加了只適合測試環境的 <code>--kubelet-insecure-tls</code>）。</p>
+<pre>kubectl top pod -n try-08
+NAME                        CPU(cores)   MEMORY(bytes)
+cafe-api-6f9c7d5b8-k2x9p    3m           27Mi
+
+kubectl top node</pre>
+<p><code>kubectl top</code> 只是當下的快照。正式環境用監控系統（devops 課第 22 課）看一段時間的分布，流程是：</p>
+<ol>
+  <li>在接近真實的負載下（壓測或正式環境的平常日）記錄每個 Pod 的 CPU 與記憶體，看 p50 與 p95。</li>
+  <li><strong>CPU requests</strong> 設在平常的用量附近（例如 p50～p95 之間）。設得比平常用量低很多，HPA 的使用率會一直偏高，排程也會塞太滿。</li>
+  <li><strong>記憶體 requests</strong> 設在平常用量；<strong>limits</strong> 設在尖峰用量再留 25～50% 的餘裕。Node 服務再依 limit 設 <code>--max-old-space-size</code>。</li>
+  <li>上線後觀察 OOMKilled 次數、CPU 節流與延遲，定期回頭調整。</li>
+</ol>
+<div class="callout practice"><strong>💡 實務上：requests 由誰訂、多久檢討一次</strong><br>新服務上線時，requests 與 limits 通常由寫服務的團隊依壓測結果訂初值；平台團隊則看整個叢集的「requests 加總」和「實際用量」差多少，差太多就代表節點在保留用不到的資源，錢白花了。所以這些數字不是設一次就算了：上線一兩週後用監控的 p50／p95 重新調一次，之後在流量明顯變化時再看。review 時看到 <code>cpu: 1</code>、<code>memory: 1Gi</code> 這種整數，資深工程師會問「這個數字從哪裡來？」，答案是「照抄別的服務」的話，就先量再說。</div>
+<p>調整 resources 原本要重建 Pod。1.35 起 <strong>in-place resize</strong>（不重建 Pod 調整 CPU 與記憶體）是 Stable：透過 Pod 的 <code>resize</code> 子資源修改，容器可以用 <code>resizePolicy</code> 決定改了要不要重啟（記憶體縮小對很多程式不安全，常設成 <code>RestartContainer</code>）。QoS 類別在建立時決定，resize 不會改變它。自動依用量調整單一 Pod 大小的工具叫 <strong>VPA（Vertical Pod Autoscaler）</strong>，要另外安裝；本課程不用，日常用 Deployment 改 resources 再滾動更新就夠了。</p>
+
+<h2>HPA 怎麼算副本數</h2>
+<p>流量有高峰有低谷。固定 10 個副本，半夜在浪費錢；固定 2 個，中午的尖峰撐不住。<strong>HPA（HorizontalPodAutoscaler，水平 Pod 自動擴展器）</strong>依指標自動調整 Deployment 的副本數。它是 kube-controller-manager 裡的一個控制迴圈（第 1 課），預設每 15 秒做一次：</p>
+<pre>期望副本數 = ceil( 目前副本數 × 目前使用率 ÷ 目標使用率 )</pre>
+<ul>
+  <li><strong>使用率以 requests 為分母</strong>：requests 100m、實際用 90m，使用率 90%。所有 Pod 取平均。沒有 requests 就沒有分母，HPA 對這個指標不做任何事。</li>
+  <li><strong>ceil 無條件進位</strong>：3 × 90% ÷ 60% ＝ 4.5，要 5 個。寧可多一個，不要少一個。</li>
+  <li><strong>容忍度（tolerance）</strong>：比值（目前 ÷ 目標）在 0.9～1.1 之間（預設 10%）就不動作，避免數字一點點波動就調整。</li>
+  <li><strong>min／max</strong>：結果夾在 <code>minReplicas</code> 與 <code>maxReplicas</code> 之間。</li>
+  <li><strong>還沒收到指標</strong>（例如剛建立、metrics-server 還沒收集到）：維持現狀，<code>kubectl get hpa</code> 的 TARGETS 顯示 <code>&lt;unknown&gt;</code>。剛啟動、還沒 Ready 的 Pod，CPU 數字也會被特別處理，避免啟動時的高用量造成誤判。</li>
+</ul>
+<p>只用公式會有問題：流量在目標附近上下跳，HPA 就會「縮兩個、一分鐘後又擴兩個」，新 Pod 要啟動、暖快取，一直抖動反而更慢。所以 HPA 有 behavior（行為）設定，預設是：</p>
+<div class="table-wrap"><table>
+  <tr><th>方向</th><th>穩定視窗</th><th>速度上限</th></tr>
+  <tr><td>擴容（scaleUp）</td><td>0 秒：一需要就擴</td><td>每 15 秒最多「加倍」或「加 4 個」，取較多的那個</td></tr>
+  <tr><td>縮容（scaleDown）</td><td>300 秒</td><td>每 15 秒最多縮 100%（一次就能縮到 min）</td></tr>
+</table></div>
+<p><strong>穩定視窗（stabilization window）</strong>的意思是：要縮容時，回看過去 300 秒內算出來的所有建議值，取<strong>最高</strong>的那個。只要 5 分鐘內有一次算出「需要 6 個」，現在就不會縮到 6 個以下。流量真的降下來 5 分鐘，才會開始縮。擴容方向預設不回看，尖峰一來就擴，因為擴慢了的代價（使用者看到錯誤）比擴多了的代價（多付幾分鐘的錢）大。</p>
+<div class="callout">練習 4 會把這套規則寫成函式。真正的控制器還有更多細節（缺少指標的 Pod 怎麼估計、多個指標取最大、速度上限的計算），練習只做公式、容忍度、min／max 與縮容穩定視窗這四件影響日常判斷的事。</div>
+
+<h2>寫一個 HPA</h2>
+<p>cafe-api 依 CPU 自動擴展，2～5 個副本，目標平均使用率 60%：</p>
+<pre>apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cafe-api
+spec:
+  scaleTargetRef:              # 要調整的目標
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cafe-api
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60   # 以 requests 為分母的百分比
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300   # 預設值，寫出來讓下一個人看得懂</pre>
+<p>用 <code>autoscaling/v2</code>，metrics 與 behavior 都在這一版。目標為什麼是 60% 而不是 90%？擴容需要時間：HPA 每 15 秒算一次、metrics-server 的資料有延遲、新 Pod 要啟動並通過 readiness。目標留 40% 的空間，就是讓現有的 Pod 撐過這段時間。<code>minReplicas</code> 至少 2：只剩一個副本時，它被驅逐、所在節點維護或換版，服務就中斷。</p>
+<p>觀察它：</p>
+<pre>kubectl get hpa -n try-08 -w
+NAME       REFERENCE             TARGETS        MINPODS   MAXPODS   REPLICAS
+cafe-api   Deployment/cafe-api   cpu: 180%/60%  2         5         2
+cafe-api   Deployment/cafe-api   cpu: 180%/60%  2         5         5
+
+kubectl describe hpa cafe-api -n try-08    # Events 寫了每次調整的原因</pre>
+<p>接上 HPA 時有幾件事一定要一起做：</p>
+<ul>
+  <li><strong>從 Deployment 的 manifest 移除 <code>replicas</code></strong>。HPA 會直接改 Deployment 的 <code>spec.replicas</code>；manifest 裡如果還寫著 <code>replicas: 3</code>，每次 <code>kubectl apply</code>（每次 CI 部署）都會把副本數改回 3，尖峰時就是把 8 個砍成 3 個，直到 HPA 下一輪再擴回來。已經在跑的 Deployment 要拿掉這個欄位時，官方文件提醒：client-side apply 會把「上次有、這次沒有」的欄位刪掉，副本數會先掉回預設的 1，要照文件的步驟先處理 last-applied 設定。第 13 課的 Helm chart 也一樣，開了 HPA 就不輸出 replicas。</li>
+  <li><strong>容器要有 CPU requests</strong>，不然 TARGETS 永遠是 <code>&lt;unknown&gt;</code>。</li>
+  <li><strong>要有 readinessProbe</strong>（<a href="07-probes-shutdown.html">第 7 課</a>）：擴出來的 Pod 準備好才收流量，不然擴容那一刻反而出錯。</li>
+</ul>
+<div class="callout practice"><strong>💡 實務上：接上 HPA 之後，手動改的副本數會被改回去</strong><br>週年慶當天流量會暴增，值班的人提前用 <code>kubectl scale</code> 加到 10 份；但活動還沒開始，CPU 很低，HPA 依公式算出只要 2 份，幾分鐘後就縮回去了。開了 HPA 之後，副本數歸 HPA 管：要預先加量，改的是 HPA 的 <code>minReplicas</code>（例如活動前一天調到 6、活動結束改回 2），而且一樣走 git。事前也要確認 <code>maxReplicas</code> 夠用、節點放得下、資料庫撐得住那麼多連線，否則 HPA 擴到上限就停了，或擴出來的 Pod 卡在 Pending。</div>
+<p>HPA 幫不上忙的情況：</p>
+<ul>
+  <li><strong>節點不夠</strong>：HPA 只建立 Pod，不會加機器。節點放不下時，新 Pod 停在 Pending（<code>Insufficient cpu</code>）。要由 <strong>Cluster Autoscaler</strong> 或 <strong>Karpenter</strong> 發現有 Pod 排不上，再向雲端開新節點；EKS 上常用 Karpenter 或 EKS Auto Mode（第 15 課）。開節點要一兩分鐘，所以 HPA 目標要留空間。</li>
+  <li><strong>瓶頸不在這個服務</strong>：慢的是資料庫時，多開 API 只是多了更多連線去搶資料庫，可能更糟。</li>
+  <li><strong>佇列型 worker</strong>：BullMQ worker 等工作時 CPU 很低、有工作就滿載，CPU 使用率反映不了「工作堆了多少」。應該看佇列長度，常用的工具是 <strong>KEDA</strong>，它依佇列長度等外部指標調整副本數，沒有工作時還能縮到 0。HPA 自己縮到 0（HPAScaleToZero）在 1.37 才進入 Beta，本課程不使用。</li>
+</ul>
+
+<h2>練習</h2>
+<p>在 <code>learn</code> 資料夾執行頁面上的指令，起始檔會複製到 <code>kubernetes/practice/work/08/</code>。每一題先做靜態檢查，通過了才套用到該題專屬的 namespace（<code>k8s-08-ex1</code> 這種名字）。練習 2 要先重現一次 OOMKilled，練習 5 要加壓 2 分鐘再等它縮回，各需要幾分鐘。自己試的時候用前面的 <code>try-08</code> namespace，用完 <code>kubectl delete namespace try-08</code>。</p>
+
+<div class="local" data-test="ex1" data-files="ex1/deployment.yaml ex1/notes.md">
+  <p>練習 1：<code>ex1/deployment.yaml</code> 每個 Pod 要求 4 顆 CPU、8Gi 記憶體，3 個副本全部 Pending。先套用到 <code>try-08</code>，用 <code>kubectl describe pod</code> 找出 FailedScheduling 的訊息貼進 <code>ex1/notes.md</code>，用 <code>kubectl describe node</code> 記下節點的 Allocatable。然後把容器 <code>api</code> 的 resources 改成 requests cpu 100m、memory 96Mi，limits memory 192Mi；replicas 維持 3，不要刪掉 resources，記憶體單位用 Mi。測試會確認 3 個 Pod 都 Ready。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="ex2-diagnosis.json ex2/deployment.yaml">
+  <p>練習 2：<code>ex2/</code> 的 cafe-api 記憶體 limit 是 128Mi，一打 <code>POST /alloc?mb=150</code> 容器就被殺。先照上面的步驟重現，在 <code>ex2-diagnosis.json</code> 寫下容器上次結束的 <code>reason</code>（字串）與 <code>exitCode</code>（數字）。再修改 <code>ex2/deployment.yaml</code>：把 limits.memory 調到處理得了這個請求，但不超過 512Mi 的記憶體預算；加上環境變數 <code>NODE_OPTIONS</code>，用 <code>--max-old-space-size</code> 把 heap 上限設在 limit 的 80% 以下。測試會先用 128Mi 重現一次、比對你的診斷，再套用你的設定，同一個請求要回 200 而且容器沒有重啟。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="ex3/guardrails.yaml">
+  <p>練習 3：<code>ex3/guardrails.yaml</code> 要替一個常常忘記寫 resources 的團隊加上防護。完成 LimitRange：沒寫 resources 的容器自動得到 requests cpu 50m、memory 64Mi 與 limits memory 128Mi。完成 ResourceQuota：整個 namespace 的 requests.cpu 總和最多 1、requests.memory 總和最多 1Gi、最多 10 個 Pod。測試會在 namespace 裡建立沒寫 resources 的 Pod 檢查預設值，再建立要求 2 顆 CPU 的 Pod 與 12 個副本的 Deployment，兩者都要被 quota 擋下。</p>
+</div>
+
+<div class="exercise">
+  <p>練習 4：實作 <code>desiredReplicas(o)</code>，照 HPA 的規則算出這一輪的副本數：</p>
+  <ul>
+    <li><code>currentUtilization</code> 是 <code>undefined</code>（還沒收到指標）時，回傳 <code>current</code>。</li>
+    <li>比值 ＝ <code>currentUtilization ÷ targetUtilization</code>；比值與 1 的差距在 <code>tolerance</code> 以內（含）時，建議值是 <code>current</code>，否則是 <code>ceil(current × 比值)</code>。</li>
+    <li>建議值比 <code>current</code> 小（要縮容）時，回看 <code>history</code> 裡 <code>time &gt; now - scaleDownWindowSec</code> 的紀錄，取它們與這次建議值中最高的，但不超過 <code>current</code>。擴容不回看。</li>
+    <li>最後夾在 <code>min</code> 與 <code>max</code> 之間。時間單位都是秒。不能修改傳入的 <code>history</code>。</li>
+  </ul>
+  <script type="start">
+type Rec = { time: number, recommendation: number }
+type Input = {
+  current: number                       // 目前副本數
+  currentUtilization: number | undefined // 目前平均使用率（%），undefined 表示還沒收到指標
+  targetUtilization: number             // 目標使用率（%）
+  min: number
+  max: number
+  tolerance: number                     // 例如 0.1
+  history: Rec[]                        // 過去每一輪的建議值
+  now: number                           // 現在時間（秒）
+  scaleDownWindowSec: number            // 縮容穩定視窗（秒）
+}
+
+function desiredReplicas(o: Input): number {
+  // 1. 還沒有指標 → 維持現狀
+  // 2. 公式＋容忍度 → 這一輪的建議值
+  // 3. 要縮容時，看穩定視窗內的歷史建議
+  // 4. 夾在 min／max 之間
+  return o.current
+}
+
+console.log(desiredReplicas({ current: 3, currentUtilization: 90, targetUtilization: 60, min: 2, max: 10, tolerance: 0.1, history: [], now: 1000, scaleDownWindowSec: 300 }))
+</script>
+  <script type="answer">
+type Rec = { time: number, recommendation: number }
+type Input = {
+  current: number
+  currentUtilization: number | undefined
+  targetUtilization: number
+  min: number
+  max: number
+  tolerance: number
+  history: Rec[]
+  now: number
+  scaleDownWindowSec: number
+}
+
+function desiredReplicas(o: Input): number {
+  if (o.currentUtilization === undefined) return o.current
+  const ratio = o.currentUtilization / o.targetUtilization
+  let rec = Math.abs(ratio - 1) <= o.tolerance ? o.current : Math.ceil(o.current * ratio)
+  if (rec < o.current) {
+    const recent = o.history.filter(h => h.time > o.now - o.scaleDownWindowSec).map(h => h.recommendation)
+    rec = Math.min(o.current, Math.max(rec, ...recent))
+  }
+  return Math.min(o.max, Math.max(o.min, rec))
+}
+
+console.log(desiredReplicas({ current: 3, currentUtilization: 90, targetUtilization: 60, min: 2, max: 10, tolerance: 0.1, history: [], now: 1000, scaleDownWindowSec: 300 }))
+</script>
+  <script type="tests">
+const base: Input = { current: 3, currentUtilization: 60, targetUtilization: 60, min: 2, max: 10, tolerance: 0.1, history: [], now: 1000, scaleDownWindowSec: 300 }
+const d = (o: Partial<Input>) => desiredReplicas({ ...base, ...o })
+
+assert.equal(d({ current: 3, currentUtilization: 90 }), 5, '3 個副本、使用率 90%、目標 60%：3 × 1.5 = 4.5，無條件進位是 5')
+assert.equal(d({ current: 2, currentUtilization: 70 }), 3, '2 個副本、使用率 70%：2 × 70 ÷ 60 ≈ 2.33，要用 Math.ceil 進位成 3（Math.round 會變成 2，擴不上去）')
+assert.equal(d({ current: 4, currentUtilization: 75, targetUtilization: 50 }), 6, '4 × 75 ÷ 50 = 6')
+assert.equal(d({ current: 4, currentUtilization: 64 }), 4, '比值 64 ÷ 60 ≈ 1.07，在 10% 容忍度以內，不能動作（沒有容忍度會算成 5）')
+assert.equal(d({ current: 4, currentUtilization: 300 }), 10, '算出 20 個，但 max 是 10：要夾住')
+assert.equal(d({ current: 4, currentUtilization: 5 }), 2, '算出 1 個，但 min 是 2：要夾住')
+assert.equal(d({ current: 4, currentUtilization: undefined, history: [{ time: 900, recommendation: 8 }] }), 4, 'currentUtilization 是 undefined（還沒收到指標）時要維持 current')
+
+assert.equal(d({ current: 6, currentUtilization: 20, history: [{ time: 900, recommendation: 5 }, { time: 950, recommendation: 3 }] }), 5,
+  '要縮到 2，但 100 秒前（在 300 秒視窗內）建議過 5：取視窗內最高的 5，不能直接縮到 2')
+assert.equal(d({ current: 6, currentUtilization: 20, history: [{ time: 950, recommendation: 3 }, { time: 900, recommendation: 5 }] }), 5,
+  '歷史紀錄的順序不一定照時間排，要看全部視窗內的紀錄')
+assert.equal(d({ current: 6, currentUtilization: 20, history: [{ time: 600, recommendation: 6 }] }), 2,
+  '400 秒前的建議已經在 300 秒視窗外，不算：可以縮到 2')
+assert.equal(d({ current: 5, currentUtilization: 20, history: [{ time: 900, recommendation: 9 }] }), 5,
+  '視窗內有比 current 高的建議時，縮容最多是「不縮」，不能因為歷史反而擴容')
+assert.equal(d({ current: 4, currentUtilization: 62, history: [{ time: 900, recommendation: 7 }] }), 4,
+  '在容忍度內不動作，就算視窗內有較高的歷史建議，也不能擴容')
+assert.equal(d({ current: 3, currentUtilization: 120, history: [{ time: 940, recommendation: 3 }, { time: 970, recommendation: 2 }] }), 6,
+  '擴容不回看歷史（預設擴容的穩定視窗是 0）：3 × 120 ÷ 60 = 6，要立刻擴到 6')
+
+const history = [{ time: 950, recommendation: 3 }, { time: 900, recommendation: 5 }, { time: 500, recommendation: 9 }]
+const snapshot = structuredClone(history)
+d({ current: 6, currentUtilization: 20, history })
+assert.deepEqual(history, snapshot, '不能修改傳入的 history（例如直接 sort、splice 或改掉紀錄的欄位）：控制器下一輪還要用')
+</script>
+  <script type="wrong">
+type Rec = { time: number, recommendation: number }
+type Input = { current: number, currentUtilization: number | undefined, targetUtilization: number, min: number, max: number, tolerance: number, history: Rec[], now: number, scaleDownWindowSec: number }
+// 用 Math.round
+function desiredReplicas(o: Input): number {
+  if (o.currentUtilization === undefined) return o.current
+  const ratio = o.currentUtilization / o.targetUtilization
+  let rec = Math.abs(ratio - 1) <= o.tolerance ? o.current : Math.round(o.current * ratio)
+  if (rec < o.current) {
+    const recent = o.history.filter(h => h.time > o.now - o.scaleDownWindowSec).map(h => h.recommendation)
+    rec = Math.min(o.current, Math.max(rec, ...recent))
+  }
+  return Math.min(o.max, Math.max(o.min, rec))
+}
+</script>
+  <script type="wrong">
+type Rec = { time: number, recommendation: number }
+type Input = { current: number, currentUtilization: number | undefined, targetUtilization: number, min: number, max: number, tolerance: number, history: Rec[], now: number, scaleDownWindowSec: number }
+// 忘記容忍度
+function desiredReplicas(o: Input): number {
+  if (o.currentUtilization === undefined) return o.current
+  let rec = Math.ceil(o.current * o.currentUtilization / o.targetUtilization)
+  if (rec < o.current) {
+    const recent = o.history.filter(h => h.time > o.now - o.scaleDownWindowSec).map(h => h.recommendation)
+    rec = Math.min(o.current, Math.max(rec, ...recent))
+  }
+  return Math.min(o.max, Math.max(o.min, rec))
+}
+</script>
+  <script type="wrong">
+type Rec = { time: number, recommendation: number }
+type Input = { current: number, currentUtilization: number | undefined, targetUtilization: number, min: number, max: number, tolerance: number, history: Rec[], now: number, scaleDownWindowSec: number }
+// 縮容沒有穩定視窗
+function desiredReplicas(o: Input): number {
+  if (o.currentUtilization === undefined) return o.current
+  const ratio = o.currentUtilization / o.targetUtilization
+  const rec = Math.abs(ratio - 1) <= o.tolerance ? o.current : Math.ceil(o.current * ratio)
+  return Math.min(o.max, Math.max(o.min, rec))
+}
+</script>
+  <script type="wrong">
+type Rec = { time: number, recommendation: number }
+type Input = { current: number, currentUtilization: number | undefined, targetUtilization: number, min: number, max: number, tolerance: number, history: Rec[], now: number, scaleDownWindowSec: number }
+// 擴容也套用穩定視窗（取視窗內最低的）
+function desiredReplicas(o: Input): number {
+  if (o.currentUtilization === undefined) return o.current
+  const ratio = o.currentUtilization / o.targetUtilization
+  let rec = Math.abs(ratio - 1) <= o.tolerance ? o.current : Math.ceil(o.current * ratio)
+  const recent = o.history.filter(h => h.time > o.now - o.scaleDownWindowSec).map(h => h.recommendation)
+  if (rec < o.current) rec = Math.min(o.current, Math.max(rec, ...recent))
+  if (rec > o.current) rec = Math.max(o.current, Math.min(rec, ...recent))
+  return Math.min(o.max, Math.max(o.min, rec))
+}
+</script>
+  <script type="wrong">
+type Rec = { time: number, recommendation: number }
+type Input = { current: number, currentUtilization: number | undefined, targetUtilization: number, min: number, max: number, tolerance: number, history: Rec[], now: number, scaleDownWindowSec: number }
+// 不分方向，一律取視窗內最高的建議
+function desiredReplicas(o: Input): number {
+  if (o.currentUtilization === undefined) return o.current
+  const ratio = o.currentUtilization / o.targetUtilization
+  const rec = Math.abs(ratio - 1) <= o.tolerance ? o.current : Math.ceil(o.current * ratio)
+  const recent = o.history.filter(h => h.time > o.now - o.scaleDownWindowSec).map(h => h.recommendation)
+  return Math.min(o.max, Math.max(o.min, rec, ...recent))
+}
+</script>
+  <script type="wrong">
+type Rec = { time: number, recommendation: number }
+type Input = { current: number, currentUtilization: number | undefined, targetUtilization: number, min: number, max: number, tolerance: number, history: Rec[], now: number, scaleDownWindowSec: number }
+// 直接對傳入的 history 排序，改到了呼叫者的資料
+function desiredReplicas(o: Input): number {
+  if (o.currentUtilization === undefined) return o.current
+  const ratio = o.currentUtilization / o.targetUtilization
+  let rec = Math.abs(ratio - 1) <= o.tolerance ? o.current : Math.ceil(o.current * ratio)
+  if (rec < o.current) {
+    const recent = o.history.sort((a, b) => b.recommendation - a.recommendation).filter(h => h.time > o.now - o.scaleDownWindowSec)
+    rec = Math.min(o.current, Math.max(rec, recent[0]?.recommendation ?? rec))
+  }
+  return Math.min(o.max, Math.max(o.min, rec))
+}
+</script>
+  <script type="wrong">
+type Rec = { time: number, recommendation: number }
+type Input = { current: number, currentUtilization: number | undefined, targetUtilization: number, min: number, max: number, tolerance: number, history: Rec[], now: number, scaleDownWindowSec: number }
+// 沒處理還沒收到指標的情況：undefined ÷ 60 是 NaN
+function desiredReplicas(o: Input): number {
+  const ratio = (o.currentUtilization ?? NaN) / o.targetUtilization
+  let rec = Math.abs(ratio - 1) <= o.tolerance ? o.current : Math.ceil(o.current * ratio)
+  if (rec < o.current) {
+    const recent = o.history.filter(h => h.time > o.now - o.scaleDownWindowSec).map(h => h.recommendation)
+    rec = Math.min(o.current, Math.max(rec, ...recent))
+  }
+  return Math.min(o.max, Math.max(o.min, rec))
+}
+</script>
+</div>
+
+<div class="local" data-test="ex5" data-files="ex5/deployment.yaml ex5/hpa.yaml">
+  <p>練習 5：替 <code>ex5/</code> 的 cafe-api 加上自動擴展。在 <code>ex5/deployment.yaml</code> 替容器加上 CPU requests 100m，並把 <code>spec.replicas</code> 移除；在 <code>ex5/hpa.yaml</code> 寫一個名為 cafe-api 的 HPA（autoscaling/v2）：目標是 Deployment cafe-api、副本 2～5 個、CPU 平均使用率目標 60%，<code>behavior.scaleDown.stabilizationWindowSeconds</code> 設 30（練習用，讓測試不必等 5 分鐘）。測試會用 loadgen 以每秒 20 個請求打 <code>/burn?ms=20</code> 120 秒，期間副本數要到 3 個以上；停止後 4 分鐘內要縮回 2 個。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：容器的 CPU limit 是 200m。尖峰時 API 的 p99 延遲從 80ms 變成 900ms，但 Pod 沒有重啟、也沒有錯誤 log。最可能是？</p>
+  <label data-key="a">OOMKilled</label>
+  <label data-key="b">CPU 節流：每個週期的 CPU 額度用完就被暫停，請求在排隊</label>
+  <label data-key="c">readinessProbe 失敗</label>
+  <label data-key="d">節點的網路壞了</label>
+  <p class="why">✓ CPU 超過 limit 不會被殺，只會變慢。a 會讓容器重啟、RESTARTS 增加；c 會讓 Pod 移出端點，流量轉到別的 Pod，不會讓所有請求都變慢；d 通常是連線錯誤或逾時，而不是平均變慢。用 <code>kubectl top pod</code> 看 CPU 是否貼著 limit，或看監控的 <code>container_cpu_cfs_throttled_periods_total</code>。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：HPA 的目標 CPU 使用率是 50%。目前 4 個副本，平均使用率 75%（以 requests 計）。HPA 會把副本數調成幾個？</p>
+  <label data-key="a">5</label>
+  <label data-key="b">6</label>
+  <label data-key="c">8</label>
+  <label data-key="d">3</label>
+  <p class="why">✓ ceil(4 × 75 ÷ 50) ＝ 6；比值 1.5 超出 10% 容忍度，所以會動作。a 是只加一個的直覺；c 是誤以為「超過目標就加倍」（加倍只是擴容速度的上限，不是目標）；d 把比值算反了。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 8：Deployment 的 manifest 寫著 <code>replicas: 3</code>，另外有 HPA（min 2、max 10）。中午尖峰 HPA 擴到 8 個，這時 CI 跑了一次部署（<code>kubectl apply</code>）。會發生什麼？</p>
+  <label data-key="a">副本數維持 8，HPA 優先</label>
+  <label data-key="b">apply 把副本數改回 3，直到 HPA 下一輪再擴回去；這段期間 3 個 Pod 要扛 8 個的流量</label>
+  <label data-key="c">HPA 被刪除</label>
+  <label data-key="d">apply 失敗，提示欄位衝突</label>
+  <p class="why">✓ HPA 與 manifest 在改同一個欄位 <code>spec.replicas</code>，誰最後寫入誰算數。交給 HPA 的 Deployment 要從 manifest 移除 replicas（Helm chart 也一樣，第 13 課）。a 錯在 Kubernetes 沒有「HPA 優先」的規則；c 不會發生；d 只有 server-side apply 在特定情況才會回報衝突，預設的 client-side apply 會直接覆蓋。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 9：HPA 已經把副本擴到 10 個，但其中 4 個一直 Pending。缺的是什麼？</p>
+  <label data-key="a">更高的 maxReplicas</label>
+  <label data-key="b">節點容量：要有 Cluster Autoscaler 或 Karpenter 增加節點，或降低每個 Pod 的 requests</label>
+  <label data-key="c">更多 readinessProbe</label>
+  <label data-key="d">把 Pod 的 limits 拿掉</label>
+  <p class="why">✓ HPA 只建立 Pod，不會加機器；Pending 的事件會寫 <code>Insufficient cpu</code> 或 <code>Insufficient memory</code>。a 只會產生更多 Pending 的 Pod；c 與排程無關；d 錯在排程看的是 requests，拿掉 limits 不會讓 Pod 排得上，還會失去保護。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>沒有 requests</strong>：排程器以為它不用資源，節點被塞滿；HPA 算不出使用率；節點記憶體不足時它最先被驅逐。</li>
+  <li><strong>記憶體沒有 limit</strong>：一個洩漏的 Pod 可以吃光節點記憶體，拖垮同節點的所有服務。</li>
+  <li><strong>heap 上限接近或大於容器 limit</strong>：V8 還沒急著 GC，容器就被 OOMKilled，log 裡什麼都沒有。<code>--max-old-space-size</code> 設在 limit 的 70～75%。</li>
+  <li><strong>CPU limit 設太緊</strong>：節流造成延遲，看起來像程式變慢、或像資料庫變慢。先量測，API 常常只設 CPU requests。</li>
+  <li><strong>把 CrashLoopBackOff 當成原因</strong>：它只是「一直重啟」的狀態；原因在 lastState 的 reason 與 exit code，以及 <code>kubectl logs --previous</code>。</li>
+  <li><strong>HPA 與 manifest 的 replicas 打架</strong>：每次部署都把副本數改回固定值。開了 HPA 就從 manifest 移除 replicas。</li>
+  <li><strong>以為 HPA 會加機器</strong>：Pod Pending 時要靠 Cluster Autoscaler 或 Karpenter 加節點。</li>
+  <li><strong>單位寫錯</strong>：<code>128M</code> 與 <code>128Mi</code> 不一樣，<code>128m</code> 更是 0.128 byte；CPU 的 <code>0.1</code> 與 <code>100m</code> 則相同。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>requests 是保留量，排程器只看它；放不下時 Pod Pending，事件寫 <code>Insufficient cpu／memory</code>。HPA 的使用率也以 requests 為分母。</li>
+  <li>limits 是上限：記憶體超過被 OOMKilled（exit code 137，看 lastState），CPU 超過被節流（變慢，不重啟）。API 常見做法是 CPU 只設 requests，記憶體 requests 與 limits 都設。</li>
+  <li>Node 服務的 heap 上限用 <code>--max-old-space-size</code> 設在記憶體 limit 的 70～75%。</li>
+  <li>QoS 類別由 resources 的寫法決定，節點記憶體不足時 BestEffort 先被驅逐；LimitRange 補預設值，ResourceQuota 限制 namespace 的總量。</li>
+  <li>先用 metrics-server、<code>kubectl top</code> 與監控量測，再設定；1.35 起可以 in-place resize。</li>
+  <li>HPA：ceil(目前副本 × 目前使用率 ÷ 目標)，10% 容忍度、夾在 min／max，縮容回看 300 秒取最高，擴容立刻。要移除 manifest 的 replicas、要有 requests 與 readiness；節點不夠要靠 Cluster Autoscaler／Karpenter，佇列 worker 用 KEDA。</li>
+</ul>
+<p>下一課處理換版本身：滾動更新的節奏、壞版本怎麼自動回滾，以及節點維護時用 PodDisruptionBudget 保證不會一次把副本全部趕走。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

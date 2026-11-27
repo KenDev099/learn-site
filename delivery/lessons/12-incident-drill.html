@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>12. 線上事故演練：定位、止血、復原、事後檢討</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="12" data-practice="delivery">
+<header>
+  <div class="eyebrow">階段 4：上線與維運 · 第 12 課</div>
+  <h1>線上事故演練：定位、止血、復原、事後檢討</h1>
+</header>
+<main>
+
+<p>星期一早上 7:40，你的手機響了。監控系統的告警：<strong>「POST /orders 最近 5 分鐘的 p95 &gt; 1 s（目前 1.9 s）」</strong>。這是一天最忙的時段，客人在門口排隊用手機點餐，送出訂單要轉好幾秒，有些直接失敗。你是這週的值班工程師。</p>
+<p>這時候最常見的錯誤是一頭栽進程式碼找 bug。這一課用一份固定的事故現場（log、部署紀錄、資料庫指標），照資深工程師的順序把整個流程走一次。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>事故的前五分鐘：為什麼第一件事是分工和記下時間，而不是打開程式碼。</li>
+  <li>定位：用 log 和部署紀錄找出從什麼時候開始、哪個路由在拖累其他人、跟哪次變更有關。</li>
+  <li>止血：關旗標、整版回滾、重啟 API 該選哪一個，為什麼回滾可能把安全修正一起丟掉。</li>
+  <li>修根因：用 EXPLAIN 看出搜尋為什麼掃整張表，用 pg_trgm 的 GIN 索引修好，再確認真的復原。</li>
+  <li>不究責的事後檢討：怎麼寫才能排出改善項目，而不是找戰犯。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="05-bug-without-repro.html">第 5 課</a>用 jq 查 log：一行一個 JSON，用 <code>select</code> 篩選、<code>-s</code> 把整個檔案收成陣列再分組統計。</li>
+  <li><a href="10-dependency-upgrade.html">第 10 課</a>的功能旗標：存在 <code>feature_flags</code> 表、程式執行時才讀的開關，用 <code>npm run flag</code> 修改，不用重新部署就能關掉一條路徑。</li>
+  <li><a href="11-load-test.html">第 11 課</a>的 EXPLAIN 與索引：<code>EXPLAIN ANALYZE</code> 看資料庫是掃整張表（<code>Seq Scan</code>）還是走索引；正式表上建索引用 <code>CREATE INDEX CONCURRENTLY</code>，才不會擋住寫入。</li>
+</ul></div>
+
+<h2>先拿到這一課的程式</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs delivery 12</code>，會建立 <code>delivery/practice/work/12/</code>。它是第 11 課的標準答案，加上今天早上 7:32 剛部署的 <strong>v2.8.0</strong>，以及事故現場的材料：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>檔案</th><th>是什麼</th></tr></thead>
+  <tbody>
+    <tr><td><code>api/src/orders/orders.controller.ts</code></td><td>v2.8.0 的兩個變更：新功能「店員訂單搜尋」<code>GET /orders/search?q=</code>（CAFE-41，由旗標 <code>orders.search</code> 控制）；安全修正 SEC-7：<code>GET /orders/:id</code> 要登入，顧客只看得到自己的訂單</td></tr>
+    <tr><td><code>api/src/auth/auth.module.ts</code></td><td>v2.8.0 新增的登入：<code>POST /auth/login</code>，成功後發 HttpOnly cookie。示範帳號見 README</td></tr>
+    <tr><td><code>logs/incident.ndjson</code></td><td>正式環境 07:00–07:45 的 API log（一行一個 JSON）</td></tr>
+    <tr><td><code>ops/deploys.log</code></td><td>部署紀錄：時間、版本、部署者、commit、內容</td></tr>
+    <tr><td><code>ops/alerts.log</code>、<code>ops/db-metrics.csv</code></td><td>告警紀錄；資料庫每分鐘的 CPU 與連線數</td></tr>
+    <tr><td><code>ops/flag-changes.log</code></td><td>功能旗標的修改紀錄。<code>npm run flag</code> 每改一次就自動加一行</td></tr>
+    <tr><td><code>incident.json</code>、<code>postmortem.md</code></td><td>練習 1、3 要填的範本</td></tr>
+  </tbody>
+</table></div>
+<p>開發環境照之前的方式準備（v2.8.0 有新的 migration 和示範帳號，所以要重跑 <code>db:setup</code>），再放進 20 萬張訂單，資料量才會跟正式環境一樣：</p>
+<pre>$ docker compose up -d --wait
+$ npm run db:setup
+$ npm run load:data
+刪掉上一次的 0 張，放進 200000 張舊訂單＋ 200 張廚房進行中的訂單</pre>
+<p>這一課要用 <code>jq</code> 查 log（<a href="05-bug-without-repro.html">第 5 課</a>用過，macOS 內建；舊版 macOS 沒有的話 <code>brew install jq</code>）。</p>
+
+<h2>事故的前五分鐘：先分工，先記時間</h2>
+<p><strong>事故（incident）</strong>是「線上服務出問題、影響到使用者，需要立刻處理」的狀況。處理事故有三件事同時在進行：查原因、動手操作、對外說明。全部壓在一個人身上，最先被犧牲的是溝通，接著是判斷。所以就算只有兩個人，第一件事也是分工（<a href="../../devops/lessons/25-alerting-incidents.html">DevOps 課第 25 課</a>有完整的流程）：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>角色</th><th>做什麼</th><th>這次是誰</th></tr></thead>
+  <tbody>
+    <tr><td>事故指揮（incident commander）</td><td>決定要做什麼、指派工作、決定什麼時候算結束。自己不動手查</td><td>值班工程師（你）</td></tr>
+    <tr><td>溝通（communications）</td><td>固定時間對店長、客服發更新，讓他們不用一直來問</td><td>後端 tech lead</td></tr>
+    <tr><td>操作（operations）</td><td>查 log、改旗標、跑 migration，做之前先說、做完回報</td><td>你（人少時指揮兼操作，但溝通一定要交出去）</td></tr>
+  </tbody>
+</table></div>
+<p>接著開一份共用的<strong>時間線</strong>，每做一件事、每看到一個現象，當下寫一行時間：「07:40 告警」「07:44 確認下單 p95 1.9 s」「07:48 關閉旗標 orders.search」。事後憑記憶補寫的時間線一定不準，而事後檢討的品質取決於它。對外的更新用固定格式，第一則在 10 分鐘內發出，之後固定間隔更新（例如每 15 分鐘），就算沒有進展也發：</p>
+<pre>【處理中】07:45 點餐系統下單變慢
+影響：07:35 起顧客送出訂單要等好幾秒，部分失敗；查訂單、菜單也變慢
+現在在做：工程師正在處理，優先讓下單恢復正常
+下一次更新：08:00 前</pre>
+<p>注意這則更新<strong>沒有猜原因</strong>（07:45 還沒有證據），也沒有承諾修好的時間。說「影響是什麼、正在做什麼、下次什麼時候更新」就夠了。</p>
+
+<div class="callout practice"><strong>💡 實務上：店長在乎的是「現在能不能點」</strong><br>事故中最常被打斷的是指揮的人：店長、客服、主管輪流私訊問「好了沒」。固定頻道、固定時間、固定格式的更新能把這些問題擋掉，讓查問題的人專心。客服拿到更新後才能回覆顧客（例如「請先到櫃台點餐」）。很多團隊把狀態更新的範本和角色分工寫在 runbook（處理手冊：常見狀況一步一步怎麼處理）裡，值班第一天就要知道它在哪。</div>
+
+<h2>定位一：從什麼時候開始</h2>
+<p>手上有三份資料：API log、部署紀錄、資料庫指標。先看 log（JSON log 與集中查詢見 <a href="../../devops/lessons/21-logs.html">DevOps 課第 21 課</a>）。每個請求一行，<code>context</code> 是 <code>"HTTP"</code>，<code>message</code> 裡有路徑、狀態碼和花了幾毫秒（<code>durationMs</code>），<code>timestamp</code> 是 Unix 毫秒（UTC）：</p>
+<pre>{"level":"log","pid":1,"timestamp":1794785580000,"message":{"requestId":"…","method":"POST","path":"/orders","status":201,"durationMs":23,"customerId":4,"productIds":[2]},"context":"HTTP"}</pre>
+<p>先回答「從什麼時候開始變慢」：依分鐘分組，算每分鐘的請求數、平均和最大的 <code>durationMs</code>。在 <code>work/12</code> 執行：</p>
+<pre>$ jq -rs '[.[] | select(.context == "HTTP")]
+  | group_by(.timestamp / 60000 | floor)
+  | .[]
+  | [(.[0].timestamp / 1000 + 8 * 3600 | strftime("%H:%M")), length,
+     (map(.message.durationMs) | add / length | round), (map(.message.durationMs) | max)]
+  | @tsv' logs/incident.ndjson</pre>
+<p>拆開來看：<code>-s</code> 把整個檔案讀成一個陣列；<code>group_by(.timestamp / 60000 | floor)</code> 把同一分鐘的請求放在一組；<code>+ 8 * 3600</code> 再 <code>strftime("%H:%M")</code> 把 UTC 轉成台北時間；<code>@tsv</code> 用 Tab 分隔印出。輸出（只列 07:28 之後，欄位是：分鐘、請求數、平均 ms、最大 ms）：</p>
+<pre>07:28	32	18	44
+07:29	33	17	40
+07:30	35	16	38
+07:31	32	18	45
+07:32	29	18	39
+07:33	40	237	1786
+07:34	45	574	2439
+07:35	52	1366	4386
+07:36	54	1668	4492
+07:37	56	1980	5056
+…</pre>
+<p>07:32 以前每分鐘平均 20 ms 以內，<strong>07:33 突然出現 1.7 秒的請求</strong>，之後一分鐘比一分鐘慢。這張表回答了「從什麼時候開始有異狀」，但告警看的是另一個指標：<strong>下單（POST /orders）每分鐘的 p95</strong>。p95 是把請求依花費的時間由快到慢排好，排在第 95% 位置的那個：100 個請求裡有 95 個不超過它（<a href="11-load-test.html">第 11 課</a>）；平均會被大量很快的請求拉低，也會被少數極慢的請求拉高，兩個方向都會騙人。事故的<strong>開始影響時間</strong>要用跟告警同一個指標算：下單 p95 第一次超過 1 秒的那一分鐘。它可能比第一個慢的請求晚幾分鐘，因為一開始只有新功能自己慢，壓力還沒傳到下單。這是練習 1 要你自己算的。</p>
+
+<h2>定位二：哪個路由、跟哪次變更有關</h2>
+<p>接著把 07:33 之後的請求依<strong>路由</strong>分組。log 裡的 <code>path</code> 是實際的網址，<code>/orders/58231</code> 和 <code>/orders/58232</code> 是同一個路由，<code>/orders/search?q=…</code> 每次的 q 也不一樣，所以先正規化：<code>split("?")[0]</code> 去掉查詢字串，<code>gsub("/[0-9]+"; "/:id")</code> 把數字換成 <code>:id</code>：</p>
+<pre>$ jq -rs '[.[] | select(.context == "HTTP")
+    | select((.timestamp / 1000 + 8 * 3600 | strftime("%H:%M")) &gt;= "07:33")
+    | {route: (.message.method + " " + (.message.path | split("?")[0] | gsub("/[0-9]+"; "/:id"))),
+       ms: .message.durationMs}]
+  | group_by(.route)
+  | map([.[0].route, length, (map(.ms) | add / length | round), (map(.ms) | max)])
+  | sort_by(-.[2])
+  | .[] | @tsv' logs/incident.ndjson
+GET /orders/search	224	4369	5883
+POST /orders	108	1382	5049
+GET /kitchen/board	72	846	1817
+GET /products	96	582	1370
+GET /orders/:id	120	506	1534
+POST /auth/login	33	451	920
+GET /health	24	34	63</pre>
+<p>每個路由都變慢了，這是資料庫整體變忙的典型樣子。要找的是<strong>哪一個在拖累其他人</strong>。三個線索都指向 <code>GET /orders/search</code>：</p>
+<ul>
+  <li><strong>它最慢</strong>：平均 4.4 秒，次數也最多（224 次，比下單還多）。</li>
+  <li><strong>它是新的</strong>：把上一個指令的時間條件改成 <code>&lt; "07:33"</code> 再跑一次，清單裡沒有它。07:33 之前這個路由不存在。</li>
+  <li><strong>時間對得上一次變更</strong>：<code>ops/deploys.log</code> 的最後一行是 <code>2026-11-16T07:32:05+08:00 v2.8.0 … CAFE-41 店員訂單搜尋（旗標 orders.search，上線即 100%）…</code>，log 裡也有那一秒的重啟紀錄：</li>
+</ul>
+<pre>$ jq -r 'select(.context != "HTTP") | [(.timestamp / 1000 + 8 * 3600 | strftime("%H:%M:%S")), .level, .message] | @tsv' logs/incident.ndjson
+07:32:05	log	Starting Nest application...
+07:32:06	log	Nest application successfully started
+07:38:10	error	timeout exceeded when trying to connect
+07:39:01	error	timeout exceeded when trying to connect
+…</pre>
+<p>再看一下搜尋送了什麼：<code>jq -r 'select(.message.path? // "" | startswith("/orders/search")) | .message.path' logs/incident.ndjson</code>，會看到 <code>q=%E7%94%9F%E6%97%A5%E8%A0%9F</code>（生日蠟）緊接著 <code>q=…%E7%87%AD</code>（生日蠟燭）：店員的搜尋框<strong>每打一個字就送一次請求</strong>，尖峰時一個人找一張單就送出好幾個 4 秒的查詢。</p>
+<p>最後看資料庫指標 <code>ops/db-metrics.csv</code>：07:35 起 CPU 95–99%，連線 10/10（連線池滿了），07:38 開始出現 <code>timeout exceeded when trying to connect</code>：下單等不到連線，直接失敗。這時候很容易下結論「CPU 不夠」「連線池太小」，但它們是<strong>症狀</strong>，不是原因。一路問「為什麼」往下追：</p>
+
+<figure>
+  <svg viewBox="0 0 700 260" role="img" aria-label="因果鏈：v2.8.0 上線搜尋，搜尋用沒有索引的 ILIKE 掃整張表，CPU 與連線被占滿，下單排隊，下單 p95 超過 1 秒觸發告警">
+    <defs><marker id="arr12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="10" y="20" width="200" height="60" rx="8"/>
+    <text class="d-text" x="110" y="45" text-anchor="middle">07:32 v2.8.0 上線</text>
+    <text class="d-small" x="110" y="66" text-anchor="middle">搜尋旗標直接 100%</text>
+    <rect class="d-soft" x="250" y="20" width="200" height="60" rx="8"/>
+    <text class="d-accent" x="350" y="45" text-anchor="middle">根因：缺索引</text>
+    <text class="d-small" x="350" y="66" text-anchor="middle">ILIKE '%…%' 每次掃整張表</text>
+    <rect class="d-box" x="490" y="20" width="200" height="60" rx="8"/>
+    <text class="d-text" x="590" y="45" text-anchor="middle">CPU 99%</text>
+    <text class="d-small" x="590" y="66" text-anchor="middle">症狀</text>
+    <rect class="d-box" x="490" y="160" width="200" height="60" rx="8"/>
+    <text class="d-text" x="590" y="185" text-anchor="middle">連線池 10/10</text>
+    <text class="d-small" x="590" y="206" text-anchor="middle">症狀：慢查詢占住連線</text>
+    <rect class="d-box" x="250" y="160" width="200" height="60" rx="8"/>
+    <text class="d-text" x="350" y="185" text-anchor="middle">下單排隊等連線</text>
+    <text class="d-small" x="350" y="206" text-anchor="middle">07:38 起部分逾時失敗</text>
+    <rect class="d-box" x="10" y="160" width="200" height="60" rx="8"/>
+    <text class="d-text" x="110" y="185" text-anchor="middle">下單 p95 &gt; 1 s</text>
+    <text class="d-small" x="110" y="206" text-anchor="middle">07:40 告警</text>
+    <line class="d-line" x1="210" y1="50" x2="246" y2="50" marker-end="url(#arr12)"/>
+    <line class="d-line" x1="450" y1="50" x2="486" y2="50" marker-end="url(#arr12)"/>
+    <line class="d-line" x1="590" y1="80" x2="590" y2="156" marker-end="url(#arr12)"/>
+    <line class="d-line" x1="490" y1="190" x2="454" y2="190" marker-end="url(#arr12)"/>
+    <line class="d-line" x1="250" y1="190" x2="214" y2="190" marker-end="url(#arr12)"/>
+  </svg>
+  <figcaption>告警看到的是鏈的最後一環；止血和修復要對準前面的環節</figcaption>
+</figure>
+<p>如果把 CPU 加倍或連線池調大，只會讓更多全表掃描同時壓在資料庫上，下單照樣排隊。<strong>只看一個指標就下結論</strong>是事故中最常見的誤判；要把 log、部署紀錄、指標三份資料的時間對在一起。</p>
+
+<h2>止血：選影響最小的手段</h2>
+<p><strong>止血（mitigation）</strong>是先讓影響停止擴大，不一定修好根因。<strong>復原（recovery）</strong>是回到正常、而且資料一致的狀態。止血優先，因為每多一分鐘，就有更多客人點不到餐；根因可以等止血之後慢慢修（「先止血，再找原因」見<a href="../../system-design/lessons/21-debugging-incidents.html">系統設計課第 21 課</a>）。現在有幾個選項：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>手段</th><th>效果</th><th>代價</th></tr></thead>
+  <tbody>
+    <tr><td><strong>關閉旗標 <code>orders.search</code></strong></td><td>幾秒內生效（每個請求都讀旗標），搜尋停止送查詢</td><td>店員暫時不能搜尋，改用訂單編號找單。其他功能完全不受影響</td></tr>
+    <tr><td>整版回滾到 v2.7.2</td><td>搜尋消失</td><td><strong>SEC-7 的修正也一起消失</strong>：任何人改網址上的訂單 id 就能看別人的訂單。用一個問題換回另一個更糟的問題</td></tr>
+    <tr><td>重啟 API</td><td>連線暫時清空，數字可能短暫恢復</td><td>店員一搜尋又會回來。只是把問題延後，還會中斷進行中的請求</td></tr>
+    <tr><td>加大連線池、升級資料庫</td><td>不確定</td><td>對準的是症狀；更多連線＝更多全表掃描同時跑，資料庫可能更慢</td></tr>
+  </tbody>
+</table></div>
+<p>SEC-7 修的是 <strong>BOLA（Broken Object Level Authorization，物件層級授權失效）</strong>：API 只檢查「你有沒有登入」，沒有檢查「這筆資料是不是你的」，所以改 id 就能讀到別人的資料（<a href="../../auth/lessons/19-object-level-authz.html">Auth 課第 19 課</a>）。v2.7.x 連登入都沒有，回滾等於把每位顧客的訂單、備註重新公開。所以這次的答案很明確：<strong>關旗標</strong>。這也是 v2.8.0 把新功能放在旗標後面的原因：出問題時只關掉那一個功能，不動同一版裡的其他變更。</p>
+<p>動手前在時間線寫一行「07:48 指揮決定關閉 orders.search」，然後執行（在開發環境演練，指令跟正式環境一樣）：</p>
+<pre>$ npm run flag -- orders.search off
+orders.search：100% → 0%（記在 ops/flag-changes.log）
+┌─────────┬───────────────────┬─────────┬────────────────────┐
+│ (index) │ key               │ percent │ updated            │
+├─────────┼───────────────────┼─────────┼────────────────────┤
+│ 0       │ 'orders.search'   │ 0       │ '2026-11-16 07:48' │
+│ 1       │ 'payments.sdk_v2' │ 100     │ '2026-11-14 10:05' │
+└─────────┴───────────────────┴─────────┴────────────────────┘</pre>
+<p>（你的 updated 欄是你執行的時間；payments.sdk_v2 那一列看你第 10 課改到哪裡。）<code>flag.ts</code> 在 v2.8.0 多了兩件事：開關型的旗標可以寫 <code>on</code>／<code>off</code>（等於 100／0），每次修改都在 <code>ops/flag-changes.log</code> 加一行時間。這一行就是時間線上「止血」的證據。</p>
+<p><strong>止血之後一定要驗證</strong>，不能改完就宣布好了。驗證兩件事：問題停了，該保留的沒被破壞。另開終端機 <code>npm run dev</code> 啟動 API，用店員和顧客的示範帳號試（<code>-c</code> 把登入的 cookie 存到檔案，<code>-b</code> 送出）：</p>
+<pre>$ curl -s -c staff.txt --json '{"username":"counter","password":"barista-7"}' localhost:3100/auth/login
+{"role":"staff","customerId":null}
+$ curl -s -b staff.txt 'localhost:3100/orders/search?q=oat'
+{"code":"NOT_FOUND","message":"找不到這個功能"}
+
+$ docker compose exec postgres psql -U learn -d cafe -tAc "SELECT id FROM orders WHERE customer_id = 3 ORDER BY id LIMIT 1"
+2
+$ curl -s -c c2.txt --json '{"username":"customer2","password":"latte-2"}' localhost:3100/auth/login
+{"role":"customer","customerId":2}
+$ curl -s -b c2.txt localhost:3100/orders/2
+{"code":"ORDER_NOT_FOUND","message":"找不到訂單 2"}</pre>
+<p>（第一行先找一張 3 號顧客的訂單，你的 id 可能不一樣，換成你查到的。）搜尋回 404（旗標關了），2 號顧客看別人的訂單還是 404：SEC-7 還在。正式環境還要看指標：下單 p95 和資料庫 CPU 在幾分鐘內回到平常的水準，才在時間線寫「止血完成」。</p>
+
+<div class="callout practice"><strong>💡 實務上：讓每個變更都能單獨關掉</strong><br>這次能在幾秒內止血，是因為新功能有旗標。資深工程師在設計發布時就會問：「出問題時，最小的關閉單位是什麼？」新功能放在旗標後面、先開 10% 觀察（<a href="10-dependency-upgrade.html">第 10 課</a>）；安全修正和新功能最好分成兩次部署，回滾時才不用二選一；也避開尖峰時段部署。事故中想回滾之前，先看那一版還帶了什麼，特別是安全修正和資料庫 migration（新版已經寫進去的資料，舊版程式不一定讀得懂）。</div>
+
+<h2>修根因：EXPLAIN 與 pg_trgm 的 GIN 索引</h2>
+<p>止血之後，壓力解除了，可以好好查原因。搜尋的程式在 <code>orders.service.ts</code>：</p>
+<pre>this.prisma.order.findMany({
+  where: { note: { contains: keyword, mode: 'insensitive' } },   // → note ILIKE '%關鍵字%'
+  orderBy: [{ orderedAt: 'desc' }, { id: 'desc' }],
+  take: 20,
+})</pre>
+<p>Prisma 的 <code>contains</code> 加上 <code>mode: 'insensitive'</code>，在 PostgreSQL 會變成 <code>ILIKE '%關鍵字%'</code>（不分大小寫的「包含」）。用 EXPLAIN ANALYZE 看資料庫怎麼找（慢查詢的讀法見 <a href="../../postgresql/lessons/29-query-tuning.html">PostgreSQL 課第 29 課</a>；<code>docker compose exec postgres psql -U learn -d cafe</code>）：</p>
+<pre>cafe=# EXPLAIN ANALYZE SELECT * FROM orders WHERE note ILIKE '%燕麥奶%' ORDER BY ordered_at DESC LIMIT 20;
+ Limit  (actual time=40.045..41.846 rows=0.00 loops=1)
+   -&gt;  Gather Merge  (actual time=40.043..41.844 rows=0.00 loops=1)
+         Workers Planned: 1
+         -&gt;  Sort  (actual time=38.548..38.548 rows=0.00 loops=2)
+               Sort Key: ordered_at DESC
+               -&gt;  Parallel Seq Scan on orders  (actual time=38.502..38.502 rows=0.00 loops=2)
+                     Filter: (note ~~* '%燕麥奶%'::text)
+                     Rows Removed by Filter: 100100
+ Execution Time: 41.888 ms</pre>
+<p>（cost 等欄位省略；<code>~~*</code> 就是 ILIKE。）<code>Seq Scan</code>：整張表掃描，20 萬列每一列都拿來比對一次。<code>Parallel</code> 是 PostgreSQL 把掃描分給 2 個程序一起做（<code>loops=2</code>），所以每個程序各丟掉約 10 萬列。在沒有別人使用的筆電上 40 ms；尖峰時店員每打一個字就送一次，好幾個全表掃描同時跑，還要和下單搶 CPU 與連線，就變成 log 裡的 4 秒。</p>
+<p>為什麼不加一般的索引就好？一般的 B-tree 索引是把值<strong>排序</strong>存起來，像字典一樣只能從開頭找：<code>LIKE '燕麥%'</code>（開頭是燕麥）用得上，<code>'%燕麥奶%'</code>（中間任何位置）用不上，因為不知道從哪裡開始翻。這種「包含」的搜尋要用 <strong>pg_trgm</strong>（<a href="../../postgresql/lessons/28-gin-search.html">PostgreSQL 課第 28 課</a>）：它把文字切成每 3 個字一組的 <strong>trigram</strong>，例如 <code>oat milk</code> 會切出 <code>oat</code>、<code>mil</code>、<code>ilk</code> 等，存進 <strong>GIN 索引</strong>（反向索引：記錄「每一組字出現在哪些列」）。查 <code>'%燕麥奶%'</code> 時，先用索引找出含有這些組合的列，再逐列確認，不用讀整張表。pg_trgm 是 PostgreSQL 內建的擴充功能（官方 postgres 映像就有），<code>CREATE EXTENSION</code> 之後就能用。</p>
+<p>兩個限制要知道：關鍵字<strong>少於 3 個字</strong>切不出完整的一組，索引沒辦法縮小範圍：實測 <code>'%燕麥%'</code> 的計畫裡雖然有 <code>Bitmap Index Scan</code>，但索引回傳了全部 20 萬列，<code>Rows Removed by Index Recheck</code> 將近 20 萬，等於還是全部讀一遍。所以 v2.8.0 的 API 要求 q 至少 3 個字（「計畫裡有索引」不等於「索引有幫上忙」，要看 ANALYZE 的列數）；GIN 索引讓寫入多一點成本，<code>orders</code> 每次新增都要更新它，對咖啡店的下單量來說可以接受。</p>
+<p>修法跟<a href="11-load-test.html">第 11 課</a>一樣是兩步：</p>
+<ol>
+  <li><code>api/prisma/schema.prisma</code> 的 <code>model Order</code> 加一行：
+<pre>@@index([note(ops: raw("gin_trgm_ops"))], type: Gin)</pre>
+  <code>type: Gin</code> 指定索引種類，<code>ops: raw("gin_trgm_ops")</code> 指定用 pg_trgm 的比對方式。Prisma 會把它命名為 <code>orders_note_idx</code>。</li>
+  <li>新增 migration 資料夾 <code>api/prisma/migrations/20261116000000_orders_note_trgm/migration.sql</code>：先建擴充功能，再用 <code>CREATE INDEX CONCURRENTLY</code> 建索引。事故剛發生，現在最不能做的就是用一般的 <code>CREATE INDEX</code> 把 <code>orders</code> 的寫入擋住，等於再停一次下單。索引的寫法：<code>CREATE INDEX CONCURRENTLY "orders_note_idx" ON "orders" USING GIN ("note" gin_trgm_ops);</code>（本課程在 Prisma 7.10.1＋PostgreSQL 18 實測過：<code>migrate deploy</code> 不會把檔案包進交易，兩句放在同一個檔案可以執行）。</li>
+</ol>
+<p><code>npm run db:setup</code> 套用之後，同一句 EXPLAIN：</p>
+<pre> Limit  (actual time=0.151..0.151 rows=0.00 loops=1)
+   -&gt;  Sort  (actual time=0.150..0.150 rows=0.00 loops=1)
+         Sort Key: ordered_at DESC
+         -&gt;  Bitmap Heap Scan on orders  (actual time=0.084..0.084 rows=0.00 loops=1)
+               Recheck Cond: (note ~~* '%燕麥奶%'::text)
+               -&gt;  Bitmap Index Scan on orders_note_idx  (actual time=0.008..0.008 rows=0.00 loops=1)
+                     Index Cond: (note ~~* '%燕麥奶%'::text)
+ Execution Time: 0.272 ms</pre>
+<p>從 42 ms 到 0.3 ms。<code>Bitmap Index Scan on orders_note_idx</code> 先從索引找出可能的列，<code>Bitmap Heap Scan</code> 再去讀那幾列、用 <code>Recheck Cond</code> 確認。正式環境的部署會跑同一個 migration；索引建好（<code>pg_index.indisvalid</code> 是 true）之後，才把旗標打開：</p>
+<pre>$ npm run flag -- orders.search on
+orders.search：0% → 100%（記在 ops/flag-changes.log）</pre>
+<p>打開之後繼續看指標 15–30 分鐘，下單 p95 和 CPU 都維持正常，才算<strong>復原</strong>。這次也要檢查資料：07:38 之後有一些下單逾時失敗（500）。訂單是在交易裡建立的（<a href="03-pickup-time.html">第 3 課</a>），失敗就整筆回滾，不會留下半張單或白佔的取餐名額，但這些客人可能沒拿到餐。客服需要失敗的時間與顧客清單（log 裡 status 500 的 <code>customerId</code>），主動聯絡他們。</p>
+
+<h2>不究責的事後檢討</h2>
+<p>事故結束後幾天內，團隊一起寫<strong>事後檢討（postmortem）</strong>。目的不是交代，而是找出「系統和流程哪裡讓這件事有機會發生」，並排出改善項目。它必須是<strong>不究責的（blameless）</strong>：檢討系統與流程為什麼允許錯誤發生，而不是找戰犯。理由很實際：如果寫出來會被點名，下次大家會隱藏問題、晚一點才說，事故只會更大；而且「某某人不小心」沒有任何可以執行的改善。</p>
+<p>同一件事，兩種寫法：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>找戰犯</th><th>找系統原因</th></tr></thead>
+  <tbody>
+    <tr><td>某某工程師上線前沒有測試效能</td><td>測試資料只有幾筆訂單，全表掃描在測試環境看不出來；PR 審查沒有要求附新查詢的 EXPLAIN</td></tr>
+    <tr><td>某某在尖峰時段部署</td><td>部署流程沒有禁止尖峰時段；新功能的旗標預設直接 100%，沒有先開一小部分觀察</td></tr>
+    <tr><td>店員一直按搜尋</td><td>搜尋框每打一個字就送請求，沒有 debounce（停止輸入一段時間才送）</td></tr>
+  </tbody>
+</table></div>
+<p>需要指人的地方寫<strong>角色</strong>（「部署的工程師」「值班工程師」），不寫名字。<code>postmortem.md</code> 的範本有四段：</p>
+<ul>
+  <li><strong>摘要</strong>：兩三句話，發生什麼事、影響誰、多久、怎麼解決。沒參與的人看完這段就知道全貌。</li>
+  <li><strong>時間線</strong>：開始影響、偵測、止血、復原的時間。偵測減開始影響是「多久才發現」，止血減偵測是「發現後多久擋住」，這兩個數字是改善的目標。</li>
+  <li><strong>根因</strong>：技術上的原因（哪個端點、做了什麼），加上流程上為什麼沒有在上線前擋下來。</li>
+  <li><strong>行動項目</strong>：每一項要具體、可驗收，有負責的角色。分兩類：<code>prevent</code>（避免再發生，例如「PR 範本加一項：新查詢要附 20 萬筆資料下的 EXPLAIN」）和 <code>detect</code>（更早發現，例如「每個路由分開告警，任何路由 p95 &gt; 1 s 持續 3 分鐘就通知」）。只寫 prevent，下次換一種原因時還是要等到下單變慢才知道；「加強測試」「大家多注意」這種寫法沒辦法驗收，等於沒寫。</li>
+</ul>
+
+<div class="callout practice"><strong>💡 實務上：行動項目要有人追</strong><br>事後檢討最常見的結局是寫完就放著，三個月後同樣的事故再發生一次。行動項目要開成工作單、排進 sprint，檢討會議的最後確認每一項的負責角色和期限，下一次例會追進度。檢討文件分享給相關的人（PM、客服、維運）：客服知道下次怎麼應對，PM 知道新功能為什麼要先開小比例。寫的時候把時間、數字、指令都寫具體，讓半年後接手的人也看得懂。</div>
+
+<h2>練習</h2>
+<p>三題都在 <code>delivery/practice/work/12</code> 裡做，寫完回到 <code>learn/</code> 執行 <code>node check.mjs delivery 12</code>。練習 1、3 只檢查你填的值和格式，練習 2 會在判分資料庫放 20 萬張訂單、用 EXPLAIN 確認索引真的有用到。</p>
+
+<div class="local" data-test="ex1" data-files="incident.json">
+  <p>練習 1：從 log 與部署紀錄定位事故，填 <code>incident.json</code>。</p>
+  <ul>
+    <li><code>startedAt</code>：<strong>下單（POST /orders）每分鐘的 p95</strong> 第一次超過 1 秒的那一分鐘，ISO 8601 加上時區，例如 <code>2026-11-16T07:00:00+08:00</code>。p95 用排序後第 <code>ceil(0.95 × 筆數)</code> 個（從 1 數起）。從上面「依分鐘統計」的 jq 改：<code>select</code> 只留 POST /orders，把平均換成 p95（<code>map(.message.durationMs) | sort | .[(length * 0.95 | ceil) - 1]</code>）。</li>
+    <li><code>slowRoute</code>：拖慢系統的路由，格式「方法 路徑」，不含查詢字串。</li>
+    <li><code>deploy</code>：跟事故有關的部署版本（<code>ops/deploys.log</code>）。</li>
+    <li><code>rootCause</code>：<code>missing-index</code>、<code>cpu-high</code>、<code>pool-too-small</code>、<code>bad-network</code> 選一個：原因，不是症狀。</li>
+    <li>判分：startedAt 帶時區，而且落在從 log 算出來的那一分鐘裡（07:xx:00～07:xx:59）；其他三個欄位正確。</li>
+  </ul>
+</div>
+
+<div class="local" data-test="ex2" data-files="api/prisma/schema.prisma ops/flag-changes.log">
+  <p>練習 2：止血，修根因，再把功能打開。</p>
+  <ul>
+    <li>先 <code>npm run flag -- orders.search off</code>（會自動記在 <code>ops/flag-changes.log</code>），用 curl 確認搜尋回 404、顧客還是看不到別人的訂單。不要整版回滾，<code>orders.controller.ts</code> 與 auth 模組都不用改。</li>
+    <li>新增 <code>api/prisma/migrations/20261116000000_orders_note_trgm/migration.sql</code>：<code>CREATE EXTENSION IF NOT EXISTS pg_trgm</code>，再用 <code>CREATE INDEX CONCURRENTLY</code> 建 <code>orders(note)</code> 的 GIN（<code>gin_trgm_ops</code>）索引。既有的 migration 不要改。</li>
+    <li><code>schema.prisma</code> 的 <code>model Order</code> 宣告同一個索引，讓 schema 跟資料庫一致。</li>
+    <li><code>npm run db:setup</code> 套用、EXPLAIN 確認用到索引之後，<code>npm run flag -- orders.search on</code>。</li>
+    <li>判分：沒登入查訂單 401、顧客查別人的訂單 404；旗標關閉時搜尋 404、打開時正常；migration 有 pg_trgm、gin_trgm_ops 與 CONCURRENTLY；<code>prisma migrate diff</code> 比對 schema 與資料庫沒有差異；20 萬張訂單時搜尋的 EXPLAIN 用到這個索引、沒有 Seq Scan；<code>ops/flag-changes.log</code> 在部署之後有關閉、之後再打開，最後是開的。</li>
+  </ul>
+</div>
+
+<div class="local" data-test="ex3" data-files="postmortem.md">
+  <p>練習 3：寫不究責的事後檢討 <code>postmortem.md</code>。</p>
+  <ul>
+    <li>四段都填：摘要、時間線、根因、行動項目。標題和 <code>- 欄位：</code> 的格式不要改，範本的 TODO 全部換掉。</li>
+    <li>時間線用 HH:MM（台北時間）：開始影響跟練習 1 同一分鐘；偵測是告警的時間（<code>ops/alerts.log</code>）；止血、復原照你演練的順序寫（止血晚於偵測，復原不早於止血）。</li>
+    <li>根因寫出端點與缺少的索引；行動項目至少 2 項，類型同時有 <code>prevent</code> 與 <code>detect</code>，每項寫負責角色。</li>
+    <li>判分：上面每一點（開始影響要跟練習 1 同一分鐘；根因要同時有 <code>/orders/search</code> 和「索引」），加上全文不能出現 <code>ops/deploys.log</code> 裡任何部署者的名字，只寫名不寫姓也不行。</li>
+  </ul>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 4：事故中你已經找到可疑的部署，但同一個版本也帶了一個安全修正。最好的止血方式通常是？</p>
+  <label data-key="a">問題在功能旗標後面就先關旗標；沒有旗標時，選影響最小、不會丟掉安全修正的操作</label>
+  <label data-key="b">整版回滾，最快回到已知的正常狀態</label>
+  <label data-key="c">直接在正式機上改程式，最快修好</label>
+  <label data-key="d">先不動，等根因修好再一起上</label>
+  <p class="why">✓ a。止血要快、副作用小。b 會把安全漏洞（這次是 BOLA）重新打開，用一個問題換另一個問題；c 繞過審查和測試，很容易造成第二個事故，也沒有紀錄；d 代表影響在修好之前一直持續擴大。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：重啟 API 之後，下單的 p95 恢復正常了。可以宣告事故結束嗎？</p>
+  <label data-key="a">可以，指標恢復就是結束</label>
+  <label data-key="b">不行：重啟沒有處理原因，店員一搜尋就會再發生；要先關旗標或建好索引，並觀察一段時間確認穩定</label>
+  <label data-key="c">可以，再重啟一次比較保險</label>
+  <label data-key="d">不行，要等事後檢討寫完才能結束</label>
+  <p class="why">✓ b。重啟只是清掉當下排隊的請求，造成問題的查詢還在，負載回來就會重演。結束的條件是原因已經被處理、指標穩定一段時間、資料一致。d 把兩件事混在一起：事故結束後才寫事後檢討。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 6：事後檢討的根因寫「工程師上線前沒有測試」。哪裡不好？</p>
+  <label data-key="a">太短，應該寫得更詳細</label>
+  <label data-key="b">沒有寫時間</label>
+  <label data-key="c">把問題歸到個人；應該寫流程為什麼允許它發生，例如測試資料太少看不出全表掃描、審查沒有要求附 EXPLAIN、旗標預設直接 100%</label>
+  <label data-key="d">沒有問題，這就是原因</label>
+  <p class="why">✓ c。不究責的檢討著重系統與流程：歸咎個人會讓大家以後隱藏問題，也產生不了可以執行的改善。寫成流程的缺口，才會有「PR 範本加 EXPLAIN」「旗標先開 10%」這種可以驗收的行動項目。a、b 都不是重點。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>一開始就埋頭找根因</strong>：沒有分工、沒有對外更新，客人持續點不到餐。先止血、先溝通，根因在止血之後查。</li>
+  <li><strong>只看一個指標就下結論</strong>：看到 CPU 99% 就升級資料庫、看到連線池滿就調大。把 log、部署紀錄、指標的時間對在一起，一路問「為什麼」到原因。</li>
+  <li><strong>平均值和全部請求混在一起看</strong>：慢的路由被快的稀釋。依路由分組（先去掉查詢字串、把 id 換成 <code>:id</code>），開始時間用跟告警同一個指標算。</li>
+  <li><strong>整版回滾</strong>：連同版本裡的安全修正一起丟掉。先找最小的關閉單位（功能旗標），回滾前看清楚那一版還帶了什麼。</li>
+  <li><strong>止血後不驗證</strong>：改完旗標就宣布好了。確認問題停了，也確認該保留的行為（這次是 SEC-7）還在。</li>
+  <li><strong>旗標關了就不再打開</strong>：功能永遠消失，也沒人記得為什麼。修好根因、確認索引有效之後打開，並記在時間線上。</li>
+  <li><strong>事故中用一般的 <code>CREATE INDEX</code></strong>：建索引的整段時間擋住下單，等於第二次事故。用 <code>CONCURRENTLY</code>，建完確認不是 INVALID。</li>
+  <li><strong>時間線事後憑記憶補寫</strong>：時間對不上，算不出偵測和止血花了多久。事故中當下記，也善用會自動記時間的工具（像 <code>ops/flag-changes.log</code>）。</li>
+  <li><strong>事後檢討變成找戰犯</strong>：寫人名、寫「某某疏忽」。寫角色和流程的缺口，行動項目同時有 prevent 和 detect，而且可以驗收。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>事故一開始先分工（指揮、溝通、操作），開時間線當下記錄，對外更新用固定格式和固定頻率。</li>
+  <li>定位靠三份資料對時間：log 依分鐘找出開始的時間、依路由找出拖累別人的那一個，部署紀錄找出相關的變更，指標分清楚症狀和原因。</li>
+  <li>止血選影響最小、副作用最小的手段（關功能旗標），不要用整版回滾丟掉同一版的安全修正；止血後驗證問題停了、該保留的還在。</li>
+  <li>修根因要有證據：EXPLAIN 看到 ILIKE '%…%' 全表掃描，用 pg_trgm 的 GIN 索引修，正式表上用 <code>CREATE INDEX CONCURRENTLY</code>，schema 同步宣告；確認之後才把功能打開，觀察穩定才算復原。</li>
+  <li>事後檢討不究責：摘要、時間線、根因、行動項目；寫系統與流程的缺口，行動項目分 prevent 和 detect，有負責角色。</li>
+</ul>
+<p>下一課是期末專題：獨立交付一張跨層需求單（訂單取消與退款），把前面學過的驗收條件、時段容量、冪等鍵、補償紀錄和這一課的擁有者檢查全部用上，附上驗收報告與自評。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

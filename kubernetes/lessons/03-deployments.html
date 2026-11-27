@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>3. Deployment 與 ReplicaSet：副本、自我修復與標籤</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="3" data-practice="kubernetes">
+<header>
+  <div class="eyebrow">階段 1：起步：從 Compose 到叢集 · 第 3 課</div>
+  <h1>Deployment 與 ReplicaSet：副本、自我修復與標籤</h1>
+</header>
+<main>
+
+<p>上一課你把 cafe-api 寫成一個 Pod，用 <code>kubectl apply</code> 跑起來了。但那個 Pod 只要被刪掉、或它所在的節點壞掉，就不會再回來，而且你只有一份。正式環境要的是「cafe-api 隨時有 3 份在跑、換版本時一份一份換、換壞了能退回去」。這些都是 <strong>Deployment</strong> 的工作。</p>
+<p>學完你能把一個無狀態服務用 Deployment 部署上去，並寫出一個在壞版本時會失敗而不是卡住的部署腳本。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>為什麼不直接建 Pod、三層結構：Deployment、ReplicaSet、Pod 各管什麼，刪掉的 Pod 為什麼會長回來。</li>
+  <li>selector 與 template 的 label：Deployment 怎麼認出「哪些 Pod 是我的」，寫錯會發生什麼事。</li>
+  <li>自我修復實驗：刪掉 Pod、停掉節點，親眼看控制器把副本補回來。</li>
+  <li>換版本與調整副本數：一份一份換新版、壞版本退回去，部署腳本怎麼在壞版本時失敗而不是卡住；尖峰時手動加的副本為什麼隔天消失。</li>
+  <li>Deployment 以外的控制器：有資料的服務、每個節點一份的程式、跑完就結束的工作，各該用什麼。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="01-why-kubernetes.html">第 1 課</a>的期望狀態與課程叢集：你宣告要的結果，控制器一直把實際狀態拉回去。練習前先用 <code>node kubernetes/practice/bin/cluster.mjs up</code> 建好叢集，並在終端機設好 <code>export KUBECONFIG="$PWD/kubernetes/practice/.kube/config"</code>。</li>
+  <li><a href="02-pods-yaml.html">第 2 課</a>的 Pod：Pod 的 YAML、貼在物件上的 label，以及 <code>kubectl apply</code>（照檔案建立或更新）、<code>describe</code>（看事件）、<code>logs</code>（看輸出）。</li>
+</ul></div>
+
+<h2>為什麼不直接建 Pod</h2>
+<p>先回想第 2 課的 Pod 會遇到什麼事：</p>
+<ul>
+  <li>有人 <code>kubectl delete pod cafe-api</code>，或某個工具清掉它：Pod 就沒了，沒有東西會把它建回來。</li>
+  <li>Pod 所在的節點當機：Pod 跟著消失。Pod 一旦被分到某個節點，就一輩子綁在那個節點上，不會自己搬家。</li>
+  <li>要 3 份：你得寫 3 個名字不同的 Pod，換版本時一個一個改、一個一個重建。</li>
+  <li>要換映像：Pod 的大部分欄位建立後不能改，只能刪掉重建，中間服務會斷。</li>
+</ul>
+<p>第 1 課說過 Kubernetes 的做法是「宣告期望狀態，讓控制器去維持」。Deployment 就是這份宣告：「我要 3 份長這樣的 Pod，換版本時一份一份換。」你不再直接管 Pod，而是管 Deployment，Pod 交給控制器去建、去補、去換。</p>
+
+<h2>三層結構：Deployment → ReplicaSet → Pod</h2>
+<p>把第 2 課的 Pod 改成 Deployment，只是把 Pod 的內容搬到 <code>spec.template</code> 底下，再加上副本數和 selector：</p>
+<pre>apiVersion: apps/v1            # Deployment 在 apps 這個 API 群組，v1 長期穩定
+kind: Deployment
+metadata:
+  name: cafe-api
+spec:
+  replicas: 3                  # 要幾份（數字，不要加引號）
+  selector:                    # 這個 Deployment 管哪些 Pod：用 label 挑
+    matchLabels:
+      app.kubernetes.io/name: cafe-api
+      app.kubernetes.io/instance: main
+  template:                    # Pod 範本：每一份 Pod 都照這個建
+    metadata:
+      labels:                  # 建出來的 Pod 會帶這些 label，必須被上面的 selector 挑得到
+        app.kubernetes.io/name: cafe-api
+        app.kubernetes.io/instance: main
+    spec:                      # 這裡就是第 2 課 Pod 的 spec，原封不動
+      containers:
+        - name: api
+          image: learn-k8s/cafe-api:v1
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: REQUIRE_DB   # cafe-api 預設要連資料庫才算準備好；這課還沒有資料庫
+              value: "0"
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 128Mi }</pre>
+<p><strong>Pod 範本</strong>（pod template）就是 <code>spec.template</code>：一個沒有名字的 Pod，Deployment 用它當模子印出每一份 Pod。Pod 的名字由控制器自動產生。</p>
+<p>apply 之後，叢集裡其實多了三種物件。Deployment 自己不建 Pod，它建一個 <strong>ReplicaSet</strong>：一個只負責「這個 Pod 範本隨時要有 N 份」的物件，再由 ReplicaSet 建 Pod。</p>
+<figure>
+  <svg viewBox="0 0 700 300" role="img" aria-label="Deployment cafe-api 擁有 ReplicaSet cafe-api-6b495df9d8，ReplicaSet 擁有三個 Pod；每一層都用 ownerReferences 指向上一層">
+    <defs><marker id="d3a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="215" y="10" width="270" height="62" rx="8"/>
+    <text class="d-text" x="350" y="36" text-anchor="middle">Deployment cafe-api</text>
+    <text class="d-small" x="350" y="57" text-anchor="middle">負責：版本更新、保留舊版本紀錄</text>
+    <path class="d-line" d="M350,72 L350,112" marker-end="url(#d3a)"/>
+    <text class="d-small" x="360" y="97">建立、調整副本數</text>
+    <rect class="d-box" x="190" y="116" width="320" height="62" rx="8"/>
+    <text class="d-text" x="350" y="142" text-anchor="middle">ReplicaSet cafe-api-6b495df9d8</text>
+    <text class="d-small" x="350" y="163" text-anchor="middle">負責：這個 Pod 範本隨時有 3 份</text>
+    <path class="d-line" d="M260,178 L130,222" marker-end="url(#d3a)"/>
+    <path class="d-line" d="M350,178 L350,222" marker-end="url(#d3a)"/>
+    <path class="d-line" d="M440,178 L570,222" marker-end="url(#d3a)"/>
+    <rect class="d-box" x="25" y="226" width="210" height="56" rx="8"/>
+    <text class="d-small" x="130" y="250" text-anchor="middle">cafe-api-6b495df9d8-db7j9</text>
+    <text class="d-small" x="130" y="270" text-anchor="middle">learn-k8s-worker</text>
+    <rect class="d-box" x="245" y="226" width="210" height="56" rx="8"/>
+    <text class="d-small" x="350" y="250" text-anchor="middle">cafe-api-6b495df9d8-gvwks</text>
+    <text class="d-small" x="350" y="270" text-anchor="middle">learn-k8s-worker2</text>
+    <rect class="d-box" x="465" y="226" width="210" height="56" rx="8"/>
+    <text class="d-small" x="570" y="250" text-anchor="middle">cafe-api-6b495df9d8-wnq4v</text>
+    <text class="d-small" x="570" y="270" text-anchor="middle">learn-k8s-worker</text>
+  </svg>
+  <figcaption>ReplicaSet 的名字是 Deployment 名稱加上 Pod 範本的雜湊；Pod 的名字再加上 5 個隨機字元。</figcaption>
+</figure>
+<p>為什麼要多一層？因為換版本時需要「新舊兩組 Pod 同時存在、一邊加一邊減」。每一組由一個 ReplicaSet 管，Deployment 只要調整兩個 ReplicaSet 的副本數就能完成更新（後面「換版本」那一節會看到）。ReplicaSet 通常不自己寫，讓 Deployment 建。</p>
+<p>用 <code>--show-labels</code> 一次看三層：</p>
+<pre>$ kubectl get deploy,rs,pod --show-labels
+NAME                       READY   UP-TO-DATE   AVAILABLE   LABELS
+deployment.apps/cafe-api   3/3     3            3           &lt;none&gt;
+
+NAME                                  DESIRED   CURRENT   READY   LABELS
+replicaset.apps/cafe-api-6b495df9d8   3         3         3       app.kubernetes.io/instance=main,app.kubernetes.io/name=cafe-api,pod-template-hash=6b495df9d8
+
+NAME                            READY   STATUS    LABELS
+pod/cafe-api-6b495df9d8-db7j9   1/1     Running   app.kubernetes.io/instance=main,app.kubernetes.io/name=cafe-api,pod-template-hash=6b495df9d8
+…</pre>
+<p>ReplicaSet 和 Pod 多了一個你沒寫的 label：<strong>pod-template-hash</strong>。Deployment 把 Pod 範本算出一個雜湊值，加在 ReplicaSet 的 selector 和它建的每個 Pod 上，用來分辨「這個 Pod 是哪一版範本建的」。範本一改，雜湊就變，就是另一個 ReplicaSet。</p>
+<p>每個 Pod 怎麼知道自己屬於誰？看 <strong>ownerReferences</strong>：物件 metadata 裡的「我屬於誰」：</p>
+<pre>$ kubectl get pod cafe-api-6b495df9d8-db7j9 -o jsonpath='{.metadata.ownerReferences}'
+[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"cafe-api-6b495df9d8","controller":true,"blockOwnerDeletion":true,"uid":"790e4bc1-…"}]</pre>
+<p>ReplicaSet 的 ownerReferences 指向 Deployment。這條鏈有兩個用途：控制器只管 <code>controller: true</code> 指向自己的物件；擁有者被刪掉時，叢集的垃圾回收（garbage collection）會連帶刪掉它擁有的物件。所以 <code>kubectl delete deployment cafe-api</code> 會把 ReplicaSet 和 3 個 Pod 一起刪掉，你不用一個一個清。反過來，只刪 Pod 沒用，ReplicaSet 會補回來。</p>
+<div class="callout"><strong>除錯時的習慣</strong>：看到一個陌生的 Pod，先看 ownerReferences 找出它的擁有者。要讓它消失、或要改它，都是去改擁有者，不是改 Pod 本身。</div>
+
+<h2>selector 與 template 的 label</h2>
+<p>Deployment 靠 <code>spec.selector</code> 認自己的 Pod，有三條規則要記住。</p>
+<p><strong>1. selector 一定要挑得到 template 的 label。</strong>否則 Deployment 建出來的 Pod 自己都認不得，會一直建下去。API server 直接拒絕這種寫法：</p>
+<pre>The Deployment "cafe-api" is invalid: spec.template.metadata.labels: Invalid value:
+{"app.kubernetes.io/name":"cafe-api"}: `selector` does not match template `labels`</pre>
+<p>template 可以比 selector 多 label（例如 <code>version: v1</code>），但 selector 裡的每一個 label，template 都要有，值也要一樣。</p>
+<p><strong>2. selector 建立後不能改。</strong>apps/v1 的 Deployment 一建立，selector 就固定了。改了再 apply 會看到：</p>
+<pre>The Deployment "cafe-api" is invalid: spec.selector: Invalid value: {…}: field is immutable</pre>
+<p>真的要改，只能刪掉 Deployment 重建（服務會中斷），或建一個新名字的 Deployment、等它 Ready 後再刪舊的。所以 selector 第一次就要想清楚，選一組以後不會改、而且只屬於這個 Deployment 的 label。</p>
+<p><strong>3. 不同 Deployment 的 selector 不要重疊。</strong>Kubernetes 不會阻止你，官方文件只警告「重疊的控制器可能衝突、行為難以預期」。在現在的版本，兩個 Deployment 不會互相搶 Pod：每個 Pod 的 ownerReferences 只指向一個 ReplicaSet，ReplicaSet 的 selector 又帶著 pod-template-hash。真正出問題的是其他「用 selector 找 Pod」的東西：</p>
+<ul>
+  <li><code>kubectl logs -l</code>、<code>kubectl delete pods -l</code> 會一起選到對方的 Pod。</li>
+  <li>Deployment 的 scale 子資源回報的 selector 就是 <code>spec.selector</code>。第 8 課的 HPA 用它找 Pod 算 CPU 平均，會把別人的 Pod 也算進去，擴縮的判斷就錯了。</li>
+  <li>第 9 課的 PodDisruptionBudget 也用 selector 計算「現在有幾個可用」。</li>
+</ul>
+<p>Kubernetes 建議的 label（第 2 課介紹過）剛好解決這件事：</p>
+<div class="table-wrap"><table>
+  <tr><th>label</th><th>意思</th><th>例子</th></tr>
+  <tr><td><code>app.kubernetes.io/name</code></td><td>這是什麼應用程式</td><td><code>cafe-api</code></td></tr>
+  <tr><td><code>app.kubernetes.io/instance</code></td><td>這個應用程式的哪一份部署</td><td><code>main</code>、<code>canary</code></td></tr>
+</table></div>
+<p>每個 Deployment 的 selector 用 name＋instance 兩個 label，組合就是唯一的。要「選到所有 cafe-api」的東西（例如第 4 課的 Service）只用 name；要「只選正式版」的用 name＋instance。<code>version</code> 這種每次部署都會變的 label 不要放進 selector：selector 不能改，放進去下次換版本就卡住了。</p>
+
+<h2>自我修復實驗</h2>
+<p><strong>自我修復</strong>（self-healing）是指 Pod 或節點壞掉時，控制器自動把副本數補回期望值。在你自己的叢集上試兩種情況（練習 1 會自動檢查第一種）。</p>
+<h3>刪掉一個 Pod</h3>
+<pre>kubectl get pods -l app.kubernetes.io/name=cafe-api -w      # 開一個視窗持續看（-w = watch）
+kubectl delete pod cafe-api-6b495df9d8-db7j9                # 在另一個視窗刪一個</pre>
+<p>第一個視窗會看到被刪的 Pod 變成 Terminating，同時多了一個新名字的 Pod 從 ContainerCreating 變成 Running。新 Pod 的名字前半段一樣，因為它屬於同一個 ReplicaSet：Pod 範本沒變，只是補一份。</p>
+<h3>停掉一個節點</h3>
+<p>kind 的節點是 Docker 容器，停掉容器就等於主機斷電：</p>
+<pre>kubectl get pods -o wide                       # 記下哪些 Pod 在 learn-k8s-worker2
+docker stop learn-k8s-worker2                  # 模擬節點當機
+kubectl get nodes -w                           # 看節點狀態變化
+kubectl get pods -o wide -w                    # 另一個視窗看 Pod
+docker start learn-k8s-worker2                 # 做完一定要開回來</pre>
+<p>你會發現 Pod 沒有馬上搬家。時間軸是這樣：</p>
+<figure>
+  <svg viewBox="0 0 700 200" role="img" aria-label="時間軸：0 秒節點停止；約 50 秒後節點被標成 NotReady 並加上 unreachable taint；再過 300 秒 Pod 被驅逐，ReplicaSet 在其他節點補上新 Pod">
+    <defs><marker id="d3b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <path class="d-line" d="M30,100 L680,100" marker-end="url(#d3b)"/>
+    <circle class="d-box" cx="40" cy="100" r="7"/>
+    <text class="d-text" x="40" y="80" text-anchor="middle">0 秒</text>
+    <text class="d-small" x="40" y="130" text-anchor="middle">節點停了</text>
+    <text class="d-small" x="40" y="148" text-anchor="middle">kubelet 不再回報</text>
+    <circle class="d-box" cx="180" cy="100" r="7"/>
+    <text class="d-text" x="180" y="80" text-anchor="middle">約 50 秒</text>
+    <text class="d-small" x="180" y="130" text-anchor="middle">節點變 NotReady</text>
+    <text class="d-small" x="180" y="148" text-anchor="middle">加上 unreachable taint</text>
+    <rect class="d-soft" x="190" y="40" width="390" height="22" rx="4"/>
+    <text class="d-small" x="385" y="56" text-anchor="middle">Pod 預設容忍 300 秒：等它恢復，不急著搬</text>
+    <circle class="d-box" cx="580" cy="100" r="7"/>
+    <text class="d-text" x="580" y="80" text-anchor="middle">約 350 秒</text>
+    <text class="d-small" x="580" y="130" text-anchor="middle">Pod 被驅逐（Terminating）</text>
+    <text class="d-accent" x="580" y="150" text-anchor="middle">ReplicaSet 在別的節點補上</text>
+  </svg>
+  <figcaption>數字是 Kubernetes 1.37 的預設值；正式叢集的平台團隊可能調過。</figcaption>
+</figure>
+<ol>
+  <li>kubelet 定期向 API server 回報節點還活著。停止回報超過 kube-controller-manager 的 <code>NodeMonitorGracePeriod</code>（預設 50 秒），節點的 Ready 變成 Unknown，<code>kubectl get nodes</code> 顯示 NotReady，控制平面在節點加上 <code>node.kubernetes.io/unreachable</code> 這個 <strong>taint</strong>（污點：標在節點上、表示「沒特別允許的 Pod 不要留在這裡」，第 9 課細講）。</li>
+  <li>每個 Pod 建立時，API server 自動幫它加上「容忍 not-ready 和 unreachable 300 秒」的 toleration。用 <code>kubectl get pod &lt;名稱&gt; -o jsonpath='{.spec.tolerations}'</code> 看得到 <code>tolerationSeconds: 300</code>。</li>
+  <li>300 秒到了，Pod 被標記刪除。節點上的 kubelet 已經不在，沒辦法確認容器真的停了，所以 Pod 會一直停在 Terminating；ReplicaSet 不把 Terminating 的 Pod 算進副本數，立刻在其他節點補一份。</li>
+  <li><code>docker start</code> 之後節點回來，kubelet 清掉那些 Terminating 的 Pod。</li>
+</ol>
+<p>為什麼要等 5 分鐘？節點「聯絡不上」不一定是當機，可能只是網路抖了幾秒。如果一聯絡不上就搬，網路一晃，整個節點上的 Pod 都會在別處重建，造成更大的負載。這是刻意的取捨：用幾分鐘的容量下降，換來不會因為小問題大搬家。這也說明了為什麼至少要 2～3 個副本、而且分散在不同節點：等待的這 5 分鐘裡，靠的是其他節點上的副本撐住服務（第 9 課會用 topologySpreadConstraints 確保分散）。</p>
+<div class="callout practice"><strong>💡 實務上：只有 1 個副本的服務，節點一掛就停 5 分鐘以上</strong><br>內部後台、報表這類「流量不大」的服務常被設成 1 個副本來省資源。它所在的節點當機時，照上面的時間軸要 5 分鐘以上才會在別的節點重建，這段時間整個服務是斷的；節點例行維護、升級時，它也一定會中斷一下。review 新服務的 manifest 時，資深工程師會問：「這個服務停 5 分鐘，誰會受影響？」會影響顧客或其他團隊，就至少 2 個副本、分散在不同節點；真的可以接受中斷，也把這個決定寫下來，讓值班的人知道。</div>
+
+<h2>換版本：rollout、revision 與回滾</h2>
+<p>從一版 Pod 範本換到另一版的過程叫 <strong>rollout</strong>（推出）。觸發的方法只有一個：改 Pod 範本。例如把映像從 v1 換成 v2，有兩種寫法：</p>
+<pre># 宣告式：改 deployment.yaml 裡的 image 再 apply（正式環境的做法，改動進 git）
+kubectl apply -f deployment.yaml
+
+# 命令式：直接改叢集裡的 Deployment（腳本與緊急時用；api 是容器名稱）
+kubectl set image deployment/cafe-api api=learn-k8s/cafe-api:v2</pre>
+<p>Pod 範本變了，雜湊就變，Deployment 建立第二個 ReplicaSet，然後一邊把新的擴大、一邊把舊的縮小：</p>
+<pre>$ kubectl rollout status deployment/cafe-api --timeout=90s
+Waiting for deployment "cafe-api" rollout to finish: 1 out of 3 new replicas have been updated...
+Waiting for deployment "cafe-api" rollout to finish: 2 out of 3 new replicas have been updated...
+Waiting for deployment "cafe-api" rollout to finish: 1 old replicas are pending termination...
+deployment "cafe-api" successfully rolled out
+
+$ kubectl get rs
+NAME                  DESIRED   CURRENT   READY
+cafe-api-5c7c4d7979   3         3         3        ← 新版（v2）
+cafe-api-6b495df9d8   0         0         0        ← 舊版（v1），縮到 0 但保留著</pre>
+<p>一次換幾個由兩個設定決定：<code>maxSurge</code>（最多可以比期望多幾個）和 <code>maxUnavailable</code>（最多可以少幾個可用），預設都是 25%。3 個副本時 maxSurge 往上取整是 1、maxUnavailable 往下取整是 0：先多開 1 個新的，等它 Ready 再關 1 個舊的，任何時候都至少有 3 個可用。細節和調整方式在第 9 課。</p>
+<p><code>kubectl rollout status</code> 會一直等到 rollout 完成，成功時以 0 結束、失敗時以非 0 結束，部署腳本靠它知道結果。<strong>一定要加 <code>--timeout</code></strong>：新版本起不來時，Deployment 要等 <code>progressDeadlineSeconds</code>（預設 600 秒）沒有進展才宣告失敗，CI 會白等 10 分鐘。</p>
+<h3>revision 與 change-cause</h3>
+<p>每次 Pod 範本改變就多一筆 <strong>revision</strong>（版本紀錄），存在舊的 ReplicaSet 裡（這就是舊 ReplicaSet 縮到 0 卻不刪的原因）。預設保留最近 10 個舊 ReplicaSet（<code>spec.revisionHistoryLimit</code>），被清掉的版本就回不去了。</p>
+<pre>$ kubectl annotate deployment/cafe-api kubernetes.io/change-cause="release v2" --overwrite
+$ kubectl rollout history deployment/cafe-api
+REVISION  CHANGE-CAUSE
+1         &lt;none&gt;
+2         release v2</pre>
+<p><code>CHANGE-CAUSE</code> 欄位讀的是 <code>kubernetes.io/change-cause</code> 這個 annotation，Kubernetes 不會自動填，要自己寫。部署腳本在改映像後順手寫上版本或 commit，出事時看 history 就知道每一版是什麼。</p>
+<p><strong>只改 replicas 不會產生新 revision</strong>：副本數不在 Pod 範本裡，同一個 ReplicaSet 直接擴大或縮小，Pod 也不會重啟。反過來，改 env、resources、label 這些 template 裡的東西，都會觸發一次 rollout。</p>
+<h3>壞版本與回滾</h3>
+<p>部署一個不存在的 tag 試試：</p>
+<pre>$ kubectl set image deployment/cafe-api api=learn-k8s/cafe-api:no-such-tag
+$ kubectl rollout status deployment/cafe-api --timeout=90s
+Waiting for deployment "cafe-api" rollout to finish: 1 out of 3 new replicas have been updated...
+error: timed out waiting for the condition          ← 以非 0 結束
+$ kubectl get pods
+cafe-api-5c7c4d7979-4bwhg   1/1   Running            ← 舊版 3 個還在服務
+cafe-api-5c7c4d7979-b4r4f   1/1   Running
+cafe-api-5c7c4d7979-mrzr8   1/1   Running
+cafe-api-748cfbd755-82g2x   0/1   ImagePullBackOff   ← 新版第 1 個就起不來，rollout 停在這裡</pre>
+<p>因為 maxUnavailable 是 0，新 Pod 沒 Ready 之前舊的一個都不會關，服務沒有中斷。但 Kubernetes <strong>不會自動回滾</strong>，它會一直卡著，回不回滾由你的部署流程決定：</p>
+<pre>kubectl rollout undo deployment/cafe-api                  # 回到上一個 revision
+kubectl rollout undo deployment/cafe-api --to-revision=2  # 回到指定的 revision
+kubectl rollout status deployment/cafe-api --timeout=90s  # 一樣要等它完成</pre>
+<p>undo 是把上一個 revision 的 Pod 範本拿回來，當成一次新的 rollout，所以 history 會變成 1、3、4（2 被「搬」成 4）。用 undo 而不是自己 <code>set image</code> 回某個 tag，是因為你不用記得上一版是什麼，而且上一版的 env、resources 也一起回來。</p>
+<div class="callout practice"><strong>💡 實務上：壞版本上線時，先 undo 止血，再修 manifest</strong><br>undo 是止血，不是修好：kubectl 會提醒 undo 不會更新 <code>last-applied-configuration</code>，git 裡的 deployment.yaml 還寫著壞版本，下一次有人 apply 又會把它部署回去。常見的流程是：在事故頻道說一聲「我要 undo cafe-api」→ 執行 undo、用 <code>rollout status</code> 等它完成 → 確認錯誤率回落 → 開 PR 把 manifest 改回好的版本（或 revert 壞的 commit）。如果新版是程式崩潰（CrashLoopBackOff），undo 之前先用 <code>kubectl logs --previous</code> 存下新版 Pod 的 log：undo 會把新 ReplicaSet 縮到 0，那些 Pod 和它們的 log 就一起消失了。</div>
+
+<h2>調整副本數：kubectl scale 與 manifest</h2>
+<pre>kubectl scale deployment/cafe-api --replicas=5     # 命令式：馬上生效</pre>
+<p>這很方便，但它只改了叢集裡的期望狀態，沒改 git 裡的 deployment.yaml。下一次 CI 執行 <code>kubectl apply</code>，replicas 會被改回檔案裡的 3。尖峰時手動加的副本，隔天部署後就悄悄消失了。</p>
+<p>正式環境的規則：<strong>宣告的檔案才是真相</strong>。要長期改副本數，改 manifest、走 code review、再部署。要依流量自動調整，交給第 8 課的 HPA，並且從 manifest 拿掉 replicas，免得每次 apply 都跟 HPA 搶。</p>
+<div class="callout practice"><strong>💡 實務上：kubectl scale 只用來救急，當天就補 PR</strong><br>週六中午點餐尖峰，值班的人用 <code>kubectl scale</code> 加到 5 份撐過去，這樣做沒有問題。要做好的是後續：在事故頻道記下「cafe-api 手動調到 5」，當天就開 PR 改 manifest 或討論要不要改回 3，不然下一次部署會在沒人注意時把副本數改回去。資深工程師會接著問：這次尖峰是可預期的（活動、發薪日），還是天天都有？天天都有，就該交給第 8 課的 HPA，而不是每次靠人手動加。</div>
+
+<h2>Deployment 以外的控制器</h2>
+<p>Deployment 適合<strong>無狀態</strong>的服務：每一份 Pod 都一樣、可以隨時被替換、資料不存在 Pod 裡（<a href="../../devops/lessons/13-scaling.html">devops 課第 13 課</a>講的條件）。其他情況有別的控制器：</p>
+<div class="table-wrap"><table>
+  <tr><th>控制器</th><th>保證什麼</th><th>例子</th></tr>
+  <tr><td>Deployment</td><td>N 份一樣的 Pod，滾動更新</td><td>cafe-api、背景 worker</td></tr>
+  <tr><td>DaemonSet</td><td>每個節點剛好一份</td><td>收集節點日誌的 agent、kube-proxy</td></tr>
+  <tr><td>StatefulSet</td><td>每一份有固定的名字和自己的儲存空間</td><td>自己架的資料庫（第 11 課）</td></tr>
+  <tr><td>Job／CronJob</td><td>跑完就結束，失敗會重試；CronJob 照排程跑</td><td>資料庫 migration、每日報表（第 10 課）</td></tr>
+</table></div>
+
+<h2>練習</h2>
+<p>在 <code>learn</code> 資料夾執行頁面上的指令，起始檔會複製到 <code>kubernetes/practice/work/03/</code>。測試會把你的 manifest 套用到專屬的 namespace（<code>k8s-03-ex1</code> 這種名字），檢查完就刪掉。自己想先試的話，建一個自己的 namespace：<code>kubectl create namespace try-03</code>，再 <code>kubectl apply -n try-03 -f kubernetes/practice/work/03/ex1/</code>，用完 <code>kubectl delete namespace try-03</code>。</p>
+
+<div class="local" data-test="ex1" data-files="ex1/deployment.yaml">
+  <p>練習 1：<code>ex1/deployment.yaml</code> 現在是第 2 課那種單獨的 Pod。把它改成 Deployment：名稱 <code>cafe-api</code>、3 個副本；selector 和 Pod 範本都用 <code>app.kubernetes.io/name: cafe-api</code> 與 <code>app.kubernetes.io/instance: main</code>；容器名稱 <code>api</code>、映像 <code>learn-k8s/cafe-api:v1</code>、<code>imagePullPolicy: IfNotPresent</code>、環境變數 <code>REQUIRE_DB=0</code>；requests 是 cpu 50m、memory 64Mi，limits 是 memory 128Mi。測試先用 kubeconform 和欄位檢查，再套用到叢集等 3 個 Pod Ready，然後刪掉其中一個，確認在時間內回到 3 個 Ready，而且新 Pod 屬於同一個 ReplicaSet。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="ex2/deployments.yaml ex2/WHY.md">
+  <p>練習 2：<code>ex2/deployments.yaml</code> 有正式版 <code>cafe-api</code>（3 份 v1）和金絲雀版 <code>cafe-api-canary</code>（1 份 v2，先讓少量流量試新版）。套用後 Pod 數量都對，但團隊發現 <code>kubectl logs -l</code> 和 HPA 的計算都把兩邊混在一起。找出原因並修好：兩個 Deployment 都要留著、副本數和映像不變、兩邊的 Pod 都保留 <code>app.kubernetes.io/name: cafe-api</code>，但每個 Deployment 的 selector 只能選到自己的 Pod。最後在 <code>ex2/WHY.md</code> 用一句話寫出原因。測試會讀每個 Deployment 的 scale 子資源（HPA 用的那個 selector），確認它只選到自己的 Pod。提醒：你如果已經在自己的 namespace 套用過舊版，改 selector 會遇到 field is immutable，先 <code>kubectl delete -f</code> 再 apply。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="ex3/release.sh ex3/rollback.sh">
+  <p>練習 3：寫部署和回滾腳本，要操作的是 namespace <code>k8s-03-ex3</code> 裡的 <code>deployment/cafe-api</code>（測試會先建好，內容跟練習 1 一樣，另外把 progressDeadlineSeconds 設成 120 秒）。<code>release.sh &lt;tag&gt;</code>：用 kubectl 把容器 <code>api</code> 的映像換成 <code>learn-k8s/cafe-api:&lt;tag&gt;</code>、寫上包含 tag 的 <code>kubernetes.io/change-cause</code>、用 <code>rollout status</code> 等它完成，最多 180 秒，沒完成要以非 0 結束。<code>rollback.sh</code>：回到上一個 revision 並等它完成。測試依序執行 <code>release.sh v2</code>（要成功、history 有 2 筆）、<code>release.sh no-such-tag</code>（要失敗、舊版 3 個 Pod 照常服務）、<code>rollback.sh</code>（要回到 v2，不是 v1）。不能刪掉重建 Deployment。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 4：只把 Deployment 的 <code>replicas</code> 從 3 改成 5 再 apply，<code>kubectl rollout history</code> 會怎樣？</p>
+  <label data-key="a">多一筆 revision</label>
+  <label data-key="b">不變：只有 Pod 範本（template）改變才會建立新的 ReplicaSet 和 revision</label>
+  <label data-key="c">舊的 revision 會被清掉</label>
+  <label data-key="d">所有 Pod 會重啟一次</label>
+  <p class="why">✓ replicas 不在 Pod 範本裡，現有的 ReplicaSet 直接擴大到 5 份，原本的 3 個 Pod 不受影響。改映像、env、resources、template 的 label 才會觸發 rollout、多一筆 revision。a、d 是把「改副本數」誤當成「改範本」；c 只有超過 revisionHistoryLimit 時才會清舊的。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：kind 的一個 worker 節點停掉後，上面的 Pod 沒有立刻搬到別的節點。為什麼？</p>
+  <label data-key="a">Kubernetes 不會搬移 Pod，要自己重建</label>
+  <label data-key="b">節點先被標成 NotReady，Pod 預設容忍 not-ready／unreachable 300 秒，時間到才被驅逐並在別處重建，避免網路短暫中斷就大量搬移</label>
+  <label data-key="c">因為 Deployment 沒有設定 replicas</label>
+  <label data-key="d">要手動執行 kubectl drain 才會搬</label>
+  <p class="why">✓ 這是刻意的延遲：先等約 50 秒確認節點失聯，再給 300 秒的容忍時間。需要更快搬移的服務可以把 tolerationSeconds 調小，代價是網路抖動時多餘的搬移。a、d 錯在會自動搬，只是有等待時間（drain 是計畫性維護時用的，第 9 課）；c 錯在沒寫 replicas 預設就是 1，一樣會補。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：同事在正式環境用 <code>kubectl scale --replicas=10</code> 應付尖峰，隔天 CI 部署之後服務又變慢了。最可能的原因是？</p>
+  <label data-key="a">kubectl scale 的效果只維持 24 小時</label>
+  <label data-key="b">CI 執行 apply 時，把 replicas 改回 manifest 寫的值；命令式的修改沒有寫進宣告的檔案</label>
+  <label data-key="c">HPA 把它縮回去了</label>
+  <label data-key="d">新版本的 Pod 被 OOMKilled</label>
+  <p class="why">✓ 宣告的檔案是真相，命令式的修改會在下一次 apply 被覆蓋。要長期改就改 manifest；要依流量自動調整就用 HPA，並從 manifest 拿掉 replicas（第 8 課）。a 不存在；c 只有設了 HPA 才可能，題目沒有；d 不會讓副本數變少。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>直接建 Pod 跑服務</strong>：Pod 被刪或節點壞掉就不會回來。服務一律用 Deployment（或其他控制器）管理。</li>
+  <li><strong>selector 和 template 的 label 對不上</strong>：API server 拒絕套用。selector 裡的每個 label 都要原樣出現在 <code>spec.template.metadata.labels</code>。</li>
+  <li><strong>想改 selector</strong>：apps/v1 的 selector 建立後不能改。第一次就用 <code>app.kubernetes.io/name</code>＋<code>instance</code> 這種不會變的組合，不要放 version。</li>
+  <li><strong>selector 和其他 Deployment 重疊</strong>：HPA、PDB、<code>kubectl -l</code> 會把別人的 Pod 算進來。每個 Deployment 用自己唯一的 label 組合。</li>
+  <li><strong>以為改了 ConfigMap 或 Secret 就會更新 Pod</strong>：只有 Pod 範本改變才會觸發 rollout（第 6 課教怎麼處理）。</li>
+  <li><strong><code>rollout status</code> 不加 <code>--timeout</code></strong>：壞版本時 CI 要等 progressDeadlineSeconds（預設 600 秒）。加上 timeout，失敗時以非 0 結束並決定要不要 undo（第 9 課）。</li>
+  <li><strong>用刪掉重建來換版本</strong>：所有 Pod 同時消失，服務中斷，history 也沒了。改 Pod 範本，讓 Deployment 滾動更新。</li>
+  <li><strong>用 kubectl scale 修正式環境</strong>：下次部署被蓋回去。改 manifest 或交給 HPA。</li>
+  <li><strong>undo 之後沒改 manifest</strong>：下一次 apply 會把壞版本部署回來。止血後馬上把檔案改回好的版本。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>Deployment 宣告「N 份這樣的 Pod」；它建 ReplicaSet，ReplicaSet 建 Pod。每一層用 ownerReferences 指向擁有者，刪擁有者會連帶刪掉底下的物件。</li>
+  <li>selector 必須挑得到 template 的 label、建立後不能改、不要跟別的 Deployment 重疊。用 <code>app.kubernetes.io/name</code>＋<code>app.kubernetes.io/instance</code>。</li>
+  <li>Pod 被刪，ReplicaSet 馬上補；節點失聯，約 50 秒後變 NotReady，Pod 再等 300 秒才被驅逐重建。這段時間靠其他節點上的副本撐住。</li>
+  <li>改 Pod 範本才會觸發 rollout：新 ReplicaSet 擴大、舊的縮小。<code>rollout status --timeout</code> 等結果，<code>rollout history</code> 看紀錄（change-cause 要自己寫），<code>rollout undo</code> 回上一版。Kubernetes 不會自動回滾。</li>
+  <li>副本數改 manifest，不要靠 <code>kubectl scale</code>；要自動調整用 HPA。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 8 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 7：cafe-api 的 3 個 Pod 都是 CrashLoopBackOff，<code>logs --previous</code> 印出 <code>Cannot find module 'dist/main.js'</code>。值班同事說：「把 Pod 刪掉讓它重建就好。」會怎樣？</p>
+  <label data-key="a">Pod 刪掉就不會回來，副本數少一份，要等下次 apply 才補</label>
+  <label data-key="b">新 Pod 會重新拉一次映像，拿到完整的檔案後就能正常啟動</label>
+  <label data-key="c">新 Pod 照同一個 Pod 範本建出來，同樣的 args 會讓它再崩潰一次</label>
+  <label data-key="d">應該改用 <code>kubectl edit pod</code> 修正那個 Pod 的 args，比刪掉快</label>
+  <p class="why">✓ 控制器只負責「維持 3 份照範本建的 Pod」，範本沒變，補回來的 Pod 就有同樣的問題。要修的是期望狀態：改 manifest 的 args 再 apply，Deployment 會滾動換成新 Pod。a 錯在 Pod 歸 ReplicaSet 管，刪掉馬上補；單獨建的 Pod 才不會回來。（第 1、2、3 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 8：咖啡店目前用 Compose 跑兩個 cafe-api 副本，設了 <code>restart: unless-stopped</code>。主管問：「程式崩潰已經會自動重開了，Kubernetes 還多解決了什麼？」最關鍵的一點是？</p>
+  <label data-key="a">那台主機當機時：Compose 只管一台，整個服務停擺；Kubernetes 會在別的節點把副本補回來</label>
+  <label data-key="b">程式崩潰時：Compose 的 restart 只在主機重開機後生效，容器崩潰不會被重開</label>
+  <label data-key="c">要多開副本時：Compose 一個服務只能跑一個容器，Kubernetes 才能跑多份</label>
+  <label data-key="d">效能：Kubernetes 用 containerd 啟動容器，比 Docker 快、也比較省記憶體</label>
+  <p class="why">✓ 程序崩潰兩邊都會重開，差別在主機層級：Compose 只管一台，主機掛了就全停；Kubernetes 的控制器發現副本少了，在其他節點補上。代價是學習、維運和費用，一台主機、一個服務時 Compose 加 systemd 和監控就夠。c 錯在 Compose 可以 <code>--scale</code>，只是不能跨主機，upstream 也要自己改。（第 1 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 9：告警規則寫成「Pod 的 phase 不是 Running 就通知」。下面哪種狀況會漏掉，不會通知？</p>
+  <label data-key="a">映像的 tag 打錯，新 Pod 一直 ImagePullBackOff</label>
+  <label data-key="b">程式啟動後就結束，容器一直被重開，顯示 CrashLoopBackOff</label>
+  <label data-key="c">init container 連不上資料庫，一直失敗重試</label>
+  <label data-key="d">Pod 引用的 Secret 不存在，顯示 CreateContainerConfigError</label>
+  <p class="why">✓ 已經排到節點、容器在跑或正在重開時，phase 就是 Running，所以一直崩潰的 Pod 仍是 Running。phase 只是大方向，要看容器的 Waiting／Terminated reason 和重啟次數。a、c、d 的主容器都還沒啟動過，phase 停在 Pending，會被這條規則抓到。（第 2 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 10：CI 把修好的程式重新 build 成同一個 tag <code>learn-k8s/cafe-api:v1</code> 推上 registry，再 <code>kubectl apply</code> 同一份 manifest，結果印出 <code>unchanged</code>，線上還是舊程式。為什麼？</p>
+  <label data-key="a">kubelet 會定期檢查 registry，新映像要等下一輪檢查才會被拉下來</label>
+  <label data-key="b">apply 只會建立不存在的物件，已經存在的 Deployment 要刪掉重建才會更新</label>
+  <label data-key="c">rollout 已經開始了，只是 maxUnavailable 是 0，要等新 Pod Ready 才看得到</label>
+  <label data-key="d">Pod 範本一個字都沒變，Deployment 不會建新的 ReplicaSet，現有的 Pod 也不會重拉映像</label>
+  <p class="why">✓ 只有 Pod 範本改變才會觸發 rollout；映像內容換了但 tag 沒換，對叢集來說期望狀態完全一樣。每次 build 用新的 tag（正式環境用 commit SHA），改 manifest 的 image 再 apply。c 錯在 <code>unchanged</code> 代表根本沒有 rollout，不是在等。（第 2、3 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 11：同事要下線一個舊的 worker 服務，刪了它的 Pod，馬上冒出新的；再刪 ReplicaSet，過幾秒 ReplicaSet 和 Pod 又全部回來了。為什麼？</p>
+  <label data-key="a">Pod 上有 finalizer 擋著，要先移除 finalizer 才刪得掉</label>
+  <label data-key="b">刪 ReplicaSet 預設不會刪掉它的 Pod，留下的 Pod 又被認領回去</label>
+  <label data-key="c">要先把 ReplicaSet 的副本數 scale 到 0，再刪才不會被重建</label>
+  <label data-key="d">ReplicaSet 也有擁有者，Deployment 發現它不見了就照範本再建一個</label>
+  <p class="why">✓ 這是兩層控制迴圈：ReplicaSet 補 Pod，Deployment 補 ReplicaSet。用 ownerReferences 往上找到最上層的擁有者，刪 Deployment，垃圾回收會連帶刪掉底下的 ReplicaSet 和 Pod。c 錯在 ReplicaSet 的副本數由 Deployment 決定，你改成 0 也會被改回期望值。（第 3 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 12：這個 Deployment 已經在線上跑 v1。下一版把兩處的 <code>v1</code> 都改成 <code>v2</code> 再 apply，會怎樣？</p>
+<pre>spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cafe-api
+      version: v1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cafe-api
+        version: v1</pre>
+  <label data-key="a">建立新的 ReplicaSet，舊的 v1 Pod 不符合新的 selector，變成沒人管的 Pod 繼續跑</label>
+  <label data-key="b">apply 被拒絕：selector 建立後不能改，只能刪掉重建或換一個新名字的 Deployment</label>
+  <label data-key="c">正常滾動更新，因為 selector 和 template 的 label 兩邊仍然一致</label>
+  <p class="why">✓ apps/v1 的 selector 一建立就固定，改了會得到 <code>field is immutable</code>。每次部署都會變的 version 只能放在 template 的 label，selector 用 <code>app.kubernetes.io/name</code>＋<code>instance</code> 這種不會變的組合。c 錯在「兩邊一致」只是建立時的檢查，已存在的 Deployment 還有不能改這條規則。（第 3 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 13：cafe-api 設了 2 個副本，剛好都排在 learn-k8s-worker2。這個節點斷電後，服務會怎樣？</p>
+  <label data-key="a">ReplicaSet 一發現節點斷線就在 learn-k8s-worker 補上 2 份，中斷只有幾秒</label>
+  <label data-key="b">Pod 綁在節點上永遠不會搬，要有人手動 drain 節點才會在別處重建</label>
+  <label data-key="c">5 分鐘以上沒有可用的副本：要等節點變 NotReady，再等 Pod 的容忍時間到了被驅逐，才會補</label>
+  <label data-key="d">scheduler 把這 2 個 Pod 原封不動搬到 learn-k8s-worker，名字和 IP 都不變</label>
+  <p class="why">✓ 節點約 50 秒後才變 NotReady，Pod 預設再容忍 300 秒才被驅逐，ReplicaSet 這時才在別處補（1.37 的預設值）。這段時間只能靠其他節點上的副本撐，所以副本要分散到不同節點（第 9 課）。a 錯在控制器不會一聯絡不上就搬，這是為了避免網路抖一下就大搬家的刻意延遲。（第 3 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 14：部署腳本如下，這次 <code>$TAG</code> 打錯了，registry 上沒有這個映像。cafe-api 原本有 3 個副本，執行後會怎樣？</p>
+<pre>kubectl set image deployment/cafe-api api=learn-k8s/cafe-api:$TAG
+kubectl rollout status deployment/cafe-api
+echo "部署完成"</pre>
+  <label data-key="a">舊版 3 個繼續服務，新 Pod 卡在 ImagePullBackOff；腳本約 10 分鐘後才失敗，而且叢集一直卡在這裡</label>
+  <label data-key="b">Deployment 發現新 Pod 起不來，自動回到上一個 revision，腳本最後印出「部署完成」</label>
+  <label data-key="c">舊 Pod 先被關掉一個讓位給新版，新版又起不來，服務剩 2 個副本直到有人回滾</label>
+  <p class="why">✓ 新 Pod 沒 Ready 之前舊的不會關，服務不中斷；但 Kubernetes 不會自動回滾，<code>rollout status</code> 要等 progressDeadlineSeconds（預設 600 秒）才以非 0 結束。修法：加 <code>--timeout</code>，失敗就 <code>rollout undo</code>，再把 manifest 改回好版本。b 是最常見的誤解：回不回滾由你的部署流程決定。（第 3 課）</p>
+</div>
+<p>這個階段的重點整理成<a href="../sheets/stage-1.html">一頁圖解</a>。</p>
+<p>下一課解決一個新問題：3 個 Pod 的 IP 會一直變，其他服務要怎麼找到它們？答案是 Service 和叢集內的 DNS。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

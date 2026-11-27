@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>17. CI/CD 與部署</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="17" data-practice="nestjs" data-task="pf17">
+<header>
+  <div class="eyebrow">階段 B3：上線與作品 · 第 17 課</div>
+  <h1>CI/CD 與部署</h1>
+</header>
+<main>
+
+<p>上一課結束時，你的 SaaS 在本機已經很完整：每個回應有 requestId、log 帶著租戶、<code>/health/ready</code> 會檢查資料庫與 Redis。但它只活在你的電腦上。面試官點開你的 GitHub repo，第一眼看的常常不是程式，而是 README 上的 CI 徽章是綠是紅、每個 PR 有沒有真的跑過測試；第二眼是 demo 網址打不打得開。這兩件事說的是同一件事：<strong>這個專案每次改動都經過驗證，而且真的跑得起來</strong>。</p>
+<p>這一課跟著一個具體的改動走完全程：你開了一個 PR，把 <code>projects.description</code> 欄位改名成 <code>summary</code>。這個 PR 要先通過 CI 的檢查，build 成一個有明確版本的映像，在不讓線上出錯的前提下套用 migration、換上新程式，部署完自動確認它真的能用，壞了能退回去，最後讓面試官在 demo 環境裡放心地玩。每一關都在擋一種真實會發生的事故。</p>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="04-docker-compose.html">第 4 課</a>的多階段 Dockerfile、一次性的 <code>migrate</code> 服務、<code>depends_on</code> 的 <code>condition</code>；<a href="05-ci-deploy-readme.html">第 5 課</a>的 GitHub Actions 與 PostgreSQL service container。</li>
+  <li><a href="../../devops/lessons/16-cd.html">DevOps 課第 16 課</a>的不可變產物（同一個標籤永遠是同一份程式）、回滾與往前修、部署後的冒煙測試。</li>
+  <li><a href="../../devops/lessons/17-deploy-migrations.html">DevOps 課第 17 課</a>的 expand／contract：先加、再搬、最後刪，讓新舊版本共存的那段時間不出錯；migration 角色與 app 角色分開。</li>
+  <li><a href="09-rls-defense-in-depth.html">第 9 課</a>的 RLS：資料庫層的租戶隔離，API 用受限的 <code>pf_app</code> 角色連線才會生效。</li>
+</ul></div>
+
+<div class="callout">練習 1、2 只讀你 repo 的檔案（<code>.github/workflows/</code>、<code>Dockerfile</code>、<code>compose.yaml</code>），不用啟動 API。練習 3 是選做：部署好之後在 <code>work/portfolio.json</code> 填 <code>saas.deployUrl</code> 才會跑，沒部署不影響其他題。</div>
+
+<p>這課的路線：</p>
+<ul>
+  <li>PR 推上去之後，CI 要證明什麼？SaaS 比階段 A 多了哪些依賴，步驟為什麼這樣排。</li>
+  <li>CI 的最後一步 build 映像：參考實作原本 build 不起來的兩個原因。</li>
+  <li>映像要叫什麼名字、migration 什麼時候跑：commit SHA 與獨立的 migration 步驟。</li>
+  <li><code>description</code> 改名成 <code>summary</code>：舊程式還在跑時怎麼不出錯（expand／contract）。</li>
+  <li>送上哪裡、secret 怎麼進去、部署完怎麼確認與回滾；最後準備給面試官的 demo 環境。</li>
+</ul>
+
+<h2>PR 推上去之後，CI 要證明什麼？</h2>
+<p>先把名詞講清楚。CI（持續整合）指的是：每一次有人推 commit 或開 PR，就由一台乾淨的機器自動把專案從頭裝起來、跑檢查與測試。它要回答的問題只有一個：「這個 commit 合進主線之後，專案還是好的嗎？」之所以要交給機器，是因為人會偷懶、會忘記、會只在自己的電腦上跑；你電腦上有的環境變數、已經建好的資料表、舊的 <code>node_modules</code>，CI 的機器上一樣都沒有，所以它抓得到「只有在我這台會動」的問題。</p>
+<p>第 5 課已經做過一次：「裝套件 → 型別 → 測試（PostgreSQL）→ build 映像」。那時候的專案只依賴一個資料庫。現在的 SaaS 多了三個依賴，CI 的機器上也要有：</p>
+<ul>
+  <li><strong>Redis</strong>：第 13、14 課的 BullMQ 佇列與限流都靠它，沒有 Redis，相關的測試根本跑不起來。</li>
+  <li><strong>Mailpit</strong>：第 10 課的邀請信要寄到某個地方，測試會去 Mailpit 收信確認。</li>
+  <li><strong>第二個資料庫角色 <code>pf_app</code></strong>：第 9 課的 RLS 只對受限的角色生效，測試裡的 API 要用它連線，原因下面會講透。</li>
+</ul>
+<p>GitHub Actions 用 <code>services</code> 在同一台機器上把這些依賴開成容器（service container），測試就像在本機跑 compose 一樣連得到它們。參考實作的 <code>.github/workflows/ci.yml</code>：</p>
+<pre>jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18.6-alpine
+        env: { POSTGRES_USER: owner, POSTGRES_PASSWORD: owner, POSTGRES_DB: my_saas }
+        ports: ["5432:5432"]
+        options: &gt;-
+          --health-cmd "pg_isready -U owner" --health-interval 2s --health-timeout 3s --health-retries 30
+      redis:
+        image: redis:8.10.3-alpine
+        ports: ["6379:6379"]
+      mailpit:
+        image: axllent/mailpit:v1.33.1
+        ports: ["1025:1025", "8025:8025"]
+    env:
+      DATABASE_URL: postgresql://owner:owner@localhost:5432/my_saas          # migration 用擁有者
+      APP_DATABASE_URL: postgresql://pf_app:pf_app@localhost:5432/my_saas    # 測試裡的 API 用 pf_app，RLS 才會生效
+      REDIS_URL: redis://localhost:6379/0
+      # …JWT_SECRET 等：CI 專用的假值，不是正式環境的 secret
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with: { node-version: 24, cache: npm }
+      - run: npm ci
+      - run: npx prisma generate
+      - run: npm run lint
+      - run: npx prisma migrate deploy
+      - run: npm test
+      - run: docker build -t my-saas:${{ github.sha }} .</pre>
+<p>步驟的順序不是隨便排的，原則是「便宜又常錯的先跑，貴的放後面」，加上「測試的環境要跟正式環境一樣」。拿你的改名 PR 來看，每一步各擋住什麼：</p>
+<p><strong>型別檢查在測試之前</strong>。<code>npm run lint</code> 在參考實作就是 <code>tsc --noEmit</code>（第 5 課），幾秒就跑完。你把欄位改名之後，只要有一個地方還寫著 <code>project.description</code>，這一步就會紅，不用等幾分鐘的 E2E 才發現。</p>
+<p><strong><code>migrate deploy</code> 在測試之前</strong>。這一步把 <code>prisma/migrations/</code> 裡的檔案依序套用到 CI 的空資料庫，跟正式環境上線時做的事一模一樣，包括第 9 課手寫的 RLS policy。這樣測試跑的是「正式環境會長成的那個 schema」。如果測試改用 <code>db push</code>（直接照 schema 檔把資料表推上去，不經過 migration 檔）或在測試裡自己建表，你手寫在 migration 裡的 RLS 就從來沒被執行過，等於沒測到。</p>
+<p><strong>測試裡的 API 用 <code>pf_app</code> 連線</strong>。這是最容易做錯、做錯又完全看不出來的一步。CI 的 <code>owner</code> 是 PostgreSQL 映像依 <code>POSTGRES_USER</code> 建立的帳號，它是 superuser。superuser 一律繞過 RLS，不管 policy 寫得多嚴、有沒有 FORCE 都一樣。如果 API 在 CI 裡用 <code>owner</code> 連線，資料庫那一道防線在測試時根本不存在：某個查詢漏了租戶條件，資料庫也照樣把別家的資料交出來，而跨租戶測試只是剛好驗證了程式那一層，就顯示「通過」。這是第 9 課那個坑在 CI 裡的版本。所以 CI 用兩條連線字串：<code>DATABASE_URL</code> 給 migration（要建表、建 policy，需要擁有者），<code>APP_DATABASE_URL</code> 給 API（受 RLS 限制的 <code>pf_app</code>），跟正式環境的分工一樣。</p>
+<p><strong>build 映像在最後</strong>。測試過了，這個 commit 才值得 build 成映像；而且「build 得起來」本身就是一項檢查，下一節會看到參考實作原本就 build 不起來。</p>
+<p><code>npm test</code> 裡包含第 8 課起寫的跨租戶 E2E（<code>test/tenant-isolation.e2e-spec.ts</code>），所以 CI 綠燈的意思包括「沒有一個端點讀得到別的租戶」。這個綠燈有意義的前提是：<strong>測試失敗時 CI 一定要失敗</strong>。常見的破壞方式是有人覺得「E2E 偶爾不穩，擋到大家合併」，就在測試步驟加 <code>continue-on-error: true</code> 或在指令後面接 <code>|| true</code>。前者讓 GitHub 把失敗的步驟當成通過，後者讓指令的結束碼永遠是 0，結果都是 CI 永遠綠燈，等於沒有 CI。不穩的測試要修或隔離（DevOps 課第 15 課），不是把結果吞掉。</p>
+<p>依賴與映像的漏洞掃描也能放進這條 CI，做法放在課末的「補充與查表」。</p>
+
+<div class="callout practice"><strong>💡 實務上：CI 的時間就是開發速度</strong><br>CI 跑 15 分鐘，每個人每天就有好幾次在等；團隊大一點，大家就開始「先合再說」，CI 的保護就名存實亡。常見的加速：npm 快取（<code>setup-node</code> 的 <code>cache: npm</code>）、型別與單元測試先跑（失敗就不用等 E2E）、E2E 與映像掃描平行。作品的 CI 不用優化到極致，但把跑完的時間寫在 README 裡（例如「CI 約 3 分鐘」），說明你有注意這件事。</div>
+
+<p>CI 到這裡證明了「這個 commit 的程式是對的」。但它的最後一步是把程式包成映像，而這一步有自己的坑。</p>
+
+<h2>CI 的最後一步 build 映像：為什麼參考實作 build 不起來？</h2>
+<p>映像（image）是把程式、執行環境與依賴打包成一份可以直接跑的檔案，正式環境跑的就是它，所以「build 不起來」等於「上不了線」。寫這門課時把參考實作的 compose 真的跑了一次，踩到兩個坑。它們都來自同一個事實：<strong>Docker build 的環境跟你的開發環境不一樣</strong>，而你的 repo 很可能也有這兩個坑。</p>
+<p><strong>坑一：<code>prisma generate</code> 在 build 時失敗</strong>。<code>.env</code> 被 <code>.dockerignore</code> 排除了，這是對的：<code>.env</code> 裡有密碼，本來就不該進映像。所以 build 的時候環境裡沒有 <code>DATABASE_URL</code>。而 <code>prisma.config.ts</code> 用的 <code>env('DATABASE_URL')</code> 在變數不存在時會直接丟錯（Prisma 7.10.1 實測：<code>PrismaConfigEnvError: Cannot resolve environment variable: DATABASE_URL</code>），連根本不需要連資料庫的 <code>generate</code> 也一樣跟著失敗。在你的電腦上永遠有 <code>.env</code>，所以這個錯只會在 Docker 裡出現。第 4 課的小專案也是這樣修的：</p>
+<pre>// prisma.config.ts
+// 用 process.env 而不是 env()：env() 在變數不存在時連 prisma generate 都會失敗，
+// 而 Docker 建置映像時沒有 DATABASE_URL。migrate 時沒設照樣會報錯
+datasource: { url: process.env.DATABASE_URL },</pre>
+<p>改用 <code>process.env.DATABASE_URL</code> 之後，build 時拿到的是 <code>undefined</code>，<code>generate</code> 不需要它所以照樣成功；真的要連資料庫的 <code>migrate</code> 沒設變數時仍然會報錯，該擋的還是擋得住。</p>
+<p><strong>坑二：<code>migrate</code> 服務裡沒有 <code>prisma</code> 指令</strong>。多階段 Dockerfile 的最後一個 stage 只裝正式依賴（<code>npm ci --omit=dev</code>），這樣映像小、攻擊面也小。但 <code>prisma</code> CLI 是 devDependency，不在最後的映像裡。如果 compose 的 migrate 服務用這個映像跑 <code>npx prisma migrate deploy</code>，會找不到指令；更糟的是 <code>npx</code> 找不到時可能去網路下載一個版本不對的 <code>prisma</code> 來跑。做法是讓 migrate 服務用 build 階段的映像，那個 stage 有完整的 devDependencies：</p>
+<pre># compose.yaml（節錄）
+  migrate:
+    profiles: [app]
+    build:
+      context: .
+      target: build          # 有 devDependencies 的那個 stage
+    command: ["npx", "prisma", "migrate", "deploy"]
+    environment:
+      DATABASE_URL: postgresql://owner:owner@db:5432/my_saas     # 擁有者，只有 migrate 拿得到
+    depends_on:
+      db: { condition: service_healthy }
+  api:
+    profiles: [app]
+    build: .                 # 最後的 stage：只有正式依賴、非 root
+    environment:
+      APP_DATABASE_URL: postgresql://pf_app:pf_app@db:5432/my_saas   # api 只拿 pf_app
+      # …
+    ports: ["127.0.0.1:3101:3100"]
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }</pre>
+<p>這份 compose 也把上一節 CI 裡的兩個角色落實到執行環境：只有 migrate 服務拿得到擁有者的密碼，api 拿到的是不能改 schema、受 RLS 限制的 <code>pf_app</code>（DevOps 課第 17 課的權限分離）。好處是 api 就算被攻破，攻擊者拿到的連線也刪不了表、繞不過 RLS。api 的 <code>depends_on</code> 寫了 <code>service_completed_successfully</code>，意思是「migrate 跑完而且結束碼是 0，api 才啟動」，migration 失敗時 api 不會帶著舊 schema 硬起來。</p>
+<p>Dockerfile 本身照第 4 課：三個 stage（build、只裝正式依賴的 deps、最後的執行映像），最後一個 stage <code>USER node</code>，<code>HEALTHCHECK</code> 打 <code>/health/ready</code>。這門課的驗收測試不會真的 build 映像，原因與 worker 要不要獨立成一個服務，見課末。</p>
+
+<p>現在 CI 能產出一個映像了。下一個問題是：這個映像要叫什麼名字，正式環境才知道該跑哪一個？</p>
+
+<h2>映像要叫什麼名字？用 commit SHA，不用 latest</h2>
+<p>CD（持續部署）接在 CI 後面：CI 證明「這個 commit 是好的」，CD 把<strong>同一個 commit build 出來的那個映像</strong>送上線。關鍵在「同一個」：上線的東西必須正是被測過的東西，不能在部署時重新 build 一次，否則中間只要有一個依賴版本變了，線上跑的就是沒被測過的程式。</p>
+<p>要做到「同一個」，映像需要一個能對回 commit 的名字。Docker 的映像名稱後面接一個標籤（tag），例如 <code>my-saas:latest</code>。<code>latest</code> 只是一個普通的標籤，每次 build 都會被重新指到最新的那份，舊的那份就失去了名字。這帶來兩個實際的問題：</p>
+<ul>
+  <li><strong>說不出線上跑的是哪個版本</strong>：客戶回報錯誤時，你不知道線上是哪個 commit，也就不知道要去看哪一版的程式。</li>
+  <li><strong>回滾沒有目標</strong>：build 好的映像會推到 registry，也就是放映像的倉庫，例如 GitHub 的 GHCR，部署時平台再從那裡拉。今天下午的部署出事，你想退回上一版，但 registry 裡的 <code>latest</code> 已經是出事的那一版，上一版沒有標籤可以指。</li>
+</ul>
+<p>所以標籤用 commit SHA，也就是 CI 裡的 <code>my-saas:${{ github.sha }}</code>。每個 commit 都有唯一的 SHA，build 出的映像推上去之後就不再改，同一個標籤永遠是同一份程式，這就是 DevOps 課第 16 課說的「不可變產物」。出事時看線上的標籤就知道是哪個 commit；回滾時把標籤換回上一個 SHA 就好。</p>
+
+<p>你的改名 PR 現在變成了一個有名字的映像。但這個 PR 除了程式，還帶著一個 migration，它應該在什麼時候、由誰來跑？</p>
+
+<h2>migration 什麼時候跑？為什麼是部署前獨立的一步</h2>
+<p>最直覺的做法是讓 api 啟動時順便跑 <code>prisma migrate deploy</code>，這樣不用多一個步驟。問題出在正式環境通常不只一個 api。為了不停機，平台多半用滾動更新（rolling update）換版：假設有 3 個副本（replica，同一個映像跑起來的多個程序），平台一次換掉一個，新的那個 ready 了再換下一個。如果 migration 綁在啟動上，會發生這些事：</p>
+<ul>
+  <li><strong>多個副本搶著跑 migration</strong>：3 個副本同時啟動，就有 3 個 migration 在搶同一份 schema。</li>
+  <li><strong>migration 失敗時 api 也起不來</strong>：服務直接掛掉，而且你在 log 裡分不清是程式的問題還是 schema 的問題。</li>
+</ul>
+<p>所以 migration 是部署程式之前、獨立的一步：先由一個一次性的程序（compose 裡的 migrate 服務、平台上的一次性任務）用擁有者帳號跑完，成功了才開始換程式，失敗了就停在這裡，線上的舊程式完全不受影響。這也是上一節 compose 裡 <code>service_completed_successfully</code> 在做的事。</p>
+<p>但這個順序留下一段時間差：migration 已經跑完、新程式還沒全部換上的那幾分鐘，線上跑的是<strong>舊程式配新 schema</strong>。滾動更新時更明顯，新舊副本會同時存在。你的改名 PR 正好會在這段時間出事。</p>
+
+<h2><code>description</code> 改名成 <code>summary</code>：舊程式還在跑怎麼辦？</h2>
+<p>上一節的時間差帶出一條規則：<strong>migration 要跟舊版程式相容</strong>。最直接的寫法是一個 migration 做 <code>RENAME COLUMN description TO summary</code>，程式改成讀寫 <code>summary</code>。migration 一跑完，還在線上的舊程式去查 <code>description</code>，欄位已經不存在，這些副本收到的請求全部 500，直到最後一個副本換掉為止。</p>
+<p>解法是 DevOps 課第 17 課的 expand／contract：把一次破壞性的改動拆成幾次部署，每次部署時新舊程式都能正常運作。expand 是先「加」（新增欄位，舊的不動），contract 是確定沒人用了再「刪」。套到改名上：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>部署</th><th>migration</th><th>程式</th><th>舊版程式還在跑時</th></tr></thead>
+  <tbody>
+    <tr><td>一次做完（錯的）</td><td><code>RENAME COLUMN description TO summary</code></td><td>讀寫 <code>summary</code></td><td>舊程式查 <code>description</code>，欄位不存在，全部 500</td></tr>
+    <tr><td>第 1 次（expand）</td><td>新增 <code>summary</code>，從 <code>description</code> 複製</td><td>兩個都寫、讀 <code>summary</code></td><td>舊程式照樣讀寫 <code>description</code>，沒事</td></tr>
+    <tr><td>第 2 次</td><td>—</td><td>只讀寫 <code>summary</code></td><td>沒有舊程式了</td></tr>
+    <tr><td>第 3 次（contract）</td><td>刪掉 <code>description</code></td><td>—</td><td>沒有人用它了</td></tr>
+  </tbody>
+</table></div>
+<p>每一列都只問一個問題：「這次 migration 跑完、程式還沒換完時，舊程式會不會壞？」第 1 次部署時，新程式「兩個都寫」是為了讓 <code>description</code> 在過渡期間還保持最新，萬一要回滾到舊程式，舊程式讀到的資料也是對的。</p>
+<p>反方向也要顧到：第 1 次部署換版期間，舊副本還在線上，它們只寫 <code>description</code>。migration 的複製只在跑的那一刻做一次，之後舊副本寫入的列，<code>summary</code> 還是舊值，而新程式讀的正是 <code>summary</code>，所以換版那幾分鐘裡，新副本可能讀到過時的內容。這些列不會自己補回來。所以等所有副本都換成新版之後，要再補一次資料，例如 <code>UPDATE projects SET summary = description WHERE summary IS DISTINCT FROM description</code>（<code>IS DISTINCT FROM</code> 把 NULL 也當成可比較的值）；或在 expand 的 migration 裡加一個 trigger，在資料庫層同步兩個欄位。不論哪一種，都要在第 2 次部署停止寫 <code>description</code> 之前做完。等第 1 次部署完全換好、資料也補齊，線上就沒有只認得 <code>description</code> 的程式了，第 2 次才能停止寫它，第 3 次才能刪掉。</p>
+<p>同樣的道理也適用在 API 的回應欄位（第 15 課的契約）：前端是另一個要相容的「舊版程式」，它不會跟後端同一秒換版。<code>summary</code> 的例子裡，API 回應要同時帶 <code>description</code> 與 <code>summary</code> 一段時間，等前端改用 <code>summary</code> 之後再刪。</p>
+
+<div class="callout practice"><strong>💡 實務上：RLS 的 migration 也要想新舊版本</strong><br>第 9 課的 RLS policy 也在 migration 裡。新增一張有 <code>tenant_id</code> 的表，同一個 migration 就要 ENABLE＋FORCE 並建 policy；忘了的話，那張表在 <code>pf_app</code> 底下沒有任何隔離，而 Prisma extension 還沒把它加進 <code>SCOPED</code> 的話，兩道防線同時缺席。資深一點的團隊會在 CI 加一個檢查：查 <code>pg_class</code>，有 <code>tenant_id</code> 欄位但 <code>relforcerowsecurity</code> 是 false 的表就失敗（第 9 課練習的灰箱檢查就是這個查詢）。這個檢查剛好放在 CI 的 <code>migrate deploy</code> 之後。</div>
+
+<p>改名 PR 的程式、映像與 migration 都準備好了。接下來要決定它們實際跑在哪裡，以及正式環境的密碼怎麼交給它們。</p>
+
+<h2>送上哪裡？secret 怎麼進到容器？</h2>
+<p>部署到哪裡是你的選擇，課程不教特定平台的點擊步驟。兩條常見的路：一條是租一台雲端主機自己用 compose 跑，另一條是把映像推到 registry，讓託管平台去跑容器。差別在於多少事情要自己顧：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th></th><th>單台 VM＋compose</th><th>託管平台（容器服務）</th></tr></thead>
+  <tbody>
+    <tr><td>做法</td><td>一台雲端主機，<code>docker compose --profile app up -d</code>，前面放 nginx 或 Caddy 做 HTTPS（DevOps 課第 12 課）</td><td>推映像到 registry，平台跑容器；資料庫、Redis 用平台的託管服務</td></tr>
+    <tr><td>費用</td><td>一台小主機的月費，資料庫自己顧</td><td>通常比較貴，資料庫另外計費</td></tr>
+    <tr><td>你要處理</td><td>備份（DevOps 課第 24 課）、更新主機、憑證續期</td><td>平台的設定與權限</td></tr>
+    <tr><td>面試能講的</td><td>整條路都是自己搭的</td><td>託管服務的取捨、怎麼用 IAM 與 secret 管理</td></tr>
+  </tbody>
+</table></div>
+<p>想部署上 AWS 的話，<a href="../../aws/index.html">AWS 課</a>（選修）的期末就是把這個作品部署上去：ECS、RDS、Secrets Manager 與 OpenTofu，接著 <a href="../../devops/lessons/18-aws-architecture.html">DevOps 課第 18 課</a>的架構往下做。有 Kubernetes 經驗想展示的，<a href="../../kubernetes/lessons/16-capstone.html">Kubernetes 課期末</a>（選讀）的做法也適用。</p>
+<p>不管哪條路，正式環境的 secret 處理方式都一樣：<strong>不進 repo，也不進映像</strong>。<code>JWT_SECRET</code> 與兩個資料庫密碼一旦 commit 進 repo，就會永遠留在 git 歷史裡；放進映像，任何拉得到映像的人都能讀出來。正確的做法是交給平台的 secret 管理（GitHub 的 Environments secrets、雲端的 secrets manager），在容器啟動時才注入成環境變數；repo 裡的 <code>.env.example</code> 只放假值，告訴別人需要哪些變數（DevOps 課第 11 課）。compose 裡 <code>compose-only-secret-change-me…</code> 這種值只給本機用，部署平台上一律換掉。</p>
+<p>線上環境也一定要 HTTPS，因為 access token 與密碼不能明文傳。helmet 預設會加 <code>Strict-Transport-Security</code>，瀏覽器看過這個標頭之後，之後一律用 HTTPS 連這個網域；refresh cookie 的 <code>COOKIE_SECURE</code> 在正式環境一律是 true（第 7 課）。HTTPS 通常由 API 前面的代理（nginx、Caddy、雲端負載平衡器）處理，這時 Express 的 <code>trust proxy</code> 要跟著調整，否則 log 裡的客戶端 IP 不是錯的就是可以偽造，設法見課末。</p>
+
+<p>改名 PR 已經跑在線上了。但「部署指令成功結束」不等於「服務能用」，你要怎麼確定？</p>
+
+<h2>部署完怎麼知道真的能用？壞了怎麼退？</h2>
+<p>第 16 課的 <code>/health/ready</code> 回 200，代表程序自己覺得準備好了：資料庫連得上、Redis 連得上。但它不知道註冊流程有沒有壞、RLS 在正式環境的角色設定對不對。冒煙測試（smoke test）補上這一塊：部署完立刻從外面，用使用者的方式打幾個最關鍵的流程，確認它真的能做事（DevOps 課第 16 課）。名字來自硬體：通電後先看會不會冒煙，不會冒煙才開始細測。</p>
+<p>作品的冒煙測試是這一組：<code>/health/ready</code>、註冊、登入、建立 project、別的租戶讀不到。最後一項特別重要：它是唯一能確認「正式環境的 API 真的用 <code>pf_app</code> 連線」的檢查，CI 再怎麼正確，正式環境的連線字串設錯一樣會漏資料。練習 3 就是這組，部署好之後在 <code>portfolio.json</code> 填 <code>deployUrl</code>，learn 的測試會對你的線上環境跑。</p>
+<p>冒煙測試失敗，就要回滾。前面幾節的設計在這裡一起發揮作用：因為映像不可變，上一個 SHA 的映像還在 registry 裡；因為 migration 跟舊程式相容，舊程式配現在的 schema 也能跑。所以<strong>回滾就是部署上一個 SHA</strong>，把標籤換回去而已，不需要動資料庫。反過來，如果某次 migration 不相容（例如已經一次刪掉了欄位），舊程式配新 schema 會壞，就只能往前修：趕快寫一個新的修正版本部署上去。expand／contract 的價值，就是讓你一直保有回滾這個選項。</p>
+
+<div class="callout practice"><strong>💡 實務上：回滾要演練過才算數</strong><br>多數團隊是在出事當下才第一次回滾，這時才發現舊映像被清掉了、或某個 migration 不相容。作品裡可以實際做一次：部署兩個版本，再把上一個 SHA 部署回去，確認冒煙測試照樣通過（自評清單有這一項）。面試時「我演練過回滾，步驟是…」比「理論上可以回滾」有說服力。</div>
+
+<p>到這裡，改名 PR 從推上去到上線、確認、可以退回，整條路都通了。最後一步是讓陌生人也能安全地使用這個線上環境。</p>
+
+<h2>讓面試官放心地玩：demo 環境要做哪些決定？</h2>
+<p>demo 環境跟正式環境的差別是：<strong>任何人都進得來，資料隨時可以被弄亂</strong>。面試官會隨手建專案、刪成員、亂填欄位，你要確保他看得到功能、弄不壞東西、也碰不到任何真實資料。幾個要做的決定：</p>
+<ul>
+  <li><strong>示範帳號</strong>：準備一個租戶與 owner、member、viewer 三個帳號，密碼寫在 README（第 19 課）。面試官不用註冊就能切換帳號，看到同一個畫面在不同角色下的權限差別。</li>
+  <li><strong>定期重設資料</strong>：排程（第 13 課的 <code>@nestjs/schedule</code>，或平台的 cron）每天清空並重新灌入示範資料，前一位訪客弄亂的東西隔天就恢復。重設腳本只在 demo 環境的設定打開，正式環境不可能執行。</li>
+  <li><strong>開不開放註冊</strong>：開放的話，任何人都能建租戶，靠限流（第 14 課）與方案上限擋住濫用；不開的話，面試官只能用示範帳號，少了「自己建租戶、邀請別人」這條最能展示多租戶的路。多數作品選開放，再加上每日重設。</li>
+  <li><strong>不放真實個資</strong>：示範資料用 <code>@example.test</code> 的 email、假名字；寄信只進 Mailpit 或關掉，不寄到真的信箱，否則面試官隨手填的 email 會真的收到你的邀請信。</li>
+  <li><strong>省錢</strong>：免費或便宜的方案常會閒置休眠，第一個請求要等幾十秒。README 寫一句「第一次開啟需要約 N 秒喚醒」，比讓面試官以為壞了好。</li>
+</ul>
+
+<p>這些都是整個 repo 共用的設定。最後回頭看你自己的業務模組，確認這條路也涵蓋到它。</p>
+
+<h2>套到你的業務模組</h2>
+<p>CI 與部署是整個 repo 共用的，業務模組要做的是讓它們「涵蓋到你」：跨租戶 E2E 有你的端點、migration 遵守 expand／contract、示範資料有你的業務資料。三個題目各有一個部署時要想的地方：</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>題目</th><th>部署時要想</th></tr></thead>
+  <tbody>
+    <tr><td>客服工單</td><td>SLA 提醒是排程：多個副本時每個副本都會跑一次。用 BullMQ 的 repeatable job（同一個 job id 只會有一個）或只在一個副本開排程，寫進 ADR。</td></tr>
+    <tr><td>預約排程</td><td>排除約束需要 <code>btree_gist</code> extension：migration 裡 <code>CREATE EXTENSION IF NOT EXISTS</code> 要擁有者權限，託管資料庫可能要先在主控台允許。CI 的 <code>postgres:18.6-alpine</code> 內建它，先在 CI 證明 migration 跑得過。</td></tr>
+    <tr><td>進銷存</td><td>異動表只追加、會一直長：示範資料的重設要 <code>TRUNCATE</code> 而不是逐筆刪；正式環境的保存與分割寫進 ADR（PostgreSQL 課第 35 課）。</td></tr>
+  </tbody>
+</table></div>
+
+<h2>練習</h2>
+
+<div class="local" data-test="ex1" data-files="">
+  <p>練習 1：<code>.github/workflows/*.yml</code> 有 PostgreSQL 與 Redis 的 service container；先 <code>prisma migrate deploy</code> 再 <code>npm test</code>；沒有 <code>continue-on-error: true</code> 或 <code>|| true</code>；build 映像，標籤用 <code>${{ github.sha }}</code>，不用 <code>:latest</code>。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="">
+  <p>練習 2：Dockerfile 至少兩個 stage、最後一個 stage 的 <code>USER</code> 不是 root；<code>.dockerignore</code> 排除 <code>node_modules</code> 與 <code>.env</code>；用 <code>npm ci</code> 就要有 <code>package-lock.json</code>。compose（測試會打開所有 profile）有 PostgreSQL、Redis、跑 <code>migrate deploy</code> 的一次性服務；api 的 command 不跑 migration，依賴 migrate 跑完、db 與 redis 健康；api 有健康檢查（Dockerfile 的 <code>HEALTHCHECK</code> 或 compose 的 <code>healthcheck</code>）；所有 port 只綁 <code>127.0.0.1</code>。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="">
+  <p>練習 3（選做）：部署到你選的平台，在 <code>work/portfolio.json</code> 的 <code>saas</code> 加 <code>"deployUrl": "https://…"</code>。測試對線上環境跑冒煙：網址是 https、有 <code>Strict-Transport-Security</code>、<code>/health/ready</code> 200、註冊、登入、建立 project、別的租戶 404。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：你要刪掉 <code>projects.archived</code> 欄位，改用新的 <code>status</code>（<code>active</code>／<code>archived</code>）。部署流程是「先跑 migration，再換程式」，api 有 3 個副本逐一更新。哪個做法不會在部署中途出錯？</p>
+  <label data-key="a">一次部署：migration 新增 <code>status</code>、複製資料、刪掉 <code>archived</code>；程式改用 <code>status</code></label>
+  <label data-key="b">一次部署，但順序改成先換程式、再跑 migration</label>
+  <label data-key="c">先部署「新增 <code>status</code>、程式兩個都寫、讀 <code>status</code>」；確定沒有舊程式之後，再部署一次刪掉 <code>archived</code></label>
+  <label data-key="d">一次部署，migration 在交易裡執行，失敗會自動回滾</label>
+  <p class="why">✓ migration 跑完到最後一個副本換好之前，舊程式還在讀寫 <code>archived</code>，所以刪欄位要等到下一次部署（expand／contract）。a 讓舊副本全部 500；b 反過來讓新程式在 <code>status</code> 還不存在時就上線；d 的交易只保證 migration 本身全有或全無，管不到「舊程式還在跑」。（第 17 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 5：CI 的最後一步是 <code>docker build -t my-saas:latest .</code>，部署腳本拉 <code>my-saas:latest</code>。哪一個問題是這個做法造成的？</p>
+  <label data-key="a">今天下午的部署出事，你要回滾，但 registry 裡的 <code>latest</code> 已經是出事的那一版，上一版沒有標籤可以指</label>
+  <label data-key="b"><code>latest</code> 標籤的映像比較大，部署比較慢</label>
+  <label data-key="c">Docker 不允許部署 <code>latest</code> 標籤到正式環境</label>
+  <label data-key="d">每次 build 都要重新下載基底映像</label>
+  <p class="why">✓ <code>latest</code> 會一直被覆蓋：出事時說不出線上跑的是哪個 commit，回滾也沒有目標。用 <code>${{ github.sha }}</code> 當標籤，每個 commit 一個不會再變的映像，回滾就是部署上一個 SHA。b、d 跟標籤名稱無關；c 不是真的限制，只是很多團隊的規範。（第 17 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 6：CI 的測試全過，部署之後客戶卻回報看到別的公司的 project。查 CI 設定發現 <code>APP_DATABASE_URL</code> 跟 <code>DATABASE_URL</code> 寫成同一個擁有者帳號。為什麼 CI 沒抓到？</p>
+  <label data-key="a">CI 的 PostgreSQL 版本跟正式環境不同，RLS 的行為不一樣</label>
+  <label data-key="b">跨租戶測試只建了一個租戶，所以測不到</label>
+  <label data-key="c">CI 沒有跑 <code>migrate deploy</code>，所以沒有 policy</label>
+  <label data-key="d">CI 的擁有者是映像用 <code>POSTGRES_USER</code> 建的 superuser，superuser 一律繞過 RLS；測試時第二道防線根本不存在，漏掉租戶條件的程式照樣通過</label>
+  <p class="why">✓ superuser 與有 BYPASSRLS 的角色不受任何 policy 限制，連 FORCE 也擋不住；一般的擁有者則要靠 FORCE 才會被限制。CI 用這個帳號跑 API，跨租戶測試只測到第一道防線，正式環境如果也設錯就是同一個洞。CI 要跟正式環境一樣，API 用 <code>pf_app</code>。b 是常見的猜測，但跨租戶測試本來就建兩個租戶。（第 17 課，第 9 課）</p>
+</div>
+
+<h2>自評清單</h2>
+<p>檔案寫得對不代表真的跑得起來。自己確認：</p>
+<ul>
+  <li><strong>映像真的 build 得起來</strong>：在 repo 執行 <code>docker build -t my-saas:test .</code> 成功；<code>docker run --rm my-saas:test whoami</code> 印出 <code>node</code>。</li>
+  <li><strong>類正式的 compose 跑得起來</strong>：<code>docker compose --profile app up -d --build</code>，<code>docker compose ps</code> 看到 migrate 是 <code>Exited (0)</code>、api 是 healthy；<code>curl localhost:3101/health/ready</code> 200。</li>
+  <li><strong>CI 會擋人</strong>：開一個 PR 故意讓一個跨租戶測試失敗，CI 變紅；在 GitHub 的分支保護把 CI 設成合併前必須通過。</li>
+  <li><strong>secret 不在 repo</strong>：<code>git grep -n "JWT_SECRET="</code> 只出現在 <code>.env.example</code> 與 CI 的假值；正式環境的值只在平台的 secret 設定裡。</li>
+  <li><strong>回滾演練過</strong>：部署兩個版本，再把上一個 SHA 部署回去，冒煙測試照樣通過。</li>
+  <li><strong>demo 環境</strong>：示範帳號登得進去、每日重設有排程、資料沒有真實個資。</li>
+</ul>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>CI 的測試用擁有者連線</strong>：CI 的擁有者是 superuser，RLS 沒有作用，跨租戶測試只測到程式那一層。API 用 <code>pf_app</code>，只有 migrate 用擁有者。</li>
+  <li><strong>測試步驟加 <code>continue-on-error</code> 或 <code>|| true</code></strong>：CI 永遠綠燈，等於沒有 CI。不穩的測試要修或隔離。</li>
+  <li><strong>測試用 <code>db push</code> 或自己建表</strong>：migration 檔裡手寫的 RLS policy 沒被執行過。測試前跑 <code>prisma migrate deploy</code>。</li>
+  <li><strong><code>prisma.config.ts</code> 用 <code>env()</code></strong>：Docker build 時沒有 <code>DATABASE_URL</code>，<code>prisma generate</code> 失敗。改用 <code>process.env.DATABASE_URL</code>。</li>
+  <li><strong>migrate 服務用最後的映像</strong>：裡面沒有 devDependency 的 <code>prisma</code>。用 <code>target: build</code>。</li>
+  <li><strong>api 啟動時跑 migration</strong>：多副本互搶、失敗時連 api 都起不來。獨立的一次性服務，api 用 <code>service_completed_successfully</code> 等它。</li>
+  <li><strong>一次部署就刪欄位或改名</strong>：migration 跑完時舊程式還在跑，欄位不見就 500。expand／contract 拆成多次部署。</li>
+  <li><strong>用 <code>latest</code> 部署</strong>：說不出線上是哪個版本、回滾沒有目標。標籤用 commit SHA。</li>
+  <li><strong>secret 寫進 repo 或映像</strong>：git 歷史與映像都刪不乾淨。由平台的 secret 管理在執行時注入，<code>.env.example</code> 只放假值。</li>
+</ul>
+
+<h2 id="appendix">補充與查表</h2>
+<h3>依賴掃描與映像掃描</h3>
+<p><code>npm audit --audit-level=high</code> 放在 <code>npm ci</code> 之後，build 完再用 <a href="../../devops/lessons/09-multi-stage-security.html">DevOps 課第 9 課</a>的 <code>trivy</code>（或 <code>aquasecurity/trivy-action</code>）掃映像；那一課也講了映像加固（非 root、釘版本）。作品裡加上它們，面試時能說「依賴有已知的高風險漏洞時，PR 合不進去」。要注意掃描結果會隨時間變（新的漏洞被公布），今天綠的明天可能紅：這是掃描的本意，不是 CI 不穩。</p>
+<h3>為什麼驗收測試不真的 build 映像</h3>
+<p>build 要從網路下載 npm 套件，判分不連外網；參考實作也沒有自己的 <code>package-lock.json</code>（它借用 learn 練習環境的套件）。所以練習 2 只檢查檔案寫得對不對，「真的 build 得起來」交給你的 CI 與自評清單。</p>
+<h3>worker 要不要獨立一個服務</h3>
+<p>看你在第 13 課的 ADR。參考實作選了「worker 跟 API 同一個程序」（ADR 0005），compose 只有 api。選了分開的話，compose 多一個 <code>worker</code> 服務（同一個映像、不同的 <code>command</code>，例如 <code>node dist/worker.js</code>），一樣依賴 migrate 跑完、一樣用 <code>pf_app</code>。</p>
+<h3>代理後面的 <code>trust proxy</code></h3>
+<p>HTTPS 由前面的代理處理時，客戶端的連線先到代理，代理再轉給 API，所以 API 直接看到的來源 IP 是代理的。代理會把真正客戶端的 IP 放在 <code>X-Forwarded-For</code> 標頭裡轉過來，Express 的 <code>trust proxy</code> 設定決定要不要相信這個標頭。設錯有兩個方向：</p>
+<ul>
+  <li><strong>沒信任到代理</strong>：<code>req.ip</code> 拿到的是代理的 IP，log 與登入紀錄都看不到真正的客戶端。</li>
+  <li><strong>信任所有來源</strong>：任何人都能自己送 <code>X-Forwarded-For</code> 偽造 IP，log 裡的 IP 就不可信。</li>
+</ul>
+<p>參考實作設成 <code>'loopback'</code>，只信任同一台機器上的代理（nginx、Caddy 跟 API 在同一台時剛好）。代理在另一台機器或是雲端負載平衡器時，改成信任那一層的位址或「最近一跳」。放到 AWS ALB 後面的做法見 <a href="../../aws/lessons/11-capstone.html">AWS 課期末</a>（選修）。</p>
+
+<h2>小結</h2>
+<ul>
+  <li>CI 證明「這個 commit 合進去還是好的」：真的 PostgreSQL＋Redis＋Mailpit、型別先跑、先 <code>migrate deploy</code> 再測試、API 用 <code>pf_app</code> 讓 RLS 生效、測試失敗 CI 就失敗、最後 build 映像。</li>
+  <li>Docker build 的環境跟開發環境不同，兩個坑：<code>prisma.config.ts</code> 用 <code>process.env</code>；migrate 服務用 build stage。只有 migrate 拿得到擁有者密碼。</li>
+  <li>映像標籤用 commit SHA：上線的正是被測過的那份，出事說得出版本、回滾有目標。</li>
+  <li>migration 是部署前獨立的一步，而且要跟舊程式相容：改名、刪欄位用 expand／contract 拆成多次部署。</li>
+  <li>secret 由平台在執行時注入；部署後自動跑冒煙測試；回滾就是部署上一個 SHA。</li>
+  <li>demo 環境：示範帳號、每日重設、沒有真實個資。</li>
+</ul>
+<p>下一課換一個角度看你的作品：當成攻擊者，用探針對自己的業務模組跑一次資安檢查。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

@@ -1,0 +1,1489 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>17. 即時推送：輪詢、SSE 與 WebSocket 的規模化</title>
+<link rel="stylesheet" href="../../style.css">
+<style>
+.tl { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin: 1.2em 0; }
+.tl table { width: 100%; }
+.tl td { vertical-align: top; }
+.tl tr.now td { background: var(--accent-soft); }
+.tl tr.later { visibility: hidden; }
+.tl .note { margin: 10px 0 0; min-height: 3.5em; }
+.tl .wait { color: var(--fail); font-weight: 600; }
+</style>
+</head>
+<body data-lesson="17">
+<header>
+  <div class="eyebrow">階段 4：架構：服務、事件與即時推送 · 第 17 課</div>
+  <h1>即時推送：輪詢、SSE 與 WebSocket 的規模化</h1>
+</header>
+<main>
+<p>咖啡店的 App 要上線「取餐通知」：王小明點了一杯拿鐵，店員在出單畫面按下「可以取餐了」，他的手機要馬上從「製作中」變成「可以取餐」。門市的出單畫面是同一個需求反過來：顧客一付款，新訂單就要出現在店員眼前，晚 10 秒就可能漏做一杯。</p>
+<p>難處在 HTTP 的基本模式是「瀏覽器問、伺服器答」。伺服器只能回應別人送來的請求，沒辦法自己開口；你在 Vue 裡寫的每一個 <code>fetch</code> 都是這個模式。要讓手機在狀態改變的那一刻知道，只有兩條路：讓手機一直問，或讓一條連線一直開著、伺服器有事就往裡面寫。這一課從頭到尾只做一件事：把「拿鐵可以取餐了」這個事件，在尖峰 10 萬個 App 同時在線、好幾台伺服器、前面還有 nginx 和負載平衡器的環境裡，準時而且不漏地送到王小明手上。在一台開發機上什麼做法都能動，問題都是規模和真實網路帶出來的，我們照遇到的順序一個一個解。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>最簡單的做法：每 5 秒問一次，伺服器每秒要接多少請求，貴在哪裡。</li>
+  <li>讓伺服器有事才開口：長輪詢、SSE、WebSocket 怎麼運作，「取餐通知」為什麼選 SSE（開場問題的最小答案）。</li>
+  <li>SSE 裡傳的是什麼：事件的格式，自己讀串流時資料被任意切塊怎麼解析。</li>
+  <li>斷線續傳：手機進電梯再出來，怎麼補上漏掉的「可以取餐了」；同一件事換成 WebSocket 要自己寫多少。</li>
+  <li>多台伺服器：更新落在 A 機、連線接在 B 機時怎麼送到，一支慢手機怎麼不拖垮整台機器。</li>
+  <li>上線：nginx、心跳、連線數上限，以及重新部署時幾萬條連線同時重連怎麼不把資料庫打垮。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../node/lessons/16-streams-backpressure.html">Node 課第 16 課</a>的 SSE 與背壓：回應不結束、一段一段 <code>write</code> 出去；對方讀得慢時 <code>write</code> 回傳 false，要等 <code>drain</code> 再寫。</li>
+  <li><a href="../../devops/lessons/12-nginx.html">部署課第 12 課</a>的 nginx 反向代理：請求先到 nginx 再轉給 Node，<code>proxy_read_timeout</code> 時間內後端沒送資料，nginx 就把連線關掉。</li>
+  <li><a href="08-timeouts-retries-backoff.html">第 8 課</a>的退避與 jitter：重試時每次等久一點，再加隨機量，避免大家同時重試。</li>
+</ul></div>
+
+<h2>最簡單的做法：每 5 秒問一次，要花多少？</h2>
+<p>伺服器不能主動開口，最直接的辦法就是讓 App 自己一直問。這叫<strong>短輪詢</strong>（polling）：客戶端每隔固定幾秒送一次一般的 GET，問「訂單 41 現在是什麼狀態」。寫成程式就是 <code>setInterval(() =&gt; fetch('/orders/41'), 5000)</code>，前端多半寫過。它不需要任何特別的伺服器設定，每個請求都是普通的 API 呼叫，所以一定能動。問題是它要花多少。</p>
+<p>先看延遲。狀態可能在兩次詢問之間的任何時刻改變：剛問完就改，要等將近 5 秒才知道；快要問的時候才改，幾乎馬上知道。平均下來，延遲是間隔的一半，每 5 秒問一次就平均晚 2.5 秒。想要更即時，只能把間隔縮短。</p>
+<p>再看伺服器的負擔，用<a href="02-estimation.html">第 2 課</a>的方法估算。假設尖峰時有 10 萬個 App 停在首頁（訂單狀態、集點、優惠都在首頁更新），每個 App 每 5 秒輪詢一次。一張訂單從成立到取餐有 4 次狀態變化（已收單、製作中、可取餐、已取餐），尖峰 2 小時有 2.4 萬張訂單。執行後先看前四行：每秒真正的狀態變化有幾次，以及三種間隔下的請求量；後兩行（長輪詢與 SSE）是下一節才介紹的做法，先放著。</p>
+<div class="lab"><script type="code">
+const apps = 100000
+const peakOrders = 60000 * 0.4               // 尖峰 2 小時的訂單（第 1 課的情境卡）
+const changesPerSec = (peakOrders * 4) / (2 * 3600)   // 每秒有幾次狀態變化
+
+console.log(`每秒真正的狀態變化：${changesPerSec.toFixed(1)} 次`)
+for (const interval of [30, 5, 2]) {
+  const rps = apps / interval
+  console.log(`短輪詢每 ${interval} 秒：每秒 ${rps.toLocaleString()} 個請求，有用的只佔 ${(changesPerSec / rps * 100).toFixed(3)}%，平均晚 ${interval / 2} 秒`)
+}
+
+const timeout = 30
+const longPollRps = changesPerSec + apps / timeout   // 有事件就回一次＋沒事件的逾時重發
+console.log(`長輪詢（逾時 ${timeout} 秒）：同時掛著 ${apps.toLocaleString()} 個請求，每秒約 ${Math.round(longPollRps).toLocaleString()} 個請求`)
+
+const heartbeat = 15
+console.log(`SSE：同時 ${apps.toLocaleString()} 條連線，每秒 ${changesPerSec.toFixed(1)} 個事件＋${(apps / heartbeat).toLocaleString()} 次心跳（每次幾個位元組）`)
+</script></div>
+<p>每秒真正的狀態變化只有十幾次，但每 5 秒輪詢一次，伺服器每秒要處理 2 萬個請求，其中 99.9% 以上回「沒有更新」。這些請求不是免費的：每一個都要經過 nginx、驗證身分、查資料庫或快取，再回一個 JSON。想讓延遲變小，把間隔改成 2 秒，請求量變成每秒 5 萬，而有用的請求數一個都沒有增加。</p>
+<p>這就是輪詢的本質：成本跟「客戶端數 ÷ 間隔」成正比，跟實際有沒有事件無關。訂單少的離峰時段，10 萬個 App 照樣每 5 秒問一次。反過來想，如果伺服器能在有事的時候才開口，工作量就只跟每秒十幾次的狀態變化有關。</p>
+<div class="callout practice"><strong>💡 實務上：先問「晚幾秒可以嗎」，再挑技術</strong><br>輪詢不是錯的。後台每 60 秒刷新的報表、只有幾十個使用者的內部工具，用輪詢最簡單，也沒有長連線要維運。PM 說「要即時」時，先問清楚能接受晚幾秒、有多少人同時在線：出單畫面晚 10 秒會讓店員漏單，集點數字晚 30 秒沒人在意。用數字判斷：客戶端多、要求即時、大部分時間沒有變化，才值得換成推送。很多團隊一開始用輪詢上線，使用者變多之後才換，換的時候只動「怎麼知道有變化」這一層，畫面拿資料的 API 不變。</div>
+
+<h2>讓伺服器有事才開口：長輪詢、SSE 與 WebSocket 怎麼選？</h2>
+<p>上一節的結論是：要省下那 99.9% 的空回應，就要讓伺服器等到有事才回答。有三種做法，差別在「等待」發生在哪裡。</p>
+<p><strong>長輪詢</strong>（long polling）是最小的改動：客戶端照樣送請求，但伺服器不馬上回，而是把請求掛著，等到訂單有新狀態才回應；一直沒有，就等到逾時（例如 30 秒）回一個「沒有更新」。客戶端收到任何回應後，馬上再送下一個請求。這樣空回應從每 5 秒一次變成每 30 秒一次，上一節範例的長輪詢那一行，請求量從每秒 2 萬降到每秒 3 千多。代價是伺服器上同時掛著 10 萬個等待中的請求，而且每送出一個事件，這個請求就結束了；連續兩個事件之間，客戶端得重新發一次請求，第二個事件要等新請求到了才送得出去。</p>
+<p><strong>SSE</strong>（Server-Sent Events）把「掛著的請求」再往前推一步：既然回應可以晚一點才寫，那就<strong>永遠不結束</strong>它。客戶端送一個普通的 GET，伺服器回 <code>Content-Type: text/event-stream</code>，然後不結束這個回應，有事件就往裡面寫一段文字。同一條連線可以送好幾個小時、好幾百個事件，不必每次重發請求。這種建立後一直開著、持續好幾分鐘甚至好幾小時的連線，叫<strong>長連線</strong>。瀏覽器用內建的 <code>EventSource</code> 接收，斷線會自動重連。方向是單向的：只有伺服器往瀏覽器寫；瀏覽器要送東西給伺服器，另外發一般的 HTTP 請求。上一節範例的 SSE 那一行：伺服器要同時維持 10 萬條連線，但每秒只送十幾個事件，加上定期的心跳（每次只有幾個位元組，用途在後面「部署到 nginx 後面」那一節講）。</p>
+<p><strong>WebSocket</strong> 走得最遠：它一開始也是一個 HTTP 請求，但這個請求要求「升級」（Upgrade）成另一個協定；伺服器同意後，這條 TCP 連線就不再說 HTTP，改成雙方都能隨時送訊息的通道。它是雙向的，適合客戶端也要頻繁送東西的情境。握手時的標頭和相關 RFC 放在課末「補充與查表」。</p>
+<p>把四種做法放在一起比：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>短輪詢</th><th>長輪詢</th><th>SSE</th><th>WebSocket</th></tr>
+  <tr><td>延遲</td><td>平均半個間隔（5 秒間隔 → 平均晚 2.5 秒）</td><td>接近即時；但連續兩個事件之間要重新發請求</td><td>即時</td><td>即時</td></tr>
+  <tr><td>伺服器成本</td><td>大量請求，大多回「沒有更新」</td><td>每個客戶端佔一個等待中的請求，加上逾時後的重發</td><td>每個客戶端一條長連線，平常幾乎不傳東西</td><td>同 SSE，另外要維護協定狀態</td></tr>
+  <tr><td>方向</td><td>客戶端拉</td><td>客戶端拉</td><td>伺服器 → 客戶端（客戶端要送東西就另外發一般請求）</td><td>雙向</td></tr>
+  <tr><td>穿越代理</td><td>沒問題，就是一般請求</td><td>要調高代理的逾時</td><td>一般 HTTP，但代理不能緩衝回應、閒置逾時要靠心跳撐住</td><td>代理要支援 Upgrade（nginx 要另外設定標頭）</td></tr>
+  <tr><td>重新連線</td><td>不需要</td><td>自己寫迴圈</td><td>瀏覽器自動重連，並帶上最後一個事件 ID</td><td>全部自己寫：重連、補資料、去重</td></tr>
+  <tr><td>適合</td><td>更新很少、晚幾十秒沒關係（每日報表）</td><td>環境不允許長連線時的退路</td><td>單向通知：訂單狀態、出單畫面、進度條</td><td>雙向且頻繁：聊天、協作編輯、遊戲</td></tr>
+</table></div>
+<p>回到取餐通知。「訂單狀態更新」只有伺服器往瀏覽器的方向；客戶端偶爾要做的事（取消訂單）用一般的 HTTP 請求就好。這種情況選 SSE：它就是 HTTP，瀏覽器內建重連與續傳用的事件 ID，代理、身分驗證、日誌都沿用原本的設定。WebSocket 留給真的需要雙向、頻繁互動的功能。表格最後兩列說 WebSocket 的重連和補資料要「全部自己寫」，具體是哪些，等後面「手機進電梯再出來」那一節看完 SSE 怎麼續傳就會清楚。</p>
+<p>選了 SSE，成本就從「大量的短請求」換成「10 萬條同時開著的長連線」。這一課後面處理的，都是很多條長連線帶來的問題。第一步是搞清楚這條不結束的回應裡，到底傳了什麼。</p>
+
+<h2>SSE 的回應裡傳的是什麼？自己讀串流時怎麼解析？</h2>
+<p>選定 SSE 之後，先看伺服器實際寫進那條連線的內容。<a href="../../node/lessons/16-streams-backpressure.html">Node 課第 16 課</a>寫過 SSE 伺服器，它送出的回應本體是 UTF-8 文字，一行一個欄位，<strong>空行</strong>代表「一個事件結束，送出」。下面是王小明那張訂單的串流：</p>
+<pre>: 這一行是註解，用來當心跳
+retry: 5000
+
+id: 1041
+event: order-status
+data: {"orderId":41,"status":"making"}
+
+id: 1042
+event: order-status
+data: {"orderId":41,
+data: "status":"ready"}
+
+</pre>
+<p>由上往下讀：冒號開頭的第一行是註解，瀏覽器會忽略它，所以伺服器可以拿它當心跳，證明連線還活著。<code>retry</code> 告訴瀏覽器斷線後等 5000 毫秒再重連。接下來是兩個事件，每個事件以空行收尾：<code>id</code> 是事件編號，<code>event</code> 是事件類型，<code>data</code> 是內容。第二個事件的 <code>data</code> 寫成兩行，瀏覽器會用換行把它們接起來，所以收到的仍然是一段完整的 JSON。</p>
+<p>瀏覽器端用 <code>EventSource</code> 接收，解析都由它做：</p>
+<pre>const es = new EventSource('/orders/41/events')
+es.addEventListener('order-status', e =&gt; {
+  const { status } = JSON.parse(e.data)   // e.lastEventId 是 '1042'
+  render(status)
+})</pre>
+<p>大多數時候這樣就夠了。但有兩種情況要自己解析：一是 <code>EventSource</code> 不能自訂標頭，你的 API 如果要帶 <code>Authorization</code> 標頭，就得改用 <code>fetch</code> 自己讀回應串流；二是在 Node 或 Worker 裡接收別的服務送來的 SSE，那裡沒有 <code>EventSource</code>。自己解析時，要照 WHATWG HTML 標準（Living Standard）定義的規則做，<code>EventSource</code> 內部也是照這份規則。下面這份清單是練習 1 的規格，查表用，不用背：</p>
+<ul>
+  <li>開頭的 BOM（位元組順序記號，字元 <code>\uFEFF</code>）去掉一次。</li>
+  <li><strong>行尾</strong>可以是 CRLF（<code>\r\n</code>）、LF（<code>\n</code>）或單獨的 CR（<code>\r</code>）。</li>
+  <li><strong>空行</strong>：送出目前累積的事件。</li>
+  <li>冒號開頭的行是<strong>註解</strong>，忽略。</li>
+  <li>其他行：第一個冒號之前是欄位名，之後是值；值如果以空白開頭，<strong>只去掉一個</strong>空白。沒有冒號時整行是欄位名，值是空字串。</li>
+  <li><code>data</code>：把值加上 <code>\n</code> 附加到資料緩衝。所以多行 <code>data</code> 會用換行接起來。</li>
+  <li><code>event</code>：設定事件類型。沒設定時類型是 <code>message</code>（<code>es.onmessage</code> 收的就是它）。</li>
+  <li><code>id</code>：值裡沒有 NULL 字元（<code>\u0000</code>）才採用，設定「最後的事件 ID」。這個值<strong>送出後不會清掉</strong>，之後的事件都沿用，直到下一個 <code>id</code>。</li>
+  <li><code>retry</code>：值全是 ASCII 數字才採用，設定斷線後等多少毫秒再重連。</li>
+  <li>其他欄位名：忽略。</li>
+  <li>送出時：資料緩衝是空的就不送（只清掉類型）；否則去掉最後一個 <code>\n</code> 再送出。送出後清空資料緩衝與事件類型。</li>
+  <li>串流結束時，最後一個沒有空行收尾的事件<strong>丟掉</strong>。</li>
+</ul>
+<p>每一條規則單獨看都單純，難的是資料怎麼到達。TCP 傳的是一連串位元組，不保留「訊息」的邊界：伺服器寫一次 <code>res.write()</code>，瀏覽器可能分兩次收到，也可能把兩次寫入合成一次收到；路上的代理、壓縮、TLS 都可能重新切。所以解析器每次拿到的一塊資料（chunk）可能停在任何位置：一行的中間、一個 <code>\r\n</code> 的 <code>\r</code> 和 <code>\n</code> 之間、甚至 UTF-8 解碼後的任何字元之間。</p>
+<p>下面這個解析器只在每個 chunk 內部找事件，不記得上一塊剩下什麼。執行後看三件事：一次收到時結果正確；同一段串流被切成兩塊時，JSON 被切成兩半；只用 CR 換行時，兩個事件被黏成一個，內容也帶著 <code>\r</code> 和下一行的欄位名。</p>
+<div class="lab"><script type="code">
+// 錯誤示範：每個 chunk 自己切事件，不保留上一塊剩下的
+function naiveParse(chunk: string): string[] {
+  return chunk.split('\n\n')
+    .filter(block => block.includes('data:'))
+    .map(block => block.split('\n').filter(l => l.startsWith('data:')).map(l => l.slice(5).trim()).join('\n'))
+}
+
+const stream = 'event: order-status\ndata: {"orderId":41,"status":"ready"}\n\n'
+console.log('一次收到：', naiveParse(stream))
+
+// 同一段串流，網路把它切成兩塊
+const cut = 30
+const chunks = [stream.slice(0, cut), stream.slice(cut)]
+console.log('第一塊：', JSON.stringify(chunks[0]))
+console.log('第二塊：', JSON.stringify(chunks[1]))
+for (const c of chunks) {
+  for (const data of naiveParse(c)) {
+    try {
+      console.log('收到事件', JSON.parse(data))
+    } catch {
+      console.log('JSON 壞掉：', data)
+    }
+  }
+}
+
+// 單獨的 CR 也是行尾：用 split('\n') 的寫法看不到第二個事件
+const crOnly = 'data: a\r\rdata: b\r\r'
+console.log('只用 CR 換行：', naiveParse(crOnly))
+</script></div>
+<p>正確的做法是讓解析器有記憶：把收到的文字累積在緩衝裡，只處理<strong>已經看到行尾</strong>的完整行，剩下的半行留到下一次 <code>push</code>。CR 最麻煩：chunk 剛好結束在 <code>\r</code> 時，你不知道下一塊是不是以 <code>\n</code> 開頭。可以先把這一行當成結束（CR 本身就是合法的行尾），記住「下一個字元如果是 <code>\n</code> 就跳過」，不然 <code>\r</code> 和 <code>\n</code> 會被當成兩個行尾，中間多出一個空行，事件被提早送出。練習 1 要你寫出這個解析器，測試會把同一段串流在每一個位置切開，結果都要一樣。</p>
+<p>解析器能把每一個事件正確收下來，前提是連線一直開著。手機的連線不會一直開著。</p>
+
+<h2>手機進電梯再出來，漏掉的「可以取餐了」怎麼補？</h2>
+<p>手機從 Wi-Fi 切到 4G、進電梯、App 被切到背景，連線都會斷。斷線期間「拿鐵可以取餐了」這個事件送出去了，王小明的 App 沒收到，畫面永遠停在「製作中」。他會一直等，直到想起來去櫃檯問，咖啡已經涼了。</p>
+<p>SSE 為這件事設計了兩個機制，剛才的格式裡都看過。第一個是自動重連：連線斷了，瀏覽器等 <code>retry</code> 指定的時間後自己重新發 GET。第二個是事件 ID：伺服器替每個事件加上遞增的 <code>id</code>，瀏覽器記住收到的最後一個；重連時，瀏覽器自動在請求標頭帶上 <strong><code>Last-Event-ID</code></strong>，等於告訴伺服器「我收到 1042 為止」。</p>
+<p>伺服器要做的是另一半：記住最近送過的事件，才有東西可以補。做法是為每個頻道（例如一間門市、一張訂單）保留最近 N 個事件，依 <code>Last-Event-ID</code> 把之後的事件補送。為什麼只保留 N 個？因為事件永遠在產生，全部留著記憶體遲早用完。只保留最近 N 個、新的進來就擠掉最舊的，這種結構叫<strong>環狀緩衝</strong>（ring buffer）。</p>
+<p>緩衝有上限，就代表斷線太久的客戶端要的事件可能已經被擠掉了。這時候不能假裝沒事、從還留著的最舊那個開始補：中間被擠掉的事件會被悄悄跳過，客戶端以為自己什麼都沒漏。要明確告訴客戶端「續傳不了」，讓它<strong>重新整理整份狀態</strong>。下面的時間軸一步一步看這三種結果：補得到、剛好補得到、補不到。</p>
+<div class="tl">
+  <div class="table-wrap"><table>
+    <tr><th>時間</th><th>伺服器緩衝（容量 3）</th><th>王小明的 App</th></tr>
+    <tr data-note="App 打開時先呼叫 GET /orders/41 拿到完整狀態（已收單），再開 SSE 連線。新連線沒有 Last-Event-ID，伺服器不補送，從現在開始推送。"><td>08:00:00</td><td>[101]</td><td>GET /orders/41 → 已收單；開 SSE</td></tr>
+    <tr data-note="訂單變成「製作中」，事件 102 推送到 App。App 記住最後的 id 是 102。"><td>08:01:10</td><td>[101, 102]</td><td>收到 102：製作中</td></tr>
+    <tr data-note="進電梯，連線斷了。App 不知道，伺服器也不一定馬上知道（手機沒機會送出關閉連線的訊號）。"><td>08:02:00</td><td>[101, 102]</td><td><span class="wait">斷線</span></td></tr>
+    <tr data-note="斷線期間發生事件 103（可取餐）。伺服器寫進緩衝；推送給 App 的那一份送不到。"><td>08:02:30</td><td>[101, 102, 103]</td><td>（沒收到 103）</td></tr>
+    <tr data-note="出電梯，瀏覽器自動重連，帶 Last-Event-ID: 102。伺服器看到 102 之後的 103 還在緩衝裡，補送 103。App 顯示「可取餐」。"><td>08:03:00</td><td>[101, 102, 103]</td><td>重連，Last-Event-ID: 102 → 補送 103 ✓</td></tr>
+    <tr data-note="App 被切到背景很久，期間門市很忙，同一個頻道又產生 104、105、106。容量只有 3，103 以前的都被擠掉了。"><td>08:20:00</td><td>[104, 105, 106]</td><td><span class="wait">斷線</span>（最後收到 103）</td></tr>
+    <tr data-note="App 帶 Last-Event-ID: 103 重連。103 之後的 104 還在緩衝裡（最舊的就是 104），可以完整補送。如果它帶的是 102，103 已經不在了，就補不了。"><td>08:25:00</td><td>[104, 105, 106]</td><td>Last-Event-ID: 103 → 補送 104～106 ✓</td></tr>
+    <tr data-note="另一台手機帶 Last-Event-ID: 101 重連。102、103 已經被擠掉，伺服器送一個 reset 事件。App 收到 reset 就重新呼叫 GET /orders/41 拿完整狀態，再從目前的 id 開始接收推送。"><td>08:25:05</td><td>[104, 105, 106]</td><td>Last-Event-ID: 101 → <span class="wait">reset</span> → 重新 GET /orders/41</td></tr>
+  </table></div>
+  <div class="bar"><button data-prev>◀ 上一步</button><button class="primary" data-next>下一步 ▶</button><span class="kbd" data-count></span></div>
+  <p class="note"></p>
+</div>
+<p>還有兩種要 reset 的情況：<code>Last-Event-ID</code> 不是合法的數字（被竄改或格式錯誤），以及它<strong>比目前最新的還大</strong>。後者通常代表伺服器重啟過、記憶體裡的緩衝和 ID 都從頭開始了，客戶端手上的 ID 屬於上一輪，數字比較沒有意義。正式環境的 ID 可以用資料庫的序號（例如<a href="12-queues-outbox.html">第 12 課</a> outbox 表的 id），重啟後也不會倒退。練習 2 實作這個緩衝。</p>
+<p>自動重連本身也有例外，不能完全依賴它：</p>
+<div class="callout warn"><code>EventSource</code> 的自動重連只發生在網路錯誤或連線正常結束時。伺服器回 200 以外的狀態碼（401、503）或 <code>Content-Type</code> 不是 <code>text/event-stream</code>，WHATWG 標準規定「fail the connection」：<code>readyState</code> 變成 <code>CLOSED</code>，<strong>不會再重連</strong>。所以在 <code>onerror</code> 裡要檢查 <code>es.readyState === EventSource.CLOSED</code>，自己用退避加 jitter 重建連線（401 時先去換新的憑證）。標準也提到可以用 204 No Content 叫客戶端停止重連。</div>
+<p>把這一節看到的放在一起：推送可能遺失（斷線、緩衝被擠掉）、可能重複（補送時有些事件客戶端其實收過）、可能在 reset 後整個重來。所以要守住一條原則：<strong>推送只是通知，狀態以 API 為準</strong>。落到程式上是四件事：</p>
+<ul>
+  <li>畫面的初始狀態一律從 API 拿；推送只負責「有變化了」。</li>
+  <li>客戶端套用事件要<strong>冪等</strong>（<a href="09-idempotency.html">第 9 課</a>：同一件事做兩次，結果跟做一次一樣）：事件帶訂單的版本號或序號，比手上舊的就丟掉，跟<a href="16-events-webhooks.html">第 16 課</a>的投影一樣。</li>
+  <li>收到 reset、或重連後不確定有沒有漏，就重新拿完整狀態。</li>
+  <li>重要的狀態（付款成功）不能只靠推送通知：使用者打開訂單頁時也要能查到。</li>
+</ul>
+<div class="callout practice"><strong>💡 實務上：前端最常漏的是「回到前景」那一刻</strong><br>寫訂單頁時，常見的 bug 是 App 在背景待了十分鐘，回到前景後畫面還是舊的，因為瀏覽器暫停了分頁或連線早就斷了。做法很單純：監聽 <code>visibilitychange</code> 或網路恢復（<code>online</code> 事件），回到前景就重新呼叫一次 API 拿完整狀態，再接上推送。把「收到推送」和「重新拿狀態」都交給同一個更新函式處理，新舊只在這裡比一次版本號，才不會兩條路各寫一套、結果不一致。Code review 看到推送事件直接改畫面、卻沒有初始的 API 呼叫，就要問一句「斷線期間的變化怎麼辦」。</div>
+
+<h2>如果當初選 WebSocket，這些要自己寫多少？</h2>
+<p>上一節的續傳，SSE 一半是瀏覽器內建的：自動重連、記住最後的 ID、重連時帶上 <code>Last-Event-ID</code>。「讓伺服器有事才開口」那一節說 WebSocket 的重連和補資料要「全部自己寫」，現在可以具體列出來。WebSocket 給你一條雙向的管子，雙方傳的是一個一個的訊框（frame），其他都要自己設計：</p>
+<ul>
+  <li><strong>沒有確認與重送</strong>：協定本身不保證對方處理了哪些訊息。斷線時，路上的訊息就沒了，要自己替訊息編序號、重連後告訴伺服器「我收到第幾號」、伺服器補送，跟 SSE 的 <code>Last-Event-ID</code> 是同一件事，只是要自己寫。</li>
+  <li><strong>沒有自動重連</strong>：瀏覽器的 <code>WebSocket</code> 斷了就是斷了，重連、退避、jitter 都是應用程式的事。</li>
+  <li><strong>訊息格式自己定</strong>：哪一種訊息、怎麼回應、錯誤怎麼表示，沒有 HTTP 的狀態碼和標頭可以用。</li>
+  <li><strong>身分驗證只發生在建立連線時</strong>：瀏覽器的 <code>new WebSocket(url, protocols)</code> 不能自訂標頭，常見做法是用 cookie，或先用一般 API 換一張短效、只能用一次的票券放在網址上（網址會進存取日誌，所以不能放長效 token）。用 cookie 時，伺服器要檢查 <code>Origin</code> 標頭是不是自己的網站（RFC 6455 第 10.2 節：不認可的來源回 403），否則別的網站可以在使用者的瀏覽器裡帶著他的 cookie 開連線（跨站 WebSocket 劫持，cross-site WebSocket hijacking）。</li>
+  <li><strong>代理要另外設定</strong>：nginx 轉送 WebSocket 要加 <code>Upgrade</code>、<code>Connection</code> 標頭（<a href="../../devops/lessons/12-nginx.html">部署課第 12 課</a>）。</li>
+</ul>
+<p>它也有 SSE 沒有的東西：協定內建 <strong>Ping／Pong</strong> 控制訊框，收到 Ping 必須回 Pong，可以當心跳、確認對方還活著。但對取餐通知來說，上面那份清單全是額外的工作，換來的雙向能力用不到。</p>
+<p>清單裡的身分驗證，帶出一個 SSE 也有的問題：長連線上的身分會<strong>過期</strong>。一般 API 每個請求都重新驗一次 token，長連線只在建立時驗一次。連線建立時 token 還有效，兩小時後使用者已經登出或被停權，連線還開著，推送照樣送到。伺服器要記住每條連線的身分到期時間，到期就關掉連線，讓客戶端帶新的憑證重連；權限被撤銷時（例如店員離職），也要主動關掉那個人的連線。</p>
+<p>到這裡，一台伺服器上的取餐通知已經完整：送得出去、斷了補得回來。但尖峰 10 萬條連線不會只放在一台機器上。</p>
+
+<h2>好幾台伺服器時，A 機的事件怎麼送到 B 機的連線？</h2>
+<p>只有一台伺服器時，「訂單 41 變成可取餐」這件事發生在哪個程序，就從哪個程序推送，連線和事件在同一個地方。擴展成多台之後，兩者會分開：王小明的 SSE 連線接在 B 機，店員按「可取餐」的 API 請求卻落在 A 機。A 機手上沒有王小明的連線，它也不知道王小明的連線在哪一台。最簡單可靠的做法是 A 機把事件送到<strong>每一台</strong>可能有訂閱者的機器，再由每台機器送給自己手上的連線。一個事件送給很多個訂閱者，叫<strong>扇出</strong>（fan-out）。</p>
+<figure>
+  <svg viewBox="0 0 700 300" role="img" aria-label="多台伺服器推送：訂單 API 在 A 機更新訂單並把事件發布到 Redis pub/sub，Redis 把事件送到 A、B、C 三台 SSE 伺服器，每台再寫入自己連線的送出佇列；慢的客戶端佇列滿了就被斷線">
+    <defs><marker id="arr17" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="10" y="20" width="150" height="50" rx="8"/><text class="d-text" x="85" y="50" text-anchor="middle">店員按「可取餐」</text>
+    <rect class="d-soft" x="10" y="110" width="150" height="70" rx="8"/><text class="d-text" x="85" y="140" text-anchor="middle">A 機：訂單 API</text><text class="d-small" x="85" y="162" text-anchor="middle">寫入 DB＋outbox</text>
+    <rect class="d-box" x="215" y="115" width="120" height="60" rx="8"/><text class="d-text" x="275" y="142" text-anchor="middle">Redis</text><text class="d-small" x="275" y="162" text-anchor="middle">pub/sub</text>
+    <rect class="d-soft" x="390" y="20" width="130" height="60" rx="8"/><text class="d-text" x="455" y="47" text-anchor="middle">A 機 SSE</text><text class="d-small" x="455" y="67" text-anchor="middle">緩衝＋連線</text>
+    <rect class="d-soft" x="390" y="115" width="130" height="60" rx="8"/><text class="d-text" x="455" y="142" text-anchor="middle">B 機 SSE</text><text class="d-small" x="455" y="162" text-anchor="middle">緩衝＋連線</text>
+    <rect class="d-soft" x="390" y="210" width="130" height="60" rx="8"/><text class="d-text" x="455" y="237" text-anchor="middle">C 機 SSE</text><text class="d-small" x="455" y="257" text-anchor="middle">緩衝＋連線</text>
+    <rect class="d-box" x="575" y="95" width="115" height="40" rx="8"/><text class="d-small" x="632" y="120" text-anchor="middle">王小明 佇列 1/100</text>
+    <rect class="d-box" x="575" y="145" width="115" height="40" rx="8"/><text class="d-small" x="632" y="170" text-anchor="middle">出單畫面 2/100</text>
+    <rect class="d-box" x="575" y="225" width="115" height="40" rx="8"/><text class="d-small" x="632" y="250" text-anchor="middle">慢手機 100/100</text>
+    <text class="d-accent" x="632" y="285" text-anchor="middle">滿了 → 斷線</text>
+    <path class="d-line" d="M85,70 L85,106" marker-end="url(#arr17)"/>
+    <path class="d-line" d="M160,145 L211,145" marker-end="url(#arr17)"/>
+    <path class="d-line" d="M335,135 L386,55" marker-end="url(#arr17)"/>
+    <path class="d-line" d="M335,145 L386,145" marker-end="url(#arr17)"/>
+    <path class="d-line" d="M335,155 L386,235" marker-end="url(#arr17)"/>
+    <path class="d-line" d="M520,140 L571,117" marker-end="url(#arr17)"/>
+    <path class="d-line" d="M520,150 L571,163" marker-end="url(#arr17)"/>
+    <path class="d-line" d="M520,240 L571,244" marker-end="url(#arr17)"/>
+  </svg>
+  <figcaption>事件從 A 機的訂單 API 經 Redis pub/sub 扇出到每一台 SSE 伺服器，每台再放進自己每條連線的送出佇列。</figcaption>
+</figure>
+<p>負責「把事件送到每一台」的，通常是一個發布／訂閱（pub/sub）系統：每台 SSE 伺服器啟動時訂閱訂單事件的頻道，A 機把事件發布到頻道，所有訂閱者都收到一份。常見的工具是 Redis 的 pub/sub（<code>PUBLISH</code>／<code>SUBSCRIBE</code>）；只有一個資料庫、程序不多時，<a href="../../node/lessons/24-scaling.html">Node 課第 24 課</a>的 PostgreSQL <code>LISTEN</code>／<code>NOTIFY</code> 也能做。</p>
+<p>要注意它的送達保證。Redis 文件寫明 pub/sub 是<strong>至多一次</strong>（<a href="12-queues-outbox.html">第 12 課</a>）：Redis 把訊息交給當下連著的訂閱者就算完成，不保存、不等確認；訂閱者當時沒連上、或處理時出錯，那則訊息就永遠遺失，Redis 不會重送。SSE 伺服器重啟、跟 Redis 的連線閃斷，都會漏掉事件。所以分工要清楚：pub/sub 只負責「快」，「不漏」要靠前一節的續傳緩衝與 reset（或改用可保存、能從某個位置重讀的 Redis Streams）。事件本身要從 outbox 送出，訂單寫入和事件才不會一個成功一個失敗。</p>
+
+<h3>一支訊號很差的手機，會不會拖垮整台伺服器？</h3>
+<p>事件扇出到每台之後，每台要把它寫進自己手上的幾萬條連線。這裡有一個只有在扇出時才會冒出來的問題：連線的另一端讀得有多快，不是伺服器能控制的。</p>
+<p>伺服器寫進連線的資料，會先放進作業系統替這條連線準備的 socket 緩衝，再由網路慢慢送出。客戶端讀得慢、網路差，socket 緩衝滿了，寫不進去的資料就堆在程序的記憶體裡。讀得比事件產生得慢的客戶端叫<strong>慢消費者</strong>（slow consumer）。<a href="../../node/lessons/16-streams-backpressure.html">Node 課第 16 課</a>教過<strong>背壓</strong>（backpressure）：下游處理不了時，要上游放慢或停止。但扇出時上游是「整間門市的事件」，不能因為一支訊號很差的手機，就讓出單畫面和其他 50 個顧客都等它。</p>
+<p>做法是每條連線一個<strong>有上限</strong>的送出佇列，讓慢的只影響自己：</p>
+<ul>
+  <li>發布事件是<strong>同步</strong>的：放進每個訂閱者自己的佇列就走，不等任何人寫完。</li>
+  <li>某條連線的佇列已經滿了，<strong>直接斷掉這條連線</strong>，不是默默丟掉這個事件。默默丟掉，客戶端不知道自己漏了，畫面永遠錯；斷線後它會重連，用 <code>Last-Event-ID</code> 補資料，太舊就 reset。這裡用上了前一節的續傳：斷線不是失敗，而是一條已經設計好的恢復路徑。</li>
+  <li>取消訂閱（連線關閉）時，從頻道移除並釋放佇列，不然記憶體只增不減。</li>
+</ul>
+<p>上限要設多少，用記憶體算。假設 10 萬條連線平均分在 4 台機器上，執行後看三種上限下，每台在最壞情況要多少記憶體：</p>
+<div class="lab"><script type="code">
+const connections = 100000
+const servers = 4
+const perServer = connections / servers
+const eventBytes = 400            // 一個訂單事件序列化後約 400 位元組（自己量）
+
+for (const maxQueue of [10, 100, 10000]) {
+  const worst = perServer * maxQueue * eventBytes
+  console.log(`每條連線最多排 ${maxQueue} 個事件：每台最壞要 ${(worst / 1024 / 1024).toFixed(0)} MB`)
+}
+// 正常狀況下佇列幾乎是空的；上限保護的是「很多客戶端同時變慢」的時候
+// 例如某家電信的網路變差，這些連線的佇列會同時變長
+</script></div>
+<p>佇列上限 10000 時，最壞情況每台要 93 GB，遠超過機器的記憶體，程序會被作業系統殺掉，所有連線一起斷、一起重連。上限 100 時最壞不到 1 GB。這裡的事件大小是假設值，正式環境要量自己的事件大小，以及每條連線本身的固定成本（socket 緩衝、TLS 狀態、框架物件），一起算出每台能放多少連線。練習 3 實作這個扇出。</p>
+<p>到這裡，程式的邏輯都對了：多台機器、慢客戶端、斷線續傳都有處理。接下來要把它部署到真正的網路上，而 SSE 最常壞掉的地方就在那裡。</p>
+
+<h2>部署到 nginx 後面，為什麼事件會卡住、連線會被切斷？</h2>
+<p>前面的一切在本機都能正常運作，因為瀏覽器直接連到 Node，中間什麼都沒有。正式環境裡，請求會先經過負載平衡器、nginx，有時還有 CDN，每一層都是為「短請求、很快回完」設計的，遇到一條好幾小時不結束的回應就會出狀況。SSE 部署到 nginx 後面就壞掉，原因幾乎都是下面這幾個：</p>
+<div class="table-wrap"><table>
+  <tr><th>症狀</th><th>原因</th><th>做法</th></tr>
+  <tr><td>事件要等很久才一次出現好幾個，或連線結束才收到</td><td>nginx 的 <code>proxy_buffering</code> 預設是 <code>on</code>，會先把上游的回應收進緩衝</td><td>SSE 回應加標頭 <code>X-Accel-Buffering: no</code>（nginx 文件：上游回應可以用這個標頭關掉緩衝），或在那個 location 設 <code>proxy_buffering off</code>。如果有對 <code>text/event-stream</code> 開壓縮（nginx 的 <code>gzip_types</code>、或應用程式的壓縮中介層），也要關掉：壓縮器會先攢一批資料再送</td></tr>
+  <tr><td>沒有事件時，連線每 60 秒斷一次</td><td>nginx 的 <code>proxy_read_timeout</code> 預設 60 秒，是<strong>兩次讀取之間</strong>的逾時，不是整個回應的上限；雲端負載平衡器也有閒置逾時</td><td>送<strong>心跳</strong>（heartbeat）：每隔一段時間送一行註解（<code>: ping</code>），間隔要比路上最短的閒置逾時短。WHATWG 標準建議大約每 15 秒一次。也可以調高 <code>proxy_read_timeout</code>，但心跳還是要有</td></tr>
+  <tr><td>開到第 7 個分頁，新分頁一直轉圈，連一般 API 都卡住</td><td>HTTP/1.1 時，瀏覽器對同一個網域最多 6 條連線（MDN；Chrome、Firefox 標記為不修），6 個分頁各開一條 SSE 就用完了</td><td>走 HTTP/2：同一條連線上多工，同時的 stream 數由伺服器設定（HTTP/2 規格 RFC 9113 建議至少 100）。或只讓一個分頁連線，用 <code>BroadcastChannel</code>（瀏覽器內建、同網域分頁之間互傳訊息的 API）分享給其他分頁</td></tr>
+  <tr><td>伺服器以為客戶端還在，其實手機早就沒訊號</td><td>沒有收到 TCP 的關閉，連線看起來還開著</td><td>心跳也能幫伺服器發現死掉的連線：寫入失敗或送出佇列一直不動，就關掉。WebSocket 用 Ping／Pong</td></tr>
+</table></div>
+<p>前兩列的原因都一樣：代理預設「回應會很快結束」。緩衝讓 nginx 先把上游的回應收好再轉送，閒置逾時用來回收卡住的連線，對一般 API 都是好設定，對 SSE 就變成把事件攢著不送、把安靜的連線當成卡住。心跳在「SSE 的回應裡傳的是什麼」那一節的格式裡看過，就是那行冒號開頭的註解：瀏覽器忽略它，但路上的每一層都看到「有資料在流動」。</p>
+<p>連線開得夠久之後，還會碰到伺服器這一端的兩個上限。第一個是檔案描述子（file descriptor）：作業系統用它代表程序開著的每一個檔案或連線，每條長連線都佔一個。程序能開的數量有上限（<code>ulimit -n</code>），Linux 預設的軟限制常常只有 1024，一台要撐幾萬條連線就要先調高。</p>
+<p>第二個是負載平衡的分配方式。<a href="04-redundancy-load-balancing.html">第 4 課</a>的輪流分配（round robin）假設每個請求差不多長，輪著分下去每台的工作量就平均。長連線一接就是好幾個小時，這個假設不成立：新上線的機器只會分到新連線，舊機器上的連線一直不走、一直滿載。改用<strong>最少連線</strong>，看的是每台目前開著的連線數，新連線優先給最閒的機器。</p>
+<div class="callout practice"><strong>💡 實務上：在跟正式環境一樣的路徑上測</strong><br>這一節的問題在本機 <code>localhost</code> 都看不到，因為中間沒有 nginx、負載平衡器、CDN。上線前在 staging 走完整條路徑測一次：開著頁面放 5 分鐘不動，看連線有沒有被切斷；觸發一個事件，看是馬上出現還是等很久才一起出現。新增 SSE 或 WebSocket 端點時，要先跟負責基礎設施的人確認每一層的閒置逾時、有沒有緩衝或壓縮、能不能走 HTTP/2，這些設定通常不在應用程式的程式碼裡。</div>
+
+<h2>重新部署時，幾萬條連線同時重連怎麼辦？</h2>
+<p>上一節處理的都是穩定運作時的問題。取餐通知最危險的時刻，反而是自己重新部署的那幾分鐘。舊程序要停掉，它身上的 2.5 萬條連線同時斷開。前面設計的每一個機制在這時都會被觸發：這些客戶端在同一秒重連，打到還活著的機器，每個重連都要驗證身分、查補送的事件，reset 的還要呼叫 API 拿完整狀態，資料庫跟著被打爆。這叫<strong>重連風暴</strong>（reconnect storm）。更糟的是連鎖反應：被打爆的機器回 503，<code>EventSource</code> 不再自動重連（前面斷線續傳那一節的警告），客戶端的重試邏輯如果沒有 jitter，下一波又是同一秒。</p>
+<p>問題不在總數，而在集中。2.5 萬個重連攤在一分鐘裡，其他機器撐得住；擠在同一秒就撐不住。下面模擬三種做法，執行後比較每一種「最忙的那一秒」有幾個重連：</p>
+<div class="lab"><script type="code">
+// 可重現的亂數（mulberry32），讓每次執行結果都一樣
+function mulberry32(seed: number) {
+  return () => { seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296 }
+}
+const random = mulberry32(17)
+const clients = 25000
+
+function peak(delays: number[]): number {
+  const perSecond = new Map<number, number>()
+  for (const d of delays) {
+    const s = Math.floor(d / 1000)
+    perSecond.set(s, (perSecond.get(s) ?? 0) + 1)
+  }
+  return Math.max(...perSecond.values())
+}
+
+// 1. 同時斷線、固定 3 秒後重連（retry: 3000，沒有 jitter）
+const fixed = Array.from({ length: clients }, () => 3000)
+console.log(`固定 3 秒：最忙的一秒有 ${peak(fixed)} 個重連`)
+
+// 2. 同時斷線、重連時間隨機分布在 0～30 秒（jitter）
+const jittered = Array.from({ length: clients }, () => random() * 30000)
+console.log(`0～30 秒 jitter：最忙的一秒有 ${peak(jittered)} 個重連`)
+
+// 3. 伺服器排空：60 秒內分批關閉連線，再加上客戶端的 jitter
+const drained = Array.from({ length: clients }, (_, i) => (i / clients) * 60000 + random() * 30000)
+console.log(`60 秒排空＋jitter：最忙的一秒有 ${peak(drained)} 個重連`)
+</script></div>
+<p>固定 3 秒重連時，2.5 萬個全部擠在同一秒；把重連時間隨機攤在 30 秒裡，最忙的一秒不到一千個；伺服器再花 60 秒分批關閉連線，又降到一半左右。三個手段一起用：</p>
+<ul>
+  <li><strong>伺服器慢慢排空</strong>（<a href="../../devops/lessons/13-scaling.html">部署課第 13 課</a>）：收到停止訊號後先不接新連線，在一段時間內分批關掉現有連線，而不是一次全斷。</li>
+  <li><strong>客戶端重連加 jitter</strong>（<a href="08-timeouts-retries-backoff.html">第 8 課</a>）：自己寫的重連要退避加 jitter。<code>EventSource</code> 自動重連的等待時間由 <code>retry</code> 欄位決定，伺服器可以在關閉連線前替每條連線送一個隨機的 <code>retry</code> 值，把重連攤開。</li>
+  <li><strong>續傳緩衝不能放在要被關掉的程序裡</strong>：只存在記憶體的緩衝會跟著程序消失，重連的人全部 reset、全部打 API。緩衝可以放在 Redis、或直接從 outbox 表依 id 查。</li>
+</ul>
+<p>這三個手段都是事前的設計，有沒有效要靠上線後的數字確認。</p>
+
+<h3>上線後要看什麼</h3>
+<p>這一課每一個設計都對應一個可以量的數字。下面這張表由上往下，大致對應連線、慢消費者、重連、續傳、扇出：</p>
+<div class="table-wrap"><table>
+  <tr><th>指標</th><th>告訴你什麼</th></tr>
+  <tr><td>每台的連線數</td><td>負載是否平均；新機器有沒有分到連線；離檔案描述子上限多遠</td></tr>
+  <tr><td>送出佇列長度（分布）、因太慢被斷線的數量</td><td>有沒有一群客戶端同時變慢；上限是否太小（正常客戶端也被踢）</td></tr>
+  <tr><td>每分鐘重連數、重連的分布</td><td>部署或網路事件造成的風暴；有沒有 jitter</td></tr>
+  <tr><td>reset 次數與比例</td><td>續傳緩衝是否太小；reset 多代表 API 的負載也會跟著上升</td></tr>
+  <tr><td>事件從產生到送出的延遲（p99）</td><td>pub/sub 或發布迴圈是否塞住（<a href="03-latency-percentiles.html">第 3 課</a>的百分位數）</td></tr>
+</table></div>
+
+<h2>補充與查表</h2>
+<ul>
+  <li><strong>WebSocket 的規格與握手</strong>：WebSocket 由 RFC 6455（2011 年 12 月）定義。瀏覽器送一個帶 <code>Upgrade: websocket</code>、<code>Connection: Upgrade</code>、<code>Sec-WebSocket-Key</code>、<code>Sec-WebSocket-Version: 13</code> 的 GET，伺服器回 <code>101 Switching Protocols</code> 與 <code>Sec-WebSocket-Accept</code>，之後這條連線就不是 HTTP 了，雙方傳的是 frame（訊框）。</li>
+  <li><strong>HTTP/2 上的 WebSocket</strong>：RFC 8441（2018 年 9 月）定義了在 HTTP/2 上用 extended CONNECT 建立 WebSocket。</li>
+</ul>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：完成 <code>SseParser</code>，依 WHATWG 規則解析 <code>text/event-stream</code>。<code>push(chunk)</code> 會被呼叫很多次，每次給一段已經解碼的文字，可能停在任何位置，回傳這段文字讓哪些事件完成（依序）。</p>
+  <ul>
+    <li>第一個不是空字串的 chunk 開頭如果是 <code>\uFEFF</code>，去掉（只有串流開頭這一次）。</li>
+    <li>行尾是 <code>\r\n</code>、<code>\n</code> 或單獨的 <code>\r</code>；<code>\r</code> 在 chunk 結尾時，下一塊開頭的 <code>\n</code> 屬於同一個行尾。還沒看到行尾的半行留到下一次 <code>push</code>。</li>
+    <li>冒號開頭的行忽略。欄位名是第一個冒號之前的文字，值是冒號之後、去掉<strong>最多一個</strong>開頭空白；沒有冒號時整行是欄位名、值是 <code>''</code>。</li>
+    <li><code>data</code>：值加上 <code>\n</code> 附加到資料緩衝；<code>event</code>：設定類型；<code>id</code>：值裡沒有 <code>\u0000</code> 才更新最後的事件 ID（之後的事件都沿用，空值也算更新）；<code>retry</code>：全是數字（0～9）才採用，<code>retry()</code> 回傳最後一次採用的值，沒有就是 <code>null</code>。其他欄位忽略。</li>
+    <li>空行：資料緩衝是空的就不送出（但清掉類型）；否則送出 <code>{ type, data, lastEventId }</code>，<code>data</code> 去掉最後一個 <code>\n</code>，<code>type</code> 沒設定時是 <code>'message'</code>。送出後清空資料緩衝與類型。</li>
+  </ul>
+  <script type="start">
+type SseEvent = { type: string; data: string; lastEventId: string }
+
+class SseParser {
+  push(chunk: string): SseEvent[] {
+    throw new Error('TODO')
+  }
+
+  retry(): number | null {
+    throw new Error('TODO')
+  }
+}
+</script>
+  <script type="answer">
+type SseEvent = { type: string; data: string; lastEventId: string }
+
+class SseParser {
+  private line = ''
+  private started = false
+  private skipLF = false   // 上一個行尾是 \r：緊接著的 \n 屬於同一個行尾
+  private data = ''
+  private type = ''
+  private lastId = ''
+  private retryMs: number | null = null
+
+  push(chunk: string): SseEvent[] {
+    if (!this.started && chunk !== '') {
+      this.started = true
+      if (chunk.startsWith('\uFEFF')) chunk = chunk.slice(1)
+    }
+    const out: SseEvent[] = []
+    for (const c of chunk) {
+      if (this.skipLF) {
+        this.skipLF = false
+        if (c === '\n') continue
+      }
+      if (c === '\r' || c === '\n') {
+        this.skipLF = c === '\r'
+        this.processLine(this.line, out)
+        this.line = ''
+      } else {
+        this.line += c
+      }
+    }
+    return out
+  }
+
+  retry(): number | null {
+    return this.retryMs
+  }
+
+  private processLine(line: string, out: SseEvent[]) {
+    if (line === '') {
+      if (this.data !== '') {
+        out.push({ type: this.type || 'message', data: this.data.slice(0, -1), lastEventId: this.lastId })
+      }
+      this.data = ''
+      this.type = ''
+      return
+    }
+    if (line.startsWith(':')) return
+    const i = line.indexOf(':')
+    const field = i < 0 ? line : line.slice(0, i)
+    let value = i < 0 ? '' : line.slice(i + 1)
+    if (value.startsWith(' ')) value = value.slice(1)
+    if (field === 'data') this.data += value + '\n'
+    else if (field === 'event') this.type = value
+    else if (field === 'id') { if (!value.includes('\u0000')) this.lastId = value }
+    else if (field === 'retry') { if (/^[0-9]+$/.test(value)) this.retryMs = Number(value) }
+  }
+}
+</script>
+  <script type="tests">
+const parseAll = (chunks: string[]) => {
+  const p = new SseParser()
+  const events = chunks.flatMap(c => p.push(c))
+  return { events, retry: p.retry() }
+}
+const ev = (data: string, type = 'message', lastEventId = '') => ({ type, data, lastEventId })
+
+assert.equal(new SseParser().retry(), null, '還沒收到 retry 時，retry() 是 null')
+assert.deepEqual(parseAll(['data: 拿鐵好了\n\n']).events, [ev('拿鐵好了')], '最基本的事件：type 預設是 message')
+assert.deepEqual(parseAll(['data: YHOO\ndata: +2\ndata: 10\n\n']).events, [ev('YHOO\n+2\n10')], '多行 data 用 \\n 接起來，最後一個 \\n 要去掉')
+assert.deepEqual(parseAll(['data: 半個事件\n']).events, [], '還沒看到空行，事件不能送出')
+assert.deepEqual(
+  parseAll([': test stream\n\ndata: first event\nid: 1\n\ndata:second event\nid\n\ndata:  third event\n\n']).events,
+  [ev('first event', 'message', '1'), ev('second event'), ev(' third event')],
+  'WHATWG 範例：冒號開頭是註解；「id」沒有冒號表示把 ID 設成空字串；值只去掉一個空白')
+assert.deepEqual(parseAll(['data\n\ndata\ndata\n\ndata:\n']).events, [ev(''), ev('\n')], 'WHATWG 範例：沒有冒號的 data 值是空字串；最後沒有空行的不送出')
+assert.deepEqual(parseAll(['data:x\n\ndata: x\n\n']).events, [ev('x'), ev('x')], "'data:x' 與 'data: x' 的值都是 'x'")
+assert.deepEqual(parseAll(['data: \t拿鐵 \n\n']).events, [ev('\t拿鐵 ')], '只去掉冒號後的一個空白，不能 trim 掉 tab 與結尾空白')
+assert.deepEqual(parseAll(['data: a:b:c\n\n']).events, [ev('a:b:c')], '只有第一個冒號分開欄位名與值')
+assert.deepEqual(
+  parseAll(['event: order-status\ndata: 41\n\ndata: 42\n\n']).events,
+  [ev('41', 'order-status'), ev('42')],
+  '送出後要清掉事件類型，下一個事件回到 message')
+assert.deepEqual(parseAll(['event: x\n\ndata: a\n\n']).events, [ev('a')], '沒有 data 的區塊不送出，但類型也要清掉')
+assert.deepEqual(
+  parseAll(['id: 7\n\ndata: a\n\ndata: b\nid: 8\n\ndata: c\n\n']).events,
+  [ev('a', 'message', '7'), ev('b', 'message', '8'), ev('c', 'message', '8')],
+  '只有 id 的區塊不送出事件，但會更新 lastEventId；之後的事件沿用最後的 id')
+assert.deepEqual(parseAll(['id: 5\ndata: a\n\nid: 6\u00007\ndata: b\n\n']).events, [ev('a', 'message', '5'), ev('b', 'message', '5')], 'id 含 \\u0000 時忽略這個 id')
+assert.deepEqual(parseAll(['foo: bar\ndata: a\n\n']).events, [ev('a')], '不認識的欄位要忽略')
+assert.equal(parseAll(['retry: 3000\n\n']).retry, 3000, 'retry: 3000 → 3000')
+assert.equal(parseAll(['retry: 3000\nretry: abc\nretry: 1.5\nretry: -1\nretry:\nretry: 1e3\nretry: 0x10\nretry: 5 \n\n']).retry, 3000, '不是全數字的 retry 要忽略，保留上一個合法值')
+assert.equal(parseAll(['retry: 0\n']).retry, 0, 'retry: 0 是合法的')
+assert.deepEqual(parseAll(['data: a\r\ndata: b\r\n\r\n']).events, [ev('a\nb')], 'CRLF 也是行尾')
+assert.deepEqual(parseAll(['data: a\rdata: b\r\rdata: c\r\r']).events, [ev('a\nb'), ev('c')], '單獨的 CR 也是行尾')
+assert.deepEqual(parseAll(['\uFEFFdata: a\n\n']).events, [ev('a')], '開頭的 BOM 要去掉')
+assert.deepEqual(parseAll(['', '\uFEFFdata: a\n\n']).events, [ev('a')], '空的 chunk 不算開頭，下一塊開頭的 BOM 還是要去掉')
+assert.deepEqual(parseAll(['\uFEFF', '\uFEFFdata: a\n\ndata: b\n\n']).events, [ev('b')], 'BOM 只在串流開頭去掉一次，第二個 BOM 是欄位名的一部分')
+
+const stream = '\uFEFF: hi\r\nretry: 2500\r\nid: 41\r\nevent: order-status\r\ndata: {"orderId":41,\r\ndata: "status":"ready"}\r\n\r\n' +
+  'data:  多一個空白\rid\r\r' + 'data: 拿鐵\ndata\n\n' + 'event: x\r\n\r\n' + 'data: 最後\r\n\r\n' + 'data: 沒有收尾\r\n'
+const whole = parseAll([stream])
+assert.equal(whole.events.length, 4, '完整串流應該有 4 個事件')
+for (let i = 0; i <= stream.length; i++) {
+  const r = parseAll([stream.slice(0, i), stream.slice(i)])
+  assert.deepEqual(r.events, whole.events, `串流在第 ${i} 個字元切成兩塊時，結果要跟一次收到相同（切在 ${JSON.stringify(stream.slice(Math.max(0, i - 3), i))}｜${JSON.stringify(stream.slice(i, i + 3))}）`)
+  assert.equal(r.retry, whole.retry, `串流在第 ${i} 個字元切開時，retry 也要一樣`)
+}
+function mulberry32(seed: number) {
+  return () => { seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296 }
+}
+const rnd = mulberry32(2026)
+for (let k = 0; k < 200; k++) {
+  const chunks: string[] = []
+  let i = 0
+  while (i < stream.length) {
+    const n = Math.floor(rnd() * 6)
+    chunks.push(stream.slice(i, i + n))
+    i += n
+  }
+  assert.deepEqual(parseAll(chunks).events, whole.events, '隨機切成很多塊（包含空的 chunk）時，結果要跟一次收到相同')
+}
+assert.deepEqual(parseAll(['data: a\r', '\n', '\r', '\ndata: b\r', '\r']).events, [ev('a'), ev('b')], '\\r 和 \\n 被切在兩塊之間時，只算一個行尾')
+</script>
+  <script type="wrong">
+// 用 split('\n')，只把行尾的 \r 去掉：單獨的 CR 不被當成行尾
+type SseEvent = { type: string; data: string; lastEventId: string }
+class SseParser {
+  private buf = ''
+  private started = false
+  private data = ''
+  private type = ''
+  private lastId = ''
+  private retryMs: number | null = null
+  push(chunk: string): SseEvent[] {
+    if (!this.started && chunk !== '') { this.started = true; if (chunk.startsWith('\uFEFF')) chunk = chunk.slice(1) }
+    this.buf += chunk
+    const lines = this.buf.split('\n')
+    this.buf = lines.pop()!
+    const out: SseEvent[] = []
+    for (let line of lines) {
+      if (line.endsWith('\r')) line = line.slice(0, -1)
+      if (line === '') {
+        if (this.data !== '') out.push({ type: this.type || 'message', data: this.data.slice(0, -1), lastEventId: this.lastId })
+        this.data = ''; this.type = ''; continue
+      }
+      if (line.startsWith(':')) continue
+      const i = line.indexOf(':')
+      const field = i < 0 ? line : line.slice(0, i)
+      let value = i < 0 ? '' : line.slice(i + 1)
+      if (value.startsWith(' ')) value = value.slice(1)
+      if (field === 'data') this.data += value + '\n'
+      else if (field === 'event') this.type = value
+      else if (field === 'id') { if (!value.includes('\u0000')) this.lastId = value }
+      else if (field === 'retry') { if (/^[0-9]+$/.test(value)) this.retryMs = Number(value) }
+    }
+    return out
+  }
+  retry(): number | null { return this.retryMs }
+}
+</script>
+  <script type="wrong">
+// 沒有保留不完整的行：每個 chunk 自己切，最後半行也當成一整行處理
+type SseEvent = { type: string; data: string; lastEventId: string }
+class SseParser {
+  private started = false
+  private data = ''
+  private type = ''
+  private lastId = ''
+  private retryMs: number | null = null
+  push(chunk: string): SseEvent[] {
+    if (!this.started && chunk !== '') { this.started = true; if (chunk.startsWith('\uFEFF')) chunk = chunk.slice(1) }
+    const out: SseEvent[] = []
+    const lines = chunk.split(/\r\n|\r|\n/)
+    lines.pop()
+    for (const line of lines) {
+      if (line === '') {
+        if (this.data !== '') out.push({ type: this.type || 'message', data: this.data.slice(0, -1), lastEventId: this.lastId })
+        this.data = ''; this.type = ''; continue
+      }
+      if (line.startsWith(':')) continue
+      const i = line.indexOf(':')
+      const field = i < 0 ? line : line.slice(0, i)
+      let value = i < 0 ? '' : line.slice(i + 1)
+      if (value.startsWith(' ')) value = value.slice(1)
+      if (field === 'data') this.data += value + '\n'
+      else if (field === 'event') this.type = value
+      else if (field === 'id') { if (!value.includes('\u0000')) this.lastId = value }
+      else if (field === 'retry') { if (/^[0-9]+$/.test(value)) this.retryMs = Number(value) }
+    }
+    return out
+  }
+  retry(): number | null { return this.retryMs }
+}
+</script>
+  <script type="wrong">
+// 保留半行，但 chunk 結尾的 \r 和下一塊開頭的 \n 被當成兩個行尾（多出一個空行）
+type SseEvent = { type: string; data: string; lastEventId: string }
+class SseParser {
+  private buf = ''
+  private started = false
+  private data = ''
+  private type = ''
+  private lastId = ''
+  private retryMs: number | null = null
+  push(chunk: string): SseEvent[] {
+    if (!this.started && chunk !== '') { this.started = true; if (chunk.startsWith('\uFEFF')) chunk = chunk.slice(1) }
+    this.buf += chunk
+    const lines = this.buf.split(/\r\n|\r|\n/)
+    this.buf = lines.pop()!
+    const out: SseEvent[] = []
+    for (const line of lines) {
+      if (line === '') {
+        if (this.data !== '') out.push({ type: this.type || 'message', data: this.data.slice(0, -1), lastEventId: this.lastId })
+        this.data = ''; this.type = ''; continue
+      }
+      if (line.startsWith(':')) continue
+      const i = line.indexOf(':')
+      const field = i < 0 ? line : line.slice(0, i)
+      let value = i < 0 ? '' : line.slice(i + 1)
+      if (value.startsWith(' ')) value = value.slice(1)
+      if (field === 'data') this.data += value + '\n'
+      else if (field === 'event') this.type = value
+      else if (field === 'id') { if (!value.includes('\u0000')) this.lastId = value }
+      else if (field === 'retry') { if (/^[0-9]+$/.test(value)) this.retryMs = Number(value) }
+    }
+    return out
+  }
+  retry(): number | null { return this.retryMs }
+}
+</script>
+  <script type="wrong">
+// 值用 trim() 去掉所有空白
+type SseEvent = { type: string; data: string; lastEventId: string }
+class SseParser {
+  private line = ''
+  private started = false
+  private skipLF = false
+  private data = ''
+  private type = ''
+  private lastId = ''
+  private retryMs: number | null = null
+  push(chunk: string): SseEvent[] {
+    if (!this.started && chunk !== '') { this.started = true; if (chunk.startsWith('\uFEFF')) chunk = chunk.slice(1) }
+    const out: SseEvent[] = []
+    for (const c of chunk) {
+      if (this.skipLF) { this.skipLF = false; if (c === '\n') continue }
+      if (c === '\r' || c === '\n') { this.skipLF = c === '\r'; this.processLine(this.line, out); this.line = '' } else this.line += c
+    }
+    return out
+  }
+  retry(): number | null { return this.retryMs }
+  private processLine(line: string, out: SseEvent[]) {
+    if (line === '') {
+      if (this.data !== '') out.push({ type: this.type || 'message', data: this.data.slice(0, -1), lastEventId: this.lastId })
+      this.data = ''; this.type = ''; return
+    }
+    if (line.startsWith(':')) return
+    const i = line.indexOf(':')
+    const field = i < 0 ? line : line.slice(0, i)
+    const value = i < 0 ? '' : line.slice(i + 1).trim()
+    if (field === 'data') this.data += value + '\n'
+    else if (field === 'event') this.type = value
+    else if (field === 'id') { if (!value.includes('\u0000')) this.lastId = value }
+    else if (field === 'retry') { if (/^[0-9]+$/.test(value)) this.retryMs = Number(value) }
+  }
+}
+</script>
+  <script type="wrong">
+// 每一行 data 就送出一個事件
+type SseEvent = { type: string; data: string; lastEventId: string }
+class SseParser {
+  private line = ''
+  private started = false
+  private skipLF = false
+  private type = ''
+  private lastId = ''
+  private retryMs: number | null = null
+  push(chunk: string): SseEvent[] {
+    if (!this.started && chunk !== '') { this.started = true; if (chunk.startsWith('\uFEFF')) chunk = chunk.slice(1) }
+    const out: SseEvent[] = []
+    for (const c of chunk) {
+      if (this.skipLF) { this.skipLF = false; if (c === '\n') continue }
+      if (c === '\r' || c === '\n') { this.skipLF = c === '\r'; this.processLine(this.line, out); this.line = '' } else this.line += c
+    }
+    return out
+  }
+  retry(): number | null { return this.retryMs }
+  private processLine(line: string, out: SseEvent[]) {
+    if (line === '') { this.type = ''; return }
+    if (line.startsWith(':')) return
+    const i = line.indexOf(':')
+    const field = i < 0 ? line : line.slice(0, i)
+    let value = i < 0 ? '' : line.slice(i + 1)
+    if (value.startsWith(' ')) value = value.slice(1)
+    if (field === 'data') out.push({ type: this.type || 'message', data: value, lastEventId: this.lastId })
+    else if (field === 'event') this.type = value
+    else if (field === 'id') { if (!value.includes('\u0000')) this.lastId = value }
+    else if (field === 'retry') { if (/^[0-9]+$/.test(value)) this.retryMs = Number(value) }
+  }
+}
+</script>
+  <script type="wrong">
+// 送出後沒有清掉事件類型
+type SseEvent = { type: string; data: string; lastEventId: string }
+class SseParser {
+  private line = ''
+  private started = false
+  private skipLF = false
+  private data = ''
+  private type = ''
+  private lastId = ''
+  private retryMs: number | null = null
+  push(chunk: string): SseEvent[] {
+    if (!this.started && chunk !== '') { this.started = true; if (chunk.startsWith('\uFEFF')) chunk = chunk.slice(1) }
+    const out: SseEvent[] = []
+    for (const c of chunk) {
+      if (this.skipLF) { this.skipLF = false; if (c === '\n') continue }
+      if (c === '\r' || c === '\n') { this.skipLF = c === '\r'; this.processLine(this.line, out); this.line = '' } else this.line += c
+    }
+    return out
+  }
+  retry(): number | null { return this.retryMs }
+  private processLine(line: string, out: SseEvent[]) {
+    if (line === '') {
+      if (this.data !== '') out.push({ type: this.type || 'message', data: this.data.slice(0, -1), lastEventId: this.lastId })
+      this.data = ''; return
+    }
+    if (line.startsWith(':')) return
+    const i = line.indexOf(':')
+    const field = i < 0 ? line : line.slice(0, i)
+    let value = i < 0 ? '' : line.slice(i + 1)
+    if (value.startsWith(' ')) value = value.slice(1)
+    if (field === 'data') this.data += value + '\n'
+    else if (field === 'event') this.type = value
+    else if (field === 'id') { if (!value.includes('\u0000')) this.lastId = value }
+    else if (field === 'retry') { if (/^[0-9]+$/.test(value)) this.retryMs = Number(value) }
+  }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：完成 <code>EventLog&lt;T&gt;</code>，伺服器替一個頻道保留最近的事件，讓重連的客戶端依 <code>Last-Event-ID</code> 補資料。</p>
+  <ul>
+    <li><code>append(data)</code>：新增一個事件，回傳 <code>{ id }</code>，id 是從 <code>'1'</code> 開始遞增的整數字串。只保留最近 <code>capacity</code> 個。</li>
+    <li><code>since(lastEventId)</code>：
+      <ul>
+        <li><code>null</code>（新連線，客戶端會先用 API 拿完整狀態）→ <code>{ kind: 'replay', events: [] }</code>。</li>
+        <li>不是我們發出的 id 格式（正整數、沒有前導 0、空白、小數點或正負號，例如 <code>'abc'</code>、<code>'-1'</code>、<code>'1.5'</code>、<code>'0'</code>、<code>'04'</code>）→ <code>{ kind: 'reset' }</code>。</li>
+        <li>比目前最新的 id 還大（伺服器重啟過或被竄改）→ reset。</li>
+        <li>lastEventId 之後的事件<strong>全部</strong>還在緩衝裡 → replay 這些事件（依 id 由小到大，可能是空陣列）。</li>
+        <li>有任何一個已經被擠掉 → reset。</li>
+      </ul>
+    </li>
+  </ul>
+  <script type="start">
+type Stored<T> = { id: string; data: T }
+type Since<T> = { kind: 'replay'; events: Stored<T>[] } | { kind: 'reset' }
+
+class EventLog<T> {
+  constructor(capacity: number) {
+    throw new Error('TODO')
+  }
+
+  append(data: T): { id: string } {
+    throw new Error('TODO')
+  }
+
+  since(lastEventId: string | null): Since<T> {
+    throw new Error('TODO')
+  }
+}
+</script>
+  <script type="answer">
+type Stored<T> = { id: string; data: T }
+type Since<T> = { kind: 'replay'; events: Stored<T>[] } | { kind: 'reset' }
+
+class EventLog<T> {
+  private capacity: number
+  private items: Array<{ id: number; data: T }> = []
+  private latest = 0
+
+  constructor(capacity: number) {
+    this.capacity = capacity
+  }
+
+  append(data: T): { id: string } {
+    this.latest++
+    this.items.push({ id: this.latest, data })
+    if (this.items.length > this.capacity) this.items.shift()
+    return { id: String(this.latest) }
+  }
+
+  since(lastEventId: string | null): Since<T> {
+    if (lastEventId === null) return { kind: 'replay', events: [] }
+    if (!/^[1-9][0-9]*$/.test(lastEventId)) return { kind: 'reset' }
+    const n = Number(lastEventId)
+    if (n > this.latest) return { kind: 'reset' }
+    const oldest = this.latest - this.items.length + 1
+    if (n + 1 < oldest) return { kind: 'reset' }   // n+1 那一個已經被擠掉了
+    const events = this.items.filter(e => e.id > n).map(e => ({ id: String(e.id), data: e.data }))
+    return { kind: 'replay', events }
+  }
+}
+</script>
+  <script type="tests">
+const ids = <T,>(r: Since<T>) => r.kind === 'replay' ? r.events.map(e => e.id) : 'reset'
+
+{
+  const log = new EventLog<string>(3)
+  assert.deepEqual(log.since(null), { kind: 'replay', events: [] }, '新連線（null）→ replay 空陣列')
+  assert.equal(ids(log.since('1')), 'reset', '還沒有任何事件時，since(\'1\') 比最新的還大 → reset')
+  assert.deepEqual(log.append('已收單'), { id: '1' }, '第一個事件的 id 是 \'1\'')
+  assert.deepEqual(log.since('1'), { kind: 'replay', events: [] }, '已經是最新的 → replay 空陣列')
+  for (const s of ['製作中', '可取餐', '已取餐', '已評分']) log.append(s)
+  assert.deepEqual(log.since('2'), { kind: 'replay', events: [{ id: '3', data: '可取餐' }, { id: '4', data: '已取餐' }, { id: '5', data: '已評分' }] }, '容量 3、寫入 5 個：since(\'2\') → replay 3、4、5（含 data）')
+  assert.deepEqual(ids(log.since('3')), ['4', '5'], 'since(\'3\') → replay 4、5')
+  assert.deepEqual(ids(log.since('5')), [], 'since(\'5\') 已經是最新的 → replay []')
+  assert.equal(ids(log.since('1')), 'reset', 'since(\'1\')：2 已經被擠掉 → reset，不能從 3 開始補')
+  assert.equal(ids(log.since('6')), 'reset', '比最新的還大 → reset')
+  assert.equal(ids(log.since('10')), 'reset', '比最新的還大 → reset')
+  for (const bad of ['abc', '-1', '1.5', '4.5', ' 4', '4 ', '', '0', '04', '+4', '1e1', '0x4']) {
+    assert.equal(ids(log.since(bad)), 'reset', `since(${JSON.stringify(bad)}) 不是正整數字串 → reset`)
+  }
+}
+{
+  const log = new EventLog<number>(20)
+  for (let i = 1; i <= 12; i++) log.append(i)
+  assert.deepEqual(ids(log.since('9')), ['10', '11', '12'], 'id 要用數字比較：\'10\' 在 \'9\' 之後')
+  assert.deepEqual(ids(log.since('10')), ['11', '12'], 'since(\'10\') → 11、12')
+  assert.deepEqual(ids(log.since('1')).length, 11, '容量足夠時從 2 補到 12')
+}
+{
+  const log = new EventLog<number>(1)
+  log.append(1)
+  log.append(2)
+  assert.deepEqual(ids(log.since('1')), ['2'], '容量 1：since(\'1\') → replay 2')
+  assert.equal(ids(log.since('99999999999999999999')), 'reset', '很大的數字也要 reset')
+}
+{
+  const log = new EventLog<string>(100)
+  for (let i = 1; i <= 250; i++) log.append(`e${i}`)
+  assert.deepEqual(ids(log.since('150')).length, 100, '容量 100、寫入 250：since(\'150\') 補 151～250')
+  assert.equal(ids(log.since('149')), 'reset', 'since(\'149\')：150 已經被擠掉 → reset')
+  const r = log.since('248')
+  r.kind === 'replay' && r.events.push({ id: 'x', data: 'x' })
+  assert.deepEqual(ids(log.since('248')), ['249', '250'], '回傳的陣列被呼叫端修改，不能影響緩衝')
+  const r2 = log.since('249')
+  if (r2.kind === 'replay' && r2.events[0]) r2.events[0].id = '999'
+  assert.deepEqual(ids(log.since('249')), ['250'], '回傳的事件物件被呼叫端修改，不能影響緩衝（回傳新的物件）')
+}
+</script>
+  <script type="wrong">
+// id 太舊時從最舊的開始補：漏掉的事件被悄悄忽略
+type Stored<T> = { id: string; data: T }
+type Since<T> = { kind: 'replay'; events: Stored<T>[] } | { kind: 'reset' }
+class EventLog<T> {
+  private items: Array<{ id: number; data: T }> = []
+  private latest = 0
+  constructor(private capacity: number) {}
+  append(data: T): { id: string } {
+    this.latest++
+    this.items.push({ id: this.latest, data })
+    if (this.items.length > this.capacity) this.items.shift()
+    return { id: String(this.latest) }
+  }
+  since(lastEventId: string | null): Since<T> {
+    if (lastEventId === null) return { kind: 'replay', events: [] }
+    if (!/^[1-9][0-9]*$/.test(lastEventId)) return { kind: 'reset' }
+    const n = Number(lastEventId)
+    if (n > this.latest) return { kind: 'reset' }
+    return { kind: 'replay', events: this.items.filter(e => e.id > n).map(e => ({ id: String(e.id), data: e.data })) }
+  }
+}
+</script>
+  <script type="wrong">
+// 邊界差一：since 剛好是最舊之前一個時，誤判成 reset
+type Stored<T> = { id: string; data: T }
+type Since<T> = { kind: 'replay'; events: Stored<T>[] } | { kind: 'reset' }
+class EventLog<T> {
+  private items: Array<{ id: number; data: T }> = []
+  private latest = 0
+  constructor(private capacity: number) {}
+  append(data: T): { id: string } {
+    this.latest++
+    this.items.push({ id: this.latest, data })
+    if (this.items.length > this.capacity) this.items.shift()
+    return { id: String(this.latest) }
+  }
+  since(lastEventId: string | null): Since<T> {
+    if (lastEventId === null) return { kind: 'replay', events: [] }
+    if (!/^[1-9][0-9]*$/.test(lastEventId)) return { kind: 'reset' }
+    const n = Number(lastEventId)
+    if (n > this.latest) return { kind: 'reset' }
+    const oldest = this.latest - this.items.length + 1
+    if (n < oldest) return { kind: 'reset' }
+    return { kind: 'replay', events: this.items.filter(e => e.id > n).map(e => ({ id: String(e.id), data: e.data })) }
+  }
+}
+</script>
+  <script type="wrong">
+// 邊界差一的另一邊：少檢查一個，漏掉的那一個沒有被發現
+type Stored<T> = { id: string; data: T }
+type Since<T> = { kind: 'replay'; events: Stored<T>[] } | { kind: 'reset' }
+class EventLog<T> {
+  private items: Array<{ id: number; data: T }> = []
+  private latest = 0
+  constructor(private capacity: number) {}
+  append(data: T): { id: string } {
+    this.latest++
+    this.items.push({ id: this.latest, data })
+    if (this.items.length > this.capacity) this.items.shift()
+    return { id: String(this.latest) }
+  }
+  since(lastEventId: string | null): Since<T> {
+    if (lastEventId === null) return { kind: 'replay', events: [] }
+    if (!/^[1-9][0-9]*$/.test(lastEventId)) return { kind: 'reset' }
+    const n = Number(lastEventId)
+    if (n > this.latest) return { kind: 'reset' }
+    const oldest = this.latest - this.items.length + 1
+    if (n + 2 < oldest) return { kind: 'reset' }
+    return { kind: 'replay', events: this.items.filter(e => e.id > n).map(e => ({ id: String(e.id), data: e.data })) }
+  }
+}
+</script>
+  <script type="wrong">
+// id 用字串比較
+type Stored<T> = { id: string; data: T }
+type Since<T> = { kind: 'replay'; events: Stored<T>[] } | { kind: 'reset' }
+class EventLog<T> {
+  private items: Stored<T>[] = []
+  private latest = 0
+  constructor(private capacity: number) {}
+  append(data: T): { id: string } {
+    this.latest++
+    this.items.push({ id: String(this.latest), data })
+    if (this.items.length > this.capacity) this.items.shift()
+    return { id: String(this.latest) }
+  }
+  since(lastEventId: string | null): Since<T> {
+    if (lastEventId === null) return { kind: 'replay', events: [] }
+    if (!/^[1-9][0-9]*$/.test(lastEventId)) return { kind: 'reset' }
+    if (lastEventId > String(this.latest)) return { kind: 'reset' }
+    const oldest = this.items[0]?.id ?? '1'
+    if (Number(lastEventId) + 1 < Number(oldest)) return { kind: 'reset' }
+    return { kind: 'replay', events: this.items.filter(e => e.id > lastEventId).map(e => ({ ...e })) }
+  }
+}
+</script>
+  <script type="wrong">
+// 未來的 id 當成 replay []
+type Stored<T> = { id: string; data: T }
+type Since<T> = { kind: 'replay'; events: Stored<T>[] } | { kind: 'reset' }
+class EventLog<T> {
+  private items: Array<{ id: number; data: T }> = []
+  private latest = 0
+  constructor(private capacity: number) {}
+  append(data: T): { id: string } {
+    this.latest++
+    this.items.push({ id: this.latest, data })
+    if (this.items.length > this.capacity) this.items.shift()
+    return { id: String(this.latest) }
+  }
+  since(lastEventId: string | null): Since<T> {
+    if (lastEventId === null) return { kind: 'replay', events: [] }
+    if (!/^[1-9][0-9]*$/.test(lastEventId)) return { kind: 'reset' }
+    const n = Number(lastEventId)
+    const oldest = this.latest - this.items.length + 1
+    if (n + 1 < oldest) return { kind: 'reset' }
+    return { kind: 'replay', events: this.items.filter(e => e.id > n).map(e => ({ id: String(e.id), data: e.data })) }
+  }
+}
+</script>
+  <script type="wrong">
+// 用 parseInt 解析：'4.5'、' 4' 被當成 4
+type Stored<T> = { id: string; data: T }
+type Since<T> = { kind: 'replay'; events: Stored<T>[] } | { kind: 'reset' }
+class EventLog<T> {
+  private items: Array<{ id: number; data: T }> = []
+  private latest = 0
+  constructor(private capacity: number) {}
+  append(data: T): { id: string } {
+    this.latest++
+    this.items.push({ id: this.latest, data })
+    if (this.items.length > this.capacity) this.items.shift()
+    return { id: String(this.latest) }
+  }
+  since(lastEventId: string | null): Since<T> {
+    if (lastEventId === null) return { kind: 'replay', events: [] }
+    const n = parseInt(lastEventId, 10)
+    if (!(n > 0)) return { kind: 'reset' }
+    if (n > this.latest) return { kind: 'reset' }
+    const oldest = this.latest - this.items.length + 1
+    if (n + 1 < oldest) return { kind: 'reset' }
+    return { kind: 'replay', events: this.items.filter(e => e.id > n).map(e => ({ id: String(e.id), data: e.data })) }
+  }
+}
+</script>
+  <script type="wrong">
+// 直接回傳緩衝裡的事件物件：呼叫端改了 events[0].id，緩衝也跟著壞掉
+type Stored<T> = { id: string; data: T }
+type Since<T> = { kind: 'replay'; events: Stored<T>[] } | { kind: 'reset' }
+class EventLog<T> {
+  private items: Stored<T>[] = []
+  private latest = 0
+  constructor(private capacity: number) {}
+  append(data: T): { id: string } {
+    this.latest++
+    this.items.push({ id: String(this.latest), data })
+    if (this.items.length > this.capacity) this.items.shift()
+    return { id: String(this.latest) }
+  }
+  since(lastEventId: string | null): Since<T> {
+    if (lastEventId === null) return { kind: 'replay', events: [] }
+    if (!/^[1-9][0-9]*$/.test(lastEventId)) return { kind: 'reset' }
+    const n = Number(lastEventId)
+    if (n > this.latest) return { kind: 'reset' }
+    if (n + 1 < this.latest - this.items.length + 1) return { kind: 'reset' }
+    return { kind: 'replay', events: this.items.filter(e => Number(e.id) > n) }
+  }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：完成 <code>Hub&lt;M&gt;</code>，一台 SSE 伺服器內部的扇出：從 pub/sub 收到的事件，放進這個頻道每條連線自己的送出佇列。</p>
+  <ul>
+    <li><code>subscribe(channel, { maxQueue, onDrop })</code>：新增一個訂閱者，回傳 <code>{ id, take, unsubscribe }</code>，<code>id</code> 每個訂閱者不同。</li>
+    <li><code>publish(channel, msg)</code>：<strong>同步</strong>地把訊息放進這個頻道每個訂閱者的佇列。某個訂閱者的佇列已經有 <code>maxQueue</code> 個時，不放入，改為移除這個訂閱者、清空它的佇列，並呼叫一次它的 <code>onDrop</code>（讓連線關閉、客戶端重連補資料）。其他訂閱者照常收到。</li>
+    <li><code>take(n)</code>：依序取出最多 <code>n</code> 個（模擬連線把資料寫出去）。被移除或取消訂閱之後回傳 <code>[]</code>。</li>
+    <li><code>unsubscribe()</code>：從頻道移除、清空佇列；之後不再收到，也不會呼叫 <code>onDrop</code>。呼叫第二次沒有作用。</li>
+    <li><code>subscriberCount(channel)</code>：這個頻道目前的訂閱者數。</li>
+  </ul>
+  <script type="start">
+type Subscription<M> = { id: number; take(n: number): M[]; unsubscribe(): void }
+type SubscribeOptions = { maxQueue: number; onDrop: () => void }
+
+class Hub<M> {
+  subscribe(channel: string, opts: SubscribeOptions): Subscription<M> {
+    throw new Error('TODO')
+  }
+
+  publish(channel: string, msg: M): void {
+    throw new Error('TODO')
+  }
+
+  subscriberCount(channel: string): number {
+    throw new Error('TODO')
+  }
+}
+</script>
+  <script type="answer">
+type Subscription<M> = { id: number; take(n: number): M[]; unsubscribe(): void }
+type SubscribeOptions = { maxQueue: number; onDrop: () => void }
+type Subscriber<M> = { queue: M[]; opts: SubscribeOptions }
+
+class Hub<M> {
+  private channels = new Map<string, Map<number, Subscriber<M>>>()
+  private nextId = 1
+
+  subscribe(channel: string, opts: SubscribeOptions): Subscription<M> {
+    const id = this.nextId++
+    const sub: Subscriber<M> = { queue: [], opts }
+    let subs = this.channels.get(channel)
+    if (!subs) {
+      subs = new Map()
+      this.channels.set(channel, subs)
+    }
+    subs.set(id, sub)
+    return {
+      id,
+      take: n => sub.queue.splice(0, n),
+      unsubscribe: () => this.remove(channel, id),
+    }
+  }
+
+  publish(channel: string, msg: M): void {
+    const subs = this.channels.get(channel)
+    if (!subs) return
+    for (const [id, sub] of [...subs]) {
+      if (sub.queue.length >= sub.opts.maxQueue) {
+        this.remove(channel, id)
+        sub.opts.onDrop()
+      } else {
+        sub.queue.push(msg)
+      }
+    }
+  }
+
+  subscriberCount(channel: string): number {
+    return this.channels.get(channel)?.size ?? 0
+  }
+
+  private remove(channel: string, id: number) {
+    const subs = this.channels.get(channel)
+    const sub = subs?.get(id)
+    if (!subs || !sub) return
+    sub.queue.length = 0
+    subs.delete(id)
+    if (subs.size === 0) this.channels.delete(channel)
+  }
+}
+</script>
+  <script type="tests">
+{
+  const hub = new Hub<number>()
+  let drops = 0
+  let otherDrops = 0
+  const slow = hub.subscribe('store:1', { maxQueue: 3, onDrop: () => drops++ })
+  const a = hub.subscribe('store:1', { maxQueue: 3, onDrop: () => otherDrops++ })
+  const b = hub.subscribe('store:1', { maxQueue: 3, onDrop: () => otherDrops++ })
+  assert.equal(new Set([slow.id, a.id, b.id]).size, 3, '每個訂閱者的 id 要不同')
+  assert.equal(hub.subscriberCount('store:1'), 3, '訂閱 3 個之後 subscriberCount 是 3')
+  assert.equal(hub.subscriberCount('store:2'), 0, '沒有訂閱者的頻道是 0')
+
+  const ret = hub.publish('store:1', 1) as unknown
+  assert.equal(ret, undefined, 'publish 要同步完成，不能回傳 Promise')
+  assert.deepEqual(a.take(10), [1], 'publish 回來之後，訊息就要已經在佇列裡（同步，不等訂閱者）')
+  hub.publish('store:1', 2)
+  hub.publish('store:1', 3)
+  assert.equal(drops, 0, '佇列剛好 3 個（等於 maxQueue）時還不能踢掉')
+  assert.deepEqual(a.take(1), [2], 'take(1) 只取 1 個，依序')
+  assert.deepEqual(b.take(10), [1, 2, 3], 'b 依序收到 1、2、3')
+  hub.publish('store:1', 4)
+  assert.equal(drops, 1, '慢的訂閱者佇列已經滿了，再 publish 時要呼叫 onDrop 一次')
+  assert.equal(hub.subscriberCount('store:1'), 2, '滿了的訂閱者要被移除')
+  assert.deepEqual(slow.take(10), [], '被移除的訂閱者佇列要清空（釋放記憶體）')
+  hub.publish('store:1', 5)
+  assert.equal(drops, 1, 'onDrop 只能被呼叫一次')
+  assert.deepEqual(slow.take(10), [], '被移除的訂閱者之後不再收到')
+  assert.deepEqual(a.take(10), [3, 4, 5], '其他訂閱者不受影響，照順序收到全部')
+  assert.deepEqual(b.take(10), [4, 5], '其他訂閱者不受影響（b）')
+  assert.equal(otherDrops, 0, '有在讀的訂閱者不能被踢掉')
+  slow.unsubscribe()
+  assert.equal(drops, 1, '已經被移除的訂閱者再 unsubscribe 不會呼叫 onDrop')
+  assert.equal(hub.subscriberCount('store:1'), 2, '已經被移除的訂閱者再 unsubscribe，不能移除到別人')
+}
+{
+  const hub = new Hub<string>()
+  let drops = 0
+  const s1 = hub.subscribe('order:41', { maxQueue: 10, onDrop: () => drops++ })
+  const s2 = hub.subscribe('order:42', { maxQueue: 10, onDrop: () => drops++ })
+  hub.publish('order:41', '可取餐')
+  assert.deepEqual(s2.take(10), [], '不同頻道的訊息不能互相收到')
+  assert.deepEqual(s1.take(10), ['可取餐'], '自己頻道的訊息要收到')
+  s1.unsubscribe()
+  assert.equal(hub.subscriberCount('order:41'), 0, 'unsubscribe 之後 subscriberCount 要減少')
+  hub.publish('order:41', '已取餐')
+  assert.deepEqual(s1.take(10), [], 'unsubscribe 之後不再收到')
+  s1.unsubscribe()
+  assert.equal(hub.subscriberCount('order:42'), 1, '重複 unsubscribe 不能影響別的訂閱者')
+  for (let i = 0; i < 50; i++) hub.publish('order:41', 'x')
+  assert.equal(drops, 0, '取消訂閱的連線不會再被 onDrop')
+}
+{
+  const hub = new Hub<string>()
+  const opts = { maxQueue: 10, onDrop: () => {} }
+  const [x, y, z] = [hub.subscribe('store:1', opts), hub.subscribe('store:1', opts), hub.subscribe('store:1', opts)]
+  x.unsubscribe()
+  x.unsubscribe()
+  assert.equal(hub.subscriberCount('store:1'), 2, '同一個訂閱者 unsubscribe 兩次，只能移除它自己，同頻道的其他人要留著')
+  hub.publish('store:1', '新訂單')
+  assert.deepEqual([y.take(5), z.take(5)], [['新訂單'], ['新訂單']], '同頻道其他訂閱者照常收到')
+}
+{
+  const hub = new Hub<number>()
+  let slowDrops = 0
+  const slow = hub.subscribe('store:1', { maxQueue: 100, onDrop: () => slowDrops++ })
+  const fast = [0, 1].map(() => hub.subscribe('store:1', { maxQueue: 100, onDrop: () => { throw new Error('讀得快的訂閱者不應該被踢掉') } }))
+  const got: number[][] = [[], []]
+  for (let i = 0; i < 10000; i++) {
+    hub.publish('store:1', i)
+    if (i % 50 === 0) fast.forEach((f, k) => got[k].push(...f.take(100)))
+  }
+  fast.forEach((f, k) => got[k].push(...f.take(1000)))
+  const expected = Array.from({ length: 10000 }, (_, i) => i)
+  assert.deepEqual(got[0], expected, '1 萬個訊息：讀得快的訂閱者要全部收到、順序正確')
+  assert.deepEqual(got[1], expected, '1 萬個訊息：第二個讀得快的訂閱者也要全部收到')
+  assert.equal(slowDrops, 1, '從不讀的訂閱者只被踢掉一次')
+  assert.equal(slow.take(1000).length, 0, '從不讀的訂閱者被踢掉後不再累積訊息')
+  assert.equal(hub.subscriberCount('store:1'), 2, '最後剩下 2 個讀得快的訂閱者')
+}
+{
+  const hub = new Hub<number>()
+  const subs = Array.from({ length: 5 }, () => hub.subscribe('c', { maxQueue: 1, onDrop: () => {} }))
+  hub.publish('c', 1)
+  hub.publish('c', 2)
+  assert.equal(hub.subscriberCount('c'), 0, '每個都滿了時，5 個都要被移除（不能只處理第一個就停）')
+  subs.forEach(s => assert.deepEqual(s.take(5), [], '被移除的訂閱者佇列要清空'))
+}
+</script>
+  <script type="wrong">
+// 佇列沒有上限
+type Subscription<M> = { id: number; take(n: number): M[]; unsubscribe(): void }
+type SubscribeOptions = { maxQueue: number; onDrop: () => void }
+class Hub<M> {
+  private channels = new Map<string, Map<number, M[]>>()
+  private nextId = 1
+  subscribe(channel: string, opts: SubscribeOptions): Subscription<M> {
+    const id = this.nextId++
+    const queue: M[] = []
+    if (!this.channels.has(channel)) this.channels.set(channel, new Map())
+    this.channels.get(channel)!.set(id, queue)
+    return { id, take: n => queue.splice(0, n), unsubscribe: () => { this.channels.get(channel)?.delete(id) } }
+  }
+  publish(channel: string, msg: M): void {
+    for (const q of this.channels.get(channel)?.values() ?? []) q.push(msg)
+  }
+  subscriberCount(channel: string): number { return this.channels.get(channel)?.size ?? 0 }
+}
+</script>
+  <script type="wrong">
+// 慢的訂閱者佇列滿時默默丟掉訊息，不斷線：客戶端不知道自己漏了
+type Subscription<M> = { id: number; take(n: number): M[]; unsubscribe(): void }
+type SubscribeOptions = { maxQueue: number; onDrop: () => void }
+class Hub<M> {
+  private channels = new Map<string, Map<number, { queue: M[]; opts: SubscribeOptions }>>()
+  private nextId = 1
+  subscribe(channel: string, opts: SubscribeOptions): Subscription<M> {
+    const id = this.nextId++
+    const sub = { queue: [] as M[], opts }
+    if (!this.channels.has(channel)) this.channels.set(channel, new Map())
+    this.channels.get(channel)!.set(id, sub)
+    return { id, take: n => sub.queue.splice(0, n), unsubscribe: () => { this.channels.get(channel)?.delete(id) } }
+  }
+  publish(channel: string, msg: M): void {
+    for (const sub of this.channels.get(channel)?.values() ?? []) {
+      if (sub.queue.length < sub.opts.maxQueue) sub.queue.push(msg)
+    }
+  }
+  subscriberCount(channel: string): number { return this.channels.get(channel)?.size ?? 0 }
+}
+</script>
+  <script type="wrong">
+// 佇列滿了呼叫 onDrop，但沒有移除：之後每次 publish 都再呼叫一次
+type Subscription<M> = { id: number; take(n: number): M[]; unsubscribe(): void }
+type SubscribeOptions = { maxQueue: number; onDrop: () => void }
+class Hub<M> {
+  private channels = new Map<string, Map<number, { queue: M[]; opts: SubscribeOptions }>>()
+  private nextId = 1
+  subscribe(channel: string, opts: SubscribeOptions): Subscription<M> {
+    const id = this.nextId++
+    const sub = { queue: [] as M[], opts }
+    if (!this.channels.has(channel)) this.channels.set(channel, new Map())
+    this.channels.get(channel)!.set(id, sub)
+    return { id, take: n => sub.queue.splice(0, n), unsubscribe: () => { this.channels.get(channel)?.delete(id) } }
+  }
+  publish(channel: string, msg: M): void {
+    for (const sub of this.channels.get(channel)?.values() ?? []) {
+      if (sub.queue.length >= sub.opts.maxQueue) sub.opts.onDrop()
+      else sub.queue.push(msg)
+    }
+  }
+  subscriberCount(channel: string): number { return this.channels.get(channel)?.size ?? 0 }
+}
+</script>
+  <script type="wrong">
+// publish 等待每個訂閱者（async 迴圈）
+type Subscription<M> = { id: number; take(n: number): M[]; unsubscribe(): void }
+type SubscribeOptions = { maxQueue: number; onDrop: () => void }
+class Hub<M> {
+  private channels = new Map<string, Map<number, { queue: M[]; opts: SubscribeOptions }>>()
+  private nextId = 1
+  subscribe(channel: string, opts: SubscribeOptions): Subscription<M> {
+    const id = this.nextId++
+    const sub = { queue: [] as M[], opts }
+    if (!this.channels.has(channel)) this.channels.set(channel, new Map())
+    this.channels.get(channel)!.set(id, sub)
+    return { id, take: n => sub.queue.splice(0, n), unsubscribe: () => { sub.queue.length = 0; this.channels.get(channel)?.delete(id) } }
+  }
+  async publish(channel: string, msg: M): Promise<void> {
+    const subs = this.channels.get(channel)
+    if (!subs) return
+    for (const [id, sub] of [...subs]) {
+      await Promise.resolve()
+      if (sub.queue.length >= sub.opts.maxQueue) { subs.delete(id); sub.queue.length = 0; sub.opts.onDrop() }
+      else sub.queue.push(msg)
+    }
+  }
+  subscriberCount(channel: string): number { return this.channels.get(channel)?.size ?? 0 }
+}
+</script>
+  <script type="wrong">
+// unsubscribe 沒有移除（只清空佇列）：之後還會收到、還佔記憶體
+type Subscription<M> = { id: number; take(n: number): M[]; unsubscribe(): void }
+type SubscribeOptions = { maxQueue: number; onDrop: () => void }
+class Hub<M> {
+  private channels = new Map<string, Map<number, { queue: M[]; opts: SubscribeOptions }>>()
+  private nextId = 1
+  subscribe(channel: string, opts: SubscribeOptions): Subscription<M> {
+    const id = this.nextId++
+    const sub = { queue: [] as M[], opts }
+    if (!this.channels.has(channel)) this.channels.set(channel, new Map())
+    this.channels.get(channel)!.set(id, sub)
+    return { id, take: n => sub.queue.splice(0, n), unsubscribe: () => { sub.queue.length = 0 } }
+  }
+  publish(channel: string, msg: M): void {
+    const subs = this.channels.get(channel)
+    if (!subs) return
+    for (const [id, sub] of [...subs]) {
+      if (sub.queue.length >= sub.opts.maxQueue) { subs.delete(id); sub.queue.length = 0; sub.opts.onDrop() }
+      else sub.queue.push(msg)
+    }
+  }
+  subscriberCount(channel: string): number { return this.channels.get(channel)?.size ?? 0 }
+}
+</script>
+  <script type="wrong">
+// 遇到滿的訂閱者就停下來：排在它後面的人收不到這個訊息
+type Subscription<M> = { id: number; take(n: number): M[]; unsubscribe(): void }
+type SubscribeOptions = { maxQueue: number; onDrop: () => void }
+class Hub<M> {
+  private channels = new Map<string, Map<number, { queue: M[]; opts: SubscribeOptions }>>()
+  private nextId = 1
+  subscribe(channel: string, opts: SubscribeOptions): Subscription<M> {
+    const id = this.nextId++
+    const sub = { queue: [] as M[], opts }
+    if (!this.channels.has(channel)) this.channels.set(channel, new Map())
+    this.channels.get(channel)!.set(id, sub)
+    return { id, take: n => sub.queue.splice(0, n), unsubscribe: () => { sub.queue.length = 0; this.channels.get(channel)?.delete(id) } }
+  }
+  publish(channel: string, msg: M): void {
+    const subs = this.channels.get(channel)
+    if (!subs) return
+    for (const [id, sub] of [...subs]) {
+      if (sub.queue.length >= sub.opts.maxQueue) { subs.delete(id); sub.queue.length = 0; sub.opts.onDrop(); return }
+      sub.queue.push(msg)
+    }
+  }
+  subscriberCount(channel: string): number { return this.channels.get(channel)?.size ?? 0 }
+}
+</script>
+  <script type="wrong">
+// 用陣列存訂閱者，unsubscribe 用 indexOf＋splice：已經移除的再 unsubscribe 時 indexOf 是 -1，splice(-1, 1) 刪掉最後一個人
+type Subscription<M> = { id: number; take(n: number): M[]; unsubscribe(): void }
+type SubscribeOptions = { maxQueue: number; onDrop: () => void }
+type Sub<M> = { id: number; queue: M[]; opts: SubscribeOptions }
+class Hub<M> {
+  private channels = new Map<string, Sub<M>[]>()
+  private nextId = 1
+  subscribe(channel: string, opts: SubscribeOptions): Subscription<M> {
+    const sub: Sub<M> = { id: this.nextId++, queue: [], opts }
+    if (!this.channels.has(channel)) this.channels.set(channel, [])
+    const list = this.channels.get(channel)!
+    list.push(sub)
+    return { id: sub.id, take: n => sub.queue.splice(0, n), unsubscribe: () => { sub.queue.length = 0; list.splice(list.indexOf(sub), 1) } }
+  }
+  publish(channel: string, msg: M): void {
+    const list = this.channels.get(channel)
+    if (!list) return
+    for (const sub of [...list]) {
+      if (sub.queue.length >= sub.opts.maxQueue) { list.splice(list.indexOf(sub), 1); sub.queue.length = 0; sub.opts.onDrop() }
+      else sub.queue.push(msg)
+    }
+  }
+  subscriberCount(channel: string): number { return this.channels.get(channel)?.length ?? 0 }
+}
+</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：尖峰時有 10 萬個 App 停在首頁，每 5 秒輪詢一次訂單狀態。同事說：「輪詢就是一般的 GET，很便宜。」伺服器每秒要處理多少請求？</p>
+  <label data-key="a">大約每秒 13 個，跟狀態變化的次數差不多</label>
+  <label data-key="b">每秒 5 千個，因為大部分 App 會被快取擋掉</label>
+  <label data-key="c">每秒 2 萬個，其中 99.9% 以上回「沒有更新」</label>
+  <label data-key="d">每秒 50 萬個，10 萬 × 5</label>
+  <p class="why">✓ 輪詢的請求量是「客戶端數 ÷ 間隔」＝ 100,000 ÷ 5 ＝ 20,000，跟有沒有事件無關；尖峰時每秒真正的狀態變化只有十幾次（a 是推送的事件數，不是輪詢的請求數）。每個請求都要驗證身分、查資料，快取只能減少查詢成本，請求還是要進來（b）。d 把間隔乘錯了方向。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：出單畫面的 SSE 在本機正常，部署到 nginx 後面之後，店員要等很久才一次看到好幾張訂單，有時要等連線斷掉才出現。最可能的原因？</p>
+  <label data-key="a">瀏覽器的 <code>EventSource</code> 會累積事件再一次觸發，要改用 WebSocket</label>
+  <label data-key="b">nginx 的 <code>proxy_buffering</code> 預設開著，把回應收進緩衝才送出；SSE 回應加 <code>X-Accel-Buffering: no</code>，或關掉那個 location 的 <code>proxy_buffering</code></label>
+  <label data-key="c"><code>proxy_read_timeout</code> 太短，要調成 1 小時</label>
+  <p class="why">✓ nginx 的 proxy 模組文件寫明 <code>proxy_buffering</code> 預設 <code>on</code>，上游回應可以用 <code>X-Accel-Buffering: no</code> 關掉。本機直連沒有代理，所以正常（a 不成立，<code>EventSource</code> 收到空行就送出事件）。<code>proxy_read_timeout</code>（c）太短的症狀是「沒事件時每 60 秒斷一次」，事件不會被攢著；而且它是兩次讀取之間的逾時，該用心跳解決，不是調成很大的數字。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：重新部署時，一台伺服器上的 2.5 萬條 SSE 連線同時被關掉。同事說：「瀏覽器會自動重連，幾秒就好了，不用處理。」實際會發生什麼，該怎麼做？</p>
+  <label data-key="a">2.5 萬個客戶端幾乎同一秒重連，打爆其他機器與資料庫（重連風暴）；要分批排空、重連加 jitter，續傳緩衝不放在被關掉的程序裡</label>
+  <label data-key="b">沒問題，負載平衡器會把重連平均分到其他機器，每台多幾千條連線而已，現在的伺服器撐得住</label>
+  <label data-key="c">要改用 WebSocket：瀏覽器的 WebSocket 斷線時不會自動重連，就不會有風暴</label>
+  <p class="why">✓ 問題不在連線總數，而在<strong>同一秒</strong>：每個重連都要驗證身分、查補送的事件，reset 的還要打 API（b 只看了平均）。被打爆的機器回 503 時，WHATWG 標準規定回應不是 200 時 <code>EventSource</code> 不再重連，客戶端要自己退避加 jitter 重建。c 只是把重連搬到應用程式裡，沒有 jitter 照樣是風暴，還要自己補資料。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 7：每台 SSE 伺服器都用 Redis pub/sub 訂閱訂單事件。某台機器跟 Redis 的連線閃斷了 2 秒又連回來。這 2 秒內發布的事件會怎樣？</p>
+  <label data-key="a">Redis 會在重新連上時補送，pub/sub 保證每個訂閱者都收到</label>
+  <label data-key="b">Redis 會保存到所有訂閱者都 ack 為止</label>
+  <label data-key="c">這台機器收不到，那些事件對它來說永遠遺失（pub/sub 是至多一次）；要靠續傳緩衝與 reset 讓客戶端補回狀態，或改用可保存的 Redis Streams</label>
+  <p class="why">✓ Redis 文件寫明 pub/sub 是 at-most-once：送出之後不會再送，訂閱者斷線或出錯時那則訊息就永遠遺失（a、b 都不成立，pub/sub 沒有 ack 也不保存）。所以 pub/sub 只負責快速扇出，「不漏」要靠能依 id 重讀的地方（outbox 表、Redis Streams）加上客戶端的 <code>Last-Event-ID</code> 與 reset。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>單向通知也用 WebSocket</strong>：重連、續傳、訊息格式、代理設定都要自己做。只有伺服器往客戶端推送時，SSE 都內建了。</li>
+  <li><strong>用 <code>split('\n')</code> 解析、不保留半行</strong>：單獨的 CR、被切開的 CRLF、被切開的 JSON 都會出錯。累積緩衝，只處理完整的行。</li>
+  <li><strong>把推送當成狀態來源</strong>：推送會遺失、重複、reset。初始狀態從 API 拿，套用事件要冪等，重連後不確定就重新整理。</li>
+  <li><strong>續傳時從最舊的開始補</strong>：中間被擠掉的事件被悄悄忽略。補不了就 reset。</li>
+  <li><strong>只靠 <code>EventSource</code> 的自動重連</strong>：回應不是 200 時它就不再重連。在 <code>onerror</code> 檢查 <code>CLOSED</code>，自己退避加 jitter 重建。</li>
+  <li><strong>長連線的身分過期了卻沒處理</strong>：使用者登出、被停權後還收得到推送。記住到期時間，到期或權限撤銷就關掉連線。</li>
+  <li><strong>以為 Redis pub/sub 不會漏</strong>：它是至多一次。搭配續傳緩衝或可保存的串流。</li>
+  <li><strong>每條連線的送出緩衝沒有上限</strong>：一群慢的客戶端吃光記憶體，整台機器被殺掉。設上限，滿了就斷線讓它重連補資料，不要默默丟掉訊息。</li>
+  <li><strong>代理緩衝 SSE</strong>：事件被攢著，連線結束才送出。回應加 <code>X-Accel-Buffering: no</code>，關掉這條路徑的壓縮。</li>
+  <li><strong>沒有心跳</strong>：沒事件時代理或負載平衡器把閒置連線切掉（nginx 預設 60 秒沒讀到東西就斷）。定期送註解行，間隔比路上最短的閒置逾時短。</li>
+  <li><strong>每個分頁一條 SSE、走 HTTP/1.1</strong>：超過 6 條，同網域的其他請求也被卡住。用 HTTP/2，或一個分頁連線、用 <code>BroadcastChannel</code> 分享。</li>
+  <li><strong>長連線用 round robin 分配</strong>：新機器一直很閒、舊機器一直滿。用最少連線。</li>
+  <li><strong>部署時沒有排空與 jitter</strong>：幾萬條連線同一秒重連。分批關閉、重連時間隨機化，續傳緩衝不放在要被關掉的程序裡。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>輪詢的成本是「客戶端數 ÷ 間隔」，跟事件數無關；推送的成本跟事件數成正比，代價是很多條長連線。客戶端多、要即時、變化少時才值得推送。</li>
+  <li>單向的狀態更新選 SSE（就是 HTTP，內建重連與 <code>Last-Event-ID</code>）；需要雙向、頻繁互動才用 WebSocket，它沒有確認、重送、重連，都要自己設計。</li>
+  <li>SSE 解析：三種行尾、空行送出、冒號開頭是註解、只去掉一個空白、<code>id</code> 會沿用、<code>retry</code> 只收數字；資料會在任何位置被切開，要累積緩衝並處理被切開的 CRLF。</li>
+  <li>斷線續傳：每個頻道保留最近 N 個事件，依 <code>Last-Event-ID</code> 補送；補不了、id 不合法或比最新的還大就 reset，客戶端重新拿完整狀態。推送只是通知，狀態以 API 為準，套用事件要冪等。長連線的身分會過期，到期或撤權就關掉連線。</li>
+  <li>多台伺服器：用 pub/sub 把事件扇出到每一台（Redis pub/sub 是至多一次，要搭配續傳）；每條連線一個有上限的送出佇列，發布不等任何人，慢的斷線重連。</li>
+  <li>維運：關掉代理緩衝、心跳比閒置逾時短、HTTP/1.1 的 6 條上限、檔案描述子上限、最少連線負載平衡；部署時分批排空加 jitter；看連線數、佇列長度、被踢掉的數量、重連率、reset 次數。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 8 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 8：咖啡店的單體越改越亂，改集點常常弄壞下單。有人提議：「拆成微服務，各管各的就不會互相弄壞了。」資深工程師會怎麼回？</p>
+  <label data-key="a">贊成，拆開之後每個服務各自部署，改集點就不可能影響下單</label>
+  <label data-key="b">贊成，先依技術分層拆成前端、API、資料庫三個服務，風險最小</label>
+  <label data-key="c">先在單體裡畫清模組邊界，用架構測試守住；出現擴展、團隊互卡這類訊號再拆</label>
+  <p class="why">✓ 程式碼亂通常是模組邊界沒畫好，拆成服務只是把亂搬到網路上，還多了網路失敗與維運成本。預設模組化單體，等真的出現值得拆的訊號，再用 strangler fig 一塊一塊拆。a 錯在下單若同步呼叫集點，集點壞了下單一樣壞，而且改 API 還要協調兩邊上線。（第 15 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 9：訂單明細頁要同時顯示訂單內容和這筆訂單拿到的點數，點數在 loyalty 服務。loyalty 服務掛了 10 分鐘，這頁該怎麼處理？</p>
+  <label data-key="a">點數是選用的：加短逾時，失敗就回傳訂單、標出 degraded，畫面顯示點數暫時無法取得</label>
+  <label data-key="b">整頁回 500，避免顧客看到不完整的資料，等 loyalty 恢復再一起顯示</label>
+  <label data-key="c">訂單服務直接 JOIN loyalty 的點數表，少一次網路呼叫，就不怕它掛掉</label>
+  <p class="why">✓ API composition 要區分必要與選用：訂單拿不到才失敗，點數拿不到就降級，逾時後用 AbortController 取消。b 讓選用的依賴變成硬相依，同步依賴的可用性相乘，loyalty 掛了訂單頁也跟著掛。c 是共用資料庫，loyalty 改欄位就打壞訂單服務，等於沒拆。（第 15 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 10：訂單服務付款成功後，透過訊息匯流排發出 <code>SendReceiptEmail</code>，收據服務收到就寄信。同事說：「走了匯流排，兩個服務已經解耦了。」對嗎？</p>
+  <label data-key="a">對，發送端不用等對方回應，走非同步就等於解耦</label>
+  <label data-key="b">不對，這是包裝成事件的命令；改發 <code>OrderPaid</code>，讓收據、集點各自決定要做什麼</label>
+  <label data-key="c">對，只是名字要改成過去式 <code>ReceiptEmailSent</code>，比較符合事件命名</label>
+  <p class="why">✓ 判斷方法：明天多一個要知道付款的功能，發布者要改程式嗎？發 <code>SendReceiptEmail</code> 時要，因為訂單服務還在指揮別人做事。事件宣布已經發生的事實，格式由發布者決定，誰需要誰來聽。a 錯在非同步只解決了等待，沒解決「發布者知道下游要做什麼」的耦合。（第 16 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 11：訂單狀態的投影這樣消費訂單事件，已經依事件 ID 去重，匯流排是至少一次送達。哪裡會出事？</p>
+<pre>async function onOrderEvent(e) {
+  await db.query('BEGIN')
+  const r = await db.query(
+    'INSERT INTO inbox (event_id) VALUES ($1) ON CONFLICT DO NOTHING', [e.id])
+  if (r.rowCount === 1) await db.query(
+    'UPDATE order_view SET status = $1 WHERE id = $2', [STATUS[e.type], e.data.orderId])
+  await db.query('COMMIT')
+  await ack(e)
+}</pre>
+  <label data-key="a">先寫 inbox 再更新狀態，更新失敗時這個事件會被當成已經處理過</label>
+  <label data-key="b">同一個事件重送時 <code>ON CONFLICT</code> 會丟錯誤，交易回滾後一直重送</label>
+  <label data-key="c">重試晚到的 <code>OrderPaid</code> 會蓋掉已套用的 <code>OrderCompleted</code>，狀態倒退</label>
+  <p class="why">✓ 重試、不同 partition、relay 重送都會讓舊事件晚到；事件 ID 只擋得住同一個事件來兩次，擋不住亂序。要記住每張訂單套用到第幾號，序號 ≤ 它就丟掉；不能改用事件的時間比，時間來自不同機器的時鐘。a 錯在 inbox 和更新在同一個交易，更新失敗時 inbox 那一列也一起回滾。（第 16 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 12：外送平台的 webhook 端點每次都 30 秒才逾時。從那天起，所有客戶收到通知都晚了好幾個小時。先改什麼？</p>
+  <label data-key="a">每個端點各自的佇列與並行上限，慢的端點只拖慢它自己的通知</label>
+  <label data-key="b">把送出的逾時從 30 秒拉長到 120 秒，讓慢的端點有機會成功</label>
+  <label data-key="c">逾時的事件直接丟掉不重試，才不會一直擋在佇列前面</label>
+  <p class="why">✓ 所有客戶共用一條佇列時，一個慢客戶就占住送出用的連線，這是隔艙要解決的問題。b 讓它占得更久，其他人更晚收到。c 會讓外送平台恢復後永遠漏掉這些事件；失敗的要照退避排程重試，修好後還能用重播補。（第 16 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 13：App 要顯示「你的拿鐵做好了」，只有伺服器往手機推送，尖峰有 10 萬個 App 在線。同事提議用 WebSocket，你會怎麼選？</p>
+  <label data-key="a">WebSocket，因為 SSE 斷線重連後不知道漏了哪些事件，只能整頁重新整理</label>
+  <label data-key="b">SSE，它就是 HTTP，內建重連與 <code>Last-Event-ID</code>，單向推送剛好夠用</label>
+  <label data-key="c">WebSocket，因為它內建訊息確認與斷線重送，比 SSE 不容易漏訊息</label>
+  <p class="why">✓ 單向的狀態更新選 SSE：瀏覽器自動重連，並在標頭帶上最後收到的 id，伺服器照著補送。WebSocket 適合雙向、頻繁互動；它沒有確認、重送、重連，這些都要自己設計。c 是最常見的誤解，以為 WebSocket 比較「完整」，其實這些機制它都沒有。（第 17 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 14：訂單頁的 Vue 元件這樣寫，在本機測都正常。哪裡會出事？</p>
+<pre>const status = ref('')
+onMounted(() =&gt; {
+  const es = new EventSource(`/orders/${id}/events`)
+  es.onmessage = (e) =&gt; {
+    status.value = JSON.parse(e.data).status
+  }
+})</pre>
+  <label data-key="a">要自己在重連時帶上 <code>Last-Event-ID</code> 標頭，不然伺服器不會補送</label>
+  <label data-key="b"><code>e.data</code> 可能被切成好幾塊，要自己累積緩衝再 <code>JSON.parse</code></label>
+  <label data-key="c">沒有先打 API 拿完整狀態；連上前或 reset 時發生的變化，畫面永遠不會出現</label>
+  <p class="why">✓ 推送只是通知，會遺失、重複、reset，狀態以 API 為準：先呼叫 API 拿完整狀態再接推送，收到 reset 或回到前景就重新拿，套用時比版本號。a 錯在瀏覽器重連時會自動帶上這個標頭。b 是自己寫解析器才要處理的事，<code>EventSource</code> 收到空行才送出完整的事件。（第 17 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 15：一台 SSE 伺服器的記憶體在尖峰時一路漲到被系統砍掉，查下去是幾百個訊號很差的手機讀得很慢，事件都堆在它們的送出緩衝裡。該怎麼改？</p>
+  <label data-key="a">發布時逐一等每條連線寫完再送下一個事件，資料就不會堆積</label>
+  <label data-key="b">每條連線的送出佇列設上限，滿了就斷線，讓它重連後依 <code>Last-Event-ID</code> 補送或 reset</label>
+  <label data-key="c">每條連線的送出佇列設上限，滿了就丟掉最舊的事件，連線保持不斷</label>
+  <p class="why">✓ 慢消費者不能拖垮整台機器，也不能拖慢別人：發布不等任何人，佇列滿的就斷線，重連時再補。a 讓一支慢手機拖住所有人的推送。c 是最容易選的錯：默默丟掉事件，客戶端不知道自己漏了，畫面一直停在錯的狀態。（第 17 課）</p>
+</div>
+<p>這個階段的重點整理成<a href="../sheets/stage-4.html">一頁圖解</a>。</p>
+<p>下一課進入階段 5：這一課做了很多選擇（SSE 還是 WebSocket、緩衝多大、放在哪），下一課學怎麼把這些決定和理由寫成設計文件與 ADR，讓團隊審查、讓一年後的人看得懂。</p>
+
+</main>
+<script>
+// 時間軸（.tl）：逐步顯示每一列 tr[data-note]，下方顯示目前步驟的說明（與 PostgreSQL 課相同）
+document.querySelectorAll('.tl').forEach(tl => {
+  const rows = [...tl.querySelectorAll('tr[data-note]')]
+  const note = tl.querySelector('.note')
+  const count = tl.querySelector('[data-count]')
+  const prev = tl.querySelector('[data-prev]')
+  const next = tl.querySelector('[data-next]')
+  let cur = 0
+  const show = () => {
+    rows.forEach((r, i) => {
+      r.classList.toggle('now', i === cur)
+      r.classList.toggle('later', i > cur)
+    })
+    note.textContent = rows[cur].dataset.note
+    count.textContent = `步驟 ${cur + 1} / ${rows.length}`
+    prev.disabled = cur === 0
+    next.textContent = cur === rows.length - 1 ? '↺ 重新播放' : '下一步 ▶'
+  }
+  prev.onclick = () => { cur--; show() }
+  next.onclick = () => { cur = cur === rows.length - 1 ? 0 : cur + 1; show() }
+  show()
+})
+</script>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

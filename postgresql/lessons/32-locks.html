@@ -1,0 +1,626 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>32. 鎖深入：鎖等級、等待佇列、死結與診斷</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="32" data-pg-2pc>
+<header>
+  <div class="eyebrow">階段 9：資深必備｜並發與正確性 · 第 32 課</div>
+  <h1>鎖深入：鎖等級、等待佇列、死結與診斷</h1>
+</header>
+<main>
+
+<p>下午兩點，咖啡店的 App 突然整個轉圈圈：點餐頁、會員頁、後台全部逾時，CPU 卻很閒。原因是一位工程師在正式環境執行了一句瞬間完成的 <code>ALTER TABLE orders ADD COLUMN note text</code>。這句 SQL 本身沒問題，問題是它在等一把鎖，而它後面又排了幾百個查詢。</p>
+<p>事情平息後，主管請你寫這次的事故檢討，並負責今晚重跑這次 migration。下午那句 <code>ADD COLUMN</code> 最後雖然成功了，但事後發現欄位定義要調整，團隊已經先把 <code>note</code> 欄位移除，排在今晚離峰時段重做。今晚的清單有三句：替 <code>orders</code> 加 <code>note</code> 欄位、補一個 <code>ordered_at</code> 的索引、驗證 <code>customer_id</code> 的外鍵。檢討要回答四個問題，這一課就依序回答它們：為什麼一句瞬間完成的 SQL 能讓整站停擺？今晚的每一句會擋住誰、怎麼替它加上護欄？App 自己的交易之間會不會也互相卡住？下次再發生時，怎麼在幾分鐘內找到根源、決定取消還是斷線？<a href="19-concurrency.html">第 19 課</a>學過列鎖和死結的直覺，這一課往下挖到 PostgreSQL 實際怎麼做。</p>
+
+<div class="callout"><strong>第一輪只要記住：</strong>
+<ul>
+  <li>每句 SQL 都會拿表級鎖。大多數 <code>ALTER TABLE</code> 要最強的 ACCESS EXCLUSIVE，它在排隊時，後面連 <code>SELECT</code> 都得等。所以 DDL 前一定設 <code>lock_timeout</code>。</li>
+  <li>多列一起改時先依 id 排序再鎖，減少死結；收到 40P01 就重試整個交易。</li>
+  <li>事故當下用 <code>pg_stat_activity</code> 和 <code>pg_blocking_pids</code> 找出根源；<code>idle in transaction</code> 的根源要用 <code>pg_terminate_backend</code> 斷線。</li>
+</ul>
+8 種鎖的清單和衝突表是查表用的，不用背。</div>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>為什麼一句瞬間完成的 ALTER 能讓整站停擺：鎖、衝突、等待佇列三句話的模型，以及防止它的 <code>lock_timeout</code>。</li>
+  <li>今晚的 migration 每句拿什麼鎖、會擋住誰：用 <code>pg_locks</code> 自己量，再用衝突表和「暫停的同事」實驗驗證。</li>
+  <li>App 的交易之間：列級鎖怎麼讓「改顧客名字」不擋住「幫他下單」，以及檢討會上「下單前先鎖顧客」的提議為什麼不好。</li>
+  <li>等待要有上限、互等要有人讓步：四個逾時設定與死結。</li>
+  <li>下次事故當下：找出誰卡住誰，決定取消還是斷線。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="18-transactions.html">第 18 課</a>的交易：<code>BEGIN</code> 開始，<code>COMMIT</code> 或 <code>ROLLBACK</code> 結束，中間的修改一起生效或一起取消。</li>
+  <li><a href="19-concurrency.html">第 19 課</a>的 <code>FOR UPDATE</code> 與死結：<code>FOR UPDATE</code> 讀的同時鎖住選到的列，直到交易結束；死結是兩個交易互相等對方手上的鎖。</li>
+  <li><a href="22-migrations.html">第 22 課</a>的「<code>ALTER TABLE</code> 會鎖表」與 <code>lock_timeout</code>：等鎖的上限，等不到就放棄，晚點再試。</li>
+  <li><a href="30-mvcc-vacuum.html">第 30 課</a>的 MVCC：一列有多個版本，<code>xmax</code> 記下刪除（或鎖住）這個版本的交易編號。</li>
+</ul></div>
+
+<div class="callout"><strong>這頁的環境：</strong>
+<ul>
+  <li>資料庫是 PGlite 0.5.13（PostgreSQL 18.6），只有一個後端程序、一條連線，看不到別人：「被別人擋住」用「暫停的同事」實驗示範，死結用時間軸、事故用快照示範。</li>
+  <li><code>lock_timeout</code>、<code>statement_timeout</code> 這類逾時設定不會觸發（實測），等鎖會永遠等，由引擎的 5 秒看門狗中止；要「拿不到就放棄」改用 <code>NOWAIT</code>。</li>
+</ul></div>
+
+<p><strong>這頁的資料：</strong><code>customers</code>（6 位顧客）、<code>products</code>（6 項商品，含 <code>stock</code> 庫存）、<code>orders</code>（<code>customer_id</code> 是參照 <code>customers</code> 的外鍵）、materialized view <code>product_menu</code>，以及事故快照表 <code>activity_snapshot</code>（最後一節用）。</p>
+
+<h2>為什麼一句瞬間完成的 ALTER 能讓整站停擺？</h2>
+<p>要回答檢討的第一題，先要知道 PostgreSQL 怎麼讓同時進來的操作不互相弄壞。它用的是鎖（lock）：一個交易要動一張表之前，先向資料庫登記「我要怎麼用這張表」，例如「我要讀」或「我要改結構」。登記的用法有強有弱：弱的只防最危險的事，強的什麼都防。兩個人登記的用法互相牴觸，叫做衝突（conflict），晚到的人就得等。</p>
+<p>以整張表為單位的鎖，叫表級鎖（table-level lock）。它回答的是「這張表現在能不能做某類操作」，例如能不能讀、能不能改結構。第 19 課的列鎖是以一列為單位，後面「列級鎖與外鍵」那一節會再回來談。有了這兩個詞，事故可以用三句話解釋：</p>
+<ol>
+  <li><strong>每個指令都會先拿表級鎖，拿到的鎖留到交易結束。</strong>一般讀取（<code>SELECT</code>）拿最弱的 ACCESS SHARE；大多數 <code>ALTER TABLE</code> 拿最強的 ACCESS EXCLUSIVE。</li>
+  <li><strong>兩把鎖衝突時，後到的人要等先拿到的人的交易結束。</strong>讀取只怕改結構：ACCESS SHARE 只和 ACCESS EXCLUSIVE 衝突。</li>
+  <li><strong>拿不到鎖的請求進入等待佇列（lock queue），依先來後到排隊。</strong>新來的請求不只要跟「已經拿到」的鎖比，也要跟「排在前面、還在等」的鎖比。所以排在前面的強鎖，會擋住後面所有和它衝突的弱鎖，即使這些弱鎖和目前拿著的鎖完全不衝突。</li>
+</ol>
+<p>第三句是事故的關鍵。少了它，報表和 App 的 <code>SELECT</code> 都只是讀，本來可以同時進行。把三句套回事故，逐步播放，每一步注意 App 那一欄：</p>
+<div class="tl">
+  <div class="table-wrap"><table>
+    <tr><th>時間</th><th>月報表（2 分鐘）</th><th>工程師的 migration</th><th>App 的查詢</th></tr>
+    <tr data-note="一份月報表開始跑，拿著 orders 的 ACCESS SHARE。讀和讀不衝突，App 照常運作。"><td>14:00:00</td><td><code>SELECT … FROM orders …</code><br>持有 ACCESS SHARE</td><td></td><td>正常</td></tr>
+    <tr data-note="ALTER 要 ACCESS EXCLUSIVE，和報表的 ACCESS SHARE 衝突，只好排隊。它本身只要幾毫秒，但要先等報表跑完。"><td>14:00:10</td><td>（還在跑）</td><td><code>ALTER TABLE orders ADD COLUMN note text</code><br><span class="wait">排隊等 ACCESS EXCLUSIVE…</span></td><td></td></tr>
+    <tr data-note="App 的 SELECT 只要 ACCESS SHARE，跟報表不衝突，可是排在前面的 ALTER 要的 ACCESS EXCLUSIVE 跟它衝突，所以排在 ALTER 後面。"><td>14:00:11</td><td>（還在跑）</td><td><span class="wait">等待中…</span></td><td><code>SELECT … FROM orders WHERE customer_id = …</code><br><span class="wait">排在 ALTER 後面…</span></td></tr>
+    <tr data-note="接下來每一個碰到 orders 的請求都排進來。連線池（第 25 課）的連線全部卡在這裡，其他頁面也拿不到連線，整個網站像當機。"><td>14:00:12 起</td><td>（還在跑）</td><td><span class="wait">等待中…</span></td><td>幾百個查詢<br><span class="wait">全部排隊…</span></td></tr>
+    <tr data-note="報表跑完，ALTER 拿到鎖、幾毫秒完成，後面的查詢才被放行。網站停擺了將近兩分鐘，罪魁禍首是報表和 ALTER 的組合。欄位雖然加上了，事後發現定義要調整，於是先移除，今晚重做。"><td>14:02:00</td><td>完成，放開鎖</td><td>拿到鎖，幾毫秒完成</td><td>一口氣全部放行</td></tr>
+  </table></div>
+  <div class="bar"><button data-prev>◀ 上一步</button><button class="primary" data-next>下一步 ▶</button><span class="kbd" data-count></span></div>
+  <p class="note"></p>
+</div>
+<p>所以網站停擺不是因為 ALTER 慢，而是它在佇列裡等的那兩分鐘，把後面每個請求一起拖住。要修的是「等待」：讓 ALTER 等不到鎖就放棄，它一離開佇列，後面的查詢就能跟報表一起讀。</p>
+<p>改表結構的指令，例如 <code>CREATE</code>、<code>ALTER</code>、<code>DROP</code>，統稱資料定義語言（DDL，Data Definition Language）。修法是在 DDL 前設 <code>lock_timeout</code>，也就是等鎖的上限：超過就讓這一句失敗、交易被取消。<code>SET LOCAL</code> 讓這個設定只在目前的交易有效，不會影響同一條連線之後的查詢：</p>
+<pre>BEGIN;
+SET LOCAL lock_timeout = '2s';
+ALTER TABLE orders ADD COLUMN note text;
+COMMIT;
+-- 等超過 2 秒：ERROR 55P03 canceling statement due to lock timeout
+-- 交易被取消，App 最多被擋 2 秒；migration 腳本等一下再重試</pre>
+<p>代價是 migration 可能失敗，所以腳本要能重試。這段在這頁不會生效（見課首「這頁的環境」）；第 34 課會把每種 DDL 的鎖和安全步驟整理成一套 migration 流程。</p>
+<p>檢討的第一題有了最小答案。但這個答案建立在「ALTER 拿最強的鎖」這句話上，今晚的清單裡還有 <code>CREATE INDEX</code> 和 <code>VALIDATE CONSTRAINT</code>，它們拿什麼鎖？與其憑印象，下一節教你自己量。</p>
+
+<h2>今晚的 migration 每句拿什麼鎖？用 pg_locks 自己量</h2>
+<p>上一節的模型只用到兩種鎖。PostgreSQL 的表級鎖其實有 8 種，要知道某個指令拿哪一種，最可靠的方法是在交易裡執行它，再看資料庫記下了哪些鎖。這需要先認識兩個工具。</p>
+<p>第一個是 pid。PostgreSQL 的每條連線由伺服器上一個獨立的程序（process）服務，程序有編號，叫 <strong>pid</strong>。<code>pg_backend_pid()</code> 回傳「服務我這條連線的程序」的編號，用來從所有連線的鎖裡挑出自己的。</p>
+<p>第二個是 <code>pg_locks</code>。它是一個系統視圖（system view），也就是 PostgreSQL 內建、可以像表一樣查詢的狀態資訊。<code>pg_locks</code> 列出資料庫裡目前所有的鎖，包括已經拿到的和正在等的。常用欄位：</p>
+<div class="table-wrap"><table>
+  <tr><th>欄位</th><th>意思</th></tr>
+  <tr><td><code>locktype</code></td><td>鎖住的是什麼：<code>relation</code>（表、索引、序號這類「關聯」）、<code>transactionid</code>（交易編號）、<code>virtualxid</code>（虛擬交易編號）……</td></tr>
+  <tr><td><code>relation</code></td><td>被鎖的表的內部編號（oid）。轉成 <code>regclass</code> 型別就會顯示成表名：<code>relation::regclass</code></td></tr>
+  <tr><td><code>mode</code></td><td>鎖的模式，例如 <code>AccessShareLock</code></td></tr>
+  <tr><td><code>granted</code></td><td><code>true</code> 已拿到；<code>false</code> 正在排隊等</td></tr>
+  <tr><td><code>pid</code></td><td>持有或等待這把鎖的程序；prepared transaction（下一節實驗裡的「暫停的同事」）的鎖這欄是 <code>NULL</code></td></tr>
+</table></div>
+<p>鎖會一直留到交易結束，所以要在交易裡做事、在交易還沒結束時查。先從最熟悉的 <code>SELECT</code> 開始：下面這格在 <code>BEGIN … ROLLBACK</code> 裡執行一般的 <code>SELECT</code>，再查自己（<code>pid = pg_backend_pid()</code>）拿到的表級鎖。<code>NOT LIKE 'pg\_%'</code> 把查 <code>pg_locks</code> 本身產生的鎖濾掉。執行後看 <code>mode</code> 欄：</p>
+<div class="lab" data-sql="BEGIN;
+SELECT * FROM orders;
+SELECT relation::regclass::text AS 表, mode FROM pg_locks
+WHERE pid = pg_backend_pid() AND locktype = 'relation' AND relation::regclass::text NOT LIKE 'pg\_%'
+ORDER BY 1, 2;
+ROLLBACK;"></div>
+<p><code>orders</code> 和它的主鍵索引 <code>orders_pkey</code> 各一把 <code>AccessShareLock</code>。讀也要拿鎖，只是這把鎖很弱。</p>
+<p>同一把鎖有兩種寫法：<code>pg_locks</code> 的 <code>AccessShareLock</code>，就是 <code>LOCK TABLE</code> 寫法的 ACCESS SHARE。課文一律用 <code>LOCK TABLE</code> 的寫法，兩種寫法的對照集中在下面的表。上面那段查詢每次重打太長，seed 裡的 <code>my_locks()</code> 就是同一段查詢，只是把模式轉成 <code>LOCK TABLE</code> 的寫法，之後都用它。</p>
+<p>判斷 migration 會擋住誰之前，要先知道 App 平常拿什麼鎖。量兩種 App 最常做的事：會鎖列的 <code>SELECT … FOR UPDATE</code>，和下單的 <code>INSERT</code>。執行後看兩張結果的「模式」欄：</p>
+<div class="lab" data-sql="BEGIN;
+SELECT * FROM orders WHERE id = 1 FOR UPDATE;
+SELECT * FROM my_locks();
+ROLLBACK;
+
+BEGIN;
+INSERT INTO orders (customer_id, total) VALUES (2, 80);
+SELECT * FROM my_locks();
+ROLLBACK;"></div>
+<ul>
+  <li><code>SELECT … FOR UPDATE</code>：表上拿 ROW SHARE，被選到的列另外加列鎖。列鎖不在 <code>pg_locks</code> 的表級欄位裡，「列級鎖與外鍵」那一節會講。</li>
+  <li><code>INSERT</code>：<code>orders</code> 拿 ROW EXCLUSIVE；<code>orders_id_seq</code> 是自動編號用的序號；<code>customers</code> 也出現了 ROW SHARE，那是外鍵（<a href="08-foreign-keys.html">第 8 課</a>）檢查去鎖顧客那一列造成的。</li>
+</ul>
+<p>到這裡已經量到三種。表級鎖模式（table-level lock mode）全部 8 種如下，由弱到強。名字裡的 ROW、SHARE 是歷史命名，別照字面理解：ROW SHARE、ROW EXCLUSIVE 也是表級鎖，不是列鎖。記「誰拿它」就好，例如 ROW EXCLUSIVE 就是「寫入拿的鎖」。下表的鎖是在 PostgreSQL 18 實際用 <code>pg_locks</code> 量出來的，查表用，不用背：</p>
+<div class="table-wrap"><table>
+  <tr><th>#</th><th>模式（<code>LOCK TABLE</code> 的寫法）</th><th><code>pg_locks.mode</code></th><th>誰會拿</th></tr>
+  <tr><td>1</td><td>ACCESS SHARE</td><td><code>AccessShareLock</code></td><td><code>SELECT</code></td></tr>
+  <tr><td>2</td><td>ROW SHARE</td><td><code>RowShareLock</code></td><td><code>SELECT … FOR UPDATE／FOR SHARE</code> 等列鎖子句</td></tr>
+  <tr><td>3</td><td>ROW EXCLUSIVE</td><td><code>RowExclusiveLock</code></td><td><code>INSERT</code>、<code>UPDATE</code>、<code>DELETE</code></td></tr>
+  <tr><td>4</td><td>SHARE UPDATE EXCLUSIVE</td><td><code>ShareUpdateExclusiveLock</code></td><td><code>VACUUM</code>（非 FULL）、<code>ANALYZE</code>、<code>CREATE INDEX CONCURRENTLY</code>、<code>ALTER TABLE … VALIDATE CONSTRAINT</code></td></tr>
+  <tr><td>5</td><td>SHARE</td><td><code>ShareLock</code></td><td><code>CREATE INDEX</code>（沒有 CONCURRENTLY）</td></tr>
+  <tr><td>6</td><td>SHARE ROW EXCLUSIVE</td><td><code>ShareRowExclusiveLock</code></td><td><code>CREATE TRIGGER</code>、<code>ADD FOREIGN KEY</code>（兩張表都拿）</td></tr>
+  <tr><td>7</td><td>EXCLUSIVE</td><td><code>ExclusiveLock</code></td><td><code>REFRESH MATERIALIZED VIEW CONCURRENTLY</code></td></tr>
+  <tr><td>8</td><td>ACCESS EXCLUSIVE</td><td><code>AccessExclusiveLock</code></td><td>大多數 <code>ALTER TABLE</code>（例如 <code>ADD COLUMN</code>、<code>RENAME</code>、<code>SET NOT NULL</code>）、<code>DROP TABLE</code>、<code>TRUNCATE</code>、<code>VACUUM FULL</code>、<code>REFRESH MATERIALIZED VIEW</code>，以及沒指定模式的 <code>LOCK TABLE</code></td></tr>
+</table></div>
+<p>現在量今晚的 migration。三句依序是補索引、加欄位、驗證外鍵。同一個指令可能在同一張表上拿好幾把鎖，看<strong>最強的那一把</strong>。執行後看三張結果的「模式」欄，和上表對照：</p>
+<div class="lab" data-sql="BEGIN;
+CREATE INDEX ON orders (ordered_at);
+SELECT 'CREATE INDEX' AS 指令, 模式 FROM my_locks() WHERE 表 = 'orders';
+ROLLBACK;
+
+BEGIN;
+ALTER TABLE orders ADD COLUMN note text;
+SELECT 'ADD COLUMN' AS 指令, 模式 FROM my_locks() WHERE 表 = 'orders';
+ROLLBACK;
+
+BEGIN;
+ALTER TABLE orders VALIDATE CONSTRAINT orders_customer_id_fkey;
+SELECT 'VALIDATE' AS 指令, 模式 FROM my_locks() WHERE 表 = 'orders';
+ROLLBACK;"></div>
+<p>三句拿的鎖強度差很多：<code>ADD COLUMN</code> 是最強的 ACCESS EXCLUSIVE，<code>CREATE INDEX</code> 和 <code>VALIDATE</code> 比較弱。</p>
+<div class="callout practice"><strong>💡 實務上：審 migration 時先問「這句拿什麼鎖」</strong><br>團隊的 PR 裡出現 <code>ALTER TABLE</code>、<code>CREATE INDEX</code> 時，資深工程師先問的通常不是語法，而是：這句拿什麼鎖、表有多大、會不會在尖峰時段跑？咖啡店的 <code>products</code> 只有幾十列，鎖再強也一閃而過；<code>orders</code> 累積幾年後，沒有 CONCURRENTLY 的 <code>CREATE INDEX</code> 會讓結帳的寫入一路卡到索引建完。不確定時就像上面那樣，在測試資料庫開交易執行、查 <code>pg_locks</code>，比憑印象可靠。後台報表用的 materialized view 也一樣，排程的 refresh 優先用 <code>CONCURRENTLY</code>（實驗見課末補充）。</div>
+<p>但「比較弱」不等於不擋人：<code>CREATE INDEX</code> 的 SHARE 會不會擋住結帳的 <code>INSERT</code>？下一節用衝突表回答。</p>
+
+<h2>這些鎖會擋住誰？衝突表與「暫停的同事」</h2>
+<p>知道每句拿什麼鎖之後，下一步是判斷它會擋住誰。第一節的模型只用到其中一格（ACCESS SHARE 對 ACCESS EXCLUSIVE），完整的是 PostgreSQL 18 文件的衝突表（conflict matrix）。列是「我想拿的鎖」，欄是「別人已經拿著的鎖」，編號對應上一節表格的 #，✕ 表示衝突。查表用，不用背：</p>
+<div class="table-wrap"><table>
+  <tr><th>想拿 ＼ 別人已持有</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th><th>8</th></tr>
+  <tr><td>1 ACCESS SHARE</td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td>✕</td></tr>
+  <tr><td>2 ROW SHARE</td><td></td><td></td><td></td><td></td><td></td><td></td><td>✕</td><td>✕</td></tr>
+  <tr><td>3 ROW EXCLUSIVE</td><td></td><td></td><td></td><td></td><td>✕</td><td>✕</td><td>✕</td><td>✕</td></tr>
+  <tr><td>4 SHARE UPDATE EXCLUSIVE</td><td></td><td></td><td></td><td>✕</td><td>✕</td><td>✕</td><td>✕</td><td>✕</td></tr>
+  <tr><td>5 SHARE</td><td></td><td></td><td>✕</td><td>✕</td><td></td><td>✕</td><td>✕</td><td>✕</td></tr>
+  <tr><td>6 SHARE ROW EXCLUSIVE</td><td></td><td></td><td>✕</td><td>✕</td><td>✕</td><td>✕</td><td>✕</td><td>✕</td></tr>
+  <tr><td>7 EXCLUSIVE</td><td></td><td>✕</td><td>✕</td><td>✕</td><td>✕</td><td>✕</td><td>✕</td><td>✕</td></tr>
+  <tr><td>8 ACCESS EXCLUSIVE</td><td>✕</td><td>✕</td><td>✕</td><td>✕</td><td>✕</td><td>✕</td><td>✕</td><td>✕</td></tr>
+</table></div>
+<p>表很大，但今晚的 migration 和 App 平常的操作只碰到其中幾格，記三句就能應付大部分情況：</p>
+<ul>
+  <li><strong>一般讀取只怕 ACCESS EXCLUSIVE。</strong>所以 <code>ALTER TABLE</code>、<code>TRUNCATE</code>、一般的 <code>REFRESH</code> 會擋住讀。今晚的 <code>ADD COLUMN</code> 屬於這一類。</li>
+  <li><strong>寫入（ROW EXCLUSIVE）怕 SHARE 以上。</strong>所以沒有 CONCURRENTLY 的 <code>CREATE INDEX</code>（SHARE）會擋住所有寫入，但不擋讀。上一節留下的問題答案是：會，結帳的 <code>INSERT</code> 要等索引建完。</li>
+  <li><strong>SHARE 和自己不衝突，SHARE UPDATE EXCLUSIVE 和自己衝突。</strong>兩個人可以同時 <code>CREATE INDEX</code>；同一張表同時只能有一個 <code>VACUUM</code>、<code>ANALYZE</code> 或 <code>VALIDATE</code>。</li>
+</ul>
+
+<h3>實驗：請一位「暫停的同事」拿著鎖</h3>
+<p>衝突表可以自己驗證，但這頁只有一條連線（見課首）。要看「被別人擋住」，需要一個不會結束的別人：沿用<a href="30-mvcc-vacuum.html">第 30 課</a>的「暫停的同事」，用 <code>PREPARE TRANSACTION 'gid'</code> 把交易<strong>暫停並保存</strong>起來。連線變回空閒，交易拿的鎖卻全部留著，直到有人執行 <code>COMMIT PREPARED 'gid'</code> 或 <code>ROLLBACK PREPARED 'gid'</code>。</p>
+<div class="callout warn">PREPARE TRANSACTION 是給分散式交易管理器用的，不是給應用程式用的。正式環境沒有交易管理器時，<code>max_prepared_transactions</code> 應該維持 0（預設），這頁是為了教學才打開。</div>
+<p>同事拿著鎖之後，你再一種一種去試。試的工具是 <code>LOCK TABLE 表 IN 模式 MODE</code>：它不做任何讀寫，只拿指定模式的表級鎖。加上 <code>NOWAIT</code> 就是「拿不到立刻報錯 55P03，不要等」，這正是測試衝突需要的。<code>LOCK TABLE</code> 只能在交易裡用：交易一結束鎖就放掉，在交易外鎖了也沒意義，所以交易外會直接報錯 25P01：</p>
+<div class="lab" data-sql="LOCK TABLE products IN SHARE MODE;"></div>
+<p>第一步：同事開交易，拿住 <code>products</code> 的 SHARE UPDATE EXCLUSIVE（等於他正在跑 <code>ANALYZE</code> 或 <code>VALIDATE</code>），然後暫停。執行後看 <code>pg_prepared_xacts</code> 裡出現了 <code>colleague</code>：</p>
+<div class="lab" data-sql="BEGIN;
+LOCK TABLE products IN SHARE UPDATE EXCLUSIVE MODE;
+PREPARE TRANSACTION 'colleague';
+
+SELECT gid, prepared FROM pg_prepared_xacts;"></div>
+<p>第二步：你用 seed 裡的 <code>try_table_locks(表)</code> 依序試 8 種模式，它對每種模式執行一句 <code>LOCK TABLE products IN 模式 MODE NOWAIT</code>。每一句都交給 seed 裡的 <code>try_sql(sql)</code> 執行：成功回傳「成功」，失敗回傳錯誤碼和訊息，不會讓整句查詢中斷。在這裡能用 <code>LOCK TABLE</code>，是因為函式本身就在那一句的交易裡執行。執行後看「結果」欄：</p>
+<div class="lab" data-sql="SELECT * FROM try_table_locks('products');"></div>
+<p>前三種成功、後五種 <code>55P03 could not obtain lock</code>，和衝突表 4 SHARE UPDATE EXCLUSIVE 那一欄一致。換成今晚的情境：<code>VALIDATE</code> 在跑的時候，App 的讀寫照常，但另一個 <code>CREATE INDEX</code> 或 <code>ALTER</code> 要等。第三步：讓同事放棄，鎖就放掉了（<code>ROLLBACK PREPARED</code> 必須單獨一格）：</p>
+<div class="lab" data-sql="ROLLBACK PREPARED 'colleague';"></div>
+<p>到這裡，今晚每一句 migration 會擋住誰，都能在動手前判斷。但表級鎖只回答了 migration 的問題。App 的寫入彼此都拿 ROW EXCLUSIVE，在表級互不衝突，那兩個交易同時改同一位顧客時，靠什麼避免互相蓋掉？檢討會上也有人針對這點提了一個方案，下一節來評估它。</p>
+
+<h2>下單前先鎖住顧客，會不會反而卡住結帳？列級鎖與外鍵</h2>
+<p>檢討會上有人提議：App 下單時先用 <code>SELECT … FOR UPDATE</code> 把顧客那一列鎖住，確保下單期間顧客資料不會被改。這個提議好不好，要看列級鎖之間怎麼互相阻擋。</p>
+<p>前面用 <code>pg_locks</code> 量鎖時，<code>SELECT … FOR UPDATE</code> 在表上只拿了 ROW SHARE，這把表級鎖幾乎不擋人。真正擋住別人改那一列的，是另外加在列上的列級鎖（row-level lock）。兩者分工：表級鎖管「整張表能不能做某類操作」，列級鎖管「這一列能不能改」。</p>
+<p>列鎖存放的位置也和表級鎖不同。<a href="30-mvcc-vacuum.html">第 30 課</a>說過每個列版本有 <code>xmax</code> 欄位，記下刪除這個版本的交易；鎖住一列時，PostgreSQL 把鎖記在這一列本身的 <code>xmax</code>，不佔共享記憶體，所以一次鎖一百萬列也不會耗盡鎖表。代價是 <code>pg_locks</code> 不會逐列列出列鎖：要等列鎖的人，在 <code>pg_locks</code> 裡看到的是它在等對方的 <code>transactionid</code>，也就是等對方的交易結束。</p>
+<p>列鎖有 4 種強度，由強到弱。最後一種是這節的重點：外鍵檢查拿的是最弱的那一把。</p>
+<div class="table-wrap"><table>
+  <tr><th>列鎖</th><th>誰會拿</th><th>擋住誰</th></tr>
+  <tr><td><code>FOR UPDATE</code></td><td><code>DELETE</code>；改到可以被外鍵參照的欄位（主鍵、唯一鍵）的 <code>UPDATE</code>；手寫 <code>SELECT … FOR UPDATE</code></td><td>其他三種全部</td></tr>
+  <tr><td><code>FOR NO KEY UPDATE</code></td><td>沒改到鍵的 <code>UPDATE</code>（最常見的修改）</td><td>FOR UPDATE、FOR NO KEY UPDATE、FOR SHARE</td></tr>
+  <tr><td><code>FOR SHARE</code></td><td>手寫 <code>SELECT … FOR SHARE</code>：我要讀，讀完前別人不准改</td><td>FOR UPDATE、FOR NO KEY UPDATE</td></tr>
+  <tr><td><code>FOR KEY SHARE</code></td><td><strong>外鍵檢查</strong>：新增訂單時，PostgreSQL 對被參照的那位顧客拿這把鎖，確保顧客在交易結束前不會被刪掉或改主鍵</td><td>只有 FOR UPDATE</td></tr>
+</table></div>
+<p>為什麼要分這麼細？因為「改顧客的名字」和「幫同一位顧客下單」同時發生非常頻繁。改名拿 FOR NO KEY UPDATE，外鍵檢查拿 FOR KEY SHARE，兩者不衝突，誰都不用等。用實驗驗證：同事把顧客 1 改名、把顧客 2（沒有訂單）刪掉，然後暫停：</p>
+<div class="lab" data-sql="BEGIN;
+UPDATE customers SET name = '王大明' WHERE id = 1;
+DELETE FROM customers WHERE id = 2;
+PREPARE TRANSACTION 'colleague';"></div>
+<p>你用 seed 裡的 <code>try_customer_locks(顧客 id)</code> 分別去鎖顧客 1 和顧客 2：它以 4 種強度各執行一句 <code>SELECT 1 FROM customers WHERE id = … FOR 強度 NOWAIT</code>，同樣透過 <code>try_sql</code>。執行後看兩張結果的「結果」欄：</p>
+<div class="lab" data-sql="SELECT * FROM try_customer_locks(1);  -- 顧客 1：被改名
+SELECT * FROM try_customer_locks(2);  -- 顧客 2：被刪除"></div>
+<ul>
+  <li>顧客 1（被改名）：只有 <code>KEY SHARE</code> 拿得到。</li>
+  <li>顧客 2（被刪除）：全部失敗。</li>
+</ul>
+<p>所以幫顧客 1 新增訂單照常成功，而且一般的 <code>SELECT</code> 不拿列鎖，看到的是改名前的舊名字（<a href="30-mvcc-vacuum.html">第 30 課</a>的 MVCC）：</p>
+<div class="lab" data-sql="INSERT INTO orders (customer_id, total) VALUES (1, 110) RETURNING id, customer_id;
+SELECT id, name FROM customers WHERE id &lt;= 2 ORDER BY id;"></div>
+<p>看完讓同事放棄：</p>
+<div class="lab" data-sql="ROLLBACK PREPARED 'colleague';"></div>
+<p>回到檢討會的提議。它想要的是「下單期間顧客資料不會被改」，但「不會被改」其實分成幾種需求，答案各不相同：</p>
+<ul>
+  <li><strong>只需要確保顧客存在、不會被刪掉</strong>：外鍵檢查已經替下單拿了 FOR KEY SHARE，顧客在交易結束前不會被刪掉、主鍵不會被改，不需要再手動鎖。</li>
+  <li><strong>真的需要顧客資料在下單期間不變</strong>：例如依會員等級算折扣，算到一半等級被改掉就會算錯。FOR KEY SHARE 擋不住這種情況，剛才的實驗才示範過改名可以同時成功。這時用 <code>SELECT … FOR SHARE</code>：它會擋住改名、改等級這類 UPDATE 拿的 FOR NO KEY UPDATE，但不擋外鍵檢查的 FOR KEY SHARE，所以別人仍然能同時幫這位顧客下單。</li>
+  <li><strong>之後要改顧客的非鍵欄位</strong>（例如扣點數、改狀態）：手寫鎖時用 <code>FOR NO KEY UPDATE</code> 就夠了。</li>
+</ul>
+<p>原提議用的 <code>FOR UPDATE</code> 是四種裡最強的，連外鍵檢查的 FOR KEY SHARE 都擋：鎖著顧客時，同一位顧客的其他訂單都要排隊。它想防止顧客資料被改，卻順便讓結帳互相等待，反而製造了新的等待。</p>
+<p>不管用哪一種，列鎖終究會讓人等。第一節替 migration 的等待設了 <code>lock_timeout</code>，App 的交易等太久、或拿著鎖不放太久時，又該由誰設上限？</p>
+
+<h2>等待要有上限：四個逾時護欄</h2>
+<p>第一節的 <code>lock_timeout</code> 只管「等鎖」這一件事。實際上會讓別人卡住的情況還有幾種：一句查詢跑太久、交易開著卻什麼都不做、整個交易拖太久。PostgreSQL 各有一個設定，各自擋一種「拿著或等著太久」，預設都是 0（不限制）：</p>
+<div class="table-wrap"><table>
+  <tr><th>設定</th><th>管什麼</th><th>超過時</th></tr>
+  <tr><td><code>lock_timeout</code></td><td>單次等鎖的時間</td><td>那一句失敗（55P03）</td></tr>
+  <tr><td><code>statement_timeout</code></td><td>單一句的總執行時間（包含等鎖）</td><td>那一句失敗（57014）</td></tr>
+  <tr><td><code>idle_in_transaction_session_timeout</code></td><td>交易開著、卻沒有在執行任何查詢的時間。專門處理「程式 <code>BEGIN</code> 之後忘了 <code>COMMIT</code>」或「交易中間去呼叫外部 API」，這類連線拿著鎖卻什麼都沒做</td><td>斷開整條連線</td></tr>
+  <tr><td><code>transaction_timeout</code>（17+）</td><td>整個交易的總時間（含單句的隱含交易）</td><td>斷開整條連線</td></tr>
+</table></div>
+<p>前兩個只讓那一句失敗，連線還在；後兩個直接斷線，因為它們針對的是「整個交易該結束了」。執行後看 <code>setting</code> 欄（<code>deadlock_timeout</code> 下一節會用到）：</p>
+<div class="lab" data-sql="SELECT name, setting, unit FROM pg_settings
+WHERE name IN ('lock_timeout', 'statement_timeout', 'idle_in_transaction_session_timeout', 'transaction_timeout', 'deadlock_timeout')
+ORDER BY name;"></div>
+<p>兩個一起設時，<code>lock_timeout</code> 要設得比 <code>statement_timeout</code> 短才有意義，否則永遠是 statement_timeout 先到。</p>
+<div class="callout practice"><strong>💡 實務上：替應用程式的角色設上限，不要寫進全域設定</strong><br>這些設定可以設在資料庫、角色、連線、交易（<code>SET LOCAL</code>）上。文件不建議寫進 <code>postgresql.conf</code>，因為會影響所有連線，包括維運和 migration。實務上替應用程式的角色設上限，例如 <code>ALTER ROLE app_user SET statement_timeout = '5s'</code>；今晚的 migration 則在自己的交易裡 <code>SET LOCAL lock_timeout</code>。第 36 課會完整規劃。</div>
+<p>逾時處理的是「等得到、只是太久」。還有一種等待，等再久也等不到，逾時只能把它切斷，不能預防它。下一節處理它。</p>
+
+<h2>兩個交易互相等，誰讓步？死結</h2>
+<p>等再久也等不到的情況，是<a href="19-concurrency.html">第 19 課</a>看過的死結（deadlock）：兩個交易各拿一把鎖、互相等對方的那一把。事故裡的 ALTER 是單向排隊，等報表結束就能前進，不會繞成一圈；死結出現在 App 自己的交易之間，最典型的地方是結帳扣庫存，所以這節換到 <code>products</code> 表。一張訂單買拿鐵和可頌，另一張買可頌和拿鐵，程式依購物車順序扣庫存：</p>
+<div class="tl">
+  <div class="table-wrap"><table>
+    <tr><th>步驟</th><th>訂單 A（拿鐵＋可頌）</th><th>訂單 B（可頌＋拿鐵）</th></tr>
+    <tr data-note="A 扣拿鐵（id 2），拿到拿鐵那一列的列鎖。"><td>1</td><td><code>UPDATE products SET stock = stock - 1 WHERE id = 2;</code></td><td></td></tr>
+    <tr data-note="B 扣可頌（id 5），拿到可頌那一列的列鎖。到這裡都沒問題。"><td>2</td><td></td><td><code>UPDATE products SET stock = stock - 1 WHERE id = 5;</code></td></tr>
+    <tr data-note="A 要扣可頌，鎖在 B 手上，A 開始等。"><td>3</td><td><code>UPDATE … WHERE id = 5;</code><br><span class="wait">等 B…</span></td><td></td></tr>
+    <tr data-note="B 要扣拿鐵，鎖在 A 手上，B 也開始等。繞成一圈：沒有任何一方能前進。"><td>4</td><td><span class="wait">等 B…</span></td><td><code>UPDATE … WHERE id = 2;</code><br><span class="wait">等 A…</span></td></tr>
+    <tr data-note="等了 deadlock_timeout（預設 1 秒）之後，PostgreSQL 檢查有沒有繞成一圈的等待，發現死結，挑其中一個交易讓它失敗（選哪一個無法預測，這裡假設是 B）。B 的整個交易被回滾，鎖全部放開。"><td>5</td><td><span class="wait">等 B…</span></td><td><code>ERROR 40P01: deadlock detected</code><br>整個交易回滾</td></tr>
+    <tr data-note="A 拿到可頌的鎖，繼續完成。B 的程式收到 40P01，應該從 BEGIN 開始重試整個交易，重試時 A 已經結束，就會成功。"><td>6</td><td>拿到鎖，<code>COMMIT</code> ✓</td><td>程式重試整個交易 → 成功</td></tr>
+  </table></div>
+  <div class="bar"><button data-prev>◀ 上一步</button><button class="primary" data-next>下一步 ▶</button><span class="kbd" data-count></span></div>
+  <p class="note"></p>
+</div>
+<p>PostgreSQL 不會一開始等鎖就檢查死結：一個交易等鎖超過 <code>deadlock_timeout</code>（預設 1 秒），才去檢查等待有沒有繞成一圈，也就是第 5 步發生的事。所以它是「等多久之後才去檢查」，不是「多久算死結」。檢查死結要鎖住共享的鎖資訊，成本不低，所以 PostgreSQL 先樂觀地等一下。把它調大不會減少死結，只會讓死結晚一點被發現。</p>
+<p>既然調參數沒用，死結要從寫法預防。三個做法：</p>
+<ul>
+  <li><strong>固定順序上鎖</strong>：多列一起改時，先依主鍵排序再鎖。例如一次鎖住整張訂單要用的商品：<code>SELECT id FROM products WHERE id IN (5, 2) ORDER BY id FOR NO KEY UPDATE</code>，再逐一扣庫存。兩張訂單都先鎖 2 再鎖 5，後到的只會排隊，不會互等。</li>
+  <li><strong>先拿需要的最強鎖</strong>：假設 A、B 兩個交易都先用 <code>SELECT … FOR SHARE</code> 讀拿鐵那一列，打算確認庫存後再扣。兩把 FOR SHARE 互不衝突，兩邊都拿到。接著 A 要 <code>UPDATE</code> 拿鐵，需要 FOR NO KEY UPDATE，被 B 的 FOR SHARE 擋住；B 也要 <code>UPDATE</code>，被 A 的 FOR SHARE 擋住，於是在同一列上繞成一圈。確定要改，就一開始用 <code>FOR NO KEY UPDATE</code>，後到的交易只會排隊等前一個結束。</li>
+  <li><strong>交易要短</strong>：拿鎖到放鎖的時間越短，撞在一起的機會越小。</li>
+</ul>
+<p>預防只能降低機率，死結無法百分之百避免。程式收到 40P01 時，處理方式和 40001 一樣：從 <code>BEGIN</code> 開始重試整個交易，次數要有上限（<a href="31-isolation-upsert.html">第 31 課</a>的 <code>withRetry</code>）。只重送失敗的那一句不行，因為整個交易已經回滾了。</p>
+<div class="callout practice"><strong>💡 實務上：死結多半藏在「一次改很多列」的程式裡</strong><br>常見來源：結帳時依購物車順序扣庫存、後台「批次修改訂單狀態」用迴圈逐筆 <code>UPDATE</code>、兩個排程同時整理同一批資料。發生 40P01 時，伺服器 log 會記下互等的連線各自在執行哪一句，排查時先看 log，就知道是哪兩段程式碼在搶。用迴圈或 ORM 批次更新時，送出前先把資料依 id 排序，是成本最低的預防。偶爾一兩次死結靠重試就好；同一組查詢反覆出現，才代表上鎖順序該改了。</div>
+<p>到這裡，檢討報告的預防措施都有了：migration 有 <code>lock_timeout</code>、App 有逾時上限、扣庫存有固定順序。剩下最後一題：如果下次網站還是卡住，怎麼在現場找出是誰造成的？</p>
+
+<h2>下次再卡住，怎麼在現場找到根源？線上診斷</h2>
+<p>前面各節都在事前預防。事故已經發生時，要依序回答三個問題：誰在等？在等誰？最源頭是誰？回答它們需要兩個工具。</p>
+<p>第一個是 <code>pg_stat_activity</code>，一個系統視圖，每條連線一列，記錄它目前在做什麼。常用欄位：</p>
+<div class="table-wrap"><table>
+  <tr><th><code>pg_stat_activity</code> 欄位</th><th>意思</th></tr>
+  <tr><td><code>state</code></td><td><code>active</code>（正在執行）、<code>idle</code>（閒置、沒有交易）、<code>idle in transaction</code>（交易開著、卻沒在執行任何查詢）</td></tr>
+  <tr><td><code>wait_event_type</code>、<code>wait_event</code></td><td>在等什麼；<code>Lock</code> 代表在等鎖，<code>Client</code>／<code>ClientRead</code> 代表在等程式送下一句</td></tr>
+  <tr><td><code>xact_start</code></td><td>目前交易開始的時間；越早代表交易開越久</td></tr>
+  <tr><td><code>query</code></td><td>正在執行的那一句；閒置的連線顯示<strong>最後一句</strong>執行過的 SQL</td></tr>
+</table></div>
+<p>第二個是函式 <code>pg_blocking_pids(pid)</code>：給它一條連線的 pid，它回傳擋住這條連線的所有 pid，型別是陣列；沒被擋就是空陣列。兩個合起來，正式環境的查詢長這樣：</p>
+<pre>SELECT pid, state, wait_event_type, now() - xact_start AS 交易時間,
+       pg_blocking_pids(pid) AS blocked_by, left(query, 60) AS query
+FROM pg_stat_activity
+WHERE state &lt;&gt; 'idle'
+ORDER BY xact_start;</pre>
+<p>在這頁跑，只會看到自己這條連線（見課首），<code>pg_blocking_pids</code> 永遠是空陣列：</p>
+<div class="lab" data-sql="SELECT pid, state, backend_type, pg_blocking_pids(pid) AS blocked_by FROM pg_stat_activity;"></div>
+<p>所以這頁準備了一份事故當下的快照 <code>activity_snapshot</code>，<code>blocked_by</code> 欄就是當時 <code>pg_blocking_pids(pid)</code> 的結果。現場和開頭的事故類似：一條 <code>ALTER</code> 卡在 <code>orders</code> 上，後面排著 App 的查詢，但這次擋住 <code>ALTER</code> 的不是報表：</p>
+<div class="lab" data-sql="SELECT pid, usename, state, wait_event_type, xact_start, blocked_by, left(query, 45) AS query
+FROM activity_snapshot ORDER BY pid;"></div>
+<p>要找的是根源（root blocker）：擋住別人、自己卻沒被任何人擋住的那一條。只有處理它，整條等待鏈才會解開；處理中間的人沒有用，因為它自己也在等。從受害者往上追，依結果由上到下：</p>
+<ul>
+  <li><strong>2101</strong>：<code>blocked_by</code> 是空的，卻擋住了 2205，它就是根源。它的狀態是 <code>idle in transaction</code>，從 13:41 開著交易，最後一句是 <code>FOR UPDATE</code>，之後就沒動靜，很可能是程式在交易中途去呼叫外部 API，或是錯誤處理漏了 <code>ROLLBACK</code>。</li>
+  <li><strong>2205</strong>（那條 <code>ALTER</code>）：在等 2101。</li>
+  <li><strong>2310～2313</strong>：在等 2205。2310 要的 ACCESS SHARE 和 2101 的鎖其實不衝突，卻被列為被 2205 擋住：<code>pg_blocking_pids</code> 會同時列出「持有衝突鎖的人」和「排在前面、要的鎖和我衝突的人」，這就是第一節的等待佇列。</li>
+  <li><strong>2402</strong>：交易比 2101 更早開始，但它沒有擋住任何人。「最老的交易」不一定是根源。</li>
+</ul>
+<figure>
+  <svg viewBox="0 0 700 210" role="img" aria-label="阻擋關係：2101 擋住 2205，2205 擋住 2310 到 2313；2402 雖然是最老的交易，但沒有擋住任何人">
+    <defs><marker id="arr32" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="20" y="40" width="170" height="64" rx="8"/>
+    <text class="d-text" x="105" y="66" text-anchor="middle">2101（根源）</text>
+    <text class="d-small" x="105" y="88" text-anchor="middle">idle in transaction</text>
+    <rect class="d-box" x="260" y="40" width="170" height="64" rx="8"/>
+    <text class="d-text" x="345" y="66" text-anchor="middle">2205</text>
+    <text class="d-small" x="345" y="88" text-anchor="middle">ALTER，排隊等鎖</text>
+    <rect class="d-box" x="500" y="40" width="180" height="64" rx="8"/>
+    <text class="d-text" x="590" y="66" text-anchor="middle">2310～2313</text>
+    <text class="d-small" x="590" y="88" text-anchor="middle">App 的查詢，排隊等鎖</text>
+    <path class="d-line" d="M190,72 L256,72" marker-end="url(#arr32)"/>
+    <text class="d-small" x="223" y="62" text-anchor="middle">擋住</text>
+    <path class="d-line" d="M430,72 L496,72" marker-end="url(#arr32)"/>
+    <text class="d-small" x="463" y="62" text-anchor="middle">擋住</text>
+    <rect class="d-soft" x="20" y="140" width="290" height="50" rx="8"/>
+    <text class="d-small" x="165" y="170" text-anchor="middle">2402：交易最老，但沒有擋住任何人</text>
+  </svg>
+  <figcaption>從被擋的那一端往左追，追到「擋住別人、自己沒被擋」的 2101 就是根源。</figcaption>
+</figure>
+<p>找到根源之後，有兩個工具，差別在處理的範圍是「一句查詢」還是「整條連線」：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th><code>pg_cancel_backend(pid)</code></th><th><code>pg_terminate_backend(pid)</code></th></tr>
+  <tr><td>做什麼</td><td>取消那條連線<strong>正在執行的查詢</strong></td><td>直接斷開整條連線</td></tr>
+  <tr><td>交易</td><td>那一句失敗，交易進入失敗狀態，等程式 <code>ROLLBACK</code></td><td>交易回滾，鎖全部放開</td></tr>
+  <tr><td>適合</td><td><code>active</code> 的長查詢</td><td><code>idle in transaction</code>：它沒有正在執行的查詢，cancel 沒有東西可取消，鎖也不會放</td></tr>
+</table></div>
+<p>2101 是 <code>idle in transaction</code>，所以要用 terminate。動手前先確認它是誰、在做什麼：terminate 會把那條連線還沒提交的工作全部回滾。如果它是一個跑了 40 分鐘、快完成的資料搬移，斷掉它代價很高；如果是一條忘了提交的 App 連線，斷掉通常比讓整個網站等下去好。斷掉之後也要回頭修程式，否則明天還會發生。根源也可能是沒有連線的 prepared transaction，這兩個函式都處理不了，做法見課末補充。</p>
+<div class="callout practice"><strong>💡 實務上：事故當下先存證、再動手、事後修根源</strong><br>網站卡住時，先把 <code>pg_stat_activity</code> 的查詢結果存下來（貼進事故頻道或存成檔案）；用 <code>pg_terminate_backend</code> 斷線之後現場就消失了，事後檢討會找不到證據。動手前在頻道說一聲要斷哪個 pid、它屬於哪個服務，讓負責的人有機會喊停，例如它其實是正在跑的資料搬移。雲端代管的資料庫（例如 AWS RDS）通常不給真正的 superuser。要斷別的角色的連線，帳號需要內建角色 <code>pg_signal_backend</code>，它允許取消、斷開其他角色的連線，最好事前確認值班帳號拿得到。事後檢討要回答的是「那條連線為什麼開著交易不放」：修好程式並設 <code>idle_in_transaction_session_timeout</code>，同樣的事故才不會重演。</div>
+
+<h2>補充與查表</h2>
+
+<h3>materialized view 的 REFRESH：兩種寫法的鎖差很多</h3>
+<p><a href="23-views-functions-triggers.html">第 23 課</a>的 materialized view 要定期 <code>REFRESH</code>。兩種寫法拿的鎖不同，同樣看<strong>最強的那一把</strong>：</p>
+<div class="lab" data-sql="BEGIN;
+REFRESH MATERIALIZED VIEW product_menu;
+SELECT 'REFRESH' AS 指令, 模式 FROM my_locks() WHERE 表 = 'product_menu';
+ROLLBACK;
+
+BEGIN;
+REFRESH MATERIALIZED VIEW CONCURRENTLY product_menu;
+SELECT 'CONCURRENTLY' AS 指令, 模式 FROM my_locks() WHERE 表 = 'product_menu';
+ROLLBACK;"></div>
+<ul>
+  <li>一般的 <code>REFRESH</code> 拿到 ACCESS EXCLUSIVE：更新期間連讀 <code>product_menu</code> 都要等。</li>
+  <li><code>CONCURRENTLY</code> 最強只到 EXCLUSIVE，讀取照常；代價是比較慢，而且 materialized view 上要有唯一索引（這頁的 seed 已經建好 <code>product_menu (id)</code> 的唯一索引）。</li>
+</ul>
+
+<h3>根源是 prepared transaction 時</h3>
+<p>prepared transaction 沒有連線，在 <code>pg_locks</code> 的 <code>pid</code> 是 <code>NULL</code>，在 <code>pg_blocking_pids</code> 的結果裡顯示成 <code>0</code>，所以 cancel 和 terminate 都找不到對象。只能從 <code>pg_prepared_xacts</code> 找到它的 gid，再 <code>COMMIT PREPARED</code> 或 <code>ROLLBACK PREPARED</code>。</p>
+<p>被遺忘的 prepared transaction 會一直拿著鎖，連重啟資料庫都不會消失；它也不受 <code>transaction_timeout</code> 限制（文件），只能靠人工處理。</p>
+
+<div class="callout"><strong>版本備註</strong>
+<ul>
+  <li>PostgreSQL 17：新增 <code>transaction_timeout</code>。</li>
+  <li>PostgreSQL 18：新增 <code>log_lock_failures</code>，可以把 <code>SELECT … NOWAIT</code> 拿不到列鎖的情況記進 log（目前只支援這一種）。</li>
+  <li>PostgreSQL 19（目前是 RC，以正式版說明為準）：<code>log_lock_waits</code> 預設開啟（等鎖超過 <code>deadlock_timeout</code> 就記 log）、新增 <code>pg_stat_lock</code> 視圖、<code>max_locks_per_transaction</code> 預設改為 128。</li>
+</ul></div>
+
+<h2>練習</h2>
+
+<div class="exercise"
+  data-start="SELECT relation::regclass::text AS relation, mode
+FROM pg_locks
+ORDER BY 1, 2;"
+  data-answer="SELECT relation::regclass::text AS relation, mode
+FROM pg_locks
+WHERE locktype = 'relation' AND pid IS NULL
+ORDER BY 1, 2;"
+  data-require="\bpg_locks\b" data-require-msg="這題要從 pg_locks 查出來，不能把結果寫死。"
+  data-ordered>
+  <p>練習 1：夜間批次程式開了一個交易，<code>PREPARE TRANSACTION 'night_batch'</code> 之後就沒再理它（題目已經準備好）。寫一句查詢，列出這個交易拿著的<strong>表級鎖</strong>：表名（<code>relation::regclass::text</code>）與 <code>mode</code>，依表名、模式排序。提示：查 <code>pg_locks</code> 這個動作本身也會拿鎖，不能算進去；交易編號那類不是表的鎖也不要；索引和序號也屬於 <code>relation</code>，要一起列出。</p>
+  <script type="text/sql" data-role="setup">BEGIN;
+UPDATE products SET stock = stock - 5 WHERE id = 2;
+INSERT INTO orders (customer_id, total) VALUES (4, 550);
+PREPARE TRANSACTION 'night_batch';</script>
+  <script type="text/sql" data-role="wrong">SELECT relation::regclass::text AS relation, mode
+FROM pg_locks
+WHERE locktype = 'relation' AND pid = pg_backend_pid()
+ORDER BY 1, 2;</script>
+  <script type="text/sql" data-role="wrong">SELECT relation::regclass::text AS relation, mode
+FROM pg_locks
+WHERE pid IS NULL
+ORDER BY 1, 2;</script>
+  <script type="text/sql" data-role="wrong">SELECT relation::regclass::text AS relation, mode
+FROM pg_locks
+WHERE locktype = 'relation'
+ORDER BY 1, 2;</script>
+  <script type="text/sql" data-role="wrong">SELECT relation::regclass::text AS relation, mode
+FROM pg_locks JOIN pg_class c ON c.oid = relation
+WHERE locktype = 'relation' AND pid IS NULL AND c.relkind = 'r'
+ORDER BY 1, 2;</script>
+  <script type="text/sql" data-role="wrong">SELECT * FROM (VALUES ('customers', 'RowShareLock'), ('orders', 'RowExclusiveLock'), ('products', 'RowExclusiveLock')) AS t(relation, mode)
+ORDER BY 1, 2;</script>
+</div>
+
+<div class="exercise"
+  data-start="BEGIN;
+-- 用 LOCK TABLE 拿鎖
+
+"
+  data-answer="BEGIN;
+LOCK TABLE products IN SHARE MODE;
+PREPARE TRANSACTION 'stocktake';"
+  data-check="SELECT (SELECT string_agg(gid, ',') FROM pg_prepared_xacts) AS gid, mode FROM pg_locks
+WHERE pid IS NULL AND relation = 'products'::regclass AND mode &lt;&gt; 'AccessShareLock';"
+  data-require="\bLOCK\s+(TABLE\s+)?(ONLY\s+)?products\b" data-require-msg="這題要用 LOCK TABLE 直接拿 products 的表級鎖。"
+  data-isolated>
+  <p>練習 2：月底盤點時要凍結 <code>products</code>：別人可以讀（一般 <code>SELECT</code>），但不能新增、修改、刪除。開一個交易，用 <code>LOCK TABLE</code> 拿<strong>最弱但足夠</strong>的鎖，然後 <code>PREPARE TRANSACTION 'stocktake'</code>，讓判分程式看得到這把鎖。對照衝突表：哪幾種模式擋得住 ROW EXCLUSIVE？其中誰最弱？</p>
+  <script type="text/sql" data-role="wrong">BEGIN;
+LOCK TABLE products IN ACCESS EXCLUSIVE MODE;
+PREPARE TRANSACTION 'stocktake';</script>
+  <script type="text/sql" data-role="wrong">BEGIN;
+LOCK TABLE products;
+PREPARE TRANSACTION 'stocktake';</script>
+  <script type="text/sql" data-role="wrong">BEGIN;
+LOCK TABLE products IN EXCLUSIVE MODE;
+PREPARE TRANSACTION 'stocktake';</script>
+  <script type="text/sql" data-role="wrong">BEGIN;
+LOCK TABLE products IN SHARE ROW EXCLUSIVE MODE;
+PREPARE TRANSACTION 'stocktake';</script>
+  <script type="text/sql" data-role="wrong">BEGIN;
+LOCK TABLE products IN ROW EXCLUSIVE MODE;
+PREPARE TRANSACTION 'stocktake';</script>
+  <script type="text/sql" data-role="wrong">BEGIN;
+LOCK TABLE products IN SHARE MODE;
+COMMIT;</script>
+  <script type="text/sql" data-role="wrong">BEGIN;
+LOCK TABLE products IN SHARE MODE;
+PREPARE TRANSACTION 'inventory';</script>
+  <script type="text/sql" data-role="wrong">BEGIN;
+CREATE INDEX ON products (stock);
+PREPARE TRANSACTION 'stocktake';</script>
+</div>
+
+<div class="exercise"
+  data-start="SELECT id FROM customers WHERE id = 1;"
+  data-answer="SELECT id FROM customers WHERE id = 1 FOR KEY SHARE NOWAIT;"
+  data-require="\bFOR\s+(NO\s+KEY\s+UPDATE|KEY\s+SHARE|UPDATE|SHARE)\b[^;]*\bNOWAIT\b"
+  data-require-msg="這題要用 SELECT … FOR &lt;鎖的強度&gt; NOWAIT 實際去拿鎖。">
+  <p>練習 3：一個幫顧客 1 改名的交易已經 PREPARE 了（題目已經準備好）。客服想知道：現在幫顧客 1 新增訂單，外鍵檢查會不會被擋？寫一句<strong>不會等待</strong>的查詢，用外鍵檢查實際使用的那種列鎖去鎖顧客 1，成功時回傳顧客的 <code>id</code>。</p>
+  <script type="text/sql" data-role="setup">BEGIN;
+UPDATE customers SET name = '王大明' WHERE id = 1;
+PREPARE TRANSACTION 'rename';</script>
+  <script type="text/sql" data-role="wrong">SELECT id FROM customers WHERE id = 1 FOR SHARE NOWAIT;</script>
+  <script type="text/sql" data-role="wrong">SELECT id FROM customers WHERE id = 1 FOR UPDATE NOWAIT;</script>
+  <script type="text/sql" data-role="wrong">SELECT id FROM customers WHERE id = 1 FOR NO KEY UPDATE NOWAIT;</script>
+  <script type="text/sql" data-role="wrong">INSERT INTO orders (customer_id, total) VALUES (1, 110) RETURNING customer_id;</script>
+  <script type="text/sql" data-role="wrong">SELECT id FROM customers WHERE id = 1 FOR KEY SHARE;</script>
+  <script type="text/sql" data-role="wrong">SELECT id FROM customers WHERE id = 1;</script>
+</div>
+
+<div class="exercise"
+  data-start="CREATE VIEW blocking_roots AS
+SELECT pid, state, xact_start, query
+FROM activity_snapshot
+WHERE …;"
+  data-answer="CREATE VIEW blocking_roots AS
+SELECT a.pid, a.state, a.xact_start, a.query
+FROM activity_snapshot a
+WHERE cardinality(a.blocked_by) = 0
+  AND EXISTS (SELECT 1 FROM activity_snapshot b WHERE a.pid = ANY (b.blocked_by));"
+  data-check="INSERT INTO activity_snapshot (pid, usename, state, wait_event_type, wait_event, xact_start, query, blocked_by) VALUES
+  (3101, 'app_user', 'active', NULL, NULL, '2026-10-20 14:00:30+08', 'UPDATE products SET price = price + 5', '{}'),
+  (3102, 'app_user', 'active', 'Lock', 'transactionid', '2026-10-20 14:04:40+08', 'UPDATE products SET stock = stock - 1 WHERE id = 2', '{3101}'),
+  (3103, 'app_user', 'active', 'Lock', 'transactionid', '2026-10-20 14:04:52+08', 'UPDATE products SET stock = stock - 2 WHERE id = 5', '{3101}');
+SELECT * FROM blocking_roots ORDER BY pid;">
+  <p>練習 4：把「找根源」存成 view <code>blocking_roots</code>：列出<strong>擋住了別人、自己卻沒被任何人擋住</strong>的連線，欄位依序是 <code>pid</code>、<code>state</code>、<code>xact_start</code>、<code>query</code>。判分會在 <code>activity_snapshot</code> 裡再加入另一組事故鏈，然後查這個 view，所以要寫成通用的條件，不能看資料寫死。提示：「x 在陣列裡」寫成 <code>x = ANY (陣列)</code>，陣列長度用 <code>cardinality(陣列)</code>。</p>
+  <script type="text/sql" data-role="wrong">CREATE VIEW blocking_roots AS
+SELECT pid, state, xact_start, query FROM activity_snapshot
+WHERE cardinality(blocked_by) &gt; 0;</script>
+  <script type="text/sql" data-role="wrong">CREATE VIEW blocking_roots AS
+SELECT pid, state, xact_start, query FROM activity_snapshot
+WHERE wait_event_type = 'Lock';</script>
+  <script type="text/sql" data-role="wrong">CREATE VIEW blocking_roots AS
+SELECT pid, state, xact_start, query FROM activity_snapshot
+WHERE pid IN (SELECT unnest(blocked_by) FROM activity_snapshot);</script>
+  <script type="text/sql" data-role="wrong">CREATE VIEW blocking_roots AS
+SELECT pid, state, xact_start, query FROM activity_snapshot
+WHERE pid = 2101;</script>
+  <script type="text/sql" data-role="wrong">CREATE VIEW blocking_roots AS
+SELECT pid, state, xact_start, query FROM activity_snapshot
+WHERE state = 'idle in transaction';</script>
+  <script type="text/sql" data-role="wrong">CREATE VIEW blocking_roots AS
+SELECT pid, state, xact_start, query FROM activity_snapshot
+WHERE cardinality(blocked_by) = 0;</script>
+  <script type="text/sql" data-role="wrong">CREATE VIEW blocking_roots AS
+SELECT pid, state, xact_start, query FROM activity_snapshot
+WHERE cardinality(blocked_by) = 0 AND state &lt;&gt; 'idle';</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：一份 2 分鐘的報表正在讀 <code>orders</code>。你執行只要幾毫秒的 <code>ALTER TABLE orders ADD COLUMN note text</code>（沒有設 <code>lock_timeout</code>）。接下來 App 對 <code>orders</code> 的一般 <code>SELECT</code> 會怎樣？</p>
+  <label data-key="a">照常執行：<code>SELECT</code> 和報表一樣只要 ACCESS SHARE，彼此不衝突</label>
+  <label data-key="b">照常執行：ALTER 只要幾毫秒，不會影響任何人</label>
+  <label data-key="c">全部卡住，直到報表結束、ALTER 完成</label>
+  <label data-key="d">ALTER 會讓報表失敗，SELECT 照常</label>
+  <p class="why">✓ ALTER 要 ACCESS EXCLUSIVE，得等報表結束，於是進入等待佇列；後來的 <code>SELECT</code> 雖然和報表不衝突，卻和排在前面的 ALTER 衝突，只好排在它後面。a 忽略了佇列；b 把「執行時間短」誤當「等待時間短」；d：PostgreSQL 不會為了 DDL 中斷別人的查詢。解法是 DDL 前 <code>SET lock_timeout</code>。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：系統一天出現好幾次 deadlock detected（40P01）。最好的長期解法是？</p>
+  <label data-key="a">把 <code>deadlock_timeout</code> 調大，讓交易多等一下</label>
+  <label data-key="b">讓所有交易用相同順序鎖列（例如依 id 排序），並對 40P01 重試整個交易</label>
+  <label data-key="c">收到 40P01 時只重送失敗的那一句</label>
+  <label data-key="d">把隔離等級改成 SERIALIZABLE</label>
+  <p class="why">✓ 固定順序讓互等繞不成一圈，重試處理剩下的少數情況。a：<code>deadlock_timeout</code> 只是「多久之後才檢查」，調大只會讓死結更晚被發現。c：40P01 時整個交易已經回滾，只重送一句會在沒有前面那些修改的狀態下執行。d：更嚴格的隔離等級不會減少鎖的互等，還會多出 40001。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 7：診斷發現根源是一條 <code>idle in transaction</code> 的連線，已經拿著鎖 20 分鐘。對它執行 <code>pg_cancel_backend(pid)</code> 有用嗎？</p>
+  <label data-key="a">沒用：它沒有正在執行的查詢可取消，鎖還在；要用 <code>pg_terminate_backend</code>，它的交易會被回滾</label>
+  <label data-key="b">有用：cancel 會回滾它的交易並放開鎖</label>
+  <label data-key="c">有用：cancel 和 terminate 效果一樣，只是名字不同</label>
+  <p class="why">✓ cancel 只取消「正在執行的那一句」，idle in transaction 的連線正在等程式送下一句，沒有東西可以取消。terminate 斷開整條連線，交易回滾、鎖放開，但它還沒提交的工作也會消失，所以動手前要先確認它是誰。長期解法是修程式，並設定 <code>idle_in_transaction_session_timeout</code>。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>DDL 沒有設 <code>lock_timeout</code></strong>：ALTER 排在長查詢後面，又擋住後面所有查詢。每個 DDL 前 <code>SET LOCAL lock_timeout</code>，失敗就稍後重試。</li>
+  <li><strong>在交易外 <code>LOCK TABLE</code>，或以為交易外的 <code>FOR UPDATE</code> 有保護作用</strong>：<code>LOCK TABLE</code> 會直接報 25P01；<code>FOR UPDATE</code> 會在那一句結束時就放開鎖。鎖要在 <code>BEGIN</code> 之後拿。</li>
+  <li><strong>只需要 <code>FOR NO KEY UPDATE</code> 卻寫 <code>FOR UPDATE</code></strong>：不改主鍵的話，用 <code>FOR UPDATE</code> 會額外擋住子表的外鍵檢查，顧客被鎖著時連下單都要等。</li>
+  <li><strong>多列更新沒有固定順序</strong>：依購物車、依輸入順序上鎖，遲早死結。先依主鍵排序再鎖。</li>
+  <li><strong>交易裡呼叫外部 API、等使用者回應</strong>：鎖跟著一起等。外部呼叫移到交易外，並設 <code>idle_in_transaction_session_timeout</code>。</li>
+  <li><strong>看到卡住就 terminate</strong>：會回滾那條連線所有未提交的工作。先用 <code>pg_stat_activity</code> 確認它是誰、在做什麼、開了多久。</li>
+  <li><strong>以為 <code>SELECT … NOWAIT</code>（以及第 33 課的 <code>SKIP LOCKED</code>）也管表級鎖</strong>：它們只管列鎖；表被別人用 ACCESS EXCLUSIVE 鎖住時，它要的表級 ROW SHARE 照樣會排隊等（文件明寫）。要「表也不等」，用 <code>LOCK TABLE … NOWAIT</code> 或 <code>lock_timeout</code>。</li>
+  <li><strong>營業時間跑沒有 CONCURRENTLY 的 <code>REFRESH MATERIALIZED VIEW</code></strong>：更新期間所有讀取都卡住。加唯一索引、改用 <code>CONCURRENTLY</code>。</li>
+</ul>
+
+<h2>小結</h2>
+<p>回到事故檢討的四個問題：</p>
+<ul>
+  <li><strong>為什麼整站停擺</strong>：每個指令都會拿表級鎖並留到交易結束；拿不到的請求依序排隊，排在前面的強鎖會擋住後面所有和它衝突的弱鎖。ALTER 本身只要幾毫秒，是它在佇列裡等報表的那段時間拖住了全站。DDL 前設 <code>lock_timeout</code>，等不到就放棄、稍後重試。</li>
+  <li><strong>今晚每句會擋住誰</strong>：<code>SELECT</code> 是 ACCESS SHARE、寫入是 ROW EXCLUSIVE、<code>CREATE INDEX</code> 是 SHARE、大多數 <code>ALTER TABLE</code> 是 ACCESS EXCLUSIVE。在交易裡查 <code>pg_locks WHERE pid = pg_backend_pid()</code> 就能自己量。衝突表的口訣：讀只怕 ACCESS EXCLUSIVE，寫怕 SHARE 以上；需要時用 <code>LOCK TABLE … NOWAIT</code> 驗證。</li>
+  <li><strong>App 的交易之間</strong>：列鎖有四種，改非鍵欄位拿 FOR NO KEY UPDATE，外鍵檢查拿 FOR KEY SHARE，所以改顧客名字不會擋住幫他下單；手寫鎖時別用過強的 <code>FOR UPDATE</code>。四個逾時設定各管等鎖、單句、閒置交易、整個交易。死結由 PostgreSQL 偵測並讓一方得到 40P01；固定順序上鎖、交易要短，並重試整個交易。</li>
+  <li><strong>下次怎麼在現場處理</strong>：<code>pg_stat_activity</code>＋<code>pg_blocking_pids</code> 找出「擋住別人、自己沒被擋」的根源；active 的查詢用 cancel，idle in transaction 要 terminate（會回滾），prepared transaction 要 <code>ROLLBACK PREPARED</code>。</li>
+</ul>
+<p>下一課把鎖拿來做正事：用 <code>SKIP LOCKED</code> 和 advisory lock 在 PostgreSQL 裡做一個多個 worker 不會搶同一件工作的工作佇列。</p>
+
+</main>
+
+<script type="text/sql" id="seed">
+CREATE TABLE customers (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL
+);
+CREATE TABLE products (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL,
+  price integer NOT NULL,
+  stock integer NOT NULL
+);
+CREATE TABLE orders (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  customer_id integer NOT NULL REFERENCES customers,
+  ordered_at timestamptz NOT NULL DEFAULT now(),
+  total integer NOT NULL
+);
+INSERT INTO customers (name) VALUES ('王小明'), ('陳美華'), ('林志豪'), ('張雅婷'), ('李建國'), ('黃淑芬');
+INSERT INTO products (name, price, stock) VALUES
+  ('美式咖啡', 80, 30), ('拿鐵', 110, 20), ('卡布奇諾', 110, 15),
+  ('伯爵紅茶', 90, 25), ('可頌', 70, 12), ('起司蛋糕', 120, 8);
+INSERT INTO orders (customer_id, ordered_at, total) VALUES
+  (1, '2026-10-20 09:05+08', 190),
+  (3, '2026-10-20 10:12+08', 80),
+  (4, '2026-10-20 11:30+08', 230),
+  (1, '2026-10-20 13:15+08', 110);
+
+CREATE MATERIALIZED VIEW product_menu AS SELECT id, name, price FROM products;
+CREATE UNIQUE INDEX ON product_menu (id);
+
+-- 執行一句 SQL：成功回傳「成功」，失敗回傳錯誤碼與訊息（不讓外面的查詢中斷）
+CREATE FUNCTION try_sql(sql text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE sql;
+  RETURN '成功';
+EXCEPTION WHEN OTHERS THEN
+  RETURN SQLSTATE || ' ' || SQLERRM;
+END $$;
+
+-- 這條連線目前拿著的表級鎖（濾掉查 pg_locks 本身產生的 pg_ 系統表的鎖）；模式轉成 LOCK TABLE 的寫法：AccessShareLock → ACCESS SHARE
+CREATE FUNCTION my_locks() RETURNS TABLE (表 text, 模式 text) LANGUAGE sql AS $$
+  SELECT relation::regclass::text,
+         upper(regexp_replace(regexp_replace(mode, 'Lock$', ''), '([a-z])([A-Z])', '\1 \2', 'g'))
+  FROM pg_locks
+  WHERE pid = pg_backend_pid() AND locktype = 'relation' AND relation::regclass::text NOT LIKE 'pg\_%'
+  ORDER BY 1, 2
+$$;
+
+-- 用 8 種表級鎖模式各試一次 LOCK TABLE … NOWAIT
+CREATE FUNCTION try_table_locks(t regclass) RETURNS TABLE (模式 text, 結果 text) LANGUAGE sql AS $$
+  SELECT m, try_sql(format('LOCK TABLE %s IN %s MODE NOWAIT', t, m))
+  FROM unnest(ARRAY['ACCESS SHARE', 'ROW SHARE', 'ROW EXCLUSIVE', 'SHARE UPDATE EXCLUSIVE',
+                    'SHARE', 'SHARE ROW EXCLUSIVE', 'EXCLUSIVE', 'ACCESS EXCLUSIVE']) WITH ORDINALITY AS u(m, n)
+  ORDER BY n
+$$;
+
+-- 用 4 種列鎖強度各試一次 SELECT … FOR 強度 NOWAIT 去鎖一位顧客
+CREATE FUNCTION try_customer_locks(customer_id integer) RETURNS TABLE (強度 text, 結果 text) LANGUAGE sql AS $$
+  SELECT s, try_sql(format('SELECT 1 FROM customers WHERE id = %s FOR %s NOWAIT', customer_id, s))
+  FROM unnest(ARRAY['KEY SHARE', 'SHARE', 'NO KEY UPDATE', 'UPDATE']) WITH ORDINALITY AS u(s, n)
+  ORDER BY n
+$$;
+
+-- 2026-10-20 14:05 事故當下的 pg_stat_activity 快照；blocked_by 是當時 pg_blocking_pids(pid) 的結果
+CREATE TABLE activity_snapshot (
+  pid integer PRIMARY KEY,
+  usename text NOT NULL,
+  state text NOT NULL,
+  wait_event_type text,
+  wait_event text,
+  xact_start timestamptz,
+  query text NOT NULL,
+  blocked_by integer[] NOT NULL
+);
+INSERT INTO activity_snapshot VALUES
+  (2101, 'app_user', 'idle in transaction', 'Client', 'ClientRead', '2026-10-20 13:41:12+08', 'SELECT * FROM orders WHERE id = 3 FOR UPDATE', '{}'),
+  (2205, 'migrator', 'active', 'Lock', 'relation', '2026-10-20 14:03:50+08', 'ALTER TABLE orders ADD COLUMN note text', '{2101}'),
+  (2310, 'app_user', 'active', 'Lock', 'relation', '2026-10-20 14:03:51+08', 'SELECT * FROM orders WHERE customer_id = $1 ORDER BY ordered_at DESC', '{2205}'),
+  (2311, 'app_user', 'active', 'Lock', 'relation', '2026-10-20 14:03:55+08', 'SELECT * FROM orders WHERE customer_id = $1 ORDER BY ordered_at DESC', '{2205}'),
+  (2312, 'app_user', 'active', 'Lock', 'relation', '2026-10-20 14:04:20+08', 'INSERT INTO orders (customer_id, total) VALUES ($1, $2)', '{2205}'),
+  (2313, 'app_user', 'active', 'Lock', 'relation', '2026-10-20 14:04:58+08', 'SELECT count(*) FROM orders WHERE ordered_at >= $1', '{2205}'),
+  (2400, 'app_user', 'active', NULL, NULL, '2026-10-20 14:04:59+08', 'SELECT id, name, price FROM products ORDER BY id', '{}'),
+  (2401, 'app_user', 'idle', 'Client', 'ClientRead', NULL, 'SELECT id, name FROM customers WHERE id = $1', '{}'),
+  (2402, 'report_reader', 'active', 'IO', 'DataFileRead', '2026-10-20 13:30:02+08', 'SELECT date_trunc(''month'', ordered_at), sum(total) FROM order_archive GROUP BY 1', '{}');
+</script>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

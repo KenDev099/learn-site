@@ -1,0 +1,12 @@
+// cafe-api v3：只認得 mobile（改名完成後的版本）。不要改這個檔
+import type { Pool } from 'pg'
+
+export async function addCustomer(db: Pool, name: string, phone: string): Promise<number> {
+  const { rows } = await db.query('INSERT INTO customers (name, mobile) VALUES ($1, $2) RETURNING id', [name, phone])
+  return Number(rows[0].id)
+}
+
+export async function getPhone(db: Pool, id: number): Promise<string | null> {
+  const { rows } = await db.query('SELECT mobile FROM customers WHERE id = $1', [id])
+  return rows[0]?.mobile ?? null
+}

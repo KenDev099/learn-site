@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>7. Storage：bucket、policy、signed URL 與上傳</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="7" data-practice="supabase">
+<header>
+  <div class="eyebrow">階段 3：Auth 與檔案 · 第 7 課</div>
+  <h1>Storage：bucket、policy、signed URL 與上傳</h1>
+</header>
+<main>
+
+<p>咖啡店開放轉帳付款，顧客要上傳轉帳收據的截圖，店員核對後出餐。收據上有姓名、帳號末幾碼，只有顧客本人和店員能看。第一版上線時，工程師為了讓 <code>&lt;img&gt;</code> 直接顯示，把存檔的地方設成「公開」；一週後有人發現把網址裡的使用者 id 換掉，就能看到別人的收據。</p>
+<p>這一課講 Supabase Storage：檔案放在哪、權限怎麼寫（答案還是 RLS，第 4、5 課學的寫法直接套用）、怎麼給前端一個會過期的下載網址，以及上傳時要擋什麼。</p>
+
+<div class="callout"><strong>這課的路線</strong>
+<ul>
+  <li>bucket 與檔案：檔案的資訊是 <code>storage.objects</code> 這張表的一列，先回答「權限寫在哪」。</li>
+  <li>公開與不公開的 bucket：開場那個漏洞是怎麼發生的。</li>
+  <li>寫 policy：路徑慣例、<code>storage.foldername</code>、上傳與覆蓋各要哪些 policy。</li>
+  <li>給前端看檔案：signed URL 與 public URL。</li>
+  <li>上傳的限制與大檔案：bucket 的大小、類型限制，以及圖片轉換、續傳的取捨。</li>
+</ul></div>
+
+<div class="callout"><strong>這課會用到：</strong>RLS 的 USING 與 WITH CHECK（USING 決定哪些既有的列看得到、改得到，WITH CHECK 檢查寫入後的新列，<a href="04-rls-basics.html">第 4 課</a>）；用 <code>app_metadata</code> 判斷角色（只有伺服器改得到，<code>user_metadata</code> 使用者自己改得到，<a href="05-rls-patterns.html">第 5 課</a>）；登入後的 client 會帶使用者的 access token（<a href="06-auth-sessions.html">第 6 課</a>）。</div>
+
+<div class="callout warn"><strong>環境</strong>：這課用到資料庫、gateway、Data API、Auth 與 Storage（db、kong、rest、auth、storage），<code>npm run up</code> 預設都會開。Storage 的檔案實際存在 storage 容器的 volume 裡，<code>npm run down</code> 不會刪掉。</div>
+
+<h2>bucket 與檔案：權限寫在哪</h2>
+<p>Supabase Storage 用 <strong>bucket</strong>（桶）分組檔案，像是最上層的資料夾，每個 bucket 有自己的設定：公不公開、單檔大小上限、允許的檔案類型。bucket 裡的檔案用路徑命名，例如 <code>receipts</code> 這個 bucket 裡的 <code>6205ef23-…/7.png</code>。</p>
+<p>上傳一個檔案時，Storage 做兩件事：把檔案內容存進儲存空間（本機是容器的磁碟，雲端是 S3 相容的物件儲存），再在資料庫的 <code>storage.objects</code> 表新增一列記錄它。看一下那一列：</p>
+<pre>select bucket_id, name, owner_id, metadata -&gt;&gt; 'mimetype' as type from storage.objects;</pre>
+<pre> bucket_id |                   name                   |               owner_id               |   type
+-----------+------------------------------------------+--------------------------------------+-----------
+ receipts  | 6205ef23-b33f-41c8-bc98-6c28481d6e44/7.png | 6205ef23-b33f-41c8-bc98-6c28481d6e44 | image/png</pre>
+<p>所以「誰能上傳、誰能下載、誰能刪」就是「誰能對 <code>storage.objects</code> 的哪些列做 INSERT、SELECT、DELETE」。Storage 服務收到請求時，用請求帶的 JWT 切換成 <code>anon</code> 或 <code>authenticated</code> 角色去操作這張表，RLS 決定結果，跟 PostgREST 一模一樣。<code>storage.objects</code> 已經開了 RLS、也已經 GRANT 給這些角色，<strong>你只要寫 policy</strong>；沒有任何 policy 時，除了 secret key（<code>service_role</code>）以外誰都不能上傳或讀取。</p>
+<div class="table-wrap"><table>
+  <tr><th>Storage 的動作（supabase-js）</th><th>對 storage.objects 做的事</th><th>要有的 policy</th></tr>
+  <tr><td><code>upload(path, file)</code></td><td>INSERT 一列</td><td>INSERT</td></tr>
+  <tr><td><code>upload(path, file, { upsert: true })</code></td><td>檔案已經存在時是 UPDATE 那一列（還要先找到它）</td><td>INSERT＋SELECT＋UPDATE</td></tr>
+  <tr><td><code>download</code>、<code>list</code>、<code>createSignedUrl</code></td><td>SELECT</td><td>SELECT</td></tr>
+  <tr><td><code>remove</code></td><td>DELETE（要先看得到）</td><td>SELECT＋DELETE</td></tr>
+  <tr><td><code>move</code>、<code>copy</code></td><td>UPDATE／INSERT</td><td>依動作</td></tr>
+</table></div>
+<p>（查表用，不用背。）本機實測：只有 INSERT policy 時，第一次上傳成功，同一個路徑再 <code>upsert</code> 會得到 403「new row violates row-level security policy」；補上 SELECT 還是一樣，要 SELECT、UPDATE 都有才成功。</p>
+<p>直接 <code>delete from storage.objects</code> 會被擋下（「Direct deletion from storage tables is not allowed. Use the Storage API instead.」）：只刪資料庫的列，儲存空間裡的檔案會變成沒人管的孤兒。刪檔一律走 Storage API。</p>
+
+<h2>公開與不公開的 bucket</h2>
+<p>知道權限在 <code>storage.objects</code> 之後，回到開場的漏洞。bucket 有一個 <code>public</code> 設定：</p>
+<ul>
+  <li><strong>public bucket</strong>：任何人只要知道網址，就能用 <code>/storage/v1/object/public/&lt;bucket&gt;/&lt;路徑&gt;</code> 下載，<strong>讀取不經過 policy</strong>（上傳、刪除仍然要 policy）。本機實測，public bucket 裡別的顧客用 <code>download()</code> 也讀得到檔案。適合商品照片、店家 logo 這類本來就公開的東西，可以被瀏覽器和 CDN 快取。</li>
+  <li><strong>private bucket</strong>（預設）：每次讀取都要過 SELECT policy；前端要顯示時，用下面會講的 signed URL。</li>
+</ul>
+<p>開場的收據放在 public bucket，網址又是「使用者 id／訂單編號」這種猜得到的格式，所以換個 id 就看到別人的收據。收據、證件、合約這類私人檔案一律放 private bucket。</p>
+<p>建 bucket 可以在 Studio 按按鈕，也可以寫成 SQL 放進 migration（第 9 課），團隊每個人的環境才會一樣：</p>
+<pre>insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('receipts', 'receipts', false, 2097152, array['image/png', 'image/jpeg']);</pre>
+<div class="callout practice"><strong>💡 實務上：一個 bucket 一種存取規則</strong><br>常見的切法是依「誰看得到」分 bucket，而不是依功能：<code>public-assets</code>（商品圖，public）、<code>receipts</code>（顧客本人＋店員）、<code>exports</code>（後台匯出的報表，只有管理員）。同一個 bucket 裡混放公開與私人檔案，policy 會越寫越複雜，也很難一眼看出哪些東西是公開的。資安審查時，先列出每個 bucket 的 public 設定，public 的逐一確認裡面沒有私人資料。</div>
+
+<h2>寫 policy：路徑就是權限的依據</h2>
+<p>private bucket 的權限全靠 policy，而 policy 能用的資訊主要是 <code>bucket_id</code> 與 <code>name</code>（路徑）。所以 Supabase 的慣例是<strong>讓路徑的第一層資料夾等於擁有者的 user id</strong>：顧客 A 的收據放 <code>&lt;A 的 id&gt;/7.png</code>。<code>storage.foldername(name)</code> 把路徑切成資料夾陣列（Postgres 的陣列從 1 開始數），<code>[1]</code> 就是第一層：</p>
+<pre>select storage.foldername('6205ef23-b33f-41c8-bc98-6c28481d6e44/2026/7.png');
+-- {6205ef23-b33f-41c8-bc98-6c28481d6e44,2026}</pre>
+<p>顧客的三條 policy：</p>
+<pre>create policy "收據：顧客上傳到自己的資料夾" on storage.objects for insert to authenticated
+  with check (bucket_id = 'receipts' and (storage.foldername(name))[1] = (select auth.uid())::text);
+
+create policy "收據：顧客讀自己的" on storage.objects for select to authenticated
+  using (bucket_id = 'receipts' and (storage.foldername(name))[1] = (select auth.uid())::text);
+
+create policy "收據：顧客覆蓋自己的" on storage.objects for update to authenticated
+  using (bucket_id = 'receipts' and (storage.foldername(name))[1] = (select auth.uid())::text)
+  with check (bucket_id = 'receipts' and (storage.foldername(name))[1] = (select auth.uid())::text);</pre>
+<ul>
+  <li><strong><code>bucket_id = 'receipts'</code> 每一條都要寫</strong>：<code>storage.objects</code> 是所有 bucket 共用的一張表，漏寫就變成「所有 bucket 裡，路徑第一層是自己 id 的檔案」都適用。</li>
+  <li><strong><code>auth.uid()</code> 轉成 text</strong>：路徑是字串，<code>auth.uid()</code> 是 uuid。包一層 <code>(select …)</code> 讓它只算一次（第 4 課）。</li>
+  <li><strong>INSERT 的 WITH CHECK 一定要檢查路徑</strong>：只寫 <code>bucket_id = 'receipts'</code> 的話，顧客 B 可以上傳檔案到 A 的資料夾，A 的收據列表就多了一張別人塞進來的圖。</li>
+</ul>
+<p>店員要看全部收據，角色照第 5 課的規則放在 <code>app_metadata</code>：</p>
+<pre>create policy "收據：店員讀全部" on storage.objects for select to authenticated
+  using (bucket_id = 'receipts' and ((select auth.jwt()) -&gt; 'app_metadata' -&gt;&gt; 'role') = 'staff');</pre>
+<p>多條 SELECT policy 是 OR：顧客讀得到自己的，店員讀得到全部。店員沒有 INSERT、UPDATE policy，所以不能替顧客上傳或改檔。要做「店員只看自己分店的收據」，路徑改成 <code>&lt;store_id&gt;/&lt;user_id&gt;/檔名</code>，policy 用第 5 課的 <code>store_members</code> 查詢判斷第一層。</p>
+<p><code>owner_id</code> 欄位記錄上傳者，也可以拿來寫 policy（<code>owner_id = (select auth.uid())::text</code>）。差別是它跟著「誰上傳」走：店員代顧客上傳時，擁有者就變成店員。用路徑表達擁有者，規則看路徑就懂。</p>
+<div class="callout practice"><strong>💡 實務上：路徑設計在第一天就決定了權限</strong><br>路徑格式一旦有幾萬個檔案就很難改（搬檔要逐一 move，policy 和程式要同時換）。開新功能時先問：這些檔案誰能看？以後會不會多一種角色（店員、分店、會計）？把那個維度放進路徑的前幾層。檔名本身用伺服器或程式產生（訂單編號、uuid），不要用顧客上傳時的原始檔名：可能重複、可能有奇怪字元，也會洩漏資訊（「王小明身分證正面.jpg」），原因在 <a href="../../nestjs/lessons/22-uploads-webhooks.html">NestJS 課第 22 課</a>講過。</div>
+
+<h2>給前端看檔案：signed URL</h2>
+<p>policy 寫好了，接著是前端怎麼顯示 private bucket 裡的圖。<code>&lt;img src&gt;</code> 發出的請求不會帶 Authorization header，所以不能直接指向 Storage 的一般網址。做法是產生 <strong>signed URL</strong>（簽過名的網址）：</p>
+<pre>const { data, error } = await supabase.storage.from('receipts').createSignedUrl(`${userId}/7.png`, 60)
+// data.signedUrl：
+// http://127.0.0.1:55421/storage/v1/object/sign/receipts/6205ef23-…/7.png?token=eyJhbGciOiJIUzI1NiJ9.eyJ1cmwiOi…</pre>
+<p><code>token</code> 是 Storage 簽的 JWT，內容寫著哪個檔案、何時到期（第二個參數是秒數）。產生網址時要通過 SELECT policy；之後<strong>任何拿到網址的人</strong>在到期前都能下載，不用登入。所以：</p>
+<ul>
+  <li>有效期取「畫面需要多久」：預覽圖 60 秒、後台列表幾分鐘。過期後重新產生。</li>
+  <li>signed URL 不要存進資料庫或寫進 log、不要放進會被分享的頁面網址。資料庫存的是路徑，要顯示時才換成 signed URL。</li>
+  <li>網址過期後，已經下載到瀏覽器（或被別人存下來）的檔案不會消失。過期只擋「之後再用這個網址下載」。</li>
+  <li>一次要很多張（店員的收據列表）用 <code>createSignedUrls(paths, 秒數)</code>，一個請求換回全部，不要每張各發一次。</li>
+</ul>
+<p><code>getPublicUrl(path)</code> 只是在本機組出 public bucket 的網址字串，不發請求、也不檢查權限；對 private bucket 用它，拿到的網址下載會失敗（本機實測回 400）。</p>
+<p>這跟 S3 的 presigned URL 是同一個概念（<a href="../../data-stores/lessons/12-object-storage.html">data-stores 課第 12 課</a>）：權限在產生網址時檢查一次，網址本身就是一張有期限的通行證。</p>
+
+<h2>上傳的限制與大檔案</h2>
+<p>最後看上傳這一端。檔案是前端直接傳給 Storage 的，中間沒有你的伺服器，所以「單檔多大、什麼類型」要設在 bucket 上，由 Storage 擋：</p>
+<ul>
+  <li><code>file_size_limit</code>：單檔上限（bytes）。還受整個專案的上限限制（本機 <code>config.toml</code> 的 <code>[storage] file_size_limit = "50MiB"</code>）。</li>
+  <li><code>allowed_mime_types</code>：允許的類型，例如 <code>{image/png,image/jpeg}</code>。本機實測上傳 <code>text/plain</code> 得到「mime type text/plain is not supported」。</li>
+</ul>
+<p>要注意 mime type 是上傳的人宣告的（<code>contentType</code>），不是 Storage 讀檔頭判斷的。它擋得住「不小心傳錯檔」和把 HTML 檔放進來被當成網頁打開，擋不住刻意偽裝。收據要做到「真的是圖片」，要在伺服器端（Edge Function，第 8 課）讀檔頭檢查，原理在 <a href="../../nestjs/lessons/22-uploads-webhooks.html">NestJS 課第 22 課</a>。</p>
+<p>另外兩件事一句帶過：大檔案（影片、幾百 MB 的備份）用可續傳上傳（resumable upload，TUS 協定），斷線後從中斷處繼續；圖片縮圖與轉檔（image transformation）是雲端付費方案的功能，課程本機排除了負責它的 imgproxy 服務。</p>
+<div class="callout practice"><strong>💡 實務上：上傳流程要想清楚「失敗一半」</strong><br>顧客上傳收據通常是兩步：檔案上傳到 Storage、再把路徑寫進訂單。第二步失敗，就留下沒人用的檔案；先寫訂單再上傳失敗，訂單指向不存在的檔案。常見做法是路徑由訂單編號決定（<code>&lt;user_id&gt;/&lt;order_id&gt;.png</code>），重傳就 upsert 覆蓋，不需要另外記路徑；再搭配定期清理「沒有對應訂單的檔案」的排程（第 8 課帶過的 pg_cron）。</div>
+
+<h2>練習</h2>
+<p>練習都在本機，題目資料夾是 <code>supabase/practice/work/07/</code>。Storage 的 bucket 與 policy 是整個 Supabase 共用的，所以判分時測試會把你寫的 <code>'receipts'</code> 換成這一題專屬的 bucket 名稱、在 policy 名稱前面加上這一題的代號，跑完再刪掉；練習 2、3 的函式收到的 <code>bucket</code> 參數就是那個名稱。</p>
+
+<div class="local" data-test="ex1" data-files="receipts.sql">
+  <p>練習 1：在 <code>receipts.sql</code> 建收據的 bucket 與 policy：bucket <code>receipts</code> 不公開、單檔最大 2 MB（2097152 bytes）、只收 <code>image/png</code> 與 <code>image/jpeg</code>；顧客只能在自己的資料夾（路徑第一層是自己的 user id）上傳、讀取、用 upsert 覆蓋；店員（<code>app_metadata</code> 的 <code>role</code> 是 <code>staff</code>）讀得到全部但不能上傳。測試會用顧客 A、顧客 B（他在自己改得到的 <code>user_metadata</code> 寫了 <code>role: staff</code>）、店員與沒登入的人逐一嘗試。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="upload.ts">
+  <p>練習 2：完成 <code>uploadReceipt(client, bucket, userId, orderId, image)</code>：上傳到 <code>&lt;userId&gt;/&lt;orderId&gt;.png</code>（<code>contentType</code> 是 <code>image/png</code>，同一張訂單重傳要覆蓋舊檔），回傳 60 秒內有效的下載網址；任何一步出錯都丟出 Error。這一題的 bucket 不公開，測試會用你回傳的網址真的下載一次。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="staff.ts">
+  <p>練習 3：完成店員後台用的 <code>receiptLinks(client, bucket, customerId)</code>：列出這位顧客資料夾裡的收據（依檔名排序），一次替全部產生 300 秒有效的下載網址，回傳 <code>[{ name, url }]</code>（<code>name</code> 是檔名，不含資料夾）。測試會數你發了幾個請求，也會用一般顧客的身分呼叫，確認 RLS 一樣管得到列檔案。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：顧客上傳收據時，第一次成功，同一張訂單重傳（<code>upsert: true</code>）卻得到 403「new row violates row-level security policy」。bucket 上只有一條 INSERT policy。缺了什麼？</p>
+  <label data-key="a">INSERT policy 的 WITH CHECK 要改成 <code>true</code></label>
+  <label data-key="b">DELETE policy：upsert 是先刪掉舊檔再新增</label>
+  <label data-key="c">SELECT 與 UPDATE policy：檔案已存在時，upsert 要找到舊的那一列並更新它</label>
+  <label data-key="d">bucket 要改成 public，upsert 才能覆蓋</label>
+  <p class="why">✓ 檔案已經存在時，upsert 對 <code>storage.objects</code> 做的是 UPDATE，要先看得到（SELECT）、再改得到（UPDATE）。本機實測只補 SELECT 還是 403。b 是最常見的猜測，但覆蓋不經過 DELETE。a 會讓任何人上傳到任何路徑。d 讓所有人讀得到收據，跟這個錯誤無關。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 5：商品照片放在 public bucket <code>menu-images</code>，上面有一條 SELECT policy「只有店員看得到」。沒登入的訪客打開 <code>/storage/v1/object/public/menu-images/latte.jpg</code>，結果是？</p>
+  <label data-key="a">看得到：public bucket 的讀取不經過 policy，policy 只管上傳、修改、刪除</label>
+  <label data-key="b">看不到：SELECT policy 擋下了沒登入的人</label>
+  <label data-key="c">看得到，但只有 60 秒</label>
+  <label data-key="d">回 401，因為沒帶 apikey</label>
+  <p class="why">✓ public bucket 用 public 網址讀取時不檢查 policy，任何知道網址的人都能下載。b 是最多人以為的：寫了 policy 就有保護，但對 public bucket 的讀取沒有作用。c 是 signed URL 的行為。要「只有店員看得到」，bucket 就要設成不公開。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 6：店員在後台打開顧客的收據，系統給了一個 5 分鐘的 signed URL。店員把圖片下載到自己的電腦，10 分鐘後網址過期。接下來？</p>
+  <label data-key="a">店員電腦裡的檔案也會跟著失效</label>
+  <label data-key="b">網址還能用，因為店員有 SELECT policy</label>
+  <label data-key="c">任何人都還能用這個網址，因為 token 已經驗證過一次</label>
+  <label data-key="d">網址不能再下載，但已經下載的檔案不受影響；要再看就重新產生網址</label>
+  <p class="why">✓ signed URL 的期限只管「用這個網址下載」；檔案一旦到了別人手上就收不回來。所以有效期要短，私人檔案也要想清楚誰需要拿到網址。b 錯在產生網址之後下載時就不再看 policy，過期就是過期，跟店員的權限無關。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>私人檔案放 public bucket</strong>：讀取不經過 policy，知道網址就能下載。收據、證件放 private bucket，顯示用 signed URL。</li>
+  <li><strong>policy 漏寫 <code>bucket_id</code></strong>：<code>storage.objects</code> 是所有 bucket 共用的表，條件會套到別的 bucket。</li>
+  <li><strong>INSERT 只檢查 bucket、沒檢查路徑</strong>：別人可以把檔案放進你的資料夾。WITH CHECK 要比對 <code>(storage.foldername(name))[1]</code>。</li>
+  <li><strong>只寫 INSERT policy 就用 upsert</strong>：重傳會 403。upsert 要 INSERT＋SELECT＋UPDATE。</li>
+  <li><strong>用 <code>user_metadata</code> 判斷店員</strong>：使用者自己改得到，用 <code>app_metadata</code>。</li>
+  <li><strong>把 signed URL 存進資料庫</strong>：過期後就壞了，而且外洩時誰都能下載。存路徑，要用時再產生。</li>
+  <li><strong>以為 <code>allowed_mime_types</code> 會檢查檔案內容</strong>：它只看上傳時宣告的類型。真的要確認內容，伺服器端讀檔頭。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>檔案用 bucket 分組；每個檔案是 <code>storage.objects</code> 的一列，Storage 用請求的角色操作這張表，權限就是它的 RLS policy。刪檔走 Storage API，不能直接刪表。</li>
+  <li>public bucket 的讀取不經過 policy，只放本來就公開的東西；私人檔案放 private bucket。</li>
+  <li>路徑第一層放擁有者的 user id，policy 用 <code>(storage.foldername(name))[1] = (select auth.uid())::text</code>，每條都寫 <code>bucket_id</code>。上傳要 INSERT，upsert 再加 SELECT＋UPDATE，讀取、列檔、產生網址要 SELECT。角色用 <code>app_metadata</code>。</li>
+  <li>前端顯示私人檔案用 signed URL：產生時檢查 SELECT policy，之後到期前誰拿到都能下載；有效期取最短夠用的，資料庫只存路徑；多個檔案用 <code>createSignedUrls</code>。</li>
+  <li>bucket 設 <code>file_size_limit</code> 與 <code>allowed_mime_types</code>；mime type 是宣告的，不是檔頭。大檔用可續傳上傳，圖片轉換是雲端付費功能。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 6 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：咖啡店的 Vue 前端在每個元件裡各自 <code>createClient(url, key)</code>，再把登入時存下來的 access token 放進 <code>global.headers</code>。客服回報顧客放著分頁一小時後，每個操作都 401。原因是？</p>
+  <label data-key="a">publishable key 一小時後過期，要換新的 key</label>
+  <label data-key="b">access token 過期了，而這些自己建的 client 不知道 session，沒有人用 refresh token 換新</label>
+  <label data-key="c">RLS 的 policy 只在登入後一小時內有效</label>
+  <label data-key="d">瀏覽器的 cookie 一小時後被清掉</label>
+  <p class="why">✓ access token 預設 3600 秒過期，換新是持有 session 的那個 client 的工作。修法是整個 app 共用一個 client，讓它自動換新，或每次從 <code>getSession()</code> 取最新的 token。a 最常見：publishable key 不會過期，它只代表哪個 app。（第 6 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 8：Nuxt 的 <code>server/api/orders/[id].delete.ts</code> 這樣判斷能不能取消訂單。哪裡會出事？</p>
+<pre>const supabase = createServerClient(url, key, { cookies: { getAll: () =&gt; parseCookieHeader(cookieHeader) } })
+const { data } = await supabase.auth.getSession()
+if (data.session?.user.id !== order.customer_id) throw createError({ statusCode: 403 })
+await admin.from('orders').delete().eq('id', order.id)   // admin 用 secret key</pre>
+  <label data-key="a">cookie 沒有設 HttpOnly，所以 <code>getSession()</code> 會回傳 null</label>
+  <label data-key="b"><code>getSession()</code> 會打 Auth 伺服器，太慢</label>
+  <label data-key="c"><code>getSession()</code> 的 user 是從 cookie 讀出來的、沒驗簽章，改 cookie 就能取消別人的訂單；要用 <code>getClaims()</code> 的 <code>sub</code></label>
+  <label data-key="d">應該用 <code>user_metadata</code> 裡的 id 比對</label>
+  <p class="why">✓ cookie 的內容使用者改得到，<code>getSession()</code> 只是讀出來；後面又用 secret key 刪除，RLS 也幫不上忙。改用 <code>getClaims()</code>（本地驗簽章）或 <code>getUser()</code>（問 Auth）。b 剛好說反了：<code>getSession()</code> 不發請求，<code>getUser()</code> 才會。（第 6 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 9：上線後所有人都註冊失敗，前端只看到「Database error saving new user」。前一天剛部署了 profiles 表加 <code>phone text not null</code> 欄位的 migration。最先查什麼？</p>
+  <label data-key="a"><code>after insert on auth.users</code> 的 trigger 函式：它的 insert 沒有給 phone，違反 not null，整個註冊跟著失敗</label>
+  <label data-key="b">Auth 的 rate limit 是不是被打爆了</label>
+  <label data-key="c">publishable key 是不是被輪替了</label>
+  <label data-key="d">SMTP 是不是寄不出驗證信</label>
+  <p class="why">✓ profiles 的 trigger 跟註冊在同一個交易，它失敗註冊就失敗，而這個錯誤訊息正是 trigger 出錯的典型樣子。修法是欄位給預設值或允許 null，並在 trigger 裡處理。去 Postgres 的 log 看實際的錯誤。b、d 的錯誤訊息不同，c 會讓所有 API 都失敗、不只註冊。（第 6 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 10：咖啡店要讓顧客上傳大頭貼。下面哪個做法同時做到「大家看得到大頭貼」與「只有本人能換自己的大頭貼」？</p>
+  <label data-key="a">private bucket，SELECT policy 用 <code>using (true)</code>，前端直接用 <code>getPublicUrl</code></label>
+  <label data-key="b">public bucket，不用寫任何 policy</label>
+  <label data-key="c">private bucket，每次顯示都用 secret key 產生 signed URL</label>
+  <label data-key="d">public bucket（讀取公開），INSERT／UPDATE policy 檢查路徑第一層是自己的 id</label>
+  <p class="why">✓ 大頭貼本來就公開，用 public bucket 讓瀏覽器與 CDN 快取；上傳與覆蓋仍然要 policy 檢查路徑。b 最常見的誤會：public 只開放讀取，沒有 policy 時誰都不能上傳。a 的 <code>getPublicUrl</code> 對 private bucket 下載不到。c 把 secret key 拿去做前端該做的事，也沒有必要。（第 7 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 11：顧客 B 的收據列表裡出現一張不是他上傳的圖。檢查 <code>storage.objects</code> 發現 owner_id 是顧客 C、路徑卻在 B 的資料夾。policy 最可能哪裡寫錯？</p>
+<pre>create policy "上傳" on storage.objects for insert to authenticated
+  with check (bucket_id = 'receipts');
+create policy "讀自己的" on storage.objects for select to authenticated
+  using (bucket_id = 'receipts' and (storage.foldername(name))[1] = (select auth.uid())::text);</pre>
+  <label data-key="a">SELECT policy 應該用 <code>owner_id</code>，不是路徑</label>
+  <label data-key="b">INSERT 的 WITH CHECK 沒檢查路徑第一層是自己的 id，C 可以把檔案放進 B 的資料夾</label>
+  <label data-key="c">少了 UPDATE policy</label>
+  <label data-key="d">bucket 應該改成 public</label>
+  <p class="why">✓ 讀取有檢查路徑，所以 B 只看得到自己資料夾的檔案；但上傳沒檢查，C 能把檔案寫進 B 的資料夾，B 就看到了。修法是 INSERT 的 WITH CHECK 也比對 <code>(storage.foldername(name))[1]</code>。a 只改了讀取的判斷，C 仍然能把檔案塞進 B 的資料夾。（第 7 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 12：店員後台的收據列表，工程師為了「不用每次都產生網址」，把 7 天有效的 signed URL 存進 <code>orders.receipt_url</code>。這樣做的問題是？</p>
+  <label data-key="a">signed URL 最長只能 1 小時，存不進去</label>
+  <label data-key="b">沒有問題，signed URL 會檢查下載的人是不是店員</label>
+  <label data-key="c">網址是一張有期限的通行證，誰拿到都能下載：資料庫外洩或網址被轉貼，7 天內都能看收據；而且過期後欄位就壞了</label>
+  <label data-key="d">signed URL 會讓 RLS 失效</label>
+  <p class="why">✓ 權限只在產生網址時檢查一次，之後任何拿到網址的人都能下載。資料庫只存路徑，要顯示時用 <code>createSignedUrls</code> 換成短效網址。b 是最多人以為的：下載時不再看身分。（第 7 課）</p>
+</div>
+
+<p>這個階段的重點整理成<a href="../sheets/stage-3.html">一頁圖解</a>。</p>
+<p>下一課進入伺服器端邏輯：結帳這種「多步驟、價格不能讓前端決定」的流程，該放資料庫函式、Edge Function，還是自己的後端。</p>
+
+<div class="callout">版本：Storage（storage-api）1.90.1、@supabase/supabase-js 2.119.0。upsert 需要的 policy、public bucket 的讀取行為、mime type 擋下的訊息、直接刪表被擋的訊息、signed URL 的 token 內容都是 2026-11-20 在本機實測。</div>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

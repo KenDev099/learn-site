@@ -1,0 +1,3 @@
+-- 練習 3：商品評論 reviews(id, product_id, author_id uuid, rating, body) 已經建好、開了 RLS，但沒有任何 policy、沒有任何 GRANT。
+-- 要做到：任何人（含沒登入）都讀得到所有評論；作者能改自己評論的 rating 與 body；
+--         改不到別人的評論；也不能把評論的 author_id 改成別人（冒名）

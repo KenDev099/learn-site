@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>11. API gateway、BFF 與把 gRPC 開放給瀏覽器（資深）</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="11" data-practice="api-styles">
+<header>
+  <div class="eyebrow">階段 5：契約與整合架構 · 第 11 課</div>
+  <h1>API gateway、BFF 與把 gRPC 開放給瀏覽器（資深）</h1>
+</header>
+<main>
+
+<p>前面幾課各自做了一個零件：GraphQL 伺服器（第 2–7 課）、gRPC 庫存服務（第 8–9 課）、契約檢查（第 10 課）。真的上線時，問題變成這些零件怎麼接在一起：App 要先連到誰？認證在哪裡檢查？菜單頁同時需要菜單與庫存，庫存服務掛掉時菜單還能不能顯示？瀏覽器能不能直接呼叫 gRPC？</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>示範問題與 API gateway：每個前端直接呼叫每個服務會出什麼事，入口統一處理哪些事，商業邏輯和物件授權為什麼不放進去（開場問題的最小答案）。</li>
+  <li>BFF 與聚合的可靠性：菜單頁同時要菜單與庫存，怎麼並行呼叫、共用 deadline 預算，庫存服務掛掉時菜單照樣顯示。</li>
+  <li>metadata：request id 一層一層往下傳，客服回報問題時能把三個服務的 log 串起來。</li>
+  <li>瀏覽器怎麼呼叫 gRPC：原生 gRPC 為什麼不行，gRPC-Web、Connect 協定各怎麼解決。</li>
+  <li>federation 與 ADR：團隊變多後 GraphQL 怎麼拆，把咖啡店的架構決定寫成文件。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="09-grpc-services.html">第 9 課</a>的 gRPC client：用 <code>timeoutMs</code> 設 deadline，metadata 就是標頭，失敗時用狀態碼（例如 <code>UNAVAILABLE</code>）表示原因。</li>
+  <li><a href="../../system-design/lessons/08-timeouts-retries-backoff.html">系統設計課第 8 課</a>的 deadline 預算：整個請求只有固定的時間，每往下呼叫一層，要扣掉已經用掉的時間。</li>
+  <li><a href="03-resolvers-mutations.html">第 3 課</a>的部分成功：可為 null 的欄位出錯時只有它變成 <code>null</code>，錯誤放進 <code>errors</code>，其他欄位照常回傳。</li>
+</ul></div>
+
+<h2>示範問題：每個前端直接呼叫每個服務</h2>
+<p>咖啡店長大了。客戶端有四種：顧客的 App、官網、店內的 POS（收銀機）、外送平台這類外部合作夥伴。後端拆成三個服務：訂單、庫存、會員。最直覺的做法是讓每個客戶端直接呼叫需要的服務。半年後會出現這些狀況：</p>
+<ul>
+  <li><strong>認證做了三次</strong>：訂單、庫存、會員各自驗 JWT、各自設 CORS、各自限流，三份程式碼的行為慢慢不一樣。</li>
+  <li><strong>前端知道內部拓樸</strong>：App 寫死 <code>inventory.coffee.tw</code>。庫存服務想拆成兩個、想換網址，要等所有使用者更新 App，行動 App 的舊版本會在手機上活好幾個月。</li>
+  <li><strong>行動網路往返太多</strong>：菜單頁要先拿菜單、再拿庫存、再拿會員點數，三次往返在 4G 上每次 100–300 ms。</li>
+  <li><strong>每個前端要的形狀不同</strong>：App 只要名字、價格、還剩幾份；POS 要條碼、成本、今天賣了幾份。同一支 API 想同時滿足兩邊，欄位越長越多。</li>
+</ul>
+<p>解法是在客戶端和服務之間加兩層：入口統一的 <strong>API gateway</strong>，以及依前端分開的 <strong>BFF</strong>。</p>
+<p>開場的問題先給最小答案：App 只連 API gateway，認證的第一道檢查在 gateway，「這張訂單是不是你的」仍由擁有資料的服務判斷；菜單頁由 BFF 同時呼叫菜單與庫存，庫存服務掛掉時菜單照樣回傳，只有「還剩幾份」是 null；瀏覽器不能直接呼叫原生 gRPC，要改用 gRPC-Web 或 Connect 協定。細節在後面的〈聚合的可靠性〉與〈瀏覽器怎麼呼叫 gRPC〉。</p>
+
+<figure>
+  <svg viewBox="0 0 700 300" role="img" aria-label="App、官網、POS、合作夥伴都先到 API gateway；gateway 把 App 與官網的請求轉給 GraphQL BFF，POS 直接用 Connect 協定呼叫庫存服務，合作夥伴走 REST；BFF 再呼叫訂單、庫存、會員服務">
+    <defs><marker id="g1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="10" y="20" width="110" height="40" rx="8"/><text class="d-text" x="65" y="45" text-anchor="middle">App</text>
+    <rect class="d-soft" x="10" y="90" width="110" height="40" rx="8"/><text class="d-text" x="65" y="115" text-anchor="middle">官網</text>
+    <rect class="d-soft" x="10" y="160" width="110" height="40" rx="8"/><text class="d-text" x="65" y="185" text-anchor="middle">店內 POS</text>
+    <rect class="d-soft" x="10" y="230" width="110" height="40" rx="8"/><text class="d-text" x="65" y="255" text-anchor="middle">合作夥伴</text>
+    <rect class="d-box" x="170" y="20" width="120" height="250" rx="8"/>
+    <text class="d-text" x="230" y="130" text-anchor="middle">API gateway</text>
+    <text class="d-small" x="230" y="152" text-anchor="middle">TLS、認證、限流</text>
+    <text class="d-small" x="230" y="170" text-anchor="middle">路由、request id</text>
+    <rect class="d-box" x="340" y="40" width="130" height="60" rx="8"/>
+    <text class="d-text" x="405" y="68" text-anchor="middle">GraphQL BFF</text>
+    <text class="d-small" x="405" y="88" text-anchor="middle">前端團隊擁有</text>
+    <rect class="d-box" x="340" y="220" width="130" height="50" rx="8"/>
+    <text class="d-text" x="405" y="250" text-anchor="middle">公開 REST</text>
+    <rect class="d-box" x="540" y="20" width="140" height="45" rx="8"/><text class="d-text" x="610" y="48" text-anchor="middle">訂單服務</text>
+    <rect class="d-box" x="540" y="115" width="140" height="45" rx="8"/><text class="d-text" x="610" y="143" text-anchor="middle">庫存服務（gRPC）</text>
+    <rect class="d-box" x="540" y="210" width="140" height="45" rx="8"/><text class="d-text" x="610" y="238" text-anchor="middle">會員服務</text>
+    <line class="d-line" x1="120" y1="40" x2="168" y2="60" marker-end="url(#g1)"/>
+    <line class="d-line" x1="120" y1="110" x2="168" y2="110" marker-end="url(#g1)"/>
+    <line class="d-line" x1="120" y1="180" x2="168" y2="180" marker-end="url(#g1)"/>
+    <line class="d-line" x1="120" y1="250" x2="168" y2="250" marker-end="url(#g1)"/>
+    <line class="d-line" x1="290" y1="70" x2="338" y2="70" marker-end="url(#g1)"/>
+    <line class="d-line" x1="290" y1="245" x2="338" y2="245" marker-end="url(#g1)"/>
+    <line class="d-line" x1="290" y1="180" x2="538" y2="145" marker-end="url(#g1)"/>
+    <text class="d-small" x="420" y="185" text-anchor="middle">POS：Connect</text>
+    <line class="d-line" x1="470" y1="60" x2="538" y2="43" marker-end="url(#g1)"/>
+    <line class="d-line" x1="470" y1="80" x2="538" y2="132" marker-end="url(#g1)"/>
+    <line class="d-line" x1="470" y1="95" x2="538" y2="225" marker-end="url(#g1)"/>
+    <line class="d-line" x1="470" y1="240" x2="538" y2="50" marker-end="url(#g1)"/>
+  </svg>
+  <figcaption>這一課結束時咖啡店的架構：所有外部流量先進 gateway；App 與官網經過 GraphQL BFF；POS 用 Connect 協定直接呼叫庫存服務；合作夥伴用公開 REST。</figcaption>
+</figure>
+
+<h2>API gateway：入口做什麼、不做什麼</h2>
+<p><strong>API gateway</strong> 是所有外部請求的入口，處理每個請求都需要、但跟商業規則無關的事，這類需求叫<strong>橫切關注（cross-cutting concerns）</strong>。<a href="../../devops/lessons/12-nginx.html">DevOps 課第 12 課</a>的 Nginx 反向代理就是最小的 gateway：收 HTTPS、依路徑轉給後面的服務。常見的選擇還有 Envoy、Kong，以及雲端的 AWS API Gateway。</p>
+<div class="table-wrap"><table>
+<thead><tr><th>gateway 該做</th><th>為什麼放這裡</th></tr></thead>
+<tbody>
+<tr><td>TLS 終止、HTTP/2</td><td>憑證只管一個地方；內部服務可以跑明文或內部憑證</td></tr>
+<tr><td>路由：<code>/graphql</code> → BFF、<code>/api/v1</code> → 公開 REST</td><td>客戶端只認一個網域，內部怎麼拆可以自由改</td></tr>
+<tr><td>認證的第一道檢查：token 簽章、有效期限</td><td>沒登入、偽造的請求在入口就擋掉，不消耗後面的資源</td></tr>
+<tr><td>限流（<a href="../../system-design/lessons/10-rate-limiting.html">系統設計課第 10 課</a>）、請求大小上限</td><td>依 IP、API key 計數，一個地方算得準</td></tr>
+<tr><td>產生 request id、存取 log、延遲與錯誤率指標</td><td>每個請求從入口就有編號，之後每個服務的 log 都帶著它</td></tr>
+</tbody></table></div>
+<p>不該做的是<strong>商業邏輯</strong>：「會員日拿鐵打九折」「庫存少於 3 份不讓外送平台下單」。寫在 gateway 的規則很難測試（要起整個 gateway）、很難部署（改一個規則要動全公司的入口），而且每個服務都被它綁住。規則放在擁有那份資料的服務裡。</p>
+<p><strong>授權也不能只放在 gateway。</strong>gateway 驗完 JWT，只知道「這是王小明」（認證）。「訂單 1042 是不是王小明的」需要查訂單資料，只有訂單服務知道（<a href="06-authz-limits-persisted.html">第 6 課</a>、<a href="../../auth/lessons/19-object-level-authz.html">Auth 課第 19 課</a>的物件層級授權）。內部的批次程式、其他服務也可能不經過 gateway 直接呼叫訂單服務。gateway 擋掉明顯的壞請求，服務自己做最後的判斷。</p>
+<p>request id 由 gateway 產生或覆蓋：客戶端送來的 <code>X-Request-Id</code> 不可信（可能很長、可能故意重複別人的 id 混淆 log）。Nginx 的寫法是 <code>proxy_set_header X-Request-Id $request_id;</code>，<code>$request_id</code> 是 Nginx 為每個請求產生的隨機 16 bytes 十六進位字串。</p>
+<div class="callout practice"><strong>💡 實務上：先分清楚錯誤是 gateway 回的，還是服務回的</strong><br>前端最常碰到 gateway 的時候，是收到 401（沒登入）、413（請求太大）、429（太頻繁）、502／504（後面的服務連不上或逾時），卻在服務的 log 裡找不到這個請求：那通常是 gateway 在入口就擋掉或等不到後面的服務。先看回應 body 的格式（gateway 的錯誤多半是一頁 HTML 或固定文字，跟服務回的 JSON 長得不一樣），再拿 request id 去 gateway 的存取 log 找。gateway 多半由維運或平台團隊管，要加路由、調請求大小上限或限流門檻，是開單請他們改，不是自己改設定。資深會先問一句：「這條規則是每個請求都要的，還是只跟某個商業情境有關？」後者就該回到服務裡做。</div>
+
+<h2>BFF：為某一種前端服務的後端</h2>
+<p>gateway 處理的是每個請求都一樣的事；每一種前端要的資料形狀不同，交給下一層。<strong>BFF（backend-for-frontend）</strong>是專門服務某一種前端的後端層。給 App 的 BFF 回傳 App 畫面要的形狀，給 POS 的 BFF 回傳店員要的形狀。它做的事主要是<strong>聚合（aggregation）</strong>：一個請求進來，在伺服器端呼叫多個下游、組合結果。App 只要一次往返，伺服器之間的呼叫在同一個資料中心裡，每次只要幾毫秒。</p>
+<p>你在第 2–7 課寫的 GraphQL 伺服器就是一個 BFF：前端用查詢決定形狀，resolver 去各個下游拿資料。BFF 通常由<strong>前端團隊擁有</strong>：前端要改畫面時，不用排隊等後端團隊改 API。</p>
+<p>BFF 有兩個常見的風險：</p>
+<ul>
+  <li><strong>長出商業邏輯</strong>：「九折」寫在 App 的 BFF，POS 的 BFF 沒寫，兩邊價格不一樣。BFF 只做組合與轉換，規則留在下游服務。</li>
+  <li><strong>BFF 太多</strong>：每個畫面一個 BFF，重複的程式碼與維運成本跟著變多。依「使用者體驗差很多的客戶端」分，常見是 App／官網共用一個、POS 一個；差不多的前端共用。</li>
+</ul>
+<p>什麼時候不需要 BFF：只有一個前端、後端只有一個服務時，前端直接呼叫那個服務就好，多一層只是多一個要部署、要監控的東西。</p>
+<div class="callout practice"><strong>💡 實務上：前端團隊擁有 BFF，也要負責它半夜壞掉</strong><br>工作上的 BFF 不一定叫這個名字：Next.js 的 Route Handler、Nuxt 的 server routes、一個專門給 App 用的 Node 服務，常常就是在做 BFF 的事。好處是改畫面不用等後端排進時程；代價是它變成正式的後端服務，要有 log、監控、告警，壞掉時前端團隊要能自己查、自己修。接手或提議加 BFF 前，先確認三件事：誰會被告警叫醒、它呼叫哪些下游、有沒有人偷偷把折扣或權限判斷寫在裡面。如果答不出來，先別再加一層。</div>
+
+<h2>聚合的可靠性：並行、預算與部分失敗</h2>
+<p>App 的菜單頁要的是「菜單加上每個商品還剩幾份」。菜單來自菜單服務（約 40 ms），庫存來自第 9 課的 gRPC 庫存服務（約 30 ms）。BFF 的 GraphQL 欄位：</p>
+<pre>type Query {
+  menuWithStock: [MenuItem!]!
+}
+type MenuItem {
+  id: ID!
+  name: String!
+  price: Int!
+  available: Int        # 為什麼可以是 null，下面會說
+}</pre>
+<p>練習的起始程式（<code>bff.ts</code>）是最直覺的寫法，它有三個問題：</p>
+<pre>const products = await ctx.menu.list(ctx.signal)                       // 先等菜單
+const stock = await ctx.inventory.listStock({}, { timeoutMs: 1000 })  // 再查庫存，逾時寫死
+return products.map(p => ({ ...p, available: stock.levels[p.id]?.available ?? null }))</pre>
+
+<h3>問題 1：依序呼叫，延遲相加</h3>
+<p>先 <code>await</code> 菜單再呼叫庫存，總時間是 40 + 30 = 70 ms。兩個呼叫彼此不需要對方的結果，可以同時出發，總時間是較慢的那個：40 ms。下游越多差越多。寫法是先呼叫拿到兩個 Promise，再一起等：</p>
+<pre>const menuCall = ctx.menu.list(ctx.signal)        // 呼叫就出發了，還沒 await
+const stockCall = ctx.inventory.listStock({}, …)  // 也出發了
+const [menu, stock] = await Promise.allSettled([menuCall, stockCall])</pre>
+<p>能不能並行取決於<strong>資料的依賴</strong>：如果庫存服務只有 <code>GetStock(product_ids)</code>，要先知道菜單有哪些商品才能查，就只能依序。所以這一課的 proto 比第 9 課多一個 <code>ListStock</code>：「列出所有商品的庫存」，不需要先知道商品 id。設計下游 API 時，想一下呼叫端能不能跟別的呼叫同時發；加一個 RPC 是安全的變更（第 10 課）。</p>
+
+<h3>問題 2：一個下游失敗，整個畫面失敗</h3>
+<p><code>Promise.all</code> 只要一個失敗就整個失敗；<code>Promise.allSettled</code> 等所有 Promise 都結束，回傳每一個的結果：<code>{ status: 'fulfilled', value }</code> 或 <code>{ status: 'rejected', reason }</code>。</p>
+<p>BFF 要分清楚哪個下游是<strong>必要</strong>的：沒有菜單，菜單頁沒有意義，菜單失敗就整個失敗；庫存是附加資訊，拿不到時菜單照樣顯示，只是「還剩幾份」變成「庫存資訊暫時無法取得」。多個下游中只有一部分失敗叫<strong>部分失敗（partial failure）</strong>，讓不必要的部分降級、其餘照常運作叫<strong>優雅降級（graceful degradation）</strong>。</p>
+<p>GraphQL 本身就能表達部分成功（第 3 課）：<code>available</code> 的 resolver 丟出錯誤，這個欄位變成 <code>null</code>，<code>errors</code> 多一筆帶著路徑的錯誤，其他欄位照常回傳。兩個細節：</p>
+<ul>
+  <li><strong>欄位要可為 null</strong>：如果寫成 <code>available: Int!</code>，null 會往上傳染，整個 <code>MenuItem</code> 變 null；而列表是 <code>[MenuItem!]!</code>，再往上傳染，最後 <code>data</code> 整個是 null，等於整個失敗。附加資料的欄位宣告成可為 null。</li>
+  <li><strong>錯誤訊息不寫內部細節</strong>：庫存服務的錯誤可能是「inventory-db-3.internal 連線被拒」，那是內部拓樸，前端看了也沒用。給前端固定的訊息與錯誤代碼（<code>INVENTORY_UNAVAILABLE</code>，放在<a href="05-pagination-errors.html">第 5 課</a>的 <code>extensions.code</code>，前端依代碼決定顯示什麼），原始錯誤寫進 log。</li>
+</ul>
+<p>在 <code>work/11</code> 執行 <code>node examples/bff.ts</code>（做完練習 1 之後），它開一個庫存服務和 BFF。用 <code>INVENTORY=down node examples/bff.ts</code> 讓庫存服務一律回 <code>UNAVAILABLE</code>，再查一次：</p>
+<pre>curl -s localhost:4000/graphql -H 'content-type: application/json' \
+  -d '{"query":"{ menuWithStock { name available } }"}'
+
+{"errors":[{"message":"庫存資訊暫時無法取得","path":["menuWithStock",0,"available"],
+            "extensions":{"code":"INVENTORY_UNAVAILABLE"}}, …每個商品一筆…],
+ "data":{"menuWithStock":[{"name":"美式咖啡","available":null},{"name":"拿鐵","available":null}, …]}}</pre>
+<p>HTTP 狀態仍是 200：執行階段的錯誤放在 <code>errors</code>，跟第 5 課一樣。<code>INVENTORY=slow</code> 讓庫存服務卡住不回應，BFF 在 300 ms 的預算內放棄，回傳一樣的結果。</p>
+<div class="callout practice"><strong>💡 實務上：「哪些下游是必要的」要在開發前跟 PM、設計講好</strong><br>部分失敗不只是後端的寫法，畫面也要跟著設計：庫存拿不到時，「加入購物車」按鈕要不要停用？顯示「庫存資訊暫時無法取得」還是乾脆不顯示數字？這些是產品決定，不該等上線出事才由工程師臨時決定。實務上會在需求討論時列出每個區塊的資料來源，逐一標「必要」或「可降級」，並確認設計稿有降級狀態。前端的元件也要真的處理 <code>available</code> 為 null 加上 <code>errors</code> 的情況，不能只寫拿得到資料的路徑。</div>
+
+<h3>問題 3：逾時寫死，不看剩下多少時間</h3>
+<p>App 對 BFF 的請求有一個總預算，例如 500 ms（系統設計課第 8 課的 deadline 預算）。BFF 開始處理時記下 <code>deadline = now() + 500</code>，之後每呼叫一個下游，就用「剩下的時間」當它的逾時：</p>
+<pre>timeoutMs = ctx.deadline − ctx.now() − 20</pre>
+<p>扣掉的 20 ms 留給 BFF 自己組回應、送回客戶端。寫死 1000 ms 的問題是：客戶端只願意等 500 ms，BFF 卻等庫存等到 1000 ms，客戶端早就放棄了，這段時間的工作全部白做，還佔著連線。</p>
+<p>剩下的時間不夠時（算出來 &lt;= 0）就<strong>不要呼叫</strong>，直接當成庫存失敗。注意 Connect 的 <code>CallOptions.timeoutMs</code> 設成 0 或負數代表「不設逾時」（<code>@connectrpc/connect</code> 2.3.0 的型別註解：Set to &lt;= 0 to disable the default timeout），直接把負數傳下去會變成永遠等。</p>
+<p>測試裡的時間一律用注入的 <code>ctx.now()</code>：測試把時鐘停住，剩餘預算才會是精確的數字，跟機器快慢無關。</p>
+<div class="callout">還有一層防護：庫存服務持續掛掉時，每個菜單請求都還是會試一次、等到逾時。<strong>斷路器（circuit breaker）</strong>（<a href="../../system-design/lessons/11-circuit-breaker-bulkhead.html">系統設計課第 11 課</a>）在連續失敗後暫時不呼叫，直接走降級，等一段時間再試。這一課只做 deadline，斷路器第 12 課的專題可以加。BFF 也不要自己重試到超過預算：重試的次數與間隔都要從同一個預算裡扣。</div>
+
+<h2>metadata：request id 與標頭往下傳</h2>
+<p>一個 App 請求會經過 gateway、BFF、庫存服務，每一層都寫 log。出事時要把同一個請求在三個服務的 log 串起來，靠的是 <strong>request id</strong>：每一層都把收到的 id 帶給下一層，log 裡也印出它（<a href="../../devops/lessons/21-logs.html">DevOps 課第 21 課</a>；分散式追蹤用的 trace context 是同一個做法的進階版）。gRPC 的 <strong>metadata</strong> 就是 HTTP 標頭（第 9 課）：Connect 的 client 用 <code>CallOptions.headers</code> 送，伺服器的 handler 從 <code>ctx.requestHeader</code> 讀。</p>
+<p>BFF 往下傳什麼要用<strong>白名單</strong>：</p>
+<div class="table-wrap"><table>
+<thead><tr><th>標頭</th><th>轉送？</th><th>原因</th></tr></thead>
+<tbody>
+<tr><td><code>x-request-id</code></td><td>要</td><td>串 log。進來有就沿用；沒有就產生一個，<strong>同一個請求只產生一次</strong>，這個請求的每個下游呼叫共用</td></tr>
+<tr><td><code>authorization</code></td><td>要（原樣）</td><td>下游服務自己做授權時要知道是誰（gateway 只做第一道檢查）</td></tr>
+<tr><td><code>cookie</code></td><td>不要</td><td>裡面可能有 session 等憑證，送進內部服務就可能被印進 log、被別的程式讀到</td></tr>
+<tr><td><code>content-type</code>、<code>content-length</code>、<code>host</code>…</td><td>不要</td><td>描述的是「客戶端到 BFF」那個請求；整包轉送會蓋掉 gRPC 請求自己的值，呼叫直接壞掉</td></tr>
+</tbody></table></div>
+<p>「每次下游呼叫各自產生新的 id」是常見的錯誤：同一個 GraphQL 請求的兩次庫存呼叫拿到兩個不同的 id，log 就串不起來。把 id 存在這個請求的 context 上（<code>ctx.requestId ??= …</code>，<code>??=</code> 是「左邊是 null 或 undefined 才指定」），之後的呼叫沿用。練習 2 把練習 1 的 <code>timeoutMs</code> 計算也收進同一個函式，BFF 每次呼叫下游都用它。</p>
+<div class="callout practice"><strong>💡 實務上：把 request id 給到客服手上</strong><br>客服轉來「早上 10 點點拿鐵失敗」，沒有 request id 時只能靠時間與使用者去翻好幾個服務的 log，常常對不起來。常見的做法是錯誤畫面或錯誤回應裡帶上 request id（例如「查詢編號：a1b2c3」，別跟 <code>INVENTORY_UNAVAILABLE</code> 這種錯誤代碼混在一起），使用者截圖給客服，工程師拿它一次查出 gateway、BFF、庫存服務各自發生了什麼。上線前可以自己測一次：故意讓下游失敗，看能不能只用畫面上的 id 在 log 系統裡把整條路串起來。request id 只是用來查 log 的隨機編號，不要放使用者資料進去。</div>
+
+<h2>瀏覽器怎麼呼叫 gRPC</h2>
+<p>POS 是一個網頁，要直接查庫存。瀏覽器支援 HTTP/2，但原生 gRPC 還是用不了：gRPC 把呼叫結果的狀態碼放在 <strong>HTTP trailers</strong>（回應 body 之後才送的標頭），瀏覽器的 <code>fetch</code> 讀不到 trailers，也不讓網頁控制 HTTP/2 的細節。所以要換一種瀏覽器可以用的協定：</p>
+<div class="table-wrap"><table>
+<thead><tr><th>做法</th><th>怎麼運作</th><th>代價</th></tr></thead>
+<tbody>
+<tr><td><strong>gRPC-Web</strong></td><td>gRPC 的變體，把狀態碼移到回應 body 的最後；瀏覽器用 gRPC-Web 的 client 呼叫</td><td>多數 gRPC 伺服器不直接支援，要在前面放 Envoy 之類的代理轉換；請求是二進位，curl 不好測</td></tr>
+<tr><td><strong>Connect 協定</strong></td><td>Buf 定義的 HTTP 協定，unary 就是一般的 <code>POST</code> + JSON（或二進位 protobuf）；Connect 的伺服器同時接受 Connect、gRPC、gRPC-Web 三種協定</td><td>伺服器要用 Connect 的實作（Node、Go、Swift、Kotlin…）；別的語言的 gRPC 伺服器要換或加代理</td></tr>
+<tr><td><strong>grpc-gateway</strong></td><td>Go 生態的工具：在 proto 寫 <code>google.api.http</code> 註解（例如 <code>get: "/v1/stock/{product_id}"</code>），產生 REST/JSON 的反向代理</td><td>要 Go 與多一個程序；適合對外提供「看起來像 REST」的 API</td></tr>
+</tbody></table></div>
+<p>這門課的庫存服務是用 Connect 寫的，<code>connectNodeAdapter</code> 開在 HTTP/2 時三種協定都收；開在一般的 HTTP/1.1（<code>http.createServer</code>）時，gRPC 協定不能用，Connect 與 gRPC-Web 可以（Connect 官方文件 Node 伺服器頁的相容性表，<code>@connectrpc/connect-node</code> 2.3.0）。在 <code>work/11</code> 執行 <code>node examples/serve-json.ts</code>，用 curl 呼叫看看：</p>
+<pre>curl -s localhost:4000/coffee.inventory.v1.InventoryService/GetStock \
+  -H 'content-type: application/json' -d '{"productIds":["1","5"]}'
+{"levels":{"1":{"productId":"1","available":12},"5":{"productId":"5"}}}
+
+curl -s -i localhost:4000/coffee.inventory.v1.InventoryService/GetStock \
+  -H 'content-type: application/json' -d '{"productIds":["99"]}'
+HTTP/1.1 404 Not Found
+content-type: application/json
+
+{"code":"not_found","message":"找不到商品 99"}</pre>
+<p>從輸出可以讀出 Connect 協定 unary 的規則（connectrpc.com/docs/protocol）：</p>
+<ul>
+  <li><strong>路徑</strong>是 <code>/&lt;package&gt;.&lt;Service&gt;/&lt;Method&gt;</code>，大小寫要一樣，不是 REST 風格的 <code>/stock</code>。方法一律 <code>POST</code>，<code>Content-Type</code> 是 <code>application/json</code> 或 <code>application/proto</code>。建議加 <code>Connect-Protocol-Version: 1</code>：伺服器可以設定成沒帶就拒絕（Connect 的 <code>requireConnectProtocolHeader</code> 選項，預設不要求）。</li>
+  <li><strong>JSON 欄位名</strong>是 proto 欄位名的小駝峰（<code>product_ids</code> → <code>productIds</code>），伺服器兩種都接受。<strong>預設值會被省略</strong>：可頌的庫存是 0，回應裡就沒有 <code>available</code>（proto3 的 JSON 對應不輸出預設值），讀的時候要把「沒有」當成 0。</li>
+  <li><strong>錯誤</strong>是非 200 的 HTTP 狀態加上 JSON body <code>{ "code", "message" }</code>，<code>code</code> 是小寫蛇形（<code>not_found</code>、<code>unavailable</code>）。錯誤的種類要讀 <code>code</code>：HTTP 狀態碼是好幾個 code 共用的，400 可能是 <code>invalid_argument</code>、<code>failed_precondition</code> 或 <code>out_of_range</code>，500 可能是 <code>internal</code>、<code>unknown</code> 或 <code>data_loss</code>。</li>
+</ul>
+<p>實際的 Vue 專案不會手寫 fetch，而是用 <code>@connectrpc/connect-web</code>（2.3.0）的 transport 加上 buf 產生的程式碼，拿到跟第 9 課一樣有型別的 client（這門課的練習資料夾沒有安裝它，這裡只看寫法）：</p>
+<pre>import { createClient } from '@connectrpc/connect'
+import { createConnectTransport } from '@connectrpc/connect-web'
+import { InventoryService } from './gen/coffee/inventory/v1/inventory_pb.js'
+
+const transport = createConnectTransport({ baseUrl: 'https://pos-api.coffee.tw' })
+const inventory = createClient(InventoryService, transport)
+const { levels } = await inventory.getStock({ productIds: ['1', '5'] })   // levels['5'].available 是 0，已經幫你補好</pre>
+<p>練習 3 刻意不用它，只用 <code>fetch</code>：證明瀏覽器不需要任何 gRPC 的東西，也看清楚線路上傳的是什麼。網頁和 API 不同網域時還要設 CORS（<a href="../../auth/lessons/05-same-origin-cors.html">Auth 課第 5 課</a>）：<code>Content-Type: application/json</code> 與 <code>Connect-Protocol-Version</code> 都會觸發預檢請求，<code>@connectrpc/connect</code> 匯出的 <code>cors.allowedMethods</code>、<code>cors.allowedHeaders</code>、<code>cors.exposedHeaders</code> 列好了要允許的值，加進你的 CORS 設定就好。</p>
+<p>為咖啡店選：POS 是自己的網頁、庫存服務已經用 Connect 寫，選 Connect 協定，不用多一個代理。如果庫存服務是別的語言的原生 gRPC 伺服器、又不能換，才考慮 gRPC-Web 加 Envoy；要給外部合作夥伴 REST，可以考慮 grpc-gateway 或另外寫公開 REST。</p>
+
+<h2>GraphQL federation（概念）</h2>
+<p>公司再長大，一個 GraphQL BFF 由很多團隊一起改：訂單團隊改訂單的型別、會員團隊改會員的型別，大家擠在同一個 repo、同一個部署流程。<strong>GraphQL federation</strong> 讓每個團隊各自擁有一個<strong>子圖（subgraph）</strong>：一個獨立部署的 GraphQL 服務，只定義自己負責的型別與欄位。前面放一個 <strong>router</strong>（例如 Apollo Router、Hive Gateway）把所有子圖組成一個完整的 schema；查詢進來時，router 算出要問哪些子圖、依什麼順序，再把結果合起來。</p>
+<p>它解決的是<strong>組織</strong>的問題（很多團隊、各自部署），不是效能問題。代價：</p>
+<ul>
+  <li>多一個 router 要部署、監控、升級，而且它是所有流量的必經之路。</li>
+  <li>跨子圖的查詢會被拆成好幾次子圖呼叫，延遲與 N+1 的問題（第 4 課）跨服務出現，比較難查。</li>
+  <li>子圖之間的型別要協調（誰擁有 <code>Product</code>、誰只是擴充它），要搭配 schema registry 與組合檢查（第 10 課）。</li>
+</ul>
+<p>咖啡店只有一個前端團隊、一個 BFF，不需要 federation。判斷的訊號是：好幾個團隊頻繁因為同一個 GraphQL 服務互相等待、互相卡部署。</p>
+
+<h2>決策：咖啡店的架構寫成 ADR</h2>
+<p>把這一課的決定寫成 ADR（架構決策紀錄，<a href="01-choosing-api-styles.html">第 1 課</a>與<a href="../../system-design/lessons/18-design-docs-adr.html">系統設計課第 18 課</a>），一年後有人問「為什麼 POS 不經過 BFF」，答案在文件裡：</p>
+<pre># ADR-007：對外入口與前端整合方式
+
+## 情境
+四種客戶端（App、官網、POS、外送平台）；三個服務（訂單、庫存 gRPC、會員）。
+認證、CORS、限流在每個服務各做一次；App 菜單頁要三次往返。
+
+## 決定
+1. Nginx 當 API gateway：TLS、路由、JWT 驗簽、依 IP 與 API key 限流、產生 X-Request-Id。
+   不放商業規則；物件層級授權留在各服務。
+2. App 與官網共用一個 GraphQL BFF（前端團隊擁有）：並行呼叫下游、500 ms 預算、
+   庫存失敗時 available 為 null 並帶 INVENTORY_UNAVAILABLE。只轉送 x-request-id 與 authorization。
+3. POS 用 Connect 協定直接呼叫庫存服務（同一個伺服器，不加代理）。
+4. 外送平台用公開 REST + webhook（第 1 課），有版本號。
+
+## 不選的
+- 每個前端直接呼叫每個服務：認證重複、前端綁死內部拓樸。
+- gRPC-Web + Envoy：庫存服務已經是 Connect，多一個代理沒有好處。
+- GraphQL federation：只有一個前端團隊，router 的維運換不到好處。團隊超過三個、常互相卡部署時再評估。
+
+## 後果
+gateway 是單點：至少兩個實例。BFF 要監控每個下游的錯誤率與延遲。</pre>
+
+<h2>練習</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs api-styles 11</code>，三題都在 <code>api-styles/practice/work/11/</code>（還沒安裝套件的話，先照<a href="02-graphql-schema-queries.html">第 2 課</a>開頭的步驟 <code>npm install</code>）。<code>inventory.ts</code>（第 9 課的庫存服務加上 <code>ListStock</code>）與 <code>server.ts</code>（用你的 resolver 建立 BFF）是課程提供的，不用改；<code>gen/</code> 每次跑測試前會依 <code>proto/</code> 重新產生。三題的測試各自獨立，可以不按順序做。</p>
+
+<div class="local" data-test="ex1" data-files="bff.ts schema.graphql">
+  <p>練習 1：改寫 <code>bff.ts</code> 的 <code>Query.menuWithStock</code>，並修改 <code>schema.graphql</code>。要求：菜單（<code>ctx.menu.list(ctx.signal)</code>）與庫存（<code>ctx.inventory.listStock</code>）同時出發；庫存的 <code>timeoutMs</code> 是 <code>ctx.deadline − ctx.now() − MIN_BUDGET_MS</code>，算出來 &lt;= 0 時不呼叫、直接當成失敗；庫存失敗（錯誤、逾時、預算不夠）時菜單照常回傳，每個商品的 <code>available</code> 放 <code>inventoryUnavailable()</code>（課程寫好的 <code>MenuItem.available</code> resolver 會把它丟出來，GraphQL 把欄位設成 null 並記下路徑）；菜單失敗時整個欄位失敗。測試用真的 Connect 庫存服務：每次菜單順序、價格、庫存數字都不同；會檢查兩個下游在任何一個完成前都已經出發、送出的逾時剛好是剩餘預算減 20、庫存服務卡住或回 <code>UNAVAILABLE</code> 時的 <code>data</code> 與 <code>errors</code>、菜單服務失敗時整個欄位失敗（不是回空陣列），以及錯誤細節沒有洩漏到回應。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="metadata.ts">
+  <p>練習 2：完成 <code>metadata.ts</code>。<code>downstreamOptions(ctx, now)</code> 回傳 BFF 呼叫庫存服務用的 <code>CallOptions</code>：<code>timeoutMs</code> 是 <code>ctx.deadline − now() − MIN_BUDGET_MS</code>；<code>headers</code> 只放 <code>x-request-id</code>（沿用 <code>ctx.headers</code> 裡的；沒有時呼叫 <code>ctx.newId()</code>，同一個請求只產生一次並存在 <code>ctx.requestId</code>）與 <code>authorization</code>（有才放，原樣轉送）。<code>callerOf(ctx)</code> 在庫存服務端從 <code>ctx.requestHeader</code> 讀回 <code>{ requestId, hasAuth }</code>。測試的 BFF 每個 GraphQL 請求呼叫庫存服務兩次，會送 <code>cookie</code> 與其他標頭，檢查庫存服務收到什麼。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="connect-json.ts">
+  <p>練習 3：完成 <code>connect-json.ts</code>。<code>createJsonServer(stock)</code> 用 <code>http.createServer</code>（HTTP/1.1）加 <code>connectNodeAdapter</code> 開出 <code>inventory.ts</code> 的 <code>inventoryRoutes</code>。<code>fetchStockJson(baseUrl, ids)</code> 只用 <code>fetch</code>，以 Connect 協定呼叫 <code>GetStock</code>：成功回傳 <code>{ levels: { 商品 id: 剩幾份 } }</code>（庫存 0 的商品也要有，值是 0）；失敗回傳 <code>{ code }</code>，code 是錯誤 JSON 裡的值。測試會檢查請求的方法、路徑與 Content-Type，用跟別的 code 共用 HTTP 狀態碼的錯誤測試 code，並確認檔案裡沒有用任何 Connect 的 client 或 transport。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 4：gateway 已經驗證了 JWT，訂單服務還要檢查「這張訂單屬於這位顧客」嗎？</p>
+  <label data-key="a">不用，gateway 檢查過了</label>
+  <label data-key="b">要：gateway 只知道是誰（認證），訂單屬於誰要查訂單資料，只有訂單服務知道</label>
+  <label data-key="c">交給前端，只顯示自己的訂單</label>
+  <label data-key="d">只有寫入操作要檢查</label>
+  <p class="why">✓ gateway 適合做認證與粗粒度的檢查。物件層級授權（BOLA，Auth 課第 19 課）需要資料，必須在擁有資料的服務裡做；內部的程式也可能不經過 gateway 直接呼叫。前端隱藏擋不住直接送請求的人（c 錯）；讀取一樣會洩漏資料（d 錯）。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：BFF 同時需要菜單與庫存。庫存服務掛了，最好的行為是？</p>
+  <label data-key="a">整個請求回錯誤，讓前端顯示「系統忙碌中」</label>
+  <label data-key="b">菜單照常回傳，庫存欄位為 null 並在 errors 標示，前端顯示「庫存資訊暫時無法取得」</label>
+  <label data-key="c">一直重試直到庫存服務恢復</label>
+  <label data-key="d">回傳上次查到的庫存，當成最新的</label>
+  <p class="why">✓ 不必要的下游失敗不該拖垮整個畫面。GraphQL 的部分成功與可為 null 的欄位正好表達這件事。a 讓顧客連菜單都看不到；c 會超過客戶端願意等的時間，還加重庫存服務的負擔；d 可能讓顧客點到已經賣完的商品，要用舊資料就要明確標示時間。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：瀏覽器為什麼不能用 <code>fetch</code> 直接呼叫原生 gRPC？</p>
+  <label data-key="a">瀏覽器不支援 HTTP/2</label>
+  <label data-key="b">gRPC 的狀態碼放在 HTTP trailers，<code>fetch</code> 讀不到 trailers，也不能控制 HTTP/2 的細節；所以要 gRPC-Web、Connect 或 gateway 轉換</label>
+  <label data-key="c">gRPC 是二進位格式，瀏覽器不能處理二進位</label>
+  <label data-key="d">CORS 不允許 POST</label>
+  <p class="why">✓ 瀏覽器支援 HTTP/2，<code>fetch</code> 也能收送二進位（<code>ArrayBuffer</code>），問題在讀不到 trailers。gRPC-Web 把狀態移到回應 body；Connect 協定的 unary 就是普通的 POST，錯誤用 HTTP 狀態加 JSON。CORS 允許 POST，只是需要正確的預檢回應（d 錯）。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>把商業邏輯放進 gateway</strong>：難測試、難部署，所有服務被它綁住。gateway 只做橫切關注，規則放在擁有資料的服務。</li>
+  <li><strong>只在 gateway 做授權</strong>：gateway 不知道資料屬於誰，內部呼叫也可能繞過它。服務自己做物件層級授權。</li>
+  <li><strong>BFF 依序呼叫互不依賴的下游</strong>：延遲相加。先發出所有呼叫，再用 <code>Promise.allSettled</code> 一起等。</li>
+  <li><strong>一個下游失敗就整個失敗</strong>：分清楚必要與附加的下游；附加資料的欄位宣告成可為 null，失敗時回 null 並帶錯誤代碼。</li>
+  <li><strong>欄位宣告成非 null 卻可能失敗</strong>：null 往上傳染，整個列表、甚至整個 <code>data</code> 變 null。</li>
+  <li><strong>下游逾時寫死</strong>：客戶端早就放棄了，BFF 還在等。每個下游用「剩餘預算 − 保留時間」，算出來 &lt;= 0 就不呼叫（Connect 的 <code>timeoutMs</code> &lt;= 0 代表不設逾時）。</li>
+  <li><strong>把下游的錯誤訊息原樣給前端</strong>：洩漏內部主機名稱與架構。給固定訊息與錯誤代碼，細節寫 log。</li>
+  <li><strong>把進來的標頭整包轉給下游</strong>：cookie 流進內部服務與 log，<code>content-type</code> 之類的還會弄壞請求。用白名單，只轉送 request id、authorization。</li>
+  <li><strong>每次下游呼叫各自產生 request id</strong>：同一個請求的 log 串不起來。一個請求只產生一次。</li>
+  <li><strong>每個前端團隊一個 BFF，各自實作同一套規則</strong>：價格、折扣在兩個 BFF 算出不同結果。規則放在下游服務。</li>
+  <li><strong>Connect 錯誤只看 HTTP 狀態碼</strong>：好幾個 code 共用一個狀態碼。讀 body 的 <code>code</code>。</li>
+  <li><strong>小團隊導入 federation</strong>：多一個 router 要維運，換不到好處。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>API gateway 是外部流量的入口：TLS、路由、認證的第一道檢查、限流、request id、log 與指標；不放商業邏輯，物件層級授權留在服務裡。</li>
+  <li>BFF 為某一種前端聚合多個下游，由前端團隊擁有；GraphQL 伺服器常扮演這個角色。BFF 只做組合與轉換，規則留在下游。</li>
+  <li>可靠的聚合：互不依賴的下游並行呼叫；每個下游的逾時從同一個 deadline 預算計算，不夠就不呼叫；附加資料失敗時降級（欄位可為 null、錯誤代碼、不洩漏細節）。</li>
+  <li>往下游只轉送需要的標頭：request id 一個請求只產生一次並共用，authorization 原樣轉送，cookie 不轉送。</li>
+  <li>瀏覽器讀不到 HTTP trailers，不能直接呼叫原生 gRPC。可以用 gRPC-Web（通常要代理）、Connect 協定（POST + JSON，路徑 <code>/package.Service/Method</code>，錯誤是 <code>{ code, message }</code>，預設值會被省略），或用 grpc-gateway 產生 REST。</li>
+  <li>GraphQL federation 解決多團隊共用一個 graph 的組織問題，代價是 router 的維運與跨子圖的複雜度；團隊少時不需要。</li>
+</ul>
+<p>下一課是期末專題：把整門課的 GraphQL 菜單與訂單歷史、gRPC 庫存服務、BFF 與契約測試組成一個完整的咖啡店後端。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>5. RLS 常見模式：多租戶、角色、security definer、view 與漏洞清單</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="5" data-practice="supabase">
+<header>
+  <div class="eyebrow">階段 2：權限：Row Level Security · 第 5 課</div>
+  <h1>RLS 常見模式：多租戶、角色、security definer、view 與漏洞清單</h1>
+</header>
+<main>
+
+<p>咖啡店開了三家分店：台北車站店、台中公園店、高雄港店。需求變成：店員只能看自己分店的訂單，也要看得到同分店的同事排班；店長看全部分店；會計要一張「每家分店營業額」的報表。上一課的擁有者 policy（<code>customer_id = auth.uid()</code>）不夠用了，訂單不屬於某個人，而是屬於某家分店。</p>
+<p>同事很快寫好了，上線一週後出了三件事：店員頁面跳出 <code>infinite recursion detected in policy</code>；有個顧客在註冊表單多送了一個欄位，就成了「店長」；報表的 view 讓任何登入的人都看得到三家店的營業額。這一課把這三個模式的正確寫法講完，最後整理成一份上線前要逐條檢查的漏洞清單，和測 RLS 的方法。</p>
+
+<div class="callout"><strong>這課的路線</strong>
+<ul>
+  <li>多租戶：用成員表決定看得到哪些分店，以及它為什麼會無限遞迴。</li>
+  <li>security definer 函式：打破遞迴，同時關好三扇門（不公開的 schema、鎖 search_path、收回執行權限）。</li>
+  <li>角色放 app_metadata：為什麼 user_metadata 一定不行。</li>
+  <li>view 與 restrictive policy：預設繞過 RLS 的 view，以及「再加一道限制」的 policy。</li>
+  <li>漏洞清單與怎麼測 RLS。</li>
+</ul></div>
+
+<div class="callout"><strong>這課會用到：</strong>第 4 課的擁有者 policy（<code>for select to authenticated using (customer_id = (select auth.uid()))</code>）和在 SQL 裡模擬請求（<code>set local role</code>＋<code>set_config('request.jwt.claims', …)</code>）；多租戶的觀念（一套系統服務很多個組織，每筆資料都要標記屬於哪個組織，<a href="../../auth/lessons/20-multi-tenancy.html">認證課第 20 課</a>）；view 與函式（<a href="../../postgresql/lessons/23-views-functions-triggers.html">PostgreSQL 課第 23 課</a>）。</div>
+
+<div class="callout warn"><strong>環境</strong>：這課用到資料庫、gateway、Data API、Auth（db、kong、rest、auth）。練習的表建在你專屬的 schema；你的 SQL 照正式專案寫 <code>public.表名</code>、<code>private.函式名</code>，判分時測試會換成你專屬的 schema 名稱。</div>
+
+<h2>多租戶：用成員表決定看得到哪些分店</h2>
+<p>「訂單屬於分店、人屬於分店」的資料模型：每張訂單有 <code>store_id</code>，另一張成員表記錄誰是哪家分店的人。這是多租戶（multi-tenant）最常見的形狀，分店換成公司、團隊、專案都一樣：</p>
+<pre>create table public.store_members (
+  store_id integer not null references public.stores (id),
+  user_id  uuid    not null,                -- Auth 使用者的 id
+  role     text    not null default 'staff',
+  primary key (store_id, user_id)
+);
+create index on public.store_members (user_id);</pre>
+<p>訂單的 policy 就是「這張訂單的分店，在我所屬的分店裡」：</p>
+<pre>create policy "看得到自己分店的訂單" on public.orders for select to authenticated
+  using (store_id in (
+    select store_id from public.store_members where user_id = (select auth.uid())
+  ));</pre>
+<p>policy 裡的子查詢也照樣受權限檢查：它以發請求的角色執行，所以 <code>store_members</code> 要 GRANT select 給 authenticated，而且開了 RLS 的話，也要有讓人看到「自己那幾列成員資料」的 policy。到這裡都還正常。</p>
+
+<h3>無限遞迴：policy 查自己</h3>
+<p>需求的第二句是「看得到同分店的同事」，所以 store_members 的 policy 寫成「這一列的分店，在我所屬的分店裡」，而「我所屬的分店」又要查 store_members：</p>
+<pre>create policy "看得到同分店的同事" on public.store_members for select to authenticated
+  using (store_id in (
+    select store_id from public.store_members where user_id = (select auth.uid())
+  ));</pre>
+<p>店員一查就得到 <code>42P17 infinite recursion detected in policy for relation "store_members"</code>。原因：讀 store_members 要套用這個 policy，policy 裡又讀了 store_members，又要套用這個 policy……Postgres 偵測到循環就直接報錯。orders 的 policy 也會因為子查詢讀了 store_members 而一起壞掉。要打破循環，就要讓「查我屬於哪些分店」那一步不再套用 RLS，這就是下一節的 security definer 函式。</p>
+
+<h2>security definer 函式：打破遞迴，關好三扇門</h2>
+<p>函式預設是 <code>security invoker</code>：以呼叫的人的身分執行，裡面的查詢照樣套用呼叫者的 RLS。宣告成 <code>security definer</code> 後，函式以<strong>擁有者</strong>的身分執行。在 Supabase 用 SQL 建的函式擁有者是 <code>postgres</code>，它是表的擁有者、不受 RLS 限制，所以函式裡讀 store_members 不會再觸發 policy，遞迴就斷了：</p>
+<pre>create function private.my_store_ids()
+returns setof integer
+language sql
+stable                    -- 同一個查詢裡結果不變，Postgres 可以少呼叫幾次
+security definer          -- 以擁有者（postgres）身分執行，不套用 RLS
+set search_path = ''      -- 鎖住名稱解析，下面的表都寫完整的 schema
+as $$
+  select store_id from public.store_members where user_id = (select auth.uid())
+$$;
+
+revoke execute on function private.my_store_ids() from public;
+grant usage on schema private to authenticated;
+grant execute on function private.my_store_ids() to authenticated;
+
+create policy "看得到同分店的同事" on public.store_members for select to authenticated
+  using (store_id in (select private.my_store_ids()));
+create policy "看得到自己分店的訂單" on public.orders for select to authenticated
+  using (store_id in (select private.my_store_ids()));</pre>
+<p>函式只回傳「我」的分店（條件裡有 <code>auth.uid()</code>），所以繞過 RLS 也不會多給什麼。但 security definer 等於一扇不受 RLS 管的門，這段程式有三個地方都是為了把門關好：</p>
+<ol>
+  <li><strong>放在不公開的 schema</strong>（這裡叫 <code>private</code>）。PostgREST 只公開 <code>config.toml</code> 的 <code>[api] schemas</code> 列出的 schema（預設 <code>public</code>），而<strong>公開 schema 裡的函式都能用 <code>supabase.rpc('函式名')</code> 從 API 呼叫</strong>。放在 public，任何人都能直接呼叫這個繞過 RLS 的函式；如果函式是「查某家分店的所有成員」這種接受參數的，就是一個現成的資料外洩點。</li>
+  <li><strong><code>set search_path = ''</code></strong>。函式裡寫 <code>store_members</code> 沒加 schema 時，Postgres 依 <code>search_path</code> 找；不鎖的話，函式會用呼叫者當下的 search_path，有心人能在自己可寫的 schema 建一個同名的表或函式，讓這個以 postgres 身分執行的函式去用它。鎖成空字串之後，裡面每個名稱都要寫完整（<code>public.store_members</code>、<code>auth.uid()</code>）。</li>
+  <li><strong>收回預設的執行權限</strong>。Postgres 預設讓所有角色（<code>PUBLIC</code>）都能執行新函式，Supabase 2026 年的新預設只收了表、沒有收函式（本機實測：在 public 新建的函式，anon 能執行）。<code>revoke … from public</code> 再只 grant 給需要的 authenticated。另外 policy 是以呼叫者身分評估的，authenticated 也要有 private 這個 schema 的 usage。</li>
+</ol>
+<div class="callout practice"><strong>💡 實務上：security definer 函式要當成對外的 API 來審</strong><br>專案裡每一個 security definer 函式，審的時候都問：它在哪個 schema（會不會被 rpc 叫到）、search_path 鎖了沒、誰能執行、參數能不能讓呼叫者查到不屬於自己的資料。Security Advisor 會標出沒鎖 search_path 的函式（<code>function_search_path_mutable</code>）。團隊慣例通常是：RLS 輔助函式一律放 <code>private</code>，要給前端呼叫的函式才放 public，而且預設寫成 security invoker。</div>
+
+<h2>角色放 app_metadata，不放 user_metadata</h2>
+<p>店長要看全部分店。「店長」是應用程式的角色，跟第 3 課的資料庫角色（<code>authenticated</code>）是兩回事：所有登入的人在資料庫裡都是 authenticated，「這個人是店長」要另外記在某個地方。Supabase 的使用者有兩包自訂資料，登入後都會出現在 JWT 裡：</p>
+<pre>{
+  "sub": "6f1c2a4e-…",
+  "role": "authenticated",                       ← 資料庫角色，不是店長
+  "app_metadata":  { "provider": "email", "role": "manager" },
+  "user_metadata": { "name": "陳美華" },
+  …
+}</pre>
+<div class="table-wrap"><table>
+  <tr><th></th><th><code>user_metadata</code></th><th><code>app_metadata</code></th></tr>
+  <tr><td>誰能改</td><td>使用者自己：<code>signUp({ options: { data } })</code>、<code>auth.updateUser({ data })</code></td><td>只有伺服器：用 secret key 的 admin API（<code>auth.admin.updateUserById</code>）</td></tr>
+  <tr><td>適合放</td><td>暱稱、頭像、偏好</td><td>角色、所屬方案、權限相關的一切</td></tr>
+</table></div>
+<p>開場那位「註冊就成了店長」的顧客，就是因為 policy 讀了 <code>user_metadata</code>：註冊 API 允許使用者自己帶 <code>data</code>，他多送了 <code>{ role: 'manager' }</code>。授權只能用使用者改不到的資料：</p>
+<pre>create policy "店長看全部訂單" on public.orders for select to authenticated
+  using (((select auth.jwt()) -&gt; 'app_metadata' -&gt;&gt; 'role') = 'manager');</pre>
+<p><code>auth.jwt()</code> 回傳整包 claims（jsonb），<code>-&gt;</code> 取出物件、<code>-&gt;&gt;</code> 取出文字。注意不要寫成 <code>auth.jwt() -&gt;&gt; 'role'</code>：最外層的 role 永遠是 authenticated。這個 policy 跟前面的「看得到自己分店的訂單」是兩個 permissive policy，任何一個成立就看得到（OR），所以店員和店長各走各的條件。</p>
+<p>JWT 的內容在簽發時就固定了：後台把某人升為店長後，他手上的 access token 還是舊的，要等下一次 refresh（最多 <code>jwt_expiry</code>，預設 3600 秒）才會看到新權限；反過來，撤銷店長也一樣有這段延遲。需要立即生效的權限（例如離職），改成查資料表（像前面的 store_members），而不是讀 JWT。</p>
+<div class="callout practice"><strong>💡 實務上：角色只有一個來源</strong><br>同一個專案裡，「誰是店長」常常同時出現在 app_metadata、profiles 表、store_members 的 role 欄位，最後三邊不一致，policy 各讀各的。先決定唯一的來源：要快、能接受延遲就放 app_metadata（第 6 課的 Custom Access Token Hook 能在簽發時從資料表算出來寫進 JWT）；要即時就查資料表。另外，多租戶的每一張表都直接帶 <code>store_id</code>，不要靠 JOIN 好幾層才知道一列屬於哪家店，policy 才寫得簡單、查得快。</div>
+
+<h2>view 預設繞過 RLS；restrictive policy 再加一道限制</h2>
+<p>會計的報表用 view 寫最方便：</p>
+<pre>create view public.store_report as
+  select store_id, count(*) as order_count, sum(total) as revenue
+  from public.orders group by store_id;
+grant select on public.store_report to authenticated;</pre>
+<p>任何登入的人查它都看到三家店的營業額。原因：view 預設以<strong>建立者</strong>的身分讀底下的表，跟 security definer 函式一樣；建立者是 postgres，orders 的 RLS 就沒有作用了。PostgreSQL 15 起可以讓 view 改用查詢者的身分：</p>
+<pre>create view public.store_report
+with (security_invoker = true)
+as select store_id, count(*) as order_count, sum(total) as revenue
+   from public.orders group by store_id;</pre>
+<p>加上之後，台北店的店員查報表只會看到台北店那一列：RLS 先把 orders 過濾成他看得到的，再做 group by。view 在 public 也會被 API 公開（<code>from('store_report')</code>），所以 GRANT 一樣只給需要的角色。view 的語法回顧 <a href="../../postgresql/lessons/23-views-functions-triggers.html">PostgreSQL 課第 23 課</a>。</p>
+
+<h3>restrictive policy：一定要同時成立的條件</h3>
+<p>到目前為止的 policy 都是 permissive（預設）：任何一個成立就放行。有時需要的是「不管其他 policy 怎麼說，這個條件一定要成立」，例如修改分店設定一定要通過兩步驟驗證（MFA，<a href="../../auth/lessons/14-mfa-totp.html">認證課第 14 課</a>）。使用者完成 MFA 後，JWT 的 <code>aal</code>（authenticator assurance level）會從 <code>aal1</code> 變成 <code>aal2</code>：</p>
+<pre>create policy "改分店設定要 MFA" on public.stores
+  as restrictive                       -- 跟其他 policy 是 AND，不是 OR
+  for update to authenticated
+  using (((select auth.jwt()) -&gt;&gt; 'aal') = 'aal2');</pre>
+<p>restrictive policy 不會單獨放行任何東西：還是要有一個 permissive 的 update policy（例如「店長能改自己的分店」）讓人過，restrictive 再把沒有 aal2 的請求擋掉。只有 restrictive、沒有 permissive，結果是誰都改不了。MFA 在 Supabase 的設定在第 6 課。</p>
+
+<h2>漏洞清單與怎麼測 RLS</h2>
+<p>把這兩課出現過的錯誤整理成一張表。上線前、接手專案時、審 migration 的 PR 時，逐條檢查。第 9 課的期末專題會用到這份清單：</p>
+<div class="table-wrap"><table>
+  <tr><th>漏洞</th><th>後果</th><th>正確做法</th></tr>
+  <tr><td>public 的表沒開 RLS</td><td>GRANT 給了什麼，每一列都能做</td><td>每張表 <code>enable row level security</code>（第 3 課）</td></tr>
+  <tr><td><code>using (true)</code>、只寫 <code>to authenticated</code></td><td>任何註冊的人看到全部</td><td>擁有者或成員條件（第 4 課）</td></tr>
+  <tr><td>WITH CHECK 比 USING 寬鬆</td><td>把資料轉給別人、冒名</td><td>WITH CHECK 寫一樣的擁有者條件（第 4 課）</td></tr>
+  <tr><td>用 <code>user_metadata</code> 判斷權限</td><td>使用者自己升級成店長</td><td>用 <code>app_metadata</code> 或資料表</td></tr>
+  <tr><td>security definer 函式放在 public、沒鎖 search_path、沒收回 execute</td><td>任何人能從 API 呼叫繞過 RLS 的函式</td><td>放 private、<code>set search_path = ''</code>、<code>revoke … from public</code></td></tr>
+  <tr><td>view 沒有 <code>security_invoker</code></td><td>透過 view 看到全部資料</td><td><code>with (security_invoker = true)</code></td></tr>
+  <tr><td>Storage 的 policy 漏寫</td><td>看到、覆蓋別人的檔案</td><td>第 7 課</td></tr>
+  <tr><td>secret key 外洩</td><td>所有 RLS 失效</td><td>只放伺服器，外洩就輪替（第 3 課）</td></tr>
+</table></div>
+<p>工具能抓到一部分：<code>npx supabase db advisors --type security</code>（CLI 3.1.0）會列出沒開 RLS 的表（<code>rls_disabled_in_public</code>）、繞過 RLS 的 view（<code>security_definer_view</code>）、沒鎖 search_path 的函式。但「條件寫錯」工具看不出來，要靠測試。</p>
+
+<h3>RLS 的測試怎麼寫</h3>
+<p>第 4 課學過在交易裡扮演使用者。把它變成測試，每張表至少測三件事：</p>
+<ol>
+  <li><strong>自己看得到</strong>：以 A 的身分查，筆數等於 A 該有的。</li>
+  <li><strong>別人看不到</strong>：以 A 的身分查 B 的資料（用 B 的 id 篩選），結果是空的。</li>
+  <li><strong>不能改成別人的</strong>：以 A 的身分新增或修改成 B 的 id，要得到 42501。</li>
+</ol>
+<p>再加上未登入（不設 claims）與特殊角色（店長、跨分店）各一組。寫法有兩種：像這門課的練習一樣，建真的使用者、用 supabase-js 從 API 打（最接近前端，也測到了 GRANT）；或寫成 SQL 測試放在 <code>supabase/tests/</code>，用 pgTAP（Postgres 的單元測試擴充套件）的 <code>is()</code>、<code>results_eq()</code> 斷言，<code>npx supabase test db</code> 執行，每個測試在交易裡跑完就 rollback。兩種都能放進 CI，重點是每加一個 policy 就加對應的測試。</p>
+<div class="callout practice"><strong>💡 實務上：權限的 bug 要先寫測試再修</strong><br>資安回報「店員能看到別家分店的訂單」時，先寫一個重現它的 RLS 測試（現在會失敗），再改 policy 讓它通過，測試留在 CI 裡防止有人改回去。多租戶專案特別值得投資：每新增一張帶 <code>store_id</code> 的表，複製一份「A 店的人看不到 B 店」的測試，比事後追查外洩便宜得多。</div>
+
+<h2>練習</h2>
+<p>三題的測試都會建 <code>stores</code>（3 家分店）與 <code>orders(id, store_id, customer_name, total)</code>：台北店 2 張、台中店 1 張、高雄店 1 張。你的 SQL 寫 <code>public.</code>、<code>private.</code> 前綴，判分時會換成你專屬的 schema；private schema 已經建好，不用 <code>create schema</code>。</p>
+
+<div class="local" data-test="ex1" data-files="ex1.sql">
+  <p>練習 1：在 <code>ex1.sql</code> 建 <code>store_members</code>（檔案裡已經寫好 create table），讓店員只看得到自己分店的訂單、看得到同分店的同事（不屬於任何分店的人什麼都看不到，沒登入也是）。「我屬於哪些分店」寫成 <code>private.my_store_ids()</code>：security definer、<code>set search_path = ''</code>、只有 authenticated 能執行，兩張表的 policy 都呼叫它。測試會用 3 位店員和 1 位外人的 JWT 從 API 讀，並檢查函式不在公開的 schema。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="ex2.sql">
+  <p>練習 2：測試已經開好 orders 的 RLS 與 GRANT，還沒有任何 policy。在 <code>ex2.sql</code> 寫一個 policy：<code>app_metadata</code> 的 <code>role</code> 是 <code>manager</code> 的人看得到全部訂單。測試會用三個人檢查：app_metadata 是店長的人、user_metadata 寫著 manager 的人，以及一個一般使用者先用 <code>updateUser</code> 把自己的 user_metadata 改成 manager、再拿新的 token 來讀。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="ex3.sql">
+  <p>練習 3：測試已經讓 orders 開好 RLS：店員只看得到 JWT 的 <code>app_metadata.store_id</code> 那家分店。在 <code>ex3.sql</code> 建報表 view <code>public.store_report(store_id, order_count, revenue)</code>（每家分店的訂單數與 total 加總），讓店員查它只看得到自己分店那一列，沒登入的人不能查。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 4：註冊表單送出 <code>supabase.auth.signUp({ email, password, options: { data: { role: 'manager' } } })</code>。這個人的權限會怎樣？</p>
+  <label data-key="a">註冊會失敗：一般使用者不能設定 role</label>
+  <label data-key="b">他的資料庫角色變成 manager，GRANT 給 authenticated 的權限都失效</label>
+  <label data-key="c"><code>app_metadata.role</code> 被設成 manager</label>
+  <label data-key="d"><code>user_metadata.role</code> 是 manager；只要有 policy 讀 user_metadata 判斷角色，他就成了店長</label>
+  <p class="why">✓ signUp 的 <code>data</code> 寫進 user_metadata，使用者之後也能用 updateUser 隨時改它，所以授權只能讀 app_metadata（只有伺服器的 admin API 改得到）或資料表。c 是最常見的誤會：app_metadata 使用者自己碰不到。b 錯在資料庫角色仍是 authenticated，JWT 最外層的 role 不受 data 影響。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 5：<code>create view public.store_report as select … from public.orders</code> 之後，orders 的 RLS 寫得很嚴格，店員卻從 API 查 store_report 看到了所有分店。為什麼？</p>
+  <label data-key="a">view 預設以建立者（postgres）的身分讀 orders，RLS 不會套用；要 <code>with (security_invoker = true)</code></label>
+  <label data-key="b">view 不能開 RLS，所以一定看得到全部</label>
+  <label data-key="c">PostgREST 查 view 時會改用 service_role</label>
+  <label data-key="d">view 的 GRANT 會覆蓋底下表的 RLS</label>
+  <p class="why">✓ view 的預設行為跟 security definer 一樣，用擁有者的權限讀底下的表；擁有者 postgres 不受 RLS 限制。加 <code>security_invoker</code> 讓它用查詢者的身分，orders 的 RLS 就會先過濾。b 錯在問題不是 view 自己要有 RLS，而是它讀表時用了誰的身分。c 錯在角色仍是 authenticated。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：RLS 的輔助函式 <code>my_store_ids()</code> 寫成 security definer 放在 public，條件也只回傳自己的分店。資安仍然要求移到 private schema，理由是？</p>
+  <label data-key="a">public 裡的函式不能被 policy 呼叫</label>
+  <label data-key="b">public 是 API 公開的 schema，裡面的函式都能用 <code>rpc()</code> 直接呼叫；繞過 RLS 的函式不該是對外的入口</label>
+  <label data-key="c">security definer 函式在 public 裡會變成 security invoker</label>
+  <label data-key="d">放在 private 才能鎖 search_path</label>
+  <p class="why">✓ PostgREST 公開 public 的表與函式，加上 Postgres 預設讓所有角色能執行新函式，任何人都叫得到它。這個函式今天只回傳自己的資料，下一個人改成接參數就成了外洩點；放 private、收回 execute 是縱深防禦。d 錯在 search_path 跟放在哪個 schema 無關，任何函式都要鎖。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>policy 查自己這張表</strong>：42P17 無限遞迴。把「我屬於哪些組織」包成 security definer 函式。</li>
+  <li><strong>security definer 函式放 public、沒鎖 search_path、沒收回 execute</strong>：它是不受 RLS 管的門，三件事都要做。</li>
+  <li><strong>用 <code>user_metadata</code> 判斷角色</strong>：使用者自己改得到。用 <code>app_metadata</code> 或資料表。</li>
+  <li><strong>讀 <code>auth.jwt() -&gt;&gt; 'role'</code> 當應用程式角色</strong>：最外層的 role 是資料庫角色 authenticated。</li>
+  <li><strong>以為改了 app_metadata 立刻生效</strong>：要等 token refresh；需要立即生效的權限查資料表。</li>
+  <li><strong>view 沒加 <code>security_invoker</code></strong>：以建立者身分讀表，繞過 RLS。</li>
+  <li><strong>只寫 restrictive policy</strong>：它只會再擋，不會放行；要搭配一個 permissive policy。</li>
+  <li><strong>只靠 advisor、不寫 RLS 測試</strong>：工具抓得到沒開 RLS，抓不到條件寫錯。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>多租戶：成員表 <code>store_members(store_id, user_id, role)</code>，policy 用 <code>store_id in (…我所屬的分店…)</code>；每張表都直接帶 store_id。</li>
+  <li>policy 查有 RLS 的自己會遞迴（42P17）：包成 <code>security definer</code> 函式，放 private schema、<code>set search_path = ''</code>、<code>revoke execute … from public</code> 再 grant 給 authenticated。</li>
+  <li>應用程式的角色放 <code>app_metadata</code>（只有伺服器改得到），用 <code>(select auth.jwt()) -&gt; 'app_metadata' -&gt;&gt; 'role'</code>；絕不用 user_metadata。JWT 要 refresh 才更新。</li>
+  <li>view 預設以建立者身分執行、繞過 RLS，加 <code>with (security_invoker = true)</code>。restrictive policy 與其他 policy 是 AND，例如 <code>aal = 'aal2'</code> 才能改設定。</li>
+  <li>漏洞清單：沒開 RLS、<code>using (true)</code>、WITH CHECK 太寬、user_metadata、security definer 放 public、view 沒 security_invoker、Storage policy 漏寫、secret key 外洩。用 advisors 掃，再用「自己看得到、別人看不到、不能改成別人的」寫 RLS 測試。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 7 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：顧客 A 把訂單網址的 id 改成 B 的訂單 id，API 回 <code>null</code>，而不是 403。面試官問：這樣的行為是好是壞、為什麼會這樣？</p>
+  <label data-key="a">不好：應該回 403 讓前端顯示沒有權限，回 null 代表 RLS 沒生效</label>
+  <label data-key="b">RLS 擋讀取時，那一列對 A 就像不存在；攻擊者分不出「沒這張訂單」和「不是你的」，代價是除錯時要記得「查不到」可能是 policy</label>
+  <label data-key="c">因為 GRANT 沒給，PostgREST 把 42501 轉成 null</label>
+  <label data-key="d">因為 supabase-js 在前端過濾掉了不屬於 A 的資料</label>
+  <p class="why">✓ USING 不符合的列會被過濾掉，讀取是空結果而不是錯誤。a 是最多人的直覺，但 null 正是 RLS 生效的樣子；真的沒權限碰這張表（GRANT）才是 42501。d 錯在過濾發生在資料庫裡，B 的資料根本沒離開資料庫。（第 4 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 8：下面的 policy 讓顧客「只看自己的訂單」。漏洞在哪？</p>
+<pre>create policy "顧客讀訂單" on orders for select to authenticated using (true);</pre>
+  <label data-key="a">沒有漏洞：<code>to authenticated</code> 已經限制只有登入的人</label>
+  <label data-key="b">應該寫 <code>to anon</code></label>
+  <label data-key="c">任何一個註冊過的帳號都能讀所有人的訂單：「有登入」不等於「是主人」，要加 <code>customer_id = (select auth.uid())</code></label>
+  <label data-key="d"><code>using (true)</code> 會讓 policy 失效，結果誰都看不到</label>
+  <p class="why">✓ 所有登入的人共用 authenticated 一個角色，分人只能靠 auth.uid()。a 是最常見的錯：開放註冊的 app 裡，登入不是門檻。這就是 BOLA／IDOR 在 Supabase 的樣子。（第 3、4 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 9：前端改備註，<code>update({ note }).eq('id', 6)</code> 回 204、沒有錯誤，重新整理後備註沒變。update policy 確認寫對了。先查什麼？</p>
+  <label data-key="a">這張表有沒有讓這個使用者看到那一列的 select policy：UPDATE 用到 WHERE 時要先通過 SELECT policy，否則改到 0 列</label>
+  <label data-key="b">GRANT：沒有 update 權限會默默改到 0 列</label>
+  <label data-key="c">safeupdate 擋下了這個 update</label>
+  <label data-key="d">PostgREST 的快取還沒更新，等一下就會出現</label>
+  <p class="why">✓ 看不到的列改不到，而且不是錯誤；接 <code>.select()</code> 看回傳是不是 <code>[]</code> 就能確認。b 錯在少了 GRANT 是明確的 42501 錯誤，不會默默成功。c 錯在 safeupdate 只擋沒有 WHERE 的請求，而且會回 21000。（第 4 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 10：作者能改自己的評論，評論對所有人公開。policy 寫成 <code>using (author_id = (select auth.uid())) with check (true)</code>。這會被怎麼利用？</p>
+  <label data-key="a">任何人都能改任何評論</label>
+  <label data-key="b">作者看不到自己的評論</label>
+  <label data-key="c">不會被利用：USING 已經限制只能改自己的列</label>
+  <label data-key="d">作者能把自己寫的負評的 author_id 改成別人，讓負評變成別人寫的</label>
+  <p class="why">✓ USING 管能改哪幾列，WITH CHECK 管改完的樣子；<code>true</code> 讓新列的作者可以是任何人。修法是 WITH CHECK 寫一樣的作者條件，GRANT 只開放 rating、body 欄位。c 是最常見的錯，只想到「改哪一列」。a 錯在 USING 仍然限制了只能動自己的評論。（第 4 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 11：店員頁面出現 <code>42P17 infinite recursion detected in policy for relation "store_members"</code>。正確的修法是？</p>
+  <label data-key="a">把 store_members 的 RLS 關掉</label>
+  <label data-key="b">把「我屬於哪些分店」寫成 security definer 函式（放 private、鎖 search_path、收回 execute），policy 改呼叫它</label>
+  <label data-key="c">改用 secret key 查 store_members</label>
+  <label data-key="d">把 store_members 的 policy 改成 <code>using (true)</code></label>
+  <p class="why">✓ store_members 的 policy 查了 store_members 自己，每次讀都要再套用自己的 policy；security definer 函式以擁有者身分查，不套用 RLS，循環就斷了。a 和 d 都能讓錯誤消失，但所有登入的人都看得到每家分店的成員名單。c 讓前端拿到繞過 RLS 的 key。（第 5 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 12：後台把某位店員升為店長（寫進 app_metadata），他說「重新整理頁面還是看不到其他分店」。最可能的原因？</p>
+  <label data-key="a">policy 應該讀 user_metadata 才會即時更新</label>
+  <label data-key="b">app_metadata 要重新部署資料庫才會生效</label>
+  <label data-key="c">他手上的 access token 是升級前簽發的，JWT 內容要等下一次 refresh（最多 jwt_expiry）才會更新</label>
+  <label data-key="d">PostgREST 快取了舊的 policy</label>
+  <p class="why">✓ policy 讀的是請求帶來的 JWT，簽發後內容就固定了；refresh 一次（或重新登入）就會帶到新的 app_metadata。需要立即生效的權限要查資料表。a 是最危險的選項：user_metadata 使用者自己改得到。（第 5 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 13：資安要你在上線前一天確認權限沒問題。以下哪個順序最有效？</p>
+  <label data-key="a">跑 <code>db advisors --type security</code> 抓沒開 RLS、繞過 RLS 的 view 與函式，再用漏洞清單逐條看 policy，最後跑「自己看得到、別人看不到、不能改成別人的」RLS 測試</label>
+  <label data-key="b">用 secret key 把每張表查一次，確認資料都在</label>
+  <label data-key="c">在前端用兩個帳號各點一遍主要頁面</label>
+  <label data-key="d">確認 publishable key 沒有出現在前端打包檔</label>
+  <p class="why">✓ 工具抓結構性的漏洞（沒開 RLS、definer view），清單抓常見的寫法錯誤，測試證明條件真的對，三者互補。c 最多人會做，但只測到前端會發的請求；攻擊者會自己組請求。b 用 service_role 繞過了 RLS，什麼都證明不了。d 錯在 publishable key 本來就是公開的。（第 3～5 課）</p>
+</div>
+
+<p>這個階段的重點整理成<a href="../sheets/stage-2.html">一頁圖解</a>。</p>
+<p>下一課進入 Auth：註冊、登入、session 怎麼更新，伺服器端怎麼確認「這個請求真的是這個人」，以及新使用者的 profiles 怎麼自動建立。</p>
+
+<div class="callout">版本備註：PostgreSQL 17.11、PostgREST 16.5、Auth（GoTrue）2.197.0、Supabase CLI 3.1.0。本機 2026-11-20 實測：policy 自我參照回 42P17、在 public 新建的函式 anon 預設可執行、使用者以 <code>updateUser</code> 改 user_metadata 後 refresh 的 token 會帶著新值、view 沒有 security_invoker 時繞過 RLS、<code>supabase db advisors</code> 的檢查名稱。</div>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

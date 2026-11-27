@@ -1,0 +1,728 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>33. 用 PostgreSQL 做工作佇列：SKIP LOCKED、advisory lock 與 outbox</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="33" data-pg-2pc>
+<header>
+  <div class="eyebrow">階段 9：資深必備｜並發與正確性 · 第 33 課</div>
+  <h1>用 PostgreSQL 做工作佇列：SKIP LOCKED、advisory lock 與 outbox</h1>
+</header>
+<main>
+
+<p>顧客在 App 下單之後，後端還有一串事要做：寄電子收據、印製作單給吧台、把營收同步到會計系統。如果全部塞在下單的 HTTP 請求裡，顧客要多等好幾秒；會計系統一掛，連下單都跟著失敗。實務做法是下單只負責「記下要做什麼」，真正的工作交給背景程式慢慢做。</p>
+<p>這一課的任務就是把咖啡店下單後的這串事交給背景程式，而且要做到：工作不會漏、兩個背景程式不會搶同一件、程式當掉或外部服務壞掉時工作還收得回來、每天的報表只產生一份，最後連「通知資料庫以外的系統」也不會和訂單對不上。全程用 PostgreSQL 本身當工作佇列，一步一步做出來。</p>
+
+<div class="callout"><strong>第一輪只要記住：</strong>
+<ul>
+  <li>多個 worker 取件用 <code>FOR UPDATE SKIP LOCKED</code>；標成 <code>running</code> 就提交，寄信這類慢的事在交易外做。</li>
+  <li>佇列只保證「至少一次」：worker 可能做完、還沒標記完成就當掉，工作會被重做，所以處理方式要冪等。</li>
+  <li>寫資料庫又要通知外部系統時，用 outbox：事件和訂單寫在同一個交易。專案裡先用現成的套件（例如 pg-boss），不要從頭寫。</li>
+</ul></div>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>下單後的那串事，要怎麼交給背景做？設計 jobs 表，先講清楚佇列能保證什麼、不能保證什麼。</li>
+  <li>兩個 worker 同時取件，怎麼不重複也不排隊？<code>FOR UPDATE</code> 為什麼會讓大家排隊，<code>SKIP LOCKED</code> 怎麼讓每個 worker 各拿各的。</li>
+  <li>取走的工作做失敗、或 worker 當掉怎麼辦？租約、退避重試、dead letter。</li>
+  <li>回收程式和每日報表開了兩台，怎麼只跑一份？advisory lock。</li>
+  <li>沒工作時，worker 要多久查一次？LISTEN／NOTIFY。</li>
+  <li>要通知資料庫以外的系統，怎麼不會只成功一半？outbox。</li>
+  <li>什麼時候該換專門的佇列？流量、扇出、排程這幾條界線。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="19-concurrency.html">第 19 課</a>的 <code>FOR UPDATE</code> 與 lost update：<code>FOR UPDATE</code> 讀的同時鎖住選到的列，直到交易結束；lost update 是兩個交易都先讀再寫，後寫的蓋掉先寫的。</li>
+  <li><a href="32-locks.html">第 32 課</a>的列鎖與 <code>NOWAIT</code>：拿不到列鎖的交易會排隊等；加上 <code>NOWAIT</code> 就不等，立刻報錯（55P03）。</li>
+  <li><a href="30-mvcc-vacuum.html">第 30 課</a>的死版本與 VACUUM，以及「暫停的同事」：<code>UPDATE</code> 會留下舊版本，由 VACUUM 清掉；<code>PREPARE TRANSACTION</code> 讓一個交易停住、手上的鎖一直留著。</li>
+  <li><a href="31-isolation-upsert.html">第 31 課</a>的 <code>ON CONFLICT</code>：<code>INSERT</code> 撞到 <code>UNIQUE</code> 時改成什麼都不做或更新，不報錯。</li>
+</ul></div>
+
+<div class="callout"><strong>這頁的環境：</strong>這頁只有一條連線，看不到別人：另一個 worker 用停在交易裡的同事模擬，兩個 worker 搶件用時間軸示範。等鎖超過 5 秒，這頁會判定「在等鎖」並重置資料庫；<code>ROLLBACK PREPARED</code> 要單獨一格執行。<code>LISTEN</code> 和 <code>NOTIFY</code> 在同一條連線上，收到的通知在輸出區顯示成灰色的一行。</div>
+
+<p><strong>這頁的資料：</strong><code>jobs</code>（10 件工作，第一節逐欄說明）、<code>outbox</code>（6 個事件，outbox 一節用）、<code>orders</code>（訂單 1001、1002）。</p>
+
+<h2>下單後的那串事，要怎麼交給背景做？</h2>
+<p>做法是讓下單 API 不自己寄收據，而是在資料庫裡留一筆待辦，例如「訂單 1001 要寄收據」，然後馬上回應顧客。另外有一支一直在執行的背景程式，定期來看有沒有待辦，有就拿去做，做完記下「完成」。</p>
+<p>存放這些待辦的地方叫<strong>工作佇列</strong>（job queue），一筆待辦叫一件<strong>工作</strong>（job）。放工作進去的程式叫 <strong>producer</strong>，這裡就是下單 API；把工作取出來執行的背景程式叫 <strong>worker</strong>，也有人叫 consumer。worker 可以同時開好幾個，工作一多就平行處理。</p>
+<p>佇列可以用專門的系統來做，這一課先用 PostgreSQL 的一張表。好處有兩個。第一，工作和訂單可以寫在<a href="18-transactions.html">第 18 課</a>的<strong>同一個交易</strong>裡：訂單成立，工作就一定在；訂單 ROLLBACK，工作也跟著消失，不會留下一件「替不存在的訂單寄收據」的工作。第二，少維護一套系統。代價是流量很大時撐不住，這課最後一節再談界線在哪裡。</p>
+<p>在動手設計之前，先講清楚佇列能保證什麼。佇列幾乎都只能保證 <strong>at-least-once</strong>，也就是「至少一次」：每件工作一定會被做到，但可能被做到兩次。原因是「做事」和「記下做完了」是兩個動作，中間可能當掉。例如 worker 寄出收據之後、還來不及在表裡標記「完成」就當掉了；從資料庫看，這件工作沒做完，只能交給別的 worker 重做，顧客就收到第二封收據。第三節會一步一步看到這件事怎麼發生。</p>
+<p>既然重做擋不掉，就要讓重做無害。一件事做一次和做好幾次，結果都一樣，這種性質叫<strong>冪等</strong>（idempotent）。「把訂單 1001 標成已寄收據」是冪等的，做兩次還是同一個狀態；「寄一封收據」不是，做兩次顧客就收到兩封，要另外處理，例如寄之前先查這張訂單寄過沒。這一課每一節都會回到這個問題。</p>
+<p>接著設計 jobs 表。worker 拿到一件工作，要知道做什麼、什麼時候可以做、現在是誰在做、失敗過幾次。這一頁的 <code>jobs</code> 表就是照這幾個問題設計的：</p>
+<div class="table-wrap"><table>
+  <tr><th>欄位</th><th>用途</th></tr>
+  <tr><td><code>kind</code>、<code>payload jsonb</code></td><td>工作種類與參數（<a href="14-jsonb-arrays.html">第 14 課</a>的 JSONB），例如 <code>send_receipt</code>、<code>{"order_id": 1001}</code></td></tr>
+  <tr><td><code>status</code></td><td><code>queued</code>（等待中）、<code>running</code>（有人在做）、<code>done</code>、<code>dead</code>（放棄，等人工處理）</td></tr>
+  <tr><td><code>run_at</code></td><td>最早什麼時候可以執行：延遲工作和重試都靠它</td></tr>
+  <tr><td><code>attempts</code>、<code>max_attempts</code></td><td>已經嘗試幾次、最多幾次</td></tr>
+  <tr><td><code>locked_until</code></td><td>租約到期時間（第三節解釋）</td></tr>
+  <tr><td><code>last_error</code></td><td>上次失敗的原因，查問題用</td></tr>
+  <tr><td><code>dedupe_key UNIQUE</code></td><td>去重鍵：同一張訂單的收據只能有一筆工作</td></tr>
+</table></div>
+<p>最後一欄 <code>dedupe_key</code> 處理的是另一種重複。前面說的重做發生在 worker 那一端；producer 這一端也可能重複放工作。例如結帳 API 回應太慢，前端或閘道逾時後重送同一個請求，下單 API 就會跑第二次，又放一筆「訂單 1001 要寄收據」。這兩筆工作各自被做完，顧客一樣收到兩封收據。</p>
+<p>擋法是讓同一件事只能有一筆工作：給每件工作一個由業務資料組成的去重鍵，例如 <code>receipt:1001</code>，欄位加上 <code>UNIQUE</code>。第二次放工作時撞到同一個鍵，搭配<a href="31-isolation-upsert.html">第 31 課</a>的 <code>INSERT … ON CONFLICT (dedupe_key) DO NOTHING</code>，就安靜地什麼都不做，同一張訂單的收據工作只會有一筆。完整寫法留給練習 5。</p>
+<p>表設計好，再想 worker 怎麼查它。worker 取件的查詢永遠是同一句：「<code>status = 'queued'</code>、<code>run_at</code> 已經到了，依 <code>run_at</code> 排序取前幾筆」。佇列表跑久了，裡面大部分是已完成的工作，真正在等的只佔一小部分。如果索引收了每一列，大部分空間都花在 worker 永遠不會查的 <code>done</code> 上。</p>
+<p><a href="27-index-design.html">第 27 課</a>的<strong>部分索引</strong>正好解決這件事：建索引時加上 <code>WHERE</code>，只收符合條件的列。這裡只收 <code>queued</code> 的列，索引小、取件快；工作改成 <code>running</code> 或 <code>done</code> 之後，新的版本不符合條件，就不會進這個索引。</p>
+<pre>CREATE INDEX jobs_ready_idx ON jobs (run_at, id) WHERE status = 'queued';</pre>
+<p>seed 已經建好這張表和索引。看一下目前的工作，執行後看 <code>status</code> 和 <code>run_at</code> 兩欄：</p>
+<div class="lab" data-sql="SELECT id, kind, status, run_at, attempts, max_attempts, locked_until, dedupe_key
+FROM jobs ORDER BY id;"></div>
+<ul>
+  <li>1、2、4、5、6 號是 <code>queued</code>，已經到了執行時間；3 號排在 2099 年才執行。</li>
+  <li>7、8、9 號是 <code>running</code>，有 worker 在做。</li>
+  <li>10 號是已完成的收據工作，<code>dedupe_key</code> 是 <code>receipt:1001</code>。</li>
+</ul>
+<div class="callout practice"><strong>💡 實務上：先分清楚哪些事可以晚一點做</strong><br>開發新功能時，常要決定一件事放在請求裡同步做，還是丟進佇列。判斷方式是問：「這件事晚 30 秒完成，顧客或店員會不會發現？」寄收據、同步會計可以晚；扣庫存、確認付款通常要在請求裡就有結果。丟進佇列的工作，資深工程師會先問兩件事：重做一次會不會出事（冪等），以及一直失敗時誰會知道。這兩個問題沒答案，就先別急著非同步化。</div>
+<p>表有了，下一步是讓 worker 來取件。只有一個 worker 時很單純；為了消化尖峰時段的工作開兩個以上，問題就來了：兩個 worker 會不會拿到同一件？</p>
+
+<h2>兩個 worker 同時取件，怎麼不重複也不排隊？</h2>
+<p>先試最直覺的寫法：「先查出一筆 <code>queued</code>，再把它改成 <code>running</code>」。兩個 worker 同時跑時，照時間軸一步一步看：</p>
+<div class="tl">
+  <div class="table-wrap"><table>
+    <tr><th>步驟</th><th>worker A</th><th>worker B</th></tr>
+    <tr data-note="A 查出最早的一筆：1 號，還是 queued。"><td>1</td><td><code>SELECT id … WHERE status = 'queued' LIMIT 1</code><br>拿到 1 號</td><td></td></tr>
+    <tr data-note="A 還沒改狀態，B 查到的也是 1 號。普通 SELECT 不會擋住別人讀（MVCC）。"><td>2</td><td></td><td><code>SELECT id … WHERE status = 'queued' LIMIT 1</code><br>也拿到 1 號</td></tr>
+    <tr data-note="A 把 1 號改成 running（自動提交），開始寄收據。"><td>3</td><td><code>UPDATE … SET status = 'running' WHERE id = 1</code><br>寄收據</td><td></td></tr>
+    <tr data-note="B 的 UPDATE 只看 id = 1，不管它已經是 running，照樣改成功，也寄了收據。"><td>4</td><td></td><td><code>UPDATE … SET status = 'running' WHERE id = 1</code><br>又寄一次收據</td></tr>
+    <tr data-note="顧客收到兩封收據。這和第 19 課的 lost update 是同一類問題：讀和寫之間有空檔。"><td>5</td><td colspan="2">結果：1 號被處理兩次</td></tr>
+  </table></div>
+  <div class="bar"><button data-prev>◀ 上一步</button><button class="primary" data-next>下一步 ▶</button><span class="kbd" data-count></span></div>
+  <p class="note"></p>
+</div>
+<p>問題出在查和改之間有空檔，這和第 19 課的 lost update 是同一類問題。第 19 課的解法是 <code>FOR UPDATE</code>：讀的同時鎖住那一列，別人要鎖同一列就得等。照第 19 課的習慣，拿著鎖把工作做完才 <code>COMMIT</code>。這樣不會重複了，但看看兩個 worker 在做什麼：</p>
+<div class="tl">
+  <div class="table-wrap"><table>
+    <tr><th>步驟</th><th>worker A</th><th>worker B</th></tr>
+    <tr data-note="A 讀出最早的 1 號並鎖住，開始寄收據（交易還開著）。"><td>1</td><td><code>BEGIN;</code><br><code>SELECT … LIMIT 1 FOR UPDATE</code><br>鎖住 1 號，寄收據</td><td></td></tr>
+    <tr data-note="B 的查詢也排到 1 號，想鎖它，只能等。後面還有 2、4、5 號沒人做，B 卻閒著。"><td>2</td><td></td><td><code>BEGIN;</code><br><code>SELECT … LIMIT 1 FOR UPDATE</code><br><span class="wait">等待中…</span></td></tr>
+    <tr data-note="A 寄完，改成 done 並提交，鎖放開。"><td>3</td><td><code>UPDATE …; COMMIT;</code></td><td><span class="wait">等待中…</span></td></tr>
+    <tr data-note="B 被放行後重新檢查 1 號的最新版本：已經不是 queued，跳過，往下鎖住 2 號。B 拿到了，但前面一直在空等。開 10 個 worker 也一樣：每個都先排在最前面那一列後面，輪流前進，同一時間只有一個在做事。"><td>4</td><td></td><td>1 號已經不是 queued，跳過<br>鎖住 2 號</td></tr>
+  </table></div>
+  <div class="bar"><button data-prev>◀ 上一步</button><button class="primary" data-next>下一步 ▶</button><span class="kbd" data-count></span></div>
+  <p class="note"></p>
+</div>
+<p>重複處理解決了，換成排隊：每個 worker 都排序到同一件、排在同一列後面等，開再多 worker 也只有一個在做事。我們要的其實是第三種行為：遇到別人鎖著的工作，不要等，也不要報錯，直接換下一件。</p>
+<p>這就是 <strong><code>SKIP LOCKED</code></strong>：加在 <code>FOR UPDATE</code> 後面，遇到被別人鎖住的列就<strong>跳過</strong>，當作它不在結果裡。A 鎖了最前面幾件，B 的查詢就自動略過它們，拿下一批，大家各做各的。</p>
+<p>實際做一次。用<a href="30-mvcc-vacuum.html">第 30 課</a>的方法：讓 worker A 取件後用 <code>PREPARE TRANSACTION</code> 停在交易裡，鎖會一直留著，就像一位做到一半的同事。執行後看 worker A 拿到哪幾件：</p>
+<div class="lab" data-sql="-- worker A：取 2 件，停在交易裡
+BEGIN;
+SELECT id, kind FROM jobs
+WHERE status = 'queued' AND run_at &lt;= now()
+ORDER BY run_at, id
+LIMIT 2
+FOR UPDATE SKIP LOCKED;
+PREPARE TRANSACTION 'worker_a';"></div>
+<p>worker A 拿了 1、2 號。現在換 worker B。先對照第 32 課的 <code>NOWAIT</code>：它也不等，但拿不到鎖就立刻報錯。執行後看錯誤碼 55P03：</p>
+<div class="lab" data-sql="SELECT id, kind FROM jobs
+WHERE status = 'queued' AND run_at &lt;= now()
+ORDER BY run_at, id
+LIMIT 2
+FOR UPDATE NOWAIT;"></div>
+<p><code>NOWAIT</code> 不會卡住，可是 B 也什麼都沒拿到，只能重試。改成 <code>SKIP LOCKED</code>，執行後看 B 拿到哪幾件：</p>
+<div class="lab" data-sql="SELECT id, kind FROM jobs
+WHERE status = 'queued' AND run_at &lt;= now()
+ORDER BY run_at, id
+LIMIT 2
+FOR UPDATE SKIP LOCKED;"></div>
+<p>B 拿到 4、5 號：1、2 號被 A 鎖著，跳過；3 號還沒到執行時間，本來就不在條件裡。如果拿掉 <code>SKIP LOCKED</code>，B 會一直等 A（這頁會在 5 秒後重置資料庫，見課首的環境說明）。</p>
+<p>看完把 worker A 的交易取消：</p>
+<div class="lab" data-sql="ROLLBACK PREPARED 'worker_a';"></div>
+<p>剛才 B 只是查出來並鎖住，還沒把工作標成 <code>running</code>。如果分成「先 <code>SELECT … SKIP LOCKED</code>，再 <code>UPDATE</code>」兩句，又得自己包交易，否則查和改之間又出現空檔。實務上取件寫成<strong>一句</strong> <code>UPDATE</code>：子查詢用 <code>SKIP LOCKED</code> 選出並鎖住要的列，外層把它們標成 <code>running</code>，<code>RETURNING</code>（<a href="06-update-delete.html">第 6 課</a>）把工作內容交給 worker。一句就是一個交易，選和改之間沒有空檔：</p>
+<pre>UPDATE jobs
+SET status = 'running', …
+WHERE id IN (
+  SELECT id FROM jobs
+  WHERE …取件條件…
+  ORDER BY …
+  LIMIT n
+  FOR UPDATE SKIP LOCKED
+)
+RETURNING id, kind, payload;</pre>
+<p>練習 1 會把 <code>…</code> 補完整。<code>SKIP LOCKED</code> 能這樣用，是因為佇列有一個特性：哪一件先被哪個 worker 拿走都沒關係，只要每件都有人做、沒有人重複做。反過來，需要看到完整資料的查詢就不能用它：</p>
+<div class="callout warn">官方文件明講：<code>SKIP LOCKED</code> 看到的是「不一致的資料」（被鎖住的列直接當作不存在），不適合一般查詢，只適合佇列這種「拿到哪件都可以」的場景。報表、對帳不要用。</div>
+<div class="callout practice"><strong>💡 實務上：先用現成的套件，不要自己從頭寫</strong><br>這一課的寫法是為了讓你看懂原理；專案裡通常會用現成、以 PostgreSQL 為底的佇列套件，例如 Node.js 的 pg-boss、Graphile Worker，Go 的 River，它們底層同樣是 <code>SKIP LOCKED</code>，也已經處理好重試、排程和清理。懂原理的好處是：出問題時看得懂它的表、知道去查哪個欄位。評估套件時看維護是否活躍、能不能配合你用的連線池（<a href="25-backend.html">第 25 課</a>），以及能不能和訂單寫在同一個交易裡新增工作（後面 outbox 一節會說明為什麼重要）。</div>
+<p>取件不重複、也不排隊了。但上面那句只把工作標成 <code>running</code> 就結束，真正寄信是在之後。這留下兩個問題：取件的交易應該多長？工作被標成 <code>running</code> 之後，worker 當掉怎麼辦？</p>
+
+<h2>取走的工作做失敗、或 worker 當掉怎麼辦？</h2>
+<p>先回答第一個問題：取件的交易要<strong>短</strong>，標成 <code>running</code> 就提交，寄信、呼叫 API 這些慢的事在交易<strong>外</strong>做。上一節第二張時間軸的寫法，是在交易裡把整件工作做完，等於拿著列鎖好幾秒，甚至好幾分鐘。交易一長有兩個代價：這段期間產生的舊版本不能被 VACUUM 清掉（<a href="30-mvcc-vacuum.html">第 30 課</a>），而佇列表偏偏是一直在 UPDATE 的表，會越長越大；每個進行中的交易還各佔一條連線，worker 一多就可能把連線池佔滿。</p>
+<p>可是交易一提交，列鎖就放開了，「這件工作是誰在做」再也沒有鎖在保護。worker 如果在寄信途中當掉，工作會永遠卡在 <code>running</code>：沒人在做，也沒有人會再去取它，因為取件只看 <code>queued</code>。</p>
+<p>解法是<strong>租約</strong>（lease）。租約是一段有期限的使用權：worker 取件時順便寫下 <code>locked_until = now() + interval '5 minutes'</code>，意思是「5 分鐘內這件歸我」。期限內別人不會動它；期限過了還沒做完，就當作這個 worker 已經不在了，工作可以交給別人。有些佇列服務把同一個概念叫 visibility timeout。worker 做完就標成 <code>done</code>：</p>
+<pre>UPDATE jobs SET status = 'done', locked_until = NULL
+WHERE id = $1 AND status = 'running';</pre>
+<p>租約過了還是 <code>running</code>，就代表 worker 大概掛了，由一個定期執行的<strong>回收程式</strong>把它改回 <code>queued</code>，你會在練習 2 寫出這句。租約要設得比工作正常需要的時間長，否則工作還在做，就被回收給別人，變成兩個 worker 同時在做。真的會做很久的工作，worker 要在做的過程中定期把 <code>locked_until</code> 往後延，這叫 heartbeat（心跳），用來告訴大家「我還活著」。</p>
+<p>有了租約，把一件工作從取件到完成拆開，看 worker 在每一步當掉會怎樣：</p>
+<div class="table-wrap"><table>
+  <tr><th>worker 在哪一步當掉</th><th>結果</th><th>怎麼收拾</th></tr>
+  <tr><td>取件的交易提交前</td><td>交易回滾，工作還是 <code>queued</code></td><td>別的 worker 直接取走，沒有影響</td></tr>
+  <tr><td>取件提交後、寄信前</td><td>工作卡在 <code>running</code>，信還沒寄</td><td>租約到期後被改回 <code>queued</code>，重做一次</td></tr>
+  <tr><td>寄信後、標成 <code>done</code> 前</td><td>信已寄出，工作卡在 <code>running</code></td><td>租約到期後重做，<strong>信再寄一次</strong>：這就是 at-least-once，工作要冪等</td></tr>
+  <tr><td>標成 <code>done</code> 之後</td><td>沒有影響</td><td>不用收拾</td></tr>
+</table></div>
+<p>第三列就是第一節說的「至少一次」實際發生的地方：寄信在資料庫外，資料庫的交易包不住它，所以重做擋不掉，只能讓寄信本身冪等。</p>
+<p>租約處理的是 worker 當掉。另一種情況是 worker 好好的，工作本身失敗了，例如寄信伺服器逾時。這時不要馬上重試：對方可能還沒恢復，立刻重試只會再失敗一次，還給已經很吃力的對方增加負擔。做法是<strong>退避</strong>（backoff）：每多失敗一次就等更久再試，例如等 2 的 <code>attempts</code> 次方秒，第 1 次等 2 秒、第 3 次等 8 秒。實務上還會在等待時間上加一點隨機的<strong>抖動</strong>（jitter），因為同一個原因一起失敗的一批工作，如果等待時間完全相同，就會在同一秒一起重試，又一起撞上對方。</p>
+<p>重試也要有上限。有些工作再試幾次都不會成功，例如資料本身就有錯。超過 <code>max_attempts</code> 就改成 <code>dead</code>，不再佔用 worker，留給人看 <code>last_error</code> 處理。這種放棄重試、等人處理的工作叫 <strong>dead letter</strong>（死信）。</p>
+<p>9 號已經試了 3 次，這次又失敗。下面的 <code>power(2, attempts)</code> 是 2 的 <code>attempts</code> 次方，<code>make_interval(secs =&gt; 秒數)</code> 把秒數變成 interval。執行後看 <code>status</code> 和 <code>wait</code>：</p>
+<div class="lab" data-sql="UPDATE jobs
+SET status = CASE WHEN attempts &gt;= max_attempts THEN 'dead' ELSE 'queued' END,
+    run_at = now() + make_interval(secs =&gt; power(2, attempts)),
+    locked_until = NULL,
+    last_error = 'SMTP timeout'
+WHERE id = 9
+RETURNING id, status, attempts, run_at - now() AS wait, last_error;"></div>
+<p>9 號回到 <code>queued</code>，<code>wait</code> 約 8 秒：8 秒後才會被取件。<code>attempts</code> 在取件時就加 1 了，所以這裡不用再加。如果 <code>attempts</code> 已經到了 <code>max_attempts</code>，同一句會把它改成 <code>dead</code>。</p>
+<div class="callout practice"><strong>💡 實務上：dead letter 要有人看得到</strong><br>常見的事故是：寄信服務的金鑰過期，收據工作全部進了 <code>dead</code>，直到客服接到「沒收到收據」的抱怨才被發現。上線前至少要有兩個監控：<code>dead</code> 的數量，以及最舊一筆 <code>queued</code> 工作已經等了多久（佇列塞住時它會一直變大）。再準備一個讓人能查看 <code>last_error</code>、修好原因後把工作改回 <code>queued</code> 的方式，後台頁面或一段寫好的 SQL 都可以。</div>
+<p>到這裡，咖啡店的佇列多了一支定期執行的回收程式。問題是，後端為了不停機部署通常開兩台以上，回收程式、每天早上產生前一天營業報表的排程，每台都會各跑一份。回收跑兩次還無害，報表產生兩份就麻煩了。要怎麼讓它們只跑一份？</p>
+
+<h2>回收程式和每日報表開了兩台，怎麼只跑一份？</h2>
+<p>前兩節用的鎖都鎖在 jobs 表的某一列上。「每日報表只能有一台在產生」這種需求，卻沒有一列可以鎖：報表還沒產生，表裡沒有它的列。我們需要的是一把「名字叫每日報表」的鎖，誰先拿到誰做。</p>
+<p>PostgreSQL 的 <strong>advisory lock</strong>（建議鎖）就是這種鎖。它不屬於任何表或列，PostgreSQL 只管一件事：「key 是某個數字的鎖，同時只能一個人拿」。這個數字代表什麼，由你的程式自己決定，所以叫「建議」：資料庫不知道它保護的是什麼，只有大家都照約定先拿鎖再做事，它才有效。</p>
+<p>key 是 <code>bigint</code>，但我們想用 <code>'daily-report'</code> 這種名稱，所以要把名稱轉成數字。<code>hashtextextended(文字, 種子)</code> 把文字算成一個 64 位元的雜湊值，同一段文字、同一個種子，永遠算出同一個數字，兩台排程器各自算，就會拿同一把鎖。</p>
+<p>拿鎖用 <code>pg_try_advisory_xact_lock(key)</code>。名字裡的 <code>try</code> 是「不等待」：拿到回 <code>true</code>，被別人拿著就立刻回 <code>false</code>；<code>xact</code> 是「交易級」，交易結束時自動放掉。執行後看 <code>got</code>：</p>
+<div class="lab" data-sql="SELECT hashtextextended('daily-report', 0) AS key,
+       pg_try_advisory_xact_lock(hashtextextended('daily-report', 0)) AS got;"></div>
+<p>排程器的寫法：開交易，拿到鎖就產生報表，拿不到就代表另一台在做，直接結束。</p>
+<pre>BEGIN;
+SELECT pg_try_advisory_xact_lock(hashtextextended('daily-report', 0));
+-- true：產生報表；false：ROLLBACK，這次不做
+COMMIT;   -- 交易結束，鎖自動釋放</pre>
+<p>為什麼用 <code>hashtextextended</code>，而不是名字更短的 <code>hashtext</code>？<code>hashtext</code> 只算出 32 位元的數字，值域小，不同名稱比較容易撞到同一個數字。一旦撞號，兩個毫無關係的排程會共用一把鎖，互相擋住，而且很難查出原因。</p>
+<p>上面用的是交易級。advisory lock 還有另一種 <strong>session 級</strong>。session 是一條連線從連上到斷開的整段期間，session 級的鎖就跟著連線走，不跟著交易走。兩種的差別：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>交易級（<code>…_xact_lock</code>）</th><th>session 級（<code>pg_advisory_lock</code> 等）</th></tr>
+  <tr><td>什麼時候釋放</td><td>交易結束時自動釋放，沒有 unlock 函式</td><td>呼叫 <code>pg_advisory_unlock</code>，或連線斷開</td></tr>
+  <tr><td>ROLLBACK 時</td><td>跟著放掉</td><td>不受交易影響，ROLLBACK 之後還拿著</td></tr>
+  <tr><td>連線池 transaction 模式</td><td>可以用</td><td>不能用（下面解釋）</td></tr>
+</table></div>
+<p>實際看 session 級的鎖在句子結束後還留著。先拿一把 key 42 的鎖：</p>
+<div class="lab" data-sql="SELECT pg_try_advisory_lock(42) AS got;"></div>
+<p>再到下一格看 <code>pg_locks</code>：第一個結果是那把鎖還在，第二句 <code>pg_advisory_unlock</code> 把它放掉。</p>
+<div class="lab" data-sql="SELECT objid, mode, granted FROM pg_locks WHERE locktype = 'advisory';
+SELECT pg_advisory_unlock(42) AS released;"></div>
+<p>忘了 unlock，這把鎖會留到連線斷開。後端程式的連線通常來自連線池、會一直重用，「連線斷開」可能是好幾天以後。</p>
+<p>更麻煩的是連線池本身。PgBouncer 的 transaction 模式（<a href="25-backend.html">第 25 課</a>）在每個交易結束時，就把連線交給下一個請求。官方文件寫明這個模式下不能用 session 級的功能，session 級 advisory lock 和下一節的 <code>LISTEN</code> 都在其中。原因是：你的鎖拿在一條連線上，交易一結束，那條連線就屬於別的請求了，鎖也跟著「被繼承」；你自己之後送出的 unlock，又可能經過另一條連線，放不掉原本那把。</p>
+<p>所以經過 transaction 模式的連線池時，一律用交易級的版本：鎖和交易同生同滅，不管連線之後交給誰都不受影響。第 36 課會再談連線池。</p>
+<div class="callout practice"><strong>💡 實務上：服務一開多台，排程就會重複跑</strong><br>為了不停機部署或分散流量，後端通常會開兩台以上；如果每台都內建 cron（定時自動執行的排程），每日報表、到期提醒、優惠券發送就會各跑一次。常見的解法有兩種：排程交給只有一份的外部排程器（例如雲端的排程服務），或是像這裡用 advisory lock 讓搶到的那台執行。用鎖時要記得「拿不到就跳過」也可能代表那台卡住了，所以工作本身仍要冪等，並記錄每次執行的結果，事後才查得到哪天沒跑。</div>
+<p>排程只跑一份了。回到 worker 本身，還有一個一直沒處理的問題：前面的 worker 都是自己去查佇列，那沒工作的時候，要多久查一次？</p>
+
+<h2>沒工作時，worker 要多久查一次？</h2>
+<p>這個問題兩頭為難。每秒查一次，幾個 worker 整天對資料庫送查詢，絕大多數都查不到東西；每分鐘查一次，顧客下單後最久要等一分鐘才收到收據。我們想要的是：平常不查，有新工作時有人「叫一聲」。</p>
+<p>PostgreSQL 內建這個功能，叫 <strong>LISTEN／NOTIFY</strong>。worker 先執行 <code>LISTEN jobs</code>，表示「我在聽 jobs 這個頻道」；之後任何連線執行 <code>NOTIFY jobs, '…'</code>，所有在聽這個頻道的連線都會收到這則通知。執行後看輸出區上方灰色的那一行：</p>
+<div class="lab" data-sql="LISTEN jobs;
+NOTIFY jobs, '有新工作';"></div>
+<p>通知有一個重要的性質：要等交易<strong>提交</strong>才送出，ROLLBACK 的話就不送。這正是我們要的：下單交易如果回滾，工作沒有寫進去，也就不該叫醒 worker。下面這格不會收到通知：</p>
+<div class="lab" data-sql="BEGIN;
+NOTIFY jobs, '這則不會送出';
+ROLLBACK;"></div>
+<p>接下來讓「新增工作」自動發通知，不必每個 producer 都記得寫 <code>NOTIFY</code>。做法是<a href="23-views-functions-triggers.html">第 23 課</a>的 trigger：jobs 每新增一列，就自動送一則通知，內容放這件工作的 id。這格用到三樣新東西：</p>
+<ul>
+  <li><code>pg_notify(頻道, 文字)</code> 是 <code>NOTIFY</code> 的函式版本，內容可以放 NEW.id 這類執行時才知道的值。</li>
+  <li>PL/pgSQL 裡呼叫函式但不需要它的回傳值時，用 <code>PERFORM</code> 取代 <code>SELECT</code>（直接寫 <code>SELECT</code> 會報錯「沒有地方放結果」）。</li>
+  <li><code>CREATE OR REPLACE TRIGGER</code> 是「沒有就建立、有就取代」，這格重複執行也不會出錯。</li>
+</ul>
+<p>這格只建立函式和 trigger，沒有結果要看：</p>
+<div class="lab" data-sql="CREATE OR REPLACE FUNCTION notify_new_job() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM pg_notify('jobs', NEW.id::text);
+  RETURN NEW;
+END $$;
+
+CREATE OR REPLACE TRIGGER jobs_notify
+AFTER INSERT ON jobs
+FOR EACH ROW EXECUTE FUNCTION notify_new_job();"></div>
+<p>接著新增一件工作。執行後對照通知的內容和 <code>RETURNING</code> 的 id：</p>
+<div class="lab" data-sql="LISTEN jobs;
+INSERT INTO jobs (kind, payload) VALUES ('print_ticket', '{&quot;order_id&quot;: 1003}')
+RETURNING id;"></div>
+<p>看起來很理想，但 NOTIFY 有一個決定性的限制：<strong>沒人在聽，通知就消失</strong>。PostgreSQL 不會替你保存，worker 重啟的那幾秒送出的通知，之後不會補發。所以 NOTIFY 只能當「提示」，不能當佇列本身：工作一定要存在 jobs 表裡，worker 也還是要定期輪詢，例如每 30 秒查一次，把漏掉通知的工作撿起來。通知的作用是讓 worker「現在就去查」，平常的延遲從 30 秒縮到幾乎即時。</p>
+<p>也因為工作本身放在表裡，通知的內容只要放 id，不必放整件工作的資料。另外，worker 要一直佔著一條連線 LISTEN；LISTEN 是上一節說的 session 級功能，這條連線不能經過 transaction 模式的連線池，要直連資料庫。payload 的大小限制見課末「補充與查表」。</p>
+<p>到這裡，咖啡店的工作都在同一個資料庫裡，工作和訂單可以寫進同一個交易，所以「訂單成立、工作卻沒放進去」不會發生。但開場那串事裡，有些要通知的對象根本不在這個資料庫裡。</p>
+
+<h2>要通知資料庫以外的系統，怎麼不會只成功一半？</h2>
+<p>下單後要通知其他服務，例如外送平台、會員點數系統。這些服務不會來讀咖啡店的 jobs 表，通常的做法是送一則<strong>事件</strong>到訊息系統（Kafka、RabbitMQ 等），由各個服務自己去收。事件是一則「發生了什麼事」的訊息，例如「訂單 1003 成立了」。</p>
+<p>問題是「寫訂單」和「送事件」分屬兩個系統，沒辦法放進同一個交易：PostgreSQL 的 ROLLBACK 收不回已經送到 Kafka 的訊息，Kafka 也不知道 PostgreSQL 的交易有沒有提交。不管先做哪一件，中間當掉都會只成功一半。這叫<strong>雙寫問題</strong>（dual write）：</p>
+<div class="table-wrap"><table>
+  <tr><th>順序</th><th>中間當掉的結果</th></tr>
+  <tr><td>先 COMMIT 訂單，再送事件</td><td>訂單成立了，事件沒送出：外送平台永遠不知道有這張單</td></tr>
+  <tr><td>先送事件，再 COMMIT 訂單</td><td>事件送出了，訂單卻 ROLLBACK：外送平台去送一張不存在的單</td></tr>
+</table></div>
+<p>解法借用這課前面的做法：既然 jobs 表能和訂單寫在同一個交易，事件也可以先當成一列資料寫進資料庫。這叫 <strong>transactional outbox</strong>：不要直接送事件，把它寫進 <code>outbox</code> 表，和訂單放在<strong>同一個交易</strong>。訂單成立，事件就一定在；訂單 ROLLBACK，事件也跟著消失。然後由另一支叫 <strong>relay</strong> 的程式，從 outbox 取出還沒送的事件，送到訊息系統，送完再標記 <code>published_at</code>。relay 做的事和 worker 一樣，只是它的「工作」是轉送事件。</p>
+<figure>
+  <svg viewBox="0 0 700 230" role="img" aria-label="下單 API 在同一個交易裡寫入 orders 和 outbox；relay 用 SKIP LOCKED 取出 outbox 的事件，送到訊息系統後標記 published_at">
+    <defs><marker id="arr33" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="20" y="80" width="130" height="60" rx="10"/>
+    <text class="d-text" x="85" y="106" text-anchor="middle">下單 API</text>
+    <text class="d-small" x="85" y="126" text-anchor="middle">producer</text>
+    <rect class="d-soft" x="200" y="20" width="230" height="190" rx="10"/>
+    <text class="d-small" x="315" y="42" text-anchor="middle">PostgreSQL：同一個交易</text>
+    <rect class="d-box" x="225" y="58" width="180" height="56" rx="8"/>
+    <text class="d-text" x="315" y="91" text-anchor="middle">orders</text>
+    <rect class="d-box" x="225" y="130" width="180" height="56" rx="8"/>
+    <text class="d-text" x="315" y="156" text-anchor="middle">outbox</text>
+    <text class="d-small" x="315" y="175" text-anchor="middle">published_at IS NULL</text>
+    <path class="d-line" d="M150,100 L221,86" marker-end="url(#arr33)"/>
+    <path class="d-line" d="M150,120 L221,152" marker-end="url(#arr33)"/>
+    <rect class="d-box" x="480" y="130" width="90" height="56" rx="8"/>
+    <text class="d-text" x="525" y="163" text-anchor="middle">relay</text>
+    <path class="d-line" d="M405,158 L476,158" marker-end="url(#arr33)"/>
+    <text class="d-accent" x="440" y="210" text-anchor="middle">① SKIP LOCKED 取出</text>
+    <rect class="d-box" x="590" y="58" width="100" height="56" rx="8"/>
+    <text class="d-text" x="640" y="84" text-anchor="middle">訊息系統</text>
+    <text class="d-small" x="640" y="102" text-anchor="middle">Kafka 等</text>
+    <path class="d-line" d="M550,130 L610,118" marker-end="url(#arr33)"/>
+    <text class="d-accent" x="600" y="140">② 送出</text>
+    <path class="d-line" d="M500,130 C470,60 440,60 409,140" marker-end="url(#arr33)" stroke-dasharray="6 4"/>
+    <text class="d-accent" x="455" y="66" text-anchor="middle">③ 標記</text>
+  </svg>
+  <figcaption>訂單和事件一起提交；relay 送出後才標記 published_at。②和③之間當掉，事件會再送一次。</figcaption>
+</figure>
+<p>先做 producer 這一半。用一句 CTE 同時寫訂單和 outbox，一句就是一個交易。<a href="16-subquery-cte.html">第 16 課</a>的 CTE 裡放的是 <code>SELECT</code>；<code>WITH</code> 裡也可以放 <code>INSERT … RETURNING</code>，外層就能用它剛產生的訂單 id。執行後看 <code>payload</code> 裡的 <code>order_id</code>：</p>
+<div class="lab" data-sql="WITH o AS (
+  INSERT INTO orders (customer_id, total) VALUES (2, 180)
+  RETURNING id
+)
+INSERT INTO outbox (topic, payload)
+SELECT 'order.created', jsonb_build_object('order_id', id) FROM o
+RETURNING id, topic, payload;"></div>
+<p>再看整張 outbox：新事件排在最後，<code>published_at</code> 是空的，等 relay 來取。</p>
+<div class="lab" data-sql="SELECT id, topic, payload, published_at FROM outbox ORDER BY id;"></div>
+<p>relay 這一半，取件方式和 worker 一模一樣：用 <code>SKIP LOCKED</code> 批次取出，多個 relay 可以同時跑而不重複，你會在練習 4 寫出這句。</p>
+<p>outbox 解決的是「只成功一半」，不是重複。它<strong>仍然是 at-least-once</strong>：relay 把事件送出之後、標記 <code>published_at</code> 之前當掉，下一次會再送一次，和第三節寄兩次收據是同一回事。所以每個事件要帶唯一的 id，消費端（例如外送平台）收到時用它去重，做到冪等。</p>
+<p>更完整的 relay 架構在<a href="../../system-design/lessons/12-queues-outbox.html">系統設計課第 12 課</a>；不用輪詢 outbox 的另一種做法，見課末「補充與查表」。</p>
+<p>jobs 表和 outbox 都建在 PostgreSQL 上，咖啡店目前的流量用得很順。最後一個問題是：什麼時候這樣做會不夠？</p>
+
+<h2>什麼時候該換專門的佇列？</h2>
+<p>PostgreSQL 佇列適合中小流量、而且工作和業務資料要一致的場景。判斷要不要換，看的是前面每一節付出的代價會不會被放大。下面這些情況就該考慮專門的工具：</p>
+<ul>
+  <li><strong>每秒上千件以上</strong>：每件工作至少一次 INSERT 和兩次 UPDATE，每次 UPDATE 都留下死版本。佇列表會快速膨脹，要調 autovacuum（第 30 課），或依日期分割、整個分區丟掉（第 35 課）。</li>
+  <li><strong>一個事件要給很多消費者，而且每個消費者有自己的進度</strong>：例如「訂單成立」要同時給外送平台、會員點數、報表系統，各自讀到哪裡不一樣。這種一對多的發送叫扇出（fan-out）。jobs 表做不到，因為一件工作被做完就標成 <code>done</code>，只適合給一個消費者。Kafka 這類 <strong>log 型</strong>系統的做法不同：事件依序附加保存，不會因為被讀過就刪掉，每個消費者各自記住自己讀到第幾筆（這個位置叫 offset）。所以同一則事件可以給很多消費者，各自照自己的速度往前讀。</li>
+  <li><strong>大量延遲工作、需要排程、優先順序、限流</strong>：Redis 上的 BullMQ（<a href="../../nestjs/lessons/20-queues-bullmq.html">NestJS 課第 20 課</a>）、SQS、RabbitMQ 都內建。</li>
+</ul>
+<p>換掉佇列不代表丟掉 outbox：只要「寫資料庫」和「送訊息」要一致，outbox 仍然是把兩者接起來的方法。</p>
+
+<h2>補充與查表</h2>
+<ul>
+  <li><strong><code>SKIP LOCKED</code> 的版本</strong>：PostgreSQL 9.5 起提供。</li>
+  <li><strong>advisory lock 的另一種 key</strong>：除了一個 <code>bigint</code>，也可以用兩個 int 參數的版本，例如 <code>(表的編號, 列的 id)</code>。</li>
+  <li><strong>不要在有 <code>LIMIT</code> 的查詢裡直接呼叫鎖函式</strong>：文件提醒，<code>LIMIT</code> 不保證在呼叫之前套用，可能鎖到你沒預期的 key；先用子查詢取好 id 再上鎖。</li>
+  <li><strong>PgBouncer transaction 模式的限制</strong>：上面「不能用 session 級的功能」依據的是 PgBouncer 1.26.1 的官方文件。</li>
+  <li><strong>NOTIFY 的 payload 大小</strong>：預設設定下要小於 8000 bytes，文件建議放 id，資料本身放在表裡。</li>
+  <li><strong>CDC</strong>（change data capture）：relay 不輪詢 outbox，改成直接讀資料庫的變更紀錄，在<a href="../../system-design/lessons/12-queues-outbox.html">系統設計課第 12 課</a>。</li>
+</ul>
+
+<h2>練習</h2>
+
+<div class="exercise" data-isolated data-max-statements="1"
+  data-require="\bSKIP\s+LOCKED\b"
+  data-require-msg="worker B 要和停在交易裡的 worker A 同時取件：不能等 A 的鎖，也不能因為碰到鎖而報錯。"
+  data-forbid="\bid\s*(=|&lt;&gt;|!=|&lt;=?|&gt;=?)\s*\d|\bid\s+(NOT\s+)?(IN\s*\(\s*\d|BETWEEN\s+\d)|ARRAY\s*\[\s*\d"
+  data-forbid-msg="不要把 id 寫死：程式事先不知道哪幾件符合條件、哪幾件被別人鎖著，要讓條件自己找出來。"
+  data-start="-- worker B：一句取件
+"
+  data-answer="UPDATE jobs
+SET status = 'running',
+    attempts = attempts + 1,
+    locked_until = now() + interval '5 minutes'
+WHERE id IN (
+  SELECT id FROM jobs
+  WHERE status = 'queued' AND run_at &lt;= now()
+  ORDER BY run_at, id
+  LIMIT 2
+  FOR UPDATE SKIP LOCKED
+)
+RETURNING id, kind;"
+  data-check="SELECT id, status, attempts,
+  locked_until &gt; now() + interval '4 minutes' AND locked_until &lt;= now() + interval '5 minutes' AS lease_5min
+FROM jobs ORDER BY id;">
+  <p>練習 1：worker A 已經取走 1、2 號並停在交易裡（題目已設定好）。寫 worker B 的<strong>一句</strong>取件：最多 2 件、<code>status = 'queued'</code> 而且已到執行時間、依 <code>run_at</code> 再依 <code>id</code> 先進先出、跳過被鎖住的；把它們標成 <code>running</code>、<code>attempts</code> 加 1、<code>locked_until</code> 設成 5 分鐘後，回傳 <code>id</code> 與 <code>kind</code>。</p>
+  <script type="text/sql" data-role="setup">BEGIN;
+SELECT id FROM jobs
+WHERE status = 'queued' AND run_at <= now()
+ORDER BY run_at, id
+LIMIT 2
+FOR UPDATE SKIP LOCKED;
+PREPARE TRANSACTION 'worker_a';</script>
+  <script type="text/sql" data-role="wrong">UPDATE jobs SET status = 'running', attempts = attempts + 1, locked_until = now() + interval '5 minutes'
+WHERE id IN (SELECT id FROM jobs WHERE status = 'queued' AND run_at <= now() ORDER BY run_at, id LIMIT 2 FOR UPDATE)
+RETURNING id, kind;</script>
+  <script type="text/sql" data-role="wrong">UPDATE jobs SET status = 'running', attempts = attempts + 1, locked_until = now() + interval '5 minutes'
+WHERE id IN (SELECT id FROM jobs WHERE status = 'queued' AND run_at <= now() ORDER BY run_at, id LIMIT 2)
+RETURNING id, kind;</script>
+  <script type="text/sql" data-role="wrong">UPDATE jobs SET status = 'running', attempts = attempts + 1, locked_until = now() + interval '5 minutes'
+WHERE id IN (SELECT id FROM jobs WHERE status = 'queued' AND run_at <= now() ORDER BY run_at, id LIMIT 2 FOR UPDATE NOWAIT)
+RETURNING id, kind;</script>
+  <script type="text/sql" data-role="wrong">UPDATE jobs SET status = 'running', attempts = attempts + 1, locked_until = now() + interval '5 minutes'
+WHERE id IN (SELECT id FROM jobs WHERE status = 'queued' AND run_at <= now() LIMIT 2 FOR UPDATE SKIP LOCKED)
+RETURNING id, kind;</script>
+  <script type="text/sql" data-role="wrong">UPDATE jobs SET status = 'running', attempts = attempts + 1, locked_until = now() + interval '5 minutes'
+WHERE id IN (SELECT id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 2 FOR UPDATE SKIP LOCKED)
+RETURNING id, kind;</script>
+  <script type="text/sql" data-role="wrong">UPDATE jobs SET status = 'running', attempts = attempts + 1
+WHERE id IN (SELECT id FROM jobs WHERE status = 'queued' AND run_at <= now() ORDER BY run_at, id LIMIT 2 FOR UPDATE SKIP LOCKED)
+RETURNING id, kind;</script>
+  <script type="text/sql" data-role="wrong">UPDATE jobs SET status = 'running', locked_until = now() + interval '5 minutes'
+WHERE id IN (SELECT id FROM jobs WHERE status = 'queued' AND run_at <= now() ORDER BY run_at, id LIMIT 2 FOR UPDATE SKIP LOCKED)
+RETURNING id, kind;</script>
+  <script type="text/sql" data-role="wrong">UPDATE jobs SET status = 'running', attempts = attempts + 1, locked_until = now() + interval '1 hour'
+WHERE id IN (SELECT id FROM jobs WHERE status = 'queued' AND run_at <= now() ORDER BY run_at, id LIMIT 2 FOR UPDATE SKIP LOCKED)
+RETURNING id, kind;</script>
+  <script type="text/sql" data-role="wrong">UPDATE jobs SET status = 'running', attempts = attempts + 1, locked_until = now() + interval '5 minutes'
+WHERE id IN (SELECT id FROM jobs WHERE run_at <= now() ORDER BY run_at, id LIMIT 2 FOR UPDATE SKIP LOCKED)
+RETURNING id, kind;</script>
+  <script type="text/sql" data-role="wrong">SELECT id, kind FROM jobs WHERE status = 'queued' AND run_at <= now() ORDER BY run_at, id LIMIT 2 FOR UPDATE SKIP LOCKED;</script>
+  <script type="text/sql" data-role="wrong">UPDATE jobs SET status = 'running', attempts = attempts + 1, locked_until = now() + interval '5 minutes'
+WHERE id IN (4, 5)
+RETURNING id, kind; -- SKIP LOCKED</script>
+  <script type="text/sql" data-role="wrong">UPDATE jobs SET status = 'running', attempts = attempts + 1, locked_until = now() + interval '5 minutes'
+WHERE id IN (SELECT id FROM jobs WHERE id > 3 AND status = 'queued' AND run_at <= now() ORDER BY run_at, id LIMIT 2 FOR UPDATE SKIP LOCKED)
+RETURNING id, kind;</script>
+  <script type="text/sql" data-role="wrong">BEGIN;
+SELECT id FROM jobs WHERE status = 'queued' AND run_at <= now() ORDER BY run_at, id LIMIT 2 FOR UPDATE SKIP LOCKED;
+UPDATE jobs SET status = 'running', attempts = attempts + 1, locked_until = now() + interval '5 minutes'
+WHERE status = 'queued' AND run_at <= now() AND run_at > now() - interval '90 minutes' AND kind <> 'sync_accounting' OR kind = 'sync_accounting' AND payload->>'order_id' = '1001'
+RETURNING id, kind;
+COMMIT;</script>
+</div>
+
+<div class="exercise" data-isolated data-max-statements="1"
+  data-forbid="\bid\s*(=|&lt;&gt;|!=|&lt;=?|&gt;=?)\s*\d|\bid\s+(NOT\s+)?(IN\s*\(\s*\d|BETWEEN\s+\d)|ARRAY\s*\[\s*\d"
+  data-forbid-msg="不要把 id 寫死：程式事先不知道哪幾件符合條件、哪幾件被別人鎖著，要讓條件自己找出來。"
+  data-start="-- 回收租約過期的工作（一句 UPDATE）
+"
+  data-answer="UPDATE jobs
+SET status = CASE WHEN attempts &gt;= max_attempts THEN 'dead' ELSE 'queued' END,
+    locked_until = NULL
+WHERE status = 'running' AND locked_until &lt; now();"
+  data-check="SELECT id, status, locked_until IS NULL AS cleared FROM jobs ORDER BY id;">
+  <p>練習 2：有 worker 當掉了。寫<strong>一句</strong> <code>UPDATE</code> 回收租約已過期（<code>locked_until &lt; now()</code>）的 <code>running</code> 工作：<code>attempts</code> 還沒到 <code>max_attempts</code> 的改回 <code>queued</code>，已經到了的改成 <code>dead</code>；兩種都要清掉 <code>locked_until</code>。租約還沒到期的工作不能動。每件工作的上限不一定都是 5，題目另外加了幾件當掉的工作。</p>
+  <script type="text/sql" data-role="setup">INSERT INTO jobs (id, kind, payload, status, run_at, attempts, max_attempts, locked_until) VALUES
+  (11, 'send_coupon',  '{"customer_id": 6}', 'running', now() - interval '3 hours', 3, 3, now() - interval '1 hour'),
+  (12, 'resize_photo', '{"product_id": 2}',  'running', now() - interval '3 hours', 5, 8, now() - interval '1 hour');</script>
+  <script type="text/sql" data-role="wrong">UPDATE jobs SET status = 'queued', locked_until = NULL
+WHERE status = 'running' AND locked_until < now();</script>
+  <script type="text/sql" data-role="wrong">UPDATE jobs SET status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'queued' END, locked_until = NULL
+WHERE status = 'running';</script>
+  <script type="text/sql" data-role="wrong">UPDATE jobs SET status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'queued' END
+WHERE status = 'running' AND locked_until < now();</script>
+  <script type="text/sql" data-role="wrong">UPDATE jobs SET status = CASE WHEN attempts > max_attempts THEN 'dead' ELSE 'queued' END, locked_until = NULL
+WHERE status = 'running' AND locked_until < now();</script>
+  <script type="text/sql" data-role="wrong">UPDATE jobs SET status = CASE WHEN attempts >= 5 THEN 'dead' ELSE 'queued' END, locked_until = NULL
+WHERE status = 'running' AND locked_until < now();</script>
+  <script type="text/sql" data-role="wrong">UPDATE jobs SET status = CASE WHEN id IN (8, 11) THEN 'dead' ELSE 'queued' END, locked_until = NULL
+WHERE status = 'running' AND locked_until < now();</script>
+</div>
+
+<div class="exercise"
+  data-require="\bpg_try_advisory_xact_lock\s*\("
+  data-require-msg="這題要不等待、而且交易結束會自動釋放的那一種。"
+  data-forbid="\b(NOT|AND|OR|CASE|IS|true|false)\b|[=&lt;&gt;!]"
+  data-forbid-msg="直接回傳拿鎖函式的結果，不要再加運算或寫死的值。"
+  data-start="-- 第二台排程器：試著拿每日報表的鎖，回傳一欄 got
+"
+  data-answer="SELECT pg_try_advisory_xact_lock(hashtextextended('daily-report', 0)) AS got;">
+  <p>練習 3：另一台排程器已經拿到每日報表的交易級 advisory lock，並停在交易裡（題目已設定好）。寫第二台排程器要執行的一句查詢：<strong>不等待</strong>地嘗試拿同一把<strong>交易級</strong>的鎖（key 用 <code>hashtextextended('daily-report', 0)</code>），回傳一欄 <code>got</code>。</p>
+  <script type="text/sql" data-role="setup">BEGIN;
+SELECT pg_advisory_xact_lock(hashtextextended('daily-report', 0));
+PREPARE TRANSACTION 'scheduler_a';</script>
+  <script type="text/sql" data-role="wrong">SELECT pg_advisory_xact_lock(hashtextextended('daily-report', 0)) IS NULL AS got;</script>
+  <script type="text/sql" data-role="wrong">SELECT pg_try_advisory_xact_lock(hashtext('daily-report')) AS got;</script>
+  <script type="text/sql" data-role="wrong">SELECT pg_try_advisory_xact_lock(1) AS got;</script>
+  <script type="text/sql" data-role="wrong">SELECT pg_try_advisory_lock(hashtextextended('daily-report', 0)) AS got;</script>
+  <script type="text/sql" data-role="wrong">SELECT false AS got; -- pg_try_advisory_xact_lock(</script>
+  <script type="text/sql" data-role="wrong">SELECT NOT pg_try_advisory_xact_lock(1) AS got;</script>
+  <script type="text/sql" data-role="wrong">SELECT pg_try_advisory_xact_lock(hashtextextended('daily-report', 1)) AS got;</script>
+</div>
+
+<div class="exercise" data-max-statements="1"
+  data-require="\bSKIP\s+LOCKED\b"
+  data-require-msg="relay B 要和停在交易裡的 relay A 同時跑：不能等 A 的鎖，也不能因為碰到鎖而報錯。"
+  data-forbid="\bid\s*(=|&lt;&gt;|!=|&lt;=?|&gt;=?)\s*\d|\bid\s+(NOT\s+)?(IN\s*\(\s*\d|BETWEEN\s+\d)|ARRAY\s*\[\s*\d"
+  data-forbid-msg="不要把 id 寫死：程式事先不知道哪幾件符合條件、哪幾件被別人鎖著，要讓條件自己找出來。"
+  data-start="-- relay B：一句批次取出並標記
+"
+  data-answer="UPDATE outbox
+SET published_at = now()
+WHERE id IN (
+  SELECT id FROM outbox
+  WHERE published_at IS NULL
+  ORDER BY id
+  LIMIT 3
+  FOR UPDATE SKIP LOCKED
+)
+RETURNING id, topic;"
+  data-check="SELECT id, published_at IS NOT NULL AS published FROM outbox ORDER BY id;">
+  <p>練習 4：relay A 已經取走 outbox 的 1 號事件，正停在交易裡送出（題目已設定好）。寫 relay B 的<strong>一句</strong>批次：最多 3 筆還沒送出（<code>published_at IS NULL</code>）的事件、依 <code>id</code>、跳過被鎖住的，標記 <code>published_at = now()</code>，回傳 <code>id</code> 與 <code>topic</code>。判分看最後哪些事件被標記。</p>
+  <script type="text/sql" data-role="setup">BEGIN;
+SELECT id FROM outbox WHERE published_at IS NULL ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED;
+PREPARE TRANSACTION 'relay_a';</script>
+  <script type="text/sql" data-role="wrong">UPDATE outbox SET published_at = now()
+WHERE id IN (SELECT id FROM outbox WHERE published_at IS NULL ORDER BY id LIMIT 3 FOR UPDATE)
+RETURNING id, topic;</script>
+  <script type="text/sql" data-role="wrong">UPDATE outbox SET published_at = now()
+WHERE id IN (SELECT id FROM outbox ORDER BY id LIMIT 3 FOR UPDATE SKIP LOCKED)
+RETURNING id, topic;</script>
+  <script type="text/sql" data-role="wrong">UPDATE outbox SET published_at = now()
+WHERE id IN (SELECT id FROM outbox WHERE published_at IS NULL LIMIT 3 FOR UPDATE SKIP LOCKED)
+RETURNING id, topic;</script>
+  <script type="text/sql" data-role="wrong">SELECT id, topic FROM outbox WHERE published_at IS NULL ORDER BY id LIMIT 3 FOR UPDATE SKIP LOCKED;</script>
+  <script type="text/sql" data-role="wrong">UPDATE outbox SET published_at = now()
+WHERE id IN (SELECT id FROM outbox WHERE published_at IS NULL ORDER BY id DESC LIMIT 3 FOR UPDATE SKIP LOCKED)
+RETURNING id, topic;</script>
+  <script type="text/sql" data-role="wrong">UPDATE outbox SET published_at = now()
+WHERE id IN (3, 4, 5)
+RETURNING id, topic; -- SKIP LOCKED</script>
+</div>
+
+<div class="exercise" data-isolated data-max-statements="1"
+  data-forbid="\bNOT\s+EXISTS\b"
+  data-forbid-msg="先檢查「不存在」再插入，兩個請求同時檢查都會看到不存在。讓 UNIQUE 約束來判斷。"
+  data-require="^(?=[\s\S]*\b1001\b)(?=[\s\S]*\b1002\b)[\s\S]*\bON\s+CONFLICT\b"
+  data-require-msg="兩張訂單都要放，而且這句要能安全地重試：撞到已經存在的工作時不能出錯。"
+  data-start="-- 替訂單 1001、1002 各放一筆寄收據工作（一句）
+"
+  data-answer="INSERT INTO jobs (kind, payload, dedupe_key) VALUES
+  ('send_receipt', '{&quot;order_id&quot;: 1001}', 'receipt:1001'),
+  ('send_receipt', '{&quot;order_id&quot;: 1002}', 'receipt:1002')
+ON CONFLICT (dedupe_key) DO NOTHING;"
+  data-check="SELECT dedupe_key, status, count(*),
+  bool_and(xmin = (SELECT xmin FROM jobs WHERE id = 1)) AS untouched
+FROM jobs WHERE dedupe_key LIKE 'receipt:%' GROUP BY dedupe_key, status;">
+  <p>練習 5：同一張訂單的寄收據工作只能有一筆，<code>dedupe_key</code> 有 <code>UNIQUE</code>，格式是 <code>receipt:訂單編號</code>。結帳 API 被重試了，要再替訂單 1001 和 1002 各放一筆寄收據工作（<code>kind</code> 是 <code>send_receipt</code>，<code>payload</code> 是 <code>{"order_id": 訂單編號}</code>）。1001 已經有了（而且已經寄出）。寫<strong>一句</strong> <code>INSERT</code>：已經有的就什麼都不做，不能出錯，也不能讓已完成的工作重新排隊。</p>
+  <script type="text/sql" data-role="wrong">INSERT INTO jobs (kind, payload, dedupe_key) VALUES
+  ('send_receipt', '{"order_id": 1001}', 'receipt:1001'),
+  ('send_receipt', '{"order_id": 1002}', 'receipt:1002');</script>
+  <script type="text/sql" data-role="wrong">INSERT INTO jobs (kind, payload, dedupe_key) VALUES
+  ('send_receipt', '{"order_id": 1001}', 'receipt:1001'),
+  ('send_receipt', '{"order_id": 1002}', 'receipt:1002')
+ON CONFLICT (dedupe_key) DO UPDATE SET status = 'queued';</script>
+  <script type="text/sql" data-role="wrong">SELECT count(*) FROM jobs WHERE dedupe_key = 'receipt:1001';
+INSERT INTO jobs (kind, payload, dedupe_key) VALUES ('send_receipt', '{"order_id": 1002}', 'receipt:1002');</script>
+  <script type="text/sql" data-role="wrong">INSERT INTO jobs (kind, payload, dedupe_key)
+SELECT 'send_receipt', jsonb_build_object('order_id', o), 'receipt:' || o
+FROM unnest(ARRAY[1001, 1002]) AS o
+WHERE NOT EXISTS (SELECT 1 FROM jobs WHERE dedupe_key = 'receipt:' || o);</script>
+  <script type="text/sql" data-role="wrong">INSERT INTO jobs (kind, payload, dedupe_key) VALUES
+  ('send_receipt', '{"order_id": 1001}', 'receipt:1001'),
+  ('send_receipt', '{"order_id": 1002}', 'receipt:1002')
+ON CONFLICT (dedupe_key) DO UPDATE SET payload = EXCLUDED.payload;</script>
+  <script type="text/sql" data-role="wrong">INSERT INTO jobs (kind, payload, dedupe_key) VALUES
+  ('send_receipt', '{"order_id": 1002}', 'receipt:1002')
+ON CONFLICT (dedupe_key) DO NOTHING;</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 6：開了 10 個 worker，每個都是 <code>BEGIN</code>、<code>SELECT … ORDER BY run_at LIMIT 1 FOR UPDATE</code>（沒有 <code>SKIP LOCKED</code>）、處理完再 <code>COMMIT</code>。佇列裡有 1000 件工作，吞吐量會怎樣？</p>
+  <label data-key="a">大約是 1 個 worker 的 10 倍，因為有鎖就不會重複</label>
+  <label data-key="b">會發生死結，PostgreSQL 讓其中 9 個失敗</label>
+  <label data-key="c">大家都在搶最前面那一列，同一時間只有一個在做事，接近 1 個 worker 的速度</label>
+  <label data-key="d">每件工作會被處理 10 次</label>
+  <p class="why">✓ c：<code>FOR UPDATE</code> 防住了重複，但 10 個 worker 都排序到同一件、排在同一列後面等；前一個提交後，下一個才跳過它、去鎖下一件。加了鎖不等於能平行處理，要 <code>SKIP LOCKED</code> 才會各拿各的。a 錯在忽略了等待；b 錯在每個交易只鎖一列、順序一致，沒有互相等待的環，不會死結；d 錯在鎖正好防住了重複處理。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：新增工作時 trigger 執行 <code>pg_notify('jobs', …)</code>。剛好那時所有 worker 都在重啟，沒有人在 LISTEN。這則通知會怎樣？</p>
+  <label data-key="a">PostgreSQL 會保存起來，worker 重新 LISTEN 時補送</label>
+  <label data-key="b">直接消失；工作還在 jobs 表裡，要靠 worker 定期輪詢撿起來</label>
+  <label data-key="c">INSERT 會失敗，因為通知送不出去</label>
+  <p class="why">✓ NOTIFY 只送給「當下」在聽的連線，不會保存。所以它只能當「有新工作，快去查」的提示，真正的工作要存在表裡，worker 仍要定期輪詢。INSERT 不受影響。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 8：worker 寄出收據後、標記 <code>done</code> 之前當掉。租約到期後工作被回收，另一個 worker 又寄了一次。該往哪個方向修？</p>
+  <label data-key="a">接受佇列是 at-least-once，讓處理冪等：例如寄信前檢查「這張訂單的收據寄過了沒」，或把去重 key 交給寄信服務</label>
+  <label data-key="b">把租約改成永遠不過期，就不會重做</label>
+  <label data-key="c">把「寄信」和「標記 done」放進同一個資料庫交易，就能剛好一次</label>
+  <p class="why">✓ 寄信是資料庫外的動作，資料庫的交易包不住它，所以只要有重試，就可能做兩次。正確方向是讓處理冪等。租約永不過期的話，worker 當掉的工作就永遠卡在 running。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 9：排程器經過 PgBouncer（transaction 模式）連資料庫，用 <code>pg_advisory_lock</code>（session 級）當互斥鎖，做完再 <code>pg_advisory_unlock</code>。會怎樣？</p>
+  <label data-key="a">沒問題，連線池對鎖沒有影響</label>
+  <label data-key="b">PostgreSQL 會報錯，拒絕在連線池後面拿鎖</label>
+  <label data-key="c">鎖留在一條交易結束後就交給別人的連線上，unlock 可能送到另一條連線而失敗，鎖一直沒放</label>
+  <p class="why">✓ transaction 模式下，每個交易結束後連線就回到池子。session 級的鎖跟著「連線」，不跟著你的程式，所以可能拿著不放、或被別的請求「繼承」。PostgreSQL 不知道前面有連線池，不會報錯。改用 <code>pg_try_advisory_xact_lock</code>，交易結束自動釋放。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>取件後在同一個交易裡做完整件工作</strong>：交易拉長、一直拿著列鎖、擋住 VACUUM 清理。取件交易只做「標記 running、寫租約」，工作在交易外做。</li>
+  <li><strong>沒有租約</strong>：worker 當掉，工作永遠卡在 <code>running</code>。取件時寫 <code>locked_until</code>，定期回收過期的。</li>
+  <li><strong>無限重試、沒有 dead letter</strong>：壞掉的工作一直重試，佔滿 worker。設 <code>max_attempts</code>、退避，超過就 <code>dead</code>，並設告警。</li>
+  <li><strong>把 NOTIFY 當成可靠的佇列</strong>：沒人在聽就消失，ROLLBACK 也不送。通知只是提示，工作要存在表裡。</li>
+  <li><strong>佇列表不管 autovacuum</strong>：大量 UPDATE、DELETE 造成表和索引膨脹，取件越來越慢。調整這張表的 autovacuum 參數，或依日期分割（第 30、35 課）。</li>
+  <li><strong>advisory lock 的 key 用 32 位元 <code>hashtext</code></strong>：容易撞號，讓無關的工作互相擋住。用 <code>hashtextextended</code> 或兩個 int 的版本。</li>
+  <li><strong>經過 transaction 模式的連線池用 session 級 advisory lock 或 LISTEN</strong>：連線會換人。用交易級的鎖；LISTEN 用一條直連的專用連線。</li>
+  <li><strong>以為 outbox 能做到剛好一次</strong>：relay 送出後、標記前當掉，事件會重送。消費端要依事件 id 去重。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>工作佇列把慢的、會失敗的事移出請求：下單 API 只留一筆待辦，worker 在背景做。用 PostgreSQL 當佇列，工作和訂單能寫在同一個交易。</li>
+  <li>佇列只保證 at-least-once：「做事」和「記下做完」之間可能當掉，所以處理要冪等。</li>
+  <li>jobs 表：狀態、<code>run_at</code>、嘗試次數、租約、去重鍵；用部分索引 <code>WHERE status = 'queued'</code> 支撐取件。</li>
+  <li>取件寫成一句 <code>UPDATE … WHERE id IN (SELECT … ORDER BY … LIMIT n FOR UPDATE SKIP LOCKED) RETURNING …</code>：不重複、不互等。</li>
+  <li>取件交易要短；用租約回收當掉的工作，失敗時退避重試，超過上限進 dead letter。</li>
+  <li>advisory lock 讓排程只跑一份；經過連線池時用交易級的 <code>pg_try_advisory_xact_lock</code>，key 用 <code>hashtextextended</code>。</li>
+  <li>LISTEN／NOTIFY 只在提交時送出、沒人聽就消失，只當叫醒 worker 的提示，worker 仍要定期輪詢。</li>
+  <li>outbox 把事件和業務資料寫在同一個交易，再由 relay 送出，解決雙寫問題；它仍是 at-least-once，消費端要去重。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 8 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 10：集點卡表每晚都有 VACUUM，檔案卻一直變大。<code>VACUUM VERBOSE</code> 顯示大量 <code>dead but not yet removable</code>，先查什麼？</p>
+  <label data-key="a">在離峰執行 <code>VACUUM FULL</code>，把表重寫一次空間就收回來了</label>
+  <label data-key="b">把這張表的 <code>autovacuum_vacuum_scale_factor</code> 調小，讓它更常清</label>
+  <label data-key="c">查 <code>pg_stat_activity</code> 和 <code>pg_prepared_xacts</code>，找開了很久的交易</label>
+  <label data-key="d">把 <code>fillfactor</code> 調低，讓更新走 HOT，少產生死版本</label>
+  <p class="why">✓ 「還不能清」代表還有交易可能看得到這些舊版本：最舊的進行中交易決定清理界線，只要有一個，整個資料庫都清不掉。依 <code>age(backend_xmin)</code> 由大到小找元兇，也查 replication slot，再設 <code>idle_in_transaction_session_timeout</code> 預防。b 錯在界線沒往前移，清得再勤，每次也都清不掉。（第 30 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 11：優惠券全店限量 100 張，領券 API 這樣寫。哪裡會出事？</p>
+<pre>BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT count(*) FROM coupon_claims WHERE coupon_id = 7;
+-- 程式確認少於 100 張才繼續
+INSERT INTO coupon_claims (coupon_id, customer_id) VALUES (7, $1);
+COMMIT;</pre>
+  <label data-key="a">兩人同時數到 99 張，各自新增都成功，總共發出 101 張</label>
+  <label data-key="b">第二個人新增時得到 40001，但程式沒有寫重試，直接報錯</label>
+  <label data-key="c"><code>count(*)</code> 在 REPEATABLE READ 下鎖住整張表，領券要排隊</label>
+  <label data-key="d">第二個人的 INSERT 會等第一個人提交，尖峰時段領券變慢</label>
+  <p class="why">✓ 規則是「先數別的列，再寫自己的列」，兩人寫的是不同的列，REPEATABLE READ 不報錯，這就是寫入偏差。修法是 SERIALIZABLE 加重試，或先 <code>FOR UPDATE</code> 鎖住共同的父列（那張優惠券）再數。b 錯在 REPEATABLE READ 只在改到別人剛改過的同一列時才得到 40001，這裡兩人新增的是不同的列。（第 31 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 12：扣庫存寫成 <code>UPDATE products SET stock = stock - 1 WHERE id = $1 AND stock &gt;= 1</code>。同事說預設的 READ COMMITTED 不安全，要改 SERIALIZABLE，你怎麼回？</p>
+  <label data-key="a">要改：READ COMMITTED 每一句拍新快照，兩人可能都讀到舊庫存</label>
+  <label data-key="b">要改：但先 <code>SELECT … FOR UPDATE</code> 再扣，比 SERIALIZABLE 便宜</label>
+  <label data-key="c">不用改：只要包進 BEGIN／COMMIT，交易之間就不會互相影響</label>
+  <label data-key="d">不用改：後到的會等前一個提交，再用最新庫存重新檢查條件</label>
+  <p class="why">✓ READ COMMITTED 的 UPDATE 遇到別人正在改的列會等，對方提交後拿最新版本重新檢查 WHERE，不成立就影響 0 列，程式看影響列數判斷。改 SERIALIZABLE 只是多了重試的成本。a 錯在重新檢查用的是最新版本，不是句子開始時的快照；要小心的是條件讀別的列，那才需要 SERIALIZABLE 或鎖父列。（第 31 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 13：接收第三方 webhook 同步會員資料，同一筆可能同時送來兩次。現在的寫法是先 <code>SELECT … WHERE external_id = $1</code>，沒有就 INSERT、有就 UPDATE。怎麼改最可靠？</p>
+  <label data-key="a">把查詢和新增包進同一個交易，中間就不會有別人插進來</label>
+  <label data-key="b">替 <code>external_id</code> 加唯一約束，改用 <code>INSERT … ON CONFLICT DO UPDATE</code></label>
+  <label data-key="c">改用 <code>MERGE</code>，一句做完「有就更新、沒有就新增」</label>
+  <label data-key="d">INSERT 前再查一次，查到重複就等一下重查，降低機率</label>
+  <p class="why">✓ 兩個請求同時查到「沒有」就會都新增：重複兩筆，或撞 23505。讓唯一約束當裁判：ON CONFLICT 遇到正在新增同一個 key 的交易會等它結束，提交就改做 UPDATE。c 錯在 MERGE 同時新增同一個 key 時會直接撞唯一約束錯誤，它適合單一程序的批次同步。（第 31 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 14：結帳交易用 SERIALIZABLE，包在共用的 <code>withRetry</code> 裡（收到 40001 或 40P01 就 ROLLBACK、從頭重做）。哪裡會出事？</p>
+<pre>await withRetry(async (tx) =&gt; {
+  const order = await createOrder(tx, cart);
+  await sendReceiptEmail(order);
+  await addPoints(tx, order);
+});</pre>
+  <label data-key="a">交易被重做時收據已經寄出，顧客會收到兩封以上</label>
+  <label data-key="b"><code>withRetry</code> 應該包住整個 HTTP 請求，只包交易不夠</label>
+  <label data-key="c">寄信期間 SIReadLock 會擋住其他人結帳，造成排隊</label>
+  <label data-key="d">重做時沿用第一次的 <code>order</code>，會寫進舊的資料</label>
+  <p class="why">✓ 會被重試的交易可能執行好幾次，寄信撤不回，重做一次就多一封；等外部服務也讓交易變長、衝突變多。寄信移到提交之後，或做成冪等。b 錯在重試的範圍是資料庫交易：重做整個請求，裡面的外部呼叫也跟著重做，例如重複扣款。（第 31 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 15：營業時間要對 <code>orders</code> 執行 <code>ALTER TABLE orders ADD COLUMN note text</code>，這句本身幾毫秒就完成。怎麼做最安全？</p>
+  <label data-key="a">先用 <code>pg_terminate_backend</code> 斷掉正在跑的長查詢，再執行</label>
+  <label data-key="b">包在 BEGIN／COMMIT 裡，出錯會自動回滾，不會影響別人</label>
+  <label data-key="c">交易裡先 <code>SET LOCAL lock_timeout = '2s'</code>，失敗就稍後重試</label>
+  <label data-key="d">直接執行，加欄位只改系統目錄，不會拿會擋人的表級鎖</label>
+  <p class="why">✓ 危險的不是 ALTER 本身，是等鎖：它排在長查詢後面等 ACCESS EXCLUSIVE，後面所有讀寫又排在它後面，整個網站卡住。設了 <code>lock_timeout</code>，等不到就放棄，佇列跟著解開，晚點再試。d 錯在大多數 ALTER TABLE 拿的是 ACCESS EXCLUSIVE，連 SELECT 都會被擋。（第 32 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 16：同步會計的 worker 這樣取件和處理，開了 5 個。哪裡會出事？</p>
+<pre>BEGIN;
+SELECT id, payload FROM jobs
+WHERE status = 'queued' ORDER BY run_at
+LIMIT 1 FOR UPDATE SKIP LOCKED;
+-- 呼叫會計系統 API：平常 3 秒，慢的時候 1 分鐘
+UPDATE jobs SET status = 'done' WHERE id = $1;
+COMMIT;</pre>
+  <label data-key="a">其他 worker 會排隊等這一列的鎖，5 個 worker 只剩一個在做事</label>
+  <label data-key="b">交易跟著 API 一起拉長，一直拿著列鎖，也擋住 VACUUM 清理</label>
+  <label data-key="c">worker 當掉時列鎖不會釋放，這件工作會永遠卡在 queued</label>
+  <label data-key="d">SKIP LOCKED 會跳過 run_at 最早的工作，執行順序完全亂掉</label>
+  <p class="why">✓ 取件交易去等外部 API，交易被拉長，期間 VACUUM 清不掉死版本，而佇列表正是大量 UPDATE 的表。取件交易只做「標記 running、寫租約」就 COMMIT，工作在交易外做，失敗靠租約回收。a 錯在 SKIP LOCKED 直接跳過被鎖的列，其他 worker 不會排隊。（第 33 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 17：下單後要送事件到 Kafka 通知外送平台。哪個做法不會出現「訂單成立、事件沒送」或「事件送了、訂單卻不存在」？</p>
+  <label data-key="a">先 COMMIT 訂單再送事件，送失敗就在程式裡重試三次</label>
+  <label data-key="b">在交易裡先送事件，確認 Kafka 收到之後再 COMMIT 訂單</label>
+  <label data-key="c">訂單提交時用 NOTIFY 通知 relay，由 relay 轉送到 Kafka</label>
+  <label data-key="d">事件寫進 outbox 表、和訂單同一個交易，再由 relay 送出</label>
+  <p class="why">✓ 寫訂單和送事件是兩個系統，放不進同一個交易（雙寫問題）；事件當成一列資料和訂單一起提交，就一起成立或一起消失。relay 送出後、標記前當掉會重送，消費端要依事件 id 去重。a 錯在程式剛 COMMIT 完就當掉時，重試的程式碼根本沒機會執行，事件就永遠沒送。（第 33 課）</p>
+</div>
+
+<p>這個階段的重點整理成<a href="../sheets/stage-9.html">一頁圖解</a>。</p>
+<p>下一課進入上線與維運：orders 累積到 4,000 萬筆、一直有人在讀寫，要加欄位、加約束、換型別時，怎麼避開 DDL 的鎖、不讓網站停擺——零停機 migration。</p>
+
+</main>
+
+<script type="text/sql" id="seed">
+CREATE TABLE orders (
+  id bigint GENERATED BY DEFAULT AS IDENTITY (START WITH 1003) PRIMARY KEY,
+  customer_id integer NOT NULL,
+  total integer NOT NULL,
+  ordered_at timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO orders (id, customer_id, total) VALUES (1001, 1, 190), (1002, 3, 110);
+
+CREATE TABLE jobs (
+  id bigint GENERATED BY DEFAULT AS IDENTITY (START WITH 100) PRIMARY KEY,
+  kind text NOT NULL,
+  payload jsonb NOT NULL DEFAULT '{}',
+  status text NOT NULL DEFAULT 'queued'
+    CHECK (status IN ('queued', 'running', 'done', 'dead')),
+  run_at timestamptz NOT NULL DEFAULT now(),
+  attempts integer NOT NULL DEFAULT 0,
+  max_attempts integer NOT NULL DEFAULT 5,
+  locked_until timestamptz,
+  last_error text,
+  dedupe_key text UNIQUE,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+-- 寫入順序刻意和 id 不同：6 號在 4、5 號之前
+INSERT INTO jobs (id, kind, payload, status, run_at, attempts, max_attempts, locked_until, dedupe_key) VALUES
+  (1,  'send_receipt',    '{"order_id": 1001}',   'queued',  now() - interval '2 hours', 0, 5, NULL, NULL),
+  (2,  'print_ticket',    '{"order_id": 1001}',   'queued',  now() - interval '2 hours', 0, 5, NULL, NULL),
+  (3,  'monthly_report',  '{"month": "2099-01"}', 'queued',  '2099-01-01 09:00+08',      0, 5, NULL, NULL),
+  (6,  'sync_accounting', '{"order_id": 1002}',   'queued',  now() - interval '1 hour',  0, 5, NULL, NULL),
+  (4,  'print_ticket',    '{"order_id": 1002}',   'queued',  now() - interval '1 hour',  0, 5, NULL, NULL),
+  (5,  'sync_accounting', '{"order_id": 1001}',   'queued',  now() - interval '1 hour',  0, 5, NULL, NULL),
+  (7,  'send_coupon',     '{"customer_id": 2}',   'running', now() - interval '3 hours', 2, 5, now() - interval '1 hour', NULL),
+  (8,  'send_coupon',     '{"customer_id": 4}',   'running', now() - interval '3 hours', 5, 5, now() - interval '1 hour', NULL),
+  (9,  'resize_photo',    '{"product_id": 6}',    'running', now() - interval '2 hours', 3, 5, now() + interval '1 hour', NULL),
+  (10, 'send_receipt',    '{"order_id": 1001}',   'done',    now() - interval '5 hours', 1, 5, NULL, 'receipt:1001');
+CREATE INDEX jobs_ready_idx ON jobs (run_at, id) WHERE status = 'queued';
+
+CREATE TABLE outbox (
+  id bigint GENERATED BY DEFAULT AS IDENTITY (START WITH 100) PRIMARY KEY,
+  topic text NOT NULL,
+  payload jsonb NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  published_at timestamptz
+);
+INSERT INTO outbox (id, topic, payload, published_at) VALUES
+  (1, 'order.created', '{"order_id": 1001}', NULL),
+  (2, 'order.paid',    '{"order_id": 1000}', now() - interval '2 hours'),
+  (3, 'order.paid',    '{"order_id": 1001}', NULL),
+  (4, 'order.created', '{"order_id": 1002}', NULL),
+  (5, 'order.paid',    '{"order_id": 1002}', NULL),
+  (6, 'stock.low',     '{"product_id": 6}',  NULL);
+-- 3 號後來被改過（補上金額），新版本寫在表的最後面
+UPDATE outbox SET payload = '{"order_id": 1001, "total": 190}' WHERE id = 3;
+</script>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

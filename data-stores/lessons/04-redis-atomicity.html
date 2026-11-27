@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>4. 原子操作：pipeline、MULTI/WATCH 與 Lua 腳本</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="4" data-practice="data-stores">
+<header>
+  <div class="eyebrow">階段 2：Redis 不只是快取 · 第 4 課</div>
+  <h1>原子操作：pipeline、MULTI/WATCH 與 Lua 腳本</h1>
+</header>
+<main>
+
+<p>咖啡店開幕要發 100 張限量優惠券，每位客人限領一張。程式這樣寫：<code>GET</code> 剩下幾張，大於 0 就 <code>DECR</code> 並記下這位客人。自己按幾次都正常，開賣那一刻幾百個人一起按，結果發出了 108 張。每個指令單獨看都沒錯，錯在「讀 → 判斷 → 寫」分成好幾步，步驟之間別人插了進來。</p>
+<p>這一課從頭到尾只修這一個優惠券。<a href="02-redis-data-structures.html">第 2 課</a>說過，<code>INCR</code>、<code>HINCRBY</code> 這種單一指令在伺服器上一步做完；可是優惠券要先看庫存、再看這位客人領過沒，一個指令做不完。Redis 提供了四種把多個指令湊在一起的工具，我們會把優惠券依序放進每一種，看它擋不擋得住插隊、為什麼擋不住，最後做出不會超發的版本。同一招也會順手修好<a href="03-redis-patterns.html">第 3 課</a>留下的滑動視窗限流，並讓你在練習裡寫出 token bucket 限流。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>108 張是怎麼多發出來的：兩位客人的指令怎麼交錯，要補這個空隙需要什麼條件，四個工具裡哪一個做得到（開場問題的最小答案）。</li>
+  <li>pipeline 與 MULTI/EXEC：把指令打包送出、讓指令連續執行，各自解決了什麼，為什麼優惠券還是會超發。</li>
+  <li>WATCH：讀完到寫入之間被人改過就重來，它能修好優惠券嗎？三百人同時搶時會怎樣，它適合用在哪。</li>
+  <li>Lua 腳本與它的規則：把讀、判斷、寫整段交給 Redis，做出不超發的優惠券；上線前要守的規則，順便修好第 3 課的滑動視窗。</li>
+  <li>回到開場：四個工具怎麼選，Redis 扣成功、資料庫寫失敗時怎麼收拾。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="02-redis-data-structures.html">第 2 課</a>的資料結構與 ioredis：指令就是同名方法，回整數的指令拿到 number，其他的值大多是字串。</li>
+  <li><a href="03-redis-patterns.html">第 3 課</a>的滑動視窗限流：每次請求依序跑 ZREMRANGEBYSCORE（清掉視窗外的紀錄）、ZCARD（數視窗內幾筆）、沒超過才 ZADD（記下這一次）。</li>
+  <li><a href="03-redis-patterns.html">第 3 課</a>的 token bucket：用一個 hash 存「還剩幾個 token」和「上次補充的時間」，每次請求先依經過的時間補 token，再拿走一個，沒有 token 就拒絕。它同樣是讀 → 算 → 寫，第 3 課說留到本課用 Lua 做，就是練習 4。</li>
+</ul></div>
+
+<h2>108 張是怎麼多發出來的？</h2>
+<p>先看第一版程式。它做三件事：讀庫存、判斷還有沒有、扣庫存並記下客人：</p>
+<pre>async function claim(redis: Redis, customerId: number) {
+  const stock = Number(await redis.get('ds:coupon:opening:stock') ?? 0)   // 1. 讀
+  if (stock &lt;= 0) return 'sold-out'                                        // 2. 判斷
+  await redis.decr('ds:coupon:opening:stock')                              // 3. 寫
+  await redis.sadd('ds:coupon:opening:claimed', customerId)
+  return 'ok'
+}</pre>
+<p>Redis 一次只執行一個指令：兩個 client 同時送來的指令，它會排成一條隊伍，一個做完才做下一個，所以單一指令不會做到一半被打斷。但它不知道哪幾個指令「是一組的」。上面的程式對 Redis 來說是三個互不相關的指令，每個 <code>await</code> 之間，Node 在等網路回覆，這段時間別人的指令可以排進隊伍。兩位客人同時按，Redis 收到的順序可能是這樣：</p>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="時間軸：客人 A 和 B 都先 GET 讀到剩 1 張，然後各自 DECR，庫存變成 -1，發出兩張">
+    <defs><marker id="arr4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <text class="d-accent" x="90" y="24" text-anchor="middle">客人 A</text>
+    <text class="d-accent" x="350" y="24" text-anchor="middle">Redis（庫存）</text>
+    <text class="d-accent" x="610" y="24" text-anchor="middle">客人 B</text>
+    <line class="d-line" x1="90" y1="34" x2="90" y2="240"/>
+    <line class="d-line" x1="350" y1="34" x2="350" y2="240"/>
+    <line class="d-line" x1="610" y1="34" x2="610" y2="240"/>
+    <line class="d-line" x1="90" y1="60" x2="340" y2="60" marker-end="url(#arr4)"/>
+    <text class="d-small" x="215" y="54" text-anchor="middle">GET → "1"</text>
+    <line class="d-line" x1="610" y1="95" x2="360" y2="95" marker-end="url(#arr4)"/>
+    <text class="d-small" x="485" y="89" text-anchor="middle">GET → "1"</text>
+    <rect class="d-soft" x="300" y="44" width="100" height="62" rx="4"/>
+    <text class="d-text" x="350" y="80" text-anchor="middle">1</text>
+    <text class="d-small" x="90" y="130" text-anchor="middle">1 &gt; 0，可以發</text>
+    <text class="d-small" x="610" y="130" text-anchor="middle">1 &gt; 0，可以發</text>
+    <line class="d-line" x1="90" y1="160" x2="340" y2="160" marker-end="url(#arr4)"/>
+    <text class="d-small" x="215" y="154" text-anchor="middle">DECR → 0</text>
+    <line class="d-line" x1="610" y1="200" x2="360" y2="200" marker-end="url(#arr4)"/>
+    <text class="d-small" x="485" y="194" text-anchor="middle">DECR → -1</text>
+    <rect class="d-soft" x="300" y="146" width="100" height="70" rx="4"/>
+    <text class="d-text" x="350" y="176" text-anchor="middle">0</text>
+    <text class="d-text" x="350" y="206" text-anchor="middle">-1</text>
+  </svg>
+  <figcaption>兩邊都在對方寫入之前讀到 1，判斷都成立，最後的 1 張發了兩次。</figcaption>
+</figure>
+<p>A 讀到 1 的那一刻，這個「1」就已經可能過期了：A 還在判斷時，B 也讀到了同一個 1。兩人都根據一個過期的值做了決定，各扣一次，庫存變成 -1。開賣時幾百個請求同時到，這種交錯會發生很多次，多出來的 8 張就是這樣來的。</p>
+<p>這種「結果取決於誰先誰後」的 bug 叫做<strong>競態條件</strong>（race condition）。只要邏輯是「先讀一個值，依它決定要不要寫」，讀和寫之間就有空隙，就有競態條件。它很難在本機重現，因為你一個人按，指令永遠不會交錯；它只在真的有很多人同時操作時出現。</p>
+<p>直覺上會想：那改成先 <code>DECR</code>，看它回傳的新值是不是負的，負的就加回去？只看庫存的話這招可以，但優惠券還要「每人限領一張」，得先用 <code>SISMEMBER</code> 查這位客人領過沒，查完再扣，又回到「先讀再寫」兩步，同一位客人連按兩次照樣可能領到兩張。</p>
+<p>所以要補的空隙有兩個條件：第一，讀、判斷、寫這幾步要被當成一組，中間不能有別人的指令；第二，<strong>判斷也要在這一組裡面</strong>，依據的是這一組裡剛讀到的值，而不是組外讀到、可能已經過期的值。同時滿足這兩個條件的操作叫做<strong>原子操作</strong>（atomic）：別人看到的狀態不是「還沒開始」就是「全部做完」，看不到做到一半的樣子。</p>
+<p>Redis 有四個常被拿來「把指令湊在一起」的工具：pipeline、MULTI/EXEC、WATCH、Lua 腳本。先講結論：只有 Lua 腳本同時做到上面兩個條件，是搶券這類情境的標準解法。但前三個不是沒用，它們各自解決別的問題，而且很多人第一次修這個 bug 時會先拿它們來試。接下來把優惠券依序放進每一個，看它卡在哪裡，你就知道每個工具真正的用途。第 3 課的滑動視窗限流也有一模一樣的空隙：兩個請求同時 ZCARD 都看到 4 筆，限額 5，兩個都放行，變成 6 筆；修好優惠券之後會一起修它。</p>
+<div class="callout practice"><strong>💡 實務上：code review 時先問「兩個請求同時進來會怎樣」</strong><br>「先讀再寫」的空隙在工作中很常見：限量優惠券、每人限領一次、庫存預扣、防止表單重複送出。這類 bug 自己在本機點幾下幾乎不會出現，要到活動開賣或流量尖峰才爆，事後只看到「怎麼多發了幾張」。資深工程師看到「GET 之後依結果決定要不要寫」的程式碼，會先問這個問題，而不是等上線才發現。想在上線前確認，可以寫一個同時送出幾百個請求的小測試（像這課練習 3 那樣），檢查最後的數字對不對。</div>
+
+<h2>把指令打包一起送（pipeline），能擋住插隊嗎？</h2>
+<p>第一個常見的嘗試是：既然問題出在指令之間有空隙，那把 GET、DECR、SADD 打包一起送出去，空隙不就沒了？這就是 pipeline。要判斷它有沒有用，先看它原本是為了解決什麼問題。</p>
+<p>每個 <code>await redis.xxx()</code> 都要等一次<strong>來回時間</strong>，英文叫 round-trip time，簡稱 RTT：指令從程式送到 Redis、Redis 執行、回覆再送回程式。Redis 執行 HSET 只要幾微秒，時間大多花在網路上。在迴圈裡 <code>await</code>，每次都要等上一次回來才送下一個（<a href="../../node/lessons/07-event-loop.html">Node 課第 7 課</a>），假設一次來回 0.5 ms，1,000 次 HSET 就是 0.5 秒，幾乎都在等。</p>
+<p>優惠券只有三個指令，看不出這個差別，所以這一節改用一個量大的情境：開幕前要把整份菜單匯入 Redis（也就是練習 1）。<strong>pipeline</strong> 是一次把多個指令送出去、再一次收回所有回覆，1,000 個指令只等一次來回：</p>
+<pre>const pipeline = redis.pipeline()                     // 還沒送出，只是一個收集指令的容器
+pipeline.hset('ds:menu:10', { name: '美式咖啡', price: 80 })   // 不用 await，只是加進去
+pipeline.hset('ds:menu:11', { name: '拿鐵', price: 110 })
+pipeline.get('ds:menu:12')
+const results = await pipeline.exec()                // 這時才送出，等一次來回
+// results: [[null, 2], [null, 2], [null, null]]     每個指令一個 [錯誤, 結果]，順序跟加入時一樣</pre>
+<p><code>exec()</code> 回傳的陣列，每一項是 <code>[錯誤, 結果]</code>：成功時錯誤是 <code>null</code>；某個指令失敗（例如對 string 做 HSET 得到 WRONGTYPE），只有它那一項的錯誤有值，<strong>其他指令照樣執行、照樣生效</strong>，不會回滾，<code>exec()</code> 本身也不會 reject。所以用 pipeline 一定要逐項檢查錯誤，不然失敗會被悄悄吞掉。</p>
+<p><code>work/04/bench.ts</code> 會比較逐一 await 和 pipeline 寫 1,000 個 hash 的耗時，在 <code>work/04</code> 執行 <code>node bench.ts</code> 看看你的電腦差多少。在撰寫課程的電腦上（Docker 裡的 Redis，同時跑著很多程式），逐一 await 花了 1.4–4.7 秒，pipeline 約 15 ms；數字依機器和負載而定，但來回次數從 1,000 變成 1，差距只會隨著網路變遠而更大。</p>
+<p>現在回到優惠券。把 GET、DECR、SADD 放進同一個 pipeline 會遇到兩個問題。第一，pipeline 只是把指令一起送到 Redis，Redis 收到後一樣一個一個執行，客人 A 的 GET 和 DECR 之間，照樣可以夾進客人 B 的 GET，跟前面那張時間軸一模一樣。第二，GET 的結果要等 <code>exec()</code> 回來才拿得到，那時 DECR 已經執行完了，「庫存大於 0 才扣」根本沒機會判斷。</p>
+<div class="callout warn">pipeline <strong>不是原子操作</strong>：它解決的是速度，不是插隊。</div>
+<p>pipeline 適合用在：一次匯入很多筆、一個頁面要讀十幾個 key、批次刪除。每批不要無限大，回覆會全部留在記憶體裡等你讀；幾千筆一批是常見的做法。但它對優惠券沒有幫助，我們需要的是 Redis 保證「這幾個指令中間不會夾別人的」，這就是下一個工具 MULTI/EXEC。</p>
+
+<h2>MULTI/EXEC 保證不被插隊，為什麼還是會超發？</h2>
+<p>pipeline 擋不住插隊，因為 Redis 不知道那些指令是一組的。<strong>MULTI/EXEC</strong> 就是用來告訴 Redis 這件事的，它是 Redis 的交易（transaction）。運作分兩段：送出 <code>MULTI</code> 之後，接下來的指令不會馬上執行，而是先排進這條連線的佇列，每個都回 <code>QUEUED</code>；送出 <code>EXEC</code> 時，Redis 把佇列裡的指令一口氣全部執行，中間不會有其他 client 的指令插進來。</p>
+<p>把優惠券放進去試試：</p>
+<pre>127.0.0.1:6379&gt; MULTI
+OK
+127.0.0.1:6379&gt; GET ds:coupon:opening:stock
+QUEUED                                  # 拿到的不是庫存，只是「排好了」</pre>
+<p>問題就在這裡：排隊時指令還沒執行，GET 回的是 <code>QUEUED</code>，不是庫存。真正的值要等 <code>EXEC</code> 執行完才拿得到，可是那時候 DECR 也已經一起執行了。換句話說，<strong>判斷沒辦法放進 MULTI 裡</strong>。優惠券的「剩幾張 &gt; 0 才扣」用 MULTI 寫不出來，GET 只能放在 MULTI 之前，讀和寫之間的空隙還在。MULTI 滿足了「一組指令不被插隊」，卻做不到「判斷在組裡面」。</p>
+<p>雖然擋不住超發，MULTI 有另一個一定要知道的行為，因為它跟你在 PostgreSQL 學到的交易很不一樣：<strong>Redis 不回滾</strong>。用一個最小的例子看出錯時會怎樣，第 2 個指令故意對 string 做 HINCRBY：</p>
+<pre>127.0.0.1:6379&gt; MULTI
+OK
+127.0.0.1:6379&gt; SET ds:a 1
+QUEUED
+127.0.0.1:6379&gt; HINCRBY ds:a f 1        # ds:a 是 string，執行時會錯
+QUEUED
+127.0.0.1:6379&gt; SET ds:b 2
+QUEUED
+127.0.0.1:6379&gt; EXEC
+1) OK
+2) (error) WRONGTYPE Operation against a key holding the wrong kind of value
+3) OK                                   # 第 2 個錯了，第 1、3 個照樣生效</pre>
+<p>錯誤分兩種，結果不一樣：</p>
+<ul>
+  <li><strong>排隊時就看得出來的錯</strong>（指令名稱打錯、參數個數不對）：Redis 記下來，<code>EXEC</code> 時整個交易被拒絕，回 <code>EXECABORT Transaction discarded because of previous errors.</code>，一個指令都不執行。</li>
+  <li><strong>執行時才發生的錯</strong>（型別不對、值不是整數）：只有那個指令失敗，其他照樣執行，已經做的不會復原。</li>
+</ul>
+<p>放到優惠券上想：如果 DECR 成功、SADD 因為 key 型別錯了而失敗，庫存少了一張，名單上卻沒有這位客人，Redis 不會幫你復原。想在 EXEC 之前放棄排好的指令，可以送 <code>DISCARD</code>。</p>
+<p>MULTI 真正適合的，是「幾個寫入要一起執行、不需要先判斷」的情況，例如會員點數轉移的兩個寫入：一邊扣、一邊加，不希望別人看到扣了還沒加的中間狀態。ioredis 的寫法跟 pipeline 很像，<code>multi()</code> 預設也會把 MULTI、所有指令、EXEC 打包成一次送出：</p>
+<pre>const results = await redis.multi()
+  .decrby('ds:points:11', 30)
+  .incrby('ds:points:12', 30)
+  .exec()
+// [[null, 70], [null, 30]]：格式跟 pipeline 一樣，執行時的錯誤放在各自那一項
+// 排隊時就錯（EXECABORT）時，exec() 會 reject</pre>
+<p>但點數轉移其實也有判斷：餘額夠才能扣。判斷只能放在 MULTI 之前，那麼問題就變成：從讀到餘額（或庫存）到 EXEC 這段時間，如果有人改了它，能不能被發現？這就是 WATCH 做的事。</p>
+
+<h2>WATCH：讀完到寫入之間被人改過，能不能發現並重來？</h2>
+<p>MULTI 留下的空隙在「讀」和「EXEC」之間。<strong>WATCH</strong> 不去消除這個空隙，而是在空隙裡站崗：你在讀之前先 WATCH 幾個 key，從 WATCH 到 EXEC 之間，只要其中一個 key 被任何人改過，EXEC 就不執行任何指令，回 nil（ioredis 回 <code>null</code>）。你知道剛剛讀到的值已經過期了，於是重新讀、重新判斷、再試一次。</p>
+<p>這種做法叫<strong>樂觀鎖</strong>（optimistic locking）。「樂觀」是指它先不鎖，假設通常不會有人來搶，讓大家自由地讀；到提交的那一刻才檢查有沒有衝突，有衝突就重做。<a href="../../postgresql/lessons/19-concurrency.html">PostgreSQL 課第 19 課</a>用版本欄位做過同一件事。把優惠券改成 WATCH 版，概念上是這樣：</p>
+<pre>await redis.watch('ds:coupon:opening:stock')                         // 盯住庫存
+const stock = Number(await redis.get('ds:coupon:opening:stock') ?? 0)  // 讀
+if (stock &lt;= 0) { await redis.unwatch(); return 'sold-out' }         // 判斷
+const result = await redis.multi()                                    // 寫
+  .decr('ds:coupon:opening:stock')
+  .sadd('ds:coupon:opening:claimed', customerId)
+  .exec()
+// result === null：讀完之後庫存被別人改過，這次什麼都沒做，要從頭再來</pre>
+<p>回到前面那張時間軸：A 和 B 都讀到 1；A 先 EXEC，庫存變 0；B 的 EXEC 發現庫存在它 WATCH 之後被改過，回 <code>null</code>，什麼都沒扣。B 重來一次，這次讀到 0，回 sold-out。這樣確實不會超發。</p>
+<p>這段程式為了看清 WATCH 的流程，只處理了庫存，「每人限領一張」被拿掉了。完整版要在讀之前把 <code>ds:coupon:opening:claimed</code> 也一起 WATCH，並在判斷庫存前先 <code>SISMEMBER</code> 查這位客人領過沒。這樣同一位客人連按兩次時，第一次的 EXEC 把他 SADD 進名單，名單被改過，第二次的 EXEC 就回 <code>null</code>；第二次重來時 SISMEMBER 讀到「已領過」，回 already-claimed。</p>
+<p>但開幕搶券是三百個請求同時搶。每一輪只有一個人的 EXEC 會成功，其他人全部回 <code>null</code>、重讀、再搶，下一輪又只有一個成功。請求越多，重試越多，大部分的流量都花在「搶輸了重來」上。另外還有三件事讓 WATCH 在正式環境裡不好用：</p>
+<p>第一，<strong>WATCH 綁在連線上</strong>。WATCH 和 EXEC 必須在同一條連線，而且 EXEC（不管成功或失敗）、DISCARD、UNWATCH 都會清掉這條連線上所有的 WATCH。一般的 ioredis client 是整個程式共用一條連線，兩個請求同時在這條連線上 WATCH，A 的 EXEC 會把 B 的 WATCH 一起清掉，B 就不受保護了。並發的請求要用 WATCH，每個請求得有自己的連線（例如從連線池借一條），這也是正式環境較少用 WATCH、改用 Lua 的原因之一。</p>
+<p>第二，<strong>重試要有上限</strong>。搶的人很多時，每次都可能被別人搶先；無限重試會讓請求一直不回應，Redis 也被重試的流量打滿。試幾次就放棄，回錯誤讓上層決定。</p>
+<p>第三，<strong>放棄時要 UNWATCH</strong>。像上面賣完時的那行，不做了就要取消盯住。不然這條連線上的 WATCH 還在，下一個用這條連線的 MULTI 可能莫名其妙失敗。</p>
+<p>所以 WATCH 適合衝突很少的地方。會員點數轉移就是：同一位客人的點數很少同時被兩個請求改，偶爾撞到重試一次就好。把上面三點都做到，寫起來是這樣（練習 2 就是這段）：</p>
+<pre>for (let attempt = 1; attempt &lt;= 5; attempt++) {
+  await redis.watch('ds:points:11', 'ds:points:12')          // 1. 盯住
+  const balance = Number(await redis.get('ds:points:11') ?? 0)  // 2. 讀
+  if (balance &lt; 30) {
+    await redis.unwatch()                                    //    不做了，記得取消盯住
+    throw new Error('點數不足')
+  }
+  const result = await redis.multi()                         // 3. 寫（排隊）
+    .decrby('ds:points:11', 30)
+    .incrby('ds:points:12', 30)
+    .exec()                                                  // 4. 送出；被改過就回 null
+  if (result !== null) return                                // 成功
+}                                                            // null：從 1. 重來
+throw new Error('一直被別人搶先，放棄')</pre>
+<p>什麼時候用 WATCH：衝突很少、邏輯需要在程式裡算（例如要呼叫別的服務才知道新值）、或你用的 Redis 服務不允許執行腳本。衝突多的地方（開賣搶券），樂觀鎖會一直重試。優惠券需要的是另一種做法：不要讓判斷留在程式裡等網路，而是把判斷本身送進 Redis，在 Redis 裡讀完馬上判斷、馬上寫。這就是 Lua 腳本。</p>
+
+<h2>Lua 腳本：讓 Redis 自己做完讀、判斷、寫</h2>
+<p>前面三個工具卡住的原因都一樣：判斷寫在 Node 裡，讀到的值要先經過網路回到 Node，判斷完再經過網路送回去寫，這段路上別人就能插進來。Lua 腳本把整段邏輯搬到 Redis 伺服器裡執行，空隙就不存在了。</p>
+<p>Lua 是一種輕量的程式語言，常被嵌進別的軟體裡當擴充用；Redis 內建了一個 Lua 執行環境（版本見課末）。你把一小段 Lua 程式送給 Redis，Redis 在伺服器上執行它。關鍵在於：<strong>腳本執行期間，Redis 不會執行任何其他指令</strong>。就像一個很長的單一指令，腳本裡的讀、判斷、寫是一個整體，別人看到的不是「還沒開始」就是「全部做完」，也就是第一節說的原子操作，兩個條件都滿足了。</p>
+<p>執行腳本用 <code>EVAL</code>：</p>
+<pre>EVAL 腳本 key的數量 key1 key2 … 參數1 參數2 …
+
+127.0.0.1:6379&gt; EVAL "return redis.call('GET', KEYS[1])" 1 ds:coupon:opening:stock
+"100"</pre>
+<p>要看懂這一行，需要知道 Lua 腳本的幾個基本規則：</p>
+<ul>
+  <li><code>KEYS</code> 和 <code>ARGV</code> 是兩個 Lua 陣列（<strong>從 1 開始</strong>算）。<code>key的數量</code>告訴 Redis 後面前幾個是 key、放進 KEYS，其餘放進 ARGV。上面的 <code>1</code> 表示只有 <code>ds:coupon:opening:stock</code> 是 key。為什麼要把 key 和一般參數分開傳，下一節會講。</li>
+  <li><code>redis.call('指令', …)</code> 在腳本裡執行 Redis 指令。指令出錯時整個腳本停下並把錯誤回給 client；<code>redis.pcall</code> 則把錯誤當成回傳值交給腳本，讓腳本自己處理。腳本停下時，<strong>前面已經執行的寫入不會回滾</strong>，跟 MULTI 一樣，所以先檢查、最後才寫。</li>
+  <li>Lua 的 <code>nil</code>、<code>false</code> 和數字型別跟 JavaScript 不同：<code>GET</code> 不存在的 key 在 Lua 裡拿到 <code>false</code>，所以常寫 <code>tonumber(redis.call('GET', k) or '0')</code>。值一律是字串，要比大小先 <code>tonumber</code>。</li>
+</ul>
+<p>有了這些，優惠券就能改成一個腳本。注意順序：先做完所有檢查（領過沒、還有沒有），最後才寫，判斷和寫入之間不可能有別人：</p>
+<pre>-- KEYS[1] = 庫存、KEYS[2] = 領過的客人；ARGV[1] = customerId
+if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 1 then return 'already-claimed' end
+local stock = tonumber(redis.call('GET', KEYS[1]) or '0')
+if stock &lt;= 0 then return 'sold-out' end
+redis.call('DECR', KEYS[1])
+redis.call('SADD', KEYS[2], ARGV[1])
+return 'ok'</pre>
+<pre>// 在 Node 裡：腳本、key 的數量、key、參數
+const result = await redis.eval(CLAIM_LUA, 2, 'ds:coupon:opening:stock', 'ds:coupon:opening:claimed', 42)</pre>
+<p>再回到那張時間軸：A 的腳本從 SISMEMBER 跑到 SADD 的整段期間，B 的腳本只能在隊伍裡等。輪到 B 時，庫存已經是 0，B 拿到 sold-out。三百個請求就是排成三百段腳本依序執行，最多發出 100 張，同一位客人按兩次，第二次拿到 already-claimed。</p>
+<p>腳本的回傳值會從 Lua 型別轉成 client 收到的型別，有一個陷阱要記住：<strong>回傳小數會被截斷成整數</strong>，<code>return 4.7</code> 回給 client 的是 <code>4</code>。要回小數，先 <code>tostring(x)</code> 轉成字串，在 Node 裡再 <code>Number()</code>。回傳 Lua 陣列 <code>{1, '2.5'}</code> 會變成 JS 陣列 <code>[1, '2.5']</code>。優惠券只回字串不受影響，但練習 4 的 token bucket 要回剩下的代幣數，就會遇到。</p>
+<p>到這裡優惠券在你的電腦上已經不會超發了。但「腳本執行期間 Redis 不做別的事」這個特性是兩面刃，而且單機 Redis 和正式環境的 Redis 不一定一樣，腳本要照幾條規則寫，上線後才不會出事。</p>
+
+<h2>Lua 腳本要怎麼寫，上線後才不會出事？</h2>
+<p>上一節的腳本能動，但還有三條寫法規則要先想好：key 怎麼傳、時間怎麼取得、腳本跑多久，每一條都對應一種上線後才會爆的狀況。最後還有一個呼叫方式的問題：每次都把整段腳本送過去，有沒有更省的做法。</p>
+<p><strong>1. 所有 key 都從 KEYS 傳入，不要在腳本裡組 key 名稱。</strong>這就是上一節把 key 和參數分開傳的原因。正式環境的 Redis 常常不是一台，而是 Redis Cluster（第 6 課）：它把 key 分散在多台機器上，執行腳本前要看 KEYS 決定這個腳本送到哪一台。腳本裡自己組出來的 key（<code>'ds:coupon:' .. ARGV[1]</code>）Cluster 看不到，那個 key 可能根本不在這一台上，執行時就出錯。單機時看不出問題，上 Cluster 才爆，所以從第一天就照規則寫。</p>
+<p>Cluster 還有一個限制跟優惠券腳本直接相關。它把所有可能的 key 分進固定的 16384 個格子，叫做 <strong>slot</strong>，每台機器負責其中一段；一個 key 落在哪個 slot，是用 key 的名稱算出來的。一個腳本用到的所有 key 必須在同一個 slot，否則整個腳本會被拒絕（回 <code>CROSSSLOT</code> 錯誤）。優惠券腳本碰兩個 key：<code>ds:coupon:opening:stock</code> 和 <code>ds:coupon:opening:claimed</code>，名稱不同，算出來的 slot 通常也不同。單機時沒問題，上 Cluster 前要改用<a href="06-redis-operations.html">第 6 課</a>的 hash tag，例如 <code>ds:coupon:{opening}:stock</code> 和 <code>ds:coupon:{opening}:claimed</code>：有大括號時只用括號裡的 <code>opening</code> 算 slot，兩個 key 就一定落在同一格。</p>
+<p><strong>2. 時間從 ARGV 傳入。</strong>腳本裡可以呼叫 <code>TIME</code>，但時間從呼叫端傳入有兩個好處：測試可以傳固定的時間，結果每次一樣；所有邏輯用同一個時間來源，好推理。限流、token bucket 這類跟時間有關的腳本都這樣寫。開場說要順便修的第 3 課滑動視窗就是例子：把 ZREMRANGEBYSCORE、ZCARD、ZADD 放進同一個腳本，兩個請求就不會同時看到 4 筆而都放行；現在時間 <code>now</code> 由 ARGV 傳入：</p>
+<pre>-- KEYS[1] = ds:ratelimit:login:&lt;ip&gt;
+-- ARGV[1] = now（毫秒）、ARGV[2] = 視窗長度（毫秒）、ARGV[3] = 上限、ARGV[4] = 這次請求的唯一 id
+local now = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - window)   -- 清掉視窗外的紀錄
+if redis.call('ZCARD', KEYS[1]) &gt;= tonumber(ARGV[3]) then
+  return 0                                                       -- 超過，拒絕
+end
+redis.call('ZADD', KEYS[1], now, ARGV[4])
+redis.call('PEXPIRE', KEYS[1], window)                           -- 沒有新請求時整個 key 自己消失
+return 1</pre>
+<p><strong>3. 要短。</strong>腳本的原子性是用「整台 Redis 停下來等它」換來的。腳本在跑的時候，所有 client 的所有指令都在排隊，不只是碰到同一個 key 的指令。優惠券腳本只碰兩個 key，幾微秒就跑完；但如果對 100 萬個成員跑迴圈，整個服務就卡住了。腳本只做少量 key 的檢查和修改；大量資料用 SCAN 分批，在程式裡處理。</p>
+<p>腳本跑太久時會發生什麼：超過一個門檻（預設 5000 ms，設定名稱見課末）之後，其他 client 的指令會收到 <code>BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.</code>。腳本還沒寫入任何東西時，可以用 <code>SCRIPT KILL</code> 停掉它；已經寫入的話，<code>SCRIPT KILL</code> 回 <code>UNKILLABLE</code>，因為停在一半會留下不完整的資料，只剩等它跑完或 <code>SHUTDOWN NOSAVE</code>，也就是關掉 Redis 而且不存檔，最後一次存檔之後的寫入全部丟失。所以「先檢查、最後才寫」除了避免寫一半，也讓腳本出事時還有救。</p>
+<p>最後是呼叫方式。開幕時每秒有幾百次領券，每次 EVAL 都把整段腳本送過去，有點浪費。Redis 會用腳本內容的 SHA1 雜湊記住執行過的腳本，之後送 <code>EVALSHA 雜湊 …</code> 就好。但 Redis 重啟、換到另一台、或有人執行 <code>SCRIPT FLUSH</code> 後，這份快取不見了，EVALSHA 回 <code>NOSCRIPT No matching script. Please use EVAL.</code>，程式要改送 EVAL 再試。</p>
+<p>這個「先 EVALSHA、失敗再 EVAL」不用自己寫。ioredis 的 <code>defineCommand</code> 把腳本註冊成一個新方法，並且會處理 EVALSHA 與 NOSCRIPT（它怎麼做見課末）。TypeScript 不知道這個新方法，要自己補型別：</p>
+<pre>import { Redis, type Result } from 'ioredis'
+
+declare module 'ioredis' {
+  interface RedisCommander&lt;Context&gt; {
+    claimCoupon(stockKey: string, claimedKey: string, customerId: number): Result&lt;string, Context&gt;
+  }
+}
+
+const redis = new Redis('redis://127.0.0.1:16479/0')
+redis.defineCommand('claimCoupon', { numberOfKeys: 2, lua: CLAIM_LUA })   // 程式啟動時註冊一次
+await redis.claimCoupon('ds:coupon:opening:stock', 'ds:coupon:opening:claimed', 42)</pre>
+<p>Redis 另外還有一種把腳本存在伺服器上的做法 Redis Functions，一般服務用 <code>defineCommand</code> 就夠，比較見課末。</p>
+<div class="callout practice"><strong>💡 實務上：Lua 腳本要當成正式程式碼管理</strong><br>腳本寫在 Redis 裡跑，很容易被當成「一段字串」隨手改，但它掌管的是庫存、限流這種一錯就出事的邏輯。常見做法是把腳本放成獨立的 <code>.lua</code> 檔進版本控制，開頭註解寫清楚每個 KEYS、ARGV 是什麼，並配一個對真的 Redis 跑的測試，包含很多請求同時進來的情況（像練習 3 那樣）。團隊裡不是每個人都會 Lua，所以腳本保持短小、只做判斷和寫入，商業邏輯能留在 TypeScript 就留在 TypeScript。改腳本時也要記得：舊版程式和新版程式可能同時在線上跑一陣子，KEYS、ARGV 的順序和回傳值不要隨便改。</div>
+<p>優惠券在 Redis 裡已經不會超發了。剩下兩個問題：什麼時候該用前面那幾個工具而不是 Lua，以及 Redis 發出去的券要怎麼變成正式紀錄。</p>
+
+<h2>回到開場：四個工具怎麼選，Redis 扣完之後呢？</h2>
+<p>把這一課試過的工具排在一起，判斷的依據是兩個問題：需不需要「讀了再決定」，以及會不會有很多人同時搶。</p>
+<div class="table-wrap"><table>
+  <tr><th>需求</th><th>用什麼</th><th>例子</th></tr>
+  <tr><td>一個指令就做得完</td><td>直接用那個指令，它本身就是原子的</td><td>INCR 計數、HINCRBY 改購物車數量、SET NX 搶鎖</td></tr>
+  <tr><td>很多個互不相關的指令，只想快</td><td>pipeline</td><td>匯入菜單、一次讀十幾個 key</td></tr>
+  <tr><td>幾個寫入要一起執行、不被插隊，不需要判斷</td><td>MULTI/EXEC</td><td>同時更新排行榜和計數器</td></tr>
+  <tr><td>要讀了再決定，衝突很少、邏輯得在程式裡</td><td>WATCH＋MULTI，有重試上限，每個請求自己的連線</td><td>依外部價格重算的會員等級</td></tr>
+  <tr><td>要讀了再決定，而且會有很多人同時搶</td><td>Lua 腳本</td><td>限量優惠券、限流、庫存預扣</td></tr>
+  <tr><td>跨很多 key、要能回滾、不能丟</td><td>回到 PostgreSQL 的交易</td><td>建立訂單、扣款</td></tr>
+</table></div>
+<p>最後一列很重要：Redis 沒有回滾，記憶體資料也可能在故障時丟失（第 6 課）。優惠券用 Redis 擋住開賣瞬間的流量很合適，但「這位客人有一張優惠券」的正式紀錄，最後還是要寫進 PostgreSQL，Redis 是前面那道快速的門。這就帶出一個新的空隙：Redis 這一步和資料庫那一步，沒辦法包在同一個交易裡。</p>
+<p>所以遲早會遇到「Redis 已經扣了庫存，接著寫 PostgreSQL 卻失敗」的情況，例如資料庫逾時。第一個做法是<strong>補償</strong>：寫入失敗時，把剛才在 Redis 做的事反過來做一次，用 <code>INCR</code> 把庫存加回去、用 <code>SREM</code> 把客人移出領取名單，讓 Redis 回到沒領過的狀態，客人可以再試一次。</p>
+<p>只做補償不夠。補償本身也是程式裡的一步，程式如果在 Redis 扣完、補償執行之前就掛了（例如部署時重啟、程序被殺掉），補償根本不會執行，Redis 裡就留下一張「扣了庫存卻沒有正式紀錄」的券。所以還要第二個做法：<strong>定期對帳</strong>，排一個定時執行的工作，比對 Redis 的領取名單和資料庫的正式紀錄，名單上有、資料庫沒有的，就補寫進資料庫或把庫存還回去。補償處理大部分即時的失敗，對帳負責收拾補償漏掉的情況。</p>
+<div class="callout practice"><strong>💡 實務上：先跟 PM 確認少發和超發哪個可接受</strong><br>補償和對帳之間總有一段時間，Redis 和資料庫的數字對不上。設計時先跟 PM 確認哪種錯比較能接受：少發幾張（客人沒領到，事後可以補發）通常比超發（多出無法兌現的券）好處理。這決定了對帳時要「補寫紀錄」還是「還回庫存」，在設計階段講清楚，比活動當天再補救便宜得多。</div>
+
+<h2>補充與查表</h2>
+<ul>
+  <li><strong>Lua 版本</strong>：Redis 8.10.3 內建的是 Lua 5.1。</li>
+  <li><strong>腳本逾時的設定</strong>：讓其他 client 開始收到 BUSY 的門檻是 <code>busy-reply-threshold</code>，Redis 8.10.3 預設 5000 ms，舊名 <code>lua-time-limit</code>。</li>
+  <li><strong>ioredis 的 <code>defineCommand</code> 怎麼處理 EVALSHA</strong>：看 ioredis 6.0.0 的原始碼，它在每條連線第一次呼叫時送 EVAL，之後送 EVALSHA，遇到 NOSCRIPT 會自動改送 EVAL 重試。</li>
+  <li><strong>Redis Functions</strong>（Redis 7.0 起）：用 <code>FUNCTION LOAD</code> 把一組 Lua 函式載入成「函式庫」，用 <code>FCALL 名稱 key的數量 …</code> 呼叫。跟 EVAL 的差別是函式庫存在伺服器上，會跟著資料一起持久化、複寫到副本，重啟後還在，不會有 NOSCRIPT；代價是部署流程多一步（改函式要重新 LOAD，新舊程式要相容）。多個服務共用同一組腳本、或腳本是平台的一部分時考慮它；一個服務自己用的幾個腳本，<code>defineCommand</code> 就夠了。</li>
+</ul>
+
+<h2>練習</h2>
+<p>先確認 Redis 有在跑（在 <code>learn/data-stores/practice</code> 執行 <code>docker compose --profile redis up -d --wait</code>），每一題都在 <code>learn/</code> 執行 <code>node check.mjs data-stores 04</code> 判分。函式的第一個參數 <code>redis</code> 由測試傳入，連到 DB 4。每個檔案最上面的註解寫了 key 名稱和規則。</p>
+
+<div class="local" data-test="ex1" data-files="batch.ts">
+  <p>練習 1：在 <code>batch.ts</code> 實作 <code>importMenu(redis, items)</code>：把每個商品寫成 hash <code>ds:menu:&lt;id&gt;</code>（欄位 <code>name</code>、<code>price</code>），200 個商品全部放進<strong>一個</strong> pipeline、只 <code>exec()</code> 一次，不要直接在 <code>redis</code> 上呼叫寫入指令。回傳寫入失敗的商品 id（照 items 的順序）。測試會先把其中一個商品的 key 設成 string，讓它的 HSET 得到 WRONGTYPE：那個 id 要回報出來，其他 199 個要寫進去，也不要因為有錯就整批重送。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="watch.ts">
+  <p>練習 2：在 <code>watch.ts</code> 用 WATCH／MULTI 實作 <code>transferPoints(redis, from, to, amount, hooks)</code>，把點數從 <code>ds:points:&lt;from&gt;</code> 轉到 <code>ds:points:&lt;to&gt;</code>。點數不夠時 UNWATCH 並丟 <code>InsufficientPointsError</code>，兩邊都不能動；EXEC 回 <code>null</code> 時重新讀取再試，最多試 <code>MAX_ATTEMPTS</code>（5）次，都失敗丟 <code>RetryExhaustedError</code>。在讀完餘額、EXEC 之前呼叫 <code>hooks.beforeExec</code>，測試會在這時從另一條連線修改點數。測試也會用 20 條連線同時轉點，總數要守恆、不能扣成負數。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="coupon.ts">
+  <p>練習 3：在 <code>coupon.ts</code> 寫 <code>CLAIM_LUA</code> 腳本和 <code>claim(redis, campaign, customerId)</code>。庫存在 <code>ds:coupon:&lt;campaign&gt;:stock</code>，領過的客人記在 set <code>ds:coupon:&lt;campaign&gt;:claimed</code>。每人限領一張，回傳 <code>'ok'</code>、<code>'sold-out'</code> 或 <code>'already-claimed'</code>（領過的人就算賣完也回 already-claimed）。用 EVAL（或 EVALSHA）執行腳本；兩個 key 都要當成 key 傳入（算進 key 的數量、在腳本裡用 <code>KEYS[1]</code>、<code>KEYS[2]</code>），腳本裡不能出現 key 名稱，也不能把 key 放進 ARGV 再拼。測試會讓 150 位客人各按兩次、300 個請求同時搶 100 張。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="token-bucket.ts">
+  <p>練習 4：在 <code>token-bucket.ts</code> 用 Lua 實作 <strong>token bucket</strong>（代幣桶，原理見<a href="../../system-design/lessons/10-rate-limiting.html">系統設計課第 10 課</a>）限流 <code>take(redis, key, capacity, refillPerSec, now)</code>：桶子最多放 <code>capacity</code> 個代幣，每秒補 <code>refillPerSec</code> 個，每個請求拿走一個，沒有代幣就拒絕；桶子滿的時候可以一次放行一小波，之後照補充速度放行。狀態存在 hash（欄位 <code>tokens</code>、<code>ts</code>），每次都設 TTL 為「從空補到滿」的毫秒數。時間只用參數 <code>now</code>。回傳 <code>{ allowed, tokens }</code>，<code>tokens</code> 可以有小數（記得 Lua 回傳小數會被截斷）。這題的規則都寫在檔案的註解裡，腳本自己設計。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：<code>MULTI</code> 之後送了 <code>SET a 1</code>、<code>HINCRBY a f 1</code>（a 是 string，會出錯）、<code>SET b 2</code>，<code>EXEC</code> 之後會怎樣？</p>
+  <label data-key="a">全部回滾，a 和 b 都沒有被設定</label>
+  <label data-key="b"><code>SET a 1</code> 和 <code>SET b 2</code> 都生效，只有 HINCRBY 那一項是錯誤</label>
+  <label data-key="c">執行到 HINCRBY 就停下，只有 <code>SET a 1</code> 生效</label>
+  <label data-key="d">EXEC 被拒絕，回 EXECABORT</label>
+  <p class="why">✓ Redis 交易保證中間不被插隊，但不回滾執行時的錯誤，也不會停在出錯的地方。a 是 PostgreSQL 交易的行為；d 只發生在排隊時就看得出來的錯（指令名稱或參數個數錯）。需要「錯了就全部不做」，要在 Lua 裡先檢查完再寫，或交給資料庫。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：pipeline 和 MULTI/EXEC 的關係，哪個說法正確？</p>
+  <label data-key="a">pipeline 就是交易，一起送出的指令不會被插隊</label>
+  <label data-key="b">pipeline 只省網路來回，中間可能夾雜別人的指令；MULTI 保證連續執行；兩者可以合用</label>
+  <label data-key="c">MULTI 比 pipeline 快，所以批次寫入應該用 MULTI</label>
+  <label data-key="d">pipeline 裡有一個指令失敗，整批都不會執行</label>
+  <p class="why">✓ 兩者解決不同問題：pipeline 是送的方式，MULTI 是執行的方式。ioredis 的 <code>multi()</code> 預設就是用 pipeline 把 MULTI、指令、EXEC 一次送出。a 錯在 pipeline 不阻止別人插進來；c 錯在 MULTI 多了排隊的成本，不會比較快；d 錯在 pipeline 的每個指令各自成功或失敗。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 7：有人在 Lua 腳本裡用 for 迴圈處理一個有 100 萬個成員的 set，執行要 8 秒。這段期間會發生什麼？</p>
+  <label data-key="a">Redis 會自動把腳本分批，其他指令穿插執行</label>
+  <label data-key="b">只有那個 set 被鎖住，其他 key 照常讀寫</label>
+  <label data-key="c">整台 Redis 不處理其他指令；超過 5 秒後其他 client 收到 BUSY 錯誤</label>
+  <label data-key="d">腳本會在背景執行，client 立刻收到回覆</label>
+  <p class="why">✓ 腳本的原子性是用阻塞整台 Redis 換來的，Redis 沒有「只鎖一個 key」的概念。超過 busy-reply-threshold（預設 5000 ms）後，其他指令收到 BUSY，只能 SCRIPT KILL（腳本還沒寫入時）或 SHUTDOWN NOSAVE。腳本要短；大量資料在程式裡用 SCAN 分批處理。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 8：為什麼 token bucket 腳本的時間要從 ARGV 傳入，而不是在腳本裡呼叫 TIME？</p>
+  <label data-key="a">測試可以傳固定的時間，結果每次一樣；所有邏輯也用同一個時間來源，好推理</label>
+  <label data-key="b">Lua 腳本裡不能呼叫 TIME</label>
+  <label data-key="c">ARGV 傳入比較快</label>
+  <label data-key="d">TIME 只能在 MULTI 裡用</label>
+  <p class="why">✓ 腳本裡可以呼叫 TIME（b、d 錯），速度也不是重點（c 錯）。用參數傳時間，跟前面課程讓函式接收 <code>now()</code> 是同一個理由：能控制時間才能寫出可重現的測試，例如「經過 0.5 秒補 2 個代幣」。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>在程式裡 GET → 判斷 → SET</strong>：步驟之間會被插隊，並發時超發、多放行。單一指令做得到就用單一指令；要判斷就用 Lua。</li>
+  <li><strong>以為 MULTI 會回滾</strong>：執行時出錯的指令只有自己失敗，其他照樣生效。要「全部或全部不做」，在 Lua 裡先檢查完再寫，或用 PostgreSQL。</li>
+  <li><strong>以為 pipeline 是原子的、或忽略 exec 的錯誤</strong>：pipeline 只省來回；<code>exec()</code> 不會因為某個指令失敗而 reject，要逐項看 <code>[錯誤, 結果]</code>。</li>
+  <li><strong>每個指令都 await</strong>：迴圈裡 await 1,000 次就是 1,000 次來回。互不相關的指令用 pipeline 一次送出。</li>
+  <li><strong>WATCH 重試沒有上限，或在共用連線上並發 WATCH</strong>：搶的人多時永遠重試；共用連線上別人的 EXEC 會清掉你的 WATCH。設上限、每個請求自己的連線，衝突多就改用 Lua。</li>
+  <li><strong>Lua 裡寫死 key 名稱</strong>：單機能跑，上 Cluster 就出錯。key 一律從 KEYS 傳入。</li>
+  <li><strong>Lua 腳本做太多事</strong>：執行期間整台 Redis 停下來等。腳本只碰少量 key，大量資料在程式裡分批。</li>
+  <li><strong>Lua 回傳小數</strong>：會被截斷成整數，<code>0.5</code> 變成 <code>0</code>。用 <code>tostring</code> 回字串。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>單一指令本身就是原子的；問題出在「讀 → 判斷 → 寫」分成多步，中間被插隊。要補這個空隙，幾步要成為一組，而且判斷也要在組裡面。</li>
+  <li>pipeline 一次送多個指令、只等一次來回，省時間但不保證原子，每個指令各自成功或失敗。</li>
+  <li>MULTI/EXEC 讓一組指令連續執行不被插隊，但不回滾，也不能依讀到的值做判斷。</li>
+  <li>WATCH 是樂觀鎖：盯住的 key 被改過，EXEC 就回 null，重新讀再試；要有重試上限，WATCH 綁在連線上。衝突少時好用，搶券這種衝突多的情境會一直重試。</li>
+  <li>Lua 腳本在 Redis 裡一次做完讀、判斷、寫，是搶券、限流這類高併發判斷的標準做法；key 從 KEYS 傳、時間從 ARGV 傳、腳本要短、先檢查最後才寫。ioredis 用 <code>defineCommand</code> 處理 EVALSHA 與 NOSCRIPT。</li>
+  <li>跨很多 key、要回滾、不能丟的資料，交給 PostgreSQL 的交易；Redis 是擋流量的門，正式紀錄寫進資料庫，並準備好補償與對帳。</li>
+</ul>
+<p>下一課看 Redis 的另一種用途：用 pub/sub 即時通知店內平板，用 Streams 做不會遺失的事件佇列。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

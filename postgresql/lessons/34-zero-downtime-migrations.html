@@ -1,0 +1,600 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>34. 零停機 migration：DDL 的鎖與安全步驟</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="34" data-pg-2pc>
+<header>
+  <div class="eyebrow">階段 10：資深必備｜上線與維運 · 第 34 課</div>
+  <h1>零停機 migration：DDL 的鎖與安全步驟</h1>
+</header>
+<main>
+
+<p>咖啡店的 <code>orders</code> 已經有 4,000 萬筆。產品經理開了三張單：訂單加上「來源管道」<code>channel</code> 而且不能是空的、顧客的手機不能重複、訂單編號從 <code>integer</code> 換成 <code>bigint</code>（快用完了）。在自己電腦上，每一件都是一句 <code>ALTER TABLE</code> 或 <code>CREATE INDEX</code>，按下去就好。照樣在正式環境執行，其中兩句會把 <code>orders</code> 整張鎖住好幾分鐘，連查詢都要等；另一句讓顧客資料在建索引的期間寫不進去。網站跟著停擺。</p>
+<p>這一課要把這三張單做成<strong>零停機</strong>（zero downtime）的 migration：改 schema 的過程中，網站的讀寫都不中斷。做法不是找一句更聰明的 SQL，而是先判斷每個 DDL 會拿什麼鎖、要做多少事，再把危險的那一句拆成一連串各自安全的小步驟。學完你能替自己的 migration 做同樣的判斷與拆解。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>這三張單為什麼會讓網站停擺？每個 DDL 先問「拿什麼鎖、要做多少事」，並替每個 DDL 加上 <code>lock_timeout</code> 與重試。</li>
+  <li>第一張單：「<code>channel</code> 不能是空的」怎麼加，才不會在強鎖底下掃全表（<code>NOT VALID</code>＋<code>VALIDATE</code>）；舊的空值怎麼分批補。</li>
+  <li>第二張單：「手機不能重複」的唯一索引怎麼建，才不擋寫入（<code>CREATE INDEX CONCURRENTLY</code>），失敗後留下的殘骸怎麼清。</li>
+  <li>第三張單：訂單編號換成 <code>bigint</code>，怎麼讓新舊版程式同時能跑（expand／contract）。</li>
+  <li>整份計畫上線前，怎麼確定它在正式資料量下也安全。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="32-locks.html">第 32 課</a>的表級鎖與等待佇列：ACCESS EXCLUSIVE 連 <code>SELECT</code> 都擋；拿不到鎖的請求會排隊，後來的請求又排在它後面。這課還會用到其他幾種鎖，由弱到強對照：ROW EXCLUSIVE 是一般寫入（<code>INSERT</code>／<code>UPDATE</code>／<code>DELETE</code>）拿的鎖；SHARE UPDATE EXCLUSIVE 讀寫都不擋，只和其他 DDL、<code>VACUUM</code> 互斥；SHARE 擋寫入但不擋讀；SHARE ROW EXCLUSIVE 也擋寫入、不擋讀；ACCESS EXCLUSIVE 連讀取都擋。</li>
+  <li><a href="22-migrations.html">第 22 課</a>的 migration 與 expand／contract：schema 的變更寫成依序執行的檔案；新舊版程式要同時能跑時，先擴充（加新的）、再收斂（移除舊的）。</li>
+  <li><a href="12-constraints.html">第 12 課</a>的約束：CHECK、NOT NULL、UNIQUE 讓資料庫擋掉不合規則的資料，<code>CONSTRAINT 名稱</code> 替約束取名。</li>
+  <li><a href="20-indexes.html">第 20 課</a>的索引：查詢不必掃全表；UNIQUE 索引同時保證不重複；外鍵欄位要自己建索引。</li>
+</ul></div>
+
+<div class="callout"><strong>這頁的環境：</strong>這頁只有一條連線，看不到別人：讀著表的同事用停在交易裡的 prepared transaction 模擬。<code>lock_timeout</code> 在這頁不會觸發，「拿不到就放棄」改用 <code>NOWAIT</code>。帶 <code>CONCURRENTLY</code> 的指令要單獨一格執行。</div>
+
+<p><strong>這頁的資料：</strong><code>customers</code>（6 位顧客，林志豪和李建國的 <code>phone</code> 一樣）、<code>products</code>、<code>orders</code>（3,001 筆，<code>channel</code> 約 1/7 是 <code>NULL</code>、分散在各處；<code>customer_id</code> 還沒有外鍵，而且第 3001 筆參照了不存在的顧客 99）。</p>
+
+<h2>這三張單為什麼會讓網站停擺？每個 DDL 先問兩件事</h2>
+<p>要回答開場的問題，先替這類指令取個名字。改資料的指令是 <code>INSERT</code>、<code>UPDATE</code>、<code>DELETE</code>；改「結構」的指令，例如 <code>ALTER TABLE</code>、<code>CREATE INDEX</code>、<code>DROP COLUMN</code>，統稱 DDL（Data Definition Language）。三張單都是 DDL。DDL 在小表上幾乎都是瞬間完成，所以在開發機上看不出差別；在大表上會不會出事，取決於兩個問題：</p>
+<ol>
+  <li><strong>拿什麼鎖？</strong>DDL 執行前要先拿表級鎖，鎖拿到交易結束才放。大多數 <code>ALTER TABLE</code> 拿最強的 ACCESS EXCLUSIVE，期間連 <code>SELECT</code> 都要等（<a href="32-locks.html">第 32 課</a>的衝突表）。</li>
+  <li><strong>要做多少事？</strong>PostgreSQL 用一組內部表記錄有哪些表、每張表有哪些欄位，這組表叫系統目錄（catalog）。有的 DDL 只改系統目錄，不管表多大都瞬間完成。有的要<strong>掃全表</strong>，讀過每一列確認舊資料符合規則；有的要<strong>重寫表</strong>，把每一列都改寫一遍。後兩種的時間跟資料量成正比。</li>
+</ol>
+<p>兩個問題要合起來看。強鎖本身不可怕，只要拿得很短；大量工作本身也不可怕，只要不擋別人。真正讓網站停擺的組合是「強鎖＋大量工作」：鎖會一直拿到工作做完，4,000 萬筆要做幾分鐘，網站就停幾分鐘。</p>
+<p>「重寫表」需要多解釋一點，因為它是最重的一種。一張表在磁碟上是一組檔案。重寫表（table rewrite）是 PostgreSQL 建一組新檔案，把每一列轉換後寫進去，連同所有索引一起重建，最後換掉舊檔案。表目前用的檔案編號叫 <strong>relfilenode</strong>，用 <code>pg_relation_filenode('表')</code> 查得到；重寫之後換成新檔案，編號就變了。所以「filenode 有沒有變」就是「有沒有重寫」的直接證據，不必靠猜。</p>
+<p>拿第三張單 <code>integer</code> 改 <code>bigint</code> 量一次：在 <code>BEGIN … ROLLBACK</code> 裡改型別（量完就撤銷），前後各查一次 filenode，再從 <code>pg_locks</code>（第 32 課）查自己（<code>pg_backend_pid()</code>）在 <code>orders</code> 上拿的鎖。執行後比較兩張結果的編號，再看「鎖」欄：</p>
+<div class="lab" data-sql="SELECT pg_relation_filenode('orders') AS 改之前;
+BEGIN;
+ALTER TABLE orders ALTER COLUMN id TYPE bigint;
+SELECT pg_relation_filenode('orders') AS 改之後,
+  (SELECT string_agg(DISTINCT mode, ', ') FROM pg_locks WHERE pid = pg_backend_pid() AND relation = 'orders'::regclass) AS 鎖;
+ROLLBACK;"></div>
+<p>編號變了，表被重寫了。「鎖」欄裡的 <code>AccessExclusiveLock</code> 是 <code>pg_locks</code> 的寫法，也就是 ACCESS EXCLUSIVE（兩種寫法的對照在第 32 課的表）。</p>
+<p>兩個答案放在一起，就是第三張單的問題：<code>integer</code> 改 <code>bigint</code> 會在 ACCESS EXCLUSIVE 底下重寫整張表和它的索引。每一列的編號都從 4 bytes 變成 8 bytes，存放格式不同，只能逐列重寫。4,000 萬筆可能要好幾分鐘，這段時間 <code>orders</code> 完全不能讀寫。</p>
+<p>每次都這樣手動量太慢。seed 裡的 <code>ddl_probe(ddl, 表)</code> 把上面那格包成一個函式：在一個會被取消的子交易裡執行 DDL，回傳這張表有沒有被<strong>重寫</strong>，以及 DDL 在這張表上拿到的<strong>最強的鎖</strong>（已經轉成 ACCESS EXCLUSIVE 這種寫法）。執行完就撤銷，不會改到資料。用它一次量 9 句常見的 DDL，執行後逐列看「重寫」和「最強的鎖」兩欄：</p>
+<div class="lab" data-sql="SELECT d AS ddl, (ddl_probe(d, 'orders')).*
+FROM unnest(ARRAY[
+  'ALTER TABLE orders ADD COLUMN note text',
+  'ALTER TABLE orders ADD COLUMN source text NOT NULL DEFAULT ''pos''',
+  'ALTER TABLE orders ADD COLUMN created_at timestamptz DEFAULT now()',
+  'ALTER TABLE orders ADD COLUMN token uuid DEFAULT gen_random_uuid()',
+  'ALTER TABLE orders ALTER COLUMN id TYPE bigint',
+  'ALTER TABLE orders ALTER COLUMN ordered_at SET NOT NULL',
+  'ALTER TABLE orders ADD CONSTRAINT orders_total_positive CHECK (total &gt; 0)',
+  'CREATE INDEX ON orders (ordered_at)',
+  'ALTER TABLE orders RENAME COLUMN channel TO sales_channel'
+]) WITH ORDINALITY AS t(d, n)
+ORDER BY n;"></div>
+<p>先看鎖：除了 <code>CREATE INDEX</code>，其他每一句都拿 ACCESS EXCLUSIVE。所以「拿什麼鎖」大多數時候答案一樣，真正把 DDL 分成安全與危險的，是第二個問題「要做多少事」。</p>
+<p>再看重寫：四句 <code>ADD COLUMN</code> 裡，只有預設值是 <code>gen_random_uuid()</code> 的那句重寫了表。同樣是「加一個有預設值的欄位」，差別在預設值固不固定。</p>
+<p>從 PostgreSQL 11 起，加欄位時如果預設值是固定的，PostgreSQL 不去改每一列，而是只在目錄裡記下「這個欄位的預設值是 'pos'」。舊的列被讀到、發現自己沒有這個欄位時，就拿目錄裡記的值補上。這叫 <strong>fast default</strong>，所以 4,000 萬筆也是瞬間完成。<code>now()</code> 看起來每次不同，但它在同一個交易裡回傳同一個時間，加欄位時只會算一次，所以也算固定。</p>
+<p>反過來，有些函式每次呼叫的結果都可能不同，叫 <strong>volatile 函式</strong>，例如 <code>gen_random_uuid()</code>、<code>clock_timestamp()</code>、<code>random()</code>。用它當預設值時，每一列都要各自算一個不同的值，目錄裡記不下「一個值」，只能把整張表重寫一遍，替每一列填上自己的值。真的需要這種欄位時，拆成三步：先加沒有預設值的欄位（瞬間）、再分批替舊資料補值（後面教）、最後 <code>SET DEFAULT</code>（只影響之後的新列，也是瞬間）。</p>
+<p>「掃全表」的 DDL 不會換檔案，filenode 量不出來，要看文件。把量到的結果加上 PostgreSQL 18 的 <code>ALTER TABLE</code> 文件整理成下表。這張表查表用，不用背，寫 migration 時回來對照：</p>
+<div class="table-wrap"><table>
+  <tr><th>DDL</th><th>鎖</th><th>要做的事</th><th>大表上</th></tr>
+  <tr><td><code>ADD COLUMN</code>（可 NULL、沒有預設值）</td><td>ACCESS EXCLUSIVE</td><td>只改目錄</td><td>瞬間</td></tr>
+  <tr><td><code>ADD COLUMN … DEFAULT 'pos'</code>、<code>DEFAULT now()</code></td><td>ACCESS EXCLUSIVE</td><td>只改目錄（fast default）</td><td>瞬間</td></tr>
+  <tr><td><code>ADD COLUMN … DEFAULT gen_random_uuid()</code></td><td>ACCESS EXCLUSIVE</td><td><strong>重寫表</strong></td><td>危險</td></tr>
+  <tr><td><code>ALTER COLUMN … TYPE bigint</code></td><td>ACCESS EXCLUSIVE</td><td><strong>重寫表</strong>和索引</td><td>危險</td></tr>
+  <tr><td><code>SET NOT NULL</code>、<code>ADD CONSTRAINT … CHECK</code></td><td>ACCESS EXCLUSIVE</td><td><strong>掃全表</strong></td><td>危險</td></tr>
+  <tr><td><code>ADD FOREIGN KEY</code></td><td>兩張表都 SHARE ROW EXCLUSIVE</td><td><strong>掃全表</strong></td><td>危險（擋寫入）</td></tr>
+  <tr><td><code>CREATE INDEX</code></td><td>SHARE</td><td>掃全表、排序</td><td>危險（擋寫入）</td></tr>
+  <tr><td><code>RENAME</code>、<code>DROP COLUMN</code></td><td>ACCESS EXCLUSIVE</td><td>只改目錄</td><td>瞬間，但還在用舊名稱的程式會壞</td></tr>
+  <tr><td><code>VALIDATE CONSTRAINT</code>、<code>CREATE INDEX CONCURRENTLY</code></td><td>SHARE UPDATE EXCLUSIVE</td><td>掃全表</td><td>慢，但讀寫照常</td></tr>
+</table></div>
+<p>對照這張表，開場的三張單各卡在哪裡，以及這課接下來怎麼解：</p>
+<ul>
+  <li><strong><code>channel</code> 不能是空的</strong>：<code>SET NOT NULL</code> 要在 ACCESS EXCLUSIVE 底下掃全表。改用 <code>NOT VALID</code> 先擋新資料，回填舊資料後再 <code>VALIDATE</code>，讀寫照常。</li>
+  <li><strong>手機不能重複</strong>：一般的 <code>CREATE INDEX</code> 拿 SHARE，唯一索引建好之前所有寫入都要等。改用 <code>CREATE INDEX CONCURRENTLY</code>。</li>
+  <li><strong>訂單編號換成 <code>bigint</code></strong>：改型別會重寫表和索引。改用 expand／contract：加一個新欄位、分批回填，最後在一個很短的交易裡切換。</li>
+</ul>
+<p>這三個解法有一個共同點：把「強鎖＋大量工作」拆開，讓強鎖只出現在瞬間完成的步驟裡。</p>
+<div class="callout practice"><strong>💡 實務上：review migration 時看的是 SQL，不是 ORM 的程式碼</strong><br>Prisma、TypeORM 這類工具會替你產生 migration，在 schema 裡把 <code>Int</code> 改成 <code>BigInt</code> 只是改一個字，背後可能就是一次重寫表。資深工程師 review 時會打開產生出來的 SQL，逐句問「拿什麼鎖、要不要掃表或重寫」，並先問一句「這張表現在多大」。小表（設定表、幾千筆的商品表）直接 <code>ALTER</code> 沒問題，不必每次都拆成五步；真正要小心的是訂單、日誌這類持續長大、又一直有人寫入的表。團隊可以把「大表清單」寫進 PR 範本，碰到就多一道檢查。</div>
+<p>不過，「只留下瞬間完成的強鎖」還不夠安全。上表標成「瞬間」的那些 DDL，都藏著一個前提：馬上拿得到鎖。下一節先處理這個前提，因為後面每一個安全步驟都會用到它。</p>
+
+<h2>就算 DDL 瞬間完成，為什麼還會卡住網站？lock_timeout 與重試</h2>
+<p>「瞬間完成」指的是拿到鎖之後的那一段。拿到鎖之前，DDL 要排隊。<a href="32-locks.html">第 32 課</a>的事故就是這樣：<code>ALTER</code> 排在一個跑了兩分鐘的報表後面等 ACCESS EXCLUSIVE，而等待佇列是先來後到，後面進來的每一個 <code>SELECT</code> 都和排在前面的 ACCESS EXCLUSIVE 衝突，只好排在 <code>ALTER</code> 後面。<code>ALTER</code> 本身只要幾毫秒，網站卻停了兩分鐘。也就是說，對網站來說，鎖等待比鎖本身危險。</p>
+<p>解法是替 DDL 的等待設上限。<code>lock_timeout</code> 是 PostgreSQL 的設定，規定一句指令最多等鎖多久，超過就放棄並回傳錯誤 55P03（拿不到鎖）。DDL 一放棄，就從佇列裡離開，排在它後面的查詢立刻放行；migration 稍後再試一次，碰到報表剛好跑完的空檔就成功。代價從「網站停擺兩分鐘」變成「部分查詢多等幾秒、migration 多試幾次」。</p>
+<p>來模擬一次。同事開了一份報表，讀著 <code>orders</code>（拿著 ACCESS SHARE），然後暫停：<code>PREPARE TRANSACTION</code> 讓這個交易停住，手上的鎖一直留著，就是第 32 課的「暫停的同事」。</p>
+<div class="lab" data-sql="BEGIN;
+SELECT count(*) FROM orders;
+PREPARE TRANSACTION 'report';"></div>
+<p>這頁的 <code>lock_timeout</code> 不會觸發（第 32 課實測），改用 <code>NOWAIT</code>：它等於「一秒都不等」，拿不到鎖就立刻失敗，同樣回傳 55P03。下面用 seed 裡的 <code>try_sql(sql)</code> 各試一次 <code>LOCK TABLE … NOWAIT</code>：它執行一句 SQL，成功回傳「成功」，失敗回傳錯誤碼和訊息，不會讓整句查詢中斷（第 32 課用過）。左欄是 <code>ALTER</code> 要的 ACCESS EXCLUSIVE，右欄是一般寫入要的 ROW EXCLUSIVE，執行後看哪一欄失敗：</p>
+<div class="lab" data-sql="SELECT try_sql('LOCK TABLE orders IN ACCESS EXCLUSIVE MODE NOWAIT') AS ALTER_要的鎖,
+       try_sql('LOCK TABLE orders IN ROW EXCLUSIVE MODE NOWAIT') AS 寫入要的鎖;"></div>
+<p>ACCESS EXCLUSIVE 和報表衝突，拿不到；一般寫入要的 ROW EXCLUSIVE 不衝突，成功。換成正式環境，左欄的 <code>ALTER</code> 就是「放棄、讓出佇列、等一下再試」，而不是排在那裡擋住右欄的每一個寫入。結束模擬，撤銷同事的交易：</p>
+<div class="lab" data-sql="ROLLBACK PREPARED 'report';"></div>
+<p>放棄之後要有人負責重試。正式環境的 migration 會把 DDL 交給一個這樣的函式執行：每次只做一個 DDL、在交易裡 <code>SET LOCAL lock_timeout</code>（只在這個交易有效，不影響這條連線之後的查詢）、收到 55P03 就等一下重試（用<a href="25-backend.html">第 25 課</a>的 <code>pg</code>）：</p>
+<pre>async function runDdl(pool: Pool, ddl: string, maxAttempts = 10) {
+  for (let attempt = 1; ; attempt++) {
+    const client = await pool.connect()
+    try {
+      await client.query('BEGIN')
+      await client.query("SET LOCAL lock_timeout = '2s'")   // 最多擋住別人 2 秒
+      await client.query(ddl)
+      await client.query('COMMIT')
+      return
+    } catch (err: any) {
+      await client.query('ROLLBACK').catch(() =&gt; {})
+      if (err.code !== '55P03' || attempt &gt;= maxAttempts) throw err   // 不是等鎖失敗，或試太多次：交給人處理
+      await new Promise(r =&gt; setTimeout(r, 1000 * attempt))          // 讓卡住的查詢有機會跑完
+    } finally {
+      client.release()
+    }
+  }
+}</pre>
+<p>逐一看這段程式的三個決定：</p>
+<ul>
+  <li><strong><code>lock_timeout = '2s'</code></strong>：DDL 排隊的這 2 秒裡，排在它後面的查詢也跟著等。所以這個數字的意思是「最壞情況下，App 的查詢多等 2 秒」。依網站能忍受的延遲設定，常見 1～5 秒。</li>
+  <li><strong>每次只做一個 DDL</strong>：前面拿到的鎖會一直拿到 <code>COMMIT</code>。一個交易裡塞好幾個 DDL，第二句在等鎖時，第一句拿到的 ACCESS EXCLUSIVE 還握在手上，照樣擋住所有人，<code>lock_timeout</code> 就只保護了一半。</li>
+  <li><strong>等待時間逐次拉長</strong>：第 1 次等 1 秒、第 2 次等 2 秒，給擋路的長查詢時間跑完。試到上限還失敗就丟出錯誤，交給人處理，不要無限重試。</li>
+</ul>
+<p>注意 <code>lock_timeout</code> 只限制「等鎖」。拿到鎖之後，掃全表、重寫表要花多久，它管不到。那一半要靠接下來三節的寫法，把大量工作移出強鎖。</p>
+<div class="callout practice"><strong>💡 實務上：<code>lock_timeout</code> 設在 migration 工具，不靠每個人記得</strong><br>實際做法是在 migration 的執行流程統一設 <code>lock_timeout</code>（連線參數或每個檔案的開頭），而不是期待每個寫 migration 的人自己加。上線前先看有沒有長時間的查詢或「開著交易沒結束」的連線（第 32 課查 <code>pg_stat_activity</code>），常見元兇是直接連正式資料庫跑的報表、BI 工具，或忘了關的管理工具視窗。重試到上限還失敗時，部署要明確失敗並通知值班的人，不要默默跳過。大型變更通常也會挑離峰時段，例如咖啡店打烊後。</div>
+<p>有了 <code>lock_timeout</code>，每個瞬間完成的 DDL 都安全了。接下來輪到不是瞬間完成的那些，從第一張單開始。</p>
+
+<h2>第一張單：「channel 不能是空的」怎麼加，才不會在強鎖底下掃全表？</h2>
+<p>直覺的寫法是 <code>ALTER COLUMN channel SET NOT NULL</code>。上一節的表說它要在 ACCESS EXCLUSIVE 底下掃全表。為什麼要掃？資料庫加上一條規則之前，必須先證明現有的每一列都符合這條規則，否則表裡會同時存在「規則」和「違反規則的資料」。為什麼要拿強鎖掃？因為規則還沒生效，掃描進行中如果有人寫入新的 <code>NULL</code>，掃描就白做了；最簡單的保證是掃描期間誰都不准動這張表。CHECK、外鍵也是同一個道理。</p>
+<p>拆解的關鍵在於：規則其實管兩批資料，一批是<strong>之後寫進來的新資料</strong>，一批是<strong>已經在表裡的舊資料</strong>。新資料只要規則一生效就會被逐筆檢查，不用掃表；需要掃表的只有舊資料。<code>NOT VALID</code> 就是把這兩件事分開做：</p>
+<ol>
+  <li><code>ADD CONSTRAINT … NOT VALID</code>：約束立刻生效，但先不掃舊資料，所以只改目錄、瞬間完成。但它仍要拿一個短暫的強鎖：CHECK 和 NOT NULL 是 ACCESS EXCLUSIVE，外鍵是兩張表各拿 SHARE ROW EXCLUSIVE（第一節的表），所以一樣交給上一節的 <code>lock_timeout</code>。從這一刻起，<strong>新寫入或修改的列</strong>都要符合。</li>
+  <li><code>VALIDATE CONSTRAINT</code>：掃舊資料，確認都符合。它只拿 SHARE UPDATE EXCLUSIVE，讀寫照常。文件的理由正好接回上面的推論：新資料已經由約束把關，掃描期間不會再有人寫進違規的資料，所以不必擋住別人。</li>
+</ol>
+<p>先用外鍵看一次完整的過程。選外鍵是因為這頁的 <code>orders</code> 剛好有一筆舊的髒資料：第 3001 筆參照了不存在的顧客 99，能讓你看到「舊資料不合規則」時 <code>VALIDATE</code> 會怎樣。<code>NOT VALID</code> 對 CHECK、外鍵、NOT NULL 的行為都一樣。下面在 <code>BEGIN … ROLLBACK</code> 裡加上 <code>NOT VALID</code> 的外鍵，再用 <code>try_sql</code> 插入一筆壞資料、驗證舊資料。最後一欄來自系統目錄 <code>pg_constraint</code>：每個約束一列，<code>convalidated</code> 表示舊資料驗證過沒有。執行後由左到右看三欄：</p>
+<div class="lab" data-sql="BEGIN;
+ALTER TABLE orders ADD CONSTRAINT orders_customer_fk
+  FOREIGN KEY (customer_id) REFERENCES customers (id) NOT VALID;
+SELECT try_sql('INSERT INTO orders (customer_id, total) VALUES (999, 80)') AS 新資料,
+       try_sql('ALTER TABLE orders VALIDATE CONSTRAINT orders_customer_fk') AS 驗證舊資料,
+       (SELECT convalidated FROM pg_constraint WHERE conname = 'orders_customer_fk') AS 已驗證;
+ROLLBACK;"></div>
+<ul>
+  <li>新資料：約束加上去的那一刻就擋住了新的壞資料（23503，外鍵違規）。</li>
+  <li>驗證舊資料：<code>VALIDATE</code> 因為舊的第 3001 筆失敗。</li>
+  <li>已驗證：<code>convalidated</code> 還是 <code>false</code>，約束仍然在擋新資料，只是還不能保證舊資料。</li>
+</ul>
+<p>這個結果說明了 <code>NOT VALID</code> 的第二個用處：先止血。發現資料有問題時，先讓新的壞資料進不來，舊的慢慢修，修完再 <code>VALIDATE</code>。<code>VALIDATE</code> 失敗不會刪掉約束，修好資料後再跑一次就好。</p>
+<p>回到 <code>channel</code>。PostgreSQL 18 起，NOT NULL 也是一個具名的約束，可以照同樣的兩步走：</p>
+<pre>ALTER TABLE 表 ADD CONSTRAINT 約束名 NOT NULL 欄位 NOT VALID;   -- 瞬間；新的 NULL 立刻被擋
+-- 回填舊的 NULL …
+ALTER TABLE 表 VALIDATE CONSTRAINT 約束名;                     -- SHARE UPDATE EXCLUSIVE，讀寫照常</pre>
+<p>加上之後怎麼確認狀態？要看兩個系統目錄。<code>pg_constraint</code> 裡，這個約束的 <code>contype</code> 是 <code>'n'</code>（not-null），還沒驗證時 <code>convalidated</code> 是 <code>false</code>。另一個是 <code>pg_attribute</code>：它每個欄位一列，其中 <code>attnotnull</code> 表示這個欄位是不是 NOT NULL。還沒驗證時它就已經是 <code>true</code>，因為新資料從這一刻起已經不能是 <code>NULL</code>。練習 2、3 會實際做一次。舊專案裡你還會看到 18 以前的繞路寫法（先加 CHECK 再轉成 NOT NULL），見課末「補充與查表」。</p>
+<div class="callout warn"><strong>NOT VALID 期間的陷阱</strong>：約束管的是「新寫入或修改的列」。舊的 <code>NULL</code> 訂單被任何 <code>UPDATE</code> 改到（例如改狀態）時，PostgreSQL 寫出的新版本列還是 <code>NULL</code>，一樣被擋（23502）。所以順序是：先部署「寫入時一定會填 <code>channel</code>」的程式 → 加 <code>NOT VALID</code> → 緊接著回填 → <code>VALIDATE</code>，別讓中間的空窗拖太久。</div>
+<p>兩步中間那一行「回填舊的 <code>NULL</code>」，在這頁是 429 筆，一句 <code>UPDATE</code> 就好；在正式環境，是 4,000 萬筆裡的 600 萬筆。它不拿強鎖，卻是整份計畫裡最容易出事的一步，下一節專門處理。</p>
+
+<h2>舊的 NULL 怎麼補？大量回填要拆成小批次</h2>
+<p>替新欄位或新規則補上舊資料的值，叫<strong>回填</strong>（backfill）。這課有兩處會用到：<code>channel</code> 的舊 <code>NULL</code> 要補成 <code>'pos'</code>；第一節的 volatile 預設值欄位、以及第三張單的 <code>bigint</code> 新欄位，都是先加空欄位再補值。最直覺的寫法是一句：</p>
+<pre>UPDATE orders SET channel = 'pos' WHERE channel IS NULL;   -- 4,000 萬筆裡的 600 萬筆</pre>
+<p>它只拿 ROW EXCLUSIVE，不擋讀取，看起來無害。但在大表上，一句 <code>UPDATE</code> 改 600 萬列，就是一個改了 600 萬列的交易，會帶來四個問題：</p>
+<ul>
+  <li><strong>一個很長的交易</strong>：被改到的每一列都拿著列鎖，直到整句結束。這段時間 App 要改其中任何一筆訂單（例如更新狀態），都要等。中途失敗就全部撤銷，從頭再來。</li>
+  <li><strong>大量死版本</strong>：PostgreSQL 更新一列時不是原地改，而是寫一個新版本、留下舊版本（<a href="30-mvcc-vacuum.html">第 30 課</a>）。600 萬個舊版本要等交易結束後 VACUUM 才清得掉，在那之前表和索引一直膨脹。</li>
+  <li><strong>WAL 暴增</strong>：PostgreSQL 每一筆修改寫進資料檔之前，會先寫進 WAL（Write-Ahead Log）這份日誌，當機時靠它復原（<a href="18-transactions.html">第 18 課</a>提過）。600 萬筆更新就會產生同等份量的 WAL，磁碟、備份和複寫都要消化它。</li>
+  <li><strong>replica 延遲</strong>：正式環境常有唯讀副本（replica），靠重播主機的 WAL 保持同步。一次湧入大量 WAL，副本跟不上，讀副本的使用者就會看到舊資料（第 37 課詳談）。</li>
+</ul>
+<p>四個問題的根源都是「一次做太多」，所以解法是拆小：每批 1,000～5,000 列、每批自己一個交易、批次之間休息一下。每批的交易很短，列鎖很快放掉；VACUUM 在批次之間就能清掉前一批的死版本；WAL 和副本有時間消化。中途失敗只損失一批。</p>
+<p>拆批次要先決定「這一批是哪幾列」。有兩種挑法：</p>
+<ul>
+  <li><strong>主鍵範圍</strong>：<code>WHERE id BETWEEN 1 AND 5000 AND channel IS NULL</code>，下一批 5001～10000。每批改到的筆數不固定（看那一段有多少 <code>NULL</code>），但每次只走主鍵索引的一小段，很好預估。</li>
+  <li><strong>挑固定筆數</strong>：<code>UPDATE</code> 沒有 <code>LIMIT</code>，要先用子查詢挑出「還沒處理、依 id 排在最前面的 N 筆」的 id，再更新這些 id。子查詢一定要寫 <code>ORDER BY</code>：沒有 <code>ORDER BY</code> 的 <code>LIMIT</code> 會拿到資料檔裡的實體順序，不是 id 順序（練習 5）。</li>
+</ul>
+<p>先看主鍵範圍的第一批，執行後看「剩下的_NULL」還有幾筆，「下一筆」是下一批要從哪個 id 開始：</p>
+<div class="lab" data-sql="UPDATE orders SET channel = 'pos' WHERE id BETWEEN 1 AND 1000 AND channel IS NULL;
+SELECT count(*) FILTER (WHERE channel IS NULL) AS 剩下的_NULL, min(id) FILTER (WHERE channel IS NULL) AS 下一筆
+FROM orders;"></div>
+<p>正式環境由一支腳本跑迴圈。它可以中斷再續跑：條件裡有 <code>channel IS NULL</code>，處理過的列不會再被選到，腳本重啟後自然從還沒做的地方接著做。</p>
+<pre>let total = 0
+for (;;) {
+  const { rowCount } = await pool.query(`
+    UPDATE orders SET channel = 'pos'
+    WHERE id IN (/* 還沒處理、依 id 最前面的 2000 筆 */)`)
+  total += rowCount
+  if (rowCount === 0) break
+  await sleep(200)                 // 讓 VACUUM、複寫、其他查詢喘口氣
+  // 監控 replica 延遲，太大就暫停（第 37 課）
+}</pre>
+<p>迴圈跑到 <code>rowCount</code> 是 0，表示舊的 <code>NULL</code> 補完了，這時再執行上一節的 <code>VALIDATE CONSTRAINT</code>，第一張單就完成了：整個過程只有加約束那一下拿了強鎖，而且是瞬間的。</p>
+<div class="callout practice"><strong>💡 實務上：回填是一支獨立的 job，不是 migration 的一部分</strong><br>回填可能跑好幾個小時，放進部署流程裡會卡住整個上線，而且失敗時很難判斷要不要回滾。常見做法是 migration 只做瞬間完成的 DDL，回填另外寫成可以續跑的腳本或背景 job，跑的時候記錄進度（處理到哪個 id、剩多少筆）。批次大小和休息時間先在演練環境試出來，正式跑時看資料庫 CPU 和 replica 延遲再調整。上線前也要跟維運或值班的人說一聲：這段時間 WAL 和磁碟用量會上升，是預期中的。</div>
+<p>第一張單靠的是「約束可以先生效、後驗證」。第二張單的「手機不能重複」要靠唯一索引，而索引沒有 <code>NOT VALID</code> 這種選項：索引不建完，就沒辦法保證不重複。它需要另一種拆法。</p>
+
+<h2>第二張單：「手機不能重複」的唯一索引，怎麼建才不擋寫入？</h2>
+<p>保證欄位不重複的是唯一索引（<a href="20-indexes.html">第 20 課</a>）。一般的 <code>CREATE INDEX</code> 拿 SHARE 鎖：讀照常，但所有寫入都要等。原因是它要掃過整張表、把每一列排序後建成索引，建的過程中如果有人插入或修改，新的列可能被漏掉，索引就不完整。最簡單的保證是建索引期間不准寫。顧客表小的時候這只是一瞬間；表大的時候，建索引的幾分鐘裡沒有人能註冊、沒有人能改資料。</p>
+<p><code>CREATE INDEX CONCURRENTLY</code>（以下簡稱 CIC）換一種方式保證完整：它只拿 SHARE UPDATE EXCLUSIVE，讓寫入照常進行，再用多做幾輪工作補上建索引期間被改到的列。代價有兩個：</p>
+<ul>
+  <li><strong>比較慢</strong>：要掃表兩次，還要等開始前已經在跑的交易全部結束，才能確定沒有漏掉的資料。</li>
+  <li><strong>不能放在交易裡</strong>：它內部會自己分成好幾個交易一段一段提交，所以不能被包進外層的 <code>BEGIN … COMMIT</code>。</li>
+</ul>
+<p>第二個代價最常在部署時踩到。這頁同一格寫兩句就會被當成一個交易（所以課首說 CONCURRENTLY 要單獨一格），正好重現這個錯誤，執行後看錯誤碼：</p>
+<div class="lab" data-sql="CREATE INDEX CONCURRENTLY orders_channel_idx ON orders (channel);
+SELECT 1;"></div>
+<p>正式環境更常見的情況是：migration 工具預設把每個檔案包在 <code>BEGIN … COMMIT</code> 裡，CIC 一跑就得到 <code>25001 cannot run inside a transaction block</code>。解法是讓這個檔案不包交易（工具通常有設定，例如在檔案開頭加註記），並且這個檔案只放這一句。<code>DROP INDEX CONCURRENTLY</code>、<code>REINDEX CONCURRENTLY</code> 也一樣。</p>
+<p>還有一個問題：唯一索引建到一半，發現資料裡已經有重複的手機，會怎樣？</p>
+
+<h3>失敗會留下 INVALID 索引</h3>
+<p>一般的 <code>CREATE INDEX</code> 失敗時整個撤銷，什麼都不留下。CIC 不一樣：它是分段提交的，失敗時前面幾段已經提交了，所以會留下一個 <strong>INVALID 索引</strong>。查詢不會用它，但它還在：佔著這個名稱，讓下一次 <code>CREATE INDEX</code> 因為名稱重複而失敗，也讓人看 schema 時以為索引已經建好。</p>
+<p>它還可能繼續影響寫入，看失敗在哪個階段（PostgreSQL 18 的 <code>CREATE INDEX</code> 文件）：如果失敗時它已經進入「寫入要維護」的階段，每次寫入都要多維護它；失敗發生在第二次掃表時，唯一索引還會繼續擋重複值。也就是說，一個查詢用不到的索引，可能還在拖慢寫入，甚至擋下資料。</p>
+<p>要看出這些狀態，要查系統目錄 <code>pg_index</code>：每個索引一列，<code>indisvalid</code> 表示查詢能不能用，<code>indisready</code> 表示寫入時要不要維護它。這頁的 seed 重現了一次失敗：有人想替 <code>customers.phone</code> 建唯一索引，但林志豪和李建國的手機一樣。執行後看 <code>customers_phone_uniq</code> 那一列：</p>
+<div class="lab" data-sql="SELECT indexrelid::regclass::text AS 索引, indisunique AS 唯一, indisvalid AS 有效, indisready AS 寫入時維護
+FROM pg_index WHERE indrelid = 'customers'::regclass ORDER BY 1;"></div>
+<p>「有效」是 <code>false</code>。這次在第一次掃表（建索引）就失敗了，所以 <code>indisready</code> 也是 <code>false</code>。</p>
+<p>健康檢查要找的是 <code>indisvalid</code> 為 <code>false</code> 的索引，不管 <code>indisready</code> 是什麼，因為兩種都要清掉重建。常用的 <code>pg_indexes</code> 視圖只有名稱和定義，看不出有效與否，要查 <code>pg_index</code>（練習 4）。</p>
+<p>修復分三步，順序不能換：資料不修好，重建一樣會失敗。第一步，找出重複的資料：</p>
+<div class="lab" data-sql="SELECT phone, array_agg(id ORDER BY id) AS 顧客, count(*) FROM customers
+GROUP BY phone HAVING count(*) &gt; 1;"></div>
+<p>第二步，修好資料。這一步要問業務，不能由工程師自己挑一筆改。業務確認李建國（id 5）的手機登記錯了：</p>
+<div class="lab" data-sql="UPDATE customers SET phone = '0933-999-000' WHERE id = 5;"></div>
+<p>第三步，刪掉殘骸、重建（CONCURRENTLY 的指令各自單獨一格）：</p>
+<div class="lab" data-sql="DROP INDEX CONCURRENTLY customers_phone_uniq;"></div>
+<div class="lab" data-sql="CREATE UNIQUE INDEX CONCURRENTLY customers_phone_uniq ON customers (phone);"></div>
+<p>索引建好了，手機已經不能重複。但通常我們想要的是唯一<strong>約束</strong>（<code>UNIQUE</code>），讓 <code>ON CONFLICT (phone)</code> 和 schema 工具看得到這條規則。不要直接 <code>ADD CONSTRAINT … UNIQUE</code>，那會在強鎖底下重新建一次索引，前面的功夫白費。用建好的索引升級，只改目錄，瞬間完成。執行後看「索引」欄，索引會改名成約束的名字：</p>
+<div class="lab" data-sql="ALTER TABLE customers ADD CONSTRAINT customers_phone_key UNIQUE USING INDEX customers_phone_uniq;
+SELECT indexrelid::regclass::text AS 索引, indisvalid AS 有效 FROM pg_index WHERE indrelid = 'customers'::regclass ORDER BY 1;"></div>
+<p>第二張單完成了，同樣只有最後的升級拿了強鎖，而且是瞬間的。剩下第三張單 <code>bigint</code>，它比前兩張都難：前兩張是「加一條規則」，可以把檢查往後延；改型別是「改變每一列的存放方式」，不論怎麼延，資料都得重寫，而且還有一個新問題：程式本身也要跟著換。</p>
+
+<h2>第三張單：訂單編號換成 bigint，怎麼讓新舊版程式同時能跑？</h2>
+<p>既然 <code>ALTER COLUMN … TYPE bigint</code> 一定會在強鎖底下重寫，就不要改原本的欄位，而是在旁邊建一個新的、慢慢把資料搬過去，最後一刻再切換。這就是<a href="22-migrations.html">第 22 課</a>提過的 <strong>expand／contract</strong>：先擴充（新舊並存）、搬資料、最後收斂（移除舊的）。</p>
+<p>為什麼要「新舊並存」一段時間，而不是搬完就切？因為正式環境的程式不會一瞬間全部換新。多台伺服器的服務，部署時通常是一台一台換成新版，這叫<strong>滾動部署</strong>（rolling deploy），好處是任何時刻都有伺服器在服務使用者。代價是部署期間，新舊兩版程式同時連著同一個資料庫，所以每一刻的 schema 都要讓兩版都能用。只要有一刻 schema 只認得其中一版，另一版就會報錯。</p>
+<p><code>bigint</code> 的步驟比較多，先用一個更簡單、但骨架相同的例子走一遍：把 <code>customers.phone</code> 改名為 <code>mobile</code>。改名本身是瞬間完成的（第一節的表），但只要一改，還在讀 <code>phone</code> 的舊版程式就全部壞掉，所以同樣不能一步完成。逐步播放，每一步注意 v1、v2 兩欄是不是都能運作：</p>
+<div class="tl">
+  <div class="table-wrap"><table>
+    <tr><th>步驟</th><th>資料庫</th><th>舊版程式（v1）</th><th>新版程式（v2）</th></tr>
+    <tr data-note="migration 1：ADD COLUMN mobile，瞬間完成。v1 不知道這欄，完全不受影響。同一個 migration 建立 trigger：寫 phone 時同步到 mobile，反之亦然。"><td>① expand</td><td><code>ADD COLUMN mobile</code>＋同步 trigger</td><td>讀寫 <code>phone</code></td><td></td></tr>
+    <tr data-note="分批回填：把舊資料的 phone 複製到 mobile。之後兩欄的內容永遠一致。"><td>② 回填</td><td>分批 <code>UPDATE … SET mobile = phone</code></td><td>讀寫 <code>phone</code></td><td></td></tr>
+    <tr data-note="滾動部署 v2：v2 只讀寫 mobile。部署期間 v1、v2 同時在跑，trigger 讓兩邊寫的資料互相看得到。出問題可以直接退回 v1。"><td>③ 部署 v2</td><td>（不變）</td><td>讀寫 <code>phone</code>（逐台下線）</td><td>讀寫 <code>mobile</code></td></tr>
+    <tr data-note="v1 全部下線、觀察一段時間沒問題後，migration 2：刪掉 trigger 和 phone。這一步之後就退不回 v1 了，所以放在最後、確定沒人讀 phone 才做。"><td>④ contract</td><td><code>DROP TRIGGER</code>、<code>DROP COLUMN phone</code></td><td>（已全部下線）</td><td>讀寫 <code>mobile</code></td></tr>
+  </table></div>
+  <div class="bar"><button data-prev>◀ 上一步</button><button class="primary" data-next>下一步 ▶</button><span class="kbd" data-count></span></div>
+  <p class="note"></p>
+</div>
+<p>這張時間軸能成立，靠的是第 ① 步的同步 trigger：任何一邊寫進來的值，都會被複製到另一欄，所以 v1 和 v2 同時在跑時看到的資料一致。trigger（<a href="23-views-functions-triggers.html">第 23 課</a>）長這樣。下面在 <code>BEGIN … ROLLBACK</code> 裡做完 expand 和回填，再模擬 v1 改 <code>phone</code>、v2 改 <code>mobile</code>、v2 新增顧客。執行後看最後的結果：每一列的 <code>phone</code> 和 <code>mobile</code> 都一樣：</p>
+<div class="lab" data-sql="BEGIN;
+ALTER TABLE customers ADD COLUMN mobile text;
+CREATE FUNCTION customers_sync_mobile() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    NEW.mobile := coalesce(NEW.mobile, NEW.phone);
+    NEW.phone := coalesce(NEW.phone, NEW.mobile);
+  ELSIF NEW.phone IS DISTINCT FROM OLD.phone THEN
+    NEW.mobile := NEW.phone;
+  ELSIF NEW.mobile IS DISTINCT FROM OLD.mobile THEN
+    NEW.phone := NEW.mobile;
+  END IF;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER customers_sync_mobile BEFORE INSERT OR UPDATE ON customers
+  FOR EACH ROW EXECUTE FUNCTION customers_sync_mobile();
+UPDATE customers SET mobile = phone WHERE mobile IS NULL;          -- 回填（這裡只有 6 筆）
+UPDATE customers SET phone = '0911-000-111' WHERE id = 1;          -- v1 寫舊欄位
+UPDATE customers SET mobile = '0922-000-222' WHERE id = 2;         -- v2 寫新欄位
+INSERT INTO customers (name, mobile) VALUES ('吳佩珊', '0966-555-444');   -- v2 新增顧客
+SELECT id, name, phone, mobile FROM customers ORDER BY id;
+ROLLBACK;"></div>
+<p>回到訂單編號。<code>integer</code> 改 <code>bigint</code> 走的是同一個骨架，只是多了「換主鍵」這個切換動作，而這一路用到的正是前面三節的工具：</p>
+<ol>
+  <li><strong>expand</strong>：<code>ADD COLUMN id_new bigint</code>（沒有預設值，只改目錄、瞬間），同時建 trigger，讓新寫入的列自動把 <code>id</code> 複製到 <code>id_new</code>。</li>
+  <li><strong>回填</strong>：照「舊的 NULL 怎麼補？」那一節的寫法，分批 <code>UPDATE … SET id_new = id</code>。</li>
+  <li><strong>準備新主鍵</strong>：主鍵欄位必須是 NOT NULL。如果切換時 <code>id_new</code> 還沒標成 NOT NULL，PostgreSQL 會在那一刻補做 <code>SET NOT NULL</code>，在強鎖底下掃全表（<code>ALTER TABLE</code> 文件）。所以先用第一張單的 <code>NOT VALID</code>＋<code>VALIDATE</code> 讓它成為已驗證的 NOT NULL，再用 <code>CREATE UNIQUE INDEX CONCURRENTLY</code> 建好新主鍵要的唯一索引。</li>
+  <li><strong>切換</strong>：在一個很短的交易裡改名、換主鍵（用建好的索引 <code>PRIMARY KEY USING INDEX</code>，跟上一節的 <code>UNIQUE USING INDEX</code> 同一個思路）、改序號。這一步仍然要 ACCESS EXCLUSIVE，但只改目錄、幾毫秒，配上 <code>lock_timeout</code> 就安全。</li>
+</ol>
+<p>「改序號」值得多說幾句。訂單編號不是程式算的，而是由掛在舊 <code>id</code> 欄位上的 identity（<a href="02-tables.html">第 2 課</a>，底層是一個 sequence 計數器）發號；<code>id_new</code> 只是普通欄位，本身不會發號。切換時要讓 <code>id_new</code> 接手發號，而且起點要設在目前最大的編號之後。少了前者，新訂單的 <code>INSERT</code> 拿不到編號，撞上主鍵的 NOT NULL 而失敗；少了後者，計數器從頭發號，發出已經存在的編號，撞上主鍵的唯一性而失敗。這些也都放在同一個短交易裡，只改目錄。</p>
+<ol start="5">
+  <li><strong>contract</strong>：確定沒有程式再用舊欄位後，刪掉 trigger 和舊欄位。</li>
+</ol>
+<p>參照 <code>orders.id</code> 的外鍵欄位（例如訂單明細的 <code>order_id</code>）也要一起規劃：它們的型別要跟著換，外鍵也要改成參照新的主鍵。這類切換牽涉的物件多、順序重要，通常要寫好腳本、在正式資料量的副本上演練過才上線。</p>
+<div class="callout practice"><strong>💡 實務上：先問「真的要改名嗎」，再記得收尾</strong><br>expand／contract 要三到四次部署、跨好幾天，成本不低。欄位只是名字不好看時，很多團隊選擇不改，在程式裡用 ORM 的欄位對應換個名字就好（例如 Prisma 的 <code>mobile String @map("phone")</code>）。真的要做時，最常見的問題是 contract 一直沒做：trigger 和舊欄位留了半年，新人不知道哪個才是對的。所以開工時就把 contract 開成一張單、排進時程，PR 說明裡寫清楚「這是第幾步、下一步是什麼、什麼時候能退回」。</div>
+<p>三張單都拆成了安全的步驟。但「安全」到目前為止都是在這頁 3,000 筆的資料上推論出來的，正式環境是 4,000 萬筆。上線前還差最後一道確認。</p>
+
+<h2>上線前，怎麼確定這份計畫在正式環境也安全？</h2>
+<p>前面每一個判斷，例如「瞬間完成」「讀寫照常」，都可以先在別的環境證明，而不是上線時才知道。上線前要過三關：</p>
+<ul>
+  <li><strong>CI 從零跑一遍</strong>：用真的 PostgreSQL（同版本）從空資料庫跑完全部 migration，抓出語法錯誤與順序問題（<a href="../../devops/lessons/15-ci.html">DevOps 課第 15 課</a>）。PostgreSQL 18 才有的寫法（例如 NOT NULL 的 <code>NOT VALID</code>），在舊版會直接報錯，版本不同就驗不出來。</li>
+  <li><strong>在正式資料量上演練</strong>：在接近正式資料量的副本（例如還原昨天的備份）上照順序跑一次，記下每一步的耗時和拿的鎖。3,000 筆瞬間完成的 <code>VALIDATE</code>，4,000 萬筆可能要十分鐘；這個數字決定了要不要挑離峰時段、回填要拆多小。</li>
+  <li><strong>和部署流程對好順序</strong>：哪些 migration 在新程式上線前跑（expand）、哪些在之後跑（contract），見 <a href="../../devops/lessons/16-cd.html">DevOps 課第 16 課</a>（部署策略）與<a href="../../devops/lessons/17-deploy-migrations.html">第 17 課</a>（部署時的 migration）。</li>
+</ul>
+<p>過了這三關，開場那三句會讓網站停擺的 <code>ALTER TABLE</code>，就變成了一份每一步都知道拿什麼鎖、要多久、失敗了怎麼辦的上線計畫。</p>
+
+<h2>補充與查表</h2>
+
+<h3>PostgreSQL 18 以前怎麼零停機加 NOT NULL</h3>
+<p>18 以前 NOT NULL 不能 <code>NOT VALID</code>，要借 CHECK 繞路。你會在舊專案的 migration 看到：</p>
+<pre>ALTER TABLE orders ADD CONSTRAINT orders_channel_check CHECK (channel IS NOT NULL) NOT VALID;
+-- 回填 …
+ALTER TABLE orders VALIDATE CONSTRAINT orders_channel_check;
+ALTER TABLE orders ALTER COLUMN channel SET NOT NULL;   -- 有已驗證的 CHECK 證明沒有 NULL，跳過掃描（文件）
+ALTER TABLE orders DROP CONSTRAINT orders_channel_check;</pre>
+
+<h3>NOT ENFORCED：名字很像 NOT VALID，意思完全不同</h3>
+<p>PostgreSQL 18 另外新增了 <code>NOT ENFORCED</code>（CHECK 與外鍵可用）：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>新寫入的資料</th><th>舊資料</th><th>用途</th></tr>
+  <tr><td><code>NOT VALID</code></td><td>檢查</td><td>還沒檢查，之後 <code>VALIDATE</code></td><td>零停機加約束</td></tr>
+  <tr><td><code>NOT ENFORCED</code></td><td><strong>不檢查</strong></td><td>不檢查（也不能 <code>VALIDATE</code>，會報錯）</td><td>只當文件或給工具看的宣告</td></tr>
+</table></div>
+<p>把第一張單那一節的外鍵例子改成 <code>NOT ENFORCED</code>，執行後看「新的壞資料」欄：</p>
+<div class="lab" data-sql="BEGIN;
+ALTER TABLE orders ADD CONSTRAINT orders_customer_ne
+  FOREIGN KEY (customer_id) REFERENCES customers (id) NOT ENFORCED;
+SELECT try_sql('INSERT INTO orders (customer_id, total) VALUES (999, 80)') AS 新的壞資料, conenforced, convalidated
+FROM pg_constraint WHERE conname = 'orders_customer_ne';
+ROLLBACK;"></div>
+<p>壞資料照樣寫進去了：<code>NOT ENFORCED</code> 的外鍵不擋任何資料，不能拿來當零停機的手段。</p>
+
+<h3>分割表</h3>
+<p>分割表的父表不能用 CIC，第 35 課會講替代做法。</p>
+
+<div class="callout"><strong>版本備註</strong>
+<ul>
+  <li>PostgreSQL 11：固定預設值的 <code>ADD COLUMN</code> 不再重寫表；volatile 預設值仍然會重寫（<code>ALTER TABLE</code> 文件）。</li>
+  <li>PostgreSQL 18：NOT NULL 約束可以 <code>NOT VALID</code> 再 <code>VALIDATE</code>；CHECK 與外鍵可以宣告 <code>NOT ENFORCED</code>（和 <code>NOT VALID</code> 不同）。</li>
+  <li>這頁的 PGlite 0.5.13（PostgreSQL 18.6）只有一條連線：<code>lock_timeout</code> 不會觸發、CIC 不用等別的交易，所以耗時和等待只能用文件與時間軸說明；鎖、重寫、<code>indisvalid</code>、錯誤碼都是在這裡實測的。</li>
+</ul></div>
+
+<h2>練習</h2>
+
+<div class="exercise"
+  data-start="SELECT relation::regclass::text AS relation, mode
+FROM pg_locks
+WHERE pid = pg_backend_pid()
+ORDER BY 1;"
+  data-answer="ALTER TABLE orders ADD CONSTRAINT orders_customer_fk
+  FOREIGN KEY (customer_id) REFERENCES customers (id) NOT VALID;
+SELECT relation::regclass::text AS relation, mode
+FROM pg_locks
+WHERE pid = pg_backend_pid()
+  AND relation IN ('orders'::regclass, 'customers'::regclass)
+  AND mode NOT IN ('AccessShareLock', 'RowShareLock')
+ORDER BY 1;"
+  data-ordered
+  data-isolated
+  data-require="\bpg_locks\b"
+  data-require-msg="這題要從系統的鎖資訊裡實際查出來，不能自己寫出答案。">
+  <p>練習 1：量出 <code>ALTER TABLE orders ADD CONSTRAINT orders_customer_fk FOREIGN KEY (customer_id) REFERENCES customers (id) NOT VALID</code> 對兩張表拿了什麼強鎖。在同一次執行裡先執行它，再查自己（<code>pg_backend_pid()</code>）在 <code>orders</code>、<code>customers</code> 上的鎖，排除 <code>AccessShareLock</code> 與 <code>RowShareLock</code>，回傳表名（<code>relation::regclass::text</code>）與 <code>mode</code>，依表名排序。（不寫 <code>BEGIN</code> 時，同一格的多句會在同一個交易裡執行，鎖還在。）</p>
+  <script type="text/sql" data-role="wrong">ALTER TABLE orders ADD CONSTRAINT orders_customer_fk
+  FOREIGN KEY (customer_id) REFERENCES customers (id) NOT VALID;
+SELECT relation::regclass::text AS relation, mode
+FROM pg_locks
+WHERE pid = pg_backend_pid()
+  AND relation IN ('orders'::regclass, 'customers'::regclass)
+ORDER BY 1;</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE orders ADD CONSTRAINT orders_customer_fk
+  FOREIGN KEY (customer_id) REFERENCES customers (id);
+SELECT relation::regclass::text AS relation, mode
+FROM pg_locks
+WHERE pid = pg_backend_pid()
+  AND relation IN ('orders'::regclass, 'customers'::regclass)
+  AND mode NOT IN ('AccessShareLock', 'RowShareLock')
+ORDER BY 1;</script>
+  <script type="text/sql" data-role="wrong">SELECT relation::regclass::text AS relation, mode
+FROM pg_locks
+WHERE pid = pg_backend_pid()
+  AND relation IN ('orders'::regclass, 'customers'::regclass)
+  AND mode NOT IN ('AccessShareLock', 'RowShareLock')
+ORDER BY 1;</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE orders ADD CONSTRAINT orders_customer_fk
+  FOREIGN KEY (customer_id) REFERENCES customers (id) NOT VALID;
+SELECT * FROM (VALUES ('customers', 'ShareRowExclusiveLock'), ('orders', 'ShareRowExclusiveLock')) AS t(relation, mode);</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE orders ADD CONSTRAINT orders_customer_fk
+  FOREIGN KEY (customer_id) REFERENCES customers (id) NOT VALID;
+SELECT relation::regclass::text AS relation, mode
+FROM pg_locks
+WHERE pid = pg_backend_pid()
+  AND mode NOT IN ('AccessShareLock', 'RowShareLock')
+ORDER BY 1;</script>
+</div>
+
+<div class="exercise"
+  data-start="-- orders.channel 有不少 NULL；加上名為 orders_channel_not_null 的 NOT NULL 約束
+"
+  data-answer="ALTER TABLE orders ADD CONSTRAINT orders_channel_not_null NOT NULL channel NOT VALID;"
+  data-check="SELECT c.contype, c.convalidated, a.attnotnull,
+  left(try_sql('INSERT INTO orders (customer_id, total) VALUES (1, 80)'), 5) AS 插入_NULL,
+  (SELECT count(*) FROM orders WHERE channel IS NULL) AS 舊的_NULL
+FROM pg_constraint c
+JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attname = 'channel'
+WHERE c.conname = 'orders_channel_not_null';"
+  data-isolated>
+  <p>練習 2：營業時間要先做到「新寫入的訂單不能沒有 <code>channel</code>」，但不能掃整張表，舊的 <code>NULL</code> 之後再處理。用 PostgreSQL 18 的寫法加上名為 <code>orders_channel_not_null</code> 的 NOT NULL 約束。</p>
+  <script type="text/sql" data-role="wrong">ALTER TABLE orders ALTER COLUMN channel SET NOT NULL;</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE orders ADD CONSTRAINT orders_channel_not_null NOT NULL channel;</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE orders ADD CONSTRAINT orders_channel_not_null CHECK (channel IS NOT NULL) NOT VALID;</script>
+  <script type="text/sql" data-role="wrong">UPDATE orders SET channel = 'pos' WHERE channel IS NULL;
+ALTER TABLE orders ALTER COLUMN channel SET NOT NULL;</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE orders ADD CONSTRAINT orders_channel_not_null NOT NULL channel NOT ENFORCED;</script>
+</div>
+
+<div class="exercise"
+  data-start="-- orders_channel_not_null 已經用 NOT VALID 加上了（題目已準備好）
+"
+  data-answer="UPDATE orders SET channel = 'pos' WHERE channel IS NULL;
+ALTER TABLE orders VALIDATE CONSTRAINT orders_channel_not_null;"
+  data-check="SELECT c.convalidated, a.attnotnull, (SELECT count(*) FROM orders WHERE channel IS NULL) AS 剩下的_NULL,
+  (SELECT count(*) FROM orders) AS 訂單數, (SELECT count(*) FROM orders WHERE channel = 'pos') AS pos_筆數
+FROM pg_constraint c
+JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attname = 'channel'
+WHERE c.conname = 'orders_channel_not_null';"
+  data-forbid="\bSET\s+NOT\s+NULL\b|\bDROP\s+CONSTRAINT\b"
+  data-forbid-msg="這會在 ACCESS EXCLUSIVE 底下處理整張表。這題要用讀寫照常的那個做法，完成原本那個約束。">
+  <p>練習 3：接續上一題，<code>orders_channel_not_null</code> 已經以 <code>NOT VALID</code> 加上。把舊的 <code>NULL</code> 補成 <code>'pos'</code>，再讓這個約束變成已驗證，過程中讀寫都不能被擋。（這裡只有 429 筆，一句 <code>UPDATE</code> 就好；正式環境要照前面教的分批。）</p>
+  <script type="text/sql" data-role="setup">ALTER TABLE orders ADD CONSTRAINT orders_channel_not_null NOT NULL channel NOT VALID;</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE orders VALIDATE CONSTRAINT orders_channel_not_null;</script>
+  <script type="text/sql" data-role="wrong">UPDATE orders SET channel = 'pos' WHERE channel IS NULL;</script>
+  <script type="text/sql" data-role="wrong">UPDATE orders SET channel = 'pos' WHERE channel IS NULL;
+ALTER TABLE orders ALTER COLUMN channel SET NOT NULL;</script>
+  <script type="text/sql" data-role="wrong">UPDATE orders SET channel = 'pos' WHERE channel IS NULL;
+ALTER TABLE orders DROP CONSTRAINT orders_channel_not_null;
+ALTER TABLE orders ADD CONSTRAINT orders_channel_not_null NOT NULL channel;</script>
+  <script type="text/sql" data-role="wrong">DELETE FROM orders WHERE channel IS NULL;
+ALTER TABLE orders VALIDATE CONSTRAINT orders_channel_not_null;</script>
+  <script type="text/sql" data-role="wrong">UPDATE orders SET channel = 'app' WHERE channel IS NULL;
+ALTER TABLE orders VALIDATE CONSTRAINT orders_channel_not_null;</script>
+  <script type="text/sql" data-role="wrong">UPDATE orders SET channel = 'pos';
+ALTER TABLE orders VALIDATE CONSTRAINT orders_channel_not_null;</script>
+</div>
+
+<div class="exercise"
+  data-start="SELECT indexname, tablename FROM pg_indexes WHERE schemaname = 'public' ORDER BY 1;"
+  data-answer="SELECT indexrelid::regclass::text AS index_name, indrelid::regclass::text AS table_name
+FROM pg_index
+WHERE NOT indisvalid
+ORDER BY 1;"
+  data-ordered
+  data-isolated>
+  <p>練習 4：有人在營業時間跑 <code>CREATE UNIQUE INDEX CONCURRENTLY</code> 失敗了（這頁的 seed 重現了它）。寫一句可以放進每日健康檢查的查詢，列出資料庫裡<strong>所有</strong> INVALID 的索引：索引名稱、所屬的表（都轉成文字），依索引名稱排序。這題的資料庫裡另外有一個建到最後一步才失敗的索引（<code>indisready</code> 是 <code>true</code>），所以不能寫死名稱。</p>
+  <script type="text/sql" data-role="setup">CREATE INDEX products_name_idx ON products (name);</script>
+  <script type="text/sql" data-role="setup">-- 模擬 CIC 在最後的驗證階段失敗：索引寫入時有維護，但查詢不能用
+UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'products_name_idx'::regclass;</script>
+  <script type="text/sql" data-role="wrong">SELECT indexrelid::regclass::text, indrelid::regclass::text FROM pg_index ORDER BY 1;</script>
+  <script type="text/sql" data-role="wrong">SELECT indexrelid::regclass::text, indrelid::regclass::text FROM pg_index WHERE indisunique ORDER BY 1;</script>
+  <script type="text/sql" data-role="wrong">SELECT indexrelid::regclass::text, indrelid::regclass::text FROM pg_index WHERE indisvalid ORDER BY 1;</script>
+  <script type="text/sql" data-role="wrong">SELECT indexrelid::regclass::text, indrelid::regclass::text FROM pg_index WHERE NOT indisready ORDER BY 1;</script>
+  <script type="text/sql" data-role="wrong">SELECT 'customers_phone_uniq', 'customers';</script>
+</div>
+
+<div class="exercise"
+  data-start="UPDATE orders SET channel = 'pos'
+WHERE channel IS NULL;"
+  data-answer="UPDATE orders SET channel = 'pos'
+WHERE id IN (SELECT id FROM orders WHERE channel IS NULL ORDER BY id LIMIT 100);"
+  data-check="SELECT count(*) AS 剩下的_NULL, min(id) AS 下一筆 FROM orders WHERE channel IS NULL;"
+  data-max-statements="1"
+  data-isolated>
+  <p>練習 5：回填 <code>orders.channel</code> 的第一批：在 <code>channel IS NULL</code> 的訂單裡，把 <strong>id 最小的 100 筆</strong>設成 <code>'pos'</code>，用一句 <code>UPDATE</code> 完成。注意 <code>NULL</code> 分散在各處，而且資料檔裡的實體順序和 id 順序不同。這題的資料庫和頁面不同：另外有一些訂單（id 是 50 的倍數）的 <code>channel</code> 也是 <code>NULL</code>，所以不能靠這頁的資料算出 id 範圍。</p>
+  <script type="text/sql" data-role="setup">UPDATE orders SET channel = NULL WHERE id % 50 = 0;</script>
+  <script type="text/sql" data-role="wrong">UPDATE orders SET channel = 'pos' WHERE id <= 100 AND channel IS NULL;</script>
+  <script type="text/sql" data-role="wrong">UPDATE orders SET channel = 'pos' WHERE id <= 696 AND channel IS NULL;</script>
+  <script type="text/sql" data-role="wrong">UPDATE orders SET channel = 'pos'
+WHERE id IN (SELECT id FROM orders WHERE channel IS NULL ORDER BY id DESC LIMIT 100);</script>
+  <script type="text/sql" data-role="wrong">UPDATE orders SET channel = 'pos'
+WHERE id IN (SELECT id FROM orders WHERE channel IS NULL LIMIT 100);</script>
+  <script type="text/sql" data-role="wrong">UPDATE orders SET channel = 'pos'
+WHERE id IN (SELECT id FROM orders ORDER BY id LIMIT 100);</script>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：<code>orders</code> 有 1 億列，下面哪一句幾乎瞬間完成（假設馬上拿得到鎖）？</p>
+  <label data-key="a"><code>ADD COLUMN channel text DEFAULT 'pos'</code></label>
+  <label data-key="b"><code>ADD COLUMN token uuid DEFAULT gen_random_uuid()</code></label>
+  <label data-key="c"><code>ALTER COLUMN id TYPE bigint</code></label>
+  <label data-key="d"><code>ALTER COLUMN channel SET NOT NULL</code></label>
+  <p class="why">✓ 固定的預設值只記在目錄裡（fast default，PostgreSQL 11 起）。b：<code>gen_random_uuid()</code> 是 volatile，每列要各自算值，整張表重寫；「ADD COLUMN DEFAULT 都很快」只對固定值成立。c：改型別重寫表和索引。d：要在 ACCESS EXCLUSIVE 底下掃全表確認沒有 NULL。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 7：部署時 migration 失敗：<code>CREATE INDEX CONCURRENTLY cannot run inside a transaction block</code>。原因和解法？</p>
+  <label data-key="a">PostgreSQL 版本太舊，升級就好</label>
+  <label data-key="b">拿掉 <code>CONCURRENTLY</code>，反正結果一樣</label>
+  <label data-key="c">migration 工具把這個檔案包進了交易；讓這個檔案不包交易，而且只放這一句</label>
+  <label data-key="d">在 SQL 前面加 <code>COMMIT;</code> 結束交易</label>
+  <p class="why">✓ CIC 要在交易外執行，而很多 migration 工具預設把每個檔案包在交易裡，不會替你處理。a：每個版本都有這個限制。b：沒有 CONCURRENTLY 會拿 SHARE，建索引期間所有寫入都被擋。d：硬塞 <code>COMMIT</code> 會打亂工具的交易管理（之後的記錄可能不在交易裡）；工具若把整個檔案當成一次多句的查詢送出，CIC 仍在隱含的交易裡，照樣 25001。正確做法是用工具提供的「這個檔案不包交易」設定。另外記得：失敗的 CIC 可能留下 INVALID 索引，要先清掉再重來。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 8：營業時間要替 4,000 萬筆的 <code>orders</code> 加上參照 <code>customers</code> 的外鍵。哪個做法對？</p>
+  <label data-key="a"><code>ADD … FOREIGN KEY … NOT ENFORCED</code>：比較快的 NOT VALID</label>
+  <label data-key="b"><code>ADD … FOREIGN KEY … NOT VALID</code>，再 <code>VALIDATE CONSTRAINT</code></label>
+  <label data-key="c">直接 <code>ADD … FOREIGN KEY</code>：外鍵只拿 SHARE ROW EXCLUSIVE，不會擋任何人</label>
+  <label data-key="d">先 <code>VALIDATE CONSTRAINT</code>，再 <code>ADD … FOREIGN KEY</code></label>
+  <p class="why">✓ <code>NOT VALID</code> 瞬間加上、立刻檢查新資料；<code>VALIDATE</code> 只拿 SHARE UPDATE EXCLUSIVE（另外對被參照的表拿 ROW SHARE），讀寫照常。a：<code>NOT ENFORCED</code> 連新資料都不檢查，也不能 VALIDATE，等於沒有外鍵。c：SHARE ROW EXCLUSIVE 和寫入的 ROW EXCLUSIVE 衝突，掃全表的期間兩張表都不能寫。d：約束要先存在才能驗證。別忘了替 <code>orders.customer_id</code> 建索引（用 CONCURRENTLY）。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>DEFAULT 用 volatile 函式、直接改欄位型別</strong>：整張表在 ACCESS EXCLUSIVE 底下重寫。先加沒有預設值的欄位再分批回填；改型別用 expand／contract。</li>
+  <li><strong>直接 <code>ADD CONSTRAINT</code> 或 <code>SET NOT NULL</code></strong>：大表上長時間掃描、擋住讀寫。用 <code>NOT VALID</code>＋<code>VALIDATE</code>。</li>
+  <li><strong>以為瞬間完成的 DDL 不用 <code>lock_timeout</code></strong>：它會排在長查詢後面，再擋住後面所有人。每個 DDL 都設 <code>lock_timeout</code> 並重試。</li>
+  <li><strong>把 CONCURRENTLY 放進交易；失敗後留下 INVALID 索引沒清</strong>：殘骸可能拖慢寫入、繼續擋重複值，也佔著名稱讓重建失敗。健康檢查定期查 <code>pg_index.indisvalid</code>，<code>DROP INDEX CONCURRENTLY</code> 後重建。</li>
+  <li><strong>一句 <code>UPDATE</code> 回填整張表</strong>：長交易、膨脹、WAL 暴增、replica 落後。每批幾千列、各自提交、可以續跑。</li>
+  <li><strong>舊程式還在讀的欄位就先改名或刪掉</strong>：滾動部署期間舊版程式全部報錯。先 expand、部署、確認沒人用，再 contract。</li>
+  <li><strong>沒有在接近正式資料量的環境演練</strong>：開發機上 3 毫秒的 migration，正式環境可能 10 分鐘。演練並記下耗時與鎖。</li>
+  <li><strong>新的外鍵欄位忘了建索引</strong>：刪除顧客時要掃整張 <code>orders</code> 找參照（第 20 課）。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>每個 DDL 先問：拿什麼鎖、要做多少事（只改目錄、掃全表、重寫表）。危險的是「強鎖＋大量工作」；用 <code>pg_locks</code> 與 <code>pg_relation_filenode()</code> 自己量。</li>
+  <li>固定預設值的 <code>ADD COLUMN</code> 瞬間完成（fast default）；volatile 預設值與改型別會重寫表。</li>
+  <li>鎖等待比鎖本身危險：每個 DDL 都設 <code>lock_timeout</code>，拿不到就放棄、稍後重試，一個交易只放一個 DDL。</li>
+  <li>加規則（CHECK、外鍵、18 起的 NOT NULL）：先 <code>NOT VALID</code> 擋新資料，回填後 <code>VALIDATE</code>（SHARE UPDATE EXCLUSIVE，讀寫照常）。<code>NOT ENFORCED</code> 是另一回事。</li>
+  <li>回填分批、每批一個交易、依 id 挑列、可以續跑，當成獨立的 job。</li>
+  <li>建索引用 <code>CREATE INDEX CONCURRENTLY</code>，不能在交易裡；失敗會留下 INVALID 索引，查 <code>pg_index.indisvalid</code>。唯一約束用 <code>UNIQUE USING INDEX</code> 升級。</li>
+  <li>改名與改型別用 expand／contract 配合滾動部署：新欄位＋同步 trigger、回填、在短交易裡切換、最後收尾。上線前在正式資料量上演練。</li>
+</ul>
+<p>下一課處理「表大到單一張表管不動」的情況：分割表、BRIN 索引，以及用分區做資料保留。</p>
+
+</main>
+
+<script type="text/sql" id="seed">
+CREATE TABLE customers (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL,
+  phone text
+);
+CREATE TABLE products (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL,
+  price integer NOT NULL
+);
+-- customer_id 還沒有外鍵；channel 可以是 NULL
+CREATE TABLE orders (
+  id integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  customer_id integer NOT NULL,
+  ordered_at timestamptz,
+  total integer NOT NULL,
+  channel text
+);
+INSERT INTO customers (name, phone) VALUES
+  ('王小明', '0912-345-678'), ('陳美華', '0922-111-222'), ('林志豪', '0933-456-789'),
+  ('張雅婷', '0955-222-333'), ('李建國', '0933-456-789'), ('黃淑芬', '0988-777-666');
+INSERT INTO products (name, price) VALUES
+  ('美式咖啡', 80), ('拿鐵', 110), ('卡布奇諾', 110), ('伯爵紅茶', 90), ('可頌', 70), ('起司蛋糕', 120);
+-- 3,000 筆訂單，寫入順序打亂（實體順序 ≠ id 順序）；id % 7 = 3 的 channel 是 NULL
+INSERT INTO orders (id, customer_id, ordered_at, total, channel)
+SELECT g, g % 6 + 1, '2026-01-01 08:00+08'::timestamptz + g * interval '97 minutes', 70 + (g % 6) * 10,
+       CASE WHEN g % 7 = 3 THEN NULL ELSE (ARRAY['pos', 'app', 'web'])[g % 3 + 1] END
+FROM generate_series(1, 3000) AS g
+ORDER BY (g * 7919) % 3000;
+-- 一筆參照不存在的顧客（舊系統匯入的髒資料）
+INSERT INTO orders (id, customer_id, ordered_at, total, channel) VALUES (3001, 99, '2026-07-31 18:00+08', 80, 'pos');
+SELECT setval(pg_get_serial_sequence('orders', 'id'), 3001);
+
+-- 執行一句 SQL：成功回傳「成功」，失敗回傳錯誤碼與訊息
+CREATE FUNCTION try_sql(sql text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE sql;
+  RETURN '成功';
+EXCEPTION WHEN OTHERS THEN
+  RETURN SQLSTATE || ' ' || SQLERRM;
+END $$;
+
+-- 在會被取消的子交易裡執行 DDL：回傳表有沒有被重寫（filenode 改變）、在這張表上拿到的最強的鎖
+-- 鎖的模式轉成 LOCK TABLE 的寫法：AccessExclusiveLock → ACCESS EXCLUSIVE
+CREATE FUNCTION ddl_probe(ddl text, tbl regclass) RETURNS TABLE (重寫 boolean, 最強的鎖 text) LANGUAGE plpgsql AS $$
+DECLARE
+  before oid := pg_relation_filenode(tbl);
+BEGIN
+  BEGIN
+    EXECUTE ddl;
+    重寫 := pg_relation_filenode(tbl) <> before;
+    SELECT upper(regexp_replace(regexp_replace(l.mode, 'Lock$', ''), '([a-z])([A-Z])', '\1 \2', 'g')) INTO 最強的鎖 FROM pg_locks l
+    WHERE l.pid = pg_backend_pid() AND l.relation = tbl
+    ORDER BY array_position(ARRAY['AccessShareLock', 'RowShareLock', 'RowExclusiveLock', 'ShareUpdateExclusiveLock',
+      'ShareLock', 'ShareRowExclusiveLock', 'ExclusiveLock', 'AccessExclusiveLock'], l.mode::text) DESC
+    LIMIT 1;
+    RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'probe';
+  EXCEPTION
+    WHEN SQLSTATE 'P0001' THEN RETURN NEXT;
+    WHEN OTHERS THEN 最強的鎖 := SQLSTATE || ' ' || SQLERRM; RETURN NEXT;
+  END;
+END $$;
+</script>
+<script type="text/sql" id="seed-after">
+-- may fail
+CREATE UNIQUE INDEX CONCURRENTLY customers_phone_uniq ON customers (phone);
+</script>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

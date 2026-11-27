@@ -1,0 +1,25 @@
+// 首頁與圖解總表共用的課程清單
+// [資料夾, 課名, 範圍]；資料夾是 null 的課還在規劃。順序：主線（轉職必修）在前，選修在後，跟首頁的說明一致
+export const COURSES = [
+  ['postgresql', 'PostgreSQL', '資料庫從零到資深：SQL、關係、交易、索引、權限，再到查詢調校、MVCC、鎖、零停機 migration、備份與複寫'],
+  ['typescript', 'JS、非同步與 TypeScript', '值與參考、原型、錯誤、event loop、Promise、取消與競態，再到型別縮小、泛型、型別運算、裝飾器，學到能寫 NestJS'],
+  ['node', 'Node.js 核心', 'Node 怎麼執行程式、模組、檔案與 Buffer、用 node:http 寫 API、stream、錯誤處理、log、連線池、優雅關機、效能與安全'],
+  ['nestjs', 'NestJS', '用框架寫 API：DI、請求管線、驗證、測試、Prisma＋PostgreSQL、交易、快取、佇列、上線與架構'],
+  ['portfolio', '作品專案：從小專案到多租戶 SaaS 後台', '先用一個小專案從零走完需求、schema、API、測試、容器、CI 到上線；再用 NestJS、Prisma、PostgreSQL 做多租戶 SaaS 後台：租戶隔離、認證、成員與角色、稽核、背景工作、部署，當履歷上的作品'],
+  ['algorithms', '演算法與資料結構：面試基礎', '從解題流程與複雜度開始，雜湊表、雙指標、二分搜尋、滑動視窗、堆疊、鏈結串列、樹、圖、回溯、貪婪、動態規劃，最後模擬面試'],
+  ['auth', '認證、權限與資安', '密碼、Cookie 與 Session、CSRF、XSS、JWT、OAuth、MFA、Passkey、RBAC、多租戶、OWASP API Top 10'],
+  ['devops', '部署與維運', 'Shell、網路、TLS、Docker、Nginx、CI/CD、migration、AWS 與 IaC、log、指標、追蹤、備份、事故處理'],
+  ['system-design', '系統設計與資深工程實踐', '快取、限流、重試、冪等、佇列、saga、可觀測性、設計文件、code review、除錯方法'],
+  ['delivery', '實戰：咖啡店產品交付', '接手一個有問題的既有專案：跨層需求、沒有重現步驟的 bug、壞掉的 CI、審查 PR、付款對帳、資料修復、依賴升級、壓測與事故演練'],
+  ['career', '面試與職涯', '招聘流程、履歷、作品集、STAR 行為面試、現場寫程式、回家作業、系統設計面試、評估 offer、走向資深'],
+  ['engineering', '資深工程師的工作方法', '需求釐清與驗收條件、估工、交付溝通、接手舊系統與安全重構、技術寫作、帶人、驗證 AI 產出'],
+  ['kubernetes', 'Kubernetes 實戰', '從期望狀態與控制迴圈開始，用 kind 跑本機叢集：Pod、Deployment、Service、Gateway API、設定與 Secret、健康檢查、自動擴展、不停機部署、Job、儲存、RBAC、Helm、除錯、GitOps 與 EKS'],
+  ['data-stores', '資料儲存選型：Redis、MongoDB 與搜尋', '從存取模式選儲存：Redis 資料結構與上線、MongoDB 建模與一致性、搜尋引擎與同步、S3、分析資料庫、DynamoDB 設計'],
+  ['api-styles', 'API 風格與整合：GraphQL、gRPC 與契約', 'GraphQL 的 resolver、DataLoader、授權與限制，protobuf 與 gRPC、deadline，契約演進與契約測試、gateway 與 BFF'],
+  ['aws', 'AWS 雲端服務實戰', '接在部署與維運課的 AWS 之後：帳號與 IAM、VPC 除錯、負載平衡與網域、ECS Fargate、Lambda 與 API Gateway、事件與佇列、最後把作品部署上 AWS'],
+  ['supabase', 'Supabase：用 Postgres 當後端', 'PostgREST＋RLS 當後端的設計方式：Data API、GRANT 與 RLS 兩道門、Auth、何時該用 BaaS、何時改回自己的 API'],
+  ['ai', 'AI 應用開發：LLM、RAG 與 Agent', 'Claude API、串流、結構化輸出、tool use、agent 迴圈、pgvector 與 RAG、eval、prompt injection 防護、成本與可靠性'],
+  ['web', 'HTML、CSS 與網頁基礎', '語意化 HTML、表單、無障礙、層疊與版面、RWD、現代 CSS、DevTools、渲染、Core Web Vitals、SEO、設計系統、自動化驗收'],
+  ['vue', 'Vue 3 深入與前端架構', '響應式原理、元件運作、composables、狀態與 API 層、表單、路由權限、測試、效能、SSR、架構'],
+  ['react', 'React：給會 Vue 的人', '重新 render 的心智模型、hooks 與副作用、元件設計與型別、TanStack Query、Actions、React Router、效能與 Compiler、並行、渲染策略、測試、錯誤與無障礙'],
+]

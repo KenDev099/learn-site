@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>11. 儲存與有狀態服務：PVC、StatefulSet，以及資料庫為什麼放 RDS</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="11" data-practice="kubernetes">
+<header>
+  <div class="eyebrow">階段 4：資料、安全與打包 · 第 11 課</div>
+  <h1>儲存與有狀態服務：PVC、StatefulSet，以及資料庫為什麼放 RDS</h1>
+</header>
+<main>
+
+<p>到目前為止，cafe-api 的每個 Pod 都可以隨時丟掉：刪掉一個，Deployment 建一個新的，什麼都沒少。這是因為它沒有自己的資料，訂單只放記憶體。可是咖啡店總有要留下來的東西：收據檔案、資料庫、上傳的照片。把它們寫在 Pod 裡，下一次換版、節點維護、Pod 被驅逐，資料就跟著消失。</p>
+<p>這一課讓資料活過 Pod，並做一個資深工程師常被問的判斷：正式環境的資料庫要不要放進 Kubernetes。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>資料放在哪裡會不見：寫在容器裡、emptyDir、PVC 的檔案，各活到什麼時候。</li>
+  <li>PVC 與 StorageClass、Deployment 掛一顆 RWO 磁碟：怎麼向叢集要一塊持久的磁碟，掛上之後為什麼只能 1 個副本、換版要先關舊的。</li>
+  <li>StatefulSet：資料庫這類每個副本各有一份資料的服務，怎麼拿到固定的名字和自己的磁碟。</li>
+  <li>正式環境的資料庫要不要放叢集、ExternalName：咖啡店為什麼選 RDS，應用怎麼用固定的名稱 <code>db</code> 連外部資料庫。</li>
+  <li>暫存資料：處理完就不要的檔案放 emptyDir，並讓根目錄唯讀，被入侵時攻擊者改不了程式。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../devops/lessons/18-aws-architecture.html">devops 課第 18 課</a>的 AWS 儲存：RDS 是代管的資料庫，EBS 是掛在 EC2 上的雲端磁碟、綁在一個可用區（AZ），S3 是不用掛載、用 SDK 存取的物件儲存。</li>
+  <li><a href="04-services-dns.html">第 4 課</a>的 headless Service：<code>clusterIP: None</code> 的 Service 沒有虛擬 IP，DNS 直接回每個 Pod 的 IP。</li>
+  <li><a href="09-rollouts-pdb.html">第 9 課</a>的滾動更新：Deployment 換版時先建新 Pod、等它準備好再關舊 Pod。</li>
+</ul></div>
+
+<h2>資料放在哪裡會不見</h2>
+<p>容器裡的程式寫檔案時，檔案落在哪裡，決定了它能活多久。Kubernetes 裡有三個層級：</p>
+<ul>
+  <li><strong>容器自己的檔案系統</strong>（可寫層，writable layer）：映像上面多疊的一層，寫進去的東西只屬於「這一次啟動的容器」。容器崩潰被 kubelet 重啟時，是用映像重新建一個容器，可寫層是新的，舊的檔案就沒了。</li>
+  <li><strong>emptyDir</strong>：Pod 層級的暫存空間。Pod 排到節點上時建立一個空資料夾，Pod 裡的容器都可以掛載它；容器重啟時資料還在，<strong>Pod 刪除時資料夾跟著刪除</strong>。</li>
+  <li><strong>PersistentVolume（PV）</strong>：叢集裡的一塊儲存，例如雲端磁碟、NFS，或 kind 節點上的一個目錄。它的生命週期跟 Pod 無關：Pod 刪了，新的 Pod 掛上同一個 PV，資料都在。</li>
+</ul>
+<figure>
+  <svg viewBox="0 0 700 260" role="img" aria-label="三種儲存的生命週期：容器的可寫層在容器重啟時就消失；emptyDir 活過容器重啟，但 Pod 刪除時消失；PersistentVolume 活過 Pod 刪除，新的 Pod 掛上去資料還在">
+    <defs><marker id="arr11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <text class="d-small" x="230" y="24" text-anchor="middle">容器重啟</text>
+    <text class="d-small" x="420" y="24" text-anchor="middle">Pod 刪除、重建</text>
+    <line class="d-line" x1="230" y1="34" x2="230" y2="240" stroke-dasharray="4 4"/>
+    <line class="d-line" x1="420" y1="34" x2="420" y2="240" stroke-dasharray="4 4"/>
+    <text class="d-text" x="10" y="72">容器可寫層</text>
+    <rect class="d-soft" x="130" y="54" width="100" height="28" rx="4"/>
+    <text class="d-small" x="240" y="72">✗ 沒了</text>
+    <text class="d-text" x="10" y="142">emptyDir</text>
+    <rect class="d-soft" x="130" y="124" width="290" height="28" rx="4"/>
+    <text class="d-small" x="430" y="142">✗ 沒了</text>
+    <text class="d-text" x="10" y="212">PV（經由 PVC）</text>
+    <rect class="d-box" x="130" y="194" width="540" height="28" rx="4"/>
+    <line class="d-line" x1="560" y1="208" x2="660" y2="208" marker-end="url(#arr11)"/>
+    <text class="d-accent" x="440" y="212">新 Pod 掛回來，還在</text>
+  </svg>
+  <figcaption>同一份檔案寫在不同地方，能活多久差很多。</figcaption>
+</figure>
+<p>在叢集裡親手看一次。cafe-api 的 <code>POST /receipts</code> 會把收據寫成 <code>/data/&lt;id&gt;.json</code>，<code>GET /receipts</code> 列出 <code>/data</code> 裡的收據。先用練習 1 的起始檔（<code>/data</code> 是 emptyDir）：</p>
+<pre>node check.mjs kubernetes 11          # 第一次執行：把起始檔複製到 kubernetes/practice/work/11/
+export KUBECONFIG="$PWD/kubernetes/practice/.kube/config"
+kubectl create namespace try-11
+kubectl apply -n try-11 -f kubernetes/practice/work/11/ex1/deployment.yaml
+kubectl exec -n try-11 deploy/cafe-api -- wget -qO- --post-data='{"total":110}' \
+  --header='content-type: application/json' 127.0.0.1:3000/receipts
+kubectl exec -n try-11 deploy/cafe-api -- wget -qO- 127.0.0.1:3000/receipts     # 看得到一張
+kubectl delete pod -n try-11 -l app.kubernetes.io/name=cafe-api
+kubectl exec -n try-11 deploy/cafe-api -- wget -qO- 127.0.0.1:3000/receipts     # []：收據不見了</pre>
+<p>（容器裡用 <code>127.0.0.1</code> 而不寫 <code>localhost</code>：映像裡的 <code>localhost</code> 會先解析成 IPv6 的 <code>::1</code>，cafe-api 只聽 IPv4。）emptyDir 對「Pod 刪除」無能為力。要讓收據活下來，就要一塊不屬於 Pod 的儲存。</p>
+
+<h2>PVC 與 StorageClass：向叢集要一塊磁碟</h2>
+<p>Pod 不直接指定「用哪一顆 EBS 磁碟」，而是提出申請：</p>
+<ul>
+  <li><strong>PersistentVolumeClaim（PVC）</strong>：Pod 對儲存的申請單，寫要多大、怎麼存取。Pod 的 volume 寫 <code>persistentVolumeClaim.claimName</code> 引用它。PVC 屬於 namespace。</li>
+  <li><strong>StorageClass</strong>：「怎麼動態建立 PV」的設定。PVC 沒有對應的 PV 時，StorageClass 指定的外掛會自動建一個（叫動態佈建，dynamic provisioning）。PV 與 StorageClass 都是整個叢集共用的物件。</li>
+  <li><strong>CSI（Container Storage Interface）</strong>：儲存外掛的標準介面。EKS 上建 EBS 磁碟的是 EBS CSI driver，建 EFS 的是 EFS CSI driver；Kubernetes 本身不認識任何雲端磁碟，靠這些外掛。</li>
+</ul>
+<pre>apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: receipts-data
+spec:
+  accessModes: [ReadWriteOnce]     # 存取方式，下面說明
+  resources:
+    requests:
+      storage: 1Gi                 # 要多大
+  # 沒寫 storageClassName：用叢集標成 (default) 的那個</pre>
+<p>課程叢集的 StorageClass：</p>
+<pre>$ kubectl get storageclass
+NAME                 PROVISIONER             RECLAIMPOLICY   VOLUMEBINDINGMODE      ALLOWVOLUMEEXPANSION
+standard (default)   rancher.io/local-path   Delete          WaitForFirstConsumer   false</pre>
+<p>kind 預設安裝 local-path-provisioner：它的「磁碟」就是某個節點上的一個目錄。把 PVC 套用上去，你會看到它停在 <code>Pending</code>，Events 寫著在等第一個使用者：這就是 <strong>volumeBindingMode: WaitForFirstConsumer</strong>，PVC 要等到有 Pod 用它、而且排程器決定好 Pod 去哪個節點之後，才在<strong>那個節點</strong>（雲端上是那個可用區）建立磁碟。如果一建 PVC 就馬上建磁碟（<code>Immediate</code>），磁碟可能落在 a 區，Pod 卻因為 CPU 不夠只能排到 b 區，永遠掛不上。Pod 出現後 PVC 變成 <code>Bound</code>，綁定到一個自動建立的 PV：</p>
+<pre>$ kubectl get pvc -n try-11
+NAME            STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS
+receipts-data   Bound    pvc-3f1c…                                  1Gi        RWO            standard</pre>
+<p>綁定之後，磁碟的位置就固定了。local-path 的 PV 帶有節點親和性（node affinity）：之後這個 PVC 的 Pod <strong>只能排到那個節點</strong>，節點壞了 Pod 就起不來。EKS 的 EBS 也一樣，只是範圍是可用區：一顆 EBS 磁碟只存在於一個可用區，Pod 不能搬到別的可用區。你的 3 個副本分散在 3 個可用區（第 9 課），但掛 EBS 的那個 Pod 只能待在磁碟那一區。</p>
+<h3>access mode：誰可以同時掛</h3>
+<div class="table-wrap"><table>
+  <tr><th>存取方式</th><th>意思</th><th>常見的儲存</th></tr>
+  <tr><td><code>ReadWriteOnce</code>（RWO）</td><td>同一時間只能掛在<strong>一個節點</strong>上讀寫（同節點的多個 Pod 仍然可以一起掛）</td><td>EBS、local-path，大部分區塊儲存</td></tr>
+  <tr><td><code>ReadWriteOncePod</code>（RWOP）</td><td>只有一個 Pod 能掛，連同節點的第二個 Pod 都不行</td><td>要 CSI driver 支援</td></tr>
+  <tr><td><code>ReadWriteMany</code>（RWX）</td><td>多個節點同時讀寫</td><td>EFS、NFS 這類網路檔案系統</td></tr>
+  <tr><td><code>ReadOnlyMany</code>（ROX）</td><td>多個節點同時唯讀</td><td>預先放好資料的磁碟</td></tr>
+</table></div>
+<p>一般的雲端磁碟都是 RWO。需要「很多 Pod 讀同一批檔案」時，先想的應該是物件儲存（S3），而不是 RWX：S3 不用掛載、沒有可用區限制，應用用 SDK 讀寫就好。</p>
+<h3>reclaim policy：PVC 刪掉之後</h3>
+<p>PV 的 <code>persistentVolumeReclaimPolicy</code> 決定 PVC 被刪除後磁碟怎麼處理。動態建立的 PV 沿用 StorageClass 的 <code>reclaimPolicy</code>，沒寫就是 <strong>Delete</strong>：PVC 一刪，PV 和底下的磁碟一起刪除。<strong>Retain</strong> 會保留 PV 與磁碟，要人工清理或接回去。<code>kubectl delete namespace</code> 會刪掉裡面所有 PVC，搭配 Delete 就是資料全部消失。Retain 只是多一層保護，真正能救回資料的是備份。</p>
+
+<div class="callout practice"><strong>💡 實務上：看到 PVC，先問備份與還原</strong><br>code review 或接手服務時看到一個 PVC，資深會先問三個問題：這份資料壞了或被誤刪，最多能接受掉多少（RPO）？備份在哪裡、多久做一次？上一次真的還原是什麼時候？最常見的事故不是磁碟壞掉，而是有人清理環境時 <code>kubectl delete namespace</code> 刪錯了，或 <code>helm uninstall</code> 把 chart 建立的 PVC 一起刪掉。正式環境的 StorageClass 可以設 <code>reclaimPolicy: Retain</code> 多一層保護，但沒演練過還原的備份等於沒有備份（devops 課第 24 課）。</div>
+
+<h2>Deployment 掛一顆 RWO 磁碟：只能 1 個副本，用 Recreate</h2>
+<p>把練習 1 的 <code>/data</code> 改成掛 PVC 後，資料活過了 Pod。但 Deployment 的兩個預設行為會跟 RWO 磁碟打架：</p>
+<ul>
+  <li><strong>多個副本</strong>：所有副本引用的是<strong>同一個</strong> PVC。排到別的節點的 Pod 掛不上，停在 <code>ContainerCreating</code>（EBS 的 Events 是 <code>Multi-Attach error for volume … Volume is already used by pod(s)</code>）；剛好在同一個節點的 Pod 掛得上，但兩個程式同時寫同一份資料，誰也不知道對方存在。</li>
+  <li><strong>滾動更新</strong>（RollingUpdate）：先建新 Pod、等它 Ready 再關舊的。新 Pod 要等舊 Pod 放開磁碟，舊 Pod 要等新 Pod Ready 才關，換版就卡住。</li>
+</ul>
+<p>所以一個 Deployment 掛一顆 RWO 磁碟時：<code>replicas: 1</code>，<code>strategy.type: Recreate</code>（先關掉舊 Pod，再建新的）。代價是換版時有幾秒沒有服務，也只能有一個副本。這適合內部的小工具；面對顧客的服務要多副本、不停機，就應該讓它不在本機存狀態：檔案放 S3、資料放資料庫。</p>
+
+<div class="callout practice"><strong>💡 實務上：從 Compose 搬上 Kubernetes，先盤點應用寫了哪些檔案</strong><br>典型的情況：原本 docker-compose 裡有一行 <code>./uploads:/app/uploads</code>（<a href="../../devops/lessons/10-compose.html">devops 課第 10 課</a>的 volume），搬到 Kubernetes 時直接換成 PVC，結果服務只能跑 1 個副本、換版會中斷，HPA 也開不了。寫 manifest 之前，先列出應用會寫到哪些路徑、每一份要活多久：使用者上傳的照片、產生的 PDF 改存 S3，session 改放 Redis，暫存檔放 emptyDir。這份清單通常會變成一兩個改程式的 PR，跟 PM 說明時可以講成「先讓服務能多開幾台」。改完之後真的需要 PVC 的，多半只剩資料庫這類有狀態服務，而它們在正式環境要不要放叢集，本課後面會談。</div>
+
+<h2>StatefulSet：每個 Pod 有自己的名字和自己的磁碟</h2>
+<p>有些服務的每個副本本來就各有一份資料，而且彼此要能點名找到對方：資料庫的主節點與複本、Kafka、Elasticsearch。<strong>StatefulSet</strong> 是給這種有狀態服務的控制器，它跟 Deployment 的差別：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>Deployment</th><th>StatefulSet</th></tr>
+  <tr><td>Pod 名稱</td><td>隨機：<code>cafe-api-7d9f…-x2k4p</code>，重建就換</td><td>固定編號：<code>pg-0</code>、<code>pg-1</code>，重建後還是 <code>pg-0</code></td></tr>
+  <tr><td>DNS</td><td>只有 Service 的名稱</td><td>搭配 headless Service，每個 Pod 有自己的名稱：<code>pg-0.pg</code></td></tr>
+  <tr><td>磁碟</td><td>所有副本共用 Pod 範本寫的同一個 PVC</td><td><code>volumeClaimTemplates</code> 替每個 Pod 建自己的 PVC：<code>data-pg-0</code>、<code>data-pg-1</code></td></tr>
+  <tr><td>啟動與關閉</td><td>同時</td><td>預設依序：pg-0 Ready 才建 pg-1；縮減時從編號最大的開始關</td></tr>
+  <tr><td>Pod 重建後</td><td>新名字、新身分</td><td>同一個名字，掛回<strong>同一個</strong> PVC</td></tr>
+</table></div>
+<p>開發用的 PostgreSQL 寫成 StatefulSet（練習 2 的答案就是這個形狀）：</p>
+<pre>apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pg
+spec:
+  serviceName: pg                  # 負責 DNS 的 headless Service
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: pg}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: pg}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:18.6-alpine3.24
+          …                        # 環境變數、readinessProbe（pg_isready）、resources
+          volumeMounts:
+            - name: data           # 名稱對應下面的 volumeClaimTemplates
+              mountPath: /var/lib/postgresql
+  volumeClaimTemplates:            # 每個 Pod 一個 PVC，名稱是 &lt;範本名稱&gt;-&lt;Pod 名稱&gt;
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg
+spec:
+  clusterIP: None                  # headless：DNS 直接回 Pod 的 IP，並建 pg-0.pg 這種名稱
+  selector: {app.kubernetes.io/name: pg}
+  ports:
+    - port: 5432</pre>
+<p>第 4 課說過，headless Service 沒有虛擬 IP，DNS 查詢直接回 Pod 的 IP。StatefulSet 的 <code>serviceName</code> 指向它之後，每個 Pod 還會多一個自己的名稱：<code>pg-0.pg</code>（完整是 <code>pg-0.pg.&lt;namespace&gt;.svc.cluster.local</code>）。要連「主節點」就連 <code>pg-0.pg</code>，不會被負載平衡分到複本去。</p>
+<div class="callout warn"><strong>postgres 18 的資料目錄換位置了</strong>：17 以前官方映像的 <code>PGDATA</code> 是 <code>/var/lib/postgresql/data</code>；18 起改成 <code>/var/lib/postgresql/18/docker</code>（跟 Debian 的 <code>pg_ctlcluster</code> 一致，以後升級大版本用 <code>pg_upgrade --link</code> 比較方便），映像宣告的 VOLUME 也改成 <code>/var/lib/postgresql</code>。照舊教學把 volume 掛在 <code>/var/lib/postgresql/data</code>，18 的入口腳本會偵測到並報錯結束。磁碟掛在 <code>/var/lib/postgresql</code>。另外，Kubernetes 不會替映像的 VOLUME 建匿名 volume：沒掛 PVC 時資料寫在容器可寫層，容器一重啟就沒了。</div>
+<p>兩個常被誤會的行為：</p>
+<ul>
+  <li><strong>刪除 StatefulSet 不會刪 PVC</strong>。<code>persistentVolumeClaimRetentionPolicy</code> 的 <code>whenDeleted</code> 與 <code>whenScaled</code> 預設都是 <code>Retain</code>，縮減副本或刪掉 StatefulSet 後，<code>data-pg-0</code> 留著，重新建立時會接回去。要清掉資料就自己刪 PVC。</li>
+  <li><strong>StatefulSet 不會複寫資料</strong>。<code>replicas: 3</code> 只是三個各自有空磁碟的 PostgreSQL，誰是主節點、怎麼串流複寫、主節點掛了誰接手，Kubernetes 全都不知道。這些是資料庫自己的事，也是下一節的重點。</li>
+</ul>
+
+<h2>正式環境的資料庫要不要放叢集</h2>
+<p>會寫 StatefulSet 之後，下一個問題是：咖啡店正式環境的 PostgreSQL，要自己在 EKS 裡跑，還是用 RDS？先列出「讓資料庫可以上線」要做的事（<a href="../../postgresql/lessons/37-backup-replication.html">PostgreSQL 課第 37 課</a>、<a href="../../devops/lessons/24-backup-dr.html">devops 課第 24 課</a>），再看誰來做：</p>
+<div class="table-wrap"><table>
+  <tr><th>工作</th><th>RDS（ElastiCache 對 Redis 類似）</th><th>叢集裡自己跑（StatefulSet）</th></tr>
+  <tr><td>每日備份、保留期限</td><td>自動備份，設定保留天數</td><td>自己寫備份 Job、放到 S3、監控它有沒有成功</td></tr>
+  <tr><td>還原到某個時間點（PITR）</td><td>保留期內任意時間點還原</td><td>自己保存 WAL、自己練習還原</td></tr>
+  <tr><td>主節點故障</td><td>Multi-AZ 自動切換到另一個可用區的備援</td><td>自己設串流複寫與切換機制；EBS 綁可用區，那一區掛了 Pod 也搬不走</td></tr>
+  <tr><td>小版本升級、安全修補</td><td>維護時段自動套用</td><td>自己換映像、自己測試</td></tr>
+  <tr><td>磁碟擴充、監控</td><td>主控台調整，內建 CloudWatch 指標</td><td>自己擴 PVC、自己裝 exporter 與告警</td></tr>
+  <tr><td>節點維護</td><td>不影響</td><td>drain 節點時資料庫 Pod 要搬家：PDB、停機時間、可用區限制（第 9 課）</td></tr>
+  <tr><td>成本</td><td>RDS 的費用比自己開同規格的 EC2 高</td><td>機器便宜，但上面每一列都是人力與風險</td></tr>
+</table></div>
+<p>咖啡店的決定：<strong>正式環境用 RDS for PostgreSQL（Multi-AZ）和 ElastiCache for Redis</strong>，叢集只跑無狀態的應用。理由是團隊沒有專職的資料庫管理員，「備份從沒還原過」「主節點掛了要半夜手動切換」的風險，比 RDS 多出的費用貴得多；人力應該花在產品上。這個決定要寫下來，並寫明何時重新評估：例如資料庫費用大到可以養一個專職人員、或要用 RDS 不支援的擴充套件時。</p>
+<p>如果真的要在叢集裡跑正式資料庫，不要自己從 StatefulSet 寫起，而是用 <strong>operator</strong>：把維運知識寫成控制器的程式，例如 PostgreSQL 的 CloudNativePG，你寫一個 <code>Cluster</code> 物件，它幫你建複本、做故障切換、排程備份到 S3。operator 讓自管容易很多，但不會讓你不需要懂 PostgreSQL 維運：還原演練、升級、出事時判斷該不該切換，還是你的工作。</p>
+<p>本課程的 postgres StatefulSet（練習 2）與第 10 課的 postgres，都只給開發與測試用：資料壞了就重建，沒有人在乎。</p>
+
+<h2>固定名稱連外部資料庫：ExternalName</h2>
+<p>資料庫在叢集外，應用的 <code>DATABASE_URL</code> 要寫 RDS 的端點，例如 <code>cafe.c9xxxx.ap-northeast-1.rds.amazonaws.com</code>。直接寫進每個 Deployment 的話，staging 與正式環境的值不同、換資料庫要改每一個用到它的服務。讓應用永遠連一個叢集內的固定名稱 <code>db:5432</code>，由 Service 決定 <code>db</code> 指到哪裡：</p>
+<pre>apiVersion: v1
+kind: Service
+metadata:
+  name: db
+spec:
+  type: ExternalName
+  externalName: cafe.c9xxxx.ap-northeast-1.rds.amazonaws.com</pre>
+<p><strong>ExternalName</strong> Service 不選 Pod、沒有虛擬 IP、不轉送任何流量，它只讓叢集的 DNS 對 <code>db</code> 回答一筆 CNAME（「這個名字其實是那個名字」），應用再去查那個名字的 IP。所以：</p>
+<ul>
+  <li>不寫 <code>selector</code>，也不需要 <code>ports</code>（應用自己連 5432）。</li>
+  <li><code>externalName</code> 一定要寫 DNS 名稱。寫 IP 的話，它會被當成「由數字組成的名稱」做 CNAME，查不到。只有 IP 時，用<strong>沒有 selector 的一般 Service</strong>，再手寫一個 EndpointSlice（label <code>kubernetes.io/service-name: db</code>、addresses 寫那個 IP）。</li>
+  <li>叢集內的服務也可以當目標，例如另一個 namespace 的 <code>ext-pg.k8s-11-ex3-ext.svc.cluster.local</code>（練習 3 用它假裝成 RDS）。</li>
+  <li>換資料庫（RDS 從快照還原成新的執行個體、搬到另一個區域）時，只改 Service <code>db</code>。DNS 結果會被快取、已經開著的連線不會自己換，所以改完後 <code>kubectl rollout restart</code> 讓應用重新連線。</li>
+</ul>
+<div class="callout warn"><strong>TLS 與主機名稱</strong>：RDS 的憑證上寫的是 RDS 的端點名稱。應用連 <code>db</code> 並要求驗證主機名稱（PostgreSQL 的 <code>sslmode=verify-full</code>）時，它比對的是連線字串裡的 <code>db</code>，跟憑證不符，連線會被拒絕；HTTPS 也有一樣的問題（官方文件因此提醒 ExternalName 用在 HTTP、HTTPS 要小心）。正式環境要求 verify-full 時，常見的做法是把真正的端點放在每個環境各自的 ConfigMap 或 Secret（第 6 課），而不是用 ExternalName 改名。ExternalName 適合不驗證主機名稱的連線，以及開發、測試環境。</div>
+
+<h2>暫存資料：emptyDir、sizeLimit 與唯讀根目錄</h2>
+<p>不是所有檔案都要持久。上傳的照片在轉存到 S3 之前、產生報表的中間檔、快取，處理完就不要了：這些放 <strong>emptyDir</strong>。兩個設定一定要知道：</p>
+<ul>
+  <li><strong><code>sizeLimit</code></strong>：emptyDir 預設用節點的磁碟，沒有上限。一個失控的上傳可以寫滿節點磁碟，同節點的每個 Pod 都受影響。設了 <code>sizeLimit: 64Mi</code>，kubelet 定期量用量，超過就<strong>驅逐整個 Pod</strong>（Events 的 reason 是 <code>Evicted</code>，訊息是 <code>Usage of EmptyDir volume "tmp" exceeds the limit "64Mi"</code>），Deployment 再建新的。</li>
+  <li><strong><code>medium: Memory</code></strong>：改用記憶體（tmpfs），比磁碟快，但寫進去的檔案算在容器的記憶體用量裡，會讓容器更接近 limit 而被 OOMKilled（第 8 課）。只放小而需要快的東西。</li>
+</ul>
+<p>emptyDir 的另一個用途是安全：<strong>readOnlyRootFilesystem</strong>。容器的 <code>securityContext.readOnlyRootFilesystem: true</code> 讓整個根目錄唯讀，被入侵時攻擊者沒辦法改程式、下載工具到容器裡。程式真的需要寫的目錄（通常是 <code>/tmp</code>）再掛 emptyDir：</p>
+<pre>    spec:
+      containers:
+        - name: api
+          securityContext:
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi</pre>
+<p>這樣「哪裡可以寫、最多寫多少」都寫在 manifest 裡，一眼看得出來。第 12 課的 Pod Security 會把唯讀根目錄列入檢查清單。長期要留的檔案（收據 PDF、顧客上傳的照片）放 S3，不放 PVC：S3 不綁節點與可用區，多副本可以一起用。</p>
+
+<h2>練習</h2>
+<p>在 <code>learn</code> 資料夾執行頁面上的指令，起始檔會複製到 <code>kubernetes/practice/work/11/</code>。每一題先做靜態檢查，通過了才套用到叢集的專屬 namespace（<code>k8s-11-ex1</code> 這種名字），需要的 Secret 由測試用隨機值建立，最後刪掉 namespace（包括裡面的 PVC）。叢集很忙時一題要幾分鐘。前面的 <code>try-11</code> 用完記得 <code>kubectl delete namespace try-11</code>。</p>
+
+<div class="local" data-test="ex1" data-files="ex1/pvc.yaml ex1/deployment.yaml">
+  <p>練習 1：收據要活過 Pod。在 <code>ex1/pvc.yaml</code> 寫 PersistentVolumeClaim <code>receipts-data</code>（1Gi、ReadWriteOnce，用預設的 StorageClass），把 <code>ex1/deployment.yaml</code> 的 <code>/data</code> 從 emptyDir 改成掛這個 PVC，並把更新策略改成適合單一 RWO 磁碟的那一種，副本維持 1。測試套用後確認 PVC 是 <code>Bound</code>，POST 一張收據、刪掉 Pod，新的 Pod 用 <code>GET /receipts</code> 還要看得到它。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="ex2/pg.yaml ex2/service.yaml">
+  <p>練習 2：開發用的 PostgreSQL。<code>ex2/pg.yaml</code> 現在是 Deployment 加一個手寫的 PVC，而且磁碟掛在舊版的路徑。把它改成 StatefulSet <code>pg</code>：<code>serviceName: pg</code>、1 個副本、用名為 <code>data</code> 的 <code>volumeClaimTemplates</code>（ReadWriteOnce、1Gi）取代手寫的 PVC，掛在 postgres 18 該掛的位置；容器的設定（映像、密碼來自 Secret <code>pg-admin</code>、<code>pg_isready</code> 的 readinessProbe）不變。<code>ex2/service.yaml</code> 改成 headless。測試會用 <code>psql -h pg-0.pg</code> 帶密碼連進去寫一筆資料，刪掉 <code>pg-0</code> 後確認新的 <code>pg-0</code> 還讀得到，最後刪掉 StatefulSet，確認 PVC <code>data-pg-0</code> 還在。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="ex3/service.yaml ex3/deployment.yaml">
+  <p>練習 3：namespace <code>k8s-11-ex3-ext</code> 裡有一個假裝是 RDS 的 PostgreSQL，Service 叫 <code>ext-pg</code>（測試會建立）。在 <code>ex3/service.yaml</code> 寫 ExternalName Service <code>db</code>，指到 <code>ext-pg</code> 的完整 DNS 名稱；把 <code>ex3/deployment.yaml</code> 裡 <code>DATABASE_URL</code> 的主機改成 <code>db</code>。cafe-api 的 <code>/health/ready</code> 會用 TCP 檢查資料庫連不連得上。測試確認它是 200 之後，把 <code>db</code> 改指到另一個 namespace（<code>k8s-11-ex3-new</code>）的資料庫、刪掉舊的那個，再 <code>rollout restart</code>：應用設定一行都不改，要照樣 Ready。</p>
+</div>
+
+<div class="local" data-test="ex4" data-files="ex4/deployment.yaml">
+  <p>練習 4：<code>ex4/deployment.yaml</code> 的 cafe-api 已經設了 <code>readOnlyRootFilesystem: true</code>，結果 <code>POST /uploads</code> 要把暫存檔寫到 <code>/tmp</code> 時回 500。只用 emptyDir（<code>sizeLimit: 64Mi</code>）讓上傳恢復，不能關掉唯讀。測試會確認上傳回 200、寫 <code>/app/x</code> 仍然因唯讀失敗，接著在 <code>/tmp</code> 寫入 80MB，等 Pod 因超過 sizeLimit 被驅逐（約一分鐘）。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：一個 Deployment 有 3 個副本，Pod 範本都掛同一個 ReadWriteOnce 的 PVC，會發生什麼事？</p>
+  <label data-key="a">三個 Pod 共享同一份資料，沒有問題</label>
+  <label data-key="b">磁碟只能掛在一個節點：排到其他節點的 Pod 掛不上而卡在 ContainerCreating；同節點的 Pod 掛得上，但同時寫同一份資料會互相破壞</label>
+  <label data-key="c">Kubernetes 會自動把資料複製成三份，各給一個 Pod</label>
+  <label data-key="d">PVC 會自動變成 ReadWriteMany</label>
+  <p class="why">✓ RWO 限制的是節點，不是 Pod 數，所以會同時出現「掛不上」和「同節點一起寫」兩種問題。Kubernetes 不會複製資料（c），access mode 也不會自己改（d）。每個副本要各自一份資料，用 StatefulSet 的 volumeClaimTemplates；要共享，用 RWX 儲存（EFS）或物件儲存（S3）；只要一份，就 1 個副本加 Recreate。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：咖啡店要在 EKS 上線，團隊 4 個人、沒有專職的資料庫管理員。正式環境的 PostgreSQL 最合理的預設是？</p>
+  <label data-key="a">用 StatefulSet 在叢集裡自己跑，因為機器比 RDS 便宜</label>
+  <label data-key="b">用 RDS（Multi-AZ）：自動備份、PITR、故障切換、小版本升級由 AWS 處理，人力放在產品上，並記錄何時重新評估</label>
+  <label data-key="c">放在 emptyDir，速度最快</label>
+  <label data-key="d">用 Deployment 掛一顆 EBS，Pod 掛了 Kubernetes 會自動重建</label>
+  <p class="why">✓ 自己跑資料庫要負責備份與還原演練、複寫與故障切換、升級、節點維護，人力與風險通常比 RDS 多出的費用貴。a 的「便宜」沒算人力；c 在 Pod 刪除時資料全部消失；d 重建得了 Pod，但 EBS 綁在一個可用區，那一區出事就搬不走，也沒有備份與故障切換。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 7：用預設 StorageClass 動態建立的 PVC 被刪除（例如有人刪了整個 namespace），資料還在嗎？</p>
+  <label data-key="a">一定還在：PV 是叢集層級的物件，不屬於 namespace</label>
+  <label data-key="b">要看 Pod 有沒有一起刪掉</label>
+  <label data-key="c">看 PV 的 reclaim policy：動態建立的 PV 沿用 StorageClass，多半是 Delete，磁碟會一起刪除；Retain 才會保留</label>
+  <label data-key="d">一定不在，沒有任何方法保留</label>
+  <p class="why">✓ PV 雖然是叢集層級，但 reclaim policy 是 Delete 時，PVC 一刪它就跟著刪（a 錯）。Pod 只是使用者，跟 PVC 刪除後的處理無關（b）。Retain 可以保留磁碟（d 錯），但真正能保護資料的是備份與還原演練。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>把資料庫當成一般服務放進叢集</strong>：StatefulSet 只給你固定名稱和磁碟，備份、還原演練、複寫與故障切換都要自己做。沒有這些就是在賭；正式環境預設用 RDS／ElastiCache。</li>
+  <li><strong>以為 PVC 會跟著 Pod 跨可用區</strong>：EBS 綁一個可用區、local-path 綁一個節點，Pod 只能排到磁碟所在的地方。要跨可用區的高可用，靠資料庫自己的複寫（RDS Multi-AZ），不是靠磁碟。</li>
+  <li><strong>刪 namespace 順手刪掉 PVC</strong>：reclaim policy 是 Delete 時資料跟著消失。正式資料要有備份；StatefulSet 的 PVC 刪除前先確認裡面是什麼。</li>
+  <li><strong>多副本 Deployment 掛 RWO 磁碟</strong>：不是卡在 ContainerCreating 就是同時寫壞資料。用 StatefulSet、改成 1 個副本加 Recreate，或讓服務不在本機存狀態。</li>
+  <li><strong>postgres 18 的 volume 掛在 <code>/var/lib/postgresql/data</code></strong>：18 的 PGDATA 是 <code>/var/lib/postgresql/18/docker</code>，入口腳本會報錯結束。掛在 <code>/var/lib/postgresql</code>。</li>
+  <li><strong>ExternalName 寫 IP、或加了 selector</strong>：externalName 只接受 DNS 名稱；selector 對它沒有作用。只有 IP 時用沒有 selector 的 Service 加 EndpointSlice。</li>
+  <li><strong>暫存檔寫在容器檔案系統</strong>：容器重啟就沒了，也讓根目錄不能設成唯讀。用 emptyDir 並設 sizeLimit。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>資料的壽命：容器可寫層到容器重啟為止，emptyDir 到 Pod 刪除為止，PV 活過 Pod。</li>
+  <li>Pod 用 PVC 申請儲存，StorageClass 動態建立 PV（雲端上透過 CSI driver）。<code>WaitForFirstConsumer</code> 讓磁碟建在 Pod 所在的節點／可用區；綁定後 Pod 只能待在那裡。</li>
+  <li>access mode 限制的是節點：雲端磁碟多半是 RWO，RWX 要 EFS 這類網路檔案系統，多副本共享檔案優先用 S3。reclaim policy 預設 Delete，PVC 刪了磁碟就沒了。</li>
+  <li>一個 Deployment 掛一顆 RWO 磁碟：1 個副本、Recreate。每個副本各自一份資料、需要固定名稱：StatefulSet（固定的 <code>pg-0</code>、headless Service 給的 <code>pg-0.pg</code>、volumeClaimTemplates、依序啟動，刪除時預設保留 PVC）。</li>
+  <li>正式資料庫預設用 RDS／ElastiCache，用錢換備份、PITR、Multi-AZ 與升級的人力；要自管就用 operator，而且仍要懂資料庫維運。叢集內的 postgres 只給開發與測試。</li>
+  <li>應用連固定名稱 <code>db</code>，用 ExternalName（CNAME）或無 selector 的 Service＋EndpointSlice 指到外部；要驗證 TLS 主機名稱時，改由每個環境的設定提供真正的端點。</li>
+  <li>暫存檔放 emptyDir 並設 sizeLimit，搭配 readOnlyRootFilesystem 讓其他地方都不能寫；長期檔案放 S3。</li>
+</ul>
+<p>下一課處理權限與隔離：誰可以對叢集做什麼（RBAC）、Pod 之間誰能連誰（NetworkPolicy），以及 Pod Security 怎麼把唯讀根目錄這類設定變成強制規則。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

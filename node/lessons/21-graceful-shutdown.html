@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>21. 優雅關機與健康檢查</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="21" data-practice="node">
+<header>
+  <div class="eyebrow">階段 5：上線前的準備 · 第 21 課</div>
+  <h1>優雅關機與健康檢查</h1>
+</header>
+<main>
+
+<p>咖啡店的訂單 API 一天部署好幾次。最近維運發現一個規律：每次部署，監控上就跳出一小撮 502 和「連線被重設」，不到一分鐘就消失；客服偶爾收到客人回報「結帳畫面顯示失敗，但好像有扣款」。把錯誤圖表跟部署時間疊在一起，兩者完全對得上。</p>
+<p>問題出在舊程序被關掉的方式。部署時平台會先開新程序、再關舊程序；舊程序如果一收到通知就直接倒下，正在結帳的請求會斷線，扣了庫存的交易可能做到一半，最後幾行 log 也來不及寫出去。這一課的任務是讓部署對客人無感：王小明在部署那一刻按下結帳，他的請求要照常成功；新上線的程序也不能在資料庫還沒準備好時就開始接客。學完你能寫出一個會照順序收尾、會回報自己狀態、啟動時會等依賴的 Node 服務。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>部署那一刻舊程序經歷了什麼、誰通知它結束：服務的生命週期，SIGTERM 怎麼送到你的程式，攔下來之後由誰決定何時結束。</li>
+  <li>怎麼讓負載平衡器先別送新請求：健康檢查的 liveness 和 readiness 各回答什麼問題、各該檢查什麼。</li>
+  <li>手上的結帳請求怎麼做完再關：優雅關機的步驟與順序，以及請求都做完了、程序卻還不結束的 keep-alive 問題。</li>
+  <li>排空永遠做不完怎麼辦：關機的時限與第二次訊號。</li>
+  <li>新程序上線時資料庫還沒好怎麼辦：啟動時有限次數的重試。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="02-process-config.html">第 2 課</a>的訊號與結束碼：訊號是作業系統送給程序的通知，SIGTERM 是「請結束」；0 是成功、非 0 是失敗。</li>
+  <li><a href="07-event-loop.html">第 7 課</a>的 handle：計時器、連線這類還在等的東西會撐住 event loop，程序不會結束；<code>.unref()</code> 讓它不撐住。</li>
+  <li><a href="13-http-server.html">第 13 課</a>的 <code>createServer</code>：建立 HTTP 伺服器，<code>listen</code> 之後開始接請求。</li>
+  <li><a href="20-postgres-pool-transactions.html">第 20 課</a>的連線池：程序共用一組資料庫連線，結束前要 <code>await pool.end()</code> 全部關掉。</li>
+</ul></div>
+
+<h2>部署那一刻，舊程序經歷了什麼？</h2>
+<p>要知道王小明的結帳為什麼會失敗，先看一個程序從啟動到結束會經過哪些階段。這些階段合起來叫<strong>生命週期</strong>（lifecycle）。一個 API 服務大致是這樣：</p>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="服務的生命週期：啟動、檢查依賴、就緒、服務中、收到 SIGTERM、不再就緒並排空、關閉資源、結束">
+    <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="10" y="30" width="120" height="56" rx="8"/>
+    <text class="d-text" x="70" y="55" text-anchor="middle">啟動</text>
+    <text class="d-small" x="70" y="74" text-anchor="middle">讀設定、檢查依賴</text>
+    <rect class="d-box" x="190" y="30" width="120" height="56" rx="8"/>
+    <text class="d-text" x="250" y="55" text-anchor="middle">就緒</text>
+    <text class="d-small" x="250" y="74" text-anchor="middle">listen，readyz 200</text>
+    <rect class="d-soft" x="370" y="30" width="140" height="56" rx="8"/>
+    <text class="d-text" x="440" y="55" text-anchor="middle">服務中</text>
+    <text class="d-small" x="440" y="74" text-anchor="middle">處理請求</text>
+    <rect class="d-box" x="560" y="150" width="130" height="56" rx="8"/>
+    <text class="d-text" x="625" y="175" text-anchor="middle">收到 SIGTERM</text>
+    <text class="d-small" x="625" y="194" text-anchor="middle">readyz 改 503</text>
+    <rect class="d-box" x="370" y="150" width="140" height="56" rx="8"/>
+    <text class="d-text" x="440" y="175" text-anchor="middle">排空</text>
+    <text class="d-small" x="440" y="194" text-anchor="middle">不接新的，做完舊的</text>
+    <rect class="d-box" x="190" y="150" width="120" height="56" rx="8"/>
+    <text class="d-text" x="250" y="175" text-anchor="middle">關閉資源</text>
+    <text class="d-small" x="250" y="194" text-anchor="middle">pool、計時器</text>
+    <rect class="d-box" x="10" y="150" width="120" height="56" rx="8"/>
+    <text class="d-text" x="70" y="175" text-anchor="middle">結束</text>
+    <text class="d-small" x="70" y="194" text-anchor="middle">結束碼 0</text>
+    <line class="d-line" x1="130" y1="58" x2="186" y2="58" marker-end="url(#arr)"/>
+    <line class="d-line" x1="310" y1="58" x2="366" y2="58" marker-end="url(#arr)"/>
+    <path class="d-line" d="M510,58 L625,58 L625,146" fill="none" marker-end="url(#arr)"/>
+    <line class="d-line" x1="560" y1="178" x2="514" y2="178" marker-end="url(#arr)"/>
+    <line class="d-line" x1="370" y1="178" x2="314" y2="178" marker-end="url(#arr)"/>
+    <line class="d-line" x1="190" y1="178" x2="134" y2="178" marker-end="url(#arr)"/>
+    <text class="d-accent" x="560" y="235" text-anchor="middle">時限內沒做完：強制關閉，結束碼 1</text>
+  </svg>
+  <figcaption>每一次部署、縮減機器數量、重新啟動，舊程序都會走完下半圈</figcaption>
+</figure>
+<p>上半圈是開店：讀設定、確認資料庫連得上，然後開始 <code>listen</code> 接請求。圖裡的 <code>readyz</code> 是程序回報「我現在能不能接客」的網址，健康檢查那一節會講。下半圈是打烊：收到結束通知，先告訴外界「別再送客人來」，把店裡的客人服務完（這一步叫排空），關掉資料庫連線這類資源，最後結束。</p>
+<p>這下半圈不是偶爾才發生的事。部署新版本（<a href="../../devops/lessons/16-cd.html">部署課第 16 課</a>）會先開新程序、再關舊程序；流量變少時平台會關掉幾個程序；機器維修時程序會被搬到別台機器。每一次都會走「收到 SIGTERM → 結束」這半圈，一天可能走好幾十次。</p>
+<p>回頭看開場的 502：那時的訂單 API 根本沒有下半圈，收到通知就從「服務中」直接跳到「結束」。正在跑的請求跟著程序一起消失，所以客人看到失敗。請求是負載平衡器轉給程序的，程序在回應前斷線，負載平衡器拿不到上游的回應，只好回給客人 502 Bad Gateway；直接連程序的客戶端則看到「連線被重設」。至於扣款：交易做到一半就斷，資料庫最後會回滾；也可能 COMMIT 已經完成、回應卻沒送出去。客人只看到失敗，不知道到底成功了沒，所以覺得「好像有扣款」。這課要做的，就是把下半圈一格一格補上。</p>
+<p>下半圈的第一格是「收到 SIGTERM」。所以第一個問題是：這個通知是什麼、誰送的、你的程式收到之後能做什麼？</p>
+
+<h2>誰通知程序結束？攔下通知之後，誰決定何時結束？</h2>
+<p>通知程序結束的是訊號。<a href="02-process-config.html">第 2 課</a>看過，<strong>訊號</strong>（signal）是作業系統送給程序的通知，每種訊號有名字和編號。跟關機有關的有三個：</p>
+<div class="table-wrap"><table>
+<tr><th>訊號</th><th>編號</th><th>意思</th><th>誰會送</th><th>能攔截嗎</th></tr>
+<tr><td>SIGINT</td><td>2</td><td>中斷，「使用者按了 Ctrl+C」</td><td>終端機</td><td>可以</td></tr>
+<tr><td>SIGTERM</td><td>15</td><td>請你結束</td><td><code>kill &lt;pid&gt;</code>、<code>docker stop</code>、Kubernetes</td><td>可以</td></tr>
+<tr><td>SIGKILL</td><td>9</td><td>強制終止</td><td><code>kill -9</code>；平台等太久時</td><td>不行，程序直接消失</td></tr>
+</table></div>
+<p>三者的差別在「能不能攔截」。SIGINT 和 SIGTERM 是有禮貌的請求：程序可以先做點事再結束。SIGKILL 是作業系統直接把程序移除，程序沒有機會執行任何一行程式，所以它是平台最後的手段。這課要做的收尾全都發生在 SIGTERM 和 SIGKILL 之間；如果收尾拖到 SIGKILL 來了，等於又回到直接倒下。</p>
+<p>如果你什麼都不寫，Node 對 SIGTERM 和 SIGINT 的預設處理是立刻結束，結束碼是 128＋訊號編號，所以從 shell 看是 143（SIGTERM）或 130（SIGINT）。這就是開場那個訂單 API 的行為：收到 SIGTERM 立刻消失。</p>
+<p>要改變它，用 <code>process.on('SIGTERM', fn)</code> 加上監聽器。只要加了監聽器，<strong>預設行為就取消了</strong>：收到訊號不會再自動結束，什麼時候結束由你的程式決定（Node 24 process 文件）。另一方面，監聽器本身不會撐住 event loop：收尾做完、沒有 handle 了，程序就自然結束，不需要自己呼叫 <code>process.exit</code>。下面的範例看第一件事；範例用 <code>setInterval</code> 刻意撐住程序，所以看不出第二件事，它要到後面的 <code>shutdown()</code> 才看得到（最後兩行做完，程序自然以 0 結束）。執行後看結束碼，以及第一次 Ctrl+C 有沒有讓程序結束：</p>
+<pre>// examples/signal.ts（節錄）
+console.log('pid', process.pid)
+setInterval(() =&gt; {}, 1000)   // 讓程序一直活著
+
+if (process.env.HANDLE) {
+  let count = 0
+  const onSignal = (signal: NodeJS.Signals) =&gt; {
+    count++
+    console.log(`收到 ${signal}（第 ${count} 次）`)
+    if (count &gt;= 2) process.exit(1)
+  }
+  process.on('SIGINT', onSignal)
+  process.on('SIGTERM', onSignal)
+}</pre>
+<pre>$ node examples/signal.ts          # 另開終端機 kill &lt;pid&gt;
+pid 51764
+$ echo $?
+143
+
+$ HANDLE=1 node examples/signal.ts # 按 Ctrl+C 兩次
+pid 51498
+^C收到 SIGINT（第 1 次）
+^C收到 SIGINT（第 2 次）
+$ echo $?
+1</pre>
+<p>第一段沒有監聽器，<code>kill</code> 一送，程序就以 143 結束。第二段的第一次 Ctrl+C 沒有讓程序結束：監聽器接手了，預設的「立刻結束」被取消。這帶來一個新責任：如果監聽器什麼都不做，使用者再怎麼按 Ctrl+C 都關不掉，只能 <code>kill -9</code>。所以範例在第二次訊號時呼叫 <code>process.exit(1)</code>，讓「再按一次」代表「我不想等了」。</p>
+<p>正式環境沒有人按 Ctrl+C，送訊號的是執行容器的平台。它們的做法都是「先禮後兵」：先送 SIGTERM，等一段時間，還沒結束就送 SIGKILL。這段等待的最長時間叫<strong>關機時限</strong>（grace period），你的收尾必須在這段時間內做完。</p>
+<ul>
+  <li><strong><code>docker stop</code></strong>：送 SIGTERM 給容器的主程序，預設等 10 秒，還沒結束就 SIGKILL（<a href="../../devops/lessons/08-dockerfile.html">部署課第 8 課</a>）。</li>
+  <li><strong>Kubernetes</strong>（管理大量容器的平台）：同樣先 SIGTERM，關機時限預設 30 秒，到了就 SIGKILL。</li>
+</ul>
+<p>注意上面寫的是「主程序」：訊號只送給容器裡最先啟動的那一個程序，不會自動傳給它開出來的子程序。<a href="03-npm-packages.html">第 3 課</a>實測過：<code>npm start</code> 會把 SIGTERM 轉送給你的 <code>node server.ts</code>，<code>node --run start</code> 不會，你的程式被留在原地，什麼都沒收到，最後被 SIGKILL。所以容器裡的主程序直接寫 <code>node server.ts</code>，你寫的關機程式才收得到訊號。</p>
+<p>到這裡，程式收得到 SIGTERM，也能自己決定何時結束。但收到訊號的當下，負載平衡器還在持續把新的結帳請求送過來。開始收尾之前，要先讓它別再送；這要靠健康檢查。</p>
+
+<h2>怎麼讓負載平衡器別再送新請求過來？</h2>
+<p>先說誰在送請求。正式環境的訂單 API 通常不只一個程序，客人的請求先到<strong>負載平衡器</strong>（load balancer），由它分給各個程序或各台機器（<a href="../../devops/lessons/12-nginx.html">部署課第 12 課</a>的 Nginx、<a href="../../devops/lessons/13-scaling.html">第 13 課</a>的水平擴展）。部署時舊程序要退場，負載平衡器得知道這件事，才會把新請求改送給新程序。</p>
+<p>負載平衡器不會讀你的程式碼，它知道程序狀態的方法是定期去問：每隔幾秒對每個程序打一個固定的網址，看回應的狀態碼。程序提供的這種網址叫<strong>健康檢查端點</strong>（health check endpoint）。</p>
+<p>平台會問兩個不同的問題，答「不行」之後的處置也不同：</p>
+<div class="table-wrap"><table>
+<tr><th></th><th>liveness（存活）</th><th>readiness（就緒）</th></tr>
+<tr><td>問題</td><td>這個程序還活著嗎？</td><td>現在可以送流量給你嗎？</td></tr>
+<tr><td>慣用路徑</td><td><code>/healthz</code></td><td><code>/readyz</code></td></tr>
+<tr><td>檢查什麼</td><td>只要能回應就是 200，不碰任何依賴</td><td>依賴（資料庫）可用、而且不在關機中才 200</td></tr>
+<tr><td>失敗時平台做什麼</td><td>重新啟動這個程序</td><td>暫時不送新流量給它，程序不動</td></tr>
+<tr><td>什麼時候會失敗</td><td>程序卡死（例如 event loop 被同步迴圈卡住，<a href="09-blocking-and-workers.html">第 9 課</a>）</td><td>資料庫斷線、啟動中、關機中</td></tr>
+</table></div>
+<p>為什麼要分成兩個？因為「程序壞了」和「程序暫時不方便接客」需要完全不同的處理。程序卡死時，重新啟動是唯一的辦法，這是 liveness 的工作。程序本身好好的，只是暫時不該接新請求，就只要把它從分流名單拿掉，等它好了再加回來，這是 readiness 的工作。</p>
+<p>關機中的程序正好是第二種：它很健康，手上還有王小明的結帳要做完，只是不想再接新的。所以收到 SIGTERM 時，把 <code>/readyz</code> 改成回 503，<code>/healthz</code> 照樣回 200。靠健康檢查摘除程序的負載平衡器（例如 Nginx 或雲端負載平衡器），下一次檢查看到 503，就不再送新請求給它，而且不會重啟它，讓它安心收尾。Kubernetes 摘除的時機不同：Pod 一進入終止流程，就被標成不接一般流量，不必等 readiness 失敗（Kubernetes Pod termination 文件）。</p>
+<p>分清楚這兩個問題，也能避開最常見的錯誤：liveness 也檢查資料庫，理由是「檢查越多越安全」。想像資料庫重開，晃了 30 秒：所有程序的 liveness 同時失敗，平台把它們<strong>全部重新啟動</strong>。重啟不會讓資料庫變好，反而所有程序同時在啟動、同時重新建立連線，把剛恢復的資料庫又打垮。資料庫不可用時該做的是「先別送流量」，那是 readiness 的工作。</p>
+<p>寫成程式是這樣，<code>shuttingDown</code> 是收到 SIGTERM 時設成 <code>true</code> 的旗標：</p>
+<pre>if (pathname === '/healthz') return sendJson(res, 200, { status: 'ok' })
+if (pathname === '/readyz') {
+  if (shuttingDown) return sendJson(res, 503, { status: 'not ready', reason: 'shutting down' })
+  try {
+    await withTimeout(checkDb(), 500)   // checkDb 例如 pool.query('SELECT 1')
+  } catch (err) {
+    return sendJson(res, 503, { status: 'not ready', reason: `database: ${(err as Error).message}` })
+  }
+  return sendJson(res, 200, { status: 'ready' })
+}</pre>
+<p>注意 <code>checkDb()</code> 外面包了 <code>withTimeout</code>。資料庫卡住時，<code>SELECT 1</code> 可能一直不回來，<code>/readyz</code> 也跟著卡住。平台的檢查有自己的逾時，到了一樣判失敗，但你的程序裡會堆著一堆等不到結果的檢查請求，每幾秒多一筆。所以自己先設一個比平台短的上限，例如 500ms，時間到就回 503。</p>
+<p><code>withTimeout</code> 通常用 <code>Promise.race</code> 讓 <code>checkDb()</code> 和一個 <code>setTimeout</code> 賽跑。容易漏的是：<code>checkDb()</code> 先贏時，那個 <code>setTimeout</code> 還在，它會多撐住 event loop 500ms，關機時程序就晚 500ms 結束。所以不管誰贏，最後都要把計時器清掉。寫法在練習 1。</p>
+<p>失敗時回 <strong>503 Service Unavailable</strong>，body 寫原因。平台只看狀態碼，<code>reason</code> 是給半夜查問題的人看的：看到 <code>shutting down</code> 就知道是正常的關機，看到 <code>database: …</code> 就知道要去看資料庫。</p>
+<div class="callout practice"><strong>💡 實務上：readiness 只放「少了它就完全不能服務」的依賴</strong><br>健康檢查的請求很頻繁（平台每隔幾秒就對每個程序各打一次），<code>/readyz</code> 的檢查要便宜：一句 <code>SELECT 1</code> 可以，跑報表查詢不行；也不要每次都寫 access log（<a href="19-structured-logging.html">第 19 課</a>），不然 log 一半都是健康檢查。檢查的對象也要挑：咖啡店訂單 API 少了資料庫什麼都做不了，算；寄收據的 email 服務、第三方金流就不該放進去，否則外部服務一晃，你所有程序會一起被摘除（負載平衡器不再送流量），整個網站下線。上線前資深工程師會跟維運確認平台的檢查間隔、逾時，以及失敗幾次才判定，健康檢查的逾時和關機的等待時間都跟這些數字有關。</div>
+<p>readiness 改成 503 之後，新請求不會再來。但已經在處理中的那幾筆，像王小明正在跑的結帳，還在等資料庫回應。下一步是讓它們做完再關。</p>
+
+<h2>手上的結帳請求，怎麼做完再關？</h2>
+<p>做完手上的工作、關好資源再結束，叫<strong>優雅關機</strong>（graceful shutdown）。其中「不再接新工作，等進行中的完成」這一段叫<strong>排空</strong>（draining），就是生命週期圖下半圈中間那格。完整的步驟和順序：</p>
+<ol>
+  <li><strong>readiness 改成 503</strong>：讓負載平衡器停止送新流量（上一節）。</li>
+  <li><strong><code>server.close()</code></strong>：不再接受新連線，之後連進來的會被拒絕（<code>ECONNREFUSED</code>）。</li>
+  <li><strong>等進行中的請求完成</strong>，並關掉閒置的 keep-alive 連線。<code>server.close(callback)</code> 的 callback 在所有連線都關掉後才呼叫。</li>
+  <li><strong>關閉資源</strong>：資料庫 pool（<code>await pool.end()</code>）、計時器、其他連線。</li>
+  <li><strong>自然結束</strong>：沒有 handle 撐住 event loop，程序以結束碼 0 結束（<a href="07-event-loop.html">第 7 課</a>）。</li>
+</ol>
+<p>這個順序的原則是「先擋住入口，再等裡面的人離開，最後才關燈」。每一步都在保護前一步還在進行的工作，所以順序不能反。舉例來說，如果先關 pool 再關伺服器，王小明的結帳請求還在處理，下一句查資料庫時會拿到 <code>Cannot use a pool after calling end on the pool</code>（pg 的錯誤訊息），客人收到 500，跟直接倒下沒兩樣。</p>
+<p>那為什麼不收到 SIGTERM 就 <code>process.exit(0)</code>，乾脆俐落？因為 <code>exit</code> 會立刻結束程序，不管手上還有什麼：</p>
+<ul>
+  <li>進行中的請求斷線，客人看到失敗。</li>
+  <li>交易沒有 COMMIT 也沒有 ROLLBACK。資料庫最後會把它回滾，但客人不知道結果，這就是「顯示失敗、好像有扣款」的來源。</li>
+  <li>還在寫入的 log 可能掉了：<a href="19-structured-logging.html">第 19 課</a>講過，stdout 接管線時是非同步寫入，程序一結束，還沒送出的就沒了。事後要查也查不到。</li>
+</ul>
+<p>結束碼也寫 0，讓平台以為一切正常。優雅關機反過來，不呼叫 <code>exit</code>，把東西一樣一樣關掉，讓程序因為「沒事可做」而自然結束。</p>
+<p>第 1 步和第 2 步之間還有一個時間差。readiness 改成 503 之後，負載平衡器要等到下一次檢查才會知道，在那之前它還會送新請求過來，而第 2 步的 <code>server.close()</code> 已經在拒絕連線了。</p>
+<div class="callout warn">所以有些團隊收到 SIGTERM 後先等幾秒（例如 5 秒，略大於檢查間隔）才呼叫 <code>close()</code>。代價是每次部署變慢；要不要等，看平台怎麼摘除程序（<a href="../../devops/lessons/26-capstone.html">部署課第 26 課</a>）。</div>
+<p>照這個順序寫，理論上請求做完、pool 關掉，程序就自然結束。實際跑起來卻常常多拖好幾秒，甚至拖到平台的時限。問題出在第 3 步提到的 keep-alive 連線。</p>
+
+<h2>請求都做完了，程序為什麼還不結束？</h2>
+<p>先回顧 keep-alive。<a href="12-http-protocol.html">第 12 課</a>講過，HTTP/1.1 預設 keep-alive：一個請求做完，TCP 連線不關，留著給同一個客戶端的下一個請求用，省掉每次重新建立連線的時間。對效能是好事，但對關機是麻煩：每條留著的連線都是一個 handle，會撐住 event loop。</p>
+<p><code>server.close()</code> 處理連線的方式是這樣：呼叫的當下，閒置的連線會被關掉；正在處理請求的連線不動，讓請求做完。問題在後者：王小明的結帳請求在 <code>close()</code> 呼叫時還在處理，回應送出之後，那條連線就變成閒置，但 <code>close()</code> 已經呼叫過了，<strong>不會再回頭去關它</strong>。這條連線要等客戶端自己關，或等伺服器的 keep-alive 逾時（<code>keepAliveTimeout</code>）到期；在 Node 24 上合計約 6 秒（版本細節見課末）。在它關掉之前，<code>close()</code> 的 callback 不會被呼叫，關機流程就停在第 3 步。</p>
+<p>下面的範例在一個 1 秒的慢請求進行中呼叫 <code>server.close()</code>。執行後看「慢請求完成」和「callback」之間差了多久：</p>
+<pre>$ node examples/keep-alive.ts
+127ms 呼叫 server.close()
+1059ms 慢請求完成
+4066ms server.close 的 callback：所有連線都關了
+
+$ FIX=1 node examples/keep-alive.ts
+111ms 呼叫 server.close()
+1021ms server.close 的 callback：所有連線都關了
+1027ms 慢請求完成</pre>
+<p>這是在這台電腦上用 Node 24.22.1 跑的結果。第一段裡，請求 1 秒就做完了，程序卻多等了 3 秒，因為 <code>fetch</code> 的客戶端把連線留著。如果客戶端是用 <code>http.Agent</code> 的 keepAlive 這類不會自己關閒置連線的寫法，要等滿約 6 秒。部署時每個舊程序都多等幾秒，平台的時限一緊就被 SIGKILL，又回到直接倒下。第二段加了修正，連線在請求完成時就關了。</p>
+<p>修法有兩種，目標都是「請求做完的那一刻，順手把連線關掉」。第一種是上面 <code>FIX=1</code> 的做法：<strong>關機期間的回應加上 <code>Connection: close</code></strong>。這個 header 告訴客戶端「這條連線用完就關」，Node 送完這個回應也會自己關掉連線，所以最後一個請求做完，最後一條連線也跟著關了：</p>
+<pre>function sendJson(res: ServerResponse, status: number, data: unknown) {
+  const body = Buffer.from(JSON.stringify(data))
+  const headers: Record&lt;string, string&gt; = { 'content-type': 'application/json; charset=utf-8', 'content-length': String(body.length) }
+  if (shuttingDown) headers.connection = 'close'
+  res.writeHead(status, headers)
+  res.end(body)
+}</pre>
+<p>第二種是<strong>每完成一個請求就呼叫 <code>server.closeIdleConnections()</code></strong>，把當時閒置的連線全部關掉。效果一樣，差別在第一種只改回應的 header，第二種要在請求完成的地方多掛一段程式。</p>
+<div class="callout practice"><strong>💡 實務上：「每次部署都有一小段 502」通常是關機沒寫好</strong><br>常見情境：咖啡店後台每次部署，監控上就跳出一小撮 502 或連線被重設，客服偶爾收到「結帳顯示失敗，但好像有扣款」。資深工程師會先把錯誤圖表跟部署時間對起來，對得上就依序查：主程序收不收得到 SIGTERM、readiness 有沒有先改 503、keep-alive 有沒有處理、pool 是不是最後才關。驗證不用很複雜：本機用迴圈持續打 API，同時對服務送 SIGTERM，看有沒有任何請求失敗。之後改用 Fastify 這類 Web 框架時，框架有自己的關機掛鉤（hook），但順序和時限仍要自己確認，不要假設預設就對。</div>
+<p>keep-alive 處理好之後，正常情況下幾秒內就能關完。但「正常情況」不保證每次都成立：如果某個請求永遠做不完呢？</p>
+
+<h2>排空永遠做不完怎麼辦？</h2>
+<p>排空是「等進行中的請求完成」，而有些請求不會完成。例如某個請求卡在一個沒有逾時的上游呼叫，或是 SSE 這種本來就不會結束的長連線（<a href="16-streams-backpressure.html">第 16 課</a>）。只要有一個這種請求，<code>server.close()</code> 的 callback 就永遠等不到，程序會一直撐到平台的時限，被 SIGKILL 砍掉，連一行「為什麼關不掉」的 log 都沒留。</p>
+<p>所以關機一定要有自己的時限，而且比平台的短一點（平台 30 秒，你可以設 25 秒）。時間到了就自己收拾：強制斷線、留下 log、以非 0 結束。被自己的時限關掉和被 SIGKILL 砍掉，結果都是有請求失敗，差別在前者知道發生了什麼。再加上前面 SIGINT 範例的第二次訊號處理，整段關機程式是這樣：</p>
+<pre>async function shutdown(signal: NodeJS.Signals) {
+  if (shuttingDown) process.exit(1)          // 第二次訊號：使用者不想等了
+  shuttingDown = true
+
+  setTimeout(() =&gt; {
+    console.error(JSON.stringify({ msg: 'shutdown timeout, forcing exit', signal }))
+    server.closeAllConnections()             // 連進行中的也一起斷
+    process.exit(1)                          // 沒有完整收尾，結束碼不是 0
+  }, timeoutMs).unref()                      // unref：這個計時器不撐住程序
+
+  await new Promise&lt;void&gt;(resolve =&gt; server.close(() =&gt; resolve()))
+  await pool.end()
+}
+process.on('SIGTERM', shutdown)
+process.on('SIGINT', shutdown)</pre>
+<p>由上往下看：</p>
+<ul>
+  <li><strong><code>if (shuttingDown) process.exit(1)</code></strong>：已經在關機中又收到訊號，代表有人不想等了（開發時多按一次 Ctrl+C），立刻結束。</li>
+  <li><strong>時限的 <code>setTimeout</code></strong>：時間到先記一筆 log，寫下為什麼強制結束，事後才查得到；接著呼叫 <code>server.closeAllConnections()</code>，連正在處理請求的連線也關掉。這是強制手段，只在時限到了才用。結束碼用 1，讓平台和監控知道這次關機沒有完整收尾。</li>
+  <li><strong><code>.unref()</code></strong>（<a href="07-event-loop.html">第 7 課</a>）：這個計時器不撐住程序。沒有它，就算一切在 0.1 秒內收好，程序也要等到時限的計時器觸發才結束，而且是以結束碼 1 結束，看起來像關機失敗。也可以存下計時器，最後 <code>clearTimeout</code>。</li>
+  <li><strong>最後兩行</strong>就是上一節「手上的結帳請求」的關機順序：等伺服器關好，再關 pool。兩者都做完，沒有 handle 了，程序自然以 0 結束。</li>
+</ul>
+<p>SSE 這類長連線不該靠時限硬砍。它們本來就不會自己結束，所以關機時要主動結束：對每個串流送最後一則事件再 <code>res.end()</code>，客戶端的 <code>EventSource</code> 會自動重連，而負載平衡器會把重連送到別的程序。</p>
+<div class="callout practice"><strong>💡 實務上：不只 HTTP 伺服器，背景工作也要能優雅停下</strong><br>咖啡店的佇列 worker 正在寄訂單收據、排程程式正在跑每日對帳，部署時被砍在一半，就可能重複寄信或對帳只做一半。思路跟 HTTP 一樣：收到訊號就不再拿新工作，把手上這一筆做完（或放回佇列）再結束。如果單筆工作可能超過平台的關機時限，就要把工作切小，或讓它被重做也不會出錯。Code review 看到會長時間執行的程式，資深工程師會問一句：「這支被 kill 在一半會怎樣？」</div>
+<p>到這裡，舊程序的下半圈完整了。但部署還有另一半：新程序上線。它也可能在資料庫還沒準備好時就開始接客。</p>
+
+<h2>新程序上線時，資料庫還沒好怎麼辦？</h2>
+<p>回到生命週期圖的上半圈第一格「啟動」。新程序啟動時會碰到兩種錯誤，處理方式完全相反，要先分開：</p>
+<ul>
+  <li><strong>設定錯了</strong>（環境變數缺少、格式不對）：再試幾次也不會好，立刻印出原因並以結束碼 1 結束，這是<a href="02-process-config.html">第 2 課</a>的 fail fast（快速失敗）。</li>
+  <li><strong>依賴暫時還沒好</strong>：容器一起啟動時，資料庫常常比 API 晚幾秒準備好。這種錯誤等一下就會好，值得重試。但不能無限重試：資料庫網址打錯時，程序會永遠卡在「啟動中」，平台看起來它還活著，沒人發現。</li>
+</ul>
+<p>第二種的做法是<strong>有限次數加退避</strong>，也就是<a href="17-calling-external-apis.html">第 17 課</a>的指數退避：每次失敗後等久一點再試，例如間隔 100、200、400、800ms，最多 5 次。間隔越拉越長，是為了給資料庫越來越多的準備時間，而不是在它還在開機時一直敲門。每次失敗都記 log，事後才看得出是「試了兩次就好」還是「五次都失敗」。全部失敗就以結束碼 1 結束，交給監督者（Docker 的 restart policy、Kubernetes）決定要不要重新啟動。</p>
+<p>還有一個順序：<strong>檢查成功之後才 <code>listen</code></strong>。一 <code>listen</code>，負載平衡器就可能把流量送進來；資料庫還不能用的期間接到的每一筆結帳都會失敗，等於把舊程序關機時避開的錯誤，換到新程序啟動時再犯一次。</p>
+<p>另一種做法是先 listen，但 <code>/readyz</code> 回 503 直到依賴可用。這也是前面健康檢查那一節 readiness 的用法：程序活著，但還不接客。兩者的取捨：</p>
+<div class="table-wrap"><table>
+<tr><th></th><th>重試後 fail fast</th><th>先啟動、readiness 503</th></tr>
+<tr><td>錯誤看得見嗎</td><td>程序反覆重啟，平台上一眼看得到</td><td>程序活著但一直沒就緒，要看 readiness 才知道</td></tr>
+<tr><td>依賴恢復時</td><td>要等平台重啟程序</td><td>自己恢復，不用重啟</td></tr>
+<tr><td>適合</td><td>資料庫是必要依賴，沒它什麼都做不了</td><td>有部分功能不需要該依賴；或啟動成本很高</td></tr>
+</table></div>
+<p>咖啡店的訂單 API 沒有資料庫什麼都做不了，所以這課的練習用第一種，它比較單純，錯誤也最明顯。</p>
+<p>把整課串起來，一次部署就是：新程序等到資料庫可用才 listen、readiness 回 200，開始接客；舊程序收到 SIGTERM，readiness 改 503，等王小明的結帳做完、連線關好、pool 關掉，在時限內以 0 結束。兩邊都做到，客人就感覺不到部署。</p>
+
+<h2>補充與查表</h2>
+<p>下面是主線用不到、但查問題時會需要的細節。</p>
+<p><strong>Node 的 HTTP 關機相關 API</strong>（依 Node 24 http 文件），查表用，不用背：</p>
+<div class="table-wrap"><table>
+<tr><th>API／設定</th><th>行為</th><th>版本</th></tr>
+<tr><td><code>server.close()</code></td><td>不再接新連線；只關掉「呼叫當下」閒置的連線</td><td>關閒置連線是 v19.0.0 起</td></tr>
+<tr><td><code>keepAliveTimeout</code></td><td>閒置的 keep-alive 連線多久後由伺服器關掉，預設 5000ms</td><td>v24.6.0 起實際再多等 <code>keepAliveTimeoutBuffer</code> 的 1000ms，合計約 6 秒</td></tr>
+<tr><td><code>server.closeIdleConnections()</code></td><td>關掉當時所有閒置的連線</td><td>v18.2.0 起</td></tr>
+<tr><td><code>server.closeAllConnections()</code></td><td>關掉所有連線，包括正在處理請求的</td><td>v18.2.0 起</td></tr>
+<tr><td><code>server[Symbol.asyncDispose]()</code></td><td>等於 <code>close()</code> 再等 callback，一樣不處理之後才閒置的連線</td><td>v24.2.0 脫離實驗</td></tr>
+</table></div>
+<p><strong>被訊號結束時的結束碼</strong>：從 shell 看是 128＋訊號編號（SIGTERM 143、SIGINT 130）；從 Node 的父程序（例如用 <code>child_process</code> 啟動它的測試）看，是 code <code>null</code>、signal <code>'SIGTERM'</code>。練習 2、3 的測試就是用子程序啟動你的程式。</p>
+<p><strong>SIGTERM 和 <code>uncaughtException</code> 的收尾不一樣</strong>：<a href="18-error-handling.html">第 18 課</a>的 <code>uncaughtException</code> 也是一種結束，但那時程式狀態已經不可信，記 log、停止接新請求、以 1 結束，不需要等排空。SIGTERM 是「程式很健康，只是該下班了」，值得花幾秒好好收尾。</p>
+
+<h2>練習</h2>
+<p>在 <code>learn/</code> 執行 <code>node check.mjs node 21</code> 建立 <code>work/21/</code>，裡面有內文的範例（<code>examples/</code>）、假的連線池 <code>pool.ts</code>（行為模仿 pg，<code>end()</code> 之後再 <code>query</code> 會丟錯）、練習 3 的進入點 <code>main.ts</code>，和三題的起始檔。練習 2、3 的測試會用子程序啟動你的程式並送訊號；想自己試，照檔案開頭的註解執行。</p>
+
+<div class="local" data-test="ex1" data-files="app.ts">
+  <p>練習 1：<code>app.ts</code> 的 <code>createApp({ checkDb })</code> 回傳 <code>{ server, startShutdown }</code>。加上兩個端點：<code>GET /healthz</code> 永遠回 200 和 <code>{ status: 'ok' }</code>，<strong>不能</strong>呼叫 <code>checkDb</code>；<code>GET /readyz</code> 每次都呼叫 <code>checkDb()</code>，成功回 200，失敗回 503，body 帶字串 <code>reason</code> 說明原因；<code>checkDb</code> 超過 500ms 沒結果也算失敗（測試的 checkDb 會卡住永遠不回應，<code>/readyz</code> 要在約 500ms 後回 503，測試最多等 2.5 秒）；呼叫 <code>startShutdown()</code> 之後 <code>/readyz</code> 一律回 503，<code>/healthz</code> 仍是 200。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="server.ts">
+  <p>練習 2：讓 <code>server.ts</code> 收到 SIGTERM 或 SIGINT 時優雅關機：不再接受新連線、等進行中的請求完成、不被 keep-alive 連線拖住；伺服器關好時印 <code>{"msg":"server closed"}</code>，接著 <code>await pool.end()</code>（它會印 <code>{"msg":"pool closed"}</code>），最後印 <code>{"msg":"bye"}</code>，以結束碼 0 結束。<code>SHUTDOWN_TIMEOUT_MS</code>（預設 10000）毫秒內沒做完，就強制關閉所有連線並以結束碼 1 結束。關機途中又收到訊號，立即以結束碼 1 結束。測試會在 1.5 秒的請求進行中送 SIGTERM，客戶端會一直留著 keep-alive 連線：那個請求要成功，程序要在它完成後馬上結束（測試容許 2.5 秒，只呼叫 <code>server.close()</code> 會多等約 6 秒）。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="start.ts">
+  <p>練習 3：完成 <code>start.ts</code> 的 <code>start({ checkDb, listen })</code>（<code>main.ts</code> 會傳入假的 <code>checkDb</code>，用環境變數 <code>FAIL_TIMES</code> 控制前幾次失敗）。<code>checkDb()</code> 成功才呼叫 <code>listen()</code>；失敗就等一下再試，間隔依序 100、200、400、800ms，最多試 5 次；每次失敗都用 <code>console.error</code> 印出錯誤的 <code>message</code>；5 次都失敗就以結束碼 1 結束，不呼叫 <code>listen</code>，最後一次失敗後不用再等。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 4：同事把 Kubernetes 的 liveness 檢查改成「<code>SELECT 1</code> 成功才回 200」，理由是檢查越多越安全。某天資料庫重開，晃了 30 秒。會發生什麼事？</p>
+  <label data-key="a">沒事，資料庫恢復後 liveness 就恢復 200</label>
+  <label data-key="b">所有程序的 liveness 一起失敗，全部被重新啟動；重啟後同時重新連線，可能把剛恢復的資料庫又打垮</label>
+  <label data-key="c">負載平衡器暫時不送流量給這些程序，資料庫恢復後自動接回</label>
+  <p class="why">✓ liveness 失敗的處置是重新啟動程序，而資料庫的問題不會因為重啟 API 而變好，所有實例同時重啟還會讓服務完全中斷、連線數瞬間暴增。a 忽略了 liveness 失敗幾次後平台就會動手。c 描述的是 readiness 的行為：依賴檢查應該放在 readiness，liveness 只回答「程序還能不能回應」。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：收到 SIGTERM 後呼叫了 <code>server.close()</code>，所有請求都回應完了，程序卻過了好幾秒才結束（或一直不結束）。最可能的原因是？</p>
+  <label data-key="a"><code>server.close()</code> 沒有作用，要改用 <code>process.exit(0)</code></label>
+  <label data-key="b">SIGTERM 的監聽器讓 Node 不會結束，一定要自己呼叫 <code>process.exit</code></label>
+  <label data-key="c">還有東西撐住 event loop：之後才閒置的 keep-alive 連線、沒 <code>unref</code> 的計時器、沒關的資料庫 pool</label>
+  <p class="why">✓ 程序在沒有 handle 撐住 event loop 時自然結束。<code>close()</code> 不會關掉呼叫之後才閒置的 keep-alive 連線，要等客戶端或 keepAliveTimeout；關機時限的計時器沒 <code>unref</code>、pool 沒 <code>end()</code> 也會撐住。a 會讓進行中的請求失敗；b 錯在監聽器只是取消預設的「立刻結束」，不會撐住程序。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：Dockerfile 的最後一行寫 <code>CMD ["node", "--run", "start"]</code>，start 腳本是 <code>node server.ts</code>，裡面寫好了 SIGTERM 的優雅關機。<code>docker stop</code> 時會怎樣？</p>
+  <label data-key="a"><code>node --run</code> 收到 SIGTERM 但不會轉送給 <code>node server.ts</code>，你的關機程式不會執行，最後被 SIGKILL</label>
+  <label data-key="b">跟直接執行 <code>node server.ts</code> 一樣，優雅關機正常執行</label>
+  <label data-key="c"><code>node --run</code> 會等 <code>server.ts</code> 自己結束，所以會多等 10 秒</label>
+  <p class="why">✓ <a href="03-npm-packages.html">第 3 課</a>在 Node 24.22.1 實測：<code>node --run</code> 收到 SIGTERM 不會轉送給子程序（<code>npm start</code> 會，npm 11.19.1）。容器的主程序是收訊號的那一個，所以直接寫 <code>CMD ["node", "server.ts"]</code>，中間不要多一層。b 錯在多了一層 <code>node --run</code>，訊號到不了你的程式；c 錯在 <code>node --run</code> 不會等子程序，它收到 SIGTERM 就自己先結束了。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>容器裡用 <code>npm start</code> 或 <code>node --run</code> 當主程序</strong>：多一層程序，訊號可能到不了你的程式，寫好的關機程式根本沒執行。直接 <code>node server.ts</code>。</li>
+  <li><strong>攔截 SIGINT 後第二次 Ctrl+C 沒反應</strong>：開發時只能 <code>kill -9</code>。關機中再收到訊號就立刻結束。</li>
+  <li><strong>liveness 檢查依賴</strong>：依賴一晃，所有程序一起被重啟。依賴放在 readiness，liveness 能回應就是 200。</li>
+  <li><strong>readiness 沒有逾時</strong>：資料庫卡住時健康檢查也卡住、請求越堆越多。設一個比平台短的上限，逾時用的計時器要清掉。</li>
+  <li><strong>收到 SIGTERM 就 <code>process.exit(0)</code></strong>：進行中的請求斷線、交易結果不明、log 可能沒寫完。照順序收尾，讓程序自然結束。</li>
+  <li><strong>先關 pool 再關伺服器</strong>：進行中的請求查資料庫失敗。先等伺服器關好，再 <code>pool.end()</code>。</li>
+  <li><strong>只呼叫 <code>server.close()</code></strong>：之後才閒置的 keep-alive 連線讓關機拖延好幾秒。關機中的回應加 <code>Connection: close</code>，或請求完成後 <code>closeIdleConnections()</code>。</li>
+  <li><strong>關機沒有時限</strong>：一個卡住的請求或 SSE 長連線讓程序永遠不結束，最後被 SIGKILL，連 log 都沒有。設時限，到了 <code>closeAllConnections()</code> 並以 1 結束；計時器要 <code>unref()</code>。</li>
+  <li><strong>啟動時無限重試，或先 listen 再檢查</strong>：前者讓設定錯誤永遠沒人發現，後者在依賴還沒好時就接流量。有限次數退避，成功才 listen。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>部署時的 502 來自舊程序直接倒下。服務的一生：啟動（設定、依賴）→ 就緒 → 服務中 → SIGTERM → 不再就緒、排空 → 關閉資源 → 結束。每次部署、縮減、重啟都會走一遍下半圈。</li>
+  <li>平台先送 SIGTERM，關機時限到了才送攔不到的 SIGKILL。SIGTERM／SIGINT 預設以 128＋編號結束，加了監聽器就由你決定何時結束。容器主程序直接執行 <code>node</code>，訊號才到得了你的程式。</li>
+  <li><code>/healthz</code>（liveness）只看程序能不能回應，失敗會被重啟；<code>/readyz</code>（readiness）檢查依賴（有逾時）與是否關機中，失敗回 503，只是暫時不送流量。</li>
+  <li>關機順序：readiness 503 → <code>server.close()</code> → 等請求完成並處理 keep-alive → <code>pool.end()</code> → 自然結束。<code>close()</code> 不關之後才閒置的連線，關機中的回應要加 <code>Connection: close</code>。</li>
+  <li>關機要有比平台短的時限（計時器 <code>unref</code>），到了 <code>closeAllConnections()</code> 並以 1 結束；第二次訊號立即結束。</li>
+  <li>新程序啟動時暫時不可用的依賴：有限次數退避重試，成功才 listen，全部失敗以 1 結束交給監督者。</li>
+</ul>
+<p>下一課回頭看「怎麼證明這些都對」：測試全過、上線卻出事時問題出在哪；怎麼用假物件和假時鐘，把要等好幾分鐘的通知流程在幾毫秒內測完；HTTP 和資料庫為什麼用真的；以及 CI 偶爾變紅的測試怎麼修好，而不是按重跑。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

@@ -1,0 +1,1848 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>14. 分散式鎖、租約與 fencing token</title>
+<link rel="stylesheet" href="../../style.css">
+<style>
+.tl { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin: 1.2em 0; }
+.tl table { width: 100%; }
+.tl td { vertical-align: top; }
+.tl tr.now td { background: var(--accent-soft); }
+.tl tr.later { visibility: hidden; }
+.tl .note { margin: 10px 0 0; min-height: 3.5em; }
+.tl .wait { color: var(--fail); font-weight: 600; }
+</style>
+</head>
+<body data-lesson="14">
+<header>
+  <div class="eyebrow">階段 3：可靠性：失敗是常態 · 第 14 課</div>
+  <h1>分散式鎖、租約與 fencing token</h1>
+</header>
+<main>
+
+<p>咖啡店的 API 跑在三台伺服器上。每天 03:00 要產生前一天的營業報表、寄給 200 家門市的店長。上線第一天，店長們收到三封一模一樣的信：三台伺服器的排程都在 03:00 醒來，各做了一次。有人加了一把 Redis 鎖，信變成一封。一個月後，報表內容偶爾是錯的：某台伺服器做到一半停了 40 秒，醒來時鎖早就換人拿了，它卻照樣把舊的結果寫了進去。</p>
+<p>這一課從頭到尾處理這份報表：讓三台伺服器每天只做一次報表，而且就算某一台停住 40 秒、醒來還以為自己拿著鎖，它的舊結果也寫不進去。學完之後，你能判斷一個問題該交給資料庫約束還是真的需要鎖；能寫出取得、釋放、續約都正確的租約鎖；能說明為什麼「寫入前先檢查租約還在」擋不住過時的寫入，並用 fencing token 讓報表儲存自己擋；能讓三台伺服器的排程只由一台負責；也能在 code review 看到「加一把 Redis 鎖」時，說出該選哪一種做法、上線後要看哪些數字。</p>
+
+<div class="callout"><strong>第一輪只要記住：</strong>
+<ul>
+  <li>能用唯一約束、條件更新解決的，就不要用分散式鎖。讓工作本身冪等，鎖只用來減少重複的工作。</li>
+  <li>分散式鎖一定是有期限的租約；釋放和續約都要「值還是我的才做」，而且比對和動作是同一個原子操作。</li>
+  <li>持有者可能停住而不自知，所以只靠鎖保證不了「同一時間只有一個人在寫」。要正確，就讓資源用遞增的 fencing token 拒絕過時的寫入。</li>
+  <li>量時間間隔、算租約剩多久，一律用單調時鐘。</li>
+</ul></div>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>報表重寄了，要加鎖嗎：什麼是分散式鎖，為什麼先讓工作冪等，鎖是為了效率還是正確性（開場問題的最小答案）。</li>
+  <li>第一把鎖怎麼做：持有者當機時為什麼需要租約；用 <code>SET NX PX</code> 取得、值相符才刪、續約；已經有 PostgreSQL 時用 advisory lock。</li>
+  <li>拿著鎖為什麼還會蓋掉報表：程序暫停、時鐘跳動、主從切換；fencing token 怎麼讓報表儲存自己擋住過時的寫入。</li>
+  <li>讓一台負責所有排程：leader election 怎麼續約、什麼時候退位；租約剩多久要用哪一種時鐘量。</li>
+  <li>有人提議用 Redlock：它的爭議、實務上怎麼選，以及上線後看哪些數字。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../postgresql/lessons/19-concurrency.html">PostgreSQL 課第 19 課</a>的 lost update 與條件更新：兩人同時讀完再寫會蓋掉對方；<code>UPDATE … WHERE stock &gt; 0</code> 把判斷和寫入放進同一個原子操作。</li>
+  <li><a href="../../postgresql/lessons/33-job-queue.html">PostgreSQL 課第 33 課</a>的 advisory lock 與 <code>SKIP LOCKED</code>：用一個數字當鎖名、交易結束自動釋放；多個 worker 各拿各的工作，不會拿到同一筆。</li>
+  <li><a href="../../nestjs/lessons/19-caching-redis.html">NestJS 課第 19 課</a>的 Redis 指令：<code>SET</code> 寫值、<code>GET</code> 讀值、<code>DEL</code> 刪除，key 可以帶 TTL 到期自動消失。</li>
+  <li><a href="09-idempotency.html">第 9 課</a>的冪等：同一件事做一次和做很多次結果相同，常用唯一約束擋掉第二次。</li>
+</ul></div>
+
+<h2>報表重寄了：第一個念頭是加鎖，真的需要嗎？</h2>
+<p>三封信的問題，最直覺的修法是「加一把鎖，拿到的那台才做」。先把這把鎖是什麼講清楚。在同一台機器上，多段程式要輪流使用同一份資料時，可以用程式語言或作業系統提供的鎖：鎖就放在這台機器的記憶體裡，誰拿著、誰在等，都在同一個地方記錄。咖啡店的三台伺服器各有各的記憶體，api-1 記憶體裡的鎖，api-2 看不到。</p>
+<p>所以要把鎖放到三台都連得到的地方，例如 Redis 或資料庫，由它記錄「現在誰拿著」。這種讓不同機器上的程序輪流、互斥地使用同一個資源的機制，叫<strong>分散式鎖</strong>（distributed lock）。它比單機的鎖難得多：拿著鎖的程序和記錄鎖的服務是兩台機器，中間隔著網路。持有者可能當機、可能被暫停、也可能只是網路斷了，鎖服務看到的都是同一件事：「它沒有消息了」。鎖服務分辨不出是哪一種，這一課後面每個問題都從這裡來。</p>
+<p>既然分散式鎖本身是一個會壞的元件，加之前先問：能不能不用？回到報表。三封信的根源是「寄報表」做三次就有三封。如果寄之前，先在資料庫寫一筆「2026-10-30 的報表已寄出」，並在報表日期上加唯一約束（<a href="09-idempotency.html">第 9 課</a>），三台同時去寫，只有一台寫得進去，另外兩台的 INSERT 直接失敗、不寄。這個檢查和寫入是資料庫的同一個原子操作，中間沒有空檔可以讓兩台都通過。就算之後加的鎖失效了，最後這一道約束也不會讓店長收到第二封。</p>
+<p>唯一約束擋得住重寄，卻擋不住開場的第二個事故：舊報表蓋掉新報表。要判斷一把鎖該做到多可靠，Martin Kleppmann 在〈How to do distributed locking〉（2016-02-08）建議先問：<strong>這把鎖是為了效率，還是為了正確性？</strong></p>
+<ul>
+  <li><strong>效率鎖</strong>：鎖失效只是重複做事。例如報表多算一次、同一張圖多縮一次。偶爾失效可以接受，成本低的做法就夠了。</li>
+  <li><strong>正確性鎖</strong>：鎖失效會弄壞資料。例如兩個程序同時改同一份帳、覆蓋對方的結果。這種鎖不能只靠鎖本身，要讓被保護的資源也參與檢查。</li>
+</ul>
+<p>三封信原本是正確性問題（店長收到重複的信），加上「已寄出」的唯一紀錄後，鎖失效只會讓第二台在 INSERT 時失敗，就變回效率問題。報表被舊結果蓋掉則是正確性問題，它的修法也是同一個思路：寫入報表時，由資料庫檢查「這次寫入是不是最新一任持有者」，過時的就拒絕。這就是後面的 fencing token。資深工程師的習慣可以濃縮成一句：<strong>讓工作本身冪等，鎖只用來減少浪費</strong>。</p>
+<div class="callout practice"><strong>💡 實務上：在 code review 看到「加一把 Redis 鎖」，先問三個問題</strong><br>常見的 PR 是：API 擴成三台後排程重複跑，或兩個人同時按「結帳」扣出負庫存，於是有人包一層 Redis 鎖。先問：<strong>鎖失效時最壞會怎樣？</strong>（多寄一封信，還是帳對不起來）；<strong>能不能改成唯一約束或條件更新？</strong>扣庫存、重複付款幾乎都可以，而且比鎖可靠；<strong>真的要鎖，失效時有誰會知道？</strong>有沒有日誌或告警。三個問題答完，常常會發現根本不需要新增一個 Redis；報表這種情況，答案是先補上「已寄出」的唯一紀錄，鎖只是省工。</div>
+<p>那報表還需要鎖嗎？需要，但目的變了：產生報表要把前一天的訂單全部撈出來算一遍，三台各算一次，只有一份會被用上。鎖讓另外兩台一開始就跳過，省下兩份重複的工作。其他常見的「看起來要鎖」的問題，例如付款只能一次、扣庫存不能扣成負數，不用鎖的解法整理在課末的〈補充與查表〉。接下來就為這個目的做第一把鎖。</p>
+
+<h2>第一把鎖：持有者當機了，鎖要怎麼放掉？</h2>
+<p>最直覺的寫法是：在 Redis 設一個 key <code>lock:daily-report</code>，設得成功的那台去做報表，做完把 key 刪掉。Redis 的 <code>SET</code> 加上 <code>NX</code> 選項，意思是「key 不存在才設定」，三台在 03:00 同時送出，只有一台會成功，另外兩台得到失敗、跳過今天的工作。</p>
+<p>問題出在「做完把 key 刪掉」。如果拿到鎖的 api-1 在做報表時當機，它永遠不會執行刪除，這個 key 就一直留在 Redis 裡。隔天 03:00，三台都設不成功，報表從此不再產生，而且沒有人會收到錯誤。上一節說過，鎖服務分辨不出持有者是當機還是做得慢，所以它也不能自己判斷「該放掉了」。</p>
+<p>解法是讓鎖本身有期限：取得時就說好最多借多久，時間到了，就算持有者沒有釋放，鎖服務也自動放掉。這種有期限的鎖叫<strong>租約</strong>（lease），跟租房子一樣，租期到了沒續約就收回。分散式鎖幾乎一定是租約。代價是持有者必須在期限內做完；做不完，就要在到期前向鎖服務把期限延長，這個動作叫<strong>續約</strong>（renew）。因為續約通常是固定間隔送出，像在報告「我還活著」，有些工具也把它叫 heartbeat。</p>
+<p>Redis 文件〈Distributed Locks with Redis〉給的單機寫法：</p>
+<pre>SET lock:daily-report 7f3a9c…（隨機值） NX PX 30000</pre>
+<ul>
+  <li><code>NX</code>：key 不存在才設定，所以同一時間只有一個人設得成功。</li>
+  <li><code>PX 30000</code>：30,000 毫秒後自動過期，這就是租約的期限。</li>
+  <li>值是<strong>擁有者 token</strong>：每次取得都產生一個唯一的隨機值，證明「這把鎖是我這一次拿的」。文件要求它在所有客戶端、所有請求之間唯一。下一節會看到它為什麼必要。</li>
+</ul>
+<p>租約你其實已經用過：<a href="12-queues-outbox.html">第 12 課</a>佇列的 visibility timeout，就是「這則訊息租給你 30 秒，沒有 ack 就交給別人」；<a href="05-caching.html">第 5 課</a>的快取 lease 也是同一個想法。它們解決的都是「拿走東西的人可能消失」。</p>
+<p>有了期限，鎖不會永遠卡住了。但期限也帶來一個新情況：持有者做完要釋放時，手上那把鎖可能已經過期、被別人拿走了。這時直接刪掉 key，刪的是誰的鎖？</p>
+
+<h2>做完要釋放：怎麼不刪到別人的鎖？</h2>
+<p>下面用一個迷你 Redis 重現這個情況：api-1 拿到 30 秒的租約，卻花了 40 秒，期間租約過期、被 api-2 拿走；api-1 做完照樣釋放，接著 api-3 也來搶。程式會跑兩輪，一輪用 <code>DEL</code> 釋放，一輪用「值相符才刪」。執行後看兩輪的最後一行：api-3 能不能拿到鎖。</p>
+<div class="lab"><script type="code">
+// 迷你 Redis：只有 SET NX PX、DEL 和「值相符才刪」，時間由 now 控制
+let now = 0
+const keys = new Map<string, { value: string; expiresAt: number }>()
+const get = (key: string) => {
+  const e = keys.get(key)
+  return e && now < e.expiresAt ? e.value : null
+}
+const setNxPx = (key: string, value: string, px: number) => {
+  if (get(key) !== null) return false
+  keys.set(key, { value, expiresAt: now + px })
+  return true
+}
+const del = (key: string) => keys.delete(key)
+const delIfEq = (key: string, value: string) => get(key) === value && keys.delete(key)
+
+for (const release of ['DEL', '值相符才刪']) {
+  now = 0
+  keys.clear()
+  console.log(`--- 釋放方式：${release}`)
+  console.log('api-1 取得：', setNxPx('lock:report', 'api-1#7f3a', 30_000))
+  now += 40_000   // api-1 做太久（或被暫停），租約過期
+  console.log('api-2 取得：', setNxPx('lock:report', 'api-2#91c2', 30_000))
+  const ok = release === 'DEL' ? del('lock:report') : delIfEq('lock:report', 'api-1#7f3a')
+  console.log('api-1 做完，釋放：', ok)
+  console.log('api-3 取得：', setNxPx('lock:report', 'api-3#5d10', 30_000))
+}
+</script></div>
+<p>用 <code>DEL</code> 時，api-1 刪掉的是 api-2 的鎖，api-3 接著拿到，api-2 和 api-3 同時以為自己拿著鎖。改成「值相符才刪」，api-1 發現 key 裡的值已經不是自己的 <code>api-1#7f3a</code>，就不刪，api-3 也拿不到。這就是上一節擁有者 token 的用途：它讓釋放的人能確認「這把還是我拿的那一把」。</p>
+<p>「值相符才刪」還有一個條件：比對和刪除必須是同一個原子操作。如果先送 <code>GET</code> 比對、再送 <code>DEL</code> 刪除，這是兩個指令，中間隔著一次網路來回；鎖可能就在這段空檔裡過期、被別人拿走，你的 <code>DEL</code> 一樣刪到別人的。Redis 在執行一段 Lua 腳本時，不會穿插其他客戶端的指令，所以 Redis 文件的做法是把比對和刪除寫進同一段腳本：</p>
+<pre>-- Lua 腳本在 Redis 裡是原子執行的
+if redis.call("get", KEYS[1]) == ARGV[1] then
+  return redis.call("del", KEYS[1])
+else
+  return 0
+end</pre>
+<p>新版 Redis 另外有一個指令直接做這件事，版本與寫法見課末〈補充與查表〉。續約也是同一個道理：值還是自己的，才延長期限，一樣用 Lua 比對後再 <code>PEXPIRE</code>；否則你會替別人的鎖續約。拿不到鎖的那一方，Redis 文件建議<strong>隨機延遲後再試</strong>，跟<a href="08-timeouts-retries-backoff.html">第 8 課</a>的 jitter 同一個道理：大家同時重試，只會一起再撞一次。</p>
+<p>如果咖啡店已經有 PostgreSQL，報表這把鎖常常不必為它多架一個 Redis。<a href="../../postgresql/lessons/33-job-queue.html">PostgreSQL 課第 33 課</a>的 advisory lock 可以直接用：<code>SELECT pg_try_advisory_xact_lock(20261030)</code> 用一個數字當鎖名，拿不到立刻回傳 false，拿到的話，交易結束時自動釋放。它的生命跟著交易走，交易所在的連線斷掉、交易結束，鎖就放掉，所以不需要 TTL，也不會有「持有者當機、鎖卡住」的問題。另一種不用交易包住、要自己釋放的寫法，見課末。</p>
+<div class="callout practice"><strong>💡 實務上：TTL 照實際耗時來設，取得和釋放包成一個共用函式</strong><br>TTL 太短，工作還沒做完鎖就換人；太長，持有者當機後大家要乾等很久。做法是先量這個工作平常要跑多久，TTL 設成明顯比它長；會跑好幾分鐘的工作改用續約，不要把 TTL 一口氣設成一小時。取得、續約、「值相符才刪」最好包成專案裡唯一的一個函式或模組，不要讓每個人各自手寫 <code>SET NX</code> 和 <code>DEL</code>，經典的「刪到別人的鎖」通常就出在某個複製貼上的版本。也要先決定拿不到鎖時怎麼辦：報表這類排程通常直接跳過並記一筆日誌，使用者正在等的請求則回一個明確的錯誤，不要無限重試。</div>
+<p>到這裡，三封信變成一封，鎖不會永遠卡住，也不會被刪到別人的。可是開場的第二個事故還在：報表偶爾被舊的結果蓋掉。api-1 明明照規則拿鎖、照規則釋放，為什麼還會寫進去？</p>
+
+<h2>拿著鎖，為什麼還會蓋掉別人的報表？</h2>
+<p>租約解決了「持有者當機、永遠鎖住」，卻帶來另一種情況：<strong>持有者沒死，只是停住了</strong>。程式停住一段時間，自己卻不知道，叫<strong>程序暫停</strong>（process pause）。從程式的角度看，它只是從一行執行到下一行；中間實際過了 40 秒，它完全沒感覺。常見的原因：</p>
+<ul>
+  <li>垃圾回收（GC）的 stop-the-world 暫停：執行環境回收記憶體時把整個程式停住，Kleppmann 的文章提到有時長達好幾分鐘。</li>
+  <li>虛擬機或容器被暫停、遷移；筆電闔上；作業系統把記憶體換到磁碟。</li>
+  <li>網路延遲：請求已經送出，卻在路上卡了很久才到（文章引用 GitHub 一次約 90 秒的封包延遲）。</li>
+</ul>
+<p>逐步看一次開場的事故。報表程序 api-1 拿到 30 秒的租約，產生報表要 10 秒，看起來綽綽有餘；它也很謹慎，寫入前先檢查租約還在：</p>
+<div class="tl">
+  <div class="table-wrap"><table>
+    <tr><th>時間</th><th>api-1</th><th>鎖服務</th><th>api-2</th><th>報表儲存</th></tr>
+    <tr data-note="api-1 取得租約，期限 30 秒（到 0:30）。"><td>0:00</td><td>取得租約</td><td>持有者 api-1，到 0:30</td><td></td><td>（空）</td></tr>
+    <tr data-note="api-1 檢查「租約還在嗎？」——還在。準備寫入。"><td>0:05</td><td>檢查租約：還在 ✓</td><td>持有者 api-1</td><td></td><td>（空）</td></tr>
+    <tr data-note="就在檢查之後，GC 暫停了 api-1 整整 40 秒。api-1 的程式碼停在「檢查完、還沒寫」的那一行，它完全不知道時間過去了。"><td>0:05</td><td><span class="wait">GC 暫停 40 秒…</span></td><td>持有者 api-1</td><td></td><td>（空）</td></tr>
+    <tr data-note="0:30 租約到期，鎖服務照規則自動釋放。這是租約該做的事：它不可能分辨「當機」和「暫停」。"><td>0:30</td><td><span class="wait">（暫停中）</span></td><td>到期，釋放</td><td></td><td>（空）</td></tr>
+    <tr data-note="api-2 拿到鎖，產生報表並寫入。到這裡一切合法。"><td>0:31</td><td><span class="wait">（暫停中）</span></td><td>持有者 api-2</td><td>取得租約、寫入報表</td><td>api-2 的報表</td></tr>
+    <tr data-note="api-1 醒來，從停住的那一行繼續：它剛剛已經檢查過租約了，於是直接寫入，蓋掉 api-2 的結果。兩個程序在同一段時間都以為自己拿著鎖。"><td>0:45</td><td>醒來，直接寫入</td><td>持有者 api-2</td><td></td><td><strong>api-1 的舊報表</strong> ✗</td></tr>
+  </table></div>
+  <div class="bar"><button data-prev>◀ 上一步</button><button class="primary" data-next>下一步 ▶</button><span class="kbd" data-count></span></div>
+  <p class="note"></p>
+</div>
+<p>重點在步驟 2 和 3：<strong>「寫入前先檢查租約還在」沒有用</strong>。暫停可以發生在檢查之後、寫入之前的任何一刻，把檢查移得再靠近寫入也一樣，兩行程式之間永遠有空檔。把 TTL 設長一點，也只是讓機率變小：暫停可能比任何你選的 TTL 都長。注意鎖服務在這裡沒有做錯任何事，0:30 放掉鎖正是租約該做的，它沒辦法分辨 api-1 是當機還是暫停。</p>
+<p>暫停不是唯一的原因，還有兩種情況會讓兩個程序同時拿到鎖。第一種是<strong>時鐘跳動</strong>：租約什麼時候到期，是 Redis 伺服器看自己的時間決定的。Redis 判斷 key 有沒有過期，看的是伺服器的系統時間，而系統時間是可以被調整的（Redis 文件明白寫著它<strong>不是單調時鐘</strong>，兩種時鐘的差別後面會講）。伺服器的時間被往前調，鎖就會提早過期，持有者還在做，別人已經拿到了。第二種是<strong>主從切換</strong>：Redis 的複寫是非同步的，api-1 在 master 拿到鎖，master 還沒把這個 key 傳給 replica 就掛了，replica 升為 master，上面沒有這把鎖，api-2 就能再拿一次（Redis 文件的例子）。這跟<a href="../../postgresql/lessons/37-backup-replication.html">PostgreSQL 課第 37 課</a>非同步複寫切換時會遺失最後幾筆交易，是同一件事。</p>
+<p>三種原因加起來的結論：只靠鎖，沒有辦法保證「同一時間只有一個人在寫」。持有者自己判斷不了，鎖服務也攔不住一個已經醒來、正要寫入的程序。能攔住它的，只剩<strong>被保護的資源自己</strong>：報表儲存在收到寫入的那一刻，判斷這個寫入是不是過時的。</p>
+
+<h2>怎麼讓報表儲存自己擋住過時的寫入？</h2>
+<p>報表儲存要判斷「過時」，就需要一個可以比大小的依據。做法叫 <strong>fencing token</strong>：fence 是柵欄，用一個數字把過時的持有者擋在外面。鎖服務每次把鎖交給一個新的持有者，就給它一個比上次大的數字；持有者寫入時把這個數字一起帶上；資源記住自己看過最大的數字，<strong>拒絕比它小的</strong>。數字越大，代表越晚拿到鎖，也就是越新的一任。Kleppmann 的例子：</p>
+<figure>
+  <svg viewBox="0 0 700 330" role="img" aria-label="api-1 拿到 token 33 後被暫停；租約過期後 api-2 拿到 token 34 並寫入，儲存記住 34；api-1 醒來帶 token 33 寫入，因為 33 小於 34 被拒絕">
+    <defs><marker id="a14" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <text class="d-text" x="90" y="24" text-anchor="middle">api-1</text>
+    <text class="d-text" x="270" y="24" text-anchor="middle">鎖服務</text>
+    <text class="d-text" x="440" y="24" text-anchor="middle">api-2</text>
+    <text class="d-text" x="610" y="24" text-anchor="middle">報表儲存</text>
+    <line class="d-line" x1="90" y1="34" x2="90" y2="315"/>
+    <line class="d-line" x1="270" y1="34" x2="270" y2="315"/>
+    <line class="d-line" x1="440" y1="34" x2="440" y2="315"/>
+    <line class="d-line" x1="610" y1="34" x2="610" y2="315"/>
+    <line class="d-line" x1="90" y1="60" x2="268" y2="60" marker-end="url(#a14)"/>
+    <text class="d-small" x="180" y="54" text-anchor="middle">取得</text>
+    <line class="d-line" x1="270" y1="85" x2="92" y2="85" marker-end="url(#a14)"/>
+    <text class="d-accent" x="180" y="80" text-anchor="middle">token 33</text>
+    <rect class="d-soft" x="60" y="100" width="60" height="150" rx="4"/>
+    <text class="d-small" x="90" y="170" text-anchor="middle">GC</text>
+    <text class="d-small" x="90" y="186" text-anchor="middle">暫停</text>
+    <text class="d-small" x="270" y="120" text-anchor="middle">租約過期</text>
+    <line class="d-line" x1="440" y1="140" x2="272" y2="140" marker-end="url(#a14)"/>
+    <text class="d-small" x="355" y="134" text-anchor="middle">取得</text>
+    <line class="d-line" x1="270" y1="165" x2="438" y2="165" marker-end="url(#a14)"/>
+    <text class="d-accent" x="355" y="160" text-anchor="middle">token 34</text>
+    <line class="d-line" x1="440" y1="200" x2="608" y2="200" marker-end="url(#a14)"/>
+    <text class="d-small" x="525" y="194" text-anchor="middle">寫入（token 34）</text>
+    <text class="d-small" x="610" y="220" text-anchor="middle">ok，記住 34</text>
+    <line class="d-line" x1="90" y1="265" x2="608" y2="265" marker-end="url(#a14)"/>
+    <text class="d-small" x="350" y="259" text-anchor="middle">醒來，寫入（token 33）</text>
+    <text class="d-accent" x="610" y="290" text-anchor="middle">拒絕：33 &lt; 34</text>
+  </svg>
+  <figcaption>鎖服務沒有阻止 api-1 醒來，但儲存端知道它的 token 已經過時。</figcaption>
+</figure>
+<p>關鍵是<strong>檢查發生在資源那一端，而且和寫入是同一個原子操作</strong>。上一節的「寫入前先檢查租約」失敗，是因為檢查在持有者這邊、寫入在資源那邊，中間有空檔。現在兩件事在同一個地方、同一個操作裡完成，api-1 不管在哪一刻被暫停，醒來帶著 33 去寫，都會被擋下來。</p>
+<p>接下來的問題是：誰發這個遞增的數字？前面 Redis 的擁有者 token 是隨機值，只能證明「是不是我」，不能比大小，所以 <code>SET NX</code> 本身給不了 fencing token。報表的資料本來就在 PostgreSQL，可以直接用一張鎖表當鎖服務：<code>locks(name, owner, token, expires_at)</code>，用條件更新取得租約，每取得一次 <code>token</code> 就加 1。到期的判斷用資料庫自己的 <code>now()</code>，三台伺服器都問同一個時鐘，不會因為各自的時間不同而判斷不一致：</p>
+<pre>UPDATE locks
+SET owner = $1, token = token + 1, expires_at = now() + interval '30 seconds'
+WHERE name = 'daily-report' AND expires_at &lt;= now()
+RETURNING token;          -- 回傳 0 列 = 別人還拿著</pre>
+<p>每個鎖事先 INSERT 一列、<code>expires_at</code> 設成過去的時間；釋放就是把自己那一列的 <code>expires_at</code> 改回 <code>now()</code>（條件是 <code>owner</code> 和 <code>token</code> 都相符，跟上一節「值相符才刪」同一個道理）。這一列永遠不刪，<code>token</code> 才會一直往上加，不會從頭再來；如果刪掉重建，token 回到 1，新的持有者反而會被當成過時的。</p>
+<p>報表那一端的檢查，在 PostgreSQL 裡就是一個條件更新，跟扣庫存的 <code>WHERE stock &gt; 0</code> 是同一種寫法：</p>
+<pre>UPDATE reports
+SET body = $1, last_token = $2
+WHERE report_date = '2026-10-30' AND last_token &lt;= $2;
+-- 影響 0 列 = token 過時，這次寫入被拒絕</pre>
+<p>條件用 <code>&lt;=</code> 而不是 <code>&lt;</code>，是因為同一個持有者在一次租約裡可能寫好幾次，它每次帶的都是同一個 token，等於的情況要放行。下面把開場的事故跑一次，比較有沒有 fencing：api-2 帶著 34 先寫，api-1 醒來帶著 33 再寫。執行後看最後內容是誰的報表：</p>
+<div class="lab"><script type="code">
+type Store = { body: string; write(body: string, token: number): boolean }
+
+const plain: Store = {
+  body: '',
+  write(body) { this.body = body; return true },
+}
+let maxToken = 0
+const fenced: Store = {
+  body: '',
+  write(body, token) {
+    if (token < maxToken) return false
+    maxToken = token
+    this.body = body
+    return true
+  },
+}
+
+for (const [name, store] of [['沒有 fencing', plain], ['有 fencing', fenced]] as const) {
+  // api-1 拿到 token 33 後被暫停；api-2 拿到 token 34 並寫入；api-1 醒來照樣寫
+  store.write('api-2 的報表', 34)
+  const ok = store.write('api-1 的舊報表', 33)
+  console.log(`${name}：api-1 的寫入${ok ? '成功' : '被拒絕'}，最後內容是「${store.body}」`)
+}
+</script></div>
+<p>fencing 要能用，有三個條件：</p>
+<ul>
+  <li><strong>token 要由鎖服務產生，而且一定遞增</strong>。上面的鎖表用 <code>token = token + 1</code> 就有。之後會介紹的 ZooKeeper 這類協調服務，每次變更都會帶一個遞增的編號（<code>zxid</code>），Kleppmann 建議可以直接拿它當 token；另一個選擇是 znode（ZooKeeper 裡存資料的一個節點）的版本號。</li>
+  <li><strong>資源要配合檢查</strong>。資料庫做得到；如果被保護的是一個不認識 token 的外部 API（例如寄信、扣款），fencing 就幫不上忙，要改用冪等鍵（<a href="09-idempotency.html">第 9 課</a>）讓重複的呼叫無害。寄報表給店長就屬於這種，所以第一節的「已寄出」唯一紀錄仍然要留著。</li>
+  <li><strong>每個資源各自記住最大 token</strong>：報表和庫存是不同的東西，互不影響。</li>
+</ul>
+<p>報表的寫入安全了。但咖啡店的排程不只報表：清理過期訂單、把 outbox 送進佇列（<a href="12-queues-outbox.html">第 12 課</a>）也都跑在三台伺服器上，也都只該跑一份。每個排程各自寫一套取得、續約、fencing，重複又容易漏。更常見的做法是：從三台裡選一台，讓它負責所有排程。</p>
+
+<h2>能不能讓一台負責所有排程？Leader election</h2>
+<p>在多個程序中選出一個負責的程序，被選出來的叫 <strong>leader</strong>，其他的叫 follower，選的過程叫 <strong>leader election</strong>。最常見的做法就是前面的租約：三台都去搶同一把租約，搶到的就是 leader，負責跑所有排程；leader 定期續約保住位子，沒續到，租約過期，其他台就能搶到、接手當新的 leader。</p>
+<p>難的是 leader 自己怎麼知道「我還是 leader」。如果它搶到時記一個布林值 <code>isLeader = true</code>，之後每次跑排程前看這個值，就會重演報表事故：暫停 40 秒醒來時，這個值還是 true，但租約早就給了別人。兩個程序都以為自己是 leader，同時跑排程，這叫 <strong>split-brain</strong>（腦裂）。要避免它，leader 每次做事前都要依租約的實際期限重新判斷，具體規則用一個 30 秒的租約來看：</p>
+<figure>
+  <svg viewBox="0 0 700 200" role="img" aria-label="一個 30 秒的租約：在 10 秒、20 秒續約；最後 5 秒是安全餘裕，依自己的時鐘到了這裡就停手">
+    <defs><marker id="b14" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="40" y="60" width="525" height="50" rx="4"/>
+    <rect class="d-soft" x="565" y="60" width="105" height="50" rx="4"/>
+    <text class="d-text" x="300" y="90" text-anchor="middle">可以工作</text>
+    <text class="d-text" x="617" y="90" text-anchor="middle">停手</text>
+    <line class="d-line" x1="40" y1="130" x2="670" y2="130" marker-end="url(#b14)"/>
+    <text class="d-small" x="40" y="150" text-anchor="middle">0</text>
+    <text class="d-small" x="250" y="150" text-anchor="middle">10 秒</text>
+    <text class="d-small" x="460" y="150" text-anchor="middle">20 秒</text>
+    <text class="d-small" x="565" y="150" text-anchor="middle">25 秒</text>
+    <text class="d-small" x="670" y="150" text-anchor="middle">30 秒</text>
+    <line class="d-line" x1="250" y1="40" x2="250" y2="60" marker-end="url(#b14)"/>
+    <line class="d-line" x1="460" y1="40" x2="460" y2="60" marker-end="url(#b14)"/>
+    <text class="d-accent" x="355" y="32" text-anchor="middle">每 1/3 個租約續約一次</text>
+    <text class="d-small" x="617" y="40" text-anchor="middle">安全餘裕</text>
+    <text class="d-small" x="350" y="185" text-anchor="middle">續約成功：整條重新從「現在」起算 30 秒</text>
+  </svg>
+  <figcaption>續約失敗兩次，還有時間在租約真的到期前停手。</figcaption>
+</figure>
+<ul>
+  <li><strong>大約每三分之一個租約續約一次</strong>：30 秒的租約，每 10 秒續一次。一次續約失敗（網路抖一下）還有機會再試。</li>
+  <li><strong>每次要做事之前，用自己的時鐘重新算</strong>：「現在 &lt; 到期時間 − 安全餘裕」才是 leader，不能讀快取的布林值。安全餘裕（safety margin）是故意少用的那一段時間，用來吸收兩台機器時鐘速度的小誤差和續約回應在路上的時間。到期時間要從<strong>送出續約請求之前</strong>記下的時間起算，因為回應晚到的那段時間，租約已經在走了。</li>
+  <li><strong>續約失敗就立刻退位</strong>：停止排程、放棄手上的工作，變回 follower。繼續做就是兩個 leader。</li>
+  <li><strong>續約不是重新取得</strong>：同一任 leader 的 token 不變；重新取得會拿到新 token，等於換了一任。</li>
+  <li><strong>leader 的寫入也要帶 fencing token</strong>：就算做到以上全部，暫停仍然可能發生在「算完我是 leader」之後，跟上一節「寫入前先檢查租約」是同一個空檔。最後一道防線還是在資源端。</li>
+</ul>
+<p>這些規則實務上很少自己寫。能讓多台機器對一件事達成一致、在部分機器故障或網路分割時仍然不會選出兩個結果的系統，叫<strong>共識系統</strong>（consensus），例如 ZooKeeper、etcd，它們內部用 Raft、ZAB 這類演算法做到這件事。Kubernetes 的 Lease 物件、etcd、ZooKeeper 都有現成的 leader election。這一課的練習 3 實作上面的規則，讓你知道這些工具在替你做什麼。</p>
+<div class="callout practice"><strong>💡 實務上：「排程只跑一台」最簡單的做法常常不是選舉</strong><br>咖啡店的 API 開三台，報表排程卻只該跑一次（<a href="../../nestjs/lessons/21-scheduling-events.html">NestJS 課第 21 課</a>與<a href="../../devops/lessons/13-scaling.html">部署課第 13 課</a>遇過的問題）。最簡單的是把排程拆成獨立的 worker，只開一份；但部署時新舊版本會短暫重疊（例如 Kubernetes 預設的滾動更新會先啟動新的再停掉舊的），那幾秒內仍可能有兩份在跑。所以不管用單一 worker、advisory lock 還是 leader election，工作本身都要冪等，例如「今天的報表已寄出」的唯一紀錄。只有在服務很多、要自動接手又不能停的時候，才值得用 Kubernetes Lease 或 etcd 做正式的 leader election。</div>
+<p>第二條規則說「用自己的時鐘重新算」。但一台機器上不只一種時鐘，選錯了，這條規則本身就會出錯。</p>
+
+<h2>租約靠量時間：該用哪一種時鐘？</h2>
+<p>租約從頭到尾都在量時間：租了多久、還剩多久、該不該續約。程式裡能拿到的時間有兩種，用途完全不同：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>牆上時間（wall clock）</th><th>單調時鐘（monotonic clock）</th></tr>
+  <tr><td>是什麼</td><td>日曆時間：2026-10-30 03:00:00</td><td>從某個起點開始累計，只會往前</td></tr>
+  <tr><td>JavaScript</td><td><code>Date.now()</code>、<code>new Date()</code></td><td><code>performance.now()</code></td></tr>
+  <tr><td>會不會被調整</td><td>會：NTP 校時、手動改時間，可能往前跳也可能倒退</td><td>不會</td></tr>
+  <tr><td>適合</td><td>記錄事件發生的時刻、跟別人比對日期</td><td>量時間間隔、逾時、租約剩多久</td></tr>
+</table></div>
+<p>牆上時間就是牆上的時鐘：它要對得上真實世界的日期，所以作業系統會定期向網路上的時間伺服器校時，用的協定叫 NTP，不斷修正它，修正的方向可能往前也可能往回。MDN 的說法：<code>Date.now()</code> 依賴系統時鐘，會受系統或使用者調整時鐘影響；<code>performance.now()</code> 相對於單調時鐘的 <code>timeOrigin</code>，不會變小、也不受調整影響。<a href="07-sharding-consistent-hashing.html">第 7 課</a>的 Snowflake 遇過時鐘倒退產生重複 ID；用牆上時間量間隔也會出事。下面模擬一段真的花了 120ms 的工作，期間 NTP 把系統時間往回調了 2 秒。執行後比較兩行量到的耗時：</p>
+<div class="lab"><script type="code">
+// 量一段工作花多久：時鐘由參數傳入，才能模擬「量到一半被 NTP 往回調」
+function elapsed(clock: () => number, work: () => void): number {
+  const start = clock()
+  work()
+  return clock() - start
+}
+
+let wall = 1_761_786_000_000            // 牆上時間（毫秒）
+let mono = 5_000                         // 單調時鐘（毫秒）
+const work = () => {
+  wall += 120; mono += 120               // 工作真的花了 120ms
+  wall -= 2_000                          // 這期間 NTP 把系統時間往回調 2 秒
+}
+console.log('用牆上時間量：', elapsed(() => wall, work), 'ms')
+console.log('用單調時鐘量：', elapsed(() => mono, work), 'ms')
+console.log('這個 Worker 的 performance.now()：', performance.now().toFixed(1), 'ms（從 Worker 啟動起算）')
+</script></div>
+<p>用牆上時間量出負的耗時。換成租約，就是「租約還剩多久」被算成很久，leader 以為自己還有時間、不續約也不退位，逾時永遠不觸發。所以規則是：<strong>量間隔、算期限一律用單調時鐘</strong>。上一節的「用自己的時鐘算」，指的就是用單調時鐘記下送出續約的時刻，再加上租約長度減掉安全餘裕。</p>
+<p>單調時鐘也有限制：它的起點是程序自己定的，只在<strong>同一台機器的同一個程序</strong>裡有意義，不能傳給別台比較。api-1 的 5,000 和 api-2 的 5,000 不是同一個時刻。所以跨機器的租約只能靠兩個假設：各機器的時鐘<strong>走的速度</strong>差不多，以及安全餘裕夠大，能吸收速度上的小誤差。前面的鎖表用資料庫的 <code>now()</code> 判斷到期，就是讓「到期了沒」只由一個時鐘決定，避開各台時間不一致的問題。如果只需要知道事件的先後、不需要真實時間，也可以完全不靠時鐘，做法見課末。</p>
+<p>到這裡，報表需要的每一塊都自己做過了：唯一紀錄擋重寄、租約鎖省重複的工作、fencing token 擋過時的寫入、leader 依單調時鐘續約與退位。剩下的是工具選擇：單一 Redis 掛掉就沒有鎖，主從切換又可能遺失鎖，於是常有人提議改用 Redlock。</p>
+
+<h2>有人提議用 Redlock：該選哪一種鎖，上線後看什麼？</h2>
+<p><strong>Redlock</strong> 是 Redis 文件提出的演算法，目的是不依賴單一 Redis：準備 N 個（範例是 5 個）完全獨立的 Redis master，客戶端同時向全部設定鎖，在多數（至少 3 個）拿到、而且花的時間小於租約時才算取得；剩下的有效時間要扣掉取得花的時間和時鐘漂移。某一台掛掉，其他台的多數仍然記得這把鎖，所以不會像主從切換那樣遺失。</p>
+<p>Kleppmann 在 2016 年的文章指出兩個問題，兩個都是這一課前面遇過的：</p>
+<ul>
+  <li><strong>沒有 fencing token</strong>：Redlock 給的是隨機值，不是遞增數字，所以擋不住報表事故那種暫停情境。多幾台 Redis 讓鎖更不容易遺失，但持有者被暫停的問題不在 Redis 那一端。</li>
+  <li><strong>安全性依賴時間假設</strong>：它假設網路延遲、程序暫停、時鐘誤差都遠小於租約。這些假設一旦不成立（某一台時鐘往前跳、GC 暫停、封包卡住），兩個客戶端就可能都以為自己拿到鎖。</li>
+</ul>
+<p>Redis 的作者 antirez 寫了回應文章，Redis 文件把兩篇都附在 Redlock 段落最後，並在免責說明裡寫：在意正確性的話，要實作 fencing token，而且 Redis 的 TTL 不是單調時鐘。兩邊的論點值得各讀一次。回到第一節的問題「這把鎖是為了效率還是正確性」，實務上的選擇：</p>
+<div class="table-wrap"><table>
+  <tr><th>情況</th><th>建議</th></tr>
+  <tr><td>效率鎖：失效只是多做一次</td><td>單一 Redis 的 <code>SET NX PX</code>＋值相符才刪就夠了，寫清楚這把鎖是「大致上」互斥；不需要 Redlock 的 5 台</td></tr>
+  <tr><td>正確性鎖，已經有 PostgreSQL</td><td>交易、唯一約束、條件更新、advisory lock；需要租約時用鎖表，資源端用 <code>last_token</code> 擋</td></tr>
+  <tr><td>正確性鎖，跨很多服務、要高可用</td><td>共識系統（etcd、ZooKeeper）的鎖或 leader election，搭配 fencing token</td></tr>
+  <tr><td>資源不認識 token（外部 API）</td><td>鎖只能降低機率；靠冪等鍵讓重複呼叫無害</td></tr>
+</table></div>
+<p>咖啡店的報表兩種都有：「三台各算一次」是效率問題，單一 Redis 或 advisory lock 就夠；「舊報表蓋掉新報表」是正確性問題，資料已經在 PostgreSQL，用鎖表發 token、<code>reports.last_token</code> 擋；寄信給店長是外部動作，靠「已寄出」的唯一紀錄。三層各自負責一件事，Redlock 一層都不需要。</p>
+<div class="callout practice"><strong>💡 實務上：上線之後看三個數字</strong><br><strong>等鎖的時間</strong>：變長代表競爭變多，或有人拿太久。<strong>租約過期的次數</strong>：持有者沒有正常釋放，代表工作比 TTL 久、或有程序當機或被暫停。<strong>fencing 拒絕的次數</strong>：平常應該是 0；只要大於 0，就代表「兩個人都以為自己拿著鎖」真的發生過，fencing 剛剛救了你一次，要去查是哪次暫停或切換造成的。報表排程的話，三個數字都記在同一筆日誌裡，出事時才查得到是哪一天、哪一台。</div>
+
+<h2>補充與查表</h2>
+<p><strong>不用分散式鎖的常見解法</strong>（查表用，不用背）。第一節的思路套到其他「看起來要鎖」的問題：</p>
+<div class="table-wrap"><table>
+  <tr><th>問題</th><th>不用分散式鎖的解法</th><th>為什麼比較好</th></tr>
+  <tr><td>一張訂單只能付款一次</td><td>付款表的 <code>order_id</code> 加唯一約束（<a href="09-idempotency.html">第 9 課</a>）</td><td>第二筆 INSERT 直接失敗，沒有時間窗口</td></tr>
+  <tr><td>扣庫存不能扣成負數</td><td>條件更新 <code>UPDATE … SET stock = stock - 1 WHERE id = $1 AND stock &gt; 0</code></td><td>判斷和寫入在同一個原子操作裡</td></tr>
+  <tr><td>同一張訂單的事件要依序處理</td><td>依 <code>order_id</code> 分區，同一個 key 只有一個消費者（<a href="12-queues-outbox.html">第 12 課</a>）</td><td>用設計讓衝突不會發生</td></tr>
+  <tr><td>每天的報表只寄一次</td><td>只讓一個程序跑排程；或用 PostgreSQL advisory lock；再加上「今天寄過了」的唯一紀錄</td><td>最後一道是資料庫約束，鎖失效也不會重寄</td></tr>
+  <tr><td>工作佇列不能兩個 worker 拿同一筆</td><td><code>SELECT … FOR UPDATE SKIP LOCKED</code>（<a href="../../postgresql/lessons/33-job-queue.html">PostgreSQL 課第 33 課</a>）</td><td>鎖跟著交易，連線斷掉就釋放</td></tr>
+</table></div>
+<p><strong>Redis 的「值相符才刪」指令</strong>：Redis 8.4 開始有 <code>DELEX key IFEQ value</code>，直接做比對加刪除，不必寫 Lua；更舊的版本用正文的 Lua 腳本。</p>
+<pre>-- Redis 8.4 以後
+DELEX lock:daily-report IFEQ 7f3a9c…</pre>
+<p><strong>session 層級的 advisory lock</strong>：正文的 <code>pg_try_advisory_xact_lock</code> 跟著交易，交易結束自動釋放。session 層級的 <code>pg_try_advisory_lock</code> 不跟著交易，要自己呼叫 <code>pg_advisory_unlock</code> 釋放；連線斷掉時也會自動釋放（PostgreSQL 18 文件）。兩種的鎖生命都跟著連線或交易，不需要 TTL。</p>
+<p><strong>Lamport 邏輯時鐘</strong>：只需要知道事件的先後、不需要真實時間時，可以完全不靠時鐘。每個程序維護一個計數器，每發生一件事就加 1，收到別人的訊息時取「自己的、對方的」較大者再加 1。這樣有因果關係的事件，數字一定照順序。fencing token 也是同一個思路：用遞增的數字排順序，而不是用時間。</p>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：完成 <code>LeaseLockService</code>（一個在記憶體裡的鎖服務，時間只能用 <code>now()</code>）。租約在 <code>now() &gt;= expiresAt</code> 時就算過期，過期的租約等於不存在。</p>
+  <ul>
+    <li><code>acquire(resource, owner, ttlMs)</code>：資源沒人持有（或租約已過期）時授予，回傳 <code>{ ok: true, token, expiresAt }</code>，<code>expiresAt = now() + ttlMs</code>。<code>token</code> 是<strong>整個服務共用</strong>的 fencing token，第一次授予是 1，之後每次授予加 1（沒授予不加）。用一個計數器，就不必替每個資源另外保存「上次給到幾號」，資源的紀錄被刪掉也不會從 1 重來（ZooKeeper 的 <code>zxid</code> 也是全域遞增）。被持有時回傳 <code>{ ok: false, heldBy, retryAfterMs }</code>，<code>retryAfterMs</code> 是租約剩下的毫秒數。同一個 owner 已經持有時再 acquire 也是 <code>ok: false</code>（不可重入）。</li>
+    <li><code>renew(resource, owner, token, ttlMs)</code>：只有租約還沒過期、owner 和 token 都相符時，把 <code>expiresAt</code> 改成 <code>now() + ttlMs</code> 並回傳 <code>true</code>；否則 <code>false</code>。</li>
+    <li><code>release(resource, owner, token)</code>：只有租約還沒過期、owner 和 token 都相符時才釋放並回傳 <code>true</code>；否則 <code>false</code>，而且不能動到別人的鎖。</li>
+  </ul>
+  <script type="start">
+type Granted = { ok: true; token: number; expiresAt: number }
+type Denied = { ok: false; heldBy: string; retryAfterMs: number }
+
+class LeaseLockService {
+  constructor(now: () => number) {
+    throw new Error('TODO')
+  }
+
+  acquire(resource: string, owner: string, ttlMs: number): Granted | Denied {
+    throw new Error('TODO')
+  }
+
+  renew(resource: string, owner: string, token: number, ttlMs: number): boolean {
+    throw new Error('TODO')
+  }
+
+  release(resource: string, owner: string, token: number): boolean {
+    throw new Error('TODO')
+  }
+}
+
+let t = 0
+const locks = new LeaseLockService(() => t)
+console.log(locks.acquire('daily-report', 'api-1', 30_000))   // { ok: true, token: 1, expiresAt: 30000 }
+console.log(locks.acquire('daily-report', 'api-2', 30_000))   // { ok: false, heldBy: 'api-1', retryAfterMs: 30000 }
+t += 40_000                                                  // api-1 被暫停 40 秒
+console.log(locks.acquire('daily-report', 'api-2', 30_000))   // { ok: true, token: 2, expiresAt: 70000 }
+console.log(locks.release('daily-report', 'api-1', 1))        // false：不能刪掉 api-2 的鎖
+</script>
+  <script type="answer">
+type Granted = { ok: true; token: number; expiresAt: number }
+type Denied = { ok: false; heldBy: string; retryAfterMs: number }
+type Lease = { owner: string; token: number; expiresAt: number }
+
+class LeaseLockService {
+  private now: () => number
+  private leases = new Map<string, Lease>()
+  private lastToken = 0
+
+  constructor(now: () => number) {
+    this.now = now
+  }
+
+  // 還沒過期的租約；過期的當作不存在
+  private current(resource: string): Lease | undefined {
+    const lease = this.leases.get(resource)
+    return lease && this.now() < lease.expiresAt ? lease : undefined
+  }
+
+  acquire(resource: string, owner: string, ttlMs: number): Granted | Denied {
+    const held = this.current(resource)
+    if (held) return { ok: false, heldBy: held.owner, retryAfterMs: held.expiresAt - this.now() }
+    const lease = { owner, token: ++this.lastToken, expiresAt: this.now() + ttlMs }
+    this.leases.set(resource, lease)
+    return { ok: true, token: lease.token, expiresAt: lease.expiresAt }
+  }
+
+  renew(resource: string, owner: string, token: number, ttlMs: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    held.expiresAt = this.now() + ttlMs
+    return true
+  }
+
+  release(resource: string, owner: string, token: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    this.leases.delete(resource)
+    return true
+  }
+}
+
+let t = 0
+const locks = new LeaseLockService(() => t)
+console.log(locks.acquire('daily-report', 'api-1', 30_000))
+console.log(locks.acquire('daily-report', 'api-2', 30_000))
+t += 40_000
+console.log(locks.acquire('daily-report', 'api-2', 30_000))
+console.log(locks.release('daily-report', 'api-1', 1))
+</script>
+  <script type="tests">
+const real = { setTimeout: globalThis.setTimeout, setInterval: globalThis.setInterval, now: Date.now, perf: performance.now }
+const boom = () => { throw new Error('時間只能用 constructor 收到的 now()，不能用計時器、Date.now 或 performance.now') }
+function guard<T>(fn: () => T): T {
+  globalThis.setTimeout = boom as unknown as typeof setTimeout
+  globalThis.setInterval = boom as unknown as typeof setInterval
+  Date.now = boom
+  performance.now = boom
+  try { return fn() } finally {
+    globalThis.setTimeout = real.setTimeout
+    globalThis.setInterval = real.setInterval
+    Date.now = real.now
+    performance.now = real.perf
+  }
+}
+let clock = 100_000
+const s = guard(() => new LeaseLockService(() => clock))
+assert.deepEqual(guard(() => s.acquire('report', 'A', 1000)), { ok: true, token: 1, expiresAt: 101_000 }, '第一次授予：token 是 1，expiresAt = now() + ttlMs')
+clock += 300
+assert.deepEqual(guard(() => s.acquire('report', 'B', 1000)), { ok: false, heldBy: 'A', retryAfterMs: 700 }, '被 A 持有時要回傳 heldBy 和剩下的毫秒數（不是 ttlMs）')
+assert.deepEqual(guard(() => s.acquire('report', 'A', 1000)), { ok: false, heldBy: 'A', retryAfterMs: 700 }, '同一個 owner 再 acquire 也要失敗（不可重入）')
+const other = guard(() => s.acquire('stock', 'B', 5000))
+assert(other.ok && other.token === 2, '另一個資源也要拿得到，token 是整個服務共用的：第二次授予是 2；失敗的 acquire 不能讓 token 增加')
+clock = 100_999
+assert.equal(guard(() => s.acquire('report', 'B', 1000)).ok, false, '到期前 1 毫秒仍然被 A 持有')
+clock = 101_000
+const b = guard(() => s.acquire('report', 'B', 1000))
+assert.deepEqual(b, { ok: true, token: 3, expiresAt: 102_000 }, 'now() >= expiresAt 時租約已過期，B 要拿得到，token 變成 3')
+assert.equal(guard(() => s.renew('report', 'A', 1, 1000)), false, 'A 的租約過期、B 拿到之後，A 不能續約')
+assert.equal(guard(() => s.release('report', 'A', 1)), false, 'A 醒來呼叫 release 要回傳 false（經典的 DEL 錯誤：不能刪掉別人的鎖）')
+assert.deepEqual(guard(() => s.acquire('report', 'C', 1000)), { ok: false, heldBy: 'B', retryAfterMs: 1000 }, 'A 的 release 不能動到 B 的鎖：B 仍然持有')
+clock += 500
+assert.equal(guard(() => s.renew('report', 'B', 99, 1000)), false, 'token 不符不能續約')
+assert.equal(guard(() => s.renew('report', 'C', 3, 1000)), false, 'owner 不符不能續約')
+assert.equal(guard(() => s.renew('report', 'B', 3, 1000)), true, '持有者用正確的 token 在到期前續約要成功')
+clock += 900
+assert.deepEqual(guard(() => s.acquire('report', 'C', 1000)), { ok: false, heldBy: 'B', retryAfterMs: 100 }, '續約要把 expiresAt 改成「續約當下的 now() + ttlMs」')
+assert.equal(guard(() => s.release('report', 'B', 2)), false, 'token 不符不能釋放')
+assert.equal(guard(() => s.release('report', 'C', 3)), false, 'owner 不符不能釋放（token 對也不行）')
+assert.equal(guard(() => s.release('report', 'B', 3)), true, '持有者用正確的 token 釋放要成功')
+assert.equal(guard(() => s.release('report', 'B', 3)), false, '已經釋放的鎖再釋放一次要回傳 false')
+assert.deepEqual(guard(() => s.acquire('report', 'C', 1000)), { ok: true, token: 4, expiresAt: clock + 1000 }, '釋放後別人馬上拿得到，token 是 4')
+clock += 1000
+assert.equal(guard(() => s.renew('report', 'C', 4, 1000)), false, '租約過期了，即使沒有別人拿走，也不能再續約（殭屍續命）')
+assert.equal(guard(() => s.release('report', 'C', 4)), false, '過期的租約不能釋放')
+const again = guard(() => s.acquire('report', 'C', 1000))
+assert(again.ok && again.token === 5, '過期後重新取得要拿到新的 token（5）')
+</script>
+  <script type="wrong">
+// 錯：release 不檢查擁有者與 token（刪掉別人的鎖）
+type Granted = { ok: true; token: number; expiresAt: number }
+type Denied = { ok: false; heldBy: string; retryAfterMs: number }
+type Lease = { owner: string; token: number; expiresAt: number }
+class LeaseLockService {
+  private now: () => number
+  private leases = new Map<string, Lease>()
+  private lastToken = 0
+  constructor(now: () => number) { this.now = now }
+  private current(resource: string): Lease | undefined {
+    const lease = this.leases.get(resource)
+    return lease && this.now() < lease.expiresAt ? lease : undefined
+  }
+  acquire(resource: string, owner: string, ttlMs: number): Granted | Denied {
+    const held = this.current(resource)
+    if (held) return { ok: false, heldBy: held.owner, retryAfterMs: held.expiresAt - this.now() }
+    const lease = { owner, token: ++this.lastToken, expiresAt: this.now() + ttlMs }
+    this.leases.set(resource, lease)
+    return { ok: true, token: lease.token, expiresAt: lease.expiresAt }
+  }
+  renew(resource: string, owner: string, token: number, ttlMs: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    held.expiresAt = this.now() + ttlMs
+    return true
+  }
+  release(resource: string, owner: string, token: number): boolean {
+    return this.leases.delete(resource)
+  }
+}
+</script>
+  <script type="wrong">
+// 錯：renew 不檢查是否過期（殭屍續命）
+type Granted = { ok: true; token: number; expiresAt: number }
+type Denied = { ok: false; heldBy: string; retryAfterMs: number }
+type Lease = { owner: string; token: number; expiresAt: number }
+class LeaseLockService {
+  private now: () => number
+  private leases = new Map<string, Lease>()
+  private lastToken = 0
+  constructor(now: () => number) { this.now = now }
+  private current(resource: string): Lease | undefined {
+    const lease = this.leases.get(resource)
+    return lease && this.now() < lease.expiresAt ? lease : undefined
+  }
+  acquire(resource: string, owner: string, ttlMs: number): Granted | Denied {
+    const held = this.current(resource)
+    if (held) return { ok: false, heldBy: held.owner, retryAfterMs: held.expiresAt - this.now() }
+    const lease = { owner, token: ++this.lastToken, expiresAt: this.now() + ttlMs }
+    this.leases.set(resource, lease)
+    return { ok: true, token: lease.token, expiresAt: lease.expiresAt }
+  }
+  renew(resource: string, owner: string, token: number, ttlMs: number): boolean {
+    const held = this.leases.get(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    held.expiresAt = this.now() + ttlMs
+    return true
+  }
+  release(resource: string, owner: string, token: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    this.leases.delete(resource)
+    return true
+  }
+}
+</script>
+  <script type="wrong">
+// 錯：acquire 不檢查是否過期（過期的鎖永遠拿不到）
+type Granted = { ok: true; token: number; expiresAt: number }
+type Denied = { ok: false; heldBy: string; retryAfterMs: number }
+type Lease = { owner: string; token: number; expiresAt: number }
+class LeaseLockService {
+  private now: () => number
+  private leases = new Map<string, Lease>()
+  private lastToken = 0
+  constructor(now: () => number) { this.now = now }
+  private current(resource: string): Lease | undefined {
+    const lease = this.leases.get(resource)
+    return lease && this.now() < lease.expiresAt ? lease : undefined
+  }
+  acquire(resource: string, owner: string, ttlMs: number): Granted | Denied {
+    const held = this.leases.get(resource)
+    if (held) return { ok: false, heldBy: held.owner, retryAfterMs: Math.max(0, held.expiresAt - this.now()) }
+    const lease = { owner, token: ++this.lastToken, expiresAt: this.now() + ttlMs }
+    this.leases.set(resource, lease)
+    return { ok: true, token: lease.token, expiresAt: lease.expiresAt }
+  }
+  renew(resource: string, owner: string, token: number, ttlMs: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    held.expiresAt = this.now() + ttlMs
+    return true
+  }
+  release(resource: string, owner: string, token: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    this.leases.delete(resource)
+    return true
+  }
+}
+</script>
+  <script type="wrong">
+// 錯：每個資源的 token 各自從 1 開始
+type Granted = { ok: true; token: number; expiresAt: number }
+type Denied = { ok: false; heldBy: string; retryAfterMs: number }
+type Lease = { owner: string; token: number; expiresAt: number }
+class LeaseLockService {
+  private now: () => number
+  private leases = new Map<string, Lease>()
+  private tokens = new Map<string, number>()
+  constructor(now: () => number) { this.now = now }
+  private current(resource: string): Lease | undefined {
+    const lease = this.leases.get(resource)
+    return lease && this.now() < lease.expiresAt ? lease : undefined
+  }
+  acquire(resource: string, owner: string, ttlMs: number): Granted | Denied {
+    const held = this.current(resource)
+    if (held) return { ok: false, heldBy: held.owner, retryAfterMs: held.expiresAt - this.now() }
+    const token = (this.tokens.get(resource) ?? 0) + 1
+    this.tokens.set(resource, token)
+    const lease = { owner, token, expiresAt: this.now() + ttlMs }
+    this.leases.set(resource, lease)
+    return { ok: true, token, expiresAt: lease.expiresAt }
+  }
+  renew(resource: string, owner: string, token: number, ttlMs: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    held.expiresAt = this.now() + ttlMs
+    return true
+  }
+  release(resource: string, owner: string, token: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    this.leases.delete(resource)
+    return true
+  }
+}
+</script>
+  <script type="wrong">
+// 錯：失敗的 acquire 也讓 token 增加，retryAfterMs 回傳 ttlMs
+type Granted = { ok: true; token: number; expiresAt: number }
+type Denied = { ok: false; heldBy: string; retryAfterMs: number }
+type Lease = { owner: string; token: number; expiresAt: number }
+class LeaseLockService {
+  private now: () => number
+  private leases = new Map<string, Lease>()
+  private lastToken = 0
+  constructor(now: () => number) { this.now = now }
+  private current(resource: string): Lease | undefined {
+    const lease = this.leases.get(resource)
+    return lease && this.now() < lease.expiresAt ? lease : undefined
+  }
+  acquire(resource: string, owner: string, ttlMs: number): Granted | Denied {
+    const token = ++this.lastToken
+    const held = this.current(resource)
+    if (held) return { ok: false, heldBy: held.owner, retryAfterMs: ttlMs }
+    const lease = { owner, token, expiresAt: this.now() + ttlMs }
+    this.leases.set(resource, lease)
+    return { ok: true, token, expiresAt: lease.expiresAt }
+  }
+  renew(resource: string, owner: string, token: number, ttlMs: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    held.expiresAt = this.now() + ttlMs
+    return true
+  }
+  release(resource: string, owner: string, token: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    this.leases.delete(resource)
+    return true
+  }
+}
+</script>
+  <script type="wrong">
+// 錯：用 Date.now 判斷過期，沒有用注入的 now()
+type Granted = { ok: true; token: number; expiresAt: number }
+type Denied = { ok: false; heldBy: string; retryAfterMs: number }
+type Lease = { owner: string; token: number; expiresAt: number }
+class LeaseLockService {
+  private now: () => number
+  private leases = new Map<string, Lease>()
+  private lastToken = 0
+  constructor(now: () => number) { this.now = now }
+  private current(resource: string): Lease | undefined {
+    const lease = this.leases.get(resource)
+    return lease && Date.now() < lease.expiresAt ? lease : undefined
+  }
+  acquire(resource: string, owner: string, ttlMs: number): Granted | Denied {
+    const held = this.current(resource)
+    if (held) return { ok: false, heldBy: held.owner, retryAfterMs: held.expiresAt - this.now() }
+    const lease = { owner, token: ++this.lastToken, expiresAt: this.now() + ttlMs }
+    this.leases.set(resource, lease)
+    return { ok: true, token: lease.token, expiresAt: lease.expiresAt }
+  }
+  renew(resource: string, owner: string, token: number, ttlMs: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    held.expiresAt = this.now() + ttlMs
+    return true
+  }
+  release(resource: string, owner: string, token: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    this.leases.delete(resource)
+    return true
+  }
+}
+  <script type="wrong">
+// 錯：release 只比對 token，沒有比對 owner
+type Granted = { ok: true; token: number; expiresAt: number }
+type Denied = { ok: false; heldBy: string; retryAfterMs: number }
+type Lease = { owner: string; token: number; expiresAt: number }
+class LeaseLockService {
+  private now: () => number
+  private leases = new Map<string, Lease>()
+  private lastToken = 0
+  constructor(now: () => number) { this.now = now }
+  private current(resource: string): Lease | undefined {
+    const lease = this.leases.get(resource)
+    return lease && this.now() < lease.expiresAt ? lease : undefined
+  }
+  acquire(resource: string, owner: string, ttlMs: number): Granted | Denied {
+    const held = this.current(resource)
+    if (held) return { ok: false, heldBy: held.owner, retryAfterMs: held.expiresAt - this.now() }
+    const lease = { owner, token: ++this.lastToken, expiresAt: this.now() + ttlMs }
+    this.leases.set(resource, lease)
+    return { ok: true, token: lease.token, expiresAt: lease.expiresAt }
+  }
+  renew(resource: string, owner: string, token: number, ttlMs: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    held.expiresAt = this.now() + ttlMs
+    return true
+  }
+  release(resource: string, owner: string, token: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.token !== token) return false
+    this.leases.delete(resource)
+    return true
+  }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：練習 1 的 <code>LeaseLockService</code> 已經寫好放在最上面。完成兩件事：</p>
+  <ul>
+    <li><code>FencedStore</code>：<code>write(key, value, token)</code> 記住<strong>每個 key</strong> 看過的最大 token；token 比它小就回傳 <code>{ ok: false, reason: 'stale_token' }</code>，值不變；等於或比較大就寫入並回傳 <code>{ ok: true }</code>（同一個持有者可以寫很多次）。<code>read(key)</code> 回傳目前的值，沒寫過是 <code>undefined</code>。</li>
+    <li><code>simulatePause(locks, store, clock)</code>：重現本課的暫停情境。依序：<code>'A'</code> 取得 <code>'daily-report'</code> 的租約（ttl 1000ms）→ <code>clock.advance(1500)</code>（A 被暫停）→ <code>'B'</code> 取得同一個資源（ttl 1000ms）→ B 用自己的 token 把 <code>'B'</code> 寫進 key <code>'daily-report'</code> → A 醒來，用自己的 token 把 <code>'A'</code> 寫進同一個 key。回傳 <code>{ aWrite, bWrite }</code>：兩次寫入各自有沒有成功。拿不到鎖時丟 <code>Error</code>。</li>
+  </ul>
+  <script type="start">
+// （已經寫好）練習 1 的 LeaseLockService
+type Granted = { ok: true; token: number; expiresAt: number }
+type Denied = { ok: false; heldBy: string; retryAfterMs: number }
+type Lease = { owner: string; token: number; expiresAt: number }
+
+class LeaseLockService {
+  private now: () => number
+  private leases = new Map<string, Lease>()
+  private lastToken = 0
+  constructor(now: () => number) { this.now = now }
+  private current(resource: string): Lease | undefined {
+    const lease = this.leases.get(resource)
+    return lease && this.now() < lease.expiresAt ? lease : undefined
+  }
+  acquire(resource: string, owner: string, ttlMs: number): Granted | Denied {
+    const held = this.current(resource)
+    if (held) return { ok: false, heldBy: held.owner, retryAfterMs: held.expiresAt - this.now() }
+    const lease = { owner, token: ++this.lastToken, expiresAt: this.now() + ttlMs }
+    this.leases.set(resource, lease)
+    return { ok: true, token: lease.token, expiresAt: lease.expiresAt }
+  }
+  renew(resource: string, owner: string, token: number, ttlMs: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    held.expiresAt = this.now() + ttlMs
+    return true
+  }
+  release(resource: string, owner: string, token: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    this.leases.delete(resource)
+    return true
+  }
+}
+
+// ↓ 從這裡開始寫
+type WriteResult = { ok: true } | { ok: false; reason: 'stale_token' }
+
+class FencedStore {
+  write(key: string, value: string, token: number): WriteResult {
+    throw new Error('TODO')
+  }
+
+  read(key: string): string | undefined {
+    throw new Error('TODO')
+  }
+}
+
+function simulatePause(
+  locks: LeaseLockService,
+  store: FencedStore,
+  clock: { advance(ms: number): void },
+): { aWrite: boolean; bWrite: boolean } {
+  throw new Error('TODO')
+}
+
+let t = 0
+const store = new FencedStore()
+console.log(simulatePause(new LeaseLockService(() => t), store, { advance(ms) { t += ms } }))  // { aWrite: false, bWrite: true }
+console.log(store.read('daily-report'))                                                          // 'B'
+</script>
+  <script type="answer">
+// （已經寫好）練習 1 的 LeaseLockService
+type Granted = { ok: true; token: number; expiresAt: number }
+type Denied = { ok: false; heldBy: string; retryAfterMs: number }
+type Lease = { owner: string; token: number; expiresAt: number }
+
+class LeaseLockService {
+  private now: () => number
+  private leases = new Map<string, Lease>()
+  private lastToken = 0
+  constructor(now: () => number) { this.now = now }
+  private current(resource: string): Lease | undefined {
+    const lease = this.leases.get(resource)
+    return lease && this.now() < lease.expiresAt ? lease : undefined
+  }
+  acquire(resource: string, owner: string, ttlMs: number): Granted | Denied {
+    const held = this.current(resource)
+    if (held) return { ok: false, heldBy: held.owner, retryAfterMs: held.expiresAt - this.now() }
+    const lease = { owner, token: ++this.lastToken, expiresAt: this.now() + ttlMs }
+    this.leases.set(resource, lease)
+    return { ok: true, token: lease.token, expiresAt: lease.expiresAt }
+  }
+  renew(resource: string, owner: string, token: number, ttlMs: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    held.expiresAt = this.now() + ttlMs
+    return true
+  }
+  release(resource: string, owner: string, token: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    this.leases.delete(resource)
+    return true
+  }
+}
+
+type WriteResult = { ok: true } | { ok: false; reason: 'stale_token' }
+
+class FencedStore {
+  private values = new Map<string, string>()
+  private maxTokens = new Map<string, number>()
+
+  write(key: string, value: string, token: number): WriteResult {
+    const max = this.maxTokens.get(key)
+    if (max !== undefined && token < max) return { ok: false, reason: 'stale_token' }
+    this.maxTokens.set(key, token)
+    this.values.set(key, value)
+    return { ok: true }
+  }
+
+  read(key: string): string | undefined {
+    return this.values.get(key)
+  }
+}
+
+function simulatePause(
+  locks: LeaseLockService,
+  store: FencedStore,
+  clock: { advance(ms: number): void },
+): { aWrite: boolean; bWrite: boolean } {
+  const a = locks.acquire('daily-report', 'A', 1000)
+  if (!a.ok) throw new Error('A 應該拿得到鎖')
+  clock.advance(1500)                       // A 被暫停，租約過期
+  const b = locks.acquire('daily-report', 'B', 1000)
+  if (!b.ok) throw new Error('A 的租約過期後，B 應該拿得到鎖')
+  const bWrite = store.write('daily-report', 'B', b.token).ok
+  const aWrite = store.write('daily-report', 'A', a.token).ok   // A 醒來，帶著舊 token
+  return { aWrite, bWrite }
+}
+
+let t = 0
+const store = new FencedStore()
+console.log(simulatePause(new LeaseLockService(() => t), store, { advance(ms) { t += ms } }))
+console.log(store.read('daily-report'))
+</script>
+  <script type="tests">
+const s = new FencedStore()
+assert.equal(s.read('menu'), undefined, '沒寫過的 key 要回傳 undefined')
+assert.deepEqual({ ...s.write('menu', 'v1', 33) }, { ok: true }, '第一次寫入，不論 token 多少都要成功')
+assert.deepEqual({ ...s.write('menu', 'v2', 33) }, { ok: true }, '相同的 token 要能連續寫（同一個持有者寫很多次）')
+assert.equal(s.read('menu'), 'v2', '寫入成功後 read 要讀到新值')
+assert.deepEqual({ ...s.write('menu', 'old', 32) }, { ok: false, reason: 'stale_token' }, '比看過的最大 token 小，要回傳 { ok: false, reason: \'stale_token\' }')
+assert.equal(s.read('menu'), 'v2', '被拒絕的寫入不能改到值')
+assert.deepEqual({ ...s.write('menu', 'v3', 40) }, { ok: true }, 'token 可以跳號，比較大就接受')
+assert.equal(s.write('menu', 'v-old', 34).ok, false, '寫過 40 之後，34 也要被拒絕')
+assert.equal(s.write('menu', 'v-old', 39).ok, false, '被拒絕的寫入不能把記住的最大 token 降低')
+assert.equal(s.read('menu'), 'v3', '最後的值是 token 40 寫的')
+assert.deepEqual({ ...s.write('stock', 's1', 1) }, { ok: true }, '每個 key 各自記住最大 token：menu 看過 40 不影響 stock')
+assert.equal(s.read('stock'), 's1', '不同的 key 互不影響')
+const fresh = new FencedStore()
+assert.equal(fresh.read('menu'), undefined, '每個 FencedStore 各自保存資料：新的儲存讀不到別的儲存寫的值')
+assert.equal(fresh.write('menu', 'n1', 1).ok, true, '每個 FencedStore 各自記住最大 token：新的儲存要接受 token 1')
+
+let t2 = 0
+const store2 = new FencedStore()
+const r = simulatePause(new LeaseLockService(() => t2), store2, { advance(ms: number) { t2 += ms } })
+assert.deepEqual({ ...r }, { aWrite: false, bWrite: true }, '有 fencing 時：B 的寫入成功，A 帶舊 token 的寫入被拒絕')
+assert.equal(store2.read('daily-report'), 'B', '最後的值要是 B 寫的')
+assert(t2 >= 1000, '要用 clock.advance 讓 A 的租約過期')
+
+// 換一個「什麼都接受」的儲存，檢查 simulatePause 真的照順序寫，而不是寫死回傳值
+let t3 = 0
+const writes: Array<[string, string, number]> = []
+const naive = {
+  write(key: string, value: string, token: number) { writes.push([key, value, token]); return { ok: true } as const },
+  read() { return undefined },
+} as unknown as FencedStore
+const r3 = simulatePause(new LeaseLockService(() => t3), naive, { advance(ms: number) { t3 += ms } })
+assert.deepEqual(writes, [['daily-report', 'B', 2], ['daily-report', 'A', 1]], '要先由 B 用 token 2 寫入，再由 A 用自己的 token 1 寫入（key 是 daily-report）')
+assert.deepEqual({ ...r3 }, { aWrite: true, bWrite: true }, '回傳值要來自 store.write 的結果，不能寫死：沒有 fencing 的儲存兩次都會成功')
+</script>
+  <script type="wrong">
+type Granted = { ok: true; token: number; expiresAt: number }
+type Denied = { ok: false; heldBy: string; retryAfterMs: number }
+type Lease = { owner: string; token: number; expiresAt: number }
+class LeaseLockService {
+  private now: () => number
+  private leases = new Map<string, Lease>()
+  private lastToken = 0
+  constructor(now: () => number) { this.now = now }
+  private current(resource: string): Lease | undefined {
+    const lease = this.leases.get(resource)
+    return lease && this.now() < lease.expiresAt ? lease : undefined
+  }
+  acquire(resource: string, owner: string, ttlMs: number): Granted | Denied {
+    const held = this.current(resource)
+    if (held) return { ok: false, heldBy: held.owner, retryAfterMs: held.expiresAt - this.now() }
+    const lease = { owner, token: ++this.lastToken, expiresAt: this.now() + ttlMs }
+    this.leases.set(resource, lease)
+    return { ok: true, token: lease.token, expiresAt: lease.expiresAt }
+  }
+}
+// 錯：相同的 token 也拒絕
+type WriteResult = { ok: true } | { ok: false; reason: 'stale_token' }
+class FencedStore {
+  private values = new Map<string, string>()
+  private maxTokens = new Map<string, number>()
+  write(key: string, value: string, token: number): WriteResult {
+    const max = this.maxTokens.get(key)
+    if (max !== undefined && token <= max) return { ok: false, reason: 'stale_token' }
+    this.maxTokens.set(key, token)
+    this.values.set(key, value)
+    return { ok: true }
+  }
+  read(key: string): string | undefined { return this.values.get(key) }
+}
+function simulatePause(locks: LeaseLockService, store: FencedStore, clock: { advance(ms: number): void }): { aWrite: boolean; bWrite: boolean } {
+  const a = locks.acquire('daily-report', 'A', 1000)
+  if (!a.ok) throw new Error('A')
+  clock.advance(1500)
+  const b = locks.acquire('daily-report', 'B', 1000)
+  if (!b.ok) throw new Error('B')
+  const bWrite = store.write('daily-report', 'B', b.token).ok
+  const aWrite = store.write('daily-report', 'A', a.token).ok
+  return { aWrite, bWrite }
+}
+</script>
+  <script type="wrong">
+type Granted = { ok: true; token: number; expiresAt: number }
+type Denied = { ok: false; heldBy: string; retryAfterMs: number }
+type Lease = { owner: string; token: number; expiresAt: number }
+class LeaseLockService {
+  private now: () => number
+  private leases = new Map<string, Lease>()
+  private lastToken = 0
+  constructor(now: () => number) { this.now = now }
+  private current(resource: string): Lease | undefined {
+    const lease = this.leases.get(resource)
+    return lease && this.now() < lease.expiresAt ? lease : undefined
+  }
+  acquire(resource: string, owner: string, ttlMs: number): Granted | Denied {
+    const held = this.current(resource)
+    if (held) return { ok: false, heldBy: held.owner, retryAfterMs: held.expiresAt - this.now() }
+    const lease = { owner, token: ++this.lastToken, expiresAt: this.now() + ttlMs }
+    this.leases.set(resource, lease)
+    return { ok: true, token: lease.token, expiresAt: lease.expiresAt }
+  }
+}
+// 錯：所有 key 共用一個最大 token
+type WriteResult = { ok: true } | { ok: false; reason: 'stale_token' }
+class FencedStore {
+  private values = new Map<string, string>()
+  private maxToken = -Infinity
+  write(key: string, value: string, token: number): WriteResult {
+    if (token < this.maxToken) return { ok: false, reason: 'stale_token' }
+    this.maxToken = token
+    this.values.set(key, value)
+    return { ok: true }
+  }
+  read(key: string): string | undefined { return this.values.get(key) }
+}
+function simulatePause(locks: LeaseLockService, store: FencedStore, clock: { advance(ms: number): void }): { aWrite: boolean; bWrite: boolean } {
+  const a = locks.acquire('daily-report', 'A', 1000)
+  if (!a.ok) throw new Error('A')
+  clock.advance(1500)
+  const b = locks.acquire('daily-report', 'B', 1000)
+  if (!b.ok) throw new Error('B')
+  const bWrite = store.write('daily-report', 'B', b.token).ok
+  const aWrite = store.write('daily-report', 'A', a.token).ok
+  return { aWrite, bWrite }
+}
+</script>
+  <script type="wrong">
+type Granted = { ok: true; token: number; expiresAt: number }
+type Denied = { ok: false; heldBy: string; retryAfterMs: number }
+type Lease = { owner: string; token: number; expiresAt: number }
+class LeaseLockService {
+  private now: () => number
+  private leases = new Map<string, Lease>()
+  private lastToken = 0
+  constructor(now: () => number) { this.now = now }
+  private current(resource: string): Lease | undefined {
+    const lease = this.leases.get(resource)
+    return lease && this.now() < lease.expiresAt ? lease : undefined
+  }
+  acquire(resource: string, owner: string, ttlMs: number): Granted | Denied {
+    const held = this.current(resource)
+    if (held) return { ok: false, heldBy: held.owner, retryAfterMs: held.expiresAt - this.now() }
+    const lease = { owner, token: ++this.lastToken, expiresAt: this.now() + ttlMs }
+    this.leases.set(resource, lease)
+    return { ok: true, token: lease.token, expiresAt: lease.expiresAt }
+  }
+}
+// 錯：記了 token 卻沒有拒絕比較小的（只記最後一次）
+type WriteResult = { ok: true } | { ok: false; reason: 'stale_token' }
+class FencedStore {
+  private values = new Map<string, string>()
+  private lastTokens = new Map<string, number>()
+  write(key: string, value: string, token: number): WriteResult {
+    this.lastTokens.set(key, token)
+    this.values.set(key, value)
+    return { ok: true }
+  }
+  read(key: string): string | undefined { return this.values.get(key) }
+}
+function simulatePause(locks: LeaseLockService, store: FencedStore, clock: { advance(ms: number): void }): { aWrite: boolean; bWrite: boolean } {
+  const a = locks.acquire('daily-report', 'A', 1000)
+  if (!a.ok) throw new Error('A')
+  clock.advance(1500)
+  const b = locks.acquire('daily-report', 'B', 1000)
+  if (!b.ok) throw new Error('B')
+  const bWrite = store.write('daily-report', 'B', b.token).ok
+  const aWrite = store.write('daily-report', 'A', a.token).ok
+  return { aWrite, bWrite }
+}
+</script>
+  <script type="wrong">
+type Granted = { ok: true; token: number; expiresAt: number }
+type Denied = { ok: false; heldBy: string; retryAfterMs: number }
+type Lease = { owner: string; token: number; expiresAt: number }
+class LeaseLockService {
+  private now: () => number
+  private leases = new Map<string, Lease>()
+  private lastToken = 0
+  constructor(now: () => number) { this.now = now }
+  private current(resource: string): Lease | undefined {
+    const lease = this.leases.get(resource)
+    return lease && this.now() < lease.expiresAt ? lease : undefined
+  }
+  acquire(resource: string, owner: string, ttlMs: number): Granted | Denied {
+    const held = this.current(resource)
+    if (held) return { ok: false, heldBy: held.owner, retryAfterMs: held.expiresAt - this.now() }
+    const lease = { owner, token: ++this.lastToken, expiresAt: this.now() + ttlMs }
+    this.leases.set(resource, lease)
+    return { ok: true, token: lease.token, expiresAt: lease.expiresAt }
+  }
+}
+type WriteResult = { ok: true } | { ok: false; reason: 'stale_token' }
+class FencedStore {
+  private values = new Map<string, string>()
+  private maxTokens = new Map<string, number>()
+  write(key: string, value: string, token: number): WriteResult {
+    const max = this.maxTokens.get(key)
+    if (max !== undefined && token < max) return { ok: false, reason: 'stale_token' }
+    this.maxTokens.set(key, token)
+    this.values.set(key, value)
+    return { ok: true }
+  }
+  read(key: string): string | undefined { return this.values.get(key) }
+}
+// 錯：simulatePause 寫死回傳值
+function simulatePause(locks: LeaseLockService, store: FencedStore, clock: { advance(ms: number): void }): { aWrite: boolean; bWrite: boolean } {
+  const a = locks.acquire('daily-report', 'A', 1000)
+  if (!a.ok) throw new Error('A')
+  clock.advance(1500)
+  const b = locks.acquire('daily-report', 'B', 1000)
+  if (!b.ok) throw new Error('B')
+  store.write('daily-report', 'B', b.token)
+  store.write('daily-report', 'A', a.token)
+  return { aWrite: false, bWrite: true }
+}
+</script>
+  <script type="wrong">
+type Granted = { ok: true; token: number; expiresAt: number }
+type Denied = { ok: false; heldBy: string; retryAfterMs: number }
+type Lease = { owner: string; token: number; expiresAt: number }
+class LeaseLockService {
+  private now: () => number
+  private leases = new Map<string, Lease>()
+  private lastToken = 0
+  constructor(now: () => number) { this.now = now }
+  private current(resource: string): Lease | undefined {
+    const lease = this.leases.get(resource)
+    return lease && this.now() < lease.expiresAt ? lease : undefined
+  }
+  acquire(resource: string, owner: string, ttlMs: number): Granted | Denied {
+    const held = this.current(resource)
+    if (held) return { ok: false, heldBy: held.owner, retryAfterMs: held.expiresAt - this.now() }
+    const lease = { owner, token: ++this.lastToken, expiresAt: this.now() + ttlMs }
+    this.leases.set(resource, lease)
+    return { ok: true, token: lease.token, expiresAt: lease.expiresAt }
+  }
+}
+type WriteResult = { ok: true } | { ok: false; reason: 'stale_token' }
+class FencedStore {
+  private values = new Map<string, string>()
+  private maxTokens = new Map<string, number>()
+  write(key: string, value: string, token: number): WriteResult {
+    const max = this.maxTokens.get(key)
+    if (max !== undefined && token < max) return { ok: false, reason: 'stale_token' }
+    this.maxTokens.set(key, token)
+    this.values.set(key, value)
+    return { ok: true }
+  }
+  read(key: string): string | undefined { return this.values.get(key) }
+}
+// 錯：A 在暫停之前就寫完了（沒有重現暫停情境）
+function simulatePause(locks: LeaseLockService, store: FencedStore, clock: { advance(ms: number): void }): { aWrite: boolean; bWrite: boolean } {
+  const a = locks.acquire('daily-report', 'A', 1000)
+  if (!a.ok) throw new Error('A')
+  const aWrite = store.write('daily-report', 'A', a.token).ok
+  clock.advance(1500)
+  const b = locks.acquire('daily-report', 'B', 1000)
+  if (!b.ok) throw new Error('B')
+  const bWrite = store.write('daily-report', 'B', b.token).ok
+  return { aWrite, bWrite }
+}
+</script>
+  <script type="wrong">
+type Granted = { ok: true; token: number; expiresAt: number }
+type Denied = { ok: false; heldBy: string; retryAfterMs: number }
+type Lease = { owner: string; token: number; expiresAt: number }
+class LeaseLockService {
+  private now: () => number
+  private leases = new Map<string, Lease>()
+  private lastToken = 0
+  constructor(now: () => number) { this.now = now }
+  private current(resource: string): Lease | undefined {
+    const lease = this.leases.get(resource)
+    return lease && this.now() < lease.expiresAt ? lease : undefined
+  }
+  acquire(resource: string, owner: string, ttlMs: number): Granted | Denied {
+    const held = this.current(resource)
+    if (held) return { ok: false, heldBy: held.owner, retryAfterMs: held.expiresAt - this.now() }
+    const lease = { owner, token: ++this.lastToken, expiresAt: this.now() + ttlMs }
+    this.leases.set(resource, lease)
+    return { ok: true, token: lease.token, expiresAt: lease.expiresAt }
+  }
+}
+type WriteResult = { ok: true } | { ok: false; reason: 'stale_token' }
+class FencedStore {
+  private values = new Map<string, string>()
+  private maxTokens = new Map<string, number>()
+  write(key: string, value: string, token: number): WriteResult {
+    const max = this.maxTokens.get(key)
+    if (max !== undefined && token < max) return { ok: false, reason: 'stale_token' }
+    this.maxTokens.set(key, token)
+    this.values.set(key, value)
+    return { ok: true }
+  }
+  read(key: string): string | undefined { return this.values.get(key) }
+}
+// 錯：用租約的 expiresAt 當成 token 帶給儲存（要用鎖服務給的 fencing token）
+function simulatePause(locks: LeaseLockService, store: FencedStore, clock: { advance(ms: number): void }): { aWrite: boolean; bWrite: boolean } {
+  const a = locks.acquire('daily-report', 'A', 1000)
+  if (!a.ok) throw new Error('A')
+  clock.advance(1500)
+  const b = locks.acquire('daily-report', 'B', 1000)
+  if (!b.ok) throw new Error('B')
+  const bWrite = store.write('daily-report', 'B', b.expiresAt).ok
+  const aWrite = store.write('daily-report', 'A', a.expiresAt).ok
+  return { aWrite, bWrite }
+}
+</script>
+  <script type="wrong">
+type Granted = { ok: true; token: number; expiresAt: number }
+type Denied = { ok: false; heldBy: string; retryAfterMs: number }
+type Lease = { owner: string; token: number; expiresAt: number }
+class LeaseLockService {
+  private now: () => number
+  private leases = new Map<string, Lease>()
+  private lastToken = 0
+  constructor(now: () => number) { this.now = now }
+  private current(resource: string): Lease | undefined {
+    const lease = this.leases.get(resource)
+    return lease && this.now() < lease.expiresAt ? lease : undefined
+  }
+  acquire(resource: string, owner: string, ttlMs: number): Granted | Denied {
+    const held = this.current(resource)
+    if (held) return { ok: false, heldBy: held.owner, retryAfterMs: held.expiresAt - this.now() }
+    const lease = { owner, token: ++this.lastToken, expiresAt: this.now() + ttlMs }
+    this.leases.set(resource, lease)
+    return { ok: true, token: lease.token, expiresAt: lease.expiresAt }
+  }
+}
+// 錯：資料放在 class 外面，所有 FencedStore 共用
+type WriteResult = { ok: true } | { ok: false; reason: 'stale_token' }
+const values = new Map<string, string>()
+const maxTokens = new Map<string, number>()
+class FencedStore {
+  write(key: string, value: string, token: number): WriteResult {
+    const max = maxTokens.get(key)
+    if (max !== undefined && token < max) return { ok: false, reason: 'stale_token' }
+    maxTokens.set(key, token)
+    values.set(key, value)
+    return { ok: true }
+  }
+  read(key: string): string | undefined { return values.get(key) }
+}
+function simulatePause(locks: LeaseLockService, store: FencedStore, clock: { advance(ms: number): void }): { aWrite: boolean; bWrite: boolean } {
+  const a = locks.acquire('daily-report', 'A', 1000)
+  if (!a.ok) throw new Error('A')
+  clock.advance(1500)
+  const b = locks.acquire('daily-report', 'B', 1000)
+  if (!b.ok) throw new Error('B')
+  const bWrite = store.write('daily-report', 'B', b.token).ok
+  const aWrite = store.write('daily-report', 'A', a.token).ok
+  return { aWrite, bWrite }
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：用租約做 leader election。練習 1 的 <code>LeaseLockService</code> 已經寫好。完成 <code>createLeaderElector(opts)</code>，回傳三個方法：</p>
+  <ul>
+    <li><code>tick()</code>：由外部定期呼叫。目前持有租約時用 <code>renew</code> 續約（不是重新 acquire），成功就把自己記的到期時間更新成「呼叫 renew 之前的 <code>now()</code> + <code>ttlMs</code>」；失敗就丟掉租約、變回 follower，並呼叫 <code>onStepDown()</code> 一次（這次 tick 不馬上重新取得）。沒有持有租約時嘗試 <code>acquire</code>。</li>
+    <li><code>isLeader()</code>：持有租約，而且 <code>now() &lt; 到期時間 − safetyMarginMs</code> 時才是 <code>true</code>。每次都要用 <code>now()</code> 重新判斷：就算一直沒有呼叫 <code>tick</code>（程序被暫停），時間到了也要回傳 <code>false</code>。</li>
+    <li><code>token()</code>：目前持有的租約 token，沒有時是 <code>null</code>。</li>
+  </ul>
+  <script type="start">
+// （已經寫好）練習 1 的 LeaseLockService
+type Granted = { ok: true; token: number; expiresAt: number }
+type Denied = { ok: false; heldBy: string; retryAfterMs: number }
+type Lease = { owner: string; token: number; expiresAt: number }
+
+class LeaseLockService {
+  private now: () => number
+  private leases = new Map<string, Lease>()
+  private lastToken = 0
+  constructor(now: () => number) { this.now = now }
+  private current(resource: string): Lease | undefined {
+    const lease = this.leases.get(resource)
+    return lease && this.now() < lease.expiresAt ? lease : undefined
+  }
+  acquire(resource: string, owner: string, ttlMs: number): Granted | Denied {
+    const held = this.current(resource)
+    if (held) return { ok: false, heldBy: held.owner, retryAfterMs: held.expiresAt - this.now() }
+    const lease = { owner, token: ++this.lastToken, expiresAt: this.now() + ttlMs }
+    this.leases.set(resource, lease)
+    return { ok: true, token: lease.token, expiresAt: lease.expiresAt }
+  }
+  renew(resource: string, owner: string, token: number, ttlMs: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    held.expiresAt = this.now() + ttlMs
+    return true
+  }
+  release(resource: string, owner: string, token: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    this.leases.delete(resource)
+    return true
+  }
+}
+
+// ↓ 從這裡開始寫
+type ElectorOptions = {
+  locks: LeaseLockService
+  resource: string
+  owner: string
+  ttlMs: number
+  safetyMarginMs: number
+  now: () => number
+  onStepDown: () => void
+}
+type Elector = { tick(): void; isLeader(): boolean; token(): number | null }
+
+function createLeaderElector(opts: ElectorOptions): Elector {
+  throw new Error('TODO')
+}
+
+let t = 0
+const locks = new LeaseLockService(() => t)
+const make = (owner: string) => createLeaderElector({
+  locks, resource: 'report-scheduler', owner, ttlMs: 30_000, safetyMarginMs: 5_000,
+  now: () => t, onStepDown: () => console.log(owner, '退位'),
+})
+const api1 = make('api-1')
+const api2 = make('api-2')
+api1.tick(); api2.tick()
+console.log('api-1 是 leader：', api1.isLeader(), 'token', api1.token())   // true 1
+t += 26_000                                                                // api-1 被暫停，沒有 tick
+console.log('暫停中的 api-1 是 leader：', api1.isLeader())                  // false（超過 30s − 5s）
+t += 4_000; api2.tick()
+console.log('api-2 接手：', api2.isLeader(), 'token', api2.token())       // true 2
+api1.tick()                                                                // 印出「api-1 退位」
+</script>
+  <script type="answer">
+// （已經寫好）練習 1 的 LeaseLockService
+type Granted = { ok: true; token: number; expiresAt: number }
+type Denied = { ok: false; heldBy: string; retryAfterMs: number }
+type Lease = { owner: string; token: number; expiresAt: number }
+
+class LeaseLockService {
+  private now: () => number
+  private leases = new Map<string, Lease>()
+  private lastToken = 0
+  constructor(now: () => number) { this.now = now }
+  private current(resource: string): Lease | undefined {
+    const lease = this.leases.get(resource)
+    return lease && this.now() < lease.expiresAt ? lease : undefined
+  }
+  acquire(resource: string, owner: string, ttlMs: number): Granted | Denied {
+    const held = this.current(resource)
+    if (held) return { ok: false, heldBy: held.owner, retryAfterMs: held.expiresAt - this.now() }
+    const lease = { owner, token: ++this.lastToken, expiresAt: this.now() + ttlMs }
+    this.leases.set(resource, lease)
+    return { ok: true, token: lease.token, expiresAt: lease.expiresAt }
+  }
+  renew(resource: string, owner: string, token: number, ttlMs: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    held.expiresAt = this.now() + ttlMs
+    return true
+  }
+  release(resource: string, owner: string, token: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    this.leases.delete(resource)
+    return true
+  }
+}
+
+type ElectorOptions = {
+  locks: LeaseLockService
+  resource: string
+  owner: string
+  ttlMs: number
+  safetyMarginMs: number
+  now: () => number
+  onStepDown: () => void
+}
+type Elector = { tick(): void; isLeader(): boolean; token(): number | null }
+
+function createLeaderElector(opts: ElectorOptions): Elector {
+  const { locks, resource, owner, ttlMs, safetyMarginMs, now, onStepDown } = opts
+  let lease: { token: number; expiresAt: number } | null = null
+
+  return {
+    tick() {
+      if (lease) {
+        const sentAt = now()   // 從送出續約之前起算，回應晚到的時間也算進去
+        if (locks.renew(resource, owner, lease.token, ttlMs)) {
+          lease.expiresAt = sentAt + ttlMs
+        } else {
+          lease = null
+          onStepDown()
+        }
+        return
+      }
+      const r = locks.acquire(resource, owner, ttlMs)
+      if (r.ok) lease = { token: r.token, expiresAt: r.expiresAt }
+    },
+    isLeader() {
+      return lease !== null && now() < lease.expiresAt - safetyMarginMs
+    },
+    token() {
+      return lease ? lease.token : null
+    },
+  }
+}
+
+let t = 0
+const locks = new LeaseLockService(() => t)
+const make = (owner: string) => createLeaderElector({
+  locks, resource: 'report-scheduler', owner, ttlMs: 30_000, safetyMarginMs: 5_000,
+  now: () => t, onStepDown: () => console.log(owner, '退位'),
+})
+const api1 = make('api-1')
+const api2 = make('api-2')
+api1.tick(); api2.tick()
+console.log('api-1 是 leader：', api1.isLeader(), 'token', api1.token())
+t += 26_000
+console.log('暫停中的 api-1 是 leader：', api1.isLeader())
+t += 4_000; api2.tick()
+console.log('api-2 接手：', api2.isLeader(), 'token', api2.token())
+api1.tick()
+</script>
+  <script type="tests">
+const real = { setTimeout: globalThis.setTimeout, setInterval: globalThis.setInterval, now: Date.now, perf: performance.now }
+const boom = () => { throw new Error('時間只能用 opts.now()，不能用計時器、Date.now 或 performance.now') }
+function guard<T>(fn: () => T): T {
+  globalThis.setTimeout = boom as unknown as typeof setTimeout
+  globalThis.setInterval = boom as unknown as typeof setInterval
+  Date.now = boom
+  performance.now = boom
+  try { return fn() } finally {
+    globalThis.setTimeout = real.setTimeout
+    globalThis.setInterval = real.setInterval
+    Date.now = real.now
+    performance.now = real.perf
+  }
+}
+let clock = 0
+const svc = new LeaseLockService(() => clock)
+const downs = { a: 0, b: 0 }
+const mk = (owner: 'a' | 'b') => guard(() => createLeaderElector({
+  locks: svc, resource: 'scheduler', owner, ttlMs: 1000, safetyMarginMs: 200,
+  now: () => clock, onStepDown: () => { downs[owner]++ },
+}))
+const a = mk('a')
+const b = mk('b')
+assert.equal(guard(() => a.isLeader()), false, '還沒 tick 之前不是 leader')
+assert.equal(guard(() => a.token()), null, '沒有租約時 token() 是 null')
+guard(() => { a.tick(); b.tick() })
+assert.equal(guard(() => a.isLeader()), true, '先 tick 的 a 要拿到租約、成為 leader')
+assert.equal(guard(() => a.token()), 1, 'a 的 token 是 1')
+assert.equal(guard(() => b.isLeader()), false, 'b 拿不到租約，不是 leader')
+assert.equal(guard(() => b.token()), null, 'b 沒有租約，token() 是 null')
+assert.equal(downs.b, 0, '本來就不是 leader 的 b 拿不到租約時，不能呼叫 onStepDown')
+
+for (let k = 0; k < 10; k++) {
+  clock += 300
+  guard(() => { a.tick(); b.tick() })
+  assert(guard(() => a.isLeader()) && !guard(() => b.isLeader()), `持續 tick 的 a 要一直是 leader（第 ${k + 1} 次 tick，t = ${clock}）`)
+  assert.equal(guard(() => a.token()), 1, '續約不能換 token：要用 renew，不能釋放再重新 acquire')
+}
+assert.equal(downs.a, 0, '續約成功時不能呼叫 onStepDown')
+
+// a 被暫停：之後不再呼叫 a.tick()。a 最後一次續約在 t = 3000，租約到 4000
+clock = 3799
+assert.equal(guard(() => a.isLeader()), true, '還在安全餘裕之前（3799 < 4000 − 200），a 仍是 leader')
+clock = 3800
+assert.equal(guard(() => a.isLeader()), false, '到了 expiresAt − safetyMarginMs（3800），a 就要自己停手，即使沒有呼叫 tick：isLeader() 要每次用 now() 重新判斷，並扣掉安全餘裕')
+for (clock = 3800; clock <= 6000; clock += 100) {
+  guard(() => b.tick())
+  assert(!(guard(() => a.isLeader()) && guard(() => b.isLeader())), `t = ${clock} 時 a 和 b 同時是 leader（split-brain）`)
+}
+assert.equal(guard(() => b.isLeader()), true, 'a 的租約過期後，持續 tick 的 b 要接手')
+assert.equal(guard(() => b.token()), 2, 'b 接手後拿到比較大的 token 2')
+
+guard(() => a.tick())
+assert.equal(downs.a, 1, 'a 醒來 tick 時續約失敗，要呼叫 onStepDown 一次')
+assert.equal(guard(() => a.isLeader()), false, '續約失敗後 a 不是 leader')
+assert.equal(guard(() => a.token()), null, '續約失敗要丟掉租約：token() 回到 null')
+guard(() => a.tick())
+assert.equal(downs.a, 1, '已經是 follower 時拿不到租約，不能再呼叫 onStepDown')
+assert.equal(guard(() => b.token()), 2, 'b 持續是 leader')
+
+// b 也停了：等 b 的租約過期，a 重新取得，token 要變大
+clock += 1000
+guard(() => a.tick())
+assert.equal(guard(() => a.isLeader()), true, 'b 的租約過期後，a 的 tick 要重新取得租約')
+assert.equal(guard(() => a.token()), 3, '重新取得是新的一任：token 3')
+assert.equal(downs.b, 0, 'b 沒有呼叫 tick，所以還沒觸發 onStepDown')
+
+// 續約的回應在路上花了 50ms：到期時間要從「呼叫 renew 之前」的 now() 起算
+let c2 = 0
+const svc2 = new LeaseLockService(() => c2)
+const slow = {
+  acquire: (r: string, o: string, ttl: number) => svc2.acquire(r, o, ttl),
+  renew: (r: string, o: string, tk: number, ttl: number) => { const ok = svc2.renew(r, o, tk, ttl); c2 += 50; return ok },
+} as unknown as LeaseLockService
+const e = guard(() => createLeaderElector({ locks: slow, resource: 'scheduler', owner: 'e', ttlMs: 1000, safetyMarginMs: 200, now: () => c2, onStepDown: () => {} }))
+guard(() => e.tick())
+c2 = 500
+guard(() => e.tick())
+c2 = 1299
+assert.equal(guard(() => e.isLeader()), true, '在 t = 500 續約成功，到期時間是 500 + 1000，1299 時仍是 leader')
+c2 = 1300
+assert.equal(guard(() => e.isLeader()), false, '在 t = 500 送出續約，到期時間要用 500 + ttlMs 算（不是回應回來時的 550）：1300 = 1500 − 200 時要停手')
+</script>
+  <script type="wrong">
+// 錯：isLeader 回傳 tick 時記下的布林值（暫停期間仍以為自己是 leader）
+type Granted = { ok: true; token: number; expiresAt: number }
+type Denied = { ok: false; heldBy: string; retryAfterMs: number }
+type Lease = { owner: string; token: number; expiresAt: number }
+class LeaseLockService {
+  private now: () => number
+  private leases = new Map<string, Lease>()
+  private lastToken = 0
+  constructor(now: () => number) { this.now = now }
+  private current(resource: string): Lease | undefined {
+    const lease = this.leases.get(resource)
+    return lease && this.now() < lease.expiresAt ? lease : undefined
+  }
+  acquire(resource: string, owner: string, ttlMs: number): Granted | Denied {
+    const held = this.current(resource)
+    if (held) return { ok: false, heldBy: held.owner, retryAfterMs: held.expiresAt - this.now() }
+    const lease = { owner, token: ++this.lastToken, expiresAt: this.now() + ttlMs }
+    this.leases.set(resource, lease)
+    return { ok: true, token: lease.token, expiresAt: lease.expiresAt }
+  }
+  renew(resource: string, owner: string, token: number, ttlMs: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    held.expiresAt = this.now() + ttlMs
+    return true
+  }
+}
+type ElectorOptions = { locks: LeaseLockService; resource: string; owner: string; ttlMs: number; safetyMarginMs: number; now: () => number; onStepDown: () => void }
+type Elector = { tick(): void; isLeader(): boolean; token(): number | null }
+function createLeaderElector(opts: ElectorOptions): Elector {
+  const { locks, resource, owner, ttlMs, now, onStepDown } = opts
+  let lease: { token: number; expiresAt: number } | null = null
+  let leader = false
+  return {
+    tick() {
+      if (lease) {
+        const sentAt = now()
+        if (locks.renew(resource, owner, lease.token, ttlMs)) lease.expiresAt = sentAt + ttlMs
+        else { lease = null; leader = false; onStepDown() }
+        return
+      }
+      const r = locks.acquire(resource, owner, ttlMs)
+      if (r.ok) { lease = { token: r.token, expiresAt: r.expiresAt }; leader = true }
+    },
+    isLeader() { return leader },
+    token() { return lease ? lease.token : null },
+  }
+}
+</script>
+  <script type="wrong">
+// 錯：沒有安全餘裕（到期前一刻仍回傳 true）
+type Granted = { ok: true; token: number; expiresAt: number }
+type Denied = { ok: false; heldBy: string; retryAfterMs: number }
+type Lease = { owner: string; token: number; expiresAt: number }
+class LeaseLockService {
+  private now: () => number
+  private leases = new Map<string, Lease>()
+  private lastToken = 0
+  constructor(now: () => number) { this.now = now }
+  private current(resource: string): Lease | undefined {
+    const lease = this.leases.get(resource)
+    return lease && this.now() < lease.expiresAt ? lease : undefined
+  }
+  acquire(resource: string, owner: string, ttlMs: number): Granted | Denied {
+    const held = this.current(resource)
+    if (held) return { ok: false, heldBy: held.owner, retryAfterMs: held.expiresAt - this.now() }
+    const lease = { owner, token: ++this.lastToken, expiresAt: this.now() + ttlMs }
+    this.leases.set(resource, lease)
+    return { ok: true, token: lease.token, expiresAt: lease.expiresAt }
+  }
+  renew(resource: string, owner: string, token: number, ttlMs: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    held.expiresAt = this.now() + ttlMs
+    return true
+  }
+}
+type ElectorOptions = { locks: LeaseLockService; resource: string; owner: string; ttlMs: number; safetyMarginMs: number; now: () => number; onStepDown: () => void }
+type Elector = { tick(): void; isLeader(): boolean; token(): number | null }
+function createLeaderElector(opts: ElectorOptions): Elector {
+  const { locks, resource, owner, ttlMs, now, onStepDown } = opts
+  let lease: { token: number; expiresAt: number } | null = null
+  return {
+    tick() {
+      if (lease) {
+        const sentAt = now()
+        if (locks.renew(resource, owner, lease.token, ttlMs)) lease.expiresAt = sentAt + ttlMs
+        else { lease = null; onStepDown() }
+        return
+      }
+      const r = locks.acquire(resource, owner, ttlMs)
+      if (r.ok) lease = { token: r.token, expiresAt: r.expiresAt }
+    },
+    isLeader() { return lease !== null && now() < lease.expiresAt },
+    token() { return lease ? lease.token : null },
+  }
+}
+</script>
+  <script type="wrong">
+// 錯：續約失敗時沒有變回 follower
+type Granted = { ok: true; token: number; expiresAt: number }
+type Denied = { ok: false; heldBy: string; retryAfterMs: number }
+type Lease = { owner: string; token: number; expiresAt: number }
+class LeaseLockService {
+  private now: () => number
+  private leases = new Map<string, Lease>()
+  private lastToken = 0
+  constructor(now: () => number) { this.now = now }
+  private current(resource: string): Lease | undefined {
+    const lease = this.leases.get(resource)
+    return lease && this.now() < lease.expiresAt ? lease : undefined
+  }
+  acquire(resource: string, owner: string, ttlMs: number): Granted | Denied {
+    const held = this.current(resource)
+    if (held) return { ok: false, heldBy: held.owner, retryAfterMs: held.expiresAt - this.now() }
+    const lease = { owner, token: ++this.lastToken, expiresAt: this.now() + ttlMs }
+    this.leases.set(resource, lease)
+    return { ok: true, token: lease.token, expiresAt: lease.expiresAt }
+  }
+  renew(resource: string, owner: string, token: number, ttlMs: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    held.expiresAt = this.now() + ttlMs
+    return true
+  }
+}
+type ElectorOptions = { locks: LeaseLockService; resource: string; owner: string; ttlMs: number; safetyMarginMs: number; now: () => number; onStepDown: () => void }
+type Elector = { tick(): void; isLeader(): boolean; token(): number | null }
+function createLeaderElector(opts: ElectorOptions): Elector {
+  const { locks, resource, owner, ttlMs, safetyMarginMs, now } = opts
+  let lease: { token: number; expiresAt: number } | null = null
+  return {
+    tick() {
+      if (lease) {
+        const sentAt = now()
+        if (locks.renew(resource, owner, lease.token, ttlMs)) lease.expiresAt = sentAt + ttlMs
+        return
+      }
+      const r = locks.acquire(resource, owner, ttlMs)
+      if (r.ok) lease = { token: r.token, expiresAt: r.expiresAt }
+    },
+    isLeader() { return lease !== null && now() < lease.expiresAt - safetyMarginMs },
+    token() { return lease ? lease.token : null },
+  }
+}
+</script>
+  <script type="wrong">
+// 錯：每次 tick 都釋放再重新 acquire（每次都換新 token，破壞 fencing 的順序）
+type Granted = { ok: true; token: number; expiresAt: number }
+type Denied = { ok: false; heldBy: string; retryAfterMs: number }
+type Lease = { owner: string; token: number; expiresAt: number }
+class LeaseLockService {
+  private now: () => number
+  private leases = new Map<string, Lease>()
+  private lastToken = 0
+  constructor(now: () => number) { this.now = now }
+  private current(resource: string): Lease | undefined {
+    const lease = this.leases.get(resource)
+    return lease && this.now() < lease.expiresAt ? lease : undefined
+  }
+  acquire(resource: string, owner: string, ttlMs: number): Granted | Denied {
+    const held = this.current(resource)
+    if (held) return { ok: false, heldBy: held.owner, retryAfterMs: held.expiresAt - this.now() }
+    const lease = { owner, token: ++this.lastToken, expiresAt: this.now() + ttlMs }
+    this.leases.set(resource, lease)
+    return { ok: true, token: lease.token, expiresAt: lease.expiresAt }
+  }
+  release(resource: string, owner: string, token: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    this.leases.delete(resource)
+    return true
+  }
+}
+type ElectorOptions = { locks: LeaseLockService; resource: string; owner: string; ttlMs: number; safetyMarginMs: number; now: () => number; onStepDown: () => void }
+type Elector = { tick(): void; isLeader(): boolean; token(): number | null }
+function createLeaderElector(opts: ElectorOptions): Elector {
+  const { locks, resource, owner, ttlMs, safetyMarginMs, now, onStepDown } = opts
+  let lease: { token: number; expiresAt: number } | null = null
+  return {
+    tick() {
+      if (lease && !locks.release(resource, owner, lease.token)) { lease = null; onStepDown(); return }
+      const r = locks.acquire(resource, owner, ttlMs)
+      lease = r.ok ? { token: r.token, expiresAt: r.expiresAt } : null
+    },
+    isLeader() { return lease !== null && now() < lease.expiresAt - safetyMarginMs },
+    token() { return lease ? lease.token : null },
+  }
+}
+</script>
+  <script type="wrong">
+// 錯：續約失敗後馬上在同一次 tick 重新 acquire，也沒有呼叫 onStepDown
+type Granted = { ok: true; token: number; expiresAt: number }
+type Denied = { ok: false; heldBy: string; retryAfterMs: number }
+type Lease = { owner: string; token: number; expiresAt: number }
+class LeaseLockService {
+  private now: () => number
+  private leases = new Map<string, Lease>()
+  private lastToken = 0
+  constructor(now: () => number) { this.now = now }
+  private current(resource: string): Lease | undefined {
+    const lease = this.leases.get(resource)
+    return lease && this.now() < lease.expiresAt ? lease : undefined
+  }
+  acquire(resource: string, owner: string, ttlMs: number): Granted | Denied {
+    const held = this.current(resource)
+    if (held) return { ok: false, heldBy: held.owner, retryAfterMs: held.expiresAt - this.now() }
+    const lease = { owner, token: ++this.lastToken, expiresAt: this.now() + ttlMs }
+    this.leases.set(resource, lease)
+    return { ok: true, token: lease.token, expiresAt: lease.expiresAt }
+  }
+  renew(resource: string, owner: string, token: number, ttlMs: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    held.expiresAt = this.now() + ttlMs
+    return true
+  }
+}
+type ElectorOptions = { locks: LeaseLockService; resource: string; owner: string; ttlMs: number; safetyMarginMs: number; now: () => number; onStepDown: () => void }
+type Elector = { tick(): void; isLeader(): boolean; token(): number | null }
+function createLeaderElector(opts: ElectorOptions): Elector {
+  const { locks, resource, owner, ttlMs, safetyMarginMs, now } = opts
+  let lease: { token: number; expiresAt: number } | null = null
+  return {
+    tick() {
+      if (lease) {
+        const sentAt = now()
+        if (locks.renew(resource, owner, lease.token, ttlMs)) { lease.expiresAt = sentAt + ttlMs; return }
+      }
+      const r = locks.acquire(resource, owner, ttlMs)
+      lease = r.ok ? { token: r.token, expiresAt: r.expiresAt } : null
+    },
+    isLeader() { return lease !== null && now() < lease.expiresAt - safetyMarginMs },
+    token() { return lease ? lease.token : null },
+  }
+}
+  <script type="wrong">
+// 錯：續約的到期時間從回應回來之後的 now() 起算
+type Granted = { ok: true; token: number; expiresAt: number }
+type Denied = { ok: false; heldBy: string; retryAfterMs: number }
+type Lease = { owner: string; token: number; expiresAt: number }
+class LeaseLockService {
+  private now: () => number
+  private leases = new Map<string, Lease>()
+  private lastToken = 0
+  constructor(now: () => number) { this.now = now }
+  private current(resource: string): Lease | undefined {
+    const lease = this.leases.get(resource)
+    return lease && this.now() < lease.expiresAt ? lease : undefined
+  }
+  acquire(resource: string, owner: string, ttlMs: number): Granted | Denied {
+    const held = this.current(resource)
+    if (held) return { ok: false, heldBy: held.owner, retryAfterMs: held.expiresAt - this.now() }
+    const lease = { owner, token: ++this.lastToken, expiresAt: this.now() + ttlMs }
+    this.leases.set(resource, lease)
+    return { ok: true, token: lease.token, expiresAt: lease.expiresAt }
+  }
+  renew(resource: string, owner: string, token: number, ttlMs: number): boolean {
+    const held = this.current(resource)
+    if (!held || held.owner !== owner || held.token !== token) return false
+    held.expiresAt = this.now() + ttlMs
+    return true
+  }
+}
+type ElectorOptions = { locks: LeaseLockService; resource: string; owner: string; ttlMs: number; safetyMarginMs: number; now: () => number; onStepDown: () => void }
+type Elector = { tick(): void; isLeader(): boolean; token(): number | null }
+function createLeaderElector(opts: ElectorOptions): Elector {
+  const { locks, resource, owner, ttlMs, safetyMarginMs, now, onStepDown } = opts
+  let lease: { token: number; expiresAt: number } | null = null
+  return {
+    tick() {
+      if (lease) {
+        if (locks.renew(resource, owner, lease.token, ttlMs)) lease.expiresAt = now() + ttlMs
+        else { lease = null; onStepDown() }
+        return
+      }
+      const r = locks.acquire(resource, owner, ttlMs)
+      if (r.ok) lease = { token: r.token, expiresAt: r.expiresAt }
+    },
+    isLeader() { return lease !== null && now() < lease.expiresAt - safetyMarginMs },
+    token() { return lease ? lease.token : null },
+  }
+}
+</script>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 4：每天 03:00 的營業報表三台伺服器都會寄。你加了一把 30 秒 TTL 的 Redis 鎖，做完才釋放，拿不到鎖的伺服器每 10 秒再試一次。產生報表要 2 分鐘，會發生什麼？</p>
+  <label data-key="a">只會寄一封：拿到鎖的那台做完才會釋放，其他兩台拿不到</label>
+  <label data-key="b">30 秒後鎖自動過期，另一台會拿到鎖、再做一次，最後可能寄出兩到三封</label>
+  <label data-key="c">拿到鎖的那台會在 30 秒時被 Redis 中斷，報表做不完</label>
+  <p class="why">✓ b。租約到期就自動釋放，Redis 不知道持有者還在工作，也不會去中斷它（c 錯），所以「做完才釋放」不成立（a 錯）。修法：TTL 要比工作時間長並在期間續約；更根本的是讓工作冪等，例如先寫一筆「2026-10-30 已寄出」的唯一紀錄，鎖失效也不會重寄。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：釋放鎖時直接 <code>DEL lock:report</code>，會有什麼問題？</p>
+  <label data-key="a">沒問題，鎖是自己拿的，自己刪掉很合理</label>
+  <label data-key="b">DEL 比較慢，應該讓它等 TTL 自然過期</label>
+  <label data-key="c">如果自己的租約已經過期、別人拿到了，DEL 會刪掉別人的鎖，讓第三個人也拿得到</label>
+  <label data-key="d">DEL 不會更新 fencing token，下一個人會拿到一樣的 token</label>
+  <p class="why">✓ c。key 名稱一樣，DEL 不知道現在的值是誰的。要在同一個原子操作裡比對值（擁有者 token）再刪：Redis 8.4 起用 <code>DELEX key IFEQ value</code>，舊版用 Lua 腳本。a 忽略了租約可能已經換人；b 會讓其他人白等；d 混淆了兩件事，fencing token 是在授予時產生的，和釋放的方式無關。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：持有鎖的程序在寫入資料前，先檢查「我的租約還沒過期」，通過了才寫。這樣能避免兩個程序同時寫嗎？</p>
+  <label data-key="a">不能，程序可能在檢查之後、寫入之前被暫停；要讓資源用 fencing token 擋住過時的寫入</label>
+  <label data-key="b">能，只要檢查和寫入之間的程式很短</label>
+  <label data-key="c">能，只要 TTL 設得比 GC 暫停長</label>
+  <p class="why">✓ a。暫停不看程式碼有多短，它可以發生在任意兩行之間（b 錯）；GC 暫停、VM 暫停、封包延遲都可能比你選的 TTL 長，TTL 只能降低機率（c 錯）。可靠的做法是把檢查放到資源那一端，和寫入在同一個原子操作裡：<code>WHERE last_token &lt;= $token</code>。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：量一個請求花了多久，用兩次 <code>Date.now()</code> 相減有什麼風險？</p>
+  <label data-key="a">沒有風險，系統時間一定往前走</label>
+  <label data-key="b">NTP 校時或手動改時間會讓牆上時間跳動甚至倒退，量出負數或過大的值；量間隔要用 <code>performance.now()</code> 這種單調時鐘</label>
+  <label data-key="c">Date.now 只有秒的精度，量不出毫秒</label>
+  <p class="why">✓ b。<code>Date.now()</code> 是牆上時間，會被調整（a 錯）；它的單位是毫秒（c 錯）。<code>performance.now()</code> 只會往前，適合量間隔、逾時與租約剩餘時間，但只在同一個程序裡有意義，不能拿去和別台機器的值比較。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 8：每天的對帳結果由拿到 Redis 租約鎖的那台寫進資料庫。api-1 GC 暫停 40 秒，租約過期由 api-2 接手寫完，api-1 醒來又用舊結果蓋掉。哪個修法擋得住？</p>
+  <label data-key="a">把 TTL 從 30 秒加到 5 分鐘，讓暫停的時間不會超過租約</label>
+  <label data-key="b">改用 Redlock，向 5 個獨立的 Redis 取得多數同意才算拿到鎖</label>
+  <label data-key="c">寫入資料庫之前，先檢查自己的租約還沒過期，過期就放棄</label>
+  <label data-key="d">鎖服務每次給遞增的 token，寫入時用 <code>last_token &lt;= $token</code> 擋</label>
+  <p class="why">✓ 只有資源那一端擋得住過時的寫入：檢查 token 和寫入是同一個原子操作，api-1 的 token 比資料庫看過的小就被拒絕。c 錯在暫停可以發生在檢查之後、寫入之前。a 只是降低機率；Redlock 給的是隨機值，不是遞增的 token。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>能用唯一約束或條件更新解決，卻用分散式鎖</strong>：多一個會壞的元件，還有時間窗口。先讓資料庫保證，鎖只用來減少重複的工作，例如報表先補上「已寄出」的唯一紀錄。</li>
+  <li><strong>鎖沒有 TTL</strong>：持有者當機後永遠鎖住。用租約，或用跟著連線、交易走的 advisory lock。</li>
+  <li><strong>TTL 比工作時間短又不續約</strong>：工作做到一半鎖就沒了，別人進來重做。TTL 要大於工作時間並定期續約，工作本身也要冪等。</li>
+  <li><strong>釋放時不比對 token</strong>：刪掉別人的鎖。比對和刪除要是同一個原子操作，用 Lua 腳本或 <code>DELEX … IFEQ</code>；先 <code>GET</code> 再 <code>DEL</code> 中間仍有空檔。</li>
+  <li><strong>以為「寫入前先檢查租約」就安全</strong>：暫停可以發生在檢查之後、寫入之前。要正確就讓資源端檢查 fencing token。</li>
+  <li><strong>正確性需求卻沒有 fencing</strong>：程序暫停後醒來覆蓋別人的資料。鎖服務給遞增的 token，資源用 <code>last_token &lt;= $token</code> 擋。</li>
+  <li><strong>用牆上時間量間隔或判斷租約</strong>：NTP 調整會讓判斷錯誤。程序內用 <code>performance.now()</code>；跨機器的到期判斷交給同一個時鐘（例如資料庫的 <code>now()</code>）並留安全餘裕。</li>
+  <li><strong>以為 Redis 主從切換後鎖還在</strong>：非同步複寫可能遺失剛設定的鎖。需要正確性就不要只靠 Redis 的鎖。</li>
+  <li><strong>續約失敗後 leader 繼續工作，或用快取的布林值判斷自己是 leader</strong>：出現兩個 leader。每次做事前用自己的單調時鐘重算，續約失敗立刻退位。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>分散式鎖讓不同機器上的程序互斥地使用同一個資源；鎖服務分辨不出持有者是當機、暫停還是斷線，這是它難的根源。</li>
+  <li>先問需不需要鎖：唯一約束、條件更新、依 key 分區、單一擁有者常常更好。需要時分清楚效率鎖（失效只是多做）和正確性鎖（失效會弄壞資料）。報表靠「已寄出」的唯一紀錄擋重寄，鎖只用來省下重複的計算。</li>
+  <li>租約鎖：<code>SET key token NX PX ttl</code> 取得；值相符才刪，比對和刪除是同一個原子操作（Lua，或 Redis 8.4 的 <code>DELEX IFEQ</code>）；到期前續約；拿不到就隨機延遲再試。已有 PostgreSQL 時用 advisory lock。</li>
+  <li>租約一定會在某些時候失效：程序暫停、網路延遲、時鐘跳動、非同步複寫的切換。「寫入前先檢查」擋不住，因為檢查和寫入之間永遠有空檔。</li>
+  <li>Fencing token：每次授予就遞增（例如鎖表的 <code>token + 1</code>），資源記住每個 key 看過的最大值，拒絕更小的；檢查和寫入在資源端原子完成。資源不認識 token 時改用冪等鍵。</li>
+  <li>Leader election：用租約、每 1/3 租約續約、續約失敗立刻退位、每次做事前用自己的時鐘加安全餘裕判斷，寫入仍然帶 fencing token。</li>
+  <li>量間隔、算期限用單調時鐘；跨機器的到期判斷交給同一個時鐘。</li>
+  <li>Redlock 沒有 fencing 且依賴時間假設。效率鎖用單一 Redis，正確性用資料庫或共識系統加 fencing；上線後看等鎖時間、租約過期次數、fencing 拒絕次數。</li>
+</ul>
+
+<p>這個階段的重點整理成<a href="../sheets/stage-3.html">一頁圖解</a>。</p>
+<p>下一課換到架構層次：咖啡店的系統要維持一個單體、改成模組化單體，還是拆成微服務？拆開之後，這一階段學的逾時、重試、saga 和鎖都會變成每天的成本。</p>
+
+</main>
+<script>
+// 時間軸（.tl）：逐步顯示每一列 tr[data-note]，下方顯示目前步驟的說明（與 PostgreSQL 課相同）
+document.querySelectorAll('.tl').forEach(tl => {
+  const rows = [...tl.querySelectorAll('tr[data-note]')]
+  const note = tl.querySelector('.note')
+  const count = tl.querySelector('[data-count]')
+  const prev = tl.querySelector('[data-prev]')
+  const next = tl.querySelector('[data-next]')
+  let cur = 0
+  const show = () => {
+    rows.forEach((r, i) => {
+      r.classList.toggle('now', i === cur)
+      r.classList.toggle('later', i > cur)
+    })
+    note.textContent = rows[cur].dataset.note
+    count.textContent = `步驟 ${cur + 1} / ${rows.length}`
+    prev.disabled = cur === 0
+    next.textContent = cur === rows.length - 1 ? '↺ 重新播放' : '下一步 ▶'
+  }
+  prev.onclick = () => { cur--; show() }
+  next.onclick = () => { cur = cur === rows.length - 1 ? 0 : cur + 1; show() }
+  show()
+})
+</script>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

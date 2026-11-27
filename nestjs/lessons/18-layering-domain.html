@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>18. 分層、領域邏輯與交易邊界</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="18" data-practice="nestjs">
+<header>
+  <div class="eyebrow">階段 3：資料庫（Docker、Prisma 7 ＋ PostgreSQL） · 第 18 課</div>
+  <h1>分層、領域邏輯與交易邊界</h1>
+</header>
+<main>
+
+<p>咖啡店的付款與取消 API 已經能用了，這週同時進來三件事。店長要排程每隔幾分鐘自動取消超過 30 分鐘還沒付款的訂單；行銷要「付款成功送 1 點集點」；客服轉來一則回報：王小明網路慢，連按兩次付款，後台的付款流程跑了兩次。你打開 <code>OrdersController</code>，付款的規則寫在路由裡，取消的規則又抄了一份，三件事都不知道該從哪裡下手。</p>
+<p>這三件事卡住的原因是同一個：<strong>每段程式放錯了地方</strong>。這課拿同一支付款／取消 API 一路重構，每一步解決一個需求：先把規則搬到不依賴框架的地方，排程才能共用；再決定交易從哪裡開始，付款和加點才會一起成功或一起失敗；最後讓資料庫擋下第二次付款。學完之後，遇到一段新程式，你能判斷它該放哪一層，並說得出理由。</p>
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>這段程式的問題出在哪：把三個需求放到肥 controller 上，看它在哪裡卡住。</li>
+  <li>四件事該放在哪裡：四層各管一件事，付款規則屬於哪一層（開場問題的最小答案）。</li>
+  <li>規則寫成什麼樣子：訂單狀態機寫成不需要 Nest 和資料庫就能測的純函式；接著判斷要不要再包一層 repository。</li>
+  <li>付款和加點怎麼一起成功或一起失敗：誰開交易、<code>tx</code> 怎麼傳到別的 service。</li>
+  <li>連按兩次付款怎麼只算一次：用條件更新讓資料庫擋下第二次；最後決定失敗時要丟錯誤還是回傳 Result。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../typescript/lessons/27-modeling-state-errors.html">TypeScript 課第 27 課</a>的狀態機與 Result：用型別列出訂單所有可能的狀態，只能照規則轉換；Result 把失敗當成回傳值，而不是丟例外。</li>
+  <li><a href="08-exception-filters.html">第 8 課</a>的領域錯誤：service 丟繼承 <code>DomainError</code> 的錯誤，<code>DomainExceptionFilter</code> 決定它變成哪個 HTTP 狀態碼。</li>
+  <li><a href="15-transactions-concurrency.html">第 15 課</a>的互動式交易與條件更新：<code>$transaction(async tx =&gt; …)</code> 裡丟例外就整筆回滾；把判斷寫進 <code>UPDATE</code> 的 <code>WHERE</code>，看 <code>count</code> 知道有沒有改到。</li>
+</ul></div>
+
+<h2>這段程式卡住三個需求，問題出在哪？</h2>
+<p>先看現在的程式。這是練習的起始程式，付款與取消兩個路由，註解標出每一行在做哪一類的事：</p>
+<pre>@Controller('orders')
+export class OrdersController {
+  constructor(private readonly prisma: PrismaService) {}
+
+  @Post(':id/pay')
+  @HttpCode(200)
+  async pay(@Param('id', ParseIntPipe) id: number) {
+    const order = await this.prisma.order.findUnique({ where: { id } })          // ① 查資料庫
+    if (!order) throw new NotFoundException(`找不到訂單 ${id}`)                   // ② HTTP 細節
+    if (order.status !== 'pending') throw new ConflictException('不能付款')      // ③ 業務規則
+    return this.prisma.order.update({ where: { id }, data: { status: 'paid' } })  // ④ 寫入
+  }
+
+  @Post(':id/cancel')
+  @HttpCode(200)
+  async cancel(@Param('id', ParseIntPipe) id: number) {
+    // 同樣的四步再寫一次，規則換成 pending 或 paid 才能取消
+  }
+}</pre>
+<p>它能跑，用 curl 打也會得到正確的回應。問題要把開場的三個需求一個一個放上去才看得出來。</p>
+<p><strong>第一個需求：排程要自動取消逾時的訂單。</strong>排程（第 21 課）是伺服器自己定時執行的程式，不是從 HTTP 請求進來的：它沒有 <code>@Param</code>，也不會經過 controller。可是「哪些狀態可以取消」這條規則只寫在 <code>cancel</code> 路由的 <code>if</code> 裡，排程要用，只能把判斷抄一份過去。抄了之後，規則就有兩份。哪天店裡加一個「外送中」狀態，你得找遍所有路由和排程，漏改一份就是 bug：App 上取消不了的訂單，排程卻取消掉了。</p>
+<p><strong>第二個需求：付款成功送 1 點。</strong>集點的資料由 <code>StampCardsService</code> 負責。照現在的寫法，你會在 <code>pay</code> 路由的 ④ 後面再加一段寫入集點卡的程式。controller 裡的資料庫操作從兩個變成三個，而「付款和加點必須一起成功」這件事該由誰保證，從程式上完全看不出來。</p>
+<p><strong>第三個需求：連按兩次不能付款兩次。</strong>現在的寫法是先讀狀態（①），判斷可以付款（③），再用 id 寫入（④）。兩個付款請求幾乎同時到達時，兩個都在 ① 讀到 <code>pending</code>、都通過 ③、都執行 ④。狀態最後確實是 <code>paid</code>，但付款流程跑了兩次；現在只是付款跑兩次，等加點上線，就會變成加 2 點。這個問題最難，放在最後一節處理。</p>
+<p>還有一個平常就會遇到的困擾：想確認「已完成的訂單不能取消」這條規則對不對，得建 Nest 測試模組、準備資料庫、送 HTTP 請求。規則本身只是「哪個狀態可以做什麼」的一張表，卻要整套環境才測得到。</p>
+<p>這些問題的根源相同：註解裡的 ①～④ 是四件性質完全不同的事，卻擠在同一個方法裡。它們各自因為不同的理由而改變，也各自需要不同的方式測試。下一節先把這四件事分開。</p>
+
+<h2>四件事該放在哪裡？四層各管一件事</h2>
+<p>上一節的 ①～④ 分別是：查資料庫、決定 HTTP 的回應方式、判斷業務規則、寫入資料庫。把程式依「負責哪一類的事」切成幾塊，就叫<strong>分層</strong>（layering）。分層有一條方向規則：上層可以呼叫下層，下層不知道上層存在。例如判斷規則的程式不知道自己是被 controller 還是排程呼叫的，所以兩邊都能用它。</p>
+<p>要看懂後端常見的四層，先認識兩個詞。</p>
+<p>第一個是 <strong>use case</strong>（使用案例）：使用者想完成的一件事，例如「付款」「取消訂單」。一個 use case 通常包含好幾個步驟：讀訂單、問規則、寫入、加點。這些步驟的順序、哪幾步要包在同一個交易裡，都是這個 use case 自己的事。use case 的名字用業務的動詞，例如 <code>pay</code>、<code>cancel</code>，不用 <code>updateStatus</code> 這種資料表的動詞，因為呼叫的人關心的是「付款」，不是「改了哪個欄位」。</p>
+<p>第二個是<strong>領域邏輯</strong>（domain logic）：業務本身的規則，跟用什麼框架、什麼資料庫無關。判斷方法是問自己：<em>把 Nest 換成 Fastify、把 Prisma 換成手寫 SQL，這段規則還成不成立？</em>「已完成的訂單不能取消」換成什麼技術都成立，所以它是領域邏輯；「找不到訂單要回 404」只在 HTTP 裡才有意義，排程找不到訂單時根本沒有狀態碼可回，所以它屬於 HTTP 層。</p>
+<p>有了這兩個詞，四層就是：</p>
+<figure>
+  <svg viewBox="0 0 700 310" role="img" aria-label="四層架構：HTTP 層的 OrdersController 呼叫應用層的 OrdersService；OrdersService 呼叫領域層的 transition 函式，也呼叫資料存取層的 Prisma；領域層不依賴任何一層">
+    <defs><marker id="a18" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="200" y="15" width="300" height="52" rx="8"/>
+    <text class="d-text" x="350" y="38" text-anchor="middle">HTTP 層：OrdersController</text>
+    <text class="d-small" x="350" y="57" text-anchor="middle">取參數、呼叫 use case、回應</text>
+    <rect class="d-box" x="200" y="110" width="300" height="52" rx="8"/>
+    <text class="d-text" x="350" y="133" text-anchor="middle">應用層：OrdersService.pay()</text>
+    <text class="d-small" x="350" y="152" text-anchor="middle">協調步驟、開交易</text>
+    <rect class="d-soft" x="30" y="215" width="270" height="62" rx="8"/>
+    <text class="d-text" x="165" y="240" text-anchor="middle">領域層：transition()</text>
+    <text class="d-small" x="165" y="261" text-anchor="middle">純函式，不 import Nest、Prisma</text>
+    <rect class="d-box" x="400" y="215" width="270" height="62" rx="8"/>
+    <text class="d-text" x="535" y="240" text-anchor="middle">資料存取層：Prisma</text>
+    <text class="d-small" x="535" y="261" text-anchor="middle">tx.order.updateMany(…)</text>
+    <line class="d-line" x1="350" y1="67" x2="350" y2="107" marker-end="url(#a18)"/>
+    <line class="d-line" x1="300" y1="162" x2="200" y2="212" marker-end="url(#a18)"/>
+    <line class="d-line" x1="400" y1="162" x2="500" y2="212" marker-end="url(#a18)"/>
+    <text class="d-accent" x="350" y="252" text-anchor="middle">✕</text>
+    <text class="d-small" x="350" y="300" text-anchor="middle">領域層和資料存取層互不呼叫</text>
+  </svg>
+  <figcaption>箭頭是「呼叫、import」的方向。領域層在最底下但不依賴任何東西，所以最好測、最好重用。</figcaption>
+</figure>
+<div class="table-wrap"><table>
+  <tr><th>層</th><th>放什麼</th><th>不放什麼</th><th>怎麼測</th></tr>
+  <tr><td>HTTP 層（controller）</td><td>路由、<code>@Param</code>、DTO 驗證（第 7 課）、狀態碼</td><td>業務規則、查詢</td><td>e2e（第 10 課）</td></tr>
+  <tr><td>應用層（service，一個方法就是一個 use case）</td><td>步驟順序：讀 → 問規則 → 寫；交易從哪裡開始到哪裡結束</td><td>HTTP 例外、規則細節</td><td>整合測試（<a href="17-db-integration-tests.html">第 17 課</a>）</td></tr>
+  <tr><td>領域層（domain）</td><td>業務規則：狀態轉換、折扣、點數怎麼算</td><td>任何 I/O：資料庫、HTTP、時間、亂數</td><td>單元測試，不用 Nest、不用資料庫</td></tr>
+  <tr><td>資料存取層</td><td>查詢與寫入。這門課直接用 Prisma Client</td><td>業務判斷</td><td>跟著應用層一起用真的資料庫測</td></tr>
+</table></div>
+<p>這就是開場問題的最小答案。把 <code>pay</code> 的 ①～④ 對回表格：</p>
+<ul>
+  <li>③「<code>pending</code> 才能付款」換什麼技術都成立，放<strong>領域層</strong>。controller 和排程都去問它，規則只有一份。</li>
+  <li>① 查詢和 ④ 寫入屬於<strong>資料存取層</strong>，這門課就是直接呼叫 Prisma Client。</li>
+  <li>「讀 → 問規則 → 寫」這個順序，以及之後「付款和加點要在同一個交易」，是付款這個 use case 的事，放<strong>應用層</strong>的 <code>OrdersService.pay()</code>。</li>
+  <li>② 的 <code>NotFoundException</code> 是 HTTP 的說法。service 改丟領域錯誤 <code>OrderNotFoundError</code>，由第 8 課的 <code>DomainExceptionFilter</code> 翻成 404；<strong>HTTP 層</strong>的 controller 只剩取 <code>id</code>、呼叫 service。</li>
+</ul>
+<p>分層的目的是把規則集中、讓它好測，不是湊層數。判斷一層該不該存在，就看它有沒有自己的事可做：</p>
+<div class="callout warn">如果 controller 呼叫 service、service 呼叫 repository、repository 呼叫 Prisma，而中間兩層都只是原封不動轉呼叫，那兩層就是多餘的。沒有規則可放的時候，少一層也沒關係。</div>
+<div class="callout practice"><strong>💡 實務上：規則遲早會有第二個入口</strong><br>咖啡店一開始只有 App 會取消訂單，接著店員後台要能取消、排程要自動取消超過 30 分鐘沒付款的單、客服工具也要能手動處理。規則寫在 controller 裡，每多一個入口就多抄一份，改規則時總有一份忘了改。review 時資深會問：「這段判斷如果改從排程或後台呼叫，還能直接用嗎？」不能的話，就是放錯層了。反過來，單純的查詢列表沒有規則，controller 直接呼叫 service 就好，不用為了分層硬拆。</div>
+<p>知道付款規則屬於領域層之後，下一個問題是它具體要寫成什麼樣子，才能讓 controller 和排程都直接用、又不需要任何環境就能測。</p>
+
+<h2>付款規則寫成什麼樣子？訂單狀態機寫成純函式</h2>
+<p>領域層要放的第一條規則，就是肥 controller 裡那兩個 <code>if</code>：哪個狀態可以付款、哪個狀態可以取消。這類規則有一個固定的寫法，叫<strong>狀態機</strong>（state machine）。</p>
+<p>狀態機是一份清單，列出一個東西所有可能的狀態，以及在每個狀態下收到哪個事件會變成哪個狀態。訂單的狀態有「待付款」「已付款」「製作中」等等，事件是「付款」「取消」這類動作。清單上沒列的組合一律不允許。它解決的正是第一節的「規則散落」：與其在每個路由各寫一個 <code>if</code>，不如把所有允許的轉換集中成一張表，所有入口都查同一張表。TypeScript 課第 27 課做過四個狀態的版本，這裡加上店裡製作的流程：</p>
+<figure>
+  <svg viewBox="0 0 700 220" role="img" aria-label="訂單狀態機：pending 收到 pay 變 paid，paid 收到 prepare 變 preparing，preparing 收到 ready 變 ready，ready 收到 complete 變 completed；pending 和 paid 收到 cancel 變 cancelled">
+    <defs><marker id="b18" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-box" x="10" y="40" width="100" height="44" rx="8"/><text class="d-text" x="60" y="67" text-anchor="middle">pending</text>
+    <rect class="d-box" x="155" y="40" width="100" height="44" rx="8"/><text class="d-text" x="205" y="67" text-anchor="middle">paid</text>
+    <rect class="d-box" x="300" y="40" width="110" height="44" rx="8"/><text class="d-text" x="355" y="67" text-anchor="middle">preparing</text>
+    <rect class="d-box" x="455" y="40" width="90" height="44" rx="8"/><text class="d-text" x="500" y="67" text-anchor="middle">ready</text>
+    <rect class="d-soft" x="590" y="40" width="100" height="44" rx="8"/><text class="d-text" x="640" y="67" text-anchor="middle">completed</text>
+    <rect class="d-soft" x="80" y="160" width="120" height="44" rx="8"/><text class="d-text" x="140" y="187" text-anchor="middle">cancelled</text>
+    <line class="d-line" x1="110" y1="62" x2="153" y2="62" marker-end="url(#b18)"/><text class="d-accent" x="132" y="30" text-anchor="middle">pay</text>
+    <line class="d-line" x1="255" y1="62" x2="298" y2="62" marker-end="url(#b18)"/><text class="d-accent" x="277" y="30" text-anchor="middle">prepare</text>
+    <line class="d-line" x1="410" y1="62" x2="453" y2="62" marker-end="url(#b18)"/><text class="d-accent" x="432" y="30" text-anchor="middle">ready</text>
+    <line class="d-line" x1="545" y1="62" x2="588" y2="62" marker-end="url(#b18)"/><text class="d-accent" x="567" y="30" text-anchor="middle">complete</text>
+    <line class="d-line" x1="60" y1="84" x2="120" y2="158" marker-end="url(#b18)"/>
+    <line class="d-line" x1="205" y1="84" x2="160" y2="158" marker-end="url(#b18)"/>
+    <text class="d-accent" x="140" y="125" text-anchor="middle">cancel</text>
+    <text class="d-small" x="270" y="187">開始製作之後就不能取消；completed、cancelled 是終點</text>
+  </svg>
+  <figcaption>沒有畫出來的箭頭都不允許，例如 cancelled → paid、ready → cancelled。</figcaption>
+</figure>
+<p>這張圖要寫成程式，而且要寫成<strong>純函式</strong>。純函式有兩個條件：同樣的輸入永遠得到同樣的輸出；執行時不改變外面的任何東西，也不讀外面會變的東西，也就是不查資料庫、不送 HTTP、不看現在時間。符合這兩個條件，函式就不需要任何環境：測試時直接呼叫，controller、排程、後台也都能直接呼叫。上一節表格裡說領域層「不放任何 I/O」，指的就是這件事。</p>
+<p>把圖寫成一張表和一個函式，放在 <code>src/orders/domain/order-state.ts</code>：</p>
+<pre>import { DomainError } from '../../errors/domain-errors.js'   // 只依賴自己專案的純 TypeScript
+
+export type OrderStatus = 'pending' | 'paid' | 'preparing' | 'ready' | 'completed' | 'cancelled'
+export type OrderEvent = 'pay' | 'prepare' | 'ready' | 'complete' | 'cancel'
+
+const TRANSITIONS: Record&lt;OrderStatus, Partial&lt;Record&lt;OrderEvent, OrderStatus&gt;&gt;&gt; = {
+  pending: { pay: 'paid', cancel: 'cancelled' },
+  // …其他狀態照圖填
+}
+
+export function transition(status: OrderStatus, event: OrderEvent): OrderStatus {
+  const next = TRANSITIONS[status][event]
+  if (!next) throw new InvalidTransitionError(status, event)   // 練習 1 自己寫這個類別
+  return next
+}</pre>
+<p><code>TRANSITIONS</code> 就是那張圖：外層的 key 是目前狀態，內層的 key 是事件，值是下一個狀態。<code>transition</code> 查表，查得到就回傳下一個狀態，查不到就表示這個轉換不允許。這段程式有三個刻意的設計：</p>
+<ul>
+  <li><strong>輸入是狀態，不是整筆訂單，更不是 id</strong>：如果輸入是 id，函式就得自己去資料庫查，它就不再是純函式。所以呼叫的人負責把狀態讀出來再傳進來，函式只做判斷。</li>
+  <li><strong>型別自己定義</strong>：<code>OrderStatus</code> 不從 <code>generated/prisma</code> import。Prisma 的 enum 產生的是同樣的字串聯合，所以應用層把 <code>order.status</code> 傳進來時型別直接相容；但領域層不必知道 Prisma 存在，換掉 Prisma 時這個檔案一行都不用改。</li>
+  <li><strong>錯誤是領域錯誤</strong>：丟 <code>InvalidTransitionError</code>（繼承第 8 課的 <code>DomainError</code>，<code>code</code> 是 <code>INVALID_TRANSITION</code>），不丟 <code>ConflictException</code>。「這是 409」是 HTTP 的決定，交給 <code>DomainExceptionFilter</code>。同一個錯誤被排程呼叫時，根本沒有 HTTP 狀態碼這回事。</li>
+</ul>
+<p>好處馬上看得到。6 個狀態乘上 5 個事件，一共 30 種組合，測試不需要 Nest 測試模組，也不需要資料庫，import 這一個檔案就能全部跑完：</p>
+<pre>import { transition, InvalidTransitionError } from './order-state.js'
+
+it('ready 之後不能取消', () =&gt; {
+  expect(() =&gt; transition('ready', 'cancel')).toThrow(InvalidTransitionError)
+})</pre>
+<p>規則搬走之後，應用層的 service 只剩三個步驟：讀狀態、問規則、寫入。第一版的 <code>cancel</code> 長這樣（<code>pay</code> 只差在事件換成 <code>'pay'</code>）：</p>
+<pre>// orders.service.ts（第一版，寫入在「連按兩次付款」那一節還會再改）
+const ORDER_SELECT = { id: true, customerId: true, total: true, status: true } as const
+
+async cancel(id: number) {
+  const order = await this.prisma.order.findUnique({ where: { id }, select: { status: true } })
+  if (!order) throw new OrderNotFoundError(id)              // 領域錯誤，filter 翻成 404
+  const next = transition(order.status, 'cancel')           // 能不能取消、變成什麼，問領域層
+  return this.prisma.order.update({ where: { id }, data: { status: next }, select: ORDER_SELECT })
+}</pre>
+<p><code>ORDER_SELECT</code> 固定 API 回傳的欄位，也就是 <code>{ id, customerId, total, status }</code>，避免把整列資料原樣回給前端；之後每個寫入都用同一份。</p>
+<p>controller 只剩轉呼叫，不再注入 <code>PrismaService</code>，也不出現任何狀態字串：</p>
+<pre>// orders.controller.ts
+@Post(':id/cancel')
+@HttpCode(200)
+cancel(@Param('id', ParseIntPipe) id: number) {
+  return this.orders.cancel(id)
+}</pre>
+<p>回到第一個需求：排程要取消逾時訂單時，呼叫同一個 <code>OrdersService.cancel(id)</code> 就好，走的是跟 App 一模一樣的規則。之後加「外送中」狀態，也只要改 <code>TRANSITIONS</code> 一個地方，再補幾個測試。</p>
+<p>你可能聽過另一種寫法：把規則寫成訂單類別的方法，例如 <code>order.cancel()</code>。本課為什麼不這樣做，放在課末的<a href="#appendix">補充與查表</a>。</p>
+<div class="callout practice"><strong>💡 實務上：狀態轉換表就是跟 PM 對齊的文件</strong><br>訂單、退款、請假單、出貨單，幾乎每個系統都有一張狀態機。PM 問「製作中還能不能取消？」時，打開 <code>TRANSITIONS</code> 就能回答，不用翻好幾個 service。要加新狀態（例如「退款中」）時，先在表上畫出箭頭和 PM 確認，再改表、補測試、加資料庫 enum 的 migration。前端也常需要同一份資訊來決定要不要顯示「取消」按鈕，可以由後端回傳目前允許的動作，不要讓前端自己再寫一份規則。</div>
+<p>現在 service 直接呼叫 <code>this.prisma.order</code>。很多教學到這裡會再加一層 repository，把 Prisma 藏起來。這門課要不要跟著加？</p>
+
+<h2>service 直接用 Prisma，要不要再包一層 repository？</h2>
+<p>先說 repository 是什麼。<strong>repository</strong> 是一個專門負責存取某一種資料的類別，例如 <code>OrdersRepository</code> 提供 <code>findById(id)</code>、<code>updateStatus(id, status)</code>。service 只呼叫它的方法，不直接碰 ORM。它想解決兩件事：同一個查詢不要在好幾個 service 各寫一次；service 的單元測試可以把 repository 換成假的，不用接資料庫。</p>
+<p>聽起來划算，所以很多教學把它當成分層的必備。但它也有成本，要看情況：</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>好處</th><th>代價</th></tr>
+  <tr><td>直接用 Prisma</td><td>少一層；Prisma Client 本身就有型別、就是資料存取層；交易直接傳 <code>tx</code></td><td>複雜查詢重複寫在幾個 service；換 ORM 時要改 service</td></tr>
+  <tr><td>再包 repository</td><td>同一個複雜查詢只寫一次；service 的單元測試可以換成假的 repository</td><td>多一層要維護；每個方法都要想辦法接收 <code>tx</code>；只轉呼叫時純粹是成本</td></tr>
+</table></div>
+<p>表格裡「每個方法都要想辦法接收 <code>tx</code>」這一項，下一節會親眼看到：交易要靠一個 <code>tx</code> 物件傳到每一個寫入，多一層 repository，它的每個方法就都要多收這個參數。至於「service 的單元測試可以換成假的」，<a href="17-db-integration-tests.html">第 17 課</a>已經看過 mock 資料存取會漏掉約束、交易、並發這些 bug，service 本來就該用真的資料庫測，這個好處沒有表面上那麼大。</p>
+<p>所以本課程的預設是<strong>直接用 Prisma</strong>。出現下面的情況再抽：同一個帶條件、帶 <code>select</code> 的查詢在三個地方重複；或者真的要換資料來源，例如部分資料改從另一個服務拿。「以後可能換 ORM」不算理由：真的換的時候，交易、錯誤碼、型別都要重寫，多一層也省不了多少。</p>
+<p>咖啡店的付款與取消，目前每個查詢都只出現在 <code>OrdersService</code> 一個地方，沒有理由抽。決定好之後，回到第二個需求：付款成功要送 1 點。</p>
+
+<h2>付款和加點怎麼一起成功或一起失敗？交易邊界</h2>
+<p>送點數這件事，跨了兩個 service：付款屬於 <code>OrdersService</code>，集點屬於 <code>StampCardsService</code>。這兩個寫入必須一起成功或一起失敗。想像只成功一半的兩種情況：付款成功但點數沒加，客人會來抱怨；點數加了但付款回滾，就是白送點數。</p>
+<p>「一起成功或一起失敗」是第 15 課的交易。這裡的新問題是：交易該由誰開？要回答它，先定義一個詞。<strong>交易邊界</strong>（transaction boundary）指的是哪些操作必須包在同一個交易裡、交易從哪一行開始到哪一行結束。</p>
+<p>原則是<strong>由應用層的 use case 決定</strong>。看看其他人選：<code>StampCardsService</code> 只知道怎麼加點，不知道自己是被付款、退款還是客服補點呼叫的，它無法判斷該跟誰綁在一起；controller 是 HTTP 層，排程走不到它。只有 <code>pay</code> 這個 use case 知道「付款＋加點」是一件事，所以由它開交易，再把交易傳給別的 service：</p>
+<pre>// orders.service.ts
+pay(id: number) {
+  return this.prisma.$transaction(async tx =&gt; {
+    const order = await this.changeStatus(tx, id, 'pay')
+    await this.stampCards.addPoints(tx, order.customerId, 1)   // 同一個 tx
+    return order
+  })
+}
+
+// stamp-cards.service.ts
+import type { Prisma } from '../generated/prisma/client.js'
+
+async addPoints(tx: Prisma.TransactionClient, customerId: number, points: number) {
+  const card = await tx.stampCard.findUnique({ where: { customerId } })
+  if (!card) throw new StampCardNotFoundError(customerId)       // 丟出去 → 整個交易回滾
+  await tx.pointTransaction.create({ data: { cardId: card.id, points, reason: '消費' } })
+}</pre>
+<p><code>changeStatus</code> 是把狀態機那一節 <code>cancel</code> 第一版的「讀狀態 → 問規則 → 寫入」收成的一個私有方法，下一節會把它寫完整。這裡要看的是 <code>tx</code> 怎麼流動：<code>pay</code> 開了交易，拿到 <code>tx</code>；改狀態用 <code>tx</code>，加點也收 <code>tx</code>、只用 <code>tx</code> 查詢和寫入。任何一步丟出錯誤，例如陳美華沒有集點卡、<code>addPoints</code> 丟出 <code>StampCardNotFoundError</code>，整個交易回滾，訂單狀態也跟著退回 <code>pending</code>。</p>
+<p><code>addPoints</code> 的參數型別 <code>Prisma.TransactionClient</code>，就是互動式交易傳進來的 <code>tx</code> 的型別（Prisma 7.10.1 產生的 client 裡有）。它能做的查詢跟 <code>PrismaClient</code> 一樣，但沒有 <code>$transaction</code>、<code>$connect</code> 這些管理用的方法。<code>PrismaService</code> 也符合這個型別，所以「有時在交易裡、有時不用」的方法可以收 <code>db: Prisma.TransactionClient</code>：<code>pay</code> 呼叫時傳 <code>tx</code>，不需要加點的 <code>cancel</code> 呼叫時傳 <code>this.prisma</code>。</p>
+<p>為什麼一定要把 <code>tx</code> 傳下去，不能在 <code>addPoints</code> 裡照樣用注入的 <code>this.prisma</code>？因為交易是綁在一條資料庫連線上的，不是綁在 <code>PrismaService</code> 這個物件上：</p>
+<div class="callout warn"><strong>同一個 PrismaService 不等於同一個交易。</strong><code>addPoints</code> 裡如果寫 <code>this.prisma.pointTransaction.create(…)</code>，這一句會從連線池拿<em>另一條</em>連線，在自己的交易裡立刻 COMMIT。之後付款失敗、外面的交易回滾，這筆點數已經寫進去了。交易綁在連線上，只有透過 <code>tx</code> 送出的查詢才在那個交易裡。</div>
+<p>把交易拉長到兩個 service，也要守第 15 課講過的兩條限制。交易進行中，這條連線一直被佔住，寫過的列也一直被鎖著，所以交易內不要呼叫外部 API、寄信，交易越短越好；互動式交易預設 5 秒逾時（<code>timeout: 5000</code>），等鎖等太久也會被中止。</p>
+<p>把 <code>tx</code> 一層層傳下去的代價是每個方法多一個參數，換來的是一眼就看得出哪些查詢在交易裡。也有套件能讓交易自動跟著呼叫流程走、不用改方法簽章，本課不採用，原因見課末的<a href="#appendix">補充與查表</a>。</p>
+<div class="callout practice"><strong>💡 實務上：先問「哪些一定要一起成功」</strong><br>需求寫著「付款後加點、通知店員、寄收據給客人」時，資深會先把它分成兩類：加點必須跟付款一起成功或一起失敗，放進交易；通知和寄信失敗了可以重試，不該拖住交易，等交易 COMMIT 之後再做。常見的坑是把寄信放進交易：郵件服務慢 3 秒，交易就多佔一條連線 3 秒；寄信成功但後面回滾，客人收到一封付款不存在的收據。review 時看到收 <code>tx</code> 參數的函式裡出現 <code>this.prisma</code>，幾乎都是 bug。</div>
+<p>付款和加點現在是同一件事了。但客服回報的那個 bug 還在，而且加點上線後更嚴重：王小明連按兩次，兩個請求各自開了自己的交易，兩個交易都會成功，連按兩次就會直接多送 1 點。交易保證的是「一起成功或一起失敗」，不保證「只做一次」。</p>
+
+<h2>連按兩次付款，怎麼讓資料庫只接受一次？條件更新</h2>
+<p>重複的付款請求不只來自連按。手機網路不穩時前端逾時自動重送、或兩個請求被負載平衡分到兩台伺服器，都會讓同一張訂單同時收到兩次付款。用上一節「先讀再寫」的寫法，時間軸是這樣：</p>
+<div class="table-wrap"><table>
+  <tr><th>時間</th><th>請求 A</th><th>請求 B</th></tr>
+  <tr><td>1</td><td>讀到 <code>pending</code>，規則說可以付款</td><td></td></tr>
+  <tr><td>2</td><td></td><td>讀到 <code>pending</code>，規則說可以付款</td></tr>
+  <tr><td>3</td><td><code>update where id</code> → <code>paid</code>，加 1 點</td><td></td></tr>
+  <tr><td>4</td><td></td><td><code>update where id</code> → <code>paid</code>，<strong>又加 1 點</strong></td></tr>
+</table></div>
+<p>狀態機沒有錯：在時間 2，訂單確實還是 <code>pending</code>，B 問規則得到「可以付款」是對的。錯在「讀」和「寫」之間有空檔，B 在時間 4 寫入時，依據的是一個已經過時的狀態。包在交易裡也擋不住，因為第 15 課講過，預設的 Read Committed 隔離等級下，普通的 SELECT 不上鎖，兩個交易都讀得到 <code>pending</code>。</p>
+<p>修法跟第 15 課的樂觀鎖同一個道理：不要讓「判斷」和「寫入」分成兩句，而是把「狀態還是我剛剛讀到的那個」寫進 UPDATE 的條件，讓資料庫在同一句裡比對並寫入。這叫<strong>條件更新</strong>。上一節提到的 <code>changeStatus</code> 完整寫出來是這樣：</p>
+<pre>private async changeStatus(db: Prisma.TransactionClient, id: number, event: OrderEvent) {
+  const order = await db.order.findUnique({ where: { id }, select: { status: true } })
+  if (!order) throw new OrderNotFoundError(id)
+  const next = transition(order.status, event)              // 領域層決定能不能、變成什麼
+  const { count } = await db.order.updateMany({
+    where: { id, status: order.status },                    // UPDATE … WHERE id = $1 AND status = $2
+    data: { status: next },
+  })
+  if (count === 0) throw new OrderStateConflictError(id)    // 寫入前狀態已經被別人改掉 → 409
+  return db.order.findUniqueOrThrow({ where: { id }, select: ORDER_SELECT })
+}</pre>
+<p>照著時間軸再走一次。A 和 B 都讀到 <code>pending</code>，都送出 <code>UPDATE … WHERE id = 1 AND status = 'pending'</code>。A 先改到這一列，取得這一列的寫鎖（PostgreSQL 課第 19 課）；B 的 UPDATE 要改同一列，只能等 A 的交易結束。A 提交後，PostgreSQL 在 Read Committed 下會用最新的資料重新檢查 B 的 WHERE：這時狀態已經是 <code>paid</code>，條件不成立，影響 0 列。B 看到 <code>count</code> 是 0，丟出 <code>OrderStateConflictError</code>，B 的交易回滾，連帶 B 的加點也不會發生。結果是付款一次、點數一點，第二個請求收到 409。</p>
+<p>這裡用 <code>updateMany</code> 而不是 <code>update</code>，是因為兩者在「條件不成立」時的行為不同。<code>update</code> 的 <code>where</code> 找不到列時會丟 P2025（第 14 課），你分不出是訂單不存在還是被別人搶先；<code>updateMany</code> 則回傳 <code>count</code>，讓你自己判斷並丟出意思明確的領域錯誤。</p>
+<p><code>cancel</code> 也走同一個 <code>changeStatus</code>，所以 <code>where</code> 裡的狀態一定要用剛讀到的值，不能寫死 <code>'pending'</code>：已付款的訂單也要能取消，寫死的話它永遠影響 0 列。</p>
+<p>有人會想在程式裡自己排隊，例如每張訂單一個 Promise，前一個付款跑完才讓下一個進來。這擋不住重複付款：</p>
+<div class="callout warn">不要用記憶體鎖（例如每張訂單一個 Promise 排隊）。它只管得到同一個 Node 程序；正式環境通常有好幾台伺服器、或同一台跑好幾個程序，請求打到不同台時鎖就不存在了。並發要交給所有程序共用的東西：資料庫的條件更新、列鎖，或之後課程的分散式鎖。</div>
+<div class="callout practice"><strong>💡 實務上：每個寫入都先想「被執行兩次會怎樣」</strong><br>重複請求比想像中常見：使用者連點、手機網路不穩時前端逾時自動重送、金流商沒收到回應就重送付款通知。前端把按鈕停用可以減少，但擋不住全部，最後一道防線一定在後端。收到 409 時，前端比較好的處理是重新讀取訂單、顯示目前狀態（「這張單已經付款了」），而不是跳出一個看不懂的錯誤。付款、扣庫存、發點數這類動到錢或數量的操作，資深在設計 API 時就會先確認重複執行是否安全。</div>
+<p>三個需求到這裡都解決了。回頭看，最後兩節都靠同一件事運作：<code>OrderStateConflictError</code>、<code>StampCardNotFoundError</code> 一丟出去，交易就回滾，filter 就翻成對應的狀態碼。「失敗時丟錯誤」本身是一個選擇，另一種做法是回傳 Result。</p>
+
+<h2>失敗時丟錯誤還是回傳 Result？全專案選一種</h2>
+<p>領域函式遇到「不允許」，有兩種表達方式。一種是這課一直在用的丟領域錯誤；另一種是 TypeScript 課第 27 課的 Result：函式不丟例外，而是回傳一個物件，成功時是 <code>{ ok: true, value }</code>，失敗時是 <code>{ ok: false, error }</code>，呼叫的人檢查 <code>ok</code> 決定怎麼做。</p>
+<div class="table-wrap"><table>
+  <tr><th></th><th>丟領域錯誤（第 8 課）</th><th>回傳 Result（TypeScript 課第 27 課）</th></tr>
+  <tr><td>寫法</td><td><code>throw new InvalidTransitionError(…)</code></td><td><code>return { ok: false, error: 'INVALID_TRANSITION' }</code></td></tr>
+  <tr><td>好處</td><td>在交易裡丟出就自動回滾；filter 統一轉成回應；呼叫端程式短</td><td>型別上看得到可能失敗，呼叫端不處理會被編譯器提醒</td></tr>
+  <tr><td>代價</td><td>從簽章看不出會丟什麼</td><td>每一層都要檢查、往上傳；在 <code>$transaction</code> 裡要記得自己丟例外才會回滾</td></tr>
+</table></div>
+<p>表格最後一格用這課的程式說明最清楚。如果 <code>addPoints</code> 改成沒有集點卡時回傳 <code>{ ok: false }</code>，而 <code>pay</code> 忘了檢查，<code>$transaction</code> 的 callback 就會正常結束，交易照常 COMMIT：訂單已付款，點數沒加，正是交易邊界那一節要避免的結果。用 Result 時，在交易裡每一步都要檢查，失敗就自己丟例外。</p>
+<p>兩種都可以，重點是<strong>全專案用同一種</strong>。混著用時，呼叫的人每次都要去看實作才知道該 <code>try/catch</code> 還是檢查 <code>ok</code>，漏掉的那邊就是 bug。這門課用丟領域錯誤，因為它跟 Prisma 交易的回滾機制、Nest 的 filter 配合得最直接。</p>
+<p>到這裡，肥 controller 已經拆成四層：規則在 <code>order-state.ts</code>，步驟和交易在 <code>OrdersService</code>，controller 只轉呼叫，寫入用條件更新。下面的練習就是把這個重構親手做一次。</p>
+
+<h2>練習</h2>
+<p>練習在 <code>nestjs/practice</code> 的第 18 題。要先 <code>docker compose up -d --wait</code>（第 12 課）。想自己用 curl 試：在 <code>work/18</code> 執行 <code>npx prisma migrate deploy</code>、<code>npx prisma db seed</code>，再 <code>npm run start:dev</code>，例如 <code>curl -X POST localhost:3100/orders/1/pay</code>。種子資料裡王小明有集點卡、陳美華沒有。</p>
+
+<div class="local" data-test="ex1" data-files="src/orders/domain/order-state.ts src/orders/orders.service.ts src/orders/orders.controller.ts">
+  <p>練習 1：把 <code>OrdersController</code> 裡的狀態判斷抽出來。</p>
+  <ul>
+    <li>在 <code>order-state.ts</code> 照上面的狀態圖寫出 <code>transition(status, event)</code>：合法時回傳下一個狀態，不合法時丟 <code>InvalidTransitionError</code>（自己寫並匯出，繼承 <code>DomainError</code>，<code>code</code> 是 <code>'INVALID_TRANSITION'</code>）。這個資料夾不能 import <code>@nestjs/*</code> 或 Prisma。</li>
+    <li>在 <code>OrdersService</code> 寫 <code>pay(id)</code> 與 <code>cancel(id)</code>：讀訂單（不存在丟 <code>OrderNotFoundError</code>）→ <code>transition</code> → 寫入，回傳 <code>{ id, customerId, total, status }</code>。這一題先用 <code>update</code> 寫入也可以，練習 2 再改。</li>
+    <li><code>OrdersController</code> 只轉呼叫，不注入 <code>PrismaService</code>，也不出現任何狀態字串。</li>
+  </ul>
+  <p>測試只 import <code>order-state.ts</code> 檢查全部 30 種組合，再透過 HTTP 確認：取消 <code>pending</code> 和 <code>paid</code> 的訂單回 200；取消已完成的訂單回 409 <code>INVALID_TRANSITION</code>；找不到訂單回 404 <code>ORDER_NOT_FOUND</code>。</p>
+</div>
+
+<div class="local" data-test="ex2" data-files="src/orders/orders.service.ts">
+  <p>練習 2：同一張訂單並發付款只能成功一次。把寫入改成條件更新：<code>updateMany</code> 的 <code>where</code> 同時比對 <code>id</code> 和剛剛讀到的狀態，<code>count</code> 是 0 就丟 <code>OrderStateConflictError</code>（409 <code>ORDER_STATE_CONFLICT</code>）。測試會開<strong>兩個</strong> Nest 應用接同一個資料庫，同時送 5 次付款：只能有 1 次 200，其他 409。只在一個程序裡有效的記憶體鎖過不了。<code>cancel</code> 也走同一個條件更新，所以 <code>where</code> 裡的狀態要用剛讀到的值，不能寫死 <code>'pending'</code>：已付款的訂單也要能取消。</p>
+</div>
+
+<div class="local" data-test="ex3" data-files="src/orders/orders.service.ts src/stamp-cards/stamp-cards.service.ts">
+  <p>練習 3：付款成功時送 1 點。把 <code>StampCardsService.addPoints</code> 改成 <code>addPoints(tx, customerId, points)</code>，裡面只用 <code>tx</code>；<code>OrdersService.pay</code> 用 <code>this.prisma.$transaction(async tx =&gt; …)</code> 把改狀態和加點包在一起（<code>cancel</code> 不用改）。顧客沒有集點卡時，<code>addPoints</code> 丟的 <code>StampCardNotFoundError</code> 會讓 API 回 422，訂單必須還是 <code>pending</code>。測試也會檢查加點時有沒有碰到 <code>this.prisma</code>，以及同時付款 5 次是否只加 1 點。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 4：新規則「會員打九折」應該放在哪？</p>
+  <label data-key="a">controller：拿到 body 之後先把價格乘 0.9，最快</label>
+  <label data-key="b">直接寫在 Prisma 的 <code>create</code> 參數裡，跟寫入放在一起</label>
+  <label data-key="c">領域函式（例如 <code>priceFor(items, isMember)</code>），由應用層在建立訂單時呼叫</label>
+  <label data-key="d">exception filter，因為它會處理所有請求</label>
+  <p class="why">✓ c。折扣是業務規則，換框架、換 ORM 都成立，所以放領域層：純函式，單元測試直接驗。放 controller（a）的話，之後從排程、後台、批次匯入建立的訂單都不會打折，規則還得抄好幾份；寫在 Prisma 參數裡（b）就把規則和資料存取混在一起，測規則得接資料庫；filter（d）只處理例外，跟計價無關。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 5：什麼情況下值得在 Prisma 外面再包一層 repository？</p>
+  <label data-key="a">每個專案都要，這是分層架構的標準做法</label>
+  <label data-key="b">同一個複雜查詢在好幾個 service 重複，或資料真的要改從別的來源拿</label>
+  <label data-key="c">為了以後可能換 ORM，越早包越好</label>
+  <label data-key="d">永遠不需要，Prisma 已經是 repository</label>
+  <p class="why">✓ b。repository 有成本：多一層、每個方法都要能接收 <code>tx</code>。有重複的查詢可以集中、或有替換資料來源的實際需求時，這個成本才划算。a 是教條，沒有規則或重複時只是轉呼叫；c 是為想像中的需求付費，真的換 ORM 時交易與錯誤處理照樣要重寫；d 太絕對，查詢重複到一定程度時集中起來是值得的。</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 6：<code>pay</code> 用 <code>this.prisma.$transaction(async tx =&gt; …)</code> 開了交易，但 <code>addPoints</code> 裡寫的是 <code>this.prisma.pointTransaction.create(…)</code>。加點之後，同一個交易裡的下一步失敗了，會怎樣？</p>
+  <label data-key="a">訂單狀態回滾，但點數已經寫進去了：<code>this.prisma</code> 走另一條連線、自己的交易，已經 COMMIT</label>
+  <label data-key="b">兩個都回滾，因為注入的是同一個 <code>PrismaService</code>，Prisma 會自動把它加入目前的交易</label>
+  <label data-key="c">Prisma 偵測到交易進行中，直接丟錯誤拒絕執行 <code>this.prisma</code> 的查詢</label>
+  <label data-key="d">兩個都提交，因為點數先寫進去了，交易就不能回滾</label>
+  <p class="why">✓ a。交易綁在連線上，Prisma 7 不會自動傳遞交易：只有透過 <code>tx</code> 送出的查詢在那個交易裡。<code>this.prisma</code> 從連線池拿另一條連線，那一句自己提交了。b 是最常見的誤解（自動傳遞要靠 <code>AsyncLocalStorage</code> 類的套件，而且要用它提供的 <code>txHost.tx</code>）；c、d 都不是 Prisma 的行為：外面的交易照樣回滾，只是回滾不到另一條連線上已經提交的東西。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>controller 越來越肥</strong>：查詢、規則、HTTP 細節擠在一起，別的入口用不到、測試要整套環境。controller 只取參數、呼叫 use case、回應。</li>
+  <li><strong>領域函式偷偷 import Prisma 或 Nest</strong>：為了省事 import Prisma 的 enum 型別、丟 <code>ConflictException</code>，規則就綁死在框架上。型別自己定義、錯誤丟 <code>DomainError</code>。</li>
+  <li><strong>為了分層而分層</strong>：controller → service → repository → Prisma，中間每層都只是轉呼叫。沒有規則或重複查詢可放的層，不要建。</li>
+  <li><strong>在 tx 之外寫入應該一起回滾的資料</strong>：helper 裡用了 <code>this.prisma</code>，或交易結束後才加點。需要一起成功的寫入，全部用同一個 <code>tx</code>，由開交易的 use case 傳下去。</li>
+  <li><strong>先讀狀態、再用 id 更新</strong>：狀態機判斷正確也擋不住並發。寫入的 <code>where</code> 要帶上剛讀到的狀態，<code>count</code> 為 0 就回 409。</li>
+  <li><strong>用記憶體鎖解決跨台伺服器的並發</strong>：只對同一個程序有效。交給資料庫。</li>
+  <li><strong>錯誤處理風格混用</strong>：有的丟例外、有的回傳 Result，呼叫的人一定會漏處理一邊。選一種，全專案一致。</li>
+</ul>
+
+<h2 id="appendix">補充與查表</h2>
+<h3>規則寫成類別的方法，還是獨立的領域函式？</h3>
+<p>還有一種寫法是把規則做成類別的方法（<code>order.cancel()</code>），資料和規則放在一起。資料與規則分開放的寫法有個名字叫<strong>貧血模型</strong>（anemic model）：資料物件只有欄位，規則都在 service。本課的狀態機也是資料與規則分開，但規則集中在領域函式裡，不是散在 service 中，已經拿到主要的好處：集中、好測。用 Prisma 時查詢回來的是普通物件，不是類別實例，硬要包成有方法的類別，就得在每次查詢後轉換一次。</p>
+<h3>不傳 tx 的另一種做法：AsyncLocalStorage</h3>
+<p>另一種做法是用 <code>AsyncLocalStorage</code>（<a href="../../node/lessons/19-structured-logging.html">Node 課第 19 課</a>）把目前的交易存在「這次呼叫的上下文」裡，例如 <code>nestjs-cls</code> 的 <code>@nestjs-cls/transactional</code> 外掛搭配 <code>@nestjs-cls/transactional-adapter-prisma</code>：在方法上加 <code>@Transactional()</code>，裡面透過注入的 <code>TransactionHost</code> 用 <code>txHost.tx</code> 查詢，自動拿到目前的交易；不在交易裡時，<code>txHost.tx</code> 就是一般的 client。好處是不用改方法簽章；代價是多三個套件、一層看不見的機制：同一行 <code>txHost.tx.order.update()</code> 在不同呼叫路徑下可能在交易裡、也可能不在，出問題時很難從程式碼看出來。本課程一律明確傳 <code>tx</code>，不另外安裝。</p>
+
+<h2>小結</h2>
+<ul>
+  <li>肥 controller 的問題是四件性質不同的事擠在一起：查詢、HTTP 細節、業務規則、寫入。規則只寫在路由裡，排程這類第二個入口就只能抄一份。</li>
+  <li>四層：HTTP 層處理請求與回應；應用層（service）一個方法一個 use case，協調步驟並決定交易邊界；領域層是不做 I/O 的純函式；資料存取層這門課直接用 Prisma。</li>
+  <li>判斷是不是領域邏輯：換掉框架和 ORM，這條規則還成立嗎？</li>
+  <li>訂單狀態機寫成 <code>transition(status, event)</code>：一張表、一個函式，非法轉換丟 <code>InvalidTransitionError</code>，不需要 Nest 或資料庫就能測完所有組合。</li>
+  <li>repository 不是必備：有重複的複雜查詢、或要換資料來源時再抽。</li>
+  <li>跨 service 的交易：use case 開 <code>$transaction</code>，把 <code>tx</code>（型別 <code>Prisma.TransactionClient</code>）明確傳下去；<code>this.prisma</code> 是另一條連線、另一個交易。</li>
+  <li>交易保證一起成功，不保證只做一次。防重複付款：<code>updateMany({ where: { id, status: 讀到的狀態 } })</code>，<code>count</code> 為 0 就是被別人搶先，回 409；記憶體鎖跨不了程序。</li>
+  <li>錯誤風格（丟領域錯誤或回傳 Result）全專案只用一種；用 Result 時，在交易裡要自己丟例外才會回滾。</li>
+</ul>
+
+<h2>階段檢核：面試會問的觀念</h2>
+<p>這個階段一定要講得出來的 8 件事。先在心裡回答，再選。</p>
+
+<div class="quiz" data-correct="c">
+  <p>練習 7：拿鐵只剩 5 杯，20 個人同時下單。扣庫存已經包在交易裡，哪裡會出事？</p>
+<pre>await this.prisma.$transaction(async (tx) =&gt; {
+  const p = await tx.product.findUnique({ where: { id } })
+  if (p.stock &lt; qty) throw new OutOfStockError()
+  await tx.product.update({ where: { id }, data: { stock: p.stock - qty } })
+})</pre>
+  <label data-key="a">20 個交易排隊等同一列的鎖，等超過預設的 5 秒，後面的請求會丟 P2028</label>
+  <label data-key="b"><code>findUnique</code> 讀到的是 Prisma 快取的庫存，看不到別的請求剛扣掉的數字</label>
+  <label data-key="c">普通 SELECT 不上鎖：好幾個請求同時讀到 5、都判斷夠，賣出的杯數超過庫存</label>
+  <p class="why">✓ c。「讀 → 判斷 → 寫回」會 lost update，預設的 READ COMMITTED 交易不會阻止兩個交易讀到同一個值。改成原子條件更新：<code>updateMany</code> 的 <code>where</code> 加 <code>stock: { gte: qty }</code>、<code>data</code> 用 <code>decrement</code>，<code>count</code> 是 0 就是庫存不足。a 錯在普通 SELECT 不上鎖，請求根本不會排隊，問題正是沒有人在等。（第 15 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 8：顧客註冊時，程式先用 <code>findUnique</code> 查 email 有沒有人用，沒有才 <code>create</code>。上線後 log 偶爾出現 P2002，客人看到 500。怎麼修最恰當？</p>
+  <label data-key="a">不必先查，直接 <code>create</code>，接住 P2002 翻成「email 已被使用」的領域錯誤回 409</label>
+  <label data-key="b">把查詢和 <code>create</code> 包進互動式交易，查詢與寫入之間就不會被別的請求插隊</label>
+  <label data-key="c">在 email 欄位加索引，讓 <code>findUnique</code> 更快，縮短查詢和寫入之間的空隙</label>
+  <p class="why">✓ a。查詢和寫入是兩句 SQL，兩個請求可以都查不到、都去 INSERT；只有 UNIQUE 約束在寫入的那一刻檢查。所以唯一值交給約束，P2002 在 service 翻成領域錯誤。b 錯在 READ COMMITTED 的交易擋不住兩個請求都查不到，第二個照樣撞上 P2002。（第 14 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 9：同事把「呼叫外送平台 API 建立配送單」放進下單的 <code>$transaction</code> callback 最後一步，理由是「API 失敗就整筆回滾，資料最一致」。問題在哪？</p>
+  <label data-key="a">互動式交易的 callback 裡不能用 <code>fetch</code>，Prisma 會直接丟錯拒絕執行</label>
+  <label data-key="b">沒有問題：API 失敗就丟例外，訂單和庫存一起回滾，這正是交易的用途</label>
+  <label data-key="c">要改成批次交易 <code>$transaction([…])</code>，外部呼叫才會跟著一起回滾</label>
+  <label data-key="d">等回應的幾秒內庫存列一直被鎖、連線被佔住；交易之後回滾時，配送單卻已建立</label>
+  <p class="why">✓ d。交易只能回滾資料庫自己的修改，外部系統做過的事收不回來；外部呼叫又慢，其他客人排隊等鎖、連線池被佔滿。交易只做資料庫的事，COMMIT 之後再呼叫外送平台。b 只想到 API 失敗的情況：API 成功、交易後來逾時（P2028）回滾時，就有配送單卻沒有訂單。（第 15 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 10：咖啡店後台這次上線要加一個新欄位，migration 已經 commit。正式資料庫的 migration 該怎麼套用？</p>
+  <label data-key="a">每台伺服器啟動時各跑一次 <code>migrate deploy</code>，確保每台看到的資料庫都是最新的</label>
+  <label data-key="b">由 CI 的部署步驟，在新版程式上線之前跑一次 <code>migrate deploy</code></label>
+  <label data-key="c">在正式環境跑 <code>migrate dev</code>：它會比對 schema，漏掉的差異也會一起補上</label>
+  <p class="why">✓ b。<code>migrate deploy</code> 只套用 commit 過、還沒套用的檔案，不產生、不重設；<code>migrate dev</code> 發現資料庫和 migration 對不上時會要求重設，只用在開發機。a 錯在 migration 一失敗每台伺服器都起不來，也很難從各台的 log 追出原因。（第 13 課）</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 11：訂單列表 API 隨著訂單變多越來越慢，整個請求要 800 毫秒；log 裡每一句 SQL 用 EXPLAIN 看都是 Index Scan、不到 1 毫秒。先查什麼？</p>
+  <label data-key="a">用 EXPLAIN ANALYZE 再看一次每一句，確認是不是還缺了哪個索引</label>
+  <label data-key="b">資料庫的 <code>max_connections</code> 是不是太小，查詢在排隊等連線</label>
+  <label data-key="c">改成 <code>Promise.all</code> 平行送出查詢，看總時間能不能縮短</label>
+  <label data-key="d">開 query log 數這個請求送了幾句 SQL，看是不是在迴圈裡查詢</label>
+  <p class="why">✓ d。每句都快、整體卻慢，而且跟著資料量變慢，典型是 N+1：句數隨訂單數成長，時間花在一句句的往返。用 <code>$on('query')</code> 數句數，改成 <code>select</code>／<code>include</code> 帶回關聯，Prisma 7 每層關聯一句 <code>IN (...)</code>。c 錯在句數沒變，一個請求還同時佔用多條連線。（第 16 課）</p>
+</div>
+
+<div class="quiz" data-correct="a">
+  <p>練習 12：下面三段程式，哪一段最需要接真的 PostgreSQL 寫整合測試？</p>
+  <label data-key="a">用 <code>updateMany</code> 加 <code>stock &gt;= quantity</code> 條件扣庫存，<code>count</code> 是 0 就丟庫存不足</label>
+  <label data-key="b">訂單狀態機 <code>transition(status, event)</code>，非法的轉換丟 <code>InvalidTransitionError</code></label>
+  <label data-key="c">呼叫外送平台 API 建立配送單，失敗時有上限地重試，用完仍丟錯</label>
+  <p class="why">✓ a。條件更新對不對，取決於資料庫怎麼執行這句 SQL、並發時怎麼重新檢查 <code>WHERE</code>；mock 只回傳你設定的 <code>count</code>，永遠會通過。b 是不做 I/O 的純函式，單元測試就能測完所有組合，不需要資料庫。外部服務（c）才是 mock 該用的地方。（第 17 課）</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 13：<code>InventoryService.reserve</code> 裡用 <code>this.prisma.product.updateMany</code> 扣庫存。下面的 <code>order.create</code> 因為外鍵錯誤（P2003）失敗時，會怎樣？</p>
+<pre>async create(dto: CreateOrderDto) {
+  return this.prisma.$transaction(async (tx) =&gt; {
+    await this.inventory.reserve(dto.items)
+    return tx.order.create({ data: toOrderData(dto) })
+  })
+}</pre>
+  <label data-key="a">兩邊都回滾：<code>reserve</code> 是在 callback 裡呼叫的，自動在同一個交易裡</label>
+  <label data-key="b">Prisma 偵測到交易進行中卻用了 <code>this.prisma</code>，直接丟錯拒絕扣庫存</label>
+  <label data-key="c">訂單沒有建立，庫存卻已扣掉：<code>reserve</code> 走另一條連線，那句已自己 COMMIT</label>
+  <p class="why">✓ c。交易綁在連線上，Prisma 7 不會自動傳遞交易，只有透過 <code>tx</code> 送出的查詢在那個交易裡。改成 <code>reserve(tx, items)</code>，裡面只用 <code>tx</code>；交易邊界由應用層的 use case 決定。a 錯在「在 callback 裡呼叫」不等於「在交易裡執行」。（第 18 課）</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 14：手機 App 的「我的訂單」往下捲就載入更多，最新的排最前面，客人隨時可能再下單。分頁怎麼做？</p>
+  <label data-key="a">LIMIT／OFFSET 加上 <code>ORDER BY</code> 固定順序，翻頁時就不會重複或漏掉</label>
+  <label data-key="b">cursor：從上一頁最後一筆的「排序值＋id」接著查，<code>take: limit + 1</code> 判斷有沒有下一頁</label>
+  <label data-key="c">cursor：只記上一頁最後一筆的建立時間接著查，比 OFFSET 快就夠了</label>
+  <p class="why">✓ b。OFFSET 只記「跳過幾筆」：越後面越慢，新訂單插在最前面時整個列表往後推，下一頁會重複。cursor 從上一頁最後一筆之後接著查，不受新資料影響；排序值可能相同，要加 id 決勝，否則同一時間的訂單跨頁時會漏掉（c）。a 錯在固定順序只解決排序，資料一變動 OFFSET 照樣錯位。（第 16 課）</p>
+</div>
+<p>這個階段的重點整理成<a href="../sheets/stage-3.html">一頁圖解</a>。</p>
+<p>下一課進入快取：用 Redis 讓菜單這類讀多寫少的資料更快，並處理資料過時與失效的問題。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

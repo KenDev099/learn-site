@@ -1,0 +1,573 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>28. GIN 與搜尋：JSONB、全文檢索、模糊搜尋</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="28" data-pg-extensions="pg_trgm">
+<header>
+  <div class="eyebrow">階段 8：資深必備｜查詢效能 · 第 28 課</div>
+  <h1>GIN 與搜尋：JSONB、全文檢索、模糊搜尋</h1>
+</header>
+<main>
+
+<p>咖啡店的商品資料長到一萬多筆，PM 開了一張搜尋需求單：後台要能篩出「季節限定」的商品、篩出「有燕麥奶選項」的商品；App 的搜尋框打「oat latte」要找到描述裡寫 lattes 的商品，而且最相關的排前面；使用者也會打中文、會打錯字，例如把「黑糖珍珠鮮奶」打成「黑糖珍奶」。你憑直覺寫出第一版：<code>'季節限定' = ANY (tags)</code>、<code>options -&gt;&gt; 'milk' = 'oat'</code>、<code>description ILIKE '%oat latte%'</code>。結果每一句的查詢計畫都是 <code>Seq Scan</code>，整張表掃一遍；英文搜尋漏掉一堆該找到的商品；想改用資料庫的全文檢索解決英文的問題，結果同一套用在中文上，搜「拿鐵」反而什麼都找不到。</p>
+<p>這四項需求有一個共通點：都在問「欄位裡<em>有沒有包含</em>某個東西」，可能是陣列裡的一個標籤、JSONB 裡的一組 key 和值、一段文字裡的一個詞、或任意一小段字。第 20 課的 B-tree 是為「等於、大於、小於」設計的，對「包含」幫不上忙。這課照需求單一項一項做下去：每一項該用 PostgreSQL 的哪種工具、怎麼用 <code>EXPLAIN</code> 確認真的走了索引、這個工具做不到什麼；最後判斷 PostgreSQL 內建的功能夠不夠，還是該換專門的搜尋引擎。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>篩出季節限定：B-tree 為什麼幫不上，另一種索引 GIN 怎麼找「含有」，以及它的代價。</li>
+  <li>篩出燕麥奶選項：JSONB 要拆成什麼放進 GIN，兩種拆法怎麼選，哪種寫法會讓索引白建。</li>
+  <li>搜尋框打英文：為什麼 <code>ILIKE</code> 不夠，全文檢索怎麼比對「詞」、怎麼排序、怎麼走索引。</li>
+  <li>搜尋框打中文、打錯字：全文檢索為什麼處理不了中文，pg_trgm 能補到哪裡、補不到哪裡。</li>
+  <li>回到需求單：每一項用什麼，什麼時候該換搜尋引擎。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="14-jsonb-arrays.html">第 14 課</a>的 JSONB、陣列與 <code>@&gt;</code>：<code>A @&gt; B</code> 是「A 包含 B」，B 裡的每一個 key 和值（或陣列元素），A 都要有。</li>
+  <li><a href="20-indexes.html">第 20 課</a>的 B-tree：把欄位值排好序的索引，所以 <code>LIKE '%…'</code> 這種開頭不固定的樣式用不上它。</li>
+  <li><a href="21-explain.html">第 21 課</a>的 <code>EXPLAIN</code>：印出查詢計畫；<code>Seq Scan</code> 是整張表掃一遍，<code>Bitmap Index Scan</code> 是先用索引收集符合的位置。</li>
+  <li><a href="27-index-design.html">第 27 課</a>的運算式索引：存的不是欄位原本的值，而是運算結果，例如 <code>lower(email)</code>。</li>
+</ul></div>
+
+<div class="callout"><strong>這頁的環境：</strong>資料庫是 PGlite 0.5.13（PostgreSQL 18.6）。範例會直接改這頁的資料庫，所以建索引的範例都包在 <code>BEGIN … ROLLBACK</code> 裡，不留下索引，之後的練習才判得準。排序規則是 C、沒有中文斷詞的擴充功能，這兩點和正式環境不同，用到時會說明。</div>
+
+<p><strong>這頁的資料：</strong><code>products</code> 有 10,002 項商品（中文品名加編號、英文描述 <code>description</code>、標籤陣列 <code>tags</code>、客製選項 <code>options</code> JSONB），<code>tags</code> 已經有一個 GIN 索引 <code>products_tags_idx</code>；<code>menu_items</code> 是 12 項的小菜單，全文檢索的範例和練習 4 用。</p>
+
+<h2>篩出「季節限定」：B-tree 為什麼幫不上，GIN 怎麼找？</h2>
+<p>需求單的第一項最單純：後台要列出 <code>tags</code> 含有「季節限定」的商品。<code>tags</code> 是文字陣列，一項商品的值可能是 <code>{季節限定}</code>、<code>{季節限定,外送}</code>、<code>{外送,季節限定,熱銷}</code>，也可能是空的 <code>{}</code>。</p>
+<p>先想 B-tree 為什麼幫不上。第 20 課說過，B-tree 把<strong>整個欄位值</strong>排好序存起來。排好序的好處是：查「等於某個值」「大於某個值」「以某段文字開頭」時，可以直接跳到排序中的某個位置，往後讀一段連續的範圍就好。陣列也能排序，但它是用整個陣列比大小：<code>{外送,季節限定}</code> 和 <code>{外送,熱銷}</code> 排在一起，因為第一個元素都是「外送」；<code>{季節限定}</code> 則排在另一個地方。所以「含有季節限定」的那些陣列，在排序裡散落在好幾段，沒有一段連續範圍可以讀，B-tree 只能整個看一遍，跟整張表掃一遍差不多。</p>
+<p>要回答「含有某個元素」，索引得換一個方向存。表裡的資料是「這一列有哪些元素」；<strong>倒排索引</strong>（inverted index）反過來，把每一列拆成一個個元素，記錄「這個元素出現在哪些列」。「倒排」指的就是這個方向的顛倒。書末的關鍵字索引是同一個概念：你不會從第一頁翻到最後一頁找「拿鐵」，而是查索引頁的「拿鐵 → 第 12、48、93 頁」。</p>
+<p>PostgreSQL 的倒排索引叫 <strong>GIN</strong>，是 Generalized Inverted Index 的縮寫，直譯是「通用倒排索引」。「通用」的意思是，它不限定元素是什麼：可以是陣列的元素、JSON 的 key 和值、一段文章裡的詞，或者文字裡每三個連續的字元。這一課的四項需求，最後都會用到 GIN，差別只在「一列要拆成什麼元素」。下圖是同一個 <code>tags</code> 欄位，用兩種索引存起來的樣子：</p>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="左邊 B-tree 依整個陣列值排序；右邊 GIN 把每個標籤對應到含有它的列編號">
+    <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <text class="d-small" x="20" y="22">B-tree：依「整個值」排序</text>
+    <rect class="d-box" x="20" y="32" width="300" height="190" rx="8"/>
+    <text class="d-text" x="36" y="62">{} → 1, 2, 4, 5 …</text>
+    <text class="d-text" x="36" y="92">{外送} → 7, 14 …</text>
+    <text class="d-text" x="36" y="122">{季節限定} → 50 …</text>
+    <text class="d-text" x="36" y="152">{季節限定,外送} → 350 …</text>
+    <text class="d-text" x="36" y="182">{外送,熱銷} → 21 …</text>
+    <text class="d-small" x="36" y="208">「含有季節限定」散在好幾段，排序幫不上</text>
+    <text class="d-small" x="380" y="22">GIN：「元素 → 出現在哪些列」</text>
+    <rect class="d-soft" x="380" y="32" width="300" height="190" rx="8"/>
+    <text class="d-text" x="396" y="72">外送</text>
+    <text class="d-text" x="396" y="122">季節限定</text>
+    <text class="d-text" x="396" y="172">熱銷</text>
+    <path class="d-line" d="M470,67 L520,67" marker-end="url(#arr)"/>
+    <path class="d-line" d="M470,117 L520,117" marker-end="url(#arr)"/>
+    <path class="d-line" d="M470,167 L520,167" marker-end="url(#arr)"/>
+    <text class="d-text" x="530" y="72">7, 14, 21, 350 …</text>
+    <text class="d-accent" x="530" y="122">50, 100, 350 …</text>
+    <text class="d-text" x="530" y="172">3, 6, 21 …</text>
+    <text class="d-small" x="396" y="208">查「季節限定」：直接取出那一串列編號</text>
+  </svg>
+  <figcaption>同一欄 <code>tags</code>：B-tree 存整個陣列值，GIN 存每一個標籤。</figcaption>
+</figure>
+<p>有了倒排索引，查「含有季節限定」就是到索引裡找「季節限定」這個元素，直接拿到那一串列的位置，再回表把那幾列讀出來。要查「同時含有季節限定和外送」，就取出兩串位置，留下兩串都有的。表再大，查詢讀的也只是這幾串清單，不必把每一列看一遍。</p>
+<p><code>tags</code> 已經建了 GIN 索引 <code>products_tags_idx</code>。但建了索引，不代表查詢一定用得上。下面用 <code>EXPLAIN</code> 比較「含有季節限定」的兩種寫法：第一句用第 14 課的包含運算子 <code>@&gt;</code>，第二句是開場那種直覺寫法 <code>= ANY (…)</code>。執行後看兩句的計畫有沒有用上 <code>products_tags_idx</code>：</p>
+<div class="lab" data-sql="EXPLAIN SELECT id FROM products WHERE tags @&gt; ARRAY['季節限定'];
+
+EXPLAIN SELECT id FROM products WHERE '季節限定' = ANY (tags);"></div>
+<ul>
+  <li>第一句：<code>Bitmap Index Scan on products_tags_idx</code>。</li>
+  <li>第二句：<code>Seq Scan</code>。</li>
+</ul>
+<p>兩句查出來的結果一樣，都是 201 項，可是只有第一句用上索引。原因在於規劃器判斷「這個條件能不能交給索引」的方式：它不看這句話的意思，而是看條件長不長成「索引欄位 運算子 值」，而且這個運算子是不是這個索引宣告過自己會處理的。陣列的 GIN 索引會處理的運算子只有 <code>@&gt;</code>（包含）、<code>&lt;@</code>（被包含）、<code>&amp;&amp;</code>（有重疊）、<code>=</code>（整個陣列相等）。<code>'季節限定' = ANY (tags)</code> 實際上是「拿這個字串跟陣列的每一個元素用文字的 <code>=</code> 比一次」，用的是文字的 <code>=</code>，不是陣列的運算子，所以索引接不住。</p>
+<p>這是這一課最重要的一句話，後面每一節都會再遇到：<strong>索引能不能用，看的是運算子，不是語意。</strong>兩種寫法對人來說意思相同，對規劃器來說是兩件不相干的事。</p>
+<p>「這個索引會處理哪些運算子」是誰決定的？每種索引在每種資料型別上，都有一份規格，寫明這種型別的值要怎麼拆成元素、能回答哪些運算子。這份規格叫 <strong>operator class</strong>，簡稱 <strong>opclass</strong>，中文是運算子類別。建索引時沒有指定，就用這個型別的預設 opclass，剛才 <code>tags</code> 用的就是陣列的預設 opclass。同一個型別也可能有好幾種 opclass，各自拆法不同、支援的運算子不同，建索引時寫在欄位名稱後面指定，例如 <code>USING gin (options jsonb_path_ops)</code>。下一節的 JSONB 就要在兩種 opclass 之間做選擇。</p>
+<h3>GIN 的代價：讀得快、寫得慢</h3>
+<p>既然 GIN 查「包含」這麼快，為什麼不在每個欄位都建一個？因為它的寫入成本比 B-tree 高很多。B-tree 新增一列，只要在索引裡插入一筆；GIN 新增一列，這一列拆出幾個元素，就要去改幾個地方。一項商品有 3 個標籤，要更新 3 串清單；一段 50 個詞的描述，就要更新 50 串。</p>
+<p>為了不讓每次寫入都這麼慢，GIN 預設開著 <code>fastupdate</code>。它的做法是先不整理：新的索引項目先丟進一份沒排序的<strong>待處理清單</strong>（pending list），之後再一次整理進主結構。整理的時機有三種：VACUUM 執行時、自動 ANALYZE 執行時，或清單大小超過 <code>gin_pending_list_limit</code>（預設 4MB）時（PostgreSQL 18 文件）。VACUUM 是 PostgreSQL 在背景定期執行的清理工作，第 30 課會詳談；ANALYZE 是<a href="21-explain.html">第 21 課</a>教過的更新統計資訊。</p>
+<p>待處理清單把寫入成本攤平了，但也帶來兩個副作用。第一，查詢除了查主結構，還要把這份沒排序的清單從頭看一遍，清單越長查詢越慢。第二，剛好碰上「清單超過上限、要整理」的那一次寫入，會負責整理整份清單，這一次會突然變得很慢。所以 GIN 適合「讀很多、改得少」的欄位。商品的標籤一個月改不了幾次，很適合；如果是一直在更新的欄位，例如把瀏覽次數、按讚數這種計數器放在 JSONB 裡又在上面建 GIN，就要先想清楚寫入撐不撐得住。</p>
+<p>第一項需求解決了：寫成 <code>@&gt;</code>，現有的 GIN 就用得上。第二項「有燕麥奶選項」存在 <code>options</code> 這個 JSONB 欄位，它跟陣列不一樣，有 key、有值，還可以一層包一層。這時 GIN 要把一列拆成什麼元素？</p>
+
+<h2>篩出「有燕麥奶選項」：JSONB 要怎麼拆進 GIN？</h2>
+<p>一項商品的 <code>options</code> 長這樣：<code>{"size":"M","milk":"oat","sugar":"30"}</code>。後台要的查詢是第 14 課的寫法 <code>options @&gt; '{"milk":"oat"}'</code>，意思是「options 裡要有 milk 這個 key，而且它的值是 oat」。上一節說過，索引怎麼拆、能回答什麼，由 opclass 決定。JSONB 有兩種 GIN opclass，差別就在拆法。</p>
+<p>預設的 <code>jsonb_ops</code> 把每個 key 和每個值<strong>各自</strong>拆成一個元素。上面那一列會拆出 size、M、milk、oat、sugar、30 六個元素。因為 key 自己就是一個元素，它能回答「有沒有 milk 這個 key」這種問題，也就是第 14 課的 <code>?</code> 運算子。但用它查 <code>@&gt; '{"milk":"oat"}'</code> 時，索引只知道「有 milk 這個 key 的列」和「有 oat 這個值的列」，不知道 oat 是不是 milk 的值：一列 <code>{"milk":"whole","topping":"oat"}</code> 也會被當成候選。所以索引先找出候選列，PostgreSQL 再回到表裡逐列確認，把不符合的丟掉。</p>
+<p>另一種 <code>jsonb_path_ops</code> 的拆法要先認識<strong>雜湊</strong>（hash）。雜湊是一種函式，把任意長度的資料算成一個固定長度的數字；同樣的輸入一定得到同樣的數字，不同的輸入幾乎不會撞到同一個數字。<code>jsonb_path_ops</code> 把「從最外層走到這個值的路徑，加上這個值」整個算成一個雜湊值，當成一個元素。上面那一列只拆出三個元素：「milk→oat」「size→M」「sugar→30」各一個。這樣做有兩個好處：元素比較少，索引比較小；「milk→oat」是綁在一起的，<code>{"topping":"oat"}</code> 不會被當成候選，查得更準。代價是 key 不再單獨存在，它回答不了「有沒有某個 key」。兩種 opclass 支援的運算子整理如下（PostgreSQL 18 文件）：</p>
+<div class="table-wrap">
+<table>
+  <tr><th>opclass</th><th>支援的運算子</th><th>拆法與特點</th></tr>
+  <tr><td><code>jsonb_ops</code>（預設）</td><td><code>@&gt;</code>、<code>?</code>（有這個 key）、<code>?|</code>、<code>?&amp;</code>、<code>@?</code>、<code>@@</code></td><td>每個 key、每個值各存一個元素，功能多、比較大</td></tr>
+  <tr><td><code>jsonb_path_ops</code></td><td>只有 <code>@&gt;</code>、<code>@?</code>、<code>@@</code></td><td>「路徑＋值」合成一個雜湊值，比較小、查得更準，但不能查「有沒有某個 key」</td></tr>
+</table>
+</div>
+<p>實際差多少，把兩種都建出來比大小。執行後看 <code>path_ops</code> 和 <code>default_ops</code> 兩欄：</p>
+<div class="lab" data-sql="BEGIN;
+CREATE INDEX opt_path ON products USING gin (options jsonb_path_ops);
+CREATE INDEX opt_ops  ON products USING gin (options);
+SELECT pg_size_pretty(pg_relation_size('opt_path')) AS path_ops,
+       pg_size_pretty(pg_relation_size('opt_ops'))  AS default_ops;
+ROLLBACK;"></div>
+<p>這份資料上 <code>jsonb_path_ops</code> 大約只有預設的一半大。選擇的規則因此很單純：先看查詢會用到哪些運算子。只用 <code>@&gt;</code> 篩「某個 key 等於某個值」，選 <code>jsonb_path_ops</code>；需要查「有沒有某個 key」，才用預設的 <code>jsonb_ops</code>。後台的燕麥奶篩選只用 <code>@&gt;</code>，所以選前者。</p>
+<p>索引選對了，查詢的寫法還是會讓它白建。開場的直覺寫法 <code>options -&gt;&gt; 'milk' = 'oat'</code> 也是第 14 課教過的，執行後比較它和 <code>@&gt;</code> 兩句的計畫：</p>
+<div class="lab" data-sql="BEGIN;
+CREATE INDEX opt_path ON products USING gin (options jsonb_path_ops);
+EXPLAIN SELECT id FROM products WHERE options -&gt;&gt; 'milk' = 'oat';   -- Seq Scan
+EXPLAIN SELECT id FROM products WHERE options @&gt; '{&quot;milk&quot;:&quot;oat&quot;}'; -- 用上 GIN
+ROLLBACK;"></div>
+<p>這和上一節的 <code>= ANY</code> 是同一個問題。<code>options -&gt;&gt; 'milk'</code> 先把 milk 的值取出來變成文字，再用文字的 <code>=</code> 跟 <code>'oat'</code> 比。條件裡的運算子是文字的 <code>=</code>，不在 JSONB opclass 的清單裡，索引接不住。解法有兩種。一是把查詢改寫成 <code>@&gt;</code>，一個 GIN 索引就涵蓋所有 key 的篩選。二是這個 key 查得非常頻繁，照<a href="27-index-design.html">第 27 課</a>另外建一個運算式 B-tree <code>((options -&gt;&gt; 'milk'))</code>，它能處理 <code>=</code>、範圍和排序，但只對 milk 這一個 key 有效。</p>
+<div class="callout practice"><strong>💡 實務上：JSONB 適合「每項不一樣」的欄位，常篩的 key 要升格成欄位</strong><br>咖啡店的客製選項、電商的商品規格、表單的自訂欄位，每一筆長得不一樣，很適合放 JSONB 加 GIN。但如果某個 key 每一筆都有、後台天天用它篩選或排序（例如「價格」「上架狀態」），就該做成一般欄位，有型別、有 <code>NOT NULL</code> 和 <code>CHECK</code>，B-tree 也最好用。另一個常見坑是 ORM 或 query builder 幫你組出 <code>-&gt;&gt;</code> 的寫法，索引其實沒用上；資深工程師會把實際送出的 SQL 拿去跑 <code>EXPLAIN</code>，而不是看到「有建 GIN」就放心。</div>
+<p>前兩項需求比對的都是完整的元素：標籤就是「季節限定」，選項的值就是 oat。第三項搜尋框不一樣，使用者打的是幾個英文詞，要在一段描述文字裡找，而且詞的形式、順序都不固定。</p>
+
+<h2>搜尋框打「oat latte」：ILIKE 為什麼不夠，全文檢索怎麼比對？</h2>
+<p>最直接的做法是<a href="04-select.html">第 4 課</a>的 <code>ILIKE</code>，也就是不分大小寫的 <code>LIKE</code>：<code>description ILIKE '%oat latte%'</code>。它的問題不只是慢，而是找錯東西：</p>
+<ul>
+  <li>詞的順序和中間的字要一模一樣：描述寫 Iced oat milk lattes，中間多了 milk，<code>'%oat latte%'</code> 就找不到。</li>
+  <li>詞形不同就找不到：使用者搜 lattes，只寫 latte 的描述不會出現。</li>
+  <li>會比對到詞的一部分：搜 <code>'%ice%'</code> 會連 price、slice 一起找出來。</li>
+  <li>只有「有」和「沒有」，沒辦法排出哪一筆最相關。</li>
+</ul>
+<p>這些問題的根源相同：<code>ILIKE</code> 比對的是<strong>字元</strong>，不知道什麼是「詞」。<strong>全文檢索</strong>（full-text search）換一種思路：先把描述和搜尋條件都整理成一個個正規化之後的詞，再比對詞。PostgreSQL 用兩種型別和一個運算子表達這件事：</p>
+<ul>
+  <li><strong>tsvector</strong>：文件那一邊。一段文字切成詞、正規化之後的結果，每個詞附上它在原文的位置。</li>
+  <li><strong>tsquery</strong>：搜尋條件那一邊。由詞和 <code>&amp;</code>（且）、<code>|</code>（或）、<code>!</code>（非）、<code>&lt;-&gt;</code>（前一個詞後面緊接著下一個詞）組成。</li>
+  <li><code>@@</code>：這個 tsvector 符不符合這個 tsquery。</li>
+</ul>
+<p>「正規化」是關鍵，先看一句英文變成 tsvector 的樣子。<code>to_tsvector</code> 的第一個參數叫<strong>設定</strong>（configuration），決定詞要怎麼處理。執行後比較 <code>english</code> 和 <code>simple</code> 兩欄：</p>
+<div class="lab" data-sql="SELECT to_tsvector('english', 'Iced oat milk lattes, less sweet') AS english,
+       to_tsvector('simple',  'Iced oat milk lattes, less sweet') AS simple;"></div>
+<p><code>english</code> 設定會做<strong>詞幹化</strong>（stemming），也就是把一個詞的各種變化還原成同一個詞幹：<code>lattes</code> 變成 <code>latt</code>、<code>Iced</code> 變成 <code>ice</code>。搜尋條件也會經過同樣的處理，使用者打 latte 也會變成 <code>latt</code>，兩邊就對得上，搜 latte 自然找得到 lattes。它也會丟掉 <code>with</code>、<code>the</code> 這類到處都有、拿來搜尋沒有意義的<strong>停用詞</strong>（stop word）。<code>simple</code> 設定只轉小寫，不做詞幹化。結果裡每個詞後面的數字是它在原文的位置，<code>&lt;-&gt;</code>「緊接著」就是靠位置判斷的。</p>
+<p>這也說明了一條規則：文件和搜尋條件要用<strong>同一個設定</strong>。一邊用 <code>english</code> 變成 <code>latt</code>、另一邊用 <code>simple</code> 留著 <code>latte</code>，就永遠比對不到。</p>
+<h3>使用者打的字，要交給哪個函式變成 tsquery？</h3>
+<p>文件這一邊有了，另一邊是把搜尋框的文字變成 tsquery。PostgreSQL 有三個函式，差別在它們怎麼解讀輸入的文字：</p>
+<div class="table-wrap">
+<table>
+  <tr><th>函式</th><th>輸入</th><th>適合</th></tr>
+  <tr><td><code>to_tsquery</code></td><td>要自己寫運算子：<code>'oat &amp; latte'</code>；格式錯就報錯</td><td>程式組好的條件</td></tr>
+  <tr><td><code>plainto_tsquery</code></td><td>一般文字，所有詞用 <code>&amp;</code> 串起來，標點全部忽略</td><td>單純關鍵字</td></tr>
+  <tr><td><code>websearch_to_tsquery</code></td><td>像搜尋網站：<code>"雙引號"</code> 是片語、<code>-</code> 是排除、<code>or</code> 是或；<strong>永遠不會報語法錯誤</strong></td><td>直接接使用者的搜尋框</td></tr>
+</table>
+</div>
+<p>使用者會照搜尋網站的習慣打字，例如用雙引號框住片語、用減號排除。把同一串輸入交給兩個函式，執行後比較 <code>websearch</code> 和 <code>plain</code> 兩欄：</p>
+<div class="lab" data-sql="SELECT websearch_to_tsquery('english', '&quot;oat milk&quot; latte -vanilla') AS websearch,
+       plainto_tsquery('english', '&quot;oat milk&quot; latte -vanilla')      AS plain;"></div>
+<ul>
+  <li><code>websearch_to_tsquery</code> 得到 <code>'oat' &lt;-&gt; 'milk' &amp; 'latt' &amp; !'vanilla'</code>：oat 後面緊接著 milk、要有 latte、不能有 vanilla，和使用者的意思一致。</li>
+  <li><code>plainto_tsquery</code> 把引號和減號都丟掉，變成「四個詞都要有」，連 vanilla 也變成必須有，意思完全相反。</li>
+</ul>
+<p>至於 <code>to_tsquery</code>，同一串文字交給它會得到語法錯誤 <code>42601</code>，因為它要求輸入本身就是合法的 tsquery 語法。使用者只要打一個引號或括號，API 就回 500。結論：使用者的輸入一律交給 <code>websearch_to_tsquery</code>。</p>
+<h3>找到之後，誰排前面？</h3>
+<p>需求單還要求「最相關的排前面」。<code>ts_rank(tsvector, tsquery)</code> 依詞出現的次數等資訊算出一個相關度分數，詞出現越多次分數越高，拿來 <code>ORDER BY … DESC</code> 就是相關度排序。<code>ts_headline</code> 則把原文裡命中的詞標出來，預設用 <code>&lt;b&gt;…&lt;/b&gt;</code> 包起來，前端拿去顯示，就是搜尋結果裡那段粗體摘要。</p>
+<p><code>products</code> 還沒有存好的 tsvector 欄位（練習 3 會由你建），所以先用 seed 已經建好 <code>search</code> 欄位的 12 項小菜單 <code>menu_items</code> 示範同樣的查詢。它的 <code>search</code> 欄位就是 <code>description</code> 的 tsvector，是預先算好存起來的，怎麼建的下一小節講。執行後看 <code>rank</code> 欄由高到低，以及 <code>snippet</code> 欄裡標出的詞：</p>
+<div class="lab" data-sql="SELECT id, name,
+       ts_rank(search, q) AS rank,
+       ts_headline('english', description, q) AS snippet
+FROM menu_items, websearch_to_tsquery('english', 'oat latte') AS q
+WHERE search @@ q
+ORDER BY rank DESC, id;"></div>
+<p>目前的 <code>search</code> 只看描述。商品搜尋通常希望品名命中比描述命中更重要，做法是用 <code>setweight</code> 幫詞標上權重 A～D（A 最重），再把兩段 tsvector 用 <code>||</code> 接成一個：<code>setweight(to_tsvector('english', name), 'A') || setweight(to_tsvector('english', description), 'B')</code>。<code>ts_rank</code> 預設把 A、B、C、D 的詞分別算成 1.0、0.4、0.2、0.1 倍，品名命中的分數就會比描述命中高。</p>
+<h3>怎麼讓搜尋走索引：存成產生欄位，再建 GIN</h3>
+<p>到這裡搜尋結果對了，但還沒解決「慢」。如果查詢寫成 <code>WHERE to_tsvector('english', description) @@ q</code>，PostgreSQL 要對一萬多列逐列把描述切詞，再一列一列比對，比 <code>ILIKE</code> 還慢。要快，就要把每一列的 tsvector 事先算好存起來，再在上面建索引。</p>
+<p>這裡用的還是第一節的 GIN。tsvector 本來就是一列一列的詞，GIN 把它拆成「詞 → 出現在哪些列」，和標籤的索引是同一個結構，只是元素從標籤換成了詞。查 <code>search @@ q</code> 時，到索引裡找出含有這些詞的列就好。</p>
+<p>問題是事先算好的 tsvector 要存在哪，而且品名或描述被修改時，它要跟著更新。自己在程式裡維護很容易漏，用 trigger 又要多寫一段程式。PostgreSQL 的<strong>產生欄位</strong>（generated column）就是為這種需求設計的：宣告這一欄的值由同一列的其他欄位算出來，之後 <code>name</code> 或 <code>description</code> 一改，它自動跟著更新。產生欄位有兩種：<code>STORED</code> 在寫入時算好、真的存進表裡；<code>VIRTUAL</code> 不存，每次讀取時才算。</p>
+<p>要建索引，就必須寫 <code>STORED</code>。<code>VIRTUAL</code> 欄位沒有存下來的值，不能建索引；而 PostgreSQL 18 的產生欄位沒寫種類時預設就是 <code>VIRTUAL</code>（PostgreSQL 18 文件），網路上舊版的範例沒寫 <code>STORED</code> 照樣能用，照抄到 18 就會出事，版本差異見課末「版本備註」。下面照舊範例的寫法做一次，執行後看錯誤碼：</p>
+<div class="lab" data-sql="-- 沒寫 STORED：兩句在同一格會一起失敗、一起取消
+ALTER TABLE menu_items ADD COLUMN search2 tsvector
+  GENERATED ALWAYS AS (to_tsvector('english', name || ' ' || description));
+CREATE INDEX ON menu_items USING gin (search2);"></div>
+<p>錯誤是 <code>0A000 indexes on virtual generated columns are not supported</code>：建索引那一步失敗了。<code>menu_items</code> 的 <code>search</code> 欄位在 seed 裡就是 <code>GENERATED ALWAYS AS (to_tsvector('english', description)) STORED</code> 加上 GIN 索引，這也是上一小節的範例能直接查的原因。除了加產生欄位，也可以直接建運算式索引，但比較容易寫錯，細節見課末「補充與查表」。</p>
+<div class="callout practice"><strong>💡 實務上：搜尋框 API 的基本配備</strong><br>常見的寫法是 <code>GET /products?q=oat latte</code>，後端用<a href="25-backend.html">第 25 課</a>的<strong>參數化查詢</strong>把 <code>q</code> 傳進 <code>websearch_to_tsquery</code>，絕對不要把使用者輸入接進 SQL 字串。回傳一定加 <code>LIMIT</code> 和分頁，排序用 <code>ts_rank</code> 再加一個穩定的次要排序（例如 <code>id</code>），翻頁才不會重複或漏掉。前端通常會做 debounce（停止輸入幾百毫秒才送出），不然每打一個字就打一次資料庫。<code>ts_headline</code> 回傳的 <code>&lt;b&gt;</code> 是 HTML，原文若含使用者輸入的內容，前端直接用 innerHTML 塞進頁面會有 XSS 風險，要先跳脫原文或只允許 <code>&lt;b&gt;</code>。</div>
+<p>英文的搜尋框需求完成了。但咖啡店的商品名稱是中文，使用者更常打的是「拿鐵」而不是 latte。把同一套全文檢索用在中文上，會發生什麼事？</p>
+
+<h2>搜尋框打中文「拿鐵」：全文檢索為什麼找不到？</h2>
+<p>上一節的全文檢索之所以能運作，前提是能把文字切成詞。英文的詞之間有空白和標點，PostgreSQL 內建的解析器就是靠這些分隔切詞的。中文的詞之間沒有空白，「燕麥奶拿鐵」要切成「燕麥奶／拿鐵」，必須知道中文有哪些詞。把連續的中文切成一個個詞，叫做<strong>斷詞</strong>（segmentation），內建的解析器不會做。執行後看 <code>tokens</code> 欄切出幾個詞，以及 <code>found</code> 欄：</p>
+<div class="lab" data-sql="SELECT to_tsvector('simple', '燕麥奶拿鐵') AS tokens,
+       to_tsvector('simple', '燕麥奶拿鐵') @@ to_tsquery('simple', '拿鐵') AS found;"></div>
+<p>整串「燕麥奶拿鐵」被當成<strong>一個詞</strong>。全文檢索比對的是整個詞，「拿鐵」跟「燕麥奶拿鐵」是兩個不同的詞，所以 <code>found</code> 是 <code>false</code>。換成 <code>english</code> 設定也一樣，設定決定的是切好的詞怎麼正規化，不會讓解析器懂中文。</p>
+<p>要讓 PostgreSQL 做中文全文檢索，得裝別人寫好的<strong>擴充功能</strong>（extension）。擴充功能是可以裝進資料庫的額外功能包，裝好之後在資料庫裡執行 <code>CREATE EXTENSION 名稱</code> 啟用，就多出新的型別、函式、運算子或 opclass。PostgreSQL 官方隨附了一批擴充功能，稱為 contrib，下一節要用的 pg_trgm 就是其中之一。中文搜尋常見的選項有三類：</p>
+<ul>
+  <li><strong>斷詞擴充功能</strong>：zhparser、pg_jieba，內建中文詞典，把中文切成詞再做全文檢索。</li>
+  <li><strong>2-gram 擴充功能</strong>：pg_bigm，不斷詞，改成以每兩個連續的字為單位建索引，兩個字的中文詞也能加速 <code>LIKE</code>。</li>
+  <li><strong>外部搜尋引擎</strong>：Elasticsearch、OpenSearch、Meilisearch，內建中文分析器。</li>
+</ul>
+<p>前兩類都<strong>不是</strong> contrib：這頁的 PGlite 0.5.13 沒有，很多雲端代管的 PostgreSQL 服務也不提供，因為代管服務只允許安裝它審核過的擴充功能。選技術之前，先查你要用的服務支援哪些擴充功能，不要在本機裝好、測好，部署時才發現正式環境裝不了。</p>
+<p>在只有內建功能和 contrib 的環境裡，中文搜尋框還能做什麼？下一節的 pg_trgm 不靠詞，而是把文字切成每三個連續的字元來比對，所以不需要知道中文的詞在哪裡斷。它同時也處理需求單上的另一項：使用者打錯字。</p>
+
+<h2>打錯字、搜任意一段字：pg_trgm 能補到哪裡？</h2>
+<p>需求單還剩兩件事。使用者會打錯字：把 cappuccino 打成 cappucino、把「黑糖珍珠鮮奶」打成「黑糖珍奶」。後台的工程師也習慣寫 <code>ILIKE '%…%'</code> 找名稱裡任意一段文字。這兩件事都跟「詞」無關，比的是字元，全文檢索幫不上，pg_trgm 兩件都處理。</p>
+<p>pg_trgm 的基本單位是 <strong>trigram</strong>（三連字）：字串裡每三個連續字元的組合。它的想法是，兩個字串共有的三連字越多，看起來就越像；打錯一個字，只會破壞那個字附近的幾個三連字，其他大部分還是對得上。這頁的 seed 已經執行過 <code>CREATE EXTENSION pg_trgm;</code>。先看一個字串會拆出哪些 trigram，執行後看 <code>latte</code> 的結果：</p>
+<div class="lab" data-sql="SELECT show_trgm('latte') AS trigrams;"></div>
+<p>pg_trgm 會在字串前後補空白再切，所以 <code>latte</code> 會有 <code>"  l"</code>、<code>" la"</code> 這種包含空白的 trigram，讓字首和字尾也有自己的 trigram。中文字在這個函式的輸出裡顯示成雜湊值，但比對時一樣是三個字一組。</p>
+<p>有了 trigram，就能算兩個字串有多像。pg_trgm 用兩個字串<strong>共同的 trigram 佔的比例</strong>當作<strong>相似度</strong>（similarity），範圍是 0 到 1，1 是完全相同。執行後由左到右看三欄：</p>
+<div class="lab" data-sql="SELECT similarity('cappucino', 'cappuccino')      AS sim,
+       'cappucino' % 'cappuccino'                 AS similar_enough,
+       word_similarity('latte', 'iced oat milk latte') AS word_sim;"></div>
+<ul>
+  <li><code>similarity(a, b)</code>：兩個字串的相似度。cappucino 只少一個 c，大部分 trigram 仍然相同，相似度很高。</li>
+  <li><code>a % b</code>：相似度超過門檻 <code>pg_trgm.similarity_threshold</code>（預設 0.3）就是 true，這是拿來當 <code>WHERE</code> 條件的寫法。</li>
+  <li><code>word_similarity(a, b)</code>：a 和 b 裡「最像的那一段」有多像。短關鍵字跟長文字比時，用整串算相似度會被長文字稀釋，這時用它比較準。</li>
+</ul>
+<p>還有一個運算子 <code>a &lt;-&gt; b</code>：兩個字串的距離，等於 1 減相似度，越小越像。<code>ORDER BY name &lt;-&gt; '關鍵字' LIMIT 10</code> 就是「找最像的 10 筆」。把 <code>%</code> 篩選和 <code>&lt;-&gt;</code> 排序用在一起，就是「打錯字也找得到」的搜尋。注意這和全文檢索 tsquery 裡的 <code>&lt;-&gt;</code> 符號相同，但意思無關：運算子的意義由兩邊的型別決定，這裡兩邊是 <code>text</code>，所以是 pg_trgm 的距離。執行後看 <code>sim</code> 欄由高到低：</p>
+<div class="lab" data-sql="-- 使用者打「黑糖珍奶」，找最像的商品
+SELECT name, similarity(name, '黑糖珍奶') AS sim
+FROM products
+WHERE name % '黑糖珍奶'
+ORDER BY name &lt;-&gt; '黑糖珍奶'
+LIMIT 5;"></div>
+<p>注意條件寫的是 <code>name % '…'</code>，不是 <code>similarity(name, '…') &gt; 0.3</code>。兩者意思一樣，但第一節的那句話在這裡又出現了：索引認的是運算子，<code>similarity(…) &gt; 0.3</code> 是函式呼叫再比大小，索引接不住。</p>
+<h3>讓 ILIKE '%…%' 走索引：三個字以上才幫得上</h3>
+<p>剩下後台的 <code>ILIKE '%…%'</code>。pg_trgm 提供了 GIN 的 opclass <code>gin_trgm_ops</code>：用它建索引，GIN 的元素就是 trigram，結構是「trigram → 出現在哪些列」，和第一節標籤的索引是同一回事。它能加速 <code>LIKE</code>、<code>ILIKE</code> 和正規表示式，連 <code>%</code> 開頭的樣式也可以（pg_trgm 文件），這正是 B-tree 做不到的地方。</p>
+<p>它的運作方式是：先從搜尋樣式裡抽出 trigram，例如「黑糖珍」抽出「黑糖珍」這一組，到索引裡找出含有這些 trigram 的列當候選，最後再逐列用原本的 <code>ILIKE</code> 確認一次。下面建一個 trigram 索引，用三種長度的樣式測試，執行後看三句各是哪一種掃描：</p>
+<div class="lab" data-sql="BEGIN;
+CREATE INDEX products_name_trgm ON products USING gin (name gin_trgm_ops);
+EXPLAIN SELECT id FROM products WHERE name ILIKE '%黑糖珍%';  -- 3 個字
+EXPLAIN SELECT id FROM products WHERE name LIKE '%珍珠%';     -- 2 個字
+EXPLAIN SELECT id FROM products WHERE name ILIKE '%sp%';      -- 2 個字
+ROLLBACK;"></div>
+<ul>
+  <li>3 個字的「黑糖珍」：<code>Bitmap Index Scan</code>。</li>
+  <li>2 個字的「珍珠」「sp」：<code>Seq Scan</code>。</li>
+</ul>
+<p>兩個字的樣式為什麼不行？<code>'%珍珠%'</code> 兩邊都是 <code>%</code>，「珍珠」可能在名稱的任何位置，前後不會補空白，裡面只有兩個字，湊不出任何一個完整的 trigram。索引沒有東西可以查，文件說這時會<strong>退化成掃描整個索引</strong>，所以規劃器乾脆直接掃表。偏偏中文最常見的詞就是兩個字：拿鐵、珍珠、烏龍。對中文搜尋框來說，pg_trgm 只能幫三個字以上的關鍵字；兩個字的詞要靠上一節提到的 pg_bigm 或搜尋引擎。</p>
+<p>pg_trgm 也能建在另一種索引 <strong>GiST</strong> 上。GiST 是處理「相似、重疊、距離」這類關係的索引框架；GIN 篩選通常較快，但要靠索引做 <code>ORDER BY … &lt;-&gt; …</code> 找最像的前幾筆，只有 GiST 做得到。細節見課末「補充與查表」。</p>
+<div class="callout practice"><strong>💡 實務上：「後台搜尋越來越慢」常見的解法</strong><br>客服在後台用顧客姓名、Email、訂單備註找資料，程式寫的是 <code>ILIKE '%…%'</code>，資料少時沒感覺，一年後變成每次搜尋都在掃整張表。加一個 <code>gin_trgm_ops</code> 索引通常就解決，但上線前要問三件事：這張表寫入多頻繁（GIN 會拖慢寫入）、索引會多大、使用者實際會打幾個字（兩個字的中文關鍵字幫不上）。在正式環境的大表上建索引會擋住寫入，要用第 34 課的 <code>CREATE INDEX CONCURRENTLY</code>。</div>
+<p>需求單上的每一項都試過了，有的完全解決，有的只解決一部分。最後把它們攤在一起，判斷 PostgreSQL 內建的功能夠不夠用。</p>
+
+<h2>回到需求單：每一項用什麼？什麼時候該換搜尋引擎？</h2>
+<p>先把這課用過的工具，加上第 20 課的 B-tree，依需求整理成一張表：</p>
+<div class="table-wrap">
+<table>
+  <tr><th>需求</th><th>工具</th></tr>
+  <tr><td>完全相等、範圍、以某段文字開頭</td><td>B-tree（非 C 排序規則的前綴搜尋加 <code>text_pattern_ops</code>）</td></tr>
+  <tr><td>JSONB 包含某組 key／value、陣列含有某個元素</td><td>GIN（只用 <code>@&gt;</code> 時選 <code>jsonb_path_ops</code>）</td></tr>
+  <tr><td>英文關鍵字、詞形變化、相關度排序</td><td>全文檢索：STORED tsvector 欄位＋GIN</td></tr>
+  <tr><td>容忍錯字、三個字以上的子字串</td><td>pg_trgm（GIN 或 GiST）</td></tr>
+  <tr><td>中文斷詞、同義詞、拼音、分面（facet，「拿鐵 32 筆、茶 18 筆」那種篩選數字）、大量搜尋流量</td><td>專門的搜尋引擎：Elasticsearch、OpenSearch、Meilisearch</td></tr>
+</table>
+</div>
+<p>第一列的前綴搜尋不需要 trigram，B-tree 就行，但它在這頁和正式環境的行為不同，見課末「補充與查表」。</p>
+<p>對照需求單：季節限定用 <code>@&gt;</code> 加現有的 GIN；燕麥奶選項用 <code>jsonb_path_ops</code> 的 GIN 加 <code>@&gt;</code>；英文搜尋用 STORED 的 tsvector 欄位加 GIN，輸入交給 <code>websearch_to_tsquery</code>，用 <code>ts_rank</code> 排序；打錯字和三個字以上的中文用 pg_trgm。真正補不起來的只有一塊：兩個字的中文關鍵字，以及需要斷詞才做得好的中文搜尋。這一塊要不要補，決定了要不要換搜尋引擎。</p>
+<p>搜尋引擎在中文分析、同義詞、分面、相關度調整上都強很多，但它是另一套要維運的系統，而且資料的正本還是在 PostgreSQL，要同步過去。最直覺的同步方式是後端「先寫資料庫，再呼叫搜尋引擎」，但兩步之間任何一步失敗，例如資料庫寫成功、呼叫搜尋引擎時網路斷了，兩邊的資料就不一致，而且沒有人知道。可靠的做法有兩種。一種是 <strong>outbox</strong>：在寫商品的同一個交易裡，多寫一筆「這項商品要同步」的紀錄，兩者一起成功或一起失敗，再由背景程式讀這些紀錄送去搜尋引擎，第 33 課會實作。另一種是 <strong>CDC</strong>（change data capture），直接讀資料庫自己的變更紀錄，把每一筆修改轉送出去，第 37 課會講。</p>
+<p>資深的判斷是：商品幾萬筆、搜尋以英文或三個字以上的關鍵字為主，PostgreSQL 內建的就夠了，少一套系統就少一份維運和同步的風險。搜尋品質變成產品的核心，或中文搜尋的需求明確時，才付出同步與維運的成本換搜尋引擎。</p>
+<div class="callout practice"><strong>💡 實務上：先把缺口講清楚，再談要不要換</strong><br>面對這張需求單，資深工程師不會直接回「PostgreSQL 做不到中文搜尋，要上 Elasticsearch」，而是先把能做的做完，再把缺口具體地告訴 PM：「三個字以上的關鍵字和打錯字都找得到，兩個字的『拿鐵』『珍珠』目前只能掃表」。接著問資料量和搜尋量：商品只有一萬多筆時，兩個字的關鍵字掃表也許還在可接受的時間內，可以先上線、量測再決定。真的要換搜尋引擎，也要把同步方式（outbox 或 CDC）和誰負責維運一起列進評估。</div>
+
+<h2>補充與查表</h2>
+<p>主線用不到、但選型或查問題時會用到的細節。</p>
+
+<h3>GiST 是什麼；pg_trgm 用 GIN 還是 GiST</h3>
+<p>另一個你會看到的索引名字是 <strong>GiST</strong>（Generalized Search Tree）：能處理「相似、重疊、距離」這類關係的索引框架。這課的 pg_trgm 兩種都支援，第 38 課的時段重疊也會用到 GiST。</p>
+<p>pg_trgm 的 GiST opclass 是 <code>gist_trgm_ops</code>。<code>LIKE</code>、<code>%</code> 篩選兩者都行，GIN 通常查得快、建得慢；要用 <code>ORDER BY … &lt;-&gt; …</code> 找最像的前幾筆，只有 GiST 能靠索引做到（pg_trgm 文件）。</p>
+
+<h3>不加欄位：全文檢索的運算式索引</h3>
+<p>也可以不加 tsvector 欄位，直接建運算式索引 <code>USING gin (to_tsvector('english', description))</code>。但查詢裡的運算式必須和索引<strong>一字不差</strong>，包括設定名稱；寫成 <code>to_tsvector(description)</code>（沒指定設定、依 <code>default_text_search_config</code>）就用不上。存成欄位比較不容易寫錯。</p>
+
+<h3>前綴搜尋與排序規則</h3>
+<p>「以某段文字開頭」的 <code>LIKE '拿鐵%'</code> 用 B-tree 就行（第 20 課），不需要 trigram。這頁的 PGlite 用 C 排序規則（collation），一般 B-tree 就能用；正式環境常見的 <code>en_US.UTF-8</code> 要建 <code>(name text_pattern_ops)</code>。在這頁看到走索引，不代表正式環境也會。</p>
+
+<h3>版本備註</h3>
+<p>PostgreSQL 18 起，產生欄位沒寫種類時預設是 <code>VIRTUAL</code>，而 VIRTUAL 欄位不能建索引（PostgreSQL 18 文件）。17 版以前只有 <code>STORED</code>，所以那時的範例沒寫 <code>STORED</code> 也不會出事，照抄到 18 就會在建索引時得到 <code>0A000</code>。這頁的環境是 PGlite 0.5.13（PostgreSQL 18.6）。</p>
+
+<h2>練習</h2>
+<p>判分要看到查詢計畫，這頁準備了小工具 <code>plan_nodes('查詢')</code>：它對那句查詢跑 <code>EXPLAIN (FORMAT JSON)</code>，把計畫攤平成「節點、表、索引、條件」四欄。查詢放在單引號字串裡，裡面的單引號要寫兩次：</p>
+<div class="lab" data-sql="SELECT * FROM plan_nodes('SELECT id FROM products WHERE tags @&gt; ARRAY[''季節限定'']');"></div>
+
+<div class="exercise"
+  data-start="-- 建一個索引，讓下面這句走 GIN，而且選比較小的 opclass
+EXPLAIN SELECT id FROM products WHERE options @&gt; '{&quot;milk&quot;:&quot;oat&quot;}';"
+  data-answer="CREATE INDEX ON products USING gin (options jsonb_path_ops);"
+  data-check="SELECT (SELECT bool_or(node = 'Bitmap Index Scan')
+        FROM plan_nodes('SELECT id FROM products WHERE options @&gt; ''{&quot;milk&quot;:&quot;oat&quot;}''')) AS uses_gin,
+       (SELECT string_agg(o.opcname, ',' ORDER BY o.opcname)
+        FROM pg_index i
+        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
+        JOIN pg_opclass o ON o.oid = i.indclass[0]
+        WHERE i.indrelid = 'products'::regclass AND a.attname = 'options' AND i.indpred IS NULL) AS opclass;">
+  <p>練習 1：後台要篩「有燕麥奶選項的商品」：<code>SELECT id FROM products WHERE options @&gt; '{"milk":"oat"}'</code>。在 <code>options</code> 上建<strong>一個</strong>索引，讓這句的計畫出現 <code>Bitmap Index Scan</code>，而且這個查詢只用 <code>@&gt;</code>，所以選比較小的那種 opclass。判分看計畫，以及建在 <code>options</code> 上的索引用了哪個 opclass。</p>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON products USING gin (options);</script>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON products (options);</script>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON products ((options ->> 'milk'));</script>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON products USING gin (options jsonb_path_ops) WHERE options @> '{"milk":"oat"}';</script>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON products USING gin (options jsonb_path_ops);
+CREATE INDEX ON products USING gin (options);</script>
+</div>
+
+<div class="exercise"
+  data-start="-- 建立 view seasonal（id, name）：tags 含有「季節限定」的商品
+"
+  data-answer="CREATE VIEW seasonal AS
+SELECT id, name FROM products
+WHERE tags @&gt; ARRAY['季節限定'];"
+  data-check="SELECT (SELECT string_agg(column_name, ',' ORDER BY ordinal_position)
+        FROM information_schema.columns WHERE table_name = 'seasonal') AS cols,
+       (SELECT count(*) FROM seasonal) AS n,
+       (SELECT bool_or(node = 'Bitmap Index Scan' AND idx = 'products_tags_idx') FROM plan_nodes('SELECT * FROM seasonal')) AS uses_gin;">
+  <p>練習 2：<code>tags</code> 已經有 GIN 索引 <code>products_tags_idx</code>。建立 view <code>seasonal</code>，欄位是 <code>id, name</code>，列出 <code>tags</code> 含有「季節限定」的商品，寫法要讓查詢這個 view 時用上那個 GIN 索引。（寫成 view 是為了讓判分看得到你的查詢的計畫。）</p>
+  <script type="text/sql" data-role="wrong">CREATE VIEW seasonal AS
+SELECT id, name FROM products
+WHERE '季節限定' = ANY (tags);</script>
+  <script type="text/sql" data-role="wrong">CREATE VIEW seasonal AS
+SELECT id, name FROM products
+WHERE array_position(tags, '季節限定') IS NOT NULL;</script>
+  <script type="text/sql" data-role="wrong">CREATE VIEW seasonal AS
+SELECT id, name FROM products
+WHERE id = ANY (ARRAY(SELECT id FROM products WHERE '季節限定' = ANY (tags)));</script>
+  <script type="text/sql" data-role="wrong">CREATE VIEW seasonal AS
+SELECT * FROM products
+WHERE tags @> ARRAY['季節限定'];</script>
+</div>
+
+<div class="exercise"
+  data-start="-- 1. 加 search 欄位（english 設定，品名權重 A、描述權重 B）
+-- 2. 建 GIN 索引
+"
+  data-answer="ALTER TABLE products ADD COLUMN search tsvector
+  GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', name), 'A') ||
+    setweight(to_tsvector('english', description), 'B')
+  ) STORED;
+CREATE INDEX ON products USING gin (search);"
+  data-check="SELECT a.attgenerated AS kind,
+       (SELECT count(*) FROM products
+        WHERE search @@ websearch_to_tsquery('english', 'oat lattes')) AS hits,
+       (SELECT bool_or(node = 'Bitmap Index Scan')
+        FROM plan_nodes('SELECT id FROM products WHERE search @@ websearch_to_tsquery(''english'', ''oat lattes'')')) AS uses_gin,
+       (SELECT string_agg(lexeme || ':' || array_to_string(weights, ''), ' ' ORDER BY lexeme)
+        FROM unnest((SELECT search FROM products WHERE id = 12))) AS sample
+FROM pg_attribute a
+WHERE a.attrelid = 'products'::regclass AND a.attname = 'search';">
+  <p>練習 3：幫 <code>products</code> 加一個產生欄位 <code>search</code>（型別 <code>tsvector</code>，用 <code>english</code> 設定；<code>name</code> 的權重 A、<code>description</code> 的權重 B），之後新增或修改商品時要自動更新；再建 GIN 索引，讓 <code>WHERE search @@ websearch_to_tsquery('english', 'oat lattes')</code> 走索引。判分看欄位種類、搜尋筆數、計畫、以及某一項商品的 <code>search</code> 內容（詞與權重）。</p>
+  <script type="text/sql" data-role="wrong">ALTER TABLE products ADD COLUMN search tsvector
+  GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', name), 'A') ||
+    setweight(to_tsvector('english', description), 'B')
+  );
+CREATE INDEX ON products USING gin (search);</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE products ADD COLUMN search tsvector
+  GENERATED ALWAYS AS (
+    setweight(to_tsvector('simple', name), 'A') ||
+    setweight(to_tsvector('simple', description), 'B')
+  ) STORED;
+CREATE INDEX ON products USING gin (search);</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE products ADD COLUMN search tsvector
+  GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', name), 'A') ||
+    setweight(to_tsvector('english', description), 'B')
+  ) STORED;</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE products ADD COLUMN search tsvector;
+UPDATE products SET search =
+  setweight(to_tsvector('english', name), 'A') ||
+  setweight(to_tsvector('english', description), 'B');
+CREATE INDEX ON products USING gin (search);</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE products ADD COLUMN search tsvector
+  GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', name), 'B') ||
+    setweight(to_tsvector('english', description), 'A')
+  ) STORED;
+CREATE INDEX ON products USING gin (search);</script>
+  <script type="text/sql" data-role="wrong">ALTER TABLE products ADD COLUMN search tsvector
+  GENERATED ALWAYS AS (to_tsvector('english', name || ' ' || description)) STORED;
+CREATE INDEX ON products USING gin (search);</script>
+</div>
+
+<div class="exercise"
+  data-start="-- 建立 view top_search（id, name）
+"
+  data-answer="CREATE VIEW top_search AS
+SELECT id, name
+FROM menu_items
+WHERE search @@ websearch_to_tsquery('english', '&quot;oat milk&quot; latte -vanilla')
+ORDER BY ts_rank(search, websearch_to_tsquery('english', '&quot;oat milk&quot; latte -vanilla')) DESC, id
+LIMIT 5;"
+  data-check="CREATE TEMP TABLE before_insert AS SELECT * FROM top_search;
+INSERT INTO menu_items (id, name, description)
+VALUES (13, '燕麥奶拿鐵（新品）', 'New oat milk latte: oat milk latte with more oat milk latte');
+SELECT (SELECT json_agg(t) FROM before_insert t) AS before_insert,
+       (SELECT json_agg(t) FROM top_search t) AS after_insert;">
+  <p>練習 4：使用者在搜尋框輸入 <code>"oat milk" latte -vanilla</code>（要「oat milk」這個片語、要有 latte、不要 vanilla）。建立 view <code>top_search</code>：用這串輸入搜尋 <code>menu_items</code> 的 <code>search</code> 欄位（seed 已建好），依 <code>ts_rank</code> 由高到低、同分時 <code>id</code> 由小到大，取前 5 筆的 <code>id</code> 與 <code>name</code>。使用者的輸入要原封不動交給適合的函式。判分會比對新增一項新品前、後 view 的內容，確認 view 是真的在搜尋。</p>
+  <script type="text/sql" data-role="wrong">CREATE VIEW top_search AS
+SELECT id, name
+FROM menu_items
+WHERE search @@ plainto_tsquery('english', '"oat milk" latte -vanilla')
+ORDER BY ts_rank(search, plainto_tsquery('english', '"oat milk" latte -vanilla')) DESC, id
+LIMIT 5;</script>
+  <script type="text/sql" data-role="wrong">CREATE VIEW top_search AS
+SELECT id, name
+FROM menu_items
+WHERE search @@ websearch_to_tsquery('english', '"oat milk" latte -vanilla')
+ORDER BY id
+LIMIT 5;</script>
+  <script type="text/sql" data-role="wrong">CREATE VIEW top_search AS
+SELECT id, name
+FROM menu_items
+WHERE search @@ to_tsquery('english', '"oat milk" latte -vanilla')
+ORDER BY ts_rank(search, to_tsquery('english', '"oat milk" latte -vanilla')) DESC, id
+LIMIT 5;</script>
+  <script type="text/sql" data-role="wrong">CREATE VIEW top_search AS
+SELECT id, name
+FROM menu_items
+WHERE search @@ websearch_to_tsquery('english', '"oat milk" latte -vanilla')
+ORDER BY ts_rank(search, websearch_to_tsquery('english', '"oat milk" latte -vanilla')) DESC
+LIMIT 5;</script>
+  <script type="text/sql" data-role="wrong">CREATE VIEW top_search AS
+SELECT id, name
+FROM menu_items
+WHERE search @@ websearch_to_tsquery('english', '"oat milk" latte')
+ORDER BY ts_rank(search, websearch_to_tsquery('english', '"oat milk" latte')) DESC, id
+LIMIT 5;</script>
+  <script type="text/sql" data-role="wrong">CREATE VIEW top_search AS
+SELECT * FROM (VALUES (6, '冰燕麥拿鐵'), (10, '燕麥奶拿鐵（大杯）'), (8, '雙份燕麥拿鐵'), (2, '燕麥奶拿鐵'), (7, '海鹽燕麥拿鐵')) AS v(id, name);</script>
+</div>
+
+<div class="exercise"
+  data-start="-- 建一個索引，讓下面這句走索引
+EXPLAIN SELECT id FROM products WHERE name ILIKE '%黑糖珍%';"
+  data-answer="CREATE INDEX ON products USING gin (name gin_trgm_ops);"
+  data-check="SELECT (SELECT bool_or(o.opcname IN ('gin_trgm_ops', 'gist_trgm_ops') AND i.indpred IS NULL)
+        FROM plan_nodes('SELECT id FROM products WHERE name ILIKE ''%黑糖珍%''') p
+        JOIN pg_class c ON c.relname = p.idx
+        JOIN pg_index i ON i.indexrelid = c.oid
+        JOIN pg_opclass o ON o.oid = i.indclass[0]) AS uses_index,
+       (SELECT count(*) FROM products WHERE name ILIKE '%黑糖珍%') AS hits;">
+  <p>練習 5：搜尋框輸入「黑糖珍」，後端執行 <code>SELECT id FROM products WHERE name ILIKE '%黑糖珍%'</code>，目前是 <code>Seq Scan</code>。建一個索引讓它走索引。</p>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON products (name);</script>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON products (lower(name));</script>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON products USING gin (to_tsvector('simple', name));</script>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON products (name text_pattern_ops);</script>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON products (id) WHERE name ILIKE '%黑糖珍%';</script>
+  <script type="text/sql" data-role="wrong">CREATE INDEX ON products USING gin (name gin_trgm_ops) WHERE name ILIKE '%黑糖珍%';</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 6：<code>to_tsvector('simple', '燕麥奶拿鐵') @@ to_tsquery('simple', '拿鐵')</code> 為什麼是 <code>false</code>？</p>
+  <label data-key="a"><code>simple</code> 設定不支援中文，換成 <code>english</code> 就會是 true</label>
+  <label data-key="b">要先建 GIN 索引，全文檢索才查得到</label>
+  <label data-key="c">內建的解析器不會中文斷詞，整串「燕麥奶拿鐵」被當成一個詞，跟「拿鐵」這個詞不相等</label>
+  <label data-key="d">tsquery 不能放中文</label>
+  <p class="why">✓ 全文檢索比對的是「詞」。中文沒有空白，內建解析器把連續中文整串當一個詞，換哪個內建設定都一樣。索引只影響速度，不影響結果；tsquery 可以放中文，只是要有東西幫你斷詞（zhparser、pg_jieba，或外部搜尋引擎）。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：<code>products.name</code> 已經有 <code>gin_trgm_ops</code> 索引，為什麼 <code>WHERE name LIKE '%拿鐵%'</code> 還是 <code>Seq Scan</code>？</p>
+  <label data-key="a">trigram 索引只支援 <code>ILIKE</code>，不支援 <code>LIKE</code></label>
+  <label data-key="b">「拿鐵」只有兩個字，兩邊又是 <code>%</code>，抽不出任何 trigram，索引篩不掉任何列</label>
+  <label data-key="c">統計資訊過時，先 <code>ANALYZE</code> 就會走索引</label>
+  <label data-key="d">中文字不能建 trigram</label>
+  <p class="why">✓ trigram 是三個連續字元，<code>'%拿鐵%'</code> 裡找不到完整的三個字，索引只能整個掃一遍，規劃器乾脆直接掃表。<code>LIKE</code>、<code>ILIKE</code> 都支援；中文三個字以上（例如「黑糖珍」）就能走索引。兩個字的中文詞要靠 pg_bigm 或搜尋引擎。</p>
+</div>
+
+<div class="quiz" data-correct="d">
+  <p>練習 8：什麼情況最適合把商品搜尋改交給 Elasticsearch／Meilisearch 這類搜尋引擎？</p>
+  <label data-key="a">專案一開始就要上，PostgreSQL 的搜尋功能不能用在正式環境</label>
+  <label data-key="b">只要用到 <code>ILIKE '%…%'</code> 就該換</label>
+  <label data-key="c">永遠不需要，PostgreSQL 全文檢索等於搜尋引擎</label>
+  <label data-key="d">需要中文斷詞、同義詞、分面篩選，或搜尋流量大到影響主資料庫，而且團隊願意負擔資料同步（outbox／CDC）與多一套系統的維運</label>
+  <p class="why">✓ 搜尋引擎在中文分析、同義詞、分面、相關度調整上強很多，代價是多一套系統、資料要可靠地同步過去。英文或三字以上的搜尋、資料量不大時，PostgreSQL 內建的 GIN、全文檢索、pg_trgm 就夠用；<code>ILIKE '%…%'</code> 很多時候加個 trigram 索引就解決了。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>寫 <code>options -&gt;&gt; 'milk' = 'oat'</code> 或 <code>'x' = ANY (tags)</code>，以為 GIN 會幫忙</strong>：GIN 只認特定運算子。改寫成 <code>@&gt;</code>，或另建運算式 B-tree。</li>
+  <li><strong>以為 <code>jsonb_path_ops</code> 支援所有 JSONB 運算子</strong>：它不支援 <code>?</code>、<code>?|</code>、<code>?&amp;</code>。要查「有沒有某個 key」就用預設的 <code>jsonb_ops</code>。</li>
+  <li><strong>產生欄位沒寫 <code>STORED</code></strong>：PostgreSQL 18 預設 VIRTUAL，建索引會失敗（0A000）。</li>
+  <li><strong>查詢時才算 <code>to_tsvector(…)</code>，而且跟索引的運算式不一致</strong>：設定名稱或運算式差一點，索引就用不上。存成 STORED 欄位最不容易錯。</li>
+  <li><strong>把使用者輸入直接丟給 <code>to_tsquery</code></strong>：一個引號就是語法錯誤。用 <code>websearch_to_tsquery</code>。</li>
+  <li><strong>用 <code>similarity(name, $1) &gt; 0.3</code> 當條件</strong>：函式呼叫用不上索引，用 <code>name % $1</code>。</li>
+  <li><strong>以為 trigram 索引讓任何 <code>LIKE</code> 都變快</strong>：少於三個字的樣式抽不出 trigram，中文兩字詞正好踩到。</li>
+  <li><strong>在一直被更新的欄位上建 GIN</strong>：每次更新都要改很多個索引項目，待處理清單整理時寫入會突然變慢。</li>
+  <li><strong>忘了 <code>CREATE EXTENSION pg_trgm</code>，或以為雲端服務什麼擴充功能都有</strong>：上線前先確認支援清單。</li>
+  <li><strong>在 PGlite（C 排序規則）看到 <code>LIKE 'abc%'</code> 走索引，就以為正式環境也一樣</strong>：<code>en_US.UTF-8</code> 要建 <code>text_pattern_ops</code>。同理，<code>ORDER BY name</code> 照字碼排，不是筆畫或注音；要中文排序得用正式環境支援的 ICU 排序規則，這頁的 PGlite 沒有。</li>
+</ul>
+
+<h2>小結</h2>
+<ul>
+  <li>「包含」類的查詢用 GIN：它是倒排索引，存「元素 → 出現在哪些列」；元素可以是陣列元素、JSONB 的 key 和值、詞、trigram。讀得快、寫得慢，適合讀多改少的欄位。</li>
+  <li>索引能不能用看<strong>運算子</strong>，不是語意：陣列和 JSONB 寫 <code>@&gt;</code>，不寫 <code>= ANY</code> 或 <code>-&gt;&gt;</code>；拆法和支援的運算子由 opclass 決定，只用 <code>@&gt;</code> 時選比較小的 <code>jsonb_path_ops</code>。</li>
+  <li>英文搜尋用全文檢索：<code>tsvector</code>＋<code>tsquery</code> 比對正規化後的詞，使用者輸入交給 <code>websearch_to_tsquery</code>，<code>setweight</code>＋<code>ts_rank</code> 排序，<code>ts_headline</code> 標關鍵字；tsvector 存成 <code>STORED</code> 產生欄位再建 GIN。</li>
+  <li>內建全文檢索不會中文斷詞；pg_trgm 用三連字比對，能容錯、能讓 <code>ILIKE '%…%'</code> 走索引，但幫不上兩個字的關鍵字。</li>
+  <li>中文斷詞、同義詞、分面、大流量才換搜尋引擎，並用 outbox 或 CDC 同步資料；換之前先把 PostgreSQL 能做的做完、把缺口講清楚。</li>
+</ul>
+<p>下一課學查詢調校：規劃器的統計資訊怎麼來、估計錯了怎麼辦，以及怎麼在正式環境找出最該優化的慢查詢。</p>
+
+</main>
+
+<script type="text/sql" id="seed">
+CREATE EXTENSION pg_trgm;
+
+-- 10,002 項商品：中文品名、英文描述、標籤陣列、客製選項 JSONB
+CREATE TABLE products (
+  id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name text NOT NULL,
+  description text NOT NULL,
+  price integer NOT NULL,
+  tags text[] NOT NULL DEFAULT '{}',
+  options jsonb NOT NULL DEFAULT '{}'
+);
+INSERT INTO products (name, description, price, tags, options)
+SELECT (ARRAY['美式咖啡','拿鐵','卡布奇諾','伯爵紅茶','可頌','起司蛋糕','燕麥奶拿鐵','抹茶拿鐵'])[1 + g % 8] || ' ' || g,
+       (ARRAY['Classic latte with whole milk',
+              'Iced oat milk lattes, less sweet',
+              'Hot americano brewed from single origin beans',
+              'Earl grey tea with bergamot',
+              'Butter croissant baked every morning',
+              'Cheesecake with a crunchy biscuit base',
+              'Cappuccino with thick milk foam',
+              'Matcha latte with whole milk',
+              'Cold brew coffee steeped for twelve hours',
+              'Hot chocolate topped with cream'])[1 + g % 10],
+       (ARRAY[70, 80, 90, 110, 120])[1 + g % 5],
+       CASE WHEN g % 50 = 0 THEN ARRAY['季節限定'] ELSE '{}' END
+         || CASE WHEN g % 7 = 0 THEN ARRAY['外送'] ELSE '{}' END
+         || CASE WHEN g % 3 = 0 THEN ARRAY['熱銷'] ELSE '{}' END,
+       jsonb_build_object('size', (ARRAY['S','M','L'])[1 + g % 3],
+                          'milk', CASE WHEN g % 40 = 1 THEN 'oat' WHEN g % 4 = 0 THEN 'none' ELSE 'whole' END,
+                          'sugar', (ARRAY['0','30','50','100'])[1 + g % 4])
+FROM generate_series(1, 10000) g;
+INSERT INTO products (name, description, price, tags, options) VALUES
+  ('黑糖珍珠鮮奶', 'Brown sugar boba with fresh milk', 95, ARRAY['外送','熱銷'], '{"size":"L","milk":"whole","sugar":"100"}'),
+  ('桂花烏龍', 'Osmanthus oolong tea', 85, ARRAY['季節限定'], '{"size":"M","sugar":"30"}');
+CREATE INDEX products_tags_idx ON products USING gin (tags);
+
+-- 練習 4 用的小菜單：search 欄位已經是 STORED 的 tsvector，也建好 GIN 索引
+CREATE TABLE menu_items (
+  id integer PRIMARY KEY,
+  name text NOT NULL,
+  description text NOT NULL,
+  search tsvector GENERATED ALWAYS AS (to_tsvector('english', description)) STORED
+);
+INSERT INTO menu_items (id, name, description) VALUES
+  (9, '焦糖燕麥拿鐵', 'Caramel oat milk latte'),
+  (7, '海鹽燕麥拿鐵', 'Sea salt oat milk latte'),
+  (12, '燕麥奶', 'Oat milk, no coffee'),
+  (1, '經典拿鐵', 'Latte with whole milk'),
+  (3, '香草燕麥拿鐵', 'Oat milk latte with vanilla syrup'),
+  (4, '燕麥美式', 'Americano with a splash of oat milk'),
+  (2, '燕麥奶拿鐵', 'Oat milk latte'),
+  (5, '燕麥酥拿鐵', 'Latte with milk, topped with oat crumble'),
+  (6, '冰燕麥拿鐵', 'Iced oat milk latte. Our oat milk latte over ice, a classic latte'),
+  (8, '雙份燕麥拿鐵', 'Double shot oat milk latte with extra oat milk'),
+  (10, '燕麥奶拿鐵（大杯）', 'Large oat milk latte, oat milk lattes are our best seller'),
+  (11, '香草拿鐵', 'Vanilla latte with oat milk');
+CREATE INDEX menu_items_search_idx ON menu_items USING gin (search);
+ANALYZE;
+
+-- 判分用的小工具（第 27 課也有）：plan_nodes('查詢') 把計畫攤平成「節點、表、索引、條件」
+CREATE FUNCTION plan_json(q text) RETURNS jsonb
+LANGUAGE plpgsql AS $$
+DECLARE j json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO j;
+  RETURN j::jsonb -> 0 -> 'Plan';
+END
+$$;
+CREATE FUNCTION plan_nodes(q text) RETURNS TABLE (node text, rel text, idx text, cond text)
+LANGUAGE sql AS $$
+  WITH RECURSIVE t(p) AS (
+    SELECT plan_json(q)
+    UNION ALL
+    SELECT c FROM t, jsonb_array_elements(t.p -> 'Plans') AS c
+  )
+  SELECT p ->> 'Node Type', p ->> 'Relation Name', p ->> 'Index Name',
+         coalesce(p ->> 'Index Cond', p ->> 'Recheck Cond', p ->> 'Filter')
+  FROM t
+$$;
+</script>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>

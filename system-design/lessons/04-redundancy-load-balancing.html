@@ -1,0 +1,1130 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>4. 冗餘與負載平衡：可用性的算術</title>
+<link rel="stylesheet" href="../../style.css">
+</head>
+<body data-lesson="4">
+<header>
+  <div class="eyebrow">階段 2：擴展：冗餘、快取與資料 · 第 4 課</div>
+  <h1>冗餘與負載平衡：可用性的算術</h1>
+</header>
+<main>
+
+<p>咖啡店的下單 API 現在只跑在一台伺服器上。假設這台機器某天早上 8 點因為系統更新重開，重開要 3 分鐘。早上 8 點正好是<a href="01-what-is-system-design.html">第 1 課</a>說的尖峰，照<a href="02-estimation.html">第 2 課</a>估的每秒 3.33 筆，這 3 分鐘裡大約 600 筆訂單全部失敗，排隊的客人只能等，或改去隔壁買。</p>
+<p>老闆問：「多開一台就好了吧？」這課就把這個問題追到底。多開一台確實有用，但要能回答老闆，得說出幾件事：多開一台到底能換到多少、兩台要放在哪裡才不會一起壞、壞掉一台之後剩下的扛不扛得住、前面負責分流量的那台機器怎麼分、它怎麼知道某台壞了並停止送流量過去、它自己壞了又怎麼辦。學完這課，你能拿算式回答老闆，也看得懂 nginx 和雲端負載平衡器的設定在防什麼。</p>
+
+<div class="callout"><strong>這課的路線：</strong>
+<ol>
+  <li>先算帳：99.9% 換成停機幾分鐘；下單背後還串了資料庫、Redis、金流，多開一台到底換到多少（開場問題的最小答案）。</li>
+  <li>兩台會不會一起壞、壞一台撐不撐得住：單點故障、故障域，以及「掉一個可用區之後」要幾台。</li>
+  <li>請求要送給哪一台：負載平衡演算法為什麼不是「選最閒的」，以及哪些情況會讓分流失準。</li>
+  <li>壞掉的機器怎麼踢出去：主動與被動健康檢查，為什麼剔除要有上限。</li>
+  <li>前面那台負載平衡器自己壞了怎麼辦，以及上線後怎麼確認備援真的有用。</li>
+</ol></div>
+
+<div class="callout"><strong>這課會用到：</strong>
+<ul>
+  <li><a href="../../devops/lessons/13-scaling.html">部署課第 13 課</a>的無狀態服務與水平擴展：服務不把使用者狀態存在單台機器上，請求送到哪一台都一樣，才能靠多開機器擴展。</li>
+  <li><a href="02-estimation.html">第 2 課</a>的 N+1 與目標使用率：比剛好夠用多準備一台，平常只讓機器用到約 60%。</li>
+</ul></div>
+
+<h2>多開一台能換到什麼？先把可用性換成停機預算</h2>
+<p>要回答「多開一台有多少幫助」，先要有一把尺，量「現在有多可靠」和「改了之後有多可靠」。這把尺叫<strong>可用性（availability）</strong>：在一段期間裡，服務能正常使用的時間佔多少比例。一個月 30 天裡壞了 43 分鐘，可用性大約是 99.9%。</p>
+<p>業界習慣用「幾個 9（nines）」來說可用性：99.9% 叫三個 9，99.99% 叫四個 9。問題是百分比很抽象，99.9% 和 99.99% 聽起來差不多，對老闆和 PM 都沒有感覺。所以要把它換成<strong>停機預算（downtime budget）</strong>：在這個目標下，一段期間內最多可以壞多久。算式是 (1 − 可用性) × 期間長度。以 99.9%、30 天為例：0.001 × 30 天 × 1440 分鐘 = 43.2 分鐘。</p>
+<div class="table-wrap"><table>
+  <tr><th>可用性</th><th>每 30 天最多停機</th><th>每年最多停機</th></tr>
+  <tr><td>99%</td><td>7.2 小時</td><td>3.65 天</td></tr>
+  <tr><td>99.9%（三個 9）</td><td>43.2 分鐘</td><td>8.76 小時</td></tr>
+  <tr><td>99.95%</td><td>21.6 分鐘</td><td>4.38 小時</td></tr>
+  <tr><td>99.99%（四個 9）</td><td>4.32 分鐘</td><td>52.6 分鐘</td></tr>
+</table></div>
+<p>每多一個 9，預算就只剩十分之一。拿開場那次 3 分鐘的重開來對照：在三個 9 的目標下，它用掉當月 43.2 分鐘預算的 7%；在四個 9 的目標下，一次重開就用掉 4.32 分鐘的將近七成。四個 9 的預算連值班的人被叫醒、打開電腦的時間都不夠，所以要做到四個 9，只能靠機器自動恢復，不能靠人。（表格數字的出處見課末。）</p>
+<p>用時間來算有一個盲點：它把每一分鐘當成一樣重要。凌晨 3 點掛 10 分鐘幾乎沒人受影響，早上 8 點掛 10 分鐘會打到大量訂單，但用時間算兩者都是 10 分鐘。所以正式環境更常用請求來算：<strong>可用性 = 成功的請求 ÷ 有效的請求</strong>。「有效」的範圍由團隊在 SLO 裡定義清楚。這個比例就是<a href="../../devops/lessons/22-metrics-slo.html">部署課第 22 課</a>的 SLI，它會反映「什麼時候壞」。</p>
+<p>下面用同一次事故比較兩種算法：咖啡店一天 6 萬筆訂單，早上 7:30～9:30 佔 40%，尖峰時掛 10 分鐘。執行後看最後一行「用掉預算」。</p>
+<div class="lab"><script type="code">
+// 每 30 天的停機預算（分鐘）
+function downtimeMinutes(availability: number, days: number) {
+  return (1 - availability) * days * 1440
+}
+console.log('99.9% 每 30 天：', downtimeMinutes(0.999, 30).toFixed(1), '分鐘')
+
+// 用請求算：一天 6 萬筆訂單，早上 7:30～9:30 佔 40%
+const peakOrdersPerMinute = 60000 * 0.4 / 120
+const lostOrders = peakOrdersPerMinute * 10           // 尖峰掛 10 分鐘
+const monthlyOrders = 60000 * 30
+const budget = monthlyOrders * (1 - 0.999)            // 99.9% 允許失敗的訂單數
+console.log('尖峰每分鐘訂單：', peakOrdersPerMinute)
+console.log('掛 10 分鐘失敗：', lostOrders, '筆')
+console.log('一個月的失敗預算：', Math.round(budget), '筆')
+console.log('用掉預算：', (lostOrders / budget * 100).toFixed(0) + '%')
+</script></div>
+<p>以時間算，10 分鐘只用掉 43.2 分鐘預算的 23%；以請求算，尖峰 10 分鐘就用掉 111%，一次就爆了。這就是為什麼 SLO 多半用請求來算：它跟使用者實際感受到的一致。對咖啡店來說，結論很直接：尖峰時段那台機器不能停，「多開一台」值得認真算。</p>
+<p>但到目前為止，我們把下單 API 當成一個整體來算可用性。實際上它要能回應，背後還依賴好幾個服務，多開一台 API 只改善了其中一環。下一節把這些相依關係也算進來。</p>
+<div class="callout practice"><strong>💡 實務上：先談「要幾個 9」，再談架構</strong><br>PM 或老闆常說「系統不能掛」，資深工程師會把它翻成具體數字：結帳、下單這類直接影響營收的路徑要幾個 9，後台報表、員工排班頁面可以低一點。每多一個 9，機器、跨可用區、值班和自動化的成本都往上跳，所以目標要分功能訂，不要整個系統一刀切。也要注意你依賴的雲端服務自己承諾幾個 9，你的目標不可能比串聯起來的結果還高（下一節會算）。訂好之後，停機預算就是團隊的共同語言：本月預算快用完時，先暫停高風險上線、優先修穩定性。</div>
+
+<h2>下單 API 背後還有誰？相依怎麼把可用性往下拉</h2>
+<p>下單 API 收到請求後，要寫 PostgreSQL、讀 Redis、呼叫金流閘道，三個都正常，這筆訂單才會成功。這種「它壞了，你就跟著壞」的關係叫<strong>硬相依（hard dependency）</strong>。硬相依越多，能讓下單失敗的原因就越多。</p>
+<p>把好幾個硬相依排成一條線，每一個都要正常才行，這叫<strong>串聯（serial）</strong>。串聯的可用性要<strong>相乘</strong>：假設各元件壞掉的時間互不相關，「全部同時正常」的機率就是各自正常機率的乘積。三個 99.99% 的元件串聯，結果是 0.9999 × 0.9999 × 0.9999 ≈ 99.97%，比其中任何一個都低。下單 API 再穩，整體也不會高過它最弱的那個依賴。</p>
+<p>老闆說的「多開一台」是另一種結構：<strong>冗餘（redundancy）</strong>，也叫<strong>並聯</strong>。同一件事準備兩份，任一份正常就能服務，只有兩份<em>同時</em>壞掉時才會停。所以算法反過來：先算「全部同時壞」的機率，也就是各自不可用率的乘積，再用 1 去減。兩台 99.9% 的 API 並聯：1 − 0.001 × 0.001 = 99.9999%。這就是開場問題的最小答案：多開一台，API 這一環的可用性從三個 9 跳到六個 9。</p>
+<p>還有第三種關係。下單成功後會發簡訊通知顧客，但簡訊服務壞了，訂單照樣可以成功：把簡訊排進佇列，晚點再送。這種「它壞了，你有備案」的依賴叫<strong>軟相依（soft dependency）</strong>。軟相依不會拉低你的可用性，因為它的失敗不會變成你的失敗。常見的備案有三種：排進佇列晚點再做、改用快取裡的舊資料、把畫面上那個區塊藏起來。把硬相依改成軟相依，通常比加機器便宜。</p>
+<figure>
+  <svg viewBox="0 0 700 250" role="img" aria-label="下單 API 硬相依 PostgreSQL、Redis、金流，形成串聯；兩台 API 並聯；簡訊是軟相依，用虛線表示">
+    <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+    <rect class="d-soft" x="20" y="40" width="130" height="45" rx="8"/>
+    <text class="d-text" x="85" y="68" text-anchor="middle">API 第 1 台</text>
+    <rect class="d-soft" x="20" y="105" width="130" height="45" rx="8"/>
+    <text class="d-text" x="85" y="133" text-anchor="middle">API 第 2 台</text>
+    <text class="d-small" x="85" y="175" text-anchor="middle">並聯：任一台好就行</text>
+    <path class="d-line" d="M150,62 L200,95" marker-end="url(#arr)"/>
+    <path class="d-line" d="M150,128 L200,100" marker-end="url(#arr)"/>
+    <rect class="d-box" x="205" y="75" width="120" height="45" rx="8"/>
+    <text class="d-text" x="265" y="103" text-anchor="middle">PostgreSQL</text>
+    <path class="d-line" d="M325,97 L360,97" marker-end="url(#arr)"/>
+    <rect class="d-box" x="365" y="75" width="90" height="45" rx="8"/>
+    <text class="d-text" x="410" y="103" text-anchor="middle">Redis</text>
+    <path class="d-line" d="M455,97 L490,97" marker-end="url(#arr)"/>
+    <rect class="d-box" x="495" y="75" width="90" height="45" rx="8"/>
+    <text class="d-text" x="540" y="103" text-anchor="middle">金流</text>
+    <text class="d-small" x="395" y="60" text-anchor="middle">串聯（硬相依）：每個都要好</text>
+    <path class="d-line" d="M265,120 L265,200 L490,200" stroke-dasharray="5 4" marker-end="url(#arr)"/>
+    <rect class="d-box" x="495" y="180" width="90" height="40" rx="8"/>
+    <text class="d-text" x="540" y="205" text-anchor="middle">簡訊</text>
+    <text class="d-accent" x="380" y="190" text-anchor="middle">軟相依：失敗就排入佇列</text>
+  </svg>
+  <figcaption>並聯的兩台 API 互相備援；PostgreSQL、Redis、金流串聯；簡訊壞了不影響下單</figcaption>
+</figure>
+<p>加機器是一條路，另一條路是讓每次壞掉的時間變短。有些元件沒有公布可用性，這時可以用兩個量來估：<strong>MTBF（mean time between failures）</strong>是平均多久壞一次，<strong>MTTR（mean time to recover）</strong>是每次壞掉平均多久修好。一個週期裡，正常的時間是 MTBF，壞掉的時間是 MTTR，所以可用性 ≈ MTBF ÷ (MTBF + MTTR)。開場那台機器重開要 3 分鐘，這 3 分鐘就是 MTTR。</p>
+<p>下面這格前兩行驗證串聯和並聯的算式，後兩行用 MTBF 和 MTTR 比較兩種元件：一種 150 天壞一次、1 小時修好，另一種 75 天壞一次、30 分鐘修好。執行後比較最後兩行。</p>
+<div class="lab"><script type="code">
+const serial = 0.9999 * 0.9999 * 0.9999
+const redundant = 1 - (1 - 0.999) * (1 - 0.999)
+console.log('三個 99.99% 串聯：', (serial * 100).toFixed(4) + '%')
+console.log('兩個 99.9% 並聯：', (redundant * 100).toFixed(4) + '%')
+
+const hours = 24
+function fromMtbf(mtbfHours: number, mttrHours: number) {
+  return mtbfHours / (mtbfHours + mttrHours)
+}
+console.log('150 天壞一次、1 小時修好：', (fromMtbf(150 * hours, 1) * 100).toFixed(3) + '%')
+console.log('75 天壞一次、30 分鐘修好：', (fromMtbf(75 * hours, 0.5) * 100).toFixed(3) + '%')
+</script></div>
+<p>第二組故障次數多一倍，但修復時間減半，可用性一樣。<strong>縮短修復時間跟減少故障一樣有效</strong>，而且常常更容易做到：自動重啟、自動切換、一鍵回滾、好的告警，都是在縮短 MTTR。</p>
+<p>回到老闆的問題。兩台並聯的 99.9999% 有兩個前提：第一，兩台不會一起壞；第二，壞掉一台之後，剩下那台扛得住全部流量。這兩個前提只要有一個不成立，六個 9 就是紙上的數字。下一節逐一檢查。</p>
+<div class="callout practice"><strong>💡 實務上：設計新功能時，先問每個依賴「它掛了會怎樣」</strong><br>例如在下單流程加上「會員點數折抵」和「推薦加購商品」：點數服務掛了，可以先讓顧客不折抵照樣下單；推薦服務掛了，直接把那個區塊藏起來。這些降級行為要跟 PM 事先講好，因為畫面要怎麼呈現、會不會被客訴是產品決定，不是工程師臨時決定。code review 時看到新增一個同步呼叫外部服務的地方，資深會先問：這是硬相依嗎？有沒有逾時（第 8 課）？失敗時的畫面是什麼？</div>
+
+<h2>兩台會不會一起壞？單點故障與故障域</h2>
+<p>先處理第一個前提。在擔心「兩台會不會一起壞」之前，要先確定每個元件都至少有兩份。只有一份、壞了整個系統就跟著壞的元件，叫<strong>單點故障（SPOF，single point of failure）</strong>。找單點故障的方法很樸素：把架構裡每個元件列出來，一個一個問「它壞了會怎樣」。</p>
+<p>咖啡店把 API 開成兩台之後，還有幾個常被漏掉的單點。第一個是負載平衡器本身：兩台 API 前面如果只有一台 nginx，它壞了兩台 API 都收不到請求（後面〈前面那台負載平衡器壞了怎麼辦〉會處理）。第二個是唯一的資料庫主機，主機掛掉時怎麼切到副本，見 <a href="../../postgresql/lessons/37-backup-replication.html">PostgreSQL 課第 37 課</a>。第三個是唯一的 NAT gateway。雲端上的後端機器通常放在外面連不進來的私有網路裡，它們要呼叫金流這類外部服務時，要經過一個叫 NAT gateway 的出口；出口只有一個，它壞了，所有對外呼叫都會失敗。最後一個不是機器：只有一個人知道怎麼部署，那個人休假時出事就沒人能修。</p>
+<p>每個元件都有兩份了，還要看兩份會不會因為同一個原因一起壞。會一起壞掉的範圍叫<strong>故障域（failure domain）</strong>。由小到大是這樣：同一台主機上的兩個程序，主機斷電時一起壞；同一個可用區裡的兩台主機，機房斷電時一起壞；同一個區域裡的所有可用區，整區出事時一起壞。</p>
+<figure>
+  <svg viewBox="0 0 700 220" role="img" aria-label="故障域由小到大：程序在主機裡，主機在可用區裡，可用區在區域裡">
+    <rect class="d-soft" x="10" y="10" width="680" height="200" rx="10"/>
+    <text class="d-text" x="25" y="35">區域（region）：例如東京；整區出事很少見，但會發生</text>
+    <rect class="d-box" x="25" y="50" width="320" height="145" rx="8"/>
+    <text class="d-text" x="40" y="72">可用區 A：獨立的電力與網路</text>
+    <rect class="d-soft" x="40" y="85" width="140" height="95" rx="6"/>
+    <text class="d-text" x="50" y="105">主機 1</text>
+    <rect class="d-box" x="50" y="115" width="120" height="25" rx="4"/>
+    <text class="d-small" x="110" y="132" text-anchor="middle">程序：API</text>
+    <rect class="d-box" x="50" y="145" width="120" height="25" rx="4"/>
+    <text class="d-small" x="110" y="162" text-anchor="middle">程序：API</text>
+    <rect class="d-soft" x="190" y="85" width="140" height="95" rx="6"/>
+    <text class="d-text" x="200" y="105">主機 2</text>
+    <rect class="d-box" x="200" y="115" width="120" height="25" rx="4"/>
+    <text class="d-small" x="260" y="132" text-anchor="middle">程序：API</text>
+    <rect class="d-box" x="355" y="50" width="320" height="145" rx="8"/>
+    <text class="d-text" x="370" y="72">可用區 B</text>
+    <rect class="d-soft" x="370" y="85" width="140" height="95" rx="6"/>
+    <text class="d-text" x="380" y="105">主機 3</text>
+    <rect class="d-box" x="380" y="115" width="120" height="25" rx="4"/>
+    <text class="d-small" x="440" y="132" text-anchor="middle">程序：API</text>
+    <text class="d-accent" x="525" y="130">同一個壞部署</text>
+    <text class="d-small" x="525" y="150">會跨過所有框框</text>
+  </svg>
+  <figcaption>同一台主機上的兩個程序會一起壞；放在不同可用區才躲得過機房斷電。但同一個壞掉的部署會同時打到每一台</figcaption>
+</figure>
+<p>圖裡的<strong>可用區（availability zone）</strong>是同一個雲端區域裡、電力與網路互相獨立的機房群（<a href="../../devops/lessons/18-aws-architecture.html">部署課第 18 課</a>）。上一節的並聯公式 1 − 0.001 × 0.001 有個前提：兩台<strong>彼此獨立</strong>，一台壞掉不會讓另一台更容易壞。兩台放在同一個可用區，機房斷電時一起壞，這個前提就不成立，算出來的 99.9999% 也不成立。所以咖啡店的兩台 API 至少要分到兩個可用區。</p>
+<p>分到不同可用區還不夠，因為圖右邊那一行：同一個壞掉的部署會跨過所有框框。多個元件因為同一個原因一起壞，叫<strong>相關性故障（correlated failure）</strong>。常見的原因是同一個有 bug 的版本部署到每一台、同一份錯誤的設定、同一張過期的憑證、同一個月底才觸發的時間 bug。這些原因跟機器放在哪裡無關，實際的大型事故多半屬於這一類。對付它的方法是分批部署、設定變更要能快速回滾，第 19、21 課會再談。</p>
+<p>到這裡，第一個前提（兩台不會一起壞）的做法是：跨可用區擺放、分批部署。接下來檢查第二個前提：真的壞掉一份時，剩下的扛得住嗎？</p>
+
+<h3>壞掉一台之後，剩下的扛得住嗎？</h3>
+<p>第二個前提是容量。<a href="02-estimation.html">第 2 課</a>說過，機器要留餘裕，目標使用率大約 60～70%。但那時只算了平常的狀況。冗餘的目的是讓系統在壞掉一份之後繼續服務，所以目標使用率要在<strong>壞掉一份之後</strong>還成立。這就是 N+1 真正的意思：N 台扛得住尖峰，再多 1 台給壞掉時用。</p>
+<p>下面這格算兩個例子：3 台 API 平常各跑 70%，掛掉一台之後剩下的每台要扛多少；以及 3 個可用區、每區 2 台、平常 60%，整區掛掉之後每台要扛多少。</p>
+<div class="lab"><script type="code">
+// 3 台 API，平常每台 70%，掛掉一台之後呢？
+const nodes = 3
+const utilization = 0.7
+const total = nodes * utilization            // 總負載 = 2.1 台的量
+console.log('剩下每台：', (total / (nodes - 1) * 100).toFixed(0) + '%')
+
+// 3 個可用區、每區 2 台，整區掛掉時
+const perZone = 2
+const zones = 3
+const load = zones * perZone * 0.6
+console.log('掉一區後每台：', (load / ((zones - 1) * perZone) * 100).toFixed(0) + '%')
+</script></div>
+<p>第一個例子剩下兩台要扛 105%。總負載是 2.1 台的量，分給 2 台，超過 100% 就是處理不完：佇列越排越長，請求逾時，客戶端重試，負載更高，剩下的機器也跟著倒（<a href="03-latency-percentiles.html">第 3 課</a>的排隊曲線，<a href="11-circuit-breaker-bulkhead.html">第 11 課</a>的連鎖故障）。原本只壞一台，結果三台全倒。第二個例子平常 60%，掉一區後 90%：沒倒，但第 3 課講過，使用率接近 100% 時排隊時間會暴增，這時的延遲已經很難看。所以容量規劃要以「掉一個故障域之後」為準，練習 2 會把它寫成函式。</p>
+<p>到這裡，老闆的「多開一台」已經變成：至少兩個可用區、每區的機器數讓「掉一區之後」使用率還在目標內。機器準備好了，下一個問題是：請求進來時，要送給哪一台？</p>
+<div class="callout practice"><strong>💡 實務上：上線前做一次「單點故障盤點」</strong><br>把架構圖攤開，一個框一個框問「它壞了會怎樣、誰會發現、多久能恢復」，常常會挖出只有一台的資料庫主機、寫死某台 IP 的設定，或只有某位同事會操作的部署流程。不是每個單點都要立刻消除：咖啡店剛起步時，資料庫只有一台、但有自動備份和演練過的還原步驟，可能就夠了。重點是把風險寫下來，讓老闆知道「這裡壞了會停多久」，再依預算決定先補哪個。</div>
+
+<h2>請求進來，要送給哪一台？負載平衡演算法</h2>
+<p>顧客的手機只知道一個網址，不會知道後面有幾台 API。站在所有後端前面、接下每個請求再轉給其中一台的元件，叫<strong>負載平衡器（load balancer）</strong>，例如<a href="../../devops/lessons/12-nginx.html">部署課第 12 課</a>的 nginx。它決定「這個請求給誰」的規則，叫負載平衡演算法。</p>
+<p>演算法為什麼重要？上一節算容量時，假設流量平均分給每台。如果分得不平均，一台已經 100%、另一台還閒著，整體看起來容量夠，那一台上的請求卻在排隊逾時。演算法的工作，就是讓上一節的假設在現實裡成立。</p>
+<p>最簡單的是 <strong>round robin</strong>：依序輪流，第 1 個請求給 1 號、第 2 個給 2 號、第 3 個再回到 1 號。nginx 沒設定時預設就是加權的 round robin。它的弱點在請求成本不一樣時：看菜單 5ms，結帳 2 秒，輪流分的結果可能是一台剛好拿到一串結帳請求，另一台拿到的都是看菜單，請求數一樣，忙碌程度差很多。機器規格不同時可以用<strong>加權 round robin</strong>，大機器分多一點，但權重是事先寫死的，反映不了當下誰比較忙。</p>
+<p>要反映當下，就要看每台的即時狀態。<strong>最少連線（least connections）</strong>每次選「進行中請求最少」的那台，請求長短差很多時比較平均。直覺上更進一步，「每次都選全世界最閒的那台」應該最好，實際上它有個問題：負載資訊總是<strong>過時</strong>的，而且通常有好幾台負載平衡器各自做決定。大家在同一瞬間都看到「3 號最閒」，就一起把請求丟給 3 號，3 號瞬間爆量；下一刻大家又看到另一台最閒，一起湧過去。這種一群決策者同時做出同一個選擇、輪流把某台壓垮的現象，叫<strong>羊群效應（herding）</strong>。</p>
+<p>解法是 <strong>P2C（power of two choices）</strong>：每個請求只隨機挑兩台，選比較閒的那台。因為有隨機，不同請求挑到的兩台不同，不會全部湧向同一台；因為有比較，又能避開很忙的機器。理論上兩台已經是最划算的點，多挑幾台改善很小（理論結果見課末）。</p>
+<p>下面模擬羊群效應：5 台後端，這一秒內進來 20 個請求，但負載平衡器手上都是同一份舊快照。一種做法每次都選快照裡最閒的，另一種用 P2C。執行後比較兩行陣列，看哪一台被塞爆。</p>
+<div class="lab"><script type="code">
+// 5 台後端的進行中請求數；這一秒內負載平衡器都只看得到同一份舊快照
+const snapshot = [3, 5, 4, 6, 5]
+
+function mulberry32(seed: number) {
+  return () => {
+    seed = seed + 0x6d2b79f5 | 0
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed)
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t
+    return ((t ^ t >>> 14) >>> 0) / 4294967296
+  }
+}
+
+const globalMin = [...snapshot]
+const p2c = [...snapshot]
+const random = mulberry32(7)
+for (let k = 0; k < 20; k++) {
+  globalMin[snapshot.indexOf(Math.min(...snapshot))]++      // 每次都選快照裡最閒的
+  const i = Math.floor(random() * 5)
+  let j = Math.floor(random() * 4)
+  if (j >= i) j++
+  p2c[snapshot[j] < snapshot[i] ? j : i]++                  // 用同一份快照做 P2C
+}
+console.log('這一秒結束時（全選最閒）：', globalMin)
+console.log('這一秒結束時（P2C）　　：', p2c)
+</script></div>
+<p>同樣拿過時的快照，全選最閒的把 20 個請求全部丟給 0 號；P2C 分散到好幾台，最忙的一台只到 12。實務上不用自己寫：<strong>Envoy</strong> 是常用的開源代理（proxy），常放在服務前面當負載平衡器，它的 least request 負載平衡在權重相同時就是 P2C（預設挑 2 台）；nginx 也有對應的寫法（版本與設定見課末）。練習 3 你會自己寫一個。</p>
+<p>下表整理常見的演算法，查表用，不用背。一致性雜湊是這節沒提到的一種，它的用途是讓同一個 key 固定到同一台，<a href="07-sharding-consistent-hashing.html">第 7 課</a>會細講。</p>
+<div class="table-wrap"><table>
+  <tr><th>演算法</th><th>怎麼選</th><th>適合</th><th>弱點</th></tr>
+  <tr><td>round robin</td><td>依序輪流</td><td>請求成本差不多、機器一樣</td><td>有的請求 5ms、有的 2 秒時會不平均</td></tr>
+  <tr><td>加權 round robin</td><td>大機器分多一點</td><td>機器規格不同</td><td>權重是固定的，反映不了當下的忙碌程度</td></tr>
+  <tr><td>最少連線</td><td>選進行中請求最少的</td><td>請求長短差很多</td><td>要知道全部機器的即時狀態；多台負載平衡器各看各的</td></tr>
+  <tr><td>隨機</td><td>隨便挑一台</td><td>簡單、不用共享狀態</td><td>運氣不好時某台會特別多</td></tr>
+  <tr><td>P2C</td><td>隨機挑兩台，選比較閒的</td><td>大多數情況的好預設</td><td>要知道被挑到的兩台的負載</td></tr>
+  <tr><td>一致性雜湊</td><td>同一個 key 永遠到同一台</td><td>讓快取集中在某台（<a href="07-sharding-consistent-hashing.html">第 7 課</a>）</td><td>熱門 key 會讓單台過熱</td></tr>
+</table></div>
+
+<h3>演算法再好也會失準：黏性 session 與長連線</h3>
+<p>演算法能決定「這個請求給誰」，但有兩種情況會讓它根本沒機會決定。</p>
+<p>第一種是<strong>黏性 session（sticky session）</strong>：負載平衡器記住使用者，讓同一個使用者的請求固定送到同一台。會用它，通常是因為應用程式把登入狀態存在那台機器的記憶體裡，換一台就認不得。代價是那台機器一壞，上面所有使用者的 session 一起消失，全部被登出；新機器加進來，也分不到已經黏在舊機器上的使用者。這就是<a href="../../devops/lessons/13-scaling.html">部署課第 13 課</a>要你把狀態放到 Redis 的原因：狀態不在機器上，送到哪一台都一樣，演算法才能自由分配。</p>
+<p>第二種是<strong>長連線</strong>。負載平衡器分兩種層級：L4 只看 IP 與 port、轉送整條 TCP 連線；L7 看得懂 HTTP 內容、能逐個請求分流（細節在〈前面那台負載平衡器壞了怎麼辦〉）。HTTP/2 會讓同一個客戶端的很多請求共用一條長時間不關的 TCP 連線。所以 WebSocket 連線，或經過 L4 負載平衡器的 HTTP/2 連線，一建立就一直使用，負載平衡器只在建立連線時分配一次。新開的機器分不到既有連線，round robin 分得再平均也沒用。看得懂 HTTP/2 的 L7 負載平衡器可以把同一條連線裡的請求分到不同後端；WebSocket 的處理在<a href="17-realtime-push.html">第 17 課</a>。</p>
+<p>到目前為止，我們都假設每台後端都是好的。但機器會壞，負載平衡器如果不知道，就會繼續把請求送過去。下一節處理這件事。</p>
+<div class="callout practice"><strong>💡 實務上：從一台變多台時，先找出藏在本機的狀態</strong><br>多數團隊直接用雲端的負載平衡器，不自己架；真正花時間的是讓應用程式能被分流。咖啡店從一台擴成兩台後最常見的 bug 是「有時候會被登出」「上傳的圖片有時看不到」，原因是 session 存在記憶體、上傳檔案存在本機硬碟、排程工作每台各跑一次。擴充前先盤點這三類：session 放 Redis、檔案放物件儲存（例如 S3）、排程只讓一台執行。用黏性 session 繞過去看似最快，但機器一壞那批使用者就全掉，屬於技術債。</div>
+
+<h2>某台壞了，負載平衡器怎麼知道？健康檢查與異常剔除</h2>
+<p>假設咖啡店有 3 台 API，用 round robin 分流，其中一台的程序卡死了。負載平衡器不知道，照樣每 3 個請求送 1 個過去，結果三分之一的訂單失敗。機器有冗餘，請求卻沒有避開壞的那台，冗餘等於沒用。所以負載平衡器要能判斷哪台壞了，暫時不送流量給它。判斷方式有兩種。</p>
+<p>第一種是<strong>主動檢查（active health check）</strong>：負載平衡器每隔幾秒主動打一次後端的檢查端點，例如 <code>/ready</code>（<a href="../../devops/lessons/13-scaling.html">部署課第 13 課</a>的 readiness，表示「這台準備好接流量了」）。好處是就算沒有流量，也能知道哪台壞了；壞處是檢查端點成功，不代表真實的下單請求會成功，例如 <code>/ready</code> 沒有碰到金流，金流連線出問題它也看不出來。</p>
+<p>第二種是<strong>被動檢查</strong>，也叫<strong>異常剔除（outlier ejection）</strong>：不另外發請求，直接看真實請求的結果，某台的表現異常就暫時把它移出輪替。它看的就是使用者遇到的情況，但要有流量送過去才看得出來。nginx 的 <code>max_fails</code> 和 <code>fail_timeout</code> 就是最簡單的被動檢查：在 <code>fail_timeout</code> 這段時間內失敗 <code>max_fails</code> 次，就把這台視為不可用，同樣持續 <code>fail_timeout</code> 那麼久。預設值是 1 次、10 秒。</p>
+<p>Envoy 的異常剔除規則比較完整，是設計時的好參考。預設是：同一台連續 5 次回 5xx 就剔除；剔除時間 = 基本 30 秒 × 這台第幾次被剔除，一直壞就越踢越久，最長 300 秒；<strong>最多只能剔除 10%</strong> 的主機，已經到上限就不再剔除（倍數怎麼降回來見課末）。</p>
+<p>前兩條很好懂，第三條的上限乍看奇怪：壞的機器為什麼不全部踢掉？想像健康檢查本身出 bug，或資料庫慢了一下，讓每台都回 503。沒有上限的話，負載平衡器會把所有機器都踢掉，原本只是部分請求失敗，變成 100% 失敗。剔除是為了避開「少數幾台壞掉」，一大批機器同時看起來壞掉，問題多半不在機器本身，踢掉它們沒有幫助。</p>
+<p>Envoy 還有第二道保險 <strong>panic threshold</strong>（預設 50%）：健康主機的比例低於它時，乾脆忽略健康狀態，把流量分給所有主機。理由是「一半以上都壞了」比較可能是檢查出錯，而不是機器真的全壞；就算真的壞了大半，把全部流量壓在剩下的少數機器上，也只會把它們一起壓垮，這就是〈壞掉一台之後，剩下的扛得住嗎？〉那節 105% 的情況。</p>
+<div class="callout warn"><strong>liveness 不要檢查依賴</strong>：<a href="../../devops/lessons/13-scaling.html">部署課第 13 課</a>講過，liveness 失敗會讓程序被重啟。如果 liveness 去查資料庫，資料庫一慢，所有副本同時被重啟，小問題變成全面停機。依賴的狀態放在 readiness，而且要有上面說的剔除上限。</div>
+<p>後端的冗餘和剔除都處理好了。回頭看最前面：所有請求都要先經過負載平衡器，如果只有一台，它就是〈兩台會不會一起壞？〉那節單點故障清單上的第一項。</p>
+
+<h2>前面那台負載平衡器壞了怎麼辦？</h2>
+<p>咖啡店如果自己架一台 nginx 當負載平衡器，它壞了，後面幾台 API 再健康也收不到請求。負載平衡器也需要冗餘，常見的做法有三種。</p>
+<p>第一種，也是多數團隊的選擇，是直接用<strong>雲端的負載平衡器</strong>，例如 AWS 的 ALB、NLB。它本身由雲端業者跨可用區部署，你不用處理它自己的冗餘；你要做的是讓它啟用多個可用區，並在每個可用區都放後端機器，這樣掉一區時它還有地方送。</p>
+<p>第二種是自己架多台負載平衡器，這時要先分清楚兩種層級。<strong>L4 負載平衡</strong>只看 IP 與 port，轉送的是 TCP 連線，看不懂裡面的 HTTP，所以快，也能轉任何協定。<strong>L7 負載平衡</strong>看得懂 HTTP，能依路徑、標頭分流，能改寫標頭，也能做 TLS 終止：在負載平衡器這裡解開 HTTPS，後面用一般的 HTTP 轉給後端。常見組合是前面一層 L4，把連線分給後面多台 L7（例如多台 nginx），這樣任何一台 nginx 壞了，L4 會把流量送給其他台。前面〈演算法再好也會失準〉講長連線時提到的 L4 和 L7，就是這裡的兩層。</p>
+<p>第三種是 <strong>DNS 輪詢</strong>：同一個網域回傳多個 IP，客戶端自己挑一個連。它很簡單，但有一個限制：DNS 的查詢結果會被客戶端和中間的伺服器快取，每筆紀錄都帶著一個 <strong>TTL</strong>，表示這筆紀錄可以被快取多久。某個 IP 壞了，要等 TTL 過了，客戶端才會重新查詢、拿到新的 IP 清單，在那之前仍然有人連到壞掉的 IP。另一種在網路層做的方式（anycast）見課末。</p>
+<p>到這裡，架構圖上每一層都有備援了。但備援畫在圖上不等於真的能用，最後一節談上線後怎麼確認。</p>
+
+<h2>上線後，怎麼確認備援真的有用？</h2>
+<p>備援平常用不到，所以它壞掉也不會有人發現，直到真的需要它的那天。上線後要持續看四件事：</p>
+<ul>
+  <li><strong>每台後端各自的錯誤率與延遲</strong>：整體平均正常時，可能有一台特別差，被平均蓋掉了。</li>
+  <li><strong>剔除事件</strong>：哪台、什麼時候、被剔除幾次，有沒有碰到剔除上限。碰到上限通常代表問題不在單台機器。</li>
+  <li><strong>掉一個可用區後的容量餘裕</strong>：把尖峰負載除以「去掉最大一區後」的機器數，看是否低於目標使用率。機器數會隨擴縮改變，這個數字要持續看，不是上線時算一次。</li>
+  <li><strong>故障演練</strong>：真的關掉一台、一個可用區，確認剔除、切換、容量都如預期。沒演練過的備援，常常在需要時才發現不能用。</li>
+</ul>
+<p>故障演練最好先在 <strong>staging</strong> 做。staging 是正式上線前、設定跟正式環境相同的測試環境，在那裡關機器不會影響真實顧客。確認流程沒問題後，再挑離峰時段在正式環境做一次。</p>
+<p>現在可以完整回答老闆了：多開一台有用，但要開在另一個可用區、數量要算到「掉一區還撐得住尖峰」，前面放跨可用區的負載平衡器，用 P2C 分流，用有上限的異常剔除踢掉壞的機器，最後實際關一台演練過，才算真的不怕早上 8 點那 3 分鐘。</p>
+
+<h2>練習</h2>
+
+<div class="exercise">
+  <p>練習 1：寫兩個可用性函式。<code>downtimeMinutes(availability, days)</code> 回傳停機預算的分鐘數：(1 − availability) × days × 1440。<code>systemAvailability(node)</code> 計算一棵相依樹的可用性：<code>component</code> 回傳自己的 availability；<code>serial</code>（硬相依串聯）相乘；<code>redundant</code>（獨立冗餘）是 1 − Π(1 − a)；<code>soft</code>（有備援的軟相依）視為 1，但裡面的節點一樣要檢查合法。availability 不在 0～1 之間（含 NaN）時丟 <code>RangeError</code>；<code>serial</code>、<code>redundant</code> 的 parts 是空陣列時也丟 <code>RangeError</code>。</p>
+  <script type="start">
+type Dep =
+  | { kind: 'component'; availability: number }
+  | { kind: 'serial'; parts: readonly Dep[] }
+  | { kind: 'redundant'; parts: readonly Dep[] }
+  | { kind: 'soft'; part: Dep }
+
+function downtimeMinutes(availability: number, days: number): number {
+  throw new Error('TODO')
+}
+
+function systemAvailability(node: Dep): number {
+  throw new Error('TODO')
+}
+
+console.log(downtimeMinutes(0.999, 30))   // 43.2（浮點數可能有很小的誤差）
+</script>
+  <script type="answer">
+type Dep =
+  | { kind: 'component'; availability: number }
+  | { kind: 'serial'; parts: readonly Dep[] }
+  | { kind: 'redundant'; parts: readonly Dep[] }
+  | { kind: 'soft'; part: Dep }
+
+function checkAvailability(a: number) {
+  if (!(a >= 0 && a <= 1)) throw new RangeError(`可用性要在 0～1 之間：${a}`)
+}
+
+function downtimeMinutes(availability: number, days: number): number {
+  checkAvailability(availability)
+  return (1 - availability) * days * 1440
+}
+
+function systemAvailability(node: Dep): number {
+  switch (node.kind) {
+    case 'component':
+      checkAvailability(node.availability)
+      return node.availability
+    case 'serial':
+      if (node.parts.length === 0) throw new RangeError('serial 至少要有一個元件')
+      return node.parts.reduce((acc, p) => acc * systemAvailability(p), 1)
+    case 'redundant':
+      if (node.parts.length === 0) throw new RangeError('redundant 至少要有一個元件')
+      return 1 - node.parts.reduce((acc, p) => acc * (1 - systemAvailability(p)), 1)
+    case 'soft':
+      systemAvailability(node.part)
+      return 1
+  }
+}
+
+console.log(downtimeMinutes(0.999, 30))
+</script>
+  <script type="tests">
+const near = (a: number, b: number, msg: string) => assert(Math.abs(a - b) < 1e-12, `${msg}（得到 ${a}，應該是 ${b}）`)
+const c = (availability: number): Dep => ({ kind: 'component', availability })
+assert(Math.abs(downtimeMinutes(0.999, 30) - 43.2) < 1e-6, '99.9% 每 30 天是 43.2 分鐘')
+assert(Math.abs(downtimeMinutes(0.9999, 365) - 52.56) < 1e-6, '99.99% 每年約 52.56 分鐘')
+near(systemAvailability(c(0.9)), 0.9, 'component 回傳自己的可用性')
+near(systemAvailability({ kind: 'serial', parts: [c(0.9999), c(0.9999), c(0.9999)] }), 0.9999 ** 3, '三個 99.99% 串聯要相乘')
+near(systemAvailability({ kind: 'redundant', parts: [c(0.999), c(0.999)] }), 1 - 0.001 * 0.001, '兩個 99.9% 冗餘是 1 −（不可用率的乘積）')
+near(systemAvailability({ kind: 'serial', parts: [c(0.9), c(0.5)] }), 0.45, '串聯要相乘，不是平均')
+const shop: Dep = { kind: 'serial', parts: [
+  { kind: 'redundant', parts: [c(0.99), c(0.99)] },
+  c(0.9995),
+  { kind: 'soft', part: c(0.95) },
+] }
+near(systemAvailability(shop), (1 - 0.01 * 0.01) * 0.9995, '軟相依（簡訊）不能拉低整體可用性')
+for (const bad of [1.2, -0.1, NaN]) {
+  let err: unknown
+  try { systemAvailability(c(bad)) } catch (e) { err = e }
+  assert(err instanceof RangeError, `availability = ${bad} 要丟 RangeError`)
+}
+{
+  let err: unknown
+  try { downtimeMinutes(2, 30) } catch (e) { err = e }
+  assert(err instanceof RangeError, 'downtimeMinutes 的 availability 超出範圍也要丟 RangeError')
+}
+for (const kind of ['serial', 'redundant'] as const) {
+  let err: unknown
+  try { systemAvailability({ kind, parts: [] }) } catch (e) { err = e }
+  assert(err instanceof RangeError, `${kind} 的 parts 是空陣列要丟 RangeError`)
+}
+{
+  let err: unknown
+  try { systemAvailability({ kind: 'soft', part: c(3) }) } catch (e) { err = e }
+  assert(err instanceof RangeError, 'soft 裡面的元件也要檢查合法')
+}
+function mulberry32(seed: number) {
+  return () => {
+    seed = seed + 0x6d2b79f5 | 0
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed)
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t
+    return ((t ^ t >>> 14) >>> 0) / 4294967296
+  }
+}
+const rnd = mulberry32(2026)
+function gen(depth: number): Dep {
+  const r = rnd()
+  if (depth === 0 || r < 0.35) return Object.freeze({ kind: 'component', availability: 0.9 + rnd() * 0.0999 })
+  if (r < 0.5) return Object.freeze({ kind: 'soft', part: gen(depth - 1) })
+  const parts = Object.freeze(Array.from({ length: 1 + Math.floor(rnd() * 3) }, () => gen(depth - 1)))
+  return Object.freeze({ kind: r < 0.75 ? 'serial' : 'redundant', parts })
+}
+function ref(n: Dep): number {
+  if (n.kind === 'component') return n.availability
+  if (n.kind === 'soft') return 1
+  if (n.kind === 'serial') return n.parts.reduce((a, p) => a * ref(p), 1)
+  return 1 - n.parts.reduce((a, p) => a * (1 - ref(p)), 1)
+}
+for (let k = 0; k < 300; k++) {
+  const tree = gen(4)
+  near(systemAvailability(tree), ref(tree), `隨機相依樹第 ${k + 1} 棵算錯：${JSON.stringify(tree).slice(0, 120)}`)
+}
+</script>
+  <script type="wrong">
+type Dep =
+  | { kind: 'component'; availability: number }
+  | { kind: 'serial'; parts: readonly Dep[] }
+  | { kind: 'redundant'; parts: readonly Dep[] }
+  | { kind: 'soft'; part: Dep }
+function check(a: number) { if (!(a >= 0 && a <= 1)) throw new RangeError('x') }
+function downtimeMinutes(availability: number, days: number): number { check(availability); return (1 - availability) * days * 1440 }
+function systemAvailability(node: Dep): number {
+  if (node.kind === 'component') { check(node.availability); return node.availability }
+  if (node.kind === 'soft') { systemAvailability(node.part); return 1 }
+  if (node.parts.length === 0) throw new RangeError('empty')
+  return node.parts.reduce((acc, p) => acc * systemAvailability(p), 1)
+}
+</script>
+  <script type="wrong">
+type Dep =
+  | { kind: 'component'; availability: number }
+  | { kind: 'serial'; parts: readonly Dep[] }
+  | { kind: 'redundant'; parts: readonly Dep[] }
+  | { kind: 'soft'; part: Dep }
+function check(a: number) { if (!(a >= 0 && a <= 1)) throw new RangeError('x') }
+function downtimeMinutes(availability: number, days: number): number { check(availability); return (1 - availability) * days * 1440 }
+function systemAvailability(node: Dep): number {
+  if (node.kind === 'component') { check(node.availability); return node.availability }
+  if (node.kind === 'soft') { systemAvailability(node.part); return 1 }
+  if (node.parts.length === 0) throw new RangeError('empty')
+  if (node.kind === 'serial') return node.parts.reduce((acc, p) => acc * systemAvailability(p), 1)
+  return 1 - node.parts.reduce((acc, p) => acc * systemAvailability(p), 1)
+}
+</script>
+  <script type="wrong">
+type Dep =
+  | { kind: 'component'; availability: number }
+  | { kind: 'serial'; parts: readonly Dep[] }
+  | { kind: 'redundant'; parts: readonly Dep[] }
+  | { kind: 'soft'; part: Dep }
+function check(a: number) { if (!(a >= 0 && a <= 1)) throw new RangeError('x') }
+function downtimeMinutes(availability: number, days: number): number { check(availability); return (1 - availability) * days * 1440 }
+function systemAvailability(node: Dep): number {
+  if (node.kind === 'component') { check(node.availability); return node.availability }
+  if (node.kind === 'soft') return systemAvailability(node.part)
+  if (node.parts.length === 0) throw new RangeError('empty')
+  if (node.kind === 'serial') return node.parts.reduce((acc, p) => acc * systemAvailability(p), 1)
+  return 1 - node.parts.reduce((acc, p) => acc * (1 - systemAvailability(p)), 1)
+}
+</script>
+  <script type="wrong">
+type Dep =
+  | { kind: 'component'; availability: number }
+  | { kind: 'serial'; parts: readonly Dep[] }
+  | { kind: 'redundant'; parts: readonly Dep[] }
+  | { kind: 'soft'; part: Dep }
+function check(a: number) { if (!(a >= 0 && a <= 1)) throw new RangeError('x') }
+function downtimeMinutes(availability: number, days: number): number { check(availability); return (1 - availability) * days * 1440 }
+function systemAvailability(node: Dep): number {
+  if (node.kind === 'component') { check(node.availability); return node.availability }
+  if (node.kind === 'soft') { systemAvailability(node.part); return 1 }
+  if (node.parts.length === 0) throw new RangeError('empty')
+  if (node.kind === 'serial') return node.parts.reduce((acc, p) => acc + systemAvailability(p), 0) / node.parts.length
+  return 1 - node.parts.reduce((acc, p) => acc * (1 - systemAvailability(p)), 1)
+}
+</script>
+  <script type="wrong">
+type Dep =
+  | { kind: 'component'; availability: number }
+  | { kind: 'serial'; parts: readonly Dep[] }
+  | { kind: 'redundant'; parts: readonly Dep[] }
+  | { kind: 'soft'; part: Dep }
+function check(a: number) { if (!(a >= 0 && a <= 1)) throw new RangeError('x') }
+function downtimeMinutes(availability: number, days: number): number { return (1 - availability) * days * 1440 }
+function systemAvailability(node: Dep): number {
+  if (node.kind === 'component') { check(node.availability); return node.availability }
+  if (node.kind === 'soft') { systemAvailability(node.part); return 1 }
+  if (node.parts.length === 0) throw new RangeError('empty')
+  if (node.kind === 'serial') return node.parts.reduce((acc, p) => acc * systemAvailability(p), 1)
+  return 1 - node.parts.reduce((acc, p) => acc * (1 - systemAvailability(p)), 1)
+}
+</script>
+  <script type="wrong">
+type Dep =
+  | { kind: 'component'; availability: number }
+  | { kind: 'serial'; parts: readonly Dep[] }
+  | { kind: 'redundant'; parts: readonly Dep[] }
+  | { kind: 'soft'; part: Dep }
+function check(a: number) { if (!(a >= 0 && a <= 1)) throw new RangeError('x') }
+function downtimeMinutes(availability: number, days: number): number { check(availability); return (1 - availability) * days * 1440 }
+function systemAvailability(node: Dep): number {
+  if (node.kind === 'component') { check(node.availability); return node.availability }
+  if (node.kind === 'soft') { return 1 }
+  if (node.parts.length === 0) throw new RangeError('empty')
+  if (node.kind === 'serial') return node.parts.reduce((acc, p) => acc * systemAvailability(p), 1)
+  return 1 - node.parts.reduce((acc, p) => acc * (1 - systemAvailability(p)), 1)
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 2：寫 <code>nodesForZoneFailure(input)</code>，算出「整個可用區掛掉之後還撐得住尖峰」最少要幾台。機器輪流放在各可用區（第 i 台放在 i % zones），所以一區掛掉時最多失去 <code>Math.ceil(n / zones)</code> 台。回傳最小的 n，使得 <code>(n - Math.ceil(n / zones)) * perNodeCapacity * maxUtilization >= peakLoad</code>（照這個順序計算，結果才跟測試一致）。<code>zones</code> 不是 2 以上的整數時丟 <code>RangeError</code>（只有一個可用區，整區掛掉就什麼都不剩）；<code>peakLoad</code>、<code>perNodeCapacity</code> 不是正數，或 <code>maxUtilization</code> 不在 (0, 1] 時也丟 <code>RangeError</code>。</p>
+  <script type="start">
+type ZoneInput = {
+  peakLoad: number          // 尖峰每秒請求數
+  perNodeCapacity: number   // 單台每秒能處理的請求數（壓測量到的）
+  maxUtilization: number    // 目標使用率上限，例如 0.7
+  zones: number             // 可用區數量
+}
+
+function nodesForZoneFailure(input: ZoneInput): number {
+  throw new Error('TODO')
+}
+
+console.log(nodesForZoneFailure({ peakLoad: 3000, perNodeCapacity: 1000, maxUtilization: 0.7, zones: 3 }))   // 8
+</script>
+  <script type="answer">
+type ZoneInput = {
+  peakLoad: number
+  perNodeCapacity: number
+  maxUtilization: number
+  zones: number
+}
+
+function nodesForZoneFailure(input: ZoneInput): number {
+  const { peakLoad, perNodeCapacity, maxUtilization, zones } = input
+  if (!Number.isInteger(zones) || zones < 2) throw new RangeError('至少要 2 個可用區才能承受整區故障')
+  if (!(peakLoad > 0) || !(perNodeCapacity > 0)) throw new RangeError('peakLoad 與 perNodeCapacity 要是正數')
+  if (!(maxUtilization > 0 && maxUtilization <= 1)) throw new RangeError('maxUtilization 要在 (0, 1]')
+  let n = 1
+  while ((n - Math.ceil(n / zones)) * perNodeCapacity * maxUtilization < peakLoad) n++
+  return n
+}
+
+console.log(nodesForZoneFailure({ peakLoad: 3000, perNodeCapacity: 1000, maxUtilization: 0.7, zones: 3 }))
+</script>
+  <script type="tests">
+const base = Object.freeze({ peakLoad: 3000, perNodeCapacity: 1000, maxUtilization: 0.7, zones: 3 })
+assert.equal(nodesForZoneFailure(base), 8, '尖峰 3000、單台 1000、上限 0.7、3 區要 8 台：7 台掉一區剩 4 台 × 700 = 2800 不夠')
+assert.equal(nodesForZoneFailure({ ...base, zones: 2 }), 10, '只有 2 區時掉一區就少一半，要 10 台')
+assert.equal(nodesForZoneFailure({ ...base, maxUtilization: 1 }), 5, '上限 1.0 時 5 台（掉一區剩 3 台 × 1000）就夠')
+for (const zones of [1, 0, 2.5]) {
+  let err: unknown
+  try { nodesForZoneFailure({ ...base, zones }) } catch (e) { err = e }
+  assert(err instanceof RangeError, `zones = ${zones} 要丟 RangeError`)
+}
+for (const bad of [{ peakLoad: 0 }, { perNodeCapacity: -1 }, { maxUtilization: 0 }, { maxUtilization: 1.5 }]) {
+  let err: unknown
+  try { nodesForZoneFailure({ ...base, ...bad }) } catch (e) { err = e }
+  assert(err instanceof RangeError, `${JSON.stringify(bad)} 要丟 RangeError`)
+}
+const ok = (n: number, i: ZoneInput) => (n - Math.ceil(n / i.zones)) * i.perNodeCapacity * i.maxUtilization >= i.peakLoad
+function mulberry32(seed: number) {
+  return () => {
+    seed = seed + 0x6d2b79f5 | 0
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed)
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t
+    return ((t ^ t >>> 14) >>> 0) / 4294967296
+  }
+}
+const rnd = mulberry32(4)
+for (let k = 0; k < 200; k++) {
+  const input = Object.freeze({
+    peakLoad: 100 + Math.floor(rnd() * 20000),
+    perNodeCapacity: 200 + Math.floor(rnd() * 2000),
+    maxUtilization: 0.4 + Math.floor(rnd() * 60) / 100,
+    zones: 2 + Math.floor(rnd() * 4),
+  })
+  const n = nodesForZoneFailure(input)
+  assert(ok(n, input), `${JSON.stringify(input)}：回傳 ${n} 台，掉一區後撐不住尖峰`)
+  assert(n === 1 || !ok(n - 1, input), `${JSON.stringify(input)}：回傳 ${n} 台，但 ${n - 1} 台就夠了，要回傳最小值`)
+}
+</script>
+  <script type="wrong">
+type ZoneInput = { peakLoad: number; perNodeCapacity: number; maxUtilization: number; zones: number }
+function nodesForZoneFailure(input: ZoneInput): number {
+  const { peakLoad, perNodeCapacity, maxUtilization, zones } = input
+  if (!Number.isInteger(zones) || zones < 2) throw new RangeError('zones')
+  if (!(peakLoad > 0) || !(perNodeCapacity > 0) || !(maxUtilization > 0 && maxUtilization <= 1)) throw new RangeError('input')
+  let n = 1
+  while ((n - Math.floor(n / zones)) * perNodeCapacity * maxUtilization < peakLoad) n++
+  return n
+}
+</script>
+  <script type="wrong">
+type ZoneInput = { peakLoad: number; perNodeCapacity: number; maxUtilization: number; zones: number }
+function nodesForZoneFailure(input: ZoneInput): number {
+  const { peakLoad, perNodeCapacity, maxUtilization, zones } = input
+  if (!Number.isInteger(zones) || zones < 2) throw new RangeError('zones')
+  if (!(peakLoad > 0) || !(perNodeCapacity > 0) || !(maxUtilization > 0 && maxUtilization <= 1)) throw new RangeError('input')
+  return Math.ceil(peakLoad / (perNodeCapacity * maxUtilization))
+}
+</script>
+  <script type="wrong">
+type ZoneInput = { peakLoad: number; perNodeCapacity: number; maxUtilization: number; zones: number }
+function nodesForZoneFailure(input: ZoneInput): number {
+  const { peakLoad, perNodeCapacity, maxUtilization, zones } = input
+  if (!Number.isInteger(zones) || zones < 2) throw new RangeError('zones')
+  if (!(peakLoad > 0) || !(perNodeCapacity > 0) || !(maxUtilization > 0 && maxUtilization <= 1)) throw new RangeError('input')
+  let n = 1
+  while ((n - Math.ceil(n / zones)) * perNodeCapacity < peakLoad) n++
+  return n
+}
+</script>
+  <script type="wrong">
+type ZoneInput = { peakLoad: number; perNodeCapacity: number; maxUtilization: number; zones: number }
+function nodesForZoneFailure(input: ZoneInput): number {
+  const { peakLoad, perNodeCapacity, maxUtilization, zones } = input
+  if (!(peakLoad > 0) || !(perNodeCapacity > 0) || !(maxUtilization > 0 && maxUtilization <= 1)) throw new RangeError('input')
+  if (zones < 1) throw new RangeError('zones')
+  let n = 1
+  while ((n - (zones === 1 ? 0 : Math.ceil(n / zones))) * perNodeCapacity * maxUtilization < peakLoad) n++
+  return n
+}
+</script>
+  <script type="wrong">
+type ZoneInput = { peakLoad: number; perNodeCapacity: number; maxUtilization: number; zones: number }
+function nodesForZoneFailure(input: ZoneInput): number {
+  const { peakLoad, perNodeCapacity, maxUtilization, zones } = input
+  if (!Number.isInteger(zones) || zones < 2) throw new RangeError('zones')
+  if (!(peakLoad > 0) || !(perNodeCapacity > 0) || !(maxUtilization > 0 && maxUtilization <= 1)) throw new RangeError('input')
+  return Math.ceil(peakLoad / (perNodeCapacity * maxUtilization) * zones / (zones - 1))
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 3：寫 <code>pickP2C(backends, random)</code>。先只留下 <code>healthy</code> 的後端（設為 h，數量 n），沒有健康的回傳 <code>null</code>；只有一台時直接回傳它的 id，不呼叫 random。否則 <code>i = Math.floor(random() * n)</code>、<code>j = Math.floor(random() * (n - 1))</code>，<code>j >= i</code> 時 j 加 1（保證兩台不同）；回傳 h[i]、h[j] 中 <code>inFlight</code> 比較小的那台的 id，一樣時回傳 h[i]。random 由呼叫端傳入，不能用 <code>Math.random</code>，也不能改動傳進來的陣列。</p>
+  <script type="start">
+type Backend = { id: string; inFlight: number; healthy: boolean }
+
+function pickP2C(backends: readonly Backend[], random: () => number): string | null {
+  throw new Error('TODO')
+}
+
+const fixed = [0.1, 0.9]   // 依序回傳的「亂數」
+console.log(pickP2C([
+  { id: 'api-a', inFlight: 5, healthy: true },
+  { id: 'api-b', inFlight: 2, healthy: true },
+  { id: 'api-c', inFlight: 1, healthy: true },
+], () => fixed.shift() ?? 0))   // i = 0（a）、j = 1 → 調整成 2（c），回傳 api-c
+</script>
+  <script type="answer">
+type Backend = { id: string; inFlight: number; healthy: boolean }
+
+function pickP2C(backends: readonly Backend[], random: () => number): string | null {
+  const h = backends.filter(b => b.healthy)
+  if (h.length === 0) return null
+  if (h.length === 1) return h[0].id
+  const n = h.length
+  const i = Math.floor(random() * n)
+  let j = Math.floor(random() * (n - 1))
+  if (j >= i) j++
+  return h[j].inFlight < h[i].inFlight ? h[j].id : h[i].id
+}
+
+const fixed = [0.1, 0.9]
+console.log(pickP2C([
+  { id: 'api-a', inFlight: 5, healthy: true },
+  { id: 'api-b', inFlight: 2, healthy: true },
+  { id: 'api-c', inFlight: 1, healthy: true },
+], () => fixed.shift() ?? 0))
+</script>
+  <script type="tests">
+const freeze = (list: Backend[]) => Object.freeze(list.map(b => Object.freeze({ ...b })))
+function seq(values: number[]) {
+  const box = { calls: 0, next: () => { box.calls++; return values[box.calls - 1] ?? 0 } }
+  return box
+}
+const realRandom = Math.random
+Math.random = () => { throw new Error('不能用 Math.random，請用參數傳進來的 random') }
+try {
+  const three = freeze([
+    { id: 'a', inFlight: 5, healthy: true },
+    { id: 'b', inFlight: 2, healthy: true },
+    { id: 'c', inFlight: 1, healthy: true },
+  ])
+  let r = seq([0.1, 0.9])
+  assert.equal(pickP2C(three, r.next), 'c', 'i = 0、j = floor(0.9 × 2) = 1 → 調整成 2，c 比較閒')
+  assert.equal(r.calls, 2, 'random 要剛好呼叫 2 次')
+  r = seq([0.5, 0.4])
+  assert.equal(pickP2C(three, r.next), 'b', 'i = 1、j = 0：比較 b 和 a，b 比較閒（不是去選全域最閒的 c）')
+  r = seq([0.9, 0.9])
+  assert.equal(pickP2C(three, r.next), 'c', 'i = 2、j = 1：比較 c 和 b')
+  r = seq([0.1, 0.1])
+  assert.equal(pickP2C(three, r.next), 'b', 'i = 0、j = floor(0.2) = 0 → j >= i 要加 1 變成 1，不能兩次挑到同一台')
+  const tie = freeze([
+    { id: 'x', inFlight: 3, healthy: true },
+    { id: 'y', inFlight: 3, healthy: true },
+  ])
+  assert.equal(pickP2C(tie, seq([0.1, 0.9]).next), 'x', 'inFlight 一樣時回傳第 i 台（這裡 i = 0）')
+  assert.equal(pickP2C(tie, seq([0.9, 0.1]).next), 'y', 'inFlight 一樣時回傳第 i 台（這裡 i = 1）')
+  const mixed = freeze([
+    { id: 'down', inFlight: 0, healthy: false },
+    { id: 'b', inFlight: 5, healthy: true },
+    { id: 'c', inFlight: 4, healthy: true },
+  ])
+  assert.equal(pickP2C(mixed, seq([0.1, 0.9]).next), 'c', '先過濾掉不健康的，i、j 是健康清單裡的位置')
+  for (let k = 0; k < 50; k++) {
+    const r1 = mulberry32(k)
+    assert(pickP2C(mixed, r1) !== 'down', '不健康的後端永遠不能被選到')
+  }
+  assert.equal(pickP2C(freeze([{ id: 'a', inFlight: 1, healthy: false }]), seq([]).next), null, '沒有健康的後端要回傳 null')
+  r = seq([])
+  assert.equal(pickP2C(freeze([{ id: 'a', inFlight: 1, healthy: false }, { id: 'b', inFlight: 9, healthy: true }]), r.next), 'b', '只剩一台健康的就直接回傳它')
+  assert.equal(r.calls, 0, '只有一台健康時不需要呼叫 random')
+  function simulate(pick: (b: readonly Backend[], r: () => number) => string | null, seed: number) {
+    const rnd = mulberry32(seed)
+    const inFlight = Array(10).fill(0)
+    const finish = new Map<number, number[]>()
+    let max = 0
+    for (let t = 0; t < 20000; t++) {
+      for (const k of finish.get(t) ?? []) inFlight[k]--
+      finish.delete(t)
+      const bs = freeze(inFlight.map((v, k) => ({ id: 'api-' + k, inFlight: v, healthy: true })))
+      const id = pick(bs, rnd)
+      const k = Number(String(id).slice(4))
+      inFlight[k]++
+      max = Math.max(max, inFlight[k])
+      const end = t + 1 + Math.floor(rnd() * 59)
+      finish.set(end, [...(finish.get(end) ?? []), k])
+    }
+    return max
+  }
+  const p2cMax = simulate(pickP2C, 42)
+  const oneMax = simulate((b, r) => b[Math.floor(r() * b.length)].id, 42)
+  assert(p2cMax <= 8 && p2cMax + 4 <= oneMax, `模擬 2 萬個請求：P2C 最忙的一台同時 ${p2cMax} 個，隨機挑一台是 ${oneMax} 個，P2C 應該明顯比較平均`)
+} finally {
+  Math.random = realRandom
+}
+function mulberry32(seed: number) {
+  return () => {
+    seed = seed + 0x6d2b79f5 | 0
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed)
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t
+    return ((t ^ t >>> 14) >>> 0) / 4294967296
+  }
+}
+</script>
+  <script type="wrong">
+type Backend = { id: string; inFlight: number; healthy: boolean }
+function pickP2C(backends: readonly Backend[], random: () => number): string | null {
+  const h = backends.filter(b => b.healthy)
+  if (h.length === 0) return null
+  return h.reduce((best, b) => b.inFlight < best.inFlight ? b : best).id
+}
+</script>
+  <script type="wrong">
+type Backend = { id: string; inFlight: number; healthy: boolean }
+function pickP2C(backends: readonly Backend[], random: () => number): string | null {
+  const h = backends.filter(b => b.healthy)
+  if (h.length === 0) return null
+  if (h.length === 1) return h[0].id
+  const i = Math.floor(random() * h.length)
+  const j = Math.floor(random() * (h.length - 1))
+  return h[j].inFlight < h[i].inFlight ? h[j].id : h[i].id
+}
+</script>
+  <script type="wrong">
+type Backend = { id: string; inFlight: number; healthy: boolean }
+function pickP2C(backends: readonly Backend[], random: () => number): string | null {
+  const h = backends
+  if (h.length === 0) return null
+  if (h.length === 1) return h[0].id
+  const i = Math.floor(random() * h.length)
+  let j = Math.floor(random() * (h.length - 1))
+  if (j >= i) j++
+  return h[j].inFlight < h[i].inFlight ? h[j].id : h[i].id
+}
+</script>
+  <script type="wrong">
+type Backend = { id: string; inFlight: number; healthy: boolean }
+function pickP2C(backends: readonly Backend[], random: () => number): string | null {
+  const h = backends.filter(b => b.healthy)
+  if (h.length === 0) return null
+  if (h.length === 1) return h[0].id
+  const i = Math.floor(random() * h.length)
+  let j = Math.floor(random() * (h.length - 1))
+  if (j >= i) j++
+  return h[j].inFlight <= h[i].inFlight ? h[j].id : h[i].id
+}
+</script>
+</div>
+
+<div class="exercise">
+  <p>練習 4：完成 <code>OutlierDetector</code>（被動健康檢查）。<code>report(host, status)</code>：500～599 讓這台的連續失敗數加 1，其他狀態碼歸零；被剔除期間收到的回報（剔除前就送出、晚到的請求）直接忽略。連續失敗數達到 <code>consecutive5xx</code> 時，先把連續失敗數歸零，再嘗試剔除：如果目前被剔除的台數已經達到 <code>Math.floor(hosts.length * maxEjectionPercent / 100)</code>，就不剔除；否則剔除，剔除時間 = <code>baseEjectionMs × 這台第幾次被剔除</code>。<code>isEjected(host)</code>：<code>now()</code> 到達剔除結束時間就自動恢復。<code>available()</code> 依原本順序回傳沒被剔除的主機。時間一律用 <code>opts.now()</code>。這是簡化過的規則：Envoy 的上限比較方式、剔除倍數會降回來等細節不同。</p>
+  <script type="start">
+type OutlierOptions = {
+  consecutive5xx: number       // 連續幾次 5xx 就剔除
+  baseEjectionMs: number       // 基本剔除時間
+  maxEjectionPercent: number   // 最多剔除幾 % 的主機
+  now: () => number            // 現在時間（毫秒）
+}
+
+class OutlierDetector {
+  constructor(hosts: readonly string[], opts: OutlierOptions) {
+    throw new Error('TODO')
+  }
+
+  report(host: string, status: number): void {
+    throw new Error('TODO')
+  }
+
+  isEjected(host: string): boolean {
+    throw new Error('TODO')
+  }
+
+  available(): string[] {
+    throw new Error('TODO')
+  }
+}
+
+let t = 0
+const detector = new OutlierDetector(['api-1', 'api-2', 'api-3', 'api-4', 'api-5'], {
+  consecutive5xx: 3, baseEjectionMs: 30000, maxEjectionPercent: 40, now: () => t,
+})
+for (let k = 0; k < 3; k++) detector.report('api-2', 503)
+console.log(detector.available())   // api-2 被剔除
+t += 30000
+console.log(detector.available())   // 30 秒後恢復
+</script>
+  <script type="answer">
+type OutlierOptions = {
+  consecutive5xx: number
+  baseEjectionMs: number
+  maxEjectionPercent: number
+  now: () => number
+}
+
+class OutlierDetector {
+  private readonly hosts: readonly string[]
+  private readonly opts: OutlierOptions
+  private readonly failures = new Map<string, number>()
+  private readonly ejectedUntil = new Map<string, number>()
+  private readonly ejections = new Map<string, number>()
+
+  constructor(hosts: readonly string[], opts: OutlierOptions) {
+    this.hosts = hosts
+    this.opts = opts
+  }
+
+  report(host: string, status: number): void {
+    if (this.isEjected(host)) return
+    if (status < 500 || status > 599) {
+      this.failures.set(host, 0)
+      return
+    }
+    const count = (this.failures.get(host) ?? 0) + 1
+    if (count < this.opts.consecutive5xx) {
+      this.failures.set(host, count)
+      return
+    }
+    this.failures.set(host, 0)
+    const max = Math.floor(this.hosts.length * this.opts.maxEjectionPercent / 100)
+    if (this.hosts.filter(h => this.isEjected(h)).length >= max) return
+    const times = (this.ejections.get(host) ?? 0) + 1
+    this.ejections.set(host, times)
+    this.ejectedUntil.set(host, this.opts.now() + this.opts.baseEjectionMs * times)
+  }
+
+  isEjected(host: string): boolean {
+    const until = this.ejectedUntil.get(host)
+    return until !== undefined && this.opts.now() < until
+  }
+
+  available(): string[] {
+    return this.hosts.filter(h => !this.isEjected(h))
+  }
+}
+
+let t = 0
+const detector = new OutlierDetector(['api-1', 'api-2', 'api-3', 'api-4', 'api-5'], {
+  consecutive5xx: 3, baseEjectionMs: 30000, maxEjectionPercent: 40, now: () => t,
+})
+for (let k = 0; k < 3; k++) detector.report('api-2', 503)
+console.log(detector.available())
+t += 30000
+console.log(detector.available())
+</script>
+  <script type="tests">
+{
+  let clock = 0
+  const hosts = Object.freeze(Array.from({ length: 10 }, (_, k) => 'h' + k))
+  const realNow = Date.now
+  Date.now = () => { throw new Error('不能用 Date.now，請用 opts.now()') }
+  try {
+    const d = new OutlierDetector(hosts, { consecutive5xx: 5, baseEjectionMs: 30000, maxEjectionPercent: 20, now: () => clock })
+    const fail = (h: string, times: number) => { for (let k = 0; k < times; k++) d.report(h, 503) }
+    fail('h0', 4)
+    d.report('h0', 200)
+    fail('h0', 4)
+    assert.equal(d.isEjected('h0'), false, '中間夾一次 200，連續失敗要歸零：4 + 4 次不連續的 5xx 不能剔除')
+    d.report('h0', 500)
+    assert.equal(d.isEjected('h0'), true, '連續 5 次 5xx 要剔除')
+    assert.deepEqual(d.available(), hosts.filter(h => h !== 'h0'), 'available() 依原本順序、不含被剔除的')
+    fail('h0', 6)
+    clock += 29999
+    assert.equal(d.isEjected('h0'), true, '第 1 次剔除是 30 秒，29.999 秒時還在剔除中')
+    clock += 1
+    assert.equal(d.isEjected('h0'), false, '第 1 次剔除滿 30 秒要自動恢復；剔除期間的回報要忽略，不能讓它重新剔除')
+    fail('h0', 4)
+    assert.equal(d.isEjected('h0'), false, '恢復後連續失敗數從 0 開始，4 次還不夠')
+    d.report('h0', 502)
+    assert.equal(d.isEjected('h0'), true, '恢復後再連續 5 次 5xx 要再剔除')
+    clock += 59999
+    assert.equal(d.isEjected('h0'), true, '第 2 次剔除要 30 秒 × 2 = 60 秒，剔除時間要逐次加長')
+    clock += 1
+    assert.equal(d.isEjected('h0'), false, '第 2 次剔除滿 60 秒要恢復')
+    fail('h1', 4)
+    d.report('h1', 404)
+    fail('h1', 4)
+    assert.equal(d.isEjected('h1'), false, '404 也要讓連續失敗數歸零（只有 500～599 算失敗）')
+    d.report('h1', 599)
+    fail('h2', 5)
+    assert.equal(d.isEjected('h1') && d.isEjected('h2'), true, 'h1、h2 都要被剔除')
+    fail('h3', 5)
+    assert.equal(d.isEjected('h3'), false, '10 台、上限 20%：已經剔除 2 台時不能再剔除第 3 台')
+    assert.equal(d.available().length, 8, '剔除上限：10 台最多剔除 2 台')
+    clock += 30000
+    fail('h3', 4)
+    assert.equal(d.isEjected('h3'), false, '達到門檻但因為上限沒剔除時，連續失敗數也要歸零')
+    d.report('h3', 500)
+    assert.equal(d.isEjected('h3'), true, 'h1、h2 恢復後，h3 再連續 5 次 5xx 就能剔除')
+    clock += 29999
+    assert.equal(d.isEjected('h3'), true, 'h3 是第 1 次真的被剔除，要剔除 30 秒')
+    clock += 1
+    assert.equal(d.isEjected('h3'), false, '因為上限沒剔除成功的那次不算「被剔除的次數」，h3 第 1 次剔除滿 30 秒就要恢復')
+    const all = new OutlierDetector(hosts, { consecutive5xx: 1, baseEjectionMs: 1000, maxEjectionPercent: 20, now: () => clock })
+    for (const h of hosts) all.report(h, 503)
+    assert.equal(all.available().length, 8, '每台都回 503 時也只能剔除 20%，不能把所有機器踢光')
+    const five = Object.freeze(['a', 'b', 'c', 'd', 'e'])
+    const small = new OutlierDetector(five, { consecutive5xx: 1, baseEjectionMs: 1000, maxEjectionPercent: 30, now: () => clock })
+    for (const h of five) small.report(h, 500)
+    assert.deepEqual(small.available(), ['b', 'c', 'd', 'e'], '5 台、上限 30%：Math.floor(1.5) = 1，只能剔除 1 台（要用 Math.floor，不是 Math.ceil 或 Math.round）')
+  } finally {
+    Date.now = realNow
+  }
+}
+</script>
+  <script type="wrong">
+type OutlierOptions = { consecutive5xx: number; baseEjectionMs: number; maxEjectionPercent: number; now: () => number }
+class OutlierDetector {
+  private failures = new Map<string, number>()
+  private ejected = new Set<string>()
+  constructor(private readonly hosts: readonly string[], private readonly opts: OutlierOptions) {}
+  report(host: string, status: number): void {
+    if (this.ejected.has(host)) return
+    if (status < 500 || status > 599) { this.failures.set(host, 0); return }
+    const count = (this.failures.get(host) ?? 0) + 1
+    this.failures.set(host, count < this.opts.consecutive5xx ? count : 0)
+    if (count < this.opts.consecutive5xx) return
+    if (this.ejected.size >= Math.floor(this.hosts.length * this.opts.maxEjectionPercent / 100)) return
+    this.ejected.add(host)
+  }
+  isEjected(host: string): boolean { return this.ejected.has(host) }
+  available(): string[] { return this.hosts.filter(h => !this.isEjected(h)) }
+}
+</script>
+  <script type="wrong">
+type OutlierOptions = { consecutive5xx: number; baseEjectionMs: number; maxEjectionPercent: number; now: () => number }
+class OutlierDetector {
+  private failures = new Map<string, number>()
+  private until = new Map<string, number>()
+  constructor(private readonly hosts: readonly string[], private readonly opts: OutlierOptions) {}
+  report(host: string, status: number): void {
+    if (this.isEjected(host)) return
+    if (status < 500 || status > 599) { this.failures.set(host, 0); return }
+    const count = (this.failures.get(host) ?? 0) + 1
+    this.failures.set(host, count < this.opts.consecutive5xx ? count : 0)
+    if (count < this.opts.consecutive5xx) return
+    if (this.hosts.filter(h => this.isEjected(h)).length >= Math.floor(this.hosts.length * this.opts.maxEjectionPercent / 100)) return
+    this.until.set(host, this.opts.now() + this.opts.baseEjectionMs)
+  }
+  isEjected(host: string): boolean { return this.opts.now() < (this.until.get(host) ?? -Infinity) }
+  available(): string[] { return this.hosts.filter(h => !this.isEjected(h)) }
+}
+</script>
+  <script type="wrong">
+type OutlierOptions = { consecutive5xx: number; baseEjectionMs: number; maxEjectionPercent: number; now: () => number }
+class OutlierDetector {
+  private failures = new Map<string, number>()
+  private until = new Map<string, number>()
+  private times = new Map<string, number>()
+  constructor(private readonly hosts: readonly string[], private readonly opts: OutlierOptions) {}
+  report(host: string, status: number): void {
+    if (this.isEjected(host)) return
+    if (status < 500 || status > 599) { this.failures.set(host, 0); return }
+    const count = (this.failures.get(host) ?? 0) + 1
+    this.failures.set(host, count < this.opts.consecutive5xx ? count : 0)
+    if (count < this.opts.consecutive5xx) return
+    const n = (this.times.get(host) ?? 0) + 1
+    this.times.set(host, n)
+    this.until.set(host, this.opts.now() + this.opts.baseEjectionMs * n)
+  }
+  isEjected(host: string): boolean { return this.opts.now() < (this.until.get(host) ?? -Infinity) }
+  available(): string[] { return this.hosts.filter(h => !this.isEjected(h)) }
+}
+</script>
+  <script type="wrong">
+type OutlierOptions = { consecutive5xx: number; baseEjectionMs: number; maxEjectionPercent: number; now: () => number }
+class OutlierDetector {
+  private failures = new Map<string, number>()
+  private until = new Map<string, number>()
+  private times = new Map<string, number>()
+  constructor(private readonly hosts: readonly string[], private readonly opts: OutlierOptions) {}
+  report(host: string, status: number): void {
+    if (this.isEjected(host)) return
+    if (status < 500 || status > 599) return
+    const count = (this.failures.get(host) ?? 0) + 1
+    this.failures.set(host, count < this.opts.consecutive5xx ? count : 0)
+    if (count < this.opts.consecutive5xx) return
+    if (this.hosts.filter(h => this.isEjected(h)).length >= Math.floor(this.hosts.length * this.opts.maxEjectionPercent / 100)) return
+    const n = (this.times.get(host) ?? 0) + 1
+    this.times.set(host, n)
+    this.until.set(host, this.opts.now() + this.opts.baseEjectionMs * n)
+  }
+  isEjected(host: string): boolean { return this.opts.now() < (this.until.get(host) ?? -Infinity) }
+  available(): string[] { return this.hosts.filter(h => !this.isEjected(h)) }
+}
+</script>
+  <script type="wrong">
+type OutlierOptions = { consecutive5xx: number; baseEjectionMs: number; maxEjectionPercent: number; now: () => number }
+class OutlierDetector {
+  private failures = new Map<string, number>()
+  private until = new Map<string, number>()
+  private times = new Map<string, number>()
+  constructor(private readonly hosts: readonly string[], private readonly opts: OutlierOptions) {}
+  report(host: string, status: number): void {
+    if (this.isEjected(host)) return
+    if (status < 500 || status > 599) { this.failures.set(host, 0); return }
+    const count = (this.failures.get(host) ?? 0) + 1
+    this.failures.set(host, count < this.opts.consecutive5xx ? count : 0)
+    if (count < this.opts.consecutive5xx) return
+    if (this.hosts.filter(h => this.isEjected(h)).length >= Math.ceil(this.hosts.length * this.opts.maxEjectionPercent / 100)) return
+    const n = (this.times.get(host) ?? 0) + 1
+    this.times.set(host, n)
+    this.until.set(host, this.opts.now() + this.opts.baseEjectionMs * n)
+  }
+  isEjected(host: string): boolean { return this.opts.now() < (this.until.get(host) ?? -Infinity) }
+  available(): string[] { return this.hosts.filter(h => !this.isEjected(h)) }
+}
+</script>
+  <script type="wrong">
+type OutlierOptions = { consecutive5xx: number; baseEjectionMs: number; maxEjectionPercent: number; now: () => number }
+class OutlierDetector {
+  private failures = new Map<string, number>()
+  private until = new Map<string, number>()
+  private times = new Map<string, number>()
+  constructor(private readonly hosts: readonly string[], private readonly opts: OutlierOptions) {}
+  report(host: string, status: number): void {
+    if (this.isEjected(host)) return
+    if (status < 500 || status > 599) { this.failures.set(host, 0); return }
+    const count = (this.failures.get(host) ?? 0) + 1
+    this.failures.set(host, count < this.opts.consecutive5xx ? count : 0)
+    if (count < this.opts.consecutive5xx) return
+    const n = (this.times.get(host) ?? 0) + 1
+    this.times.set(host, n)
+    if (this.hosts.filter(h => this.isEjected(h)).length >= Math.floor(this.hosts.length * this.opts.maxEjectionPercent / 100)) return
+    this.until.set(host, this.opts.now() + this.opts.baseEjectionMs * n)
+  }
+  isEjected(host: string): boolean { return this.opts.now() < (this.until.get(host) ?? -Infinity) }
+  available(): string[] { return this.hosts.filter(h => !this.isEjected(h)) }
+}
+</script>
+  <script type="wrong">
+type OutlierOptions = { consecutive5xx: number; baseEjectionMs: number; maxEjectionPercent: number; now: () => number }
+class OutlierDetector {
+  private failures = new Map<string, number>()
+  private until = new Map<string, number>()
+  private times = new Map<string, number>()
+  constructor(private readonly hosts: readonly string[], private readonly opts: OutlierOptions) {}
+  report(host: string, status: number): void {
+    if (status < 500 || status > 599) { this.failures.set(host, 0); return }
+    const count = (this.failures.get(host) ?? 0) + 1
+    this.failures.set(host, count < this.opts.consecutive5xx ? count : 0)
+    if (count < this.opts.consecutive5xx) return
+    if (this.hosts.filter(h => this.isEjected(h)).length >= Math.floor(this.hosts.length * this.opts.maxEjectionPercent / 100)) return
+    const n = (this.times.get(host) ?? 0) + 1
+    this.times.set(host, n)
+    this.until.set(host, this.opts.now() + this.opts.baseEjectionMs * n)
+  }
+  isEjected(host: string): boolean { return this.opts.now() < (this.until.get(host) ?? -Infinity) }
+  available(): string[] { return this.hosts.filter(h => !this.isEjected(h)) }
+}
+</script>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 5：下單 API 本身 99.99%，硬相依 PostgreSQL 99.95%、Redis 99.9%、金流 99.9%。下單的理論可用性大約是多少？</p>
+  <label data-key="a">99.99%，看最好的那一個</label>
+  <label data-key="b">99.94%，四個取平均</label>
+  <label data-key="c">99.74%，四個相乘</label>
+  <label data-key="d">99.9%，看最差的那一個</label>
+  <p class="why">✓ 硬相依是串聯，每個都要好才行，所以相乘：0.9999 × 0.9995 × 0.999 × 0.999 ≈ 0.9974，每個月約 1.9 小時的停機預算，比任何一個元件都差。平均或取最差都高估了。要提高它，可以減少硬相依（改成軟相依）或提高最弱的幾個。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 6：兩台 99.9% 的 API 放在同一個可用區，用同一條部署流程同時更新。可以說它們的組合可用性是 1 − 0.001² = 99.9999% 嗎？</p>
+  <label data-key="a">可以，冗餘的公式永遠成立</label>
+  <label data-key="b">不行，公式假設兩台獨立；同一個可用區、同一次壞部署會讓它們一起壞</label>
+  <label data-key="c">可以，只要負載平衡器有做健康檢查</label>
+  <p class="why">✓ 並聯公式的前提是「彼此獨立」。機房斷電、同一個有 bug 的版本、同一份錯誤設定都會讓兩台同時壞，這叫相關性故障。要讓公式比較接近事實，要分散到不同可用區、分批部署。健康檢查只能把壞的踢掉，兩台一起壞時它也沒辦法。</p>
+</div>
+
+<div class="quiz" data-correct="b">
+  <p>練習 7：3 台 API 平常各跑在 70% 使用率。其中一台掛掉會怎樣？</p>
+  <label data-key="a">還有兩台，使用率變成 70% × 2 ÷ 3 ≈ 47%，沒問題</label>
+  <label data-key="b">剩下兩台各要扛 105%，處理不完、排隊暴增，可能連鎖倒下</label>
+  <label data-key="c">負載平衡器會自動限流，所以不會有影響</label>
+  <p class="why">✓ 總負載是 3 × 70% = 2.1 台的量，分給 2 台就是每台 105%，超過能處理的上限，佇列越排越長，逾時引發重試讓負載更高。容量要以「掉一台（或一個可用區）之後」的使用率來規劃。負載平衡器預設不會幫你限流，限流與負載卸除在<a href="10-rate-limiting.html">第 10 課</a>、<a href="11-circuit-breaker-bulkhead.html">第 11 課</a>。</p>
+</div>
+
+<div class="quiz" data-correct="c">
+  <p>練習 8：健康檢查程式出了 bug，讓每台機器都回 503。負載平衡器把所有機器都剔除，服務全掛。哪個設計最能避免這種事？</p>
+  <label data-key="a">把檢查改得更嚴格，例如連續 1 次失敗就剔除</label>
+  <label data-key="b">liveness 加上資料庫連線檢查，確保依賴也正常</label>
+  <label data-key="c">設定最多剔除比例與 panic threshold：大部分機器同時「壞掉」時，比較可能是檢查本身出錯，寧可照樣送流量</label>
+  <p class="why">✓ Envoy 預設最多剔除 10%、健康比例低於 50% 時進入 panic 模式忽略健康狀態，就是為了這種情況。更嚴格的檢查會更快把機器踢光；liveness 檢查資料庫會讓資料庫一慢所有副本都被重啟，是反效果。</p>
+</div>
+
+<h2>常見錯誤</h2>
+<ul>
+  <li><strong>以為多一份就是冗餘</strong>：兩份放在同一台主機、同一個可用區，或用同一次部署一起更新，會一起壞。冗餘要跨故障域，部署要分批。</li>
+  <li><strong>只算正常時的容量</strong>：平常 70% 很安全，掉一台就超過 100%。N+1 要算「壞掉一台／一個可用區之後」的使用率。</li>
+  <li><strong>依賴越加越多卻沒算可用性</strong>：每多一個硬相依就多一個讓你掛掉的機會。能改成軟相依（佇列、快取的舊資料、隱藏區塊）就改。</li>
+  <li><strong>健康檢查沒有上限地剔除</strong>：檢查本身出錯、或共同的依賴慢了一下，會把所有機器踢光。要有最多剔除比例或 panic threshold。</li>
+  <li><strong>liveness 檢查資料庫</strong>：資料庫一慢，所有副本同時被重啟。依賴放在 readiness。</li>
+  <li><strong>負載平衡器只有一台</strong>：它自己就是單點故障。用雲端跨可用區的負載平衡器，或至少兩台加上切換機制。</li>
+  <li><strong>每次都選全域最閒的機器</strong>：資訊過時時，多台負載平衡器會同時湧向同一台。用 P2C。</li>
+  <li><strong>長連線用 round robin</strong>：連線建立後就不再分配，新機器分不到流量（第 17 課）。</li>
+</ul>
+
+<h2 id="appendix">補充與查表</h2>
+<h3>數字的出處</h3>
+<p>停機預算表的數字出自 Google SRE 書的可用性表。第二節程式格裡的串聯、並聯和「150 天壞一次、1 小時修好」三個數字出自 AWS Well-Architected 可靠性支柱；「75 天壞一次、30 分鐘修好」是拿來對照的。</p>
+<h3>P2C 的理論結果</h3>
+<p>把 n 個請求隨機分給 n 台時，最忙的那台大約有 log n / log log n 個；改成挑兩台選比較少的，降到 log log n / log 2 左右（Mitzenmacher 等人 2001 年的綜述）。從挑一台變挑兩台是指數級的改善，再多挑幾台只多一個常數倍的改善，所以兩台是最划算的點。</p>
+<h3>nginx 與 Envoy 的對應設定</h3>
+<ul>
+  <li>nginx 1.15.1 起有 <code>random two least_conn</code>：隨機挑兩台，選連線比較少的那台，作法跟 P2C 相同。</li>
+  <li>Envoy 的異常剔除倍數：一台被剔除後恢復，如果之後一直正常，下次剔除用的倍數會慢慢降回來，不會永遠記著過去被踢過幾次。</li>
+</ul>
+<h3>anycast</h3>
+<p>anycast 是在網路路由層做的分流：同一個 IP 在多個地點同時宣告，網路路由會把封包送到最近的那個地點。某個地點壞了，路由會改送到其他地點，不用等 DNS 的 TTL。CDN 常用這種方式。</p>
+
+<h2>小結</h2>
+<ul>
+  <li>可用性換成停機預算才有感：99.9% 每 30 天 43.2 分鐘、99.99% 只有 4.32 分鐘。以請求計算時，尖峰的停機特別貴，所以 SLO 多半用請求算。</li>
+  <li>硬相依串聯要相乘，比任何一個都低；獨立的冗餘是 1 − 不可用率的乘積，兩台 99.9% 並聯是 99.9999%；軟相依不拉低可用性，把硬相依改成軟相依常比加機器便宜。</li>
+  <li>可用性 ≈ MTBF ÷ (MTBF + MTTR)，縮短修復時間跟減少故障一樣有效。</li>
+  <li>冗餘公式假設獨立：先找出單點故障，再讓冗餘跨故障域（主機、可用區），並提防相關性故障（同一個部署、同一份設定）。</li>
+  <li>容量以「掉一個可用區之後」的使用率規劃，不然壞一台會拖垮剩下的。</li>
+  <li>負載平衡器拿到的負載資訊總是過時，「全選最閒」會造成羊群效應；P2C 隨機挑兩台選比較閒的，Envoy 的 least request 在權重相同時就是它。黏性 session 和長連線會讓演算法失效。</li>
+  <li>健康檢查分主動與被動；異常剔除要有連續失敗門檻、逐次加長的剔除時間和最多剔除比例，panic threshold 防止把機器踢光。</li>
+  <li>負載平衡器本身也要冗餘：雲端跨可用區的負載平衡器、L4 加多台 L7，或 DNS 輪詢（受 TTL 限制）。沒演練過的備援不算數。</li>
+</ul>
+<p>下一課：快取。多加機器能分擔 API 的負載，但每台都去讀同一個資料庫；快取讓大部分讀取不必打到資料庫，代價是過時、失效和擊穿。</p>
+
+</main>
+<script type="module" src="../lab.js"></script>
+</body>
+</html>
